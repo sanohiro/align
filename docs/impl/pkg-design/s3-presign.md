@@ -1,7 +1,7 @@
 # pkg.s3 — explicit-expiry presigning
 
 > English is authoritative. Japanese mirror: `ja/s3-presign.md`.
-> Status: design accepted, 2026-09-09; implementation pending.
+> Status: implemented, 2026-09-09.
 
 ## Capability and public-contract ledger
 
@@ -153,7 +153,7 @@ No performance or exact allocation-count promise is made; no benchmark is requir
 | ID / exact owner | Required implementation and regression closure |
 |---|---|
 | P-G `presign_vectors` | Published AWS 2013-05-24 GET example: canonical hash `3bfa292879f6447bbcda7001decf97f4a54dc650c8942174ae0a9121cf58ad04`, signature `aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404`. Independently assemble canonical bytes and full URL. Exact URL, method and returned header rows cover None/Some token, zero/multiple user headers, encoded prefix sorting, duplicate/empty pairs, binary secret, normalized whitespace, authority/port and UTF-8/NUL/slash/dot paths. User headers on both sides of Host in byte order must produce `content-type;host;x-test` and returned rows `content-type`, `x-test`. Reconstruct captured bytes back to canonical form and verify the signature, excluding only its final pair. |
-| P-V `presign_validation` | Reuse V2–V6 parameterized owners where shared production validators are called; discriminate presign's aggregate and validation entry points. Counts 0/limit/next, expiry -1/0/1/604800/604801/i64 extrema, time -1/0/fraction/max, every reserved query/header category, token None/Some/empty, multi-invalid inputs. Private predicate probes may close impractical size limits, but public calls own admission routing. No rejected input triggers HTTP or sends bytes. |
+| P-V `presign_validation`, `presign_expiry_counts` | Reuse V2–V6 parameterized owners where shared production validators are called; discriminate presign's aggregate and validation entry points. Counts 0/limit/next, expiry -1/0/1/604800/604801/i64 extrema, time -1/0/fraction/max, every reserved query/header category, token None/Some/empty, multi-invalid inputs. Private predicate probes may close impractical size limits, but public calls own admission routing. No rejected input triggers HTTP or sends bytes. |
 | P-O `presign_round_trip` | Output escapes an input arena and temporary credentials/field buffers; original inputs then change or drop. Move result through helpers/Result/Option, replace it, return, destructure, borrow repeatedly and drop nested headers. Existing record/array owners cover if/match/else/?/loop joins, early exit, move-out source nulling and cleanup; add one result-replacement/reuse witness distinguishing this aggregate. Local peer verifies GET and PUT (binary and explicit empty payload), nonempty normalized required headers, token states, shared-client reuse and raw denial response. Arbitrary body variation does not change query authentication. |
 | P-I `presign_imports_effects_cache` | Whole-program/per-unit × Dev/Release use the same URL/wire oracle. Cross-package nominal record/array interface and borrowed projections compile; Impure call is rejected in a parallel closure returning a valid primitive. Cold/warm and private signature-helper edit/restore invalidate artifacts correctly; existing request vectors stay unchanged. The unchanged single-module package inventory includes the new callable surface without native symbols or new source units. |
 
@@ -187,3 +187,14 @@ reproduces the published vector in both directions. The independent full-diff
 design review found one P2 ambiguity in Host ordering; P4 and P-G now explicitly
 sort the complete host-plus-user set and remove Host only from returned rows.
 The author audited every generated/user ordering rule and synchronized the mirror.
+
+
+Implementation closure: `presign` performs P1 admission before its first builder,
+then uses shared `encoded_query`, `credential_scope` and `signature` helpers for
+P2–P7. P-G pins independently reconstructed URL bytes in both compilation modes
+and profiles; P-O reconstructs canonical bytes from a local peer and exercises
+borrowed consumers in a separate package. P-V reuses every shared validator case
+and adds public count, duration and serialized-time boundaries. P-I checks private
+signing-body cache invalidation and impurity through both frontend paths. P-O moves
+and destructures the owned method/URL strings while the remaining header array
+uses ordinary recursive Drop; it does not widen existing aggregate move rules.

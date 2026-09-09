@@ -118,10 +118,10 @@ request returns. The complete ownership boundary is now implemented under
 `docs/impl/std-design/http-client-composition.md`, including borrowed helpers,
 recursive carriers and whole/unit producer validation. The independently reviewed
 `pkg.s3`/SigV4 contract in `docs/impl/pkg-design/s3.md` is implemented, including
-general HTTP explicit-empty-body framing required by S3 PUT. The next consumer
-boundary is explicit-expiry S3 presigning. Its public-contract ledger and closure
-matrix in `docs/impl/pkg-design/s3-presign.md` are independently reviewed and
-accepted. Next is the complete URL-to-wire implementation under that matrix.
+general HTTP explicit-empty-body framing required by S3 PUT. Explicit-expiry S3 presigning is implemented under the accepted public-contract ledger
+and closure matrix in `docs/impl/pkg-design/s3-presign.md`, including owned output,
+normalized required headers, signature-to-wire parity and input-independent reuse.
+The next cloud capability requires consumer selection and its own exact design.
 Other transports and S1–S6 retain their own evidence/design gates.
 
 **Current next work (owner-resumed 2026-09-07):** Request 55 and the fixed v0.7.3 release are

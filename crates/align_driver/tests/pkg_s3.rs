@@ -337,6 +337,15 @@ fn main() -> Result<(), Error> {{
 
 #[test]
 fn input_validation() {
+    validation_cases(false);
+}
+
+#[test]
+fn presign_validation() {
+    validation_cases(true);
+}
+
+fn validation_cases(presign: bool) {
     if !backend_available() {
         return;
     }
@@ -614,6 +623,14 @@ fn main() {
         expected.push_str(if good { "true\n" } else { "false\n" });
     }
     main.push_str("  }\n}\n");
+    if presign {
+        let original = main.clone();
+        main = main.replace(
+            "pkg.s3.request(credentials, endpoint, method, path, query, headers, body, now_ns)",
+            "pkg.s3.presign(credentials, endpoint, method, path, query, headers, now_ns, 86400)",
+        );
+        assert_ne!(main, original, "presign validation routing");
+    }
     let project = Project::new(&main);
     let exe = project.build(&main, true, Profile::Dev);
     assert_eq!(run_bounded(&exe), expected);
@@ -712,6 +729,15 @@ fn main() -> Result<(), Error> {{
 
 #[test]
 fn imports_effects_cache() {
+    cache_cases(false);
+}
+
+#[test]
+fn presign_imports_effects_cache() {
+    cache_cases(true);
+}
+
+fn cache_cases(presign: bool) {
     use align_driver::{CacheContext, UnitReuse, build_package};
     let main = r#"import pkg.s3
 fn main() -> Result<(), Error> {
@@ -725,6 +751,16 @@ fn main() -> Result<(), Error> {
   return Ok(())
 }
 "#;
+    let main = if presign {
+        main.replace(
+            "pkg.s3.request(credentials, endpoint, \"GET\", \"/\", empty, empty, \"\".bytes(), 0)",
+            "pkg.s3.presign(credentials, endpoint, \"GET\", \"/\", empty, empty, 0, 86400)",
+        )
+    } else {
+        main.to_owned()
+    };
+    assert_eq!(main.contains("pkg.s3.presign("), presign);
+    let main = main.as_str();
     let project = Project::new(main);
     let context = CacheContext::at(project.0.join("cache"));
     let build = || {
@@ -761,8 +797,8 @@ fn main() -> Result<(), Error> {
     let path = project.0.join("pkg/s3.align");
     let original = fixture("apps/s3/pkg/s3.align");
     let changed = original.replace(
-        "AWS4-HMAC-SHA256 Credential=",
-        "AWS4-HMAC-SHA256 Credential=changed",
+        "signing.write(\"AWS4-HMAC-SHA256\\n\")",
+        "signing.write(\"AWS4-HMAC-SHA256-changed\\n\")",
     );
     assert_ne!(changed, original);
     std::fs::write(&path, changed).unwrap();
@@ -1042,4 +1078,344 @@ fn run_bounded(exe: &Path) -> String {
             Err(error) => panic!("wait: {error}"),
         }
     }
+}
+
+fn percent(text: &str, path: bool) -> String {
+    let mut encoded = String::new();
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-_.~".contains(&byte) || (path && byte == b'/') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn presigned_oracle(
+    origin: &str,
+    method: &str,
+    path: &str,
+    query: &[(&str, &str)],
+    headers: &[(&str, &str)],
+    token: Option<&str>,
+    secret: &[u8],
+) -> (String, String) {
+    let authority = origin.split_once("://").unwrap().1;
+    let mut rows = std::collections::BTreeMap::from([("host".to_owned(), authority.to_owned())]);
+    for (name, value) in headers {
+        rows.insert(
+            name.to_ascii_lowercase(),
+            value.split_ascii_whitespace().collect::<Vec<_>>().join(" "),
+        );
+    }
+    let names = rows.keys().cloned().collect::<Vec<_>>().join(";");
+    let mut fields = query
+        .iter()
+        .map(|(k, v)| (percent(k, false), percent(v, false)))
+        .collect::<Vec<_>>();
+    for (name, value) in [
+        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
+        (
+            "X-Amz-Credential",
+            "AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request",
+        ),
+        ("X-Amz-Date", DATE),
+        ("X-Amz-Expires", "86400"),
+        ("X-Amz-SignedHeaders", &names),
+    ] {
+        fields.push((percent(name, false), percent(value, false)));
+    }
+    if let Some(token) = token {
+        fields.push(("X-Amz-Security-Token".into(), percent(token, false)));
+    }
+    fields.sort();
+    let query = fields
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let uri = percent(path, true);
+    let canonical_headers = rows
+        .iter()
+        .map(|(k, v)| format!("{k}:{v}\n"))
+        .collect::<String>();
+    let canonical =
+        format!("{method}\n{uri}\n{query}\n{canonical_headers}\n{names}\nUNSIGNED-PAYLOAD");
+    let auth = authorization(&canonical, &names, secret);
+    let signature = auth.rsplit('=').next().unwrap();
+    (
+        format!("{origin}{uri}?{query}&X-Amz-Signature={signature}"),
+        canonical,
+    )
+}
+
+#[test]
+fn presign_vectors() {
+    if !backend_available() {
+        return;
+    }
+    let mut main = String::from("import pkg.s3\nfn main() -> Result<(), Error> { arena {\n");
+    let mut expected = String::new();
+    for (i, (origin, method, path, query, headers, token, secret)) in [
+        (
+            "https://examplebucket.s3.amazonaws.com",
+            "GET",
+            "/test.txt",
+            vec![],
+            vec![],
+            None,
+            SECRET,
+        ),
+        (
+            "http://example.com:9000",
+            "PUT",
+            "/bucket/a//../%é\0",
+            vec![
+                ("a-", ""),
+                ("a", "z"),
+                ("a", " "),
+                ("a", " "),
+                ("é\0", "?%"),
+            ],
+            vec![
+                ("X-Test", " alpha\t beta "),
+                ("Content-Type", " application/octet-stream "),
+            ],
+            Some("token/+=="),
+            b"a\0b".as_slice(),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (url, canonical) =
+            presigned_oracle(origin, method, path, &query, &headers, token, secret);
+        if i == 0 {
+            assert_eq!(
+                hex(&sha(canonical.as_bytes())),
+                "3bfa292879f6447bbcda7001decf97f4a54dc650c8942174ae0a9121cf58ad04"
+            );
+            assert!(
+                url.ends_with("aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404")
+            );
+        }
+        let fields = |rows: &[(&str, &str)]| {
+            rows.iter()
+                .map(|(k, v)| format!("pkg.s3.Field{{name: {}, value: {}}}", quote(k), quote(v)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        main.push_str(&format!("c{i} := pkg.s3.Credentials{{access_key: \"AKIAIOSFODNN7EXAMPLE\", secret_key: {}.bytes(), session_token: {}}}\ne{i} := pkg.s3.Endpoint{{origin: {}, region: \"us-east-1\"}}\nf{i} := [pkg.s3.Field{{name: \"unused\", value: \"\"}}]\n", quote(std::str::from_utf8(secret).unwrap()), token.map(|t| format!("Some({})", quote(t))).unwrap_or("None".into()), quote(origin)));
+        let mut input = Vec::new();
+        for (role, rows) in [("q", &query), ("h", &headers)] {
+            if rows.is_empty() {
+                input.push(format!("f{i}[0..0]"));
+            } else {
+                main.push_str(&format!("{role}{i} := [{}]\n", fields(rows)));
+                input.push(format!("{role}{i}"));
+            }
+        }
+        main.push_str(&format!("r{i} := pkg.s3.presign(c{i}, e{i}, {}, {}, {}, {}, {NOW}, 86400)?\nprint(r{i}.method)\nprint(r{i}.url)\nprint(r{i}.headers.len())\n",quote(method),quote(path),input[0],input[1]));
+        expected.push_str(&format!("{method}\n{url}\n{}\n", headers.len()));
+        if !headers.is_empty() {
+            main.push_str(&format!("print(r{i}.headers[0].name)\nprint(r{i}.headers[0].value)\nprint(r{i}.headers[1].name)\nprint(r{i}.headers[1].value)\n"));
+            expected.push_str("content-type\napplication/octet-stream\nx-test\nalpha beta\n");
+        }
+    }
+    main.push_str("}\nreturn Ok(())\n}\n");
+    for unit in [false, true] {
+        for profile in [Profile::Dev, Profile::Release] {
+            let project = Project::new(&main);
+            let exe = project.build(&main, unit, profile);
+            assert_eq!(run_bounded(&exe), expected);
+        }
+    }
+}
+
+#[test]
+fn presign_round_trip() {
+    if !backend_available() {
+        return;
+    }
+    for unit in [false, true] {
+        for profile in [Profile::Dev, Profile::Release] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let authority = listener.local_addr().unwrap().to_string();
+            let main = format!(
+                r#"import pkg.s3
+import std.http
+fn make(method: str, token: Option<str>) -> Result<pkg.s3.PresignedRequest, Error> {{
+  return arena {{
+    access := "AKIAIOSFODNN7EXAMPLE".clone()
+    mut secret := buffer(3)
+    secret.append("a\0b")
+    origin := "http://{authority}".clone()
+    path := "/bucket/a//../%é\0".clone()
+    value := " alpha\t beta ".clone()
+    credentials := pkg.s3.Credentials{{access_key: access[0..access.len()], secret_key: secret.bytes(), session_token: token}}
+    endpoint := pkg.s3.Endpoint{{origin: origin[0..origin.len()], region: "us-east-1"}}
+    fields := [pkg.s3.Field{{name: "a", value: " "}}, pkg.s3.Field{{name: "a-", value: ""}}]
+    headers := [pkg.s3.Field{{name: "X-Test", value: value[0..value.len()]}}, pkg.s3.Field{{name: "Content-Type", value: " application/octet-stream "}}]
+    result := pkg.s3.presign(credentials, endpoint, method, path, fields, headers, {NOW}, 86400)?
+    secret.append("changed")
+    Ok(result)
+  }}
+}}
+fn carry(value: pkg.s3.PresignedRequest) -> Option<pkg.s3.PresignedRequest> = Some(value)
+fn send(borrow client: http_client, borrow signed: pkg.s3.PresignedRequest, body: slice<u8>) -> Result<(), Error> {{
+  outgoing := http.request(signed.method, signed.url)
+  mut i := 0
+  loop {{
+    if i >= signed.headers.len() {{ break }}
+    outgoing.header(signed.headers[i].name, signed.headers[i].value)
+    i = i + 1
+  }}
+  outgoing.body(body)
+  response := client.request(outgoing)?
+  print(response.status())
+  print(response.body().as_str()?)
+  return Ok(())
+}}
+fn main() -> Result<(), Error> {{
+  client := http.client()
+  client.timeout(3000000000)
+  mut signed := carry(make("GET", None)?) else {{ return Err(Error.Invalid) }}
+  send(client, signed, "".bytes())?
+  signed = make("PUT", Some("token/+=="))?
+  send(client, signed, "a\0b".bytes())?
+  send(client, signed, "".bytes())?
+  (owned_url, owned_method) := (signed.url, signed.method)
+  print(owned_url.len() > 0)
+  print(signed.headers[0].name)
+  return Ok(())
+}}
+"#
+            );
+            let (helpers, entry) = main.split_once("fn main()").unwrap();
+            let consumer = format!(
+                "module pkg.consumer\n{}",
+                helpers
+                    .replace("fn make(", "pub fn make(")
+                    .replace("fn carry(", "pub fn carry(")
+                    .replace("fn send(", "pub fn send(")
+            );
+            let main = format!(
+                "import pkg.consumer\nimport std.http\nfn main(){}",
+                entry
+                    .replace("carry(make(", "pkg.consumer.carry(pkg.consumer.make(")
+                    .replace("= make(", "= pkg.consumer.make(")
+                    .replace("  send(", "  pkg.consumer.send(")
+            );
+            let project = Project::new(&main);
+            std::fs::write(project.0.join("pkg/consumer.align"), consumer).unwrap();
+            let exe = project.build(&main, unit, profile);
+            std::thread::scope(|scope| {
+                let peer = scope.spawn(|| {
+                let mut stream = accept(&listener);
+                for (index, (method, token, body)) in [("GET", None, b"".as_slice()), ("PUT", Some("token/+=="), b"a\0b"), ("PUT", Some("token/+=="), b"")].into_iter().enumerate() {
+                    let (url, _) = presigned_oracle(&format!("http://{authority}"), method, "/bucket/a//../%é\0", &[("a", " "), ("a-", "")], &[("content-type", "application/octet-stream"), ("x-test", "alpha beta")], token, b"a\0b");
+                    let target = url.strip_prefix(&format!("http://{authority}")).unwrap();
+                    let (line, headers, actual_body) = read_request(&mut stream);
+                    assert_eq!(line, format!("{method} {target} HTTP/1.1"));
+                    assert_eq!(actual_body, body);
+                    assert_eq!(headers, vec![("host".into(), authority.clone()), ("content-type".into(), "application/octet-stream".into()), ("x-test".into(), "alpha beta".into()), ("content-length".into(), body.len().to_string())]);
+                    // Reconstruct the signature input using only the captured target and headers.
+                    let captured_target = line.split_whitespace().nth(1).unwrap();
+                    let (unsigned, signature) = captured_target.rsplit_once("&X-Amz-Signature=").unwrap();
+                    let (uri, query) = unsigned.split_once('?').unwrap();
+                    let rows = headers.iter().filter(|(name,_)| name != "content-length").cloned().collect::<std::collections::BTreeMap<_,_>>();
+                    let names = rows.keys().cloned().collect::<Vec<_>>().join(";");
+                    let canonical_headers = rows.iter().map(|(k,v)| format!("{k}:{v}\n")).collect::<String>();
+                    let canonical = format!("{method}\n{uri}\n{query}\n{canonical_headers}\n{names}\nUNSIGNED-PAYLOAD");
+                    assert_eq!(authorization(&canonical, &names, b"a\0b").rsplit('=').next().unwrap(), signature);
+                    let response = if index == 2 { b"HTTP/1.1 403 Forbidden\r\nContent-Length: 8\r\n\r\n<Error/>".as_slice() } else { b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" };
+                    stream.write_all(response).unwrap();
+                }
+            });
+                assert_eq!(
+                    run_bounded(&exe),
+                    "200\n\n200\n\n403\n<Error/>\ntrue\ncontent-type\n"
+                );
+                peer.join().unwrap();
+            });
+        }
+    }
+}
+
+#[test]
+fn presign_expiry_counts() {
+    if !backend_available() {
+        return;
+    }
+    let mut main = String::from(
+        r#"import pkg.s3
+fn admitted(query: slice<pkg.s3.Field>, headers: slice<pkg.s3.Field>, now: i64, expiry: i64) -> bool {
+  credentials := pkg.s3.Credentials{access_key: "key", secret_key: "secret".bytes(), session_token: None}
+  endpoint := pkg.s3.Endpoint{origin: "http://127.0.0.1:1", region: "us-east-1"}
+  return match pkg.s3.presign(credentials, endpoint, "GET", "/", query, headers, now, expiry) {
+    Ok(_) => true, Err(error) => match error { Invalid => false, _ => { print("wrong error"); false } },
+  }
+}
+fn main() { arena {
+  fields := [pkg.s3.Field{name: "x", value: ""}]
+  empty := fields[0..0]
+"#,
+    );
+    let mut expected = String::new();
+    for expiry in [i64::MIN, -1, 0, 1, 604800, 604801, i64::MAX] {
+        let expression = if expiry == i64::MIN {
+            "(-9223372036854775807 - 1)".into()
+        } else {
+            expiry.to_string()
+        };
+        main.push_str(&format!(
+            "print(admitted(empty, empty, 9223372036854775807, {expression}))\n"
+        ));
+        expected.push_str(if (1..=604800).contains(&expiry) {
+            "true\n"
+        } else {
+            "false\n"
+        });
+    }
+    for (index, (q, h, good)) in [
+        (0, 0, true),
+        (128, 120, true),
+        (129, 120, false),
+        (128, 121, false),
+        (129, 121, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let rows = |count: usize| {
+            (0..count.max(1))
+                .map(|i| format!("pkg.s3.Field{{name: \"x{i}\", value: \"\"}}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        main.push_str(&format!("q{index} := [{}]\nh{index} := [{}]\nprint(admitted(q{index}[0..{q}], h{index}[0..{h}], 0, 1))\n",rows(q),rows(h)));
+        expected.push_str(if good { "true\n" } else { "false\n" });
+    }
+    main.push_str("print(admitted(empty, empty, -1, 0))\n");
+    expected.push_str("false\n");
+    // Check serialized seconds and truncation, including a duration whose absolute ns deadline overflows.
+    main.push_str(r#"credentials := pkg.s3.Credentials{access_key: "key", secret_key: "secret".bytes(), session_token: None}
+endpoint := pkg.s3.Endpoint{origin: "http://127.0.0.1:1", region: "us-east-1"}
+"#);
+    for (index, (now, expiry, date)) in [
+        (0, 1, "19700101T000000Z"),
+        (999999999, 604800, "19700101T000000Z"),
+        (i64::MAX, 604800, "22620411T234716Z"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        main.push_str(&format!("r{index} := pkg.s3.presign(credentials, endpoint, \"GET\", \"/\", empty, empty, {now}, {expiry}) else {{ print(\"unexpected error\"); return }}\nprint(r{index}.url.contains(\"X-Amz-Date={date}&X-Amz-Expires={expiry}&\"))\n"));
+        expected.push_str("true\n");
+    }
+    main.push_str("}\n}\n");
+    let project = Project::new(&main);
+    let exe = project.build(&main, true, Profile::Dev);
+    assert_eq!(run_bounded(&exe), expected);
 }

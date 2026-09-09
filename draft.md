@@ -3662,7 +3662,7 @@ is introduced. The separately designed `presign(...) -> Result<PresignedRequest,
 returns owned method/URL/required-header data with explicit `expires_seconds`
 (1–604800), using query authentication and an unsigned body. Its exact Move
 records, validation and canonical bytes are owned by
-`docs/impl/pkg-design/s3-presign.md`; implementation follows its design gate.
+`docs/impl/pkg-design/s3-presign.md`; the accepted capability is implemented.
 
 The implemented first-party packages in this repository are exactly nine vendorable subtrees:
 
