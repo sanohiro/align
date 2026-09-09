@@ -42,7 +42,7 @@ elsewhere and are **not** ledger rows.
 
 | Item | Owner of record | Status |
 |---|---|---|
-| A value-carrying `if`/`else` expression cannot move an already-bound owned local out of an arm. Every sibling form — a `match` arm, an `else`-unwrap fallback, a block tail, a statement-form `if` + `return` — already does this correctly. | `docs/open-questions.md`, "A value-carrying `if` expression cannot move a bound owned local (DEFERRED, recorded 2026-08-13)"; spec text in `docs/language-spec.md` Memory and `draft.md` §6.3 | DEFERRED. Closing it is a sema/MIR change mirroring the working `match` join, plus a diagnostic reword. |
+| Bound owned locals in value-carrying `if` results. | `docs/impl/38-bound-if-result-plan.md`; `draft.md` §6.3 | DONE 2026-09-09. Selected-edge transfer and path-local replacement cleanup. |
 | A `sort_by_key` key must be a **Copy** `Ord` value. An owned `string` key type-checks and is then rejected at the MIR boundary as an internal error, because the fused sort path has no per-key Drop. | `docs/impl/19-hir-validation-ledger.md`; spec text in `docs/language-spec.md` and `draft.md` | DEFERRED. The restriction is a missing capability in the fused sort path, not a decision about keys. |
 
 Both are A because the design already describes the working behavior; only the

@@ -7,6 +7,11 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
+**Bound `if` results (2026-09-09):** the Category A bound-local transfer gap is
+closed with path-local replacement cleanup; see
+[`38-bound-if-result-plan.md`](docs/impl/38-bound-if-result-plan.md) for owner evidence
+and the separately reproduced `else`-fallback and HTTP-client linkage follow-ups.
+
 **Request batch closure (2026-09-08):** the reproduced Request 45 nested-field
 ownership defect (#978), Request 39 replacement cleanup (#980), and Request 61
 borrowed buffer/writer projections (#982) are repaired. Requests 43/49's imported

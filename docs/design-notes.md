@@ -1,5 +1,10 @@
 # Align Design Notes
 
+Bound owned `if` results reuse the existing branch-local transfer. Static may-moved
+sets reject unsafe later reads, but cannot decide replacement cleanup at runtime:
+the selected source is cleared before the old destination's ownership bit is tested.
+This also preserves direct self-assignment without a separate lowering rule.
+
 The `pkg.s3` boundary (`impl/pkg-design/s3.md`) assembles one signed
 `http_request` from explicit inputs. Canonicalization and actual HTTP bytes stay
 under one package operation, while existing client/response owners preserve

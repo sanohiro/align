@@ -439,21 +439,16 @@ resolution rule.
 Record: `draft.md` Error handling and Modules, `docs/language-spec.md`,
 `docs/design-notes.md`, `docs/impl/pkg-design/db.md`
 
-### A value-carrying `if` expression cannot move a bound owned local (DEFERRED, recorded 2026-08-13)
+### Bound owned locals in value-carrying `if` expressions (DONE 2026-09-09)
 
-**Current behavior, not a decision.** A value-carrying `if`/`else` **expression** rejects an arm
-that moves an already-bound owned local: `c := if n > 2 { a } else { "hi".clone() }` fails with
-`cannot move owned value 'a' out through a conditional expression yet`. The restriction belongs to
-the `if`-expression arm, not to the consumer — the binding, argument, and `return` positions are all
-rejected identically. Every sibling form already does this correctly: a `match` arm, an
-`else`-unwrap fallback, a block tail, a statement-form `if` + `return`, and an `if` expression whose
-arms build fresh temporaries.
+The Category A implementation gap is closed: binding, argument and return positions
+transfer the selected bound source through the existing MIR join. Possible-move reuse
+still rejects; a borrowed conditional retains its bound sources. Whole-local replacement
+uses path-local ownership flags rather than the static may-moved union, preserving
+self-assignment while releasing an unselected old destination.
 
-Closing the gap is a sema/MIR change mirroring the working `match` join, plus a diagnostic reword
-(today's "bind the `if`/`else` result to a local first" is wrong advice — the user already has).
-Until then the restriction is spec text, so the §6.3 table no longer over-promises.
-
-Record: `draft.md` §6.3, `docs/language-spec.md` Memory
+Record: `draft.md` §6.3, `docs/language-spec.md` Memory,
+`docs/impl/38-bound-if-result-plan.md`.
 
 ### Empty array literals require an expected element type (SETTLED 2026-08-07)
 
