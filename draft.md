@@ -594,9 +594,9 @@ one visible-length case — `str`/`string`, whose order is **byte-lexicographic*
 this equals Unicode scalar order). It is deterministic and locale-free; dictionary/locale
 collation is a library concern (`pkg`), never the operator. A `sort_by_key` key is a **Copy** `Ord`
 value: a number, a `char`, or a borrowed `str`. An owned `string` key is **not** supported today —
-it satisfies `Ord`, so the checker accepts it, but the program is then rejected at the MIR boundary
-as an internal error rather than with a user diagnostic (the fused sort path has no per-key Drop;
-the deferral is recorded in `docs/impl/19-hir-validation-ledger.md`). Project the key to a `str`.
+it satisfies `Ord`, but the checker rejects it because the fused sort path has no per-key Drop
+(the deferral is recorded in `docs/impl/19-hir-validation-ledger.md`). Return a Copy key or a
+borrowed `str`.
 Aggregates have no order, exactly as they have no `==`.
 
 The operator and builtin-bound paths compare owned `string` values through a non-consuming,
