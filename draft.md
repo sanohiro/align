@@ -3648,11 +3648,11 @@ that are deliberately **not** in `core`/`std`. The building blocks that make the
 in core/std (`bytes`, `buffer`, `builder`, `arena`, `json`, `reader`/`writer`, the `http` primitive,
 `crypto`, `encoding`), so a `pkg` library is ordinary Align that needs no privileged surface.
 
-The next designed package, `pkg.s3`, prepares S3 SigV4 Authorization-header requests
+`pkg.s3` prepares S3 SigV4 Authorization-header requests
 from explicit borrowed credentials, endpoint, method, unencoded absolute path,
 query/header fields, body and Unix nanoseconds. Its exact public records and
 `request(...) -> Result<http_request, Error>` are owned by
-`docs/impl/pkg-design/s3.md`; implementation is pending. The independently owned
+`docs/impl/pkg-design/s3.md`. The independently owned
 result composes with the caller's existing HTTP client or streaming receive.
 Package validation returns `Error.Invalid` before allocation/crypto/setters;
 there is no ambient credential, clock, endpoint or retry policy. The same capability
@@ -3660,7 +3660,7 @@ preserves explicit HTTP body presence: `.body(empty)` and `post(url, empty)` emi
 `Content-Length: 0`, while unset bodies omit it. No second transport or error model
 is introduced.
 
-The implemented first-party packages in this repository are exactly seven vendorable subtrees:
+The implemented first-party packages in this repository are exactly nine vendorable subtrees:
 
 ```text
 pkg.web            // the zero-copy REST framework (routing included; no separate pkg.router)
@@ -3673,6 +3673,8 @@ pkg.auth           // HS256, bounded Argon2id PHC, and opaque session tokens
 pkg.kv             // synchronous plaintext RESP2 GET/SET/DEL client
 pkg.csv            // typed in-memory CSV direct-to-SoA decoder
 pkg.ws             // RFC 6455 server routes over pkg.web HTTP Upgrade
+pkg.template       // explicit HTML builder with default escaping
+pkg.s3             // explicit S3 SigV4 signed HTTP request preparation
 ```
 
 `pkg.kv` is one vendorable subtree with root `pkg.kv` and private implementation module

@@ -26,8 +26,7 @@ The independently reviewed public contract is `docs/impl/pkg-design/s3.md`. One 
 credentials, endpoint, time and request data only for the call. It owns S3
 canonicalization, not provider discovery, transport, response interpretation or
 credential refresh. Its HTTP prerequisite distinguishes an unset body from an
-explicit empty body and emits Content-Length for the latter. The design is accepted;
-implementation remains pending. No language invariant is reopened.
+explicit empty body and emits Content-Length for the latter. The contract is implemented. No language invariant is reopened.
 
 ### HTTP client package composition — SETTLED 2026-09-09
 

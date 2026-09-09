@@ -1,0 +1,443 @@
+module pkg.s3
+
+import std.crypto
+import std.encoding
+import std.http
+import std.time
+
+pub Credentials {
+  access_key: str,
+  secret_key: slice<u8>,
+  session_token: Option<str>,
+}
+
+pub Endpoint { origin: str, region: str }
+pub Field { name: str, value: str }
+
+fn digit(byte: u8) -> bool = byte >= 48 as u8 && byte <= 57 as u8
+fn upper(byte: u8) -> bool = byte >= 65 as u8 && byte <= 90 as u8
+fn lower(byte: u8) -> bool = byte >= 97 as u8 && byte <= 122 as u8
+fn alpha(byte: u8) -> bool = upper(byte) || lower(byte)
+fn hex(byte: u8) -> bool = digit(byte) ||
+(byte >= 65 as u8 && byte <= 70 as u8) || (byte >= 97 as u8 && byte <= 102 as u8)
+fn space(byte: u8) -> bool = byte == 32 as u8 || byte == 9 as u8
+
+fn credentials_valid(value: Credentials) -> bool {
+  if value.access_key.len() == 0 || value.access_key.len() > 256 { return false }
+  access := value.access_key.bytes()
+  mut i := 0
+  loop {
+    if i >= access.len() { break }
+    byte := access[i]
+    if !alpha(byte) && !digit(byte) && byte != 45 as u8 && byte != 95 as u8 {
+      return false
+    }
+    i = i + 1
+  }
+  if value.secret_key.len() == 0 || value.secret_key.len() > 4096 { return false }
+  return match value.session_token {
+    None => true,
+    Some(token) => {
+      if token.len() == 0 || token.len() > 16384 { return false }
+      bytes := token.bytes()
+      mut j := 0
+      loop {
+        if j >= bytes.len() { break }
+        if bytes[j] < 33 as u8 || bytes[j] > 126 as u8 { return false }
+        j = j + 1
+      }
+      true
+    },
+  }
+}
+
+fn port_valid(suffix: str) -> bool {
+  if suffix.len() == 0 { return true }
+  if suffix.len() < 2 || suffix.len() > 6 || !suffix.starts_with(":") { return false }
+  bytes := suffix.bytes()
+  mut port := 0
+  mut i := 1
+  loop {
+    if i >= bytes.len() { break }
+    if !digit(bytes[i]) { return false }
+    port = port * 10 + (bytes[i] - 48 as u8) as i64
+    i = i + 1
+  }
+  return port >= 1 && port <= 65535
+}
+
+fn authority_valid(authority: str) -> bool {
+  if authority.len() == 0 { return false }
+  bytes := authority.bytes()
+  if authority.starts_with("[") {
+    end := authority.find("]") else { return false }
+    mut i := 1
+    mut colon := false
+    loop {
+      if i >= end { break }
+      byte := bytes[i]
+      if byte == 58 as u8 { colon = true }
+      if !hex(byte) && byte != 58 as u8 && byte != 46 as u8 { return false }
+      i = i + 1
+    }
+    return colon && port_valid(authority[end + 1..authority.len()])
+  }
+  end := authority.find(":") else authority.len()
+  if end == 0 { return false }
+  mut j := 0
+  loop {
+    if j >= end { break }
+    byte := bytes[j]
+    if !alpha(byte) && !digit(byte) && byte != 46 as u8 && byte != 45 as u8 && byte != 95 as u8 {
+      return false
+    }
+    j = j + 1
+  }
+  return port_valid(authority[end..authority.len()])
+}
+
+fn endpoint_valid(value: Endpoint) -> bool {
+  if value.origin.len() == 0 || value.origin.len() > 1024 { return false }
+  offset := if value.origin.starts_with("https://") { 8 } else if value.origin.starts_with("http://") { 7 } else { return false }
+  if !authority_valid(value.origin[offset..value.origin.len()]) { return false }
+  if value.region.len() == 0 || value.region.len() > 64 { return false }
+  bytes := value.region.bytes()
+  mut i := 0
+  loop {
+    if i >= bytes.len() { break }
+    byte := bytes[i]
+    if !lower(byte) && !digit(byte) && byte != 45 as u8 { return false }
+    i = i + 1
+  }
+  return true
+}
+
+fn method_valid(method: str) -> bool {
+  if method.len() == 0 || method.len() > 32 { return false }
+  bytes := method.bytes()
+  mut i := 0
+  loop {
+    if i >= bytes.len() { break }
+    if !upper(bytes[i]) { return false }
+    i = i + 1
+  }
+  return true
+}
+
+fn query_valid(fields: slice<Field>) -> bool {
+  mut i := 0
+  loop {
+    if i >= fields.len() { break }
+    field := fields[i]
+    if field.name.len() == 0 || field.name.len() > 1024 { return false }
+    if field.value.len() > 8192 { return false }
+    prefix := field.name.bytes()
+    if prefix.len() >= 6 {
+      if (prefix[0] == 88 as u8 || prefix[0] == 120 as u8) && prefix[1] == 45 as u8 &&
+      (prefix[2] == 65 as u8 || prefix[2] == 97 as u8) &&
+      (prefix[3] == 77 as u8 || prefix[3] == 109 as u8) &&
+      (prefix[4] == 90 as u8 || prefix[4] == 122 as u8) && prefix[5] == 45 as u8 {
+        return false
+      }
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn header_name_valid(name: str) -> bool {
+  if name.len() == 0 || name.len() > 256 { return false }
+  bytes := name.bytes()
+  mut i := 0
+  loop {
+    if i >= bytes.len() { break }
+    byte := bytes[i]
+    if byte > 127 as u8 { return false }
+    if !alpha(byte) && !digit(byte) && !"!#$%&'*+-.^_`|~".contains(name[i..i + 1]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn reserved_header(name: str) -> bool =
+name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("host") ||
+name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("transfer-encoding") ||
+name.eq_ignore_ascii_case("connection") || name.eq_ignore_ascii_case("trailer") ||
+name.eq_ignore_ascii_case("te") || name.eq_ignore_ascii_case("upgrade") ||
+name.eq_ignore_ascii_case("proxy-authorization") || name.eq_ignore_ascii_case("proxy-authenticate") ||
+name.eq_ignore_ascii_case("expect") || name.eq_ignore_ascii_case("x-amz-date") ||
+name.eq_ignore_ascii_case("x-amz-content-sha256") || name.eq_ignore_ascii_case("x-amz-security-token")
+
+fn headers_valid(fields: slice<Field>) -> bool {
+  mut i := 0
+  loop {
+    if i >= fields.len() { break }
+    field := fields[i]
+    if !header_name_valid(field.name) { return false }
+    if field.value.len() > 16384 { return false }
+    bytes := field.value.bytes()
+    mut j := 0
+    loop {
+      if j >= bytes.len() { break }
+      byte := bytes[j]
+      if byte != 9 as u8 && (byte < 32 as u8 || byte > 126 as u8) { return false }
+      j = j + 1
+    }
+    if reserved_header(field.name) { return false }
+    mut earlier := 0
+    loop {
+      if earlier >= i { break }
+      previous := fields[earlier]
+      if field.name.eq_ignore_ascii_case(previous.name) { return false }
+      earlier = earlier + 1
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn lowercase(name: str) -> string {
+  mut output := builder()
+  bytes := name.bytes()
+  mut i := 0
+  loop {
+    if i >= bytes.len() { break }
+    byte := bytes[i]
+    if upper(byte) {
+      offset := (byte - 65 as u8) as i64
+      output.write("abcdefghijklmnopqrstuvwxyz"[offset..offset + 1])
+    } else { output.write(name[i..i + 1]) }
+    i = i + 1
+  }
+  return output.to_string()
+}
+
+fn normalized(value: str) -> string {
+  mut output := builder()
+  bytes := value.bytes()
+  mut i := 0
+  mut started := false
+  mut gap := false
+  loop {
+    if i >= bytes.len() { break }
+    if space(bytes[i]) { gap = started } else {
+      if gap { output.write(" ") }
+      output.write(value[i..i + 1])
+      started = true
+      gap = false
+    }
+    i = i + 1
+  }
+  return output.to_string()
+}
+
+fn compare(left: str, right: str) -> i64 {
+  a := left.bytes()
+  b := right.bytes()
+  mut i := 0
+  loop {
+    if i >= a.len() || i >= b.len() { break }
+    if a[i] < b[i] { return -1 }
+    if a[i] > b[i] { return 1 }
+    i = i + 1
+  }
+  if a.len() < b.len() { return -1 }
+  if a.len() > b.len() { return 1 }
+  return 0
+}
+
+// Sort indices, preserving the separate name/value order and duplicate multiplicity.
+fn order(borrow names: array<string>, borrow values: array<string>) -> array<i64> {
+  mut indices: array_builder<i64> := array_builder()
+  mut i := 0
+  loop {
+    if i >= names.len() { break }
+    indices.push(i)
+    i = i + 1
+  }
+  mut result := indices.build()
+  mut next := 1
+  loop {
+    if next >= result.len() { break }
+    selected := result[next]
+    mut j := next
+    loop {
+      if j == 0 { break }
+      previous := result[j - 1]
+      names_order := compare(names[previous], names[selected])
+      if names_order < 0 || (names_order == 0 && compare(values[previous], values[selected]) <= 0) { break }
+      result[j] = previous
+      j = j - 1
+    }
+    result[j] = selected
+    next = next + 1
+  }
+  return result
+}
+
+fn canonical_query(fields: slice<Field>) -> string {
+  mut names: array_builder<string> := array_builder()
+  mut values: array_builder<string> := array_builder()
+  mut i := 0
+  loop {
+    if i >= fields.len() { break }
+    field := fields[i]
+    names.push(encoding.percent_encode(field.name))
+    values.push(encoding.percent_encode(field.value))
+    i = i + 1
+  }
+  keys := names.build()
+  data := values.build()
+  positions := order(keys, data)
+  mut output := builder()
+  mut j := 0
+  loop {
+    if j >= positions.len() { break }
+    if j > 0 { output.write("&") }
+    index := positions[j]
+    output.write(keys[index])
+    output.write("=")
+    output.write(data[index])
+    j = j + 1
+  }
+  return output.to_string()
+}
+
+fn authorization(credentials: Credentials, region: str, timestamp: str, canonical_hash: str, signed_headers: str) -> string {
+  date := timestamp[0..8]
+  mut scope_builder := builder()
+  scope_builder.write(date)
+  scope_builder.write("/")
+  scope_builder.write(region)
+  scope_builder.write("/s3/aws4_request")
+  scope := scope_builder.to_string()
+  mut signing := builder()
+  signing.write("AWS4-HMAC-SHA256\n")
+  signing.write(timestamp)
+  signing.write("\n")
+  signing.write(scope)
+  signing.write("\n")
+  signing.write(canonical_hash)
+  signing_input := signing.to_string()
+
+  // The secret is binary; use a byte buffer rather than a UTF-8 string builder.
+  mut secret := buffer(4 + credentials.secret_key.len())
+  secret.append("AWS4".bytes())
+  secret.append(credentials.secret_key)
+  date_key := crypto.hmac_sha256(secret.bytes(), date)
+  region_key := crypto.hmac_sha256(date_key[0..date_key.len()], region)
+  service_key := crypto.hmac_sha256(region_key[0..region_key.len()], "s3")
+  signing_key := crypto.hmac_sha256(service_key[0..service_key.len()], "aws4_request")
+  digest := crypto.hmac_sha256(signing_key[0..signing_key.len()], signing_input)
+  signature := encoding.hex_encode(digest[0..digest.len()])
+  mut authorization := builder()
+  authorization.write("AWS4-HMAC-SHA256 Credential=")
+  authorization.write(credentials.access_key)
+  authorization.write("/")
+  authorization.write(scope)
+  authorization.write(",SignedHeaders=")
+  authorization.write(signed_headers)
+  authorization.write(",Signature=")
+  authorization.write(signature)
+
+  return authorization.to_string()
+}
+
+fn input_sizes_valid(query_len: i64, header_len: i64, body_len: i64) -> bool =
+query_len <= 128 && header_len <= 120 && body_len <= 1073741824
+
+pub fn request(
+  credentials: Credentials, endpoint: Endpoint, method: str, path: str,
+  query: slice<Field>, headers: slice<Field>, body: slice<u8>, now_ns: i64,
+) -> Result<http_request, Error> {
+  if !input_sizes_valid(query.len(), headers.len(), body.len()) { return Err(Error.Invalid) }
+  if !credentials_valid(credentials) { return Err(Error.Invalid) }
+  if !endpoint_valid(endpoint) { return Err(Error.Invalid) }
+  if !method_valid(method) { return Err(Error.Invalid) }
+  if path.len() == 0 || path.len() > 8192 || !path.starts_with("/") { return Err(Error.Invalid) }
+  if !query_valid(query) { return Err(Error.Invalid) }
+  if !headers_valid(headers) { return Err(Error.Invalid) }
+  if now_ns < 0 { return Err(Error.Invalid) }
+
+  timestamp := time.basic_iso(now_ns)?
+  uri := encoding.percent_encode_path(path)
+  query_text := canonical_query(query)
+  payload_digest := crypto.sha256(body)
+  payload_hash := encoding.hex_encode(payload_digest[0..payload_digest.len()])
+  offset := if endpoint.origin.starts_with("https://") { 8 } else { 7 }
+  authority := endpoint.origin[offset..endpoint.origin.len()]
+
+  mut names: array_builder<string> := array_builder()
+  mut values: array_builder<string> := array_builder()
+  names.push("host".clone())
+  values.push(authority.clone())
+  names.push("x-amz-content-sha256".clone())
+  values.push(payload_hash.clone())
+  names.push("x-amz-date".clone())
+  values.push(timestamp.clone())
+  match credentials.session_token {
+    None => {},
+    Some(token) => { names.push("x-amz-security-token".clone()); values.push(token.clone()) },
+  }
+  mut i := 0
+  loop {
+    if i >= headers.len() { break }
+    field := headers[i]
+    names.push(lowercase(field.name))
+    values.push(normalized(field.value))
+    i = i + 1
+  }
+  keys := names.build()
+  data := values.build()
+  positions := order(keys, data)
+  mut canonical_headers := builder()
+  mut signed := builder()
+  mut j := 0
+  loop {
+    if j >= positions.len() { break }
+    index := positions[j]
+    canonical_headers.write(keys[index])
+    canonical_headers.write(":")
+    canonical_headers.write(data[index])
+    canonical_headers.write("\n")
+    if j > 0 { signed.write(";") }
+    signed.write(keys[index])
+    j = j + 1
+  }
+  signed_headers := signed.to_string()
+  mut canonical := builder()
+  canonical.write(method)
+  canonical.write("\n")
+  canonical.write(uri)
+  canonical.write("\n")
+  canonical.write(query_text)
+  canonical.write("\n")
+  canonical.write(canonical_headers.to_string())
+  canonical.write("\n")
+  canonical.write(signed_headers)
+  canonical.write("\n")
+  canonical.write(payload_hash)
+  canonical_digest := crypto.sha256(canonical.to_string())
+  canonical_hash := encoding.hex_encode(canonical_digest[0..canonical_digest.len()])
+
+  auth := authorization(credentials, endpoint.region, timestamp, canonical_hash, signed_headers)
+
+  mut url := builder()
+  url.write(endpoint.origin)
+  url.write(uri)
+  if query_text.len() > 0 { url.write("?"); url.write(query_text) }
+  output := http.request(method, url.to_string())
+  mut k := 0
+  loop {
+    if k >= positions.len() { break }
+    index := positions[k]
+    name := keys[index]
+    if name != "host" { output.header(name, data[index]) }
+    k = k + 1
+  }
+  output.header("authorization", auth)
+  output.body(body)
+  return Ok(output)
+}

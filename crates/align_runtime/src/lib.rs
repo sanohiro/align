@@ -19733,6 +19733,8 @@ pub struct HttpRequest {
     url: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    /// An explicit empty body still requires Content-Length: 0.
+    body_present: bool,
     /// The per-request I/O timeout in nanoseconds set by [`align_rt_http_timeout`], or `0` for "inherit
     /// the client default" (http.md "I/O timeouts"). A positive value overrides the client default; the
     /// effective per-op deadline (connect + send + receive) is resolved in [`http_client_perform`].
@@ -19751,6 +19753,7 @@ struct HttpRequestView<'a> {
     url: &'a str,
     headers: &'a [(String, String)],
     body: &'a [u8],
+    body_present: bool,
     /// The per-request timeout override (`0` = inherit the client default). Carried so
     /// [`http_client_perform`] can resolve the effective per-op deadline (http.md "I/O timeouts"); the
     /// convenience `get`/`post` views (no request handle) always set `0` (inherit).
@@ -19765,6 +19768,7 @@ impl HttpRequest {
             url: &self.url,
             headers: &self.headers,
             body: &self.body,
+            body_present: self.body_present,
             timeout_ns: self.timeout_ns,
             max_response_body_bytes: self.max_response_body_bytes,
         }
@@ -19884,6 +19888,7 @@ pub unsafe extern "C" fn align_rt_http_request_new(
         url,
         headers: Vec::new(),
         body: Vec::new(),
+        body_present: false,
         timeout_ns: 0,
         max_response_body_bytes: 0,
     }))
@@ -19924,6 +19929,7 @@ pub unsafe extern "C" fn align_rt_http_header(
 }
 
 /// `r.body(data)` — copy `data` into the request's owned body buffer (replacing any prior body).
+/// Even empty input marks a body present, so serialization emits Content-Length: 0.
 /// Null-safe on `req`.
 ///
 /// # Safety
@@ -19935,6 +19941,7 @@ pub unsafe extern "C" fn align_rt_http_body(req: *mut HttpRequest, data_ptr: *co
     }
     let r = unsafe { &mut *req };
     r.body = unsafe { bytes_view(data_ptr, data_len) }.to_vec();
+    r.body_present = true;
 }
 
 /// `r.timeout(ns)` — set the request's per-request I/O timeout in nanoseconds (http.md "I/O timeouts").
@@ -20027,7 +20034,7 @@ fn http_split_url(url: &str) -> Option<(HttpScheme, &str, &str)> {
 /// is rejected rather than silently overridden). The wire request is scheme-independent (`https://`
 /// serializes exactly as `http://`; only the client's transport differs). Layout:
 /// `METHOD <path> HTTP/1.1\r\nHost: <authority>\r\n<caller headers>\r\n[Content-Length: <n>\r\n]\r\n<body>`.
-/// `Content-Length` is emitted iff the body is non-empty.
+/// `Content-Length` is emitted iff a body was explicitly supplied, including an empty body.
 ///
 /// This is Slice 1's internal codec — Slice 2's client calls [`http_serialize_core`] directly, then
 /// writes the buffer with one `write`. It is deliberately not (yet) a language builtin.
@@ -20058,7 +20065,7 @@ pub unsafe extern "C" fn align_rt_http_serialize(req: *const HttpRequest, out: *
 /// §3.3.2 — so it is rejected rather than silently overridden), a non-token method, or a request-line
 /// field carrying a start-line-breaking byte (CR/LF/NUL/SP). Layout:
 /// `METHOD <path> HTTP/1.1\r\nHost: <authority>\r\n<caller headers>\r\n[Content-Length: <n>\r\n]\r\n<body>`.
-/// `Content-Length` is emitted iff the body is non-empty. Shared by the codec FFI and the Slice-2
+/// `Content-Length` is emitted iff a body was explicitly supplied. Shared by the codec FFI and the Slice-2
 /// client (`http_client_perform`) — the ONE source of request wire bytes.
 fn http_serialize_core(r: HttpRequestView<'_>) -> Result<Vec<u8>, i32> {
     let mut buf = Vec::new();
@@ -20102,7 +20109,7 @@ fn http_serialize_into(r: HttpRequestView<'_>, buf: &mut Vec<u8>) -> Result<(), 
             wire_len = wire_len.checked_add(n).ok_or(AL_INVALID)?;
         }
     }
-    if !r.body.is_empty() {
+    if r.body_present {
         for n in [HTTP_CONTENT_LENGTH_PREFIX.len(), http_decimal_len(r.body.len()), 2] {
             wire_len = wire_len.checked_add(n).ok_or(AL_INVALID)?;
         }
@@ -20124,7 +20131,7 @@ fn http_serialize_into(r: HttpRequestView<'_>, buf: &mut Vec<u8>) -> Result<(), 
         buf.extend_from_slice(value.as_bytes());
         buf.extend_from_slice(b"\r\n");
     }
-    if !r.body.is_empty() {
+    if r.body_present {
         buf.extend_from_slice(HTTP_CONTENT_LENGTH_PREFIX);
         http_push_decimal(buf, r.body.len());
         buf.extend_from_slice(b"\r\n");
@@ -24458,6 +24465,7 @@ fn http_get_request(url: String) -> HttpRequest {
         url,
         headers: Vec::new(),
         body: Vec::new(),
+        body_present: false,
         timeout_ns: 0,
         max_response_body_bytes: 0,
     }
@@ -24490,6 +24498,7 @@ pub unsafe extern "C" fn align_rt_http_client_get(
         url,
         headers: &[],
         body: &[],
+        body_present: false,
         timeout_ns: 0,
         max_response_body_bytes: 0,
     };
@@ -24698,6 +24707,7 @@ pub unsafe extern "C" fn align_rt_http_client_post(
         url,
         headers: &[],
         body,
+        body_present: true,
         timeout_ns: 0,
         max_response_body_bytes: 0,
     };
@@ -41781,6 +41791,7 @@ mod tests {
                 url: "http://localhost:8080",
                 headers: &[],
                 body: &[],
+                body_present: false,
                 timeout_ns: 0,
                 max_response_body_bytes: 0,
             },
@@ -41789,6 +41800,7 @@ mod tests {
                 url: "https://example.com/path?q=1",
                 headers: &[],
                 body: &[],
+                body_present: false,
                 timeout_ns: 0,
                 max_response_body_bytes: 0,
             },
@@ -41797,6 +41809,7 @@ mod tests {
                 url: "http://example.com/submit",
                 headers: &headers,
                 body,
+                body_present: true,
                 timeout_ns: 0,
                 max_response_body_bytes: 0,
             },
@@ -41813,6 +41826,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn http_explicit_body_framing() {
+        let method = b"PUT";
+        let url = b"http://example.com/object";
+        let raw = unsafe { align_rt_http_request_new(method.as_ptr(), 3, url.as_ptr(), 25) };
+        let mut request = unsafe { Box::from_raw(raw) };
+        let prefix = b"PUT /object HTTP/1.1\r\nHost: example.com\r\n";
+        let mut absent = prefix.to_vec();
+        absent.extend_from_slice(b"\r\n");
+        assert_eq!(http_serialize_core(request.as_view()), Ok(absent));
+        for body in [b"".as_slice(), b"a\0b", b"", b"next"] {
+            unsafe { align_rt_http_body(&mut *request, body.as_ptr(), body.len() as i64) };
+            let mut expected = prefix.to_vec();
+            expected
+                .extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+            expected.extend_from_slice(body);
+            let actual = http_serialize_core(request.as_view()).expect("valid explicit request");
+            assert_eq!(actual, expected);
+            assert_eq!(actual.capacity(), actual.len());
+        }
+        let batch = http_get_request("http://example.com/object".to_owned());
+        assert_eq!(batch.body_present, false);
+        let empty_view = HttpRequestView {
+            body: &[],
+            body_present: true,
+            ..batch.as_view()
+        };
+        assert_eq!(
+            http_serialize_core(empty_view),
+            Ok(b"GET /object HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n".to_vec())
+        );
+        for name in ["Host", "Content-Length"] {
+            request.headers = vec![(name.to_owned(), "0".to_owned())];
+            assert_eq!(http_serialize_core(request.as_view()), Err(AL_INVALID));
+        }
+        for authority in ["EXAMPLE.com:00080", "example.com:443", "[::1]:8080"] {
+            let url = format!("https://{authority}/a//../%25?q=%00");
+            let view = HttpRequestView {
+                url: &url,
+                ..empty_view
+            };
+            assert_eq!(
+                http_serialize_core(view),
+                Ok(format!("GET /a//../%25?q=%00 HTTP/1.1\r\nHost: {authority}\r\nContent-Length: 0\r\n\r\n").into_bytes())
+            );
+        }
+    }
+
     /// A client reuses request serialization storage across calls, returns it after validation
     /// failures, and bounds both retained capacity and burst concurrency. Large requests remain
     /// valid; only their completed scratch allocation is discarded.
@@ -41825,6 +41886,7 @@ mod tests {
             url: "http://example.com/path",
             headers: &[],
             body: &[],
+            body_present: false,
             timeout_ns: 0,
             max_response_body_bytes: 0,
         };
@@ -41860,6 +41922,7 @@ mod tests {
                 url: "http://example.com/upload",
                 headers: &[],
                 body: &large_body,
+                body_present: true,
                 timeout_ns: 0,
                 max_response_body_bytes: 0,
             };

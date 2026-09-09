@@ -1,6 +1,6 @@
 # Align Design Notes
 
-The designed `pkg.s3` boundary (`impl/pkg-design/s3.md`) assembles one signed
+The `pkg.s3` boundary (`impl/pkg-design/s3.md`) assembles one signed
 `http_request` from explicit inputs. Canonicalization and actual HTTP bytes stay
 under one package operation, while existing client/response owners preserve
 pooling and streaming composition. A second client or signing-key owner is

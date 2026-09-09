@@ -23,13 +23,13 @@ revocation remain separate backlog items.
 
 ## Signatures
 
-The S3 capability's [H1 ledger](../pkg-design/s3.md) designs explicit-body framing:
+The S3 capability's [H1 ledger](../pkg-design/s3.md) implements explicit-body framing:
 a fresh request has no body; `.body(data)` marks it present even when empty,
 and `post(url, body)` does likewise. Content-Length is then emitted for every
 present body, including `0`, and omitted only for an unset body. Replacement
 preserves presence. The private owner/view bool adds no ABI or allocation.
-Implementation is pending; the historical slices below describe the original
-nonempty-only rule. H1 and the S3 wire owner close the transition together.
+The historical slices below describe the original nonempty-only rule. H1 and
+the S3 wire owner close the transition together.
 
 v1 proposal, Fable's settled shapes:
 

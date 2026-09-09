@@ -1389,17 +1389,17 @@ containing one before replacement resolution or session mutation; tests run thro
 
 ## Packages
 
-The next designed package, `pkg.s3`, prepares a signed S3 request through
+`pkg.s3` prepares a signed S3 request through
 `request(...) -> Result<http_request, Error>` using explicit credentials, origin,
 region, method, unencoded path, query/header fields, body and Unix nanoseconds.
 The exact borrowed `Credentials`, `Endpoint` and `Field` records, validation,
-signature bytes and ownership are in `impl/pkg-design/s3.md`; implementation is
-pending. The result owns all request data and uses the caller's ordinary HTTP
-client. The capability also preserves explicit body presence in HTTP:
+signature bytes and ownership are in `impl/pkg-design/s3.md`. The result owns all
+request data and uses the caller's ordinary HTTP client. The capability also
+preserves explicit body presence in HTTP:
 `.body(empty)` and `post(url, empty)` emit `Content-Length: 0`; unset bodies omit it.
 No ambient authentication, clock, endpoint discovery or package retry is added.
 
-The implemented first-party packages in this repository are exactly seven vendorable subtrees:
+The implemented first-party packages in this repository are exactly nine vendorable subtrees:
 
 ```text
 pkg.web            // the zero-copy REST framework (routing included; no separate pkg.router)
@@ -1412,6 +1412,8 @@ pkg.auth           // HS256, bounded Argon2id PHC, and opaque session tokens
 pkg.kv             // synchronous plaintext RESP2 GET/SET/DEL client
 pkg.csv            // typed in-memory CSV direct-to-SoA decoder
 pkg.ws             // RFC 6455 server routes over pkg.web HTTP Upgrade
+pkg.template       // explicit HTML builder with default escaping
+pkg.s3             // explicit S3 SigV4 signed HTTP request preparation
 ```
 
 `pkg.kv` is one vendorable subtree with root `pkg.kv` and private implementation module
