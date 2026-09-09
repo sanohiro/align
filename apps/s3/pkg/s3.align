@@ -14,6 +14,9 @@ pub Credentials {
 pub Endpoint { origin: str, region: str }
 pub Field { name: str, value: str }
 
+pub SignedHeader { name: string, value: string }
+pub PresignedRequest { method: string, url: string, headers: array<SignedHeader> }
+
 fn digit(byte: u8) -> bool = byte >= 48 as u8 && byte <= 57 as u8
 fn upper(byte: u8) -> bool = byte >= 65 as u8 && byte <= 90 as u8
 fn lower(byte: u8) -> bool = byte >= 97 as u8 && byte <= 122 as u8
@@ -290,6 +293,10 @@ fn canonical_query(fields: slice<Field>) -> string {
   }
   keys := names.build()
   data := values.build()
+  return encoded_query(keys, data)
+}
+
+fn encoded_query(borrow keys: array<string>, borrow data: array<string>) -> string {
   positions := order(keys, data)
   mut output := builder()
   mut j := 0
@@ -305,14 +312,9 @@ fn canonical_query(fields: slice<Field>) -> string {
   return output.to_string()
 }
 
-fn authorization(credentials: Credentials, region: str, timestamp: str, canonical_hash: str, signed_headers: str) -> string {
+fn signature(credentials: Credentials, region: str, timestamp: str, canonical_hash: str) -> string {
   date := timestamp[0..8]
-  mut scope_builder := builder()
-  scope_builder.write(date)
-  scope_builder.write("/")
-  scope_builder.write(region)
-  scope_builder.write("/s3/aws4_request")
-  scope := scope_builder.to_string()
+  scope := credential_scope(region, timestamp)
   mut signing := builder()
   signing.write("AWS4-HMAC-SHA256\n")
   signing.write(timestamp)
@@ -331,7 +333,21 @@ fn authorization(credentials: Credentials, region: str, timestamp: str, canonica
   service_key := crypto.hmac_sha256(region_key[0..region_key.len()], "s3")
   signing_key := crypto.hmac_sha256(service_key[0..service_key.len()], "aws4_request")
   digest := crypto.hmac_sha256(signing_key[0..signing_key.len()], signing_input)
-  signature := encoding.hex_encode(digest[0..digest.len()])
+  return encoding.hex_encode(digest[0..digest.len()])
+}
+
+fn credential_scope(region: str, timestamp: str) -> string {
+  mut output := builder()
+  output.write(timestamp[0..8])
+  output.write("/")
+  output.write(region)
+  output.write("/s3/aws4_request")
+  return output.to_string()
+}
+
+fn authorization(credentials: Credentials, region: str, timestamp: str, canonical_hash: str, signed_headers: str) -> string {
+  scope := credential_scope(region, timestamp)
+  signature := signature(credentials, region, timestamp, canonical_hash)
   mut authorization := builder()
   authorization.write("AWS4-HMAC-SHA256 Credential=")
   authorization.write(credentials.access_key)
@@ -440,4 +456,120 @@ pub fn request(
   output.header("authorization", auth)
   output.body(body)
   return Ok(output)
+}
+
+pub fn presign(
+  credentials: Credentials, endpoint: Endpoint, method: str, path: str,
+  query: slice<Field>, headers: slice<Field>, now_ns: i64, expires_seconds: i64,
+) -> Result<PresignedRequest, Error> {
+  if query.len() > 128 { return Err(Error.Invalid) }
+  if headers.len() > 120 { return Err(Error.Invalid) }
+  if !credentials_valid(credentials) { return Err(Error.Invalid) }
+  if !endpoint_valid(endpoint) { return Err(Error.Invalid) }
+  if !method_valid(method) { return Err(Error.Invalid) }
+  if path.len() == 0 || path.len() > 8192 || !path.starts_with("/") { return Err(Error.Invalid) }
+  if !query_valid(query) { return Err(Error.Invalid) }
+  if !headers_valid(headers) { return Err(Error.Invalid) }
+  if now_ns < 0 { return Err(Error.Invalid) }
+  if expires_seconds < 1 || expires_seconds > 604800 { return Err(Error.Invalid) }
+
+  timestamp := time.basic_iso(now_ns)?
+  uri := encoding.percent_encode_path(path)
+  scope := credential_scope(endpoint.region, timestamp)
+  offset := if endpoint.origin.starts_with("https://") { 8 } else { 7 }
+  authority := endpoint.origin[offset..endpoint.origin.len()]
+  mut names: array_builder<string> := array_builder()
+  mut values: array_builder<string> := array_builder()
+  names.push("host".clone())
+  values.push(authority.clone())
+  mut i := 0
+  loop {
+    if i >= headers.len() { break }
+    field := headers[i]
+    names.push(lowercase(field.name))
+    values.push(normalized(field.value))
+    i = i + 1
+  }
+  keys := names.build()
+  data := values.build()
+  positions := order(keys, data)
+  mut canonical_headers := builder()
+  mut signed := builder()
+  mut returned: array_builder<SignedHeader> := array_builder()
+  mut j := 0
+  loop {
+    if j >= positions.len() { break }
+    index := positions[j]
+    canonical_headers.write(keys[index])
+    canonical_headers.write(":")
+    canonical_headers.write(data[index])
+    canonical_headers.write("\n")
+    if j > 0 { signed.write(";") }
+    signed.write(keys[index])
+    if keys[index] != "host" {
+      returned.push(SignedHeader{name: keys[index].clone(), value: data[index].clone()})
+    }
+    j = j + 1
+  }
+  signed_headers := signed.to_string()
+  mut credential := builder()
+  credential.write(credentials.access_key)
+  credential.write("/")
+  credential.write(scope)
+  credential_text := credential.to_string()
+  mut expiry := builder()
+  expiry.write_int(expires_seconds)
+  expiry_text := expiry.to_string()
+  mut query_names: array_builder<string> := array_builder()
+  mut query_values: array_builder<string> := array_builder()
+  mut q := 0
+  loop {
+    if q >= query.len() { break }
+    field := query[q]
+    query_names.push(encoding.percent_encode(field.name))
+    query_values.push(encoding.percent_encode(field.value))
+    q = q + 1
+  }
+  query_names.push("X-Amz-Algorithm".clone())
+  query_values.push("AWS4-HMAC-SHA256".clone())
+  query_names.push("X-Amz-Credential".clone())
+  query_values.push(encoding.percent_encode(credential_text))
+  query_names.push("X-Amz-Date".clone())
+  query_values.push(encoding.percent_encode(timestamp))
+  query_names.push("X-Amz-Expires".clone())
+  query_values.push(expiry_text)
+  query_names.push("X-Amz-SignedHeaders".clone())
+  query_values.push(encoding.percent_encode(signed_headers))
+  match credentials.session_token {
+    None => {},
+    Some(token) => {
+      query_names.push("X-Amz-Security-Token".clone())
+      query_values.push(encoding.percent_encode(token))
+    },
+  }
+  query_keys := query_names.build()
+  query_data := query_values.build()
+  query_text := encoded_query(query_keys, query_data)
+  mut canonical := builder()
+  canonical.write(method)
+  canonical.write("\n")
+  canonical.write(uri)
+  canonical.write("\n")
+  canonical.write(query_text)
+  canonical.write("\n")
+  canonical.write(canonical_headers.to_string())
+  canonical.write("\n")
+  canonical.write(signed_headers)
+  canonical.write("\nUNSIGNED-PAYLOAD")
+  digest := crypto.sha256(canonical.to_string())
+  canonical_hash := encoding.hex_encode(digest[0..digest.len()])
+  signed_digest := signature(credentials, endpoint.region, timestamp, canonical_hash)
+  mut url := builder()
+  url.write(endpoint.origin)
+  url.write(uri)
+  url.write("?")
+  url.write(query_text)
+  url.write("&X-Amz-Signature=")
+  url.write(signed_digest)
+  return Ok(PresignedRequest{method: method.clone(), url: url.to_string(), headers: returned.build()})
 }

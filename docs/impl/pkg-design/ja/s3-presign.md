@@ -1,7 +1,7 @@
 # pkg.s3 — 明示的な有効期間を持つ署名付きURL
 
 > 英語版 `../s3-presign.md` が正本。
-> 状態: 設計承認済み、2026-09-09。実装待ち。
+> 状態: 実装済み、2026-09-09。
 
 ## 能力境界と公開契約台帳
 
@@ -135,7 +135,7 @@ URLからwireまでの完全な境界を閉じる。helperだけの独立produce
 | ID / 正確なowner | 実装と回帰によるclosure |
 |---|---|
 | P-G `presign_vectors` | AWS公開2013-05-24 GET例: canonical hash `3bfa292879f6447bbcda7001decf97f4a54dc650c8942174ae0a9121cf58ad04`、署名 `aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404`。canonical bytes/完全URLを独立構成。正確なURL/method/header rowでtoken None/Some、headerゼロ/複数、encoded prefix sort、重複/空pair、binary secret、空白、authority/port、UTF-8/NUL/slash/dot pathを網羅。Hostのbyte順前後に利用者headerを置き、`content-type;host;x-test` と返却row `content-type`、`x-test` を検証する。captureしたbyteからcanonical形へ逆構成し、最後の署名pairだけを除いて検証する。 |
-| P-V `presign_validation` | 本番validatorを共有するV2–V6 parameterized ownerを再利用し、presignの件数/検証入口を区別する。件数0/上限/次、期間-1/0/1/604800/604801/i64両端、時刻-1/0/小数/max、予約query/header全分類、token None/Some/空、複合不正入力。巨大サイズは非公開predicate probeでも閉じられるが公開呼出で入口を確認する。拒否入力はHTTPも送信も行わない。 |
+| P-V `presign_validation`、`presign_expiry_counts` | 本番validatorを共有するV2–V6 parameterized ownerを再利用し、presignの件数/検証入口を区別する。件数0/上限/次、期間-1/0/1/604800/604801/i64両端、時刻-1/0/小数/max、予約query/header全分類、token None/Some/空、複合不正入力。巨大サイズは非公開predicate probeでも閉じられるが公開呼出で入口を確認する。拒否入力はHTTPも送信も行わない。 |
 | P-O `presign_round_trip` | 入力arena、一時credentials/field bufferを抜けて結果を返し、元入力を変更/破棄する。helper/Result/Optionでmove、置換、return、分解、反復借用、nested header Drop。if/match/else/?/loop join、early exit、move-out source nulling、cleanupは既存record/array ownerを再利用し、このaggregateを区別する置換/再利用caseを加える。local peerでGET/PUT(binary/明示空body)、正規化した必要header、token両状態、client再利用、raw拒否responseを検証。bodyを変えてもquery認証は変わらない。 |
 | P-I `presign_imports_effects_cache` | whole-program/per-unit × Dev/Releaseで同じURL/wire oracle。package越しnominal record/array interfaceとborrowed projectionをcompile。正しいprimitiveを返す並列closureでImpure呼出を拒否。cold/warm、非公開署名helper変更/復元でartifactが正しく失効し、既存request vectorは不変。単一moduleの既存package inventoryで新callableを含み、native symbol/source unitは増えない。 |
 
@@ -163,3 +163,13 @@ schema、SigV4a、provider固有認証は対象外。
 通過した。独立Python oracleで公開vectorを双方向に再現した。全差分の独立設計レビューは
 Host順序の曖昧さをP2として1件指摘し、P4/P-GでHostと利用者row全体のsortと、
 返却rowからだけHostを除く規則を明記した。著者は全生成/利用者順序規則を監査しmirrorを同期した。
+
+
+実装closure: `presign` は最初のbuilderより前にP1を検証し、共有helper
+`encoded_query`、`credential_scope`、`signature` でP2–P7を構成する。
+P-Gは両コンパイル方式・profileで独立構成したURL byteを固定し、P-Oはlocal peerの
+受信byteからcanonical bytesを逆構成して別packageの借用consumerを検証する。
+P-Vは共有validatorの全caseを再利用し、公開呼出の件数・期間・時刻直列化境界を追加する。
+P-Iは非公開署名body変更時のcache無効化と両frontend経路のImpure拒否を検証する。
+P-Oは所有method/URL stringをmoveしてtuple分解し、残るheader配列は通常の再帰Dropに
+従う。既存のaggregate move規則は広げない。
