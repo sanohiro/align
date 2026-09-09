@@ -1675,3 +1675,15 @@ five keyed rows using A47/A73/A83/A62, for
 347 keyed, 365 base, 372 allocation-probe, 369 parallel-probe, and 376 maximum records while A124
 remains unused. Exact contract and closure matrix:
 `impl/pkg-design/template.md`.
+
+### HTTP client package composition — proposed
+
+`http_client`, `http_request`, and `http_response` name the existing distinct
+Move owners. The proposed implementation must close by-value/borrowed helper
+boundaries and ordinary recursive owning carriers together. Client operations
+and request setters require `borrow mut` on borrowed receivers; request
+serialization and response inspection accept shared borrows. Response views and
+dependent streams retain their exact owner roots through imported helpers.
+This adds no transport, allocation, retry, or runtime ABI policy. The exact
+surface, exclusions, persistence tags and closure matrix are owned by
+`docs/impl/std-design/http-client-composition.md`; implementation is pending.
