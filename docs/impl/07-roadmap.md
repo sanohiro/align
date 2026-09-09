@@ -3892,7 +3892,9 @@ consumer-boundary investigation are complete. The selected next consumer is
 client/request/response ownership family is implemented under
 `std-design/http-client-composition.md`, enabling fallible request preparation and
 caller-owned pool reuse through package helpers. Next: the S3/SigV4 public-contract
-ledger and independent design review. Merge each coherent capability
+ledger in `pkg-design/s3.md` and independent design review. The selected boundary
+is explicit SigV4 request preparation plus general explicit-empty HTTP body
+framing; the caller supplies its existing client. Merge each coherent capability
 before starting the next.
 Other transports and execution/storage items retain their own admission gates.
 
@@ -3911,9 +3913,9 @@ pending. This section records their sequencing and status; it does not lock an u
 2. Asymmetric signature suite (RS256 / ES256 / Ed25519 + canonical PKCS#8 v1 PEM) — IMPLEMENTED 2026-08-30
      unlocks GCP SA key, Azure cert credential, CloudFront signed URLs, JWT RS256 / JWKS
 3. Small pieces: std.xml (well-formed read-only) — IMPLEMENTED 2026-09-05
-     std.time named formatters are paused until post-XML consolidation closes and cloud work is selected
+     std.time named formatters and parsers — IMPLEMENTED #996
      unlock S3 / Azure Storage / CloudFront / Route53 / SigV4
-     (encoding.percent_encode already shipped; only a '/'-passthrough path variant remains)
+     (encoding.percent_encode and '/'-preserving percent_encode_path are implemented)
 4. Transport: mTLS / Unix domain socket / proxy, then HTTP/2
      unlock Kubernetes, Docker, corporate networks, gRPC-family services
 ```

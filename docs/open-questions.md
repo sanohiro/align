@@ -19,6 +19,17 @@ five mechanical workarounds across at least two independent real programs. Reach
 only makes the proposal admissible; the re-examination itself follows the ordinary procedure in
 this file and the design gate in `CLAUDE.md`.
 
+### S3 SigV4 request composition — design candidate 2026-09-09
+
+The public-contract candidate is `docs/impl/pkg-design/s3.md`. One ordinary
+`pkg.s3.request` returns an owned signed HTTP request, borrowing explicit
+credentials, endpoint, time and request data only for the call. It owns S3
+canonicalization, not provider discovery, transport, response interpretation or
+credential refresh. Its HTTP prerequisite distinguishes an unset body from an
+explicit empty body and emits Content-Length for the latter. Independent design
+review must close this candidate before implementation; no language invariant
+is reopened.
+
 ### HTTP client package composition — SETTLED 2026-09-09
 
 The next cloud prerequisite names the existing `http_client`, `http_request` and

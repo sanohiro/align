@@ -117,8 +117,10 @@ then exposed unnamed HTTP client/request/response owners and missing fallible
 request returns. The complete ownership boundary is now implemented under
 `docs/impl/std-design/http-client-composition.md`, including borrowed helpers,
 recursive carriers and whole/unit producer validation. The next work is the
-`pkg.s3`/SigV4 public-contract ledger and its independently reviewed capability
-boundary. Other transports and S1–S6 retain their own evidence/design gates.
+`pkg.s3`/SigV4 public-contract candidate in `docs/impl/pkg-design/s3.md` and its
+independent design review. Its explicit signed-request boundary includes the
+general HTTP explicit-empty-body framing prerequisite needed by S3 PUT.
+Other transports and S1–S6 retain their own evidence/design gates.
 
 **Current next work (owner-resumed 2026-09-07):** Request 55 and the fixed v0.7.3 release are
 complete. S0A is implemented in PR #955, S0B in PR #959, and the C0 chunks
