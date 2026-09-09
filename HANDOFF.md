@@ -112,8 +112,11 @@ verification design, and change the workflow boundary first.
 **Normal capability work resumed (2026-09-08):** the owner requested continuing implementation ->
 PR -> merge -> next implementation. The selected consumer is `pkg.s3`/SigV4. Its named UTC
 formatting/parsing and slash-preserving percent-encoding prerequisite follows the exact public
-contract and closure matrix in `docs/impl/std-design/time.md`. Continue to the consumer after
-merging that prerequisite; other transports and S1–S6 retain their own evidence/design gates.
+contract and closure matrix in `docs/impl/std-design/time.md`. The time/encoding prerequisite is merged in #996. The consumer composition probe
+then exposed unnamed HTTP client/request/response owners and missing fallible
+request returns. The accepted next prerequisite is the complete ownership boundary
+in `docs/impl/std-design/http-client-composition.md`; implement it before the S3
+package. Other transports and S1–S6 retain their own evidence/design gates.
 
 **Current next work (owner-resumed 2026-09-07):** Request 55 and the fixed v0.7.3 release are
 complete. S0A is implemented in PR #955, S0B in PR #959, and the C0 chunks

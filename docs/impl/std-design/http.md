@@ -1562,7 +1562,7 @@ Exact validation, pointer, ownership, cache, and test contracts: `../pkg-design/
   `sema_and_codegen_struct_layout_agree` row. (`crates/align_driver/tests/http_headers_view.rs` +
   `apps_web_root.rs::web_header_reads_the_request_header_table`.)
 
-## Client package composition (proposed 2026-09-09)
+## Client package composition (designed 2026-09-09)
 
 The complete nameable client/request/response ownership boundary is specified in
 [http-client-composition.md](http-client-composition.md). Implementation is pending;

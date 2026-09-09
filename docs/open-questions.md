@@ -19,12 +19,15 @@ five mechanical workarounds across at least two independent real programs. Reach
 only makes the proposal admissible; the re-examination itself follows the ordinary procedure in
 this file and the design gate in `CLAUDE.md`.
 
-### HTTP client package composition — proposed 2026-09-09
+### HTTP client package composition — SETTLED 2026-09-09
 
 The next cloud prerequisite names the existing `http_client`, `http_request` and
 `http_response` owners and closes helper/carrier ownership as one capability.
 It preserves the existing Move/borrow/Drop model and wire/transport policy.
-The exact proposed contract and independent-review gate are recorded in
+Shared client network helpers preserve the existing shared stream loan;
+configuration and request setters require exclusive borrowed authority. The
+general bound-owner value-carrying `if` gap remains deferred. The exact accepted
+contract, review closure and implementation gate are recorded in
 `docs/impl/std-design/http-client-composition.md`; implementation remains pending.
 
 

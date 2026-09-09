@@ -1,7 +1,7 @@
 # HTTP client ownership across package boundaries
 
 > English is authoritative. Japanese mirror: `ja/http-client-composition.md`.
-> Status: proposed, 2026-09-09. This is the next S3/SigV4 prerequisite after
+> Status: designed, 2026-09-09; implementation pending. This is the next S3/SigV4 prerequisite after
 > the implemented named-time and path-encoding family.
 
 ## Evidence and capability boundary
@@ -35,8 +35,8 @@ clock, retry policy, HTTP protocol change, or S3 API is introduced.
 | `http_request` | Global arity-zero builtin type spelling for the existing `http.request(method: str, url: str)` result. Construction remains total; existing serialization/transport validation and setter aborts remain unchanged. Wrong arity is a compile error. | Nominal opaque Move owner of method, URL, headers and copied body. Helpers may construct and return it. Move is allocation-free; unfinished Drop uses the existing request free exactly once. Constructor/setters retain their existing explicit copies; no caller view is retained. | Sema spelling and `Scalar::HttpRequest`, existing `Ty::HttpRequest`; same ownership and interface owners. H1, O1, W1, I1. |
 | `http_response` | Global arity-zero builtin type spelling for the existing successful `http.parse` and whole-body HTTP results. `http.response(status)` continues to construct the distinct existing `response_builder`. Wrong arity is a compile error. | Existing nominal opaque Move response; no new scalar representation. Header/body views borrow its exact storage root. Moving transfers its retained data without copying. Drop uses the existing parsed-response free. | Sema spelling and existing `Scalar::HttpResponse`/`Ty::HttpResponse`. H1, O1, V1, I1. |
 | Owning carriers for all three | Bare locals, by-value parameters and returns; recursively owning records, user sums, tuples, `Option` and `Result`; source-formed fixed arrays of recursively owning Move records use the existing move-path carrier rules. All generic instances obey the same rules after substitution. | Each reachable live owner is moved, source-nulled and dropped exactly once, including partial moves, replacement and early exits. Constructors are the only safe source of a fresh handle. Borrowing a carrier does not mint ownership. | Existing recursive owner machinery gains the two missing scalar leaves. Direct handle collection elements, dynamic collections of owning records, boxes of owned values, constants/globals, escaping captures, tasks/parallel captures and public extern signatures stay rejected under their existing policies. The already shipped `array<http_response>` batch representation remains supported; this change does not add a client/request array representation. H1, O1, M1. |
-| Borrowed helper parameters | `borrow` and `borrow mut` use the existing parameter syntax and call-bounded lifetime inference. A borrowed owner cannot be consumed, returned as owned, dropped or replaced by the callee. A returned response view retains the input response root; existing dependent raw/SSE stream carrier and origin rules still apply. | No allocation, retain count or new native shell. The caller remains the owner. Mutable loans exclude overlapping shared/mutable access and move/Drop/replacement for the loan's lifetime, including retained streams. | Sema borrow/move/region checks and imported ownership summaries. V1, M1, I1. |
-| Client methods | Existing `get`, `post`, `request`, `request_stream`, `get_many`, `timeout`, and `max_response_body_bytes` require exclusive authority when the bound receiver is a borrowed parameter: `borrow mut`, never shared `borrow`. Owned local and by-value parameter receivers keep the existing implicit handle-mutation convention; binding `mut` is not newly required. All methods still require a bound local receiver. | A complete response owns its data independently of the client; a streaming response retains its existing client loan. Both request-taking methods consume the request exactly once even on transport failure. No access to the client may invalidate an outstanding dependent stream. | Existing method HIR and native operations; exclusive receiver checks and region transport must include imported/generic helpers. No effect change: network methods remain Impure, setters Pure. M1, V1, W1. |
+| Borrowed helper parameters | `borrow` and `borrow mut` use the existing parameter syntax and call-bounded lifetime inference. A borrowed owner cannot be consumed, returned as owned, dropped or replaced by the callee. A returned response view retains the input response root; existing dependent raw/SSE stream carrier and origin rules still apply. | No allocation, retain count or new native shell. The caller remains the owner. Mutable loans exclude overlapping access and move/Drop/replacement for their lifetime. Dependent streams retain a shared client loan, permitting further shared request operations while excluding client move/Drop/replacement and incompatible mutable helper access. | Sema borrow/move/region checks and imported ownership summaries. V1, M1, I1. |
+| Client methods | Existing network methods `get`, `post`, `request`, `request_stream`, and `get_many` accept shared `borrow` client parameters, as required by the shipped stream/pool contract. Configuration setters `timeout` and `max_response_body_bytes` require `borrow mut` on borrowed parameters. Owned local and by-value parameter receivers keep the existing implicit handle-mutation convention; binding `mut` is not newly required. All methods still require a bound local receiver. | A complete response owns its data independently of the client; a streaming response retains its existing client loan. Both request-taking methods consume the request exactly once even on transport failure. No access to the client may invalidate an outstanding dependent stream. | Existing method HIR and native operations; exclusive receiver checks and region transport must include imported/generic helpers. No effect change: network methods remain Impure, setters Pure. M1, V1, W1. |
 | Request methods | Existing `header`, `body`, `timeout`, and `max_response_body_bytes` require `borrow mut` on a borrowed bound-local receiver. `serialize() -> Result<buffer, Error>` is read-only and accepts shared `borrow`; it returns independent owned bytes and does not consume the request. Owned/by-value receiver convention and bound-local rule remain unchanged. | Setter inputs are copied during the call and retain no input loan. Serialization owns its output. Consuming a shared or mutable borrowed request is forbidden; only an owning source may be passed to the native consuming request operation. | Existing operations and allocation/error contracts. M1, W1, V1. |
 | Response methods | Existing `status() -> i64`, `header(name: str) -> Option<str>`, `body() -> slice<u8>` accept a shared borrowed bound local. Existing receiver rules otherwise remain unchanged. Header lookup retains no name argument. | Status is independent Copy data; header/body views retain the response root through helper return, fields, Option, joins and imports. Replacing/moving/dropping that root while a view is live is rejected. The completed response does not retain a client/request/input-buffer loan. | Existing response region producer and imported retained-root summaries. V1, I1. |
 
@@ -88,13 +88,20 @@ record the implementation and final owner mapping here before preflight.
 | ID | Applicable invariant / paths | Exact acceptance owner |
 |---|---|---|
 | H1 | Three names/arity, direct and nested admitted carriers, generic substitution; reject forbidden direct collections, boxes, capture/parallel/extern carriers and wrong nominal type | `formation_and_carrier_matrix` |
-| O1 | Construct, move-in/out, selected source nulling, recursive Drop, partial move/reinitialization, replacement, returned Result; `if`, `match`, `else`, `?`, `map_err`, branch/loop joins and early exits | `ownership_control_flow_whole_and_unit` |
-| M1 | Mutable versus shared parameter authority for every client/request method; read-only serialization and response access; reject borrowed consumption and same-root overlap through helpers/aggregates | `borrow_authority_and_consumption_matrix` |
-| V1 | Response body/header return lifetimes, independent status/serialized bytes/completed response, stream-derived client loan through helper/import/generic paths; move/replacement/Drop invalidation | `retained_views_and_stream_origins` |
+| O1 | Construct, move-in/out, selected source nulling, recursive Drop, partial move/reinitialization, replacement, returned Result; fresh-value `if`, statement-form `if`/return, `match`, `else`, `?`, `map_err`, branch/loop joins and early exits; preserve rejection of bound-owner value-carrying `if` | `ownership_control_flow_whole_and_unit` |
+| M1 | Shared network versus exclusive configuration authority for every client method; mutable versus shared request authority; read-only serialization and response access; reject borrowed consumption and same-root overlap through helpers/aggregates | `borrow_authority_and_consumption_matrix` |
+| V1 | Response body/header return lifetimes, independent status/serialized bytes/completed response, shared stream-derived client loan through helper/import/generic paths; a live stream plus a second direct/imported shared request succeeds; move/replacement/Drop and incompatible mutable helper access fail | `retained_views_and_stream_origins` |
 | W1 | Returned request serialized and sent from caller-owned client; literal/owned/NUL/binary inputs preserve existing HTTP behavior; success and network-error consumption; pool reuse; whole/unit optimized/unoptimized native output | `package_request_and_pool_wire_round_trip` |
 | I1 | Imported/generic ownership modes, complete nominal graph, serialized tags and malformed records, cold/warm/edit/restore cache, borrowed roots not lost in interface replay | `interfaces_and_cache_restore`; `align_mir --lib canonical_field_codec_covers_every_primitive_and_scalar_tag` and `canonical_type_codec` extended for both scalar tags |
 | P1 | Checked HIR operand/result identity; exact native access/slot producer certification; sibling-type substitution, missing storage proof and forged borrowed consumption refuse before LLVM | `align_mir --lib hir_body_validator_native`; `align_codegen_llvm --lib xml_mir_gate_authenticates_types_on_every_producer_edge` |
 | A1 | Exact pointer ABI and frees; allocation-free move, no double-free/leak on completed or failed consuming calls, partially moved aggregate cleanup | `ownership_control_flow_whole_and_unit` plus existing native HTTP lifecycle owner; use allocation probes where existing structural owners do not discriminate cleanup |
+
+The general bound-owner value-carrying `if` gap remains explicitly deferred under
+`docs/impl/23-friction-ledger.md` Category A. Fresh constructed arm values and
+statement-form `if` with explicit return remain supported; no HTTP-specific
+exception or general control-flow ownership widening is part of this capability.
+The existing `align_sema --lib move_owned_local_through_if_arm_rejected` owner and
+O1's HTTP-family negative control pin this boundary.
 
 No speed or peak-memory improvement is promised, so no benchmark is a correctness
 gate. There is no new runtime allocation path to justify a new global probe ABI.
@@ -103,7 +110,7 @@ counting source spellings is not sufficient ownership evidence.
 
 ## Example and consistency obligations
 
-This is an example of the proposed composition surface, not a shipped API claim:
+This is an example of the designed composition surface, not a shipped API claim:
 
 ```align
 module main
@@ -115,12 +122,12 @@ fn prepare(url: str) -> Result<http_request, Error> {
   return Ok(req)
 }
 
-fn send(borrow mut client: http_client, req: http_request) -> Result<http_response, Error> {
+fn send(borrow client: http_client, req: http_request) -> Result<http_response, Error> {
   return client.request(req)
 }
 
 fn main() -> Result<(), Error> {
-  mut client := http.client()
+  client := http.client()
   req := prepare("https://example.com/object")?
   response := send(client, req)?
   print(response.status())
@@ -139,3 +146,13 @@ ledgers only if their normative record changes. HANDOFF records the prerequisite
 once at the accepted capability boundary. S3's endpoint, credential, canonical
 request, signature, response/status and interoperability contract remains a
 separate package design after this prerequisite.
+
+## Design review closure
+
+The independent inspection of candidate `0d03915a` found two P2 issues. Both are
+closed in this ledger before implementation: network helpers preserve shared
+client authority and retained-stream concurrency, while configuration helpers
+require exclusive authority; O1 explicitly preserves the general bound-owner
+value-carrying `if` rejection. M1/V1 own the authority product, O1 owns supported
+control paths and the negative boundary. The complete source-of-truth summaries,
+example and Japanese mirror carry the same decisions.
