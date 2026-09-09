@@ -28,7 +28,7 @@ Shared client network helpers preserve the existing shared stream loan;
 configuration and request setters require exclusive borrowed authority. The
 general bound-owner value-carrying `if` gap remains deferred. The exact accepted
 contract, review closure and implementation gate are recorded in
-`docs/impl/std-design/http-client-composition.md`; implementation remains pending.
+`docs/impl/std-design/http-client-composition.md`.
 
 
 ### `pkg.template` v1 is one escape-by-default HTML builder (SETTLED 2026-09-04)

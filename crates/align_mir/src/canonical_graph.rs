@@ -1576,6 +1576,8 @@ fn decode_scalar(cursor: &mut DecodeCursor<'_>) -> Result<Scalar, CanonicalCodec
         46 => Ok(Scalar::CodecEncoder),
         47 => Ok(Scalar::HttpUpgrade),
         48 => Ok(Scalar::XmlReader),
+        49 => Ok(Scalar::HttpClient),
+        50 => Ok(Scalar::HttpRequest),
         _ => Err(CanonicalCodecError::UnknownTag),
     }
 }
@@ -2540,6 +2542,8 @@ fn scalar(
             Scalar::CodecEncoder => leaf!(46),
             Scalar::HttpUpgrade => leaf!(47),
             Scalar::XmlReader => leaf!(48),
+            Scalar::HttpClient => leaf!(49),
+            Scalar::HttpRequest => leaf!(50),
             Scalar::Param(_) | Scalar::SoaParam(_) => {
                 Err(CanonicalGraphError::InvalidGraph)
             }
@@ -3697,6 +3701,8 @@ mod tests {
             Scalar::UdpSocket,
             Scalar::Child,
             Scalar::File,
+            Scalar::HttpClient,
+            Scalar::HttpRequest,
             Scalar::HttpResponse,
             Scalar::HttpServer,
             Scalar::HttpRequestCtx,
@@ -3713,6 +3719,19 @@ mod tests {
         for scalar in scalars {
             let encoded = CanonicalTy::from_program(Ty::Option(scalar), &program).unwrap();
             assert_eq!(CanonicalTy::decode(encoded.as_bytes()).unwrap(), encoded);
+        }
+
+        for (scalar, tag) in [(Scalar::HttpClient, 49), (Scalar::HttpRequest, 50), (Scalar::HttpResponse, 27)] {
+            let expected = [3, 0, 0, 0, 0, 4, tag];
+            let Ok(encoded) = CanonicalTy::from_program(Ty::Option(scalar), &program) else {
+                panic!("HTTP option golden must encode");
+            };
+            assert_eq!(encoded.as_bytes(), expected);
+            assert_eq!(CanonicalTy::decode(&expected).as_ref(), Ok(&encoded));
+            assert!(CanonicalTy::decode(&expected[..6]).is_err());
+        }
+        for tag in 51..=u8::MAX {
+            assert!(CanonicalTy::decode(&[3, 0, 0, 0, 0, 4, tag]).is_err());
         }
 
         let logger = CanonicalTy::from_program(Ty::Logger, &program);
@@ -3837,7 +3856,7 @@ mod tests {
         error(&[3, 0, 0, 0, 0, 63], CanonicalCodecError::Truncated);
         error(&[3, 0, 0, 0, 0, 4, 39], CanonicalCodecError::Truncated);
         error(&[3, 0, 0, 0, 0, 73], CanonicalCodecError::UnknownTag);
-        error(&[3, 0, 0, 0, 0, 4, 49], CanonicalCodecError::UnknownTag);
+        error(&[3, 0, 0, 0, 0, 4, 51], CanonicalCodecError::UnknownTag);
         error(&[3, 0, 0, 0, 0], CanonicalCodecError::Truncated);
         error(
             &[3, 0, 0, 0, 0, 71, 0],
@@ -4198,6 +4217,9 @@ mod tests {
             Scalar::CodecF64Column => [43], Scalar::CodecBoolColumn => [44],
             Scalar::CodecStrColumn => [45], Scalar::CodecEncoder => [46],
             Scalar::HttpUpgrade => [47],
+            Scalar::XmlReader => [48],
+            Scalar::HttpClient => [49],
+            Scalar::HttpRequest => [50],
         );
     }
 

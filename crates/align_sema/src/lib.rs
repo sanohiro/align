@@ -280,10 +280,13 @@ pub enum Scalar {
     /// closes it. Opaque pointer, like [`Scalar::Reader`]/[`Scalar::Writer`] — owned, never
     /// region-tracked (a `file` has no borrowed variant).
     File,
+    /// An owned HTTP connection pool in an ordinary owning carrier.
+    HttpClient,
+    /// An owned HTTP request builder in an ordinary owning carrier.
+    HttpRequest,
     /// A `response` payload (`Result<response, Error>` from `http.parse`). An owned **Move** handle
     /// (one raw byte buffer + an offset table); the enclosing `Result`'s `Drop` frees it. Opaque
-    /// pointer, like [`Scalar::Buffer`] — owned, never region-tracked. (There is no
-    /// `Scalar::HttpRequest`: a `request` builder never rides an aggregate — it has no `Scalar`.)
+    /// pointer, like [`Scalar::Buffer`] — owned, never region-tracked.
     HttpResponse,
     /// A `http_server` payload (`Result<http_server, Error>` from `http.serve`). An owned **Move** handle
     /// (a listening socket fd); the enclosing `Result`'s `Drop` closes it. Opaque pointer, like
@@ -350,7 +353,7 @@ impl Scalar {
     /// the I/O handles `reader`/`writer`, a decoded `buffer`, a `cli parsed`, a `tcp_conn`, a
     /// `tcp_listener`, a `udp_socket`, or a package-defined resource.
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Logger | Scalar::XmlReader | Scalar::CodecEncoder | Scalar::Buffer | Scalar::SignatureKey(_) | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::HttpUpgrade | Scalar::HttpReadStream | Scalar::HttpSseStream | Scalar::ResponseBuilder | Scalar::RunOutput | Scalar::RunBytes | Scalar::Resource(_))
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Logger | Scalar::XmlReader | Scalar::CodecEncoder | Scalar::Buffer | Scalar::SignatureKey(_) | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpClient | Scalar::HttpRequest | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::HttpUpgrade | Scalar::HttpReadStream | Scalar::HttpSseStream | Scalar::ResponseBuilder | Scalar::RunOutput | Scalar::RunBytes | Scalar::Resource(_))
     }
 }
 
@@ -750,7 +753,7 @@ pub enum Ty {
     /// `execvp` lookup path + the full argv + an optional working directory, `Drop`-freed
     /// (`command_free`). `c.cwd(dir)` mutates it in place (not consumed); `c.run()` **borrows** it
     /// (re-runnable, like `ch.wait()`) and yields `Result<run_output, Error>`. Never rides an aggregate
-    /// (a builder — like `http request` — so it has no `Scalar`). Impure. Opaque pointer.
+    /// (this command builder has no `Scalar`). Impure. Opaque pointer.
     Command,
     /// A `run_output` (`std.process` Slice 4) — one completed run's captured output, the `Ok` payload of
     /// `c.run()`'s `Result<run_output, Error>`. An owned **Move** handle (modeled on [`Ty::HttpResponse`])
@@ -766,8 +769,8 @@ pub enum Ty {
     /// owned **Move** handle (like `reader`/`writer`/`buffer`/`cli command`) owning its method / url /
     /// header list / body buffer, `Drop`-freed. `r.header(name, value)` / `r.body(data)` mutate it in
     /// place through the handle (not consumed). Pure in this slice (no I/O — serialization is an
-    /// internal codec, the network client is Slice 2). Opaque pointer. Never rides an aggregate (no
-    /// `Scalar::HttpRequest`).
+    /// internal codec, the network client is Slice 2). Opaque pointer; owning carriers use
+    /// `Scalar::HttpRequest`.
     HttpRequest,
     /// An `http response` (`std.http`) — a parsed HTTP/1.1 response, the `Ok` payload of `http.parse`'s
     /// `Result<response, Error>`. An owned **Move** handle owning ONE raw byte buffer + an offset table
@@ -1023,6 +1026,8 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Scalar::UdpSocket
         | Scalar::Child
         | Scalar::File
+        | Scalar::HttpClient
+        | Scalar::HttpRequest
         | Scalar::HttpResponse
         | Scalar::HttpServer
         | Scalar::HttpRequestCtx
@@ -1098,8 +1103,9 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::UdpSocket => Some(Scalar::UdpSocket),
         // A `child` owned handle as the `Result` Ok payload of `process.spawn`.
         Ty::Child => Some(Scalar::Child),
-        // An `http response` owned handle as the `Result` Ok payload of `http.parse`. (An `http
-        // request` builder is never a payload — it has no `Scalar` and maps to `None` here.)
+        // HTTP client owners share the ordinary recursive owning carrier representation.
+        Ty::HttpClient => Some(Scalar::HttpClient),
+        Ty::HttpRequest => Some(Scalar::HttpRequest),
         Ty::HttpResponse => Some(Scalar::HttpResponse),
         // A `http_server` / `http_request_ctx` owned handle as the `Result` Ok payload of `http.serve`
         // / `srv.accept()`. (A `response_builder` is never a payload — it has no `Scalar`, `None` here.)
@@ -1230,6 +1236,8 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::TcpListener => Ty::TcpListener,
         Scalar::UdpSocket => Ty::UdpSocket,
         Scalar::Child => Ty::Child,
+        Scalar::HttpClient => Ty::HttpClient,
+        Scalar::HttpRequest => Ty::HttpRequest,
         Scalar::HttpResponse => Ty::HttpResponse,
         Scalar::HttpServer => Ty::HttpServer,
         Scalar::HttpRequestCtx => Ty::HttpRequestCtx,
@@ -3350,6 +3358,8 @@ fn ty_contains_http_receive_stream(
             | Scalar::UdpSocket
             | Scalar::Child
             | Scalar::File
+            | Scalar::HttpClient
+            | Scalar::HttpRequest
             | Scalar::HttpResponse
             | Scalar::HttpServer
             | Scalar::HttpRequestCtx
@@ -3568,6 +3578,8 @@ pub fn http_stream_carrier_class(
             | Scalar::UdpSocket
             | Scalar::Child
             | Scalar::File
+            | Scalar::HttpClient
+            | Scalar::HttpRequest
             | Scalar::HttpResponse
             | Scalar::HttpServer
             | Scalar::HttpRequestCtx
@@ -4354,6 +4366,9 @@ pub const BUILTIN_SPELLING_TYS: &[(&str, Ty)] = &[
     ("udp_socket", Ty::UdpSocket),
     ("child", Ty::Child),
     ("run_bytes", Ty::RunBytes),
+    ("http_client", Ty::HttpClient),
+    ("http_request", Ty::HttpRequest),
+    ("http_response", Ty::HttpResponse),
     ("http_request_ctx", Ty::HttpRequestCtx),
     ("response_builder", Ty::ResponseBuilder),
     ("http_stream", Ty::HttpStream),
@@ -9035,8 +9050,10 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                     // smaller than a Move-handle payload. (Generic sum types with a fn payload are still
                     // rejected upstream at the template payload resolver — deferred, no consumer.)
                     Ty::Fn(fid) => payload.push(Scalar::Fn(fid)),
-                    // pkg.web middleware's short-circuit verdict. A response builder is an owned
-                    // opaque handle; the enum's tag-switched drop calls its null-safe free routine.
+                    // Opaque HTTP owners retain tag-switched, null-safe cleanup in sums.
+                    Ty::HttpClient => payload.push(Scalar::HttpClient),
+                    Ty::HttpRequest => payload.push(Scalar::HttpRequest),
+                    Ty::HttpResponse => payload.push(Scalar::HttpResponse),
                     Ty::ResponseBuilder => payload.push(Scalar::ResponseBuilder),
                     // `log.logger` may cross a sum-type boundary as an owned tagged carrier.
                     // The enum's tag-switched drop forwards the active handle to `log_free`.
@@ -24070,13 +24087,13 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::ArrayLit { elems, .. } if elems.is_empty() => {}
             ExprKind::ArrayToSlice(_)
             | ExprKind::ArrayLit { .. }
-            | ExprKind::HttpRespBody { .. }
             | ExprKind::HttpCtxBody { .. } => return true,
-            // A byte view minted from a local or by-value buffer/run_bytes owner dies with this frame.
+            // A byte view minted from a local or by-value buffer/response/run_bytes owner dies with this frame.
             // A `borrow`/`borrow mut` parameter still belongs to the caller, however, so its view
             // may be returned with that caller-side provenance (the same distinction made by
             // `borrowed_storage_cap` in `region_of`).
             ExprKind::BufferBytes { buffer: out }
+            | ExprKind::HttpRespBody { resp: out }
             | ExprKind::RunBytesStdout { out } | ExprKind::RunBytesStderr { out } => {
                 if !self.borrowed_param_place(out) {
                     return true;
@@ -47075,7 +47092,8 @@ impl<'a, 't> Checker<'a, 't> {
             match ty_to_scalar(self.resolve(ce.ty)) {
                 Some(s @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char
                 | Scalar::Str | Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_)
-                | Scalar::Resource(_) | Scalar::ResourceRef(_))) => scalars.push(s),
+                | Scalar::Resource(_) | Scalar::ResourceRef(_)
+                | Scalar::HttpClient | Scalar::HttpRequest | Scalar::HttpResponse)) => scalars.push(s),
                 _ => {
                     if ce.ty != Ty::Error {
                         self.diags.error(
@@ -60986,6 +61004,9 @@ impl<'a, 't> Checker<'a, 't> {
             }
             return err;
         }
+        if !self.require_exclusive_handle_receiver(&recv_expr, "http_request", method, "mutate") {
+            return err;
+        }
         match method {
             "header" => {
                 if args.len() != 2 {
@@ -61147,6 +61168,11 @@ impl<'a, 't> Checker<'a, 't> {
                     span,
                 );
             }
+            return err;
+        }
+        if matches!(method, "timeout" | "max_response_body_bytes")
+            && !self.require_exclusive_handle_receiver(&recv_expr, "http_client", method, "configure")
+        {
             return err;
         }
         let result_ty = Ty::Result(Scalar::HttpResponse, Scalar::Enum(self.error_enum_id));
@@ -66292,7 +66318,7 @@ fn ty_name(ty: Ty) -> String {
             "array<{}>",
             ty_name(ty.dyn_aggregate_array_element().expect("matched aggregate array").ty())
         ),
-        Ty::DynResponseArray => "array<response>".to_string(),
+        Ty::DynResponseArray => "array<http_response>".to_string(),
         Ty::Str => "str".to_string(),
         Ty::String => "string".to_string(),
         Ty::ArenaHandle => "region".to_string(),
@@ -66336,9 +66362,9 @@ fn ty_name(ty: Ty) -> String {
         Ty::Command => "command".to_string(),
         Ty::RunOutput => "run output".to_string(),
         Ty::RunBytes => "run_bytes".to_string(),
-        Ty::HttpRequest => "http request".to_string(),
-        Ty::HttpResponse => "http response".to_string(),
-        Ty::HttpClient => "http client".to_string(),
+        Ty::HttpRequest => "http_request".to_string(),
+        Ty::HttpResponse => "http_response".to_string(),
+        Ty::HttpClient => "http_client".to_string(),
         Ty::HttpServer => "http_server".to_string(),
         Ty::HttpRequestCtx => "http_request_ctx".to_string(),
         Ty::HttpHeaders => "http_headers".to_string(),
@@ -66647,7 +66673,7 @@ fn resolved_type_source_spelling(
                     next,
                 )
             ),
-            Ty::DynResponseArray => "array<response>".to_string(),
+            Ty::DynResponseArray => "array<http_response>".to_string(),
             Ty::Box(payload) => format!(
                 "box<{}>",
                 scalar(
@@ -66769,9 +66795,9 @@ fn resolved_type_source_spelling(
             Ty::Command => "command".to_string(),
             Ty::RunOutput => "run_output".to_string(),
             Ty::RunBytes => "run_bytes".to_string(),
-            Ty::HttpRequest => "http request".to_string(),
-            Ty::HttpResponse => "http response".to_string(),
-            Ty::HttpClient => "http client".to_string(),
+            Ty::HttpRequest => "http_request".to_string(),
+            Ty::HttpResponse => "http_response".to_string(),
+            Ty::HttpClient => "http_client".to_string(),
             Ty::HttpServer => "http_server".to_string(),
             Ty::HttpRequestCtx => "http_request_ctx".to_string(),
             Ty::HttpHeaders => "http_headers".to_string(),
@@ -67841,7 +67867,7 @@ fn scalar_arg(
         );
         return None;
     }
-    if matches!(ty, Ty::CliCommand | Ty::HttpRequest | Ty::Command) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Logger | Ty::XmlReader | Ty::CodecBatch | Ty::CodecI64Column | Ty::CodecF64Column | Ty::CodecBoolColumn | Ty::CodecStrColumn | Ty::CodecEncoder | Ty::Buffer | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::HttpReadStream | Ty::HttpSseStream | Ty::ResponseBuilder | Ty::RunOutput | Ty::RunBytes) && !allow_param) {
+    if matches!(ty, Ty::CliCommand | Ty::Command) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Logger | Ty::XmlReader | Ty::CodecBatch | Ty::CodecI64Column | Ty::CodecF64Column | Ty::CodecBoolColumn | Ty::CodecStrColumn | Ty::CodecEncoder | Ty::Buffer | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::HttpReadStream | Ty::HttpSseStream | Ty::ResponseBuilder | Ty::RunOutput | Ty::RunBytes) && !allow_param) {
         diags.error(
             format!("{what} cannot be `{}` — an owned I/O handle/buffer is bound to one local, not collected into an array/slice/box (bind it to a local)", ty_name(ty)),
             span,
@@ -68402,7 +68428,8 @@ fn resolve_type(
                 match ty_to_scalar(ety) {
                     Some(s @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char
                     | Scalar::Str | Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_)
-                    | Scalar::Resource(_) | Scalar::ResourceRef(_))) => scalars.push(s),
+                    | Scalar::Resource(_) | Scalar::ResourceRef(_)
+                | Scalar::HttpClient | Scalar::HttpRequest | Scalar::HttpResponse)) => scalars.push(s),
                     _ => {
                         diags.error(
                             format!("tuple elements must be a scalar, str, owned string, owned array, resource, or resource reference for now, got {}", ty_name(ety)),
@@ -68804,6 +68831,17 @@ fn resolve_type(
             }
             Ty::RunBytes
         }
+        "http_client" | "http_request" | "http_response" => {
+            if !args.is_empty() {
+                diags.error(format!("{name} takes no type arguments"), span);
+                return Ty::Error;
+            }
+            match name {
+                "http_client" => Ty::HttpClient,
+                "http_request" => Ty::HttpRequest,
+                _ => Ty::HttpResponse,
+            }
+        }
         // `http_request_ctx` (`std.http`) — one accepted+parsed request, an owned Move handle
         // (`srv.accept()`). A surface type name (F1②) so the pkg.web request `Ctx` can **own** it as
         // a struct field (`Ctx { req: http_request_ctx, … }`) — the struct becomes Move and its drop
@@ -69012,6 +69050,8 @@ fn resolve_type(
             // An `array<Struct>` is a dynamic AoS (its own owned type); only a primitive
             // element resolves to the scalar `array<T>` (`DynArray`).
             match inner {
+                // The existing batch-response owner has one canonical source spelling.
+                Ty::HttpResponse => Ty::DynResponseArray,
                 // An `align(N)` struct element would need its size padded to its alignment for a
                 // tight, aligned stride (deferred) — reject embedding it in an array for now.
                 Ty::Struct(id) if cx.structs.get(id as usize).and_then(|s| s.align).is_some() => {
@@ -69750,7 +69790,10 @@ fn enum_payload_ok(
         Scalar::Enum(id) => enums.get(id as usize).is_some(),
         // Opaque handles admitted by concrete Pass 0c must remain legal after generic
         // substitution too. Their active sum arm owns exactly one null-safe Drop leaf.
-        Scalar::ResponseBuilder
+        Scalar::HttpClient
+        | Scalar::HttpRequest
+        | Scalar::HttpResponse
+        | Scalar::ResponseBuilder
         | Scalar::Logger
         | Scalar::XmlReader
         | Scalar::CodecBatch

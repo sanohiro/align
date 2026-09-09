@@ -16133,6 +16133,8 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         | Scalar::UdpSocket
         | Scalar::Child
         | Scalar::File
+        | Scalar::HttpClient
+        | Scalar::HttpRequest
         | Scalar::HttpResponse
         | Scalar::HttpServer
         | Scalar::HttpRequestCtx

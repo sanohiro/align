@@ -6846,9 +6846,6 @@ fn region_only_array_builder_headers_are_placement_valid() {
 fn body_only_header_types_fail_placement_closed() {
     for (label, ty) in [
         ("cli parsed", Ty::CliParsed),
-        ("http request", Ty::HttpRequest),
-        ("http response", Ty::HttpResponse),
-        ("http client", Ty::HttpClient),
         ("http server", Ty::HttpServer),
         ("command", Ty::Command),
         ("run output", Ty::RunOutput),
@@ -16036,6 +16033,8 @@ const fn delegation_scalar_sweep_tripwire(scalar: &Scalar) {
         | Scalar::UdpSocket
         | Scalar::Child
         | Scalar::File
+        | Scalar::HttpClient
+        | Scalar::HttpRequest
         | Scalar::HttpResponse
         | Scalar::HttpServer
         | Scalar::HttpRequestCtx
@@ -18124,5 +18123,60 @@ fn mutable_retention_replay_rejects_stale_local_facts() {
         let mut bad = base.clone();
         bad.fns[0].mutable_retention = replacement;
         assert_replay_rejects_without_mutating(bad, "mutable-retention facts must match the actual body");
+    }
+}
+
+#[test]
+fn hir_body_validator_native_http_client_ownership() {
+    for (name, operation) in [
+        ("http_client", "value.timeout(1)"),
+        ("http_client", "value.max_response_body_bytes(1)"),
+        ("http_request", "value.timeout(1)"),
+        ("http_request", "value.max_response_body_bytes(1)"),
+        ("http_request", "value.header(\"x\", \"y\")"),
+        ("http_request", "value.body(\"body\")"),
+    ] {
+        let mut program = checked_source_program(&format!(
+            "fn configure(borrow mut value: {name}) {{ {operation} }}\nfn main() {{}}\n"
+        ));
+        assert!(body_core_metadata_is_valid(&program), "{operation}");
+        let Some(function) = program.fns.iter_mut().find(|function| function.name == "configure") else {
+            panic!("checked fixture must contain configure");
+        };
+        function.param_modes[0] = align_ast::ParamMode::Borrow;
+        function.locals[function.params[0] as usize].is_mut = false;
+        assert_body_entrypoints_empty(operation, &program);
+    }
+}
+
+#[test]
+fn hir_body_validator_native_http_borrowed_consumption() {
+    let base = checked_source_program(
+        "fn send(borrow client: http_client, req: http_request) -> Result<http_response, Error> = client.request(req)\nfn main() {}\n",
+    );
+    assert!(!is_empty(&lower_program(&base)));
+    for mode in [
+        align_ast::ParamMode::Borrow,
+        align_ast::ParamMode::BorrowMut,
+    ] {
+        let mut program = base.clone();
+        let Some(function) = program.fns.iter_mut().find(|function| function.name == "send") else {
+            panic!("checked fixture must contain send");
+        };
+        function.param_modes[1] = mode;
+        function.locals[function.params[1] as usize].is_mut =
+            mode == align_ast::ParamMode::BorrowMut;
+        let map = SourceMap::new();
+        for lowered in [
+            lower_program(&program),
+            lower_program_located(&program, &map),
+            lower_program_per_unit(&program),
+            lower_program_per_unit_located(&program, &map),
+        ] {
+            assert!(
+                is_empty(&lowered),
+                "borrowed request consumption published MIR: {mode:?}"
+            );
+        }
     }
 }

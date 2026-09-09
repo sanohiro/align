@@ -4873,6 +4873,7 @@ fn xml_selected_ty(
                 scalar_to_ty(*program.tuples.get(id as usize)?.elems.get(index as usize)?)
             }
             XmlAccessPathSegment::Element => match ty {
+                Ty::DynResponseArray => Ty::HttpResponse,
                 Ty::Box(payload)
                 | Ty::Array(payload, _)
                 | Ty::Slice(payload)
@@ -4929,6 +4930,10 @@ fn xml_inline_array_element(program: &Program, ty: Ty) -> Option<Ty> {
     }
 }
 
+fn http_client_owner_leaf(ty: Ty) -> bool {
+    matches!(ty, Ty::HttpClient | Ty::HttpRequest | Ty::HttpResponse | Ty::DynResponseArray)
+}
+
 fn xml_owned_leaf_paths(
     program: &Program,
     root: Ty,
@@ -4936,7 +4941,7 @@ fn xml_owned_leaf_paths(
     let mut leaves = Vec::new();
     let mut pending = vec![(root, Vec::new(), Vec::<Ty>::new())];
     while let Some((ty, path, mut ancestors)) = pending.pop() {
-        if matches!(ty, Ty::Str | Ty::String | Ty::XmlReader | Ty::Fn(_)) {
+        if matches!(ty, Ty::Str | Ty::String | Ty::XmlReader | Ty::Fn(_)) || http_client_owner_leaf(ty) {
             leaves.push((ty, path));
             continue;
         }
@@ -5171,6 +5176,152 @@ fn xml_const_element_matches_ty(element: &ConstElem, ty: Ty) -> bool {
             | (ConstElem::Bool(_), Ty::Bool)
             | (ConstElem::Str(_), Ty::Str)
     )
+}
+
+/// Exact client-family native contracts, shared by value and out-slot producer checks.
+struct HttpClientMirContract<'a> {
+    result: Ty,
+    out: Option<(Slot, Ty)>,
+    operands: Vec<(&'a Operand, Ty, OperandRequirement)>,
+    access: XmlAccessProvenance,
+}
+
+fn http_client_mir_contract<'a>(
+    function: &Function,
+    value: &'a Rvalue,
+) -> Option<HttpClientMirContract<'a>> {
+    let read = OperandRequirement::READ;
+    let write = OperandRequirement {
+        write: true,
+        exclusive: true,
+        ..read
+    };
+    let consume = OperandRequirement {
+        move_value: true,
+        ..read
+    };
+    let i32_ty = Ty::Int(IntTy {
+        bits: 32,
+        signed: true,
+    });
+    let i64_ty = Ty::Int(IntTy {
+        bits: 64,
+        signed: true,
+    });
+    let bytes = Ty::Slice(Scalar::Int(IntTy {
+        bits: 8,
+        signed: false,
+    }));
+    let byte_view = |operand| match xml_operand_base_ty(function, operand) {
+        Some(ty @ (Ty::Str | Ty::String)) => ty,
+        Some(ty) if ty == bytes => ty,
+        _ => Ty::Error,
+    };
+    let mut contract = HttpClientMirContract {
+        result: Ty::Unit,
+        out: None,
+        operands: Vec::new(),
+        access: XmlAccessProvenance::Owned,
+    };
+    match value {
+        Rvalue::HttpClient => contract.result = Ty::HttpClient,
+        Rvalue::HttpRequest { method, url } => {
+            contract.result = Ty::HttpRequest;
+            contract.operands = vec![(method, Ty::Str, read), (url, Ty::Str, read)];
+        }
+        Rvalue::HttpHeader { req, name, value } => {
+            contract.operands = vec![
+                (req, Ty::HttpRequest, write),
+                (name, Ty::Str, read),
+                (value, Ty::Str, read),
+            ];
+        }
+        Rvalue::HttpBody { req, data } => {
+            contract.operands = vec![(req, Ty::HttpRequest, write), (data, byte_view(data), read)];
+        }
+        Rvalue::HttpRequestTimeout { req, ns: limit }
+        | Rvalue::HttpRequestMaxResponseBodyBytes { req, limit } => {
+            contract.operands = vec![(req, Ty::HttpRequest, write), (limit, i64_ty, read)];
+        }
+        Rvalue::HttpClientTimeout { client, ns: limit }
+        | Rvalue::HttpClientMaxResponseBodyBytes { client, limit } => {
+            contract.operands = vec![(client, Ty::HttpClient, write), (limit, i64_ty, read)];
+        }
+        Rvalue::HttpParse { data, out } => {
+            contract.result = i32_ty;
+            contract.out = Some((*out, Ty::HttpResponse));
+            contract.operands = vec![(data, byte_view(data), read)];
+        }
+        Rvalue::HttpRespStatus { resp } => {
+            contract.result = i64_ty;
+            contract.operands = vec![(resp, Ty::HttpResponse, read)];
+        }
+        Rvalue::HttpRespBody { resp } => {
+            contract.result = bytes;
+            contract.operands = vec![(resp, Ty::HttpResponse, read)];
+            contract.access = XmlAccessProvenance::Shared;
+        }
+        Rvalue::HttpRespHeader { resp, name, out } => {
+            contract.result = i32_ty;
+            contract.out = Some((*out, Ty::Str));
+            contract.operands = vec![(resp, Ty::HttpResponse, read), (name, Ty::Str, read)];
+            contract.access = XmlAccessProvenance::Shared;
+        }
+        Rvalue::HttpClientGet { client, url, out } => {
+            contract.result = i32_ty;
+            contract.out = Some((*out, Ty::HttpResponse));
+            contract.operands = vec![(client, Ty::HttpClient, read), (url, Ty::Str, read)];
+        }
+        Rvalue::HttpClientPost {
+            client,
+            url,
+            body,
+            out,
+        } => {
+            contract.result = i32_ty;
+            contract.out = Some((*out, Ty::HttpResponse));
+            contract.operands = vec![
+                (client, Ty::HttpClient, read),
+                (url, Ty::Str, read),
+                (body, byte_view(body), read),
+            ];
+        }
+        Rvalue::HttpClientRequest { client, req, out }
+        | Rvalue::HttpClientRequestStream { client, req, out } => {
+            contract.result = i32_ty;
+            contract.out = Some((
+                *out,
+                if matches!(value, Rvalue::HttpClientRequestStream { .. }) {
+                    Ty::HttpReadStream
+                } else {
+                    Ty::HttpResponse
+                },
+            ));
+            contract.operands = vec![
+                (client, Ty::HttpClient, read),
+                (req, Ty::HttpRequest, consume),
+            ];
+        }
+        Rvalue::HttpGetMany {
+            client,
+            urls,
+            max_concurrency,
+            out,
+        } => {
+            contract.result = i32_ty;
+            contract.out = Some((*out, Ty::DynResponseArray));
+            contract.operands = vec![
+                (client, Ty::HttpClient, read),
+                (urls, match xml_operand_base_ty(function, urls) {
+                    Some(ty @ (Ty::Array(Scalar::Str, _) | Ty::Slice(Scalar::Str) | Ty::DynArray(Scalar::Str))) => ty,
+                    _ => Ty::Error,
+                }, read),
+                (max_concurrency, i64_ty, read),
+            ];
+        }
+        _ => return None,
+    }
+    Some(contract)
 }
 
 fn xml_written_slots(rvalue: &Rvalue) -> Vec<(Slot, XmlAccessProvenance)> {
@@ -6758,6 +6909,27 @@ impl<'a> XmlAccessAnalyzer<'a> {
             return equation;
         }
         let definition = (*definition).clone();
+        if let Some(contract) = http_client_mir_contract(self.graph.function, &definition) {
+            if result_ty != contract.result || !path.is_empty()
+                || contract.out.is_some_and(|(slot, ty)| {
+                    self.graph.function.slots.get(slot as usize) != Some(&ty)
+                        || self.graph.function.params.contains(&slot)
+                        || self.graph.slot_stores.roots.get(slot as usize).is_none_or(|stores| !stores.is_empty())
+                        || self.graph.slot_stores.producers.get(slot as usize).is_none_or(|producers| producers.len() != 1 || producers[0].0 != value)
+                })
+            {
+                equation.invalid = true;
+            }
+            for (operand, expected, requirement) in contract.operands {
+                if requirement.move_value && !matches!(operand, Operand::Value(_) | Operand::Arg(_)) {
+                    equation.invalid = true;
+                }
+                let source = self.read_source(&mut equation, operand, expected, Vec::new());
+                Self::add_required_source(&mut equation, source, requirement);
+            }
+            equation.seed = Some(if contract.out.is_some() { XmlAccessProvenance::Owned } else { contract.access });
+            return equation;
+        }
         let slice_index_noalias = matches!(&definition, Rvalue::SliceIndexNoalias { .. });
         match definition {
             Rvalue::Use(operand) => {
@@ -7109,6 +7281,11 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 }
                 self.check_whole_read_operand(&mut equation, &source, source_ty);
                 self.check_operand(&mut equation, &index, i64_ty);
+                if source_ty == Ty::DynResponseArray {
+                    // Indexing a batch borrows its response; it never transfers the owning leaf.
+                    equation.seed = Some(XmlAccessProvenance::Shared);
+                    return equation;
+                }
                 self.add_read_operand(
                     &mut equation,
                     &source,
@@ -9278,7 +9455,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 if !path.is_empty()
                     || result_ty != to
                     || xml_operand_base_ty(self.graph.function, &operand) != Some(from)
-                    || matches!(result_ty, Ty::String | Ty::XmlReader)
+                    || align_sema::ty_is_move(result_ty, &self.graph.program.structs, &self.graph.program.tuples, &self.graph.program.enums, &self.graph.program.tagged_types)
                 {
                     equation.invalid = true;
                 } else {
@@ -9698,6 +9875,29 @@ impl<'a> XmlAccessAnalyzer<'a> {
             return;
         }
 
+        if let Some(contract) = http_client_mir_contract(self.graph.function, rvalue) {
+            if contract.out != Some((slot, slot_ty)) || !path.is_empty() || contract.access != recorded_access {
+                equation.invalid = true;
+            }
+            for (operand, expected, requirement) in contract.operands {
+                if requirement.move_value && !matches!(operand, Operand::Value(_) | Operand::Arg(_)) {
+                    equation.invalid = true;
+                }
+                let source = self.read_source(equation, operand, expected, Vec::new());
+                Self::add_required_source(equation, source, requirement);
+            }
+            equation.seed = merge_xml_access(equation.seed, contract.access);
+            return;
+        }
+
+        // Only the authenticated client-family operations above can produce these owners.
+        // A foreign native opcode cannot claim one merely by naming a pointer-sized out slot,
+        // including an HTTP leaf selected inside an otherwise valid aggregate decoder result.
+        if http_client_owner_leaf(selected_ty) {
+            equation.invalid = true;
+            return;
+        }
+
         let (expected_out, access) = match rvalue {
             Rvalue::JsonEncodeBounded {
                 pieces,
@@ -10032,18 +10232,6 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 }
                 self.check_operand(equation, input, Ty::Str);
                 self.check_operand(equation, arena, Ty::ArenaHandle);
-                (*out, XmlAccessProvenance::Shared)
-            }
-            Rvalue::HttpRespHeader { resp, name, out } => {
-                if slot_ty != Ty::Str
-                    || xml_operand_base_ty(self.graph.function, resp) != Some(Ty::HttpResponse)
-                    || xml_operand_base_ty(self.graph.function, name) != Some(Ty::Str)
-                {
-                    equation.invalid = true;
-                    return;
-                }
-                self.check_operand(equation, resp, Ty::HttpResponse);
-                self.check_operand(equation, name, Ty::Str);
                 (*out, XmlAccessProvenance::Shared)
             }
             Rvalue::HttpReadStreamHeader { stream, name, out } => {
@@ -11103,7 +11291,7 @@ fn validate_resource_rvalues_component(
             } else {
                 cached_path_access(operand, selected, path.to_vec())
             };
-            if matches!(selected, Ty::String | Ty::XmlReader) {
+            if align_sema::ty_is_move(selected, &program.structs, &program.tuples, &program.enums, &program.tagged_types) {
                 state.owned_if_present()
             } else {
                 matches!(
@@ -11388,6 +11576,11 @@ fn validate_resource_rvalues_component(
                     .get(*value as usize)
                     .copied()
                     .ok_or_else(|| fail(function, "result value id is absent"))?;
+                if http_client_mir_contract(function, rvalue).is_some()
+                    && !OperandRequirement::READ.is_satisfied_by(xml_access(&Operand::Value(*value), result))
+                {
+                    return Err(fail(function, "HTTP client native producer contract mismatch"));
+                }
                 let protected_call_boundary = |args: &[Operand]| {
                     xml_owned_leaf_paths(program, result)
                         .is_none_or(|leaves| !leaves.is_empty())
@@ -12502,6 +12695,8 @@ fn validate_tagged_program_inner(
                 | Scalar::UdpSocket
                 | Scalar::Child
                 | Scalar::File
+                | Scalar::HttpClient
+                | Scalar::HttpRequest
                 | Scalar::HttpResponse
                 | Scalar::HttpServer
                 | Scalar::HttpRequestCtx
@@ -15919,6 +16114,8 @@ fn tagged_child(payload: Scalar) -> Option<u32> {
         | Scalar::UdpSocket
         | Scalar::Child
         | Scalar::File
+        | Scalar::HttpClient
+        | Scalar::HttpRequest
         | Scalar::HttpResponse
         | Scalar::HttpServer
         | Scalar::HttpRequestCtx
@@ -16501,7 +16698,8 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::Captures => unreachable!("a captures handle is not a box/array payload"),
         Scalar::File => unreachable!("a file handle is not a box/array payload"),
         Scalar::CliParsed => unreachable!("a cli parsed handle is not a box/array payload"),
-        Scalar::HttpResponse => unreachable!("an http response handle is not a box/array payload"),
+        // Source formation rejects handle collections; malformed MIR sizing stays total.
+        Scalar::HttpClient | Scalar::HttpRequest | Scalar::HttpResponse => 8,
         Scalar::HttpServer => unreachable!("an http_server handle is not a box/array payload"),
         Scalar::HttpRequestCtx => unreachable!("an http_request_ctx handle is not a box/array payload"),
         Scalar::ResponseBuilder => unreachable!("a response_builder handle is not a box/array payload"),
@@ -36187,6 +36385,335 @@ fn main() -> i32 = 0
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn http_mixed_carriers_preserve_recursive_ownership_proof() {
+        for owner in ["http_client", "http_request", "http_response"] {
+            for carrier in [
+                owner.to_owned(),
+                "Mixed".into(),
+                format!("({owner}, str)"),
+                "Option<Mixed>".into(),
+                "Result<Mixed, Error>".into(),
+                "Choice".into(),
+            ] {
+                // Tuple and Option/Result parameters are not scalar function-type parameters.
+                let indirect = if carrier != owner && carrier != "Mixed" && carrier != "Choice" {
+                    String::new()
+                } else {
+                    format!(
+                        "fn indirect(action: fn({carrier}) -> (), value: {carrier}) {{ action(value) }}\n"
+                    )
+                };
+                let source = format!(
+                    "Mixed {{ owner: {owner}, view: str, callback: fn() -> i64 }}\nChoice {{ With(Mixed), Without }}\nfn relay(value: {carrier}) -> {carrier} = value\nfn sink(value: {carrier}) {{}}\nfn forward(value: {carrier}) {{ sink(value) }}\n{indirect}fn main() -> i32 = 0\n"
+                );
+                let base = mir(&source);
+                assert!(
+                    validate_mir_producers(&base).is_ok(),
+                    "owned {owner}/{carrier}"
+                );
+                for boundary in ["relay", "forward", "indirect", "imported"] {
+                    if boundary == "indirect" && indirect.is_empty() {
+                        continue;
+                    }
+                    let mut candidate = base.clone();
+                    let name = if boundary == "imported" {
+                        let index = xml_test_function(&candidate, "sink");
+                        let sink = candidate.fns.remove(index);
+                        candidate.imported_fns.push(align_mir::ImportedFn {
+                            name: sink.name,
+                            params: sink
+                                .params
+                                .iter()
+                                .map(|slot| sink.slots[*slot as usize])
+                                .collect(),
+                            param_modes: sink.param_modes,
+                            ret: sink.ret,
+                            return_borrow: sink.return_borrow,
+                            return_region: sink.return_region,
+                            return_cleanup: sink.return_cleanup,
+                            producer_certified: true,
+                        });
+                        "forward"
+                    } else {
+                        boundary
+                    };
+                    assert!(
+                        validate_mir_producers(&candidate).is_ok(),
+                        "owned {boundary}/{carrier}"
+                    );
+                    let index = xml_test_function(&candidate, name);
+                    let parameter = usize::from(boundary == "indirect");
+                    for mode in [
+                        align_ast::ParamMode::Borrow,
+                        align_ast::ParamMode::BorrowMut,
+                    ] {
+                        let mut malformed = candidate.clone();
+                        malformed.fns[index].param_modes[parameter] = mode;
+                        let label = format!("{owner}/{carrier}/{boundary}/{mode:?}");
+                        assert!(
+                            validate_mir_producers(&malformed).is_err(),
+                            "publication accepted {label}"
+                        );
+                        assert_xml_producer_rejected(&malformed, &label);
+                    }
+                }
+            }
+        }
+        for target in [Ty::HttpClient, Ty::HttpRequest, Ty::HttpResponse] {
+            for source in [Ty::Raw, Ty::HttpClient, Ty::HttpRequest, Ty::HttpResponse] {
+                if target == source {
+                    continue;
+                }
+                let mut malformed = mir("fn cast(value: raw) -> raw = value\nfn main() -> i32 = 0\n");
+                let index = xml_test_function(&malformed, "cast");
+                let function = &mut malformed.fns[index];
+                function.slots[function.params[0] as usize] = source;
+                function.ret = target;
+                function.value_tys = vec![target];
+                function.blocks = vec![Block {
+                    id: 0,
+                    stmts: vec![Stmt::Let(
+                        0,
+                        Rvalue::Cast {
+                            operand: Operand::Arg(0),
+                            from: source,
+                            to: target,
+                        },
+                    )],
+                    stmt_lines: Vec::new(),
+                    term: Term::Return(Some(Operand::Value(0))),
+                }];
+                assert_xml_producer_rejected(
+                    &malformed,
+                    "a cast cannot mint HTTP ownership or sibling identity",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn http_owner_slots_reject_foreign_native_producers() {
+        for owner in [
+            Ty::HttpClient,
+            Ty::HttpRequest,
+            Ty::HttpResponse,
+            Ty::DynResponseArray,
+        ] {
+            let Some(scalar) = align_sema::ty_to_scalar(owner) else {
+                panic!("HTTP owner scalar");
+            };
+            for writer in [false, true] {
+                let mut program = mir(
+                    "import std.http\nfn parse(text: str) -> Result<http_response, Error> = http.parse(text)\nfn main() -> i32 = 0\n",
+                );
+                let index = xml_test_function(&program, "parse");
+                let function = &mut program.fns[index];
+                let retype = |ty| match ty {
+                    Ty::HttpResponse => owner,
+                    Ty::Result(Scalar::HttpResponse, error) => Ty::Result(scalar, error),
+                    other => other,
+                };
+                function.ret = retype(function.ret);
+                for ty in function.slots.iter_mut().chain(&mut function.value_tys) {
+                    *ty = retype(*ty);
+                }
+                let mut replaced = false;
+                for statement in function
+                    .blocks
+                    .iter_mut()
+                    .flat_map(|block| &mut block.stmts)
+                {
+                    if let Stmt::Let(_, value @ Rvalue::HttpParse { .. }) = statement {
+                        let Rvalue::HttpParse { data, out } = value.clone() else {
+                            panic!("matched parse");
+                        };
+                        *value = if writer {
+                            Rvalue::WriterCreate { path: data, out }
+                        } else {
+                            Rvalue::ReaderOpen { path: data, out }
+                        };
+                        replaced = true;
+                    }
+                }
+                assert!(replaced);
+                assert_xml_producer_rejected(
+                    &program,
+                    "foreign native opcode cannot claim an HTTP out slot",
+                );
+            }
+        }
+        // Specialized aggregate decoders must obey the same selected-leaf boundary as the
+        // generic native-out fallback; nominally valid record metadata is not an HTTP producer.
+        for owner in ["http_client", "http_request", "http_response"] {
+            let mut program = mir(&format!(
+                "Record {{ owner: {owner} }}\nfn fabricate(value: Record) -> Record = value\nfn main() -> i32 = 0\n"
+            ));
+            let index = xml_test_function(&program, "fabricate");
+            let function = &mut program.fns[index];
+            let Ty::Struct(record) = function.ret else {
+                panic!("record fixture");
+            };
+            let i32_ty = Ty::Int(IntTy {
+                bits: 32,
+                signed: true,
+            });
+            function.params.clear();
+            function.param_modes.clear();
+            function.borrow_mut_cleanup_slots.clear();
+            function.slots = vec![function.ret];
+            function.slot_align = vec![None];
+            function.value_tys = vec![i32_ty, function.ret, Ty::Str];
+            function.blocks = vec![Block {
+                id: 0,
+                stmts: vec![
+                    Stmt::Let(2, Rvalue::StrLit("{}".into())),
+                    Stmt::Let(
+                        0,
+                        Rvalue::JsonDecode {
+                            struct_id: record,
+                            input: Operand::Value(2),
+                            out: 0,
+                            arena: None,
+                        },
+                    ),
+                    Stmt::Let(1, Rvalue::Load(0)),
+                ],
+                stmt_lines: Vec::new(),
+                term: Term::Return(Some(Operand::Value(1))),
+            }];
+            assert_xml_producer_rejected(
+                &program,
+                "foreign aggregate decoder cannot produce nested HTTP ownership",
+            );
+        }
+    }
+
+    #[test]
+    fn http_recursive_carriers_emit_the_exact_owner_free() {
+        for (name, symbol) in [
+            ("http_client", "align_rt_http_client_free"),
+            ("http_request", "align_rt_http_request_free"),
+            ("http_response", "align_rt_http_resp_free"),
+        ] {
+            for shape in [
+                name.to_owned(),
+                format!("Option<{name}>"),
+                format!("Result<{name}, Error>"),
+                "Holder".into(),
+                "Choice".into(),
+                format!("({name}, i64)"),
+            ] {
+                let source = format!(
+                    "Holder {{ value: {name} }}\nChoice {{ Some({name}), None }}\nfn discard(value: {shape}) {{}}\nfn main() -> i32 = 0\n"
+                );
+                let program = mir(&source);
+                let Ok(ir) = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None) else {
+                    panic!("checked HTTP carrier cleanup must emit LLVM");
+                };
+                assert_eq!(
+                    ir.matches(&format!("call void @{symbol}(")).count(),
+                    1,
+                    "{shape} must emit its exact null-safe free once"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn http_mir_gate_preserves_owner_identity_and_authority() {
+        let base = mir("import std.http\n\
+                 fn client() -> http_client = http.client()\n\
+                 fn request() -> http_request = http.request(\"GET\", \"http://example.com\")\n\
+                 fn client_cap(borrow mut client: http_client) { client.max_response_body_bytes(1) }\n\
+                 fn request_timeout(borrow mut req: http_request) { req.timeout(1) }\n\
+                 fn request_cap(borrow mut req: http_request) { req.max_response_body_bytes(1) }\n\
+                 fn header(borrow mut req: http_request) { req.header(\"x\", \"y\") }\n\
+                 fn parse(text: str) -> Result<http_response, Error> = http.parse(text)\n\
+                 fn body(borrow response: http_response) -> slice<u8> = response.body()\n\
+                 fn lookup(borrow response: http_response) -> Option<str> = response.header(\"x\")\n\
+                 fn get(borrow client: http_client) -> Result<http_response, Error> = client.get(\"http://example.com\")\n\
+                 fn post(borrow client: http_client) -> Result<http_response, Error> = client.post(\"http://example.com\", \"x\")\n\
+                 fn stream(borrow client: http_client, req: http_request) -> Result<http_read_stream, Error> = client.request_stream(req)\n\
+                 fn batch(borrow client: http_client, urls: slice<str>) -> Result<array<http_response>, Error> = client.get_many(urls, 2)\n\
+                 fn configure(borrow mut client: http_client) { client.timeout(1) }\n\
+                 fn prepare(borrow mut request: http_request) { request.body(\"x\") }\n\
+                 fn inspect(borrow response: http_response) -> i64 = response.status()\n\
+                 fn send(borrow client: http_client, request: http_request) -> Result<http_response, Error> = client.request(request)\n\
+                 fn main() -> i32 = 0\n");
+        assert!(validate_resource_rvalues(&base).is_ok());
+        let mut operations = 0;
+        for (index, function) in base.fns.iter().enumerate() {
+            for statement in function.blocks.iter().flat_map(|block| &block.stmts) {
+                let Stmt::Let(value, rvalue) = statement else {
+                    continue;
+                };
+                let Some(contract) = http_client_mir_contract(function, rvalue) else {
+                    continue;
+                };
+                operations += 1;
+                let mut wrong_result = base.clone();
+                wrong_result.fns[index].value_tys[*value as usize] = Ty::Bool;
+                assert_xml_producer_rejected(
+                    &wrong_result,
+                    &format!("{} native result", function.name),
+                );
+                if let Some((out, _)) = contract.out {
+                    let mut wrong_out = base.clone();
+                    wrong_out.fns[index].slots[out as usize] = Ty::Raw;
+                    assert_xml_producer_rejected(
+                        &wrong_out,
+                        &format!("{} native output slot", function.name),
+                    );
+                    let mut duplicate_out = base.clone();
+                    let duplicate_function = &mut duplicate_out.fns[index];
+                    let Ok(duplicate_value) = u32::try_from(duplicate_function.value_tys.len()) else {
+                        panic!("fixture SSA inventory must fit u32");
+                    };
+                    duplicate_function.value_tys.push(contract.result);
+                    let Some(block) = duplicate_function.blocks.iter_mut().find(|block| {
+                        block.stmts.iter().any(|statement| matches!(statement, Stmt::Let(id, _) if id == value))
+                    }) else { panic!("fixture native producer must belong to a block"); };
+                    let Some(position) = block.stmts.iter().position(|statement| matches!(statement, Stmt::Let(id, _) if id == value)) else {
+                        panic!("selected block must contain fixture producer");
+                    };
+                    block.stmts.insert(position, Stmt::Let(duplicate_value, rvalue.clone()));
+                    if !block.stmt_lines.is_empty() { block.stmt_lines.insert(position, (0, 0)); }
+                    assert_xml_producer_rejected(&duplicate_out, "HTTP output requires a distinct native scratch slot");
+                }
+            }
+        }
+        assert_eq!(
+            operations, 17,
+            "every client-family native row needs a malformed control"
+        );
+        for (name, expected) in [
+            ("configure", Ty::HttpClient),
+            ("prepare", Ty::HttpRequest),
+            ("inspect", Ty::HttpResponse),
+        ] {
+            let index = xml_test_function(&base, name);
+            for sibling in [Ty::HttpClient, Ty::HttpRequest, Ty::HttpResponse, Ty::Raw] {
+                if sibling == expected {
+                    continue;
+                }
+                let mut malformed = base.clone();
+                let function = &mut malformed.fns[index];
+                function.slots[function.params[0] as usize] = sibling;
+                assert_xml_producer_rejected(
+                    &malformed,
+                    &format!("HTTP {name} operand {expected:?} replaced by {sibling:?}"),
+                );
+            }
+        }
+        for (name, parameter) in [("configure", 0), ("prepare", 0), ("send", 1)] {
+            let index = xml_test_function(&base, name);
+            let mut malformed = base.clone();
+            malformed.fns[index].param_modes[parameter] = align_ast::ParamMode::Borrow;
+            assert_xml_producer_rejected(&malformed, "HTTP borrowed mutation/consumption");
         }
     }
 

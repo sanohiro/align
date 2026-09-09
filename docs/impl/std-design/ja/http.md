@@ -1505,9 +1505,9 @@ test contract は `../pkg-design/ws.md`。generated declaration は reused shape
   (`crates/align_driver/tests/http_headers_view.rs` +
   `apps_web_root.rs::web_header_reads_the_request_header_table`)
 
-## クライアントのパッケージ合成（設計済み、2026-09-09）
+## クライアントのパッケージ合成（実装済み、2026-09-09）
 
 名前を記述できるclient/request/responseの所有権境界は
-[http-client-composition.md](http-client-composition.md) を参照してください。実装は未完了です。
-キャリア、受信者の権限、保持ルートの正確な規則は、実装時に従来の無名ローカル限定を置き換えます。
+[http-client-composition.md](http-client-composition.md) を参照してください。
+キャリア、受信者の権限、保持ルートの正確な規則は、従来の無名ローカル限定を置き換えます。
 HTTPワイヤ、通信、timeout、上限、割り当て、再試行は本台帳の規則を維持します。

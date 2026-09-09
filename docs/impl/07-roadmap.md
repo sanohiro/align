@@ -3888,10 +3888,11 @@ required by the plan.
 **Owner-resumed cloud lane (2026-09-08):** the bounded consolidation and subsequent
 consumer-boundary investigation are complete. The selected next consumer is
 `pkg.s3`/SigV4, beginning with the named time and path-encoding prerequisite in
-`std-design/time.md` (implemented in #996). The next required boundary is the
-nameable HTTP client/request/response ownership family in
-`std-design/http-client-composition.md`; S3 needs fallible request preparation and
-caller-owned pool reuse through package helpers. Merge each coherent capability
+`std-design/time.md` (implemented in #996). The nameable HTTP
+client/request/response ownership family is implemented under
+`std-design/http-client-composition.md`, enabling fallible request preparation and
+caller-owned pool reuse through package helpers. Next: the S3/SigV4 public-contract
+ledger and independent design review. Merge each coherent capability
 before starting the next.
 Other transports and execution/storage items retain their own admission gates.
 
