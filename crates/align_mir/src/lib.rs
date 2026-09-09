@@ -3077,7 +3077,8 @@ fn rvalue_capability(rv: &Rvalue) -> Option<Capability> {
         | Rvalue::CryptoPublicKeyFromJwk(_)
         | Rvalue::CryptoSign { .. }
         | Rvalue::CryptoVerify(_) => Some(Capability::Crypto),
-        Rvalue::HttpClientGet { .. }
+        Rvalue::HttpClient
+        | Rvalue::HttpClientGet { .. }
         | Rvalue::HttpClientPost { .. }
         | Rvalue::HttpClientRequest { .. }
         | Rvalue::HttpClientRequestStream { .. }
@@ -3095,7 +3096,7 @@ fn rvalue_capability(rv: &Rvalue) -> Option<Capability> {
 
 /// The capabilities a single function requires — the gated external libraries its builtins or
 /// owned values call into (`libz`/`libzstd`/`libcrypto`/`libssl`). A signature-key Drop calls
-/// libcrypto and a receive-stream Drop can close a TLS connection even when the function never uses
+/// libcrypto and a client/receive-stream Drop can close TLS even when the function never uses
 /// either handle, so the slot types are part of this answer alongside [`rvalue_capability`]. The
 /// per-function granularity is what the M15 per-unit interface summary unions over a unit's
 /// functions. Emitted in first-seen order (deduped); an empty vec for a function with no gated
@@ -3134,13 +3135,14 @@ pub fn function_capabilities(
     }
     if !caps.contains(&Capability::Tls)
         && f.slots.iter().copied().any(|ty| {
-            align_sema::http_stream_carrier_class(
-                ty,
-                structs,
-                tuples,
-                enums,
-                tagged_types,
-            ) != align_sema::HttpStreamCarrierClass::None
+            align_sema::ty_contains_http_client(ty, structs, tuples, enums, tagged_types)
+                || align_sema::http_stream_carrier_class(
+                    ty,
+                    structs,
+                    tuples,
+                    enums,
+                    tagged_types,
+                ) != align_sema::HttpStreamCarrierClass::None
         })
     {
         caps.push(Capability::Tls);

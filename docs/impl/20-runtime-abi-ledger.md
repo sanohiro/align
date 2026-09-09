@@ -1217,3 +1217,24 @@ owned-string allocation follows successful stack formatting. Parsing allocates n
 retains no input. The public ledger supplies the complete length, overlap, ownership and error
 contract. A126 is the next unreserved shape. All earlier next-shape mentions describe their
 historical capability boundary, not the current allocation point.
+
+## HTTP client Drop capability closure
+
+An HTTP client owns pooled connections; its existing destructor can call
+`SSL_shutdown` and `SSL_free` even when a compilation unit contains no request
+operation. Capability collection must therefore retain TLS libraries for client
+construction and for a slot whose reachable value type contains a client.
+This repairs the existing link contract without adding a runtime symbol, ABI
+shape, allocation, ownership rule or serialized interface field.
+
+| Closure axis | Implementation and exact owner |
+|---|---|
+| Construction, return-only producer, unbound expression | MIR `HttpClient` rvalue requires TLS; `http_client_drop_capability_matrix` |
+| Move-in/out, Drop, replacement and joins | Existing runtime and MIR cleanup remain unchanged; slot-type capability discovery uses the cycle-safe structural type graph already used for signature keys; `http_client_drop_capability_matrix` covers direct, record, tuple, Option/Result, and enum carriers; owned record arrays containing clients remain rejected by the existing heap-record rule |
+| Generic/imported and whole/per-unit compilation | Existing `function_capabilities` union feeds both MIR and interface summaries; `http_client_drop_capability_matrix` checks imported producer/consumer units and both native profiles |
+| Borrow/control/early-exit and malformed input | No checking or lowering rule changes. The shared traversal retains its checked-index and visited-definition guards; `capability_linking` retains the signature-key and pure-program negative owners |
+| ABI, allocation and runtime provenance | Existing constructor/destructor and cleanup-bit ABI are unchanged. Native construct/drop runs verify link completion without network access; no benchmark or resource claim is added |
+
+The author-side matrix follows the shipped capability-linking strategy. Its
+boundary check belongs to the single preflight code review. The focused owner is
+`capability_linking`; no broad design or library-surface update is needed.
