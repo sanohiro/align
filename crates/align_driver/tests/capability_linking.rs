@@ -351,3 +351,194 @@ fn crypto_binary_links_the_superset_and_not_ssl() {
     assert!(libs.iter().any(|l| is_lib(l, "crypto")), "crypto binary must link libcrypto, got {libs:?}");
     assert!(!libs.iter().any(|l| is_lib(l, "ssl")), "crypto binary must not link libssl, got {libs:?}");
 }
+
+// No request or network operation: the constructor and Drop-only consumer must each
+// carry their own link boundary, even when they reside in separate compilation units.
+#[test]
+fn http_client_drop_capability_matrix() {
+    let mut helper = String::from("module clients\nimport std.http\npub Holder { client: http_client }\npub Choice { Client(http_client), Empty }\npub fn pass<T>(value: T) -> T = value\npub fn unbound() { http.client(); return }\npub fn replace(borrow mut value: http_client) { value = http.client() }\n");
+    let mut main = String::from("import clients\nfn main() {\n");
+    for (name, ty, constructor) in [
+        ("direct", "http_client", "http.client()"),
+        ("record", "Holder", "Holder{client: http.client()}"),
+        ("tuple", "(http_client, i64)", "(http.client(), 1)"),
+        ("option", "Option<http_client>", "Some(http.client())"),
+        ("result", "Result<http_client, Error>", "Ok(http.client())"),
+        ("sum", "Choice", "Choice.Client(http.client())"),
+    ] {
+        helper.push_str(&format!(
+            "pub fn make_{name}() -> {ty} = {constructor}\npub fn drop_{name}(value: {ty}) {{}}\n"
+        ));
+        main.push_str(&format!("  local_{name} := clients.make_{name}()\n  clients.drop_{name}(clients.make_{name}())\n"));
+    }
+    main.push_str("  clients.unbound()\n  generic := clients.pass(clients.make_direct())\n  mut replaced := clients.make_direct()\n  clients.replace(replaced)\n}\n");
+    let mut negative_sources = SourceMap::new();
+    let excluded_array = "import std.http\nHolder { client: http_client }\nfn main() { mut values: array_builder<Holder> := array_builder(); values.push(Holder{client: http.client()}) }\n";
+    let rejected = check(
+        &mut negative_sources,
+        "client-array-rejection",
+        excluded_array,
+    );
+    assert!(rejected.diags.has_errors());
+    assert!(
+        align_driver::format_diagnostics(&negative_sources, &rejected.diags)
+            .contains("excluded type http_client")
+    );
+    assert!(gated_link_libs("unused-http-import", "import std.http\nfn main() {}\n").is_empty());
+    let project = ClientLinkProject::new(&main, &helper);
+    let tls = ["crypto", "ssl", "z", "zstd"];
+    for unit in [false, true] {
+        let mut sm = SourceMap::new();
+        let programs = if unit {
+            let checked = align_driver::build_per_unit(&mut sm, &project.entry(), &main);
+            assert!(
+                !checked.diags.has_errors(),
+                "{}",
+                align_driver::format_diagnostics(&sm, &checked.diags)
+            );
+            assert!(checked.units.len() >= 2);
+            checked
+                .units
+                .into_iter()
+                .map(|unit| unit.mir)
+                .collect::<Vec<_>>()
+        } else {
+            let checked = check(&mut sm, &project.entry(), &main);
+            assert!(
+                !checked.diags.has_errors(),
+                "{}",
+                align_driver::format_diagnostics(&sm, &checked.diags)
+            );
+            vec![align_driver::try_lower_to_mir(&checked.hir).expect("checked MIR")]
+        };
+        for program in &programs {
+            let mut libraries = program.link_libs.clone();
+            libraries.sort();
+            assert_eq!(libraries, tls, "each producer/consumer unit retains TLS");
+            for function in &program.fns {
+                assert!(
+                    align_mir::function_capabilities(
+                        function,
+                        &program.structs,
+                        &program.tuples,
+                        &program.enums,
+                        &program.tagged_types
+                    )
+                    .contains(&align_mir::Capability::Tls),
+                    "constructor/Drop-only function: {:?}",
+                    function.name
+                );
+            }
+        }
+        if backend_available() {
+            for profile in [Profile::Dev, Profile::Release] {
+                project.run(&programs, profile);
+            }
+        }
+    }
+}
+
+struct ClientLinkProject(std::path::PathBuf);
+impl ClientLinkProject {
+    fn new(main: &str, helper: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let project = loop {
+            let path = std::env::temp_dir().join(format!(
+                "align-client-link-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => break Self(path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("acquire project: {error}"),
+            }
+        };
+        std::fs::write(project.0.join("main.align"), main).unwrap();
+        std::fs::write(project.0.join("clients.align"), helper).unwrap();
+        project
+    }
+    fn entry(&self) -> String {
+        self.0.join("main.align").display().to_string()
+    }
+    fn run(&self, programs: &[align_driver::MirProgram], profile: Profile) {
+        let mut objects = Vec::new();
+        let mut libraries = Vec::new();
+        for (index, program) in programs.iter().enumerate() {
+            let object = self.0.join(format!("unit{index}.o"));
+            emit_object_file(program, &object, BuildTarget::Baseline, profile, &[], false)
+                .expect("codegen");
+            objects.push(object);
+            for library in &program.link_libs {
+                if !libraries.contains(library) {
+                    libraries.push(library.clone());
+                }
+            }
+        }
+        let exe = self.0.join(format!("run{}", std::env::consts::EXE_SUFFIX));
+        let refs = objects
+            .iter()
+            .map(std::path::PathBuf::as_path)
+            .collect::<Vec<_>>();
+        link_objects(
+            &align_driver::CDriver::default(),
+            &refs,
+            &exe,
+            &libraries,
+            profile,
+        )
+        .expect("link");
+        let stdout = self.0.join("stdout");
+        let stderr = self.0.join("stderr");
+        let mut command = std::process::Command::new(exe);
+        command.stdout(std::fs::File::create(&stdout).unwrap());
+        command.stderr(std::fs::File::create(&stderr).unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = ClientLinkChild(Some(command.spawn().expect("spawn")));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            assert!(std::time::Instant::now() < deadline, "child deadline");
+            match child.0.as_mut().unwrap().try_wait() {
+                Ok(Some(status)) => {
+                    child.0.take();
+                    assert!(
+                        status.success(),
+                        "{status}: {}",
+                        std::fs::read_to_string(&stderr).unwrap()
+                    );
+                    assert_eq!(std::fs::metadata(stdout).unwrap().len(), 0);
+                    assert_eq!(std::fs::metadata(stderr).unwrap().len(), 0);
+                    break;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("wait: {error}"),
+            }
+        }
+    }
+}
+impl Drop for ClientLinkProject {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+struct ClientLinkChild(Option<std::process::Child>);
+impl Drop for ClientLinkChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            #[cfg(unix)]
+            if let Ok(pid) = i32::try_from(child.id()) {
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}

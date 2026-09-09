@@ -786,7 +786,7 @@ pub enum Ty {
     /// only transport/parse failures are `Err`. `cl` is borrowed by its methods (not consumed);
     /// `request` **consumes** its `req` argument. **Impure** (network). In Slice 2 it owns no pooled
     /// conns (one connection per request); Slice 3 adds a keepalive pool behind the same surface.
-    /// Opaque pointer; never rides an aggregate (no `Scalar::HttpClient`).
+    /// Owned opaque pointer to a keepalive connection pool.
     HttpClient,
     /// A `http_server` (`std.http`) — the listening handle from `http.serve(host, port)`, the `Ok`
     /// payload of its `Result<http_server, Error>`. An owned **Move** handle owning the listening socket
@@ -2863,14 +2863,41 @@ pub fn ty_contains_signature_key(
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> bool {
+    ty_contains_leaf(root, structs, tuples, enums, tagged_types, |ty| {
+        matches!(ty, Ty::SignatureKey(_))
+    })
+}
+
+/// Whether a reachable value type contains an HTTP client's pooled-connection owner.
+/// MIR uses this for Drop-only link capabilities, including imported aggregate carriers.
+pub fn ty_contains_http_client(
+    root: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    ty_contains_leaf(root, structs, tuples, enums, tagged_types, |ty| ty == Ty::HttpClient)
+}
+
+fn ty_contains_leaf(
+    root: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+    matches_leaf: impl std::ops::Fn(Ty) -> bool,
+) -> bool {
     let mut work = vec![root];
     let mut visited_structs = HashSet::new();
     let mut visited_tuples = HashSet::new();
     let mut visited_enums = HashSet::new();
     let mut visited_tagged = HashSet::new();
     while let Some(ty) = work.pop() {
+        if matches_leaf(ty) {
+            return true;
+        }
         match ty {
-            Ty::SignatureKey(_) => return true,
             Ty::Option(payload)
             | Ty::Array(payload, _)
             | Ty::Slice(payload)
@@ -2933,7 +2960,8 @@ pub fn ty_contains_signature_key(
             | Ty::FixedArrayBuilder(element, length) => {
                 work.push(Ty::Array(element, length));
             }
-            Ty::Int(_)
+            Ty::SignatureKey(_)
+            | Ty::Int(_)
             | Ty::Param(_)
             | Ty::IntVar(_)
             | Ty::Float(_)
