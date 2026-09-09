@@ -9,6 +9,14 @@ S3 PUT: source `.body(empty)` means a present zero-byte body, so Content-Length
 is zero. Unset bodies remain absent; this decision is independent of provider,
 method or signature headers.
 
+The separate presigning boundary (`impl/pkg-design/s3-presign.md`) returns an
+owned method, URL and normalized required headers. Keeping those headers with
+the URL makes non-URL request requirements inspectable and transferable without
+retaining credentials or adding a transport wrapper. Its explicit duration is
+relative to the supplied whole-second timestamp; it neither synthesizes an i64
+nanosecond deadline nor promises access past credential or policy expiry. The
+body is unsigned so the recipient can supply it later.
+
 The named UTC wire-format family (`impl/std-design/time.md`) shares the existing signed-nanosecond
 timeline and Error model. All five formatters are fallible under one representability rule:
 flooring precision may move the lower endpoint outside i64. Rejecting before allocation keeps

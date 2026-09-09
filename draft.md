@@ -3658,7 +3658,11 @@ Package validation returns `Error.Invalid` before allocation/crypto/setters;
 there is no ambient credential, clock, endpoint or retry policy. The same capability
 preserves explicit HTTP body presence: `.body(empty)` and `post(url, empty)` emit
 `Content-Length: 0`, while unset bodies omit it. No second transport or error model
-is introduced.
+is introduced. The separately designed `presign(...) -> Result<PresignedRequest, Error>`
+returns owned method/URL/required-header data with explicit `expires_seconds`
+(1–604800), using query authentication and an unsigned body. Its exact Move
+records, validation and canonical bytes are owned by
+`docs/impl/pkg-design/s3-presign.md`; implementation follows its design gate.
 
 The implemented first-party packages in this repository are exactly nine vendorable subtrees:
 

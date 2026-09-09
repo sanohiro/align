@@ -3894,7 +3894,10 @@ client/request/response ownership family is implemented under
 caller-owned pool reuse through package helpers. The independently reviewed
 S3/SigV4 ledger in `pkg-design/s3.md` is implemented: explicit request preparation
 plus general explicit-empty HTTP body framing, with the caller supplying its
-existing client. Next: the separately reviewed explicit-expiry presigning design.
+existing client. Next: the explicit-expiry presigning contract and closure
+matrix in `pkg-design/s3-presign.md`; independent design review precedes its
+implementation. It returns owned method/URL/required headers without a body or
+ambient clock/credential policy.
 Merge each coherent capability before starting the next.
 Other transports and execution/storage items retain their own admission gates.
 
