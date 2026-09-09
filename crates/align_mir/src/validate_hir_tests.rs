@@ -6846,9 +6846,6 @@ fn region_only_array_builder_headers_are_placement_valid() {
 fn body_only_header_types_fail_placement_closed() {
     for (label, ty) in [
         ("cli parsed", Ty::CliParsed),
-        ("http request", Ty::HttpRequest),
-        ("http response", Ty::HttpResponse),
-        ("http client", Ty::HttpClient),
         ("http server", Ty::HttpServer),
         ("command", Ty::Command),
         ("run output", Ty::RunOutput),

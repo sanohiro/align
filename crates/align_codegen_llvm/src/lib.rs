@@ -4937,7 +4937,8 @@ fn xml_owned_leaf_paths(
     let mut leaves = Vec::new();
     let mut pending = vec![(root, Vec::new(), Vec::<Ty>::new())];
     while let Some((ty, path, mut ancestors)) = pending.pop() {
-        if matches!(ty, Ty::Str | Ty::String | Ty::XmlReader | Ty::Fn(_)) {
+        if matches!(ty, Ty::Str | Ty::String | Ty::XmlReader | Ty::Fn(_)
+            | Ty::HttpClient | Ty::HttpRequest | Ty::HttpResponse | Ty::DynResponseArray) {
             leaves.push((ty, path));
             continue;
         }
@@ -9451,7 +9452,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 if !path.is_empty()
                     || result_ty != to
                     || xml_operand_base_ty(self.graph.function, &operand) != Some(from)
-                    || matches!(result_ty, Ty::String | Ty::XmlReader)
+                    || align_sema::ty_is_move(result_ty, &self.graph.program.structs, &self.graph.program.tuples, &self.graph.program.enums, &self.graph.program.tagged_types)
                 {
                     equation.invalid = true;
                 } else {
@@ -11279,7 +11280,7 @@ fn validate_resource_rvalues_component(
             } else {
                 cached_path_access(operand, selected, path.to_vec())
             };
-            if matches!(selected, Ty::String | Ty::XmlReader) {
+            if align_sema::ty_is_move(selected, &program.structs, &program.tuples, &program.enums, &program.tagged_types) {
                 state.owned_if_present()
             } else {
                 matches!(
@@ -36372,6 +36373,113 @@ fn main() -> i32 = 0
                         "access join must be associative for {left:?}, {right:?}, and {third:?}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn http_mixed_carriers_preserve_recursive_ownership_proof() {
+        for owner in ["http_client", "http_request", "http_response"] {
+            for carrier in [
+                owner.to_owned(),
+                "Mixed".into(),
+                format!("({owner}, str)"),
+                "Option<Mixed>".into(),
+                "Result<Mixed, Error>".into(),
+                "Choice".into(),
+            ] {
+                // Tuple and Option/Result parameters are not scalar function-type parameters.
+                let indirect = if carrier != owner && carrier != "Mixed" && carrier != "Choice" {
+                    String::new()
+                } else {
+                    format!(
+                        "fn indirect(action: fn({carrier}) -> (), value: {carrier}) {{ action(value) }}\n"
+                    )
+                };
+                let source = format!(
+                    "Mixed {{ owner: {owner}, view: str, callback: fn() -> i64 }}\nChoice {{ With(Mixed), Without }}\nfn relay(value: {carrier}) -> {carrier} = value\nfn sink(value: {carrier}) {{}}\nfn forward(value: {carrier}) {{ sink(value) }}\n{indirect}fn main() -> i32 = 0\n"
+                );
+                let base = mir(&source);
+                assert!(
+                    validate_mir_producers(&base).is_ok(),
+                    "owned {owner}/{carrier}"
+                );
+                for boundary in ["relay", "forward", "indirect", "imported"] {
+                    if boundary == "indirect" && indirect.is_empty() {
+                        continue;
+                    }
+                    let mut candidate = base.clone();
+                    let name = if boundary == "imported" {
+                        let index = xml_test_function(&candidate, "sink");
+                        let sink = candidate.fns.remove(index);
+                        candidate.imported_fns.push(align_mir::ImportedFn {
+                            name: sink.name,
+                            params: sink
+                                .params
+                                .iter()
+                                .map(|slot| sink.slots[*slot as usize])
+                                .collect(),
+                            param_modes: sink.param_modes,
+                            ret: sink.ret,
+                            return_borrow: sink.return_borrow,
+                            return_region: sink.return_region,
+                            return_cleanup: sink.return_cleanup,
+                            producer_certified: true,
+                        });
+                        "forward"
+                    } else {
+                        boundary
+                    };
+                    assert!(
+                        validate_mir_producers(&candidate).is_ok(),
+                        "owned {boundary}/{carrier}"
+                    );
+                    let index = xml_test_function(&candidate, name);
+                    let parameter = usize::from(boundary == "indirect");
+                    for mode in [
+                        align_ast::ParamMode::Borrow,
+                        align_ast::ParamMode::BorrowMut,
+                    ] {
+                        let mut malformed = candidate.clone();
+                        malformed.fns[index].param_modes[parameter] = mode;
+                        let label = format!("{owner}/{carrier}/{boundary}/{mode:?}");
+                        assert!(
+                            validate_mir_producers(&malformed).is_err(),
+                            "publication accepted {label}"
+                        );
+                        assert_xml_producer_rejected(&malformed, &label);
+                    }
+                }
+            }
+        }
+        for target in [Ty::HttpClient, Ty::HttpRequest, Ty::HttpResponse] {
+            for source in [Ty::Raw, Ty::HttpClient, Ty::HttpRequest, Ty::HttpResponse] {
+                if target == source {
+                    continue;
+                }
+                let mut malformed = mir("fn cast(value: raw) -> raw = value\nfn main() -> i32 = 0\n");
+                let index = xml_test_function(&malformed, "cast");
+                let function = &mut malformed.fns[index];
+                function.slots[function.params[0] as usize] = source;
+                function.ret = target;
+                function.value_tys = vec![target];
+                function.blocks = vec![Block {
+                    id: 0,
+                    stmts: vec![Stmt::Let(
+                        0,
+                        Rvalue::Cast {
+                            operand: Operand::Arg(0),
+                            from: source,
+                            to: target,
+                        },
+                    )],
+                    stmt_lines: Vec::new(),
+                    term: Term::Return(Some(Operand::Value(0))),
+                }];
+                assert_xml_producer_rejected(
+                    &malformed,
+                    "a cast cannot mint HTTP ownership or sibling identity",
+                );
             }
         }
     }

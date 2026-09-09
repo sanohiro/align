@@ -22,6 +22,7 @@ pub fn batch(borrow client: http_client, urls: slice<str>) -> Result<array<http_
   client.get_many(urls, 2)
 pub fn response() -> Result<http_response, Error> =
   http.parse("HTTP/1.1 200 OK\r\nContent-Length: 3\r\nx-test: yes\r\n\r\nabc")
+pub fn replace<T>(borrow mut value: T, replacement: T) { value = replacement }
 pub fn relay<T>(value: T) -> T = value
 pub fn configure(borrow mut req: http_request) { req.timeout(1000000000) }
 pub fn status(borrow value: http_response) -> i64 = value.status()
@@ -673,4 +674,67 @@ fn main() -> Result<(), Error> {
     assert_ne!(snapshot(build(), false), cold);
     std::fs::write(project.0.join("helpers.align"), HELPERS).unwrap();
     assert_eq!(snapshot(build(), true), cold);
+}
+
+#[test]
+fn borrowed_whole_owner_replacement() {
+    run_both(
+        "http-borrowed-replacement",
+        r#"module main
+import helpers
+fn main() -> Result<(), Error> {
+  mut client := helpers.client()
+  mut request := helpers.prepare("old")?
+  mut response := helpers.response()?
+  helpers.replace(client, helpers.client())
+  helpers.replace(request, helpers.prepare("new")?)
+  helpers.replace(response, helpers.response()?)
+  helpers.configure(request)
+  print(helpers.status(response))
+  print(helpers.body(response).as_str()?)
+  result := helpers.batch(client, [])?
+  print(result.len())
+  return Ok(())
+}
+"#,
+        "200\nabc\n0\n",
+    );
+    for name in ["http_client", "http_request", "http_response"] {
+        check_both(
+            "http-shared-replacement",
+            &format!(
+                "module main\nfn replace(borrow value: {name}, replacement: {name}) {{ value = replacement }}\nfn main() {{}}\n"
+            ),
+            false,
+        );
+    }
+    check_both(
+        "http-replacement-retains-view",
+        r#"module main
+import helpers
+fn main() -> Result<(), Error> {
+  mut response := helpers.response()?
+  view := helpers.body(response)
+  helpers.replace(response, helpers.response()?)
+  print(view.len())
+  return Ok(())
+}
+"#,
+        false,
+    );
+    check_both(
+        "http-replacement-retains-stream",
+        r#"module main
+import helpers
+fn main() -> Result<(), Error> {
+  mut client := helpers.client()
+  request := helpers.prepare("stream")?
+  stream := helpers.stream(client, request)?
+  helpers.replace(client, helpers.client())
+  print(stream.status())
+  return Ok(())
+}
+"#,
+        false,
+    );
 }
