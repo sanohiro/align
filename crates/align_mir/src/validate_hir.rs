@@ -10453,7 +10453,9 @@ impl<'a> BodyValidator<'a> {
                 let flow = self.expr_flow(source)?;
                 if !matches!(
                     flow.ty,
-                    Ty::Str
+                    Ty::Array(..)
+                        | Ty::StructArray(..)
+                        | Ty::Str
                         | Ty::String
                         | Ty::Slice(_)
                         | Ty::DynArray(_)

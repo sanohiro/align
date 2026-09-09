@@ -18180,3 +18180,41 @@ fn hir_body_validator_native_http_borrowed_consumption() {
         }
     }
 }
+
+#[test]
+fn fixed_array_len_child_and_result_contract() {
+    for literal in ["[1, 2]", "[Row{value: 1}, Row{value: 2}]"] {
+        let source = format!(
+            "Row {{ value: i64 }}\nfn length() -> i64 = {literal}.len()\nfn main() -> i32 = length() as i32\n"
+        );
+        let program = checked_source_program(&source);
+        assert!(validate_hir::body_only_metadata_is_valid(&program));
+        assert_eq!(lower_program(&program).fns.len(), 2);
+        assert_eq!(lower_program_per_unit(&program).fns.len(), 2);
+        for mutation in 0..3 {
+            let mut bad = program.clone();
+            let function = bad.fns.iter_mut().find(|function| function.name == "length").unwrap();
+            let result = function.body.value.as_mut().unwrap();
+            if mutation == 0 {
+                result.ty = Ty::Bool;
+            } else {
+                let hir::ExprKind::Len(receiver) = &mut result.kind else {
+                    panic!("fixed length must retain its receiver");
+                };
+                if mutation == 1 {
+                    receiver.ty = match receiver.ty {
+                        Ty::Array(element, n) => Ty::Array(element, n + 1),
+                        Ty::StructArray(id, n) => Ty::StructArray(id, n + 1),
+                        _ => panic!("fixed receiver"),
+                    };
+                } else {
+                    receiver.kind = hir::ExprKind::Bool(true);
+                    receiver.ty = Ty::Bool;
+                }
+            }
+            assert!(!validate_hir::body_only_metadata_is_valid(&bad), "mutation {mutation}");
+            assert!(is_empty(&lower_program(&bad)), "mutation {mutation}");
+            assert!(is_empty(&lower_program_per_unit(&bad)), "mutation {mutation}");
+        }
+    }
+}

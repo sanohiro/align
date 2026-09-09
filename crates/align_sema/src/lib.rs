@@ -58524,8 +58524,8 @@ impl<'a, 't> Checker<'a, 't> {
             // A `file`'s length is a **live** `fstat` — `Result<i64, Error>`, not a bare `i64` (unlike
             // a buffer's cached byte count). Same bound-receiver gate as the other `file` methods.
             Ty::File => self.check_file_method(r, "len", args, span),
-            // A fixed array's length is known at compile time.
-            Ty::Array(_, n) | Ty::StructArray(_, n) => Expr { kind: ExprKind::Int(n as i128), ty: i64_ty, span },
+            // The length is constant, but receiver effects, control flow and bindings remain.
+            Ty::Array(..) | Ty::StructArray(..) => Expr { kind: ExprKind::Len(Box::new(r)), ty: i64_ty, span },
             // A `json.doc`'s length is its member/element count (0 on a non-container / Missing) — a
             // runtime read of the tape node (J4 slice 2).
             Ty::JsonDoc => Expr { kind: ExprKind::JsonDocLen { doc: Box::new(r) }, ty: i64_ty, span },
