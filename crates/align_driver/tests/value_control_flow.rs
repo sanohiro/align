@@ -350,7 +350,9 @@ fn bound_if_families() -> String {
 const BOUND_IF_HELPERS: &str = r#"
 extern "C" {
   fn align_rt_requested_live_bytes() -> i64
+  fn align_rt_requested_live_reset()
 }
+pub fn start_probe() { unsafe { align_rt_requested_live_reset() } }
 pub fn replacement(c: bool) {
   baseline := unsafe { align_rt_requested_live_bytes() }
   replace_buffer(c, baseline)
@@ -359,6 +361,7 @@ pub fn replacement(c: bool) {
 fn replace_buffer(c: bool, baseline: i64) {
   mut x := buffer(4096)
   single := unsafe { align_rt_requested_live_bytes() } - baseline
+  if single <= 0 { print("probe-inactive") }
   x = if c { x } else { buffer(4096) }
   print(unsafe { align_rt_requested_live_bytes() } - baseline == single)
   wrapped := { x = if c { x } else { buffer(4096) }; 0 }
@@ -446,7 +449,7 @@ pub fn borrow_only(c: bool) {
 "#;
 
 fn bound_if_main() -> String {
-    let mut main = String::from("import choices\nfn main() -> Result<(), Error> {\n");
+    let mut main = String::from("import choices\nfn main() -> Result<(), Error> {\n  choices.start_probe()\n");
     for flag in ["true", "false"] {
         for family in [
             "text", "numbers", "texts", "records", "chunks", "record", "tuple", "optional",
@@ -739,7 +742,7 @@ fn bound_if_result_flag_transfer() {
 
 fn bound_else_sources() -> (String, String) {
     let mut helpers = String::from("module choices\nimport std.http\npub Record { text: string }\npub Choice { Text(string), Empty }\n");
-    let mut main = String::from("import choices\nfn main() {\n");
+    let mut main = String::from("import choices\nfn main() {\n  choices.start_probe()\n");
     for (name, ty, constructor) in [
         ("text", "string", "\"owned\".clone()"),
         ("numbers", "array<i64>", "[1, 2].to_array()"),
@@ -757,7 +760,11 @@ fn bound_else_sources() -> (String, String) {
     }
     helpers.push_str(
         r#"
-extern "C" { fn align_rt_requested_live_bytes() -> i64 }
+extern "C" {
+  fn align_rt_requested_live_bytes() -> i64
+  fn align_rt_requested_live_reset()
+}
+pub fn start_probe() { unsafe { align_rt_requested_live_reset() } }
 pub fn choose<T>(input: Option<T>, fallback: T) -> T = input else fallback
 pub fn take(value: string) -> i64 = value.len()
 pub fn early(c: bool) -> string {
@@ -798,6 +805,7 @@ pub fn allocation(c: bool) {
 fn counted(c: bool, baseline: i64) {
   mut x := buffer(4096)
   single := unsafe { align_rt_requested_live_bytes() } - baseline
+  if single <= 0 { print("probe-inactive") }
   input: Option<buffer> := if c { Some(buffer(4096)) } else { None }
   x = input else x
   print(unsafe { align_rt_requested_live_bytes() } - baseline == single)
