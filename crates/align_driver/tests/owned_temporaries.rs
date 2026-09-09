@@ -13,7 +13,7 @@ fn mir_text(src: &str) -> String {
         "unexpected errors:\n{}",
         align_driver::format_diagnostics(&sm, &checked.diags)
     );
-    align_mir::print::program_to_string(&lower_to_mir(&checked.hir))
+    align_mir::print::program_to_string(&align_driver::try_lower_to_mir(&checked.hir).expect("producer-checked HIR must lower"))
 }
 
 fn optimized_llvm(src: &str) -> String {
@@ -24,7 +24,7 @@ fn optimized_llvm(src: &str) -> String {
         "unexpected errors:\n{}",
         align_driver::format_diagnostics(&sm, &checked.diags)
     );
-    let mir = lower_to_mir(&checked.hir);
+    let mir = align_driver::try_lower_to_mir(&checked.hir).expect("producer-checked HIR must lower");
     emit_llvm_ir(&mir, BuildTarget::Baseline, true, &[], false).expect("optimized LLVM IR")
 }
 
@@ -538,5 +538,50 @@ fn borrowed_views_of_fresh_owners_cannot_escape() {
             diagnostics.contains("cannot return") || diagnostics.contains("cannot escape"),
             "{name} must reject a view outliving its synthetic owner:\n{diagnostics}"
         );
+    }
+}
+
+#[test]
+fn codec_dispatch_preserves_non_codec_receiver_bindings() {
+    for (name, parameters, receiver, consumer) in [
+        ("string-len", "", "\"abc\".clone()", "len()"),
+        ("string-find", "", "\"abc\".clone()", "find(\"b\") else -1"),
+        ("str-find", "", "\"abc\"", "find(\"b\") else -1"),
+        ("json-len", "doc: json.doc", "doc", "len()"),
+        ("json-kind", "doc: json.doc", "doc", "kind()"),
+        ("json-at", "doc: json.doc", "doc", "at(0)"),
+        ("codec-i64-len", "column: codec.i64_column", "column", "len()"),
+        ("codec-f64-len", "column: codec.f64_column", "column", "len()"),
+        ("codec-bool-len", "column: codec.bool_column", "column", "len()"),
+        ("codec-str-len", "column: codec.str_column", "column", "len()"),
+    ] {
+        let source = format!(
+            "import core.json\nimport core.codec\npub fn probe({parameters}) {{\n  _ := ({{ marker := {receiver}\n    marker\n  }}).{consumer}\n}}\nfn main() -> i32 = 0\n"
+        );
+        let mir = mir_text(&source);
+        assert!(mir.contains("fn probe"), "{name}: {mir}");
+        let mut sm = SourceMap::new();
+        let units = align_driver::build_per_unit(&mut sm, "receiver-bindings.align", &source);
+        assert!(
+            !units.diags.has_errors(),
+            "{name}: {}",
+            align_driver::format_diagnostics(&sm, &units.diags)
+        );
+        assert!(!units.units.is_empty(), "{name}: no per-unit artifacts");
+    }
+}
+
+#[test]
+fn codec_dispatch_diagnoses_an_invalid_receiver_once() {
+    for method in ["len()", "find(\"x\")", "kind()", "at(0)"] {
+        let mut sm = SourceMap::new();
+        let checked = check(
+            &mut sm,
+            "invalid-receiver.align",
+            &format!("fn main() {{ _ := missing.{method} }}\n"),
+        );
+        let diagnostics = align_driver::format_diagnostics(&sm, &checked.diags);
+        assert_eq!(checked.diags.error_count(), 1, "{method}: {diagnostics}");
+        assert!(diagnostics.contains("missing"), "{diagnostics}");
     }
 }

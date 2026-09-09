@@ -109,14 +109,9 @@ Two existing gaps were reproduced while forming the original matrix:
   Drop-capability closure in `20-runtime-abi-ledger.md` repairs constructor and
   carrier detection; the else matrix now includes the client family too.
 
-The surrounding `owned_temporaries` target has three pre-existing empty-MIR
-failures, reproduced unchanged on baseline `ab34b044` in an isolated checkout:
-`borrowed_control_flow_temporaries_lower_exactly_once`,
-`borrowed_scope_temporaries_lower_their_scope_exactly_once`, and
-`match_and_try_preserve_temporary_ownership`. Its other nine tests pass. The
-capability owner command skips exactly those three baseline failures, while
-running all `value_control_flow`, `owned_tagged_payloads`, and
-`borrowed_replacement` tests. Producer rejection investigation remains separate.
+The three baseline `owned_temporaries` empty-MIR failures are closed by the
+codec receiver single-check correction in `19-hir-validation-ledger.md`.
+The complete target now runs without the former three-test exclusion.
 
 ## Bound else-fallback closure (implemented 2026-09-09)
 
