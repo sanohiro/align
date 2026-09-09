@@ -14,7 +14,7 @@ if [[ -e "$PROJECT_ROOT" ]]; then
 fi
 mkdir -p "$PROJECT_ROOT/pkg"
 
-for TREE in apps/web/pkg apps/frame/pkg apps/auth/pkg apps/db/pkg apps/kv/pkg apps/csv/pkg apps/ws/pkg apps/template/pkg; do
+for TREE in apps/web/pkg apps/frame/pkg apps/auth/pkg apps/db/pkg apps/kv/pkg apps/csv/pkg apps/ws/pkg apps/template/pkg apps/s3/pkg; do
   cp -R "$REPO_ROOT/$TREE/." "$PROJECT_ROOT/pkg/"
 done
 
@@ -36,6 +36,7 @@ import pkg.kv
 import pkg.csv
 import pkg.ws
 import pkg.template
+import pkg.s3
 
 fn main() -> i32 = 0
 ALIGN

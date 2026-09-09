@@ -3891,11 +3891,11 @@ consumer-boundary investigation are complete. The selected next consumer is
 `std-design/time.md` (implemented in #996). The nameable HTTP
 client/request/response ownership family is implemented under
 `std-design/http-client-composition.md`, enabling fallible request preparation and
-caller-owned pool reuse through package helpers. Next: implement the independently
-reviewed S3/SigV4 ledger in `pkg-design/s3.md`. The selected boundary
-is explicit SigV4 request preparation plus general explicit-empty HTTP body
-framing; the caller supplies its existing client. Merge each coherent capability
-before starting the next.
+caller-owned pool reuse through package helpers. The independently reviewed
+S3/SigV4 ledger in `pkg-design/s3.md` is implemented: explicit request preparation
+plus general explicit-empty HTTP body framing, with the caller supplying its
+existing client. Next: the separately reviewed explicit-expiry presigning design.
+Merge each coherent capability before starting the next.
 Other transports and execution/storage items retain their own admission gates.
 
 Planned first-party library capabilities to follow the `pkg.db` product. Ordering and outline below.
