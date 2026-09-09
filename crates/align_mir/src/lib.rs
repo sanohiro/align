@@ -10184,6 +10184,27 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 Operand::Value(v)
             }
             hir::ExprKind::Len(inner) => {
+                if let Ty::Array(_, n) | Ty::StructArray(_, n) = inner.ty {
+                    if matches!(inner.kind, hir::ExprKind::ArrayLit { .. }) {
+                        // Literals are slot-backed. Reuse guarded element initialization so an
+                        // early exit cleans up the completed owned prefix, never generic SSA.
+                        let (slot, _) = array_source_slot(b, inner);
+                        if !lowering_continues(b) {
+                            return Operand::Const(Const::Unit);
+                        }
+                        if needs_drop_flag(inner.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types) {
+                            b.emit_drop_if_live(slot);
+                        }
+                    } else {
+                        lower_required_binding!(
+                            b,
+                            receiver = lower_borrowed_owned(b, inner),
+                            Operand::Const(Const::Unit)
+                        );
+                        drop_borrow_owners(b, &receiver);
+                    }
+                    return Operand::Const(Const::Int(i128::from(n), i64_ty()));
+                }
                 if let hir::ExprKind::ArrayChunks { source, n, elem } = &inner.kind {
                     // A direct `.chunks(n).len()` needs only ceil(source_len / n). Keep stored chunks
                     // materialized, but avoid allocating/filling headers for this scalar consumer.
