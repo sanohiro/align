@@ -206,6 +206,14 @@ nested function-value environment.
 order and calls the key exactly N times before reordering; the source contract now makes that
 behavior normative. Comparisons consume the recorded keys and never re-evaluate the callable.
 
+The tiny-input boundary follows the same rule: an empty surviving input invokes no key;
+a singleton invokes it once through ordinary decoration. Only unkeyed sorting may bypass
+work at length one. `sort_adaptive::tiny_key_evaluation_preserves_survivor_order` owns
+empty, direct singleton, filtered singleton and pair evaluation traces for integer, float,
+borrowed-string and captured keys. It fails against the former shared `len < 2` bypass.
+Existing total-order precheck, insertion-only and non-adaptive cleanup paths free the
+singleton decorate storage normally; no ownership or allocation strategy changes.
+
 Section 3.1 is independent: even when a callable is Pure, it may abort and cannot be speculated
 without the stronger inactive-lane proof.
 
