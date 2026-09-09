@@ -1668,7 +1668,8 @@ impl<'a> PlacementValidator<'a> {
         match scalar {
             Scalar::Int(integer) => valid_int(integer.bits),
             Scalar::Float(float) => valid_float(float.bits),
-            Scalar::Bool | Scalar::Char | Scalar::Str | Scalar::String => true,
+            Scalar::Bool | Scalar::Char | Scalar::Str | Scalar::String
+            | Scalar::HttpClient | Scalar::HttpRequest | Scalar::HttpResponse => true,
             Scalar::DynArray(element) => valid_prim(element),
             Scalar::DynStructArray(id) => self.dynamic_struct_array_ok(id),
             Scalar::Resource(id) | Scalar::ResourceRef(id) => {
@@ -1809,6 +1810,8 @@ impl<'a> PlacementValidator<'a> {
             | Scalar::TcpListener
             | Scalar::UdpSocket
             | Scalar::Child
+            | Scalar::HttpClient
+            | Scalar::HttpRequest
             | Scalar::HttpResponse
             | Scalar::HttpServer
             | Scalar::HttpRequestCtx
@@ -1856,7 +1859,10 @@ impl<'a> PlacementValidator<'a> {
             Scalar::SignatureKey(_) => true,
             Scalar::Enum(id) => self.program.enums.get(id as usize).is_some(),
             Scalar::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
-            Scalar::ResponseBuilder
+            Scalar::HttpClient
+            | Scalar::HttpRequest
+            | Scalar::HttpResponse
+            | Scalar::ResponseBuilder
             | Scalar::Logger
             | Scalar::XmlReader
             | Scalar::CodecBatch
@@ -1934,6 +1940,7 @@ impl<'a> PlacementValidator<'a> {
                     && self.scalar_ok(element, ScalarPlacement::Collection)
             }
             Ty::DynSliceArray(element) => valid_prim(element),
+            Ty::DynResponseArray => true,
             ty @ (Ty::DynVecArray(..)
             | Ty::DynMaskArray(..)
             | Ty::DynFixedArray(..)
@@ -1977,6 +1984,9 @@ impl<'a> PlacementValidator<'a> {
             | Ty::UdpSocket
             | Ty::Child
             | Ty::File
+            | Ty::HttpClient
+            | Ty::HttpRequest
+            | Ty::HttpResponse
             | Ty::HttpRequestCtx
             | Ty::ResponseBuilder
             | Ty::HttpStream
@@ -1985,9 +1995,6 @@ impl<'a> PlacementValidator<'a> {
             // These handles are body-produced only. They are valid local/expression types but have
             // no source `resolve_type` spelling and therefore cannot occur in a declaration header.
             Ty::CliParsed
-            | Ty::HttpRequest
-            | Ty::HttpResponse
-            | Ty::HttpClient
             | Ty::HttpServer
             | Ty::Command
             | Ty::RunOutput => false,
@@ -2001,7 +2008,6 @@ impl<'a> PlacementValidator<'a> {
             | Ty::FloatVar(_)
             | Ty::Array(_, _)
             | Ty::StructArray(_, _)
-            | Ty::DynResponseArray
             | Ty::Task(_)
             | Ty::Builder
             | Ty::StrFinder
@@ -2546,6 +2552,8 @@ impl<'a> Validator<'a> {
             | Scalar::UdpSocket
             | Scalar::Child
             | Scalar::File
+            | Scalar::HttpClient
+            | Scalar::HttpRequest
             | Scalar::HttpResponse
             | Scalar::HttpServer
             | Scalar::HttpRequestCtx
@@ -3838,6 +3846,8 @@ impl<'a> BodyValidator<'a> {
             | Scalar::TcpListener
             | Scalar::UdpSocket
             | Scalar::Child
+            | Scalar::HttpClient
+            | Scalar::HttpRequest
             | Scalar::HttpResponse
             | Scalar::HttpServer
             | Scalar::HttpRequestCtx
@@ -5199,10 +5209,10 @@ impl<'a> BodyValidator<'a> {
         expression.ty == ty && self.local_type(context, id) == Some(ty)
     }
 
-    /// A streamed response read mutates its transport/framing cursor. Nonparameter locals own that
-    /// cursor; a parameter may advance it only by value or through an exclusive mutable borrow.
+    /// An opaque handle mutation requires an owning or exclusive local. This covers streamed
+    /// response cursors and HTTP client/request configuration without duplicating the authority rule.
     /// This independently rejects handcrafted HIR that bypasses the source checker.
-    fn http_stream_cursor_place(
+    fn exclusive_handle_place(
         &self,
         context: &BodyContext,
         expression: &hir::Expr,
@@ -9367,24 +9377,24 @@ impl<'a> BodyValidator<'a> {
                     .then(|| strict(Ty::HttpRequest, &[method, url]))?
             }
             hir::ExprKind::HttpHeader { req, name, value } => {
-                (local(req, Ty::HttpRequest)
+                (self.exclusive_handle_place(context, req, Ty::HttpRequest)
                     && req.ty == Ty::HttpRequest
                     && name.ty == Ty::Str
                     && value.ty == Ty::Str)
                     .then(|| strict(Ty::Unit, &[req, name, value]))?
             }
             hir::ExprKind::HttpBody { req, data } => {
-                (local(req, Ty::HttpRequest)
+                (self.exclusive_handle_place(context, req, Ty::HttpRequest)
                     && req.ty == Ty::HttpRequest
                     && byte_view(data.ty))
                     .then(|| strict(Ty::Unit, &[req, data]))?
             }
             hir::ExprKind::HttpRequestTimeout { req, ns } => {
-                (local(req, Ty::HttpRequest) && req.ty == Ty::HttpRequest && ns.ty == i64)
+                (self.exclusive_handle_place(context, req, Ty::HttpRequest) && req.ty == Ty::HttpRequest && ns.ty == i64)
                     .then(|| strict(Ty::Unit, &[req, ns]))?
             }
             hir::ExprKind::HttpRequestMaxResponseBodyBytes { req, limit } => {
-                (local(req, Ty::HttpRequest) && req.ty == Ty::HttpRequest && limit.ty == i64)
+                (self.exclusive_handle_place(context, req, Ty::HttpRequest) && req.ty == Ty::HttpRequest && limit.ty == i64)
                     .then(|| strict(Ty::Unit, &[req, limit]))?
             }
             hir::ExprKind::HttpParse { data } => {
@@ -9404,11 +9414,11 @@ impl<'a> BodyValidator<'a> {
             }
             hir::ExprKind::HttpClient => (expression.ty == Ty::HttpClient).then_some((Ty::HttpClient, true, Vec::new())),
             hir::ExprKind::HttpClientTimeout { client, ns } => {
-                (local(client, Ty::HttpClient) && client.ty == Ty::HttpClient && ns.ty == i64)
+                (self.exclusive_handle_place(context, client, Ty::HttpClient) && client.ty == Ty::HttpClient && ns.ty == i64)
                     .then(|| strict(Ty::Unit, &[client, ns]))?
             }
             hir::ExprKind::HttpClientMaxResponseBodyBytes { client, limit } => {
-                (local(client, Ty::HttpClient) && client.ty == Ty::HttpClient && limit.ty == i64)
+                (self.exclusive_handle_place(context, client, Ty::HttpClient) && client.ty == Ty::HttpClient && limit.ty == i64)
                     .then(|| strict(Ty::Unit, &[client, limit]))?
             }
             hir::ExprKind::HttpClientGet { client, url } => {
@@ -9446,7 +9456,7 @@ impl<'a> BodyValidator<'a> {
                     .then(|| strict(Ty::Option(Scalar::Str), &[stream, name]))?
             }
             hir::ExprKind::HttpReadStreamRead { stream, buffer } => {
-                (self.http_stream_cursor_place(context, stream, Ty::HttpReadStream)
+                (self.exclusive_handle_place(context, stream, Ty::HttpReadStream)
                     && stream.ty == Ty::HttpReadStream
                     && mutable_local(buffer, Ty::Buffer)
                     && buffer.ty == Ty::Buffer)
@@ -9497,7 +9507,7 @@ impl<'a> BodyValidator<'a> {
                 let option_id = self.program.tagged_types.iter().position(|tagged| {
                     *tagged == hir::TaggedType::Option(Scalar::Struct(event_id))
                 })? as u32;
-                (self.http_stream_cursor_place(context, stream, Ty::HttpSseStream)
+                (self.exclusive_handle_place(context, stream, Ty::HttpSseStream)
                     && stream.ty == Ty::HttpSseStream
                     && mutable_local(buffer, Ty::Buffer)
                     && buffer.ty == Ty::Buffer)

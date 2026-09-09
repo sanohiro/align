@@ -879,7 +879,7 @@ mod tests {
         // -- key region --
         "01000000",                         // key_format_version = 1
         "01000000000000000200000000000000", // compiler_fingerprint = Hash128 { lo: 1, hi: 2 }
-        "0a000000",                         // frontend_schema = align_interface::FORMAT_VERSION = 10
+        "0b000000",                         // frontend_schema = align_interface::FORMAT_VERSION = 11
         "04000000",                         // env_toggles: exactly 4
         "10000000414c49474e5f434f4e53545f504f4f4c", "00",             // ALIGN_CONST_POOL   Absent
         "12000000414c49474e5f4e4545444c455f484f495354", "01", "030000006f6666", // ..NEEDLE_HOIST Present("off")
@@ -968,7 +968,7 @@ mod tests {
         assert_eq!(
             align_interface::FORMAT_VERSION,
             10,
-            "the golden vector transcribes frontend_schema = 10; re-transcribe it if the interface \
+            "the golden vector transcribes frontend_schema = 11; re-transcribe it if the interface \
              codec version moves"
         );
         let prefix = from_hex(GOLDEN_PREFIX_HEX);

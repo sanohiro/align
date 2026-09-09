@@ -387,6 +387,8 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             | Scalar::UdpSocket
             | Scalar::Child
             | Scalar::File
+            | Scalar::HttpClient
+            | Scalar::HttpRequest
             | Scalar::HttpResponse
             | Scalar::HttpServer
             | Scalar::HttpRequestCtx

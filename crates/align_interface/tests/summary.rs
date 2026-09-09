@@ -806,8 +806,10 @@ fn deserialize_unknown_version_fails_closed() {
         Err(DecodeError::UnknownVersion(v)) => assert_eq!(v, 6),
         other => panic!("expected UnknownVersion, got {other:?}"),
     }
-    bytes[..4].copy_from_slice(&8u32.to_le_bytes());
-    assert_eq!(deserialize(&bytes), Err(DecodeError::UnknownVersion(8)));
+    for version in [8u32, 9, 10] {
+        bytes[..4].copy_from_slice(&version.to_le_bytes());
+        assert_eq!(deserialize(&bytes), Err(DecodeError::UnknownVersion(version)));
+    }
 }
 
 #[test]
@@ -1021,6 +1023,9 @@ fn builtin_spelling_ownership_matches_the_producer_for_every_interface_spelling(
         "tcp_listener",
         "udp_socket",
         "child",
+        "http_client",
+        "http_request",
+        "http_response",
         "http_request_ctx",
         "response_builder",
         "http_stream",
@@ -2585,7 +2590,7 @@ fn parameter_mode_and_producer_certificate_codec_have_a_byte_golden() {
     let hex = surface.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
     assert_eq!(
         hex,
-        "0a000000040000006d61696e0100000007000000696e73706563740000000001000000010005000000736c69636501000000000300000069363400000000000300000069363400000000000000010000000000010100000001000000010000000000000000000000000000000000000000000000000000"
+        "0b000000040000006d61696e0100000007000000696e73706563740000000001000000010005000000736c69636501000000000300000069363400000000000300000069363400000000000000010000000000010100000001000000010000000000000000000000000000000000000000000000000000"
     );
 
     let mut artifact = serialize(&summary);
