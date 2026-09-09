@@ -406,3 +406,75 @@ fn early_exit_and_small_paths_free_keys_once() {
     assert_eq!(bout.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&bout.stderr));
     assert_eq!(String::from_utf8_lossy(&bout.stdout), format!("{}\n", 7 * n));
 }
+
+/// Empty and singleton materializations still obey the key-call contract, including after
+/// filtering. Exercise both total-order and float keys and a captured key in one native owner.
+#[test]
+fn tiny_key_evaluation_preserves_survivor_order() {
+    if !backend_available() {
+        return;
+    }
+    let mut src = String::from("fn integer(x: i64) -> i64 { print(x)\n return -x }\nfn floating(x: i64) -> f64 { print(x)\n return 0.0 }\nfn text(x: i64) -> str { print(x)\n return \"key\" }\nfn main() -> i32 {\n offset := 100\n");
+    let mut expected = String::new();
+    for (key_id, key) in ["integer", "floating", "text", "fn x { print(x + offset)\n x }"].iter().enumerate() {
+        for (case, pipeline, values) in [
+            ("empty", "[3, 1, 2].where(fn x { false })", vec![]),
+            ("singleton", "[3]", vec![3]),
+            ("filtered", "[3, 1, 2].where(fn x { x == 1 })", vec![1]),
+            ("pair", "[3, 1, 2].where(fn x { x != 2 })", vec![3, 1]),
+        ] {
+            let label = format!("{key_id}-{case}");
+            src.push_str(&format!(" print(\"{label}\")\n s_{key_id}_{case} := {pipeline}.sort_by_key({key})\n print(s_{key_id}_{case}.sum())\n"));
+            expected.push_str(&format!("{label}\n"));
+            for value in &values {
+                expected.push_str(&format!("{}\n", value + if key_id == 3 { 100 } else { 0 }));
+            }
+            expected.push_str(&format!("{}\n", values.iter().sum::<i64>()));
+        }
+    }
+    src.push_str(" return 0\n}\n");
+    let out = run_tiny_sort_keys(&src);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+}
+
+fn run_tiny_sort_keys(src: &str) -> std::process::Output {
+    let executable = build_exe("tiny-sort-keys", src);
+    let mut command = std::process::Command::new(&executable.exe);
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = SortChild(Some(command.spawn().expect("spawn tiny sort")));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        assert!(std::time::Instant::now() < deadline, "tiny sort exceeded child deadline");
+        match child.0.as_mut().expect("owned child").try_wait() {
+            Ok(Some(_)) => {
+                // This fixture produces less than one pipe buffer and starts no descendants.
+                // The process has exited, so draining its two pipes cannot wait for execution.
+                return child.0.take().expect("exited child").wait_with_output().expect("read output");
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => panic!("poll tiny sort: {error}"),
+        }
+    }
+}
+
+struct SortChild(Option<std::process::Child>);
+impl Drop for SortChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            #[cfg(unix)]
+            if let Ok(pid) = i32::try_from(child.id()) {
+                unsafe { libc::kill(-pid, libc::SIGKILL); }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}

@@ -16409,15 +16409,16 @@ fn lower_array_sort(
     // Shared exit plumbing (all key types): `ret` returns `arr`; `free_keys` (created below, after
     // the `keys` allocation) frees the `sort_by_key` decorate buffer on every post-decorate exit;
     // the merge path additionally frees the ping buffers before reaching `free_keys`. `keys` must be
-    // freed on every exit *after* it is allocated, but the `len < 2` exit happens *before* any
+    // freed on every exit *after* it is allocated, but the empty/unkeyed-singleton exit happens *before* any
     // allocation, so it targets `ret`.
     let ret = b.new_block();
 
-    // Fewer than 2 elements → already sorted; return the collected buffer untouched. Nothing has
-    // been allocated yet (not even `keys`), so this exits straight to `ret`.
+    // Empty input needs no work. An unkeyed singleton is also already sorted, but a keyed
+    // singleton must still execute its key callable once through the ordinary decorate path.
     let sort_start = b.new_block();
-    let ge2 = sort_cmp(b, BinOp::Ge, len.clone(), index_const(2));
-    b.terminate(Term::Branch(ge2, sort_start, ret));
+    let minimum_len = if has_keys { 1 } else { 2 };
+    let needs_work = sort_cmp(b, BinOp::Ge, len.clone(), index_const(minimum_len));
+    b.terminate(Term::Branch(needs_work, sort_start, ret));
 
     b.cur = sort_start;
 
@@ -16903,7 +16904,7 @@ fn lower_array_sort(
 
     // free_keys: free the `sort_by_key` decorate buffer (shallow spine — `str` keys are Copy views).
     // Reached by every post-decorate exit (ordered early exit, the `len <= 32` gate, and the merge
-    // path via `merge_free`); the pre-decorate `len < 2` exit skips it (nothing allocated).
+    // path via `merge_free`); the pre-decorate empty/unkeyed-singleton exit skips it (nothing allocated).
     b.cur = free_keys;
     if has_keys {
         b.push(Stmt::DropValue(keys_val));
