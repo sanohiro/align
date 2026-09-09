@@ -119,8 +119,9 @@ request returns. The complete ownership boundary is now implemented under
 recursive carriers and whole/unit producer validation. The independently reviewed
 `pkg.s3`/SigV4 contract in `docs/impl/pkg-design/s3.md` is implemented, including
 general HTTP explicit-empty-body framing required by S3 PUT. The next consumer
-boundary is explicit-expiry S3 presigning, which requires its own public-contract
-design and independent review before implementation.
+boundary is explicit-expiry S3 presigning. Its public-contract ledger and closure
+matrix in `docs/impl/pkg-design/s3-presign.md` are independently reviewed and
+accepted. Next is the complete URL-to-wire implementation under that matrix.
 Other transports and S1–S6 retain their own evidence/design gates.
 
 **Current next work (owner-resumed 2026-09-07):** Request 55 and the fixed v0.7.3 release are

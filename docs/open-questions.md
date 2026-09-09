@@ -19,6 +19,15 @@ five mechanical workarounds across at least two independent real programs. Reach
 only makes the proposal admissible; the re-examination itself follows the ordinary procedure in
 this file and the design gate in `CLAUDE.md`.
 
+### S3 explicit-expiry presigning — SETTLED 2026-09-09
+
+The independently reviewed additional contract is `docs/impl/pkg-design/s3-presign.md`.
+`pkg.s3.presign` returns owned method/URL/required-header data from explicit
+inputs and an inclusive 1–604800-second lifetime, with unsigned body bytes.
+It reuses the existing borrowed input records and adds ordinary Move output
+records. The design is accepted with explicit complete-set Host ordering;
+implementation is next. No language or existing header-authentication decision is reopened.
+
 ### S3 SigV4 request composition — SETTLED 2026-09-09
 
 The independently reviewed public contract is `docs/impl/pkg-design/s3.md`. One ordinary

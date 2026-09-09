@@ -1398,6 +1398,11 @@ request data and uses the caller's ordinary HTTP client. The capability also
 preserves explicit body presence in HTTP:
 `.body(empty)` and `post(url, empty)` emit `Content-Length: 0`; unset bodies omit it.
 No ambient authentication, clock, endpoint discovery or package retry is added.
+The separately designed `presign(...) -> Result<PresignedRequest, Error>`
+returns owned method/URL/required headers and takes explicit `expires_seconds`
+(1–604800). Its query authentication uses an unsigned body. Exact Move records,
+validation and wire rules are in `impl/pkg-design/s3-presign.md`; implementation
+follows its design gate.
 
 The implemented first-party packages in this repository are exactly nine vendorable subtrees:
 
