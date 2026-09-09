@@ -263,9 +263,9 @@ once per scope chain — with one exception, two **disjoint sibling blocks** may
 name, because neither is in the other's chain. Floats are IEEE 754 and never abort (`x/0.0` → `±inf`, NaN ≠ NaN); only
 integer division aborts. `str`/`string` are `Ord` (byte-lexicographic; locale collation is a
 library concern), so strings sort and compare. A `sort_by_key` key is a **Copy** `Ord` value — a
-number, a `char`, or a borrowed `str`; an owned `string` key type-checks but is then rejected at the
-MIR boundary as an internal error (no per-key Drop in the fused sort path — see
-`docs/impl/19-hir-validation-ledger.md`), so project the key to a `str`. `else` works on `Result` as
+number, a `char`, or a borrowed `str`; the checker rejects an owned `string` key because the fused
+sort path has no per-key Drop (see `docs/impl/19-hir-validation-ledger.md`). Return a Copy key or a
+borrowed `str`. `else` works on `Result` as
 well as `Option` — the intent triangle is `?` propagates / `else` falls back / `match` inspects.
 Details: `draft.md` §4 (display, equality, ordering, floats) and §12 (literals and escapes).
 

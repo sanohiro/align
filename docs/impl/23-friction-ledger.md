@@ -43,7 +43,7 @@ elsewhere and are **not** ledger rows.
 | Item | Owner of record | Status |
 |---|---|---|
 | Bound owned locals in value-carrying `if` results. | `docs/impl/38-bound-if-result-plan.md`; `draft.md` §6.3 | DONE 2026-09-09. Selected-edge transfer and path-local replacement cleanup. |
-| A `sort_by_key` key must be a **Copy** `Ord` value. An owned `string` key type-checks and is then rejected at the MIR boundary as an internal error, because the fused sort path has no per-key Drop. | `docs/impl/19-hir-validation-ledger.md`; spec text in `docs/language-spec.md` and `draft.md` | DEFERRED. The restriction is a missing capability in the fused sort path, not a decision about keys. |
+| A `sort_by_key` key must be a **Copy** `Ord` value. The checker rejects an owned `string` key because the fused sort path has no per-key Drop. | `docs/impl/19-hir-validation-ledger.md`; spec text in `docs/language-spec.md` and `draft.md` | DEFERRED. The restriction is a missing capability in the fused sort path, not a decision about keys. |
 
 Both are A because the design already describes the working behavior; only the
 implementation is short. Neither belongs in the reopen protocol.
