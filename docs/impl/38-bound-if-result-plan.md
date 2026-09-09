@@ -99,17 +99,15 @@ wrappers, previous possible moves and final scope exit, in both compilation mode
 and both profiles. Borrowed results retain both sources; negative owners retain
 possible-move, borrowed parameter/payload, live-view and region-escape refusals.
 
-Two unrelated existing gaps were reproduced while forming the matrix and remain
-outside this accepted if-result boundary:
+Two existing gaps were reproduced while forming the original matrix:
 
-- A bound local in an `else`-unwrap fallback still hits the indirect-source guard
+- A bound local in an `else`-unwrap fallback hit the indirect-source guard
   (`optional else fallback`). Earlier prose incorrectly called this sibling fully
-  working. The current owner uses a fresh fallback and separately tests the owned
-  payload path; direct fallback transfer needs its own closure of the else walker.
-- A program that only constructs and drops `http.client()` can omit `ssl` from
-  inferred link libraries and fail on `SSL_shutdown`/`SSL_free`. The type-family
-  owner covers buffer as the native handle family; HTTP capability inference needs
-  a focused production fix and link-owner test, without forced libraries here.
+  working. The follow-up is closed by the bound else-fallback matrix below.
+- A program that only constructed and dropped `http.client()` could omit `ssl`
+  from inferred link libraries and fail on `SSL_shutdown`/`SSL_free`. The
+  Drop-capability closure in `20-runtime-abi-ledger.md` repairs constructor and
+  carrier detection; the else matrix now includes the client family too.
 
 The surrounding `owned_temporaries` target has three pre-existing empty-MIR
 failures, reproduced unchanged on baseline `ab34b044` in an isolated checkout:
@@ -119,3 +117,28 @@ failures, reproduced unchanged on baseline `ab34b044` in an isolated checkout:
 capability owner command skips exactly those three baseline failures, while
 running all `value_control_flow`, `owned_tagged_payloads`, and
 `borrowed_replacement` tests. Producer rejection investigation remains separate.
+
+## Bound else-fallback closure (implemented 2026-09-09)
+
+The separately reproduced `optional else fallback` gap uses the same existing
+selected-edge MIR transfer as the accepted if-result capability. The sole
+ElseUnwrap move worklist must mark its consuming fallback as a direct transfer
+site. `lower_else_unwrap` already routes the negative edge through
+`store_control_result`; the positive edge consumes the container and transfers
+its payload. A Result's discarded error is dropped before the fallback runs.
+Borrowed fallback results retain the fallback source; the input container keeps
+its existing consuming behavior. No MIR/ABI, ownership strategy, type admission,
+allocation, effect or serialization rule changes.
+
+| Closure axis | Implementation and exact owner |
+|---|---|
+| Formation and type families | One ElseUnwrap worklist, canonical Move classification and existing MIR join; `bound_else_fallback_matrix` covers strings, supported arrays, records, Option/Result/enums, buffers and clients; tuple and array-of-slice Option payloads retain their existing formation refusal |
+| Selection, move, Drop, replacement, return and allocation provenance | Existing negative-edge result store and path-local cleanup; `bound_else_fallback_matrix` covers both Option and Result alternatives, discarded owned errors, self-replacement and heap/arena paths using live buffer counts |
+| Wrappers, nested control, generic/imported boundaries, arguments and exits | Existing worklist dispatch and control joins; `bound_else_fallback_matrix` covers nested if/else, block fallback, generic helper, argument/return and diverging fallback in whole/per-unit Dev/Release; existing `bound_if_result_execution_matrix` owns unchanged `?`/`map_err` paths |
+| Borrow and rejection | Preserve consuming=false for the fallback and ordinary container consumption; `bound_else_fallback_rejections` pins possible-move reuse, borrowed input/payload consumption, live views and arena escape; matrix execution retains a borrowed fallback source |
+| Malformed HIR, serialization and runtime ABI | Representation and validators are unchanged; existing bounded gate and the original plan's owners retain these cells |
+
+This follows the reviewed selected-edge strategy; boundary inspection belongs to
+one fresh preflight code review. The owner target is `value_control_flow`, with
+`owned_tagged_payloads` for the unchanged discarded-error cleanup. No performance
+promise or benchmark is added.

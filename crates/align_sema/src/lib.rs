@@ -40246,7 +40246,8 @@ impl<'a> MoveCheck<'a> {
                         fallback,
                         success,
                     });
-                    work.push(Work::Eval(fallback, consuming, false));
+                    // A consuming fallback is transferred and cleared by its own negative edge.
+                    work.push(Work::Eval(fallback, consuming, true));
                 }
                 Work::AfterFallback {
                     expression,
