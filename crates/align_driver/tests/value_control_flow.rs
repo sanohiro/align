@@ -736,3 +736,138 @@ fn bound_if_result_flag_transfer() {
         }
     }
 }
+
+fn bound_else_sources() -> (String, String) {
+    let mut helpers = String::from("module choices\nimport std.http\npub Record { text: string }\npub Choice { Text(string), Empty }\n");
+    let mut main = String::from("import choices\nfn main() {\n");
+    for (name, ty, constructor) in [
+        ("text", "string", "\"owned\".clone()"),
+        ("numbers", "array<i64>", "[1, 2].to_array()"),
+        ("texts", "array<string>", "{ mut b: array_builder<string> := array_builder(); b.push(\"owned\".clone()); b.build() }"),
+        ("records", "array<Record>", "{ mut b: array_builder<Record> := array_builder(); b.push(Record{text: \"owned\".clone()}); b.build() }"),
+        ("record", "Record", "Record{text: \"owned\".clone()}"),
+        ("optional", "Option<string>", "Some(\"owned\".clone())"),
+        ("result", "Result<string, Error>", "Ok(\"owned\".clone())"),
+        ("sum", "Choice", "Choice.Text(\"owned\".clone())"),
+        ("bytes", "buffer", "buffer(8)"),
+        ("client", "http_client", "http.client()"),
+    ] {
+        helpers.push_str(&format!("pub fn {name}(c: bool) {{\n  left: {ty} := {constructor}\n  right: {ty} := {constructor}\n  input: Option<{ty}> := if c {{ Some(left) }} else {{ None }}\n  selected := input else right\n}}\n"));
+        main.push_str(&format!("  choices.{name}(true)\n  choices.{name}(false)\n"));
+    }
+    helpers.push_str(
+        r#"
+extern "C" { fn align_rt_requested_live_bytes() -> i64 }
+pub fn choose<T>(input: Option<T>, fallback: T) -> T = input else fallback
+pub fn take(value: string) -> i64 = value.len()
+pub fn early(c: bool) -> string {
+  input: Option<string> := if c { Some("yes".clone()) } else { None }
+  return input else { return "no".clone() }
+}
+pub fn exercise(c: bool) {
+  input: Option<string> := if c { Some("some".clone()) } else { None }
+  fallback := "fallback".clone()
+  print(take(input else { print(7); fallback }))
+  borrowed: Option<string> := if c { Some("some".clone()) } else { None }
+  retained := "retained".clone()
+  print((borrowed else retained).len())
+  print(retained)
+  nested: Option<string> := None
+  a := "a".clone()
+  b := "b".clone()
+  print(choose(Some(1), 2))
+  selected := nested else if c { a } else { b }
+  print(selected)
+  looping: Option<string> := None
+  final := "loop".clone()
+  output := loop { break looping else final }
+  print(output)
+  heap := [7, 8].to_array()
+  input_array: Option<array<i64>> := if c { Some(heap) } else { None }
+  arena {
+    local := [1, 2].to_array()
+    selected_array := input_array else local
+    print(selected_array[0])
+  }
+}
+pub fn allocation(c: bool) {
+  baseline := unsafe { align_rt_requested_live_bytes() }
+  counted(c, baseline)
+  print(unsafe { align_rt_requested_live_bytes() } == baseline)
+}
+fn counted(c: bool, baseline: i64) {
+  mut x := buffer(4096)
+  single := unsafe { align_rt_requested_live_bytes() } - baseline
+  input: Option<buffer> := if c { Some(buffer(4096)) } else { None }
+  x = input else x
+  print(unsafe { align_rt_requested_live_bytes() } - baseline == single)
+  another: Option<buffer> := if c { Some(buffer(4096)) } else { None }
+  wrapped := { x = another else x; 0 }
+  print(unsafe { align_rt_requested_live_bytes() } - baseline == single)
+  // Both paths of this Result allocate. Err must be dropped before the bound fallback moves.
+  result: Result<buffer, buffer> := if c { Ok(buffer(4096)) } else { Err(buffer(4096)) }
+  x = result else {
+    if unsafe { align_rt_requested_live_bytes() } - baseline != single { print("error-not-dropped") }
+    x
+  }
+  print(unsafe { align_rt_requested_live_bytes() } - baseline == single)
+  x.put_u8(7)
+  print(x.bytes().u8(0))
+}
+"#,
+    );
+    for condition in ["true", "false"] {
+        main.push_str(&format!("  choices.exercise({condition})\n  choices.allocation({condition})\n  print(choices.early({condition}))\n"));
+    }
+    main.push_str(
+        "  empty: Option<string> := None\n  print(choices.choose(empty, \"generic\".clone()))\n}\n",
+    );
+    (main, helpers)
+}
+
+#[test]
+fn bound_else_fallback_matrix() {
+    let (main, helpers) = bound_else_sources();
+    let project = IfProject::new(&main, &helpers);
+    let expected = "4\n4\nretained\n1\na\nloop\n7\ntrue\ntrue\ntrue\n7\ntrue\nyes\n7\n8\n8\nretained\n1\nb\nloop\n1\ntrue\ntrue\ntrue\n7\ntrue\nno\ngeneric\n";
+    for unit in [false, true] {
+        let programs = project.programs(&main, unit);
+        assert!(programs.iter().all(|program| !program.fns.is_empty()));
+        if backend_available() {
+            for profile in [Profile::Dev, Profile::Release] {
+                assert_eq!(project.run(&programs, profile), expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn bound_else_fallback_rejections() {
+    for (source, message) in [
+        ("pub fn bad(borrow input: Option<string>, a: string) -> string = input else a", "borrow"),
+        ("pub fn bad(input: Option<(string, array<i64>)>) {}", "Option payload"),
+        ("pub fn bad(input: Option<array<slice<i64>>>) {}", "Option payload"),
+        ("pub fn bad(input: Option<string>) { a := \"a\".clone(); b := input else a; print(a) }", "moved"),
+        ("pub fn bad(input: Option<string>, borrow a: string) -> string = input else a", "borrow"),
+        ("pub fn bad(input: Option<string>, borrow a: Option<string>) -> string = match a { Some(s) => input else s, None => \"n\".clone() }", "borrowed match payload"),
+        ("pub fn bad() -> array<i64> { input: Option<array<i64>> := None; return arena { a := [1].to_array(); input else a } }", "escape"),
+        ("pub fn bad(input: Option<buffer>) { a := buffer(8); view := a.bytes(); b := input else a; print(view.len()) }", "borrow"),
+    ] {
+        let helpers = format!("module choices\n{source}\n");
+        let main = "import choices\nfn main() {}\n";
+        let project = IfProject::new(main, &helpers);
+        for unit in [false, true] {
+            let mut sm = SourceMap::new();
+            let diagnostics = if unit {
+                let result = align_driver::build_per_unit(&mut sm, &project.entry(), main);
+                assert!(result.diags.has_errors(), "accepted {source}");
+                align_driver::format_diagnostics(&sm, &result.diags)
+            } else {
+                let result = check(&mut sm, &project.entry(), main);
+                assert!(result.diags.has_errors(), "accepted {source}");
+                align_driver::format_diagnostics(&sm, &result.diags)
+            };
+            assert!(diagnostics.contains(message), "{source}: {diagnostics}");
+        }
+    }
+}
