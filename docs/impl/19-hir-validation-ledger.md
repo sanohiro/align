@@ -2095,3 +2095,26 @@ Result/string lifecycle and generic source-template replay carry the extension; 
 The five-kind checked-HIR owner mutates operands and result types; encode-only HTML/PercentPath
 decoders reject. Native-envelope admission is explicit. The protected-leaf producer owner also
 requires the exact scalar parser status/output equation, even when no string leaf is returned.
+
+## Codec method receiver single-check closure
+
+The codec method pre-dispatch checked arbitrary value receivers and discarded
+non-codec HIR before normal method dispatch checked the same AST again. A match
+payload or named arena consequently left an orphan local, violating the exact
+one-binding rule above. The existing validation rule remains unchanged; dispatch
+must consume one checked receiver. This repairs the producer without changing
+source types, ownership strategy, ABI, or IR shape.
+
+| Axis | Implementation and owner |
+| --- | --- |
+| Construction and validation | Move codec value dispatch behind the common checked receiver; route codec column `len` inside `check_len`. `owned_temporaries` exercises match bindings and named arena records; `core_codec` owns codec methods. |
+| Borrow, move, cleanup, replacement, return | Retain the original checked receiver, coercions and MIR cleanup. Existing `owned_temporaries` owners cover fresh/bound/mixed results, borrowed scopes, match and `?`, exact branch/store/frame counts and native results. |
+| Control paths | Existing if/match/else, block/unsafe/arena/named-arena/task-group matrix must pass without skips. `codec_dispatch_preserves_non_codec_receiver_bindings` adds local-binding receivers for shared len/find/kind/at names. |
+| Generic and imported calls, whole/per-unit | `core_codec::codec_types_cross_whole_program_and_per_unit_interfaces` owns imports; generic machinery is unchanged. `codec_dispatch_preserves_non_codec_receiver_bindings` covers string/str and JSON shared names plus all four codec column types through whole-program and per-unit lowering. |
+| Malformed receiver and arguments | Preserve existing method diagnostics; `codec_dispatch_diagnoses_an_invalid_receiver_once` requires exactly one missing-receiver error for len/find/kind/at. |
+| Allocation, provenance and ABI | No runtime allocation or native declaration changes. Retained receiver uses existing ownership and region rules; no benchmark promise. |
+| Adjacent speculative dispatch | SIMD reduction probing and response-array receiver interception are separate existing dispatch paths, outside this codec regression; this change introduces no new speculative checker. |
+
+The author-side boundary is one producer dispatch correction plus its owner
+coverage. The preflight independent review checks this matrix with the diff;
+no new safety strategy requires a separate plan review.

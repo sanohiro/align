@@ -50732,72 +50732,6 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         }
-        if matches!(
-            method,
-            "rows"
-                | "columns"
-                | "name"
-                | "kind"
-                | "find"
-                | "i64s"
-                | "f64s"
-                | "bools"
-                | "strs"
-                | "at"
-                | "put_i64"
-                | "put_f64"
-                | "put_bool"
-                | "put_str"
-                | "finish"
-        ) {
-            let recv_expr = self.check_expr(recv, None);
-            match recv_expr.ty {
-                Ty::CodecBatch => {
-                    if matches!(
-                        method,
-                        "rows" | "columns" | "name" | "kind" | "find" | "i64s" | "f64s"
-                            | "bools" | "strs"
-                    ) {
-                        return self.check_codec_batch_method(recv_expr, method, args, span);
-                    }
-                    self.diags.error(
-                        format!("'.{method}()' is not a method on codec.batch"),
-                        span,
-                    );
-                    return err;
-                }
-                Ty::CodecI64Column | Ty::CodecF64Column | Ty::CodecBoolColumn | Ty::CodecStrColumn => {
-                    if method == "at" {
-                        return self.check_codec_column_method(recv_expr, method, args, span);
-                    }
-                    self.diags.error(
-                        format!("'.{method}()' is not a method on {}", ty_name(recv_expr.ty)),
-                        span,
-                    );
-                    return err;
-                }
-                Ty::CodecEncoder => {
-                    if matches!(method, "put_i64" | "put_f64" | "put_bool" | "put_str" | "finish") {
-                        return self.check_codec_encoder_method(recv_expr, method, args, span);
-                    }
-                    self.diags.error(
-                        format!("'.{method}()' is not a method on codec.encoder"),
-                        span,
-                    );
-                    return err;
-                }
-                _ => {}
-            }
-        }
-        if method == "len" {
-            let recv_expr = self.check_expr(recv, None);
-            if matches!(
-                recv_expr.ty,
-                Ty::CodecI64Column | Ty::CodecF64Column | Ty::CodecBoolColumn | Ty::CodecStrColumn
-            ) {
-                return self.check_codec_column_method(recv_expr, method, args, span);
-            }
-        }
         // `log.logger` methods borrow one bound logger handle. Keep this dispatch ahead of the
         // shared writer `.flush()` lane so the receiver is checked exactly once.
         if matches!(method, "enabled" | "line" | "flush") {
@@ -51116,6 +51050,64 @@ impl<'a, 't> Checker<'a, 't> {
         };
         let recv_expr = self.check_expr(recv, recv_expected);
         let recv_ty = recv_expr.ty;
+        // Codec names overlap ordinary value methods. Reuse this checked receiver on
+        // fallback: rechecking its AST would leave orphan locals from the discarded HIR.
+        if matches!(
+            method,
+            "rows"
+                | "columns"
+                | "name"
+                | "kind"
+                | "find"
+                | "i64s"
+                | "f64s"
+                | "bools"
+                | "strs"
+                | "at"
+                | "put_i64"
+                | "put_f64"
+                | "put_bool"
+                | "put_str"
+                | "finish"
+        ) {
+            match recv_expr.ty {
+                Ty::CodecBatch => {
+                    if matches!(
+                        method,
+                        "rows" | "columns" | "name" | "kind" | "find" | "i64s" | "f64s"
+                            | "bools" | "strs"
+                    ) {
+                        return self.check_codec_batch_method(recv_expr, method, args, span);
+                    }
+                    self.diags.error(
+                        format!("'.{method}()' is not a method on codec.batch"),
+                        span,
+                    );
+                    return err;
+                }
+                Ty::CodecI64Column | Ty::CodecF64Column | Ty::CodecBoolColumn | Ty::CodecStrColumn => {
+                    if method == "at" {
+                        return self.check_codec_column_method(recv_expr, method, args, span);
+                    }
+                    self.diags.error(
+                        format!("'.{method}()' is not a method on {}", ty_name(recv_expr.ty)),
+                        span,
+                    );
+                    return err;
+                }
+                Ty::CodecEncoder => {
+                    if matches!(method, "put_i64" | "put_f64" | "put_bool" | "put_str" | "finish") {
+                        return self.check_codec_encoder_method(recv_expr, method, args, span);
+                    }
+                    self.diags.error(
+                        format!("'.{method}()' is not a method on codec.encoder"),
+                        span,
+                    );
+                    return err;
+                }
+                _ => {}
+            }
+        }
         match method {
             // `json.doc` navigation / leaf accessors (J4): `d.kind()` / `d.get(k)` / `d.at(i)` /
             // `d.as_i64()` / `d.as_f64()` / `d.as_bool()`. Type-guarded on the receiver (checked once
@@ -58499,10 +58491,16 @@ impl<'a, 't> Checker<'a, 't> {
     /// `.len()` — the element count of a `str`, `slice<T>`, or fixed array, as an `i64`.
     fn check_len(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
         let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let r = self.check_expr(recv, None);
+        if matches!(
+            r.ty,
+            Ty::CodecI64Column | Ty::CodecF64Column | Ty::CodecBoolColumn | Ty::CodecStrColumn
+        ) {
+            return self.check_codec_column_method(r, "len", args, span);
+        }
         if !args.is_empty() {
             self.diags.error(format!("'.len()' takes no arguments, got {}", args.len()), span);
         }
-        let r = self.check_expr(recv, None);
         match r.ty {
             // `str`/`slice`/`soa` carry a runtime length in their `{ ptr, len }` view (a `soa`'s
             // length is its row count).
