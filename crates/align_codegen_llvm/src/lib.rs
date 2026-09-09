@@ -4930,6 +4930,10 @@ fn xml_inline_array_element(program: &Program, ty: Ty) -> Option<Ty> {
     }
 }
 
+fn http_client_owner_leaf(ty: Ty) -> bool {
+    matches!(ty, Ty::HttpClient | Ty::HttpRequest | Ty::HttpResponse | Ty::DynResponseArray)
+}
+
 fn xml_owned_leaf_paths(
     program: &Program,
     root: Ty,
@@ -4937,8 +4941,7 @@ fn xml_owned_leaf_paths(
     let mut leaves = Vec::new();
     let mut pending = vec![(root, Vec::new(), Vec::<Ty>::new())];
     while let Some((ty, path, mut ancestors)) = pending.pop() {
-        if matches!(ty, Ty::Str | Ty::String | Ty::XmlReader | Ty::Fn(_)
-            | Ty::HttpClient | Ty::HttpRequest | Ty::HttpResponse | Ty::DynResponseArray) {
+        if matches!(ty, Ty::Str | Ty::String | Ty::XmlReader | Ty::Fn(_)) || http_client_owner_leaf(ty) {
             leaves.push((ty, path));
             continue;
         }
@@ -9884,6 +9887,14 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 Self::add_required_source(equation, source, requirement);
             }
             equation.seed = merge_xml_access(equation.seed, contract.access);
+            return;
+        }
+
+        // Only the authenticated client-family operations above can produce these owners.
+        // A foreign native opcode cannot claim one merely by naming a pointer-sized out slot,
+        // including an HTTP leaf selected inside an otherwise valid aggregate decoder result.
+        if http_client_owner_leaf(selected_ty) {
+            equation.invalid = true;
             return;
         }
 
@@ -36485,6 +36496,103 @@ fn main() -> i32 = 0
     }
 
     #[test]
+    fn http_owner_slots_reject_foreign_native_producers() {
+        for owner in [
+            Ty::HttpClient,
+            Ty::HttpRequest,
+            Ty::HttpResponse,
+            Ty::DynResponseArray,
+        ] {
+            let Some(scalar) = align_sema::ty_to_scalar(owner) else {
+                panic!("HTTP owner scalar");
+            };
+            for writer in [false, true] {
+                let mut program = mir(
+                    "import std.http\nfn parse(text: str) -> Result<http_response, Error> = http.parse(text)\nfn main() -> i32 = 0\n",
+                );
+                let index = xml_test_function(&program, "parse");
+                let function = &mut program.fns[index];
+                let retype = |ty| match ty {
+                    Ty::HttpResponse => owner,
+                    Ty::Result(Scalar::HttpResponse, error) => Ty::Result(scalar, error),
+                    other => other,
+                };
+                function.ret = retype(function.ret);
+                for ty in function.slots.iter_mut().chain(&mut function.value_tys) {
+                    *ty = retype(*ty);
+                }
+                let mut replaced = false;
+                for statement in function
+                    .blocks
+                    .iter_mut()
+                    .flat_map(|block| &mut block.stmts)
+                {
+                    if let Stmt::Let(_, value @ Rvalue::HttpParse { .. }) = statement {
+                        let Rvalue::HttpParse { data, out } = value.clone() else {
+                            panic!("matched parse");
+                        };
+                        *value = if writer {
+                            Rvalue::WriterCreate { path: data, out }
+                        } else {
+                            Rvalue::ReaderOpen { path: data, out }
+                        };
+                        replaced = true;
+                    }
+                }
+                assert!(replaced);
+                assert_xml_producer_rejected(
+                    &program,
+                    "foreign native opcode cannot claim an HTTP out slot",
+                );
+            }
+        }
+        // Specialized aggregate decoders must obey the same selected-leaf boundary as the
+        // generic native-out fallback; nominally valid record metadata is not an HTTP producer.
+        for owner in ["http_client", "http_request", "http_response"] {
+            let mut program = mir(&format!(
+                "Record {{ owner: {owner} }}\nfn fabricate(value: Record) -> Record = value\nfn main() -> i32 = 0\n"
+            ));
+            let index = xml_test_function(&program, "fabricate");
+            let function = &mut program.fns[index];
+            let Ty::Struct(record) = function.ret else {
+                panic!("record fixture");
+            };
+            let i32_ty = Ty::Int(IntTy {
+                bits: 32,
+                signed: true,
+            });
+            function.params.clear();
+            function.param_modes.clear();
+            function.borrow_mut_cleanup_slots.clear();
+            function.slots = vec![function.ret];
+            function.slot_align = vec![None];
+            function.value_tys = vec![i32_ty, function.ret, Ty::Str];
+            function.blocks = vec![Block {
+                id: 0,
+                stmts: vec![
+                    Stmt::Let(2, Rvalue::StrLit("{}".into())),
+                    Stmt::Let(
+                        0,
+                        Rvalue::JsonDecode {
+                            struct_id: record,
+                            input: Operand::Value(2),
+                            out: 0,
+                            arena: None,
+                        },
+                    ),
+                    Stmt::Let(1, Rvalue::Load(0)),
+                ],
+                stmt_lines: Vec::new(),
+                term: Term::Return(Some(Operand::Value(1))),
+            }];
+            assert_xml_producer_rejected(
+                &program,
+                "foreign aggregate decoder cannot produce nested HTTP ownership",
+            );
+        }
+    }
+
+    #[test]
     fn http_recursive_carriers_emit_the_exact_owner_free() {
         for (name, symbol) in [
             ("http_client", "align_rt_http_client_free"),
@@ -36503,8 +36611,9 @@ fn main() -> i32 = 0
                     "Holder {{ value: {name} }}\nChoice {{ Some({name}), None }}\nfn discard(value: {shape}) {{}}\nfn main() -> i32 = 0\n"
                 );
                 let program = mir(&source);
-                let ir = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
-                    .expect("HTTP recursive cleanup");
+                let Ok(ir) = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None) else {
+                    panic!("checked HTTP carrier cleanup must emit LLVM");
+                };
                 assert_eq!(
                     ir.matches(&format!("call void @{symbol}(")).count(),
                     1,
@@ -36561,12 +36670,16 @@ fn main() -> i32 = 0
                     );
                     let mut duplicate_out = base.clone();
                     let duplicate_function = &mut duplicate_out.fns[index];
-                    let duplicate_value = u32::try_from(duplicate_function.value_tys.len()).unwrap();
+                    let Ok(duplicate_value) = u32::try_from(duplicate_function.value_tys.len()) else {
+                        panic!("fixture SSA inventory must fit u32");
+                    };
                     duplicate_function.value_tys.push(contract.result);
-                    let block = duplicate_function.blocks.iter_mut().find(|block| {
+                    let Some(block) = duplicate_function.blocks.iter_mut().find(|block| {
                         block.stmts.iter().any(|statement| matches!(statement, Stmt::Let(id, _) if id == value))
-                    }).unwrap();
-                    let position = block.stmts.iter().position(|statement| matches!(statement, Stmt::Let(id, _) if id == value)).unwrap();
+                    }) else { panic!("fixture native producer must belong to a block"); };
+                    let Some(position) = block.stmts.iter().position(|statement| matches!(statement, Stmt::Let(id, _) if id == value)) else {
+                        panic!("selected block must contain fixture producer");
+                    };
                     block.stmts.insert(position, Stmt::Let(duplicate_value, rvalue.clone()));
                     if !block.stmt_lines.is_empty() { block.stmt_lines.insert(position, (0, 0)); }
                     assert_xml_producer_rejected(&duplicate_out, "HTTP output requires a distinct native scratch slot");

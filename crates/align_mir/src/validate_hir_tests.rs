@@ -18140,11 +18140,9 @@ fn hir_body_validator_native_http_client_ownership() {
             "fn configure(borrow mut value: {name}) {{ {operation} }}\nfn main() {{}}\n"
         ));
         assert!(body_core_metadata_is_valid(&program), "{operation}");
-        let function = program
-            .fns
-            .iter_mut()
-            .find(|function| function.name == "configure")
-            .unwrap();
+        let Some(function) = program.fns.iter_mut().find(|function| function.name == "configure") else {
+            panic!("checked fixture must contain configure");
+        };
         function.param_modes[0] = align_ast::ParamMode::Borrow;
         function.locals[function.params[0] as usize].is_mut = false;
         assert_body_entrypoints_empty(operation, &program);
@@ -18162,11 +18160,9 @@ fn hir_body_validator_native_http_borrowed_consumption() {
         align_ast::ParamMode::BorrowMut,
     ] {
         let mut program = base.clone();
-        let function = program
-            .fns
-            .iter_mut()
-            .find(|function| function.name == "send")
-            .unwrap();
+        let Some(function) = program.fns.iter_mut().find(|function| function.name == "send") else {
+            panic!("checked fixture must contain send");
+        };
         function.param_modes[1] = mode;
         function.locals[function.params[1] as usize].is_mut =
             mode == align_ast::ParamMode::BorrowMut;

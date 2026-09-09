@@ -191,7 +191,12 @@ P1's parameterized owner covers each HTTP type in direct and mixed/nested
 carriers at both return and consuming-call boundaries, with valid owned twins
 and forged shared/mutable borrowed or sibling-typed twins. The implementation
 uses `xml_owned_leaf_paths` and the existing operand requirement product; it
-introduces no alternative graph or pointer-size inference. Casts cannot mint a
+introduces no alternative graph or pointer-size inference. Native out-slot
+certification is closed for these leaves: only an exact client-family contract
+may produce one, including a selected HTTP field inside a decoded aggregate.
+Foreign native opcodes cannot inherit ownership from a caller-recorded slot type.
+`http_owner_slots_reject_foreign_native_producers` covers the plain and nested
+producer-substitution negatives. Casts cannot mint a
 Move owner. Return ownership checks use the semantic ownership predicate; the
 String/XmlReader dynamic cleanup-bit ABI is not imposed on always-owned HTTP
 handles. Indirect-call twins cover the existing scalar function-type parameter

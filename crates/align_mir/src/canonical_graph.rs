@@ -3723,9 +3723,11 @@ mod tests {
 
         for (scalar, tag) in [(Scalar::HttpClient, 49), (Scalar::HttpRequest, 50), (Scalar::HttpResponse, 27)] {
             let expected = [3, 0, 0, 0, 0, 4, tag];
-            let encoded = CanonicalTy::from_program(Ty::Option(scalar), &program).unwrap();
+            let Ok(encoded) = CanonicalTy::from_program(Ty::Option(scalar), &program) else {
+                panic!("HTTP option golden must encode");
+            };
             assert_eq!(encoded.as_bytes(), expected);
-            assert_eq!(CanonicalTy::decode(&expected).unwrap(), encoded);
+            assert_eq!(CanonicalTy::decode(&expected).as_ref(), Ok(&encoded));
             assert!(CanonicalTy::decode(&expected[..6]).is_err());
         }
         for tag in 51..=u8::MAX {

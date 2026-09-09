@@ -159,7 +159,10 @@ client/request/responseの全葉は、既存MIR producerの固定点検証に参
 P1のパラメータ化ownerは、各HTTP型の直接・混合・入れ子キャリアについて、returnと消費callを
 検証します。正しい所有起源と、偽造した共有・可変借用起源・異なる型の負例を対にします。
 実装は `xml_owned_leaf_paths` と既存operand権限を使用し、別グラフやポインタ幅からの推論を
-導入しません。castからMove所有権を生成することはできず、戻り値の所有権判定は
+導入しません。native出力slotのHTTP葉は正確なclient-family契約だけが生成できます。
+集約decoder内のHTTPフィールドも同じで、他のnative opcodeはslotの型記録だけから
+所有権を得られません。`http_owner_slots_reject_foreign_native_producers` が直接・入れ子の
+producer置換を拒否します。castからMove所有権を生成することはできず、戻り値の所有権判定は
 意味上の所有権述語を使用します。String/XmlReaderの動的cleanup-bit ABIを、常に所有される
 HTTPハンドルへ追加しません。間接callの対照例は既存scalar関数型引数の範囲を対象とし、
 tuple・Option/Resultの関数型引数は引き続き拒否します。
