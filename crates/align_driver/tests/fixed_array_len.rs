@@ -328,10 +328,17 @@ pub fn exercise() {
 fn fixed_length_preserves_array_formation_rejections() {
     for (receiver, message) in [
         ("[]", "empty array literal needs an expected element type"),
+        ("{ [1,2]; xs := [3,4]; xs }", "an expression statement"),
+        ("{ [1,2] }", "a block value"),
+        (
+            "match Some(true) { Some(flag) => [1,2], None => [3,4] }",
+            "a `match` arm value",
+        ),
+        ("loop { break [1,2] }", "a `break` value"),
         ("[\"a\".clone()]", "cannot be an element of a fixed array"),
         ("[[1,2],[3,4]]", "composite payloads are not supported"),
     ] {
-        let source = format!("fn main() -> i32 = {receiver}.len() as i32\n");
+        let source = format!("fn main() -> i32 = ({receiver}).len() as i32\n");
         let mut sm = SourceMap::new();
         let checked = check(&mut sm, "fixed-len-rejection.align", &source);
         let diagnostics = align_driver::format_diagnostics(&sm, &checked.diags);

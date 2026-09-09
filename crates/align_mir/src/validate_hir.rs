@@ -7204,6 +7204,9 @@ impl<'a> BodyValidator<'a> {
                 Some((Ty::Enum(*enum_id), falls, breaks))
             }
             hir::ExprKind::Match { scrutinee, arms, .. } => {
+                if arms.iter().any(|arm| matches!(arm.body.kind, hir::ExprKind::ArrayLit { .. })) {
+                    return None;
+                }
                 let scrutinee_flow = self.expr_flow(scrutinee)?;
                 let payloads = self.sum_payloads(scrutinee_flow.ty)?;
                 if arms.is_empty() {
@@ -7756,6 +7759,9 @@ impl<'a> BodyValidator<'a> {
                 }
             }
             hir::ExprKind::ElseUnwrap { opt, fallback } => {
+                if matches!(fallback.kind, hir::ExprKind::ArrayLit { .. }) {
+                    return None;
+                }
                 let option = self.expr_flow(opt)?;
                 let fallback = self.expr_flow(fallback)?;
                 let payload = match option.ty {
@@ -11742,6 +11748,11 @@ impl<'a> BodyValidator<'a> {
     }
 
     fn finish_block(&mut self, block: &hir::Block, _: &BodyContext) -> bool {
+        // Fixed literals materialize at an initializer or collection consumer, never as
+        // a free block value. Apply this to every scope wrapper, including dead tails.
+        if block.value.as_deref().is_some_and(|value| matches!(value.kind, hir::ExprKind::ArrayLit { .. })) {
+            return false;
+        }
         let mut falls = true;
         let mut breaks = Vec::new();
         let mut result = Ty::Unit;
@@ -11940,6 +11951,9 @@ impl<'a> BodyValidator<'a> {
                 self.store_statement(statement, Ty::Unit, false, breaks)
             }
             hir::Stmt::Break { value, accepted } => {
+                if value.as_ref().is_some_and(|value| matches!(value.kind, hir::ExprKind::ArrayLit { .. })) {
+                    return false;
+                }
                 let value_ty = value
                     .as_ref()
                     .and_then(|_| flows.first().map(|flow| flow.ty))
@@ -11981,7 +11995,10 @@ impl<'a> BodyValidator<'a> {
                     }
                     self.store_statement(statement, Ty::Unit, flow.falls, flow.breaks.clone())
             }
-            hir::Stmt::Expr(_) => {
+            hir::Stmt::Expr(expression) => {
+                if matches!(expression.kind, hir::ExprKind::ArrayLit { .. }) {
+                    return false;
+                }
                 let Some(flow) = flows.first() else {
                     return false;
                 };

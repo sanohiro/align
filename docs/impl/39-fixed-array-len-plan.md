@@ -48,3 +48,23 @@ initialization followed by return/`?`, and bound-owned-array source reuse across
 control joins. Perform one author matrix-to-diff pass and the normal
 committed-candidate preflight review. The expected capability is well
 below 1,000 hand-written changed lines.
+
+## Review closure — free literal placement
+
+The committed-candidate review found one P2: the expanded Len receiver domain
+admitted a forged `Len(Block(ArrayLit))`, although the source checker rejects a
+bare block-tail literal and generic MIR expression lowering cannot materialize
+it. Preserve the existing source placement rule at the shared block, match-arm,
+else-fallback and break validators, rather than special-casing Len's descendants.
+This covers every scope and both if arms through their existing block validator.
+The same audit found bare literal expression statements lacked a producer guard;
+they now use `reject_bare_array_value` and the matching statement validator.
+Direct `.len()` literals and existing initializer/collection-source literals remain
+admitted, including guarded partial-owned initialization.
+
+`fixed_array_len_rejects_free_literal_placement` starts from producer-valid scalar
+and struct receivers, mutates only the free literal placement in nine scope/control/
+statement positions, and requires rejection from all four MIR entrypoints.
+`fixed_length_preserves_array_formation_rejections` owns the source diagnostics.
+The literal strategy and ownership boundary remain unchanged; this local validation
+correction closes against the original review and owner checks.

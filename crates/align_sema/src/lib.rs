@@ -45889,6 +45889,7 @@ impl<'a, 't> Checker<'a, 't> {
                     stmts.push(Stmt::Break { value, accepted });
                 }
                 ast::Stmt::Expr(e) => {
+                    self.reject_bare_array_value(e, None, "an expression statement");
                     if let Some(assertion) = self.check_test_assertion_statement(e) {
                         stmts.push(assertion);
                         continue;
@@ -46020,7 +46021,7 @@ impl<'a, 't> Checker<'a, 't> {
         }
         if matches!(e.kind, ast::ExprKind::ArrayLit(_)) {
             self.diags.error(
-                format!("a bare array literal cannot be used as {context} (a fixed `[…]` materializes only as a `let` initializer, slice borrow, or pipeline source); bind it to a local first"),
+                format!("a bare array literal cannot be used as {context} (a fixed `[…]` materializes only as a `let` initializer, slice borrow, pipeline source, or `.len()` receiver); bind it to a local first"),
                 e.span,
             );
             return true;
@@ -64284,8 +64285,8 @@ impl<'a, 't> Checker<'a, 't> {
             .expect("enclosing loop checked above")
             .accepted_breaks
             .insert(span);
-        // A bare array literal materializes only as a `let` initializer, slice borrow, or pipeline
-        // source — MIR has no lowering for one in a free value position and would panic.
+        // A bare array literal materializes only as a `let` initializer, slice borrow, pipeline
+        // source, or `.len()` receiver; a free break value has no materialization path.
         let expected = self.loops.last().unwrap().break_ty;
         if let Some(v) = value
             && self.reject_bare_array_value(v, expected, "a `break` value")

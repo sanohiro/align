@@ -7473,6 +7473,19 @@ fn body_test_local(
 }
 
 fn body_unit_case(name: &str, expression: hir::Expr) -> hir::Fn {
+    // Fixed literals need an initializer; a bare expression statement is not producer-valid.
+    if matches!(expression.kind, hir::ExprKind::ArrayLit { .. }) {
+        let local = body_test_local(0, "array", expression.ty, false, false);
+        return body_test_named_function(
+            name,
+            hir::Block {
+                stmts: vec![hir::Stmt::Let { local: 0, init: expression }],
+                value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit))),
+            },
+            vec![local],
+            Ty::Unit,
+        );
+    }
     body_test_named_function(
         name,
         hir::Block {
@@ -7529,10 +7542,11 @@ fn body_statement_expression_mut<'a>(
     name: &str,
 ) -> &'a mut hir::Expr {
     let statement = body_first_statement_mut(program, name);
-    let hir::Stmt::Expr(expression) = statement else {
-        panic!("statement fixture {name} is not an expression")
-    };
-    expression
+    match statement {
+        hir::Stmt::Expr(expression) => expression,
+        hir::Stmt::Let { init, .. } if matches!(init.kind, hir::ExprKind::ArrayLit { .. }) => init,
+        _ => panic!("statement fixture {name} has no materialized expression"),
+    }
 }
 
 fn body_first_let_init_mut<'a>(program: &'a mut hir::Program, name: &str) -> &'a mut hir::Expr {
@@ -9587,51 +9601,9 @@ fn hir_body_validator_storage_vector_array() {
 fn hir_body_validator_storage_vector_array_control_flow() {
     let integer = int(64);
     let scalar = scalar_int(64);
-    let array = |value: i128| {
-        body_test_expr(
-            hir::ExprKind::ArrayLit {
-                elems: vec![body_test_expr(hir::ExprKind::Int(value), integer)],
-                elem: integer,
-                pooled: false,
-            },
-            Ty::Array(scalar, 1),
-        )
-    };
-    let mut valid = baseline_program();
-    valid.fns.push(body_unit_case(
-        "storage_branch_join",
-        body_test_expr(
-            hir::ExprKind::If {
-                cond: Box::new(body_test_expr(hir::ExprKind::Bool(true), Ty::Bool)),
-                then: hir::Block {
-                    stmts: Vec::new(),
-                    value: Some(Box::new(array(1))),
-                },
-                els: hir::Block {
-                    stmts: Vec::new(),
-                    value: Some(Box::new(array(2))),
-                },
-            },
-            Ty::Array(scalar, 1),
-        ),
-    ));
-    valid.fns.push(body_unit_case(
-        "storage_loop_join",
-        body_test_expr(
-            hir::ExprKind::Loop {
-                body: hir::Block {
-                    stmts: vec![hir::Stmt::Break {
-                        value: Some(array(3)),
-                        accepted: true,
-                    }],
-                    value: None,
-                },
-                diverges: false,
-                body_locals: 0..0,
-            },
-            Ty::Array(scalar, 1),
-        ),
-    ));
+    let valid = checked_source_program(
+        "fn main() -> i32 { xs := [1]\n if true { xs } else { xs }\n loop { break xs }\n return 0 }\n",
+    );
     assert!(body_core_metadata_is_valid(&valid));
 
     let diverging = body_test_expr(
@@ -18182,7 +18154,7 @@ fn hir_body_validator_native_http_borrowed_consumption() {
 }
 
 #[test]
-fn fixed_array_len_child_and_result_contract() {
+fn fixed_array_len_child_and_result_contract() -> Result<(), &'static str> {
     for literal in ["[1, 2]", "[Row{value: 1}, Row{value: 2}]"] {
         let source = format!(
             "Row {{ value: i64 }}\nfn length() -> i64 = {literal}.len()\nfn main() -> i32 = length() as i32\n"
@@ -18193,8 +18165,8 @@ fn fixed_array_len_child_and_result_contract() {
         assert_eq!(lower_program_per_unit(&program).fns.len(), 2);
         for mutation in 0..3 {
             let mut bad = program.clone();
-            let function = bad.fns.iter_mut().find(|function| function.name == "length").unwrap();
-            let result = function.body.value.as_mut().unwrap();
+            let function = bad.fns.iter_mut().find(|function| function.name == "length").ok_or("length function")?;
+            let result = function.body.value.as_mut().ok_or("length body value")?;
             if mutation == 0 {
                 result.ty = Ty::Bool;
             } else {
@@ -18217,4 +18189,59 @@ fn fixed_array_len_child_and_result_contract() {
             assert!(is_empty(&lower_program_per_unit(&bad)), "mutation {mutation}");
         }
     }
+    Ok(())
+}
+
+#[test]
+fn fixed_array_len_rejects_free_literal_placement() -> Result<(), &'static str> {
+    for literal in ["[1,2]", "[Row{value: 1},Row{value: 2}]"] {
+        for (name, receiver) in [
+            ("block", "{ xs }"),
+            ("unsafe", "unsafe { xs }"),
+            ("arena", "arena { xs }"),
+            ("named-arena", "arena region { xs }"),
+            ("task-group", "task_group { xs }"),
+            ("if", "if true { xs } else { xs }"),
+            ("match", "match Some(true) { Some(flag) => xs, None => xs }"),
+            ("loop", "loop { break xs }"),
+            ("statement", "{ 0; xs }"),
+        ] {
+            let source = format!("Row {{ value: i64 }}\nfn length() -> i64 {{ xs := {literal}\n return ({receiver}).len() }}\nfn main() -> i32 = length() as i32\n");
+            let mut program = checked_source_program(&source);
+            assert!(validate_hir::body_only_metadata_is_valid(&program), "{name}: positive");
+            let function = program.fns.iter_mut().find(|function| function.name == "length").ok_or("length function")?;
+            let hir::Stmt::Let { init: literal, .. } = &function.body.stmts[0] else { panic!("array initializer") };
+            let literal = literal.clone();
+            let hir::Stmt::Return(Some(result)) = function.body.stmts.last_mut().ok_or("length return statement")? else { panic!("length return") };
+            let hir::ExprKind::Len(receiver) = &mut result.kind else { panic!("retained receiver") };
+            match &mut receiver.kind {
+                hir::ExprKind::Block(block) if name == "statement" => {
+                    block.stmts[0] = hir::Stmt::Expr(literal);
+                }
+                hir::ExprKind::Block(block)
+                | hir::ExprKind::Unsafe(block)
+                | hir::ExprKind::Arena(block)
+                | hir::ExprKind::NamedArena { block, .. }
+                | hir::ExprKind::TaskGroup(block) => block.value = Some(Box::new(literal)),
+                hir::ExprKind::If { then, .. } => then.value = Some(Box::new(literal)),
+                hir::ExprKind::Match { arms, .. } => arms[0].body = literal,
+                hir::ExprKind::Loop { body, .. } => {
+                    let hir::Stmt::Break { value, .. } = &mut body.stmts[0] else { panic!("break") };
+                    *value = Some(literal);
+                }
+                _ => panic!("receiver fixture"),
+            }
+            assert!(!validate_hir::body_only_metadata_is_valid(&program), "{name}: malformed placement");
+            let source_map = SourceMap::new();
+            for lowered in [
+                lower_program(&program),
+                lower_program_per_unit(&program),
+                lower_program_located(&program, &source_map),
+                lower_program_per_unit_located(&program, &source_map),
+            ] {
+                assert!(is_empty(&lowered), "{name}: partial MIR");
+            }
+        }
+    }
+    Ok(())
 }
