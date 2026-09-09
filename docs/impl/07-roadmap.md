@@ -3888,7 +3888,11 @@ required by the plan.
 **Owner-resumed cloud lane (2026-09-08):** the bounded consolidation and subsequent
 consumer-boundary investigation are complete. The selected next consumer is
 `pkg.s3`/SigV4, beginning with the named time and path-encoding prerequisite in
-`std-design/time.md`. Merge each coherent capability before starting the next.
+`std-design/time.md` (implemented in #996). The next required boundary is the
+nameable HTTP client/request/response ownership family in
+`std-design/http-client-composition.md`; S3 needs fallible request preparation and
+caller-owned pool reuse through package helpers. Merge each coherent capability
+before starting the next.
 Other transports and execution/storage items retain their own admission gates.
 
 Planned first-party library capabilities to follow the `pkg.db` product. Ordering and outline below.

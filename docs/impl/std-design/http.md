@@ -1561,3 +1561,11 @@ Exact validation, pointer, ownership, cache, and test contracts: `../pkg-design/
   payload and as an array element; a struct carrying it stays Copy (no drop emitted) with a
   `sema_and_codegen_struct_layout_agree` row. (`crates/align_driver/tests/http_headers_view.rs` +
   `apps_web_root.rs::web_header_reads_the_request_header_table`.)
+
+## Client package composition (designed 2026-09-09)
+
+The complete nameable client/request/response ownership boundary is specified in
+[http-client-composition.md](http-client-composition.md). Implementation is pending;
+its exact carrier, receiver-authority and retained-root records supersede the old
+unnamed-local limitation only when that capability is implemented. HTTP wire,
+transport, timeouts, caps, allocation and retry behavior remain as specified here.

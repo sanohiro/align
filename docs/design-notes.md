@@ -1778,3 +1778,16 @@ domains stay explicit and consumer-driven.
 ## In one sentence
 
 Align is a data-oriented language that aligns human intent, AI generation, compiler optimization, and modern hardware.
+
+### HTTP client package composition — designed
+
+`http_client`, `http_request`, and `http_response` name the existing distinct
+Move owners. The accepted implementation must close by-value/borrowed helper
+boundaries and ordinary recursive owning carriers together. Client network operations accept shared `borrow`; client configuration and
+request setters require `borrow mut` on borrowed receivers. Request serialization
+and response inspection accept shared borrows. The existing bound-owner
+value-carrying `if` gap remains deferred without an HTTP-specific exception. Response views and
+dependent streams retain their exact owner roots through imported helpers.
+This adds no transport, allocation, retry, or runtime ABI policy. The exact
+surface, exclusions, persistence tags and closure matrix are owned by
+`docs/impl/std-design/http-client-composition.md`; implementation is pending.
