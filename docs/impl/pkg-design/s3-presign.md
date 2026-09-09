@@ -1,7 +1,7 @@
 # pkg.s3 — explicit-expiry presigning
 
 > English is authoritative. Japanese mirror: `ja/s3-presign.md`.
-> Status: design candidate, 2026-09-09; implementation follows independent review.
+> Status: design accepted, 2026-09-09; implementation pending.
 
 ## Capability and public-contract ledger
 
@@ -74,8 +74,12 @@ canonical query and added only at P7. Empty user input still produces the five
 mandatory pairs. Token bytes such as `+`, `/` and `=` are percent-encoded as data.
 
 **P4 — headers.** Apply S3 W3's lowercase/whitespace normalization to every user
-header and sort by lowercase name. Include exact origin authority as the one
-generated `host` row in canonical headers and SignedHeaders. Canonical rows end
+header. Add exact origin authority as the one generated `host` row, then sort
+this complete host-plus-user set by lowercase name for both canonical headers
+and SignedHeaders. Filter only Host from that sorted set to obtain the returned
+header array. For user names `x-test` and `content-type`, SignedHeaders is exactly
+`content-type;host;x-test` and output rows are `content-type`, then `x-test`.
+Canonical rows end
 in LF, including the last row; names join with `;`. Do not generate date, payload
 hash, token or Authorization headers. P1 retains all V6 reserved names, including
 those four authentication names. The returned header array contains only the
@@ -148,7 +152,7 @@ No performance or exact allocation-count promise is made; no benchmark is requir
 
 | ID / exact owner | Required implementation and regression closure |
 |---|---|
-| P-G `presign_vectors` | Published AWS 2013-05-24 GET example: canonical hash `3bfa292879f6447bbcda7001decf97f4a54dc650c8942174ae0a9121cf58ad04`, signature `aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404`. Independently assemble canonical bytes and full URL. Exact URL, method and returned header rows cover None/Some token, zero/multiple user headers, encoded prefix sorting, duplicate/empty pairs, binary secret, normalized whitespace, authority/port and UTF-8/NUL/slash/dot paths. Reconstruct captured bytes back to canonical form and verify the signature, excluding only its final pair. |
+| P-G `presign_vectors` | Published AWS 2013-05-24 GET example: canonical hash `3bfa292879f6447bbcda7001decf97f4a54dc650c8942174ae0a9121cf58ad04`, signature `aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404`. Independently assemble canonical bytes and full URL. Exact URL, method and returned header rows cover None/Some token, zero/multiple user headers, encoded prefix sorting, duplicate/empty pairs, binary secret, normalized whitespace, authority/port and UTF-8/NUL/slash/dot paths. User headers on both sides of Host in byte order must produce `content-type;host;x-test` and returned rows `content-type`, `x-test`. Reconstruct captured bytes back to canonical form and verify the signature, excluding only its final pair. |
 | P-V `presign_validation` | Reuse V2–V6 parameterized owners where shared production validators are called; discriminate presign's aggregate and validation entry points. Counts 0/limit/next, expiry -1/0/1/604800/604801/i64 extrema, time -1/0/fraction/max, every reserved query/header category, token None/Some/empty, multi-invalid inputs. Private predicate probes may close impractical size limits, but public calls own admission routing. No rejected input triggers HTTP or sends bytes. |
 | P-O `presign_round_trip` | Output escapes an input arena and temporary credentials/field buffers; original inputs then change or drop. Move result through helpers/Result/Option, replace it, return, destructure, borrow repeatedly and drop nested headers. Existing record/array owners cover if/match/else/?/loop joins, early exit, move-out source nulling and cleanup; add one result-replacement/reuse witness distinguishing this aggregate. Local peer verifies GET and PUT (binary and explicit empty payload), nonempty normalized required headers, token states, shared-client reuse and raw denial response. Arbitrary body variation does not change query authentication. |
 | P-I `presign_imports_effects_cache` | Whole-program/per-unit × Dev/Release use the same URL/wire oracle. Cross-package nominal record/array interface and borrowed projections compile; Impure call is rejected in a parallel closure returning a valid primitive. Cold/warm and private signature-helper edit/restore invalidate artifacts correctly; existing request vectors stay unchanged. The unchanged single-module package inventory includes the new callable surface without native symbols or new source units. |
@@ -176,3 +180,10 @@ Synchronize `s3.md`, both Japanese mirrors, `draft.md`, `docs/language-spec.md`,
 compile the public type/example probe, check the ledger-to-prose Cartesian cases
 and reproduce the published vector with an independent hash/HMAC implementation.
 The type probe is not an implementation or signature witness.
+
+Author closure: the public type/example and exported borrowed consumer compile
+through per-unit checking and LLVM emission. An independent Python oracle
+reproduces the published vector in both directions. The independent full-diff
+design review found one P2 ambiguity in Host ordering; P4 and P-G now explicitly
+sort the complete host-plus-user set and remove Host only from returned rows.
+The author audited every generated/user ordering rule and synchronized the mirror.

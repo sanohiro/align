@@ -1,7 +1,7 @@
 # pkg.s3 — 明示的な有効期間を持つ署名付きURL
 
 > 英語版 `../s3-presign.md` が正本。
-> 状態: 設計候補、2026-09-09。独立レビュー後に実装する。
+> 状態: 設計承認済み、2026-09-09。実装待ち。
 
 ## 能力境界と公開契約台帳
 
@@ -67,8 +67,11 @@ encoding/sortより前に次の生成pairを追加する。
 percent encodingする。
 
 **P4 — header。** 全利用者headerをS3 W3の小文字/空白正規化に通し、
-小文字名でsortする。正確なorigin authorityを唯一の生成 `host` rowとして
-canonical headersとSignedHeadersに含める。最終行も含め各行末はLF、名前の
+正確なorigin authorityを唯一の生成 `host` rowとして加える。このHostと利用者rowの
+全体を小文字名でsortし、canonical headersとSignedHeadersの両方に使う。
+返却header配列はそのsort済み集合からHostだけを除く。利用者名が `x-test` と
+`content-type` ならSignedHeadersは正確に `content-type;host;x-test`、
+返却rowは `content-type`、次に `x-test`。最終行も含め各行末はLF、名前の
 連結は `;`。date/payload hash/token/Authorization headerは生成しない。
 P1はこれら認証名4種も含むV6予約名すべてを維持する。返すheader配列は同じ順の
 正規化済み利用者rowだけでHostを除き、全rowが署名対象。入力headerが空のとき
@@ -131,7 +134,7 @@ URLからwireまでの完全な境界を閉じる。helperだけの独立produce
 
 | ID / 正確なowner | 実装と回帰によるclosure |
 |---|---|
-| P-G `presign_vectors` | AWS公開2013-05-24 GET例: canonical hash `3bfa292879f6447bbcda7001decf97f4a54dc650c8942174ae0a9121cf58ad04`、署名 `aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404`。canonical bytes/完全URLを独立構成。正確なURL/method/header rowでtoken None/Some、headerゼロ/複数、encoded prefix sort、重複/空pair、binary secret、空白、authority/port、UTF-8/NUL/slash/dot pathを網羅。captureしたbyteからcanonical形へ逆構成し、最後の署名pairだけを除いて検証する。 |
+| P-G `presign_vectors` | AWS公開2013-05-24 GET例: canonical hash `3bfa292879f6447bbcda7001decf97f4a54dc650c8942174ae0a9121cf58ad04`、署名 `aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404`。canonical bytes/完全URLを独立構成。正確なURL/method/header rowでtoken None/Some、headerゼロ/複数、encoded prefix sort、重複/空pair、binary secret、空白、authority/port、UTF-8/NUL/slash/dot pathを網羅。Hostのbyte順前後に利用者headerを置き、`content-type;host;x-test` と返却row `content-type`、`x-test` を検証する。captureしたbyteからcanonical形へ逆構成し、最後の署名pairだけを除いて検証する。 |
 | P-V `presign_validation` | 本番validatorを共有するV2–V6 parameterized ownerを再利用し、presignの件数/検証入口を区別する。件数0/上限/次、期間-1/0/1/604800/604801/i64両端、時刻-1/0/小数/max、予約query/header全分類、token None/Some/空、複合不正入力。巨大サイズは非公開predicate probeでも閉じられるが公開呼出で入口を確認する。拒否入力はHTTPも送信も行わない。 |
 | P-O `presign_round_trip` | 入力arena、一時credentials/field bufferを抜けて結果を返し、元入力を変更/破棄する。helper/Result/Optionでmove、置換、return、分解、反復借用、nested header Drop。if/match/else/?/loop join、early exit、move-out source nulling、cleanupは既存record/array ownerを再利用し、このaggregateを区別する置換/再利用caseを加える。local peerでGET/PUT(binary/明示空body)、正規化した必要header、token両状態、client再利用、raw拒否responseを検証。bodyを変えてもquery認証は変わらない。 |
 | P-I `presign_imports_effects_cache` | whole-program/per-unit × Dev/Releaseで同じURL/wire oracle。package越しnominal record/array interfaceとborrowed projectionをcompile。正しいprimitiveを返す並列closureでImpure呼出を拒否。cold/warm、非公開署名helper変更/復元でartifactが正しく失効し、既存request vectorは不変。単一moduleの既存package inventoryで新callableを含み、native symbol/source unitは増えない。 |
@@ -155,3 +158,8 @@ schema、SigV4a、provider固有認証は対象外。
 `docs/open-questions.md`、`docs/impl/07-roadmap.md` を同期する。`HANDOFF.md` は能力境界を
 一度記録する。独立レビュー前に公開型/例probeをcompileし、台帳とproseの状態組合せを
 照合し、独立hash/HMAC実装で公開vectorを再現する。型probeは実装/署名の証拠ではない。
+
+著者closure: 公開型/例とexportしたborrowed consumerはper-unit checkとLLVM emissionを
+通過した。独立Python oracleで公開vectorを双方向に再現した。全差分の独立設計レビューは
+Host順序の曖昧さをP2として1件指摘し、P4/P-GでHostと利用者row全体のsortと、
+返却rowからだけHostを除く規則を明記した。著者は全生成/利用者順序規則を監査しmirrorを同期した。
