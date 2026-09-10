@@ -4845,6 +4845,17 @@ fn xml_dict_field_ty(program: &Program, id: u32, key: u32, index: u32) -> Option
     }
 }
 
+/// Physical inline field GEPs traverse ordinary records only; SoA fields are column views.
+fn inline_struct_path_ty(program: &Program, id: u32, path: &[u32]) -> Option<Ty> {
+    if path.is_empty() { return None; }
+    let mut ty = Ty::Struct(id);
+    for field in path {
+        let Ty::Struct(id) = ty else { return None; };
+        ty = program.structs.get(id as usize)?.fields.get(*field as usize)?.ty;
+    }
+    Some(ty)
+}
+
 fn xml_selected_ty(
     program: &Program,
     mut ty: Ty,
@@ -7165,10 +7176,10 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 };
-                if !matches!(slot_ty, Ty::StructArray(..)) {
+                let Ty::StructArray(struct_id, _) = slot_ty else {
                     equation.invalid = true;
                     return equation;
-                }
+                };
                 let mut result_path = vec![XmlAccessPathSegment::Element];
                 result_path.extend(
                     fields
@@ -7177,7 +7188,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         .map(XmlAccessPathSegment::StructField),
                 );
                 let Some(expected_result) =
-                    xml_selected_ty(self.graph.program, slot_ty, &result_path)
+                    inline_struct_path_ty(self.graph.program, struct_id, &fields)
                 else {
                     equation.invalid = true;
                     return equation;
@@ -7397,7 +7408,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 if fields.is_empty() { equation.invalid = true; return equation; }
                 let mut source_path = vec![XmlAccessPathSegment::Element];
                 source_path.extend(fields.iter().copied().map(XmlAccessPathSegment::StructField));
-                let Some(field_ty) = xml_selected_ty(self.graph.program, base_ty, &source_path) else {
+                let Some(field_ty) = inline_struct_path_ty(self.graph.program, struct_id, &fields) else {
                     equation.invalid = true;
                     return equation;
                 };
@@ -14270,6 +14281,42 @@ fn validate_slice_index_rvalues(program: &Program) -> Result<(), CodegenError> {
                 let Stmt::Let(value, rvalue) = statement else {
                     continue;
                 };
+                // Plain scalar leaves do not necessarily enter the ownership graph. Certify
+                // physical inline paths here for every result, before any LLVM GEP construction.
+                let field_access = match rvalue {
+                    Rvalue::IndexFieldPtr { base, index, path, struct_id } => {
+                        let root_matches = matches!(preflight_operand_ty(function, base),
+                            Some(Ty::DynStructArray(id, Layout::Aos) | Ty::Slice(Scalar::Struct(id))) if id == *struct_id);
+                        Some((root_matches.then_some(*struct_id), index, path, false))
+                    }
+                    Rvalue::IndexField(slot, index, path) => {
+                        let root = match function.slots.get(*slot as usize) {
+                            Some(Ty::StructArray(id, _)) => Some(*id),
+                            _ => None,
+                        };
+                        Some((root, index, path, true))
+                    }
+                    _ => None,
+                };
+                if let Some((root, index, path, fixed)) = field_access {
+                    let leaf = root.and_then(|id| inline_struct_path_ty(program, id, path));
+                    let result = function.value_tys.get(*value as usize).copied();
+                    let valid_leaf = leaf.is_some_and(|leaf| {
+                        if leaf == Ty::String { result == Some(Ty::Str) }
+                        else {
+                            result == Some(leaf) && ((fixed && matches!(leaf, Ty::Resource(_)))
+                                || !align_sema::ty_is_move(leaf, &program.structs, &program.tuples,
+                                    &program.enums, &program.tagged_types))
+                        }
+                    });
+                    if !valid_leaf || preflight_operand_ty(function, index) != Some(i64_ty) {
+                        return Err(CodegenError::Lowering(format!(
+                            "indexed field MIR in function '{}' has an invalid inline path or leaf type: {:?}, {:?}, {:?}, {:?}",
+                            function.name, root, leaf, result, preflight_operand_ty(function, index)
+                        )));
+                    }
+                    continue;
+                }
                 let (source, index, noalias) = match rvalue {
                     Rvalue::SliceIndex(source, index) => (source, index, false),
                     Rvalue::SliceIndexNoalias { slice, index, .. } => (slice, index, true),
@@ -43816,6 +43863,17 @@ fn main() -> i32 = 0
                     reject(&bad, "owning String slice read");
                 }
             }
+        }
+        for body in [
+            "fn read(view: slice<Row>) -> i64 = view[0].inner.number\nfn main() {}\n",
+            "fn read(view: array<Row>) -> i64 = view[0].inner.number\nfn main() {}\n",
+            "fn fixed() -> i64 { rows := [Row { inner: Inner { number: 1 } }]\nreturn rows[0].inner.number }\nfn main() {}\n",
+        ] {
+            let mut soa_path = mir(&format!("Inner {{ number: i64 }}\nRow {{ inner: Inner }}\n{body}"));
+            let row = soa_path.structs.iter().position(|record| record.name == "Row").ok_or("nested SoA row")?;
+            let Ty::Struct(inner) = soa_path.structs[row].fields[0].ty else { return Err("nested SoA field"); };
+            soa_path.structs[row].fields[0].ty = Ty::Soa(inner);
+            reject(&soa_path, "SoA intermediate is not an inline record path");
         }
         let mut nested_reads = 0;
         for (fi, function) in base.fns.iter().enumerate() {

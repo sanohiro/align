@@ -170,3 +170,23 @@ fixed-element-array variant for a fixed-slot BorrowedFixedElementPlace. It now
 requires exactly StructArray, matching physical place validation; no dynamic
 alternative is admitted. Existing index/path/type/callee/cleanup validation and
 root authority are preserved. The original owner closes this correction.
+
+The revised full-diff review found one P2 in malformed MIR: generic provenance
+field traversal admitted a SoA intermediate although an inline GEP requires an
+ordinary Struct. A shared strict inline-path classifier now certifies both
+IndexField and IndexFieldPtr. The unconditional indexed-load preflight applies
+the path and leaf checks to scalar results as well as ownership-bearing results;
+scalar leaves cannot rely solely on the ownership graph. Slice, dynamic and fixed
+root mutation twins reject the SoA substitution across all emission entrypoints.
+This closes the original path invariant without changing the public contract or
+IR strategy.
+
+Unconditional scalar validation also exposed an existing pipeline producer gap:
+a second field Project, or a field predicate after Project, read the original
+source row rather than the current Copy record. All five pipeline lowering
+consumers now project from the current value after the first indexed read.
+This does not admit Move pipeline elements or add an intermediate Move owner.
+struct_index::nested_pipeline_fields_use_the_current_record exercises reduction,
+collection, map_into, partition, parallel reduction and JSON scanning with distinct
+outer padding/inner values and an inner bool predicate. The existing whole/per-unit
+plan-decision owner closes imported producer certification for this same shape.

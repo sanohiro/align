@@ -13256,6 +13256,23 @@ fn lower_zip_element(
     Operand::Value(tuple)
 }
 
+/// Later projections and field predicates read the current pipeline record, not the source row.
+/// Pipeline records are already Copy values; this creates no Move intermediate owner.
+fn lower_current_pipeline_field(
+    b: &mut Builder,
+    current: &Option<Operand>,
+    field: u32,
+    out_ty: Ty,
+) -> Option<ValueId> {
+    let Some(Operand::Value(value)) = current else { return None; };
+    let ty = b.value_tys[*value as usize];
+    let slot = b.new_slot(ty);
+    b.push(Stmt::Store(slot, Operand::Value(*value)));
+    let result = b.fresh_value(out_ty);
+    b.push(Stmt::Let(result, Rvalue::Field(slot, vec![field])));
+    Some(result)
+}
+
 /// The **single layout seam** for struct-array element-field addressing — the one place that
 /// turns `arr[i].field` into a load, shared by the fused pipeline (8d-2) and surface indexing
 /// (8f). A stack-slot (fixed) `array<Struct>` is always AoS and uses the slot-based
@@ -13715,7 +13732,8 @@ fn lower_array_reduce(
     for (stage_idx, stage) in stages.iter().enumerate() {
         match &stage.kind {
             hir::StageKind::Project { field } => {
-                let v = lower_field_access(
+                let v = lower_current_pipeline_field(b, &cur, *field, stage.out_ty)
+                    .unwrap_or_else(|| lower_field_access(
                     b,
                     struct_view,
                     &slice_val,
@@ -13723,7 +13741,7 @@ fn lower_array_reduce(
                     &index,
                     *field,
                     stage.out_ty,
-                );
+                ));
                 cur = Some(Operand::Value(v));
             }
             hir::StageKind::Map { func, .. } => {
@@ -13820,7 +13838,8 @@ fn lower_array_reduce(
             hir::StageKind::WhereField { field } => {
                 // Predicate on a struct element's (bool) field; the element is unchanged.
                 let pred =
-                    lower_field_access(b, struct_view, &slice_val, slot, &index, *field, Ty::Bool);
+                    lower_current_pipeline_field(b, &cur, *field, Ty::Bool)
+                    .unwrap_or_else(|| lower_field_access(b, struct_view, &slice_val, slot, &index, *field, Ty::Bool));
                 if guard_rejected {
                     let accepted = b.new_block();
                     b.terminate(Term::Branch(Operand::Value(pred), accepted, cont));
@@ -14110,7 +14129,8 @@ fn lower_json_scan_reduce(
     for (stage_idx, stage) in stages.iter().enumerate() {
         match &stage.kind {
             hir::StageKind::Project { field } => {
-                let v = lower_field_access(b, None, &None, row, &index, *field, stage.out_ty);
+                let v = lower_current_pipeline_field(b, &cur, *field, stage.out_ty)
+                    .unwrap_or_else(|| lower_field_access(b, None, &None, row, &index, *field, stage.out_ty));
                 cur = Some(Operand::Value(v));
             }
             hir::StageKind::Map { func, .. } => {
@@ -14146,7 +14166,8 @@ fn lower_json_scan_reduce(
                 b.cur = accepted;
             }
             hir::StageKind::WhereField { field } => {
-                let pred = lower_field_access(b, None, &None, row, &index, *field, Ty::Bool);
+                let pred = lower_current_pipeline_field(b, &cur, *field, Ty::Bool)
+                    .unwrap_or_else(|| lower_field_access(b, None, &None, row, &index, *field, Ty::Bool));
                 let accepted = b.new_block();
                 b.terminate(Term::Branch(Operand::Value(pred), accepted, cont));
                 b.cur = accepted;
@@ -14507,7 +14528,8 @@ fn lower_array_collect(
     for (stage_idx, stage) in stages.iter().enumerate() {
         match &stage.kind {
             hir::StageKind::Project { field } => {
-                let v = lower_field_access(
+                let v = lower_current_pipeline_field(b, &cur, *field, stage.out_ty)
+                    .unwrap_or_else(|| lower_field_access(
                     b,
                     struct_view,
                     &slice_val,
@@ -14515,7 +14537,7 @@ fn lower_array_collect(
                     &index,
                     *field,
                     stage.out_ty,
-                );
+                ));
                 cur = Some(Operand::Value(v));
             }
             hir::StageKind::Map { func, .. } => {
@@ -14601,7 +14623,8 @@ fn lower_array_collect(
             }
             hir::StageKind::WhereField { field } => {
                 let pred =
-                    lower_field_access(b, struct_view, &slice_val, slot, &index, *field, Ty::Bool);
+                    lower_current_pipeline_field(b, &cur, *field, Ty::Bool)
+                    .unwrap_or_else(|| lower_field_access(b, struct_view, &slice_val, slot, &index, *field, Ty::Bool));
                 let keep = b.new_block();
                 b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
                 b.cur = keep;
@@ -14846,7 +14869,8 @@ fn lower_array_map_into(
     for (stage_idx, stage) in stages.iter().enumerate() {
         match &stage.kind {
             hir::StageKind::Project { field } => {
-                let v = lower_field_access(
+                let v = lower_current_pipeline_field(b, &cur, *field, stage.out_ty)
+                    .unwrap_or_else(|| lower_field_access(
                     b,
                     struct_view,
                     &slice_val,
@@ -14854,7 +14878,7 @@ fn lower_array_map_into(
                     &index,
                     *field,
                     stage.out_ty,
-                );
+                ));
                 cur = Some(Operand::Value(v));
             }
             hir::StageKind::Map { func, .. } => {
@@ -15946,7 +15970,8 @@ fn lower_array_partition(
     for (stage_idx, stage) in stages.iter().enumerate() {
         match &stage.kind {
             hir::StageKind::Project { field } => {
-                let v = lower_field_access(
+                let v = lower_current_pipeline_field(b, &cur, *field, stage.out_ty)
+                    .unwrap_or_else(|| lower_field_access(
                     b,
                     struct_view,
                     &slice_val,
@@ -15954,7 +15979,7 @@ fn lower_array_partition(
                     &index,
                     *field,
                     stage.out_ty,
-                );
+                ));
                 cur = Some(Operand::Value(v));
             }
             hir::StageKind::Map { func, .. } => {
@@ -16035,7 +16060,8 @@ fn lower_array_partition(
             }
             hir::StageKind::WhereField { field } => {
                 let pred =
-                    lower_field_access(b, struct_view, &slice_val, slot, &index, *field, Ty::Bool);
+                    lower_current_pipeline_field(b, &cur, *field, Ty::Bool)
+                    .unwrap_or_else(|| lower_field_access(b, struct_view, &slice_val, slot, &index, *field, Ty::Bool));
                 let keep = b.new_block();
                 b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
                 b.cur = keep;

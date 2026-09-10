@@ -10285,7 +10285,7 @@ fn main() -> i32 = 0\n";
 
         let mut per_unit_map = SourceMap::new();
         let walk = build_per_unit_located(&mut per_unit_map, "plan.align", source);
-        assert!(!walk.diags.has_errors());
+        assert!(!walk.diags.has_errors(), "{:?}", walk.diags.iter().map(|diag| &diag.message).collect::<Vec<_>>());
         assert_eq!(walk.units.len(), 1);
         let per_unit = &walk.units[0].mir;
         assert_eq!(

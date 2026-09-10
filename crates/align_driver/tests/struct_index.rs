@@ -589,3 +589,35 @@ fn main() -> Result<(), Error> = Ok(())
         assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
     }
 }
+
+#[test]
+fn nested_pipeline_fields_use_the_current_record() {
+    if !backend_available() { return; }
+    let source = r#"import core.json
+Inner { keep: bool, value: i64 }
+Outer { padding: i64, inner: Inner }
+fn big(value: i64) -> bool = value > 15
+fn double(value: i64) -> i64 = value * 2
+fn main() -> Result<(), Error> {
+    rows := [Outer { padding: 900, inner: Inner { keep: true, value: 10 } }, Outer { padding: 800, inner: Inner { keep: false, value: 20 } }]
+    print(rows.inner.value.sum())
+    print(rows.inner.where(.keep).value.sum())
+    values := rows.inner.value.to_array()
+    print(values.sum())
+    mut output := [0, 0]
+    mut destination: slice<i64> := output
+    rows.inner.value.map_into(destination)
+    print(output.sum())
+    (large, small) := rows.inner.value.partition(big)
+    print(large.sum())
+    print(small.sum())
+    print(rows.inner.value.par_map(double).sum())
+    scanner: json.scanner<Outer> := json.scan("[{\"padding\":900,\"inner\":{\"keep\":true,\"value\":10}},{\"padding\":800,\"inner\":{\"keep\":false,\"value\":20}}]")
+    print(scanner.inner.where(.keep).value.sum()?)
+    return Ok(())
+}
+"#;
+    let out = build_and_run("nested-pipeline-fields", source);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "30\n10\n30\n30\n20\n10\n60\n10\n");
+}
