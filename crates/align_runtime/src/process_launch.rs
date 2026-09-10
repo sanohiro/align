@@ -1045,8 +1045,15 @@ pub(crate) mod tests {
             std::thread::yield_now();
         }
         let mut byte = [0];
-        assert_eq!(child.stdout.read(&mut byte).unwrap(), Some(0));
         let mut readiness = [0u8; 3];
+        // Terminal status is not a pipe-lifetime witness. Cache stdout EOF only
+        // after its own readiness; another concurrent native launch can retain a
+        // transient pre-exec duplicate even after this child has exited.
+        assert_eq!(unsafe { super::super::process_live::align_rt_child_poll(
+            &mut *child, 1, 5_000_000_000, readiness.as_mut_ptr().cast(),
+        ) }, 0);
+        assert_eq!(readiness, [1,0,0]);
+        assert_eq!(child.stdout.read(&mut byte).unwrap(), Some(0));
         assert_eq!(
             unsafe {
                 super::super::process_live::align_rt_child_poll(
@@ -1063,6 +1070,10 @@ pub(crate) mod tests {
         assert_eq!(byte, [b'x']);
         let result = child.wait().unwrap();
         assert_eq!(result.termination.exited, 0);
+        assert_eq!(unsafe { super::super::process_live::align_rt_child_poll(
+            &mut *child, 2, 5_000_000_000, readiness.as_mut_ptr().cast(),
+        ) }, 0);
+        assert_eq!(readiness, [0,1,0]);
         assert_eq!(child.stderr.read(&mut byte).unwrap(), Some(0));
         for (interest, timeout) in [(0, 0), (8, 0), (1, -1)] {
             assert_eq!(
