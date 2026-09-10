@@ -514,7 +514,7 @@ fn built() -> Result<xml.reader, Error> {
   return xml.parse(output.to_string())
 }
 fn json_generated(row: JsonRow) -> Result<xml.reader, Error> {
-  encoded := json.encode(row)
+  encoded := json.encode(row)?
   return xml.parse(encoded.clone())
 }
 fn file_generated(path: str) -> Result<xml.reader, Error> = xml.parse(fs.read_file(path)?)

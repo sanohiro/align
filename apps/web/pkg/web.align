@@ -189,7 +189,7 @@ pub fn text(s: str) -> Result<response_builder, Error> = status_text(200, s)
 //
 // `body` is the ENCODED document, not a value: Align has no user-written generics, so a `json(x)`
 // that encoded `x` itself is not expressible — and writing the encode at the call site
-// (`web.json(json.encode(m))`) is the better reading anyway, since the allocation that encoding
+// (`web.json(json.encode(m)?)`) is the better reading anyway, since the allocation that encoding
 // performs stays visible in the handler (Nothing hidden).
 pub fn status_json(code: i64, body: str) -> Result<response_builder, Error> {
   rb := http.response(code)

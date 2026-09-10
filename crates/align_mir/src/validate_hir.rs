@@ -3208,9 +3208,9 @@ impl<'a> LocalScopeValidator<'a> {
             | hir::ExprKind::Field { root: local, .. }
             | hir::ExprKind::SoaColumn { base: local, .. }
             | hir::ExprKind::IndexField { base: local, .. }
-            | hir::ExprKind::JsonEncodeBounded { base: local, .. }
-            | hir::ExprKind::JsonOwnedEncode { base: local, .. }
-            | hir::ExprKind::JsonOwnedEncodeBounded { base: local, .. }
+            | hir::ExprKind::JsonEncode { base: local, plan: align_sema::hir::JsonEncodePlan::Pieces(_), .. }
+            | hir::ExprKind::JsonEncode { base: local, plan: align_sema::hir::JsonEncodePlan::Owned(_), max_bytes: None, .. }
+            | hir::ExprKind::JsonEncode { base: local, plan: align_sema::hir::JsonEncodePlan::Owned(_), max_bytes: Some(_), .. }
             | hir::ExprKind::ArrayGroupAgg { base: local, .. }
             | hir::ExprKind::ArrayGroupAggMulti { base: local, .. }
             | hir::ExprKind::ArrayDictEncode { base: local, .. } => Some(*local),
@@ -4479,13 +4479,13 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::Template(parts) => {
                 !parts.is_empty() && self.template_parts_envelope_ok(parts)
             }
-            hir::ExprKind::JsonOwnedEncode { base, plan } => {
+            hir::ExprKind::JsonEncode { base, plan: align_sema::hir::JsonEncodePlan::Owned(plan), max_bytes: None } => {
                 self.owned_json_source_ok(*base, plan, context)
             }
-            hir::ExprKind::JsonEncodeBounded { parts, .. } => {
+            hir::ExprKind::JsonEncode { plan: align_sema::hir::JsonEncodePlan::Pieces(parts), .. } => {
                 !parts.is_empty() && self.json_encode_parts_envelope_ok(parts)
             }
-            hir::ExprKind::JsonOwnedEncodeBounded { base, plan, .. } => {
+            hir::ExprKind::JsonEncode { base, plan: align_sema::hir::JsonEncodePlan::Owned(plan), max_bytes: Some(_), .. } => {
                 self.owned_json_source_ok(*base, plan, context)
             }
             hir::ExprKind::JsonDecode { struct_id, .. }
@@ -5831,8 +5831,8 @@ impl<'a> BodyValidator<'a> {
         })
     }
 
-    fn owned_json_plan_ok(&self, plan: &hir::OwnedJsonGraphPlanV2) -> bool {
-        align_sema::owned_json_graph_plan_v2(&self.program.structs, plan.root)
+    fn owned_json_plan_ok(&self, plan: &hir::OwnedJsonGraphPlanV3) -> bool {
+        align_sema::owned_json_graph_plan_v3(&self.program.structs, plan.root)
             .is_ok_and(|rebuilt| rebuilt == *plan)
             && {
                 let drop = align_sema::drop_plan(
@@ -5848,7 +5848,7 @@ impl<'a> BodyValidator<'a> {
     fn owned_json_source_ok(
         &self,
         base: hir::LocalId,
-        plan: &hir::OwnedJsonGraphPlanV2,
+        plan: &hir::OwnedJsonGraphPlanV3,
         context: &BodyContext,
     ) -> bool {
         self.local_ok(context, base)
@@ -6905,12 +6905,10 @@ impl<'a> BodyValidator<'a> {
                         }
                     }
                 }
-                hir::ExprKind::JsonEncodeBounded {
-                    parts, max_bytes, ..
-                } => {
+                hir::ExprKind::JsonEncode { plan: align_sema::hir::JsonEncodePlan::Pieces(parts), max_bytes, .. } => {
                     // The source accesses encoded by `parts` are evaluated before the explicit limit.
                     // Push in reverse because this worklist is LIFO.
-                    push_expr!(max_bytes, context.clone());
+                    if let Some(max_bytes) = max_bytes { push_expr!(max_bytes, context.clone()); }
                     for part in parts.iter().rev() {
                         match part {
                             hir::TemplatePart::Hole(expr) | hir::TemplatePart::JsonStr(expr) => {
@@ -6927,8 +6925,8 @@ impl<'a> BodyValidator<'a> {
                         }
                     }
                 }
-                hir::ExprKind::JsonOwnedEncode { .. } => {}
-                hir::ExprKind::JsonOwnedEncodeBounded { max_bytes, .. } => {
+                hir::ExprKind::JsonEncode { plan: align_sema::hir::JsonEncodePlan::Owned(_), max_bytes: None, .. } => {}
+                hir::ExprKind::JsonEncode { plan: align_sema::hir::JsonEncodePlan::Owned(_), max_bytes: Some(max_bytes), .. } => {
                     push_expr!(max_bytes, context.clone());
                 }
                 hir::ExprKind::JsonDecode { input, .. }
@@ -10749,57 +10747,24 @@ impl<'a> BodyValidator<'a> {
                 let (falls, breaks) = strict_flow(&[receiver, index_flow]);
                 Some((leaf, falls, breaks))
             }
-            hir::ExprKind::Template(parts) => self.derive_template_expression(parts, context),
-            hir::ExprKind::JsonOwnedEncode { base, plan } => {
-                self.derive_owned_json_encode_expression(*base, plan, context)
-            }
-            hir::ExprKind::JsonEncodeBounded {
-                base,
-                parts,
-                max_bytes,
-            } => {
-                let (template_ty, template_falls, template_breaks) =
-                    self.derive_json_encode_expression(*base, parts, context)?;
-                let limit = self.expr_flow(max_bytes)?;
-                if template_ty != Ty::Str || limit.ty != i64_ty() {
-                    return None;
-                }
-                let template = BodyFlow {
-                    ty: template_ty,
-                    falls: template_falls,
-                    breaks: template_breaks,
+            hir::ExprKind::Template(parts) => {
+                if !parts.iter().all(|part| matches!(part, hir::TemplatePart::Text(_) | hir::TemplatePart::Hole(_))) { return None; }
+                self.derive_template_expression(parts, context)
+            },
+            hir::ExprKind::JsonEncode { base, plan, max_bytes } => {
+                let (template_ty, template_falls, template_breaks) = match plan {
+                    hir::JsonEncodePlan::Pieces(parts) => self.derive_json_encode_expression(*base, parts, context)?,
+                    hir::JsonEncodePlan::Owned(plan) => self.derive_owned_json_encode_expression(*base, plan, context)?,
                 };
-                let error = self.error_id()?;
-                let (falls, breaks) = strict_flow(&[template, limit]);
-                Some((
-                    Ty::Result(Scalar::String, Scalar::Enum(error)),
-                    falls,
-                    breaks,
-                ))
-            }
-            hir::ExprKind::JsonOwnedEncodeBounded {
-                base,
-                plan,
-                max_bytes,
-            } => {
-                let (template_ty, template_falls, template_breaks) =
-                    self.derive_owned_json_encode_expression(*base, plan, context)?;
-                let limit = self.expr_flow(max_bytes)?;
-                if template_ty != Ty::Str || limit.ty != i64_ty() {
-                    return None;
+                if template_ty != Ty::Str { return None; }
+                let mut flows = vec![BodyFlow { ty: template_ty, falls: template_falls, breaks: template_breaks }];
+                if let Some(limit) = max_bytes {
+                    let limit = self.expr_flow(limit)?;
+                    if limit.ty != i64_ty() { return None; }
+                    flows.push(limit);
                 }
-                let template = BodyFlow {
-                    ty: template_ty,
-                    falls: template_falls,
-                    breaks: template_breaks,
-                };
-                let error = self.error_id()?;
-                let (falls, breaks) = strict_flow(&[template, limit]);
-                Some((
-                    Ty::Result(Scalar::String, Scalar::Enum(error)),
-                    falls,
-                    breaks,
-                ))
+                let (falls, breaks) = strict_flow(&flows);
+                Some((Ty::Result(Scalar::String, Scalar::Enum(self.error_id()?)), falls, breaks))
             }
             hir::ExprKind::JsonDecode { struct_id, input } => {
                 self.derive_json_decode_struct(*struct_id, input, context, false)
@@ -11520,7 +11485,7 @@ impl<'a> BodyValidator<'a> {
     fn derive_owned_json_encode_expression(
         &self,
         base: hir::LocalId,
-        plan: &hir::OwnedJsonGraphPlanV2,
+        plan: &hir::OwnedJsonGraphPlanV3,
         context: &BodyContext,
     ) -> Option<(Ty, bool, Vec<Ty>)> {
         if !self.owned_json_source_ok(base, plan, context) {

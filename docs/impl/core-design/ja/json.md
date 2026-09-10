@@ -63,7 +63,28 @@ implementation PR を開く前に、author-side matrix-to-diff pass で全 appli
 owner test に対応付ける。benchmark-evidence document は別の trusted measurement boundary であり、この
 language/runtime contract を定義しない。
 
-## Direct owned record（Request 9）
+## Owned JSON record
+
+**R63 の契約（2026-09-10）。**
+[詳細契約](../../47-json-numeric-contract.md) を数値変換と encode の正本とする。
+`json.encode(value)` と `json.encode_bounded(value, max_bytes: i64)` は共に
+`Result<string, Error>` を返す。入力を呼び出し中だけ借用し、成功時は伸長バッファの
+所有権を移して独立した string を返す。arena 内でも同じで、最後の全体コピーはない。
+選択された非有限 float、負の上限、上限超過は `Error.Invalid` とし、部分結果を返さない。
+割り当て失敗の terminal 方針は維持する。decode は f32/f64 へ直接最近接・偶数丸めし、
+符号付きゼロと subnormal を保持する。丸めた結果が非有限なら `Error.Code(1)`。
+`json.doc` の `as_f64()` はこの範囲エラーで None を返すが、文法上有効な巨大な数は
+ナビゲーションや読み飛ばしで受理する。数値の先頭ゼロは拒否する。有限値の encode は
+元の幅で最短の有効数字を選ぶ固定小数点表記と `.0` / `-0.0` を維持する。
+通常の template と print は変更しない。owned graph の既存 scalar/Option/array の各位置に
+f32/f64 を追加し、他の root/container 制限は維持する。descriptor/envelope は V3、
+interface は 11 から 12 へ統一し、互換経路は残さない。以下の古い float 除外、
+`encode -> str`、V1/V2 transport、実装状況の記述はこの変更が置き換える。
+古い golden vector は履歴として残す。所有者が R63 の再検討を明示的に承認したため、
+本件に追加の friction 件数条件はない。性能は計画に沿う実装前後のローカル計測で確認し、
+未計測の速度保証はしない。
+
+### Request 9 の過去の境界
 
 Request 9 は、既存の inferred operation に、closed で flat な owned-record graph を1つ追加する。
 implementation は shipped である。direct record に direct `string`、
@@ -106,7 +127,7 @@ scalar-array、`json.doc`、recursively-Copy `json.scan` route は変更しな�
 exact public ledger、descriptor bytes、error precedence、implementation closure matrix、golden vector の
 正本は [`../../24-owned-json-plan.md`](../../24-owned-json-plan.md) である。
 
-## Recursive owned record（Request 13、design accepted）
+### Request 13 の過去の境界
 
 Request 13 は同じ3つの inferred operation を維持したまま、flat な owned implementation boundary を
 acyclic で view-free な単一 graph に置き換える。transitive な owned `string` が route を選ぶ。graph
@@ -131,10 +152,10 @@ bytes、validation order、C6 fixture scope、implementation matrix の正本は
 [`../../25-recursive-owned-json-plan.md`](../../25-recursive-owned-json-plan.md) である。implementation は
 pending であり、直前の Request 9 section が現在 shipped している compiler behavior である。
 
-## Signatures (pending と明記したものを除き verified)
+## Signatures
 
 ```text
-json.encode(x)   -> str                      // x: struct (nested structs recurse); str fields JSON-escaped
+json.encode(x)   -> Result<string, Error>
 json.encode_bounded(x, max_bytes: i64) -> Result<string, Error>
 json.decode(s)   -> Result<T, Error>         // T from the binding/context: u: User := json.decode(s)?
 
@@ -271,12 +292,10 @@ region-tie される（`struct_has_str` が再帰する）。上で説明した�
 
 ## Type & ownership classification
 
-- `encode` は内部的に string builder を使用して文字列を構築する。戻り値は arena に region 付けされた `str` となる。
-- `encode_bounded` は同じ受理済み値グラフを借用し、同じ順序の encode piece を使うが、
-  inclusive な `max_bytes` 以下で成功したときは個別所有の `string` を1つ返す。上限は成長前の
-  UTF-8 出力バイトへ適用され、負値または超過は部分結果を返さず `Error.Invalid` になる。
-  shipped operation 自体は新しい JSON shape を受理しない。accepted Request 13 implementation は、
-  flat owned part を両方の encode operation が共有する単一の V2 descriptor-driven root writer に置き換える。
+- 確定した R63 契約では両 encode が入力を呼び出し中だけ借用し、arena 内でも独立した
+  owned string を Result で返す。伸長バッファを移し、最後の全体コピーはしない。
+  失敗時は部分 string を公開せず内部バッファを解放する。bounded 版では伸長前に
+  inclusive な UTF-8 バイト上限も検査する。両 API は V3 graph/writer を共有する。
 - `array<T>` / `array<Struct>` への `decode` は、所有権を持つ Move 配列を生成する（破棄時は deep-drop される）。
 - `soa<T>` への `decode` は、外側の arena に列（カラム）を割り当てる（`align_rt_json_decode_soa` により、1 回のカウント用パスと 1 回の値パース用パスが `FieldDst` を介して Mison の投機的実行（speculation）パスを共有する）。
 - デコードされた `str` フィールドや列は、**入力された `str` へのビュー（参照）** である。そのため、入力データはデコード結果よりも長生きしなければならず、これは region チェッカによって強制される。
@@ -289,11 +308,12 @@ Pure（パース処理は純粋な計算であり、I/O は発生しない。バ
 
 不正なデータはすべて `Err(Error)` として扱われ、パニックが発生したり、静かに誤った値が返されたりすることは決してない。これには構文エラー、フィールドの欠落、型の不一致、**範囲外の整数** が含まれる（符号を考慮するフィールドタグ、#295。`u64` フィールドは単一のディスパッチャを経由して `u64` の全範囲を受け入れる、#311）。宣言済みフィールドは正確に1回だけ現れなければならず、重複した宣言済みキーは strict path と speculative path の両方で `Err` になる。学習済みパターンが未照会位置とみなした場所に重複が現れた場合も同じであり、未宣言キーだけが読み飛ばされる。
 
-`encode_bounded` は `encode` の fallible なリソース境界版である。負の上限、または inclusive な上限を
-超える最初の出力バイトは `Err(Error.Invalid)` になる。allocator failure は言語全体で既存の terminal-abort
-方針を保つ。成功時のバイト列は、宣言順キー、数値表現、escape、`None` の省略、配列、union を含めて
-`encode` と byte-identical である。ここでいう “canonical” は RFC 8785 sorting を意味しない。
-正式な契約と closure matrix は `../17-library-boundary-prerequisites.md` §7.7 にある。
+R63 では選択された非有限 float を両 encode が `Err(Error.Invalid)` として返す。
+bounded 版の負の上限と超過も同じエラーとなる。成功時は同一の canonical bytes を所有する。
+decode の対象幅への直接丸め後の overflow は `Error.Code(1)`、document の数値 accessor は
+None を返す。割り当て失敗は terminal のままである。確定した契約と closure matrix の正本は
+[plan 47](../../47-json-numeric-contract.md) である。この契約が上の Request 9/13 の
+古い実装経過に優先する。
 
 ## Regions
 

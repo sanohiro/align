@@ -5,6 +5,13 @@ This is an adoption assessment and capability plan. The candidate interfaces bel
 are design notation, not shipped declarations. H1 proceeds under the exact
 [incremental SHA-256 ledger](41-incremental-sha256-plan.md). R65 has explicit
 unclosed platform and lifecycle decisions; it is not ready for implementation.
+The owner's subsequent request to address R65 and R63 proceeds under
+[plan 46](46-deferred-client-boundaries-plan.md): namespace ownership qualification
+and the shared JSON numeric-validity decision precede their exact implementation
+contracts. The owner has since admitted R63 reconsideration for standard JSON
+support with performance preservation; [plan 47](47-json-numeric-contract.md)
+now owns the exact R63 contract and review status, superseding the initial deferral
+below. R65 remains under plan 46.
 
 ## 1. Evidence and scope
 

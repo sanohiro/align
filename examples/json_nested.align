@@ -22,6 +22,6 @@ fn main() -> Result<(), Error> {
   print(r.choice.message.role)      // assistant
   print(r.choice.message.content)   // hi
   print(r.usage.prompt_tokens)      // 8
-  print(json.encode(r))             // the nested object, re-encoded in declaration order
+  print(json.encode(r)?)             // the nested object, re-encoded in declaration order
   return Ok(())
 }

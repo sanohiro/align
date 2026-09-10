@@ -1136,10 +1136,10 @@ fn main() -> i32 {
     );
 }
 
-/// `json.encode` desugars to `ExprKind::Template`, so it inherits the fix rather than needing its
-/// own rule — the reason the provenance edge belongs on the node and not on the surface syntax.
+/// Borrowing the owned successful encoder result still requires its temporary owner to live
+/// through every use; assigning only a str view cannot extend that owner past the loop.
 #[test]
-fn json_encode_escaping_a_loop_is_rejected_like_its_template_desugaring() {
+fn json_encode_temporary_view_cannot_escape_a_loop() {
     let src = "\
 import core.json
 P { a: i64 }
@@ -1148,7 +1148,7 @@ fn main() -> i32 {
   mut c := 0
   loop {
     p := P { a: c }
-    keep = json.encode(p)
+    keep = (json.encode(p) else { return 1 })
     c = c + 1
     if c >= 3 { break }
   }
@@ -1160,7 +1160,7 @@ fn main() -> i32 {
     assert!(
         diags.contains("use of invalidated borrow 'keep'")
             && diags.contains("it borrows a temporary value created inside the loop"),
-        "`json.encode` is a `template`, so it must be rejected identically: {diags}"
+        "the owned encoder result cannot lend a view beyond its temporary lifetime: {diags}"
     );
 }
 

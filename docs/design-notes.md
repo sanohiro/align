@@ -834,6 +834,18 @@ rule — `open-questions.md` Future "Library architecture principle".)
 
 ## The JSON philosophy
 
+**R63 rationale (2026-09-10).** Standard JSON
+numbers must not become invalid wire tokens merely because a record owns text.
+The [exact contract](impl/47-json-numeric-contract.md) admits f32/f64 structurally,
+rounds decode directly to the target width, and makes both encoders return owned
+`Result<string, Error>`. Invalid nonfinite values are the caller's policy decision;
+the codec reports `Error.Invalid`. Moving the grow buffer into the result exposes
+ownership without another full copy and makes failure cleanup one normal Result
+path. The finite spelling and integer fast path remain; performance is measured
+before merge. This supersedes historical float exclusions and infallible encoder
+results below, not the separate Copy-only scanner or view-free owned grammar.
+
+
 JSON is the de facto assembly language of modern APIs.
 
 Align treats JSON as a first-class concern.

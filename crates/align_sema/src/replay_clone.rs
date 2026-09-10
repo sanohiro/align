@@ -806,28 +806,9 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             struct_id: *struct_id,
         },
         ExprKind::Template(parts) => ExprKind::Template(clones.parts(parts.len())?),
-        ExprKind::JsonOwnedEncode { base, plan } => ExprKind::JsonOwnedEncode {
-            base: *base,
-            plan: plan.clone(),
-        },
-        ExprKind::JsonEncodeBounded {
-            base,
-            parts,
-            max_bytes,
-        } => ExprKind::JsonEncodeBounded {
-            base: *base,
-            parts: clones.parts(parts.len())?,
-            max_bytes: boxed!(max_bytes),
-        },
-        ExprKind::JsonOwnedEncodeBounded {
-            base,
-            plan,
-            max_bytes,
-        } => ExprKind::JsonOwnedEncodeBounded {
-            base: *base,
-            plan: plan.clone(),
-            max_bytes: boxed!(max_bytes),
-        },
+        ExprKind::JsonEncode { base, plan: crate::hir::JsonEncodePlan::Owned(plan), max_bytes: None } => ExprKind::JsonEncode { base: *base, plan: crate::hir::JsonEncodePlan::Owned(plan.clone()), max_bytes: None },
+        ExprKind::JsonEncode { base, plan: crate::hir::JsonEncodePlan::Pieces(parts), max_bytes } => ExprKind::JsonEncode { base: *base, plan: crate::hir::JsonEncodePlan::Pieces(clones.parts(parts.len())?), max_bytes: take_optional_boxed_expr(clones, max_bytes.is_some())? },
+        ExprKind::JsonEncode { base, plan: crate::hir::JsonEncodePlan::Owned(plan), max_bytes: Some(max_bytes) } => ExprKind::JsonEncode { base: *base, plan: crate::hir::JsonEncodePlan::Owned(plan.clone()), max_bytes: Some(boxed!(max_bytes)) },
         ExprKind::JsonDecode { struct_id, input } => ExprKind::JsonDecode {
             struct_id: *struct_id,
             input: boxed!(input),
@@ -2866,14 +2847,12 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             one!(dst);
         }
         ExprKind::Template(parts) => parts!(parts),
-        ExprKind::JsonEncodeBounded {
-            parts, max_bytes, ..
-        } => {
+        ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Pieces(parts), max_bytes, .. } => {
             parts!(parts);
-            one!(max_bytes);
+            if let Some(max_bytes) = max_bytes { one!(max_bytes); }
         }
-        ExprKind::JsonOwnedEncode { .. } => {}
-        ExprKind::JsonOwnedEncodeBounded { max_bytes, .. } => one!(max_bytes),
+        ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Owned(_), max_bytes: None, .. } => {}
+        ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Owned(_), max_bytes: Some(max_bytes), .. } => one!(max_bytes),
         ExprKind::JsonDocGet { doc, key }
         | ExprKind::JsonDocAt { doc, index: key }
         | ExprKind::JsonDocKey { doc, index: key } => {

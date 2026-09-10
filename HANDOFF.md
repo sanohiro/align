@@ -8,6 +8,15 @@ precedence and cleanup with omitted-Drop negative controls. Consumer traversal,
 snapshot policy and adoption remain external. R65 platform/lifecycle qualification
 remains the next unclosed product-cutover boundary.
 
+R63 is implemented under [plan 47](docs/impl/47-json-numeric-contract.md): direct
+f32/f64 JSON conversion, finite-only encoders returning owned
+`Result<string, Error>`, recursive owned float leaves, V3/interface-12 transport,
+and one compiler/native encoder operation. Plan 47 records the correctness and
+local performance evidence. Consumer adoption remains
+align-llm-owned. [Plan 46](docs/impl/46-deferred-client-boundaries-plan.md) retains
+the independent, unresolved R65 deployment/lifecycle qualification; R65 needs its
+own exact design after R63 and is not part of this implementation.
+
 `std.fs` ordinary directory operations are implemented: `fs.create_dir` creates
 one directory under normal umask rules; `fs.is_dir` returns a fallible followed
 metadata type observation. [Plan 43](docs/impl/43-ordinary-directory-plan.md)
@@ -34,8 +43,8 @@ Move-record and owned-string slice views (R67) are implemented under
 [plan 44](docs/impl/44-move-record-slice-plan.md), retaining source ownership and
 using existing field/shared-call readers without implicit copies.
 Retained-tree access follows plan 45. Verified-process platform/lifecycle proof
-must close before R65 implementation; R63 remains subject to the settled-decision
-reopen protocol. Consumer adoption is separate.
+must close before R65 implementation; R63 follows its owner-approved plan 47.
+Consumer adoption is separate.
 
 **Bound `if` results (2026-09-09):** the Category A bound-local transfer gap is
 closed with path-local replacement cleanup; see

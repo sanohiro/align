@@ -21,6 +21,8 @@ use std::rc::Rc;
 
 mod canonical_graph;
 mod generated_id;
+mod json_encode;
+pub use json_encode::json_encode_sequence_is_valid;
 pub mod print;
 mod runtime_key;
 mod source_shape;
@@ -1521,11 +1523,11 @@ pub enum Rvalue {
     /// `template "..."` — build a `str` from pieces. The optional operand is the enclosing arena
     /// handle; absent means individually owned storage held by a synthetic `string` owner.
     Template(Vec<TemplatePiece>, Option<Operand>),
-    /// `json.encode_bounded` — emit the shared canonical template pieces into a bounded stack
-    /// builder, consume it into the owned `string` `out` slot, and yield an i32 status.
-    JsonEncodeBounded {
+    /// Emit canonical JSON pieces through a private stack builder, with an optional byte cap.
+    /// Consume it into the owned `string` `out` slot and yield an i32 status.
+    JsonEncode {
         pieces: Vec<TemplatePiece>,
-        max_bytes: Operand,
+        max_bytes: Option<Operand>,
         out: Slot,
     },
     /// `json.decode` into struct `struct_id`: parse the `str` `input` and fill the `out`
@@ -1540,7 +1542,7 @@ pub enum Rvalue {
     /// Direct-owned record JSON decode. Its descriptor kinds materialize every text leaf into
     /// free-standing allocations; no arena operand is legal.
     JsonOwnedDecode {
-        plan: hir::OwnedJsonGraphPlanV2,
+        plan: hir::OwnedJsonGraphPlanV3,
         input: Operand,
         out: Slot,
     },
@@ -2826,10 +2828,10 @@ pub enum TemplatePiece {
     FloatHole(Operand),
     /// A `str` operand emitted as a JSON string literal (quoted + escaped). From `json.encode`.
     JsonStrHole(Operand),
-    /// One recursive owned-record root rendered through the validated V2 descriptor graph.
+    /// One recursive owned-record root rendered through the validated V3 descriptor graph.
     OwnedJsonObject {
         value: Operand,
-        plan: hir::OwnedJsonGraphPlanV2,
+        plan: hir::OwnedJsonGraphPlanV3,
     },
     /// A `json.encode` `Option<T>` field (REST-gateway runway, Slice B): when `opt` is `Some`, append
     /// `"name":<payload>,` (payload rendered per its scalar kind — int/float/bool raw, str
@@ -7065,7 +7067,7 @@ fn lower_template_parts(
 fn owned_json_piece(
     b: &mut Builder,
     base: hir::LocalId,
-    plan: &hir::OwnedJsonGraphPlanV2,
+    plan: &hir::OwnedJsonGraphPlanV3,
 ) -> TemplatePiece {
     let value = b.fresh_value(Ty::Struct(plan.root));
     b.push(Stmt::Let(value, Rvalue::Load(base)));
@@ -7076,65 +7078,27 @@ fn owned_json_piece(
 }
 
 #[inline(never)]
-fn lower_owned_json_encode(
+fn lower_json_encode(
     b: &mut Builder,
     base: hir::LocalId,
-    plan: &hir::OwnedJsonGraphPlanV2,
-    expression: &hir::Expr,
-) -> Operand {
-    let piece = owned_json_piece(b, base, plan);
-    let arena = b.arenas.last().map(|handle| Operand::Value(*handle));
-    let result = b.fresh_value(expression.ty);
-    b.push(Stmt::Let(result, Rvalue::Template(vec![piece], arena)));
-    if owns_hidden_string(expression, !b.arenas.is_empty()) {
-        let owner = b.new_synthetic_owner(Ty::String);
-        b.push(Stmt::Store(owner, Operand::Value(result)));
-        b.set_drop_flag(owner, true);
-        b.attach_borrow_owners(result, [owner]);
-    }
-    Operand::Value(result)
-}
-
-#[inline(never)]
-fn lower_json_encode_bounded(
-    b: &mut Builder,
-    parts: &[hir::TemplatePart],
-    max_bytes: &hir::Expr,
+    plan: &hir::JsonEncodePlan,
+    max_bytes: Option<&hir::Expr>,
     result_ty: Ty,
 ) -> Operand {
-    let Some(pieces) = lower_template_parts(b, parts) else {
-        return terminated_operand();
+    let limit = max_bytes.map(|limit| lower_expr(b, limit));
+    if !lowering_continues(b) { return terminated_operand(); }
+    let pieces = match plan {
+        hir::JsonEncodePlan::Pieces(parts) => {
+            let Some(pieces) = lower_template_parts(b, parts) else { return terminated_operand(); };
+            pieces
+        }
+        hir::JsonEncodePlan::Owned(plan) => vec![owned_json_piece(b, base, plan)],
     };
-    lower_json_encode_bounded_pieces(b, pieces, max_bytes, result_ty)
-}
-
-#[inline(never)]
-fn lower_owned_json_encode_bounded(
-    b: &mut Builder,
-    base: hir::LocalId,
-    plan: &hir::OwnedJsonGraphPlanV2,
-    max_bytes: &hir::Expr,
-    result_ty: Ty,
-) -> Operand {
-    let piece = owned_json_piece(b, base, plan);
-    lower_json_encode_bounded_pieces(b, vec![piece], max_bytes, result_ty)
-}
-
-fn lower_json_encode_bounded_pieces(
-    b: &mut Builder,
-    pieces: Vec<TemplatePiece>,
-    max_bytes: &hir::Expr,
-    result_ty: Ty,
-) -> Operand {
-    let limit = lower_expr(b, max_bytes);
-    if !lowering_continues(b) {
-        return terminated_operand();
-    }
     let out = b.new_slot(Ty::String);
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(
         code,
-        Rvalue::JsonEncodeBounded {
+        Rvalue::JsonEncode {
             pieces,
             max_bytes: limit,
             out,
@@ -7456,9 +7420,9 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
             | hir::ExprKind::Arena(_)
             | hir::ExprKind::NamedArena { .. }
             | hir::ExprKind::TaskGroup(_)
-            | hir::ExprKind::JsonOwnedEncode { .. }
-            | hir::ExprKind::JsonEncodeBounded { .. }
-            | hir::ExprKind::JsonOwnedEncodeBounded { .. }
+            | hir::ExprKind::JsonEncode { plan: align_sema::hir::JsonEncodePlan::Owned(_), max_bytes: None, .. }
+            | hir::ExprKind::JsonEncode { plan: align_sema::hir::JsonEncodePlan::Pieces(_), .. }
+            | hir::ExprKind::JsonEncode { plan: align_sema::hir::JsonEncodePlan::Owned(_), max_bytes: Some(_), .. }
             | hir::ExprKind::FileCreateRw { .. }
             | hir::ExprKind::FileOpenRw { .. }
             | hir::ExprKind::FilePread { .. }
@@ -7636,15 +7600,7 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::NamedArena { local, block } => lower_named_arena_block(b, *local, block),
         hir::ExprKind::TaskGroup(block) => lower_task_group_block(b, block),
         hir::ExprKind::Template(_) => lower_template_spine(b, e),
-        hir::ExprKind::JsonOwnedEncode { base, plan } => lower_owned_json_encode(b, *base, plan, e),
-        hir::ExprKind::JsonEncodeBounded {
-            parts, max_bytes, ..
-        } => lower_json_encode_bounded(b, parts, max_bytes, e.ty),
-        hir::ExprKind::JsonOwnedEncodeBounded {
-            base,
-            plan,
-            max_bytes,
-        } => lower_owned_json_encode_bounded(b, *base, plan, max_bytes, e.ty),
+        hir::ExprKind::JsonEncode { base, plan, max_bytes } => lower_json_encode(b, *base, plan, max_bytes.as_deref(), e.ty),
         hir::ExprKind::FileCreateRw { .. }
         | hir::ExprKind::FileOpenRw { .. }
         | hir::ExprKind::FilePread { .. }
@@ -7935,17 +7891,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 len: _,
             } => finish_const_array(b, elems, *elem, e.ty),
             hir::ExprKind::Template(_) => lower_template_spine(b, e),
-            hir::ExprKind::JsonOwnedEncode { base, plan } => {
-                lower_owned_json_encode(b, *base, plan, e)
-            }
-            hir::ExprKind::JsonEncodeBounded {
-                parts, max_bytes, ..
-            } => lower_json_encode_bounded(b, parts, max_bytes, e.ty),
-            hir::ExprKind::JsonOwnedEncodeBounded {
-                base,
-                plan,
-                max_bytes,
-            } => lower_owned_json_encode_bounded(b, *base, plan, max_bytes, e.ty),
+            hir::ExprKind::JsonEncode { base, plan, max_bytes } => lower_json_encode(b, *base, plan, max_bytes.as_deref(), e.ty),
             hir::ExprKind::JsonDecode { struct_id, input } => {
                 lower_json_decode_record(b, *struct_id, input, e.ty, None)
             }
@@ -17292,7 +17238,7 @@ fn lower_json_decode_record(
     struct_id: u32,
     input: &hir::Expr,
     result_ty: Ty,
-    owned: Option<hir::OwnedJsonGraphPlanV2>,
+    owned: Option<hir::OwnedJsonGraphPlanV3>,
 ) -> Operand {
     let sty = Ty::Struct(struct_id);
     let out = b.new_slot(sty);
@@ -23620,25 +23566,18 @@ mod tests {
             };
         }
         let owned = hir::Expr {
-            kind: hir::ExprKind::JsonOwnedEncode {
-                base: 0,
-                plan: hir::OwnedJsonGraphPlanV2 {
+            kind: hir::ExprKind::JsonEncode { base: 0, plan: align_sema::hir::JsonEncodePlan::Owned(hir::OwnedJsonGraphPlanV3 {
                     root: 0,
                     records: Vec::new(),
-                },
-            },
-            ty: Ty::Str,
+                }), max_bytes: None },
+            ty: Ty::Result(Scalar::String, Scalar::Enum(0)),
             span,
         };
         let bounded = hir::Expr {
-            kind: hir::ExprKind::JsonOwnedEncodeBounded {
-                base: 0,
-                plan: hir::OwnedJsonGraphPlanV2 {
+            kind: hir::ExprKind::JsonEncode { base: 0, plan: align_sema::hir::JsonEncodePlan::Owned(hir::OwnedJsonGraphPlanV3 {
                     root: 0,
                     records: Vec::new(),
-                },
-                max_bytes: Box::new(max_bytes),
-            },
+                }), max_bytes: Some(Box::new(max_bytes)) },
             ty: Ty::Result(Scalar::String, Scalar::Enum(0)),
             span,
         };

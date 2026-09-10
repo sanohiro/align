@@ -100,7 +100,7 @@ import core.json
 Row { id: i64, ok: bool }
 fn main() -> i32 {
   row := Row { id: 7, ok: true }
-  text := json.encode(row)
+  text := (json.encode(row) else { return 1 })
   print(text)
   return text.len() as i32
 }
@@ -339,29 +339,29 @@ fn an_unencodable_json_field_is_a_diagnostic_not_a_codegen_panic() {
     let cases: &[(&str, &str, &str)] = &[
         (
             "option-enum",
-            "import core.json\nC { R, G, B }\nS { a: Option<C> }\nfn main() -> i32 {\n  s := S { a: Some(C.G) }\n  print(json.encode(s))\n  return 0\n}\n",
+            "import core.json\nC { R, G, B }\nS { a: Option<C> }\nfn main() -> i32 {\n  s := S { a: Some(C.G) }\n  print((json.encode(s) else { return 1 }))\n  return 0\n}\n",
             "an `Option` field's payload must be an int, float, bool, str, or a nested struct",
         ),
         (
             "option-char",
-            "import core.json\nS { a: Option<char> }\nfn main() -> i32 {\n  s := S { a: Some('x') }\n  print(json.encode(s))\n  return 0\n}\n",
+            "import core.json\nS { a: Option<char> }\nfn main() -> i32 {\n  s := S { a: Some('x') }\n  print((json.encode(s) else { return 1 }))\n  return 0\n}\n",
             "an `Option` field's payload must be an int, float, bool, str, or a nested struct",
         ),
         (
             "array-char",
-            "import core.json\nS { xs: array<char> }\nfn main() -> i32 {\n  s := S { xs: ['a', 'b'].to_array() }\n  print(json.encode(s))\n  return 0\n}\n",
+            "import core.json\nS { xs: array<char> }\nfn main() -> i32 {\n  s := S { xs: ['a', 'b'].to_array() }\n  print((json.encode(s) else { return 1 }))\n  return 0\n}\n",
             "an `array` field's element must be an int, float, bool, str, or a struct",
         ),
         // Payload-less: aborted in `emit_json_union`. The payload-carrying spelling below is the
         // silent-wrong-output case — it printed `{"xs":[null,null]}` on `main`.
         (
             "array-enum",
-            "import core.json\nC { R, G }\nS { xs: array<C> }\nfn main() -> i32 {\n  s := S { xs: [C.R, C.G].to_array() }\n  print(json.encode(s))\n  return 0\n}\n",
+            "import core.json\nC { R, G }\nS { xs: array<C> }\nfn main() -> i32 {\n  s := S { xs: [C.R, C.G].to_array() }\n  print((json.encode(s) else { return 1 }))\n  return 0\n}\n",
             "an `array` field's element must be an int, float, bool, str, or a struct",
         ),
         (
             "array-enum-with-payload",
-            "import core.json\nC { N(i64), T(str) }\nS { xs: array<C> }\nfn main() -> i32 {\n  s := S { xs: [C.N(1), C.N(2)].to_array() }\n  print(json.encode(s))\n  return 0\n}\n",
+            "import core.json\nC { N(i64), T(str) }\nS { xs: array<C> }\nfn main() -> i32 {\n  s := S { xs: [C.N(1), C.N(2)].to_array() }\n  print((json.encode(s) else { return 1 }))\n  return 0\n}\n",
             "an `array` field's element must be an int, float, bool, str, or a struct",
         ),
         // An `array<Struct>` field's ELEMENT struct drives the descriptor table the runtime encoder
@@ -371,7 +371,7 @@ fn an_unencodable_json_field_is_a_diagnostic_not_a_codegen_panic() {
         // only be produced by `json.decode` today, and the point is to reach the ENCODE gate.)
         (
             "array-struct-element",
-            "import core.json\nE { c: char }\nBag { items: array<E> }\nfn enc(b: Bag) -> i64 = json.encode(b).len()\nfn main() -> i32 = 0\n",
+            "import core.json\nE { c: char }\nBag { items: array<E> }\nfn enc(b: Bag) -> i64 = (json.encode(b) else { return 1 }).len()\nfn main() -> i32 = 0\n",
             "'json.encode' field 'c' has type char",
         ),
     ];
@@ -405,7 +405,7 @@ fn every_encodable_json_field_shape_still_encodes() {
                S { a: Option<i64>, b: Option<str>, c: Option<bool>, d: Option<f64>, e: Option<N>, xs: array<i64>, ys: array<str>, zs: array<bool> }\n\
                fn main() -> i32 {\n\
                  s := S { a: Some(1), b: Some(\"x\"), c: Some(true), d: Some(1.5), e: Some(N { z: 2 }), xs: [7, 8].to_array(), ys: [\"p\"].to_array(), zs: [false].to_array() }\n\
-                 print(json.encode(s))\n\
+                 print((json.encode(s) else { return 1 }))\n\
                  return 0\n\
                }\n";
     // An `array<Struct>` field — the descriptor-table path, whose element schema the encode gate
@@ -416,7 +416,7 @@ fn every_encodable_json_field_shape_still_encodes() {
                fn main() -> Result<(), Error> {\n\
                  input := \"{\\\"items\\\":[{\\\"x\\\":1,\\\"name\\\":\\\"a\\\"},{\\\"x\\\":2,\\\"name\\\":\\\"b\\\"}]}\"\n\
                  b: Bag := json.decode(input)?\n\
-                 print(json.encode(b))\n\
+                 print(json.encode(b)?)\n\
                  return Ok(())\n\
                }\n";
     // The one field shape the encode and decode domains DISAGREE on: an `Option<enum>` inside a
@@ -429,7 +429,7 @@ fn every_encodable_json_field_shape_still_encodes() {
                S { a: Option<N> }\n\
                fn main() -> i32 {\n\
                  s := S { a: Some(N { c: Some(C.N(7)) }) }\n\
-                 print(json.encode(s))\n\
+                 print((json.encode(s) else { return 1 }))\n\
                  return 0\n\
                }\n";
     let cases: &[(&str, &str, &str)] = &[
@@ -449,7 +449,7 @@ fn every_encodable_json_field_shape_still_encodes() {
     // No runnable form exists (such a value can only come from `json.decode`, which rejects the
     // shape), so it is pinned as an acceptance row through a parameter.
     let element_optional_union =
-        "import core.json\nC { N(i64), T(str) }\nE { x: i64, a: Option<C> }\nBag { items: array<E> }\nfn enc(b: Bag) -> i64 = json.encode(b).len()\nfn main() -> i32 = 0\n";
+        "import core.json\nC { N(i64), T(str) }\nE { x: i64, a: Option<C> }\nBag { items: array<E> }\nfn enc(b: Bag) -> i64 = (json.encode(b) else { return 1 }).len()\nfn main() -> i32 = 0\n";
     let diagnostics = check_diagnostics("json-encodable-element-optional-union", element_optional_union);
     assert!(
         !diagnostics.contains("error"),

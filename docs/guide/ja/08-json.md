@@ -11,14 +11,21 @@ import core.json
 
 User { id: i64, name: str, active: bool }
 
-fn main() -> i32 {
+fn main() -> Result<(), Error> {
     u := User { id: 7, name: "ada", active: true }
-    print(json.encode(u))       // {"id":7,"name":"ada","active":true}
-    return 0
+    print(json.encode(u)?)      // {"id":7,"name":"ada","active":true}
+    return Ok(())
 }
 ```
 
-`json.encode(x)` は、構造体を JSON オブジェクトの文字列表現としてシリアライズします。文字列フィールドのエスケープ処理は自動的に行われます。内部的には [07](07-strings-and-text.md) 章で解説した文字列 `builder` が使用されており、実行時リフレクションや中間表現（DOM）は一切使用していません。
+両 encode は `Result<string, Error>` を通じて所有する文字列を返します。
+`json.encode(x)` は `Result<string, Error>` を返し、成功時は JSON テキストを所有します。
+非有限 float は `Error.Invalid` となり、`?` で伝播できます。
+`json.encode_bounded(x, max_bytes)` は負のバイト上限と超過も拒否します。
+出力は入力と外側の arena より長く保持でき、文字列フィールドは自動で escape されます。
+[詳細契約](../../impl/47-json-numeric-contract.md) を参照してください。
+
+内部的には [07](07-strings-and-text.md) 章で解説した文字列 `builder` が使用されており、実行時リフレクションや中間表現（DOM）は一切使用していません。
 
 ## デコード ― 型は注釈から来る
 

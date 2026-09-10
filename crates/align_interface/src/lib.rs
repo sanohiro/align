@@ -310,6 +310,7 @@ fn resolved_owned_json_type(
     let named = |path: String, args: Vec<IType>| IType::Named { path, args };
     match ty {
         align_sema::Ty::Int(value) => named(value.name(), Vec::new()),
+        align_sema::Ty::Float(value) => named(value.name(), Vec::new()),
         align_sema::Ty::Bool => named("bool".to_string(), Vec::new()),
         align_sema::Ty::String => named("string".to_string(), Vec::new()),
         align_sema::Ty::Struct(id) => structs
