@@ -992,6 +992,12 @@ pub(crate) mod tests {
             child.wait().unwrap().termination.signaled,
             i64::from(libc::SIGKILL)
         );
+        // Reaping the leader does not imply every group member has finished
+        // closing its inherited pipe. Observe stdout readiness independently.
+        assert_eq!(unsafe { super::super::process_live::align_rt_child_poll(
+            &mut *child, 1, 1_000_000_000, observed.as_mut_ptr().cast(),
+        ) }, 0);
+        assert_eq!(observed[0], 1);
         assert_eq!(child.stdout.read(&mut bytes).unwrap(), Some(0));
         assert_eq!(child.stdout.read(&mut bytes).unwrap(), Some(0));
         assert_eq!(child.signal(0, true), Err(AL_INVALID));
@@ -1085,7 +1091,7 @@ pub(crate) mod tests {
         // Darwin may report ESRCH for a group containing only its unreaped zombie.
         // The API preserves that native observation; loss of authority is Invalid.
         let probe = child.signal(0, true);
-        assert!(probe == Ok(()) || probe == Err(libc::ESRCH), "{probe:?}");
+        assert!(probe == Ok(()) || probe == Err(super::super::AL_CODE + libc::ESRCH), "{probe:?}");
         for signal in [-1, super::super::MAX_SIGNAL + 1, i64::MAX] {
             assert_eq!(child.signal(signal, true), Err(AL_INVALID));
         }
