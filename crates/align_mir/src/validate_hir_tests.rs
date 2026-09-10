@@ -11794,10 +11794,10 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        // FsTree adds one closed operation family; keep this count synchronized with
-        // the exhaustive validation, source-shape, replay-clone, and canonical-graph matches.
+        // R63 replaces three encoder variants with one operation. The exhaustive validation,
+        // source-shape, replay-clone, and canonical-graph matches handle both plans and limits.
         variants,
-        334,
+        332,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }

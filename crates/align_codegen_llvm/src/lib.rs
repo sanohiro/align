@@ -42162,7 +42162,7 @@ fn main() -> i32 = 0
         )
         .expect_err("a `char` array element has no JSON descriptor tag");
         assert!(
-            err.to_string().contains("json.encode MIR metadata invalid"),
+            err.to_string().contains("is not an encodable/decodable payload type"),
             "got: {err}"
         );
 
@@ -42198,7 +42198,7 @@ fn main() -> i32 = 0
             vec![],
         )
         .expect_err("a payload-less union variant has no descriptor arm");
-        assert!(err.to_string().contains("json.encode MIR metadata invalid"), "got: {err}");
+        assert!(err.to_string().contains("carries no payload"), "got: {err}");
     }
 
     #[test]

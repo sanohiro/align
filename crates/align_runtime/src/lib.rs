@@ -3127,7 +3127,7 @@ pub unsafe extern "C" fn align_rt_builder_init_stack(out: *mut u8, arena: *mut A
 /// Numeric admission checks do not establish allocation provenance.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_json_builder_init(out: *mut u8, mode: i32, max_bytes: i64) -> *mut Builder {
-    if out.is_null() || out.addr() % 16 != 0 || out.addr().checked_add(64).is_none()
+    if out.is_null() || !out.addr().is_multiple_of(16) || out.addr().checked_add(64).is_none()
         || !matches!(mode, 0 | 1) || (mode == 0 && max_bytes != 0) {
         return core::ptr::null_mut();
     }
@@ -8645,7 +8645,7 @@ pub unsafe extern "C" fn align_rt_json_builder_finish(b: *mut Builder, out: *mut
     let dest = out.addr();
     let Some(end) = start.checked_add(64) else { return AL_INVALID; };
     let Some(dest_end) = dest.checked_add(16) else { return AL_INVALID; };
-    if b.is_null() || out.is_null() || start % 16 != 0 || dest % 8 != 0
+    if b.is_null() || out.is_null() || !start.is_multiple_of(16) || !dest.is_multiple_of(8)
         || (start < dest_end && dest < end) {
         return AL_INVALID;
     }
