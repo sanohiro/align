@@ -1391,6 +1391,12 @@ const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("fs.dir_entry", 0, BuiltinCapability::Opaque),
     ("fs.metadata", 0, BuiltinCapability::Opaque),
     ("fs.entry_kind", 0, BuiltinCapability::Opaque),
+    ("process.termination", 0, BuiltinCapability::Opaque),
+    ("process.wait_result", 0, BuiltinCapability::Opaque),
+    ("process.readiness", 0, BuiltinCapability::Opaque),
+    ("process.signal", 0, BuiltinCapability::Opaque),
+    ("process.signal_set", 0, BuiltinCapability::Opaque),
+    ("process.snapshot", 0, BuiltinCapability::Opaque),
     ("rs256_private_key", 0, BuiltinCapability::Opaque),
     ("crypto.rs256_private_key", 0, BuiltinCapability::Opaque),
     ("rs256_public_key", 0, BuiltinCapability::Opaque),
@@ -1411,6 +1417,8 @@ const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("tcp_listener", 0, BuiltinCapability::Opaque),
     ("udp_socket", 0, BuiltinCapability::Opaque),
     ("child", 0, BuiltinCapability::Opaque),
+    ("command", 0, BuiltinCapability::Opaque),
+    ("run_output", 0, BuiltinCapability::Opaque),
     ("run_bytes", 0, BuiltinCapability::Opaque),
     ("http_client", 0, BuiltinCapability::Opaque),
     ("http_request", 0, BuiltinCapability::Opaque),
@@ -2693,6 +2701,7 @@ pub fn summary_to_source(
                         }
                         "fs.directory" | "fs.dir_cursor" | "fs.dir_entry" | "fs.metadata" | "fs.entry_kind" => { builtin_type_imports.insert("std.fs".to_string()); }
                         "os.host_info" => { builtin_type_imports.insert("std.os".to_string()); }
+                        "process.termination" | "process.wait_result" | "process.readiness" | "process.signal" | "process.signal_set" | "process.snapshot" | "command" | "run_output" => { builtin_type_imports.insert("std.process".to_string()); }
                         "regex.regex_match" => {
                             builtin_type_imports.insert("std.regex".to_string());
                         }

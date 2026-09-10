@@ -789,6 +789,7 @@ fn walk_body_records<'a>(
                 }
                 | ExprKind::Call { args: operands, .. }
                 | ExprKind::FsTree { args: operands, .. }
+                | ExprKind::ProcessLive { args: operands, .. }
                 | ExprKind::StructLit {
                     fields: operands, ..
                 }
@@ -938,10 +939,8 @@ fn walk_body_records<'a>(
                 | ExprKind::CommandEnvClear { command: recv }
                 | ExprKind::CommandRun { command: recv }
                 | ExprKind::CommandRunBytes { command: recv }
-                | ExprKind::RunOutputCode { out: recv }
                 | ExprKind::RunOutputStdout { out: recv }
                 | ExprKind::RunOutputStderr { out: recv }
-                | ExprKind::RunBytesCode { out: recv }
                 | ExprKind::RunBytesStdout { out: recv }
                 | ExprKind::RunBytesStderr { out: recv }
                 | ExprKind::EncodingEncode { data: recv, .. }

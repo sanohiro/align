@@ -3194,9 +3194,29 @@ promise. The exact contract and closure owners are in
 
 ### std.process
 
+**R65 process capabilities.** The exact public contract
+and implementation boundaries are [plan 50](docs/impl/50-r65-process-capability-handoff.md)
+and its [common ledger](docs/impl/49-native-process-contract.md).
+`wait` returns `Result<process.wait_result, Error>` and both capture results replace
+`code()` with `status() -> process.wait_result`, without aliases. Termination is
+`Exited(i64)` or `Signaled(i64)` and maximum RSS is `Option<i64>` bytes. Nonblocking
+WNOWAIT status retains process-group authority until explicit reap; caller-buffer
+reads use the existing writable `out`/no-alias model. Live capture, file output,
+readiness, group control, process-table observations and explicit signal
+subscriptions are native Linux/macOS capabilities.
+
+The additional Linux-only facilities are explicit memory-file construction and
+sealing in `std.fs`, admitted executable and namespace authority, controlled
+inheritance, running-main-image observation and one exclusive `process.child_scope`.
+The scope owns subreaping and certifies absence only through kernel wait ownership;
+application code owns monitoring, limits and cleanup policy. No installed helper,
+privileged service, dedicated user or VM is required. The exact ledgers are part
+of this contract. Common child operations are implemented first; signal subscriptions
+and Linux-only authority follow the capability order in plan 50.
+
 ```text
 process.spawn(cmd: str, args: array<str>) -> Result<child, Error>  // fork+exec; the child owns its pid
-ch.wait() -> Result<i64, Error>          // reap; returns the exit code
+ch.wait() -> Result<process.wait_result, Error> // reap once, cache typed status and optional RSS
 ch.kill(sig: i64) -> Result<(), Error>
 process.exec(cmd: str, args: array<str>) -> Result<(), Error>      // replace this image (returns only on error)
 process.exit(code: i64)                  // run cleanup (flush buffered output), then exit
@@ -3204,9 +3224,9 @@ process.abort()                          // immediate `_exit(1)`, NO cleanup
 process.cpu_count() -> i64               // parallelism available to THIS process (affinity/quota aware, >= 1)
 ```
 
-`child` is a **Move** handle owning a pid. Explicit `wait()` returns the exit code; Drop without a
-`wait()` still reaps the child with a blocking `waitpid` (discarding the code) so it can never become
-a zombie. `exit` and `abort` are the deliberate pair: `exit` runs ordinary cleanup so a buffered
+`child` is a **Move** handle owning a direct child. Explicit `wait()` returns a typed
+termination and optional maximum RSS, cached for repeated calls. Drop closes capture
+reads and blocks in `wait4` until the child is reaped. `exit` and `abort` are the deliberate pair: `exit` runs ordinary cleanup so a buffered
 `print` is flushed, `abort` is the no-cleanup escape.
 
 `cpu_count` is the number a `task_group` worker count is sized against — the runtime schedules a
@@ -3226,10 +3246,10 @@ c.max_capture_bytes(limit: i64)    // per-stream stdout/stderr bound; explicit 0
 out := c.run() -> Result<run_output, Error>   // fork + capture; borrows c, so it is re-runnable
 raw := c.run_bytes() -> Result<run_bytes, Error> // same capture as bytes; borrows c
 
-out.code()   -> i64
+out.status() -> process.wait_result
 out.stdout() -> str    // captured stdout, a zero-copy view region-tied to `out`
 out.stderr() -> str    // ditto
-raw.code()   -> i64
+raw.status() -> process.wait_result
 raw.stdout() -> slice<u8> // arbitrary bytes, zero-copy and region-tied to `raw`
 raw.stderr() -> slice<u8>
 ```

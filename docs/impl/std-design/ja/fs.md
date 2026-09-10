@@ -15,6 +15,15 @@ temporary-directory lifecycle は [`../36-fs-private-temp-plan.md`](../36-fs-pri
 > single-link open も実装済みであり、align-llm 側の adoption は外部作業として残る。Request 56 の
 > private temporary-directory lifecycle は実装済みであり、release と align-llm 側 adoption が残る。
 
+## R65 の封印済みストレージ契約
+
+設計・レビュー指摘の反映を完了した [plan 50](../../50-r65-process-capability-handoff.md) が、明示的な
+memory_kind、memory_writer、sealed_file、OS の seal、位置指定の writable-out 読み取り、
+所有権、ABI、検証条件を定めます。これらは非対応ホストのエラーを定めた Linux 固有の
+OS 機能であり、Mac の通常のファイル・プロセス操作の前提にはしません。データの作成は
+明示的なチャンク書き込みで行い、seal は writer を消費します。起動時にファイル全体を
+コピーしません。実行イメージの検証と明示的な継承は std.process の責務です。
+
 ## 概要
 
 これは既存の M9 ファイルシステム API への狭い拡張であり、競合するディレクトリエントリを置換せずに

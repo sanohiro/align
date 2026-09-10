@@ -1406,6 +1406,7 @@ pub enum ExprKind {
     /// `fs.remove_empty_dir(path)` — remove exactly one empty directory through retained,
     /// no-follow descriptor traversal. The absolute path is borrowed for the call.
     FsCreateDir { path: Box<Expr> },
+    ProcessLive { kind: crate::process_live::ProcessLiveKind, args: Vec<Expr> },
     FsTree { kind: crate::fs_tree::FsTreeKind, args: Vec<Expr> },
     FsIsDir { path: Box<Expr> },
     FsRemoveEmptyDir { path: Box<Expr> },
@@ -1546,21 +1547,14 @@ pub enum ExprKind {
     /// (no Drops / flushes / atexit). The asymmetric counterpart to `process.exit`. Impure; diverges.
     /// The `ty` is [`crate::Ty::Unit`] (no `Never` type yet).
     ProcessAbort,
-    /// `process.spawn(cmd, args)` (`std.process`) — `fork` + `execvp(cmd, argv)` in the child. `cmd`
+    /// `process.spawn(cmd, args)` (`std.process`) — the shared native child launcher. `cmd`
     /// is the borrowed `str` lookup path (resolved via `PATH`); `args` is the borrowed `array<str>`
     /// that becomes the child's **full** `argv` — the caller supplies `argv[0]` (P5). The `ty` is
-    /// `Result<child, Error>` (an owned Move handle owning the child's pid; `Drop` reaps it via a
-    /// blocking `waitpid`). A `fork` failure surfaces as `Err(errno)`; an `execvp` failure cannot be
-    /// reported synchronously — the forked child `_exit(127)`s (the shell convention), so an
-    /// exec-not-found surfaces later as `wait() == 127`. Impure. Both `cmd` and `args` are borrowed
-    /// (never consumed).
+    /// Result<child, Error> owns the direct child. Parent-marshalled setup/exec failures return
+    /// Error before publication; both inputs are borrowed and Child Drop performs blocking reap.
     ProcessSpawn { cmd: Box<Expr>, args: Box<Expr> },
-    /// `ch.wait()` (`std.process`) — block in `waitpid` for the `child` to exit, returning its
-    /// exit code as `Result<i64, Error>`: a normal exit yields `WEXITSTATUS` (`0..=255`); a
-    /// signal-killed child yields `128 + signal` (the shell convention). Marks the child **reaped**
-    /// (through the borrow — the receiver is read, not consumed, so the later `Drop` becomes a no-op);
-    /// a second `wait()` on an already-reaped child is `Err` (a clean status, not an `ECHILD` race).
-    /// `child` is borrowed (never consumed — mirrors `l.accept()`). Impure.
+    /// Reap once through wait4 and return Result<process.wait_result, Error>; repeats use the cache.
+    /// The receiver is exclusively borrowed. Pending capture must reach EOF before blocking.
     ChildWait { child: Box<Expr> },
     /// `ch.kill(sig)` (`std.process`) — send signal `sig` (an `i64`) to the `child` via libc `kill`,
     /// returning `Result<(), Error>`. Like [`ChildWait`], `child` is **borrowed** (never consumed); the
@@ -1614,15 +1608,10 @@ pub enum ExprKind {
     /// `c.run()` (`std.process` Slice 4) — fork a child running the command with BOTH stdout and stderr
     /// captured, drain both pipes to EOF, reap the child, and yield `Result<run_output, Error>` (the
     /// `ty` — an owned [`crate::Ty::RunOutput`] Ok payload). `command` is **borrowed** (re-runnable, like
-    /// [`ChildWait`]). A `pipe`/`fork` failure or non-UTF-8 captured output is `Err`; a `chdir`/`execvp`
-    /// failure in the child surfaces as exit code 127 in `out.code()` (not an `Err`). Impure.
+    /// [`ChildWait`]). Setup/exec failures and invalid UTF-8 return Err; status is typed. Impure.
     CommandRun { command: Box<Expr> },
     /// `c.run_bytes()` — binary captured output, sharing the command capture engine. Impure.
     CommandRunBytes { command: Box<Expr> },
-    /// `out.code()` (`std.process` Slice 4) — the run's exit code (`i64`: `WEXITSTATUS` / `128+signal` /
-    /// `127`). `out` is a bound [`crate::Ty::RunOutput`] local. Pure (reads the owned handle). The
-    /// exit-code dual of [`HttpRespStatus`].
-    RunOutputCode { out: Box<Expr> },
     /// `out.stdout()` / `out.stderr()` (`std.process` Slice 4) — the captured stdout / stderr as a `str`
     /// **view** into `out`'s owned buffer (the `ty` is [`crate::Ty::Str`]), region-bound to `out` (an
     /// escape past `out`'s `Drop` is a compile error, #297). `out` is a bound local. Pure. The
@@ -1630,8 +1619,6 @@ pub enum ExprKind {
     RunOutputStdout { out: Box<Expr> },
     /// The stderr sibling of [`RunOutputStdout`] (a `str` view into `out`'s captured stderr buffer).
     RunOutputStderr { out: Box<Expr> },
-    /// `run_bytes.code()` — Copy exit code read.
-    RunBytesCode { out: Box<Expr> },
     /// `run_bytes.stdout()` — region-bound `slice<u8>` view.
     RunBytesStdout { out: Box<Expr> },
     /// `run_bytes.stderr()` — region-bound `slice<u8>` view.

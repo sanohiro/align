@@ -12,6 +12,21 @@ module.
 > (`process.command`/`c.cwd`/`c.run` capture; `c.timeout_ns` + the core `Error.Timeout` variant;
 > `c.env`/`c.env_clear`). The bounded text/bytes extension is **SHIPPED** for align-llm Request 11.
 
+## R65 contract
+
+The exact replacement is [plan 50](../50-r65-process-capability-handoff.md) and
+[plan 49](../49-native-process-contract.md). They own the
+new signatures, types, errors, resource costs, ABI, carriers and owner tests.
+The older slices below are historical implementation records. For changed process
+operations, plans 49/50 supersede their numeric status and fork/bootstrap descriptions.
+Common child operations are implemented first; the other capabilities follow plan 50.
+`wait` and captured output `code()` migrate outright to typed wait_result/status;
+there are no compatibility aliases. Live I/O, group controls, file redirection,
+process-table observations and explicit signal subscriptions support native
+Linux/macOS. Verified sealed-image selection, namespace inheritance and exclusive
+child_scope retain explicit Linux-only acquisition contracts. Application code
+owns supervision; no additional service, dedicated user, VM or keeper is required.
+
 ## Overview
 
 spawn, exec, exit (draft §18.2). Fork/exec/waitpid + a child Move handle. **This module settles

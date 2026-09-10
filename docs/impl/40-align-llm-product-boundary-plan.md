@@ -1,17 +1,15 @@
 # Align-owned boundaries for the align-llm product cutover
 
-Status: **implementation authorized by the owner, 2026-09-10**.
-This is an adoption assessment and capability plan. The candidate interfaces below
-are design notation, not shipped declarations. H1 proceeds under the exact
-[incremental SHA-256 ledger](41-incremental-sha256-plan.md). R65 has explicit
-unclosed platform and lifecycle decisions; it is not ready for implementation.
-The owner's subsequent request to address R65 and R63 proceeds under
-[plan 46](46-deferred-client-boundaries-plan.md): namespace ownership qualification
-and the shared JSON numeric-validity decision precede their exact implementation
-contracts. The owner has since admitted R63 reconsideration for standard JSON
-support with performance preservation; [plan 47](47-json-numeric-contract.md)
-now owns the exact R63 contract and review status, superseding the initial deferral
-below. R65 remains under plan 46.
+**R65 supersession:** [plan 50](50-r65-process-capability-handoff.md) selects the
+full request scope, native mechanisms and implementation boundaries, with plan
+49 for common operations. Design and independent-review corrections are complete. The earlier
+extra namespace/init and unqualified-Mac-extension requirements below are
+historical proposals, not decisions left to the implementation model.
+
+Status: **historical wave assessment**. The implementation contracts are plans
+41–45 for R29/R53/R64/R66/R67, plan 47 for R63, and plans 49–50 for R65.
+The candidate tables and open qualification cells below record the initial
+assessment; they do not override those exact contracts or current HANDOFF status.
 
 ## 1. Evidence and scope
 

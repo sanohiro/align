@@ -3294,6 +3294,22 @@ every caller's Drops is the documented ideal, deferred. (Was Open, target M11; t
 run-Drops-then-exit vs. an immediate hard-exit API — both landed: the first as `exit`, the second as
 `abort`.)
 
+### R65 process capability boundary — SETTLED (2026-09-10; designed, not implemented)
+
+The selected contract is [plan 50](impl/50-r65-process-capability-handoff.md), with
+exact common operations in [plan 49](impl/49-native-process-contract.md). The
+language owns explicit OS authority and cleanup, while applications own
+supervision. Common process operations work natively on Linux and macOS. Sealed
+memory files, admitted ELF execution, namespace inheritance and exclusive
+child_scope use their stated Linux-only contracts and unsupported-host errors.
+The scope's kernel-empty witness replaces the earlier extra namespace/init
+proposal; no privileged service, dedicated user, VM or hidden reaper is added.
+Child wait and capture status migrate outright to typed wait_result, and live
+writes into caller storage obey existing out/readonly/no-alias checks. This
+changes no ownership, optional, error, parallel or lifetime model. Independent
+review findings are incorporated; the design is ready for implementation.
+Implementation and consumer adoption follow separately.
+
 ### `std.process` bounded text/byte capture — SETTLED (2026-08-14, align-llm Request 11)
 
 The command-local spelling is `c.max_capture_bytes(limit: i64)`. The non-negative limit applies

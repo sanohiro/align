@@ -15,6 +15,7 @@ use align_span::Span;
 
 pub mod hir;
 pub mod fs_tree;
+pub mod process_live;
 pub use hir::*;
 mod hir_depth;
 mod replay_clone;
@@ -770,8 +771,8 @@ pub enum Ty {
     Command,
     /// A `run_output` (`std.process` Slice 4) — one completed run's captured output, the `Ok` payload of
     /// `c.run()`'s `Result<run_output, Error>`. An owned **Move** handle (modeled on [`Ty::HttpResponse`])
-    /// owning the exit code + two owned byte buffers (stdout / stderr, validated UTF-8), `Drop`-freed
-    /// (`run_output_free`). `out.code()` reads the `i64` exit code; `out.stdout()` / `out.stderr()`
+    /// owning the typed wait result + two owned byte buffers (stdout / stderr, validated UTF-8), `Drop`-freed
+    /// (`run_output_free`). `out.status()` copies the typed wait result; `out.stdout()` / `out.stderr()`
     /// return a `str` **view** region-bound to `out` (an escape past its `Drop` is a compile error,
     /// #297). Rides `Result`'s Ok slot as [`Scalar::RunOutput`]. Impure to produce, pure to read. Opaque
     /// pointer.
@@ -4463,6 +4464,8 @@ pub const BUILTIN_SPELLING_TYS: &[(&str, Ty)] = &[
     ("tcp_listener", Ty::TcpListener),
     ("udp_socket", Ty::UdpSocket),
     ("child", Ty::Child),
+    ("command", Ty::Command),
+    ("run_output", Ty::RunOutput),
     ("run_bytes", Ty::RunBytes),
     ("http_client", Ty::HttpClient),
     ("http_request", Ty::HttpRequest),
@@ -4507,6 +4510,7 @@ fn builtin_spelling_ty(head: &str) -> Option<Ty> {
 /// spelling bridge lives here, and the ownership answer stays exactly [`needs_drop_flag`] — the same
 /// call that assigned the bit being validated.
 pub fn builtin_spelling_needs_return_cleanup(head: &str) -> Option<bool> {
+    if process_live::COPY_NAMES.contains(&head) { return Some(false); }
     if head == "fs.dir_entry" { return Some(needs_drop_flag(Ty::Struct(0), &[fs_dir_entry_definition()], &[], &[], &[])); }
     if matches!(head, "fs.metadata" | "fs.entry_kind") {
         let ty = if head == "fs.metadata" { Ty::Struct(0) } else { Ty::Enum(0) };
@@ -4525,6 +4529,7 @@ pub fn builtin_spelling_needs_return_cleanup(head: &str) -> Option<bool> {
 /// bit. Keeping the Move answer in sema prevents the interface decoder from inventing a second
 /// builtin ownership table.
 pub fn builtin_spelling_is_move(head: &str) -> Option<bool> {
+    if process_live::COPY_NAMES.contains(&head) { return Some(false); }
     if head == "fs.dir_entry" { return Some(ty_is_move(Ty::Struct(0), &[fs_dir_entry_definition()], &[], &[], &[])); }
     if matches!(head, "fs.metadata" | "fs.entry_kind") {
         let ty = if head == "fs.metadata" { Ty::Struct(0) } else { Ty::Enum(0) };
@@ -6196,6 +6201,12 @@ struct BuiltinNominalAlias {
 
 const BUILTIN_NOMINAL_ALIASES: &[BuiltinNominalAlias] = &[
     BuiltinNominalAlias { bare: "fs.dir_entry", explicit: "fs.dir_entry", canonical: "fs.dir_entry", required_import: Some("std.fs") },
+    BuiltinNominalAlias { bare: "process.termination", explicit: "process.termination", canonical: "process.termination", required_import: Some("std.process") },
+    BuiltinNominalAlias { bare: "process.wait_result", explicit: "process.wait_result", canonical: "process.wait_result", required_import: Some("std.process") },
+    BuiltinNominalAlias { bare: "process.readiness", explicit: "process.readiness", canonical: "process.readiness", required_import: Some("std.process") },
+    BuiltinNominalAlias { bare: "process.signal", explicit: "process.signal", canonical: "process.signal", required_import: Some("std.process") },
+    BuiltinNominalAlias { bare: "process.signal_set", explicit: "process.signal_set", canonical: "process.signal_set", required_import: Some("std.process") },
+    BuiltinNominalAlias { bare: "process.snapshot", explicit: "process.snapshot", canonical: "process.snapshot", required_import: Some("std.process") },
     BuiltinNominalAlias { bare: "fs.metadata", explicit: "fs.metadata", canonical: "fs.metadata", required_import: Some("std.fs") },
     BuiltinNominalAlias { bare: "fs.entry_kind", explicit: "fs.entry_kind", canonical: "fs.entry_kind", required_import: Some("std.fs") },
     BuiltinNominalAlias { bare: "os.host_info", explicit: "os.host_info", canonical: "os.host_info", required_import: Some("std.os") },
@@ -8669,6 +8680,23 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         structs.push(fs_metadata_definition(kind));
     } else {
         diags.error("filesystem builtin type table capacity exceeded".to_string(), Span::new(0, 0, 0));
+    }
+
+    if let Ok(termination) = u32::try_from(enums.len()) {
+        for definition in [process_live::termination_definition(), process_live::signal_definition()] {
+            if let Ok(id) = u32::try_from(enums.len()) {
+                enum_ids.insert(definition.name.clone(), id);
+                enums.push(definition);
+            }
+        }
+        for definition in process_live::record_definitions(termination) {
+            if let Ok(id) = u32::try_from(structs.len()) {
+                struct_ids.insert(definition.name.clone(), id);
+                structs.push(definition);
+            }
+        }
+    } else {
+        diags.error("process builtin type table capacity exceeded".to_string(), Span::new(0, 0, 0));
     }
 
     struct_ids.insert("os.host_info".to_string(), structs.len() as u32);
@@ -16182,10 +16210,10 @@ impl EffectScan<'_> {
                 walk!(command);
                 self.impure_direct = true;
             }
-            ExprKind::RunOutputCode { out } | ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
+            ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
                 walk!(out);
             }
-            ExprKind::RunBytesCode { out } | ExprKind::RunBytesStdout { out } | ExprKind::RunBytesStderr { out } => {
+            ExprKind::RunBytesStdout { out } | ExprKind::RunBytesStderr { out } => {
                 walk!(out);
             }
             // Encoding and named time transforms are pure computations; recurse into the input.
@@ -16488,6 +16516,7 @@ impl EffectScan<'_> {
             // any extern-calling fn is non-Pure), so a hashing closure is rejected by `par_map`
             // (matching `std.compress`; hashing's determinism does not make it pure). Recurse into
             // the byte view.
+            ExprKind::ProcessLive { kind, args } => { for argument in args { walk!(argument); } if !kind.pure() { self.impure_direct = true; } }
             ExprKind::FsTree { args, .. } => { for argument in args { walk!(argument); } self.impure_direct = true; }
             ExprKind::CryptoDigestNew => { self.impure_direct = true; }
             ExprKind::CryptoDigestFinish { digest: data }
@@ -22149,7 +22178,7 @@ impl<'a> EscapeCheck<'a> {
         // accepted owner free-standing. Keep this producer aligned with `region_of` and the
         // checked-HIR allocation-mode contract instead of deriving its Drop mode from lexical
         // allocation context like the ordinary arena-aware collection producers below.
-        if matches!(expression.kind, ExprKind::FsTree { .. } | ExprKind::OsHost | ExprKind::JsonOwnedDecode { .. } | ExprKind::CryptoDigestFinish { .. }) {
+        if matches!(expression.kind, ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. } | ExprKind::OsHost | ExprKind::JsonOwnedDecode { .. } | ExprKind::CryptoDigestFinish { .. }) {
             return Some(true);
         }
         if matches!(
@@ -24068,7 +24097,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ChildKill { .. }
             | ExprKind::ProcessExec { .. }
             // `process.command` owns its result handle; `c.cwd(dir)` is `()`; `c.run()` owns its
-            // `Result<run_output, Error>`; `out.code()` copies an `i64` — none borrows, so `Static`.
+            // `Result<run_output, Error>`; `out.status()` copies a wait result — none borrows, so `Static`.
             // (The `out.stdout()`/`out.stderr()` VIEWS are `Frame`-regioned in the arm above.)
             | ExprKind::ProcessCommand { .. }
             | ExprKind::CommandCwd { .. }
@@ -24082,8 +24111,6 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::CommandEnvClear { .. }
             | ExprKind::CommandRun { .. }
             | ExprKind::CommandRunBytes { .. }
-            | ExprKind::RunOutputCode { .. }
-            | ExprKind::RunBytesCode { .. }
             | ExprKind::EncodingEncode { .. }
             | ExprKind::TimeFormat { .. }
             | ExprKind::TimeParse { .. }
@@ -24151,7 +24178,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpStreamReject { .. }
             | ExprKind::CryptoCtEqual { .. }
             | ExprKind::CryptoRandom { .. }
-            | ExprKind::FsTree { .. } | ExprKind::CryptoDigestNew | ExprKind::CryptoDigestUpdate { .. } | ExprKind::CryptoDigestFinish { .. }
+            | ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. } | ExprKind::CryptoDigestNew | ExprKind::CryptoDigestUpdate { .. } | ExprKind::CryptoDigestFinish { .. }
             | ExprKind::CryptoHash { .. }
             | ExprKind::CryptoHmac { .. }
             | ExprKind::CryptoHkdf { .. }
@@ -24541,10 +24568,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::CommandEnvClear { .. }
             | ExprKind::CommandRun { .. }
             | ExprKind::CommandRunBytes { .. }
-            | ExprKind::RunOutputCode { .. }
             | ExprKind::RunOutputStdout { .. }
             | ExprKind::RunOutputStderr { .. }
-            | ExprKind::RunBytesCode { .. }
             | ExprKind::EncodingEncode { .. }
             | ExprKind::TimeFormat { .. }
             | ExprKind::TimeParse { .. }
@@ -24626,7 +24651,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpStreamReject { .. }
             | ExprKind::CryptoCtEqual { .. }
             | ExprKind::CryptoRandom { .. }
-            | ExprKind::FsTree { .. } | ExprKind::CryptoDigestNew | ExprKind::CryptoDigestUpdate { .. } | ExprKind::CryptoDigestFinish { .. }
+            | ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. } | ExprKind::CryptoDigestNew | ExprKind::CryptoDigestUpdate { .. } | ExprKind::CryptoDigestFinish { .. }
             | ExprKind::CryptoHash { .. }
             | ExprKind::CryptoHmac { .. }
             | ExprKind::CryptoHkdf { .. }
@@ -27913,10 +27938,10 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::CommandEnvClear { command } => self.walk(command, depth),
             ExprKind::CommandRun { command } | ExprKind::CommandRunBytes { command } => self.walk(command, depth),
-            ExprKind::RunOutputCode { out } | ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
+            ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
                 self.walk(out, depth)
             }
-            ExprKind::RunBytesCode { out } | ExprKind::RunBytesStdout { out } | ExprKind::RunBytesStderr { out } => {
+            ExprKind::RunBytesStdout { out } | ExprKind::RunBytesStderr { out } => {
                 self.walk(out, depth)
             }
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.walk(data, depth),
@@ -28174,7 +28199,7 @@ impl<'a> EscapeCheck<'a> {
             // `crypto.sha256`/`sha512` return a fresh *owned* `array<u8>` that borrows nothing (it
             // owns its heap buffer, `Drop`-freed) — freely returnable, like `rand.sample`. Just
             // recurse into the byte view so any escape *inside* it is still checked.
-            ExprKind::FsTree { args, .. } => { for argument in args { self.walk(argument, depth); } }
+            ExprKind::FsTree { args, .. } | ExprKind::ProcessLive { args, .. } => { for argument in args { self.walk(argument, depth); } }
             ExprKind::CryptoDigestNew => {},
             ExprKind::CryptoDigestFinish { digest: data }
             | ExprKind::CryptoHash { data, .. } => self.walk(data, depth),
@@ -30240,7 +30265,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         // The runtime materializes a fresh `array<RowPair>` in Result::Ok and retains neither
         // codec view. `RowPair` is scalar-only, so the generation starts without borrowed content;
         // Result::Err carries no storage header.
-        ExprKind::FsTree { .. } | ExprKind::OsHost | ExprKind::FrameInnerJoin { .. } | ExprKind::CryptoDigestFinish { .. } => {
+        ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. } | ExprKind::OsHost | ExprKind::FrameInnerJoin { .. } | ExprKind::CryptoDigestFinish { .. } => {
             StorageVariantPolicy::Fresh(StorageContentInitializer::FreshEmpty)
         }
 
@@ -30400,10 +30425,8 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::CommandEnvClear { .. }
         | ExprKind::CommandRun { .. }
         | ExprKind::CommandRunBytes { .. }
-        | ExprKind::RunOutputCode { .. }
         | ExprKind::RunOutputStdout { .. }
         | ExprKind::RunOutputStderr { .. }
-        | ExprKind::RunBytesCode { .. }
         | ExprKind::EncodingEncode { .. }
         | ExprKind::TimeFormat { .. }
         | ExprKind::TimeParse { .. }
@@ -32575,6 +32598,14 @@ impl<'a> MoveCheck<'a> {
                 && let Some(receiver) = args.first() {
                 arguments.insert(Self::expr_key(receiver));
                 places.insert(Self::expr_key(receiver));
+            }
+            if let ExprKind::ProcessLive { kind, args } = &expression.kind {
+                for (input, argument) in kind.inputs().iter().zip(args) {
+                    if matches!(input, process_live::Input::Owner(_) | process_live::Input::OutBytes) {
+                        arguments.insert(Self::expr_key(argument));
+                        places.insert(Self::expr_key(argument));
+                    }
+                }
             }
             if let ExprKind::CryptoDigestUpdate { digest, .. } = &expression.kind {
                 arguments.insert(Self::expr_key(digest));
@@ -37590,7 +37621,7 @@ impl<'a> MoveCheck<'a> {
             // its Ok payload nor its Error payload borrows the input.
             ExprKind::JsonEncode { .. }
             | ExprKind::JsonOwnedDecode { .. }
-            | ExprKind::FsTree { .. } => BorrowRoots::new(),
+            | ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. } => BorrowRoots::new(),
             ExprKind::JsonDecode { input, .. }
             | ExprKind::JsonDecodeArray { input, .. }
             | ExprKind::JsonDecodeStructArray { input, .. } => self.storage_roots(input),
@@ -37886,7 +37917,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::TcpReadTimeout { .. } | ExprKind::TcpWriteTimeout { .. }
             | ExprKind::CommandEnv { .. } | ExprKind::CommandEnvClear { .. } | ExprKind::CommandRun { .. }
             | ExprKind::CommandRunBytes { .. }
-            | ExprKind::RunOutputCode { .. } | ExprKind::RunBytesCode { .. } | ExprKind::EncodingEncode { .. }
+            | ExprKind::EncodingEncode { .. }
             | ExprKind::TimeFormat { .. } | ExprKind::TimeParse { .. } | ExprKind::EncodingDecode { .. } | ExprKind::Utf8Valid { .. } | ExprKind::Compress { .. }
             | ExprKind::Decompress { .. } | ExprKind::RandSeed | ExprKind::RandSeedWith { .. }
             | ExprKind::RandNext { .. } | ExprKind::RandRange { .. } | ExprKind::RandShuffle { .. }
@@ -44365,10 +44396,10 @@ impl<'a> MoveCheck<'a> {
             ExprKind::CommandRun { command } | ExprKind::CommandRunBytes { command } => {
                 move_expr!(self, command, moved, false, false)
             }
-            ExprKind::RunOutputCode { out } | ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
+            ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
                 move_expr!(self, out, moved, false, false)
             }
-            ExprKind::RunBytesCode { out } | ExprKind::RunBytesStdout { out } | ExprKind::RunBytesStderr { out } => {
+            ExprKind::RunBytesStdout { out } | ExprKind::RunBytesStderr { out } => {
                 move_expr!(self, out, moved, false, false)
             }
             // `std.encoding` borrows its byte-view / `str` arg (never consumed) — like `hash64`.
@@ -44652,7 +44683,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::CryptoRandom { out } => move_expr!(self, out, moved, false, false),
             // `crypto.sha256`/`sha512` borrow the byte view (never consume it). Recurse non-consuming
             // to catch a use-after-move *inside* the operand.
-            ExprKind::FsTree { args, .. } => { for argument in args { move_expr!(self, argument, moved, false, false); } }
+            ExprKind::FsTree { args, .. } | ExprKind::ProcessLive { args, .. } => { for argument in args { move_expr!(self, argument, moved, false, false); } }
             ExprKind::CryptoDigestNew => {},
             ExprKind::CryptoDigestFinish { digest } => move_expr!(self, digest, moved, true, true),
             ExprKind::CryptoHash { data, .. } => move_expr!(self, data, moved, false, false),
@@ -50558,6 +50589,10 @@ impl<'a, 't> Checker<'a, 't> {
             // `std.process` — `process.cpu_count()` -> i64: the parallelism available to this
             // process (affinity/quota aware, always >= 1). The number a `task_group` worker count is
             // sized against, since the runtime's task pool is sized from the same source.
+            if module == "process" && matches!(method, "table" | "signal_number") {
+                let kind = if method == "table" { process_live::ProcessLiveKind::ProcessTable } else { process_live::ProcessLiveKind::SignalNumber };
+                return self.check_process_live(kind, None, args, span);
+            }
             if module == "process" && method == "cpu_count" {
                 self.require_import("std.process", "process.cpu_count", span);
                 if !args.is_empty() {
@@ -51242,6 +51277,9 @@ impl<'a, 't> Checker<'a, 't> {
         };
         let recv_expr = self.check_expr(recv, recv_expected);
         let recv_ty = recv_expr.ty;
+        if let Some(kind) = process_live::ProcessLiveKind::from_method(recv_ty, method) {
+            return self.check_process_live(kind, Some(recv_expr), args, span);
+        }
         if let Some(kind) = fs_tree::FsTreeKind::from_method(recv_ty, method) {
             return self.check_fs_tree(kind, Some(recv_expr), args, span);
         }
@@ -51389,7 +51427,7 @@ impl<'a, 't> Checker<'a, 't> {
             "cwd" | "timeout_ns" | "max_capture_bytes" | "env" | "env_clear" | "run" | "run_bytes" if recv_ty == Ty::Command => {
                 self.check_command_method(recv_expr, method, args, span)
             }
-            // `std.process` (Slice 4) `run_output` getters on a `run_output`: `out.code()` (`i64`) /
+            // `std.process` (Slice 4) `run_output` getters on a `run_output`: `out.status()` (typed wait result) /
             // `out.stdout()` / `out.stderr()` (`str` views into `out`). Type-guarded.
             "code" | "stdout" | "stderr" if recv_ty == Ty::RunOutput => {
                 self.check_run_output_method(recv_expr, method, args, span)
@@ -58942,6 +58980,54 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    fn check_process_live(&mut self, kind: process_live::ProcessLiveKind, receiver: Option<Expr>, args: &[ast::Expr], span: Span) -> Expr {
+        use process_live::Input;
+        self.require_import("std.process", "process operation", span);
+        let invalid = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let offset = usize::from(receiver.is_some());
+        if args.len().checked_add(offset) != Some(kind.inputs().len()) {
+            self.diags.error(format!("process operation expects {} arguments, got {}",kind.inputs().len().saturating_sub(offset),args.len()),span);
+            return invalid;
+        }
+        let mut checked = Vec::new();
+        if let Some(receiver) = receiver {
+            if !matches!(receiver.kind,ExprKind::Local(_)) {
+                self.diags.error("bind the process handle to a local before calling a method".to_string(),span); return invalid;
+            }
+            if kind.exclusive() && !self.require_exclusive_handle_receiver(&receiver,"process handle","operation","mutate") { return invalid; }
+            checked.push(receiver);
+        }
+        for (argument,input) in args.iter().zip(&kind.inputs()[offset..]) {
+            let Some(expected) = process_live::input_type(*input,self.structs,self.enums) else { return invalid; };
+            let mode = if *input == Input::OutBytes { ast::ParamMode::Out } else if matches!(input,Input::Owner(_)) { ast::ParamMode::Borrow } else { ast::ParamMode::ByValue };
+            let value = self.check_call_argument_for_mode(argument,Some(expected),mode,None);
+            if self.resolve(value.ty) != expected && !hir_expr_diverges(&value) {
+                self.diags.error("process operation argument has the wrong type".to_string(),argument.span); return invalid;
+            }
+            if *input == Input::OutBytes && !hir_expr_diverges(&value) {
+                let root = self.arg_root_local(argument);
+                let writable = root.is_some_and(|id| {
+                    let local = &self.locals[id as usize];
+                    local.is_mut && self.slice_root_is_known(id)
+                        && matches!(self.resolve(local.ty),Ty::Array(_,_) | Ty::DynArray(_) | Ty::Slice(_))
+                        && (!matches!(self.resolve(local.ty),Ty::Slice(_)) || self.current_params.iter().position(|param|*param==id)
+                            .is_some_and(|index|matches!(self.current_param_modes.get(index),Some(ast::ParamMode::Out))))
+                });
+                if !writable || self.hir_is_readonly_view(&value) {
+                    self.diags.error("process byte reads require a writable array/slice or out parameter".to_string(),argument.span); return invalid;
+                }
+            }
+            self.validate_borrow_argument(&value,mode,"process operation");
+            checked.push(value);
+        }
+        let Some(payload) = process_live::payload_type(kind,self.structs,self.enums) else { return invalid; };
+        let ty = if kind.fallible() {
+            let scalar = self.payload_scalar(payload,"process result",true,span);
+            Ty::Result(scalar,Scalar::Enum(self.error_enum_id))
+        } else { payload };
+        Expr { kind: ExprKind::ProcessLive { kind, args: checked }, ty, span }
+    }
+
     /// Validate the closed retained filesystem signature and its call-borrow receiver.
     fn check_fs_tree(&mut self, kind: fs_tree::FsTreeKind, receiver: Option<Expr>, args: &[ast::Expr], span: Span) -> Expr {
         self.require_import("std.fs", "retained filesystem operation", span);
@@ -59672,16 +59758,10 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::ProcessExit { code: Box::new(code) }, ty: Ty::Unit, span }
     }
 
-    /// `process.spawn(cmd, args)` (`std.process`) -> `Result<child, Error>` — `fork` + `execvp` a
-    /// child process. `cmd` is a borrowed `str` (owned `string` auto-borrowed) — the **lookup path**
-    /// passed to `execvp` (resolved via `PATH` when it has no `/`). `args` is a borrowed str-view
-    /// collection (`array<str>` — e.g. `main(args)` — or a `slice<str>` of it) that becomes the
-    /// child's **full** `argv`, **including `argv[0]`** (P5: the caller supplies the program name, not
-    /// the runtime; `cmd` and `args[0]` are independent). Both are borrowed (never consumed). The Ok
-    /// payload is an owned `child` Move handle (`Drop` reaps it via a blocking `waitpid`). A `fork`
-    /// failure is `Err(errno)`; an `execvp` failure cannot be reported synchronously — the forked child
-    /// `_exit(127)`s (the shell convention), so an exec-not-found surfaces later as `wait() == 127`
-    /// (`docs/impl/std-design/process.md` P5). Impure. Builtin.
+    /// Spawn one owned direct child through the shared parent-marshalled native launcher.
+    /// The borrowed command path uses the final environment's PATH; the borrowed argv includes
+    /// caller-supplied argv[0]. Setup and exec failures return their native Error before publication.
+    /// Child Drop closes captures and reaps; observations and typed wait results remain separate.
     fn check_process_spawn(&mut self, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         if args.len() != 2 {
@@ -59799,9 +59879,11 @@ impl<'a, 't> Checker<'a, 't> {
                 .error(format!("'.wait()' takes no arguments, got {}", args.len()), span);
             return err;
         }
+        if !self.require_exclusive_handle_receiver(&recv_expr, "child", "wait", "reap") { return err; }
+        let Some(result) = fs_tree::record_id(self.structs, "process.wait_result") else { return err; };
         Expr {
             kind: ExprKind::ChildWait { child: Box::new(recv_expr) },
-            ty: Ty::Result(Scalar::Int(IntTy { bits: 64, signed: true }), Scalar::Enum(self.error_enum_id)),
+            ty: Ty::Result(Scalar::Struct(result), Scalar::Enum(self.error_enum_id)),
             span,
         }
     }
@@ -59896,6 +59978,8 @@ impl<'a, 't> Checker<'a, 't> {
             }
             return err;
         }
+        if !matches!(method,"run" | "run_bytes")
+            && !self.require_exclusive_handle_receiver(&recv_expr,"command",method,"configure") { return err; }
         match method {
             "cwd" => {
                 if args.len() != 1 {
@@ -60013,7 +60097,7 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// `out.code()` / `out.stdout()` / `out.stderr()` on a `run_output` ([`Ty::RunOutput`]), the
+    /// `out.status()` / `out.stdout()` / `out.stderr()` on a `run_output` ([`Ty::RunOutput`]), the
     /// receiver already evaluated. The receiver must be a bound local (the v1 gate). `code` yields
     /// `i64`; `stdout`/`stderr` yield a `str` **view** into `out` (region-bound — the `region_of` arm
     /// rejects an escape past `out`'s `Drop`, P9). The captured-output dual of
@@ -60026,7 +60110,7 @@ impl<'a, 't> Checker<'a, 't> {
         if !matches!(recv_expr.kind, ExprKind::Local(_)) {
             if recv_expr.ty != Ty::Error {
                 self.diags.error(
-                    "bind the run output to a local first, then read it (`out := c.run()?` then `out.code()`) — a temporary owned run output handle is not dropped yet".to_string(),
+                    "bind the run output to a local first, then read it (`out := c.run()?` then `out.status()`) — a temporary owned run output handle is not dropped yet".to_string(),
                     span,
                 );
             }
@@ -60037,11 +60121,6 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         match method {
-            "code" => Expr {
-                kind: ExprKind::RunOutputCode { out: Box::new(recv_expr) },
-                ty: Ty::Int(IntTy { bits: 64, signed: true }),
-                span,
-            },
             "stdout" => Expr { kind: ExprKind::RunOutputStdout { out: Box::new(recv_expr) }, ty: Ty::Str, span },
             "stderr" => Expr { kind: ExprKind::RunOutputStderr { out: Box::new(recv_expr) }, ty: Ty::Str, span },
             _ => {
@@ -60067,11 +60146,6 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         match method {
-            "code" => Expr {
-                kind: ExprKind::RunBytesCode { out: Box::new(recv_expr) },
-                ty: Ty::Int(IntTy { bits: 64, signed: true }),
-                span,
-            },
             "stdout" => Expr {
                 kind: ExprKind::RunBytesStdout { out: Box::new(recv_expr) },
                 ty: Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })),
@@ -65275,10 +65349,10 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ExprKind::CommandEnvClear { command } => self.finalize_expr(command),
             ExprKind::CommandRun { command } | ExprKind::CommandRunBytes { command } => self.finalize_expr(command),
-            ExprKind::RunOutputCode { out } | ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
+            ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
                 self.finalize_expr(out)
             }
-            ExprKind::RunBytesCode { out } | ExprKind::RunBytesStdout { out } | ExprKind::RunBytesStderr { out } => {
+            ExprKind::RunBytesStdout { out } | ExprKind::RunBytesStderr { out } => {
                 self.finalize_expr(out)
             }
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.finalize_expr(data),
@@ -65508,7 +65582,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(b);
             }
             ExprKind::CryptoRandom { out } => self.finalize_expr(out),
-            ExprKind::FsTree { args, .. } => { for argument in args { self.finalize_expr(argument); } }
+            ExprKind::FsTree { args, .. } | ExprKind::ProcessLive { args, .. } => { for argument in args { self.finalize_expr(argument); } }
             ExprKind::CryptoDigestNew => {},
             ExprKind::CryptoDigestFinish { digest: data }
             | ExprKind::CryptoHash { data, .. } => self.finalize_expr(data),
@@ -69144,6 +69218,13 @@ fn resolve_type(
             }
             Ty::Child
         }
+        "command" | "run_output" if !cx.type_table.get(cx.cur_module).is_some_and(|types|types.contains_key(name)) => {
+            if !args.is_empty() {
+                diags.error(format!("{name} takes no type arguments"), span);
+                return Ty::Error;
+            }
+            if name=="command" { Ty::Command } else { Ty::RunOutput }
+        }
         "run_bytes" => {
             if !args.is_empty() {
                 diags.error("run_bytes takes no type arguments".to_string(), span);
@@ -71485,7 +71566,7 @@ mod tests {
         // JsonEncode replaces three variants with one fresh owned Result producer.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 332,
+            variants, 331,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

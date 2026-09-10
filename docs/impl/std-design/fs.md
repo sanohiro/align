@@ -17,6 +17,16 @@ private temporary-directory lifecycle is owned by
 > single-link open is IMPLEMENTED; align-llm adoption remains external. Request 56 private
 > temporary-directory lifecycle is IMPLEMENTED; release and align-llm adoption remain pending.
 
+## R65 sealed storage contract
+
+[Plan 50](../50-r65-process-capability-handoff.md), designed and ready for implementation, owns
+the explicit memory_kind, memory_writer and sealed_file declarations, native
+seals, positional writable-out reads, ownership, ABI and acceptance. These are
+Linux-only OS facilities with a defined unsupported-host error; ordinary native
+Mac filesystem/process workflows do not depend on them. Materialization is
+explicit and chunked, seal consumes the writer, and launch does not copy the
+whole file. Executable admission and controlled inheritance belong to std.process.
+
 ## Overview
 
 This is a narrow extension to the existing M9 filesystem surface. It supplies

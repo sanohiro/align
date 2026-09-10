@@ -11,7 +11,7 @@ macro_rules! runtime_keys {
         }
 
         impl RuntimeKey {
-            pub const ALL: [Self; 391] = [$(Self::$variant,)*];
+            pub const ALL: [Self; 405] = [$(Self::$variant,)*];
 
             pub const fn logical_name(self) -> &'static str {
                 match self {
@@ -73,7 +73,15 @@ runtime_keys! {
     BuilderWriteUint => "builder_write_uint",
     BytesAsStr => "bytes_as_str",
     ChildFree => "child_free",
+    ChildGroupMembers => "child_group_members",
+    ChildId => "child_id",
     ChildKill => "child_kill",
+    ChildKillGroup => "child_kill_group",
+    ChildPoll => "child_poll",
+    ChildReadStderr => "child_read_stderr",
+    ChildReadStdout => "child_read_stdout",
+    ChildStatus => "child_status",
+    ChildTryWait => "child_try_wait",
     ChildWait => "child_wait",
     Chunks => "chunks",
     CliCommand => "cli_command",
@@ -101,8 +109,12 @@ runtime_keys! {
     CommandFree => "command_free",
     CommandMaxCapture => "command_max_capture",
     CommandNew => "command_new",
+    CommandNewSession => "command_new_session",
     CommandRun => "command_run",
     CommandRunBytes => "command_run_bytes",
+    CommandStart => "command_start",
+    CommandStderrTo => "command_stderr_to",
+    CommandStdoutTo => "command_stdout_to",
     CommandTimeout => "command_timeout",
     CompressGzipCompress => "compress_gzip_compress",
     CompressGzipDecompress => "compress_gzip_decompress",
@@ -333,7 +345,9 @@ runtime_keys! {
     ProcessCpuCount => "process_cpu_count",
     ProcessExec => "process_exec",
     ProcessExit => "process_exit",
+    ProcessSignalNumber => "process_signal_number",
     ProcessSpawn => "process_spawn",
+    ProcessTable => "process_table",
     RangeFail => "range_fail",
     RegexCaptures => "regex_captures",
     RegexCapturesFree => "regex_captures_free",
@@ -353,12 +367,12 @@ runtime_keys! {
     RngSeedOs => "rng_seed_os",
     RngSeedWith => "rng_seed_with",
     RngShuffle => "rng_shuffle",
-    RunBytesCode => "run_bytes_code",
     RunBytesFree => "run_bytes_free",
+    RunBytesStatus => "run_bytes_status",
     RunBytesStderr => "run_bytes_stderr",
     RunBytesStdout => "run_bytes_stdout",
-    RunOutputCode => "run_output_code",
     RunOutputFree => "run_output_free",
+    RunOutputStatus => "run_output_status",
     RunOutputStderr => "run_output_stderr",
     RunOutputStdout => "run_output_stdout",
     StrClone => "str_clone",
@@ -416,7 +430,7 @@ runtime_keys! {
     XmlText => "xml_text",
 }
 
-const _: [(); 391] = [(); RuntimeKey::ALL.len()];
+const _: [(); 405] = [(); RuntimeKey::ALL.len()];
 
 #[cfg(test)]
 mod tests {
@@ -425,7 +439,7 @@ mod tests {
 
     #[test]
     fn runtime_keys_are_complete_unique_and_alphabetical() {
-        assert_eq!(RuntimeKey::ALL.len(), 391);
+        assert_eq!(RuntimeKey::ALL.len(), 405);
         let names: Vec<_> = RuntimeKey::ALL
             .iter()
             .map(|key| key.logical_name())

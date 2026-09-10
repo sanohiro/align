@@ -5194,6 +5194,7 @@ struct NativeOwnerMirContract<'a> {
     result: Ty,
     outputs: Vec<(Slot, Ty)>,
     operands: Vec<(&'a Operand, Ty, OperandRequirement)>,
+    writable_buffers: Vec<&'a Operand>,
     access: XmlAccessProvenance,
 }
 
@@ -5241,9 +5242,49 @@ fn native_owner_mir_contract<'a>(
         result: Ty::Unit,
         outputs: Vec::new(),
         operands: Vec::new(),
+        writable_buffers: Vec::new(),
         access: XmlAccessProvenance::Owned,
     };
     match value {
+        Rvalue::ProcessLive { kind, args, out } => {
+            contract.result = if kind.fallible() { i32_ty } else if out.is_some() { Ty::Unit }
+                else if matches!(kind,align_sema::process_live::ProcessLiveKind::ChildId | align_sema::process_live::ProcessLiveKind::SignalNumber) { i64_ty } else { Ty::Unit };
+            for (index,(input,operand)) in kind.inputs().iter().zip(args).enumerate() {
+                use align_sema::process_live::Input;
+                if *input==Input::OutBytes {
+                    // An Out buffer proves its writable backing without reading its elements.
+                    // The separate shape gate still fixes the exact slice type.
+                    contract.writable_buffers.push(operand);
+                    continue;
+                }
+                let actual = xml_operand_base_ty(function,operand).unwrap_or(Ty::Error);
+                let expected = match input { Input::Owner(ty) => *ty, Input::Integer => i64_ty,
+                    Input::Bool => Ty::Bool, Input::OutBytes => bytes, Input::Readiness | Input::Signal => actual };
+                let requirement = if index==0 && kind.exclusive() && matches!(input,Input::Owner(_)) { write } else { read };
+                contract.operands.push((operand,expected,requirement));
+            }
+            if let Some(out) = out { contract.outputs.push((*out,function.slots.get(*out as usize).copied().unwrap_or(Ty::Error))); }
+        }
+        Rvalue::CommandCwd { command, dir } => {
+            contract.operands=vec![(command,Ty::Command,write),(dir,Ty::Str,read)];
+        }
+        Rvalue::CommandTimeout { command, ns } | Rvalue::CommandMaxCapture { command, limit: ns } => {
+            contract.operands=vec![(command,Ty::Command,write),(ns,i64_ty,read)];
+        }
+        Rvalue::CommandEnv { command, name, value } => {
+            contract.operands=vec![(command,Ty::Command,write),(name,Ty::Str,read),(value,Ty::Str,read)];
+        }
+        Rvalue::CommandEnvClear { command } => contract.operands=vec![(command,Ty::Command,write)],
+        Rvalue::CommandRun { command, out } | Rvalue::CommandRunBytes { command, out } => {
+            contract.result=i32_ty;
+            contract.operands=vec![(command,Ty::Command,read)];
+            contract.outputs=vec![(*out,if matches!(value,Rvalue::CommandRun { .. }) { Ty::RunOutput } else { Ty::RunBytes })];
+        }
+        Rvalue::ChildWait { child, out } => {
+            contract.result = i32_ty;
+            contract.operands.push((child, Ty::Child, write));
+            contract.outputs.push((*out, function.slots.get(*out as usize).copied().unwrap_or(Ty::Error)));
+        }
         Rvalue::FsTree { kind, args, output } => {
             contract.result = i32_ty;
             for (input, operand) in kind.inputs().iter().zip(args) {
@@ -5387,6 +5428,8 @@ fn xml_written_slots(rvalue: &Rvalue) -> Vec<(Slot, XmlAccessProvenance)> {
 
     let owned = |slot| vec![(slot, Owned)];
     match rvalue {
+        Rvalue::ProcessLive { out, .. } => out.iter().map(|slot|(*slot,Owned)).collect(),
+        Rvalue::ChildWait { out, .. } => vec![(*out, Owned)],
         Rvalue::FsTree { output, .. } => fs_tree_output_slots(*output).into_iter().map(|slot| (slot, Owned)).collect(),
         Rvalue::JsonDecode { out, arena, .. }
         | Rvalue::JsonDecodeStructArray { out, arena, .. }
@@ -6987,6 +7030,12 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 }
                 let source = self.read_source(&mut equation, operand, expected, Vec::new());
                 Self::add_required_source(&mut equation, source, requirement);
+            }
+            for operand in contract.writable_buffers {
+                let source = self.buffer_source(operand, Vec::new());
+                Self::add_required_source(&mut equation, source, OperandRequirement {
+                    write: true, exclusive: true, ..OperandRequirement::default()
+                });
             }
             equation.seed = Some(if !contract.outputs.is_empty() { XmlAccessProvenance::Owned } else { contract.access });
             return equation;
@@ -9761,7 +9810,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::FsWriteFileBuilder { .. }
             | Rvalue::FsExists { .. }
             | Rvalue::FsRemove { .. }
-            | Rvalue::FsCreateDir { .. } | Rvalue::FsIsDir { .. } | Rvalue::FsTree { .. }
+            | Rvalue::FsCreateDir { .. } | Rvalue::FsIsDir { .. } | Rvalue::FsTree { .. } | Rvalue::ProcessLive { .. }
             | Rvalue::FsRemoveEmptyDir { .. }
             | Rvalue::RenameNoReplace { .. }
             | Rvalue::FsReadDir { .. }
@@ -9841,8 +9890,6 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::CommandEnvClear { .. }
             | Rvalue::CommandRun { .. }
             | Rvalue::CommandRunBytes { .. }
-            | Rvalue::RunOutputCode { .. }
-            | Rvalue::RunBytesCode { .. }
             | Rvalue::RunBytesView { .. }
             | Rvalue::HttpParse { .. }
             | Rvalue::HttpRespStatus { .. }
@@ -9945,7 +9992,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
 
         if let Some(contract) = native_owner_mir_contract(self.graph.function, rvalue) {
             if !contract.outputs.contains(&(slot, slot_ty))
-                || (!path.is_empty() && !matches!(rvalue, Rvalue::OsHost { .. } | Rvalue::FsTree { .. }))
+                || (!path.is_empty() && !matches!(rvalue, Rvalue::OsHost { .. } | Rvalue::FsTree { .. } | Rvalue::ProcessLive { .. }))
                 || contract.access != recorded_access {
                 equation.invalid = true;
             }
@@ -9955,6 +10002,12 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 }
                 let source = self.read_source(equation, operand, expected, Vec::new());
                 Self::add_required_source(equation, source, requirement);
+            }
+            for operand in contract.writable_buffers {
+                let source = self.buffer_source(operand, Vec::new());
+                Self::add_required_source(equation, source, OperandRequirement {
+                    write: true, exclusive: true, ..OperandRequirement::default()
+                });
             }
             equation.seed = merge_xml_access(equation.seed, contract.access);
             return;
@@ -11137,6 +11190,35 @@ pub fn validate_mir_producers(program: &Program) -> Result<HashSet<String>, Code
 }
 
 fn validate_host_mir(program: &Program) -> Result<(), CodegenError> {
+    if !align_sema::process_live::schemas_valid(&program.structs, &program.enums) {
+        return Err(CodegenError::Lowering("malformed process observation schema".to_string()));
+    }
+    for function in &program.fns {
+        for statement in function.blocks.iter().flat_map(|block| &block.stmts) {
+            if let Stmt::Let(value,Rvalue::ProcessLive { kind,args,out }) = statement {
+                use align_sema::process_live::{input_type,payload_type};
+                let payload = payload_type(*kind,&program.structs,&program.enums);
+                let native_ty = if kind.fallible() { Some(Ty::Int(IntTy { bits:32,signed:true })) }
+                    else if kind.scratch() { Some(Ty::Unit) } else { payload };
+                let output_valid = match out { Some(slot) => kind.scratch() && function.slots.get(*slot as usize).copied()==payload,
+                    None => !kind.scratch() };
+                if payload.is_none() || !output_valid || function.value_tys.get(*value as usize).copied()!=native_ty
+                    || args.len()!=kind.inputs().len() || kind.inputs().iter().zip(args).any(|(input,operand)|
+                        xml_operand_base_ty(function,operand)!=input_type(*input,&program.structs,&program.enums)) {
+                    return Err(CodegenError::Lowering("malformed live process producer".to_string()));
+                }
+            }
+            if let Stmt::Let(value, Rvalue::ChildWait { child, out }) = statement {
+                let result = align_sema::fs_tree::record_id(&program.structs, "process.wait_result").map(Ty::Struct);
+                if result.is_none() || function.slots.get(*out as usize).copied() != result
+                    || xml_operand_base_ty(function, child) != Some(Ty::Child)
+                    || function.value_tys.get(*value as usize).copied() != Some(Ty::Int(IntTy { bits: 32, signed: true })) {
+                    return Err(CodegenError::Lowering("malformed child wait producer".to_string()));
+                }
+            }
+        }
+    }
+
     if !align_sema::fs_tree_schemas_valid(&program.structs, &program.enums) {
         return Err(CodegenError::Lowering("malformed retained filesystem schema".to_string()));
     }
@@ -11702,7 +11784,7 @@ fn validate_resource_rvalues_component(
                 if native_owner_mir_contract(function, rvalue).is_some()
                     && !OperandRequirement::READ.is_satisfied_by(xml_access(&Operand::Value(*value), result))
                 {
-                    return Err(fail(function, "native owner producer contract mismatch"));
+                    return Err(fail(function, &format!("native owner producer contract mismatch: {rvalue:?}")));
                 }
                 let protected_call_boundary = |args: &[Operand]| {
                     xml_owned_leaf_paths(program, result)
@@ -24099,6 +24181,61 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("fs_remove returns i32")
             }
+            Rvalue::ProcessLive { kind,args,out } => {
+                use align_sema::process_live::{ProcessLiveKind,Input};
+                let mut native_args = Vec::new();
+                for (input,operand) in kind.inputs().iter().zip(args) {
+                    match input {
+                        Input::OutBytes => {
+                            let (pointer,length) = self.split_str(operand)?;
+                            native_args.push(pointer.into()); native_args.push(length.into());
+                        }
+                        Input::Readiness => {
+                            let record = self.operand(operand)?.into_struct_value();
+                            let mut mask = self.ctx.i32_type().const_zero();
+                            for index in 0..3 {
+                                let bit = self.builder.build_extract_value(record,index,"interest").map_err(|e|self.err(e))?.into_int_value();
+                                let bit = self.builder.build_int_z_extend(bit,self.ctx.i32_type(),"interest.bit").map_err(|e|self.err(e))?;
+                                let shifted = self.builder.build_left_shift(bit,self.ctx.i32_type().const_int(u64::from(index),false),"interest.shift").map_err(|e|self.err(e))?;
+                                mask = self.builder.build_or(mask,shifted,"interest.mask").map_err(|e|self.err(e))?;
+                            }
+                            native_args.push(mask.into());
+                        }
+                        Input::Signal => {
+                            let record = self.operand(operand)?.into_struct_value();
+                            native_args.push(self.builder.build_extract_value(record,0,"signal.tag").map_err(|e|self.err(e))?.into());
+                        }
+                        Input::Bool => {
+                            let value = self.operand(operand)?.into_int_value();
+                            native_args.push(self.builder.build_int_z_extend(value,self.ctx.i8_type(),"process.bool").map_err(|e|self.err(e))?.into());
+                        }
+                        Input::Owner(_) | Input::Integer => native_args.push(self.operand(operand)?.into()),
+                    }
+                }
+                if let Some(out) = out { native_args.push((*self.slots.get(out).ok_or_else(||self.err("missing process output"))?).into()); }
+                let key = match kind {
+                    ProcessLiveKind::CommandNewSession => RuntimeKey::CommandNewSession,
+                    ProcessLiveKind::CommandStdoutTo => RuntimeKey::CommandStdoutTo,
+                    ProcessLiveKind::CommandStderrTo => RuntimeKey::CommandStderrTo,
+                    ProcessLiveKind::CommandStart => RuntimeKey::CommandStart,
+                    ProcessLiveKind::ChildId => RuntimeKey::ChildId,
+                    ProcessLiveKind::ChildStatus => RuntimeKey::ChildStatus,
+                    ProcessLiveKind::ChildTryWait => RuntimeKey::ChildTryWait,
+                    ProcessLiveKind::ChildReadStdout => RuntimeKey::ChildReadStdout,
+                    ProcessLiveKind::ChildReadStderr => RuntimeKey::ChildReadStderr,
+                    ProcessLiveKind::ChildPoll => RuntimeKey::ChildPoll,
+                    ProcessLiveKind::ChildKillGroup => RuntimeKey::ChildKillGroup,
+                    ProcessLiveKind::ChildGroupMembers => RuntimeKey::ChildGroupMembers,
+                    ProcessLiveKind::RunOutputStatus => RuntimeKey::RunOutputStatus,
+                    ProcessLiveKind::RunBytesStatus => RuntimeKey::RunBytesStatus,
+                    ProcessLiveKind::SignalNumber => RuntimeKey::ProcessSignalNumber,
+                    ProcessLiveKind::ProcessTable => RuntimeKey::ProcessTable,
+                };
+                let call = self.builder.build_call(self.runtime(key),&native_args,"process.live").map_err(|e|self.err(e))?;
+                if !kind.fallible() && (kind.scratch() || *kind==ProcessLiveKind::CommandNewSession) {
+                    self.ctx.i8_type().const_zero().into()
+                } else { call.try_as_basic_value().basic().ok_or_else(||self.err("live process ABI result"))? }
+            }
             Rvalue::FsTree { kind, args, output } => {
                 use align_sema::fs_tree::{FsTreeKind, Input};
                 let mut native_args = Vec::new();
@@ -24309,14 +24446,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("process_spawn returns i32")
             }
-            // ch.wait — waitpid the child (marking it reaped through the pointer); return i64 (exit
-            // code >= 0, or -(status) on a double-wait / waitpid error).
-            Rvalue::ChildWait { child } => {
+            // Exclusive child wait returns i32 status and writes the typed wait-result scratch.
+            Rvalue::ChildWait { child, out } => {
                 let cp = self.operand(child)?.into();
+                let output = *self.slots.get(out).ok_or_else(||self.err("missing child wait output"))?;
                 self.builder
-                    .build_call(self.runtime(RuntimeKey::ChildWait), &[cp], "cwait")
+                    .build_call(self.runtime(RuntimeKey::ChildWait), &[cp, output.into()], "cwait")
                     .map_err(|e| self.err(e))?
-                    .try_as_basic_value().basic().expect("child_wait returns i64")
+                    .try_as_basic_value().basic().expect("child_wait returns i32")
             }
             // ch.kill — libc kill(pid, sig); return i32 status (0 = ok, AL_INVALID for a bad sig /
             // reaped child, else the mapped errno). `child` is a *Child pointer, `sig` an i64.
@@ -25009,14 +25146,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .basic()
                     .ok_or_else(|| self.err("command_run_bytes returned no i32 status"))?
             }
-            // `out.code()` — the runtime returns the i64 exit code directly.
-            Rvalue::RunOutputCode { out } => {
-                let p = self.operand(out)?.into_pointer_value();
-                self.builder
-                    .build_call(self.runtime(RuntimeKey::RunOutputCode), &[p.into()], "rocode")
-                    .map_err(|e| self.err(e))?
-                    .try_as_basic_value().basic().expect("run_output_code returns i64")
-            }
+
             // `out.stdout()` / `out.stderr()` — a `str` view `{ptr,len}` into the run-output buffer.
             Rvalue::RunOutputView { out, err } => {
                 let p = self.operand(out)?.into_pointer_value();
@@ -25026,15 +25156,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("run_output_stdout/stderr returns a {ptr,len}")
             }
-            Rvalue::RunBytesCode { out } => {
-                let p = self.operand(out)?.into_pointer_value();
-                self.builder
-                    .build_call(self.runtime(RuntimeKey::RunBytesCode), &[p.into()], "rbcode")
-                    .map_err(|e| self.err(e))?
-                    .try_as_basic_value()
-                    .basic()
-                    .ok_or_else(|| self.err("run_bytes_code returned no i64 value"))?
-            }
+
             Rvalue::RunBytesView { out, err } => {
                 let p = self.operand(out)?.into_pointer_value();
                 let key = if *err { RuntimeKey::RunBytesStderr } else { RuntimeKey::RunBytesStdout };
@@ -44065,6 +44187,49 @@ fn main() -> i32 = 0
         }
         assert!(nested_reads > 0, "nested field path mutation covered no load");
         assert!(reads > 0, "String projection mutation covered no load");
+        Ok(())
+    }
+
+    #[test]
+    fn live_process_mir_contract_matrix() -> Result<(), &'static str> {
+        use align_sema::process_live::ProcessLiveKind;
+        let base=mir("import std.process\nfn read(borrow mut child: child,out bytes:slice<u8>) -> Result<Option<i64>,Error> = child.read_stdout(bytes)\nfn status(borrow output:run_bytes) -> process.wait_result = output.status()\nfn main() {}\n");
+        assert!(validate_mir_producers(&base).is_ok(), "{:?}", validate_mir_producers(&base));
+        let mut producers=0;
+        for (fi,function) in base.fns.iter().enumerate() {
+            for (bi,block) in function.blocks.iter().enumerate() {
+                for (si,statement) in block.stmts.iter().enumerate() {
+                    let Stmt::Let(_,Rvalue::ProcessLive { .. })=statement else { continue; };
+                    producers+=1;
+                    for mutation in 0..6 {
+                        let mut bad=base.clone();
+                        let function=&mut bad.fns[fi];
+                        let Stmt::Let(value,Rvalue::ProcessLive { kind,args,out })=&mut function.blocks[bi].stmts[si] else { return Err("process producer"); };
+                        match mutation {
+                            0=>args.clear(),
+                            1=>*out=None,
+                            2=>*out=Some(u32::MAX),
+                            3=>*kind=ProcessLiveKind::CommandStart,
+                            4=>function.value_tys[*value as usize]=Ty::Bool,
+                            _=>args[0]=Operand::Const(Const::Unit),
+                        }
+                        assert_xml_producer_rejected(&bad,"malformed live process producer");
+                    }
+                }
+            }
+        }
+        assert_eq!(producers,2);
+        for mode in [align_ast::ParamMode::ByValue,align_ast::ParamMode::Borrow,align_ast::ParamMode::BorrowMut] {
+            let mut bad=base.clone();
+            let function=bad.fns.iter_mut().find(|function|function.name.as_str()=="read").ok_or("read")?;
+            function.param_modes[1]=mode;
+            assert_xml_producer_rejected(&bad,"readonly process destination");
+        }
+        for name in ["process.wait_result","process.readiness","process.snapshot"] {
+            let mut bad=base.clone();
+            bad.structs.iter_mut().find(|definition|definition.name==name).ok_or("schema")?.fields[0].ty=Ty::Raw;
+            assert_xml_producer_rejected(&bad,"forged process schema");
+        }
         Ok(())
     }
 
