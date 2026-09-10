@@ -2153,6 +2153,7 @@ pub enum Rvalue {
     /// `time.now()` — wall-clock UNIX-epoch nanoseconds (`CLOCK_REALTIME`), an `i64`. Impure.
     TimeNow,
     /// `process.cpu_count()` — the parallelism available to this process, an `i64` (>= 1). Impure.
+    OsHost { out: Slot },
     ProcessCpuCount,
     /// `time.instant()` — monotonic-clock nanoseconds (`CLOCK_MONOTONIC`), an `i64`. Impure.
     TimeInstant,
@@ -8475,6 +8476,14 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 let v = b.fresh_value(e.ty);
                 b.push(Stmt::Let(v, Rvalue::TimeInstant));
                 Operand::Value(v)
+            }
+            hir::ExprKind::OsHost => {
+                let Ty::Result(Scalar::Struct(id), _) = e.ty else { return Operand::Const(Const::Unit) };
+                let ty = Ty::Struct(id);
+                let out = b.new_slot(ty);
+                let status = b.fresh_value(status_ty());
+                b.push(Stmt::Let(status, Rvalue::OsHost { out }));
+                emit_open_handle_result(b, status, out, ty, e.ty)
             }
             hir::ExprKind::ProcessCpuCount => {
                 let v = b.fresh_value(e.ty);
@@ -28705,7 +28714,7 @@ fn main() -> i32 = 0
         // parameters type), `http_sse_event` (the std.http SSE event view), and `regex_match` (the
         // std.regex match span) — all present in every program's struct table, like the builtin
         // `Error` enum.
-        assert_eq!(p.structs.len(), 4);
+        assert_eq!(p.structs.len(), 5);
         let f = &p.fns[0];
         let stmts: Vec<&Stmt> = f.blocks.iter().flat_map(|b| &b.stmts).collect();
         // Two field stores for the literal, two field loads for the reads.

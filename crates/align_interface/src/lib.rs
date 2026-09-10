@@ -1418,6 +1418,7 @@ const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("codec.kind", 0, BuiltinCapability::Opaque),
     ("Error", 0, BuiltinCapability::Opaque),
     ("core.Error", 0, BuiltinCapability::Opaque),
+    ("os.host_info", 0, BuiltinCapability::Opaque),
     ("argon2_params", 0, BuiltinCapability::Opaque),
     ("crypto.argon2_params", 0, BuiltinCapability::Opaque),
     ("regex_match", 0, BuiltinCapability::Opaque),
@@ -2684,6 +2685,7 @@ pub fn summary_to_source(
                         | "crypto.ed25519_public_key" => {
                             builtin_type_imports.insert("std.crypto".to_string());
                         }
+                        "os.host_info" => { builtin_type_imports.insert("std.os".to_string()); }
                         "regex.regex_match" => {
                             builtin_type_imports.insert("std.regex".to_string());
                         }

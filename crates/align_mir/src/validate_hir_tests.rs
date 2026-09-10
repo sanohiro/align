@@ -11831,7 +11831,7 @@ fn request11_expr_kind_inventory_tripwire() {
         // Incremental SHA-256 adds three operations; keep this count synchronized with
         // the exhaustive validation, source-shape, replay-clone, and canonical-graph matches.
         variants,
-        330,
+        331,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -18286,5 +18286,39 @@ fn fixed_array_len_rejects_free_literal_placement() -> Result<(), &'static str> 
             }
         }
     }
+    Ok(())
+}
+
+#[test]
+fn host_schema_rejects_malformed_records() -> Result<(), &'static str> {
+    for source in ["fn main() {}\n", "import std.os\nfn get() -> Result<os.host_info, Error> = os.host()\nfn main() {}\n"] {
+        let base = checked_source_program(source);
+        assert!(!is_empty(&lower_program(&base)));
+        let id = base.structs.iter().position(align_sema::host_info_schema_valid).ok_or("host schema")?;
+        for mutation in 0..10 {
+            let mut bad = base.clone();
+            let record = &mut bad.structs[id];
+            match mutation {
+                0 => record.name = "lookalike".to_string(),
+                1 => record.source_name = "lookalike".to_string(),
+                2 => record.fields.swap(0,1),
+                3 => record.fields[0].ty = Ty::Str,
+                4 => record.fields[3].ty = Ty::Option(Scalar::Str),
+                5 => record.fields[4].ty = Ty::Option(Scalar::Int(IntTy { bits:32, signed:true })),
+                6 => record.c_repr = true,
+                7 => record.align = Some(16),
+                8 => { record.fields.pop(); },
+                _ => record.fields[2].name = "arch".to_string(),
+            }
+            assert!(!validate_hir::global_type_metadata_is_valid(&bad));
+            let source_map = SourceMap::new();
+            for lowered in [lower_program(&bad), lower_program_per_unit(&bad), lower_program_located(&bad,&source_map), lower_program_per_unit_located(&bad,&source_map)] {
+                assert!(is_empty(&lowered), "host schema mutation {mutation}");
+            }
+        }
+    }
+    let mut bad = checked_source_program("import std.os\nfn get() -> Result<os.host_info, Error> = os.host()\nfn main() {}\n");
+    bad.fns.iter_mut().find(|f| f.name == "get").ok_or("get")?.body.value.as_mut().ok_or("host tail")?.ty = Ty::Bool;
+    assert_body_entrypoints_empty("host wrong result", &bad);
     Ok(())
 }

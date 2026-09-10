@@ -970,6 +970,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::TimeFormat { kind, ns, out } => format!("time_format({kind:?}, {}, s{out})", operand_str(ns)),
         Rvalue::TimeParse { kind, input, out } => format!("time_parse({kind:?}, {}, s{out})", operand_str(input)),
         Rvalue::TimeNow => "time_now()".to_string(),
+        Rvalue::OsHost { out } => format!("os_host({out:?})"),
         Rvalue::ProcessCpuCount => "process_cpu_count()".to_string(),
         Rvalue::TimeInstant => "time_instant()".to_string(),
         Rvalue::TimeSleep { ns } => format!("time_sleep({})", operand_str(ns)),

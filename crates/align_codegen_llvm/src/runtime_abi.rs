@@ -1758,6 +1758,7 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
             symbol: "align_rt_process_abort",
             shape: RuntimeAbiShape::A54,
         },
+        RuntimeKey::OsHost => RuntimeAbi { key, symbol: "align_rt_os_host", shape: RuntimeAbiShape::A03 },
         RuntimeKey::ProcessCpuCount => RuntimeAbi {
             key,
             symbol: "align_rt_process_cpu_count",
@@ -2155,15 +2156,15 @@ pub(super) fn runtime_abis() -> impl Iterator<Item = RuntimeAbi> {
 }
 
 pub(super) fn validate_registry() -> Result<(), String> {
-    if RuntimeKey::ALL.len() != 365 || keyed_runtime_abis().len() != 365 {
+    if RuntimeKey::ALL.len() != 366 || keyed_runtime_abis().len() != 366 {
         return Err("runtime ABI registry invariant: key-count".to_string());
     }
-    if runtime_abis().count() != 383 {
+    if runtime_abis().count() != 384 {
         return Err("runtime ABI registry invariant: base-count".to_string());
     }
 
     let mut keys = HashSet::with_capacity(RuntimeKey::ALL.len());
-    let mut symbols = HashSet::with_capacity(383);
+    let mut symbols = HashSet::with_capacity(384);
     for abi in keyed_runtime_abis() {
         let key = abi
             .runtime_key()
@@ -3845,17 +3846,17 @@ mod tests {
         );
         validate_registry().unwrap();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 383);
+        assert_eq!(rows.len(), 384);
         assert_eq!(
             rows.iter().map(|row| row.key).collect::<HashSet<_>>().len(),
-            383
+            384
         );
         assert_eq!(
             rows.iter()
                 .map(|row| row.symbol)
                 .collect::<HashSet<_>>()
                 .len(),
-            383
+            384
         );
         for (key, row) in RuntimeKey::ALL.into_iter().zip(keyed_runtime_abis()) {
             assert_eq!(row.key, RuntimeAbiId::Keyed(key));
@@ -3885,7 +3886,7 @@ mod tests {
     fn runtime_abi_extern_type_matrix_is_exact_for_every_row_and_ordinal() {
         let ctx = inkwell::context::Context::create();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 383);
+        assert_eq!(rows.len(), 384);
 
         for row in rows {
             let symbol = row.symbol;

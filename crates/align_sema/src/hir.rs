@@ -1534,6 +1534,7 @@ pub enum ExprKind {
     /// quota-aware), an `i64` that is always `>= 1`. Impure (observes the machine), and the number a
     /// `task_group` worker count must be sized against — the runtime's own pool is sized from the
     /// same source, so more long-lived tasks than this would never all start.
+    OsHost,
     ProcessCpuCount,
     /// `time.sleep(ns)` — suspend the calling thread for `ns` nanoseconds (the `ty` is
     /// [`crate::Ty::Unit`]). A negative `ns` is a no-op; `EINTR` resumes for the remaining time.

@@ -1,5 +1,11 @@
 # Session handoff
 
+`std.os` host observation is implemented: `os.host()` returns the qualified
+ordinary owned `os.host_info` record, with exact uname text and optional online CPU
+count. CPU description remains None. [Plan 42](docs/impl/42-host-observation-plan.md)
+owns the public/native contract and whole/per-unit, cleanup, cache and malformed
+schema owners. Align-llm adoption remains consumer-owned.
+
 Current continuity note for a fresh Claude Code or Codex session. Keep this file
 about the present state, the next decision, and operational facts. The former
 per-PR journals are preserved in

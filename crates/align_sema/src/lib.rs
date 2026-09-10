@@ -4459,6 +4459,7 @@ fn builtin_spelling_ty(head: &str) -> Option<Ty> {
 /// spelling bridge lives here, and the ownership answer stays exactly [`needs_drop_flag`] — the same
 /// call that assigned the bit being validated.
 pub fn builtin_spelling_needs_return_cleanup(head: &str) -> Option<bool> {
+    if head == "os.host_info" { return Some(needs_drop_flag(Ty::Struct(0), &[host_info_definition()], &[], &[], &[])); }
     let ty = builtin_spelling_ty(head)?;
     Some(needs_drop_flag(ty, &[], &[], &[], &[]))
 }
@@ -4471,6 +4472,7 @@ pub fn builtin_spelling_needs_return_cleanup(head: &str) -> Option<bool> {
 /// bit. Keeping the Move answer in sema prevents the interface decoder from inventing a second
 /// builtin ownership table.
 pub fn builtin_spelling_is_move(head: &str) -> Option<bool> {
+    if head == "os.host_info" { return Some(ty_is_move(Ty::Struct(0), &[host_info_definition()], &[], &[], &[])); }
     let ty = builtin_spelling_ty(head)?;
     Some(ty_is_move(ty, &[], &[], &[], &[]))
 }
@@ -6135,6 +6137,7 @@ struct BuiltinNominalAlias {
 }
 
 const BUILTIN_NOMINAL_ALIASES: &[BuiltinNominalAlias] = &[
+    BuiltinNominalAlias { bare: "os.host_info", explicit: "os.host_info", canonical: "os.host_info", required_import: Some("std.os") },
     BuiltinNominalAlias {
         bare: "Error",
         explicit: "core.Error",
@@ -8594,6 +8597,9 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
             },
         ],
     });
+
+    struct_ids.insert("os.host_info".to_string(), structs.len() as u32);
+    structs.push(host_info_definition());
 
     // The builtin `argon2_params` struct (M11 std.crypto Slice 5) — a plain **Copy** struct of four
     // `i64` tuning knobs for `crypto.argon2id` (`m_cost` KiB, `t_cost` iterations, `parallelism`
@@ -16019,7 +16025,7 @@ impl EffectScan<'_> {
                 walk!(value);
                 self.impure_direct = true;
             }
-            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::ProcessCpuCount => self.impure_direct = true,
+            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::ProcessCpuCount => self.impure_direct = true,
             ExprKind::TimeSleep { ns } => {
                 walk!(ns);
                 self.impure_direct = true;
@@ -22060,7 +22066,7 @@ impl<'a> EscapeCheck<'a> {
         // accepted owner free-standing. Keep this producer aligned with `region_of` and the
         // checked-HIR allocation-mode contract instead of deriving its Drop mode from lexical
         // allocation context like the ordinary arena-aware collection producers below.
-        if matches!(expression.kind, ExprKind::JsonOwnedDecode { .. } | ExprKind::CryptoDigestFinish { .. }) {
+        if matches!(expression.kind, ExprKind::OsHost | ExprKind::JsonOwnedDecode { .. } | ExprKind::CryptoDigestFinish { .. }) {
             return Some(true);
         }
         if matches!(
@@ -23969,7 +23975,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::EnvGet { .. }
             | ExprKind::EnvSet { .. }
             | ExprKind::TimeNow
-            | ExprKind::ProcessCpuCount
+            | ExprKind::OsHost | ExprKind::ProcessCpuCount
             | ExprKind::TimeInstant
             | ExprKind::TimeSleep { .. }
             | ExprKind::ProcessExit { .. }
@@ -24431,7 +24437,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::EnvGet { .. }
             | ExprKind::EnvSet { .. }
             | ExprKind::TimeNow
-            | ExprKind::ProcessCpuCount
+            | ExprKind::OsHost | ExprKind::ProcessCpuCount
             | ExprKind::TimeInstant
             | ExprKind::TimeSleep { .. }
             | ExprKind::ProcessExit { .. }
@@ -27772,7 +27778,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(name, depth);
                 self.walk(value, depth);
             }
-            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::ProcessCpuCount => {}
+            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::ProcessCpuCount => {}
             ExprKind::TimeSleep { ns } => self.walk(ns, depth),
             // `process.exit` diverges and its `code` is a scalar `i64` (nothing escapes); `abort`
             // has no operand.
@@ -30153,7 +30159,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         // The runtime materializes a fresh `array<RowPair>` in Result::Ok and retains neither
         // codec view. `RowPair` is scalar-only, so the generation starts without borrowed content;
         // Result::Err carries no storage header.
-        ExprKind::FrameInnerJoin { .. } | ExprKind::CryptoDigestFinish { .. } => {
+        ExprKind::OsHost | ExprKind::FrameInnerJoin { .. } | ExprKind::CryptoDigestFinish { .. } => {
             StorageVariantPolicy::Fresh(StorageContentInitializer::FreshEmpty)
         }
 
@@ -37758,7 +37764,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::TcpAccept { .. } | ExprKind::UdpBind { .. } | ExprKind::UdpSendTo { .. }
             | ExprKind::UdpRecvFrom { .. } | ExprKind::PathJoin { .. } | ExprKind::PathNormalize { .. }
             | ExprKind::EnvGet { .. } | ExprKind::EnvSet { .. } | ExprKind::TimeNow | ExprKind::TimeInstant
-            | ExprKind::ProcessCpuCount | ExprKind::TimeSleep { .. } | ExprKind::ProcessExit { .. }
+            | ExprKind::OsHost | ExprKind::ProcessCpuCount | ExprKind::TimeSleep { .. } | ExprKind::ProcessExit { .. }
             | ExprKind::ProcessAbort | ExprKind::ProcessSpawn { .. } | ExprKind::ChildWait { .. }
             | ExprKind::ChildKill { .. } | ExprKind::ProcessExec { .. }
             // `process.command` (owns the handle) / `c.cwd` (`()`) / `c.run` (owns its `Result`) /
@@ -44174,7 +44180,7 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, name, moved, false, false);
                 move_expr!(self, value, moved, false, false);
             }
-            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::ProcessCpuCount => {}
+            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::ProcessCpuCount => {}
             ExprKind::TimeSleep { ns } => move_expr!(self, ns, moved, false, false),
             // `process.exit(code)` reads a scalar `i64` (never consumed); `abort` reads nothing.
             ExprKind::ProcessExit { code } => {
@@ -50411,6 +50417,19 @@ impl<'a, 't> Checker<'a, 't> {
             if module == "process" && matches!(method, "exit" | "abort") {
                 self.require_import("std.process", &format!("process.{method}"), span);
                 return self.check_process_op(method, args, span);
+            }
+            if module == "os" && method == "host" {
+                self.require_import("std.os", "os.host", span);
+                if !args.is_empty() {
+                    self.diags.error("'os.host' takes no arguments".to_string(), span);
+                    return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+                }
+                let Some(&id) = self.struct_ids.get("os.host_info") else {
+                    self.diags.error("missing builtin os.host_info".to_string(), span);
+                    return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+                };
+                return Expr { kind: ExprKind::OsHost,
+                    ty: Ty::Result(Scalar::Struct(id), Scalar::Enum(self.error_enum_id)), span };
             }
             // `std.process` — `process.cpu_count()` -> i64: the parallelism available to this
             // process (affinity/quota aware, always >= 1). The number a `task_group` worker count is
@@ -65040,7 +65059,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(name);
                 self.finalize_expr(value);
             }
-            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::ProcessCpuCount => {}
+            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::ProcessCpuCount => {}
             ExprKind::TimeSleep { ns } => self.finalize_expr(ns),
             ExprKind::ProcessExit { code } => self.finalize_expr(code),
             ExprKind::ProcessAbort => {}
@@ -66102,7 +66121,7 @@ const BUILTIN_MODULES: &[&str] = &[
     "core.arena", "core.json", "core.codec", "core.template", "core.hash", "core.math",
     "core.test",
     // std — the OS boundary
-    "std.io", "std.fs", "std.path", "std.process", "std.env", "std.time", "std.net",
+    "std.io", "std.fs", "std.path", "std.os", "std.process", "std.env", "std.time", "std.net",
     "std.cli", "std.encoding", "std.regex", "std.compress", "std.rand", "std.crypto", "std.http",
     "std.log",
     "std.xml",
@@ -71273,7 +71292,7 @@ mod tests {
         // Digest New/Update retain no storage; Finish forms an individually owned array
         // with fresh empty content. All three have explicit wildcard-free policies.
         assert_eq!(
-            variants, 330,
+            variants, 331,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 
@@ -80210,4 +80229,25 @@ fn exit_branch(flag: bool) -> i64 {
         assert_eq!(render(Ty::Param(0)), "<unknown type parameter>");
         assert_eq!(render(Ty::Tagged(1)), "Option<<nested tagged type>>");
     }
+}
+
+/// Producer-owned nominal schema for the ordinary owned host observation record.
+pub fn host_info_definition() -> hir::StructDef {
+    hir::StructDef {
+        name: "os.host_info".to_string(), source_name: "os.host_info".to_string(),
+        fields: vec![
+            hir::FieldDef { name: "system".to_string(), ty: Ty::String },
+            hir::FieldDef { name: "release".to_string(), ty: Ty::String },
+            hir::FieldDef { name: "machine".to_string(), ty: Ty::String },
+            hir::FieldDef { name: "cpu".to_string(), ty: Ty::Option(Scalar::String) },
+            hir::FieldDef { name: "logical_cpu_count".to_string(), ty: Ty::Option(Scalar::Int(IntTy { bits: 64, signed: true })) },
+        ], align: None, c_repr: false,
+    }
+}
+pub fn host_info_schema_valid(definition: &hir::StructDef) -> bool {
+    let expected = host_info_definition();
+    definition.name == expected.name && definition.source_name == expected.source_name
+        && definition.align.is_none() && !definition.c_repr
+        && definition.fields.len() == expected.fields.len()
+        && definition.fields.iter().zip(&expected.fields).all(|(a,b)| a.name == b.name && a.ty == b.ty)
 }

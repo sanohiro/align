@@ -13,6 +13,11 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+- **Owned host observation:** `std.os` exposes only `os.host() -> Result<os.host_info, Error>`
+  in this boundary. The qualified ordinary Move record owns exact uname strings and optional
+  online CPU facts. No inferred CPU description, ambient configuration, or authenticated
+  identity promise. [Plan 42](impl/42-host-observation-plan.md) owns the schema and validation.
+
 ### Incremental SHA-256 (Settled, 2026-09-10)
 
 R29 admits one qualified `crypto.digest` Move owner with `sha256_stream`,

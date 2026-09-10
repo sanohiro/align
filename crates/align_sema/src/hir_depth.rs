@@ -360,6 +360,7 @@ fn walk_body_records<'a>(
                 | ExprKind::WriterStd { .. }
                 | ExprKind::TimeNow
                 | ExprKind::TimeInstant
+                | ExprKind::OsHost
                 | ExprKind::ProcessCpuCount
                 | ExprKind::ProcessAbort
                 | ExprKind::RandSeed
