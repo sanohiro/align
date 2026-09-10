@@ -38444,13 +38444,15 @@ mod tests {
     fn exited(code: i64) -> Result<process_live::Termination, i32> {
         Ok(process_live::Termination { exited: code, ..process_live::Termination::default() })
     }
+    fn process_coreutil(name: &str) -> Option<String> {
+        ["/bin", "/usr/bin"].iter().map(|directory| format!("{directory}/{name}"))
+            .find(|path| std::path::Path::new(path).exists())
+    }
     #[test]
     fn process_spawn_and_wait_true_is_zero() {
-        if !std::path::Path::new("/bin/true").exists() {
-            return;
-        }
-        let (cp, cl) = view_of("/bin/true");
-        let argv = argv_of(&["/bin/true"]);
+        let Some(program) = process_coreutil("true") else { return };
+        let (cp, cl) = view_of(&program);
+        let argv = argv_of(&[&program]);
         let mut ch: *mut Child = std::ptr::null_mut();
         assert_eq!(unsafe { align_rt_process_spawn(cp, cl, argv.as_ptr(), argv.len() as i64, &mut ch) }, 0);
         assert!(!ch.is_null());
@@ -38462,11 +38464,9 @@ mod tests {
 
     #[test]
     fn process_spawn_and_wait_false_is_one() {
-        if !std::path::Path::new("/bin/false").exists() {
-            return;
-        }
-        let (cp, cl) = view_of("/bin/false");
-        let argv = argv_of(&["/bin/false"]);
+        let Some(program) = process_coreutil("false") else { return };
+        let (cp, cl) = view_of(&program);
+        let argv = argv_of(&[&program]);
         let mut ch: *mut Child = std::ptr::null_mut();
         assert_eq!(unsafe { align_rt_process_spawn(cp, cl, argv.as_ptr(), argv.len() as i64, &mut ch) }, 0);
         assert_eq!(unsafe { wait_termination(ch) }, exited(1), "/bin/false exits 1");
@@ -38515,11 +38515,9 @@ mod tests {
 
     #[test]
     fn child_free_without_wait_reaps_no_zombie() {
-        if !std::path::Path::new("/bin/true").exists() {
-            return;
-        }
-        let (cp, cl) = view_of("/bin/true");
-        let argv = argv_of(&["/bin/true"]);
+        let Some(program) = process_coreutil("true") else { return };
+        let (cp, cl) = view_of(&program);
+        let argv = argv_of(&[&program]);
         let mut ch: *mut Child = std::ptr::null_mut();
         assert_eq!(unsafe { align_rt_process_spawn(cp, cl, argv.as_ptr(), argv.len() as i64, &mut ch) }, 0);
         let pid = unsafe { (*ch).pid };
@@ -38529,7 +38527,7 @@ mod tests {
         let mut status: i32 = 0;
         let r = unsafe { waitpid(pid, &mut status, 0) };
         assert_eq!(r, -1, "the child was already reaped by its Drop");
-        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(10), "ECHILD — no zombie remains");
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD), "ECHILD — no zombie remains");
     }
 
     #[test]
@@ -38593,11 +38591,9 @@ mod tests {
 
     #[test]
     fn child_kill_after_wait_is_err() {
-        if !std::path::Path::new("/bin/true").exists() {
-            return;
-        }
-        let (cp, cl) = view_of("/bin/true");
-        let argv = argv_of(&["/bin/true"]);
+        let Some(program) = process_coreutil("true") else { return };
+        let (cp, cl) = view_of(&program);
+        let argv = argv_of(&[&program]);
         let mut ch: *mut Child = std::ptr::null_mut();
         assert_eq!(unsafe { align_rt_process_spawn(cp, cl, argv.as_ptr(), argv.len() as i64, &mut ch) }, 0);
         assert_eq!(unsafe { wait_termination(ch) }, exited(0));
