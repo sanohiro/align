@@ -333,6 +333,52 @@ pub(crate) fn disjoint<A, B>(a: *const A, b: *const B) -> bool {
 mod tests {
     use super::*;
     use core::mem::{align_of, offset_of, size_of};
+    std::thread_local! {
+        static FINISH_DURING_FALLBACK: core::cell::Cell<bool> = const {core::cell::Cell::new(false)};
+    }
+    pub(super) fn finish_during_fallback(pid: i32) {
+        if !FINISH_DURING_FALLBACK.with(|value| value.replace(false)) {
+            return;
+        }
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+        let mut info = unsafe { core::mem::zeroed::<libc::siginfo_t>() };
+        loop {
+            if unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    u32::try_from(pid).unwrap(),
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            } == 0
+            {
+                break;
+            }
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EINTR)
+            );
+        }
+        // Native terminal state is visible, but no NativeChild cache was updated.
+    }
+    #[test]
+    fn final_fallback_chunk_observes_terminal_transition() {
+        let command = crate::process_launch::tests::command("exec sleep 30");
+        let mut child = crate::process_launch::launch(&command, false, false).unwrap();
+        let event = std::fs::File::open("/dev/null").unwrap().into();
+        child
+            .finish_event_registration(event, Err(std::io::Error::from_raw_os_error(libc::ESRCH)))
+            .unwrap();
+        assert!(child.observed.is_none());
+        FINISH_DURING_FALLBACK.with(|value| value.set(true));
+        // One nanosecond forces this to be the final (possibly zero-rounded) chunk.
+        assert_eq!(child.poll(4, 1).unwrap().status, 1);
+        assert!(!FINISH_DURING_FALLBACK.with(core::cell::Cell::get));
+        assert_eq!(
+            child.wait().unwrap().termination.signaled,
+            i64::from(libc::SIGKILL)
+        );
+    }
     #[test]
     fn registration_exit_window_retains_finite_status_observation() {
         let command = crate::process_launch::tests::command("exec sleep 30");
@@ -827,6 +873,11 @@ impl NativeChild {
                 if ready.stdout | ready.stderr | ready.status != 0 {
                     return Ok(ready);
                 }
+            }
+            if count == 0 && self.event_missed && interest & 4 != 0 {
+                #[cfg(test)]
+                tests::finish_during_fallback(self.pid);
+                ready.status = u8::from(self.status()?.is_some());
             }
             if ready.stdout | ready.stderr | ready.status != 0 {
                 return Ok(ready);
