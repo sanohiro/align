@@ -1134,7 +1134,7 @@ pub(crate) mod tests {
         // Darwin may report ESRCH for a group containing only its unreaped zombie.
         // The API preserves that native observation; loss of authority is Invalid.
         let probe = child.signal(0, true);
-        assert!(probe == Ok(()) || probe == Err(libc::ESRCH), "{probe:?}");
+        assert!(probe == Ok(()) || probe == Err(super::super::AL_CODE + libc::ESRCH), "{probe:?}");
         for signal in [-1, super::super::MAX_SIGNAL + 1, i64::MAX] {
             assert_eq!(child.signal(signal, true), Err(AL_INVALID));
         }

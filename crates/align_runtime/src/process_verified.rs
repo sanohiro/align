@@ -21,11 +21,14 @@ fn ranges_disjoint(a: *const u8, a_len: usize, b: *const u8, b_len: usize) -> bo
 fn error() -> i32 {
     io_error_to_status(&std::io::Error::last_os_error())
 }
+fn unsupported() -> i32 {
+    io_error_to_status(&std::io::Error::from_raw_os_error(libc::ENOTSUP))
+}
 fn supported() -> Result<(), i32> {
     if cfg!(target_os = "linux") {
         Ok(())
     } else {
-        Err(libc::ENOTSUP)
+        Err(unsupported())
     }
 }
 fn owned(raw: i32) -> Result<OwnedFd, i32> {
@@ -89,7 +92,7 @@ fn memory_file(kind: i32, cap: i64) -> Result<Box<MemoryWriter>, i32> {
         }))
     }
     #[cfg(not(target_os = "linux"))]
-    Err(libc::ENOTSUP)
+    Err(unsupported())
 }
 impl MemoryWriter {
     fn write(&mut self, bytes: &[u8]) -> Result<(), i32> {
@@ -157,7 +160,7 @@ impl MemoryWriter {
             })
         }
         #[cfg(not(target_os = "linux"))]
-        Err(libc::ENOTSUP)
+        Err(unsupported())
     }
 }
 fn metadata(fd: &OwnedFd) -> Result<libc::stat, i32> {
@@ -184,7 +187,7 @@ fn check_seals(fd: &OwnedFd) -> Result<(), i32> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = fd;
-        Err(libc::ENOTSUP)
+        Err(unsupported())
     }
 }
 fn read_at(file: &Sealed, offset: i64, bytes: &mut [u8]) -> Result<i64, i32> {
@@ -276,7 +279,7 @@ fn namespace(path: &[u8]) -> Result<OwnedFd, i32> {
         Ok(fd)
     }
     #[cfg(not(target_os = "linux"))]
-    Err(libc::ENOTSUP)
+    Err(unsupported())
 }
 
 /// # Safety
@@ -727,13 +730,19 @@ mod tests {
         assert!(matches!(namespace(&[255]), Err(AL_INVALID)));
         #[cfg(target_os = "macos")]
         {
-            assert!(matches!(memory_file(0, 0), Err(libc::ENOTSUP)));
-            assert!(matches!(memory_file(1, 0), Err(libc::ENOTSUP)));
-            assert!(matches!(namespace(b"/valid"), Err(libc::ENOTSUP)));
+            assert!(
+                matches!(memory_file(0, 0), Err(value) if value == super::super::AL_CODE + libc::ENOTSUP)
+            );
+            assert!(
+                matches!(memory_file(1, 0), Err(value) if value == super::super::AL_CODE + libc::ENOTSUP)
+            );
+            assert!(
+                matches!(namespace(b"/valid"), Err(value) if value == super::super::AL_CODE + libc::ENOTSUP)
+            );
             let mut out = core::ptr::null_mut();
             assert_eq!(
                 unsafe { align_rt_process_current_image(&mut out) },
-                libc::ENOTSUP
+                super::super::AL_CODE + libc::ENOTSUP
             );
             assert!(out.is_null());
         }
@@ -859,7 +868,8 @@ mod tests {
         drop(image);
         drop(file);
         for fallback in [false, true] {
-            crate::process_launch::FORCE_FD_SCAN.store(fallback, std::sync::atomic::Ordering::Relaxed);
+            crate::process_launch::FORCE_FD_SCAN
+                .store(fallback, std::sync::atomic::Ordering::Relaxed);
             let mut child = super::super::process_launch::launch(&command, false, false).unwrap();
             assert_eq!(child.wait().unwrap().termination.exited, 0);
         }
@@ -984,7 +994,8 @@ mod tests {
             );
         }
         for fallback in [false, true] {
-            crate::process_launch::FORCE_FD_SCAN.store(fallback, std::sync::atomic::Ordering::Relaxed);
+            crate::process_launch::FORCE_FD_SCAN
+                .store(fallback, std::sync::atomic::Ordering::Relaxed);
             let bindings = launch_bindings(&command, 18).unwrap();
             assert_eq!(
                 bindings.iter().map(|(slot, _)| *slot).collect::<Vec<_>>(),

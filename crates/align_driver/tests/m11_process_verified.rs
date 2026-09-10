@@ -442,3 +442,45 @@ int64_t unlink_owned_main(void) {
         );
     }
 }
+
+#[test]
+fn unsupported_platform_uses_the_shared_error_code() {
+    let source = r#"import std.fs
+import std.process
+fn show(error:Error) { match error { Code(value) => print(value), _ => print(-1) } }
+fn main() {
+    match fs.memory_file(fs.memory_kind.Data,0) { Err(error) => show(error), Ok(value) => print(-1) }
+    match process.user_namespace("/valid") { Err(error) => show(error), Ok(value) => print(-1) }
+    match process.current_image() { Err(error) => show(error), Ok(value) => print(-1) }
+}
+"#;
+    let checked = diff_check_multi(
+        "verified-unsupported-check",
+        &[("main.align", source)],
+        "main.align",
+    );
+    assert!(
+        !checked.whole_errors && !checked.per_unit_errors,
+        "{}\n{}",
+        checked.whole_diags,
+        checked.per_unit_diags
+    );
+    if !backend_available() || !cfg!(target_os = "macos") {
+        return;
+    }
+    for output in [
+        build_and_run("verified-unsupported", source),
+        build_per_unit_multi(
+            "verified-unsupported-unit",
+            &[("main.align", source)],
+            "main.align",
+        )
+        .link_and_run(),
+    ] {
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            format!("{0}\n{0}\n{0}\n", libc::ENOTSUP)
+        );
+    }
+}

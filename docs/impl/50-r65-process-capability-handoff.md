@@ -525,3 +525,11 @@ Native unsupported-acquisition cases are in the shared macOS suite; valid inputs
 return the platform ENOTSUP code and invalid input still takes precedence.
 Capability 4 owns the scope-specific matrix rows; this capability adds no scope
 constructor or partially usable descendant owner.
+
+Native-error encoding closure: raw OS errno values cross the shared
+io_error_to_status classifier before entering an Align status result, including
+unsupported-platform constants. The platform owner independently expects
+AL_CODE + native ENOTSUP; it must not compare the status directly with errno.
+Internal ESRCH/EINTR branches likewise compare raw errno before conversion or
+compare the encoded status afterwards. This closes the native-error-encoding
+axis of the matrix without changing the public Error contract.
