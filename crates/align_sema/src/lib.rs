@@ -63500,7 +63500,7 @@ impl<'a, 't> Checker<'a, 't> {
         // aggregate slot transferred ownership, so copying any recursive Drop plan would leave
         // both the result and the array owning the same payload.
         if drop_plan(leaf_ty, self.structs, self.enums, self.tagged_types).needs_drop()
-            && !matches!(leaf_ty, Ty::Resource(_))
+            && !(matches!(leaf_ty, Ty::Resource(_)) && matches!(r.ty, Ty::StructArray(..)))
         {
             self.diags.error(
                 format!(

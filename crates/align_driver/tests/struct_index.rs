@@ -481,9 +481,8 @@ fn main() -> Result<(), Error> {
     }
 
     #[test]
-    fn a_move_struct_slice_receiver_is_rejected() {
-        // `slice<MoveStruct>` is declarable, and the shared element guard must reject viewing it
-        // — the validator always did, so a sema gap here was an internal error, not a diagnostic.
+    fn a_move_struct_slice_receiver_can_be_resliced() {
+        // Re-slicing borrows existing storage without loading an owning element.
         let src = "\
 S { name: string }
 fn first(xs: slice<S>) -> i64 = xs[0..1].len()
@@ -491,8 +490,8 @@ fn main() -> Result<(), Error> = Ok(())
 ";
         let diagnostics = check_diagnostics("sa-slice-move-recv", src);
         assert!(
-            diagnostics.contains("slicing a collection of the Move type"),
-            "a Move-struct slice receiver should be rejected in sema:\n{diagnostics}",
+            diagnostics.is_empty(),
+            "a Move-struct slice receiver should remain a borrowed view:\n{diagnostics}",
         );
     }
 
@@ -529,11 +528,8 @@ fn main() -> Result<(), Error> = Ok(())
     }
 
     #[test]
-    fn an_array_to_slice_borrow_of_a_move_element_is_rejected_at_every_init_site() {
-        // The array → slice borrow is the third element reader: the view makes the source's
-        // elements readable, and the MIR boundary has always refused it for a Move element. Sema
-        // built the borrow unguarded at all three init sites, so an owned `array<string>` reaching
-        // a `slice<string>` position was an internal error instead of a diagnostic.
+    fn an_owned_string_array_can_be_borrowed_at_every_init_site() {
+        // Formation is independent of whole-value readability at every coercion site.
         for (label, source) in [
             (
                 "call-argument",
@@ -549,14 +545,12 @@ fn main() -> Result<(), Error> = Ok(())
             ),
         ] {
             let diagnostics = check_diagnostics(&format!("sa-slice-borrow-{label}"), source);
-            assert!(
-                diagnostics.contains("slicing a collection of the Move type string"),
-                "an owned `array<string>` borrowed as a slice should be rejected in sema ({label}):\n{diagnostics}",
-            );
-            assert!(
-                !diagnostics.contains("failed HIR validation"),
-                "the borrow must be a diagnostic, not an internal error ({label}):\n{diagnostics}",
-            );
+            assert!(diagnostics.is_empty(), "{label}: {diagnostics}");
+            if backend_available() {
+                let out = build_and_run(&format!("sa-slice-borrow-{label}"), source);
+                assert_eq!(out.status.code(), Some(0));
+                assert_eq!(out.stdout, b"1\n");
+            }
         }
     }
 

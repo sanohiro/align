@@ -2148,4 +2148,6 @@ Index admits Slice(String) only as logical Str. BorrowedIndex accepts stable
 slice bases under the unchanged payload classifier. Owner facts, projected paths,
 header reservations, return roots and early-exit index typing are recomputed.
 The move_slice_records_reject_forged_shapes owner rejects malformed descriptors
-and owning projections through every public HIR lowering entrypoint.
+and owning projections through every public HIR lowering entrypoint. Complete
+nested field paths are retained into MIR; leaf-only loads preserve each physical
+field permutation without manufacturing intermediate Move values.

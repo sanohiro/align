@@ -10448,8 +10448,8 @@ fn hir_body_validator_pipeline_array_views() {
             Ty::Unit,
         ));
         assert!(
-            !body_core_metadata_is_valid(&reject),
-            "{name}: array-to-slice must reject Move-element arrays"
+            body_core_metadata_is_valid(&reject) == matches!(source_ty, Ty::DynArray(_) | Ty::DynStructArray(..)),
+            "{name}: view admission must preserve existing owning-array type formation"
         );
     }
 
@@ -18347,7 +18347,8 @@ fn ordinary_directory_records_reject_malformed_types() -> Result<(), &'static st
 #[test]
 fn move_slice_records_reject_forged_shapes() -> Result<(), &'static str> {
     let source = "Row { text: string }\nfn inspect(borrow row: Row) -> i64 = row.text.len()\nfn use(view: slice<Row>) -> i64 = inspect(view[0])\nfn field(view: slice<Row>) -> str = view[0].text\nfn text(view: slice<string>) -> str = view[0]\nfn main() {}\n";
-    let base = checked_source_program(source);
+    let source = format!("{source}Inner {{ text: string }}\nNested {{ inner: Inner }}\nfn nested(view: slice<Nested>) -> str = view[0].inner.text\n");
+    let base = checked_source_program(&source);
     assert!(!is_empty(&lower_program(&base)));
     for mutation in 0..7 {
         let mut bad = base.clone();
@@ -18373,6 +18374,13 @@ fn move_slice_records_reject_forged_shapes() -> Result<(), &'static str> {
         let mut bad = base.clone();
         bad.fns.iter_mut().find(|f| f.name == name).ok_or("projection")?.body.value.as_mut().ok_or("projection tail")?.ty = Ty::String;
         assert_body_entrypoints_empty("owning slice projection", &bad);
+    }
+    for invalid in [vec![], vec![99], vec![0], vec![0, 99], vec![0, 0, 0]] {
+        let mut bad = base.clone();
+        let expression = bad.fns.iter_mut().find(|f| f.name == "nested").ok_or("nested")?.body.value.as_mut().ok_or("nested tail")?;
+        let hir::ExprKind::ElemField { path, .. } = &mut expression.kind else { return Err("nested field"); };
+        *path = invalid;
+        assert_body_entrypoints_empty("malformed complete nested HIR path", &bad);
     }
     Ok(())
 }

@@ -489,7 +489,9 @@ mandatory sequence and exhaustive-pass verification are in
 
 Existing SliceRange/SliceIndex and IndexFieldPtr operations address the admitted
 Move-record/string backing storage. IndexFieldPtr certifies an exact AoS record
-array or Slice(Struct) base; SliceIndex admits Slice(String) only as Str, never
+array or Slice(Struct) base and a complete nonempty declared field path; it loads
+only the Copy leaf or String-to-Str view, without intermediate Move values.
+SliceIndex admits Slice(String) only as Str, never
 as an owning String or noalias load. Indexed shared calls keep the existing
 BorrowedElementPlace descriptor and reserve both the header slot and backing
 owner until the call. No new IR variant or runtime ABI is introduced.

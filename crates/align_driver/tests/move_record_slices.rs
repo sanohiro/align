@@ -4,6 +4,15 @@ use common::*;
 
 const HELPER: &str = r#"module helper
 pub Row { text: string, number: i64 }
+pub Inner { small: u8, text: string, number: i64 }
+pub Nested { flag: bool, inner: Inner, tail: u32 }
+pub fn nested_text(view: slice<Nested>) -> str = view[0].inner.text
+pub fn nested_number(view: slice<Nested>) -> i64 = view[0].inner.number
+pub fn nested_rows() -> array<Nested> {
+  mut builder: array_builder<Nested> := array_builder()
+  builder.push(Nested { flag: true, inner: Inner { small: 3, text: "nested".clone(), number: 19 }, tail: 11 })
+  return builder.build()
+}
 pub fn field(view: slice<Row>) -> str = view[0].text
 pub fn inspect(borrow row: Row) -> str { text: str := row.text; return text }
 pub fn via_call(view: slice<Row>) -> str = inspect(view[0])
@@ -27,6 +36,12 @@ fn main() -> i32 {
   print(helper.indirect(view))
   print(helper.inspect(view[0]))
   print(rows[0].text)
+  nested_rows := helper.nested_rows()
+  nested_view: slice<helper.Nested> := nested_rows
+  print(helper.nested_text(nested_view)); print(helper.nested_number(nested_view))
+  print(nested_rows[0].inner.text)
+  fixed := [helper.Nested { flag: true, inner: helper.Inner { small: 3, text: "fixed-nested".clone(), number: 23 }, tail: 11 }]
+  print(fixed[0].inner.text); print(helper.nested_text(fixed)); print(fixed[0].inner.number)
   return 0
 }
 "#;
@@ -46,7 +61,10 @@ fn main() -> i32 {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        assert_eq!(out.stdout, b"owned\n7\nowned\nowned\nowned\nowned\nowned\n");
+        let whole = build_and_run_multi("move-slice-fields-whole", files, "main.align");
+        assert_eq!(whole.status.code(), Some(0));
+        assert_eq!(whole.stdout, out.stdout);
+        assert_eq!(out.stdout, b"owned\n7\nowned\nowned\nowned\nowned\nowned\nnested\n19\nnested\nfixed-nested\nfixed-nested\n23\n");
     }
 }
 
@@ -301,17 +319,18 @@ fn main() -> i32 {
 }
 
 const CLEANUP_HELPER: &str = r#"module helper
-Row { text: string }
+Inner { text: string }
+Row { inner: Inner }
 extern "C" fn align_rt_alloc_count() -> i64
-fn inspect(borrow row: Row) -> str { value: str := row.text; return value }
+fn inspect(borrow row: Row) -> str { value: str := row.inner.text; return value }
 fn early() -> Result<(), Error> {
   mut builder: array_builder<Row> := array_builder()
-  builder.push(Row { text: "owned".clone() })
+  builder.push(Row { inner: Inner { text: "owned".clone() } })
   rows := builder.build()
   before := unsafe { align_rt_alloc_count() }
   view: slice<Row> := rows
   nested := view[0..1]
-  if inspect(nested[0]) != "owned" || rows[0].text != "owned" { return Err(Error.Invalid) }
+  if nested[0].inner.text != "owned" || inspect(nested[0]) != "owned" || rows[0].inner.text != "owned" { return Err(Error.Invalid) }
   if unsafe { align_rt_alloc_count() } != before { return Err(Error.Invalid) }
   cloned := inspect(nested[0]).clone()
   if cloned != "owned" { return Err(Error.Invalid) }

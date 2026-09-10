@@ -47,7 +47,7 @@ For Slice(String), and only that added mismatch, physical String may load as
 logical Str. Slot and projected owner provenance must never be inferred solely
 from an asserted element type or forged path descriptor.
 
-No persisted encoding changes. Existing complete canonical type graph and body
+No public persisted encoding changes. The reopened projection-path axis below changes an existing MIR record shape. Existing complete canonical type graph and body
 fingerprints identify the new allowed programs; changed bodies invalidate caches.
 Imported declarations reconstruct ordinary slice/record graphs and return/retention
 summaries. There is no text/wire/native boundary, global native state, inspection
@@ -111,3 +111,62 @@ slice element at its Copy header frame. Shared-path metadata still undergoes
 independent root/path/owner checks. Existing borrowed_params and owned_temporaries
 owners remain green; new receiver/type cases and fail-closed IR mutations close
 this extension. No ABI/tag/canonical format changes or runtime dependencies occur.
+
+## Reopened closure axis: complete nested projection paths
+
+The candidate's independent review found one P2: ElemField admitted nested Move
+records but lowering materialized the first intermediate record as an owning
+SSA value. The existing IndexFieldPtr validator correctly rejected that Move
+result. Reopening the path axis replaces that intermediate load rather than
+relaxing ownership certification.
+
+Exact MIR correction: `IndexFieldPtr { base: Operand, index: Operand,
+path: Vec<u32>, struct_id: u32 }` replaces its single `field: u32`. Path is
+nonempty, in declaration-field order; each nonfinal selection must be a declared
+struct and every index must exist. The producer-owned root must independently be
+the exact AoS dynamic record array or Slice(Struct(struct_id)). Only the complete
+leaf may be loaded: Copy as itself or String as Str. No owning Move leaf or
+intermediate record value, temporary owner slot, cleanup, clone or source null
+is generated. A fixed array uses the existing full-path IndexField operation.
+SoA keeps its single scalar-column path; it gains no nested collection shape.
+
+LLVM resolves every logical field through that record's physical permutation,
+then constructs one element-plus-full-field-path GEP and one leaf load. Producer
+provenance prepends Element plus the entire declared path before the existing
+selected-result path. Empty, out-of-range, non-struct intermediate, wrong root
+nominal/layout, and owning-leaf mutations reject before LLVM pointer construction.
+Pipeline first-level field selectors keep their existing domain and produce a
+one-field vector. The text printer records the complete path. Canonical type and
+interface formats are unchanged; MIR body/cache identity must include every path
+ordinal in order (the existing codegen hash consumes the MIR text representation).
+No runtime ABI changes or application persisted format follow.
+
+| Reopened cell | Owner |
+| --- | --- |
+| Dynamic/fixed/slice root × direct/nested Copy/String leaf | move_record_slices::field_and_shared_calls and formation_and_type_domain; whole/per-unit runtime and repeated original-source use. |
+| No intermediate owner and complete physical path | owned_source_cleanup with nested owning row; MIR shape assertion ensures leaf-only IndexField/IndexFieldPtr results; LLVM nested-layout output oracle. |
+| All pointer-path invalidity and owning results | move_slice_mir_gate complete-path mutation sweep; move_slice_records_reject_forged_shapes HIR paths; all emission/lowering entrypoints. |
+| Pipeline siblings and cache | existing struct_index and m5 owner cases plus interfaces_and_cache edit/revert; printer path-order assertion and codegen hash inequality for distinct nested paths. |
+
+Author plan pass: every existing IndexFieldPtr construction/match is enumerated
+by repository search. The change has one producer shape, one text representation,
+one provenance path and one physical GEP path; it never represents a borrowed
+Move intermediate as an ordinary owned value. Request a fresh independent
+strategy review before implementation, then a fresh full-diff review because
+this correction changes an IR shape.
+
+The fresh independent strategy review accepted the complete-path correction and
+identified the fixed IndexField String-to-Str sibling as part of the same owner.
+Both dynamic and fixed paths now certify the final leaf without an intermediate
+Move load. The existing fixed-array template-resource method place remains in
+its existing domain; slice/dynamic resource-field value reads still reject.
+The pkg_template fixed-resource borrow/finish/Drop owner pins that unchanged path.
+Old struct_index and HIR view-domain expectations now distinguish admitted views
+from the unchanged forbidden fixed-array parameter/type forms.
+
+The fixed-resource sibling owner reproduced a pre-existing per-unit rejection on
+clean main as well as this candidate: xml_borrowed_access required the dynamic
+fixed-element-array variant for a fixed-slot BorrowedFixedElementPlace. It now
+requires exactly StructArray, matching physical place validation; no dynamic
+alternative is admitted. Existing index/path/type/callee/cleanup validation and
+root authority are preserved. The original owner closes this correction.
