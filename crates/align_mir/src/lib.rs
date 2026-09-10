@@ -1971,6 +1971,8 @@ pub enum Rvalue {
         path: Operand,
     },
     /// `fs.remove_empty_dir(path)` — retained, no-follow removal of exactly one empty directory.
+    FsCreateDir { path: Operand },
+    FsIsDir { path: Operand, out: Slot },
     FsRemoveEmptyDir {
         path: Operand,
     },
@@ -8298,6 +8300,19 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 let code = b.fresh_value(status_ty());
                 b.push(Stmt::Let(code, Rvalue::FsRemove { path: pop }));
                 lower_status_result(b, code, e.ty)
+            }
+            hir::ExprKind::FsCreateDir { path } => {
+                lower_required_binding!(b, path = lower_expr(b, path), Operand::Const(Const::Unit));
+                let status = b.fresh_value(status_ty());
+                b.push(Stmt::Let(status, Rvalue::FsCreateDir { path }));
+                lower_status_result(b,status,e.ty)
+            }
+            hir::ExprKind::FsIsDir { path } => {
+                lower_required_binding!(b, path = lower_expr(b, path), Operand::Const(Const::Unit));
+                let out = b.new_slot(Ty::Bool);
+                let status = b.fresh_value(status_ty());
+                b.push(Stmt::Let(status, Rvalue::FsIsDir { path, out }));
+                emit_open_handle_result(b,status,out,Ty::Bool,e.ty)
             }
             hir::ExprKind::FsRemoveEmptyDir { path } => {
                 lower_required_binding!(b, pop = lower_expr(b, path), Operand::Const(Const::Unit));

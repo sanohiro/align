@@ -2130,3 +2130,12 @@ an OsHost expression. LLVM producer validation independently checks the schema,
 status result and exclusive typed scratch before certifying nested owned fields.
 No new Ty/Scalar variant or canonical scalar tag is introduced. See the exact
 closure matrix in [plan 42](42-host-observation-plan.md).
+
+## Ordinary directory operations
+
+`FsCreateDir` and `FsIsDir` each require one str child and return the exact
+Result<Unit,Error> or Result<Bool,Error>. Every child/replay/purity/storage sweep
+handles both explicitly. LLVM authenticates str input, i32 status and the is_dir
+exclusive bool scratch through the common native producer contract. No type or
+scalar tag is added. [Plan 43](43-ordinary-directory-plan.md) names the malformed
+record owners and whole/per-unit source behavior.

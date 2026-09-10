@@ -913,6 +913,8 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::FsWriteFileBuilder { path, builder } => format!("fs_write_file_builder({}, {})", operand_str(path), operand_str(builder)),
         Rvalue::FsExists { path } => format!("fs_exists({})", operand_str(path)),
         Rvalue::FsRemove { path } => format!("fs_remove({})", operand_str(path)),
+        Rvalue::FsCreateDir { path } => format!("fs_create_dir({path:?})"),
+        Rvalue::FsIsDir { path, out } => format!("fs_is_dir({path:?}, {out:?})"),
         Rvalue::FsRemoveEmptyDir { path } => {
             format!("fs_remove_empty_dir({})", operand_str(path))
         }

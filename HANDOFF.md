@@ -1,5 +1,11 @@
 # Session handoff
 
+`std.fs` ordinary directory operations are implemented: `fs.create_dir` creates
+one directory under normal umask rules; `fs.is_dir` returns a fallible followed
+metadata type observation. [Plan 43](docs/impl/43-ordinary-directory-plan.md)
+owns the exact contract and path/permission/whole-per-unit/IR owners. Retained
+raw tree access remains R64; Align-llm adoption is external.
+
 `std.os` host observation is implemented: `os.host()` returns the qualified
 ordinary owned `os.host_info` record, with exact uname text and optional online CPU
 count. CPU description remains None. [Plan 42](docs/impl/42-host-observation-plan.md)

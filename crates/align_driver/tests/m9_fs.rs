@@ -1107,3 +1107,114 @@ pub fn main(args: array<str>) -> Result<(), Error> {
         "it must be a diagnostic, not an internal error:\n{diagnostics}",
     );
 }
+
+#[test]
+fn ordinary_directory_formation() {
+    for source in [
+        "fn main() { fs.create_dir(\"x\") }",
+        "import std.fs\nfn main() { fs.create_dir() }",
+        "import std.fs\nfn main() { fs.is_dir(1) }",
+        "import std.fs\nfn main() { xs := [1,2]; ys := xs.par_map(|x| { result := fs.create_dir(\"x\"); x }) }",
+    ] {
+        let checked = diff_check_multi("directory-formation", &[("main.align",source)], "main.align");
+        assert!(checked.whole_errors && checked.per_unit_errors,"accepted: {source}");
+    }
+}
+
+#[test]
+fn ordinary_directory_operations() {
+    use std::os::unix::fs::symlink;
+    if !backend_available() { return; }
+    for per_unit in [false,true] {
+        let root = TempDir::new(if per_unit { "ordinary-unit" } else { "ordinary-whole" });
+        std::fs::write(root.path.join("file"),b"x").expect("file");
+        std::fs::create_dir(root.path.join("directory")).expect("directory");
+        symlink("directory",root.path.join("link")).expect("directory link");
+        symlink("absent",root.path.join("broken")).expect("broken link");
+        symlink("loop",root.path.join("loop")).expect("loop link");
+        let source = r#"import std.fs
+fn failed<T>(value: Result<T,Error>) -> bool = match value { Ok(_) => false, Err(_) => true }
+fn same(error: Error) -> Error = error
+fn early(path: str) -> i64 { ignored := fs.create_dir({ return 7; path }); return 9 }
+fn inspect(path: str) -> Result<bool,Error> = arena { fs.is_dir(path) }
+fn main() -> Result<(),Error> {
+  root := "ROOT".clone()
+  fs.create_dir("ROOT/new/")?
+  if !(inspect("ROOT/new")?) { return Err(Error.Invalid) }
+  if fs.is_dir("ROOT/file")? { return Err(Error.Invalid) }
+  if !(fs.is_dir("ROOT/link")?) { return Err(Error.Invalid) }
+  if !failed(fs.create_dir("ROOT/new")) { return Err(Error.Invalid) }
+  if !failed(fs.create_dir("ROOT/file")) { return Err(Error.Invalid) }
+  if !failed(fs.create_dir("ROOT/link")) { return Err(Error.Invalid) }
+  if !failed(fs.create_dir("ROOT/missing/child")) { return Err(Error.Invalid) }
+  if !failed(fs.create_dir("ROOT/file/child")) { return Err(Error.Invalid) }
+  if !failed(fs.is_dir("ROOT/absent")) { return Err(Error.Invalid) }
+  if !failed(fs.is_dir("ROOT/broken")) { return Err(Error.Invalid) }
+  if !failed(fs.is_dir("ROOT/loop")) { return Err(Error.Invalid) }
+  if !failed(fs.is_dir("ROOT/file/child")) { return Err(Error.Invalid) }
+  if !failed(fs.is_dir("ROOT/file/")) { return Err(Error.Invalid) }
+  if !failed(fs.is_dir("")) { return Err(Error.Invalid) }
+  if !failed(fs.create_dir("")) { return Err(Error.Invalid) }
+  if !failed(fs.create_dir("ROOT/hidden\0suffix")) { return Err(Error.Invalid) }
+  if !failed(fs.is_dir("ROOT\0suffix")) { return Err(Error.Invalid) }
+  if early("ROOT/never") != 7 { return Err(Error.Invalid) }
+  loop { if !(fs.is_dir(root)?) { return Err(Error.Invalid) }; break }
+  present := fs.is_dir(root).map_err(same) else false
+  if !present { return Err(Error.Invalid) }
+  print("ok")
+  return Ok(())
+}
+"#.replace("ROOT",&root.str());
+        let checked = diff_check_multi("directory-operations", &[("main.align",&source)], "main.align");
+        assert!(!checked.whole_errors && !checked.per_unit_errors,"whole:{}\nunit:{}",checked.whole_diags,checked.per_unit_diags);
+        let out = if per_unit { build_per_unit_multi("directory-operations",&[("main.align",&source)],"main.align").link_and_run() }
+            else { build_and_run("directory-operations",&source) };
+        assert_eq!(out.status.code(),Some(0),"{}",String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.stdout,b"ok\n");
+        assert!(!root.path.join("never").exists());
+        assert!(!root.path.join("hidden").exists());
+        assert!(!root.path.join("missing").exists());
+    }
+}
+
+#[test]
+fn ordinary_directory_umask() {
+    use std::os::unix::fs::PermissionsExt;
+    if !backend_available() { return; }
+    let root = TempDir::new("ordinary-mode");
+    let source = r#"import std.fs
+extern "C" fn directory_test_umask(mask: u32) -> u32
+fn main() -> i32 {
+  previous := unsafe { directory_test_umask(63) }
+  result := fs.create_dir("ROOT/child")
+  observed := unsafe { directory_test_umask(previous) }
+  if observed != 63 { return 1 }
+  match result { Ok(_) => {}, Err(_) => { return 2 } }
+  return 0
+}
+"#.replace("ROOT",&root.str());
+    let out = build_and_run_with_c("directory-mode", &source, "#include <stdint.h>\n#include <sys/stat.h>\nuint32_t directory_test_umask(uint32_t mask) { return (uint32_t)umask((mode_t)mask); }\n");
+    assert_eq!(out.status.code(),Some(0),"{}",String::from_utf8_lossy(&out.stderr));
+    assert_eq!(std::fs::metadata(root.path.join("child")).expect("created directory").permissions().mode() & 0o777,0o700);
+
+    // Permission refusal runs only in the generated child. Even a root test runner cannot
+    // accidentally turn the expected Denied into a privileged successful observation.
+    let denied = root.path.join("denied");
+    std::fs::create_dir(&denied).expect("denied directory");
+    std::fs::set_permissions(&root.path,std::fs::Permissions::from_mode(0o755)).expect("traversable parent");
+    std::fs::set_permissions(&denied,std::fs::Permissions::from_mode(0)).expect("deny search");
+    let source = r#"import std.fs
+extern "C" fn geteuid() -> u32
+extern "C" fn seteuid(id: u32) -> i32
+fn denied<T>(result: Result<T,Error>) -> bool = match result { Ok(_) => false, Err(error) => match error { Denied => true, _ => false } }
+fn main() -> i32 {
+  unsafe { if geteuid() == 0 { if seteuid(65534) != 0 { return 77 } } }
+  if !denied(fs.is_dir("ROOT/denied/child")) { return 1 }
+  if !denied(fs.create_dir("ROOT/denied/child")) { return 2 }
+  return 0
+}
+"#.replace("ROOT",&root.str());
+    let out = build_and_run("directory-denied",&source);
+    std::fs::set_permissions(&denied,std::fs::Permissions::from_mode(0o700)).expect("restore cleanup access");
+    assert_eq!(out.status.code(),Some(0),"permission child: {}",String::from_utf8_lossy(&out.stderr));
+}

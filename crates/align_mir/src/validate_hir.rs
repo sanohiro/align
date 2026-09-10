@@ -4603,6 +4603,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::FsWriteFile { .. }
             | hir::ExprKind::FsExists { .. }
             | hir::ExprKind::FsRemove { .. }
+            | hir::ExprKind::FsCreateDir { .. } | hir::ExprKind::FsIsDir { .. }
             | hir::ExprKind::FsRemoveEmptyDir { .. }
             | hir::ExprKind::FsReadDir { .. }
             | hir::ExprKind::RenameNoReplace { .. }
@@ -4985,6 +4986,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::ArrayBuilderBuild(..)
             | hir::ExprKind::FsExists { .. }
             | hir::ExprKind::FsRemove { .. }
+            | hir::ExprKind::FsCreateDir { .. } | hir::ExprKind::FsIsDir { .. }
             | hir::ExprKind::FsRemoveEmptyDir { .. }
             | hir::ExprKind::FsReadDir { .. }
             | hir::ExprKind::RenameNoReplace { .. }
@@ -9041,13 +9043,17 @@ impl<'a> BodyValidator<'a> {
                 }
                 result(Ty::Unit, &[path, data])
             }
+            hir::ExprKind::FsIsDir { path } => {
+                (path.ty == Ty::Str).then(|| result(Ty::Bool, &[path]))?
+            }
             hir::ExprKind::FsExists { path } => {
                 (path.ty == Ty::Str).then(|| strict(Ty::Bool, &[path]))?
             }
             hir::ExprKind::FsRemove { path } => {
                 (path.ty == Ty::Str).then(|| result(Ty::Unit, &[path]))?
             }
-            hir::ExprKind::FsRemoveEmptyDir { path } => {
+            hir::ExprKind::FsCreateDir { path }
+            | hir::ExprKind::FsRemoveEmptyDir { path } => {
                 (path.ty == Ty::Str).then(|| result(Ty::Unit, &[path]))?
             }
             hir::ExprKind::RenameNoReplace { source, destination } => {

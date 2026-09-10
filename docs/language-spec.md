@@ -1746,3 +1746,26 @@ hard-error policy. The observation is not an authenticated identity or an atomic
 snapshot, and its online CPU count makes no physical-machine, affinity or quota
 promise. The exact contract and closure owners are in
 [host observation](impl/42-host-observation-plan.md).
+
+### Ordinary directory creation and type observation
+
+`fs.create_dir(path: str) -> Result<(), Error>` creates exactly one directory.
+It requests Unix mode 0777 filtered by the existing process umask and native ACL
+policy, without changing umask or creating missing ancestors. An existing entry
+of any kind is an error, including an existing directory or symlink.
+
+`fs.is_dir(path: str) -> Result<bool, Error>` follows ordinary path/symlink
+resolution. A successful directory metadata observation returns true; a successful
+other-kind observation returns false. Missing, denied, non-directory-ancestor,
+broken-link, loop and other query failures remain errors. This observes type,
+not writability, stable identity or future access.
+
+Both require `import std.fs`, are Impure, take one required path and retain no
+input. Owned strings auto-borrow as str. Reject empty paths, embedded NUL and
+invalid UTF-8 before filesystem I/O. Relative paths use the current cwd; dot,
+dot-dot, repeated and trailing separators have ordinary OS semantics. No path
+normalization, environment expansion, recursion, caching or cwd mutation occurs.
+Native path marshalling may allocate proportional to the explicit path; OOM keeps
+the normal hard-error policy. Errors use the existing errno mapping, including
+Code(EEXIST). No new owner, type tag or Error variant is added. The exact contract
+and closure are in [ordinary directory operations](impl/43-ordinary-directory-plan.md).

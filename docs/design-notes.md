@@ -1831,3 +1831,12 @@ resource or inspection lifetime exists. Preserve uname bytes as strict UTF-8 tex
 keep unavailable optional facts absent, and separate online logical CPU observations
 from process parallelism sizing. No distribution parsing or CPU-name inference is
 hidden in this boundary. [Plan 42](impl/42-host-observation-plan.md) fixes the exact schema.
+
+### Ordinary directory observations
+
+`fs.create_dir` and fallible `fs.is_dir` complete the general path API independently
+of retained raw-name traversal. Preserve ordinary symlink resolution and native
+umask semantics. A successful non-directory observation is false; failed metadata
+is Error. This distinction supports useful diagnostics without pretending that a
+type check proves write authority. [Plan 43](impl/43-ordinary-directory-plan.md)
+owns the exact contract and verification.

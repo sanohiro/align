@@ -15942,7 +15942,7 @@ impl EffectScan<'_> {
             | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::CreateExclusive { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path }
-            | ExprKind::FsRemoveEmptyDir { path } | ExprKind::FsReadDir { path }
+            | ExprKind::FsCreateDir { path } | ExprKind::FsIsDir { path } | ExprKind::FsRemoveEmptyDir { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
             | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } => {
                 walk!(path);
@@ -23960,7 +23960,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::FsWriteFile { .. }
             | ExprKind::FsExists { .. }
             | ExprKind::FsRemove { .. }
-            | ExprKind::FsRemoveEmptyDir { .. }
+            | ExprKind::FsCreateDir { .. } | ExprKind::FsIsDir { .. } | ExprKind::FsRemoveEmptyDir { .. }
             | ExprKind::FsReadDir { .. }
             | ExprKind::RenameNoReplace { .. }
             | ExprKind::DnsResolve { .. }
@@ -24417,7 +24417,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::FsWriteFile { .. }
             | ExprKind::FsExists { .. }
             | ExprKind::FsRemove { .. }
-            | ExprKind::FsRemoveEmptyDir { .. }
+            | ExprKind::FsCreateDir { .. } | ExprKind::FsIsDir { .. } | ExprKind::FsRemoveEmptyDir { .. }
             | ExprKind::FsReadDir { .. }
             | ExprKind::RenameNoReplace { .. }
             | ExprKind::DnsResolve { .. }
@@ -27726,7 +27726,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::CreateExclusive { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path }
-            | ExprKind::FsRemoveEmptyDir { path } | ExprKind::FsReadDir { path }
+            | ExprKind::FsCreateDir { path } | ExprKind::FsIsDir { path } | ExprKind::FsRemoveEmptyDir { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
             | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } => self.walk(path, depth),
             ExprKind::RenameNoReplace { source, destination } => {
@@ -30283,7 +30283,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::FsWriteFile { .. }
         | ExprKind::FsExists { .. }
         | ExprKind::FsRemove { .. }
-        | ExprKind::FsRemoveEmptyDir { .. }
+        | ExprKind::FsCreateDir { .. } | ExprKind::FsIsDir { .. } | ExprKind::FsRemoveEmptyDir { .. }
         | ExprKind::RenameNoReplace { .. }
         | ExprKind::FsReadDir { .. }
         | ExprKind::DnsResolve { .. }
@@ -37758,7 +37758,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ArrayBuilderNew { region: None, .. } | ExprKind::ArrayBuilderPush { .. }
             | ExprKind::ArrayBuilderAppend { .. } | ExprKind::FsWriteFile { .. }
             | ExprKind::FsExists { .. } | ExprKind::FsRemove { .. }
-            | ExprKind::FsRemoveEmptyDir { .. } | ExprKind::FsReadDir { .. }
+            | ExprKind::FsCreateDir { .. } | ExprKind::FsIsDir { .. } | ExprKind::FsRemoveEmptyDir { .. } | ExprKind::FsReadDir { .. }
             | ExprKind::RenameNoReplace { .. }
             | ExprKind::DnsResolve { .. } | ExprKind::TcpConnect { .. } | ExprKind::TcpListen { .. }
             | ExprKind::TcpAccept { .. } | ExprKind::UdpBind { .. } | ExprKind::UdpSendTo { .. }
@@ -44115,7 +44115,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::CreateExclusive { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path }
-            | ExprKind::FsRemoveEmptyDir { path } | ExprKind::FsReadDir { path }
+            | ExprKind::FsCreateDir { path } | ExprKind::FsIsDir { path } | ExprKind::FsRemoveEmptyDir { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
             | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } => move_expr!(self, path, moved, false, false),
             ExprKind::RenameNoReplace { source, destination } => {
@@ -50368,7 +50368,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
             // `fs.exists(path)` -> bool; `fs.remove(path)` / `fs.read_dir(path)` / `fs.read_file_view(path)`
             // — the single-path std.fs ops.
-            if module == "fs" && matches!(method, "exists" | "remove" | "remove_empty_dir" | "read_dir" | "read_file_view" | "read_bytes_view") {
+            if module == "fs" && matches!(method, "exists" | "remove" | "create_dir" | "is_dir" | "remove_empty_dir" | "read_dir" | "read_file_view" | "read_bytes_view") {
                 self.require_import("std.fs", &format!("fs.{method}"), span);
                 return self.check_fs_path_op(method, args, span);
             }
@@ -59083,6 +59083,8 @@ impl<'a, 't> Checker<'a, 't> {
                 ty: Ty::Result(Scalar::Unit, err_enum),
                 span,
             },
+            "create_dir" => Expr { kind: ExprKind::FsCreateDir { path }, ty: Ty::Result(Scalar::Unit, err_enum), span },
+            "is_dir" => Expr { kind: ExprKind::FsIsDir { path }, ty: Ty::Result(Scalar::Bool, err_enum), span },
             "remove_empty_dir" => Expr {
                 kind: ExprKind::FsRemoveEmptyDir { path },
                 ty: Ty::Result(Scalar::Unit, err_enum),
@@ -65007,7 +65009,7 @@ impl<'a, 't> Checker<'a, 't> {
             | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
             | ExprKind::CreateExclusive { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path }
-            | ExprKind::FsRemoveEmptyDir { path } | ExprKind::FsReadDir { path }
+            | ExprKind::FsCreateDir { path } | ExprKind::FsIsDir { path } | ExprKind::FsRemoveEmptyDir { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
             | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } => self.finalize_expr(path),
             ExprKind::RenameNoReplace { source, destination } => {
@@ -71292,7 +71294,7 @@ mod tests {
         // Digest New/Update retain no storage; Finish forms an individually owned array
         // with fresh empty content. All three have explicit wildcard-free policies.
         assert_eq!(
-            variants, 331,
+            variants, 333,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

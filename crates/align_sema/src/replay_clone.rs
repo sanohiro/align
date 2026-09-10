@@ -1139,6 +1139,8 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         },
         ExprKind::FsExists { path } => ExprKind::FsExists { path: boxed!(path) },
         ExprKind::FsRemove { path } => ExprKind::FsRemove { path: boxed!(path) },
+        ExprKind::FsCreateDir { path } => ExprKind::FsCreateDir { path: boxed!(path) },
+        ExprKind::FsIsDir { path } => ExprKind::FsIsDir { path: boxed!(path) },
         ExprKind::FsRemoveEmptyDir { path } => ExprKind::FsRemoveEmptyDir { path: boxed!(path) },
         ExprKind::RenameNoReplace { source, destination } => ExprKind::RenameNoReplace {
             source: boxed!(source),
@@ -2702,6 +2704,8 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::BufferLen { buffer: recv }
         | ExprKind::FsExists { path: recv }
         | ExprKind::FsRemove { path: recv }
+        | ExprKind::FsCreateDir { path: recv }
+        | ExprKind::FsIsDir { path: recv }
         | ExprKind::FsRemoveEmptyDir { path: recv }
         | ExprKind::FsReadDir { path: recv }
         | ExprKind::DnsResolve { host: recv }
