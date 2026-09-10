@@ -372,17 +372,174 @@ fn stream_owned_control_flow() {
         checked.per_unit_diags
     );
     if backend_available() {
-        let whole = build_and_run_multi("digest-owned-whole", files, "main.align");
+        for per_unit in [false, true] {
+            for omit_drop in [false, true] {
+                let out = run_digest_cleanup_probe(per_unit, omit_drop);
+                assert_eq!(
+                    out.status.code(),
+                    Some(i32::from(omit_drop)),
+                    "per_unit={per_unit} omit_drop={omit_drop}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&out.stdout),
+                    if omit_drop { "15\n1\n" } else { "15\n0\n" }
+                );
+            }
+        }
+    }
+}
+
+// Interpose the real engine's allocation/free calls in the generated executable. This leaves
+// production runtime state unchanged and sees both successful Finish and every implicit Drop.
+const DIGEST_CLEANUP_PROBE: &str = r#"
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdint.h>
+#include <stdlib.h>
+static int64_t created, live;
+void *EVP_MD_CTX_new(void) {
+    void *(*real_new)(void) = (void *(*)(void))dlsym(RTLD_NEXT, "EVP_MD_CTX_new");
+    if (!real_new) abort();
+    void *context = real_new();
+    if (context) { ++created; ++live; }
+    return context;
+}
+void EVP_MD_CTX_free(void *context) {
+    void (*real_free)(void *) = (void (*)(void *))dlsym(RTLD_NEXT, "EVP_MD_CTX_free");
+    if (!real_free) abort();
+    if (context) --live;
+    real_free(context);
+}
+int64_t digest_probe_created(void) { return created; }
+int64_t digest_probe_live(void) { return live; }
+"#;
+
+fn run_digest_cleanup_probe(per_unit: bool, omit_drop: bool) -> std::process::Output {
+    let main = r#"import helper
+extern "C" fn digest_probe_created() -> i64
+extern "C" fn digest_probe_live() -> i64
+fn main() -> i32 {
+  result := helper.exercise("unused")
+  match result { Ok(_) => {}, Err(_) => { return 2 } }
+  unsafe {
+    created := digest_probe_created()
+    live := digest_probe_live()
+    print(created)
+    print(live)
+    if created != 15 { return 3 }
+    if live != 0 { return 1 }
+  }
+  return 0
+}
+"#;
+    let project = Proj::new(
+        "digest-cleanup-probe",
+        &[
+            ("helper.align", DIGEST_OWNERSHIP_HELPER),
+            ("main.align", main),
+        ],
+        "main.align",
+    );
+    let entry = project.dir.join("main.align");
+    let mut map = SourceMap::new();
+    let mut programs = if per_unit {
+        let walk = build_per_unit(&mut map, &entry.display().to_string(), main);
         assert!(
-            whole.status.success(),
+            !walk.diags.has_errors(),
             "{}",
-            String::from_utf8_lossy(&whole.stderr)
+            align_driver::format_diagnostics(&map, &walk.diags)
         );
-        let out = build_per_unit_multi("digest-owned", files, "main.align").link_and_run();
+        walk.units
+            .into_iter()
+            .map(|unit| unit.mir)
+            .collect::<Vec<_>>()
+    } else {
+        let checked = check(&mut map, &entry.display().to_string(), main);
         assert!(
-            out.status.success(),
+            !checked.diags.has_errors(),
             "{}",
-            String::from_utf8_lossy(&out.stderr)
+            align_driver::format_diagnostics(&map, &checked.diags)
+        );
+        vec![lower_to_mir(&checked.hir)]
+    };
+    if omit_drop {
+        let mut removed = 0;
+        for program in &mut programs {
+            for function in &mut program.fns {
+                if !function.name.as_str().ends_with("$try_early") {
+                    continue;
+                }
+                for block in &mut function.blocks {
+                    block.stmts.retain(|statement| {
+                        let remove = matches!(statement, align_mir::Stmt::Drop(slot)
+                            if function.slots[*slot as usize] == align_sema::Ty::CryptoDigest);
+                        if remove {
+                            removed += 1;
+                        }
+                        !remove
+                    });
+                    block.stmt_lines.clear();
+                }
+            }
+        }
+        assert!(
+            removed > 0,
+            "negative control must remove an actual digest Drop"
         );
     }
+    let c_source = project.dir.join("probe.c");
+    let c_object = project.dir.join("probe.o");
+    std::fs::write(&c_source, DIGEST_CLEANUP_PROBE).expect("write native probe");
+    let compiler = std::process::Command::new("cc")
+        .args(["-std=c11", "-c"])
+        .arg(&c_source)
+        .arg("-o")
+        .arg(&c_object)
+        .output()
+        .expect("compile native probe");
+    assert!(
+        compiler.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiler.stderr)
+    );
+    let mut objects = vec![c_object];
+    let mut libraries = Vec::new();
+    for (index, program) in programs.iter().enumerate() {
+        let object = project.dir.join(format!("unit{index}.o"));
+        emit_object_file(
+            program,
+            &object,
+            BuildTarget::Baseline,
+            Profile::Release,
+            &[],
+            false,
+        )
+        .expect("emit ownership probe");
+        objects.push(object);
+        for library in &program.link_libs {
+            if !libraries.contains(library) {
+                libraries.push(library.clone());
+            }
+        }
+    }
+    if cfg!(target_os = "linux") {
+        libraries.push("dl".to_string());
+    }
+    let executable = project.dir.join("probe");
+    let refs = objects
+        .iter()
+        .map(|path| path.as_path())
+        .collect::<Vec<_>>();
+    link_objects(
+        &align_driver::CDriver::default(),
+        &refs,
+        &executable,
+        &libraries,
+        Profile::Release,
+    )
+    .expect("link ownership probe");
+    std::process::Command::new(executable)
+        .output()
+        .expect("run ownership probe")
 }

@@ -136,3 +136,11 @@ explicit benchmark run): one 16-byte shell and one live context at 1, 16 and
 11,800 KiB. This witnesses bounded retained state, not an exact RSS guarantee or
 throughput threshold. The ABI golden adds exactly four declarations, using A47,
 A73, A83 and A62; in particular New has no `nofree` attribute.
+
+Generated-code cleanup is observed separately from runtime unit counters:
+`stream_owned_control_flow` interposes the real EVP context constructor/free in
+its whole-program and per-unit executables. Each fixture creates exactly 15
+contexts and ends with zero live contexts. A negative control removes digest
+Drop from its existing early-`?` function; the same executable reports one live
+context and fails. This catches missing cleanup rather than treating normal
+exit as a resource-balance witness. No production probe/export is introduced.

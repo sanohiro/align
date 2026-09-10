@@ -71270,10 +71270,10 @@ mod tests {
                 variants += 1;
             }
         }
-        // Named time formatting/parsing add two pure, non-retaining result producers. The
-        // wildcard-free policy classifies both explicitly beside existing encoders.
+        // Digest New/Update retain no storage; Finish forms an individually owned array
+        // with fresh empty content. All three have explicit wildcard-free policies.
         assert_eq!(
-            variants, 327,
+            variants, 330,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 
