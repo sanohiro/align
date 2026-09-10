@@ -21,13 +21,10 @@ fd-selected execution, namespace inheritance and exclusive child_scope contracts
 The existing sandbox remains application-selected. There is no extra Align init,
 privileged service, dedicated user or VM prerequisite. Local unprivileged probes
 cover sealing/fd execution, prepared namespace handoff, double-setsid adoption,
-zombie-leader/live-thread handling and kernel-empty release. Design and
-independent-review corrections are complete. The next work is the four coherent
-implementation capabilities in plan 50: common process operations, explicit
-signals, verified launch authority, then the exclusive child scope. No further
-platform/helper design decision is deferred to the implementation model.
-All four R65 capabilities are implemented; verified launch and exclusive
-child_scope are completing their owner/review/platform acceptance.
+zombie-leader/live-thread handling and kernel-empty release. All four coherent R65 capabilities are implemented: common process operations,
+explicit signal ownership, verified launch authority and exclusive child scopes.
+Plans 49–50 map the native, ownership/control-flow, ABI and platform acceptance
+owners. No further platform/helper design decision is deferred.
 Consumer adoption remains external.
 
 `std.fs` ordinary directory operations are implemented: `fs.create_dir` creates

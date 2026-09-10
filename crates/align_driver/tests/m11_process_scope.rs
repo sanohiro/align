@@ -291,7 +291,7 @@ pub fn main() -> Result<(),Error> {
 }
 
 #[test]
-fn clone_parent_without_sigchld_is_owned_and_reaped() {
+fn clone_parent_is_owned_and_reaped() {
     if !backend_available() || !cfg!(target_os = "linux") {
         return;
     }

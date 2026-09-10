@@ -560,9 +560,12 @@ The capability-4 matrix maps to these invariant-level owners:
 - `m11_process_scope` runs whole/per-unit imported generic and owned-carrier
   transport, shared member_info helpers, record/sum/Option/Result, branches,
   loops, early error propagation, replacement and Drop with stable fd counts.
-  Dedicated native C fixtures exercise CLONE_PARENT without SIGCHLD and a zombie
+  Dedicated native C fixtures exercise CLONE_PARENT and a zombie
   thread leader with a live worker; process completion stays false until the
   worker exits, and the executed root independently observes NO_NEW_PRIVS.
+  `non_sigchld_wait_domain` deliberately injects a direct clone with exit_signal=0
+  in an isolated test scope: plain wait falsely reports ECHILD while the scope's
+  __WALL admission, absence and reap owners retain and recover that child.
 - Native layout/range owners, canonical leaves, every scope/member producer in
   the HIR/MIR mutation sweeps and all nine native declaration/export rows close
   ABI/cache and malformed-input cells. macOS performs source/interface checks

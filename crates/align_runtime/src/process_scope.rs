@@ -684,6 +684,77 @@ mod tests {
             align_rt_scope_free(core::ptr::null_mut());
             align_rt_process_member_free(core::ptr::null_mut());
         }
+        let mut closed = Scope {
+            root: NativeChild::new(0),
+            owner: 0,
+            closed: true,
+            lost: false,
+        };
+        let owner = &raw mut closed;
+        let mut output = AlignStr {
+            ptr: core::ptr::dangling(),
+            len: 99,
+        };
+        for operation in [align_rt_scope_children, align_rt_scope_reap] {
+            assert_eq!(
+                unsafe { operation(core::ptr::null_mut(), 1, &mut output) },
+                AL_INVALID
+            );
+            assert_eq!(output.len, 99);
+            assert_eq!(unsafe { operation(owner, 1, owner.cast()) }, AL_INVALID);
+            assert_eq!(
+                unsafe { operation(owner, 1, owner.cast::<u8>().wrapping_add(1).cast()) },
+                AL_INVALID
+            );
+            for limit in [0, -1, i64::MAX]
+                .into_iter()
+                .chain(cfg!(target_os = "linux").then_some(1))
+            {
+                output = AlignStr {
+                    ptr: core::ptr::dangling(),
+                    len: 99,
+                };
+                assert_eq!(unsafe { operation(owner, limit, &mut output) }, AL_INVALID);
+                assert!(output.ptr.is_null());
+                assert_eq!(output.len, 0);
+            }
+            output = AlignStr {
+                ptr: core::ptr::dangling(),
+                len: 99,
+            };
+        }
+        let mut ready = 99u8;
+        assert_eq!(
+            unsafe { align_rt_scope_release(core::ptr::null_mut(), &mut ready) },
+            AL_INVALID
+        );
+        assert_eq!(ready, 99);
+        assert_eq!(
+            unsafe { align_rt_scope_release(owner, owner.cast()) },
+            AL_INVALID
+        );
+        assert_eq!(unsafe { align_rt_scope_release(owner, &mut ready) }, 0);
+        assert_eq!(ready, 1);
+        let command = crate::process_launch::tests::command("exit 0");
+        let command_ptr = &raw const command;
+        assert_eq!(
+            unsafe { align_rt_command_start_scope(command_ptr, command_ptr.cast_mut().cast()) },
+            AL_INVALID
+        );
+        let mut member = Member {
+            fd: std::fs::File::open("/dev/null").unwrap().into(),
+        };
+        let member_ptr = &raw mut member;
+        assert_eq!(
+            unsafe { align_rt_process_member_finished(member_ptr, member_ptr.cast()) },
+            AL_INVALID
+        );
+        for signal in [-1, i64::MAX] {
+            assert_eq!(
+                unsafe { align_rt_process_member_kill(member_ptr, signal) },
+                AL_INVALID
+            );
+        }
         #[cfg(target_os = "macos")]
         {
             let command = crate::process_launch::tests::command("exit 0");
@@ -960,5 +1031,70 @@ mod tests {
         drop(scope);
         assert_eq!(second.release(), Ok(false));
         finish(&mut second);
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_sigchld_wait_domain() {
+        if isolated(
+            "process_scope::tests::non_sigchld_wait_domain",
+            "ALIGN_R65_SCOPE_WALL",
+        ) {
+            return;
+        }
+        let command = crate::process_launch::tests::command("exit 0");
+        let mut scope = start(&command).unwrap();
+        scope.root.stdout.fd.take();
+        scope.root.stderr.fd.take();
+        assert_eq!(scope.root.wait().unwrap().termination.exited, 0);
+        // Deliberate test-only foreign injection: a direct non-SIGCHLD child.
+        // CLONE_PARENT inherits the creator's exit signal and cannot supply this.
+        let pid = unsafe { libc::syscall(libc::SYS_clone, 0, 0usize, 0usize, 0usize, 0usize) };
+        assert!(pid >= 0);
+        if pid == 0 {
+            loop {
+                unsafe {
+                    libc::pause();
+                }
+            }
+        }
+        let pid = i32::try_from(pid).unwrap();
+        let mut info = unsafe { core::mem::zeroed::<libc::siginfo_t>() };
+        // Negative control: plain wait reports absence despite the living child.
+        assert_eq!(
+            unsafe {
+                libc::waitid(
+                    libc::P_ALL,
+                    0,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert_eq!(scope.release(), Ok(false));
+        let members = scope.children(4096).unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].0, pid);
+        members[0].1.kill(i64::from(libc::SIGKILL)).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let rows = loop {
+            let rows = scope.reap(1).unwrap();
+            if !rows.is_empty() {
+                break rows;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        assert_eq!(rows[0].pid, i64::from(pid));
+        assert_eq!(
+            rows[0].status.termination.signaled,
+            i64::from(libc::SIGKILL)
+        );
+        assert!(scope.reap(1).unwrap().is_empty());
+        assert_eq!(scope.release(), Ok(true));
     }
 }
