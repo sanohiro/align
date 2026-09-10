@@ -19,7 +19,11 @@ fn source_shapes_match(
 
 /// Validate the program-global HIR type domain before MIR construction.
 pub(crate) fn global_type_metadata_is_valid(program: &hir::Program) -> bool {
-    Validator::new(program).validate()
+    program.structs.iter().filter(|definition| definition.name == "os.host_info").count() <= 1
+    && program.structs.iter().all(|definition| {
+        !(definition.name == "os.host_info" || definition.source_name == "os.host_info")
+            || align_sema::host_info_schema_valid(definition)
+    }) && Validator::new(program).validate()
 }
 
 /// Validate the placement of body-independent HIR types.
@@ -4622,6 +4626,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::EnvSet { .. }
             | hir::ExprKind::TimeNow
             | hir::ExprKind::TimeInstant
+            | hir::ExprKind::OsHost
             | hir::ExprKind::ProcessCpuCount
             | hir::ExprKind::TimeSleep { .. }
             | hir::ExprKind::ProcessExit { .. }
@@ -5002,6 +5007,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::EnvSet { .. }
             | hir::ExprKind::TimeNow
             | hir::ExprKind::TimeInstant
+            | hir::ExprKind::OsHost
             | hir::ExprKind::ProcessCpuCount
             | hir::ExprKind::TimeSleep { .. }
             | hir::ExprKind::ProcessExit { .. }
@@ -9130,6 +9136,10 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::EnvSet { name, value } => {
                 (name.ty == Ty::Str && value.ty == Ty::Str)
                     .then(|| result(Ty::Unit, &[name, value]))?
+            }
+            hir::ExprKind::OsHost => {
+                let id = self.program.structs.iter().position(align_sema::host_info_schema_valid)?;
+                result(Ty::Struct(u32::try_from(id).ok()?), &[])
             }
             hir::ExprKind::TimeNow | hir::ExprKind::TimeInstant | hir::ExprKind::ProcessCpuCount => {
                 strict(i64, &[])

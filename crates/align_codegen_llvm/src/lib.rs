@@ -5224,6 +5224,11 @@ fn native_owner_mir_contract<'a>(
         access: XmlAccessProvenance::Owned,
     };
     match value {
+        Rvalue::OsHost { out } => {
+            // Exact nominal schema is independently certified by validate_host_mir.
+            contract.result = i32_ty;
+            contract.out = Some((*out, function.slots.get(*out as usize).copied().unwrap_or(Ty::Error)));
+        }
         Rvalue::CryptoDigestNew => contract.result = Ty::CryptoDigest,
         Rvalue::CryptoDigestUpdate { digest, data } => {
             let data_ty = match xml_operand_base_ty(function, data) {
@@ -5398,6 +5403,7 @@ fn xml_written_slots(rvalue: &Rvalue) -> Vec<(Slot, XmlAccessProvenance)> {
         | Rvalue::WriterCreateExclusive { out, .. }
         | Rvalue::WriterCreateExclusiveBeneath { out, .. }
         | Rvalue::CodecEncoderNew { out, .. }
+        | Rvalue::OsHost { out }
         | Rvalue::FrameInnerJoin { out, .. }
         | Rvalue::FileCreateRw { out, .. }
         | Rvalue::FileOpenRw { out, .. }
@@ -9687,6 +9693,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::CodecEncoderNew { .. }
             | Rvalue::CodecEncoderPut { .. }
             | Rvalue::CodecEncoderFinish(..)
+            | Rvalue::OsHost { .. }
             | Rvalue::FrameInnerJoin { .. }
             | Rvalue::IoCopy(..)
             | Rvalue::FileCreateRw { .. }
@@ -9890,7 +9897,9 @@ impl<'a> XmlAccessAnalyzer<'a> {
         }
 
         if let Some(contract) = native_owner_mir_contract(self.graph.function, rvalue) {
-            if contract.out != Some((slot, slot_ty)) || !path.is_empty() || contract.access != recorded_access {
+            if contract.out != Some((slot, slot_ty))
+                || (!path.is_empty() && !matches!(rvalue, Rvalue::OsHost { .. }))
+                || contract.access != recorded_access {
                 equation.invalid = true;
             }
             for (operand, expected, requirement) in contract.operands {
@@ -11081,7 +11090,32 @@ pub fn validate_mir_producers(program: &Program) -> Result<HashSet<String>, Code
     Ok(certified)
 }
 
+fn validate_host_mir(program: &Program) -> Result<(), CodegenError> {
+    let mut host = None;
+    for (id, definition) in program.structs.iter().enumerate() {
+        if definition.name == "os.host_info" || definition.source_name == "os.host_info" {
+            if host.is_some() || !align_sema::host_info_schema_valid(definition) {
+                return Err(CodegenError::Lowering("malformed os.host_info schema".to_string()));
+            }
+            host = u32::try_from(id).ok();
+        }
+    }
+    for function in &program.fns {
+        for statement in function.blocks.iter().flat_map(|block| &block.stmts) {
+            if let Stmt::Let(value, Rvalue::OsHost { out }) = statement {
+                if host.is_none()
+                    || function.slots.get(*out as usize).copied() != host.map(Ty::Struct)
+                    || function.value_tys.get(*value as usize).copied() != Some(Ty::Int(IntTy { bits: 32, signed: true })) {
+                    return Err(CodegenError::Lowering("malformed os.host producer".to_string()));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
+    validate_host_mir(program)?;
     validate_template_html_mir_signatures(program)?;
     let components = xml_local_call_components(program)?;
     let mut certified = HashSet::<ProgramCall>::new();
@@ -25510,6 +25544,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 .build_call(self.runtime(RuntimeKey::TimeInstant), &[], "instant")
                 .map_err(|e| self.err(e))?
                 .try_as_basic_value().basic().expect("time_instant returns i64"),
+            Rvalue::OsHost { out } => {
+                let pointer = *self.slots.get(out).ok_or_else(|| self.err("missing host output slot"))?;
+                self.builder.build_call(self.runtime(RuntimeKey::OsHost), &[pointer.into()], "host")
+                    .map_err(|e| self.err(e))?.try_as_basic_value().basic().ok_or_else(|| self.err("host ABI result"))?
+            }
             Rvalue::ProcessCpuCount => self
                 .builder
                 .build_call(self.runtime(RuntimeKey::ProcessCpuCount), &[], "cpucount")
@@ -43705,4 +43744,65 @@ fn main() -> i32 = 0
         assert!(text.contains(&format!("call i64 @\"{fib}\"")), "expected recursive calls:\n{text}");
         assert!(text.contains("icmp slt"), "expected signed comparison:\n{text}");
     }
+    #[test]
+    fn host_mir_gate_rejects_forged_schema() -> Result<(), &'static str> {
+        for source in ["fn main() {}\n", "import std.os\nfn get() -> Result<os.host_info, Error> = os.host()\nfn main() {}\n"] {
+            let base = mir(source);
+            assert!(validate_mir_producers(&base).is_ok());
+            let id = base.structs.iter().position(align_sema::host_info_schema_valid).ok_or("host schema")?;
+            for mutation in 0..10 {
+                let mut bad = base.clone();
+                let record = &mut bad.structs[id];
+                match mutation {
+                    0 => record.name = "lookalike".to_string(),
+                    1 => record.source_name = "lookalike".to_string(),
+                    2 => record.fields.swap(0,1),
+                    3 => record.fields[0].ty = Ty::Str,
+                    4 => record.fields[3].ty = Ty::Option(Scalar::Str),
+                    5 => record.fields[4].ty = Ty::Option(Scalar::Int(IntTy { bits:32, signed:true })),
+                    6 => record.c_repr = true,
+                    7 => record.align = Some(16),
+                    8 => { record.fields.pop(); },
+                    _ => record.fields[2].name = "arch".to_string(),
+                }
+                assert_xml_producer_rejected(&bad, "forged host schema");
+            }
+            for (index,function) in base.fns.iter().enumerate() {
+                for statement in function.blocks.iter().flat_map(|b| &b.stmts) {
+                    if let Stmt::Let(value, Rvalue::OsHost { out }) = statement {
+                        let mut bad = base.clone();
+                        bad.fns[index].value_tys[*value as usize] = Ty::Bool;
+                        assert_xml_producer_rejected(&bad, "host result");
+                        for ty in [Ty::Raw, Ty::String, Ty::Unit] {
+                            let mut bad = base.clone();
+                            bad.fns[index].slots[*out as usize] = ty;
+                            assert_xml_producer_rejected(&bad, "host out slot");
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn host_layout_matches_native_contract() -> Result<(), String> {
+        let context = Context::create();
+        let machine = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).map_err(|e| format!("{e:?}"))?;
+        let data = machine.get_target_data();
+        let definition = align_sema::host_info_definition();
+        let definitions = [definition];
+        let mut layouts = align_sema::TypeLayoutCache::new(&definitions, &[], &[]);
+        let permutation = logical_to_physical(&definitions[0], &mut layouts);
+        let structure = context.opaque_struct_type("host_info");
+        let bodies = HashMap::new();
+        let tagged = TaggedTypes { shells: &[], by_body: &bodies };
+        set_struct_body(&context, structure, &definitions[0], &permutation, &[structure], &[], tagged, &data);
+        assert_eq!((data.get_abi_size(&structure), data.get_abi_alignment(&structure)), (88,8));
+        for (index,expected) in [0,16,32,48,72].into_iter().enumerate() {
+            assert_eq!(data.offset_of_element(&structure, permutation[index]), Some(expected));
+        }
+        Ok(())
+    }
+
 }

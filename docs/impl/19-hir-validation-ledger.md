@@ -2121,3 +2121,12 @@ source types, ownership strategy, ABI, or IR shape.
 The author-side boundary is one producer dispatch correction plus its owner
 coverage. The preflight independent review checks this matrix with the diff;
 no new safety strategy requires a separate plan review.
+
+## Host observation
+
+The nullary `OsHost` record requires the exact builtin `Result<os.host_info, Error>`.
+Global validation authenticates the complete reserved nominal schema even without
+an OsHost expression. LLVM producer validation independently checks the schema,
+status result and exclusive typed scratch before certifying nested owned fields.
+No new Ty/Scalar variant or canonical scalar tag is introduced. See the exact
+closure matrix in [plan 42](42-host-observation-plan.md).

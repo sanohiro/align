@@ -13,8 +13,8 @@ With bounded canonical JSON, process capture, bounded HTTP response bodies,
 owned JSON, exclusive filesystem publication, retained-root regular-file access, private temporary-directory
 lifecycle, HTTP client
 raw/SSE receive streaming, asymmetric signatures, `std.log`, `core.codec`, `pkg.frame`, `pkg.kv`,
-`pkg.csv`, `pkg.ws`, `pkg.template`, and named time/path wire formats, there
-are 365 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
+`pkg.csv`, `pkg.ws`, `pkg.template`, named time/path wire formats, incremental SHA-256 and host observation, there
+are 366 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
 `ArrayBuilderNewIn` and `ArrayBuilderPushBytes`; the four
 AEAD symbols that were previously selected from `AeadCipher × AeadDir` become
 ordinary typed keys; they may no longer bypass the registry. Eighteen always-built
@@ -27,7 +27,7 @@ runtime records have no `RuntimeKey` and instead use the eighteen-variant
 `align_rt_f64_from_bits`, `align_rt_f32_text_len`, `align_rt_f64_text_len`,
 `align_rt_f32_text_write`, and `align_rt_f64_text_write`, plus the four compiler-private
 `core.test` child-control rows recorded below and the package-internal checked TCP timeout row
-`align_rt_tcp_conn_set_io_timeout`. The base native registry therefore has 383 records. Request 12
+`align_rt_tcp_conn_set_io_timeout`. The base native registry therefore has 384 records. Request 12
 adds the keyed bounded-builder stack initializer and consuming status/out-slot finish; both reuse existing ABI shapes
 A51 and A19.
 The explicit `alloc-count` runtime feature may expose seven
@@ -40,10 +40,10 @@ test/benchmark-only definitions: the allocation/free and finder counters plus
 `i64 @align_rt_test_par_map_workers()`. `task-group-probe` and
 `crypto-asymmetric-probe` change internal Rust state only and add no unmangled native export.
 
-The compiler-visible native registry is always exactly the 383 base records.
+The compiler-visible native registry is always exactly the 384 base records.
 There is no target option, environment variable, Cargo feature, linked-runtime
 inspection, or other ambient input that changes it. The eleven optional probe
-records extend only the verification-time maximum runtime-export table to 394.
+records extend only the verification-time maximum runtime-export table to 395.
 They never gain a `RuntimeKey`, callable/declaration policy, collision
 reservation, or compatible-extern reuse. Their spellings remain ordinary
 program/extern/export identities in a normal build. Probe-feature runtime
@@ -62,7 +62,7 @@ added six keyed rows, `core.codec` then added eight, `pkg.frame` added two, `pkg
 source-reachable unkeyed row, `pkg.csv` added one keyed row, `pkg.ws` added eleven keyed rows, and
 `pkg.template` added five keyed rows. Their runtime
 definitions and registry entries activated atomically at their respective capability boundaries: the current exact counts
-are 365 keyed records, 383 base records, and 394 records in the maximum optional-probe export table.
+are 366 keyed records, 384 base records, and 395 records in the maximum optional-probe export table.
 No new probe category was introduced. The implemented `pkg.kv` row reuses an existing ABI shape. Its two
 independently useful prerequisites first hardened the shared TCP timeout substrate and existing
 TCP-derived writers without changing a symbol, key, shape, attribute, or count.
@@ -1256,3 +1256,13 @@ context and returns the normal owned 32-byte array, and Free accepts null.
 The latter three rows also have no extra attributes. Constructor error cleanup
 can free native allocations, so New deliberately does not claim `nofree`.
 The exact ownership, input checks and failure order are in plan 41.
+
+## Host observation ABI
+
+`RuntimeKey::OsHost` maps to `align_rt_os_host`, A03 `i32(ptr)` with no extra
+attributes. The exact 88-byte, alignment-8 out-record and validation order are
+owned by [plan 42](42-host-observation-plan.md). Zero means success; nonzero is
+existing errno status with empty scratch and no escaped owner. The native and
+LLVM layout owners independently pin every field offset. Counts are now 366
+keyed / 384 base / 391 alloc-count / 388 par-map-probe / 395 maximum exports.
+No new optional probe category or scalar encoding tag is introduced.

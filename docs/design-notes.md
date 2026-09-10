@@ -1822,3 +1822,12 @@ and consuming finalization. Existing exclusive-borrow and recursive cleanup
 machinery owns the lifecycle; SHA-256 stays in the existing EVP engine. Its
 failure model matches the total-or-abort one-shot digest, without adding a second
 recoverable crypto error model. Exact surfaces and closure: plan 41.
+
+### Owned host observations
+
+`std.os` owns OS identity observations; application packages own interpretation and
+schema digests. `os.host` returns an ordinary owned record because no ongoing native
+resource or inspection lifetime exists. Preserve uname bytes as strict UTF-8 text,
+keep unavailable optional facts absent, and separate online logical CPU observations
+from process parallelism sizing. No distribution parsing or CPU-name inference is
+hidden in this boundary. [Plan 42](impl/42-host-observation-plan.md) fixes the exact schema.

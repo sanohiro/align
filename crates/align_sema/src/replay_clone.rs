@@ -343,7 +343,8 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         | ExprKind::WriterStd { .. }
         | ExprKind::TimeNow
         | ExprKind::TimeInstant
-        | ExprKind::ProcessCpuCount
+        | ExprKind::OsHost
+                | ExprKind::ProcessCpuCount
         | ExprKind::ProcessAbort
         | ExprKind::RandSeed
         | ExprKind::CryptoDigestNew
@@ -2168,7 +2169,8 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::WriterStd { .. }
         | ExprKind::TimeNow
         | ExprKind::TimeInstant
-        | ExprKind::ProcessCpuCount
+        | ExprKind::OsHost
+                | ExprKind::ProcessCpuCount
         | ExprKind::ProcessAbort
         | ExprKind::RandSeed
         | ExprKind::CryptoDigestNew
