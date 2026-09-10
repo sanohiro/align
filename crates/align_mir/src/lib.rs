@@ -1160,7 +1160,7 @@ pub enum Rvalue {
     IndexFieldPtr {
         base: Operand,
         index: Operand,
-        field: u32,
+        path: Vec<u32>,
         struct_id: u32,
     },
     /// `base.field[index]` for a `soa<Struct>` view: `base` is the `{ptr,len}` column-major buffer,
@@ -12444,12 +12444,18 @@ fn lower_index_field(
     struct_id: u32,
     leaf_ty: Ty,
 ) -> Operand {
-    let idx = lower_required!(b, lower_expr(b, index), Operand::Const(Const::Unit));
     // Set the element-field address up the same way the fused pipeline does (one shared seam,
     // `lower_field_access`): a fixed `array<Struct>` is slot-addressed, an owned dynamic
     // `array<Struct>` is a `{ptr,len}` value addressed by pointer. Differs from the pipeline only
     // in needing an explicit bounds check (the loop's counter is in-bounds by construction).
     let (struct_view, slice_val, slot, fixed_len) = match recv.ty {
+        Ty::Slice(Scalar::Struct(_)) => {
+            let sv = lower_borrowed_owned(b, recv);
+            if !lowering_continues(b) {
+                return Operand::Const(Const::Unit);
+            }
+            (Some((struct_id, Layout::Aos)), Some(sv), 0, None)
+        }
         Ty::DynStructArray(_, layout) => {
             let sv = lower_borrowed_owned(b, recv);
             if !lowering_continues(b) {
@@ -12477,7 +12483,7 @@ fn lower_index_field(
             )
         }
     };
-    let Some(first_ty) = checked_struct_field_path(b, struct_id, path, leaf_ty) else {
+    let Some(_) = checked_struct_field_path(b, struct_id, path) else {
         b.terminate(Term::Unreachable);
         return Operand::Const(Const::Unit);
     };
@@ -12494,6 +12500,7 @@ fn lower_index_field(
             return Operand::Const(Const::Unit);
         }
     };
+    let idx = lower_required!(b, lower_expr(b, index), Operand::Const(Const::Unit));
     emit_bounds_check(b, &idx, len);
     if fixed {
         b.ctx.element_field_places.insert(
@@ -12501,19 +12508,30 @@ fn lower_index_field(
             (slot, idx.clone(), path.to_vec()),
         );
     }
-    // Load the element's first field via the shared seam. For a depth-1 path that *is* the leaf; for
-    // a nested path (`arr[i].a.x`) it is the intermediate sub-struct, which we materialize to a temp
-    // slot and then project the remaining field path out of (reusing the slot-field GEP) — so the
-    // pipeline's single-field seam stays untouched.
-    let first = lower_field_access(b, struct_view, &slice_val, slot, &idx, path[0], first_ty);
-    let result = if path.len() == 1 {
-        first
-    } else {
-        let tmp = b.new_slot(first_ty);
-        b.push(Stmt::Store(tmp, Operand::Value(first)));
-        let leaf = b.fresh_value(leaf_ty);
-        b.push(Stmt::Let(leaf, Rvalue::Field(tmp, path[1..].to_vec())));
-        leaf
+    // Project directly to the complete leaf. A Move intermediate is never an SSA owner.
+    let result = match (struct_view, &slice_val) {
+        (Some((id, Layout::Aos)), Some(base)) => {
+            let value = b.fresh_value(leaf_ty);
+            b.push(Stmt::Let(
+                value,
+                Rvalue::IndexFieldPtr {
+                    base: base.clone(),
+                    index: idx.clone(),
+                    path: path.to_vec(),
+                    struct_id: id,
+                },
+            ));
+            value
+        }
+        (None, _) => {
+            let value = b.fresh_value(leaf_ty);
+            b.push(Stmt::Let(
+                value,
+                Rvalue::IndexField(slot, idx.clone(), path.to_vec()),
+            ));
+            value
+        }
+        _ => lower_field_access(b, struct_view, &slice_val, slot, &idx, path[0], leaf_ty),
     };
     if let Some(source) = &slice_val {
         if align_sema::ty_may_borrow(leaf_ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types) {
@@ -12528,26 +12546,17 @@ fn lower_index_field(
 /// Validate handcrafted HIR field metadata after every written child has fallen through and before
 /// the first bounds/action instruction. Sema normally guarantees this path; malformed direct HIR
 /// must become an unreachable continuation instead of indexing compiler-owned tables.
-fn checked_struct_field_path(b: &Builder, struct_id: u32, path: &[u32], leaf_ty: Ty) -> Option<Ty> {
-    let first = *path.first()?;
+fn checked_struct_field_path(b: &Builder, struct_id: u32, path: &[u32]) -> Option<()> {
     let mut current = struct_id;
-    let mut first_ty = None;
     for (depth, &field_index) in path.iter().enumerate() {
         let field = b
             .structs
             .get(current as usize)?
             .fields
             .get(field_index as usize)?;
-        if depth == 0 {
-            debug_assert_eq!(field_index, first);
-            first_ty = Some(field.ty);
-        }
         if depth + 1 == path.len() {
-            // Sema may expose an owned `string` leaf as a borrowed `str` read. Ac validates only
-            // that the stored field path is structurally safe to follow; am-b owns complete
-            // expression/type consistency. Preserve the checked expression's settled result type
-            // for a depth-one read, matching the pre-ac lowering.
-            return Some(if path.len() == 1 { leaf_ty } else { first_ty? });
+            // HIR validation owns the leaf/result type relation, including String-to-Str reads.
+            return Some(());
         }
         let Ty::Struct(next) = field.ty else {
             return None;
@@ -13247,6 +13256,23 @@ fn lower_zip_element(
     Operand::Value(tuple)
 }
 
+/// Later projections and field predicates read the current pipeline record, not the source row.
+/// Pipeline records are already Copy values; this creates no Move intermediate owner.
+fn lower_current_pipeline_field(
+    b: &mut Builder,
+    current: &Option<Operand>,
+    field: u32,
+    out_ty: Ty,
+) -> Option<ValueId> {
+    let Some(Operand::Value(value)) = current else { return None; };
+    let ty = b.value_tys[*value as usize];
+    let slot = b.new_slot(ty);
+    b.push(Stmt::Store(slot, Operand::Value(*value)));
+    let result = b.fresh_value(out_ty);
+    b.push(Stmt::Let(result, Rvalue::Field(slot, vec![field])));
+    Some(result)
+}
+
 /// The **single layout seam** for struct-array element-field addressing — the one place that
 /// turns `arr[i].field` into a load, shared by the fused pipeline (8d-2) and surface indexing
 /// (8f). A stack-slot (fixed) `array<Struct>` is always AoS and uses the slot-based
@@ -13274,7 +13300,7 @@ fn lower_field_access(
                         .clone()
                         .expect("a struct-view source has a {ptr,len} value"),
                     index: index.clone(),
-                    field,
+                    path: vec![field],
                     struct_id,
                 },
             )),
@@ -13706,7 +13732,8 @@ fn lower_array_reduce(
     for (stage_idx, stage) in stages.iter().enumerate() {
         match &stage.kind {
             hir::StageKind::Project { field } => {
-                let v = lower_field_access(
+                let v = lower_current_pipeline_field(b, &cur, *field, stage.out_ty)
+                    .unwrap_or_else(|| lower_field_access(
                     b,
                     struct_view,
                     &slice_val,
@@ -13714,7 +13741,7 @@ fn lower_array_reduce(
                     &index,
                     *field,
                     stage.out_ty,
-                );
+                ));
                 cur = Some(Operand::Value(v));
             }
             hir::StageKind::Map { func, .. } => {
@@ -13811,7 +13838,8 @@ fn lower_array_reduce(
             hir::StageKind::WhereField { field } => {
                 // Predicate on a struct element's (bool) field; the element is unchanged.
                 let pred =
-                    lower_field_access(b, struct_view, &slice_val, slot, &index, *field, Ty::Bool);
+                    lower_current_pipeline_field(b, &cur, *field, Ty::Bool)
+                    .unwrap_or_else(|| lower_field_access(b, struct_view, &slice_val, slot, &index, *field, Ty::Bool));
                 if guard_rejected {
                     let accepted = b.new_block();
                     b.terminate(Term::Branch(Operand::Value(pred), accepted, cont));
@@ -14101,7 +14129,8 @@ fn lower_json_scan_reduce(
     for (stage_idx, stage) in stages.iter().enumerate() {
         match &stage.kind {
             hir::StageKind::Project { field } => {
-                let v = lower_field_access(b, None, &None, row, &index, *field, stage.out_ty);
+                let v = lower_current_pipeline_field(b, &cur, *field, stage.out_ty)
+                    .unwrap_or_else(|| lower_field_access(b, None, &None, row, &index, *field, stage.out_ty));
                 cur = Some(Operand::Value(v));
             }
             hir::StageKind::Map { func, .. } => {
@@ -14137,7 +14166,8 @@ fn lower_json_scan_reduce(
                 b.cur = accepted;
             }
             hir::StageKind::WhereField { field } => {
-                let pred = lower_field_access(b, None, &None, row, &index, *field, Ty::Bool);
+                let pred = lower_current_pipeline_field(b, &cur, *field, Ty::Bool)
+                    .unwrap_or_else(|| lower_field_access(b, None, &None, row, &index, *field, Ty::Bool));
                 let accepted = b.new_block();
                 b.terminate(Term::Branch(Operand::Value(pred), accepted, cont));
                 b.cur = accepted;
@@ -14498,7 +14528,8 @@ fn lower_array_collect(
     for (stage_idx, stage) in stages.iter().enumerate() {
         match &stage.kind {
             hir::StageKind::Project { field } => {
-                let v = lower_field_access(
+                let v = lower_current_pipeline_field(b, &cur, *field, stage.out_ty)
+                    .unwrap_or_else(|| lower_field_access(
                     b,
                     struct_view,
                     &slice_val,
@@ -14506,7 +14537,7 @@ fn lower_array_collect(
                     &index,
                     *field,
                     stage.out_ty,
-                );
+                ));
                 cur = Some(Operand::Value(v));
             }
             hir::StageKind::Map { func, .. } => {
@@ -14592,7 +14623,8 @@ fn lower_array_collect(
             }
             hir::StageKind::WhereField { field } => {
                 let pred =
-                    lower_field_access(b, struct_view, &slice_val, slot, &index, *field, Ty::Bool);
+                    lower_current_pipeline_field(b, &cur, *field, Ty::Bool)
+                    .unwrap_or_else(|| lower_field_access(b, struct_view, &slice_val, slot, &index, *field, Ty::Bool));
                 let keep = b.new_block();
                 b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
                 b.cur = keep;
@@ -14837,7 +14869,8 @@ fn lower_array_map_into(
     for (stage_idx, stage) in stages.iter().enumerate() {
         match &stage.kind {
             hir::StageKind::Project { field } => {
-                let v = lower_field_access(
+                let v = lower_current_pipeline_field(b, &cur, *field, stage.out_ty)
+                    .unwrap_or_else(|| lower_field_access(
                     b,
                     struct_view,
                     &slice_val,
@@ -14845,7 +14878,7 @@ fn lower_array_map_into(
                     &index,
                     *field,
                     stage.out_ty,
-                );
+                ));
                 cur = Some(Operand::Value(v));
             }
             hir::StageKind::Map { func, .. } => {
@@ -15937,7 +15970,8 @@ fn lower_array_partition(
     for (stage_idx, stage) in stages.iter().enumerate() {
         match &stage.kind {
             hir::StageKind::Project { field } => {
-                let v = lower_field_access(
+                let v = lower_current_pipeline_field(b, &cur, *field, stage.out_ty)
+                    .unwrap_or_else(|| lower_field_access(
                     b,
                     struct_view,
                     &slice_val,
@@ -15945,7 +15979,7 @@ fn lower_array_partition(
                     &index,
                     *field,
                     stage.out_ty,
-                );
+                ));
                 cur = Some(Operand::Value(v));
             }
             hir::StageKind::Map { func, .. } => {
@@ -16026,7 +16060,8 @@ fn lower_array_partition(
             }
             hir::StageKind::WhereField { field } => {
                 let pred =
-                    lower_field_access(b, struct_view, &slice_val, slot, &index, *field, Ty::Bool);
+                    lower_current_pipeline_field(b, &cur, *field, Ty::Bool)
+                    .unwrap_or_else(|| lower_field_access(b, struct_view, &slice_val, slot, &index, *field, Ty::Bool));
                 let keep = b.new_block();
                 b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
                 b.cur = keep;

@@ -29,7 +29,7 @@ slice<T>         borrowed view {ptr,len}, Copy, region = the data it points into
 ```text
 xs.len()   -> i64        // direct length: str/string, slice, array (fixed = const), soa, buffer
 xs[i]                    // index (bounds-checked abort): scalar elem / chunk slice / struct gather / vec lane
-xs[a..b]   -> slice<T>   // range view; scalar elements only; either bound omittable
+xs[a..b]   -> slice<T>   // range view of admitted contiguous elements; either bound omittable
 xs[i] = v                // Copy scalar / borrowed str write; mut local or out slice; no owned string/Move
 arr[i] = structval       // whole-struct element write (POD; Move structs into FIXED arrays only)
 arr[i].f = v             // element-field write, nested paths ok; dynamic arrays: primitive leaf only
@@ -173,3 +173,28 @@ purity rejections), `map_into.rs` (+#328 aliasing cases), `out_params.rs` (no-al
 `zip_pipeline.rs` (fusion, SIMD, length/effect/trap/alias contract),
 examples `pipeline.align`, `chunks.align`, `partition.align`, `sort_by_key.align`,
 `owned_array.align`. Differential fuzzer covers reducer terminals (#326).
+
+### Borrowed views of Move elements
+
+An existing contiguous AoS record array can be borrowed as `slice<Record>`, even
+when the record is Move. Existing owned-string arrays can be borrowed as
+`slice<string>`. Annotation, argument and field coercion, range slicing and
+re-slicing use the same Copy slice header; they allocate and copy no elements.
+Fixed arrays retain their literal-or-named-local receiver restriction. Owning
+collection formation and other specialized collection forms are unchanged.
+
+`view[i].field` reads Copy leaves and projects owned string leaves as `str`.
+`slice<string>[i]` likewise produces `str`. An entire Move record is addressable
+only as the immediate argument to an explicit shared `borrow` parameter under
+the existing borrowed-payload classifier and stable-local/field-place rules.
+Whole Move-value loads, mutable element borrows, writes and materializing or
+by-value pipeline consumers remain rejected. Explicitly cloning a projected
+`str` produces an independent owned string.
+
+Views retain the backing allocation and its transitive borrow roots. The slice
+header slot is independently reserved from before indexed shared-call argument
+evaluation until the call; replacing it with a shorter slice of the same source
+is still invalid during that interval. Returning a view propagates backing
+lifetimes, not the lifetime of the copied header. Source invalidation and arena
+escape follow existing rules. Receivers and indices/bounds evaluate once in
+source order; early termination performs no later bounds check or action.

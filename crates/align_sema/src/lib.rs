@@ -4061,19 +4061,9 @@ pub fn scalar_is_move(
             if drop_plan(Ty::Tagged(id), structs, enums, tagged_types).needs_drop())
 }
 
-/// Whether an element of `elem` may be **read out of a collection** — `xs[i]` (a value read) and
-/// `xs[a..b]` (a view whose elements are readable). A Move element cannot: the read copies the
-/// element's representation without transferring ownership, so the collection and the copy would
-/// both free the same storage (double free / double close).
-///
-/// The single owner of that rule for all three producer readers — `check_index`,
-/// `check_slice_range`, and the array → slice borrow in `check_slice_init` — and for the HIR
-/// validator's matching index / slice-range / array-to-slice guards. It was a hand-written deny-list
-/// of Move `Ty`s here while the validator asked the real Move question, so every Move shape missing
-/// from the list — a Move sum type (`E { A(string), B }` in a `slice<E>`), a package resource handle
-/// — was accepted by sema and rejected at the MIR boundary, which surfaced as "passed checking but
-/// failed HIR validation" instead of a diagnostic. Asking the ownership authority cannot drift
-/// again.
+/// Whether a collection element can be loaded as an ordinary value without
+/// transferring ownership. View formation and explicit borrowed places have
+/// separate admission rules; they must never widen this value-copy predicate.
 pub fn collection_element_read_ok(
     elem: Ty,
     structs: &[StructDef],
@@ -4082,6 +4072,17 @@ pub fn collection_element_read_ok(
     tagged_types: &[hir::TaggedType],
 ) -> bool {
     !ty_capture_is_move(elem, structs, tuples, enums, tagged_types)
+}
+
+/// A read-only view may address an existing record or owned string without loading its owner.
+/// Value-read and pipeline/materialization admission remain separate and unchanged.
+pub fn collection_element_view_ok(
+    elem: Ty, structs: &[StructDef], tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef], tagged_types: &[hir::TaggedType],
+) -> bool {
+    collection_element_read_ok(elem, structs, tuples, enums, tagged_types)
+        || elem == Ty::String
+        || matches!(elem, Ty::Struct(id) if structs.get(id as usize).is_some())
 }
 
 /// Whether a plain indexed element store may overwrite its destination without a per-element
@@ -12084,7 +12085,7 @@ fn borrowed_element_metadata_is_valid(program: &hir::Program) -> bool {
                 return false;
             }
             let expected_element = match base.array_ty {
-                Ty::DynArray(element) => Some(scalar_to_ty(element)),
+                Ty::Slice(element) | Ty::DynArray(element) => Some(scalar_to_ty(element)),
                 Ty::DynStructArray(id, Layout::Aos) => Some(Ty::Struct(id)),
                 _ => None,
             };
@@ -18970,6 +18971,10 @@ impl<'a> EscapeCheck<'a> {
     }
 
     fn call_return_root_cap(&self, argument: &Expr, mode: ast::ParamMode) -> Option<Region> {
+        if matches!(&argument.kind, ExprKind::BorrowedIndex { base, .. } if matches!(base.array_ty, Ty::Slice(_))) {
+            // The selected owner lives in the slice backing, not in this frame's header.
+            return None;
+        }
         (matches!(mode, ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
             && (is_owned_droppable(argument.ty, self.structs, self.enums, self.tagged_types)
                 || ty_tuple_is_move(argument.ty, self.tuples)))
@@ -34759,6 +34764,28 @@ impl<'a> MoveCheck<'a> {
         roots
     }
 
+    // A slice element refers to backing storage, not to the Copy header slot. The
+    // slot is reserved separately until the immediate shared call completes.
+    fn borrowed_element_content_roots(&self, base: &hir::BorrowedElementBase) -> BorrowRoots {
+        if !matches!(base.array_ty, Ty::Slice(_)) {
+            return self.borrowed_element_roots(base.root_local);
+        }
+        let path = base.path.iter().skip(1).filter_map(|segment| match *segment {
+            hir::BorrowedPathSegment::RootSlot => None,
+            hir::BorrowedPathSegment::StructField(field) => Some(BorrowProjection::StructField(field)),
+            hir::BorrowedPathSegment::EnumPayload { variant, payload_ordinal } => Some(BorrowProjection::EnumPayload { variant, index: payload_ordinal }),
+            hir::BorrowedPathSegment::OptionSome => Some(BorrowProjection::OptionSome),
+            hir::BorrowedPathSegment::ResultOk => Some(BorrowProjection::ResultOk),
+            hir::BorrowedPathSegment::ResultErr => Some(BorrowProjection::ResultErr),
+        }).collect::<Vec<_>>();
+        let headers = self.local_headers(base.root_local).project_path(&path);
+        if headers.leaves.is_empty() {
+            self.local_storage_roots(base.root_local)
+        } else {
+            self.borrows.resolve_headers(&headers).non_storage.live_roots()
+        }
+    }
+
     fn local_borrow_fact(&self, id: LocalId) -> BorrowFact {
         let mut fact = self.borrows.facts.get(&id).cloned().unwrap_or_default();
         if let Some(headers) = self.borrows.headers.get(&id) {
@@ -34990,7 +35017,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::Index { recv, .. }
             | ExprKind::ElemField { recv, .. } => roots.extend(self.storage_roots(recv)),
             ExprKind::BorrowedIndex { base, .. } => {
-                roots.extend(self.borrowed_element_roots(base.root_local));
+                roots.extend(self.borrowed_element_content_roots(base));
             }
             // A valueless block is Unit: nothing to borrow. (A block WITH a value never reaches
             // this match — `borrow_transparent_value` forwarded it above.)
@@ -36182,6 +36209,9 @@ impl<'a> MoveCheck<'a> {
         let mut completion_roots = fact.live_roots();
         completion_roots.extend(storage.live_roots());
         completion_roots.extend(backing.roots.iter().filter_map(|root| root.live()));
+        if let ExprKind::BorrowedIndex { base, .. } = &expression.kind {
+            completion_roots.extend(self.borrowed_element_roots(base.root_local));
+        }
         self.borrows.begin_value_source(key, completion_roots);
         self.borrows.begin_value_headers(key, headers);
         if self.borrow_mut_place_snapshots.contains(&key)
@@ -37448,7 +37478,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::Index { recv, .. }
             | ExprKind::ElemField { recv, .. } => self.storage_roots(recv),
             ExprKind::BorrowedIndex { base, .. } => {
-                self.borrowed_element_roots(base.root_local)
+                self.borrowed_element_content_roots(base)
             }
             // Chunks are views into the source slots themselves. The materializing transforms below
             // instead copy view values into fresh storage, so they inherit only the source value's
@@ -48651,7 +48681,7 @@ impl<'a, 't> Checker<'a, 't> {
 
     fn borrowed_dynamic_array_element(&self, ty: Ty) -> Option<Ty> {
         match self.resolve(ty) {
-            Ty::DynArray(element) => Some(scalar_to_ty(element)),
+            Ty::Slice(element) | Ty::DynArray(element) => Some(scalar_to_ty(element)),
             Ty::DynStructArray(id, Layout::Aos) => Some(Ty::Struct(id)),
             _ => None,
         }
@@ -49889,12 +49919,10 @@ impl<'a, 't> Checker<'a, 't> {
         e
     }
 
-    /// Report the array → slice borrow of a Move element and answer whether it was rejected. The
-    /// view makes the source's elements readable, so it is gated by the same producer-owned rule as
-    /// `xs[i]` and `xs[a..b]` — and the MIR boundary has always enforced exactly that, so an
-    /// unguarded borrow here is an internal error rather than a diagnostic.
+    /// Diagnose unsupported view elements using the same formation predicate as
+    /// range slicing and checked HIR. Ordinary element reads remain separately gated.
     fn slice_borrow_element_rejected(&mut self, elem: Ty, span: Span) -> bool {
-        if !self.collection_element_is_unsupported_move(elem) {
+        if collection_element_view_ok(elem, self.structs, self.tuples, self.enums, self.tagged_types) {
             return false;
         }
         self.diags.error(
@@ -58655,7 +58683,7 @@ impl<'a, 't> Checker<'a, 't> {
             // The array remains the sole owner of the selected string. `string` and `str` share
             // the same `{ptr,len}` representation, but the logical result carries no Drop and its
             // region/storage roots are inherited from the receiver below.
-            Ty::DynArray(Scalar::String) => Ty::Str,
+            Ty::DynArray(Scalar::String) | Ty::Slice(Scalar::String) => Ty::Str,
             Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
             ty if let Some(elem) = ty.dyn_aggregate_array_element() => elem.ty(),
             // Indexing an `array<slice<T>>` (a `chunks` result) yields one chunk `slice<T>`.
@@ -58749,11 +58777,10 @@ impl<'a, 't> Checker<'a, 't> {
                 (Expr { kind: ExprKind::StrBorrow(Box::new(r)), ty: Ty::Str, span: rspan }, Ty::Str)
             }
             // A fixed or owned struct array slices exactly like its scalar dual: contiguous
-            // storage viewed as `{ptr,len}`. Naming the element `Scalar::Struct` keeps the one
-            // Move guard below in force, so a Move-struct element is still rejected.
-            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => {
+            // storage viewed as `{ptr,len}` without loading or transferring an element.
+            Ty::StructArray(id, _) | Ty::DynStructArray(id, Layout::Aos) => {
                 let element = Scalar::Struct(id);
-                if self.collection_element_is_unsupported_move(Ty::Struct(id)) {
+                if !collection_element_view_ok(Ty::Struct(id), self.structs, self.tuples, self.enums, self.tagged_types) {
                     self.diags.error(
                         format!(
                             "slicing a collection of the Move type {} is not supported yet",
@@ -58766,11 +58793,9 @@ impl<'a, 't> Checker<'a, 't> {
                 (r, Ty::Slice(element))
             }
             Ty::Slice(s) | Ty::Array(s, _) | Ty::DynArray(s) => {
-                // A Move element would let the sub-slice alias an owned buffer the source still
-                // frees — the same double-free reasoning as `check_index`, so the same predicate
-                // decides it. Slices are read-only views, so a `slice<scalar>` is fine.
+                // Viewability is independent of whole-element value readability.
                 let elem = scalar_to_ty(s);
-                if self.collection_element_is_unsupported_move(elem) {
+                if !collection_element_view_ok(elem, self.structs, self.tuples, self.enums, self.tagged_types) {
                     self.diags.error(
                         format!("slicing a collection of the Move type {} is not supported yet", self.ty_display(elem)),
                         span,
@@ -58798,16 +58823,15 @@ impl<'a, 't> Checker<'a, 't> {
         }
         // Both bounds are `i64` (like `.len()` and element indices). An omitted bound is filled in
         // at lowering (0 / len), so only present bounds are type-checked here.
-        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
         let check_bound = |this: &mut Self, b: Option<&ast::Expr>| -> Option<Option<Box<Expr>>> {
             match b {
                 None => Some(None),
                 Some(e) => {
-                    let be = this.check_expr(e, Some(i64_ty));
+                    let be = this.check_array_index_expr(e);
                     if be.ty == Ty::Error {
                         return None;
                     }
-                    if !be.ty.is_int_like() {
+                    if !be.ty.is_int_like() && !hir_expr_diverges(&be) {
                         this.diags.error(format!("a slice bound must be an integer, got {}", ty_name(be.ty)), e.span);
                         return None;
                     }
@@ -63416,16 +63440,16 @@ impl<'a, 't> Checker<'a, 't> {
     fn check_index_field(&mut self, arr: &ast::Expr, index: &ast::Expr, fields: &[&ast::Ident], expected: Option<Ty>, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Local(u32::MAX), ty: Ty::Error, span };
         let r = self.check_expr(arr, None);
-        let i = self.check_expr(index, Some(Ty::Int(IntTy { bits: 64, signed: true })));
+        let i = self.check_array_index_expr(index);
         if i.ty == Ty::Error {
             return err;
         }
-        if !i.ty.is_int_like() {
+        if !i.ty.is_int_like() && !hir_expr_diverges(&i) {
             self.diags.error(format!("an array index must be an integer, got {}", ty_name(i.ty)), index.span);
             return err;
         }
         let struct_id = match r.ty {
-            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => id,
+            Ty::Slice(Scalar::Struct(id)) | Ty::StructArray(id, _) | Ty::DynStructArray(id, Layout::Aos) => id,
             // `s[i].field` on a soa reads one column's element directly (lowered via the shared
             // `lower_field_access` seam → `IndexColumn`) — cheaper than gathering the whole struct.
             // soa fields are scalar, so the path is always length 1 (a nested `.field.sub` fails in
@@ -63476,7 +63500,7 @@ impl<'a, 't> Checker<'a, 't> {
         // aggregate slot transferred ownership, so copying any recursive Drop plan would leave
         // both the result and the array owning the same payload.
         if drop_plan(leaf_ty, self.structs, self.enums, self.tagged_types).needs_drop()
-            && !matches!(leaf_ty, Ty::Resource(_))
+            && !(matches!(leaf_ty, Ty::Resource(_)) && matches!(r.ty, Ty::StructArray(..)))
         {
             self.diags.error(
                 format!(
@@ -77842,8 +77866,8 @@ fn exit_branch(flag: bool) -> i64 {
     /// *views*, *rearranges*, *draws*, or *writes* must be Copy too, because the checked-HIR body
     /// validator refuses a Move value in each of those positions (`ty_copy_ok` / `scalar_copy_ok`).
     ///
-    /// The axis is the **reachable `slice<Move>` parameter domain**: `slice<string>` is a
-    /// declarable and passable parameter type even though no expression can build such a value, so
+    /// The axis is the **reachable `slice<Move>` parameter domain**. View formation and
+    /// projection are independent of ownership-copying consumers, so
     /// "a Move element collection cannot be constructed" never proves a gate unreachable. Three of
     /// these six rows (`shuffle`, `sample`, `map_into`) were live internal errors that argument had
     /// dismissed.
@@ -77853,7 +77877,7 @@ fn exit_branch(flag: bool) -> i64 {
     /// property — that the *build* stops here and never reaches the MIR boundary.
     #[test]
     fn move_copy_positions_are_rejected() {
-        // The type that makes the whole axis reachable: unbuildable as a value, legal as a type.
+        // The type that keeps the complete consumer axis reachable.
         let param = "fn take(xs: slice<string>) -> i64 = xs.len()\nfn main() -> i32 = 0\n";
         let (_p, d) = check(param);
         assert!(!d.has_errors(), "a `slice<string>` parameter must stay declarable and passable");

@@ -4845,6 +4845,17 @@ fn xml_dict_field_ty(program: &Program, id: u32, key: u32, index: u32) -> Option
     }
 }
 
+/// Physical inline field GEPs traverse ordinary records only; SoA fields are column views.
+fn inline_struct_path_ty(program: &Program, id: u32, path: &[u32]) -> Option<Ty> {
+    if path.is_empty() { return None; }
+    let mut ty = Ty::Struct(id);
+    for field in path {
+        let Ty::Struct(id) = ty else { return None; };
+        ty = program.structs.get(id as usize)?.fields.get(*field as usize)?.ty;
+    }
+    Some(ty)
+}
+
 fn xml_selected_ty(
     program: &Program,
     mut ty: Ty,
@@ -7165,10 +7176,10 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 };
-                if !matches!(slot_ty, Ty::StructArray(..)) {
+                let Ty::StructArray(struct_id, _) = slot_ty else {
                     equation.invalid = true;
                     return equation;
-                }
+                };
                 let mut result_path = vec![XmlAccessPathSegment::Element];
                 result_path.extend(
                     fields
@@ -7177,7 +7188,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         .map(XmlAccessPathSegment::StructField),
                 );
                 let Some(expected_result) =
-                    xml_selected_ty(self.graph.program, slot_ty, &result_path)
+                    inline_struct_path_ty(self.graph.program, struct_id, &fields)
                 else {
                     equation.invalid = true;
                     return equation;
@@ -7188,10 +7199,18 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     bits: 64,
                     signed: true,
                 });
+                let result_matches = if expected_result == Ty::String {
+                    result_ty == Ty::Str
+                } else {
+                    result_ty == expected_result && (matches!(expected_result, Ty::Resource(_)) || !align_sema::ty_is_move(
+                        expected_result, &self.graph.program.structs, &self.graph.program.tuples,
+                        &self.graph.program.enums, &self.graph.program.tagged_types,
+                    ))
+                };
                 if fields.is_empty()
-                    || result_ty != expected_result
-                    || xml_selected_ty(self.graph.program, slot_ty, &source_path)
-                        != Some(selected_ty)
+                    || !result_matches
+                    || !xml_selected_ty(self.graph.program, slot_ty, &source_path).is_some_and(|source|
+                        source == selected_ty || xml_ty_is_view_retype(source, selected_ty))
                     || xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
                 {
                     equation.invalid = true;
@@ -7378,25 +7397,21 @@ impl<'a> XmlAccessAnalyzer<'a> {
             Rvalue::IndexFieldPtr {
                 base,
                 index,
-                field,
+                path: fields,
                 struct_id,
             } => {
-                let base_ty = Ty::DynStructArray(struct_id, Layout::Aos);
-                let Some(field_ty) = self
-                    .graph
-                    .program
-                    .structs
-                    .get(struct_id as usize)
-                    .and_then(|record| record.fields.get(field as usize))
-                    .map(|field| field.ty)
-                else {
+                let base_ty = match xml_operand_base_ty(self.graph.function, &base) {
+                    Some(ty @ Ty::DynStructArray(id, Layout::Aos))
+                    | Some(ty @ Ty::Slice(Scalar::Struct(id))) if id == struct_id => ty,
+                    _ => { equation.invalid = true; return equation; }
+                };
+                if fields.is_empty() { equation.invalid = true; return equation; }
+                let mut source_path = vec![XmlAccessPathSegment::Element];
+                source_path.extend(fields.iter().copied().map(XmlAccessPathSegment::StructField));
+                let Some(field_ty) = inline_struct_path_ty(self.graph.program, struct_id, &fields) else {
                     equation.invalid = true;
                     return equation;
                 };
-                let mut source_path = vec![
-                    XmlAccessPathSegment::Element,
-                    XmlAccessPathSegment::StructField(field),
-                ];
                 source_path.extend(path);
                 let Some(source_selected) =
                     xml_selected_ty(self.graph.program, base_ty, &source_path)
@@ -10760,7 +10775,7 @@ fn xml_borrowed_access(
             let Some(mut ty) = graph.function.slots.get(place.base as usize).copied() else {
                 return XmlProducerState::Invalid;
             };
-            let Ty::DynFixedStructArray(struct_id, len) = ty else {
+            let Ty::StructArray(struct_id, len) = ty else {
                 return XmlProducerState::Invalid;
             };
             if place.index >= len {
@@ -10787,9 +10802,8 @@ fn xml_borrowed_access(
             if ty != place.ty {
                 return XmlProducerState::Invalid;
             }
-            // Fixed arrays have no selected-path representation in the XML graph. Their owning
-            // local/parameter root nevertheless supplies the borrow authority after the ordinary
-            // borrowed-place validator has authenticated the element descriptor.
+            // This restricted resource-field call derives borrow authority from the owning
+            // fixed local/parameter after the ordinary place validator authenticates the path.
             let access = graph
                 .function
                 .params
@@ -14236,7 +14250,7 @@ fn slice_index_result_matches(program: &Program, source: Ty, result: Ty, noalias
     let Some(physical) = slice_index_physical_element(source) else {
         return false;
     };
-    if source == Ty::DynArray(Scalar::String) {
+    if matches!(source, Ty::DynArray(Scalar::String) | Ty::Slice(Scalar::String)) {
         return !noalias && result == Ty::Str;
     }
     if source == Ty::DynResponseArray {
@@ -14267,6 +14281,42 @@ fn validate_slice_index_rvalues(program: &Program) -> Result<(), CodegenError> {
                 let Stmt::Let(value, rvalue) = statement else {
                     continue;
                 };
+                // Plain scalar leaves do not necessarily enter the ownership graph. Certify
+                // physical inline paths here for every result, before any LLVM GEP construction.
+                let field_access = match rvalue {
+                    Rvalue::IndexFieldPtr { base, index, path, struct_id } => {
+                        let root_matches = matches!(preflight_operand_ty(function, base),
+                            Some(Ty::DynStructArray(id, Layout::Aos) | Ty::Slice(Scalar::Struct(id))) if id == *struct_id);
+                        Some((root_matches.then_some(*struct_id), index, path, false))
+                    }
+                    Rvalue::IndexField(slot, index, path) => {
+                        let root = match function.slots.get(*slot as usize) {
+                            Some(Ty::StructArray(id, _)) => Some(*id),
+                            _ => None,
+                        };
+                        Some((root, index, path, true))
+                    }
+                    _ => None,
+                };
+                if let Some((root, index, path, fixed)) = field_access {
+                    let leaf = root.and_then(|id| inline_struct_path_ty(program, id, path));
+                    let result = function.value_tys.get(*value as usize).copied();
+                    let valid_leaf = leaf.is_some_and(|leaf| {
+                        if leaf == Ty::String { result == Some(Ty::Str) }
+                        else {
+                            result == Some(leaf) && ((fixed && matches!(leaf, Ty::Resource(_)))
+                                || !align_sema::ty_is_move(leaf, &program.structs, &program.tuples,
+                                    &program.enums, &program.tagged_types))
+                        }
+                    });
+                    if !valid_leaf || preflight_operand_ty(function, index) != Some(i64_ty) {
+                        return Err(CodegenError::Lowering(format!(
+                            "indexed field MIR in function '{}' has an invalid inline path or leaf type: {:?}, {:?}, {:?}, {:?}",
+                            function.name, root, leaf, result, preflight_operand_ty(function, index)
+                        )));
+                    }
+                    continue;
+                }
                 let (source, index, noalias) = match rvalue {
                     Rvalue::SliceIndex(source, index) => (source, index, false),
                     Rvalue::SliceIndexNoalias { slice, index, .. } => (slice, index, true),
@@ -22313,16 +22363,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?;
                 loaded
             }
-            Rvalue::IndexFieldPtr { base, index, field, struct_id } => {
+            Rvalue::IndexFieldPtr { base, index, path, struct_id } => {
                 // `base` is a `{ptr,len}` view of `[%Struct]`; GEP `%Struct, ptr, index, field`.
                 let agg = self.operand(base)?.into_struct_value();
                 let buf = self.builder.build_extract_value(agg, 0, "aosptr").map_err(|e| self.err(e))?.into_pointer_value();
                 let st = self.struct_types[*struct_id as usize];
                 let index = self.operand(index)?.into_int_value();
-                let f = self.ctx.i32_type().const_int(self.pfield(*struct_id, *field) as u64, false);
+                let mut indices = vec![index];
+                indices.extend(self.phys_field_indices(*struct_id, path).into_iter()
+                    .map(|field| self.ctx.i32_type().const_int(u64::from(field), false)));
                 let ep = unsafe {
                     self.builder
-                        .build_in_bounds_gep(st, buf, &[index, f], "aosfield")
+                        .build_in_bounds_gep(st, buf, &indices, "aosfield")
                         .map_err(|e| self.err(e))?
                 };
                 let ty = abi_type(
@@ -30978,11 +31030,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
     ) -> Result<Ty, CodegenError> {
         let base_ty = self.checked_borrowed_place_ty(&place.base)?;
         let element_ty = match base_ty {
-            Ty::DynArray(element) => align_sema::scalar_to_ty(element),
+            Ty::Slice(element) | Ty::DynArray(element) => align_sema::scalar_to_ty(element),
             Ty::DynStructArray(id, align_sema::Layout::Aos) => Ty::Struct(id),
             _ => {
                 return Err(self.err(
-                    "borrowed element place base is not an ordinary dynamic array",
+                    "borrowed element place base is not an ordinary array or slice",
                 ));
             }
         };
@@ -43765,6 +43817,86 @@ fn main() -> i32 = 0
         assert!(text.contains(&format!("call i64 @\"{fib}\"")), "expected recursive calls:\n{text}");
         assert!(text.contains("icmp slt"), "expected signed comparison:\n{text}");
     }
+    #[test]
+    fn move_slice_mir_gate() -> Result<(), &'static str> {
+        fn reject(program: &Program, label: &str) {
+            assert!(emit_llvm_ir(program, &BuildTarget::Baseline, false, &[], None).is_err(), "{label}");
+            let output = std::env::temp_dir().join(format!("align-move-slice-rejected-{}", std::process::id()));
+            assert!(emit_object(program, &output, &BuildTarget::Baseline, Profile::Release, &[], None).is_err(), "{label}");
+            assert!(emit_prelink_bc(program, &output, &BuildTarget::Baseline, Profile::Release, &[], None, "move-slice-reject").is_err(), "{label}");
+            assert!(!output.exists(), "rejected MIR wrote an artifact");
+        }
+        let source = "Row { text: string }\nfn inspect(borrow row: Row) -> i64 = row.text.len()\nfn use(view: slice<Row>) -> i64 = inspect(view[0])\nfn field(view: slice<Row>) -> str = view[0].text\nfn text(view: slice<string>) -> str = view[0]\nfn main() {}\n";
+        let source = format!("{source}Inner {{ text: string, other: string, number: i64 }}\nNested {{ padding: u32, inner: Inner }}\nfn nested(view: slice<Nested>) -> str = view[0].inner.text\n");
+        let base = mir(&source);
+        let alternate = mir(&source.replace("inner.text", "inner.other"));
+        assert_ne!(align_mir::print::codegen_input_to_string(&base), align_mir::print::codegen_input_to_string(&alternate));
+        assert!(validate_mir_producers(&base).is_ok());
+        for mutation in 0..6 {
+            let mut bad = base.clone();
+            let place = borrowed_element_place_mut(&mut bad);
+            match mutation {
+                0 => place.element_ty = Ty::String,
+                1 => place.base.slot = u32::MAX,
+                2 => place.guard.reservation = u32::MAX,
+                3 => place.index = Operand::Const(Const::Bool(true)),
+                4 => place.base.path.push(hir::BorrowedPathSegment::StructField(99)),
+                _ => place.base.ty = Ty::Soa(0),
+            }
+            reject(&bad, "forged Move slice element");
+        }
+        let mut bad = base.clone();
+        for function in &mut bad.fns {
+            for block in &mut function.blocks {
+                block.stmts.retain(|statement| !matches!(statement, Stmt::BorrowedElementReservation { .. }));
+                block.stmt_lines.clear();
+            }
+        }
+        reject(&bad, "missing slice header reservation");
+        let mut reads = 0;
+        for (fi,function) in base.fns.iter().enumerate() {
+            for statement in function.blocks.iter().flat_map(|block| &block.stmts) {
+                if let Stmt::Let(value, Rvalue::SliceIndex(..)) = statement {
+                    reads += 1;
+                    let mut bad = base.clone();
+                    bad.fns[fi].value_tys[*value as usize] = Ty::String;
+                    reject(&bad, "owning String slice read");
+                }
+            }
+        }
+        for body in [
+            "fn read(view: slice<Row>) -> i64 = view[0].inner.number\nfn main() {}\n",
+            "fn read(view: array<Row>) -> i64 = view[0].inner.number\nfn main() {}\n",
+            "fn fixed() -> i64 { rows := [Row { inner: Inner { number: 1 } }]\nreturn rows[0].inner.number }\nfn main() {}\n",
+        ] {
+            let mut soa_path = mir(&format!("Inner {{ number: i64 }}\nRow {{ inner: Inner }}\n{body}"));
+            let row = soa_path.structs.iter().position(|record| record.name == "Row").ok_or("nested SoA row")?;
+            let Ty::Struct(inner) = soa_path.structs[row].fields[0].ty else { return Err("nested SoA field"); };
+            soa_path.structs[row].fields[0].ty = Ty::Soa(inner);
+            reject(&soa_path, "SoA intermediate is not an inline record path");
+        }
+        let mut nested_reads = 0;
+        for (fi, function) in base.fns.iter().enumerate() {
+            for (bi, block) in function.blocks.iter().enumerate() {
+                for (si, statement) in block.stmts.iter().enumerate() {
+                    let Stmt::Let(value, Rvalue::IndexFieldPtr { path, .. }) = statement else { continue };
+                    assert!(!align_sema::ty_is_move(function.value_tys[*value as usize], &base.structs, &base.tuples, &base.enums, &base.tagged_types));
+                    if path.len() < 2 { continue }
+                    nested_reads += 1;
+                    for invalid in [vec![], vec![99], vec![0, 0], vec![1, 99], vec![1]] {
+                        let mut bad = base.clone();
+                        let Stmt::Let(_, Rvalue::IndexFieldPtr { path, .. }) = &mut bad.fns[fi].blocks[bi].stmts[si] else { return Err("nested field mutation fixture"); };
+                        *path = invalid;
+                        reject(&bad, "malformed complete nested field path");
+                    }
+                }
+            }
+        }
+        assert!(nested_reads > 0, "nested field path mutation covered no load");
+        assert!(reads > 0, "String projection mutation covered no load");
+        Ok(())
+    }
+
     #[test]
     fn host_mir_gate_rejects_forged_schema() -> Result<(), &'static str> {
         for source in ["fn main() {}\n", "import std.os\nfn get() -> Result<os.host_info, Error> = os.host()\nfn main() {}\n"] {

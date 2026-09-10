@@ -1840,3 +1840,11 @@ umask semantics. A successful non-directory observation is false; failed metadat
 is Error. This distinction supports useful diagnostics without pretending that a
 type check proves write authority. [Plan 43](impl/43-ordinary-directory-plan.md)
 owns the exact contract and verification.
+
+## Move-element views preserve ownership in the collection
+
+Plan 44 separates view formation from value-read admission. A Copy slice header
+can address a Move record or owned string without transferring it. Existing
+field projection and shared-call places supply the usable consumers; no reference
+type or implicit clone is introduced. Header reservations protect delayed call
+addressing, while returned-view facts retain the backing owner independently.

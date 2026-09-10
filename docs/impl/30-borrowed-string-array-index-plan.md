@@ -1,5 +1,12 @@
 # Borrowed string-array indexing
 
+Current slice extension: [plan 44](44-move-record-slice-plan.md) admits views of
+existing AoS Move-record and owned-string collections. It extends the receiver
+domain of field/shared-call reads and String-to-Str indexing to slices without
+changing this plan's owning collection or borrowed-payload grammar. The historical
+scope exclusions below describe this capability's original boundary.
+
+
 Status: **IMPLEMENTED against the accepted contract.**
 
 This document owns the Align answer to align-llm Request 22. The first blocked consumer is the R7

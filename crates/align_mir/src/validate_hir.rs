@@ -4433,7 +4433,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::SliceRange { .. } => true,
             hir::ExprKind::BorrowedIndex { base, index } => {
                 let element_ty = match base.array_ty {
-                    Ty::DynArray(element) => Some(align_sema::scalar_to_ty(element)),
+                    Ty::Slice(element) | Ty::DynArray(element) => Some(align_sema::scalar_to_ty(element)),
                     Ty::DynStructArray(id, align_sema::Layout::Aos) => Some(Ty::Struct(id)),
                     _ => None,
                 };
@@ -10460,11 +10460,10 @@ impl<'a> BodyValidator<'a> {
             }
             hir::ExprKind::ArrayToSlice(source) => {
                 let flow = self.expr_flow(source)?;
-                // The view's elements must be readable through it, so the borrow asks the same
-                // sema-owned element rule the index / slice-range guards ask.
+                // View formation uses its sema-owned predicate independently of value reads.
                 let result = match flow.ty {
                     Ty::Array(scalar, _) => {
-                        if !self.collection_element_read_ok(align_sema::scalar_to_ty(scalar)) {
+                        if !self.collection_element_view_ok(align_sema::scalar_to_ty(scalar)) {
                             return None;
                         }
                         if !matches!(
@@ -10476,7 +10475,7 @@ impl<'a> BodyValidator<'a> {
                         Ty::Slice(scalar)
                     }
                     Ty::StructArray(id, _) => {
-                        if !self.collection_element_read_ok(Ty::Struct(id)) {
+                        if !self.collection_element_view_ok(Ty::Struct(id)) {
                             return None;
                         }
                         if !matches!(
@@ -10488,12 +10487,12 @@ impl<'a> BodyValidator<'a> {
                         Ty::Slice(Scalar::Struct(id))
                     }
                     Ty::DynArray(scalar)
-                        if self.collection_element_read_ok(align_sema::scalar_to_ty(scalar)) =>
+                        if self.collection_element_view_ok(align_sema::scalar_to_ty(scalar)) =>
                     {
                         Ty::Slice(scalar)
                     }
                     Ty::DynStructArray(id, Layout::Aos)
-                        if self.collection_element_read_ok(Ty::Struct(id)) =>
+                        if self.collection_element_view_ok(Ty::Struct(id)) =>
                     {
                         Ty::Slice(Scalar::Struct(id))
                     }
@@ -10567,7 +10566,7 @@ impl<'a> BodyValidator<'a> {
                     }
                     _ => return None,
                 };
-                let result = if receiver.ty == Ty::DynArray(Scalar::String) {
+                let result = if matches!(receiver.ty, Ty::DynArray(Scalar::String) | Ty::Slice(Scalar::String)) {
                     Ty::Str
                 } else {
                     physical_result
@@ -10583,7 +10582,7 @@ impl<'a> BodyValidator<'a> {
                 let response_element_borrow =
                     receiver.ty == Ty::DynResponseArray && physical_result == Ty::HttpResponse;
                 let borrowed_string_element =
-                    receiver.ty == Ty::DynArray(Scalar::String) && result == Ty::Str;
+                    matches!(receiver.ty, Ty::DynArray(Scalar::String) | Ty::Slice(Scalar::String)) && result == Ty::Str;
                 if !response_element_borrow
                     && !borrowed_string_element
                     && !self.collection_element_read_ok(physical_result)
@@ -10599,7 +10598,7 @@ impl<'a> BodyValidator<'a> {
                     return None;
                 }
                 let element_ty = match base.array_ty {
-                    Ty::DynArray(element) => align_sema::scalar_to_ty(element),
+                    Ty::Slice(element) | Ty::DynArray(element) => align_sema::scalar_to_ty(element),
                     Ty::DynStructArray(id, Layout::Aos) => Ty::Struct(id),
                     _ => return None,
                 };
@@ -10628,8 +10627,8 @@ impl<'a> BodyValidator<'a> {
                     Some(expr) => Some(self.expr_flow(expr)?),
                     None => None,
                 };
-                if start_flow.as_ref().is_some_and(|flow| flow.ty != i64_ty())
-                    || end_flow.as_ref().is_some_and(|flow| flow.ty != i64_ty())
+                if start_flow.as_ref().is_some_and(|flow| flow.falls && flow.ty != i64_ty())
+                    || end_flow.as_ref().is_some_and(|flow| flow.falls && flow.ty != i64_ty())
                 {
                     return None;
                 }
@@ -10649,7 +10648,7 @@ impl<'a> BodyValidator<'a> {
                     Ty::Str | Ty::String => Ty::Str,
                     _ => {
                         let scalar = sliced_element?;
-                        if !self.collection_element_read_ok(align_sema::scalar_to_ty(scalar)) {
+                        if !self.collection_element_view_ok(align_sema::scalar_to_ty(scalar)) {
                             return None;
                         }
                         // A fixed array is a stack slot, so only a named local or a literal can
@@ -10683,11 +10682,11 @@ impl<'a> BodyValidator<'a> {
             } => {
                 let receiver = self.expr_flow(recv)?;
                 let index_flow = self.expr_flow(index)?;
-                if index_flow.ty != i64_ty() || path.is_empty() {
+                if (index_flow.falls && index_flow.ty != i64_ty()) || path.is_empty() {
                     return None;
                 }
                 let receiver_id = match receiver.ty {
-                    Ty::StructArray(id, _) | Ty::DynStructArray(id, Layout::Aos) | Ty::Soa(id) => id,
+                    Ty::Slice(Scalar::Struct(id)) | Ty::StructArray(id, _) | Ty::DynStructArray(id, Layout::Aos) | Ty::Soa(id) => id,
                     _ => return None,
                 };
                 if receiver_id != *struct_id
@@ -12400,6 +12399,10 @@ impl<'a> BodyValidator<'a> {
     /// Whether an element read (`xs[i]`) or view (`xs[a..b]`) of `elem` is admissible: structural
     /// validity is this validator's own business, the Move rule is sema's
     /// (`collection_element_read_ok` — the producer's own index / slice-range guard).
+    fn collection_element_view_ok(&self, elem: Ty) -> bool {
+        align_sema::collection_element_view_ok(elem, &self.program.structs, &self.program.tuples, &self.program.enums, &self.program.tagged_types)
+    }
+
     fn collection_element_read_ok(&self, elem: Ty) -> bool {
         self.body_ty_ok(elem)
             && align_sema::collection_element_read_ok(

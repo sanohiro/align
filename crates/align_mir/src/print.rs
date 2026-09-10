@@ -418,8 +418,8 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::VecSum { vec, .. } => format!("vsum({})", operand_str(vec)),
         Rvalue::MaskAny { mask, .. } => format!("mask_any({})", operand_str(mask)),
         Rvalue::VecLoad { slice, index, n, .. } => format!("{}[{}..+{n}]", operand_str(slice), operand_str(index)),
-        Rvalue::IndexFieldPtr { base, index, field, struct_id } => {
-            format!("{}[{}].{field} (struct#{struct_id})", operand_str(base), operand_str(index))
+        Rvalue::IndexFieldPtr { base, index, path, struct_id } => {
+            format!("{}[{}].{} (struct#{struct_id})", operand_str(base), operand_str(index), path.iter().map(u32::to_string).collect::<Vec<_>>().join("."))
         }
         Rvalue::IndexColumn { base, index, field, struct_id } => {
             format!("{}.col{field}[{}] (soa struct#{struct_id})", operand_str(base), operand_str(index))
