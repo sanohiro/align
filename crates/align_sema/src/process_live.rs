@@ -117,10 +117,29 @@ pub fn record_definitions(termination: u32) -> Vec<hir::StructDef> {
     })
     .collect()
 }
-pub fn scope_record_definitions(wait:u32) -> Vec<hir::StructDef> {
-    [("process.member_info",vec![("handle",Ty::ProcessMember),("pid",Ty::Int(IntTy {bits:64,signed:true}))]),
-     ("process.reaped",vec![("pid",Ty::Int(IntTy {bits:64,signed:true})),("status",Ty::Struct(wait))])]
-    .into_iter().map(|(name,fields)|hir::StructDef {name:name.into(),source_name:name.into(),fields:fields.into_iter().map(|(name,ty)|hir::FieldDef {name:name.into(),ty}).collect(),c_repr:false,align:None}).collect()
+pub fn member_info_definition() -> hir::StructDef {
+    hir::StructDef {
+        name: "process.member_info".into(),
+        source_name: "process.member_info".into(),
+        fields: vec![
+            hir::FieldDef { name: "handle".into(), ty: Ty::ProcessMember },
+            hir::FieldDef { name: "pid".into(), ty: Ty::Int(IntTy { bits: 64, signed: true }) },
+        ],
+        c_repr: false,
+        align: None,
+    }
+}
+pub fn scope_record_definitions(wait: u32) -> Vec<hir::StructDef> {
+    vec![member_info_definition(), hir::StructDef {
+        name: "process.reaped".into(),
+        source_name: "process.reaped".into(),
+        fields: vec![
+            hir::FieldDef { name: "pid".into(), ty: Ty::Int(IntTy { bits: 64, signed: true }) },
+            hir::FieldDef { name: "status".into(), ty: Ty::Struct(wait) },
+        ],
+        c_repr: false,
+        align: None,
+    }]
 }
 pub fn schemas_valid(structs: &[hir::StructDef], enums: &[hir::EnumDef]) -> bool {
     let mut termination_id = None;

@@ -4561,6 +4561,9 @@ fn builtin_spelling_ty(head: &str) -> Option<Ty> {
 /// spelling bridge lives here, and the ownership answer stays exactly [`needs_drop_flag`] — the same
 /// call that assigned the bit being validated.
 pub fn builtin_spelling_needs_return_cleanup(head: &str) -> Option<bool> {
+    if head == "process.member_info" {
+        return Some(needs_drop_flag(Ty::Struct(0), &[process_live::member_info_definition()], &[], &[], &[]));
+    }
     if process_live::COPY_NAMES.contains(&head) { return Some(false); }
     if head == "fs.dir_entry" { return Some(needs_drop_flag(Ty::Struct(0), &[fs_dir_entry_definition()], &[], &[], &[])); }
     if matches!(head, "fs.metadata" | "fs.entry_kind") {
@@ -4580,6 +4583,9 @@ pub fn builtin_spelling_needs_return_cleanup(head: &str) -> Option<bool> {
 /// bit. Keeping the Move answer in sema prevents the interface decoder from inventing a second
 /// builtin ownership table.
 pub fn builtin_spelling_is_move(head: &str) -> Option<bool> {
+    if head == "process.member_info" {
+        return Some(ty_is_move(Ty::Struct(0), &[process_live::member_info_definition()], &[], &[], &[]));
+    }
     if process_live::COPY_NAMES.contains(&head) { return Some(false); }
     if head == "fs.dir_entry" { return Some(ty_is_move(Ty::Struct(0), &[fs_dir_entry_definition()], &[], &[], &[])); }
     if matches!(head, "fs.metadata" | "fs.entry_kind") {

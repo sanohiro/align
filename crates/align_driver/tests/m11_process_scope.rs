@@ -10,6 +10,8 @@ pub fn stop(borrow member:process.member) -> Result<(),Error> {
     if member.finished()? { return Ok(()) }
     member.kill(process.signal_number(process.signal.Kill))
 }
+pub fn pass_entry(entry:process.member_info) -> process.member_info = entry
+pub fn pass_reaped(event:process.reaped) -> process.reaped = event
 pub fn stop_entry(borrow entry:process.member_info) -> Result<(),Error> = stop(entry.handle)
 pub fn cleanup(borrow mut scope:process.child_scope) -> Result<(),Error> {
     loop {
