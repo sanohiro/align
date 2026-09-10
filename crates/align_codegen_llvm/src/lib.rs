@@ -11102,12 +11102,11 @@ fn validate_host_mir(program: &Program) -> Result<(), CodegenError> {
     }
     for function in &program.fns {
         for statement in function.blocks.iter().flat_map(|block| &block.stmts) {
-            if let Stmt::Let(value, Rvalue::OsHost { out }) = statement {
-                if host.is_none()
+            if let Stmt::Let(value, Rvalue::OsHost { out }) = statement
+                && (host.is_none()
                     || function.slots.get(*out as usize).copied() != host.map(Ty::Struct)
-                    || function.value_tys.get(*value as usize).copied() != Some(Ty::Int(IntTy { bits: 32, signed: true })) {
-                    return Err(CodegenError::Lowering("malformed os.host producer".to_string()));
-                }
+                    || function.value_tys.get(*value as usize).copied() != Some(Ty::Int(IntTy { bits: 32, signed: true }))) {
+                return Err(CodegenError::Lowering("malformed os.host producer".to_string()));
             }
         }
     }
