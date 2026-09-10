@@ -5,8 +5,7 @@
 independent raw-name enumeration, descriptor metadata/modes and relative operations.
 The owner suite covers whole/per-unit transport, malformed HIR/MIR, native failure
 precedence and cleanup with omitted-Drop negative controls. Consumer traversal,
-snapshot policy and adoption remain external. R65 platform/lifecycle qualification
-remains the next unclosed product-cutover boundary.
+snapshot policy and adoption remain external.
 
 R63 is implemented under [plan 47](docs/impl/47-json-numeric-contract.md): direct
 f32/f64 JSON conversion, finite-only encoders returning owned
@@ -14,8 +13,21 @@ f32/f64 JSON conversion, finite-only encoders returning owned
 and one compiler/native encoder operation. Plan 47 records the correctness and
 local performance evidence. Consumer adoption remains
 align-llm-owned. [Plan 46](docs/impl/46-deferred-client-boundaries-plan.md) retains
-the independent, unresolved R65 deployment/lifecycle qualification; R65 needs its
-own exact design after R63 and is not part of this implementation.
+the earlier R65 deployment/lifecycle qualification. R65's complete implementation handoff is now in
+[plan 50](docs/impl/50-r65-process-capability-handoff.md), with the common exact
+ledger in [plan 49](docs/impl/49-native-process-contract.md). The selected scope
+preserves native Linux/macOS process workflows and states Linux-only sealing,
+fd-selected execution, namespace inheritance and exclusive child_scope contracts.
+The existing sandbox remains application-selected. There is no extra Align init,
+privileged service, dedicated user or VM prerequisite. Local unprivileged probes
+cover sealing/fd execution, prepared namespace handoff, double-setsid adoption,
+zombie-leader/live-thread handling and kernel-empty release. Design and
+independent-review corrections are complete. The next work is the four coherent
+implementation capabilities in plan 50: common process operations, explicit
+signals, verified launch authority, then the exclusive child scope. No further
+platform/helper design decision is deferred to the implementation model.
+Implementation is in progress in capability 1 (the common native process workflow).
+Consumer adoption remains external.
 
 `std.fs` ordinary directory operations are implemented: `fs.create_dir` creates
 one directory under normal umask rules; `fs.is_dir` returns a fallible followed
@@ -42,8 +54,7 @@ SHA-256 (R29) is implemented under [plan 41](docs/impl/41-incremental-sha256-pla
 Move-record and owned-string slice views (R67) are implemented under
 [plan 44](docs/impl/44-move-record-slice-plan.md), retaining source ownership and
 using existing field/shared-call readers without implicit copies.
-Retained-tree access follows plan 45. Verified-process platform/lifecycle proof
-must close before R65 implementation; R63 follows its owner-approved plan 47.
+Retained-tree access follows plan 45. R65 follows the complete capability contract in plan 50; R63 follows its owner-approved plan 47.
 Consumer adoption is separate.
 
 **Bound `if` results (2026-09-09):** the Category A bound-local transfer gap is

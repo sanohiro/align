@@ -6,7 +6,7 @@
 //! - `c.cwd(dir)` sets the working directory in place (returns `()`); `c.run()` forks a child with
 //!   BOTH stdout and stderr captured, drains both pipes to EOF (the P7 two-pipe drain), reaps the
 //!   child, and yields `Result<run_output, Error>`.
-//! - `out.code()` is the exit code; `out.stdout()` / `out.stderr()` are `str` VIEWS region-bound to
+//! - `out.status()` returns typed termination; stdout/stderr are views bound to
 //!   `out` (an escape past `out`'s `Drop` is a compile error, P9).
 //!
 //! The headline is the Request-1 acceptance gate: capture stdout, stderr, and the exit code of a
@@ -30,7 +30,9 @@ fn command_captures_stdout_stderr_and_code() {
 pub fn main() -> Result<(), Error> {\n\
   c := process.command(\"/bin/sh\", [\"/bin/sh\", \"-c\", \"printf HELLO; printf OOPS 1>&2; exit 7\"])\n\
   out := c.run()?\n\
-  print(out.code())\n\
+  print(({ process_status := out.status()
+ match process_status.termination { Exited(exit_value) => exit_value, Signaled(signal_value) => -signal_value }
+ }))\n\
   print(out.stdout())\n\
   print(out.stderr())\n\
   Ok(())\n\
@@ -175,7 +177,9 @@ pub fn main() -> i32 {\n\
   c := process.command(\"/bin/sh\", [\"/bin/sh\", \"-c\", \"sleep 10\"])\n\
   c.timeout_ns(100_000_000)\n\
   match c.run() {\n\
-    Ok(out) => out.code() as i32,\n\
+    Ok(out) => ({ process_status := out.status()
+ match process_status.termination { Exited(exit_value) => exit_value, Signaled(signal_value) => -signal_value }
+ }) as i32,\n\
     Err(e) => match e {\n\
       Timeout => 42,\n\
       _       => 2,\n\
@@ -202,7 +206,9 @@ pub fn main() -> i32 {\n\
   c := process.command(\"/bin/sh\", [\"/bin/sh\", \"-c\", \"printf hi; exit 5\"])\n\
   c.timeout_ns(30_000_000_000)\n\
   match c.run() {\n\
-    Ok(out) => out.code() as i32,\n\
+    Ok(out) => ({ process_status := out.status()
+ match process_status.termination { Exited(exit_value) => exit_value, Signaled(signal_value) => -signal_value }
+ }) as i32,\n\
     Err(e)  => match e {\n\
       NotFound => 90,\n\
       Invalid  => 91,\n\
@@ -224,7 +230,9 @@ pub fn main() -> Result<(), Error> {\n\
   c := process.command(\"/bin/echo\", [\"/bin/echo\", \"hi\"])\n\
   c.timeout_ns(\"soon\")\n\
   out := c.run()?\n\
-  print(out.code())\n\
+  print(({ process_status := out.status()
+ match process_status.termination { Exited(exit_value) => exit_value, Signaled(signal_value) => -signal_value }
+ }))\n\
   Ok(())\n\
 }\n";
     assert!(check_errs("cmd-timeout-badarg", bad), "timeout_ns with a non-i64 argument must error");
@@ -236,7 +244,9 @@ fn command_requires_the_import() {
     let missing = "pub fn main() -> Result<(), Error> {\n\
   c := process.command(\"/bin/echo\", [\"/bin/echo\", \"hi\"])\n\
   out := c.run()?\n\
-  print(out.code())\n\
+  print(({ process_status := out.status()
+ match process_status.termination { Exited(exit_value) => exit_value, Signaled(signal_value) => -signal_value }
+ }))\n\
   Ok(())\n\
 }\n";
     assert!(check_errs("cmd-no-import", missing), "process.command without `import std.process` must error");
@@ -287,7 +297,9 @@ fn command_and_run_output_require_a_bound_receiver() {
     let temp_run = "import std.process\n\
 pub fn main() -> Result<(), Error> {\n\
   out := process.command(\"/bin/echo\", [\"/bin/echo\", \"hi\"]).run()?\n\
-  print(out.code())\n\
+  print(({ process_status := out.status()
+ match process_status.termination { Exited(exit_value) => exit_value, Signaled(signal_value) => -signal_value }
+ }))\n\
   Ok(())\n\
 }\n";
     assert!(check_errs("command-temp-run", temp_run), "run() on a temporary command must error (bind it first)");
@@ -318,7 +330,9 @@ pub fn main() -> Result<(), Error> {\n\
     let temporary_run = "import std.process\n\
 pub fn main() -> Result<(), Error> {\n\
   out := process.command(\"/bin/echo\", [\"/bin/echo\"]).run_bytes()?\n\
-  print(out.code())\n\
+  print(({ process_status := out.status()
+ match process_status.termination { Exited(exit_value) => exit_value, Signaled(signal_value) => -signal_value }
+ }))\n\
   Ok(())\n\
 }\n";
     assert!(check_errs("command-run-bytes-temporary", temporary_run));
@@ -387,7 +401,9 @@ pub fn main() -> Result<(), Error> {\n\
   c := process.command(\"/bin/sh\", [\"/bin/sh\", \"-c\", \"printf '\\\\377\\\\000A'\"])\n\
   c.max_capture_bytes(3)\n\
   out := c.run_bytes()?\n\
-  print(out.code())\n\
+  print(({ process_status := out.status()
+ match process_status.termination { Exited(exit_value) => exit_value, Signaled(signal_value) => -signal_value }
+ }))\n\
   print(encoding.hex_encode(out.stdout()))\n\
   Ok(())\n\
 }\n";
@@ -520,7 +536,9 @@ pub fn main() -> Result<(), Error> {\n\
   c := process.command(\"/bin/sh\", [\"/bin/sh\", \"-c\", \"printf '\\\\377\\\\000A'; printf '\\\\000E' 1>&2; exit 7\"])\n\
   c.max_capture_bytes(3)\n\
   out := c.run_bytes()?\n\
-  print(out.code())\n\
+  print(({ process_status := out.status()
+ match process_status.termination { Exited(exit_value) => exit_value, Signaled(signal_value) => -signal_value }
+ }))\n\
   print(encoding.hex_encode(out.stdout()))\n\
   print(encoding.hex_encode(out.stderr()))\n\
   Ok(())\n\
@@ -568,7 +586,9 @@ pub fn main() -> Result<(), Error> {\n\
 pub fn main() -> Result<(), Error> {\n\
   c := process.command(\"/bin/echo\", [\"/bin/echo\", \"x\"])\n\
   out := c.run_bytes()?\n\
-  f := fn unused: i64 { out.code() }\n\
+  f := fn unused: i64 { ({ process_status := out.status()
+ match process_status.termination { Exited(exit_value) => exit_value, Signaled(signal_value) => -signal_value }
+ }) }\n\
   print(f(0))\n\
   Ok(())\n\
 }\n";
@@ -579,7 +599,9 @@ pub fn main() -> Result<(), Error> {\n\
   c := process.command(\"/bin/echo\", [\"/bin/echo\", \"x\"])\n\
   out := c.run_bytes()?\n\
   returned := identity(out)\n\
-  print(returned.code())\n\
+  print(({ process_status := returned.status()
+ match process_status.termination { Exited(exit_value) => exit_value, Signaled(signal_value) => -signal_value }
+ }))\n\
   Ok(())\n\
 }\n";
     let diagnostics = check_diagnostics("run-bytes-generic-bare-return", generic_return);
@@ -604,8 +626,12 @@ fn make() -> Result<run_bytes, Error> {\n\
 pub fn main() -> Result<(), Error> {\n\
   first := make()?\n\
   second := first\n\
-  print(first.code())\n\
-  print(second.code())\n\
+  print(({ process_status := first.status()
+ match process_status.termination { Exited(exit_value) => exit_value, Signaled(signal_value) => -signal_value }
+ }))\n\
+  print(({ process_status := second.status()
+ match process_status.termination { Exited(exit_value) => exit_value, Signaled(signal_value) => -signal_value }
+ }))\n\
   Ok(())\n\
 }\n";
     assert!(check_errs("run-bytes-moved-source", moved_source), "moving a run_bytes local must null and invalidate its source");
@@ -623,35 +649,49 @@ fn keep_error(e: Error) -> Error = e\n\
 fn through_try() -> Result<i64, Error> {\n\
   result := make()\n\
   out := result?\n\
-  Ok(out.code())\n\
+  Ok(({ process_status := out.status()
+ match process_status.termination { Exited(exit_value) => exit_value, Signaled(signal_value) => -signal_value }
+ }))\n\
 }\n\
 fn through_else() -> i64 {\n\
   result := make()\n\
   out := result else { return 90 }\n\
-  out.code()\n\
+  ({ process_status := out.status()
+ match process_status.termination { Exited(exit_value) => exit_value, Signaled(signal_value) => -signal_value }
+ })\n\
 }\n\
 fn through_match() -> i64 = match make() {\n\
-  Ok(out) => out.code(),\n\
+  Ok(out) => ({ process_status := out.status()
+ match process_status.termination { Exited(exit_value) => exit_value, Signaled(signal_value) => -signal_value }
+ }),\n\
   Err(_) => 91,\n\
 }\n\
 fn through_map_err() -> Result<i64, Error> {\n\
   out := make().map_err(keep_error)?\n\
-  Ok(out.code())\n\
+  Ok(({ process_status := out.status()
+ match process_status.termination { Exited(exit_value) => exit_value, Signaled(signal_value) => -signal_value }
+ }))\n\
 }\n\
 fn through_replacement() -> Result<i64, Error> {\n\
   mut out := make()?\n\
   out = make()?\n\
-  Ok(out.code())\n\
+  Ok(({ process_status := out.status()
+ match process_status.termination { Exited(exit_value) => exit_value, Signaled(signal_value) => -signal_value }
+ }))\n\
 }\n\
 fn through_return() -> Result<run_bytes, Error> = make()\n\
 fn through_early_exit() -> Result<i64, Error> {\n\
   out := make()?\n\
-  if out.code() == 0 { return Ok(1) }\n\
+  if ({ process_status := out.status()
+ match process_status.termination { Exited(exit_value) => exit_value, Signaled(signal_value) => -signal_value }
+ }) == 0 { return Ok(1) }\n\
   Ok(92)\n\
 }\n\
 pub fn main() -> Result<(), Error> {\n\
   returned := through_return()?\n\
-  total := through_try()? + through_else() + through_match() + through_map_err()? + through_replacement()? + returned.code() + through_early_exit()?\n\
+  total := through_try()? + through_else() + through_match() + through_map_err()? + through_replacement()? + ({ process_status := returned.status()
+ match process_status.termination { Exited(exit_value) => exit_value, Signaled(signal_value) => -signal_value }
+ }) + through_early_exit()?\n\
   print(total)\n\
   Ok(())\n\
 }\n";
@@ -707,9 +747,12 @@ pub fn run() -> Result<run_bytes, Error> {
             "main.align",
             r#"
 import capture
+import std.process
 fn main() -> i32 {
   match capture.run() {
-    Ok(out) => if out.stdout().len() == 8 { out.code() as i32 } else { 90 },
+    Ok(out) => if out.stdout().len() == 8 { ({ process_status := out.status()
+ match process_status.termination { Exited(exit_value) => exit_value, Signaled(signal_value) => -signal_value }
+ }) as i32 } else { 90 },
     Err(_) => 91,
   }
 }

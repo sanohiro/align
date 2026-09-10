@@ -11,7 +11,7 @@ macro_rules! runtime_keys {
         }
 
         impl RuntimeKey {
-            pub const ALL: [Self; 391] = [$(Self::$variant,)*];
+            pub const ALL: [Self; 405] = [$(Self::$variant,)*];
 
             pub const fn logical_name(self) -> &'static str {
                 match self {
@@ -72,6 +72,22 @@ runtime_keys! {
     BuilderWriteStrIntStr => "builder_write_str_int_str",
     BuilderWriteUint => "builder_write_uint",
     BytesAsStr => "bytes_as_str",
+    CommandNewSession => "command_new_session",
+    CommandStdoutTo => "command_stdout_to",
+    CommandStderrTo => "command_stderr_to",
+    CommandStart => "command_start",
+    ChildId => "child_id",
+    ChildStatus => "child_status",
+    ChildTryWait => "child_try_wait",
+    ChildReadStdout => "child_read_stdout",
+    ChildReadStderr => "child_read_stderr",
+    ChildPoll => "child_poll",
+    ChildKillGroup => "child_kill_group",
+    ChildGroupMembers => "child_group_members",
+    RunOutputStatus => "run_output_status",
+    RunBytesStatus => "run_bytes_status",
+    ProcessSignalNumber => "process_signal_number",
+    ProcessTable => "process_table",
     ChildFree => "child_free",
     ChildKill => "child_kill",
     ChildWait => "child_wait",
@@ -353,11 +369,9 @@ runtime_keys! {
     RngSeedOs => "rng_seed_os",
     RngSeedWith => "rng_seed_with",
     RngShuffle => "rng_shuffle",
-    RunBytesCode => "run_bytes_code",
     RunBytesFree => "run_bytes_free",
     RunBytesStderr => "run_bytes_stderr",
     RunBytesStdout => "run_bytes_stdout",
-    RunOutputCode => "run_output_code",
     RunOutputFree => "run_output_free",
     RunOutputStderr => "run_output_stderr",
     RunOutputStdout => "run_output_stdout",
@@ -416,7 +430,7 @@ runtime_keys! {
     XmlText => "xml_text",
 }
 
-const _: [(); 391] = [(); RuntimeKey::ALL.len()];
+const _: [(); 405] = [(); RuntimeKey::ALL.len()];
 
 #[cfg(test)]
 mod tests {
@@ -425,7 +439,7 @@ mod tests {
 
     #[test]
     fn runtime_keys_are_complete_unique_and_alphabetical() {
-        assert_eq!(RuntimeKey::ALL.len(), 391);
+        assert_eq!(RuntimeKey::ALL.len(), 405);
         let names: Vec<_> = RuntimeKey::ALL
             .iter()
             .map(|key| key.logical_name())

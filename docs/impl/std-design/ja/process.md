@@ -11,6 +11,19 @@
 > 4〜6 は実装済み**（`process.command`/`c.cwd`/`c.run` のキャプチャ、`c.timeout_ns` とコアの `Error.Timeout`
 > バリアント、`c.env`/`c.env_clear`）。align-llm Request 11 の有界 text/bytes 拡張も**実装済み**です。
 
+## R65 の契約
+
+設計・レビュー指摘の反映を完了した置換仕様は、[plan 50](../../50-r65-process-capability-handoff.md)
+と [plan 49](../../49-native-process-contract.md) にまとめています。シグネチャ、型、エラー、
+資源コスト、ABI、格納・所有権ルール、検証条件はこの二つに従います。以下の旧スライスは
+過去の実装記録です。変更対象の数値ステータスと起動処理の説明は plan 49/50 が置き換えます。
+共通の子プロセス操作から実装し、残る機能は plan 50 の順序で進めます。`wait` と出力の `code()` は、型付きの
+wait_result/status に置き換え、互換別名は残しません。ライブ入出力、グループ操作、
+ファイル出力、プロセス一覧、明示的な signal 購読は Linux/macOS の両方でネイティブに
+提供します。封印した実行イメージ、名前空間の継承、排他的 child_scope は Linux 固有の
+取得契約を明記します。監視方針はアプリケーションが持ち、追加サービス、専用ユーザー、
+VM、維持用プロセスは要求しません。
+
 ## Overview
 
 spawn / exec / exit(draft §18.2)。fork/exec/waitpid と、子プロセスを表す child Move ハンドルで構成する。

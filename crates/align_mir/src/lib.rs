@@ -1982,6 +1982,7 @@ pub enum Rvalue {
     },
     /// `fs.remove_empty_dir(path)` — retained, no-follow removal of exactly one empty directory.
     FsCreateDir { path: Operand },
+    ProcessLive { kind: align_sema::process_live::ProcessLiveKind, args: Vec<Operand>, out: Option<Slot> },
     FsTree { kind: align_sema::fs_tree::FsTreeKind, args: Vec<Operand>, output: FsTreeOutput },
     FsIsDir { path: Operand, out: Slot },
     FsRemoveEmptyDir {
@@ -2090,12 +2091,10 @@ pub enum Rvalue {
         args: Operand,
         out: Slot,
     },
-    /// `ch.wait()` — block in `waitpid` for the `child` operand to exit, marking it reaped (through the
-    /// borrow — the receiver is read, not consumed). Yields an `i64`: the exit code (`>= 0`:
-    /// `WEXITSTATUS`, or `128 + signal` for a signal-killed child) on success, or `-(status)` on error
-    /// (a double-wait / `waitpid` failure — the [`Rvalue::ReaderRead`] sign convention).
+    /// Exclusive direct-child wait. Writes the typed wait result and returns i32 errno status.
     ChildWait {
         child: Operand,
+        out: Slot,
     },
     /// `ch.kill(sig)` — send signal `sig` (an `i64`) to the `child` operand via libc `kill`. Yields an
     /// `i32` errno-status (0 = ok; a negative / out-of-range `sig`, or killing an already-`reaped` child,
@@ -2545,19 +2544,11 @@ pub enum Rvalue {
         command: Operand,
         out: Slot,
     },
-    /// `out.code()` — the run's exit code (`i64`) of the run-output handle `out`. Pure.
-    RunOutputCode {
-        out: Operand,
-    },
     /// `out.stdout()` / `out.stderr()` — the captured stdout / stderr as a `str` **view** `{ptr,len}`
     /// into `out`'s owned buffer (region-bound to `out`). `err` selects the stderr buffer. Pure.
     RunOutputView {
         out: Operand,
         err: bool,
-    },
-    /// Exit-code accessor for a `run_bytes` handle.
-    RunBytesCode {
-        out: Operand,
     },
     /// Byte-slice stdout/stderr view for a `run_bytes` handle.
     RunBytesView {
@@ -7443,10 +7434,8 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
             | hir::ExprKind::CommandEnvClear { .. }
             | hir::ExprKind::CommandRun { .. }
             | hir::ExprKind::CommandRunBytes { .. }
-            | hir::ExprKind::RunOutputCode { .. }
             | hir::ExprKind::RunOutputStdout { .. }
             | hir::ExprKind::RunOutputStderr { .. }
-            | hir::ExprKind::RunBytesCode { .. }
             | hir::ExprKind::RunBytesStdout { .. }
             | hir::ExprKind::RunBytesStderr { .. }
             | hir::ExprKind::PathJoin { .. }
@@ -7621,11 +7610,9 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         | hir::ExprKind::CommandEnvClear { .. }
         | hir::ExprKind::CommandRun { .. }
         | hir::ExprKind::CommandRunBytes { .. }
-        | hir::ExprKind::RunOutputCode { .. }
         | hir::ExprKind::RunOutputStdout { .. }
         | hir::ExprKind::RunOutputStderr { .. } => lower_command(b, e),
-        hir::ExprKind::RunBytesCode { .. }
-        | hir::ExprKind::RunBytesStdout { .. }
+        hir::ExprKind::RunBytesStdout { .. }
         | hir::ExprKind::RunBytesStderr { .. } => lower_command(b, e),
         hir::ExprKind::CryptoPrivateKeyFromPem { .. }
         | hir::ExprKind::CryptoPublicKeyFromPem { .. }
@@ -8361,11 +8348,9 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             | hir::ExprKind::CommandEnvClear { .. }
             | hir::ExprKind::CommandRun { .. }
             | hir::ExprKind::CommandRunBytes { .. }
-            | hir::ExprKind::RunOutputCode { .. }
             | hir::ExprKind::RunOutputStdout { .. }
             | hir::ExprKind::RunOutputStderr { .. } => lower_command(b, e),
-            hir::ExprKind::RunBytesCode { .. }
-            | hir::ExprKind::RunBytesStdout { .. }
+            hir::ExprKind::RunBytesStdout { .. }
             | hir::ExprKind::RunBytesStderr { .. } => lower_command(b, e),
             // `fs.read_file_view(path)` yields `Result<str, Error>`, threading the enclosing arena so the
             // runtime registers the mmap for `munmap` at arena end.
@@ -8447,6 +8432,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 b.push(Stmt::Let(v, Rvalue::TimeInstant));
                 Operand::Value(v)
             }
+            hir::ExprKind::ProcessLive { kind, args } => lower_process_live(b, *kind, args, e.ty),
             hir::ExprKind::FsTree { kind, args } => lower_fs_tree(b, *kind, args, e.ty),
             hir::ExprKind::OsHost => {
                 let Ty::Result(Scalar::Struct(id), _) = e.ty else { return Operand::Const(Const::Unit) };
@@ -18369,9 +18355,14 @@ fn lower_file_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
 /// helper (the `reader.read` sign convention). `child` is borrowed (never consumed — no move-out).
 fn lower_child_wait(b: &mut Builder, child: &hir::Expr, result_ty: Ty) -> Operand {
     let ch = lower_required!(b, lower_expr(b, child), Operand::Const(Const::Unit));
-    let n = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(n, Rvalue::ChildWait { child: ch }));
-    lower_count_or_status_result(b, n, result_ty)
+    let Some(id) = align_sema::fs_tree::record_id(&b.structs, "process.wait_result") else {
+        b.terminate(Term::Unreachable); return Operand::Const(Const::Unit);
+    };
+    let payload = Ty::Struct(id);
+    let out = b.new_slot(payload);
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(code, Rvalue::ChildWait { child: ch, out }));
+    emit_open_handle_result(b, code, out, payload, result_ty)
 }
 
 /// `ch.kill(sig)` → the runtime `kill(pid, sig)`s (guarding a reaped/recycled pid through the borrow),
@@ -19161,6 +19152,28 @@ fn lower_beneath_handle(
 }
 
 /// Evaluate retained filesystem inputs in source order and reconstruct ordinary result carriers.
+fn lower_process_live(b: &mut Builder, kind: align_sema::process_live::ProcessLiveKind, args: &[hir::Expr], result_ty: Ty) -> Operand {
+    let mut operands = Vec::with_capacity(args.len());
+    for argument in args {
+        operands.push(lower_required!(b, lower_expr(b,argument),Operand::Const(Const::Unit)));
+    }
+    let Some(payload) = align_sema::process_live::payload_type(kind,&b.structs,&b.enums) else {
+        b.terminate(Term::Unreachable); return Operand::Const(Const::Unit);
+    };
+    let out = kind.scratch().then(|| b.new_slot(payload));
+    let native_ty = if kind.fallible() { status_ty() } else if out.is_some() { Ty::Unit } else { payload };
+    let value = b.fresh_value(native_ty);
+    b.push(Stmt::Let(value,Rvalue::ProcessLive { kind, args: operands, out }));
+    if kind.fallible() {
+        if let Some(out) = out { emit_open_handle_result(b,value,out,payload,result_ty) }
+        else { lower_status_result(b,value,result_ty) }
+    } else if let Some(out) = out {
+        let value = b.fresh_value(payload);
+        b.push(Stmt::Let(value,Rvalue::Load(out)));
+        Operand::Value(value)
+    } else { Operand::Value(value) }
+}
+
 fn lower_fs_tree(b: &mut Builder, kind: align_sema::fs_tree::FsTreeKind, args: &[hir::Expr], result_ty: Ty) -> Operand {
     let mut operands = Vec::with_capacity(args.len());
     for argument in args {
@@ -19762,13 +19775,6 @@ fn lower_command(b: &mut Builder, e: &hir::Expr) -> Operand {
                 false,
             )
         }
-        // `out.code()` → the runtime returns the i64 exit code directly.
-        hir::ExprKind::RunOutputCode { out } => {
-            let o = lower_required!(b, lower_expr(b, out), Operand::Const(Const::Unit));
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::RunOutputCode { out: o }));
-            Operand::Value(v)
-        }
         // `out.stdout()` / `out.stderr()` → a `str` view `{ptr,len}` into the run-output buffer
         // (region-bound to `out`; not owned — no `Drop`).
         hir::ExprKind::RunOutputStdout { out } | hir::ExprKind::RunOutputStderr { out } => {
@@ -19784,12 +19790,7 @@ fn lower_command(b: &mut Builder, e: &hir::Expr) -> Operand {
             ));
             Operand::Value(v)
         }
-        hir::ExprKind::RunBytesCode { out } => {
-            let o = lower_required!(b, lower_expr(b, out), Operand::Const(Const::Unit));
-            let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::RunBytesCode { out: o }));
-            Operand::Value(v)
-        }
+
         hir::ExprKind::RunBytesStdout { out } | hir::ExprKind::RunBytesStderr { out } => {
             let is_err = matches!(&e.kind, hir::ExprKind::RunBytesStderr { .. });
             let o = lower_required!(b, lower_expr(b, out), Operand::Const(Const::Unit));

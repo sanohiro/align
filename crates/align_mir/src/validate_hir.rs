@@ -23,7 +23,7 @@ pub(crate) fn global_type_metadata_is_valid(program: &hir::Program) -> bool {
     && program.structs.iter().all(|definition| {
         !(definition.name == "os.host_info" || definition.source_name == "os.host_info")
             || align_sema::host_info_schema_valid(definition)
-    }) && align_sema::fs_tree_schemas_valid(&program.structs, &program.enums)
+    }) && align_sema::fs_tree_schemas_valid(&program.structs, &program.enums) && align_sema::process_live::schemas_valid(&program.structs, &program.enums)
     && Validator::new(program).validate()
 }
 
@@ -2009,10 +2009,8 @@ impl<'a> PlacementValidator<'a> {
             // These handles are body-produced only. They are valid local/expression types but have
             // no source `resolve_type` spelling and therefore cannot occur in a declaration header.
             Ty::CliParsed
-            | Ty::HttpServer
-            | Ty::Command
-            | Ty::RunOutput => false,
-            Ty::RunBytes => true,
+            | Ty::HttpServer => false,
+            Ty::Command | Ty::RunOutput | Ty::RunBytes => true,
             Ty::CliCommand => false,
             _ if align_sema::is_move_handle(ty) => true,
             Ty::Rng | Ty::HttpHeaders | Ty::JsonDoc => true,
@@ -4618,7 +4616,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::FsWriteFile { .. }
             | hir::ExprKind::FsExists { .. }
             | hir::ExprKind::FsRemove { .. }
-            | hir::ExprKind::FsTree { .. } | hir::ExprKind::FsCreateDir { .. } | hir::ExprKind::FsIsDir { .. }
+            | hir::ExprKind::FsTree { .. } | hir::ExprKind::ProcessLive { .. } | hir::ExprKind::FsCreateDir { .. } | hir::ExprKind::FsIsDir { .. }
             | hir::ExprKind::FsRemoveEmptyDir { .. }
             | hir::ExprKind::FsReadDir { .. }
             | hir::ExprKind::RenameNoReplace { .. }
@@ -4659,10 +4657,8 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::CommandEnvClear { .. }
             | hir::ExprKind::CommandRun { .. }
             | hir::ExprKind::CommandRunBytes { .. }
-            | hir::ExprKind::RunOutputCode { .. }
             | hir::ExprKind::RunOutputStdout { .. }
             | hir::ExprKind::RunOutputStderr { .. }
-            | hir::ExprKind::RunBytesCode { .. }
             | hir::ExprKind::RunBytesStdout { .. }
             | hir::ExprKind::RunBytesStderr { .. }
             | hir::ExprKind::EncodingEncode { .. }
@@ -5001,7 +4997,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::ArrayBuilderBuild(..)
             | hir::ExprKind::FsExists { .. }
             | hir::ExprKind::FsRemove { .. }
-            | hir::ExprKind::FsTree { .. } | hir::ExprKind::FsCreateDir { .. } | hir::ExprKind::FsIsDir { .. }
+            | hir::ExprKind::FsTree { .. } | hir::ExprKind::ProcessLive { .. } | hir::ExprKind::FsCreateDir { .. } | hir::ExprKind::FsIsDir { .. }
             | hir::ExprKind::FsRemoveEmptyDir { .. }
             | hir::ExprKind::FsReadDir { .. }
             | hir::ExprKind::RenameNoReplace { .. }
@@ -5041,10 +5037,8 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::CommandEnvClear { .. }
             | hir::ExprKind::CommandRun { .. }
             | hir::ExprKind::CommandRunBytes { .. }
-            | hir::ExprKind::RunOutputCode { .. }
             | hir::ExprKind::RunOutputStdout { .. }
             | hir::ExprKind::RunOutputStderr { .. }
-            | hir::ExprKind::RunBytesCode { .. }
             | hir::ExprKind::RunBytesStdout { .. }
             | hir::ExprKind::RunBytesStderr { .. }
             | hir::ExprKind::Utf8Valid { .. }
@@ -5311,7 +5305,7 @@ impl<'a> BodyValidator<'a> {
             && !self.readonly_slice_local(context, id)
     }
 
-    fn readonly_slice_local(&self, context: &BodyContext, target: hir::LocalId) -> bool {
+    fn local_assignments(&self, context: &BodyContext) -> Vec<(hir::LocalId, &hir::Expr)> {
         enum Scan<'b> {
             Block(&'b hir::Block),
             Stmt(&'b hir::Stmt),
@@ -5319,7 +5313,7 @@ impl<'a> BodyValidator<'a> {
         }
 
         let Some(function) = self.program.fns.get(context.function) else {
-            return false;
+            return Vec::new();
         };
         let mut work = vec![Scan::Block(&function.body)];
         let mut blocks = HashSet::new();
@@ -5401,6 +5395,11 @@ impl<'a> BodyValidator<'a> {
             }
         }
 
+        assignments
+    }
+
+    fn readonly_slice_local(&self, context: &BodyContext, target: hir::LocalId) -> bool {
+        let assignments = self.local_assignments(context);
         let mut readonly = HashSet::new();
         for (local, expression) in assignments {
             if self.readonly_view_expression(expression, &readonly) {
@@ -9065,6 +9064,26 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::FsRemove { path } => {
                 (path.ty == Ty::Str).then(|| result(Ty::Unit, &[path]))?
             }
+            hir::ExprKind::ProcessLive { kind, args } => {
+                use align_sema::process_live::{Input,input_type,result_type};
+                if kind.inputs().len()!=args.len() { return None; }
+                for (index,(input,argument)) in kind.inputs().iter().zip(args).enumerate() {
+                    let expected = input_type(*input,&self.program.structs,&self.program.enums)?;
+                    if !self.expr_flow(argument)?.falls { continue; }
+                    if argument.ty!=expected { return None; }
+                    if let Input::Owner(ty) = input {
+                        if !self.local_handle_place(context,argument,*ty) { return None; }
+                        if index==0 && kind.exclusive() {
+                            let hir::ExprKind::Local(id) = argument.kind else { return None; };
+                            let function = self.program.fns.get(context.function)?;
+                            if let Some(position) = function.params.iter().position(|parameter| *parameter==id)
+                                && !matches!(function.param_modes.get(position),Some(align_ast::ParamMode::ByValue | align_ast::ParamMode::BorrowMut)) { return None; }
+                        }
+                    }
+                    if *input==Input::OutBytes && !self.native_byte_output_is_writable(context,argument) { return None; }
+                }
+                strict(result_type(*kind,&self.program.structs,&self.program.enums,&self.program.tagged_types)?,&args.iter().collect::<Vec<_>>())
+            }
             hir::ExprKind::FsTree { kind, args } => {
                 let inputs = kind.inputs();
                 if inputs.len() != args.len() { return None; }
@@ -9203,8 +9222,9 @@ impl<'a> BodyValidator<'a> {
                 (cmd.ty == Ty::Str && is_argv_ty(args.ty)).then(|| result(Ty::Child, &[cmd, args]))?
             }
             hir::ExprKind::ChildWait { child } => {
-                (local(child, Ty::Child) && child.ty == Ty::Child)
-                    .then(|| result(i64, &[child]))?
+                let id = align_sema::fs_tree::record_id(&self.program.structs, "process.wait_result")?;
+                (self.exclusive_handle_place(context, child, Ty::Child) && child.ty == Ty::Child)
+                    .then(|| result(Ty::Struct(id), &[child]))?
             }
             hir::ExprKind::ChildKill { child, sig } => {
                 (local(child, Ty::Child) && child.ty == Ty::Child && sig.ty == i64)
@@ -9217,16 +9237,16 @@ impl<'a> BodyValidator<'a> {
                 (cmd.ty == Ty::Str && is_argv_ty(args.ty)).then(|| strict(Ty::Command, &[cmd, args]))?
             }
             hir::ExprKind::CommandCwd { command, dir } => {
-                (local(command, Ty::Command) && command.ty == Ty::Command && dir.ty == Ty::Str)
+                (self.exclusive_handle_place(context, command, Ty::Command) && command.ty == Ty::Command && dir.ty == Ty::Str)
                     .then(|| strict(Ty::Unit, &[command, dir]))?
             }
             hir::ExprKind::CommandTimeout { command, ns } => {
-                (local(command, Ty::Command) && command.ty == Ty::Command && ns.ty == i64)
+                (self.exclusive_handle_place(context, command, Ty::Command) && command.ty == Ty::Command && ns.ty == i64)
                     .then(|| strict(Ty::Unit, &[command, ns]))?
             }
             hir::ExprKind::CommandMaxCapture { command, limit } => {
                 let flows = self.native_children(&[command, limit])?;
-                if !local(command, Ty::Command) || command.ty != Ty::Command || limit.ty != i64 {
+                if !self.exclusive_handle_place(context, command, Ty::Command) || command.ty != Ty::Command || limit.ty != i64 {
                     return None;
                 }
                 let (falls, breaks) = strict_flow(&flows);
@@ -9237,14 +9257,14 @@ impl<'a> BodyValidator<'a> {
                 name,
                 value,
             } => {
-                (local(command, Ty::Command)
+                (self.exclusive_handle_place(context, command, Ty::Command)
                     && command.ty == Ty::Command
                     && name.ty == Ty::Str
                     && value.ty == Ty::Str)
                     .then(|| strict(Ty::Unit, &[command, name, value]))?
             }
             hir::ExprKind::CommandEnvClear { command } => {
-                (local(command, Ty::Command) && command.ty == Ty::Command)
+                (self.exclusive_handle_place(context, command, Ty::Command) && command.ty == Ty::Command)
                     .then(|| strict(Ty::Unit, &[command]))?
             }
             hir::ExprKind::CommandRun { command } => {
@@ -9259,22 +9279,12 @@ impl<'a> BodyValidator<'a> {
                 let (falls, breaks) = strict_flow(&flows);
                 Some((self.native_result_ty(Ty::RunBytes)?, falls, breaks))
             }
-            hir::ExprKind::RunOutputCode { out } => {
-                (local(out, Ty::RunOutput) && out.ty == Ty::RunOutput)
-                    .then(|| strict(i64, &[out]))?
-            }
+
             hir::ExprKind::RunOutputStdout { out } | hir::ExprKind::RunOutputStderr { out } => {
                 (local(out, Ty::RunOutput) && out.ty == Ty::RunOutput)
                     .then(|| strict(Ty::Str, &[out]))?
             }
-            hir::ExprKind::RunBytesCode { out } => {
-                let flows = self.native_children(&[out])?;
-                if !local(out, Ty::RunBytes) || out.ty != Ty::RunBytes {
-                    return None;
-                }
-                let (falls, breaks) = strict_flow(&flows);
-                Some((i64, falls, breaks))
-            }
+
             hir::ExprKind::RunBytesStdout { out } | hir::ExprKind::RunBytesStderr { out } => {
                 let flows = self.native_children(&[out])?;
                 if !local(out, Ty::RunBytes) || out.ty != Ty::RunBytes {
@@ -12448,6 +12458,59 @@ impl<'a> BodyValidator<'a> {
             }
         }
         found
+    }
+
+    /// Certify writable backing, independently of the mutability of a copied slice header.
+    /// Follow the same admitted local/slice roots as source checking, through every assignment.
+    fn native_byte_output_is_writable(&self, context: &BodyContext, argument: &hir::Expr) -> bool {
+        let Some(function)=self.program.fns.get(context.function) else { return false; };
+        let assignments=self.local_assignments(context);
+        let mut work=vec![argument];
+        let mut locals=HashSet::new();
+        let mut expressions=HashSet::new();
+        let mut grounded=false;
+        while let Some(expression)=work.pop() {
+            if !expressions.insert(ptr_key(expression)) { continue; }
+            match &expression.kind {
+                hir::ExprKind::Local(id) => {
+                    if !locals.insert(*id) { continue; }
+                    let Some(local)=function.locals.get(*id as usize).filter(|local|local.id==*id) else { return false; };
+                    let mode=function.params.iter().position(|parameter|parameter==id)
+                        .and_then(|index|function.param_modes.get(index));
+                    match local.ty {
+                        Ty::Array(_,_) | Ty::DynArray(_) => {
+                            if !local.is_mut || matches!(mode,Some(align_ast::ParamMode::Borrow)) { return false; }
+                            grounded=true;
+                        }
+                        Ty::Slice(_) => {
+                            if let Some(mode)=mode {
+                                if !matches!(mode,align_ast::ParamMode::Out) { return false; }
+                                grounded=true;
+                            }
+                            let mut assigned=false;
+                            for (target,value) in &assignments {
+                                if target==id { assigned=true; work.push(value); }
+                            }
+                            if mode.is_none() && !assigned { return false; }
+                        }
+                        _ => return false,
+                    }
+                }
+                hir::ExprKind::ArrayToSlice(inner) | hir::ExprKind::SliceRange { recv:inner,.. } => work.push(inner),
+                hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) | hir::ExprKind::Arena(block) | hir::ExprKind::NamedArena { block,.. } => {
+                    let Some(value)=block.value.as_deref() else { return false; }; work.push(value);
+                }
+                hir::ExprKind::If { then,els,.. } => {
+                    for block in [then,els] { let Some(value)=block.value.as_deref() else { return false; }; work.push(value); }
+                }
+                hir::ExprKind::Match { arms,.. } => {
+                    if arms.is_empty() { return false; }
+                    for arm in arms { work.push(&arm.body); }
+                }
+                _ => return false,
+            }
+        }
+        grounded
     }
 
     fn out_arg_is_writable(

@@ -1870,3 +1870,23 @@ position and keeps entry storage independent from stream lifetime. Descriptor
 observations and mode changes stay explicit; metadata does not flush a writer.
 Create failure never performs a racy rollback unlink. The exact nineteen-operation
 contract and hostile-mutation limits are in [plan 45](impl/45-retained-byte-tree-plan.md).
+
+### Process authority without application supervision
+
+R65's [final capability design](impl/50-r65-process-capability-handoff.md) keeps
+native observations and authority in std while application Align code composes
+fair draining, hashing, resource limits, cancellation and cleanup. WNOWAIT status
+and wait4 reap are separate so a terminated session leader retains group identity
+until its caller deliberately releases it. A typed termination avoids exit/signal
+collisions; positional reads and output buffers make copying explicit.
+
+Sealed storage is a filesystem capability, executable selection a process
+capability, and the existing external sandbox remains application policy. The
+Linux child_scope explicitly reserves process-wide creation/reaping and enables
+subreaping; kernel ECHILD under that exclusion proves complete absence. It adds
+no hidden init or helper process. Its global restriction is explicit and checked,
+like the signal lease, rather than hidden in runtime initialization. Native Mac
+process workflows remain supported; Linux-only kernel guarantees have a stated
+unsupported-host result instead of an administrator-service prerequisite. This
+supersedes the earlier extra PID-namespace/init proposal and its unnecessary
+bootstrap/deployment obligations. The design and independent-review corrections are complete; implementation follows plans 49–50.

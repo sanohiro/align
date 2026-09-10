@@ -11553,9 +11553,18 @@ fn main() -> i32 = 0
     });
 }
 
+fn push_process_wait_schema(program: &mut hir::Program) -> Ty {
+    let termination=u32::try_from(program.enums.len()).unwrap();
+    program.enums.push(align_sema::process_live::termination_definition());
+    let wait=u32::try_from(program.structs.len()).unwrap();
+    program.structs.extend(align_sema::process_live::record_definitions(termination));
+    Ty::Struct(wait)
+}
+
 #[test]
 fn request11_process_rows_match_the_producer() {
     let mut program = baseline_program();
+    let process_wait = push_process_wait_schema(&mut program);
     let error = push_builtin_error(&mut program);
     let result = native_result(Ty::RunBytes, error);
     let bytes = Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false }));
@@ -11590,13 +11599,11 @@ fn request11_process_rows_match_the_producer() {
     add(
         "request11_code",
         body_test_expr(
-            hir::ExprKind::RunBytesCode {
-                out: Box::new(native_local(0, Ty::RunBytes)),
-            },
-            int(64),
+            hir::ExprKind::ProcessLive { kind: align_sema::process_live::ProcessLiveKind::RunBytesStatus, args: vec![native_local(0, Ty::RunBytes)] },
+            process_wait,
         ),
         vec![body_test_local(0, "out", Ty::RunBytes, false, false)],
-        int(64),
+        process_wait,
     );
     add(
         "request11_stdout",
@@ -11669,9 +11676,9 @@ fn request11_process_rows_match_the_producer() {
         match &mut expression.kind {
             hir::ExprKind::CommandMaxCapture { command, .. }
             | hir::ExprKind::CommandRunBytes { command } => command.ty = Ty::RunBytes,
-            hir::ExprKind::RunBytesCode { out }
-            | hir::ExprKind::RunBytesStdout { out }
+            hir::ExprKind::RunBytesStdout { out }
             | hir::ExprKind::RunBytesStderr { out } => out.ty = Ty::RunOutput,
+            hir::ExprKind::ProcessLive { args, .. } => args[0].ty = Ty::RunOutput,
             _ => panic!("{name}: wrong Request 11 fixture"),
         }
         assert!(!body_core_metadata_is_valid(&malformed), "{name}: wrong receiver type");
@@ -11756,18 +11763,18 @@ fn request11_process_rows_match_the_producer() {
         let mut temporary = program.clone();
         let expression = expression_mut(&mut temporary, name);
         let out = match &mut expression.kind {
-            hir::ExprKind::RunBytesCode { out }
-            | hir::ExprKind::RunBytesStdout { out }
-            | hir::ExprKind::RunBytesStderr { out } => out,
+            hir::ExprKind::RunBytesStdout { out }
+            | hir::ExprKind::RunBytesStderr { out } => out.as_mut(),
+            hir::ExprKind::ProcessLive { args, .. } => &mut args[0],
             _ => panic!("{name}: fixture lost its discriminator"),
         };
-        *out = Box::new(body_test_expr(
+        *out = body_test_expr(
             hir::ExprKind::Block(hir::Block {
                 stmts: Vec::new(),
                 value: Some(Box::new(native_local(0, Ty::RunBytes))),
             }),
             Ty::RunBytes,
-        ));
+        );
         assert!(!body_core_metadata_is_valid(&temporary), "{name}: temporary receiver");
     }
 }
@@ -11805,6 +11812,7 @@ fn request11_expr_kind_inventory_tripwire() {
 #[test]
 fn hir_body_validator_native() {
     let mut program = baseline_program();
+    let process_wait = push_process_wait_schema(&mut program);
     let heap_record = program.structs.len() as u32;
     program.structs.push(StructDef {
         name: "HeapRecord".to_string(),
@@ -12809,10 +12817,10 @@ fn hir_body_validator_native() {
             hir::ExprKind::ChildWait {
                 child: Box::new(native_local(0, Ty::Child)),
             },
-            result_i64,
+            native_result(process_wait, error),
         ),
         vec![body_test_local(0, "child", Ty::Child, false, false)],
-        result_i64
+        native_result(process_wait, error)
     );
     add!(
         "native_child_kill",
@@ -12935,13 +12943,11 @@ fn hir_body_validator_native() {
     add!(
         "native_run_output_code",
         body_test_expr(
-            hir::ExprKind::RunOutputCode {
-                out: Box::new(native_local(0, Ty::RunOutput)),
-            },
-            i64_ty,
+            hir::ExprKind::ProcessLive { kind: align_sema::process_live::ProcessLiveKind::RunOutputStatus, args: vec![native_local(0, Ty::RunOutput)] },
+            process_wait,
         ),
         vec![body_test_local(0, "out", Ty::RunOutput, false, false)],
-        i64_ty
+        process_wait
     );
     add!(
         "native_run_output_stdout",
@@ -12968,13 +12974,11 @@ fn hir_body_validator_native() {
     add!(
         "native_run_bytes_code",
         body_test_expr(
-            hir::ExprKind::RunBytesCode {
-                out: Box::new(native_local(0, Ty::RunBytes)),
-            },
-            i64_ty,
+            hir::ExprKind::ProcessLive { kind: align_sema::process_live::ProcessLiveKind::RunBytesStatus, args: vec![native_local(0, Ty::RunBytes)] },
+            process_wait,
         ),
         vec![body_test_local(0, "out", Ty::RunBytes, false, false)],
-        i64_ty
+        process_wait
     );
     add!(
         "native_run_bytes_stdout",
@@ -18405,6 +18409,50 @@ fn retained_tree_hidden_collection_owners() -> Result<(), &'static str> {
             assert!(!validate_hir::type_placement_metadata_is_valid(&bad), "hidden {owner}: {ty:?}");
             assert_body_entrypoints_empty("hidden filesystem collection owner", &bad);
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn live_process_records_and_writable_backing() -> Result<(), &'static str> {
+    let base=checked_source_program("import std.process\nfn start(command: command) -> Result<child,Error> = command.start()\nfn read(borrow mut child: child,out bytes:slice<u8>) -> Result<Option<i64>,Error> = child.read_stdout(bytes)\nfn result(borrow output:run_bytes) -> process.wait_result = output.status()\nfn main() {}\n");
+    assert!(!is_empty(&lower_program(&base)));
+    for name in ["start","read","result"] {
+        for mutation in 0..5 {
+            let mut bad=base.clone();
+            let function=bad.fns.iter_mut().find(|function|function.name==name).ok_or("function")?;
+            let expression=function.body.value.as_mut().ok_or("tail")?;
+            let hir::ExprKind::ProcessLive { kind,args }=&mut expression.kind else { return Err("process record"); };
+            match mutation {
+                0=>expression.ty=Ty::Bool,
+                1=>args.clear(),
+                2=>args[0]=native_i64(),
+                3=>*kind=align_sema::process_live::ProcessLiveKind::ProcessTable,
+                _=>args.push(native_i64()),
+            }
+            assert_body_entrypoints_empty("malformed process record",&bad);
+        }
+    }
+    for mode in [align_ast::ParamMode::ByValue,align_ast::ParamMode::Borrow,align_ast::ParamMode::BorrowMut] {
+        let mut bad=base.clone();
+        let function=bad.fns.iter_mut().find(|function|function.name=="read").ok_or("read")?;
+        function.param_modes[1]=mode;
+        function.locals[1].is_mut=true; // Mutability of the header does not grant backing authority.
+        assert_body_entrypoints_empty("forged writable process read",&bad);
+    }
+    for name in ["process.wait_result","process.readiness","process.snapshot","process.signal_set"] {
+        let id=base.structs.iter().position(|definition|definition.name==name).ok_or("record")?;
+        for mutation in 0..5 {
+            let mut bad=base.clone(); let definition=&mut bad.structs[id];
+            match mutation { 0=>definition.fields.clear(),1=>definition.fields[0].ty=Ty::Raw,
+                2=>definition.source_name="lookalike".into(),3=>definition.c_repr=true,_=>definition.align=Some(16) }
+            assert!(!validate_hir::global_type_metadata_is_valid(&bad));
+        }
+    }
+    for name in ["process.termination","process.signal"] {
+        let id=base.enums.iter().position(|definition|definition.name==name).ok_or("sum")?;
+        let mut bad=base.clone(); bad.enums[id].variants[0].field_base=99;
+        assert!(!validate_hir::global_type_metadata_is_valid(&bad));
     }
     Ok(())
 }

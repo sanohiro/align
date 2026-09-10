@@ -573,6 +573,7 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         },
         ExprKind::BuilderToString(expr) => ExprKind::BuilderToString(boxed!(expr)),
         ExprKind::FsTree { kind, args } => ExprKind::FsTree { kind: *kind, args: take_exprs(clones, args.len())? },
+        ExprKind::ProcessLive { kind, args } => ExprKind::ProcessLive { kind: *kind, args: take_exprs(clones, args.len())? },
         ExprKind::ArrayLit {
             elems,
             elem,
@@ -1237,10 +1238,10 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         ExprKind::CommandRunBytes { command } => ExprKind::CommandRunBytes {
             command: boxed!(command),
         },
-        ExprKind::RunOutputCode { out } => ExprKind::RunOutputCode { out: boxed!(out) },
+
         ExprKind::RunOutputStdout { out } => ExprKind::RunOutputStdout { out: boxed!(out) },
         ExprKind::RunOutputStderr { out } => ExprKind::RunOutputStderr { out: boxed!(out) },
-        ExprKind::RunBytesCode { out } => ExprKind::RunBytesCode { out: boxed!(out) },
+
         ExprKind::RunBytesStdout { out } => ExprKind::RunBytesStdout { out: boxed!(out) },
         ExprKind::RunBytesStderr { out } => ExprKind::RunBytesStderr { out: boxed!(out) },
         ExprKind::EncodingEncode { kind, data } => ExprKind::EncodingEncode {
@@ -2566,6 +2567,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         }
         | ExprKind::Call { args: operands, .. }
         | ExprKind::FsTree { args: operands, .. }
+        | ExprKind::ProcessLive { args: operands, .. }
         | ExprKind::StructLit {
             fields: operands, ..
         }
@@ -2706,10 +2708,8 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::CommandEnvClear { command: recv }
         | ExprKind::CommandRun { command: recv }
         | ExprKind::CommandRunBytes { command: recv }
-        | ExprKind::RunOutputCode { out: recv }
         | ExprKind::RunOutputStdout { out: recv }
         | ExprKind::RunOutputStderr { out: recv }
-        | ExprKind::RunBytesCode { out: recv }
         | ExprKind::RunBytesStdout { out: recv }
         | ExprKind::RunBytesStderr { out: recv }
         | ExprKind::EncodingEncode { data: recv, .. }

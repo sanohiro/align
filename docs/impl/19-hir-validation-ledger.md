@@ -1,5 +1,12 @@
 # Checked-HIR validation ledger
 
+**R65 planned contract:** [plan 50](50-r65-process-capability-handoff.md) and
+[plan 49](49-native-process-contract.md), designed and ready for implementation, own the new
+closed operation schemas, writable out provenance, receiver families, Move
+carriers, canonical tags, exact native declarations and replacement child-wait/
+capture-status ABI. Current rows below remain the shipped baseline; update them
+atomically with the implementing capability, not as an alternative contract.
+
 **R63 implementation contract:**
 [Plan 47](47-json-numeric-contract.md) supersedes this document's JSON float
 exclusions, infallible/arena-view encoder result, bounded-only encoder IR/native

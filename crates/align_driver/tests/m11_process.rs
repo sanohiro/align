@@ -163,7 +163,8 @@ const SPAWN_WAIT_PRINT: &str = "\
 import std.process
 pub fn main(args: array<str>) -> Result<(), Error> {
   ch := process.spawn(args[1], args[1..])?
-  code := ch.wait()?
+  status := ch.wait()?
+  code := match status.termination { Exited(value) => value, Signaled(value) => -value }
   print(code)
   return Ok(())
 }";
@@ -203,12 +204,13 @@ fn spawn_false_waits_one() {
 /// An exec-not-found cannot be reported synchronously (the fork already happened): the forked child
 /// `_exit(127)`s (the shell convention), so `wait()` returns 127 (P5).
 #[test]
-fn spawn_nonexistent_waits_127() {
+fn spawn_nonexistent_returns_error() {
     if !backend_available() {
         return;
     }
     let out = build_and_run_args("m11proc-missing", SPAWN_WAIT_PRINT, &["/nonexistent/definitely-not-a-real-binary"]);
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "127", "exec-not-found → wait 127");
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
 }
 
 /// The natural call form: the argv is a **fixed-size array literal** (`["…/true"]`, typed
@@ -226,7 +228,8 @@ fn spawn_with_fixed_array_literal_argv() {
 import std.process
 pub fn main() -> Result<(), Error> {{
   ch := process.spawn(\"{tru}\", [\"{tru}\"])?
-  code := ch.wait()?
+  status := ch.wait()?
+  code := match status.termination {{ Exited(value) => value, Signaled(value) => -value }}
   print(code)
   return Ok(())
 }}"
@@ -244,12 +247,12 @@ pub fn main() -> Result<(), Error> {{
 /// `wait()` returns `128 + 9 = 137` (the shell convention; `ch.kill` is a Slice-3 API, so the child
 /// kills itself here).
 #[test]
-fn spawn_signal_killed_child_is_128_plus_sig() {
+fn spawn_signal_killed_child_keeps_signal_domain() {
     if !backend_available() || !std::path::Path::new("/bin/sh").exists() {
         return;
     }
     let out = build_and_run_args("m11proc-signal", SPAWN_WAIT_PRINT, &["/bin/sh", "-c", "kill -9 $$"]);
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "137", "SIGKILL-ed child → 128+9");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "-9", "SIGKILL stays distinct from a normal exit");
 }
 
 /// A `child` dropped without `wait()` is reaped by its `Drop` (a blocking `waitpid`) — no zombie, no
@@ -276,7 +279,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 /// A second `wait()` on an already-reaped child is a clean `Err` (detected via the reaped flag, not an
 /// `ECHILD` race). The first wait succeeds (prints the code); the second's `else`-unwrap runs.
 #[test]
-fn double_wait_second_is_err() {
+fn double_wait_returns_cached_result() {
     if !backend_available() {
         return;
     }
@@ -285,10 +288,10 @@ import std.process
 pub fn main(args: array<str>) -> Result<(), Error> {
   ch := process.spawn(args[1], args[1..])?
   first := ch.wait()?
-  print(first)
+  print(match first.termination { Exited(value) => value, Signaled(value) => -value })
   match ch.wait() {
     Ok(code) => {
-      print(code)
+      print(match code.termination { Exited(value) => value, Signaled(value) => -value })
     }
     Err(_) => {
       print(\"second-err\")
@@ -298,7 +301,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 }";
     let Some(tru) = coreutil("true") else { return };
     let out = build_and_run_args("m11proc-double-wait", prog, &[&tru]);
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0\nsecond-err", "double-wait → clean Err");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0\n0", "double-wait returns the cached result");
 }
 
 /// A `child` threads through a function parameter (a Move handle passed by value) — but cannot be
@@ -368,7 +371,8 @@ fn child_moved_into_function_is_reaped_once() {
     let prog = "\
 import std.process
 fn run(c: child) -> Result<i64, Error> {
-  code := c.wait()?
+  status := c.wait()?
+  code := match status.termination { Exited(value) => value, Signaled(value) => -value }
   return Ok(code)
 }
 pub fn main(args: array<str>) -> Result<(), Error> {
@@ -390,7 +394,8 @@ fn process_spawn_requires_import() {
     let src = "\
 pub fn main(args: array<str>) -> Result<(), Error> {
   ch := process.spawn(args[1], args[1..])?
-  code := ch.wait()?
+  status := ch.wait()?
+  code := match status.termination { Exited(value) => value, Signaled(value) => -value }
   print(code)
   return Ok(())
 }
@@ -410,7 +415,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 /// `ch.kill(15)` (SIGTERM) terminates a live child; `wait()` then reports `128 + 15 = 143` (the shell
 /// convention — the child dies by signal, not a normal exit). The harness supplies a long-lived sleeper.
 #[test]
-fn kill_terminates_live_child_wait_is_143() {
+fn kill_termination_is_distinct_from_exit() {
     if !backend_available() || !std::path::Path::new("/bin/sleep").exists() {
         return;
     }
@@ -419,12 +424,13 @@ import std.process
 pub fn main(args: array<str>) -> Result<(), Error> {
   ch := process.spawn(args[1], args[1..])?
   ch.kill(15)?
-  code := ch.wait()?
+  status := ch.wait()?
+  code := match status.termination { Exited(value) => value, Signaled(value) => -value }
   print(code)
   return Ok(())
 }";
     let out = build_and_run_args("m11proc-kill-term", prog, &["/bin/sleep", "30"]);
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "143", "kill(SIGTERM) → wait 128+15; stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "-15", "kill(SIGTERM) is a signal termination; stderr: {}", String::from_utf8_lossy(&out.stderr));
 }
 
 /// `ch.kill(0)` is the liveness probe: no signal is sent, but it succeeds (`Ok`) on a still-running
@@ -441,12 +447,13 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   ch.kill(0)?
   print(\"alive\")
   ch.kill(9)?
-  code := ch.wait()?
+  status := ch.wait()?
+  code := match status.termination { Exited(value) => value, Signaled(value) => -value }
   print(code)
   return Ok(())
 }";
     let out = build_and_run_args("m11proc-kill-probe", prog, &["/bin/sleep", "30"]);
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "alive\n137", "kill(0) Ok on live child, then SIGKILL → 137; stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "alive\n-9", "kill(0) Ok on live child, then SIGKILL; stderr: {}", String::from_utf8_lossy(&out.stderr));
 }
 
 /// Killing an already-`wait()`ed (reaped) child is a clean `Err` — the reaped flag guards the possibly
@@ -460,7 +467,8 @@ fn kill_after_wait_is_err() {
 import std.process
 pub fn main(args: array<str>) -> Result<(), Error> {
   ch := process.spawn(args[1], args[1..])?
-  code := ch.wait()?
+  status := ch.wait()?
+  code := match status.termination { Exited(value) => value, Signaled(value) => -value }
   print(code)
   match ch.kill(15) {
     Ok(_) => {

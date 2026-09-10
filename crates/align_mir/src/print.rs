@@ -913,6 +913,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::FsWriteFileBuilder { path, builder } => format!("fs_write_file_builder({}, {})", operand_str(path), operand_str(builder)),
         Rvalue::FsExists { path } => format!("fs_exists({})", operand_str(path)),
         Rvalue::FsRemove { path } => format!("fs_remove({})", operand_str(path)),
+        Rvalue::ProcessLive { kind, args, out } => format!("process_live({kind:?}, {args:?}, {out:?})"),
         Rvalue::FsTree { kind, args, output } => format!("fs_tree({kind:?}, {args:?}, {output:?})"),
         Rvalue::FsCreateDir { path } => format!("fs_create_dir({path:?})"),
         Rvalue::FsIsDir { path, out } => format!("fs_is_dir({path:?}, {out:?})"),
@@ -937,7 +938,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::UdpSendTo { sock, data, host, port } => format!("udp_send_to({}, {}, {}, {})", operand_str(sock), operand_str(data), operand_str(host), operand_str(port)),
         Rvalue::UdpRecvFrom { sock, buffer } => format!("udp_recv_from({}, {})", operand_str(sock), operand_str(buffer)),
         Rvalue::ProcessSpawn { cmd, args, out } => format!("process_spawn({}, {}, -> _{out})", operand_str(cmd), operand_str(args)),
-        Rvalue::ChildWait { child } => format!("child_wait({})", operand_str(child)),
+        Rvalue::ChildWait { child, out } => format!("child_wait({}, out s{out})", operand_str(child)),
         Rvalue::ChildKill { child, sig } => format!("child_kill({}, {})", operand_str(child), operand_str(sig)),
         Rvalue::ProcessExec { cmd, args } => format!("process_exec({}, {})", operand_str(cmd), operand_str(args)),
         Rvalue::Command { cmd, args } => format!("command({}, {})", operand_str(cmd), operand_str(args)),
@@ -948,11 +949,11 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::CommandEnvClear { command } => format!("command_env_clear({})", operand_str(command)),
         Rvalue::CommandRun { command, out } => format!("command_run({}, -> _{out})", operand_str(command)),
         Rvalue::CommandRunBytes { command, out } => format!("command_run_bytes({}, -> _{out})", operand_str(command)),
-        Rvalue::RunOutputCode { out } => format!("run_output_code({})", operand_str(out)),
+
         Rvalue::RunOutputView { out, err } => {
             format!("run_output_{}({})", if *err { "stderr" } else { "stdout" }, operand_str(out))
         }
-        Rvalue::RunBytesCode { out } => format!("run_bytes_code({})", operand_str(out)),
+
         Rvalue::RunBytesView { out, err } => {
             format!("run_bytes_{}({})", if *err { "stderr" } else { "stdout" }, operand_str(out))
         }

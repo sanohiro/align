@@ -1186,13 +1186,24 @@ substring views). `std.process`: `spawn`/`wait`/`kill`/`exec`, `exit` (runs clea
 (immediate `_exit(1)`), `cpu_count()`, and the `command` builder — `process.command(cmd, args)` plus
 `cwd`/`env`/`env_clear`/`timeout_ns` setters, the optional per-stream
 `max_capture_bytes(limit)` bound, `run() -> Result<run_output, Error>` for UTF-8 text capture, and
-`run_bytes() -> Result<run_bytes, Error>` for arbitrary bytes. Both output handles expose `code()` as
-a Copy `i64`; `stdout()`/`stderr()` are region-bound zero-copy views. An unset capture bound
+`run_bytes() -> Result<run_bytes, Error>` for arbitrary bytes. Both output handles expose `status()` as
+a Copy `process.wait_result`; `stdout()`/`stderr()` are region-bound zero-copy views. An unset capture bound
 preserves the existing unbounded behavior; explicit `0` permits only empty streams, exact-limit output succeeds,
 and overflow signals the owned process group when present, kills and reaps the direct child, discards
 partial output, and returns `Error.Invalid`. The timeout deadline remains active through direct-child wait after pipe EOF; hard
 pipe/wait failures signal an owned group when present, kill/reap the direct child, and return
 `Error.Code` without partial output.
+The **R65 contract** is fixed by [plan 50](impl/50-r65-process-capability-handoff.md)
+and [plan 49](impl/49-native-process-contract.md).
+It replaces numeric child wait/capture status with one typed termination/optional
+RSS result, adds native Linux/macOS live read/readiness/group/file-output/signal
+and process-table operations, and uses existing writable out admission. Explicit
+Linux-only sealed files, fd-selected images, namespace inheritance and exclusive
+child_scope supply verified launch and descendant reap/absence. The caller owns
+supervision and cleanup policy. No privileged deployment or implicit sandbox is
+introduced. Common child operations are implemented first; signal subscriptions
+and Linux-only authority follow the capability order in plan 50.
+
 `std.http` whole-body clients expose
 `cl.max_response_body_bytes(limit: i64)` and the request-local
 `r.max_response_body_bytes(limit: i64)`. Zero clears/inherits; a positive request value only

@@ -1,15 +1,22 @@
 # R65 and R63: decisions before implementation
 
-Status: **R63 implementation and acceptance follow [plan 47](47-json-numeric-contract.md);
-R65 exact contract remains incomplete and its implementation has not started**.
-Assessed provider main `d469adcb931848ba03d18dcff022d32d95c2fda9` and the
-uncommitted align-llm request register. This document advances the two unresolved
-rows of [plan 40](40-align-llm-product-boundary-plan.md). It is a decision and
-qualification plan, not an accepted replacement for the process or JSON specs.
-This earlier decision record does not qualify any production isolation deployment.
-The implementation-model handoff and remaining design work are in §8. Plan 47
-supersedes this document's unclosed JSON design cells and policy alternatives;
-its review status is authoritative for R63.
+**R65 supersession:** [plan 50](50-r65-process-capability-handoff.md) selects the
+full request scope, native mechanisms and implementation boundaries, with plan
+49 for common operations. Design and independent-review corrections are complete. The earlier
+extra namespace/init and unqualified-Mac-extension requirements below are
+historical proposals, not decisions left to the implementation model.
+
+Status: **historical decision and qualification record**. R63 follows
+[plan 47](47-json-numeric-contract.md); R65 follows
+[plan 50](50-r65-process-capability-handoff.md) and its common ledger in
+[plan 49](49-native-process-contract.md). Those records replace this document's
+preliminary signatures, platform assumptions, preferred namespace/init strategy
+and formerly open design cells. The evidence and rejected alternatives below are
+retained as history, not unfinished instructions for the implementation model.
+
+Assessed provider main d469adcb931848ba03d18dcff022d32d95c2fda9 and the uncommitted
+align-llm request register. No production isolation deployment is qualified by
+this earlier record.
 
 ## 1. Decision ledger
 
@@ -378,7 +385,9 @@ public/native fields.
 | Process / R65 | Per-launch owned PID namespace/init preferred; typed executable/input/fd authority; minimal native launch/reap; application supervision; no weak fallback or guessed absence. | Run Q0 on the actual supported deployment, including prepared user-namespace credentials. Close init parent/reap exclusion, bootstrap/helper choice and artifact identity, authenticated status/member transport, complete signatures/native layouts/errors, parent-death and release/Drop failure semantics. Propagate and review the exact contract after qualification. |
 
 The broad strategy review in §7 is useful evidence, not a review of an exact
-contract. R63 now has that separate review in plan 47; R65 remains unwritten. Reuse its finding and local probes; do not rerun the
+contract. R63 has that separate review in plan 47; R65's common candidate is in
+plan 49 and its strong extension remains unclosed. Reuse the findings and local
+probes; do not rerun the
 same strategy review as an implementation-discovery loop. Review the newly closed
 contract once, then follow the repository's ordinary code review and local gates.
 No consumer implementation or adoption work is authorized. Maintain the sibling

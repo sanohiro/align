@@ -22,6 +22,9 @@ pub use str_prims::*;
 mod crypto_asymmetric;
 mod crypto_digest;
 mod os_host;
+mod process_live;
+mod process_launch;
+mod process_table;
 mod fs_directory;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod fs_retained_tree;
@@ -14989,33 +14992,9 @@ pub extern "C" fn align_rt_process_abort() -> ! {
 
 // --- process.spawn / child.wait / child Drop-reap (std.process Slice 2) ------------------------
 
-/// A `child` (`std.process`) — a Move handle owning a spawned child process's pid, plus a `reaped`
-/// flag. `Drop` ([`align_rt_child_free`]) reaps the pid via a blocking `waitpid` iff not yet reaped,
-/// so a dropped-without-`wait()` child can never become a zombie (P2 — the documented tradeoff is that
-/// dropping a *still-running* child blocks until it exits; `kill()` first to avoid, a Slice-3 API). A
-/// successful `ch.wait()` flips `reaped` through the borrow so the later `Drop` is a no-op.
-pub struct Child {
-    pid: i32,
-    reaped: bool,
-}
-
-/// Decode a `waitpid` status into the exit code Align returns. A normal exit (`WIFEXITED`) yields
-/// `WEXITSTATUS` (`0..=255`); a signal-killed child (`WIFSIGNALED`) yields `128 + signal` (the shell
-/// convention — documented, may collide with a program that literally `exit`s in `129..=192`). The
-/// wait-status bit layout (`status & 0x7f` = the terminating signal, `0` = exited, `0x7f` = stopped;
-/// `(status >> 8) & 0xff` = the exit code) is identical on Linux and macOS/BSD. A `WIFSTOPPED` status
-/// (`0x7f`) should never occur — we never pass `WUNTRACED` — so it maps to a clean `AL_INVALID` `Err`
-/// rather than a bogus code.
-fn decode_wait_status(status: i32) -> i64 {
-    let term = status & 0x7f;
-    if term == 0 {
-        i64::from((status >> 8) & 0xff)
-    } else if term != 0x7f {
-        i64::from(128 + term)
-    } else {
-        -i64::from(AL_INVALID)
-    }
-}
+/// An owned direct child with typed observation/reap caches and optional capture reads.
+/// Drop closes reads and blocks until native reaping completes; explicit kill selects cancellation.
+pub use process_live::NativeChild as Child;
 
 /// Marshal a `cmd` lookup-path view + a full-argv `AlignStr` slice into NUL-terminated C strings for
 /// `execvp` — shared by `process.spawn` (built in the parent before `fork`) and `process.exec` (built
@@ -15032,6 +15011,10 @@ unsafe fn marshal_cmd_argv(
     args: *const AlignStr,
     args_len: i64,
 ) -> Result<(std::ffi::CString, Vec<std::ffi::CString>, Vec<*const u8>), i32> {
+    if process_live::valid_range(cmd, cmd_len).is_none()
+        || process_live::valid_range(args, args_len).is_none() {
+        return Err(AL_INVALID);
+    }
     // `cmd` → a NUL-terminated C string (the `execvp` lookup path), copied directly from the ABI
     // view. Empty / non-UTF-8 / interior-NUL is rejected — never a panic.
     let Some(cmd_str) = (unsafe { abi_str_view(cmd, cmd_len) }) else {
@@ -15058,7 +15041,9 @@ unsafe fn marshal_cmd_argv(
     }
     let mut argv_owned: Vec<std::ffi::CString> = Vec::with_capacity(n);
     for a in argv_views {
-        let bytes = unsafe { bytes_view(a.ptr, a.len) };
+        if process_live::valid_range(a.ptr,a.len).is_none() { return Err(AL_INVALID); }
+        let Some(text) = (unsafe { abi_str_view(a.ptr,a.len) }) else { return Err(AL_INVALID); };
+        let bytes = text.as_bytes();
         let Ok(c) = std::ffi::CString::new(bytes) else {
             return Err(AL_INVALID); // interior NUL in an arg
         };
@@ -15070,15 +15055,8 @@ unsafe fn marshal_cmd_argv(
     Ok((cmd_c, argv_owned, argv_ptrs))
 }
 
-/// `process.spawn(cmd, args)` — `fork` + `execvp` a child process. `cmd` is the lookup-path `str` view
-/// (resolved via `PATH` by `execvp` when it has no `/`); `args` is the child's **full** `argv`
-/// (`args_len` `AlignStr` views, **including `argv[0]`** — the caller supplies the program name, P5).
-/// Marshals `cmd` + every `argv` entry into NUL-terminated C strings **before** `fork` (so *our* child
-/// branch allocates nothing), then forks: the child `execvp`s and, if that fails,
-/// `_exit(127)`s (the shell convention — an exec-not-found is not reported synchronously; it surfaces
-/// as `wait() == 127`). On success writes the owned `child` handle to `out`, returns `0`. Failures:
-/// `AL_INVALID` for a null/empty `cmd`, an empty `argv` (no `argv[0]`), or an interior NUL in `cmd` /
-/// any arg; the mapped `fork` errno otherwise. Leaves `*out = null` on failure.
+/// Launch through the shared parent-marshalled backend and publish one owned child.
+/// Setup/exec failures return their mapped native errors before ownership publication.
 ///
 /// # Safety
 /// `cmd`/`cmd_len` and `args`/`args_len` must describe valid byte / `AlignStr` ranges; `out` must point
@@ -15091,112 +15069,68 @@ pub unsafe extern "C" fn align_rt_process_spawn(
     args_len: i64,
     out: *mut *mut Child,
 ) -> i32 {
-    if out.is_null() {
-        return AL_INVALID;
+    if !process_live::valid_pointer(out) { return AL_INVALID; }
+    let output = (out.addr(), out.addr() + core::mem::size_of::<*mut Child>());
+    let valid_input = |range: Option<(usize,usize)>| range.is_some_and(|(start,end)|
+        start == end || end <= output.0 || output.1 <= start);
+    if !valid_input(process_live::valid_range(cmd,cmd_len))
+        || !valid_input(process_live::valid_range(args,args_len)) { return AL_INVALID; }
+    // Validate every nested range before scratch initialization could overwrite an argv input.
+    for argument in unsafe { safe_slice(args,args_len) } {
+        if !valid_input(process_live::valid_range(argument.ptr,argument.len)) { return AL_INVALID; }
     }
-    unsafe { *out = core::ptr::null_mut() };
-    // Marshal `cmd` + the full argv into C strings **before** `fork` (so the child branch below does no
-    // allocation of its own). `_argv_owned` backs the raw pointers in `argv_ptrs` — it must stay live
-    // through the `execvp` call, so it is bound (leading `_` only silences the unused-read warning; the
-    // value is still dropped at scope end, not early).
-    let (cmd_c, _argv_owned, argv_ptrs) = match unsafe { marshal_cmd_argv(cmd, cmd_len, args, args_len) } {
-        Ok(v) => v,
-        Err(status) => return status,
+    unsafe { *out = core::ptr::null_mut(); }
+    let (cmd, argv, _) = match unsafe { marshal_cmd_argv(cmd,cmd_len,args,args_len) } {
+        Ok(value) => value, Err(error) => return error,
     };
-
-    // SAFETY: `fork` takes no arguments and is always available. We do our own marshalling (the `cmd`
-    // / `argv` CStrings and the pointer vector) in the *parent* above so the child branch below does no
-    // allocation of its own. The remaining honest caveat: `execvp` is NOT async-signal-safe — its
-    // `PATH` search may `getenv`/`malloc`. If the parent is multithreaded (`task_group` / `par_map`)
-    // and another thread holds the allocator lock at the instant we `fork`, the child can deadlock in
-    // `execvp` before it ever `exec`s (the child inherits a *copy* of the locked mutex, which no thread
-    // will ever unlock). This is the classic POSIX fork/exec-in-a-threaded-process hazard; Rust's own
-    // `std::process` takes the same risk on the fork path. The recorded ideal fix is `posix_spawn`
-    // (which the C library implements without running arbitrary user code between fork and exec) or
-    // pre-resolving `PATH` in the parent so the child calls only the async-signal-safe `execv`; both
-    // are deferred. The child otherwise touches only `execvp` and `_exit`.
-    let pid = unsafe { fork() };
-    if pid < 0 {
-        return io_error_to_status(&std::io::Error::last_os_error());
+    unsafe { *out = core::ptr::null_mut(); }
+    let command = Command { cmd, argv, cwd: None, timeout_ns: 0, max_capture_bytes: None,
+        env: Vec::new(), env_clear: false, new_session: false, stdout_binding: None, stderr_binding: None };
+    match process_launch::launch(&command,false,false) {
+        Ok(child) => { unsafe { *out = Box::into_raw(child); } 0 }
+        Err(error) => error,
     }
-    if pid == 0 {
-        // Child: replace the image. `execvp` returns only on failure — then `_exit(127)` (the shell
-        // "command not found / not executable" convention). No `malloc`/`print` here.
-        unsafe {
-            execvp(cmd_c.as_ptr().cast(), argv_ptrs.as_ptr());
-            _exit(127)
-        }
-    }
-    // Parent: own the pid.
-    unsafe { *out = Box::into_raw(Box::new(Child { pid, reaped: false })) };
-    0
 }
 
-/// `ch.wait()` — block in `waitpid` for the child to exit, returning its exit code (`>= 0`:
-/// [`decode_wait_status`] — `WEXITSTATUS` or `128 + signal`) or `-(status)` on error (the
-/// `reader.read` sign convention). Marks the child **reaped** (through the pointer) so the later `Drop`
-/// is a no-op. A second `wait()` on an already-reaped child returns `-(AL_INVALID)` — a clean `Err`,
-/// detected via the `reaped` flag rather than racing `waitpid` into an `ECHILD` (the pid may have been
-/// recycled). `EINTR` is retried. Null child → `-(AL_INVALID)`.
+/// Return the child's cached or newly reaped typed termination and maximum RSS.
+/// Pending children with undrained capture require explicit reads before blocking wait.
 ///
 /// # Safety
 /// `ch` must be null or a valid `Child` pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_child_wait(ch: *mut Child) -> i64 {
-    if ch.is_null() {
-        return -i64::from(AL_INVALID);
-    }
-    let c = unsafe { &mut *ch };
-    if c.reaped {
-        return -i64::from(AL_INVALID); // double wait — clean Err, no ECHILD race
-    }
-    let mut status: i32 = 0;
-    loop {
-        let r = unsafe { waitpid(c.pid, &mut status, 0) };
-        if r < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::Interrupted {
-                continue; // EINTR: retry the blocking wait
-            }
-            // A genuine failure (e.g. ECHILD): mark reaped so `Drop` doesn't block on the same pid.
-            c.reaped = true;
-            return -i64::from(io_error_to_status(&e));
-        }
-        c.reaped = true;
-        return decode_wait_status(status);
+pub unsafe extern "C" fn align_rt_child_wait(ch: *mut Child, out: *mut core::ffi::c_void) -> i32 {
+    use process_live::{WaitResult, valid_pointer, disjoint};
+    let out = out.cast::<WaitResult>();
+    if !valid_pointer(ch) || !valid_pointer(out) || !disjoint(ch, out) { return AL_INVALID; }
+    // SAFETY: validated disjoint, aligned allocations are owed by the native caller.
+    unsafe { out.write(WaitResult::default()); }
+    match unsafe { &mut *ch }.wait() {
+        Ok(result) => { unsafe { out.write(result); } 0 }
+        Err(error) => error,
     }
 }
 
-/// Reap a `child` at `Drop`: if it was never `wait()`ed, `waitpid` it (blocking, discarding the code)
-/// so it cannot linger as a zombie (P2). Null-safe (a moved-out / never-initialised owned slot drops
-/// harmlessly). `EINTR` is retried; any other `waitpid` error is swallowed (the pid is already gone /
-/// not ours — nothing to reap).
+/// Close capture reads and reap an owned child at Drop, retrying EINTR.
+/// ECHILD records lost ownership; other unrecoverable cleanup errors abort.
+/// Null moved-out slots are harmless. Completed children retain their cached result.
 ///
 /// # Safety
 /// `ch` must be null or a pointer from [`align_rt_process_spawn`], not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_child_free(ch: *mut Child) {
-    if ch.is_null() {
-        return;
-    }
-    let c = unsafe { Box::from_raw(ch) };
-    if !c.reaped {
-        loop {
-            let mut status: i32 = 0;
-            let r = unsafe { waitpid(c.pid, &mut status, 0) };
-            if r < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue; // EINTR: retry the reap
-            }
-            break;
-        }
-    }
+    if ch.is_null() { return; }
+    // SAFETY: the unique owned shell came from an Align child constructor.
+    unsafe { drop(Box::from_raw(ch)); }
 }
 
 /// Signals are numbered `1..=SIGRTMAX` (`64` on Linux, `31` "highest" on macOS + realtime up to ~127).
 /// `64` covers the fixed + realtime range on Linux and safely bounds the `i64 → i32` narrowing below;
 /// anything outside `0..=64` is rejected as `AL_INVALID` before the `kill` call so a huge/negative
 /// `i64` can never be truncated into a *valid* signal number. `0` is allowed (the POSIX liveness probe).
+#[cfg(target_os = "linux")]
 const MAX_SIGNAL: i64 = 64;
+#[cfg(not(target_os = "linux"))]
+const MAX_SIGNAL: i64 = 31;
 
 /// `ch.kill(sig)` — send signal `sig` to the child via libc `kill(pid, sig)`. Returns `0` on success,
 /// else a mapped errno-status (`EPERM` → `AL_DENIED`, `ESRCH`/other → `Error.Code`, a bad signal →
@@ -15210,26 +15144,8 @@ const MAX_SIGNAL: i64 = 64;
 /// `ch` must be null or a valid `Child` pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_child_kill(ch: *mut Child, sig: i64) -> i32 {
-    if ch.is_null() {
-        return AL_INVALID;
-    }
-    let c = unsafe { &*ch };
-    if c.reaped || c.pid <= 0 {
-        // Reaped/recycled or invalid pid — never signal a possibly-unrelated process. A pid of
-        // 0/-1 would broadcast to the process group / all processes (POSIX kill semantics);
-        // unreachable from a valid spawn (fork returns > 0 in the parent), guarded defensively.
-        return AL_INVALID;
-    }
-    if !(0..=MAX_SIGNAL).contains(&sig) {
-        return AL_INVALID; // out-of-range signal → Error.Invalid (guards the i64→i32 narrow)
-    }
-    // SAFETY: `c.pid` is this process's child (from a successful `fork`), `sig` is bounded to `0..=64`
-    // (fits `i32`). `kill` performs no allocation and is async-signal-safe.
-    let r = unsafe { kill(c.pid, sig as i32) };
-    if r < 0 {
-        return io_error_to_status(&std::io::Error::last_os_error());
-    }
-    0
+    if !process_live::valid_pointer(ch) { return AL_INVALID; }
+    match unsafe { &*ch }.signal(sig, false) { Ok(()) => 0, Err(error) => error }
 }
 
 /// `process.exec(cmd, args)` — `execvp(cmd, argv)` in the **current** process (no `fork`). On success it
@@ -15278,6 +15194,9 @@ pub unsafe extern "C" fn align_rt_process_exec(
 /// adds `timeout_ns`; Slice 6 adds the `env` overrides + `env_clear`. `cmd` is stored SEPARATELY from `argv` because the `execvp`
 /// lookup path and `argv[0]` are independent (P5): the child runs `execvp(cmd, argv)`.
 pub struct Command {
+    new_session: bool,
+    stdout_binding: Option<std::os::fd::OwnedFd>,
+    stderr_binding: Option<std::os::fd::OwnedFd>,
     cmd: std::ffi::CString,
     argv: Vec<std::ffi::CString>,
     cwd: Option<std::ffi::CString>,
@@ -15305,7 +15224,7 @@ pub struct Command {
 /// [`align_rt_run_output_stdout`] / [`align_rt_run_output_stderr`] can never expose non-UTF-8 bytes.
 /// Freed by [`align_rt_run_output_free`].
 pub struct RunOutput {
-    code: i64,
+    status: process_live::WaitResult,
     out: Vec<u8>,
     err: Vec<u8>,
 }
@@ -15313,42 +15232,9 @@ pub struct RunOutput {
 /// A `run_bytes` handle: the binary-output sibling of [`RunOutput`]. The buffers are not UTF-8
 /// validated and its accessors expose byte slices rather than strings.
 pub struct RunBytes {
-    code: i64,
+    status: process_live::WaitResult,
     out: Vec<u8>,
     err: Vec<u8>,
-}
-
-/// Create a pipe whose BOTH ends are close-on-exec (`O_CLOEXEC`), so neither the parent's copies nor
-/// the read ends leak into the exec'd child (P3). `Ok([read, write])` or `Err(mapped-status)`. On
-/// Linux `pipe2` sets CLOEXEC atomically; elsewhere a `pipe` + best-effort `set_cloexec` on both ends.
-///
-/// # Safety
-/// Calls libc `pipe2`/`pipe`; no invariants beyond a valid process state.
-#[cfg(target_os = "linux")]
-unsafe fn make_pipe_cloexec() -> Result<[i32; 2], i32> {
-    let mut fds = [0i32; 2];
-    if unsafe { pipe2(fds.as_mut_ptr(), O_CLOEXEC) } != 0 {
-        return Err(io_error_to_status(&std::io::Error::last_os_error()));
-    }
-    Ok(fds)
-}
-
-/// See the Linux variant. Non-Linux: `pipe` then `set_cloexec` each end (best-effort — a failed
-/// `fcntl` only loses the leak protection, never fatal).
-///
-/// # Safety
-/// Calls libc `pipe`; no invariants beyond a valid process state.
-#[cfg(not(target_os = "linux"))]
-unsafe fn make_pipe_cloexec() -> Result<[i32; 2], i32> {
-    let mut fds = [0i32; 2];
-    if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
-        return Err(io_error_to_status(&std::io::Error::last_os_error()));
-    }
-    unsafe {
-        set_cloexec(fds[0]);
-        set_cloexec(fds[1]);
-    }
-    Ok(fds)
 }
 
 #[cfg(test)]
@@ -15572,11 +15458,11 @@ unsafe fn capture_read(fd: i32, index: usize, bytes: &mut [u8]) -> Result<isize,
     if rc < 0 { Err(std::io::Error::last_os_error()) } else { Ok(rc) }
 }
 
-unsafe fn capture_waitpid(pid: i32, raw: &mut i32, options: i32) -> Result<i32, std::io::Error> {
+unsafe fn capture_wait4(pid: i32, raw: &mut i32, options: i32, usage: &mut libc::rusage) -> Result<i32, std::io::Error> {
     #[cfg(test)]
     if capture_failpoint_take(CaptureFailpoint::WaitReapedAfterDeadline) {
         loop {
-            let rc = unsafe { waitpid(pid, raw, 0) };
+            let rc = unsafe { libc::wait4(pid, raw, 0, usage) };
             if rc == pid {
                 expire_capture_timeout();
                 return Ok(rc);
@@ -15598,7 +15484,7 @@ unsafe fn capture_waitpid(pid: i32, raw: &mut i32, options: i32) -> Result<i32, 
         // potentially recycled pid.
         unsafe { kill(pid, 9) };
         loop {
-            let rc = unsafe { waitpid(pid, raw, 0) };
+            let rc = unsafe { libc::wait4(pid, raw, 0, usage) };
             if rc == pid {
                 break;
             }
@@ -15614,7 +15500,7 @@ unsafe fn capture_waitpid(pid: i32, raw: &mut i32, options: i32) -> Result<i32, 
         // classified. Cleanup must remember that the direct child was already consumed.
         unsafe { kill(pid, 9) };
         loop {
-            let rc = unsafe { waitpid(pid, raw, 0) };
+            let rc = unsafe { libc::wait4(pid, raw, 0, usage) };
             if rc == pid {
                 break;
             }
@@ -15625,7 +15511,7 @@ unsafe fn capture_waitpid(pid: i32, raw: &mut i32, options: i32) -> Result<i32, 
         expire_capture_timeout();
         return Err(std::io::Error::from_raw_os_error(10));
     }
-    let rc = unsafe { waitpid(pid, raw, options) };
+    let rc = unsafe { libc::wait4(pid, raw, options, usage) };
     if rc < 0 { Err(std::io::Error::last_os_error()) } else { Ok(rc) }
 }
 
@@ -15759,56 +15645,20 @@ unsafe fn close_capture_fd(fd: &mut i32) {
     }
 }
 
-/// Reap the direct child, retrying EINTR. ECHILD means another checkpoint already reaped it.
-unsafe fn reap_capture_child(pid: i32, already_reaped: bool) {
-    if already_reaped {
-        return;
-    }
-    let mut raw = 0i32;
-    loop {
-        let rc = unsafe { waitpid(pid, &mut raw, 0) };
-        if rc == pid {
-            return;
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::Interrupted {
-            continue;
-        }
-        if error.raw_os_error() == Some(10) {
-            return; // ECHILD: already reaped.
-        }
-        return;
-    }
-}
-
-/// Terminal capture cleanup. The winning status is chosen by the caller and is never overwritten by
-/// teardown errors. An owned group is signalled when present; the direct pid is always signalled and
-/// is the only process this caller reaps.
-unsafe fn fail_command_capture(
-    pid: i32,
-    use_pgroup: bool,
-    child_reaped: bool,
-    out_fd: &mut i32,
-    err_fd: &mut i32,
-) {
-    // Once waitpid has consumed the direct child (or ECHILD reports that somebody else did), its pid
-    // is no longer ours to signal and may already have been recycled. Both descriptors are already
-    // EOF in that state, so there is no descendant writer left for this capture to terminate.
-    if !child_reaped {
+/// Close capture and terminate only the still-owned direct child/group.
+unsafe fn fail_command_capture(child: &mut Child, use_pgroup: bool, out_fd: &mut i32, err_fd: &mut i32) {
+    if child.reaped.is_none() && !child.lost {
         if use_pgroup {
             #[cfg(test)]
-            CAPTURE_CLEANUP_KILL_CALLS.with(|calls| calls.borrow_mut().push(-pid));
-            unsafe { kill(-pid, 9) };
+            CAPTURE_CLEANUP_KILL_CALLS.with(|calls| calls.borrow_mut().push(-child.pid));
+            unsafe { kill(-child.pid,libc::SIGKILL); }
         }
         #[cfg(test)]
-        CAPTURE_CLEANUP_KILL_CALLS.with(|calls| calls.borrow_mut().push(pid));
-        unsafe { kill(pid, 9) };
+        CAPTURE_CLEANUP_KILL_CALLS.with(|calls| calls.borrow_mut().push(child.pid));
+        let _ = child.signal(i64::from(libc::SIGKILL),false);
     }
-    unsafe {
-        close_capture_fd(out_fd);
-        close_capture_fd(err_fd);
-        reap_capture_child(pid, child_reaped);
-    }
+    unsafe { close_capture_fd(out_fd); close_capture_fd(err_fd); }
+    let _ = child.wait();
 }
 
 /// Shared parent capture/reap engine for `run` and `run_bytes`. All bounded storage is supplied by
@@ -15818,75 +15668,20 @@ unsafe fn run_command_capture(
     cmd: &Command,
     out_buf: &mut CommandCaptureBuffer,
     err_buf: &mut CommandCaptureBuffer,
-) -> Result<i64, i32> {
-    let mut argv_ptrs: Vec<*const u8> = cmd.argv.iter().map(|a| a.as_ptr().cast()).collect();
-    argv_ptrs.push(core::ptr::null());
-    let cmd_ptr: *const u8 = cmd.cmd.as_ptr().cast();
-    let cwd_ptr: *const u8 = cmd.cwd.as_ref().map_or(core::ptr::null(), |d| d.as_ptr().cast());
-    let use_pgroup = cmd.timeout_ns > 0 || cmd.max_capture_bytes.is_some();
+) -> Result<process_live::WaitResult, i32> {
+    use std::os::fd::IntoRawFd;
+    let use_pgroup = cmd.timeout_ns > 0 || cmd.max_capture_bytes.is_some() || cmd.new_session;
+    let mut child = process_launch::launch(cmd,true,use_pgroup)?;
+    let mut out_fd = child.stdout.fd.take().ok_or(AL_INVALID)?.into_raw_fd();
+    let mut err_fd = child.stderr.fd.take().ok_or(AL_INVALID)?.into_raw_fd();
+    let mut timeout_budget = MonotonicTimeoutBudget::from_positive_ns(cmd.timeout_ns);
+    if let Some(budget) = timeout_budget.as_mut() { budget.start = child.started; }
 
-    let out_pipe = unsafe { make_pipe_cloexec() }?;
-    let err_pipe = match unsafe { make_pipe_cloexec() } {
-        Ok(pipe) => pipe,
-        Err(status) => {
-            unsafe { close(out_pipe[0]); close(out_pipe[1]); }
-            return Err(status);
-        }
-    };
-    if let Err(status) = unsafe { set_capture_nonblocking(out_pipe[0], true) } {
-        unsafe { close(out_pipe[0]); close(out_pipe[1]); close(err_pipe[0]); close(err_pipe[1]); }
-        return Err(status);
-    }
-    if let Err(status) = unsafe { set_capture_nonblocking(err_pipe[0], false) } {
-        unsafe { close(out_pipe[0]); close(out_pipe[1]); close(err_pipe[0]); close(err_pipe[1]); }
-        return Err(status);
-    }
-
-    let pid = unsafe { fork() };
-    if pid < 0 {
-        let status = io_error_to_status(&std::io::Error::last_os_error());
-        unsafe { close(out_pipe[0]); close(out_pipe[1]); close(err_pipe[0]); close(err_pipe[1]); }
-        return Err(status);
-    }
-    if pid == 0 {
-        unsafe {
-            if use_pgroup { setpgid(0, 0); }
-            if !cwd_ptr.is_null() && chdir(cwd_ptr) != 0 { _exit(127); }
-            if cmd.env_clear { clearenv_portable(); }
-            for (name, value) in &cmd.env {
-                setenv(name.as_ptr().cast(), value.as_ptr().cast(), 1);
-            }
-            dup2(out_pipe[1], 1);
-            dup2(err_pipe[1], 2);
-            close(out_pipe[0]); close(out_pipe[1]); close(err_pipe[0]); close(err_pipe[1]);
-            execvp(cmd_ptr, argv_ptrs.as_ptr());
-            _exit(127);
-        }
-    }
-
-    #[cfg(test)]
-    {
-        CAPTURE_FORK_COUNT.with(|count| count.set(count.get() + 1));
-        CAPTURE_LAST_PID.with(|last| last.set(pid));
-        CAPTURE_LAST_FDS.with(|last| last.set((out_pipe[0], err_pipe[0])));
-    }
-
-    if use_pgroup {
-        unsafe { setpgid(pid, pid) };
-    }
-    unsafe { close(out_pipe[1]); close(err_pipe[1]); }
-    let mut out_fd = out_pipe[0];
-    let mut err_fd = err_pipe[0];
-    // Keep the accepted post-fork anchor, but store start + positive Duration rather than an
-    // absolute `Instant`. Even `i64::MAX` ns therefore remains bounded.
-    let timeout_budget = MonotonicTimeoutBudget::from_positive_ns(cmd.timeout_ns);
-    let mut child_reaped = false;
-    let mut raw_status = 0i32;
     let mut scratch = [0u8; 65536];
 
     loop {
         if timeout_budget.as_ref().is_some_and(MonotonicTimeoutBudget::is_exhausted) {
-            unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+            unsafe { fail_command_capture(&mut child, use_pgroup, &mut out_fd, &mut err_fd) };
             return Err(AL_TIMEOUT);
         }
 
@@ -15894,66 +15689,48 @@ unsafe fn run_command_capture(
         // its pid from being recycled while a descendant still owns a pipe and a later timeout or
         // hard I/O error must signal the direct pid. Once both streams reach EOF, untimed capture
         // blocks and timed capture checkpoints with WNOHANG until the shared deadline.
-        if !child_reaped && out_fd < 0 && err_fd < 0 {
-            let wait_options = if timeout_budget.is_none() { 0 } else { 1 }; // WNOHANG for timed EOF/live
-            let wait_result = unsafe { capture_waitpid(pid, &mut raw_status, wait_options) };
-            // Record consumption before a post-syscall deadline check. Otherwise a wait that reaps
-            // at the deadline boundary could send SIGKILL to a newly recycled pid during cleanup.
-            let wait_reaped = matches!(&wait_result, Ok(wait_rc) if *wait_rc == pid)
-                || matches!(&wait_result, Err(error) if error.raw_os_error() == Some(10));
-            if wait_reaped {
-                child_reaped = true;
-            }
+        if child.reaped.is_none() && out_fd < 0 && err_fd < 0 {
+            let result = if timeout_budget.is_none() { child.wait().map(Some) } else { child.try_wait() };
             if timeout_budget.as_ref().is_some_and(MonotonicTimeoutBudget::is_exhausted) {
-                unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                unsafe { fail_command_capture(&mut child,use_pgroup,&mut out_fd,&mut err_fd); }
                 return Err(AL_TIMEOUT);
             }
-            match wait_result {
-                Ok(wait_rc) if wait_rc == pid => {}
-                Ok(_) => {}
-                Err(error) => {
-                    if error.kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    // ECHILD records an already-consumed child but is still a hard wait failure: no
-                    // exit status is available, so it must never manufacture a partial code-0 success.
-                    let winning = io_error_to_status(&error);
-                    unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
-                    return Err(winning);
-                }
+            if let Err(error) = result {
+                unsafe { fail_command_capture(&mut child,use_pgroup,&mut out_fd,&mut err_fd); }
+                return Err(error);
             }
         }
 
         if out_fd < 0 && err_fd < 0 {
-            if child_reaped {
-                return Ok(decode_wait_status(raw_status));
+            if let Some(result) = child.reaped {
+                return Ok(result);
             }
             // Timed EOF/live-child: allocation-free short sleep, then another deadline/WNOHANG
             // checkpoint. Untimed EOF/live-child was handled by blocking waitpid above.
             let Some(timeout_budget) = timeout_budget.as_ref() else {
                 // The untimed EOF/live state uses blocking waitpid above, so reaching this branch is
                 // an internal state mismatch. Fail closed through the ordinary terminal cleanup.
-                unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                unsafe { fail_command_capture(&mut child, use_pgroup, &mut out_fd, &mut err_fd) };
                 return Err(AL_INVALID);
             };
             let Some(remaining) = timeout_budget.remaining() else {
-                unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                unsafe { fail_command_capture(&mut child, use_pgroup, &mut out_fd, &mut err_fd) };
                 return Err(AL_TIMEOUT);
             };
             let Some(timeout) = poll_timeout_ms(remaining).map(|timeout| timeout.min(1)) else {
-                unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                unsafe { fail_command_capture(&mut child, use_pgroup, &mut out_fd, &mut err_fd) };
                 return Err(AL_TIMEOUT);
             };
             let poll_result = unsafe { capture_poll(core::ptr::null_mut(), 0, timeout) };
             if timeout_budget.is_exhausted() {
-                unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                unsafe { fail_command_capture(&mut child, use_pgroup, &mut out_fd, &mut err_fd) };
                 return Err(AL_TIMEOUT);
             }
             if let Err(error) = poll_result
                 && error.kind() != std::io::ErrorKind::Interrupted
             {
                 let winning = io_error_to_status(&error);
-                unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                unsafe { fail_command_capture(&mut child, use_pgroup, &mut out_fd, &mut err_fd) };
                 return Err(winning);
             }
             continue;
@@ -15967,7 +15744,7 @@ unsafe fn run_command_capture(
             Some(timeout_budget) => match timeout_budget.remaining().and_then(poll_timeout_ms) {
                 Some(ms) => ms,
                 None => {
-                    unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                    unsafe { fail_command_capture(&mut child, use_pgroup, &mut out_fd, &mut err_fd) };
                     return Err(AL_TIMEOUT);
                 }
             },
@@ -15975,7 +15752,7 @@ unsafe fn run_command_capture(
         };
         let poll_result = unsafe { capture_poll(fds.as_mut_ptr(), 2, timeout) };
         if timeout_budget.as_ref().is_some_and(MonotonicTimeoutBudget::is_exhausted) {
-            unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+            unsafe { fail_command_capture(&mut child, use_pgroup, &mut out_fd, &mut err_fd) };
             return Err(AL_TIMEOUT);
         }
         let rc = match poll_result {
@@ -15983,7 +15760,7 @@ unsafe fn run_command_capture(
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => {
                 let winning = io_error_to_status(&error);
-                unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                unsafe { fail_command_capture(&mut child, use_pgroup, &mut out_fd, &mut err_fd) };
                 return Err(winning);
             }
         };
@@ -15994,7 +15771,7 @@ unsafe fn run_command_capture(
         // Fixed stdout-then-stderr traversal owns deterministic simultaneous-error precedence.
         for (index, pf) in fds.iter().copied().enumerate() {
             if timeout_budget.as_ref().is_some_and(MonotonicTimeoutBudget::is_exhausted) {
-                unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                unsafe { fail_command_capture(&mut child, use_pgroup, &mut out_fd, &mut err_fd) };
                 return Err(AL_TIMEOUT);
             }
             if pf.fd < 0 || pf.revents == 0 {
@@ -16002,29 +15779,29 @@ unsafe fn run_command_capture(
             }
             if pf.revents & POLLNVAL != 0 {
                 let winning = io_error_to_status(&std::io::Error::from_raw_os_error(9)); // EBADF
-                unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                unsafe { fail_command_capture(&mut child, use_pgroup, &mut out_fd, &mut err_fd) };
                 return Err(winning);
             }
             loop {
                 if timeout_budget.as_ref().is_some_and(MonotonicTimeoutBudget::is_exhausted) {
-                    unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                    unsafe { fail_command_capture(&mut child, use_pgroup, &mut out_fd, &mut err_fd) };
                     return Err(AL_TIMEOUT);
                 }
                 let read_result = unsafe { capture_read(pf.fd, index, &mut scratch) };
                 if timeout_budget.as_ref().is_some_and(MonotonicTimeoutBudget::is_exhausted) {
-                    unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                    unsafe { fail_command_capture(&mut child, use_pgroup, &mut out_fd, &mut err_fd) };
                     return Err(AL_TIMEOUT);
                 }
                 match read_result {
                     Ok(n) if n > 0 => {
                         let Ok(read_len) = usize::try_from(n) else {
-                            unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                            unsafe { fail_command_capture(&mut child, use_pgroup, &mut out_fd, &mut err_fd) };
                             return Err(AL_INVALID);
                         };
                         let bytes = &scratch[..read_len];
                         let accepted = if index == 0 { out_buf.append(bytes) } else { err_buf.append(bytes) };
                         if !accepted {
-                            unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                            unsafe { fail_command_capture(&mut child, use_pgroup, &mut out_fd, &mut err_fd) };
                             return Err(AL_INVALID);
                         }
                     }
@@ -16037,12 +15814,12 @@ unsafe fn run_command_capture(
                         std::io::ErrorKind::WouldBlock => break,
                         _ => {
                             let winning = io_error_to_status(&error);
-                            unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                            unsafe { fail_command_capture(&mut child, use_pgroup, &mut out_fd, &mut err_fd) };
                             return Err(winning);
                         }
                     },
                     Ok(_) => {
-                        unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                        unsafe { fail_command_capture(&mut child, use_pgroup, &mut out_fd, &mut err_fd) };
                         return Err(AL_INVALID);
                     }
                 }
@@ -16078,6 +15855,7 @@ pub unsafe extern "C" fn align_rt_command_new(
         Err(_) => panic_abort("process.command: invalid command/argv (empty, interior NUL, or non-UTF-8)"),
     };
     Box::into_raw(Box::new(Command {
+        new_session: false, stdout_binding: None, stderr_binding: None,
         cmd: cmd_c,
         argv: argv_owned,
         cwd: None,
@@ -16194,65 +15972,11 @@ pub unsafe extern "C" fn align_rt_command_env_clear(c: *mut Command) {
     unsafe { &mut *c }.env_clear = true;
 }
 
-/// Empty the child's environment for `c.env_clear()` — the portable `clearenv(3)` replacement.
-/// glibc/musl have `clearenv`; **macOS/BSD do NOT**, so there we unset every currently-set name via
-/// `unsetenv`, reaching `environ` through `_NSGetEnviron()` (referencing `environ` directly from a
-/// dylib is unsupported on macOS). Returns `0` on success. Called ONLY in the post-fork child before
-/// `execvp` (single-threaded; same non-async-signal-safe caveat as `execvp` — the macOS shim
-/// allocates a small `Vec` per name, acceptable there just like the `execvp` PATH `malloc`).
-///
-/// # Safety
-/// Must run where mutating the process environment is sound (the post-fork, pre-exec child).
-#[cfg(target_os = "linux")]
-unsafe fn clearenv_portable() -> i32 {
-    unsafe { clearenv() }
-}
-
-/// See [`clearenv_portable`] (Linux). macOS/BSD: unset each name via `unsetenv` (`_NSGetEnviron`).
-///
-/// # Safety
-/// See [`clearenv_portable`] (Linux).
-#[cfg(not(target_os = "linux"))]
-unsafe fn clearenv_portable() -> i32 {
-    unsafe extern "C" {
-        fn _NSGetEnviron() -> *mut *const *const u8;
-        fn unsetenv(name: *const u8) -> i32;
-    }
-    let envp = unsafe { _NSGetEnviron() };
-    if envp.is_null() {
-        return 0;
-    }
-    // Remove the FIRST variable repeatedly: `unsetenv` deletes every occurrence of a name and compacts
-    // `environ`, so `(*envp)[0]` walks to the end and the loop terminates in one pass over the distinct
-    // names. The cap is a backstop so a misbehaving libc can never spin forever.
-    for _ in 0..65536 {
-        let env = unsafe { *envp }; // `char**` — the current `environ`
-        if env.is_null() {
-            return 0;
-        }
-        let entry = unsafe { *env }; // `char*` — "NAME=VALUE", or null at the end
-        if entry.is_null() {
-            return 0; // `environ` is empty
-        }
-        // NAME = the bytes before '=' (or the whole entry if it has none).
-        let mut n = 0usize;
-        while unsafe { *entry.add(n) } != 0 && unsafe { *entry.add(n) } != b'=' {
-            n += 1;
-        }
-        let mut name: Vec<u8> = Vec::with_capacity(n + 1);
-        name.extend_from_slice(unsafe { core::slice::from_raw_parts(entry, n) });
-        name.push(0);
-        if unsafe { unsetenv(name.as_ptr()) } != 0 {
-            return -1; // unexpected — bail rather than risk spinning
-        }
-    }
-    0
-}
-
 /// Shared front end for the text and byte terminals. Bounded capture stores and the output shell are
 /// allocated before the engine creates pipes or forks; a recoverable failure leaves the caller's
 /// result slot null and drops every preallocated object.
 fn prepare_command_capture(cmd: &Command) -> Result<(CommandCaptureBuffer, CommandCaptureBuffer), i32> {
+    if cmd.stdout_binding.is_some() || cmd.stderr_binding.is_some() { return Err(AL_INVALID); }
     let limit = command_capture_limit(cmd)?;
     #[cfg(test)]
     capture_allocation_checkpoint(CaptureFailpoint::AllocFirst);
@@ -16270,13 +15994,10 @@ fn prepare_command_capture(cmd: &Command) -> Result<(CommandCaptureBuffer, Comma
 /// properly aligned storage for one `RunOutput` pointer, and a non-null `out` must not alias `c`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_command_run(c: *mut Command, out: *mut *mut RunOutput) -> i32 {
-    if out.is_null() {
+    if !process_live::valid_pointer(c) || !process_live::valid_pointer(out) || !process_live::disjoint(c,out) {
         return AL_INVALID;
     }
-    unsafe { *out = core::ptr::null_mut() };
-    if c.is_null() {
-        return AL_INVALID;
-    }
+    unsafe { *out = core::ptr::null_mut(); }
     let cmd = unsafe { &*c };
     let (mut stdout, mut stderr) = match prepare_command_capture(cmd) {
         Ok(buffers) => buffers,
@@ -16284,7 +16005,7 @@ pub unsafe extern "C" fn align_rt_command_run(c: *mut Command, out: *mut *mut Ru
     };
     #[cfg(test)]
     capture_allocation_checkpoint(CaptureFailpoint::AllocShell);
-    let mut shell = Box::new(RunOutput { code: 0, out: Vec::new(), err: Vec::new() });
+    let mut shell = Box::new(RunOutput { status: process_live::WaitResult::default(), out: Vec::new(), err: Vec::new() });
     let code = match unsafe { run_command_capture(cmd, &mut stdout, &mut stderr) } {
         Ok(code) => code,
         Err(status) => return status,
@@ -16294,7 +16015,7 @@ pub unsafe extern "C" fn align_rt_command_run(c: *mut Command, out: *mut *mut Ru
     if std::str::from_utf8(&stdout).is_err() || std::str::from_utf8(&stderr).is_err() {
         return AL_INVALID;
     }
-    shell.code = code;
+    shell.status = code;
     shell.out = stdout;
     shell.err = stderr;
     unsafe { *out = Box::into_raw(shell) };
@@ -16309,13 +16030,10 @@ pub unsafe extern "C" fn align_rt_command_run(c: *mut Command, out: *mut *mut Ru
 /// properly aligned storage for one `RunBytes` pointer, and a non-null `out` must not alias `c`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_command_run_bytes(c: *mut Command, out: *mut *mut RunBytes) -> i32 {
-    if out.is_null() {
+    if !process_live::valid_pointer(c) || !process_live::valid_pointer(out) || !process_live::disjoint(c,out) {
         return AL_INVALID;
     }
-    unsafe { *out = core::ptr::null_mut() };
-    if c.is_null() {
-        return AL_INVALID;
-    }
+    unsafe { *out = core::ptr::null_mut(); }
     let cmd = unsafe { &*c };
     let (mut stdout, mut stderr) = match prepare_command_capture(cmd) {
         Ok(buffers) => buffers,
@@ -16323,30 +16041,16 @@ pub unsafe extern "C" fn align_rt_command_run_bytes(c: *mut Command, out: *mut *
     };
     #[cfg(test)]
     capture_allocation_checkpoint(CaptureFailpoint::AllocShell);
-    let mut shell = Box::new(RunBytes { code: 0, out: Vec::new(), err: Vec::new() });
+    let mut shell = Box::new(RunBytes { status: process_live::WaitResult::default(), out: Vec::new(), err: Vec::new() });
     let code = match unsafe { run_command_capture(cmd, &mut stdout, &mut stderr) } {
         Ok(code) => code,
         Err(status) => return status,
     };
-    shell.code = code;
+    shell.status = code;
     shell.out = stdout.into_vec();
     shell.err = stderr.into_vec();
     unsafe { *out = Box::into_raw(shell) };
     0
-}
-
-/// `out.code()` — the run's exit code (`WEXITSTATUS` `0..=255`, or `128 + signal`; `127` if the child
-/// could not `chdir`/`execvp`). Null handle → `0` (matches [`align_rt_http_resp_status`]'s null
-/// convention; unreachable from a bound local).
-///
-/// # Safety
-/// `o` must be null or a valid `RunOutput` pointer.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_run_output_code(o: *const RunOutput) -> i64 {
-    if o.is_null() {
-        return 0;
-    }
-    unsafe { &*o }.code
 }
 
 /// `out.stdout()` — a zero-copy `str` **view** over the captured stdout bytes (validated UTF-8 at
@@ -16382,15 +16086,6 @@ pub unsafe extern "C" fn align_rt_run_output_stderr(o: *const RunOutput) -> Alig
         return AlignStr { ptr: core::ptr::null(), len: 0 };
     }
     AlignStr { ptr: r.err.as_ptr(), len: r.err.len() as i64 }
-}
-
-/// Return the captured process exit code, or zero for a null handle.
-///
-/// # Safety
-/// `o` must be null or point to a live `RunBytes` owner.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_run_bytes_code(o: *const RunBytes) -> i64 {
-    if o.is_null() { 0 } else { unsafe { &*o }.code }
 }
 
 /// Return a byte view over the captured stdout buffer.
@@ -17020,8 +16715,6 @@ unsafe extern "C" {
     // success. **glibc/musl only** — macOS/BSD have NO `clearenv(3)`, so the non-Linux build uses the
     // `clearenv_portable` shim below (declaring this unconditionally caused the v0.4.0 macOS release to
     // fail with `Undefined symbols: _clearenv`).
-    #[cfg(target_os = "linux")]
-    fn clearenv() -> i32;
     // OS CSPRNG seed for `rand.seed()`; never raw `RDRAND`/`RNDR` (outside the baseline, `SIGILL`
     // on older silicon — `docs/open-questions.md` #342). Per-OS symbol (the C entry differs):
     //   Linux — `getrandom(2)` (glibc ≥ 2.25 / musl): fills `buf` with `buflen` bytes, returns the
@@ -17087,8 +16780,8 @@ unsafe extern "C" {
     // `0` to the child, `-1` (errno set) on failure. `execvp` replaces the image (searching `PATH` for
     // `file`), returning only on error. `waitpid` reaps `pid`, filling `status` with the wait-encoded
     // exit info; `options = 0` blocks. Identical prototypes on Linux and macOS/BSD.
-    fn fork() -> i32;
     fn execvp(file: *const u8, argv: *const *const u8) -> i32;
+    #[cfg(test)]
     fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
     // `kill(2)` — `ch.kill(sig)` (Slice 3): send signal `sig` to `pid`, returning `0` on success or
     // `-1` (errno set: EINVAL for a bad signal, EPERM/ESRCH otherwise). `sig == 0` sends no signal but
@@ -17100,20 +16793,13 @@ unsafe extern "C" {
     // tree the command spawns — not just the direct child. Without it, `sh -c "sleep 10"` leaves the
     // `sleep` grandchild holding the capture pipes open past the kill, wedging the drain-to-EOF.
     // Async-signal-safe. Identical prototype on Linux and macOS/BSD.
-    fn setpgid(pid: i32, pgid: i32) -> i32;
     // `dup2`/`chdir` — `process.command(...).run()` (Slice 4): the forked child `dup2`s the two capture
     // pipe write-ends onto fds 1/2 and (if a cwd was set) `chdir`s into it before `execvp`. Both are
     // async-signal-safe. Identical prototypes on Linux and macOS/BSD.
-    fn dup2(oldfd: i32, newfd: i32) -> i32;
-    fn chdir(path: *const u8) -> i32;
     // `pipe2` (Linux) — create a pipe with both ends `O_CLOEXEC` atomically (no `fcntl` race, and the
     // read ends never leak into the exec'd child, P3). `fds` receives `[read, write]`. Returns `0` /
     // `-1` (errno set). No `pipe2` on macOS/BSD (`pipe` + `set_cloexec` there — see `make_pipe_cloexec`).
-    #[cfg(target_os = "linux")]
-    fn pipe2(fds: *mut i32, flags: i32) -> i32;
     // `pipe` — the non-Linux capture-pipe primitive (CLOEXEC set afterwards via `set_cloexec`).
-    #[cfg(not(target_os = "linux"))]
-    fn pipe(fds: *mut i32) -> i32;
     // `accept4` (Linux) — `accept` plus a `flags` arg, so `SOCK_CLOEXEC` sets close-on-exec on the
     // connected fd atomically (no `accept`+`fcntl` race). No such call on macOS/BSD (see `set_cloexec`).
     #[cfg(target_os = "linux")]
@@ -38735,6 +38421,24 @@ mod tests {
         flags >= 0 && (flags & T_FD_CLOEXEC) != 0
     }
 
+    unsafe fn captured_output_exit_code(owner: *const RunOutput) -> i64 {
+        let mut status=process_live::WaitResult::default();
+        unsafe { process_live::align_rt_run_output_status(owner,&mut status); }
+        if status.termination.tag==0 { status.termination.exited } else { 128+status.termination.signaled }
+    }
+    unsafe fn captured_bytes_exit_code(owner: *const RunBytes) -> i64 {
+        let mut status=process_live::WaitResult::default();
+        unsafe { process_live::align_rt_run_bytes_status(owner,&mut status); }
+        if status.termination.tag==0 { status.termination.exited } else { 128+status.termination.signaled }
+    }
+    unsafe fn wait_termination(child: *mut Child) -> Result<process_live::Termination, i32> {
+        let mut result = process_live::WaitResult::default();
+        let status = unsafe { align_rt_child_wait(child, (&mut result as *mut process_live::WaitResult).cast()) };
+        if status == 0 { Ok(result.termination) } else { Err(status) }
+    }
+    fn exited(code: i64) -> Result<process_live::Termination, i32> {
+        Ok(process_live::Termination { exited: code, ..process_live::Termination::default() })
+    }
     #[test]
     fn process_spawn_and_wait_true_is_zero() {
         if !std::path::Path::new("/bin/true").exists() {
@@ -38745,9 +38449,9 @@ mod tests {
         let mut ch: *mut Child = std::ptr::null_mut();
         assert_eq!(unsafe { align_rt_process_spawn(cp, cl, argv.as_ptr(), argv.len() as i64, &mut ch) }, 0);
         assert!(!ch.is_null());
-        assert_eq!(unsafe { align_rt_child_wait(ch) }, 0, "/bin/true exits 0");
+        assert_eq!(unsafe { wait_termination(ch) }, exited(0), "/bin/true exits 0");
         // A second wait on the reaped child is a clean Err, not an ECHILD race.
-        assert_eq!(unsafe { align_rt_child_wait(ch) }, -(AL_INVALID as i64), "double wait → clean Err");
+        assert_eq!(unsafe { wait_termination(ch) }, exited(0), "repeated wait returns its cached result");
         unsafe { align_rt_child_free(ch) }; // already reaped — a no-op, must not block/crash
     }
 
@@ -38760,18 +38464,17 @@ mod tests {
         let argv = argv_of(&["/bin/false"]);
         let mut ch: *mut Child = std::ptr::null_mut();
         assert_eq!(unsafe { align_rt_process_spawn(cp, cl, argv.as_ptr(), argv.len() as i64, &mut ch) }, 0);
-        assert_eq!(unsafe { align_rt_child_wait(ch) }, 1, "/bin/false exits 1");
+        assert_eq!(unsafe { wait_termination(ch) }, exited(1), "/bin/false exits 1");
         unsafe { align_rt_child_free(ch) };
     }
 
     #[test]
-    fn process_spawn_nonexistent_child_exits_127() {
-        // The fork succeeds (spawn returns 0); the failed `execvp` in the child `_exit(127)`s.
+    fn process_spawn_nonexistent_is_setup_error() {
         let (cp, cl) = view_of("/nonexistent/definitely-not-a-real-binary");
         let argv = argv_of(&["/nonexistent/definitely-not-a-real-binary"]);
         let mut ch: *mut Child = std::ptr::null_mut();
-        assert_eq!(unsafe { align_rt_process_spawn(cp, cl, argv.as_ptr(), argv.len() as i64, &mut ch) }, 0);
-        assert_eq!(unsafe { align_rt_child_wait(ch) }, 127, "exec-not-found → child _exit(127)");
+        assert_eq!(unsafe { align_rt_process_spawn(cp, cl, argv.as_ptr(), argv.len() as i64, &mut ch) }, AL_NOT_FOUND);
+        assert!(ch.is_null());
         unsafe { align_rt_child_free(ch) };
     }
 
@@ -38802,7 +38505,7 @@ mod tests {
 
     #[test]
     fn child_wait_null_is_err() {
-        assert_eq!(unsafe { align_rt_child_wait(std::ptr::null_mut()) }, -(AL_INVALID as i64));
+        assert_eq!(unsafe { wait_termination(std::ptr::null_mut()) }, Err(AL_INVALID));
     }
 
     #[test]
@@ -38836,7 +38539,7 @@ mod tests {
         let argv = argv_of(&["/bin/sh", "-c", "exit $#", "argv0-ignored-by-sh", "one", "two"]);
         let mut ch: *mut Child = std::ptr::null_mut();
         assert_eq!(unsafe { align_rt_process_spawn(cp, cl, argv.as_ptr(), argv.len() as i64, &mut ch) }, 0);
-        assert_eq!(unsafe { align_rt_child_wait(ch) }, 2, "sh saw two positional args → exit 2");
+        assert_eq!(unsafe { wait_termination(ch) }, exited(2), "sh saw two positional args → exit 2");
         unsafe { align_rt_child_free(ch) };
     }
 
@@ -38868,7 +38571,7 @@ mod tests {
         let Some(ch) = spawn_sleeper() else { return };
         // SIGTERM (15) terminates the sleeper; `wait` then reports 128 + 15 = 143 (shell convention).
         assert_eq!(unsafe { align_rt_child_kill(ch, 15) }, 0, "kill(SIGTERM) on a live child succeeds");
-        assert_eq!(unsafe { align_rt_child_wait(ch) }, 143, "signal-killed child → 128 + 15");
+        assert_eq!(unsafe { wait_termination(ch) }, Ok(process_live::Termination { tag: 1, signaled: 15, ..process_live::Termination::default() }), "signal termination remains distinct from exit 143");
         unsafe { align_rt_child_free(ch) };
     }
 
@@ -38879,7 +38582,7 @@ mod tests {
         assert_eq!(unsafe { align_rt_child_kill(ch, 0) }, 0, "kill(0) on a live child is Ok");
         // Clean up: SIGKILL + reap.
         assert_eq!(unsafe { align_rt_child_kill(ch, 9) }, 0);
-        let _ = unsafe { align_rt_child_wait(ch) };
+        let _ = unsafe { wait_termination(ch) };
         unsafe { align_rt_child_free(ch) };
     }
 
@@ -38892,7 +38595,7 @@ mod tests {
         let argv = argv_of(&["/bin/true"]);
         let mut ch: *mut Child = std::ptr::null_mut();
         assert_eq!(unsafe { align_rt_process_spawn(cp, cl, argv.as_ptr(), argv.len() as i64, &mut ch) }, 0);
-        assert_eq!(unsafe { align_rt_child_wait(ch) }, 0);
+        assert_eq!(unsafe { wait_termination(ch) }, exited(0));
         // The child is reaped; killing it must NOT signal the (possibly recycled) pid — a clean Err.
         assert_eq!(unsafe { align_rt_child_kill(ch, 15) }, AL_INVALID, "kill after wait (reaped) → clean Err");
         unsafe { align_rt_child_free(ch) };
@@ -38906,7 +38609,7 @@ mod tests {
         assert_eq!(unsafe { align_rt_child_kill(ch, MAX_SIGNAL + 1) }, AL_INVALID, "out-of-range signal → Invalid");
         // The child is untouched by the rejected signals — still killable normally.
         assert_eq!(unsafe { align_rt_child_kill(ch, 9) }, 0);
-        let _ = unsafe { align_rt_child_wait(ch) };
+        let _ = unsafe { wait_termination(ch) };
         unsafe { align_rt_child_free(ch) };
     }
 
@@ -38928,14 +38631,16 @@ mod tests {
     }
 
     #[test]
-    fn decode_wait_status_maps_exit_and_signal() {
-        // A normal exit: WEXITSTATUS in the high byte, low 7 bits zero.
-        assert_eq!(decode_wait_status(0 << 8), 0);
-        assert_eq!(decode_wait_status(3 << 8), 3);
-        assert_eq!(decode_wait_status(255 << 8), 255);
-        // A signal death: the terminating signal in the low 7 bits → 128 + signal (e.g. SIGKILL 9).
-        assert_eq!(decode_wait_status(9), 128 + 9);
-        assert_eq!(decode_wait_status(15), 128 + 15);
+    fn wait_status_preserves_exit_and_signal_domains() {
+        for code in [0,3,143,255] {
+            let value=process_live::Termination::from_wait(code<<8).unwrap();
+            assert_eq!((value.tag,value.exited),(0,i64::from(code)));
+        }
+        for signal in [9,15] {
+            let value=process_live::Termination::from_wait(signal).unwrap();
+            assert_eq!((value.tag,value.signaled),(1,i64::from(signal)));
+        }
+        assert!(process_live::Termination::from_wait(0x7f).is_err());
     }
 
     // --- std.process Slice 4 — command / cwd / run capture --------------------------------------
@@ -38973,14 +38678,14 @@ mod tests {
         let mut out: *mut RunOutput = std::ptr::null_mut();
         assert_eq!(unsafe { align_rt_command_run(c, &mut out) }, 0);
         assert!(!out.is_null());
-        assert_eq!(unsafe { align_rt_run_output_code(out) }, 3, "exit 3");
+        assert_eq!(unsafe { captured_output_exit_code(out) }, 3, "exit 3");
         assert_eq!(unsafe { ro_stdout(out) }, "out-line");
         assert_eq!(unsafe { ro_stderr(out) }, "err-line");
         unsafe { align_rt_run_output_free(out) };
         // `c` is re-runnable (run borrows it) — a second run works and is independent.
         let mut out2: *mut RunOutput = std::ptr::null_mut();
         assert_eq!(unsafe { align_rt_command_run(c, &mut out2) }, 0);
-        assert_eq!(unsafe { align_rt_run_output_code(out2) }, 3);
+        assert_eq!(unsafe { captured_output_exit_code(out2) }, 3);
         unsafe { align_rt_run_output_free(out2) };
         unsafe { align_rt_command_free(c) };
     }
@@ -39000,7 +38705,7 @@ mod tests {
         unsafe { align_rt_command_cwd(c, dp, dl) };
         let mut out: *mut RunOutput = std::ptr::null_mut();
         assert_eq!(unsafe { align_rt_command_run(c, &mut out) }, 0);
-        assert_eq!(unsafe { align_rt_run_output_code(out) }, 0);
+        assert_eq!(unsafe { captured_output_exit_code(out) }, 0);
         assert_eq!(unsafe { ro_stdout(out) }.trim_end(), "/", "the child's pwd is the set cwd");
         unsafe { align_rt_run_output_free(out) };
         unsafe { align_rt_command_free(c) };
@@ -39008,7 +38713,7 @@ mod tests {
 
     /// A bad cwd makes the child `_exit(127)` (the fork itself succeeded — not an `Err`).
     #[test]
-    fn command_bad_cwd_exits_127() {
+    fn command_bad_cwd_is_setup_error() {
         if !std::path::Path::new("/bin/sh").exists() {
             return;
         }
@@ -39018,8 +38723,8 @@ mod tests {
         let (dp, dl) = view_of("/nonexistent/definitely/not/a/dir");
         unsafe { align_rt_command_cwd(c, dp, dl) };
         let mut out: *mut RunOutput = std::ptr::null_mut();
-        assert_eq!(unsafe { align_rt_command_run(c, &mut out) }, 0);
-        assert_eq!(unsafe { align_rt_run_output_code(out) }, 127, "chdir failure → child _exit(127)");
+        assert_eq!(unsafe { align_rt_command_run(c, &mut out) }, AL_NOT_FOUND);
+        assert!(out.is_null());
         assert_eq!(unsafe { ro_stdout(out) }, "", "the command never ran");
         unsafe { align_rt_run_output_free(out) };
         unsafe { align_rt_command_free(c) };
@@ -39109,7 +38814,7 @@ mod tests {
         let mut out: *mut RunOutput = std::ptr::null_mut();
         assert_eq!(unsafe { align_rt_command_run(c, &mut out) }, 0, "finished in time → normal success");
         assert!(!out.is_null());
-        assert_eq!(unsafe { align_rt_run_output_code(out) }, 4);
+        assert_eq!(unsafe { captured_output_exit_code(out) }, 4);
         assert_eq!(unsafe { ro_stdout(out) }, "fast-line");
         unsafe { align_rt_run_output_free(out) };
         unsafe { align_rt_command_free(c) };
@@ -39225,7 +38930,6 @@ mod tests {
     /// Null-safety of every accessor / free and `run` with a null out slot.
     #[test]
     fn command_run_output_null_safety() {
-        assert_eq!(unsafe { align_rt_run_output_code(std::ptr::null()) }, 0);
         let v = unsafe { align_rt_run_output_stdout(std::ptr::null()) };
         assert!(v.ptr.is_null() && v.len == 0);
         let v = unsafe { align_rt_run_output_stderr(std::ptr::null()) };
@@ -39299,7 +39003,7 @@ mod tests {
         unsafe { align_rt_command_max_capture(c, 3) };
         let mut out: *mut RunBytes = std::ptr::null_mut();
         assert_eq!(unsafe { align_rt_command_run_bytes(c, &mut out) }, 0);
-        assert_eq!(unsafe { align_rt_run_bytes_code(out) }, 0);
+        assert_eq!(unsafe { captured_bytes_exit_code(out) }, 0);
         let stdout = unsafe { align_rt_run_bytes_stdout(out) };
         let stderr = unsafe { align_rt_run_bytes_stderr(out) };
         assert_eq!(unsafe { safe_slice(stdout.ptr, stdout.len) }, &[0xff, 0, b'A']);
@@ -39549,7 +39253,7 @@ mod tests {
             let command = capture_test_command(script, bound, timeout_ns);
             let mut out: *mut RunOutput = std::ptr::null_mut();
             assert_eq!(unsafe { align_rt_command_run(command, &mut out) }, 0, "{script}");
-            assert_eq!(unsafe { align_rt_run_output_code(out) }, expected_code, "{script}");
+            assert_eq!(unsafe { captured_output_exit_code(out) }, expected_code, "{script}");
             unsafe { align_rt_run_output_free(out) };
             unsafe { align_rt_command_free(command) };
         }
