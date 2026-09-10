@@ -484,3 +484,12 @@ reduction is a possible future feature, not an unimplemented branch of the curre
 Borrow/resource/region/static-Query lowering is also settled but not yet implemented; its
 mandatory sequence and exhaustive-pass verification are in
 `17-library-boundary-prerequisites.md` §§8–10.
+
+## Move-element slices (plan 44)
+
+Existing SliceRange/SliceIndex and IndexFieldPtr operations address the admitted
+Move-record/string backing storage. IndexFieldPtr certifies an exact AoS record
+array or Slice(Struct) base; SliceIndex admits Slice(String) only as Str, never
+as an owning String or noalias load. Indexed shared calls keep the existing
+BorrowedElementPlace descriptor and reserve both the header slot and backing
+owner until the call. No new IR variant or runtime ABI is introduced.

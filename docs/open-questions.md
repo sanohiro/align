@@ -18,6 +18,12 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
   Both follow ordinary path semantics and grant no retained or write authority.
   [Plan 43](impl/43-ordinary-directory-plan.md) owns the exact boundary.
 
+- **Move-element slice views:** existing AoS record and owned-string collections
+  admit read-only slices under plan 44. Field/string projections and the existing
+  explicit shared-call payload grammar preserve source ownership. Whole Move
+  element reads, writes and materializing consumers remain excluded.
+
+
 - **Owned host observation:** `std.os` exposes only `os.host() -> Result<os.host_info, Error>`
   in this boundary. The qualified ordinary Move record owns exact uname strings and optional
   online CPU facts. No inferred CPU description, ambient configuration, or authenticated

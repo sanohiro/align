@@ -12444,12 +12444,16 @@ fn lower_index_field(
     struct_id: u32,
     leaf_ty: Ty,
 ) -> Operand {
-    let idx = lower_required!(b, lower_expr(b, index), Operand::Const(Const::Unit));
     // Set the element-field address up the same way the fused pipeline does (one shared seam,
     // `lower_field_access`): a fixed `array<Struct>` is slot-addressed, an owned dynamic
     // `array<Struct>` is a `{ptr,len}` value addressed by pointer. Differs from the pipeline only
     // in needing an explicit bounds check (the loop's counter is in-bounds by construction).
     let (struct_view, slice_val, slot, fixed_len) = match recv.ty {
+        Ty::Slice(Scalar::Struct(_)) => {
+            let sv = lower_borrowed_owned(b, recv);
+            if !lowering_continues(b) { return Operand::Const(Const::Unit); }
+            (Some((struct_id, Layout::Aos)), Some(sv), 0, None)
+        }
         Ty::DynStructArray(_, layout) => {
             let sv = lower_borrowed_owned(b, recv);
             if !lowering_continues(b) {
@@ -12494,6 +12498,7 @@ fn lower_index_field(
             return Operand::Const(Const::Unit);
         }
     };
+    let idx = lower_required!(b, lower_expr(b, index), Operand::Const(Const::Unit));
     emit_bounds_check(b, &idx, len);
     if fixed {
         b.ctx.element_field_places.insert(

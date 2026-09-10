@@ -7381,7 +7381,11 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 field,
                 struct_id,
             } => {
-                let base_ty = Ty::DynStructArray(struct_id, Layout::Aos);
+                let base_ty = match xml_operand_base_ty(self.graph.function, &base) {
+                    Some(ty @ Ty::DynStructArray(id, Layout::Aos))
+                    | Some(ty @ Ty::Slice(Scalar::Struct(id))) if id == struct_id => ty,
+                    _ => { equation.invalid = true; return equation; }
+                };
                 let Some(field_ty) = self
                     .graph
                     .program
@@ -14236,7 +14240,7 @@ fn slice_index_result_matches(program: &Program, source: Ty, result: Ty, noalias
     let Some(physical) = slice_index_physical_element(source) else {
         return false;
     };
-    if source == Ty::DynArray(Scalar::String) {
+    if matches!(source, Ty::DynArray(Scalar::String) | Ty::Slice(Scalar::String)) {
         return !noalias && result == Ty::Str;
     }
     if source == Ty::DynResponseArray {
@@ -30978,11 +30982,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
     ) -> Result<Ty, CodegenError> {
         let base_ty = self.checked_borrowed_place_ty(&place.base)?;
         let element_ty = match base_ty {
-            Ty::DynArray(element) => align_sema::scalar_to_ty(element),
+            Ty::Slice(element) | Ty::DynArray(element) => align_sema::scalar_to_ty(element),
             Ty::DynStructArray(id, align_sema::Layout::Aos) => Ty::Struct(id),
             _ => {
                 return Err(self.err(
-                    "borrowed element place base is not an ordinary dynamic array",
+                    "borrowed element place base is not an ordinary array or slice",
                 ));
             }
         };
@@ -43765,6 +43769,53 @@ fn main() -> i32 = 0
         assert!(text.contains(&format!("call i64 @\"{fib}\"")), "expected recursive calls:\n{text}");
         assert!(text.contains("icmp slt"), "expected signed comparison:\n{text}");
     }
+    #[test]
+    fn move_slice_mir_gate() {
+        fn reject(program: &Program, label: &str) {
+            assert!(emit_llvm_ir(program, &BuildTarget::Baseline, false, &[], None).is_err(), "{label}");
+            let output = std::env::temp_dir().join(format!("align-move-slice-rejected-{}", std::process::id()));
+            assert!(emit_object(program, &output, &BuildTarget::Baseline, Profile::Release, &[], None).is_err(), "{label}");
+            assert!(emit_prelink_bc(program, &output, &BuildTarget::Baseline, Profile::Release, &[], None, "move-slice-reject").is_err(), "{label}");
+            assert!(!output.exists(), "rejected MIR wrote an artifact");
+        }
+        let source = "Row { text: string }\nfn inspect(borrow row: Row) -> i64 = row.text.len()\nfn use(view: slice<Row>) -> i64 = inspect(view[0])\nfn field(view: slice<Row>) -> str = view[0].text\nfn text(view: slice<string>) -> str = view[0]\nfn main() {}\n";
+        let base = mir(source);
+        assert!(validate_mir_producers(&base).is_ok());
+        for mutation in 0..6 {
+            let mut bad = base.clone();
+            let place = borrowed_element_place_mut(&mut bad);
+            match mutation {
+                0 => place.element_ty = Ty::String,
+                1 => place.base.slot = u32::MAX,
+                2 => place.guard.reservation = u32::MAX,
+                3 => place.index = Operand::Const(Const::Bool(true)),
+                4 => place.base.path.push(hir::BorrowedPathSegment::StructField(99)),
+                _ => place.base.ty = Ty::Soa(0),
+            }
+            reject(&bad, "forged Move slice element");
+        }
+        let mut bad = base.clone();
+        for function in &mut bad.fns {
+            for block in &mut function.blocks {
+                block.stmts.retain(|statement| !matches!(statement, Stmt::BorrowedElementReservation { .. }));
+                block.stmt_lines.clear();
+            }
+        }
+        reject(&bad, "missing slice header reservation");
+        let mut reads = 0;
+        for (fi,function) in base.fns.iter().enumerate() {
+            for statement in function.blocks.iter().flat_map(|block| &block.stmts) {
+                if let Stmt::Let(value, Rvalue::SliceIndex(..)) = statement {
+                    reads += 1;
+                    let mut bad = base.clone();
+                    bad.fns[fi].value_tys[*value as usize] = Ty::String;
+                    reject(&bad, "owning String slice read");
+                }
+            }
+        }
+        assert!(reads > 0, "String projection mutation covered no load");
+    }
+
     #[test]
     fn host_mir_gate_rejects_forged_schema() -> Result<(), &'static str> {
         for source in ["fn main() {}\n", "import std.os\nfn get() -> Result<os.host_info, Error> = os.host()\nfn main() {}\n"] {

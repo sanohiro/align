@@ -18343,3 +18343,36 @@ fn ordinary_directory_records_reject_malformed_types() -> Result<(), &'static st
     }
     Ok(())
 }
+
+#[test]
+fn move_slice_records_reject_forged_shapes() -> Result<(), &'static str> {
+    let source = "Row { text: string }\nfn inspect(borrow row: Row) -> i64 = row.text.len()\nfn use(view: slice<Row>) -> i64 = inspect(view[0])\nfn field(view: slice<Row>) -> str = view[0].text\nfn text(view: slice<string>) -> str = view[0]\nfn main() {}\n";
+    let base = checked_source_program(source);
+    assert!(!is_empty(&lower_program(&base)));
+    for mutation in 0..7 {
+        let mut bad = base.clone();
+        let function = bad.fns.iter_mut().find(|f| f.name == "use").ok_or("use")?;
+        let expression = function.body.value.as_mut().ok_or("tail")?;
+        let hir::ExprKind::Call { args, .. } = &mut expression.kind else { return Err("call"); };
+        let hir::ExprKind::BorrowedIndex { base, index } = &mut args[0].kind else { return Err("index"); };
+        match mutation {
+            0 => base.array_ty = Ty::Soa(0),
+            1 => base.element_ty = Ty::String,
+            2 => base.root_local = u32::MAX,
+            3 => base.owner_fact.clear(),
+            4 => base.path.push(hir::BorrowedPathSegment::StructField(99)),
+            5 => base.owner_fact[0].ordinal = u32::MAX,
+            _ => index.ty = Ty::Bool,
+        }
+        let map = SourceMap::new();
+        for lowered in [lower_program(&bad), lower_program_per_unit(&bad), lower_program_located(&bad, &map), lower_program_per_unit_located(&bad, &map)] {
+            assert!(is_empty(&lowered), "forged Move slice place {mutation}");
+        }
+    }
+    for name in ["field", "text"] {
+        let mut bad = base.clone();
+        bad.fns.iter_mut().find(|f| f.name == name).ok_or("projection")?.body.value.as_mut().ok_or("projection tail")?.ty = Ty::String;
+        assert_body_entrypoints_empty("owning slice projection", &bad);
+    }
+    Ok(())
+}

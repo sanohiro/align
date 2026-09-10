@@ -2139,3 +2139,13 @@ handles both explicitly. LLVM authenticates str input, i32 status and the is_dir
 exclusive bool scratch through the common native producer contract. No type or
 scalar tag is added. [Plan 43](43-ordinary-directory-plan.md) names the malformed
 record owners and whole/per-unit source behavior.
+
+## Move-element slice closure (plan 44)
+
+ArrayToSlice and SliceRange share sema's view-formation predicate independently
+of whole-value readability. ElemField accepts exact Slice(Struct) receivers;
+Index admits Slice(String) only as logical Str. BorrowedIndex accepts stable
+slice bases under the unchanged payload classifier. Owner facts, projected paths,
+header reservations, return roots and early-exit index typing are recomputed.
+The move_slice_records_reject_forged_shapes owner rejects malformed descriptors
+and owning projections through every public HIR lowering entrypoint.

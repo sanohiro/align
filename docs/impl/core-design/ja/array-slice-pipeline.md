@@ -26,7 +26,7 @@ slice<T>         borrowed view {ptr,len}, Copy, region = the data it points into
 ```text
 xs.len()   -> i64        // direct length: str/string, slice, array (fixed = const), soa, buffer
 xs[i]                    // index (bounds-checked abort): scalar elem / chunk slice / struct gather / vec lane
-xs[a..b]   -> slice<T>   // range view; scalar elements only; either bound omittable
+xs[a..b]   -> slice<T>   // range view of admitted contiguous elements; either bound omittable
 xs[i] = v                // Copy scalar / 借用 str 書き込み。mut local / out slice。owned string / Move は対象外
 arr[i] = structval       // whole-struct element write (POD; Move structs into FIXED arrays only)
 arr[i].f = v             // element-field write, nested paths ok; dynamic arrays: primitive leaf only
@@ -132,3 +132,24 @@ storage: field 'f' owns independent heap storage`。設計は
 
 `m4.rs`（count/min/max/any/all）、`mmv2.rs`（scan/sort）、`lambda.rs`（ステージのラムダ、arity、純粋性の拒否）、`map_into.rs`（+#328 の aliasing ケース）、`out_params.rs`（no-alias、bounds）、`struct_index.rs`（要素/フィールド書き込み、ネストしたパス）、`tuples.rs`（partition の分解）、`zip_pipeline.rs`（fusion、SIMD、長さ/effect/trap/alias の契約）。
 例として `pipeline.align`、`chunks.align`、`partition.align`、`sort_by_key.align`、`owned_array.align` がある。また、differential fuzzer が reducer の terminal を網羅している（#326）。
+
+### Move 要素の借用ビュー
+
+既存の連続 AoS レコード配列は、要素が Move でも `slice<Record>` として借用できる。
+既存の所有文字列配列も `slice<string>` として借用できる。型注釈・引数・フィールドでの
+変換、範囲スライスと再スライスは同じ Copy ヘッダーを使い、要素の割り当てやコピーを
+行わない。固定配列の受け手は従来どおりリテラルか名前付きローカルに限る。
+所有コレクションの形成や特殊なコレクション形式は拡張しない。
+
+`view[i].field` は Copy フィールドを読み、所有文字列フィールドを `str` として借用する。
+`slice<string>[i]` も `str` を返す。Move レコード全体は、既存の借用ペイロード分類と
+安定したローカル・フィールドの条件を満たす、明示的な共有 `borrow` 引数としてのみ
+参照できる。Move 値全体のロード、要素の可変借用・書き込み、所有値を実体化したり
+値渡ししたりするパイプライン操作は引き続き拒否する。取り出した `str` の明示的な
+clone は独立した所有文字列になる。
+
+ビューは元の割り当てと推移的な借用元を保持する。添字付き共有借用では、添字評価前
+から呼び出し完了まで slice ヘッダーも別途予約する。同じ配列の短い slice への
+差し替えもその間は無効である。返却ビューには Copy ヘッダー自体ではなく元データの
+寿命が伝播する。元データの無効化と arena からの脱出には既存の規則を適用する。
+受け手・添字・範囲はソース順に一度だけ評価し、途中終了後の境界検査や操作は行わない。

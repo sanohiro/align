@@ -23,6 +23,9 @@ neither is a source of current status.
 [`40-align-llm-product-boundary-plan.md`](docs/impl/40-align-llm-product-boundary-plan.md)
 assesses R29/R53/R63–67 and owns the selected capability boundaries. Incremental
 SHA-256 (R29) is implemented under [plan 41](docs/impl/41-incremental-sha256-plan.md).
+Move-record and owned-string slice views (R67) are implemented under
+[plan 44](docs/impl/44-move-record-slice-plan.md), retaining source ownership and
+using existing field/shared-call readers without implicit copies.
 Retained-tree exact contracts and verified-process platform/lifecycle proof must
 close before their implementation; R63 remains subject to the settled-decision
 reopen protocol. Consumer adoption is separate.
