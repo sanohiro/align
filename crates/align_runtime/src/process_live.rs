@@ -94,6 +94,7 @@ impl Capture {
     }
 }
 
+#[repr(C)]
 pub struct NativeChild {
     pub(crate) started: std::time::Instant,
     pub(crate) tracked: bool,

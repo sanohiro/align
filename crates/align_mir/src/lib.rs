@@ -16170,7 +16170,7 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         | Scalar::CryptoDigest
         | Scalar::FsDirectory
         | Scalar::FsDirCursor
-        | Scalar::ProcessSignalSubscription | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command
+        | Scalar::ProcessSignalSubscription | Scalar::ProcessChildScope | Scalar::ProcessMember | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command
         | Scalar::CodecEncoder
         | Scalar::SignatureKey(_)
         | Scalar::Regex
@@ -22520,6 +22520,8 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::FsDirectory => "fs.directory".to_string(),
         Ty::FsDirCursor => "fs.dir_cursor".to_string(),
         Ty::ProcessSignalSubscription => "process.signal_subscription".to_string(),
+        Ty::ProcessChildScope => "process.child_scope".to_string(),
+        Ty::ProcessMember => "process.member".to_string(),
         Ty::FsMemoryWriter => "fs.memory_writer".to_string(),
         Ty::FsSealedFile => "fs.sealed_file".to_string(),
         Ty::ProcessImage => "process.image".to_string(),

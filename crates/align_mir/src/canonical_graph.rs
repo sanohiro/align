@@ -1586,6 +1586,8 @@ fn decode_scalar(cursor: &mut DecodeCursor<'_>) -> Result<Scalar, CanonicalCodec
         57 => Ok(Scalar::ProcessImage),
         58 => Ok(Scalar::ProcessUserNamespace),
         61 => Ok(Scalar::Command),
+        59 => Ok(Scalar::ProcessChildScope),
+        60 => Ok(Scalar::ProcessMember),
         54 => Ok(Scalar::ProcessSignalSubscription),
         _ => Err(CanonicalCodecError::UnknownTag),
     }
@@ -1747,6 +1749,8 @@ fn decode_ty(cursor: &mut DecodeCursor<'_>) -> Result<Ty, CanonicalCodecError> {
         78 => Ok(Ty::FsSealedFile),
         79 => Ok(Ty::ProcessImage),
         80 => Ok(Ty::ProcessUserNamespace),
+        81 => Ok(Ty::ProcessChildScope),
+        82 => Ok(Ty::ProcessMember),
         76 => Ok(Ty::ProcessSignalSubscription),
         _ => Err(CanonicalCodecError::UnknownTag),
     }
@@ -2565,6 +2569,8 @@ fn scalar(
             Scalar::ProcessImage => leaf!(57),
             Scalar::ProcessUserNamespace => leaf!(58),
             Scalar::Command => leaf!(61),
+            Scalar::ProcessChildScope => leaf!(59),
+            Scalar::ProcessMember => leaf!(60),
             Scalar::ProcessSignalSubscription => leaf!(54),
             Scalar::HttpUpgrade => leaf!(47),
             Scalar::XmlReader => leaf!(48),
@@ -2812,6 +2818,8 @@ fn ty(
             Ty::FsSealedFile => leaf!(78),
             Ty::ProcessImage => leaf!(79),
             Ty::ProcessUserNamespace => leaf!(80),
+            Ty::ProcessChildScope => leaf!(81),
+            Ty::ProcessMember => leaf!(82),
             Ty::ProcessSignalSubscription => leaf!(76),
             Ty::HttpUpgrade => leaf!(71),
             Ty::XmlReader => leaf!(72),
@@ -3652,6 +3660,8 @@ mod tests {
             Ty::FsSealedFile,
             Ty::ProcessImage,
             Ty::ProcessUserNamespace,
+            Ty::ProcessChildScope,
+            Ty::ProcessMember,
             Ty::ProcessSignalSubscription,
             Ty::Reader,
             Ty::Buffer,
@@ -3742,6 +3752,8 @@ mod tests {
             Scalar::ProcessImage,
             Scalar::ProcessUserNamespace,
             Scalar::Command,
+            Scalar::ProcessChildScope,
+            Scalar::ProcessMember,
             Scalar::ProcessSignalSubscription,
             Scalar::Buffer,
             Scalar::Regex,
@@ -3781,7 +3793,7 @@ mod tests {
             assert_eq!(CanonicalTy::decode(&expected).as_ref(), Ok(&encoded));
             assert!(CanonicalTy::decode(&expected[..6]).is_err());
         }
-        for tag in [59,60].into_iter().chain(62..=u8::MAX) {
+        for tag in 62..=u8::MAX {
             assert!(CanonicalTy::decode(&[3, 0, 0, 0, 0, 4, tag]).is_err());
         }
 
@@ -3842,6 +3854,10 @@ mod tests {
             (Ty::Option(Scalar::ProcessUserNamespace), vec![3, 0, 0, 0, 0, 4, 58]),
             (Ty::Command, vec![3, 0, 0, 0, 0, 38]),
             (Ty::Option(Scalar::Command), vec![3, 0, 0, 0, 0, 4, 61]),
+            (Ty::ProcessChildScope, vec![3,0,0,0,0,81]),
+            (Ty::Option(Scalar::ProcessChildScope), vec![3,0,0,0,0,4,59]),
+            (Ty::ProcessMember, vec![3,0,0,0,0,82]),
+            (Ty::Option(Scalar::ProcessMember), vec![3,0,0,0,0,4,60]),
             (Ty::ProcessSignalSubscription, vec![3, 0, 0, 0, 0, 76]),
             (Ty::Option(Scalar::ProcessSignalSubscription), vec![3, 0, 0, 0, 0, 4, 54]),
             (Ty::Option(Scalar::FsDirectory), vec![3, 0, 0, 0, 0, 4, 52]),
@@ -3933,8 +3949,8 @@ mod tests {
         error(&[3, 0, 0, 0, 0, 0xff], CanonicalCodecError::UnknownTag);
         error(&[3, 0, 0, 0, 0, 63], CanonicalCodecError::Truncated);
         error(&[3, 0, 0, 0, 0, 4, 39], CanonicalCodecError::Truncated);
-        error(&[3, 0, 0, 0, 0, 81], CanonicalCodecError::UnknownTag);
-        error(&[3, 0, 0, 0, 0, 4, 59], CanonicalCodecError::UnknownTag);
+        error(&[3, 0, 0, 0, 0, 83], CanonicalCodecError::UnknownTag);
+        error(&[3, 0, 0, 0, 0, 4, 62], CanonicalCodecError::UnknownTag);
         error(&[3, 0, 0, 0, 0], CanonicalCodecError::Truncated);
         error(
             &[3, 0, 0, 0, 0, 71, 0],
@@ -4293,7 +4309,7 @@ mod tests {
             Scalar::Logger => [40],
             Scalar::CodecBatch => [41], Scalar::CodecI64Column => [42],
             Scalar::CodecF64Column => [43], Scalar::CodecBoolColumn => [44],
-            Scalar::CodecStrColumn => [45], Scalar::CodecEncoder => [46], Scalar::CryptoDigest => [51], Scalar::FsDirectory => [52], Scalar::FsDirCursor => [53], Scalar::FsMemoryWriter => [55], Scalar::FsSealedFile => [56], Scalar::ProcessImage => [57], Scalar::ProcessUserNamespace => [58], Scalar::Command => [61], Scalar::ProcessSignalSubscription => [54],
+            Scalar::CodecStrColumn => [45], Scalar::CodecEncoder => [46], Scalar::CryptoDigest => [51], Scalar::FsDirectory => [52], Scalar::FsDirCursor => [53], Scalar::FsMemoryWriter => [55], Scalar::FsSealedFile => [56], Scalar::ProcessImage => [57], Scalar::ProcessUserNamespace => [58], Scalar::Command => [61], Scalar::ProcessChildScope => [59], Scalar::ProcessMember => [60], Scalar::ProcessSignalSubscription => [54],
             Scalar::HttpUpgrade => [47],
             Scalar::XmlReader => [48],
             Scalar::HttpClient => [49],
@@ -4353,7 +4369,7 @@ mod tests {
             Ty::Logger => [64],
             Ty::CodecBatch => [65], Ty::CodecI64Column => [66],
             Ty::CodecF64Column => [67], Ty::CodecBoolColumn => [68],
-            Ty::CodecStrColumn => [69], Ty::CodecEncoder => [70], Ty::CryptoDigest => [73], Ty::FsDirectory => [74], Ty::FsDirCursor => [75], Ty::FsMemoryWriter => [77], Ty::FsSealedFile => [78], Ty::ProcessImage => [79], Ty::ProcessUserNamespace => [80], Ty::ProcessSignalSubscription => [76],
+            Ty::CodecStrColumn => [69], Ty::CodecEncoder => [70], Ty::CryptoDigest => [73], Ty::FsDirectory => [74], Ty::FsDirCursor => [75], Ty::FsMemoryWriter => [77], Ty::FsSealedFile => [78], Ty::ProcessImage => [79], Ty::ProcessUserNamespace => [80], Ty::ProcessChildScope => [81], Ty::ProcessMember => [82], Ty::ProcessSignalSubscription => [76],
             Ty::HttpUpgrade => [71], Ty::XmlReader => [72],
             Ty::dyn_aggregate_array(AggregateArrayElem::FixedStructArray(1, 2))
                 => [59, 3, 1, 0x10, 0, 0, 2, 0, 0, 0],

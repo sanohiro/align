@@ -1345,10 +1345,24 @@ reference only permanent atomic state; no native owner pointer escapes to them.
 
 ### R65 verified launch authority
 
-Seventeen keyed records bring the current inventory to 426 keyed, 444 base,
+Seventeen keyed records brought that capability inventory to 426 keyed, 444 base,
 451 alloc-count, 448 par-map-probe and 455 maximum exports. Plan 50 owns exact
 signatures and ownership. FsMemoryFile uses A135. FsMemoryWrite and both
 CommandInherit rows use A20; FsMemorySeal and ProcessExecutable use A19;
 FsSealedReadAt and ProcessImageReadAt use A12; both cached Len rows use A29;
 CommandImage uses A22; ProcessCurrentImage uses A03; ProcessUserNamespace uses
 A08; the four owner frees use A62. None adds native attributes or optional exports.
+
+### R65 exclusive child scope
+
+Nine keyed rows bring the current inventory to 435 keyed, 453 base, 460
+alloc-count, 457 par-map-probe and 464 maximum exports. Plan 50 owns the
+exact signatures and record order. CommandStartScope uses A19; ScopeOwnerId
+uses A29; ScopeChildren and ScopeReap use A08; ProcessMemberKill uses A04;
+ProcessMemberFinished and ScopeRelease use A19; both owner frees use A62.
+The shared Child operations accept the validated NativeChild prefix at offset
+zero only through scope-specific checked operations; ScopeFree retains the
+exclusive lease until cleanup and restoration complete. MemberInfo is a natural
+16-byte owned record; Reaped is a 48-byte Copy record with status at offset 8.
+The two canonical leaves are Ty 81/82 and Scalar 59/60. No attributes or optional
+exports are added.

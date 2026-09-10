@@ -647,6 +647,15 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
         RuntimeKey::ProcessUserNamespaceFree => RuntimeAbi { key, symbol: "align_rt_process_user_namespace_free", shape: RuntimeAbiShape::A62 },
         RuntimeKey::CommandInheritFile => RuntimeAbi { key, symbol: "align_rt_command_inherit_file", shape: RuntimeAbiShape::A20 },
         RuntimeKey::CommandInheritNamespace => RuntimeAbi { key, symbol: "align_rt_command_inherit_namespace", shape: RuntimeAbiShape::A20 },
+        RuntimeKey::CommandStartScope => RuntimeAbi { key, symbol:"align_rt_command_start_scope", shape:RuntimeAbiShape::A19 },
+        RuntimeKey::ScopeOwnerId => RuntimeAbi { key, symbol:"align_rt_scope_owner_id", shape:RuntimeAbiShape::A29 },
+        RuntimeKey::ScopeChildren => RuntimeAbi { key, symbol:"align_rt_scope_children", shape:RuntimeAbiShape::A08 },
+        RuntimeKey::ProcessMemberKill => RuntimeAbi { key, symbol:"align_rt_process_member_kill", shape:RuntimeAbiShape::A04 },
+        RuntimeKey::ProcessMemberFinished => RuntimeAbi { key, symbol:"align_rt_process_member_finished", shape:RuntimeAbiShape::A19 },
+        RuntimeKey::ProcessMemberFree => RuntimeAbi { key, symbol:"align_rt_process_member_free", shape:RuntimeAbiShape::A62 },
+        RuntimeKey::ScopeReap => RuntimeAbi { key, symbol:"align_rt_scope_reap", shape:RuntimeAbiShape::A08 },
+        RuntimeKey::ScopeRelease => RuntimeAbi { key, symbol:"align_rt_scope_release", shape:RuntimeAbiShape::A19 },
+        RuntimeKey::ScopeFree => RuntimeAbi { key, symbol:"align_rt_scope_free", shape:RuntimeAbiShape::A62 },
         RuntimeKey::ProcessTable => RuntimeAbi { key, symbol: "align_rt_process_table", shape: RuntimeAbiShape::A119 },
         RuntimeKey::ChildWait => RuntimeAbi {
             key,
@@ -2218,15 +2227,15 @@ pub(super) fn runtime_abis() -> impl Iterator<Item = RuntimeAbi> {
 }
 
 pub(super) fn validate_registry() -> Result<(), String> {
-    if RuntimeKey::ALL.len() != 426 || keyed_runtime_abis().len() != 426 {
+    if RuntimeKey::ALL.len() != 435 || keyed_runtime_abis().len() != 435 {
         return Err("runtime ABI registry invariant: key-count".to_string());
     }
-    if runtime_abis().count() != 444 {
+    if runtime_abis().count() != 453 {
         return Err("runtime ABI registry invariant: base-count".to_string());
     }
 
     let mut keys = HashSet::with_capacity(RuntimeKey::ALL.len());
-    let mut symbols = HashSet::with_capacity(444);
+    let mut symbols = HashSet::with_capacity(453);
     for abi in keyed_runtime_abis() {
         let key = abi
             .runtime_key()
@@ -3945,17 +3954,17 @@ mod tests {
         );
         validate_registry().unwrap();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 444);
+        assert_eq!(rows.len(), 453);
         assert_eq!(
             rows.iter().map(|row| row.key).collect::<HashSet<_>>().len(),
-            444
+            453
         );
         assert_eq!(
             rows.iter()
                 .map(|row| row.symbol)
                 .collect::<HashSet<_>>()
                 .len(),
-            444
+            453
         );
         for (key, row) in RuntimeKey::ALL.into_iter().zip(keyed_runtime_abis()) {
             assert_eq!(row.key, RuntimeAbiId::Keyed(key));
@@ -3985,7 +3994,7 @@ mod tests {
     fn runtime_abi_extern_type_matrix_is_exact_for_every_row_and_ordinal() {
         let ctx = inkwell::context::Context::create();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 444);
+        assert_eq!(rows.len(), 453);
 
         for row in rows {
             let symbol = row.symbol;

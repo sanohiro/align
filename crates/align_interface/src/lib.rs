@@ -1418,6 +1418,11 @@ const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("udp_socket", 0, BuiltinCapability::Opaque),
     ("child", 0, BuiltinCapability::Opaque),
     ("process.signal_subscription", 0, BuiltinCapability::Opaque),
+    ("process.child_scope", 0, BuiltinCapability::Opaque),
+    ("process.member", 0, BuiltinCapability::Opaque),
+    ("process.member_info", 0, BuiltinCapability::Opaque),
+    ("process.reaped", 0, BuiltinCapability::Opaque),
+
     ("fs.memory_writer", 0, BuiltinCapability::Opaque),
     ("fs.sealed_file", 0, BuiltinCapability::Opaque),
     ("process.image", 0, BuiltinCapability::Opaque),
@@ -2709,7 +2714,7 @@ pub fn summary_to_source(
                             builtin_type_imports.insert("std.crypto".to_string());
                         }
                         "fs.memory_writer" | "fs.sealed_file" | "fs.memory_kind" | "fs.directory" | "fs.dir_cursor" | "fs.dir_entry" | "fs.metadata" | "fs.entry_kind" => { builtin_type_imports.insert("std.fs".to_string()); }
-                        "process.image" | "process.user_namespace" | "process.signal_subscription" => { builtin_type_imports.insert("std.process".to_string()); }
+                        "process.child_scope" | "process.member" | "process.member_info" | "process.reaped" | "process.image" | "process.user_namespace" | "process.signal_subscription" => { builtin_type_imports.insert("std.process".to_string()); }
                         "os.host_info" => { builtin_type_imports.insert("std.os".to_string()); }
                         "process.termination" | "process.wait_result" | "process.readiness" | "process.signal" | "process.signal_set" | "process.snapshot" | "command" | "run_output" => { builtin_type_imports.insert("std.process".to_string()); }
                         "regex.regex_match" => {

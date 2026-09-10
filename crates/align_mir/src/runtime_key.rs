@@ -11,7 +11,7 @@ macro_rules! runtime_keys {
         }
 
         impl RuntimeKey {
-            pub const ALL: [Self; 426] = [$(Self::$variant,)*];
+            pub const ALL: [Self; 435] = [$(Self::$variant,)*];
 
             pub const fn logical_name(self) -> &'static str {
                 match self {
@@ -116,6 +116,7 @@ runtime_keys! {
     CommandRun => "command_run",
     CommandRunBytes => "command_run_bytes",
     CommandStart => "command_start",
+    CommandStartScope => "command_start_scope",
     CommandStderrTo => "command_stderr_to",
     CommandStdoutTo => "command_stdout_to",
     CommandTimeout => "command_timeout",
@@ -360,6 +361,9 @@ runtime_keys! {
     ProcessImageFree => "process_image_free",
     ProcessImageLen => "process_image_len",
     ProcessImageReadAt => "process_image_read_at",
+    ProcessMemberFinished => "process_member_finished",
+    ProcessMemberFree => "process_member_free",
+    ProcessMemberKill => "process_member_kill",
     ProcessSignalClose => "process_signal_close",
     ProcessSignalFree => "process_signal_free",
     ProcessSignalNext => "process_signal_next",
@@ -396,6 +400,11 @@ runtime_keys! {
     RunOutputStatus => "run_output_status",
     RunOutputStderr => "run_output_stderr",
     RunOutputStdout => "run_output_stdout",
+    ScopeChildren => "scope_children",
+    ScopeFree => "scope_free",
+    ScopeOwnerId => "scope_owner_id",
+    ScopeReap => "scope_reap",
+    ScopeRelease => "scope_release",
     StrClone => "str_clone",
     StrCmp => "str_cmp",
     StrContains => "str_contains",
@@ -451,7 +460,7 @@ runtime_keys! {
     XmlText => "xml_text",
 }
 
-const _: [(); 426] = [(); RuntimeKey::ALL.len()];
+const _: [(); 435] = [(); RuntimeKey::ALL.len()];
 
 #[cfg(test)]
 mod tests {
@@ -460,7 +469,7 @@ mod tests {
 
     #[test]
     fn runtime_keys_are_complete_unique_and_alphabetical() {
-        assert_eq!(RuntimeKey::ALL.len(), 426);
+        assert_eq!(RuntimeKey::ALL.len(), 435);
         let names: Vec<_> = RuntimeKey::ALL
             .iter()
             .map(|key| key.logical_name())
