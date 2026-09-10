@@ -984,6 +984,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::Utf8Valid { data } => format!("utf8_valid({})", operand_str(data)),
         Rvalue::CryptoCtEqual { a, b } => format!("crypto_ct_equal({}, {})", operand_str(a), operand_str(b)),
         Rvalue::CryptoRandom { out } => format!("crypto_random({})", operand_str(out)),
+        Rvalue::CryptoDigestNew => "crypto_digest_new()".to_string(),
+        Rvalue::CryptoDigestUpdate { digest, data } => format!("crypto_digest_update({}, {})", operand_str(digest), operand_str(data)),
+        Rvalue::CryptoDigestFinish(digest) => format!("crypto_digest_finish({})", operand_str(digest)),
         Rvalue::CryptoHash { algo, data } => {
             let name = match algo {
                 align_sema::hir::HashAlgo::Sha256 => "sha256",

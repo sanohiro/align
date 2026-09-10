@@ -5178,18 +5178,18 @@ fn xml_const_element_matches_ty(element: &ConstElem, ty: Ty) -> bool {
     )
 }
 
-/// Exact client-family native contracts, shared by value and out-slot producer checks.
-struct HttpClientMirContract<'a> {
+/// Exact native-owner contracts, shared by value and out-slot producer checks.
+struct NativeOwnerMirContract<'a> {
     result: Ty,
     out: Option<(Slot, Ty)>,
     operands: Vec<(&'a Operand, Ty, OperandRequirement)>,
     access: XmlAccessProvenance,
 }
 
-fn http_client_mir_contract<'a>(
+fn native_owner_mir_contract<'a>(
     function: &Function,
     value: &'a Rvalue,
-) -> Option<HttpClientMirContract<'a>> {
+) -> Option<NativeOwnerMirContract<'a>> {
     let read = OperandRequirement::READ;
     let write = OperandRequirement {
         write: true,
@@ -5217,13 +5217,26 @@ fn http_client_mir_contract<'a>(
         Some(ty) if ty == bytes => ty,
         _ => Ty::Error,
     };
-    let mut contract = HttpClientMirContract {
+    let mut contract = NativeOwnerMirContract {
         result: Ty::Unit,
         out: None,
         operands: Vec::new(),
         access: XmlAccessProvenance::Owned,
     };
     match value {
+        Rvalue::CryptoDigestNew => contract.result = Ty::CryptoDigest,
+        Rvalue::CryptoDigestUpdate { digest, data } => {
+            let data_ty = match xml_operand_base_ty(function, data) {
+                Some(Ty::Str) => Ty::Str,
+                Some(ty) if ty == bytes => bytes,
+                _ => Ty::Error,
+            };
+            contract.operands = vec![(digest, Ty::CryptoDigest, write), (data, data_ty, read)];
+        }
+        Rvalue::CryptoDigestFinish(digest) => {
+            contract.result = Ty::DynArray(Scalar::Int(IntTy { bits: 8, signed: false }));
+            contract.operands = vec![(digest, Ty::CryptoDigest, consume)];
+        }
         Rvalue::HttpClient => contract.result = Ty::HttpClient,
         Rvalue::HttpRequest { method, url } => {
             contract.result = Ty::HttpRequest;
@@ -6909,7 +6922,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             return equation;
         }
         let definition = (*definition).clone();
-        if let Some(contract) = http_client_mir_contract(self.graph.function, &definition) {
+        if let Some(contract) = native_owner_mir_contract(self.graph.function, &definition) {
             if result_ty != contract.result || !path.is_empty()
                 || contract.out.is_some_and(|(slot, ty)| {
                     self.graph.function.slots.get(slot as usize) != Some(&ty)
@@ -9738,6 +9751,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::Utf8Valid { .. }
             | Rvalue::CryptoCtEqual { .. }
             | Rvalue::CryptoRandom { .. }
+            | Rvalue::CryptoDigestNew | Rvalue::CryptoDigestUpdate { .. } | Rvalue::CryptoDigestFinish(_)
             | Rvalue::CryptoHash { .. }
             | Rvalue::CryptoHmac { .. }
             | Rvalue::CryptoHkdf { .. }
@@ -9875,7 +9889,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             return;
         }
 
-        if let Some(contract) = http_client_mir_contract(self.graph.function, rvalue) {
+        if let Some(contract) = native_owner_mir_contract(self.graph.function, rvalue) {
             if contract.out != Some((slot, slot_ty)) || !path.is_empty() || contract.access != recorded_access {
                 equation.invalid = true;
             }
@@ -11576,10 +11590,10 @@ fn validate_resource_rvalues_component(
                     .get(*value as usize)
                     .copied()
                     .ok_or_else(|| fail(function, "result value id is absent"))?;
-                if http_client_mir_contract(function, rvalue).is_some()
+                if native_owner_mir_contract(function, rvalue).is_some()
                     && !OperandRequirement::READ.is_satisfied_by(xml_access(&Operand::Value(*value), result))
                 {
-                    return Err(fail(function, "HTTP client native producer contract mismatch"));
+                    return Err(fail(function, "native owner producer contract mismatch"));
                 }
                 let protected_call_boundary = |args: &[Operand]| {
                     xml_owned_leaf_paths(program, result)
@@ -12685,6 +12699,7 @@ fn validate_tagged_program_inner(
                 | Scalar::CodecF64Column
                 | Scalar::CodecBoolColumn
                 | Scalar::CodecStrColumn
+                | Scalar::CryptoDigest
                 | Scalar::CodecEncoder
                 | Scalar::SignatureKey(_)
                 | Scalar::Regex
@@ -12828,6 +12843,7 @@ fn validate_tagged_program_inner(
                         | Ty::CodecF64Column
                         | Ty::CodecBoolColumn
                         | Ty::CodecStrColumn
+                        | Ty::CryptoDigest
                         | Ty::CodecEncoder
                         | Ty::SignatureKey(_)
                         | Ty::StrFinder
@@ -16104,6 +16120,7 @@ fn tagged_child(payload: Scalar) -> Option<u32> {
         | Scalar::CodecF64Column
         | Scalar::CodecBoolColumn
         | Scalar::CodecStrColumn
+        | Scalar::CryptoDigest
         | Scalar::CodecEncoder
         | Scalar::SignatureKey(_)
         | Scalar::Regex
@@ -16320,6 +16337,7 @@ fn abi_type<'c>(
         | Ty::Logger
         | Ty::XmlReader
         | Ty::Buffer
+        | Ty::CryptoDigest
         | Ty::CodecEncoder
         | Ty::ArrayBuilder(_)
         | Ty::VecArrayBuilder(..)
@@ -16686,7 +16704,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::Reader | Scalar::Writer | Scalar::Logger | Scalar::XmlReader => {
             unreachable!("an I/O/logger/XML handle is not a box/array payload")
         }
-        Scalar::Buffer | Scalar::CodecEncoder | Scalar::SignatureKey(_) => {
+        Scalar::Buffer | Scalar::CryptoDigest | Scalar::CodecEncoder | Scalar::SignatureKey(_) => {
             unreachable!("a buffer/key handle is not a box/array payload")
         }
         Scalar::CodecBatch
@@ -16798,6 +16816,7 @@ fn handle_free_key(ty: Ty) -> Option<RuntimeKey> {
         Ty::XmlReader => RuntimeKey::XmlFree,
         Ty::Buffer => RuntimeKey::BufferFree,
         Ty::CodecEncoder => RuntimeKey::CodecEncoderFreeV1,
+        Ty::CryptoDigest => RuntimeKey::CryptoDigestFree,
         Ty::SignatureKey(_) => RuntimeKey::CryptoKeyFree,
         Ty::File => RuntimeKey::IoFileFree,
         Ty::Regex => RuntimeKey::RegexFree,
@@ -24222,6 +24241,23 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             // std.crypto — sha256/sha512 split the data byte view to `{ptr,len}` and return a fresh
             // owned `array<u8>` `{ptr,len}` (the digest), by value like `rng_sample`.
+            Rvalue::CryptoDigestNew => self.builder
+                .build_call(self.runtime(RuntimeKey::CryptoDigestNew), &[], "digest")
+                .map_err(|e| self.err(e))?.try_as_basic_value().basic()
+                .ok_or_else(|| self.err("digest constructor must return a pointer"))?,
+            Rvalue::CryptoDigestUpdate { digest, data } => {
+                let owner = self.operand(digest)?;
+                let (ptr, len) = self.split_str(data)?;
+                self.builder.build_call(self.runtime(RuntimeKey::CryptoDigestUpdate), &[owner.into(), ptr.into(), len.into()], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
+            Rvalue::CryptoDigestFinish(digest) => {
+                let owner = self.operand(digest)?;
+                self.builder.build_call(self.runtime(RuntimeKey::CryptoDigestFinish), &[owner.into()], "digest.bytes")
+                    .map_err(|e| self.err(e))?.try_as_basic_value().basic()
+                    .ok_or_else(|| self.err("digest finish must return bytes"))?
+            }
             Rvalue::CryptoHash { algo, data } => {
                 let (dp, dl) = self.split_str(data)?;
                 let f = match algo {
@@ -26134,6 +26170,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             | Ty::Logger
             | Ty::XmlReader
             | Ty::Buffer
+            | Ty::CryptoDigest
             | Ty::CodecEncoder
             | Ty::ArrayBuilder(_)
             | Ty::VecArrayBuilder(..)
@@ -36651,7 +36688,7 @@ fn main() -> i32 = 0
                 let Stmt::Let(value, rvalue) = statement else {
                     continue;
                 };
-                let Some(contract) = http_client_mir_contract(function, rvalue) else {
+                let Some(contract) = native_owner_mir_contract(function, rvalue) else {
                     continue;
                 };
                 operations += 1;
@@ -36714,6 +36751,39 @@ fn main() -> i32 = 0
             let mut malformed = base.clone();
             malformed.fns[index].param_modes[parameter] = align_ast::ParamMode::Borrow;
             assert_xml_producer_rejected(&malformed, "HTTP borrowed mutation/consumption");
+        }
+    }
+
+    #[test]
+    fn digest_mir_gate_preserves_owner_identity_and_authority() {
+        let base = mir("import std.crypto\nfn make() -> crypto.digest = crypto.sha256_stream()\nfn add(borrow mut d: crypto.digest) { d.update(\"abc\") }\nfn finish(d: crypto.digest) -> array<u8> = d.finish()\nfn main() {}\n");
+        assert!(validate_mir_producers(&base).is_ok());
+        let mut operations = 0;
+        for (index, function) in base.fns.iter().enumerate() {
+            for statement in function.blocks.iter().flat_map(|block| &block.stmts) {
+                let Stmt::Let(value, rvalue) = statement else { continue; };
+                if native_owner_mir_contract(function, rvalue).is_none() { continue; }
+                operations += 1;
+                let mut bad = base.clone();
+                bad.fns[index].value_tys[*value as usize] = Ty::Bool;
+                assert_xml_producer_rejected(&bad, "digest result type");
+            }
+        }
+        assert_eq!(operations, 3);
+        for name in ["add", "finish"] {
+            let index = xml_test_function(&base, name);
+            for sibling in [Ty::Raw, Ty::CodecEncoder, Ty::XmlReader, Ty::HttpClient] {
+                let mut bad = base.clone();
+                let function = &mut bad.fns[index];
+                function.slots[function.params[0] as usize] = sibling;
+                assert_xml_producer_rejected(&bad, "digest sibling owner");
+            }
+            for mode in [align_ast::ParamMode::Borrow, align_ast::ParamMode::BorrowMut] {
+                if name == "add" && mode == align_ast::ParamMode::BorrowMut { continue; }
+                let mut bad = base.clone();
+                bad.fns[index].param_modes[0] = mode;
+                assert_xml_producer_rejected(&bad, "digest borrowed authority");
+            }
         }
     }
 

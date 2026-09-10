@@ -346,6 +346,7 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         | ExprKind::ProcessCpuCount
         | ExprKind::ProcessAbort
         | ExprKind::RandSeed
+        | ExprKind::CryptoDigestNew
         | ExprKind::RawNull
         | ExprKind::HttpClient => kind.clone(),
         ExprKind::Unary { op, expr } => ExprKind::Unary {
@@ -1568,6 +1569,8 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             b: boxed!(b),
         },
         ExprKind::CryptoRandom { out } => ExprKind::CryptoRandom { out: boxed!(out) },
+        ExprKind::CryptoDigestUpdate { digest, data } => ExprKind::CryptoDigestUpdate { digest: boxed!(digest), data: boxed!(data) },
+        ExprKind::CryptoDigestFinish { digest } => ExprKind::CryptoDigestFinish { digest: boxed!(digest) },
         ExprKind::CryptoHash { algo, data } => ExprKind::CryptoHash {
             algo: *algo,
             data: boxed!(data),
@@ -2168,6 +2171,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::ProcessCpuCount
         | ExprKind::ProcessAbort
         | ExprKind::RandSeed
+        | ExprKind::CryptoDigestNew
         | ExprKind::RawNull
         | ExprKind::HttpClient
         | ExprKind::TemplateHtmlNew { .. } => {}
@@ -2486,6 +2490,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             rb: rhs,
         }
         | ExprKind::CryptoCtEqual { a: lhs, b: rhs }
+        | ExprKind::CryptoDigestUpdate { digest: lhs, data: rhs }
         | ExprKind::CryptoHmac {
             key: lhs,
             data: rhs,
@@ -2685,6 +2690,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::CodecColumnLen { column: recv }
         | ExprKind::CodecEncoderNew { rows: recv }
         | ExprKind::CodecEncoderFinish { encoder: recv }
+        | ExprKind::CryptoDigestFinish { digest: recv }
         | ExprKind::FileCreateRw { path: recv }
         | ExprKind::FileOpenRw { path: recv }
         | ExprKind::FileLen { file: recv }

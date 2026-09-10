@@ -193,6 +193,48 @@ fn checked_source_program(source: &str) -> hir::Program {
     program
 }
 
+#[test]
+fn hir_digest_records_reject_malformed_types_and_borrowed_consumption() -> Result<(), &'static str> {
+    let source = "import std.crypto\nfn make() -> crypto.digest = crypto.sha256_stream()\nfn add(borrow mut d: crypto.digest) { d.update(\"abc\") }\nfn finish(d: crypto.digest) -> array<u8> = d.finish()\nfn discard(d: Option<crypto.digest>) {}\nfn main() {}\n";
+    let base = checked_source_program(source);
+    let lowered = lower_program(&base);
+    assert!(!is_empty(&lowered));
+    let discard = lowered.fns.iter().find(|f| f.name.as_str() == "discard").ok_or("drop-only function")?;
+    assert!(function_capabilities(discard, &lowered.structs, &lowered.tuples, &lowered.enums, &lowered.tagged_types).contains(&Capability::Crypto));
+    for mutation in 0..7 {
+        let mut bad = base.clone();
+        let name = if mutation == 0 { "make" } else if mutation < 4 { "add" } else { "finish" };
+        let function = bad.fns.iter_mut().find(|f| f.name == name).ok_or("digest fixture function")?;
+        if mutation == 1 || mutation == 4 || mutation == 5 {
+            function.param_modes[0] = if mutation == 5 {
+                align_ast::ParamMode::BorrowMut
+            } else {
+                align_ast::ParamMode::Borrow
+            };
+        } else if name == "add" {
+            let expression = function.body.value.as_mut().ok_or("update tail")?;
+            if mutation == 2 {
+                expression.ty = Ty::Bool;
+            } else {
+                let hir::ExprKind::CryptoDigestUpdate { data, .. } = &mut expression.kind else { panic!("update") };
+                *data = Box::new(native_i64());
+            }
+        } else {
+            function.body.value.as_mut().ok_or("digest tail")?.ty = Ty::Bool;
+        }
+        assert_body_entrypoints_empty(&format!("digest mutation {mutation}"), &bad);
+    }
+    for ty in [Ty::Array(Scalar::CryptoDigest, 1), Ty::DynArray(Scalar::CryptoDigest),
+        Ty::Slice(Scalar::CryptoDigest), Ty::Box(Scalar::CryptoDigest),
+        Ty::ArrayBuilder(Scalar::CryptoDigest), Ty::Vec(Scalar::CryptoDigest, 4)] {
+        let mut bad = base.clone();
+        let discard = bad.fns.iter_mut().find(|f| f.name == "discard").ok_or("discard carrier")?;
+        discard.locals[discard.params[0] as usize].ty = ty;
+        assert_body_entrypoints_empty(&format!("digest forbidden carrier {ty:?}"), &bad);
+    }
+    Ok(())
+}
+
 fn template_hir_program() -> hir::Program {
     let resource = 0;
     let owner = || body_test_expr(hir::ExprKind::Local(0), Ty::Resource(resource));
@@ -11786,10 +11828,10 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        // Named time formatting/parsing add two operations; keep this count synchronized with
+        // Incremental SHA-256 adds three operations; keep this count synchronized with
         // the exhaustive validation, source-shape, replay-clone, and canonical-graph matches.
         variants,
-        327,
+        330,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -15994,6 +16036,7 @@ const fn delegation_scalar_sweep_tripwire(scalar: &Scalar) {
         | Scalar::CodecF64Column
         | Scalar::CodecBoolColumn
         | Scalar::CodecStrColumn
+        | Scalar::CryptoDigest
         | Scalar::CodecEncoder
         | Scalar::Buffer
         | Scalar::SignatureKey(_)

@@ -7,6 +7,14 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
+**align-llm product-cutover implementation (2026-09-10):**
+[`40-align-llm-product-boundary-plan.md`](docs/impl/40-align-llm-product-boundary-plan.md)
+assesses R29/R53/R63–67 and owns the selected capability boundaries. Incremental
+SHA-256 (R29) is implemented under [plan 41](docs/impl/41-incremental-sha256-plan.md).
+Retained-tree exact contracts and verified-process platform/lifecycle proof must
+close before their implementation; R63 remains subject to the settled-decision
+reopen protocol. Consumer adoption is separate.
+
 **Bound `if` results (2026-09-09):** the Category A bound-local transfer gap is
 closed with path-local replacement cleanup; see
 [`38-bound-if-result-plan.md`](docs/impl/38-bound-if-result-plan.md) for owner evidence

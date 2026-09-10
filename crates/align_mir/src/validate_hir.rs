@@ -1774,7 +1774,7 @@ impl<'a> PlacementValidator<'a> {
             Scalar::Enum(id) => {
                 self.program.enums.get(id as usize).is_some()
                     && (!matches!(mode, ScalarPlacement::Collection)
-                        || !align_sema::ty_contains_signature_key(
+                        || !align_sema::ty_contains_crypto_owner(
                             Ty::Enum(id),
                             &self.program.structs,
                             &self.program.tuples,
@@ -1802,6 +1802,7 @@ impl<'a> PlacementValidator<'a> {
             | Scalar::CodecF64Column
             | Scalar::CodecBoolColumn
             | Scalar::CodecStrColumn
+            | Scalar::CryptoDigest
             | Scalar::CodecEncoder
             | Scalar::Regex
             | Scalar::Captures
@@ -1870,6 +1871,7 @@ impl<'a> PlacementValidator<'a> {
             | Scalar::CodecF64Column
             | Scalar::CodecBoolColumn
             | Scalar::CodecStrColumn
+            | Scalar::CryptoDigest
             | Scalar::CodecEncoder => true,
             Scalar::HttpReadStream | Scalar::HttpSseStream => false,
             Scalar::DynArray(PrimScalar::String) => false,
@@ -1974,6 +1976,7 @@ impl<'a> PlacementValidator<'a> {
             | Ty::CodecF64Column
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
+            | Ty::CryptoDigest
             | Ty::CodecEncoder
             | Ty::Buffer
             | Ty::SignatureKey(_)
@@ -2470,6 +2473,7 @@ impl<'a> Validator<'a> {
             | Ty::CodecF64Column
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
+            | Ty::CryptoDigest
             | Ty::CodecEncoder
             | Ty::Buffer
             | Ty::SignatureKey(_)
@@ -2541,6 +2545,7 @@ impl<'a> Validator<'a> {
             | Scalar::CodecF64Column
             | Scalar::CodecBoolColumn
             | Scalar::CodecStrColumn
+            | Scalar::CryptoDigest
             | Scalar::CodecEncoder
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
@@ -3516,6 +3521,7 @@ impl<'a> BodyValidator<'a> {
             | Ty::CodecF64Column
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
+            | Ty::CryptoDigest
             | Ty::CodecEncoder
             | Ty::Buffer
             | Ty::SignatureKey(_)
@@ -3835,6 +3841,7 @@ impl<'a> BodyValidator<'a> {
             | Scalar::CodecF64Column
             | Scalar::CodecBoolColumn
             | Scalar::CodecStrColumn
+            | Scalar::CryptoDigest
             | Scalar::CodecEncoder
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
@@ -4717,6 +4724,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::HttpStreamReject { .. }
             | hir::ExprKind::CryptoCtEqual { .. }
             | hir::ExprKind::CryptoRandom { .. }
+            | hir::ExprKind::CryptoDigestNew | hir::ExprKind::CryptoDigestUpdate { .. } | hir::ExprKind::CryptoDigestFinish { .. }
             | hir::ExprKind::CryptoHash { .. }
             | hir::ExprKind::CryptoHmac { .. }
             | hir::ExprKind::CryptoHkdf { .. }
@@ -4901,6 +4909,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::TimeFormat { .. }
             | hir::ExprKind::TimeParse { .. }
             | hir::ExprKind::EncodingEncode { .. }
+            | hir::ExprKind::CryptoDigestNew | hir::ExprKind::CryptoDigestUpdate { .. } | hir::ExprKind::CryptoDigestFinish { .. }
             | hir::ExprKind::CryptoHash { .. }
             | hir::ExprKind::CryptoAead { .. }
             | hir::ExprKind::CryptoArgon2 { .. }
@@ -5465,6 +5474,18 @@ impl<'a> BodyValidator<'a> {
 
     fn logger_place(&self, expression: &hir::Expr, context: &BodyContext) -> bool {
         self.local_handle_place(context, expression, Ty::Logger)
+    }
+
+    fn digest_place(&self, expression: &hir::Expr, context: &BodyContext, consume: bool) -> bool {
+        let hir::ExprKind::Local(id) = expression.kind else { return false };
+        if !self.local_handle_place(context, expression, Ty::CryptoDigest) { return false; }
+        let Some(function) = self.program.fns.get(context.function) else { return false };
+        let Some(position) = function.params.iter().position(|parameter| *parameter == id) else { return true };
+        match function.param_modes.get(position) {
+            Some(align_ast::ParamMode::ByValue) => true,
+            Some(align_ast::ParamMode::BorrowMut) => !consume,
+            _ => false,
+        }
     }
 
     fn codec_encoder_place(&self, expression: &hir::Expr, context: &BodyContext) -> bool {
@@ -9661,6 +9682,15 @@ impl<'a> BodyValidator<'a> {
                 (mutable_local(out, Ty::Buffer) && out.ty == Ty::Buffer)
                     .then(|| strict(Ty::Unit, &[out]))?
             }
+            hir::ExprKind::CryptoDigestNew => strict(Ty::CryptoDigest, &[]),
+            hir::ExprKind::CryptoDigestUpdate { digest, data } => {
+                (self.digest_place(digest, context, false) && byte_view(data.ty))
+                    .then(|| strict(Ty::Unit, &[digest, data]))?
+            }
+            hir::ExprKind::CryptoDigestFinish { digest } => {
+                self.digest_place(digest, context, true)
+                    .then(|| strict(Ty::DynArray(Scalar::Int(align_sema::IntTy { bits: 8, signed: false })), &[digest]))?
+            }
             hir::ExprKind::CryptoHash { data, .. } => {
                 (byte_view(data.ty)).then(|| strict(Ty::DynArray(Scalar::Int(align_sema::IntTy { bits: 8, signed: false })), &[data]))?
             }
@@ -9808,6 +9838,7 @@ impl<'a> BodyValidator<'a> {
             | Ty::CodecF64Column
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
+            | Ty::CryptoDigest
             | Ty::CodecEncoder
             | Ty::Buffer
             | Ty::SignatureKey(_)

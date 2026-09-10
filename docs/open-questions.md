@@ -13,6 +13,15 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### Incremental SHA-256 (Settled, 2026-09-10)
+
+R29 admits one qualified `crypto.digest` Move owner with `sha256_stream`,
+nonretaining exclusive `update`, and consuming `finish`. Provider/OOM/length
+failure aborts like existing one-shot hashing; output is an owned 32-byte array.
+No reset, clone, context view or algorithm selector. The exact carrier, input,
+lifecycle and compiler/native contract is `impl/41-incremental-sha256-plan.md`.
+
+
 Re-examining an item in this section goes through the friction-ledger protocol first
 (`docs/impl/23-friction-ledger.md`): a proposal is admissible once that ledger records at least
 five mechanical workarounds across at least two independent real programs. Reaching the threshold

@@ -501,3 +501,19 @@ latency target でもない。
 `docs/impl/07-roadmap.md`、`docs/impl/19-hir-validation-ledger.md`、
 `docs/impl/20-runtime-abi-ledger.md`、English original と一致させる。implementation status は
 capability boundary だけで変更し、この contract を書き換えない。
+
+## 増分 SHA-256
+
+`crypto.sha256_stream() -> crypto.digest` で開始し、
+`d.update(data: bytes) -> ()` を繰り返し、所有権を消費する
+`d.finish() -> array<u8>` で終了する。`crypto.digest` は `import std.crypto`
+が必要な修飾名のみの Move 型で、固定の EVP コンテキストを一つ所有する。
+入力は str、暗黙に借用する string、slice<u8>。buffer は `.bytes()`、
+配列は明示的なスライスを渡す。入力を保持せず、NUL と空入力も認める。
+Update のレシーバーは所有ローカルまたは排他的借用引数、Finish は
+所有ローカルまたは値渡し引数に限定し、独立した所有配列 32 バイトを返す。
+三操作とも Impure。プロバイダー・確保の失敗と累積長 `2^61-1` 超過は、
+既存の一括ハッシュと同じく abort。clone/reset/アルゴリズム選択は設けない。
+通常の所有キャリアは既存の Move/Drop 規則に従う。digest を直接要素とする
+コレクション、tuple/box、ネイティブ境界と並列キャプチャは認めない。
+正確なキャリアと ABI の契約は [plan 41](../../41-incremental-sha256-plan.md) を参照。

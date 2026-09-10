@@ -1384,6 +1384,7 @@ const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("buffer", 0, BuiltinCapability::Opaque),
     ("xml.reader", 0, BuiltinCapability::Opaque),
     ("codec.encoder", 0, BuiltinCapability::Opaque),
+    ("crypto.digest", 0, BuiltinCapability::Opaque),
     ("rs256_private_key", 0, BuiltinCapability::Opaque),
     ("crypto.rs256_private_key", 0, BuiltinCapability::Opaque),
     ("rs256_public_key", 0, BuiltinCapability::Opaque),
@@ -2674,7 +2675,7 @@ pub fn summary_to_source(
             match ty {
                 IType::Named { path, args } => {
                     match path.as_str() {
-                        "crypto.argon2_params"
+                        "crypto.argon2_params" | "crypto.digest"
                         | "crypto.rs256_private_key"
                         | "crypto.rs256_public_key"
                         | "crypto.es256_private_key"

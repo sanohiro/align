@@ -1309,6 +1309,12 @@ pub enum ExprKind {
     CodecColumnAt { column: Box<Expr>, index: Box<Expr> },
     /// `codec.encoder(rows)` creates one fresh transactional Move owner.
     CodecEncoderNew { rows: Box<Expr> },
+    /// One independent incremental SHA-256 owner.
+    CryptoDigestNew,
+    /// Exclusive nonretaining update of a bound digest.
+    CryptoDigestUpdate { digest: Box<Expr>, data: Box<Expr> },
+    /// Consume a bound digest into a standalone owned byte array.
+    CryptoDigestFinish { digest: Box<Expr> },
     /// One of the four typed staging operations. The encoder is borrowed mutably, never consumed.
     CodecEncoderPut {
         encoder: Box<Expr>,

@@ -1370,6 +1370,9 @@ merely because its `Ty` matches.
 | `HttpStreamReject` | `env[]; child[stream,rb]`; `HttpStream,ResponseBuilder; result ERR(Unit); both consumed exactly once; Impure`. |
 | `CryptoCtEqual` | `env[]; child[a,b]`; `byte-view,byte-view; result Bool; borrowed; Pure constant-time-content comparison`. |
 | `CryptoRandom` | `env[]; child[out]`; `SourceMutLocal(Buffer,out); result Unit; buffer mutated; Impure`. |
+| `CryptoDigestNew` | `env[]; child[]; result CryptoDigest`; fresh opaque Move owner; Impure. |
+| `CryptoDigestUpdate` | `env[]; child[digest,data]`; bound live `CryptoDigest` local or exclusive borrowed parameter, byte-view data, Unit result; no retained input; receiver survives eager data evaluation; Impure. |
+| `CryptoDigestFinish` | `env[]; child[digest]`; bound owned `CryptoDigest` local or by-value parameter; consumes and nulls source; fresh individually owned `DynArray(u8)` result; Impure. |
 | `CryptoHash` | `env[algo]`; `child[data]`; `byte-view; result DynArray(u8); fresh owned output, exact runtime length 32/64 by algo; Impure`. |
 | `CryptoHmac` | `env[]; child[key,data]`; `byte-view,byte-view; result DynArray(u8) with exact length 32; fresh owned output; Impure`. |
 | `CryptoHkdf` | `env[]; child[salt,ikm,info,len]`; `byte-view,byte-view,byte-view,i64; result ERR(Buffer); all borrowed, fresh owned output; Impure`. |

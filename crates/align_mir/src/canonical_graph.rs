@@ -1578,6 +1578,7 @@ fn decode_scalar(cursor: &mut DecodeCursor<'_>) -> Result<Scalar, CanonicalCodec
         48 => Ok(Scalar::XmlReader),
         49 => Ok(Scalar::HttpClient),
         50 => Ok(Scalar::HttpRequest),
+        51 => Ok(Scalar::CryptoDigest),
         _ => Err(CanonicalCodecError::UnknownTag),
     }
 }
@@ -1731,6 +1732,7 @@ fn decode_ty(cursor: &mut DecodeCursor<'_>) -> Result<Ty, CanonicalCodecError> {
         70 => Ok(Ty::CodecEncoder),
         71 => Ok(Ty::HttpUpgrade),
         72 => Ok(Ty::XmlReader),
+        73 => Ok(Ty::CryptoDigest),
         _ => Err(CanonicalCodecError::UnknownTag),
     }
 }
@@ -2540,6 +2542,7 @@ fn scalar(
             Scalar::CodecBoolColumn => leaf!(44),
             Scalar::CodecStrColumn => leaf!(45),
             Scalar::CodecEncoder => leaf!(46),
+            Scalar::CryptoDigest => leaf!(51),
             Scalar::HttpUpgrade => leaf!(47),
             Scalar::XmlReader => leaf!(48),
             Scalar::HttpClient => leaf!(49),
@@ -2779,6 +2782,7 @@ fn ty(
             Ty::CodecBoolColumn => leaf!(68),
             Ty::CodecStrColumn => leaf!(69),
             Ty::CodecEncoder => leaf!(70),
+            Ty::CryptoDigest => leaf!(73),
             Ty::HttpUpgrade => leaf!(71),
             Ty::XmlReader => leaf!(72),
             Ty::Param(_) | Ty::SoaParam(_) | Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error => {
@@ -3611,6 +3615,7 @@ mod tests {
             Ty::CodecBoolColumn,
             Ty::CodecStrColumn,
             Ty::CodecEncoder,
+            Ty::CryptoDigest,
             Ty::Reader,
             Ty::Buffer,
             Ty::ArrayBuilder(Scalar::Bool),
@@ -3692,6 +3697,7 @@ mod tests {
             Scalar::CodecBoolColumn,
             Scalar::CodecStrColumn,
             Scalar::CodecEncoder,
+            Scalar::CryptoDigest,
             Scalar::Buffer,
             Scalar::Regex,
             Scalar::Captures,
@@ -3730,7 +3736,7 @@ mod tests {
             assert_eq!(CanonicalTy::decode(&expected).as_ref(), Ok(&encoded));
             assert!(CanonicalTy::decode(&expected[..6]).is_err());
         }
-        for tag in 51..=u8::MAX {
+        for tag in 52..=u8::MAX {
             assert!(CanonicalTy::decode(&[3, 0, 0, 0, 0, 4, tag]).is_err());
         }
 
@@ -3776,6 +3782,17 @@ mod tests {
                 .unwrap_or_else(|error| panic!("Result<xml.reader, Error> must decode: {error:?}")),
             result_xml
         );
+
+        for (ty, expected) in [
+            (Ty::CryptoDigest, vec![3, 0, 0, 0, 0, 73]),
+            (Ty::Option(Scalar::CryptoDigest), vec![3, 0, 0, 0, 0, 4, 51]),
+        ] {
+            let Ok(encoded) = CanonicalTy::from_program(ty, &program) else {
+                panic!("digest golden must encode");
+            };
+            assert_eq!(encoded.as_bytes(), expected);
+            assert_eq!(CanonicalTy::decode(&expected), Ok(encoded));
+        }
 
         for (ordinal, (ty, scalar)) in [
             (Ty::CodecBatch, Scalar::CodecBatch),
@@ -3855,8 +3872,8 @@ mod tests {
         error(&[3, 0, 0, 0, 0, 0xff], CanonicalCodecError::UnknownTag);
         error(&[3, 0, 0, 0, 0, 63], CanonicalCodecError::Truncated);
         error(&[3, 0, 0, 0, 0, 4, 39], CanonicalCodecError::Truncated);
-        error(&[3, 0, 0, 0, 0, 73], CanonicalCodecError::UnknownTag);
-        error(&[3, 0, 0, 0, 0, 4, 51], CanonicalCodecError::UnknownTag);
+        error(&[3, 0, 0, 0, 0, 74], CanonicalCodecError::UnknownTag);
+        error(&[3, 0, 0, 0, 0, 4, 52], CanonicalCodecError::UnknownTag);
         error(&[3, 0, 0, 0, 0], CanonicalCodecError::Truncated);
         error(
             &[3, 0, 0, 0, 0, 71, 0],
@@ -4215,7 +4232,7 @@ mod tests {
             Scalar::Logger => [40],
             Scalar::CodecBatch => [41], Scalar::CodecI64Column => [42],
             Scalar::CodecF64Column => [43], Scalar::CodecBoolColumn => [44],
-            Scalar::CodecStrColumn => [45], Scalar::CodecEncoder => [46],
+            Scalar::CodecStrColumn => [45], Scalar::CodecEncoder => [46], Scalar::CryptoDigest => [51],
             Scalar::HttpUpgrade => [47],
             Scalar::XmlReader => [48],
             Scalar::HttpClient => [49],
@@ -4275,7 +4292,7 @@ mod tests {
             Ty::Logger => [64],
             Ty::CodecBatch => [65], Ty::CodecI64Column => [66],
             Ty::CodecF64Column => [67], Ty::CodecBoolColumn => [68],
-            Ty::CodecStrColumn => [69], Ty::CodecEncoder => [70],
+            Ty::CodecStrColumn => [69], Ty::CodecEncoder => [70], Ty::CryptoDigest => [73],
             Ty::HttpUpgrade => [71], Ty::XmlReader => [72],
             Ty::dyn_aggregate_array(AggregateArrayElem::FixedStructArray(1, 2))
                 => [59, 3, 1, 0x10, 0, 0, 2, 0, 0, 0],
