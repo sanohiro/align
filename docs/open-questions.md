@@ -13,6 +13,12 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+- **Retained raw filesystem access:** directory/cursor are opaque Move owners;
+  names are owned raw byte arrays and metadata is an ordinary Copy record. No
+  implicit sort/stat/flush, recursive deletion or source snapshot guarantee.
+  [Plan 45](impl/45-retained-byte-tree-plan.md) fixes the nineteen operations,
+  exclusive cursor advancement, no-follow admission and failure precedence.
+
 - **Ordinary directory operations:** `fs.create_dir` creates one directory with normal
   umask semantics; `fs.is_dir` returns Result<bool,Error>, preserving metadata errors.
   Both follow ordinary path semantics and grant no retained or write authority.

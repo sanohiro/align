@@ -2151,3 +2151,15 @@ The move_slice_records_reject_forged_shapes owner rejects malformed descriptors
 and owning projections through every public HIR lowering entrypoint. Complete
 nested field paths are retained into MIR; leaf-only loads preserve each physical
 field permutation without manufacturing intermediate Move values.
+
+## Retained filesystem records (R64)
+
+`FsTree { kind, args }` uses the closed nineteen-case signature table in
+[plan 45](45-retained-byte-tree-plan.md). Every argument ordinal and the exact
+Result/Option/nominal schema must match; owner receivers are named local places.
+CursorNext rejects shared-borrow parameters and permits owned or BorrowMut
+receivers. Fresh outputs retain no input. Qualified entry/metadata/kind schemas
+are reserved and validated globally even without a filesystem operation. Both
+opaque owners use the existing structural Move carrier and cleanup rules.
+The HIR owner is `retained_tree_records`; the LLVM owner is
+`retained_tree_mir_gate`, including closed output discriminators and scratch types.

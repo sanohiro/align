@@ -5192,9 +5192,18 @@ fn xml_const_element_matches_ty(element: &ConstElem, ty: Ty) -> bool {
 /// Exact native-owner contracts, shared by value and out-slot producer checks.
 struct NativeOwnerMirContract<'a> {
     result: Ty,
-    out: Option<(Slot, Ty)>,
+    outputs: Vec<(Slot, Ty)>,
     operands: Vec<(&'a Operand, Ty, OperandRequirement)>,
     access: XmlAccessProvenance,
+}
+
+fn fs_tree_output_slots(output: align_mir::FsTreeOutput) -> Vec<Slot> {
+    use align_mir::FsTreeOutput::*;
+    match output {
+        None => Vec::new(),
+        Owner(slot) | Metadata(slot) => vec![slot],
+        CursorNext { entry, present } => vec![entry, present],
+    }
 }
 
 fn native_owner_mir_contract<'a>(
@@ -5230,15 +5239,26 @@ fn native_owner_mir_contract<'a>(
     };
     let mut contract = NativeOwnerMirContract {
         result: Ty::Unit,
-        out: None,
+        outputs: Vec::new(),
         operands: Vec::new(),
         access: XmlAccessProvenance::Owned,
     };
     match value {
+        Rvalue::FsTree { kind, args, output } => {
+            contract.result = i32_ty;
+            for (input, operand) in kind.inputs().iter().zip(args) {
+                let actual = xml_operand_base_ty(function, operand).unwrap_or(Ty::Error);
+                let expected = if align_sema::fs_tree::input_matches(*input, actual) { actual } else { Ty::Error };
+                let requirement = if kind.exclusive() && matches!(input, align_sema::fs_tree::Input::Owner(_)) { write } else { read };
+                contract.operands.push((operand, expected, requirement));
+            }
+            contract.outputs = fs_tree_output_slots(*output).into_iter().map(|slot|
+                (slot, function.slots.get(slot as usize).copied().unwrap_or(Ty::Error))).collect();
+        }
         Rvalue::OsHost { out } => {
             // Exact nominal schema is independently certified by validate_host_mir.
             contract.result = i32_ty;
-            contract.out = Some((*out, function.slots.get(*out as usize).copied().unwrap_or(Ty::Error)));
+            contract.outputs = vec![(*out, function.slots.get(*out as usize).copied().unwrap_or(Ty::Error))];
         }
         Rvalue::FsCreateDir { path } => {
             contract.result = i32_ty;
@@ -5246,7 +5266,7 @@ fn native_owner_mir_contract<'a>(
         }
         Rvalue::FsIsDir { path, out } => {
             contract.result = i32_ty;
-            contract.out = Some((*out,Ty::Bool));
+            contract.outputs = vec![(*out,Ty::Bool)];
             contract.operands = vec![(path, Ty::Str, read)];
         }
         Rvalue::CryptoDigestNew => contract.result = Ty::CryptoDigest,
@@ -5287,7 +5307,7 @@ fn native_owner_mir_contract<'a>(
         }
         Rvalue::HttpParse { data, out } => {
             contract.result = i32_ty;
-            contract.out = Some((*out, Ty::HttpResponse));
+            contract.outputs = vec![(*out, Ty::HttpResponse)];
             contract.operands = vec![(data, byte_view(data), read)];
         }
         Rvalue::HttpRespStatus { resp } => {
@@ -5301,13 +5321,13 @@ fn native_owner_mir_contract<'a>(
         }
         Rvalue::HttpRespHeader { resp, name, out } => {
             contract.result = i32_ty;
-            contract.out = Some((*out, Ty::Str));
+            contract.outputs = vec![(*out, Ty::Str)];
             contract.operands = vec![(resp, Ty::HttpResponse, read), (name, Ty::Str, read)];
             contract.access = XmlAccessProvenance::Shared;
         }
         Rvalue::HttpClientGet { client, url, out } => {
             contract.result = i32_ty;
-            contract.out = Some((*out, Ty::HttpResponse));
+            contract.outputs = vec![(*out, Ty::HttpResponse)];
             contract.operands = vec![(client, Ty::HttpClient, read), (url, Ty::Str, read)];
         }
         Rvalue::HttpClientPost {
@@ -5317,7 +5337,7 @@ fn native_owner_mir_contract<'a>(
             out,
         } => {
             contract.result = i32_ty;
-            contract.out = Some((*out, Ty::HttpResponse));
+            contract.outputs = vec![(*out, Ty::HttpResponse)];
             contract.operands = vec![
                 (client, Ty::HttpClient, read),
                 (url, Ty::Str, read),
@@ -5327,14 +5347,14 @@ fn native_owner_mir_contract<'a>(
         Rvalue::HttpClientRequest { client, req, out }
         | Rvalue::HttpClientRequestStream { client, req, out } => {
             contract.result = i32_ty;
-            contract.out = Some((
+            contract.outputs = vec![(
                 *out,
                 if matches!(value, Rvalue::HttpClientRequestStream { .. }) {
                     Ty::HttpReadStream
                 } else {
                     Ty::HttpResponse
                 },
-            ));
+            )];
             contract.operands = vec![
                 (client, Ty::HttpClient, read),
                 (req, Ty::HttpRequest, consume),
@@ -5347,7 +5367,7 @@ fn native_owner_mir_contract<'a>(
             out,
         } => {
             contract.result = i32_ty;
-            contract.out = Some((*out, Ty::DynResponseArray));
+            contract.outputs = vec![(*out, Ty::DynResponseArray)];
             contract.operands = vec![
                 (client, Ty::HttpClient, read),
                 (urls, match xml_operand_base_ty(function, urls) {
@@ -5367,6 +5387,7 @@ fn xml_written_slots(rvalue: &Rvalue) -> Vec<(Slot, XmlAccessProvenance)> {
 
     let owned = |slot| vec![(slot, Owned)];
     match rvalue {
+        Rvalue::FsTree { output, .. } => fs_tree_output_slots(*output).into_iter().map(|slot| (slot, Owned)).collect(),
         Rvalue::JsonDecode { out, arena, .. }
         | Rvalue::JsonDecodeStructArray { out, arena, .. }
         | Rvalue::JsonDecodeUnion { out, arena, .. } => {
@@ -6951,7 +6972,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
         let definition = (*definition).clone();
         if let Some(contract) = native_owner_mir_contract(self.graph.function, &definition) {
             if result_ty != contract.result || !path.is_empty()
-                || contract.out.is_some_and(|(slot, ty)| {
+                || contract.outputs.iter().any(|&(slot, ty)| {
                     self.graph.function.slots.get(slot as usize) != Some(&ty)
                         || self.graph.function.params.contains(&slot)
                         || self.graph.slot_stores.roots.get(slot as usize).is_none_or(|stores| !stores.is_empty())
@@ -6967,7 +6988,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 let source = self.read_source(&mut equation, operand, expected, Vec::new());
                 Self::add_required_source(&mut equation, source, requirement);
             }
-            equation.seed = Some(if contract.out.is_some() { XmlAccessProvenance::Owned } else { contract.access });
+            equation.seed = Some(if !contract.outputs.is_empty() { XmlAccessProvenance::Owned } else { contract.access });
             return equation;
         }
         let slice_index_noalias = matches!(&definition, Rvalue::SliceIndexNoalias { .. });
@@ -9740,7 +9761,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::FsWriteFileBuilder { .. }
             | Rvalue::FsExists { .. }
             | Rvalue::FsRemove { .. }
-            | Rvalue::FsCreateDir { .. } | Rvalue::FsIsDir { .. }
+            | Rvalue::FsCreateDir { .. } | Rvalue::FsIsDir { .. } | Rvalue::FsTree { .. }
             | Rvalue::FsRemoveEmptyDir { .. }
             | Rvalue::RenameNoReplace { .. }
             | Rvalue::FsReadDir { .. }
@@ -9923,8 +9944,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
         }
 
         if let Some(contract) = native_owner_mir_contract(self.graph.function, rvalue) {
-            if contract.out != Some((slot, slot_ty))
-                || (!path.is_empty() && !matches!(rvalue, Rvalue::OsHost { .. }))
+            if !contract.outputs.contains(&(slot, slot_ty))
+                || (!path.is_empty() && !matches!(rvalue, Rvalue::OsHost { .. } | Rvalue::FsTree { .. }))
                 || contract.access != recorded_access {
                 equation.invalid = true;
             }
@@ -11116,6 +11137,36 @@ pub fn validate_mir_producers(program: &Program) -> Result<HashSet<String>, Code
 }
 
 fn validate_host_mir(program: &Program) -> Result<(), CodegenError> {
+    if !align_sema::fs_tree_schemas_valid(&program.structs, &program.enums) {
+        return Err(CodegenError::Lowering("malformed retained filesystem schema".to_string()));
+    }
+    for function in &program.fns {
+        for statement in function.blocks.iter().flat_map(|block| &block.stmts) {
+            let Stmt::Let(value, Rvalue::FsTree { kind, args, output }) = statement else { continue; };
+            use align_sema::fs_tree::{Output, input_matches, record_id};
+            use align_mir::FsTreeOutput;
+            let slot_ty = |slot: Slot| function.slots.get(slot as usize).copied();
+            let valid_output = match (kind.output(), *output) {
+                (Output::Unit, FsTreeOutput::None) => true,
+                (Output::Directory, FsTreeOutput::Owner(slot)) => slot_ty(slot) == Some(Ty::FsDirectory),
+                (Output::Cursor, FsTreeOutput::Owner(slot)) => slot_ty(slot) == Some(Ty::FsDirCursor),
+                (Output::Reader, FsTreeOutput::Owner(slot)) => slot_ty(slot) == Some(Ty::Reader),
+                (Output::Writer, FsTreeOutput::Owner(slot)) => slot_ty(slot) == Some(Ty::Writer),
+                (Output::Metadata, FsTreeOutput::Metadata(slot)) => record_id(&program.structs, "fs.metadata")
+                    .is_some_and(|id| slot_ty(slot) == Some(Ty::Struct(id))),
+                (Output::EntryOption, FsTreeOutput::CursorNext { entry, present }) => entry != present
+                    && slot_ty(present) == Some(Ty::Bool)
+                    && record_id(&program.structs, "fs.dir_entry").is_some_and(|id| slot_ty(entry) == Some(Ty::Struct(id))),
+                _ => false,
+            };
+            if !valid_output || args.len() != kind.inputs().len()
+                || function.value_tys.get(*value as usize).copied() != Some(Ty::Int(IntTy { bits: 32, signed: true }))
+                || kind.inputs().iter().zip(args).any(|(input, operand)|
+                    xml_operand_base_ty(function, operand).is_none_or(|ty| !input_matches(*input, ty))) {
+                return Err(CodegenError::Lowering("malformed retained filesystem producer".to_string()));
+            }
+        }
+    }
     let mut host = None;
     for (id, definition) in program.structs.iter().enumerate() {
         if definition.name == "os.host_info" || definition.source_name == "os.host_info" {
@@ -12758,6 +12809,8 @@ fn validate_tagged_program_inner(
                 | Scalar::CodecBoolColumn
                 | Scalar::CodecStrColumn
                 | Scalar::CryptoDigest
+                | Scalar::FsDirectory
+                | Scalar::FsDirCursor
                 | Scalar::CodecEncoder
                 | Scalar::SignatureKey(_)
                 | Scalar::Regex
@@ -12902,6 +12955,8 @@ fn validate_tagged_program_inner(
                         | Ty::CodecBoolColumn
                         | Ty::CodecStrColumn
                         | Ty::CryptoDigest
+                        | Ty::FsDirectory
+                        | Ty::FsDirCursor
                         | Ty::CodecEncoder
                         | Ty::SignatureKey(_)
                         | Ty::StrFinder
@@ -16215,6 +16270,8 @@ fn tagged_child(payload: Scalar) -> Option<u32> {
         | Scalar::CodecBoolColumn
         | Scalar::CodecStrColumn
         | Scalar::CryptoDigest
+        | Scalar::FsDirectory
+        | Scalar::FsDirCursor
         | Scalar::CodecEncoder
         | Scalar::SignatureKey(_)
         | Scalar::Regex
@@ -16432,6 +16489,8 @@ fn abi_type<'c>(
         | Ty::XmlReader
         | Ty::Buffer
         | Ty::CryptoDigest
+        | Ty::FsDirectory
+        | Ty::FsDirCursor
         | Ty::CodecEncoder
         | Ty::ArrayBuilder(_)
         | Ty::VecArrayBuilder(..)
@@ -16798,7 +16857,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::Reader | Scalar::Writer | Scalar::Logger | Scalar::XmlReader => {
             unreachable!("an I/O/logger/XML handle is not a box/array payload")
         }
-        Scalar::Buffer | Scalar::CryptoDigest | Scalar::CodecEncoder | Scalar::SignatureKey(_) => {
+        Scalar::Buffer | Scalar::CryptoDigest | Scalar::FsDirectory | Scalar::FsDirCursor | Scalar::CodecEncoder | Scalar::SignatureKey(_) => {
             unreachable!("a buffer/key handle is not a box/array payload")
         }
         Scalar::CodecBatch
@@ -16911,6 +16970,8 @@ fn handle_free_key(ty: Ty) -> Option<RuntimeKey> {
         Ty::Buffer => RuntimeKey::BufferFree,
         Ty::CodecEncoder => RuntimeKey::CodecEncoderFreeV1,
         Ty::CryptoDigest => RuntimeKey::CryptoDigestFree,
+        Ty::FsDirectory => RuntimeKey::FsDirectoryFree,
+        Ty::FsDirCursor => RuntimeKey::FsCursorFree,
         Ty::SignatureKey(_) => RuntimeKey::CryptoKeyFree,
         Ty::File => RuntimeKey::IoFileFree,
         Ty::Regex => RuntimeKey::RegexFree,
@@ -24030,6 +24091,47 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("fs_remove returns i32")
             }
+            Rvalue::FsTree { kind, args, output } => {
+                use align_sema::fs_tree::{FsTreeKind, Input};
+                let mut native_args = Vec::new();
+                for (input, operand) in kind.inputs().iter().zip(args) {
+                    match input {
+                        Input::Text | Input::Bytes => {
+                            let (pointer, length) = self.split_str(operand)?;
+                            native_args.push(pointer.into());
+                            native_args.push(length.into());
+                        }
+                        Input::Owner(_) | Input::Mode => native_args.push(self.operand(operand)?.into()),
+                    }
+                }
+                for slot in fs_tree_output_slots(*output) {
+                    native_args.push((*self.slots.get(&slot).ok_or_else(|| self.err("missing filesystem output"))?).into());
+                }
+                let key = match kind {
+                    FsTreeKind::DirectoryOpen => RuntimeKey::FsDirectoryOpen,
+                    FsTreeKind::DirectoryCursor => RuntimeKey::FsDirectoryCursor,
+                    FsTreeKind::CursorNext => RuntimeKey::FsCursorNext,
+                    FsTreeKind::DirectoryMetadata => RuntimeKey::FsDirectoryMetadata,
+                    FsTreeKind::DirectoryMetadataAt => RuntimeKey::FsDirectoryMetadataAt,
+                    FsTreeKind::DirectoryOpenDir => RuntimeKey::FsDirectoryOpenDir,
+                    FsTreeKind::DirectoryOpenRead => RuntimeKey::FsDirectoryOpenRead,
+                    FsTreeKind::DirectoryOpenReadSingleLink => RuntimeKey::FsDirectoryOpenReadSingleLink,
+                    FsTreeKind::DirectoryCreateNew => RuntimeKey::FsDirectoryCreateNew,
+                    FsTreeKind::DirectoryCreateDir => RuntimeKey::FsDirectoryCreateDir,
+                    FsTreeKind::DirectoryRemoveFile => RuntimeKey::FsDirectoryRemoveFile,
+                    FsTreeKind::DirectoryRemoveDir => RuntimeKey::FsDirectoryRemoveDir,
+                    FsTreeKind::DirectorySetMode => RuntimeKey::FsDirectorySetMode,
+                    FsTreeKind::ReaderMetadata => RuntimeKey::FsReaderMetadata,
+                    FsTreeKind::WriterMetadata => RuntimeKey::FsWriterMetadata,
+                    FsTreeKind::FileMetadata => RuntimeKey::FsFileMetadata,
+                    FsTreeKind::ReaderSetMode => RuntimeKey::FsReaderSetMode,
+                    FsTreeKind::WriterSetMode => RuntimeKey::FsWriterSetMode,
+                    FsTreeKind::FileSetMode => RuntimeKey::FsFileSetMode,
+                };
+                self.builder.build_call(self.runtime(key), &native_args, "fs_tree")
+                    .map_err(|error| self.err(error))?.try_as_basic_value().basic()
+                    .ok_or_else(|| self.err("filesystem ABI result"))?
+            }
             Rvalue::FsCreateDir { path } => {
                 let (pointer,length) = self.split_str(path)?;
                 self.builder.build_call(self.runtime(RuntimeKey::FsCreateDir), &[pointer.into(),length.into()], "mkdir")
@@ -26283,6 +26385,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             | Ty::XmlReader
             | Ty::Buffer
             | Ty::CryptoDigest
+            | Ty::FsDirectory
+            | Ty::FsDirCursor
             | Ty::CodecEncoder
             | Ty::ArrayBuilder(_)
             | Ty::VecArrayBuilder(..)
@@ -36810,7 +36914,7 @@ fn main() -> i32 = 0
                     &wrong_result,
                     &format!("{} native result", function.name),
                 );
-                if let Some((out, _)) = contract.out {
+                for (out, _) in contract.outputs {
                     let mut wrong_out = base.clone();
                     wrong_out.fns[index].slots[out as usize] = Ty::Raw;
                     assert_xml_producer_rejected(
@@ -39806,7 +39910,10 @@ Query { data: i64 }
 fn metadata(query: Query) -> i32 = 0
 fn main() -> i32 = 0
 "#);
-        for definition in &mut program.enums {
+        for definition in program.enums.iter_mut().filter(|definition| matches!(
+            definition.name.as_str(), "Driver" | "DriverRestriction" | "MetaStatementClass"
+                | "MetaQueryState" | "MetaQueryEntry" | "MetaNullability"
+        )) {
             definition.source_name = format!("pkg.db${}", definition.source_name);
         }
         let row = program.structs.iter().position(|definition| definition.source_name == "QueryMeta")
@@ -43986,6 +44093,78 @@ fn main() -> i32 = 0
             }
         }
         assert_eq!(seen,2);
+    }
+
+    #[test]
+    fn retained_tree_mir_gate() {
+        let mut source = String::from("import std.fs\nfn main() {}\nfn root(path: str) -> Result<fs.directory, Error> = fs.open_directory(path)\n");
+        for (name, owner, method, args, result) in [
+            ("cursor", "fs.directory", "cursor", "", "fs.dir_cursor"),
+            ("next", "fs.dir_cursor", "next", "", "Option<fs.dir_entry>"),
+            ("dm", "fs.directory", "metadata", "", "fs.metadata"),
+            ("at", "fs.directory", "metadata_at", "\"x\"", "fs.metadata"),
+            ("od", "fs.directory", "open_dir", "\"x\"", "fs.directory"),
+            ("read", "fs.directory", "open_read", "\"x\"", "reader"),
+            ("single", "fs.directory", "open_read_single_link", "\"x\"", "reader"),
+            ("create", "fs.directory", "create_new", "\"x\"", "writer"),
+            ("mkdir", "fs.directory", "create_dir", "\"x\", 448", "()"),
+            ("unlink", "fs.directory", "remove_file", "\"x\"", "()"),
+            ("rmdir", "fs.directory", "remove_dir", "\"x\"", "()"),
+            ("chmod", "fs.directory", "set_mode", "384", "()"),
+            ("rm", "reader", "metadata", "", "fs.metadata"),
+            ("wm", "writer", "metadata", "", "fs.metadata"),
+            ("fm", "file", "metadata", "", "fs.metadata"),
+            ("rc", "reader", "set_mode", "384", "()"),
+            ("wc", "writer", "set_mode", "384", "()"),
+            ("fc", "file", "set_mode", "384", "()"),
+        ] {
+            source.push_str(&format!("fn {name}(owner: {owner}) -> Result<{result}, Error> = owner.{method}({args})\n"));
+        }
+        let base = mir(&source);
+        assert!(validate_mir_producers(&base).is_ok());
+        let mut seen = HashSet::new();
+        for (fi, function) in base.fns.iter().enumerate() {
+            for (bi, block) in function.blocks.iter().enumerate() {
+                for (si, statement) in block.stmts.iter().enumerate() {
+                    let Stmt::Let(value, Rvalue::FsTree { kind, args, output }) = statement else { continue; };
+                    seen.insert(*kind);
+                    let mut bad = base.clone();
+                    bad.fns[fi].value_tys[*value as usize] = Ty::Bool;
+                    assert_xml_producer_rejected(&bad, "filesystem status");
+                    for argument in 0..args.len() {
+                        let mut bad = base.clone();
+                        if let Stmt::Let(_, Rvalue::FsTree { args, .. }) = &mut bad.fns[fi].blocks[bi].stmts[si] {
+                            args[argument] = Operand::Const(align_mir::Const::Bool(false));
+                        }
+                        assert_xml_producer_rejected(&bad, "filesystem operand ordinal");
+                    }
+                    for replacement in [align_mir::FsTreeOutput::None, align_mir::FsTreeOutput::Owner(u32::MAX),
+                        align_mir::FsTreeOutput::Metadata(u32::MAX), align_mir::FsTreeOutput::CursorNext { entry: u32::MAX, present: u32::MAX }] {
+                        if replacement == *output { continue; }
+                        let mut bad = base.clone();
+                        if let Stmt::Let(_, Rvalue::FsTree { output, .. }) = &mut bad.fns[fi].blocks[bi].stmts[si] { *output = replacement; }
+                        assert_xml_producer_rejected(&bad, "filesystem output discriminator");
+                    }
+                    for slot in fs_tree_output_slots(*output) {
+                        let mut bad = base.clone();
+                        bad.fns[fi].slots[slot as usize] = Ty::Raw;
+                        assert_xml_producer_rejected(&bad, "filesystem output type");
+                    }
+                    let mut bad = base.clone();
+                    if let Stmt::Let(_, Rvalue::FsTree { args, .. }) = &mut bad.fns[fi].blocks[bi].stmts[si] { args.clear(); }
+                    assert_xml_producer_rejected(&bad, "filesystem input arity");
+                }
+            }
+        }
+        assert_eq!(seen.len(), align_sema::fs_tree::FsTreeKind::ALL.len());
+        for name in ["fs.metadata", "fs.dir_entry"] {
+            for index in 0..base.structs.len() {
+                if base.structs[index].name != name { continue; }
+                let mut bad = base.clone();
+                bad.structs[index].fields.clear();
+                assert_xml_producer_rejected(&bad, "filesystem reserved schema");
+            }
+        }
     }
 
 }

@@ -486,3 +486,8 @@ post-open descriptor revalidation and explicit concurrent-device-substitution
 limit in the filesystem ledger, error order, executable-input boundary and owner
 matrix. The reviewer found no other actionable issue in this proposal; no second
 full review or implementation verification is claimed.
+
+F2/R64's exact accepted contract and implementation closure are now owned by
+[plan 45](45-retained-byte-tree-plan.md). It implements retained directory/cursor
+ownership, raw names, descriptor metadata/modes and relative operations together.
+R65's independent platform/lifecycle qualification remains unclosed.

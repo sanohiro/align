@@ -44,9 +44,10 @@ struct TempDir {
 impl TempDir {
     fn new(name: &str) -> TempDir {
         let path = std::env::temp_dir().join(format!("align-m9fs-dir-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
+        std::fs::create_dir(&path).expect("acquire temp dir");
+        let mut directory = TempDir { path };
+        directory.path = std::fs::canonicalize(&directory.path).expect("canonicalize acquired directory");
+        directory
     }
     fn str(&self) -> String {
         self.path.display().to_string()
@@ -1083,11 +1084,9 @@ pub fn main(args: array<str>) -> Result<(), Error> {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "active score: 42\n");
 }
 
-/// The owned `array<string>` `fs.read_dir` returns cannot be borrowed as a `slice<string>`: the
-/// view would make its Move elements readable, which the MIR boundary refuses. The producer must
-/// say so with a diagnostic — this shape used to reach the boundary and report an internal error.
+/// R67 allows a shared view of the owned strings returned by read_dir without moving elements.
 #[test]
-fn read_dir_result_cannot_be_borrowed_as_a_move_element_slice() {
+fn read_dir_result_borrows_as_an_owned_string_slice() {
     let prog = "\
 import std.fs
 fn count(names: slice<string>) -> i64 = names.len()
@@ -1097,15 +1096,14 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   return Ok(())
 }
 ";
-    let diagnostics = check_diagnostics("m9fs-readdir-slice-borrow", prog);
-    assert!(
-        diagnostics.contains("slicing a collection of the Move type string"),
-        "borrowing an owned `array<string>` as a slice must be diagnosed:\n{diagnostics}",
-    );
-    assert!(
-        !diagnostics.contains("failed HIR validation"),
-        "it must be a diagnostic, not an internal error:\n{diagnostics}",
-    );
+    assert!(!check_errs("m9fs-readdir-slice-borrow", prog));
+    if backend_available() {
+        let directory = TempDir::new("readdir-slice");
+        std::fs::write(directory.path.join("entry"), b"data").expect("fixture entry");
+        let out = build_and_run_args("m9fs-readdir-slice", prog, &[&directory.str()]);
+        assert_eq!(out.status.code(), Some(0));
+        assert_eq!(out.stdout, b"1\n");
+    }
 }
 
 #[test]

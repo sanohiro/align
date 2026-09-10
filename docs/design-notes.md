@@ -1848,3 +1848,13 @@ can address a Move record or owned string without transferring it. Existing
 field projection and shared-call places supply the usable consumers; no reference
 type or implicit clone is introduced. Header reservations protect delayed call
 addressing, while returned-view facts retain the backing owner independently.
+
+### Retained raw filesystem boundary
+
+Retained descriptors separate directory identity from mutable path names. Raw owned
+basenames preserve the complete namespace without imposing application sorting,
+evidence or traversal policy. Independent cursor ownership avoids shared enumeration
+position and keeps entry storage independent from stream lifetime. Descriptor
+observations and mode changes stay explicit; metadata does not flush a writer.
+Create failure never performs a racy rollback unlink. The exact nineteen-operation
+contract and hostile-mutation limits are in [plan 45](impl/45-retained-byte-tree-plan.md).

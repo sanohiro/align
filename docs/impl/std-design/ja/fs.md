@@ -344,3 +344,51 @@ I/O 前に拒否する。相対パスは現在の cwd、dot/dot-dot・連続区�
 ネイティブ形式への変換は明示パス長に比例する割り当てを行いうる。OOM は既存の即時停止。
 既存の errno 対応（既存エントリなら Code(EEXIST)）を使い、新しい所有型や Error variant
 は追加しない。[正本と検証計画](../../43-ordinary-directory-plan.md) を参照。
+
+### 保持したディレクトリと生のエントリ名
+
+`import std.fs` は不透明な Move 所有型 `fs.directory` と `fs.dir_cursor` を提供する。
+`fs.open_directory(path: str) -> Result<fs.directory, Error>` はシンボリックリンクを
+たどらずディレクトリを保持する。`directory.cursor() -> Result<fs.dir_cursor, Error>`
+は独立した列挙位置を持ち、ディレクトリの Drop 後も有効なカーソルを作る。排他的な
+`cursor.next() -> Result<Option<fs.dir_entry>, Error>` は所有した生のベース名を返す。
+EOF の None とネイティブ読み取り失敗の Error は終端状態として保存する。省く名前は
+`.` と `..` だけで、ソート、UTF-8 フィルタ、暗黙のメタデータ取得は行わない。
+`fs.dir_entry` は通常の Move レコード `{ name: array<u8> }` である。
+
+メソッドは名前付きローカルのレシーバーを呼び出し中だけ借用し、入力を保持しない。
+所有ローカルのカーソルは内部状態を進められる。借用ヘルパーで next を呼ぶには
+`borrow mut` が必要である。一時値とフィールドパスを直接レシーバーにすることは
+認めない。通常のレコード・直和・Option・Result の受け渡しは既存の Move 解放規則を
+使う。不透明型を直接要素とするコレクション、タプル、box、グローバル、キャプチャ、
+並列処理、FFI での受け渡しは対象外。Drop は所有資源を閉じ、エントリを削除しない。
+
+ディレクトリの相対メソッドは `bytes` を受け取る。`metadata_at` は `fs.metadata`、
+`open_dir` は `fs.directory`、`open_read` と `open_read_single_link` は `reader`、
+`create_new` は `writer` を、それぞれ `Result<_, Error>` で返す。
+`create_dir(path: bytes, mode: u32)`、`remove_file(path: bytes)`、
+`remove_dir(path: bytes)` は `Result<(), Error>` を返す。作成は排他的かつ一段階で、
+create_new は通常の umask/ACL の下で 0666 を要求する。公開前に失敗した場合は新しい
+記述子を閉じるが、ロールバックの unlink は行わない。削除は非再帰的であり、
+remove_file はシンボリックリンク自体を削除し、remove_dir は空ディレクトリだけを削除する。
+
+ルート・相対パスとも NUL、空の構成要素、連続・末尾の区切り、`.`・`..` の構成要素を
+I/O 前に拒否する。ルート単体の `.` と `/` は例外として有効で、先頭の `/` も許可する。
+ルートは UTF-8 が必要。相対パスは絶対パスを許可せず、NUL 以外の任意の生バイトを
+受け入れる。祖先をシンボリックリンクなしで検証し、reader はさらに通常ファイルの
+種類と記述子の同一性を再検証する。single-link 版は公開前のリンク数が 1 であることも要求する。
+
+ディレクトリ、reader、writer、file はそれぞれ記述子に対する
+`metadata() -> Result<fs.metadata, Error>` と
+`set_mode(mode: u32) -> Result<(), Error>` を提供する。mode は 0..07777 で、
+無効ビットは I/O 前に拒否する。名前付き作成ではパスを mode より先に検証する。
+metadata は位置を変えず、バッファを flush しない。通常の Copy レコードの宣言順は
+`kind: fs.entry_kind`、`device: u64`、`inode: u64`、`links: u64`、`mode: u32`、
+`size: i64`、`modified_seconds: i64`、`modified_nanoseconds: u32`、
+`changed_seconds: i64`、`changed_nanoseconds: u32`。
+Copy 直和 `fs.entry_kind` はペイロードなしの Regular、Directory、Symlink、Other を
+この順で持つ。メタデータの変換は検証付きで、ナノ秒は 1,000,000,000 未満、changed は
+作成日時ではなく ctime を表す。全操作は Impure で既存の Error モデルを使う。
+観測結果はスナップショット、書き込み可能性、ソースの不変性、同一性条件付き削除を
+保証しない。検証順序、所有権、プラットフォーム・競合の限界、ABI の厳密な定義は
+[生バイトツリーの台帳](../../45-retained-byte-tree-plan.md) にある。

@@ -377,6 +377,8 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             | Scalar::CodecBoolColumn
             | Scalar::CodecStrColumn
             | Scalar::CryptoDigest
+            | Scalar::FsDirectory
+            | Scalar::FsDirCursor
             | Scalar::CodecEncoder
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
@@ -528,6 +530,8 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
             | Ty::CryptoDigest
+            | Ty::FsDirectory
+            | Ty::FsDirCursor
             | Ty::CodecEncoder
             | Ty::Buffer
             | Ty::SignatureKey(_)

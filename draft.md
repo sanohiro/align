@@ -4252,3 +4252,52 @@ is still invalid during that interval. Returning a view propagates backing
 lifetimes, not the lifetime of the copied header. Source invalidation and arena
 escape follow existing rules. Receivers and indices/bounds evaluate once in
 source order; early termination performs no later bounds check or action.
+
+### Retained directories and raw entry names
+
+`import std.fs` exposes two opaque Move owners, `fs.directory` and `fs.dir_cursor`.
+`fs.open_directory(path: str) -> Result<fs.directory, Error>` opens a retained,
+no-follow directory. `directory.cursor() -> Result<fs.dir_cursor, Error>` creates
+an independently positioned stream that survives directory Drop. Exclusive
+`cursor.next() -> Result<Option<fs.dir_entry>, Error>` returns an owned raw basename,
+then cached None at EOF or a cached Error after a native read failure. Only `.`
+and `..` are omitted; there is no sorting, UTF-8 filtering or implicit metadata.
+`fs.dir_entry` is the ordinary Move record `{ name: array<u8> }`.
+
+All methods borrow a named local receiver for the call and retain no input.
+An owned local cursor can advance internally; a borrowed helper needs `borrow mut`
+for next. Temporary and field-path method receivers remain excluded. Ordinary
+record/sum/Option/Result transport uses existing Move cleanup; direct opaque
+collections, tuples, boxes, globals, captures, parallel and FFI transport remain
+excluded. Drop closes owners without deleting directory entries.
+
+Directory relative methods accept `bytes`: `metadata_at` returns `fs.metadata`,
+`open_dir` returns `fs.directory`, `open_read` and `open_read_single_link` return
+`reader`, and `create_new` returns `writer`, each inside `Result<_, Error>`.
+`create_dir(path: bytes, mode: u32)`, `remove_file(path: bytes)`, and
+`remove_dir(path: bytes)` return `Result<(), Error>`. Creation is exclusive and
+one-level; create_new requests 0666 under normal umask/ACL rules. Failed publication
+closes the new descriptor without rollback unlink. Removal is nonrecursive;
+remove_file unlinks a symlink itself and remove_dir requires an empty directory.
+
+Both root and relative paths reject NUL, empty/repeated/trailing components, `.`
+and `..` components before I/O. Root alone additionally accepts `.` and `/`, an
+optional leading slash, and requires UTF-8. Relative paths cannot be absolute and
+accept arbitrary non-NUL bytes. Ancestors are admitted without following symlinks;
+readers additionally require regular-file kind and descriptor identity revalidation.
+The single-link form requires descriptor link count one before publication.
+
+Directory, reader, writer and file each expose `metadata() -> Result<fs.metadata,
+Error>` and `set_mode(mode: u32) -> Result<(), Error>` on the descriptor. Mode is
+0..07777; invalid bits fail before I/O, and named creation checks path before mode.
+Metadata does not change position or flush buffers. The ordinary Copy record has
+fields, in declaration order: `kind: fs.entry_kind`, `device: u64`, `inode: u64`,
+`links: u64`, `mode: u32`, `size: i64`, `modified_seconds: i64`,
+`modified_nanoseconds: u32`, `changed_seconds: i64`, `changed_nanoseconds: u32`.
+The Copy sum `fs.entry_kind` has payload-free Regular, Directory, Symlink, Other
+variants in that order. Metadata conversion is checked, nanoseconds are below
+1,000,000,000, and changed time is ctime rather than creation time. All operations
+are Impure and use the existing Error model. Observations grant no snapshot,
+writability, source immutability or identity-conditional deletion guarantee.
+The exact validation precedence, ownership, platform/race limits and ABI are in
+[the retained byte-tree ledger](docs/impl/45-retained-byte-tree-plan.md).

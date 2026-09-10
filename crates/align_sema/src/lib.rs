@@ -14,6 +14,7 @@ use align_diag::Diagnostics;
 use align_span::Span;
 
 pub mod hir;
+pub mod fs_tree;
 pub use hir::*;
 mod hir_depth;
 mod replay_clone;
@@ -240,6 +241,10 @@ pub enum Scalar {
     CodecEncoder,
     /// Owned incremental SHA-256 context; retains no input views.
     CryptoDigest,
+    /// Retained filesystem directory identity.
+    FsDirectory,
+    /// Independently positioned raw-name directory cursor.
+    FsDirCursor,
     /// A `buffer` payload (`Result<buffer, Error>` from `encoding.*_decode`). An owned **Move**
     /// handle (a growable byte container); the enclosing `Result`'s `Drop` frees it. Opaque pointer,
     /// like [`Scalar::Reader`]/[`Scalar::Writer`] — owned, never region-tracked (it borrows nothing).
@@ -355,7 +360,7 @@ impl Scalar {
     /// the I/O handles `reader`/`writer`, a decoded `buffer`, a `cli parsed`, a `tcp_conn`, a
     /// `tcp_listener`, a `udp_socket`, or a package-defined resource.
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Logger | Scalar::XmlReader | Scalar::CryptoDigest | Scalar::CodecEncoder | Scalar::Buffer | Scalar::SignatureKey(_) | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpClient | Scalar::HttpRequest | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::HttpUpgrade | Scalar::HttpReadStream | Scalar::HttpSseStream | Scalar::ResponseBuilder | Scalar::RunOutput | Scalar::RunBytes | Scalar::Resource(_))
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Logger | Scalar::XmlReader | Scalar::CryptoDigest | Scalar::FsDirectory | Scalar::FsDirCursor | Scalar::CodecEncoder | Scalar::Buffer | Scalar::SignatureKey(_) | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpClient | Scalar::HttpRequest | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::HttpUpgrade | Scalar::HttpReadStream | Scalar::HttpSseStream | Scalar::ResponseBuilder | Scalar::RunOutput | Scalar::RunBytes | Scalar::Resource(_))
     }
 }
 
@@ -648,6 +653,10 @@ pub enum Ty {
     CodecEncoder,
     /// Owned incremental SHA-256 context; retains no input views.
     CryptoDigest,
+    /// Retained filesystem directory identity.
+    FsDirectory,
+    /// Independently positioned raw-name directory cursor.
+    FsDirCursor,
     /// A `reader` (`std.io`) — the one concrete read-source Move type: `io.stdin`, `fs.open` (a
     /// file). An opaque owned handle to a heap reader object owning an fd. `r.read(b: mut buffer)`
     /// fills a caller-owned buffer. `Drop`-freed (a file fd is also closed). Its reads are Impure.
@@ -947,6 +956,8 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Ty::CodecBoolColumn
         | Ty::CodecStrColumn
         | Ty::CryptoDigest
+        | Ty::FsDirectory
+        | Ty::FsDirCursor
         | Ty::CodecEncoder
         | Ty::Reader
         | Ty::Buffer
@@ -1021,6 +1032,8 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Scalar::CodecBoolColumn
         | Scalar::CodecStrColumn
         | Scalar::CryptoDigest
+        | Scalar::FsDirectory
+        | Scalar::FsDirCursor
         | Scalar::CodecEncoder
         | Scalar::Buffer
         | Scalar::SignatureKey(_)
@@ -1091,6 +1104,8 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::CodecStrColumn => Some(Scalar::CodecStrColumn),
         Ty::CodecEncoder => Some(Scalar::CodecEncoder),
         Ty::CryptoDigest => Some(Scalar::CryptoDigest),
+        Ty::FsDirectory => Some(Scalar::FsDirectory),
+        Ty::FsDirCursor => Some(Scalar::FsDirCursor),
         // A `buffer` owned handle as a `Result` Ok payload (`encoding.*_decode`).
         Ty::Buffer => Some(Scalar::Buffer),
         Ty::SignatureKey(kind) => Some(Scalar::SignatureKey(kind)),
@@ -1234,6 +1249,8 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::CodecStrColumn => Ty::CodecStrColumn,
         Scalar::CodecEncoder => Ty::CodecEncoder,
         Scalar::CryptoDigest => Ty::CryptoDigest,
+        Scalar::FsDirectory => Ty::FsDirectory,
+        Scalar::FsDirCursor => Ty::FsDirCursor,
         Scalar::Buffer => Ty::Buffer,
         Scalar::SignatureKey(kind) => Ty::SignatureKey(kind),
         Scalar::Regex => Ty::Regex,
@@ -1456,6 +1473,8 @@ pub fn heap_tree_record_error(
                 | Ty::Char
                 | Ty::String
                 | Ty::CryptoDigest
+                | Ty::FsDirectory
+                | Ty::FsDirCursor
                 | Ty::SignatureKey(_) => {}
                 Ty::Struct(id) => work.push(Work::EnterStruct { id, path }),
                 Ty::Option(payload) => work.push(Work::Field {
@@ -2502,6 +2521,8 @@ pub fn drop_plan(
                         | Ty::Logger
                         | Ty::XmlReader
                         | Ty::CryptoDigest
+                        | Ty::FsDirectory
+                        | Ty::FsDirCursor
                         | Ty::CodecEncoder
                         | Ty::Reader
                         | Ty::Buffer
@@ -2883,6 +2904,14 @@ pub fn ty_contains_crypto_owner(root: Ty, structs: &[StructDef], tuples: &[hir::
     ty_contains_leaf(root, structs, tuples, enums, tagged_types, |ty| matches!(ty, Ty::CryptoDigest | Ty::SignatureKey(_)))
 }
 
+/// Restricted native owners cannot enter scalar collections, including through sum payloads.
+/// Dedicated AoS record-container formation remains the existing explicit exception.
+pub fn ty_contains_restricted_collection_owner(root: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], enums: &[hir::EnumDef], tagged_types: &[hir::TaggedType]) -> bool {
+    ty_contains_leaf(root, structs, tuples, enums, tagged_types, |ty|
+        matches!(ty, Ty::CryptoDigest | Ty::SignatureKey(_) | Ty::FsDirectory | Ty::FsDirCursor))
+}
+
+
 /// Whether a reachable value type contains an HTTP client's pooled-connection owner.
 /// MIR uses this for Drop-only link capabilities, including imported aggregate carriers.
 pub fn ty_contains_http_client(
@@ -3004,6 +3033,8 @@ fn ty_contains_leaf(
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
             | Ty::CryptoDigest
+            | Ty::FsDirectory
+            | Ty::FsDirCursor
             | Ty::CodecEncoder
             | Ty::Reader
             | Ty::Buffer
@@ -3278,6 +3309,8 @@ fn ty_contains_http_upgrade(
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
             | Ty::CryptoDigest
+            | Ty::FsDirectory
+            | Ty::FsDirCursor
             | Ty::CodecEncoder
             | Ty::Reader
             | Ty::Buffer
@@ -3393,6 +3426,8 @@ fn ty_contains_http_receive_stream(
             | Scalar::CodecBoolColumn
             | Scalar::CodecStrColumn
             | Scalar::CryptoDigest
+            | Scalar::FsDirectory
+            | Scalar::FsDirCursor
             | Scalar::CodecEncoder
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
@@ -3531,6 +3566,8 @@ fn ty_contains_http_receive_stream(
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
             | Ty::CryptoDigest
+            | Ty::FsDirectory
+            | Ty::FsDirCursor
             | Ty::CodecEncoder
             | Ty::Reader
             | Ty::Buffer
@@ -3615,6 +3652,8 @@ pub fn http_stream_carrier_class(
             | Scalar::CodecBoolColumn
             | Scalar::CodecStrColumn
             | Scalar::CryptoDigest
+            | Scalar::FsDirectory
+            | Scalar::FsDirCursor
             | Scalar::CodecEncoder
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
@@ -3752,6 +3791,8 @@ pub fn http_stream_carrier_class(
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
             | Ty::CryptoDigest
+            | Ty::FsDirectory
+            | Ty::FsDirCursor
             | Ty::CodecEncoder
             | Ty::Reader
             | Ty::Buffer
@@ -4396,6 +4437,8 @@ pub const BUILTIN_SPELLING_TYS: &[(&str, Ty)] = &[
     ("codec.str_column", Ty::CodecStrColumn),
     ("codec.encoder", Ty::CodecEncoder),
     ("crypto.digest", Ty::CryptoDigest),
+    ("fs.directory", Ty::FsDirectory),
+    ("fs.dir_cursor", Ty::FsDirCursor),
     ("buffer", Ty::Buffer),
     ("rs256_private_key", Ty::SignatureKey(SignatureKeyKind::Rs256Private)),
     ("crypto.rs256_private_key", Ty::SignatureKey(SignatureKeyKind::Rs256Private)),
@@ -4460,6 +4503,11 @@ fn builtin_spelling_ty(head: &str) -> Option<Ty> {
 /// spelling bridge lives here, and the ownership answer stays exactly [`needs_drop_flag`] — the same
 /// call that assigned the bit being validated.
 pub fn builtin_spelling_needs_return_cleanup(head: &str) -> Option<bool> {
+    if head == "fs.dir_entry" { return Some(needs_drop_flag(Ty::Struct(0), &[fs_dir_entry_definition()], &[], &[], &[])); }
+    if matches!(head, "fs.metadata" | "fs.entry_kind") {
+        let ty = if head == "fs.metadata" { Ty::Struct(0) } else { Ty::Enum(0) };
+        return Some(needs_drop_flag(ty, &[fs_metadata_definition(0)], &[], &[fs_entry_kind_definition()], &[]));
+    }
     if head == "os.host_info" { return Some(needs_drop_flag(Ty::Struct(0), &[host_info_definition()], &[], &[], &[])); }
     let ty = builtin_spelling_ty(head)?;
     Some(needs_drop_flag(ty, &[], &[], &[], &[]))
@@ -4473,6 +4521,11 @@ pub fn builtin_spelling_needs_return_cleanup(head: &str) -> Option<bool> {
 /// bit. Keeping the Move answer in sema prevents the interface decoder from inventing a second
 /// builtin ownership table.
 pub fn builtin_spelling_is_move(head: &str) -> Option<bool> {
+    if head == "fs.dir_entry" { return Some(ty_is_move(Ty::Struct(0), &[fs_dir_entry_definition()], &[], &[], &[])); }
+    if matches!(head, "fs.metadata" | "fs.entry_kind") {
+        let ty = if head == "fs.metadata" { Ty::Struct(0) } else { Ty::Enum(0) };
+        return Some(ty_is_move(ty, &[fs_metadata_definition(0)], &[], &[fs_entry_kind_definition()], &[]));
+    }
     if head == "os.host_info" { return Some(ty_is_move(Ty::Struct(0), &[host_info_definition()], &[], &[], &[])); }
     let ty = builtin_spelling_ty(head)?;
     Some(ty_is_move(ty, &[], &[], &[], &[]))
@@ -6138,6 +6191,9 @@ struct BuiltinNominalAlias {
 }
 
 const BUILTIN_NOMINAL_ALIASES: &[BuiltinNominalAlias] = &[
+    BuiltinNominalAlias { bare: "fs.dir_entry", explicit: "fs.dir_entry", canonical: "fs.dir_entry", required_import: Some("std.fs") },
+    BuiltinNominalAlias { bare: "fs.metadata", explicit: "fs.metadata", canonical: "fs.metadata", required_import: Some("std.fs") },
+    BuiltinNominalAlias { bare: "fs.entry_kind", explicit: "fs.entry_kind", canonical: "fs.entry_kind", required_import: Some("std.fs") },
     BuiltinNominalAlias { bare: "os.host_info", explicit: "os.host_info", canonical: "os.host_info", required_import: Some("std.os") },
     BuiltinNominalAlias {
         bare: "Error",
@@ -8599,6 +8655,18 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         ],
     });
 
+    if let (Ok(kind), Ok(entry)) = (u32::try_from(enums.len()), u32::try_from(structs.len()))
+        && let Some(metadata) = entry.checked_add(1) {
+        enum_ids.insert("fs.entry_kind".to_string(), kind);
+        enums.push(fs_entry_kind_definition());
+        struct_ids.insert("fs.dir_entry".to_string(), entry);
+        structs.push(fs_dir_entry_definition());
+        struct_ids.insert("fs.metadata".to_string(), metadata);
+        structs.push(fs_metadata_definition(kind));
+    } else {
+        diags.error("filesystem builtin type table capacity exceeded".to_string(), Span::new(0, 0, 0));
+    }
+
     struct_ids.insert("os.host_info".to_string(), structs.len() as u32);
     structs.push(host_info_definition());
 
@@ -9125,6 +9193,8 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                     Ty::CodecStrColumn => payload.push(Scalar::CodecStrColumn),
                     Ty::CodecEncoder => payload.push(Scalar::CodecEncoder),
                     Ty::CryptoDigest => payload.push(Scalar::CryptoDigest),
+                    Ty::FsDirectory => payload.push(Scalar::FsDirectory),
+                    Ty::FsDirCursor => payload.push(Scalar::FsDirCursor),
                     Ty::Option(value) => payload.push(Scalar::Tagged(intern_tagged_type(
                         &mut tagged_types,
                         hir::TaggedType::Option(value),
@@ -16415,6 +16485,7 @@ impl EffectScan<'_> {
             // any extern-calling fn is non-Pure), so a hashing closure is rejected by `par_map`
             // (matching `std.compress`; hashing's determinism does not make it pure). Recurse into
             // the byte view.
+            ExprKind::FsTree { args, .. } => { for argument in args { walk!(argument); } self.impure_direct = true; }
             ExprKind::CryptoDigestNew => { self.impure_direct = true; }
             ExprKind::CryptoDigestFinish { digest: data }
             | ExprKind::CryptoHash { data, .. } => {
@@ -19842,6 +19913,8 @@ impl<'a> EscapeCheck<'a> {
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
             | Ty::CryptoDigest
+            | Ty::FsDirectory
+            | Ty::FsDirCursor
             | Ty::CodecEncoder
             | Ty::Child
             | Ty::HttpRequest
@@ -21997,6 +22070,8 @@ impl<'a> EscapeCheck<'a> {
             | Ty::Builder
             | Ty::Buffer
             | Ty::CryptoDigest
+            | Ty::FsDirectory
+            | Ty::FsDirCursor
             | Ty::CodecEncoder
             | Ty::SignatureKey(_)
             // The compiler-internal `str_finder` plan owns a boxed searcher (it copied the needle
@@ -22071,7 +22146,7 @@ impl<'a> EscapeCheck<'a> {
         // accepted owner free-standing. Keep this producer aligned with `region_of` and the
         // checked-HIR allocation-mode contract instead of deriving its Drop mode from lexical
         // allocation context like the ordinary arena-aware collection producers below.
-        if matches!(expression.kind, ExprKind::OsHost | ExprKind::JsonOwnedDecode { .. } | ExprKind::CryptoDigestFinish { .. }) {
+        if matches!(expression.kind, ExprKind::FsTree { .. } | ExprKind::OsHost | ExprKind::JsonOwnedDecode { .. } | ExprKind::CryptoDigestFinish { .. }) {
             return Some(true);
         }
         if matches!(
@@ -24073,7 +24148,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpStreamReject { .. }
             | ExprKind::CryptoCtEqual { .. }
             | ExprKind::CryptoRandom { .. }
-            | ExprKind::CryptoDigestNew | ExprKind::CryptoDigestUpdate { .. } | ExprKind::CryptoDigestFinish { .. }
+            | ExprKind::FsTree { .. } | ExprKind::CryptoDigestNew | ExprKind::CryptoDigestUpdate { .. } | ExprKind::CryptoDigestFinish { .. }
             | ExprKind::CryptoHash { .. }
             | ExprKind::CryptoHmac { .. }
             | ExprKind::CryptoHkdf { .. }
@@ -24551,7 +24626,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpStreamReject { .. }
             | ExprKind::CryptoCtEqual { .. }
             | ExprKind::CryptoRandom { .. }
-            | ExprKind::CryptoDigestNew | ExprKind::CryptoDigestUpdate { .. } | ExprKind::CryptoDigestFinish { .. }
+            | ExprKind::FsTree { .. } | ExprKind::CryptoDigestNew | ExprKind::CryptoDigestUpdate { .. } | ExprKind::CryptoDigestFinish { .. }
             | ExprKind::CryptoHash { .. }
             | ExprKind::CryptoHmac { .. }
             | ExprKind::CryptoHkdf { .. }
@@ -28099,6 +28174,7 @@ impl<'a> EscapeCheck<'a> {
             // `crypto.sha256`/`sha512` return a fresh *owned* `array<u8>` that borrows nothing (it
             // owns its heap buffer, `Drop`-freed) — freely returnable, like `rand.sample`. Just
             // recurse into the byte view so any escape *inside* it is still checked.
+            ExprKind::FsTree { args, .. } => { for argument in args { self.walk(argument, depth); } }
             ExprKind::CryptoDigestNew => {},
             ExprKind::CryptoDigestFinish { digest: data }
             | ExprKind::CryptoHash { data, .. } => self.walk(data, depth),
@@ -30164,7 +30240,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         // The runtime materializes a fresh `array<RowPair>` in Result::Ok and retains neither
         // codec view. `RowPair` is scalar-only, so the generation starts without borrowed content;
         // Result::Err carries no storage header.
-        ExprKind::OsHost | ExprKind::FrameInnerJoin { .. } | ExprKind::CryptoDigestFinish { .. } => {
+        ExprKind::FsTree { .. } | ExprKind::OsHost | ExprKind::FrameInnerJoin { .. } | ExprKind::CryptoDigestFinish { .. } => {
             StorageVariantPolicy::Fresh(StorageContentInitializer::FreshEmpty)
         }
 
@@ -32496,6 +32572,12 @@ impl<'a> MoveCheck<'a> {
             let hir_depth::BodyEvent::ExprEnter(expression) = event else {
                 continue;
             };
+            if let ExprKind::FsTree { kind, args } = &expression.kind
+                && matches!(kind.inputs().first(), Some(fs_tree::Input::Owner(_)))
+                && let Some(receiver) = args.first() {
+                arguments.insert(Self::expr_key(receiver));
+                places.insert(Self::expr_key(receiver));
+            }
             if let ExprKind::CryptoDigestUpdate { digest, .. } = &expression.kind {
                 arguments.insert(Self::expr_key(digest));
                 places.insert(Self::expr_key(digest));
@@ -37510,7 +37592,8 @@ impl<'a> MoveCheck<'a> {
             // its Ok payload nor its Error payload borrows the input.
             ExprKind::JsonEncodeBounded { .. }
             | ExprKind::JsonOwnedEncodeBounded { .. }
-            | ExprKind::JsonOwnedDecode { .. } => BorrowRoots::new(),
+            | ExprKind::JsonOwnedDecode { .. }
+            | ExprKind::FsTree { .. } => BorrowRoots::new(),
             ExprKind::JsonDecode { input, .. }
             | ExprKind::JsonDecodeArray { input, .. }
             | ExprKind::JsonDecodeStructArray { input, .. } => self.storage_roots(input),
@@ -44560,6 +44643,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::CryptoRandom { out } => move_expr!(self, out, moved, false, false),
             // `crypto.sha256`/`sha512` borrow the byte view (never consume it). Recurse non-consuming
             // to catch a use-after-move *inside* the operand.
+            ExprKind::FsTree { args, .. } => { for argument in args { move_expr!(self, argument, moved, false, false); } }
             ExprKind::CryptoDigestNew => {},
             ExprKind::CryptoDigestFinish { digest } => move_expr!(self, digest, moved, true, true),
             ExprKind::CryptoHash { data, .. } => move_expr!(self, data, moved, false, false),
@@ -50400,6 +50484,9 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.fs", &format!("fs.{method}"), span);
                 return self.check_fs_path_op(method, args, span);
             }
+            if module == "fs" && method == "open_directory" {
+                return self.check_fs_tree(fs_tree::FsTreeKind::DirectoryOpen, None, args, span);
+            }
             if module == "fs" && method == "rename_no_replace" {
                 self.require_import("std.fs", "fs.rename_no_replace", span);
                 return self.check_fs_rename_no_replace(args, span);
@@ -51066,6 +51153,9 @@ impl<'a, 't> Checker<'a, 't> {
         // named user method on another value still resolves normally.
         if matches!(method, "next" | "range" | "shuffle" | "sample") {
             let recv_expr = self.check_expr(recv, None);
+            if recv_expr.ty == Ty::FsDirCursor && method == "next" {
+                return self.check_fs_tree(fs_tree::FsTreeKind::CursorNext, Some(recv_expr), args, span);
+            }
             if recv_expr.ty == Ty::HttpSseStream && method == "next" {
                 return self.check_http_sse_stream_method(recv_expr, method, args, span);
             }
@@ -51143,6 +51233,9 @@ impl<'a, 't> Checker<'a, 't> {
         };
         let recv_expr = self.check_expr(recv, recv_expected);
         let recv_ty = recv_expr.ty;
+        if let Some(kind) = fs_tree::FsTreeKind::from_method(recv_ty, method) {
+            return self.check_fs_tree(kind, Some(recv_expr), args, span);
+        }
         if recv_ty == Ty::CryptoDigest {
             return self.check_crypto_digest_method(recv_expr, method, args, span);
         }
@@ -58848,6 +58941,60 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// Validate the closed retained filesystem signature and its call-borrow receiver.
+    fn check_fs_tree(&mut self, kind: fs_tree::FsTreeKind, receiver: Option<Expr>, args: &[ast::Expr], span: Span) -> Expr {
+        self.require_import("std.fs", "retained filesystem operation", span);
+        let invalid = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let inputs = kind.inputs();
+        let offset = usize::from(receiver.is_some());
+        if args.len().checked_add(offset) != Some(inputs.len()) {
+            self.diags.error(format!("retained filesystem operation expects {} arguments, got {}", inputs.len().saturating_sub(offset), args.len()), span);
+            return invalid;
+        }
+        let mut checked = Vec::with_capacity(inputs.len());
+        if let Some(receiver) = receiver {
+            if !matches!(receiver.kind, ExprKind::Local(_)) {
+                self.diags.error("bind the filesystem handle to a local before calling a method".to_string(), receiver.span);
+                return invalid;
+            }
+            if kind.exclusive() && !self.require_exclusive_handle_receiver(&receiver, "fs.dir_cursor", "next", "advance") {
+                return invalid;
+            }
+            checked.push(receiver);
+        }
+        for (argument, input) in args.iter().zip(&inputs[offset..]) {
+            let value = match input {
+                fs_tree::Input::Text => self.check_str_init(argument),
+                fs_tree::Input::Bytes => {
+                    let Some(value) = self.check_byte_view(argument, "retained filesystem path") else { return invalid; };
+                    value
+                }
+                fs_tree::Input::Mode => self.check_expr(argument, Some(Ty::Int(IntTy { bits: 32, signed: false }))),
+                fs_tree::Input::Owner(_) => {
+                    self.diags.error("missing filesystem receiver".to_string(), span);
+                    return invalid;
+                }
+            };
+            if !fs_tree::input_matches(*input, self.resolve(value.ty)) && !hir_expr_diverges(&value) {
+                self.diags.error("retained filesystem argument has the wrong type".to_string(), argument.span);
+                return invalid;
+            }
+            checked.push(value);
+        }
+        if kind.output() == fs_tree::Output::EntryOption {
+            let Some(entry) = fs_tree::record_id(self.structs, "fs.dir_entry") else {
+                self.diags.error("missing fs.dir_entry schema".to_string(), span);
+                return invalid;
+            };
+            intern_tagged_type(self.tagged_types, hir::TaggedType::Option(Scalar::Struct(entry)));
+        }
+        let Some(ty) = fs_tree::result_type(kind, self.structs, self.enums, self.tagged_types) else {
+            self.diags.error("missing retained filesystem result schema".to_string(), span);
+            return invalid;
+        };
+        Expr { kind: ExprKind::FsTree { kind, args: checked }, ty, span }
+    }
+
     /// `fs.read_file(path)` — read the whole file at `path` (a `str`) into a freshly heap-allocated
     /// owned `string`, yielding `Result<string, Error>`. The returned `string` owns its buffer
     /// (freed by the binding's `Drop`); an I/O error is `Err`. The first `std.fs` surface (the
@@ -65362,6 +65509,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(b);
             }
             ExprKind::CryptoRandom { out } => self.finalize_expr(out),
+            ExprKind::FsTree { args, .. } => { for argument in args { self.finalize_expr(argument); } }
             ExprKind::CryptoDigestNew => {},
             ExprKind::CryptoDigestFinish { digest: data }
             | ExprKind::CryptoHash { data, .. } => self.finalize_expr(data),
@@ -66488,6 +66636,8 @@ fn ty_name(ty: Ty) -> String {
         Ty::CodecStrColumn => "codec.str_column".to_string(),
         Ty::CodecEncoder => "codec.encoder".to_string(),
         Ty::CryptoDigest => "crypto.digest".to_string(),
+        Ty::FsDirectory => "fs.directory".to_string(),
+        Ty::FsDirCursor => "fs.dir_cursor".to_string(),
         Ty::Reader => "reader".to_string(),
         Ty::Buffer => "buffer".to_string(),
         Ty::SignatureKey(kind) => kind.name().to_string(),
@@ -66897,6 +67047,8 @@ fn resolved_type_source_spelling(
             Ty::CodecStrColumn => "codec.str_column".to_string(),
             Ty::CodecEncoder => "codec.encoder".to_string(),
             Ty::CryptoDigest => "crypto.digest".to_string(),
+        Ty::FsDirectory => "fs.directory".to_string(),
+        Ty::FsDirCursor => "fs.dir_cursor".to_string(),
             Ty::Reader => "reader".to_string(),
             Ty::Buffer => "buffer".to_string(),
             Ty::ArrayBuilder(elem) => format!(
@@ -67245,7 +67397,7 @@ fn subst_param_ty(
         Ty::Box(s) => Ty::Box(subst_scalar(s, args, tagged_types)),
         Ty::Slice(s) => {
             let element = subst_collection_element_ty(s, args, tagged_types);
-            if ty_contains_crypto_owner(element, structs, &[], enums, tagged_types) {
+            if ty_contains_restricted_collection_owner(element, structs, &[], enums, tagged_types) {
                 Ty::Error
             } else {
                 collection_scalar_type(element)
@@ -67264,7 +67416,7 @@ fn subst_param_ty(
         Ty::ArrayBuilder(s) => {
             let element = subst_collection_element_ty(s, args, tagged_types);
             if !matches!(element, Ty::Struct(_))
-                && ty_contains_crypto_owner(element, structs, &[], enums, tagged_types)
+                && ty_contains_restricted_collection_owner(element, structs, &[], enums, tagged_types)
             {
                 Ty::Error
             } else {
@@ -67318,7 +67470,7 @@ fn dynamic_array_type(
             Some(Ty::DynFixedStructArray(id, length))
         }
         Ty::Slice(elem) => scalar_to_prim(elem).map(Ty::DynSliceArray),
-        other if ty_contains_crypto_owner(other, structs, &[], enums, tagged_types) => None,
+        other if ty_contains_restricted_collection_owner(other, structs, &[], enums, tagged_types) => None,
         other => collection_scalar_type(other).map(Ty::DynArray),
     }
 }
@@ -67335,7 +67487,7 @@ fn fixed_array_type(
 ) -> Option<Ty> {
     match element {
         Ty::Struct(id) => Some(Ty::StructArray(id, length)),
-        other if ty_contains_crypto_owner(other, structs, &[], enums, tagged_types) => None,
+        other if ty_contains_restricted_collection_owner(other, structs, &[], enums, tagged_types) => None,
         other => collection_scalar_type(other).map(|scalar| Ty::Array(scalar, length)),
     }
 }
@@ -68013,12 +68165,12 @@ fn scalar_arg(
     // handle would double-`close` its fd), exactly like `tcp_listener` / `http response`.
     if matches!(ty, Ty::SignatureKey(_)) && !allow_param {
         diags.error(
-            format!("{what} cannot be `{}` — a crypto key or digest is a single owner, not a collection element", ty_name(ty)),
+            format!("{what} cannot be `{}` — a restricted native handle is a single owner, not a collection element", ty_name(ty)),
             span,
         );
         return None;
     }
-    if matches!(ty, Ty::CliCommand | Ty::Command) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Logger | Ty::XmlReader | Ty::CodecBatch | Ty::CodecI64Column | Ty::CodecF64Column | Ty::CodecBoolColumn | Ty::CodecStrColumn | Ty::CryptoDigest | Ty::CodecEncoder | Ty::Buffer | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::HttpReadStream | Ty::HttpSseStream | Ty::ResponseBuilder | Ty::RunOutput | Ty::RunBytes) && !allow_param) {
+    if matches!(ty, Ty::CliCommand | Ty::Command) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Logger | Ty::XmlReader | Ty::CodecBatch | Ty::CodecI64Column | Ty::CodecF64Column | Ty::CodecBoolColumn | Ty::CodecStrColumn | Ty::CryptoDigest | Ty::FsDirectory | Ty::FsDirCursor | Ty::CodecEncoder | Ty::Buffer | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::HttpReadStream | Ty::HttpSseStream | Ty::ResponseBuilder | Ty::RunOutput | Ty::RunBytes) && !allow_param) {
         diags.error(
             format!("{what} cannot be `{}` — an owned I/O handle/buffer is bound to one local, not collected into an array/slice/box (bind it to a local)", ty_name(ty)),
             span,
@@ -68063,7 +68215,7 @@ fn collection_scalar_arg(
     span: Span,
     diags: &mut Diagnostics,
 ) -> Option<Scalar> {
-    if ty_contains_crypto_owner(
+    if ty_contains_restricted_collection_owner(
         ty,
         tables.structs,
         tables.tuples,
@@ -68072,7 +68224,7 @@ fn collection_scalar_arg(
     ) {
         diags.error(
             format!(
-                "{what} cannot be `{}` — a crypto key or digest is a single owner, not a collection element",
+                "{what} cannot be `{}` — a restricted native handle is a single owner, not a collection element",
                 ty_name(ty)
             ),
             span,
@@ -68115,6 +68267,8 @@ fn collection_scalar_type(ty: Ty) -> Option<Scalar> {
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
             | Ty::CryptoDigest
+            | Ty::FsDirectory
+            | Ty::FsDirCursor
             | Ty::CodecEncoder
             | Ty::Regex
             | Ty::Captures
@@ -68709,6 +68863,14 @@ fn resolve_type(
             _ => unreachable!(),
         };
     }
+    if path.segments.len() == 2 && path.segments[0].name == "fs"
+        && matches!(path.segments[1].name.as_str(), "directory" | "dir_cursor") {
+        if !args.is_empty() || !cx.builtin_imports.contains("std.fs") {
+            diags.error("fs.directory and fs.dir_cursor require import std.fs and take no type arguments".to_string(), span);
+            return Ty::Error;
+        }
+        return if path.segments[1].name == "directory" { Ty::FsDirectory } else { Ty::FsDirCursor };
+    }
     if path.segments.len() == 2 && path.segments[0].name == "crypto" && path.segments[1].name == "digest" {
         if !args.is_empty() || !cx.builtin_imports.contains("std.crypto") {
             diags.error("crypto.digest requires import std.crypto and takes no type arguments".to_string(), span);
@@ -68841,7 +69003,7 @@ fn resolve_type(
                 return Ty::Error;
             }
             if !matches!(inner, Ty::Struct(_))
-                && ty_contains_crypto_owner(
+                && ty_contains_restricted_collection_owner(
                     inner,
                     cx.structs,
                     cx.tuples,
@@ -68851,7 +69013,7 @@ fn resolve_type(
             {
                 diags.error(
                     format!(
-                        "array_builder element cannot be `{}` — a crypto key or digest is a single owner, not a builder element",
+                        "array_builder element cannot be `{}` — a restricted native handle is a single owner, not a builder element",
                         ty_name(inner)
                     ),
                     span,
@@ -69540,6 +69702,8 @@ pub const MOVE_HANDLE_TYPES: &[Ty] = &[
     Ty::XmlReader,
     Ty::CodecEncoder,
     Ty::CryptoDigest,
+    Ty::FsDirectory,
+    Ty::FsDirCursor,
     Ty::Reader,
     Ty::Buffer,
     Ty::SignatureKey(SignatureKeyKind::Rs256Private),
@@ -69962,6 +70126,8 @@ fn enum_payload_ok(
         | Scalar::CodecBoolColumn
         | Scalar::CodecStrColumn
         | Scalar::CryptoDigest
+        | Scalar::FsDirectory
+        | Scalar::FsDirCursor
         | Scalar::CodecEncoder => true,
         // An owned scalar `array<T>` payload (J2) makes the enum Move (tag-switched drop). Flat
         // scalar-element arrays are admitted; bare `array<string>` is excluded because its
@@ -71316,9 +71482,10 @@ mod tests {
             }
         }
         // Digest New/Update retain no storage; Finish forms an individually owned array
-        // with fresh empty content. All three have explicit wildcard-free policies.
+        // with fresh empty content. FsTree also constructs fresh owners without retained inputs.
+        // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 333,
+            variants, 334,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 
@@ -80276,4 +80443,70 @@ pub fn host_info_schema_valid(definition: &hir::StructDef) -> bool {
         && definition.align.is_none() && !definition.c_repr
         && definition.fields.len() == expected.fields.len()
         && definition.fields.iter().zip(&expected.fields).all(|(a,b)| a.name == b.name && a.ty == b.ty)
+}
+
+/// Producer-owned schemas of retained filesystem observations.
+pub fn fs_entry_kind_definition() -> hir::EnumDef {
+    hir::EnumDef {
+        name: "fs.entry_kind".to_string(), source_name: "fs.entry_kind".to_string(),
+        variants: ["Regular", "Directory", "Symlink", "Other"].into_iter().map(|name|
+            hir::EnumVariant { name: name.to_string(), payload: Vec::new(), field_base: 1 }).collect(),
+    }
+}
+pub fn fs_dir_entry_definition() -> hir::StructDef {
+    hir::StructDef {
+        name: "fs.dir_entry".to_string(), source_name: "fs.dir_entry".to_string(),
+        fields: vec![hir::FieldDef { name: "name".to_string(), ty: Ty::DynArray(Scalar::Int(IntTy { bits: 8, signed: false })) }],
+        align: None, c_repr: false,
+    }
+}
+pub fn fs_metadata_definition(kind: u32) -> hir::StructDef {
+    let u64_ty = Ty::Int(IntTy { bits: 64, signed: false });
+    let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+    let u32_ty = Ty::Int(IntTy { bits: 32, signed: false });
+    hir::StructDef {
+        name: "fs.metadata".to_string(), source_name: "fs.metadata".to_string(),
+        fields: [("kind", Ty::Enum(kind)), ("device", u64_ty), ("inode", u64_ty),
+            ("links", u64_ty), ("mode", u32_ty), ("size", i64_ty),
+            ("modified_seconds", i64_ty), ("modified_nanoseconds", u32_ty),
+            ("changed_seconds", i64_ty), ("changed_nanoseconds", u32_ty)].into_iter()
+            .map(|(name, ty)| hir::FieldDef { name: name.to_string(), ty }).collect(),
+        align: None, c_repr: false,
+    }
+}
+
+/// Reserve qualified names globally, including interfaces that invoke no filesystem operation.
+pub fn fs_tree_schemas_valid(structs: &[hir::StructDef], enums: &[hir::EnumDef]) -> bool {
+    let kind = fs_entry_kind_definition();
+    let matching = |actual: &hir::StructDef, expected: &hir::StructDef| {
+        actual.name == expected.name && actual.source_name == expected.source_name
+            && actual.align == expected.align && actual.c_repr == expected.c_repr
+            && actual.fields.len() == expected.fields.len()
+            && actual.fields.iter().zip(&expected.fields).all(|(a,b)| a.name == b.name && a.ty == b.ty)
+    };
+    let mut kind_id = None;
+    for (id, definition) in enums.iter().enumerate() {
+        if definition.name == kind.name || definition.source_name == kind.source_name {
+            if kind_id.is_some() || definition.name != kind.name || definition.source_name != kind.source_name
+                || definition.variants.len() != kind.variants.len()
+                || !definition.variants.iter().zip(&kind.variants).all(|(a,b)| a.name == b.name && a.payload == b.payload && a.field_base == b.field_base) {
+                return false;
+            }
+            let Ok(id) = u32::try_from(id) else { return false; };
+            kind_id = Some(id);
+        }
+    }
+    for name in ["fs.dir_entry", "fs.metadata"] {
+        let mut found = false;
+        for definition in structs {
+            if definition.name == name || definition.source_name == name {
+                if found { return false; }
+                found = true;
+                let expected = if name == "fs.dir_entry" { fs_dir_entry_definition() }
+                    else { let Some(id) = kind_id else { return false; }; fs_metadata_definition(id) };
+                if !matching(definition, &expected) { return false; }
+            }
+        }
+    }
+    true
 }

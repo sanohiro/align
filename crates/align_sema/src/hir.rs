@@ -1421,6 +1421,7 @@ pub enum ExprKind {
     /// `fs.remove_empty_dir(path)` — remove exactly one empty directory through retained,
     /// no-follow descriptor traversal. The absolute path is borrowed for the call.
     FsCreateDir { path: Box<Expr> },
+    FsTree { kind: crate::fs_tree::FsTreeKind, args: Vec<Expr> },
     FsIsDir { path: Box<Expr> },
     FsRemoveEmptyDir { path: Box<Expr> },
     /// `fs.rename_no_replace(source, destination)` — atomically move one directory entry to an
