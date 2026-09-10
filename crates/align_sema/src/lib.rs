@@ -69218,7 +69218,7 @@ fn resolve_type(
             }
             Ty::Child
         }
-        "command" | "run_output" => {
+        "command" | "run_output" if !cx.type_table.get(cx.cur_module).is_some_and(|types|types.contains_key(name)) => {
             if !args.is_empty() {
                 diags.error(format!("{name} takes no type arguments"), span);
                 return Ty::Error;
@@ -71566,7 +71566,7 @@ mod tests {
         // JsonEncode replaces three variants with one fresh owned Result producer.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 332,
+            variants, 331,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

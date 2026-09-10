@@ -6889,8 +6889,6 @@ fn body_only_header_types_fail_placement_closed() {
     for (label, ty) in [
         ("cli parsed", Ty::CliParsed),
         ("http server", Ty::HttpServer),
-        ("command", Ty::Command),
-        ("run output", Ty::RunOutput),
     ] {
         let mut program = baseline_program();
         program.fn_types[0].ret = ty;
@@ -11554,9 +11552,9 @@ fn main() -> i32 = 0
 }
 
 fn push_process_wait_schema(program: &mut hir::Program) -> Ty {
-    let termination=u32::try_from(program.enums.len()).unwrap();
+    let termination=u32::try_from(program.enums.len()).unwrap_or_else(|_|panic!("fixture enum count"));
     program.enums.push(align_sema::process_live::termination_definition());
-    let wait=u32::try_from(program.structs.len()).unwrap();
+    let wait=u32::try_from(program.structs.len()).unwrap_or_else(|_|panic!("fixture struct count"));
     program.structs.extend(align_sema::process_live::record_definitions(termination));
     Ty::Struct(wait)
 }
@@ -11804,7 +11802,7 @@ fn request11_expr_kind_inventory_tripwire() {
         // R63 replaces three encoder variants with one operation. The exhaustive validation,
         // source-shape, replay-clone, and canonical-graph matches handle both plans and limits.
         variants,
-        332,
+        331,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }

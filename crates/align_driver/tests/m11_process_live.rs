@@ -166,10 +166,15 @@ fn retained_file_output_and_group_observation() {
     let source = format!(
         r#"import std.process
 import std.fs
+Outputs {{ handle: writer }}
+fn bind(borrow mut command: command, borrow outputs: Outputs) -> Result<(), Error> {{
+    command.stdout_to(outputs.handle)?
+    command.stderr_to(outputs.handle)?
+    Ok(())
+}}
 fn configure(borrow mut command: command, path: str) -> Result<(), Error> {{
-    writer := fs.create(path)?
-    command.stdout_to(writer)?
-    command.stderr_to(writer)?
+    outputs := Outputs {{ handle: fs.create(path)? }}
+    bind(command, outputs)?
     Ok(())
 }}
 pub fn main() -> Result<(), Error> {{
@@ -220,6 +225,54 @@ pub fn main() -> Result<(), Error> {{
         assert_eq!(
             String::from_utf8_lossy(&output.stdout),
             "outerrouterr\ntrue\ntrue\ntrue\ntrue\n"
+        );
+    }
+}
+
+#[test]
+fn imported_process_copy_signatures_reconstruct_capabilities() {
+    let helper = r#"module process_helpers
+import std.process
+pub fn termination() -> process.termination = process.termination.Exited(7)
+pub fn status() -> process.wait_result = process.wait_result { termination: termination(), max_rss_bytes: None }
+pub fn ready() -> process.readiness = process.readiness { stdout: true, stderr: false, status: true }
+pub fn signal() -> process.signal = process.signal.Terminate
+pub fn selection() -> process.signal_set = process.signal_set { hangup: false, interrupt: true, quit: false, terminate: true }
+pub fn snapshot() -> process.snapshot = process.snapshot { pid: 1, parent_pid: 0, rss_bytes: None, cpu_ns: None, threads: None }
+pub fn number(value: process.signal) -> i64 = process.signal_number(value)
+"#;
+    let main = r#"import process_helpers
+pub fn main() {
+    status := process_helpers.status()
+    print(match status.termination { Exited(value) => value, Signaled(value) => -value })
+    ready := process_helpers.ready()
+    print(ready.stdout)
+    selection := process_helpers.selection()
+    print(selection.interrupt)
+    snapshot := process_helpers.snapshot()
+    print(snapshot.pid)
+    print(process_helpers.number(process_helpers.signal()) > 0)
+}
+"#;
+    let files = [("process_helpers.align", helper), ("main.align", main)];
+    let checked = diff_check_multi("process-imported-copy", &files, "main.align");
+    assert!(
+        !checked.whole_errors && !checked.per_unit_errors,
+        "{}\n{}",
+        checked.whole_diags,
+        checked.per_unit_diags
+    );
+    if backend_available() {
+        let output =
+            build_per_unit_multi("process-imported-copy", &files, "main.align").link_and_run();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "7\ntrue\ntrue\n1\ntrue\n"
         );
     }
 }

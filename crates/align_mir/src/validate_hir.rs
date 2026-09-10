@@ -9070,9 +9070,9 @@ impl<'a> BodyValidator<'a> {
                 for (index,(input,argument)) in kind.inputs().iter().zip(args).enumerate() {
                     let expected = input_type(*input,&self.program.structs,&self.program.enums)?;
                     if !self.expr_flow(argument)?.falls { continue; }
-                    if argument.ty!=expected { return None; }
+                    if !self.body_ty_matches(argument.ty,expected) { return None; }
                     if let Input::Owner(ty) = input {
-                        if !self.local_handle_place(context,argument,*ty) { return None; }
+                        if index==0 && !self.local_handle_place(context,argument,*ty) { return None; }
                         if index==0 && kind.exclusive() {
                             let hir::ExprKind::Local(id) = argument.kind else { return None; };
                             let function = self.program.fns.get(context.function)?;

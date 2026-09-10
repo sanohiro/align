@@ -218,6 +218,14 @@ pub(crate) fn launch(
     capture: bool,
     force_group: bool,
 ) -> Result<Box<NativeChild>, i32> {
+    if command.cmd.as_bytes().is_empty()
+        || command
+            .cwd
+            .as_ref()
+            .is_some_and(|cwd| cwd.as_bytes().is_empty())
+    {
+        return Err(AL_INVALID);
+    }
     acquisition()?;
     let prepared = Prepared::new(command)?;
     let mut reservation = creation();
@@ -908,6 +916,19 @@ mod tests {
                 }
             }
             assert!(completed, "all acquisition phases must be exercised");
+        }
+    }
+    #[test]
+    fn empty_cwd_rejects_before_any_launch_acquisition() {
+        let mut configuration = command("exit 0");
+        configuration.cwd = Some(CString::new("").unwrap());
+        for capture in [false, true] {
+            OBSERVED_PHASE.with(|value| value.set(0));
+            assert!(matches!(
+                launch(&configuration, capture, false),
+                Err(AL_INVALID)
+            ));
+            assert_eq!(OBSERVED_PHASE.with(|value| value.get()), 0);
         }
     }
     #[test]

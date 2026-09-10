@@ -14,10 +14,6 @@ struct Observation {
     row: Snapshot,
     group: i64,
 }
-#[cfg(target_os = "macos")]
-fn error() -> i32 {
-    io_error_to_status(&std::io::Error::last_os_error())
-}
 fn budget(value: i64) -> Result<usize, i32> {
     if !(1..=536870910).contains(&value) {
         return Err(AL_INVALID);
@@ -51,7 +47,6 @@ fn candidates(maximum: usize) -> Result<Vec<i32>, i32> {
 }
 #[cfg(target_os = "linux")]
 fn observe(pid: i32) -> Result<Option<Observation>, i32> {
-    use std::io::Read;
     let file = match std::fs::File::open(format!("/proc/{pid}/stat")) {
         Ok(file) => file,
         Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
@@ -59,14 +54,26 @@ fn observe(pid: i32) -> Result<Option<Observation>, i32> {
         }
         Err(error) => return Err(io_error_to_status(&error)),
     };
+    let Some(bytes) = observation_bytes(file)? else {
+        return Ok(None);
+    };
+    parse_stat(pid, &bytes).map(Some)
+}
+#[cfg(any(test, target_os = "linux"))]
+fn observation_bytes(reader: impl std::io::Read) -> Result<Option<Vec<u8>>, i32> {
+    use std::io::Read;
     let mut bytes = Vec::new();
-    file.take(65537)
-        .read_to_end(&mut bytes)
-        .map_err(|e| io_error_to_status(&e))?;
+    match reader.take(65537).read_to_end(&mut bytes) {
+        Ok(_) => {}
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(io_error_to_status(&error)),
+    }
     if bytes.len() > 65536 {
         return Err(AL_INVALID);
     }
-    parse_stat(pid, &bytes).map(Some)
+    Ok(Some(bytes))
 }
 #[cfg(target_os = "linux")]
 fn parse_stat(pid: i32, bytes: &[u8]) -> Result<Observation, i32> {
@@ -142,8 +149,22 @@ fn candidates(maximum: usize) -> Result<Vec<i32>, i32> {
             bytes,
         )
     };
-    if used < 0 {
-        return Err(error());
+    let native_error = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    decode_pid_list(pids, used, bytes, native_error)
+}
+#[cfg(any(test, target_os = "macos"))]
+fn decode_pid_list(
+    mut pids: Vec<i32>,
+    used: i32,
+    bytes: i32,
+    native_error: i32,
+) -> Result<Vec<i32>, i32> {
+    if used <= 0 {
+        return Err(if native_error == 0 {
+            AL_INVALID
+        } else {
+            io_error_to_status(&std::io::Error::from_raw_os_error(native_error))
+        });
     }
     if used % 4 != 0 || used > bytes || used == bytes {
         return Err(AL_INVALID);
@@ -326,6 +347,36 @@ pub unsafe extern "C" fn align_rt_child_group_members(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_scan_failures_are_not_empty_observations() {
+        for native_error in [libc::EACCES, libc::EIO] {
+            assert_eq!(
+                decode_pid_list(vec![0; 3], 0, 12, native_error),
+                Err(io_error_to_status(&std::io::Error::from_raw_os_error(
+                    native_error
+                )))
+            );
+        }
+        assert_eq!(decode_pid_list(vec![0; 3], 0, 12, 0), Err(AL_INVALID));
+        assert_eq!(decode_pid_list(vec![3, 1, 0], 8, 12, 0), Ok(vec![1, 3]));
+        for used in [-1, 1, 12, 16] {
+            assert!(decode_pid_list(vec![0; 3], used, 12, 0).is_err());
+        }
+        struct Failure(i32);
+        impl std::io::Read for Failure {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from_raw_os_error(self.0))
+            }
+        }
+        for vanished in [libc::ENOENT, libc::ESRCH] {
+            assert_eq!(observation_bytes(Failure(vanished)), Ok(None));
+        }
+        assert!(observation_bytes(Failure(libc::EIO)).is_err());
+        assert_eq!(
+            observation_bytes(&b"record"[..]),
+            Ok(Some(b"record".to_vec()))
+        );
+    }
     #[test]
     fn bounded_table_layout_order_and_identity() {
         assert_eq!(core::mem::size_of::<Snapshot>(), 64);

@@ -28791,8 +28791,8 @@ fn main() -> i32 = 0
     fn struct_lowers_to_field_stores_and_loads() {
         let src = "Point { x: i32, y: i32 }\nfn main() -> i32 {\n  p := Point { x: 3, y: 4 }\n  return p.x + p.y\n}\n";
         let p = lower(src);
-        // Point and the six always-registered crypto, HTTP, regex, host and filesystem records.
-        assert_eq!(p.structs.len(), 7);
+        // Identify the source definition independently of the builtin record inventory.
+        assert_eq!(p.structs.iter().filter(|definition|definition.name=="Point").count(),1);
         let f = &p.fns[0];
         let stmts: Vec<&Stmt> = f.blocks.iter().flat_map(|b| &b.stmts).collect();
         // Two field stores for the literal, two field loads for the reads.
