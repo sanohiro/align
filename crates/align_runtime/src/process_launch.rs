@@ -819,7 +819,7 @@ pub(crate) mod tests {
             if let Some(status) = guard.0.try_wait().unwrap() {
                 // Reaping ends signal authority, including on an unsuccessful test exit.
                 guard.1 = false;
-                assert!(status.success());
+                assert!(status.success(), "isolated native owner failed: {status:?}");
                 return;
             }
             assert!(
@@ -854,12 +854,14 @@ pub(crate) mod tests {
                 libc::close(1);
                 libc::close(2);
             }
-            let mut child = launch(&command("exit 7"), false, false).unwrap();
-            assert_eq!(child.wait().unwrap().termination.exited, 7);
-            let mut captured = launch(&command("exit 8"), true, false).unwrap();
-            captured.stdout.fd.take();
-            captured.stderr.fd.take();
-            assert_eq!(captured.wait().unwrap().termination.exited, 8);
+            for (capture, timeout) in [(false,0),(true,0),(false,1_000_000_000),(true,1_000_000_000)] {
+                let mut configuration = command("exit 7");
+                configuration.timeout_ns = timeout;
+                let mut child = launch(&configuration, capture, false).unwrap();
+                child.stdout.fd.take();
+                child.stderr.fd.take();
+                assert_eq!(child.wait().unwrap().termination.exited, 7);
+            }
             std::process::exit(0);
         }
         isolated(NAME, "ALIGN_R65_CLOSED_STDIO");
@@ -1080,7 +1082,10 @@ pub(crate) mod tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::yield_now();
         }
-        assert_eq!(child.signal(0, true), Ok(()));
+        // Darwin may report ESRCH for a group containing only its unreaped zombie.
+        // The API preserves that native observation; loss of authority is Invalid.
+        let probe = child.signal(0, true);
+        assert!(probe == Ok(()) || probe == Err(libc::ESRCH), "{probe:?}");
         for signal in [-1, super::super::MAX_SIGNAL + 1, i64::MAX] {
             assert_eq!(child.signal(signal, true), Err(AL_INVALID));
         }
