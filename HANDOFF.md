@@ -1,5 +1,11 @@
 # Session handoff
 
+**Future std/pkg review (planned, no implementation scheduled):**
+[Plan 51](docs/impl/51-package-composition-review-plan.md) records the overlap
+assessment and existing-module priority: std.process, std.fs, then demonstrated
+std.cli gaps. No new exec/tree/CLI package is selected. Reuse and responsibility
+review precede additions; this is separate from completed R65 delivery.
+
 `std.fs` retained raw tree access (R64) is implemented under
 [plan 45](docs/impl/45-retained-byte-tree-plan.md): owned directory/cursor handles,
 independent raw-name enumeration, descriptor metadata/modes and relative operations.
