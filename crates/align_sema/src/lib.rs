@@ -249,6 +249,8 @@ pub enum Scalar {
     /// Exclusive process-global signal observation lease; opaque non-Send Move owner.
     Command,
     ProcessSignalSubscription,
+    ProcessChildScope,
+    ProcessMember,
     FsMemoryWriter,
     FsSealedFile,
     ProcessImage,
@@ -368,7 +370,7 @@ impl Scalar {
     /// the I/O handles `reader`/`writer`, a decoded `buffer`, a `cli parsed`, a `tcp_conn`, a
     /// `tcp_listener`, a `udp_socket`, or a package-defined resource.
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Logger | Scalar::XmlReader | Scalar::CryptoDigest | Scalar::FsDirectory | Scalar::FsDirCursor | Scalar::ProcessSignalSubscription | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command | Scalar::CodecEncoder | Scalar::Buffer | Scalar::SignatureKey(_) | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpClient | Scalar::HttpRequest | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::HttpUpgrade | Scalar::HttpReadStream | Scalar::HttpSseStream | Scalar::ResponseBuilder | Scalar::RunOutput | Scalar::RunBytes | Scalar::Resource(_))
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Logger | Scalar::XmlReader | Scalar::CryptoDigest | Scalar::FsDirectory | Scalar::FsDirCursor | Scalar::ProcessSignalSubscription | Scalar::ProcessChildScope | Scalar::ProcessMember | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command | Scalar::CodecEncoder | Scalar::Buffer | Scalar::SignatureKey(_) | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpClient | Scalar::HttpRequest | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::HttpUpgrade | Scalar::HttpReadStream | Scalar::HttpSseStream | Scalar::ResponseBuilder | Scalar::RunOutput | Scalar::RunBytes | Scalar::Resource(_))
     }
 }
 
@@ -667,6 +669,8 @@ pub enum Ty {
     FsDirCursor,
     /// Exclusive process-global signal observation lease; opaque non-Send Move owner.
     ProcessSignalSubscription,
+    ProcessChildScope,
+    ProcessMember,
     FsMemoryWriter,
     FsSealedFile,
     ProcessImage,
@@ -972,7 +976,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Ty::CryptoDigest
         | Ty::FsDirectory
         | Ty::FsDirCursor
-        | Ty::ProcessSignalSubscription | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
+        | Ty::ProcessSignalSubscription | Ty::ProcessChildScope | Ty::ProcessMember | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
         | Ty::CodecEncoder
         | Ty::Reader
         | Ty::Buffer
@@ -1049,7 +1053,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Scalar::CryptoDigest
         | Scalar::FsDirectory
         | Scalar::FsDirCursor
-        | Scalar::ProcessSignalSubscription | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command
+        | Scalar::ProcessSignalSubscription | Scalar::ProcessChildScope | Scalar::ProcessMember | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command
         | Scalar::CodecEncoder
         | Scalar::Buffer
         | Scalar::SignatureKey(_)
@@ -1124,6 +1128,8 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::FsDirCursor => Some(Scalar::FsDirCursor),
         Ty::Command => Some(Scalar::Command),
         Ty::ProcessSignalSubscription => Some(Scalar::ProcessSignalSubscription),
+        Ty::ProcessChildScope => Some(Scalar::ProcessChildScope),
+        Ty::ProcessMember => Some(Scalar::ProcessMember),
         Ty::FsMemoryWriter => Some(Scalar::FsMemoryWriter),
         Ty::FsSealedFile => Some(Scalar::FsSealedFile),
         Ty::ProcessImage => Some(Scalar::ProcessImage),
@@ -1275,6 +1281,8 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::FsDirCursor => Ty::FsDirCursor,
         Scalar::Command => Ty::Command,
         Scalar::ProcessSignalSubscription => Ty::ProcessSignalSubscription,
+        Scalar::ProcessChildScope => Ty::ProcessChildScope,
+        Scalar::ProcessMember => Ty::ProcessMember,
         Scalar::FsMemoryWriter => Ty::FsMemoryWriter,
         Scalar::FsSealedFile => Ty::FsSealedFile,
         Scalar::ProcessImage => Ty::ProcessImage,
@@ -1504,7 +1512,7 @@ pub fn heap_tree_record_error(
                 | Ty::CryptoDigest
                 | Ty::FsDirectory
                 | Ty::FsDirCursor
-                | Ty::ProcessSignalSubscription | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
+                | Ty::ProcessSignalSubscription | Ty::ProcessChildScope | Ty::ProcessMember | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
                 | Ty::SignatureKey(_) => {}
                 Ty::Struct(id) => work.push(Work::EnterStruct { id, path }),
                 Ty::Option(payload) => work.push(Work::Field {
@@ -1678,7 +1686,7 @@ fn materializes_fresh_soa_storage(expression: &Expr) -> bool {
 /// Whether a sum payload may be exposed as a read-only projection from a stable borrowed place.
 ///
 /// This is deliberately a closed, cycle-safe classifier. It admits primitive values and views,
-/// owned `string`, `buffer`, `writer`, ordinary dynamic scalar/AoS-record arrays, and finite acyclic
+/// owned `string`, `buffer`, `writer`, shared `process.member` authority, ordinary dynamic scalar/AoS-record arrays, and finite acyclic
 /// structs/sums whose reachable payload graph stays within the same set. Fixed/specialized arrays, aggregate buffers,
 /// builders, boxes, resources, and other opaque handles remain outside because their projection/drop/
 /// escape contracts are not defined.
@@ -1699,7 +1707,7 @@ pub fn borrowed_sum_payload_is_admissible(
     ) -> bool {
         match ty {
             Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Unit | Ty::Str | Ty::String
-            | Ty::Slice(_) | Ty::Raw | Ty::Rng | Ty::Buffer | Ty::Writer => true,
+            | Ty::Slice(_) | Ty::Raw | Ty::Rng | Ty::Buffer | Ty::Writer | Ty::ProcessMember => true,
             Ty::Struct(id) => {
                 if !active_structs.insert(id) {
                     return false;
@@ -2557,7 +2565,7 @@ pub fn drop_plan(
                         | Ty::CryptoDigest
                         | Ty::FsDirectory
                         | Ty::FsDirCursor
-                        | Ty::ProcessSignalSubscription | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
+                        | Ty::ProcessSignalSubscription | Ty::ProcessChildScope | Ty::ProcessMember | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
                         | Ty::CodecEncoder
                         | Ty::Reader
                         | Ty::Buffer
@@ -2943,7 +2951,7 @@ pub fn ty_contains_crypto_owner(root: Ty, structs: &[StructDef], tuples: &[hir::
 /// Dedicated AoS record-container formation remains the existing explicit exception.
 pub fn ty_contains_restricted_collection_owner(root: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], enums: &[hir::EnumDef], tagged_types: &[hir::TaggedType]) -> bool {
     ty_contains_leaf(root, structs, tuples, enums, tagged_types, |ty|
-        matches!(ty, Ty::Command | Ty::CryptoDigest | Ty::SignatureKey(_) | Ty::FsDirectory | Ty::FsDirCursor | Ty::ProcessSignalSubscription | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace))
+        matches!(ty, Ty::Command | Ty::CryptoDigest | Ty::SignatureKey(_) | Ty::FsDirectory | Ty::FsDirCursor | Ty::ProcessSignalSubscription | Ty::ProcessChildScope | Ty::ProcessMember | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace))
 }
 
 
@@ -3070,7 +3078,7 @@ fn ty_contains_leaf(
             | Ty::CryptoDigest
             | Ty::FsDirectory
             | Ty::FsDirCursor
-            | Ty::ProcessSignalSubscription | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
+            | Ty::ProcessSignalSubscription | Ty::ProcessChildScope | Ty::ProcessMember | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
             | Ty::CodecEncoder
             | Ty::Reader
             | Ty::Buffer
@@ -3347,7 +3355,7 @@ fn ty_contains_http_upgrade(
             | Ty::CryptoDigest
             | Ty::FsDirectory
             | Ty::FsDirCursor
-            | Ty::ProcessSignalSubscription | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
+            | Ty::ProcessSignalSubscription | Ty::ProcessChildScope | Ty::ProcessMember | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
             | Ty::CodecEncoder
             | Ty::Reader
             | Ty::Buffer
@@ -3465,7 +3473,7 @@ fn ty_contains_http_receive_stream(
             | Scalar::CryptoDigest
             | Scalar::FsDirectory
             | Scalar::FsDirCursor
-            | Scalar::ProcessSignalSubscription | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command
+            | Scalar::ProcessSignalSubscription | Scalar::ProcessChildScope | Scalar::ProcessMember | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command
             | Scalar::CodecEncoder
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
@@ -3606,7 +3614,7 @@ fn ty_contains_http_receive_stream(
             | Ty::CryptoDigest
             | Ty::FsDirectory
             | Ty::FsDirCursor
-            | Ty::ProcessSignalSubscription | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
+            | Ty::ProcessSignalSubscription | Ty::ProcessChildScope | Ty::ProcessMember | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
             | Ty::CodecEncoder
             | Ty::Reader
             | Ty::Buffer
@@ -3693,7 +3701,7 @@ pub fn http_stream_carrier_class(
             | Scalar::CryptoDigest
             | Scalar::FsDirectory
             | Scalar::FsDirCursor
-            | Scalar::ProcessSignalSubscription | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command
+            | Scalar::ProcessSignalSubscription | Scalar::ProcessChildScope | Scalar::ProcessMember | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command
             | Scalar::CodecEncoder
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
@@ -3833,7 +3841,7 @@ pub fn http_stream_carrier_class(
             | Ty::CryptoDigest
             | Ty::FsDirectory
             | Ty::FsDirCursor
-            | Ty::ProcessSignalSubscription | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
+            | Ty::ProcessSignalSubscription | Ty::ProcessChildScope | Ty::ProcessMember | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
             | Ty::CodecEncoder
             | Ty::Reader
             | Ty::Buffer
@@ -4481,6 +4489,8 @@ pub const BUILTIN_SPELLING_TYS: &[(&str, Ty)] = &[
     ("fs.directory", Ty::FsDirectory),
     ("fs.dir_cursor", Ty::FsDirCursor),
     ("process.signal_subscription", Ty::ProcessSignalSubscription),
+    ("process.child_scope", Ty::ProcessChildScope),
+    ("process.member", Ty::ProcessMember),
     ("fs.memory_writer", Ty::FsMemoryWriter),
     ("fs.sealed_file", Ty::FsSealedFile),
     ("process.image", Ty::ProcessImage),
@@ -4551,6 +4561,9 @@ fn builtin_spelling_ty(head: &str) -> Option<Ty> {
 /// spelling bridge lives here, and the ownership answer stays exactly [`needs_drop_flag`] — the same
 /// call that assigned the bit being validated.
 pub fn builtin_spelling_needs_return_cleanup(head: &str) -> Option<bool> {
+    if head == "process.member_info" {
+        return Some(needs_drop_flag(Ty::Struct(0), &[process_live::member_info_definition()], &[], &[], &[]));
+    }
     if process_live::COPY_NAMES.contains(&head) { return Some(false); }
     if head == "fs.dir_entry" { return Some(needs_drop_flag(Ty::Struct(0), &[fs_dir_entry_definition()], &[], &[], &[])); }
     if matches!(head, "fs.metadata" | "fs.entry_kind") {
@@ -4570,6 +4583,9 @@ pub fn builtin_spelling_needs_return_cleanup(head: &str) -> Option<bool> {
 /// bit. Keeping the Move answer in sema prevents the interface decoder from inventing a second
 /// builtin ownership table.
 pub fn builtin_spelling_is_move(head: &str) -> Option<bool> {
+    if head == "process.member_info" {
+        return Some(ty_is_move(Ty::Struct(0), &[process_live::member_info_definition()], &[], &[], &[]));
+    }
     if process_live::COPY_NAMES.contains(&head) { return Some(false); }
     if head == "fs.dir_entry" { return Some(ty_is_move(Ty::Struct(0), &[fs_dir_entry_definition()], &[], &[], &[])); }
     if matches!(head, "fs.metadata" | "fs.entry_kind") {
@@ -6243,6 +6259,10 @@ struct BuiltinNominalAlias {
 const BUILTIN_NOMINAL_ALIASES: &[BuiltinNominalAlias] = &[
     BuiltinNominalAlias { bare: "fs.dir_entry", explicit: "fs.dir_entry", canonical: "fs.dir_entry", required_import: Some("std.fs") },
     BuiltinNominalAlias { bare: "process.signal_subscription", explicit: "process.signal_subscription", canonical: "process.signal_subscription", required_import: Some("std.process") },
+    BuiltinNominalAlias { bare: "process.child_scope", explicit: "process.child_scope", canonical: "process.child_scope", required_import: Some("std.process") },
+    BuiltinNominalAlias { bare: "process.member", explicit: "process.member", canonical: "process.member", required_import: Some("std.process") },
+    BuiltinNominalAlias { bare: "process.member_info", explicit: "process.member_info", canonical: "process.member_info", required_import: Some("std.process") },
+    BuiltinNominalAlias { bare: "process.reaped", explicit: "process.reaped", canonical: "process.reaped", required_import: Some("std.process") },
     BuiltinNominalAlias { bare: "fs.memory_writer", explicit: "fs.memory_writer", canonical: "fs.memory_writer", required_import: Some("std.fs") },
     BuiltinNominalAlias { bare: "fs.sealed_file", explicit: "fs.sealed_file", canonical: "fs.sealed_file", required_import: Some("std.fs") },
     BuiltinNominalAlias { bare: "process.image", explicit: "process.image", canonical: "process.image", required_import: Some("std.process") },
@@ -8746,6 +8766,12 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         diags.error("process builtin type table capacity exceeded".to_string(), Span::new(0, 0, 0));
     }
 
+    if let Some(wait)=fs_tree::record_id(&structs,"process.wait_result") {
+        for definition in process_live::scope_record_definitions(wait) {
+            if let Ok(id)=u32::try_from(structs.len()) {struct_ids.insert(definition.name.clone(),id);structs.push(definition);}
+        }
+    }
+
     struct_ids.insert("os.host_info".to_string(), structs.len() as u32);
     structs.push(host_info_definition());
 
@@ -9276,6 +9302,8 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                     Ty::FsDirCursor => payload.push(Scalar::FsDirCursor),
                     Ty::Command => payload.push(Scalar::Command),
                     Ty::ProcessSignalSubscription => payload.push(Scalar::ProcessSignalSubscription),
+                    Ty::ProcessChildScope => payload.push(Scalar::ProcessChildScope),
+                    Ty::ProcessMember => payload.push(Scalar::ProcessMember),
                     Ty::FsMemoryWriter => payload.push(Scalar::FsMemoryWriter),
                     Ty::FsSealedFile => payload.push(Scalar::FsSealedFile),
                     Ty::ProcessImage => payload.push(Scalar::ProcessImage),
@@ -20000,7 +20028,7 @@ impl<'a> EscapeCheck<'a> {
             | Ty::CryptoDigest
             | Ty::FsDirectory
             | Ty::FsDirCursor
-            | Ty::ProcessSignalSubscription | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
+            | Ty::ProcessSignalSubscription | Ty::ProcessChildScope | Ty::ProcessMember | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
             | Ty::CodecEncoder
             | Ty::Child
             | Ty::HttpRequest
@@ -22158,7 +22186,7 @@ impl<'a> EscapeCheck<'a> {
             | Ty::CryptoDigest
             | Ty::FsDirectory
             | Ty::FsDirCursor
-            | Ty::ProcessSignalSubscription | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
+            | Ty::ProcessSignalSubscription | Ty::ProcessChildScope | Ty::ProcessMember | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
             | Ty::CodecEncoder
             | Ty::SignatureKey(_)
             // The compiler-internal `str_finder` plan owns a boxed searcher (it copied the needle
@@ -51223,6 +51251,10 @@ impl<'a, 't> Checker<'a, 't> {
         // values (in particular the bare `wait(handle)` task_group builtin is unaffected).
         if method == "wait" {
             let recv_expr = self.check_expr(recv, None);
+            if matches!(recv_expr.ty,Ty::ProcessChildScope | Ty::ProcessMember)
+                && let Some(kind)=process_live::ProcessLiveKind::from_method(recv_expr.ty,method) {
+                return self.check_process_live(kind,Some(recv_expr),args,span);
+            }
             if recv_expr.ty == Ty::Child {
                 return self.check_child_wait(recv_expr, args, span);
             }
@@ -51236,6 +51268,10 @@ impl<'a, 't> Checker<'a, 't> {
         // (`Result<(), Error>`). Dispatched on the receiver type so the name stays free on other values.
         if method == "kill" {
             let recv_expr = self.check_expr(recv, None);
+            if matches!(recv_expr.ty,Ty::ProcessChildScope | Ty::ProcessMember)
+                && let Some(kind)=process_live::ProcessLiveKind::from_method(recv_expr.ty,method) {
+                return self.check_process_live(kind,Some(recv_expr),args,span);
+            }
             if recv_expr.ty == Ty::Child {
                 return self.check_child_kill(recv_expr, args, span);
             }
@@ -66792,6 +66828,8 @@ fn ty_name(ty: Ty) -> String {
         Ty::FsDirectory => "fs.directory".to_string(),
         Ty::FsDirCursor => "fs.dir_cursor".to_string(),
         Ty::ProcessSignalSubscription => "process.signal_subscription".to_string(),
+        Ty::ProcessChildScope => "process.child_scope".to_string(),
+        Ty::ProcessMember => "process.member".to_string(),
         Ty::FsMemoryWriter => "fs.memory_writer".to_string(),
         Ty::FsSealedFile => "fs.sealed_file".to_string(),
         Ty::ProcessImage => "process.image".to_string(),
@@ -67208,6 +67246,8 @@ fn resolved_type_source_spelling(
         Ty::FsDirectory => "fs.directory".to_string(),
         Ty::FsDirCursor => "fs.dir_cursor".to_string(),
         Ty::ProcessSignalSubscription => "process.signal_subscription".to_string(),
+        Ty::ProcessChildScope => "process.child_scope".to_string(),
+        Ty::ProcessMember => "process.member".to_string(),
         Ty::FsMemoryWriter => "fs.memory_writer".to_string(),
         Ty::FsSealedFile => "fs.sealed_file".to_string(),
         Ty::ProcessImage => "process.image".to_string(),
@@ -68333,7 +68373,7 @@ fn scalar_arg(
         );
         return None;
     }
-    if matches!(ty, Ty::CliCommand) || (matches!(ty, Ty::Command | Ty::Reader | Ty::Writer | Ty::Logger | Ty::XmlReader | Ty::CodecBatch | Ty::CodecI64Column | Ty::CodecF64Column | Ty::CodecBoolColumn | Ty::CodecStrColumn | Ty::CryptoDigest | Ty::FsDirectory | Ty::FsDirCursor | Ty::ProcessSignalSubscription | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace | Ty::CodecEncoder | Ty::Buffer | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::HttpReadStream | Ty::HttpSseStream | Ty::ResponseBuilder | Ty::RunOutput | Ty::RunBytes) && !allow_param) {
+    if matches!(ty, Ty::CliCommand) || (matches!(ty, Ty::Command | Ty::Reader | Ty::Writer | Ty::Logger | Ty::XmlReader | Ty::CodecBatch | Ty::CodecI64Column | Ty::CodecF64Column | Ty::CodecBoolColumn | Ty::CodecStrColumn | Ty::CryptoDigest | Ty::FsDirectory | Ty::FsDirCursor | Ty::ProcessSignalSubscription | Ty::ProcessChildScope | Ty::ProcessMember | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace | Ty::CodecEncoder | Ty::Buffer | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::HttpReadStream | Ty::HttpSseStream | Ty::ResponseBuilder | Ty::RunOutput | Ty::RunBytes) && !allow_param) {
         diags.error(
             format!("{what} cannot be `{}` — an owned I/O handle/buffer is bound to one local, not collected into an array/slice/box (bind it to a local)", ty_name(ty)),
             span,
@@ -68432,7 +68472,7 @@ fn collection_scalar_type(ty: Ty) -> Option<Scalar> {
             | Ty::CryptoDigest
             | Ty::FsDirectory
             | Ty::FsDirCursor
-            | Ty::ProcessSignalSubscription | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
+            | Ty::ProcessSignalSubscription | Ty::ProcessChildScope | Ty::ProcessMember | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
             | Ty::CodecEncoder
             | Ty::Regex
             | Ty::Captures
@@ -68919,6 +68959,20 @@ fn resolve_type(
             return Ty::Error;
         }
         return Ty::ProcessSignalSubscription;
+    }
+    if path.segments.len()==2 && path.segments[0].name=="process" && name=="child_scope" {
+        if !cx.builtin_imports.contains("std.process") || !args.is_empty() {
+            diags.error("process.child_scope requires import std.process and takes no type arguments".to_string(),span);
+            return Ty::Error;
+        }
+        return Ty::ProcessChildScope;
+    }
+    if path.segments.len()==2 && path.segments[0].name=="process" && name=="member" {
+        if !cx.builtin_imports.contains("std.process") || !args.is_empty() {
+            diags.error("process.member requires import std.process and takes no type arguments".to_string(),span);
+            return Ty::Error;
+        }
+        return Ty::ProcessMember;
     }
     if path.segments.len()==2 && path.segments[0].name=="fs" && name=="memory_writer" {
         if !cx.builtin_imports.contains("std.fs") || !args.is_empty() {
@@ -69912,6 +69966,8 @@ pub const MOVE_HANDLE_TYPES: &[Ty] = &[
     Ty::FsDirectory,
     Ty::FsDirCursor,
     Ty::ProcessSignalSubscription,
+    Ty::ProcessChildScope,
+    Ty::ProcessMember,
     Ty::FsMemoryWriter,
     Ty::FsSealedFile,
     Ty::ProcessImage,
@@ -70340,7 +70396,7 @@ fn enum_payload_ok(
         | Scalar::CryptoDigest
         | Scalar::FsDirectory
         | Scalar::FsDirCursor
-        | Scalar::ProcessSignalSubscription | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command
+        | Scalar::ProcessSignalSubscription | Scalar::ProcessChildScope | Scalar::ProcessMember | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command
         | Scalar::CodecEncoder => true,
         // An owned scalar `array<T>` payload (J2) makes the enum Move (tag-switched drop). Flat
         // scalar-element arrays are admitted; bare `array<string>` is excluded because its

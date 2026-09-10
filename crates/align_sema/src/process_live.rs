@@ -8,6 +8,7 @@ pub const COPY_NAMES: &[&str] = &[
     "process.signal",
     "process.signal_set",
     "process.snapshot",
+    "process.reaped",
 ];
 pub fn termination_definition() -> hir::EnumDef {
     hir::EnumDef {
@@ -116,6 +117,30 @@ pub fn record_definitions(termination: u32) -> Vec<hir::StructDef> {
     })
     .collect()
 }
+pub fn member_info_definition() -> hir::StructDef {
+    hir::StructDef {
+        name: "process.member_info".into(),
+        source_name: "process.member_info".into(),
+        fields: vec![
+            hir::FieldDef { name: "handle".into(), ty: Ty::ProcessMember },
+            hir::FieldDef { name: "pid".into(), ty: Ty::Int(IntTy { bits: 64, signed: true }) },
+        ],
+        c_repr: false,
+        align: None,
+    }
+}
+pub fn scope_record_definitions(wait: u32) -> Vec<hir::StructDef> {
+    vec![member_info_definition(), hir::StructDef {
+        name: "process.reaped".into(),
+        source_name: "process.reaped".into(),
+        fields: vec![
+            hir::FieldDef { name: "pid".into(), ty: Ty::Int(IntTy { bits: 64, signed: true }) },
+            hir::FieldDef { name: "status".into(), ty: Ty::Struct(wait) },
+        ],
+        c_repr: false,
+        align: None,
+    }]
+}
 pub fn schemas_valid(structs: &[hir::StructDef], enums: &[hir::EnumDef]) -> bool {
     let mut termination_id = None;
     for expected in [
@@ -149,12 +174,14 @@ pub fn schemas_valid(structs: &[hir::StructDef], enums: &[hir::EnumDef]) -> bool
             }
         }
     }
-    for expected in record_definitions(termination_id.unwrap_or(0)) {
+    let wait_id=crate::fs_tree::record_id(structs,"process.wait_result");
+    for expected in record_definitions(termination_id.unwrap_or(0)).into_iter().chain(scope_record_definitions(wait_id.unwrap_or(0))) {
         let mut found = false;
         for actual in structs {
             if actual.name == expected.name || actual.source_name == expected.source_name {
                 if found
                     || (expected.name == "process.wait_result" && termination_id.is_none())
+                    || (expected.name == "process.reaped" && wait_id.is_none())
                     || actual.name != expected.name
                     || actual.source_name != expected.source_name
                     || actual.align.is_some()
@@ -196,6 +223,23 @@ pub enum ProcessLiveKind {
     SignalNew,
     SignalNext,
     SignalClose,
+    ScopeStart,
+    ScopeId,
+    ScopeOwnerId,
+    ScopeStatus,
+    ScopeTryWait,
+    ScopeWait,
+    ScopeReadStdout,
+    ScopeReadStderr,
+    ScopePoll,
+    ScopeKill,
+    ScopeKillGroup,
+    ScopeChildren,
+    ScopeReap,
+    ScopeRelease,
+    MemberKill,
+    MemberFinished,
+
     MemoryNew,
     MemoryWrite,
     MemorySeal,
@@ -259,6 +303,23 @@ impl ProcessLiveKind {
             Self::SignalNumber => &[Signal],
             Self::ProcessTable => &[Integer],
             Self::SignalNew => &[SignalSet],
+            Self::ScopeStart => &[Owner(Ty::Command)],
+            Self::ScopeId => &[Owner(Ty::ProcessChildScope)],
+            Self::ScopeOwnerId => &[Owner(Ty::ProcessChildScope)],
+            Self::ScopeStatus => &[Owner(Ty::ProcessChildScope)],
+            Self::ScopeTryWait => &[Owner(Ty::ProcessChildScope)],
+            Self::ScopeWait => &[Owner(Ty::ProcessChildScope)],
+            Self::ScopeReadStdout => &[Owner(Ty::ProcessChildScope),OutBytes],
+            Self::ScopeReadStderr => &[Owner(Ty::ProcessChildScope),OutBytes],
+            Self::ScopePoll => &[Owner(Ty::ProcessChildScope),Readiness,Integer],
+            Self::ScopeKill => &[Owner(Ty::ProcessChildScope),Integer],
+            Self::ScopeKillGroup => &[Owner(Ty::ProcessChildScope),Integer],
+            Self::ScopeChildren => &[Owner(Ty::ProcessChildScope),Integer],
+            Self::ScopeReap => &[Owner(Ty::ProcessChildScope),Integer],
+            Self::ScopeRelease => &[Owner(Ty::ProcessChildScope)],
+            Self::MemberKill => &[Owner(Ty::ProcessMember),Integer],
+            Self::MemberFinished => &[Owner(Ty::ProcessMember)],
+
             Self::MemoryNew => &[MemoryKind, Integer],
             Self::MemoryWrite => &[Owner(Ty::FsMemoryWriter), Bytes],
             Self::MemorySeal => &[Owner(Ty::FsMemoryWriter)],
@@ -285,6 +346,8 @@ impl ProcessLiveKind {
                 | Self::SignalNumber
                 | Self::SealedLen
                 | Self::ImageLen
+                | Self::ScopeId
+                | Self::ScopeOwnerId
         )
     }
     pub fn fallible(self) -> bool {
@@ -306,6 +369,18 @@ impl ProcessLiveKind {
                 | Self::InheritNamespace
                 | Self::SignalNext
                 | Self::SignalClose
+                | Self::ScopeStatus
+                | Self::ScopeTryWait
+                | Self::ScopeWait
+                | Self::ScopeReadStdout
+                | Self::ScopeReadStderr
+                | Self::ScopePoll
+                | Self::ScopeKill
+                | Self::ScopeKillGroup
+                | Self::ScopeChildren
+                | Self::ScopeReap
+                | Self::ScopeRelease
+
         )
     }
     pub fn scratch(self) -> bool {
@@ -318,11 +393,16 @@ impl ProcessLiveKind {
                 | Self::ChildKillGroup
                 | Self::SignalNumber
                 | Self::SignalClose
+                | Self::ScopeKill
+                | Self::ScopeKillGroup
+                | Self::MemberKill
                 | Self::MemoryWrite
                 | Self::InheritFile
                 | Self::InheritNamespace
                 | Self::SealedLen
                 | Self::ImageLen
+                | Self::ScopeId
+                | Self::ScopeOwnerId
         )
     }
     pub fn from_method(receiver: Ty, name: &str) -> Option<Self> {
@@ -351,6 +431,22 @@ impl ProcessLiveKind {
             (Ty::ProcessImage, "read_at") => Self::ImageReadAt,
             (Ty::Command, "inherit_file") => Self::InheritFile,
             (Ty::Command, "inherit_namespace") => Self::InheritNamespace,
+            (Ty::Command,"start_scope") => Self::ScopeStart,
+            (Ty::ProcessChildScope,"id") => Self::ScopeId,
+            (Ty::ProcessChildScope,"owner_id") => Self::ScopeOwnerId,
+            (Ty::ProcessChildScope,"status") => Self::ScopeStatus,
+            (Ty::ProcessChildScope,"try_wait") => Self::ScopeTryWait,
+            (Ty::ProcessChildScope,"wait") => Self::ScopeWait,
+            (Ty::ProcessChildScope,"read_stdout") => Self::ScopeReadStdout,
+            (Ty::ProcessChildScope,"read_stderr") => Self::ScopeReadStderr,
+            (Ty::ProcessChildScope,"poll") => Self::ScopePoll,
+            (Ty::ProcessChildScope,"kill") => Self::ScopeKill,
+            (Ty::ProcessChildScope,"kill_group") => Self::ScopeKillGroup,
+            (Ty::ProcessChildScope,"children") => Self::ScopeChildren,
+            (Ty::ProcessChildScope,"reap") => Self::ScopeReap,
+            (Ty::ProcessChildScope,"release") => Self::ScopeRelease,
+            (Ty::ProcessMember,"finished") => Self::MemberFinished,
+            (Ty::ProcessMember,"kill") => Self::MemberKill,
             _ => return None,
         })
     }
@@ -390,6 +486,22 @@ pub fn payload_type(
         signed: true,
     });
     Some(match kind {
+        ScopeStart => Ty::ProcessChildScope,
+        ScopeId => Ty::Int(IntTy {bits:64,signed:true}),
+        ScopeOwnerId => Ty::Int(IntTy {bits:64,signed:true}),
+        ScopeStatus => payload_type(ChildStatus,structs,enums)?,
+        ScopeTryWait => payload_type(ChildTryWait,structs,enums)?,
+        ScopeWait => Ty::Struct(crate::fs_tree::record_id(structs,"process.wait_result")?),
+        ScopeReadStdout => payload_type(ChildReadStdout,structs,enums)?,
+        ScopeReadStderr => payload_type(ChildReadStderr,structs,enums)?,
+        ScopePoll => payload_type(ChildPoll,structs,enums)?,
+        ScopeKill => Ty::Unit,
+        ScopeKillGroup => Ty::Unit,
+        ScopeChildren => Ty::DynStructArray(crate::fs_tree::record_id(structs,"process.member_info")?,crate::Layout::Aos),
+        ScopeReap => Ty::DynStructArray(crate::fs_tree::record_id(structs,"process.reaped")?,crate::Layout::Aos),
+        ScopeRelease => Ty::Bool,
+        MemberKill => Ty::Unit,
+        MemberFinished => Ty::Bool,
         CommandNewSession | CommandStdoutTo | CommandStderrTo | ChildKillGroup => Ty::Unit,
         CommandStart => Ty::Child,
         SignalNew => Ty::ProcessSignalSubscription,

@@ -1418,6 +1418,11 @@ const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("udp_socket", 0, BuiltinCapability::Opaque),
     ("child", 0, BuiltinCapability::Opaque),
     ("process.signal_subscription", 0, BuiltinCapability::Opaque),
+    ("process.child_scope", 0, BuiltinCapability::Opaque),
+    ("process.member", 0, BuiltinCapability::Opaque),
+    ("process.member_info", 0, BuiltinCapability::Opaque),
+    ("process.reaped", 0, BuiltinCapability::Opaque),
+
     ("fs.memory_writer", 0, BuiltinCapability::Opaque),
     ("fs.sealed_file", 0, BuiltinCapability::Opaque),
     ("process.image", 0, BuiltinCapability::Opaque),
@@ -2709,7 +2714,7 @@ pub fn summary_to_source(
                             builtin_type_imports.insert("std.crypto".to_string());
                         }
                         "fs.memory_writer" | "fs.sealed_file" | "fs.memory_kind" | "fs.directory" | "fs.dir_cursor" | "fs.dir_entry" | "fs.metadata" | "fs.entry_kind" => { builtin_type_imports.insert("std.fs".to_string()); }
-                        "process.image" | "process.user_namespace" | "process.signal_subscription" => { builtin_type_imports.insert("std.process".to_string()); }
+                        "process.child_scope" | "process.member" | "process.member_info" | "process.reaped" | "process.image" | "process.user_namespace" | "process.signal_subscription" => { builtin_type_imports.insert("std.process".to_string()); }
                         "os.host_info" => { builtin_type_imports.insert("std.os".to_string()); }
                         "process.termination" | "process.wait_result" | "process.readiness" | "process.signal" | "process.signal_set" | "process.snapshot" | "command" | "run_output" => { builtin_type_imports.insert("std.process".to_string()); }
                         "regex.regex_match" => {
@@ -2982,7 +2987,7 @@ mod builtin_spelling_tests {
     }
 
     #[test]
-    fn xml_reader_return_cleanup_is_authenticated_from_the_independent_builtin_inventory() {
+    fn owned_builtin_return_cleanup_is_authenticated_from_the_independent_inventory() {
         let mut summary = InterfaceSummary {
             unit: "xml_provider".to_owned(),
             fns: vec![IFnSig {
@@ -3012,12 +3017,32 @@ mod builtin_spelling_tests {
             interface_hash: Hash128 { lo: 0, hi: 0 },
             impl_hash: Hash128 { lo: 0, hi: 0 },
         };
-        assert!(validate_for_import(&summary).is_ok());
-
-        summary.fns[0].return_cleanup = align_sema::hir::ReturnCleanupAbi::None;
-        assert_eq!(
-            validate_for_import(&summary),
-            Err(ImportCompatibilityError::ReturnCleanupMismatch),
-        );
+        for (spelling, owned) in [
+            ("xml.reader", true),
+            ("process.signal_subscription", true),
+            ("fs.memory_writer", true),
+            ("fs.sealed_file", true),
+            ("process.image", true),
+            ("process.user_namespace", true),
+            ("process.child_scope", true),
+            ("process.member", true),
+            ("process.member_info", true),
+            ("process.reaped", false),
+        ] {
+            assert_eq!(align_sema::builtin_spelling_is_move(spelling), Some(owned), "{spelling}");
+            summary.fns[0].ret = IType::Named { path: spelling.to_owned(), args: Vec::new() };
+            let valid = if owned { align_sema::hir::ReturnCleanupAbi::DynamicBit }
+                else { align_sema::hir::ReturnCleanupAbi::None };
+            let invalid = if owned { align_sema::hir::ReturnCleanupAbi::None }
+                else { align_sema::hir::ReturnCleanupAbi::DynamicBit };
+            summary.fns[0].return_cleanup = valid;
+            assert!(validate_for_import(&summary).is_ok(), "{spelling}");
+            summary.fns[0].return_cleanup = invalid;
+            assert_eq!(
+                validate_for_import(&summary),
+                Err(ImportCompatibilityError::ReturnCleanupMismatch),
+                "{spelling}",
+            );
+        }
     }
 }

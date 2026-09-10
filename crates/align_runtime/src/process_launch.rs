@@ -31,6 +31,11 @@ std::thread_local! {
     static FAILURE_PHASE: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
     static OBSERVED_PHASE: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn inject_acquisition_failure(phase:usize) {
+    FAILURE_PHASE.with(|value|value.set(phase));
+    OBSERVED_PHASE.with(|value|value.set(0));
+}
 // Parent-side acquisition checkpoints; never called from a forked bootstrap.
 #[inline]
 fn acquisition() -> Result<(), i32> {
@@ -231,6 +236,13 @@ pub(crate) fn launch(
     capture: bool,
     force_group: bool,
 ) -> Result<Box<NativeChild>, i32> {
+    launch_inner(command, capture, force_group, false)
+}
+#[cfg(target_os="linux")]
+pub(crate) fn launch_scope_root(command: &Command) -> Result<Box<NativeChild>, i32> {
+    launch_inner(command, true, false, true)
+}
+fn launch_inner(command: &Command, capture: bool, force_group: bool, scoped: bool) -> Result<Box<NativeChild>, i32> {
     if matches!(&command.target, super::CommandTarget::Path(path) if path.as_bytes().is_empty())
         || command
             .cwd
@@ -242,7 +254,7 @@ pub(crate) fn launch(
     acquisition()?;
     let prepared = Prepared::new(command)?;
     let mut reservation = creation();
-    if reservation.scope {
+    if reservation.scope != scoped {
         return Err(AL_INVALID);
     }
     let mut disposition: libc::sigaction = unsafe { core::mem::zeroed() };
@@ -319,17 +331,18 @@ pub(crate) fn launch(
                 error_write.as_raw_fd(),
                 &mask,
                 force_group,
+                scoped,
             )
         }
     }
     child.started = std::time::Instant::now();
     child.pid =
         i32::try_from(pid).unwrap_or_else(|_| super::panic_abort("invalid native child PID"));
-    reservation.children = reservation
-        .children
-        .checked_add(1)
-        .unwrap_or_else(|| super::panic_abort("process owner count overflow"));
-    child.tracked = true;
+    if !scoped {
+        reservation.children = reservation.children.checked_add(1)
+            .unwrap_or_else(|| super::panic_abort("process owner count overflow"));
+        child.tracked = true;
+    }
     #[cfg(test)]
     if capture {
         super::CAPTURE_FORK_COUNT.with(|count| count.set(count.get() + 1));
@@ -670,7 +683,11 @@ unsafe fn bootstrap(
     error_fd: i32,
     mask: &SignalMask,
     force_group: bool,
+    scoped: bool,
 ) -> ! {
+    if scoped && unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        unsafe { report_and_exit(error_fd, native_error()) }
+    }
     let reset = unsafe { reset_caught() };
     if reset != 0 {
         unsafe { report_and_exit(error_fd, reset) }

@@ -5248,7 +5248,7 @@ fn native_owner_mir_contract<'a>(
     match value {
         Rvalue::ProcessLive { kind, args, out } => {
             contract.result = if kind.fallible() { i32_ty } else if out.is_some() { Ty::Unit }
-                else if matches!(kind,align_sema::process_live::ProcessLiveKind::ChildId | align_sema::process_live::ProcessLiveKind::SignalNumber | align_sema::process_live::ProcessLiveKind::SealedLen | align_sema::process_live::ProcessLiveKind::ImageLen) { i64_ty } else { Ty::Unit };
+                else if matches!(kind,align_sema::process_live::ProcessLiveKind::ScopeId | align_sema::process_live::ProcessLiveKind::ScopeOwnerId | align_sema::process_live::ProcessLiveKind::ChildId | align_sema::process_live::ProcessLiveKind::SignalNumber | align_sema::process_live::ProcessLiveKind::SealedLen | align_sema::process_live::ProcessLiveKind::ImageLen) { i64_ty } else { Ty::Unit };
             for (index,(input,operand)) in kind.inputs().iter().zip(args).enumerate() {
                 use align_sema::process_live::Input;
                 if *input==Input::OutBytes {
@@ -12893,7 +12893,7 @@ fn validate_tagged_program_inner(
                 | Scalar::CryptoDigest
                 | Scalar::FsDirectory
                 | Scalar::FsDirCursor
-                | Scalar::ProcessSignalSubscription | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command
+                | Scalar::ProcessSignalSubscription | Scalar::ProcessChildScope | Scalar::ProcessMember | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command
                 | Scalar::CodecEncoder
                 | Scalar::SignatureKey(_)
                 | Scalar::Regex
@@ -13040,7 +13040,7 @@ fn validate_tagged_program_inner(
                         | Ty::CryptoDigest
                         | Ty::FsDirectory
                         | Ty::FsDirCursor
-                        | Ty::ProcessSignalSubscription | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
+                        | Ty::ProcessSignalSubscription | Ty::ProcessChildScope | Ty::ProcessMember | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
                         | Ty::CodecEncoder
                         | Ty::SignatureKey(_)
                         | Ty::StrFinder
@@ -16364,7 +16364,7 @@ fn tagged_child(payload: Scalar) -> Option<u32> {
         | Scalar::CryptoDigest
         | Scalar::FsDirectory
         | Scalar::FsDirCursor
-        | Scalar::ProcessSignalSubscription | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command
+        | Scalar::ProcessSignalSubscription | Scalar::ProcessChildScope | Scalar::ProcessMember | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command
         | Scalar::CodecEncoder
         | Scalar::SignatureKey(_)
         | Scalar::Regex
@@ -16584,7 +16584,7 @@ fn abi_type<'c>(
         | Ty::CryptoDigest
         | Ty::FsDirectory
         | Ty::FsDirCursor
-        | Ty::ProcessSignalSubscription | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
+        | Ty::ProcessSignalSubscription | Ty::ProcessChildScope | Ty::ProcessMember | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
         | Ty::CodecEncoder
         | Ty::ArrayBuilder(_)
         | Ty::VecArrayBuilder(..)
@@ -16951,7 +16951,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::Reader | Scalar::Writer | Scalar::Logger | Scalar::XmlReader => {
             unreachable!("an I/O/logger/XML handle is not a box/array payload")
         }
-        Scalar::Buffer | Scalar::CryptoDigest | Scalar::FsDirectory | Scalar::FsDirCursor | Scalar::ProcessSignalSubscription | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command | Scalar::CodecEncoder | Scalar::SignatureKey(_) => {
+        Scalar::Buffer | Scalar::CryptoDigest | Scalar::FsDirectory | Scalar::FsDirCursor | Scalar::ProcessSignalSubscription | Scalar::ProcessChildScope | Scalar::ProcessMember | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command | Scalar::CodecEncoder | Scalar::SignatureKey(_) => {
             unreachable!("a buffer/key handle is not a box/array payload")
         }
         Scalar::CodecBatch
@@ -17067,6 +17067,8 @@ fn handle_free_key(ty: Ty) -> Option<RuntimeKey> {
         Ty::FsDirectory => RuntimeKey::FsDirectoryFree,
         Ty::FsDirCursor => RuntimeKey::FsCursorFree,
         Ty::ProcessSignalSubscription => RuntimeKey::ProcessSignalFree,
+        Ty::ProcessChildScope => RuntimeKey::ScopeFree,
+        Ty::ProcessMember => RuntimeKey::ProcessMemberFree,
         Ty::FsMemoryWriter => RuntimeKey::FsMemoryFree,
         Ty::FsSealedFile => RuntimeKey::FsSealedFree,
         Ty::ProcessImage => RuntimeKey::ProcessImageFree,
@@ -24239,6 +24241,22 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     ProcessLiveKind::RunBytesStatus => RuntimeKey::RunBytesStatus,
                     ProcessLiveKind::SignalNumber => RuntimeKey::ProcessSignalNumber,
                     ProcessLiveKind::ProcessTable => RuntimeKey::ProcessTable,
+                    ProcessLiveKind::ScopeStart => RuntimeKey::CommandStartScope,
+                    ProcessLiveKind::ScopeId => RuntimeKey::ChildId,
+                    ProcessLiveKind::ScopeOwnerId => RuntimeKey::ScopeOwnerId,
+                    ProcessLiveKind::ScopeStatus => RuntimeKey::ChildStatus,
+                    ProcessLiveKind::ScopeTryWait => RuntimeKey::ChildTryWait,
+                    ProcessLiveKind::ScopeWait => RuntimeKey::ChildWait,
+                    ProcessLiveKind::ScopeReadStdout => RuntimeKey::ChildReadStdout,
+                    ProcessLiveKind::ScopeReadStderr => RuntimeKey::ChildReadStderr,
+                    ProcessLiveKind::ScopePoll => RuntimeKey::ChildPoll,
+                    ProcessLiveKind::ScopeKill => RuntimeKey::ChildKill,
+                    ProcessLiveKind::ScopeKillGroup => RuntimeKey::ChildKillGroup,
+                    ProcessLiveKind::ScopeChildren => RuntimeKey::ScopeChildren,
+                    ProcessLiveKind::ScopeReap => RuntimeKey::ScopeReap,
+                    ProcessLiveKind::ScopeRelease => RuntimeKey::ScopeRelease,
+                    ProcessLiveKind::MemberKill => RuntimeKey::ProcessMemberKill,
+                    ProcessLiveKind::MemberFinished => RuntimeKey::ProcessMemberFinished,
                     ProcessLiveKind::SignalNew => RuntimeKey::ProcessSignals,
                     ProcessLiveKind::SignalNext => RuntimeKey::ProcessSignalNext,
                     ProcessLiveKind::SignalClose => RuntimeKey::ProcessSignalClose,
@@ -26543,7 +26561,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             | Ty::CryptoDigest
             | Ty::FsDirectory
             | Ty::FsDirCursor
-            | Ty::ProcessSignalSubscription | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
+            | Ty::ProcessSignalSubscription | Ty::ProcessChildScope | Ty::ProcessMember | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
             | Ty::CodecEncoder
             | Ty::ArrayBuilder(_)
             | Ty::VecArrayBuilder(..)
@@ -44220,7 +44238,7 @@ fn main() -> i32 = 0
     #[test]
     fn live_process_mir_contract_matrix() -> Result<(), &'static str> {
         use align_sema::process_live::ProcessLiveKind;
-        let base=mir("import std.process\nimport std.fs\nfn memory(kind: fs.memory_kind, cap:i64) -> Result<fs.memory_writer,Error> = fs.memory_file(kind,cap)\nfn write(borrow mut writer:fs.memory_writer, data:str) -> Result<(),Error> = writer.write(data)\nfn seal(writer:fs.memory_writer) -> Result<fs.sealed_file,Error> = writer.seal()\nfn length(borrow file:fs.sealed_file) -> i64 = file.len()\nfn positional(borrow file:fs.sealed_file, out bytes:slice<u8>) -> Result<i64,Error> = file.read_at(0,bytes)\nfn executable(borrow file:fs.sealed_file) -> Result<process.image,Error> = process.executable(file)\nfn image_length(borrow image:process.image) -> i64 = image.len()\nfn image_read(borrow image:process.image, out bytes:slice<u8>) -> Result<i64,Error> = image.read_at(0,bytes)\nfn image_command(borrow image:process.image, args:slice<str>) -> Result<command,Error> = process.command_image(image,args)\nfn current() -> Result<reader,Error> = process.current_image()\nfn namespace(path:str) -> Result<process.user_namespace,Error> = process.user_namespace(path)\nfn inherit(borrow mut command:command, borrow file:fs.sealed_file, slot:i64) -> Result<(),Error> = command.inherit_file(file,slot)\nfn inherit_ns(borrow mut command:command, borrow ns:process.user_namespace, slot:i64) -> Result<(),Error> = command.inherit_namespace(ns,slot)\nfn read(borrow mut child: child,out bytes:slice<u8>) -> Result<Option<i64>,Error> = child.read_stdout(bytes)\nfn status(borrow output:run_bytes) -> process.wait_result = output.status()\nfn signals(selection: process.signal_set) -> Result<process.signal_subscription,Error> = process.signals(selection)\nfn next(borrow mut subscription: process.signal_subscription) -> Result<Option<process.signal>,Error> = subscription.next()\nfn close(borrow mut subscription: process.signal_subscription) -> Result<(),Error> = subscription.close()\nfn main() {}\n");
+        let base=mir("import std.process\nimport std.fs\nfn scope_start(borrow command:command) -> Result<process.child_scope,Error> = command.start_scope()\nfn scope_id(borrow scope:process.child_scope) -> i64 = scope.id()\nfn scope_owner(borrow scope:process.child_scope) -> i64 = scope.owner_id()\nfn scope_status(borrow mut scope:process.child_scope) -> Result<Option<process.termination>,Error> = scope.status()\nfn scope_try(borrow mut scope:process.child_scope) -> Result<Option<process.wait_result>,Error> = scope.try_wait()\nfn scope_wait(borrow mut scope:process.child_scope) -> Result<process.wait_result,Error> = scope.wait()\nfn scope_stdout(borrow mut scope:process.child_scope,out bytes:slice<u8>) -> Result<Option<i64>,Error> = scope.read_stdout(bytes)\nfn scope_stderr(borrow mut scope:process.child_scope,out bytes:slice<u8>) -> Result<Option<i64>,Error> = scope.read_stderr(bytes)\nfn scope_poll(borrow mut scope:process.child_scope, interest:process.readiness) -> Result<process.readiness,Error> = scope.poll(interest,0)\nfn scope_kill(borrow mut scope:process.child_scope) -> Result<(),Error> = scope.kill(0)\nfn scope_group(borrow mut scope:process.child_scope) -> Result<(),Error> = scope.kill_group(0)\nfn scope_children(borrow mut scope:process.child_scope) -> Result<array<process.member_info>,Error> = scope.children(1)\nfn scope_reap(borrow mut scope:process.child_scope) -> Result<array<process.reaped>,Error> = scope.reap(1)\nfn scope_release(borrow mut scope:process.child_scope) -> Result<bool,Error> = scope.release()\nfn member_kill(borrow member:process.member) -> Result<(),Error> = member.kill(0)\nfn member_finished(borrow member:process.member) -> Result<bool,Error> = member.finished()\nfn memory(kind: fs.memory_kind, cap:i64) -> Result<fs.memory_writer,Error> = fs.memory_file(kind,cap)\nfn write(borrow mut writer:fs.memory_writer, data:str) -> Result<(),Error> = writer.write(data)\nfn seal(writer:fs.memory_writer) -> Result<fs.sealed_file,Error> = writer.seal()\nfn length(borrow file:fs.sealed_file) -> i64 = file.len()\nfn positional(borrow file:fs.sealed_file, out bytes:slice<u8>) -> Result<i64,Error> = file.read_at(0,bytes)\nfn executable(borrow file:fs.sealed_file) -> Result<process.image,Error> = process.executable(file)\nfn image_length(borrow image:process.image) -> i64 = image.len()\nfn image_read(borrow image:process.image, out bytes:slice<u8>) -> Result<i64,Error> = image.read_at(0,bytes)\nfn image_command(borrow image:process.image, args:slice<str>) -> Result<command,Error> = process.command_image(image,args)\nfn current() -> Result<reader,Error> = process.current_image()\nfn namespace(path:str) -> Result<process.user_namespace,Error> = process.user_namespace(path)\nfn inherit(borrow mut command:command, borrow file:fs.sealed_file, slot:i64) -> Result<(),Error> = command.inherit_file(file,slot)\nfn inherit_ns(borrow mut command:command, borrow ns:process.user_namespace, slot:i64) -> Result<(),Error> = command.inherit_namespace(ns,slot)\nfn read(borrow mut child: child,out bytes:slice<u8>) -> Result<Option<i64>,Error> = child.read_stdout(bytes)\nfn status(borrow output:run_bytes) -> process.wait_result = output.status()\nfn signals(selection: process.signal_set) -> Result<process.signal_subscription,Error> = process.signals(selection)\nfn next(borrow mut subscription: process.signal_subscription) -> Result<Option<process.signal>,Error> = subscription.next()\nfn close(borrow mut subscription: process.signal_subscription) -> Result<(),Error> = subscription.close()\nfn main() {}\n");
         assert!(validate_mir_producers(&base).is_ok(), "{:?}", validate_mir_producers(&base));
         let mut producers=0;
         for (fi,function) in base.fns.iter().enumerate() {
@@ -44245,7 +44263,7 @@ fn main() -> i32 = 0
                 }
             }
         }
-        assert_eq!(producers,18);
+        assert_eq!(producers,34);
         for mode in [align_ast::ParamMode::ByValue,align_ast::ParamMode::Borrow,align_ast::ParamMode::BorrowMut] {
             let mut bad=base.clone();
             let function=bad.fns.iter_mut().find(|function|function.name.as_str()=="read").ok_or("read")?;

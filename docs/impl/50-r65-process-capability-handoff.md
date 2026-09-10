@@ -533,3 +533,45 @@ AL_CODE + native ENOTSUP; it must not compare the status directly with errno.
 Internal ESRCH/EINTR branches likewise compare raw errno before conversion or
 compare the encoded status afterwards. This closes the native-error-encoding
 axis of the matrix without changing the public Error contract.
+
+## Exclusive-scope implementation evidence
+
+`process_scope.rs` owns the lease, Linux subreaper restoration, bounded child
+observations and process pidfds. `process_launch` serializes admission with every
+ordinary launch, while the scope-specific bootstrap sets NO_NEW_PRIVS before exec.
+The root uses the offset-zero NativeChild state and shared status/reap cache.
+No member stores a numeric PID for signalling; its sole field is an owned pidfd.
+
+The capability-4 matrix maps to these invariant-level owners:
+
+- `exclusive_scope` and `foreign_children_and_failed_constructor` cover existing
+  ordinary and clone children, cached handles, concurrent ordinary launch, second
+  scope rejection, existing subreaper, SIGCHLD IGN/NOCLDWAIT and failed exec.
+- `restoration_and_reap_failure_state` and
+  `constructor_phases_and_partial_observations` inject every acquisition phase,
+  partial member admission, kill denial, partial reap and restoration failure.
+  The native lease remains retryable, completed root cache survives output
+  failure, partial pidfds close and contradictory foreign state remains lost.
+- `adoption_and_drop` uses nested setsid/orphan adoption and verifies the kernel
+  ECHILD witness after Drop; intentionally retaining the raw owner is the negative
+  control that leaves both lease and children present. Released-owner operations
+  and Drop cannot touch a later scope. Retained pidfds remain finished after reap
+  and return the shared encoded ESRCH instead of addressing a later PID.
+- `m11_process_scope` runs whole/per-unit imported generic and owned-carrier
+  transport, shared member_info helpers, record/sum/Option/Result, branches,
+  loops, early error propagation, replacement and Drop with stable fd counts.
+  Dedicated native C fixtures exercise CLONE_PARENT and a zombie
+  thread leader with a live worker; process completion stays false until the
+  worker exits, and the executed root independently observes NO_NEW_PRIVS.
+  `non_sigchld_wait_domain` deliberately injects a direct clone with exit_signal=0
+  in an isolated test scope: plain wait falsely reports ECHILD while the scope's
+  __WALL admission, absence and reap owners retain and recover that child.
+- Native layout/range owners, canonical leaves, every scope/member producer in
+  the HIR/MIR mutation sweeps and all nine native declaration/export rows close
+  ABI/cache and malformed-input cells. macOS performs source/interface checks
+  and returns its encoded native ENOTSUP at scope acquisition.
+
+The scope adds fixed owner state and no helper process. Children charges every
+task entry and PID candidate and publishes sorted unique owned records only on
+success; reap bounds successful events and publishes no partial result on error.
+No throughput promise or application cleanup policy is introduced.
