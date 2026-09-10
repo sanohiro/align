@@ -1,5 +1,15 @@
 # Checked-HIR validation ledger
 
+**R63 implementation contract:**
+[Plan 47](47-json-numeric-contract.md) supersedes this document's JSON float
+exclusions, infallible/arena-view encoder result, bounded-only encoder IR/native
+names and V1/V2 JSON transport. Both encoders return owned `Result<string, Error>`;
+§§1–5 fix errors, ownership, V3 descriptor/envelope, interface 11 -> 12, the unified
+HIR/MIR operation and exact ABI rows. §8 owns closure and §9 performance evidence.
+Historical vectors/version transitions and current shipped ABI inventories below
+remain baseline records, not alternate implementation contracts. In particular,
+plan 47 records the replacement ABI counts and rows.
+
 ## Status and authority
 
 This is the exact per-record contract owned by L2b-a2-am-r and consumed by
@@ -1081,7 +1091,7 @@ means:
 | `SliceRange` | `env[start presence,end presence]`; `child[recv,start if present,end if present]`; `post[start/end i64; recv Str→Str or fixed/dynamic primitive array/Slice(s)→Slice(s); result view inherits recv owner/region; range action last]`. |
 | `ElemField` | `env[path,struct_id]`: nonempty valid path in struct_id. `child[recv,index]`; `post[index i64; recv fixed/dynamic StructArray(struct_id) or Soa(struct_id) where producer admits this path; result exact leaf; result view/Copy fact inherits the complete direct/field/BorrowedProjection receiver generation and contained roots; a terminating index has no bounds/result fact; bounds/path action last]`. |
 | `Template` | `env[parts.len]`; `child[parts in order]`; `post[nonempty; every part is checked against its exact access type; an exact `Text("{")`/`Text("}")` stack tracks nested optional-field objects, and each `PopComma` requires an optional field since the previous pop in the current object; result Str; hidden builder ownership is registered before holes and cleaned/transferred exactly]`. Part records have no span; only the enclosing expression span participates. |
-| `JsonEncodeBounded` | `env[base, parts.len]`; `child[parts in order, max_bytes]`; `post[base is one visible admitted source local; reconstructing its complete reachable schema exactly matches every static token, field ordinal, access root/path, name, descriptor identity, and fixed-array element in parts; nonempty; max_bytes exactly i64; result exactly Result<String,builtin Error>; every part access is borrowed; source accesses precede the limit; success owns the String payload and failure owns no partial builder output]`. |
+| `JsonEncode` | `env[base,plan]`; one stable visible source place and exact `Result<String,builtin Error>`. `plan=Pieces` reconstructs the complete canonical schema, static tokens, field ordinals and borrowed accesses; `plan=Owned` reconstructs the complete V3 graph. The optional limit is exact i64, checked after source/schema and evaluated once while reserving source ownership and transitive views. Success owns an independent String; failure publishes no partial output. Plan 47 §§3–5 owns the complete record. |
 | `JsonDecode` | `env[struct_id]`: Decode-direction JSON descriptor. `child[input]`; `post[input Str; result ERR(Struct(struct_id)); clean Str fields retain input provenance; escaped selected Str fields require the nullable caller arena and retain input+arena provenance; successful struct ownership exact]`.
 | `JsonDecodeArray` | `env[elem]`: JSON scalar-array element is Int/Float/Bool. `child[input]`; `post[input Str; result ERR(DynArray(payload(elem))); new owned array, no input view]`. |
 | `JsonDecodeScalar` | `env[scalar]`: scalar is Int/Float/Bool. `child[input]`; `post[input Str; result ERR(scalar); copied result]`. |
@@ -1118,8 +1128,6 @@ with one `OwnedJsonGraphPlanV2 { root, graph }`.
 | Discriminator | V2 envelope, children, and postcondition |
 |---|---|
 | `JsonOwnedDecode` | `env[root,graph]`: root is an existing nonempty natural-layout record; a non-diagnosing scan finds a transitive owned String; iterative root-first validation admits only fixed-width integers, Bool, String, accepted records, non-nested Options, and dynamic arrays of integer/Bool/String/record; graph is acyclic, view-free, constructor depth ≤ 128, exact under recursive `DropPlan`, and byte-equal to reconstructed `OwnedJsonGraphDescV2`. `child[input]`; `post[input Str; exact Result<Struct(root),Error>; every reachable owner free-standing; no input/arena provenance; one complete transfer]`. |
-| `JsonOwnedEncode` | `env[root,graph,base]`: the same reconstructed V2 graph and one stable visible root place; no unrolled recursive template parts remain. `child[base borrow]`; `post[exact Str under existing builder lifetime; A80 visits declaration-order graph; source not moved or mutated]`. |
-| `JsonOwnedEncodeBounded` | `env[root,graph,base]`: same V2 source plan. `child[base borrow,max_bytes]`; `post[max_bytes exact i64 after source-plan validation; exact Result<String,Error>; bounded A80 bytes equal unbounded on success; no partial owner]`. |
 
 Interface format 8 validates `OwnedJsonInterfaceEnvelopeV2` and the complete V2
 graph before cache lookup or HIR construction. The body gate reconstructs it

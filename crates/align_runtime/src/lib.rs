@@ -14,6 +14,7 @@
 // `docs/impl/07-roadmap.md`). ONE source of truth: this same file is compiled into the staticlib
 // here. `pub use` re-exports `safe_slice` (used by `str_cmp`/`str_contains`/… below) and the four
 // `align_rt_str_*` symbols.
+mod json_number;
 mod time_formats;
 pub use time_formats::*;
 mod str_prims;
@@ -2919,9 +2920,9 @@ struct BuilderBuf {
     /// Inclusive emitted-byte ceiling for bounded JSON encoding. `None` preserves the ordinary
     /// builder's unbounded growth policy.
     limit: Option<usize>,
-    /// Sticky failure: once a write would cross `limit`, later writes remain allocation-free and
-    /// the bounded finish rejects the whole partial value.
-    limit_exceeded: bool,
+    /// Sticky JSON failure: a nonfinite float or exceeded limit prevents later growth;
+    /// JSON finalization rejects the complete partial value.
+    encode_failed: bool,
 }
 
 impl BuilderBuf {
@@ -2931,7 +2932,7 @@ impl BuilderBuf {
             len: 0,
             cap: 0,
             limit: None,
-            limit_exceeded: false,
+            encode_failed: false,
         };
         // Preserve the old best-effort capacity hint: an impossible/failed eager reservation is
         // ignored, while an actual later write still follows the runtime's fail-fast OOM policy.
@@ -2954,14 +2955,14 @@ impl BuilderBuf {
                 len: 0,
                 cap: 0,
                 limit: Some(limit),
-                limit_exceeded: false,
+                encode_failed: false,
             },
             Err(()) => BuilderBuf {
                 ptr: core::ptr::null_mut(),
                 len: 0,
                 cap: 0,
                 limit: Some(0),
-                limit_exceeded: true,
+                encode_failed: true,
             },
         }
     }
@@ -2983,18 +2984,18 @@ impl BuilderBuf {
     }
 
     fn failed_limit(&self) -> bool {
-        self.limit_exceeded
+        self.encode_failed
     }
 
     fn reserve(&mut self, additional: usize) -> bool {
-        if self.limit_exceeded {
+        if self.encode_failed {
             return false;
         }
         let Some(required) = self.len.checked_add(additional) else {
             panic_abort("builder allocation too large");
         };
         if self.limit.is_some_and(|limit| required > limit) {
-            self.limit_exceeded = true;
+            self.encode_failed = true;
             return false;
         }
         if required <= self.cap {
@@ -3046,6 +3047,15 @@ impl std::io::Write for BuilderBuf {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+// JSON formatting cannot produce an I/O error. Writing through fmt::Write avoids
+// the std::io adapter while retaining the same Display digits and sticky cap.
+impl std::fmt::Write for BuilderBuf {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        self.extend_from_slice(text.as_bytes());
         Ok(())
     }
 }
@@ -3108,21 +3118,22 @@ pub unsafe extern "C" fn align_rt_builder_init_stack(out: *mut u8, arena: *mut A
     b
 }
 
-/// Initialize a compiler-provided nonescaping builder for bounded JSON encoding. The payload never
-/// grows beyond `max_bytes`; a negative or exceeded limit becomes a sticky `AL_INVALID` result at
-/// [`align_rt_builder_finish_bounded_stack`].
+/// Initialize private JSON output storage. Mode 0/limit 0 is unbounded; mode 1
+/// supplies an inclusive byte cap. Negative caps initialize sticky failure.
+/// Invalid storage or mode admission leaves storage untouched and returns null.
 ///
 /// # Safety
-/// `out` has the same storage, alignment, and lifetime requirements as
-/// [`align_rt_builder_init_stack`].
+/// `out` reserves 64 writable bytes aligned to 16, containing no live Builder.
+/// Numeric admission checks do not establish allocation provenance.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_builder_init_bounded_stack(out: *mut u8, max_bytes: i64) -> *mut Builder {
-    if out.is_null() {
+pub unsafe extern "C" fn align_rt_json_builder_init(out: *mut u8, mode: i32, max_bytes: i64) -> *mut Builder {
+    if out.is_null() || out.addr() % 16 != 0 || out.addr().checked_add(64).is_none()
+        || !matches!(mode, 0 | 1) || (mode == 0 && max_bytes != 0) {
         return core::ptr::null_mut();
     }
-    debug_assert_eq!(out as usize % core::mem::align_of::<Builder>(), 0, "stack Builder storage is misaligned");
+    let value = if mode == 0 { builder_value(core::ptr::null_mut(), 0) } else { bounded_builder_value(max_bytes) };
     let b = out.cast::<Builder>();
-    unsafe { b.write(bounded_builder_value(max_bytes)) };
+    unsafe { b.write(value) };
     b
 }
 
@@ -3234,6 +3245,9 @@ unsafe fn json_encode_object(b: &mut Builder, base: *const u8, descs: &[JsonFiel
     b.buf.push(b'}');
 }
 
+#[cfg(test)]
+thread_local! { static JSON_ENCODER_VALUE_READS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) }; }
+
 /// Encode a single JSON value at `fp` per its descriptor `kind` (the payload-kind dispatch shared by
 /// object-field encode [`json_encode_object`] and shape-directed union encode
 /// [`align_rt_json_encode_union`]): bool/float/`str`(escaped)/nested-object/`array<struct>`/integer.
@@ -3246,6 +3260,8 @@ unsafe fn json_encode_value(b: &mut Builder, fp: *const u8, d: &JsonField, kind:
     if b.buf.failed_limit() {
         return;
     }
+    #[cfg(test)]
+    JSON_ENCODER_VALUE_READS.with(|reads| reads.set(reads.get() + 1));
     match kind {
         1 => b.buf.extend_from_slice(if unsafe { *fp } != 0 { &b"true"[..] } else { &b"false"[..] }),
         2 => {
@@ -3253,11 +3269,11 @@ unsafe fn json_encode_value(b: &mut Builder, fp: *const u8, d: &JsonField, kind:
             if w == 4 {
                 let mut bytes = [0u8; 4];
                 unsafe { core::ptr::copy_nonoverlapping(fp, bytes.as_mut_ptr(), 4) };
-                push_float(&mut b.buf, f32::from_le_bytes(bytes));
+                json_push_f32(&mut b.buf, f32::from_le_bytes(bytes));
             } else {
                 let mut bytes = [0u8; 8];
                 unsafe { core::ptr::copy_nonoverlapping(fp, bytes.as_mut_ptr(), 8) };
-                push_float(&mut b.buf, f64::from_le_bytes(bytes));
+                json_push_f64(&mut b.buf, f64::from_le_bytes(bytes));
             }
         }
         3 | 8 => {
@@ -3704,6 +3720,47 @@ pub unsafe extern "C" fn align_rt_builder_write_f32(b: *mut Builder, x: f32) {
         return;
     }
     push_float(&mut b.buf, x);
+}
+
+// Rust Display uses fixed-point spelling for finite f32/f64. A finite JSON writer
+// only needs to detect the decimal point; ordinary IEEE formatting still handles
+// inf/NaN and exponent/alphabetic spellings through push_float.
+fn json_push_finite<T: std::fmt::Display>(buf: &mut BuilderBuf, value: T) {
+    let start = buf.len();
+    let _ = std::fmt::Write::write_fmt(buf, format_args!("{value}"));
+    if !buf.encode_failed && !buf.as_slice()[start..].contains(&b'.') {
+        buf.extend_from_slice(b".0");
+    }
+}
+
+#[inline]
+fn json_push_f32(buf: &mut BuilderBuf, value: f32) {
+    if buf.failed_limit() { return; }
+    if value.is_finite() { json_push_finite(buf, value); } else { buf.encode_failed = true; }
+}
+
+#[inline]
+fn json_push_f64(buf: &mut BuilderBuf, value: f64) {
+    if buf.failed_limit() { return; }
+    if value.is_finite() { json_push_finite(buf, value); } else { buf.encode_failed = true; }
+}
+
+/// Append a finite JSON binary32 value, or mark the private builder failed.
+///
+/// # Safety
+/// `b` is a live, uniquely borrowed initialized Builder.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_json_builder_write_f32(b: *mut Builder, value: f32) {
+    json_push_f32(unsafe { &mut (*b).buf }, value);
+}
+
+/// Append a finite JSON binary64 value, or mark the private builder failed.
+///
+/// # Safety
+/// `b` is a live, uniquely borrowed initialized Builder.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_json_builder_write_f64(b: *mut Builder, value: f64) {
+    json_push_f64(unsafe { &mut (*b).buf }, value);
 }
 
 /// Append a `str` as a JSON string literal: a leading/trailing `"` with the content
@@ -4894,14 +4951,13 @@ unsafe fn write_value(p: &mut JsonParser, kind: i32, width: i64, d: &JsonField, 
             if w != 4 && w != 8 {
                 return None;
             }
-            let v = p.number()?;
             // `bytes` is a local (stack) array from `to_le_bytes()`, `dst` a distinct heap/arena
             // slot — they never alias, so a straight-line bulk copy is sound.
             if w == 4 {
-                let bytes = (v as f32).to_le_bytes();
+                let bytes = p.number_f32()?.to_le_bytes();
                 unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
             } else {
-                let bytes = v.to_le_bytes();
+                let bytes = p.number()?.to_le_bytes();
                 unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
             }
             Some(())
@@ -5715,10 +5771,9 @@ pub unsafe extern "C" fn align_rt_json_decode_array(
                     }
                     2 => {
                         // float — f32 (4) or f64 (8).
-                        let v = p.number()?;
                         match width {
-                            4 => bytes.extend_from_slice(&(v as f32).to_le_bytes()),
-                            8 => bytes.extend_from_slice(&v.to_le_bytes()),
+                            4 => bytes.extend_from_slice(&p.number_f32()?.to_le_bytes()),
+                            8 => bytes.extend_from_slice(&p.number()?.to_le_bytes()),
                             _ => return None,
                         }
                     }
@@ -7638,7 +7693,7 @@ impl<'a> JsonParser<'a> {
                 }
             }
         }
-        if self.pos == digits {
+        if self.pos == digits || (self.pos - digits > 1 && self.src.get(digits) == Some(&b'0')) {
             return None;
         }
         if neg { Some(v) } else { v.checked_neg() }
@@ -7677,7 +7732,7 @@ impl<'a> JsonParser<'a> {
                 }
             }
         }
-        if self.pos == digits {
+        if self.pos == digits || (self.pos - digits > 1 && self.src.get(digits) == Some(&b'0')) {
             return None;
         }
         Some(v)
@@ -7718,7 +7773,7 @@ impl<'a> JsonParser<'a> {
         while matches!(self.peek(), Some(b'0'..=b'9')) {
             self.pos += 1;
         }
-        if self.pos == int_start {
+        if self.pos == int_start || (self.pos - int_start > 1 && self.src.get(int_start) == Some(&b'0')) {
             self.pos = start;
             return None;
         }
@@ -7754,7 +7809,12 @@ impl<'a> JsonParser<'a> {
     /// Read a JSON number as `f64`.
     fn number(&mut self) -> Option<f64> {
         let span = self.number_span()?;
-        std::str::from_utf8(span).ok()?.parse::<f64>().ok()
+        json_number::f64(span)
+    }
+    /// Parse directly at binary32 precision; rounding via binary64 is not equivalent.
+    fn number_f32(&mut self) -> Option<f32> {
+        let span = self.number_span()?;
+        json_number::f32(span)
     }
     /// Skip a JSON number **lexically** — advance over the token without parsing it to `f64`.
     /// Used by [`skip_value`] for unknown numeric fields, whose value is discarded; lexical skip
@@ -8461,13 +8521,17 @@ pub unsafe extern "C" fn align_rt_json_doc_as_i64(tape: *const DocTape, node: i6
     }
 }
 
+fn parse_json_f64(text: &str) -> Option<f64> {
+    json_number::f64(text.as_bytes())
+}
+
 /// `d.as_f64()` — `Some(f64)` if this doc is a JSON number, else `None`. Returns 1/0.
 ///
 /// # Safety
 /// `tape` must be null or a live [`DocTape`]; `out` must point to a writable `f64`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_json_doc_as_f64(tape: *const DocTape, node: i64, out: *mut f64) -> i32 {
-    match unsafe { doc_number_span(tape, node) }.and_then(|s| s.parse::<f64>().ok()) {
+    match unsafe { doc_number_span(tape, node) }.and_then(parse_json_f64) {
         Some(v) => {
             unsafe { out.write(v) };
             1
@@ -8567,27 +8631,27 @@ pub unsafe extern "C" fn align_rt_builder_into_string_stack(b: *mut Builder) -> 
     unsafe { builder_into_string_value(b.read()) }
 }
 
-/// Consume a bounded stack-header builder. On success, transfer its allocator-compatible payload
-/// into `out` and return `0`. On a negative or exceeded byte ceiling, drop the partial payload,
-/// leave `out` as canonical null/0, and return `AL_INVALID`.
+/// Consume admitted JSON builder storage, transferring success or dropping a
+/// failed partial buffer. Invalid output admission consumes neither region.
 ///
 /// # Safety
-/// `b` must point to a live value from [`align_rt_builder_init_bounded_stack`] and `out` must point
-/// to writable [`AlignStr`] storage. This call consumes `b` on every path.
+/// `b` contains a live JSON Builder in 64 bytes aligned to 16. `out` reserves a
+/// separate 16-byte, 8-aligned stack slot containing no live String owner, disjoint
+/// from source storage and the builder payload. Numeric checks do not prove these
+/// allocation preconditions. An admitted call consumes b; rejection permits retry.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_builder_finish_bounded_stack(b: *mut Builder, out: *mut AlignStr) -> i32 {
-    if out.is_null() {
-        if !b.is_null() {
-            unsafe { b.drop_in_place() };
-        }
-        return AL_INVALID;
-    }
-    unsafe { out.write(AlignStr { ptr: core::ptr::null(), len: 0 }) };
-    if b.is_null() {
+pub unsafe extern "C" fn align_rt_json_builder_finish(b: *mut Builder, out: *mut AlignStr) -> i32 {
+    let start = b.addr();
+    let dest = out.addr();
+    let Some(end) = start.checked_add(64) else { return AL_INVALID; };
+    let Some(dest_end) = dest.checked_add(16) else { return AL_INVALID; };
+    if b.is_null() || out.is_null() || start % 16 != 0 || dest % 8 != 0
+        || (start < dest_end && dest < end) {
         return AL_INVALID;
     }
     let b = unsafe { b.read() };
-    if b.buf.limit_exceeded {
+    unsafe { out.write(AlignStr { ptr: core::ptr::null(), len: 0 }) };
+    if b.buf.encode_failed {
         drop(b);
         return AL_INVALID;
     }
@@ -31744,14 +31808,14 @@ mod tests {
         for max_bytes in 0_u8..=8 {
             let mut storage = StackHeader([0; 64]);
             let b = unsafe {
-                align_rt_builder_init_bounded_stack(storage.0.as_mut_ptr(), i64::from(max_bytes))
+                align_rt_json_builder_init(storage.0.as_mut_ptr(), 1, i64::from(max_bytes))
             };
             unsafe { align_rt_builder_write(b, b"{}".as_ptr(), 2) };
             let observed_cap = unsafe { (*b).buf.cap };
             assert!(observed_cap <= usize::from(max_bytes), "cap {max_bytes} allocated {observed_cap}");
 
             let mut out = AlignStr { ptr: core::ptr::null(), len: -1 };
-            let status = unsafe { align_rt_builder_finish_bounded_stack(b, &mut out) };
+            let status = unsafe { align_rt_json_builder_finish(b, &mut out) };
             if max_bytes < 2 {
                 assert_eq!(status, AL_INVALID, "cap {max_bytes} rejects two emitted bytes");
                 assert!(out.ptr.is_null());
@@ -31765,11 +31829,11 @@ mod tests {
         }
 
         let mut storage = StackHeader([0; 64]);
-        let b = unsafe { align_rt_builder_init_bounded_stack(storage.0.as_mut_ptr(), -1) };
+        let b = unsafe { align_rt_json_builder_init(storage.0.as_mut_ptr(), 1, -1) };
         unsafe { align_rt_builder_write(b, b"{}".as_ptr(), 2) };
         assert_eq!(unsafe { (*b).buf.cap }, 0);
         let mut out = AlignStr { ptr: core::ptr::null(), len: -1 };
-        assert_eq!(unsafe { align_rt_builder_finish_bounded_stack(b, &mut out) }, AL_INVALID);
+        assert_eq!(unsafe { align_rt_json_builder_finish(b, &mut out) }, AL_INVALID);
         assert!(out.ptr.is_null());
         assert_eq!(out.len, 0);
     }
@@ -31777,7 +31841,7 @@ mod tests {
     #[test]
     fn bounded_stack_builder_null_abi_inputs_fail_defensively() {
         assert!(unsafe {
-            align_rt_builder_init_bounded_stack(core::ptr::null_mut(), 8).is_null()
+            align_rt_json_builder_init(core::ptr::null_mut(), 1, 8).is_null()
         });
 
         let mut out = AlignStr {
@@ -31786,20 +31850,22 @@ mod tests {
         };
         assert_eq!(
             unsafe {
-                align_rt_builder_finish_bounded_stack(core::ptr::null_mut(), &mut out)
+                align_rt_json_builder_finish(core::ptr::null_mut(), &mut out)
             },
             AL_INVALID
         );
-        assert!(out.ptr.is_null());
-        assert_eq!(out.len, 0);
+        assert_eq!(out.ptr.addr(), 1);
+        assert_eq!(out.len, -1);
 
         let mut storage = StackHeader([0; 64]);
-        let b = unsafe { align_rt_builder_init_bounded_stack(storage.0.as_mut_ptr(), 8) };
+        let b = unsafe { align_rt_json_builder_init(storage.0.as_mut_ptr(), 1, 8) };
         unsafe { align_rt_builder_write(b, b"{}".as_ptr(), 2) };
         assert_eq!(
-            unsafe { align_rt_builder_finish_bounded_stack(b, core::ptr::null_mut()) },
+            unsafe { align_rt_json_builder_finish(b, core::ptr::null_mut()) },
             AL_INVALID
         );
+        assert_eq!(unsafe { align_rt_json_builder_finish(b, &mut out) }, 0);
+        unsafe { align_rt_free(out.ptr.cast_mut()) };
     }
 
     #[test]
@@ -31807,7 +31873,7 @@ mod tests {
         fn encode(max_bytes: i64, write: impl FnOnce(*mut Builder)) -> (i32, Vec<u8>, usize) {
             let mut storage = StackHeader([0; 64]);
             let b = unsafe {
-                align_rt_builder_init_bounded_stack(storage.0.as_mut_ptr(), max_bytes)
+                align_rt_json_builder_init(storage.0.as_mut_ptr(), 1, max_bytes)
             };
             write(b);
             let peak = unsafe { (*b).buf.cap };
@@ -31815,7 +31881,7 @@ mod tests {
                 ptr: core::ptr::null(),
                 len: -1,
             };
-            let status = unsafe { align_rt_builder_finish_bounded_stack(b, &mut out) };
+            let status = unsafe { align_rt_json_builder_finish(b, &mut out) };
             let bytes = unsafe { safe_slice(out.ptr, out.len) }.to_vec();
             unsafe { align_rt_free(out.ptr as *mut u8) };
             (status, bytes, peak)
@@ -31896,7 +31962,7 @@ mod tests {
                     let max = if index % 2 == 0 { 2 } else { 1 };
                     let mut storage = StackHeader([0; 64]);
                     let b = unsafe {
-                        align_rt_builder_init_bounded_stack(storage.0.as_mut_ptr(), max)
+                        align_rt_json_builder_init(storage.0.as_mut_ptr(), 1, max)
                     };
                     unsafe { align_rt_builder_write(b, b"{}".as_ptr(), 2) };
                     let mut out = AlignStr {
@@ -31904,7 +31970,7 @@ mod tests {
                         len: 0,
                     };
                     let status = unsafe {
-                        align_rt_builder_finish_bounded_stack(b, &mut out)
+                        align_rt_json_builder_finish(b, &mut out)
                     };
                     let bytes = unsafe { safe_slice(out.ptr, out.len) }.to_vec();
                     unsafe { align_rt_free(out.ptr as *mut u8) };
@@ -50462,4 +50528,183 @@ mod regex_tests {
         assert_eq!(align_rt_free_count() - free_before_drop, 1);
         assert_eq!(align_rt_requested_live_bytes(), 0);
     }
+}
+
+#[cfg(test)]
+mod r63_tests {
+    use super::*;
+
+    #[test]
+    pub(super) fn r63_numeric_vectors() {
+        // Fixed oracles independently derived with exact rational rounding (plan 47).
+        let vectors: &[(u8, &str, u64, Option<&str>)] = &[
+            (32, "0", 0x00000000_u64, Some("0.0")),
+            (32, "-0", 0x80000000_u64, Some("-0.0")),
+            (32, "0.3", 0x3e99999a_u64, Some("0.3")),
+            (32, "1.000000059604644775390625", 0x3f800000_u64, Some("1.0")),
+            (32, "1.0000000596046448", 0x3f800001_u64, Some("1.0000001")),
+            (32, "16777217", 0x4b800000_u64, Some("16777216.0")),
+            (32, "3.4028234663852886e38", 0x7f7fffff_u64, Some("340282350000000000000000000000000000000.0")),
+            (32, "3.4028235e38", 0x7f7fffff_u64, Some("340282350000000000000000000000000000000.0")),
+            (32, "3.4028236e38", 0x7f800000_u64, None),
+            (32, "1.1754943508222875e-38", 0x00800000_u64, Some("0.000000000000000000000000000000000000011754944")),
+            (32, "1.401298464324817e-45", 0x00000001_u64, Some("0.000000000000000000000000000000000000000000001")),
+            (32, "7e-46", 0x00000000_u64, Some("0.0")),
+            (32, "8e-46", 0x00000001_u64, Some("0.000000000000000000000000000000000000000000001")),
+            (32, "-1e-999", 0x80000000_u64, Some("-0.0")),
+            (32, "1e999", 0x7f800000_u64, None),
+            (64, "0", 0x0000000000000000_u64, Some("0.0")),
+            (64, "-0", 0x8000000000000000_u64, Some("-0.0")),
+            (64, "0.3", 0x3fd3333333333333_u64, Some("0.3")),
+            (64, "1.00000000000000011102230246251565404236316680908203125", 0x3ff0000000000000_u64, Some("1.0")),
+            (64, "1.00000000000000011102230246251565404236316680908203126", 0x3ff0000000000001_u64, Some("1.0000000000000002")),
+            (64, "9007199254740993", 0x4340000000000000_u64, Some("9007199254740992.0")),
+            (64, "1.7976931348623157e308", 0x7fefffffffffffff_u64, Some("179769313486231570000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000.0")),
+            (64, "1.7976931348623158e308", 0x7fefffffffffffff_u64, Some("179769313486231570000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000.0")),
+            (64, "1.7976931348623159e308", 0x7ff0000000000000_u64, None),
+            (64, "2.2250738585072014e-308", 0x0010000000000000_u64, Some("0.000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000022250738585072014")),
+            (64, "4.9406564584124654e-324", 0x0000000000000001_u64, Some("0.000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005")),
+            (64, "2e-324", 0x0000000000000000_u64, Some("0.0")),
+            (64, "3e-324", 0x0000000000000001_u64, Some("0.000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005")),
+            (64, "-1e-999", 0x8000000000000000_u64, Some("-0.0")),
+            (64, "1e999", 0x7ff0000000000000_u64, None),
+        ];
+        for &(width, token, bits, encoded) in vectors {
+            let mut parser = JsonParser::new(token.as_bytes());
+            let mut buf = BuilderBuf::new(0);
+            if width == 32 {
+                let value = parser.number_f32();
+                assert_eq!(value.map(|v| u64::from(v.to_bits())), encoded.map(|_| bits), "f32 {token}");
+                json_push_f32(&mut buf, f32::from_bits(u32::try_from(bits).unwrap()));
+            } else {
+                let value = parser.number();
+                assert_eq!(value.map(f64::to_bits), encoded.map(|_| bits), "f64 {token}");
+                json_push_f64(&mut buf, f64::from_bits(bits));
+            }
+            assert_eq!(buf.encode_failed, encoded.is_none(), "{token}");
+            if let Some(encoded) = encoded { assert_eq!(buf.as_slice(), encoded.as_bytes(), "{token}"); }
+        }
+    }
+
+    #[test]
+    fn r63_numeric_grammar_and_doc() {
+        for token in ["+1", "01", "-01", "1.", ".1", "1e", "1e+", "--1", "NaN", "Infinity", "-Infinity", "0x1"] {
+            let mut p = JsonParser::new(token.as_bytes());
+            let accepted = p.number().is_some() && p.pos == token.len();
+            assert!(!accepted, "{token}");
+            let mut p = JsonParser::new(token.as_bytes());
+            let accepted = p.skip_number().is_some() && p.pos == token.len();
+            assert!(!accepted, "skip {token}");
+        }
+        for token in ["01", "-01"] {
+            assert!(JsonParser::new(token.as_bytes()).integer().is_none());
+            assert!(JsonParser::new(token.as_bytes()).integer_unsigned().is_none());
+        }
+        assert_eq!(JsonParser::new(b"1e999").skip_number(), Some(()));
+        assert_eq!(parse_json_f64("1e999"), None);
+        assert!(parse_json_f64("3.4028236e38").is_some());
+    }
+
+    #[test]
+    fn r63_builder_failure_matrix() {
+        for width in [32, 64] {
+            for negative in [false, true] {
+                for payload in [0_u64, 1, 1_u64 << if width == 32 { 22 } else { 51 }] {
+                    let mut b = BuilderBuf::new_bounded(128);
+                    b.extend_from_slice(b"{\"x\":");
+                    if width == 32 {
+                        let bits = 0x7f800000 | u32::try_from(payload).unwrap() | if negative { 1 << 31 } else { 0 };
+                        json_push_f32(&mut b, f32::from_bits(bits));
+                    } else {
+                        let bits = 0x7ff0000000000000 | payload | if negative { 1 << 63 } else { 0 };
+                        json_push_f64(&mut b, f64::from_bits(bits));
+                    }
+                    assert!(b.encode_failed);
+                    let before = (b.ptr, b.len, b.cap);
+                    b.extend_from_slice(&[b'x'; 256]);
+                    assert_eq!((b.ptr, b.len, b.cap), before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn r63_builder_native_admission() {
+        #[repr(align(16))]
+        struct Header([u8; 64]);
+        let mut header = Header([0xa5; 64]);
+        for (mode, cap) in [(2, 0), (-1, 0), (0, 1)] {
+            assert!(unsafe { align_rt_json_builder_init(header.0.as_mut_ptr(), mode, cap) }.is_null());
+            assert_eq!(header.0, [0xa5; 64]);
+        }
+        assert!(unsafe { align_rt_json_builder_init(header.0.as_mut_ptr().wrapping_add(1), 0, 0) }.is_null());
+        assert_eq!(header.0, [0xa5; 64]);
+        // Rejection examines addresses only, before dereferencing a header or output.
+        let overflowing = core::ptr::without_provenance_mut::<u8>(usize::MAX & !15);
+        assert!(unsafe { align_rt_json_builder_init(overflowing, 0, 0) }.is_null());
+        for mode in [0, 1] {
+            let b = unsafe { align_rt_json_builder_init(header.0.as_mut_ptr(), mode, if mode == 0 { 0 } else { 64 }) };
+            unsafe { align_rt_builder_write(b, b"{}".as_ptr(), 2) };
+            let grow = unsafe { (*b).buf.ptr };
+            let before = header.0;
+            assert_eq!(unsafe { align_rt_json_builder_finish(b, b.cast()) }, AL_INVALID);
+            assert_eq!(header.0, before);
+            let mut out = AlignStr { ptr: core::ptr::null(), len: -1 };
+            assert_eq!(unsafe { align_rt_json_builder_finish(b, (&mut out as *mut AlignStr).cast::<u8>().wrapping_add(1).cast()) }, AL_INVALID);
+            assert_eq!(header.0, before);
+            assert_eq!(out.len, -1);
+            assert_eq!(unsafe { align_rt_json_builder_finish(b, &mut out) }, 0);
+            assert_eq!(out.ptr, grow, "success transfers the original allocation");
+            assert_eq!(unsafe { safe_slice(out.ptr, out.len) }, b"{}");
+            unsafe { align_rt_free(out.ptr.cast_mut()) };
+        }
+    }
+
+
+    #[test]
+    #[cfg(feature = "alloc-count")]
+    fn r63_decode_failure_allocation_parity() {
+        let _guard = crate::tests::ALLOC_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for width in [4_i32, 8] {
+            let fields = [
+                JsonField { name_ptr: b"text".as_ptr(), name_len: 4, tag: (8 << 8) | 16, offset: 0, sub: core::ptr::null(), opt_tag: -1 },
+                JsonField { name_ptr: b"number".as_ptr(), name_len: 6, tag: (2 << 8) | width, offset: 16, sub: core::ptr::null(), opt_tag: -1 },
+            ];
+            for suffix in ["1e999}", "01}", "0.3} trailing", "[0]}"] {
+                let input = format!("{{\"text\":\"allocated\\ntext\",\"number\":{suffix}");
+                let mut out = [0_u8; 24];
+                let before = (align_rt_alloc_count(), align_rt_free_count());
+                assert_ne!(unsafe { align_rt_json_decode(input.as_ptr(), input.len() as i64, fields.as_ptr(), 2, out.as_mut_ptr(), 24, core::ptr::null(), 0, 0, core::ptr::null_mut()) }, 0);
+                let allocated = align_rt_alloc_count() - before.0;
+                assert!(allocated > 0);
+                assert_eq!(allocated, align_rt_free_count() - before.1);
+            }
+        }
+        // Negative control: retaining a successful encoder result leaves exactly one live buffer
+        // until the receiving String owner releases it.
+        #[repr(align(16))] struct Header([u8; 64]);
+        let mut header = Header([0; 64]);
+        align_rt_requested_live_reset();
+        let b = unsafe { align_rt_json_builder_init(header.0.as_mut_ptr(), 0, 0) };
+        unsafe { align_rt_builder_write(b, b"{}".as_ptr(), 2) };
+        let mut out = AlignStr { ptr: core::ptr::null(), len: 0 };
+        assert_eq!(unsafe { align_rt_json_builder_finish(b, &mut out) }, 0);
+        assert!(align_rt_requested_live_bytes() > 0, "omitting receiving-owner cleanup must be observable");
+        unsafe { align_rt_free(out.ptr.cast_mut()) };
+        assert_eq!(align_rt_requested_live_bytes(), 0);
+    }
+
+    #[test]
+    fn r63_failed_encoder_stops_descriptor_traversal() {
+        let values = vec![0.3_f32; 1_000_000];
+        for failed in [false, true] {
+            let mut b = Builder { buf: BuilderBuf::new(0), arena: core::ptr::null_mut() };
+            if failed { json_push_f32(&mut b.buf, f32::INFINITY); }
+            JSON_ENCODER_VALUE_READS.with(|reads| reads.set(0));
+            unsafe { align_rt_json_encode_scalar_array(&mut b, values.as_ptr().cast(), 1_000_000, (2 << 8) | 4) };
+            let reads = JSON_ENCODER_VALUE_READS.with(core::cell::Cell::get);
+            assert_eq!(reads, if failed { 0 } else { values.len() });
+        }
+    }
+
 }

@@ -1,5 +1,15 @@
 # Recursive owned declared JSON plan
 
+**R63 implementation contract:**
+[Plan 47](47-json-numeric-contract.md) supersedes this document's JSON float
+exclusions, infallible/arena-view encoder result, bounded-only encoder IR/native
+names and V1/V2 JSON transport. Both encoders return owned `Result<string, Error>`;
+§§1–5 fix errors, ownership, V3 descriptor/envelope, interface 11 -> 12, the unified
+HIR/MIR operation and exact ABI rows. §8 owns closure and §9 performance evidence.
+Historical vectors/version transitions and current shipped ABI inventories below
+remain baseline records, not alternate implementation contracts. In particular,
+plan 47 records the replacement ABI counts and rows.
+
 Status: **ACCEPTED DESIGN; IMPLEMENTATION PENDING**.
 
 This document is the plan of record for align-llm Request 13. It replaces the

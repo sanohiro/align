@@ -74,9 +74,32 @@ The author-side matrix-to-diff pass must point every applicable row to implement
 owner test before the implementation PR is opened. The benchmark-evidence document remains the
 separate trusted measurement boundary; it does not define this language or runtime contract.
 
-## Direct owned records (Request 9)
+## Owned JSON records
 
-Request 9 extends the existing inferred operations with one closed, flat owned-record graph. The
+**R63 contract (2026-09-10).**
+[R63 exact contract](../47-json-numeric-contract.md) is authoritative for JSON numeric conversion and encoder results.
+Both `json.encode(value)` and `json.encode_bounded(value, max_bytes: i64)` return
+`Result<string, Error>`. They borrow the source for the call and transfer one
+free-standing output buffer on success, including inside an arena, without a final
+copy. Nonfinite selected floats, negative caps and exceeded caps return
+`Error.Invalid`; no partial output is published. Allocation failure retains the
+terminal policy. Decode rounds directly to f32/f64, nearest/ties-even, preserving
+signed zero and subnormals; a nonfinite rounded result returns `Error.Code(1)`.
+`json.doc.as_f64` returns None for that range failure while grammar-valid huge
+numbers remain navigable/skippable. JSON number grammar rejects leading zeros.
+Finite encode retains source-width shortest-significand fixed-point spelling,
+including `.0` and `-0.0`; ordinary templates/print are unchanged. Owned graphs
+admit f32/f64 at every existing scalar/Option/array leaf. Root/container exclusions
+otherwise remain. Descriptor/envelope V3 and interface 11 -> 12 replace V2 without
+compatibility paths. This amendment supersedes earlier float exclusions,
+infallible `encode -> str`, V1/V2 transport and rollout descriptions below;
+older golden vectors remain historical. The owner explicitly reopened R63, so
+this request has no further friction-count prerequisite. Performance requires
+local before/after evidence under the plan, not an unmeasured speed claim.
+
+### Historical Request 9 boundary
+
+Request 9 extended the existing inferred operations with one closed, flat owned-record graph. The
 implementation ships. A direct record selects the owned route when it has
 at least one direct `string`, `Option<string>`, or `array<string>` field. Once selected, every other
 field must be a required signed/unsigned 8/16/32/64-bit integer or `bool`. A `str`, `array<str>`,
@@ -119,7 +142,7 @@ recursively-Copy `json.scan` routes are unchanged.
 The exact public ledger, descriptor bytes, error precedence, implementation closure matrix, and
 golden vectors are authoritative in [`../24-owned-json-plan.md`](../24-owned-json-plan.md).
 
-## Recursive owned records (Request 13, design accepted)
+### Historical Request 13 boundary
 
 Request 13 replaces the flat owned implementation boundary with one acyclic, view-free graph while
 keeping the same three inferred operations. A transitive owned `string` selects the route. The
@@ -144,10 +167,10 @@ bytes, validation order, C6 fixture scope, and implementation matrix are authori
 [`../25-recursive-owned-json-plan.md`](../25-recursive-owned-json-plan.md). Implementation is
 pending; the preceding Request 9 section remains the current shipped compiler behavior.
 
-## Signatures (verified unless marked pending)
+## Signatures
 
 ```text
-json.encode(x)   -> str                      // x: struct (nested structs recurse); str fields JSON-escaped
+json.encode(x)   -> Result<string, Error>
 json.encode_bounded(x, max_bytes: i64) -> Result<string, Error>
 json.decode(s)   -> Result<T, Error>         // T from the binding/context: u: User := json.decode(s)?
 
@@ -293,13 +316,11 @@ The later Option, array-field, and union slices described above compose with thi
 
 ## Type & ownership classification
 
-- `encode` builds through the string builder; result is an arena-regioned `str`.
-- `encode_bounded` borrows the same accepted value graph and uses the same ordered encode pieces,
-  but returns one individually owned `string` on exact-fit-or-smaller success. Its inclusive
-  `max_bytes` ceiling applies to emitted UTF-8 bytes before growth; negative or exceeded limits are
-  `Error.Invalid`, with no partial result. The shipped operation adds no shape by itself. The
-  accepted Request 13 implementation replaces the flat owned parts with one V2 descriptor-driven
-  root writer shared by both encode operations.
+- Under the accepted R63 contract, both encoders borrow the source for the call
+  and return one free-standing owned string in Result, even inside an arena.
+  The grow buffer transfers without a final copy; failure publishes no partial
+  string and frees private storage. Bounded encoding additionally enforces an
+  inclusive UTF-8 byte cap before growth. Both APIs share the V3 graph/writer.
 - `decode` into `array<T>`/`array<Struct>` produces an owned Move array (deep-dropped).
 - `decode` into `soa<T>` allocates columns in the enclosing arena (`align_rt_json_decode_soa`,
   one count pass + one value-parse pass sharing the Mison speculation via `FieldDst`).
@@ -319,12 +340,12 @@ field must appear exactly once: a duplicate declared key is an `Err` on both the
 speculative paths, including at a position the learned pattern considered unqueried. Undeclared
 keys are skipped.
 
-`encode_bounded` is the fallible resource-boundary sibling of `encode`: a negative limit or the
-first emitted byte beyond the inclusive ceiling is `Err(Error.Invalid)`. An allocator failure keeps
-the language-wide terminal-abort policy. Successful bytes are byte-identical to `encode`, including
-declaration-order keys, numeric spelling, escaping, omitted `None`, arrays, and unions; “canonical”
-does not mean RFC 8785 sorting. The authoritative contract and closure matrix are in
-`../17-library-boundary-prerequisites.md` §7.7.
+Under R63 both encoders return `Err(Error.Invalid)` for a selected nonfinite
+float; bounded encode also returns it for a negative or exceeded inclusive cap.
+Success owns identical canonical bytes under either API. Decode overflow after
+direct target-width rounding is `Error.Code(1)`; document numeric access returns
+None. Allocation failure remains terminal. The exact current accepted contract
+and closure matrix are [plan 47](../47-json-numeric-contract.md). Its rules supersede earlier Request 9/13 rollout prose above.
 
 ## Regions
 

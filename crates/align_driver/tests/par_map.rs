@@ -220,7 +220,7 @@ fn par_map_round_trips_json_aos_with_abi_stride() {
     // JSON AoS decode/encode and the range kernel must agree on the ABI allocation size. The
     // natural field order gives this row a tail-padded 16-byte stride (bool + i64), while the
     // logical descriptor still reports fields in source order.
-    let src = "import core.json\nRow { active: bool, amount: i64 }\nBatch { rows: array<Row> }\nfn amount(row: Row) -> i64 = row.amount\nfn main() -> Result<(), Error> {\n  rows: array<Row> := json.decode(\"[{\\\"active\\\":true,\\\"amount\\\":3},{\\\"active\\\":false,\\\"amount\\\":7}]\")?\n  batch: Batch := json.decode(\"{\\\"rows\\\":[{\\\"active\\\":true,\\\"amount\\\":3},{\\\"active\\\":false,\\\"amount\\\":7}]}\")?\n  out := rows.par_map(amount)\n  print(out[0])\n  print(out[1])\n  print(json.encode(batch))\n  return Ok(())\n}\n";
+    let src = "import core.json\nRow { active: bool, amount: i64 }\nBatch { rows: array<Row> }\nfn amount(row: Row) -> i64 = row.amount\nfn main() -> Result<(), Error> {\n  rows: array<Row> := json.decode(\"[{\\\"active\\\":true,\\\"amount\\\":3},{\\\"active\\\":false,\\\"amount\\\":7}]\")?\n  batch: Batch := json.decode(\"{\\\"rows\\\":[{\\\"active\\\":true,\\\"amount\\\":3},{\\\"active\\\":false,\\\"amount\\\":7}]}\")?\n  out := rows.par_map(amount)\n  print(out[0])\n  print(out[1])\n  print(json.encode(batch)?)\n  return Ok(())\n}\n";
     let out = build_and_run("pm-json-aos", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n7\n{\"rows\":[{\"active\":true,\"amount\":3},{\"active\":false,\"amount\":7}]}\n");

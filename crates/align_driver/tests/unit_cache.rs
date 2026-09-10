@@ -157,12 +157,12 @@ fn two_module(tag: &str) -> Proj {
 }
 
 #[test]
-fn owned_json_descriptor_participates_in_cold_edit_revert_cache_identity() {
+fn r63_json_identity_matrix() {
     let _serial = serial();
     let original = concat!(
         "module lib\n",
         "import core.json\n",
-        "pub Value { id: string, tags: array<string>, note: Option<string> }\n",
+        "pub Value { id: string, tags: array<string>, note: Option<string>, numeric: Option<f32> }\n",
         "pub fn parse(input: str) -> Result<Value, Error> = json.decode(input)\n",
     );
     let main = concat!(
@@ -220,13 +220,20 @@ fn owned_json_descriptor_participates_in_cold_edit_revert_cache_identity() {
     project.write(
         "lib.align",
         &original.replace(
-            "pub Value { id: string, tags: array<string>, note: Option<string> }",
-            "pub Value { id: string, enabled: bool, tags: array<string>, note: Option<string> }",
+            "pub Value { id: string, tags: array<string>, note: Option<string>, numeric: Option<f32> }",
+            "pub Value { id: string, enabled: bool, tags: array<string>, note: Option<string>, numeric: Option<f32> }",
         ),
     );
     let edited = project.build(UnitReuse::Allowed);
     assert!(!hit(&edited, "lib"));
     assert!(!hit(&edited, "main"), "descriptor/public-layout edits invalidate consumers");
+
+    project.write("lib.align", &original.replace("Option<f32>", "Option<f64>"));
+    let width_edited = project.build(UnitReuse::Allowed);
+    assert!(!hit(&width_edited, "lib") && !hit(&width_edited, "main"));
+    let width_descriptor = &width_edited.units.iter().find(|unit| unit.unit == "lib").unwrap().summary.owned_json_graphs[0].envelope;
+    assert_ne!(width_descriptor, &cold_descriptor, "reachable float width participates in V3 identity");
+    assert_eq!(cold_descriptor[0], 3);
 
     project.write("lib.align", original);
     let reverted = project.build(UnitReuse::Allowed);

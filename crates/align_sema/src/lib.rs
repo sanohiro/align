@@ -1972,7 +1972,7 @@ enum JsonShapeRoot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum OwnedJsonRoute {
     Existing,
-    Owned(hir::OwnedJsonGraphPlanV2),
+    Owned(hir::OwnedJsonGraphPlanV3),
 }
 
 const OWNED_JSON_MAX_CONSTRUCTOR_DEPTH: u16 = 128;
@@ -1981,10 +1981,10 @@ const OWNED_JSON_MAX_CONSTRUCTOR_DEPTH: u16 = 128;
 /// canonical root-first DFS order; a repeated completed record is a DAG edge, while an active
 /// record is a cycle. Constructor depth counts the root record as one and every record, Option, or
 /// dynamic-array edge thereafter.
-pub fn owned_json_graph_plan_v2(
+pub fn owned_json_graph_plan_v3(
     structs: &[hir::StructDef],
     root: u32,
-) -> Result<hir::OwnedJsonGraphPlanV2, String> {
+) -> Result<hir::OwnedJsonGraphPlanV3, String> {
     enum Work {
         Record(u32, u16),
         Type(Ty, u16),
@@ -2062,6 +2062,7 @@ pub fn owned_json_graph_plan_v2(
                     bits: 8 | 16 | 32 | 64,
                     ..
                 })
+                | Ty::Float(FloatTy { bits: 32 | 64 })
                 | Ty::Bool
                 | Ty::String => {}
                 Ty::Struct(id) => work.push(Work::Record(id, next_depth(depth)?)),
@@ -2072,6 +2073,7 @@ pub fn owned_json_graph_plan_v2(
                             bits: 8 | 16 | 32 | 64,
                             ..
                         })
+                        | Scalar::Float(FloatTy { bits: 32 | 64 })
                         | Scalar::Bool
                         | Scalar::String => {}
                         Scalar::Struct(id) => work.push(Work::Record(id, next_depth(depth)?)),
@@ -2080,6 +2082,7 @@ pub fn owned_json_graph_plan_v2(
                                 bits: 8 | 16 | 32 | 64,
                                 ..
                             })
+                            | PrimScalar::Float(FloatTy { bits: 32 | 64 })
                             | PrimScalar::Bool
                             | PrimScalar::String,
                         ) => {
@@ -2101,7 +2104,8 @@ pub fn owned_json_graph_plan_v2(
                         bits: 8 | 16 | 32 | 64,
                         ..
                     })
-                    | Scalar::Bool
+                    | Scalar::Float(FloatTy { bits: 32 | 64 })
+                        | Scalar::Bool
                     | Scalar::String,
                 ) => {
                     next_depth(depth)?;
@@ -2122,12 +2126,12 @@ pub fn owned_json_graph_plan_v2(
         .into_iter()
         .map(|id| {
             let definition = &structs[id as usize];
-            hir::OwnedJsonGraphRecordV2 {
+            hir::OwnedJsonGraphRecordV3 {
                 id,
                 fields: definition
                     .fields
                     .iter()
-                    .map(|field| hir::OwnedJsonGraphFieldV2 {
+                    .map(|field| hir::OwnedJsonGraphFieldV3 {
                         name: field.name.clone(),
                         ty: field.ty,
                     })
@@ -2135,7 +2139,7 @@ pub fn owned_json_graph_plan_v2(
             }
         })
         .collect();
-    Ok(hir::OwnedJsonGraphPlanV2 { root, records })
+    Ok(hir::OwnedJsonGraphPlanV3 { root, records })
 }
 
 fn struct_has_transitive_owned_json_text(structs: &[hir::StructDef], root: u32) -> bool {
@@ -4626,7 +4630,7 @@ pub fn owns_hidden_string(e: &hir::Expr, in_arena: bool) -> bool {
     !in_arena
         && matches!(
             e.kind,
-            hir::ExprKind::Template(_) | hir::ExprKind::JsonOwnedEncode { .. }
+            hir::ExprKind::Template(_)
         )
 }
 
@@ -10920,8 +10924,7 @@ fn compact_abstract_nominal_instances(
             | ExprKind::TemplateHtmlToString { resource, .. } => {
                 remap_id(resource, &remap.resources, valid)
             }
-            ExprKind::JsonOwnedEncode { plan, .. }
-            | ExprKind::JsonOwnedEncodeBounded { plan, .. }
+            ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Owned(plan), .. }
             | ExprKind::JsonOwnedDecode { plan, .. } => {
                 remap_id(&mut plan.root, &remap.structs, valid);
                 for record in &mut plan.records {
@@ -10974,7 +10977,7 @@ fn compact_abstract_nominal_instances(
                     remap_template_part(part, remap, valid);
                 }
             }
-            ExprKind::JsonEncodeBounded { parts, .. } => {
+            ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Pieces(parts), .. } => {
                 for part in parts {
                     remap_template_part(part, remap, valid);
                 }
@@ -16913,7 +16916,7 @@ impl EffectScan<'_> {
                     }
                 }
             }
-            ExprKind::JsonEncodeBounded { parts, max_bytes, .. } => {
+            ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Pieces(parts), max_bytes, .. } => {
                 for p in parts {
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => walk!(h),
@@ -16921,10 +16924,10 @@ impl EffectScan<'_> {
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
-                walk!(max_bytes);
+                if let Some(max_bytes) = max_bytes { walk!(max_bytes); }
             }
-            ExprKind::JsonOwnedEncode { .. } => {}
-            ExprKind::JsonOwnedEncodeBounded { max_bytes, .. } => walk!(max_bytes),
+            ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Owned(_), max_bytes: None, .. } => {}
+            ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Owned(_), max_bytes: Some(max_bytes), .. } => walk!(max_bytes),
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonOwnedDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. }
             | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. }
             // `json.scan(input)` is Pure (build a streaming scanner — no I/O); walk the input (J5).
@@ -23134,7 +23137,7 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::HeapNew(_) | ExprKind::BoxClone(_) => {
                 values.push(self.allocation_region(expression));
             }
-            ExprKind::Template(_) | ExprKind::JsonOwnedEncode { .. } => values.push(
+            ExprKind::Template(_) => values.push(
                 self.allocation_region_by_expr
                     .get(&Self::expr_key(expression))
                     .copied()
@@ -24161,8 +24164,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::CryptoVerify { .. }
             | ExprKind::ArrayGroupAgg { .. }
             | ExprKind::ArrayGroupAggMulti { .. }
-            | ExprKind::JsonEncodeBounded { .. }
-            | ExprKind::JsonOwnedEncodeBounded { .. }
+            | ExprKind::JsonEncode { .. }
             | ExprKind::JsonOwnedDecode { .. }
             | ExprKind::RawNull
             | ExprKind::SqliteCallbackDescriptor { .. } => values.push(Region::Static),
@@ -24416,9 +24418,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ArrayChunks { .. }
             | ExprKind::Len(..)
             | ExprKind::Template(..)
-            | ExprKind::JsonOwnedEncode { .. }
-            | ExprKind::JsonEncodeBounded { .. }
-            | ExprKind::JsonOwnedEncodeBounded { .. }
+            | ExprKind::JsonEncode { .. }
             | ExprKind::JsonDecode { .. }
             | ExprKind::JsonOwnedDecode { .. }
             | ExprKind::JsonDecodeArray { .. }
@@ -27760,7 +27760,7 @@ impl<'a> EscapeCheck<'a> {
                     }
                 }
             }
-            ExprKind::JsonEncodeBounded { parts, max_bytes, .. } => {
+            ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Pieces(parts), max_bytes, .. } => {
                 for p in parts {
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.walk(h, depth),
@@ -27768,10 +27768,10 @@ impl<'a> EscapeCheck<'a> {
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
-                self.walk(max_bytes, depth);
+                if let Some(max_bytes) = max_bytes { self.walk(max_bytes, depth); }
             }
-            ExprKind::JsonOwnedEncode { .. } => {}
-            ExprKind::JsonOwnedEncodeBounded { max_bytes, .. } => self.walk(max_bytes, depth),
+            ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Owned(_), max_bytes: None, .. } => {}
+            ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Owned(_), max_bytes: Some(max_bytes), .. } => self.walk(max_bytes, depth),
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonOwnedDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.walk(input, depth),
             ExprKind::CsvDecode {
                 input,
@@ -30302,9 +30302,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::ArrayMapInto { .. }
         | ExprKind::Len(_)
         | ExprKind::Template(_)
-        | ExprKind::JsonOwnedEncode { .. }
-        | ExprKind::JsonEncodeBounded { .. }
-        | ExprKind::JsonOwnedEncodeBounded { .. }
+        | ExprKind::JsonEncode { .. }
         | ExprKind::JsonDecodeScalar { .. }
         | ExprKind::JsonDoc { .. }
         | ExprKind::JsonDocKind { .. }
@@ -37580,18 +37578,17 @@ impl<'a> MoveCheck<'a> {
             // already-flattened provenance. With `slice<str>` elements those values are `str`
             // VIEWS, so the sampled array borrows exactly what `xs` borrows (`rng`/`k` are Copy).
             ExprKind::RandSample { xs, .. } => self.borrow_sources(xs),
-            // `template "…"` / `json.encode(…)` produce a `str` view of a hidden owned `string` MIR
+            // `template "…"` produces a `str` view of a hidden owned `string` MIR
             // allocates at the node (see [`Self::template_owner_root`]); inside a loop that owner is
             // freed on every iteration edge. The *holes* contribute nothing: the template COPIES
             // their rendered bytes into its own storage, so `t := template "{h}"` survives a later
             // `h = …` — exactly the property that keeps it a real copy rather than a view of `h`.
-            ExprKind::Template(_) | ExprKind::JsonOwnedEncode { .. } => {
+            ExprKind::Template(_) => {
                 self.template_owner_root(e).into_iter().collect()
             }
-            // The bounded encoder copies source bytes into a free-standing owned `string`; neither
+            // Either JSON encoder copies source bytes into a free-standing owned `string`; neither
             // its Ok payload nor its Error payload borrows the input.
-            ExprKind::JsonEncodeBounded { .. }
-            | ExprKind::JsonOwnedEncodeBounded { .. }
+            ExprKind::JsonEncode { .. }
             | ExprKind::JsonOwnedDecode { .. }
             | ExprKind::FsTree { .. } => BorrowRoots::new(),
             ExprKind::JsonDecode { input, .. }
@@ -40929,6 +40926,15 @@ impl<'a> MoveCheck<'a> {
                     let falls_through =
                         values.pop().expect("Move expression result");
                     let mut child_snapshots = self.finish_value_snapshot_frame();
+                    if matches!(expression.kind, ExprKind::JsonEncode { .. }) {
+                        if falls_through {
+                            if self.borrows.invalid_mutable_place_sources.remove(&key).is_some() {
+                                self.diags.error("JSON source place was invalidated before the enclosing operation by a later eager operand".to_string(), expression.span);
+                            }
+                            self.validate_value_snapshot(key, key, expression.span);
+                        }
+                        self.borrows.finish_value_source(key);
+                    }
                     if falls_through
                         && !Self::defers_child_snapshot_validation(
                             &expression.kind,
@@ -44146,30 +44152,10 @@ impl<'a> MoveCheck<'a> {
                     }
                 }
             }
-            ExprKind::JsonEncodeBounded {
-                parts, max_bytes, ..
-            } => {
-                for p in parts {
-                    match p {
-                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => {
-                            move_expr!(self, h, moved, false, false)
-                        }
-                        TemplatePart::OptionField { access, .. }
-                        | TemplatePart::OptionStructField { access, .. }
-                        | TemplatePart::StructArrayField { access, .. }
-                        | TemplatePart::ScalarArrayField { access, .. }
-                        | TemplatePart::UnionValue { access, .. } => {
-                            move_expr!(self, access, moved, false, false)
-                        }
-                        TemplatePart::Text(_) | TemplatePart::PopComma => {}
-                    }
-                }
-                move_expr!(self, max_bytes, moved, false, false);
-            }
-            ExprKind::JsonOwnedEncode { base, .. }
-            | ExprKind::JsonOwnedEncodeBounded { base, .. } => {
-                // These nodes store their root directly, so no Local child checks the read.
-                // Encoding borrows the complete record, including every partially moved field.
+            ExprKind::JsonEncode { base, plan, max_bytes } => {
+                // Reserve the source place and its transitive backing generations before the
+                // eager limit runs. Finish validates and retires this reservation even when the
+                // limit diverges; output completion must never inherit the source provenance.
                 if whole_moved(moved, *base) {
                     let name = self.f.locals.get(*base as usize)
                         .map_or("<unknown>", |local| local.name.as_str());
@@ -44177,8 +44163,31 @@ impl<'a> MoveCheck<'a> {
                 } else {
                     self.check_borrow_use(*base, e.span);
                 }
-                if let ExprKind::JsonOwnedEncodeBounded { max_bytes, .. } = &e.kind {
-                    move_expr!(self, max_bytes, moved, false, false);
+                let reservation = Self::expr_key(e);
+                let mut roots = self.borrowed_element_roots(*base);
+                roots.extend(self.local_borrow_fact(*base).live_roots());
+                self.borrows.begin_value_source(reservation, roots);
+                self.borrows.begin_value_headers(reservation, self.local_headers(*base));
+                self.borrows.begin_mutable_place_source(reservation, MutablePlaceSnapshot {
+                    root: *base, path: Vec::new(),
+                });
+                if let crate::hir::JsonEncodePlan::Pieces(parts) = plan {
+                    for part in parts {
+                        match part {
+                            TemplatePart::Hole(access) | TemplatePart::JsonStr(access)
+                            | TemplatePart::OptionField { access, .. }
+                            | TemplatePart::OptionStructField { access, .. }
+                            | TemplatePart::StructArrayField { access, .. }
+                            | TemplatePart::ScalarArrayField { access, .. }
+                            | TemplatePart::UnionValue { access, .. } => {
+                                move_expr!(self, access, moved, false, false);
+                            }
+                            TemplatePart::Text(_) | TemplatePart::PopComma => {}
+                        }
+                    }
+                }
+                if let Some(limit) = max_bytes {
+                    move_expr!(self, limit, moved, false, false);
                 }
             }
             ExprKind::JsonDecode { input, .. }
@@ -57676,7 +57685,7 @@ impl<'a, 't> Checker<'a, 't> {
         if !struct_has_transitive_owned_json_text(self.structs, sid) {
             return Some(OwnedJsonRoute::Existing);
         }
-        match owned_json_graph_plan_v2(self.structs, sid) {
+        match owned_json_graph_plan_v3(self.structs, sid) {
             Ok(plan) => Some(OwnedJsonRoute::Owned(plan)),
             Err(reason) => {
                 self.diags.error(format!("'{}' {reason}", dir.name()), span);
@@ -57702,10 +57711,10 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         };
         let kind = match route {
-            OwnedJsonRoute::Existing => ExprKind::Template(parts),
-            OwnedJsonRoute::Owned(plan) => ExprKind::JsonOwnedEncode { base, plan },
+            OwnedJsonRoute::Existing => ExprKind::JsonEncode { base, plan: hir::JsonEncodePlan::Pieces(parts), max_bytes: None },
+            OwnedJsonRoute::Owned(plan) => ExprKind::JsonEncode { base, plan: crate::hir::JsonEncodePlan::Owned(plan), max_bytes: None },
         };
-        Expr { kind, ty: Ty::Str, span }
+        Expr { kind, ty: Ty::Result(Scalar::String, Scalar::Enum(self.error_enum_id)), span }
     }
 
     /// Construct the one checked encode plan shared by `json.encode` and
@@ -57805,16 +57814,8 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         let kind = match route {
-            OwnedJsonRoute::Existing => ExprKind::JsonEncodeBounded {
-                base,
-                parts,
-                max_bytes: Box::new(max_bytes),
-            },
-            OwnedJsonRoute::Owned(plan) => ExprKind::JsonOwnedEncodeBounded {
-                base,
-                plan,
-                max_bytes: Box::new(max_bytes),
-            },
+            OwnedJsonRoute::Existing => ExprKind::JsonEncode { base, plan: crate::hir::JsonEncodePlan::Pieces(parts), max_bytes: Some(Box::new(max_bytes)) },
+            OwnedJsonRoute::Owned(plan) => ExprKind::JsonEncode { base, plan: crate::hir::JsonEncodePlan::Owned(plan), max_bytes: Some(Box::new(max_bytes)) },
         };
         Expr {
             kind,
@@ -65122,9 +65123,7 @@ impl<'a, 't> Checker<'a, 't> {
                     }
                 }
             }
-            ExprKind::JsonEncodeBounded {
-                parts, max_bytes, ..
-            } => {
+            ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Pieces(parts), max_bytes, .. } => {
                 for p in parts {
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.finalize_expr(h),
@@ -65136,10 +65135,10 @@ impl<'a, 't> Checker<'a, 't> {
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
-                self.finalize_expr(max_bytes);
+                if let Some(max_bytes) = max_bytes { self.finalize_expr(max_bytes); }
             }
-            ExprKind::JsonOwnedEncode { .. } => {}
-            ExprKind::JsonOwnedEncodeBounded { max_bytes, .. } => self.finalize_expr(max_bytes),
+            ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Owned(_), max_bytes: None, .. } => {}
+            ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Owned(_), max_bytes: Some(max_bytes), .. } => self.finalize_expr(max_bytes),
             ExprKind::JsonDecode { input, .. }
             | ExprKind::JsonOwnedDecode { input, .. }
             | ExprKind::JsonDecodeArray { input, .. }
@@ -77727,19 +77726,19 @@ fn exit_branch(flag: bool) -> i64 {
 
     #[test]
     fn json_encode_struct_checks() {
-        let (_p, d) = check("import core.json\nUser { id: i64, name: str, active: bool }\nfn main() -> i32 {\n  u := User{id: 1, name: \"a\", active: true}\n  print(json.encode(u))\n  return 0\n}\n");
+        let (_p, d) = check("import core.json\nUser { id: i64, name: str, active: bool }\nfn main() -> i32 {\n  u := User{id: 1, name: \"a\", active: true}\n  print((json.encode(u) else { return 1 }))\n  return 0\n}\n");
         assert!(!d.has_errors(), "json.encode of a flat struct should check");
     }
 
     #[test]
     fn json_encode_struct_array_checks() {
-        let (_p, d) = check("import core.json\nUser { id: i64, name: str }\nfn main() -> i32 {\n  us := [User{id: 1, name: \"a\"}, User{id: 2, name: \"b\"}]\n  print(json.encode(us))\n  return 0\n}\n");
+        let (_p, d) = check("import core.json\nUser { id: i64, name: str }\nfn main() -> i32 {\n  us := [User{id: 1, name: \"a\"}, User{id: 2, name: \"b\"}]\n  print((json.encode(us) else { return 1 }))\n  return 0\n}\n");
         assert!(!d.has_errors(), "json.encode of a struct array should check");
     }
 
     #[test]
     fn json_encode_rejects_non_struct() {
-        let (_p, d) = check("import core.json\nfn main() -> i32 {\n  x := 5\n  print(json.encode(x))\n  return 0\n}\n");
+        let (_p, d) = check("import core.json\nfn main() -> i32 {\n  x := 5\n  print((json.encode(x) else { return 1 }))\n  return 0\n}\n");
         assert!(d.has_errors(), "json.encode requires a struct");
     }
 
@@ -77747,7 +77746,7 @@ fn exit_branch(flag: bool) -> i64 {
     fn json_encode_rejects_unsupported_field() {
         // A char field is a valid struct field but not encodable yet; json.encode must error
         // (and not return a malformed template).
-        let (_p, d) = check("import core.json\nC { ch: char, n: i32 }\nfn main() -> i32 {\n  c := C{ch: 'x', n: 1}\n  print(json.encode(c))\n  return 0\n}\n");
+        let (_p, d) = check("import core.json\nC { ch: char, n: i32 }\nfn main() -> i32 {\n  c := C{ch: 'x', n: 1}\n  print((json.encode(c) else { return 1 }))\n  return 0\n}\n");
         assert!(d.has_errors(), "json.encode rejects a struct with an unsupported field type");
     }
 
@@ -80288,7 +80287,7 @@ fn exit_branch(flag: bool) -> i64 {
                     }
                 }
                 source.push_str(
-                    "fn decode(data: str) -> Result<(), Error> {\n  value: JsonDeep0 := json.decode(data)?\n  return Ok(())\n}\nfn encode(value: JsonDeep0) -> i64 {\n  text := json.encode(value)\n  return text.len()\n}\nfn main() -> i32 = 0\n",
+                    "fn decode(data: str) -> Result<(), Error> {\n  value: JsonDeep0 := json.decode(data)?\n  return Ok(())\n}\nfn encode(value: JsonDeep0) -> i64 {\n  text := (json.encode(value) else { return 1 })\n  return text.len()\n}\nfn main() -> i32 = 0\n",
                 );
                 let (_, diagnostics) = check(&source);
                 let messages = diagnostics
@@ -80344,7 +80343,7 @@ fn exit_branch(flag: bool) -> i64 {
         let dag = "import core.json\nLeaf { text: string }\nLeft { leaf: Leaf }\nRight { leaf: Leaf }\nRoot { left: Left, right: Right }\nfn decode(data: str) -> Result<Root, Error> = json.decode(data)\nfn main() -> i32 = 0\n";
         let (program, diagnostics) = check(dag);
         assert!(!diagnostics.has_errors());
-        let plan = owned_json_graph_plan_v2(&program.structs, 3).expect("DAG plan");
+        let plan = owned_json_graph_plan_v3(&program.structs, 3).expect("DAG plan");
         assert_eq!(
             plan.records
                 .iter()

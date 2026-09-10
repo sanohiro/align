@@ -351,7 +351,7 @@ fn json_decode_encode_nested_struct_roundtrip() {
          fn main() -> Result<(), Error> {{\n  \
          o := parse({json:?})?\n  \
          print(o.id)\n  print(o.inner.x)\n  print(o.inner.name)\n  print(o.count)\n  \
-         print(json.encode(o))\n  return Ok(())\n}}\n",
+         print(json.encode(o)?)\n  return Ok(())\n}}\n",
     );
     let out = build_and_run("json-nested-roundtrip", &src);
     assert_eq!(out.status.code(), Some(0));
@@ -395,7 +395,7 @@ fn json_encode_fixed_struct_array_with_nested() {
         Outer { id: i64, inner: Inner }\n\
         fn main() -> i32 {\n  \
         a := [Outer{id: 1, inner: Inner{x: 5, name: \"a\"}}, Outer{id: 2, inner: Inner{x: 6, name: \"b\"}}]\n  \
-        print(json.encode(a))\n  return 0\n}\n";
+        print((json.encode(a) else { return 1 }))\n  return 0\n}\n";
     let out = build_and_run("json-encode-fixed-nested", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(
@@ -466,11 +466,11 @@ fn json_encode_option_fields_omit_none() {
         Req { model: str, temperature: Option<f64>, stream: Option<bool>, tag: Option<str> }\n\
         fn main() -> i32 {\n  \
         a := Req{model: \"gpt\", temperature: Some(0.5), stream: None, tag: Some(\"x\")}\n  \
-        print(json.encode(a))\n  \
+        print((json.encode(a) else { return 1 }))\n  \
         b := Req{model: \"m\", temperature: None, stream: None, tag: None}\n  \
-        print(json.encode(b))\n  \
+        print((json.encode(b) else { return 1 }))\n  \
         c := Req{model: \"z\", temperature: None, stream: Some(false), tag: None}\n  \
-        print(json.encode(c))\n  return 0\n}\n";
+        print((json.encode(c) else { return 1 }))\n  return 0\n}\n";
     let out = build_and_run("json-option-encode", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(
@@ -493,7 +493,7 @@ fn json_option_field_decode_encode_roundtrip() {
          Req {{ model: str, temperature: Option<f64>, stream: Option<bool> }}\n\
          fn main() -> Result<(), Error> {{\n  \
          r: Req := json.decode({json:?})?\n  \
-         print(json.encode(r))\n  return Ok(())\n}}\n",
+         print(json.encode(r)?)\n  return Ok(())\n}}\n",
     );
     let out = build_and_run("json-option-roundtrip", &src);
     assert_eq!(out.status.code(), Some(0));
@@ -516,10 +516,10 @@ fn json_encode_nested_struct_and_option_compose() {
         StaticParent { id: i64, inner: Inner }\n\
         OptParent { id: i64, opt: Option<i64>, inner: Plain }\n\
         fn main() -> i32 {\n  \
-        a := StaticParent{id: 1, inner: Inner{a: 2, b: Some(3)}}\n  print(json.encode(a))\n  \
-        b := StaticParent{id: 4, inner: Inner{a: 5, b: None}}\n  print(json.encode(b))\n  \
-        c := OptParent{id: 6, opt: Some(9), inner: Plain{a: 7}}\n  print(json.encode(c))\n  \
-        d := OptParent{id: 8, opt: None, inner: Plain{a: 7}}\n  print(json.encode(d))\n  return 0\n}\n";
+        a := StaticParent{id: 1, inner: Inner{a: 2, b: Some(3)}}\n  print((json.encode(a) else { return 1 }))\n  \
+        b := StaticParent{id: 4, inner: Inner{a: 5, b: None}}\n  print((json.encode(b) else { return 1 }))\n  \
+        c := OptParent{id: 6, opt: Some(9), inner: Plain{a: 7}}\n  print((json.encode(c) else { return 1 }))\n  \
+        d := OptParent{id: 8, opt: None, inner: Plain{a: 7}}\n  print((json.encode(d) else { return 1 }))\n  return 0\n}\n";
     let out = build_and_run("json-nested-option-compose", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(
@@ -548,9 +548,9 @@ fn json_option_struct_field_encode_roundtrip() {
         fn main() -> Result<(), Error> {\n  \
         arena {\n    \
         p: Outer := json.decode(\"{\\\"a\\\":1,\\\"b\\\":{\\\"v\\\":9,\\\"tag\\\":\\\"hi\\\"},\\\"c\\\":\\\"x\\\"}\")?\n    \
-        print(json.encode(p))\n    \
+        print(json.encode(p)?)\n    \
         q: Outer := json.decode(\"{\\\"a\\\":2,\\\"c\\\":\\\"y\\\"}\")?\n    \
-        print(json.encode(q))\n  }\n  \
+        print(json.encode(q)?)\n  }\n  \
         return Ok(())\n}\n";
     let out = build_and_run("json-option-struct", src);
     assert_eq!(out.status.code(), Some(0));
@@ -575,11 +575,11 @@ fn json_option_struct_field_last_and_nested_compose() {
         fn main() -> Result<(), Error> {\n  \
         arena {\n    \
         a: Doc := json.decode(\"{\\\"id\\\":7,\\\"meta\\\":{\\\"n\\\":5,\\\"note\\\":\\\"hi\\\",\\\"d\\\":{\\\"z\\\":true}}}\")?\n    \
-        print(json.encode(a))\n    \
+        print(json.encode(a)?)\n    \
         b: Doc := json.decode(\"{\\\"id\\\":8,\\\"meta\\\":{\\\"n\\\":6,\\\"d\\\":{\\\"z\\\":false}}}\")?\n    \
-        print(json.encode(b))\n    \
+        print(json.encode(b)?)\n    \
         c: Doc := json.decode(\"{\\\"id\\\":9}\")?\n    \
-        print(json.encode(c))\n  }\n  \
+        print(json.encode(c)?)\n  }\n  \
         return Ok(())\n}\n";
     let out = build_and_run("json-option-struct-nested", src);
     assert_eq!(out.status.code(), Some(0));
@@ -602,9 +602,9 @@ fn json_option_move_struct_payload_remains_admitted() {
          Doc { id: i64, meta: Option<Owned> }\n\
          fn main() -> Result<(), Error> {\n  \
            a: Doc := json.decode(\"{\\\"id\\\":1,\\\"meta\\\":{\\\"xs\\\":[2,3]}}\")?\n  \
-           print(json.encode(a))\n  \
+           print(json.encode(a)?)\n  \
            b: Doc := json.decode(\"{\\\"id\\\":2}\")?\n  \
-           print(json.encode(b))\n  \
+           print(json.encode(b)?)\n  \
            return Ok(())\n\
          }\n";
     let out = build_and_run("json-option-move-struct", src);
@@ -657,7 +657,7 @@ fn json_array_struct_field_decode_read_and_roundtrip() {
          r: Req := json.decode(s)?\n  \
          print(r.messages.len())\n  \
          print(r.messages[0].role)\n  print(r.messages[1].content)\n  \
-         print(json.encode(r))\n  return Ok(())\n}}\n",
+         print(json.encode(r)?)\n  return Ok(())\n}}\n",
     );
     let out = build_and_run("json-array-field", &src);
     assert_eq!(out.status.code(), Some(0));
@@ -679,7 +679,7 @@ fn json_full_openai_response_shape_roundtrip() {
          Choice {{ index: i64, message: Message }}\n\
          Response {{ id: str, choices: array<Choice>, usage: Usage }}\n\
          fn main() -> Result<(), Error> {{\n  \
-         s := {json:?}\n  r: Response := json.decode(s)?\n  print(json.encode(r))\n  return Ok(())\n}}\n",
+         s := {json:?}\n  r: Response := json.decode(s)?\n  print(json.encode(r)?)\n  return Ok(())\n}}\n",
     );
     let out = build_and_run("json-openai-response", &src);
     assert_eq!(out.status.code(), Some(0));
@@ -698,7 +698,7 @@ fn json_empty_array_struct_field() {
          Msg {{ role: str }}\n\
          Req {{ model: str, messages: array<Msg> }}\n\
          fn main() -> Result<(), Error> {{\n  \
-         s := {json:?}\n  r: Req := json.decode(s)?\n  print(r.messages.len())\n  print(json.encode(r))\n  return Ok(())\n}}\n",
+         s := {json:?}\n  r: Req := json.decode(s)?\n  print(r.messages.len())\n  print(json.encode(r)?)\n  return Ok(())\n}}\n",
     );
     let out = build_and_run("json-empty-array-field", &src);
     assert_eq!(out.status.code(), Some(0));
@@ -719,7 +719,7 @@ fn json_array_element_with_option_field_roundtrip() {
          Item {{ x: i64, note: Option<str> }}\n\
          Bag {{ items: array<Item> }}\n\
          fn main() -> Result<(), Error> {{\n  \
-         s := {json:?}\n  b: Bag := json.decode(s)?\n  print(json.encode(b))\n  return Ok(())\n}}\n",
+         s := {json:?}\n  b: Bag := json.decode(s)?\n  print(json.encode(b)?)\n  return Ok(())\n}}\n",
     );
     let out = build_and_run("json-array-elem-option", &src);
     assert_eq!(out.status.code(), Some(0));
@@ -1081,7 +1081,7 @@ fn json_decode_struct_str_array_field_roundtrip() {
     // input literal's Static scope here). Escaped elements now materialize in the enclosing arena;
     // this fixture intentionally uses clean literals so it exercises the input-view path used by
     // align-llm argv/tag cases without making the test arena-bound.
-    let src = "import core.json\nSpec { id: str, argv: array<str>, code: i64 }\nfn main() -> Result<(), Error> {\n  r: Spec := json.decode(\"{\\\"id\\\":\\\"t1\\\",\\\"argv\\\":[\\\"git\\\",\\\"status\\\",\\\"--porcelain\\\"],\\\"code\\\":7}\")?\n  print(r.argv.len())\n  print(r.argv[0])\n  print(r.argv[2])\n  print(json.encode(r))\n  return Ok(())\n}\n";
+    let src = "import core.json\nSpec { id: str, argv: array<str>, code: i64 }\nfn main() -> Result<(), Error> {\n  r: Spec := json.decode(\"{\\\"id\\\":\\\"t1\\\",\\\"argv\\\":[\\\"git\\\",\\\"status\\\",\\\"--porcelain\\\"],\\\"code\\\":7}\")?\n  print(r.argv.len())\n  print(r.argv[0])\n  print(r.argv[2])\n  print(json.encode(r)?)\n  return Ok(())\n}\n";
     let out = build_and_run("json-decode-str-array-field", src);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(
@@ -1097,7 +1097,7 @@ fn json_decode_struct_str_array_field_empty() {
     }
     // An empty JSON array `[]` decodes to an empty owned `array<str>` (len 0, no allocation of
     // element views), and re-encodes as `[]`.
-    let src = "import core.json\nE { xs: array<str> }\nfn main() -> Result<(), Error> {\n  a: E := json.decode(\"{\\\"xs\\\":[]}\")?\n  print(a.xs.len())\n  print(json.encode(a))\n  return Ok(())\n}\n";
+    let src = "import core.json\nE { xs: array<str> }\nfn main() -> Result<(), Error> {\n  a: E := json.decode(\"{\\\"xs\\\":[]}\")?\n  print(a.xs.len())\n  print(json.encode(a)?)\n  return Ok(())\n}\n";
     let out = build_and_run("json-decode-str-array-empty", src);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n{\"xs\":[]}\n");
@@ -2585,7 +2585,7 @@ fn json_decode_then_encode_roundtrips() {
         return;
     }
     // §19 spirit: decode → (re-)encode. {"id":7,"active":false} round-trips.
-    let src = "import core.json\nUser { id: i64, active: bool }\nfn run(s: str) -> Result<(), Error> {\n  u: User := json.decode(s)?\n  print(json.encode(u))\n  return Ok(())\n}\nfn main() -> Result<(), Error> {\n  run(\"{\\\"id\\\": 7, \\\"active\\\": false}\")?\n  return Ok(())\n}\n";
+    let src = "import core.json\nUser { id: i64, active: bool }\nfn run(s: str) -> Result<(), Error> {\n  u: User := json.decode(s)?\n  print(json.encode(u)?)\n  return Ok(())\n}\nfn main() -> Result<(), Error> {\n  run(\"{\\\"id\\\": 7, \\\"active\\\": false}\")?\n  return Ok(())\n}\n";
     let out = build_and_run("json-roundtrip", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "{\"id\":7,\"active\":false}\n");
@@ -2598,7 +2598,7 @@ fn json_encode_flat_struct() {
     }
     // A struct of i64/str/bool encodes to a JSON object; the str field's embedded quote
     // is JSON-escaped.
-    let src = "import core.json\nUser { id: i64, name: str, active: bool }\nfn main() -> i32 {\n  u := User{id: 7, name: \"a\\\"b\", active: true}\n  print(json.encode(u))\n  return 0\n}\n";
+    let src = "import core.json\nUser { id: i64, name: str, active: bool }\nfn main() -> i32 {\n  u := User{id: 7, name: \"a\\\"b\", active: true}\n  print((json.encode(u) else { return 1 }))\n  return 0\n}\n";
     let out = build_and_run("json-encode", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "{\"id\":7,\"name\":\"a\\\"b\",\"active\":true}\n");
@@ -2610,7 +2610,7 @@ fn json_encode_struct_array() {
         return;
     }
     // A fixed struct array encodes to a JSON array of objects (str fields escaped).
-    let src = "import core.json\nUser { id: i64, name: str, active: bool }\nfn main() -> i32 {\n  us := [User{id: 1, name: \"a\", active: true}, User{id: 2, name: \"b\\n\", active: false}]\n  print(json.encode(us))\n  return 0\n}\n";
+    let src = "import core.json\nUser { id: i64, name: str, active: bool }\nfn main() -> i32 {\n  us := [User{id: 1, name: \"a\", active: true}, User{id: 2, name: \"b\\n\", active: false}]\n  print((json.encode(us) else { return 1 }))\n  return 0\n}\n";
     let out = build_and_run("json-encode-array", src);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(
@@ -3016,10 +3016,10 @@ fn json_union_encode_bare_payload_and_roundtrip() {
         Shape { Name(str), At(Point), N(i64), Yes(bool) }\n\
         fn main() -> Result<(), Error> {\n  \
         a := Shape.Name(\"hi\")\n  b := Shape.N(42)\n  c := Shape.Yes(true)\n  \
-        print(json.encode(a))\n  print(json.encode(b))\n  print(json.encode(c))\n  \
+        print(json.encode(a)?)\n  print(json.encode(b)?)\n  print(json.encode(c)?)\n  \
         arena {\n    p: Shape := json.decode(\"{\\\"x\\\":3,\\\"y\\\":4}\")?\n    \
-        print(json.encode(p))\n    \
-        round := json.encode(p)\n    p2: Shape := json.decode(round)?\n    print(json.encode(p2))\n  }\n  \
+        print(json.encode(p)?)\n    \
+        round := json.encode(p)?\n    p2: Shape := json.decode(round)?\n    print(json.encode(p2)?)\n  }\n  \
         return Ok(())\n}\n";
     let out = build_and_run("json-union-encode", src);
     assert_eq!(out.status.code(), Some(0));
@@ -3084,7 +3084,7 @@ fn json_union_struct_field_decode_encode_roundtrip() {
         arena {\n    \
         a: Message := json.decode(\"{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"hello\\\"}\")?\n    \
         b: Message := json.decode(\"{\\\"role\\\":\\\"sys\\\",\\\"content\\\":42}\")?\n    \
-        print(json.encode(a))\n    print(json.encode(b))\n    \
+        print(json.encode(a)?)\n    print(json.encode(b)?)\n    \
         print(match a.content { Text(s) => s.len() as i64, Count(n) => n, Flag(f) => -1 })\n  }\n  \
         return Ok(())\n}\n";
     let out = build_and_run("json-union-field", src);
@@ -3111,7 +3111,7 @@ fn json_union_struct_field_object_payload_and_option_coexist() {
         arena {\n    \
         a: Message := json.decode(\"{\\\"content\\\":{\\\"url\\\":\\\"u\\\"},\\\"name\\\":\\\"bob\\\"}\")?\n    \
         b: Message := json.decode(\"{\\\"content\\\":\\\"hi\\\"}\")?\n    \
-        print(json.encode(a))\n    print(json.encode(b))\n  }\n  \
+        print(json.encode(a)?)\n    print(json.encode(b)?)\n  }\n  \
         return Ok(())\n}\n";
     let out = build_and_run("json-union-field-obj", src);
     assert_eq!(out.status.code(), Some(0));
@@ -3131,7 +3131,7 @@ fn json_union_struct_field_rejects_non_union_enum() {
     ));
     assert!(check_errs(
         "json-union-field-bad-encode",
-        "import core.json\nBad { A(i64), B(f64) }\nWrap { x: Bad }\nfn main() -> i32 {\n  w := Wrap { x: Bad.A(1) }\n  s := json.encode(w)\n  return 0\n}\n"
+        "import core.json\nBad { A(i64), B(f64) }\nWrap { x: Bad }\nfn main() -> i32 {\n  w := Wrap { x: Bad.A(1) }\n  s := (json.encode(w) else { return 1 })\n  return 0\n}\n"
     ));
 }
 
@@ -3153,7 +3153,7 @@ fn json_union_field_in_struct_array_roundtrips() {
         fn main() -> Result<(), Error> {\n  \
         arena {\n    \
         c: Chat := json.decode(\"{\\\"messages\\\":[{\\\"role\\\":\\\"u\\\",\\\"content\\\":{\\\"url\\\":\\\"z\\\",\\\"w\\\":9}},{\\\"role\\\":\\\"a\\\",\\\"content\\\":\\\"hi\\\"}]}\")?\n    \
-        print(json.encode(c))\n    print(c.messages.len())\n  }\n  \
+        print(json.encode(c)?)\n    print(c.messages.len())\n  }\n  \
         return Ok(())\n}\n";
     let out = build_and_run("json-union-field-array", src);
     assert_eq!(out.status.code(), Some(0));
@@ -3202,11 +3202,11 @@ fn json_union_array_variant_encode_bare_and_roundtrip() {
         Part { kind: str, text: str }\n\
         Content { Text(str), Parts(array<Part>) }\n\
         fn main() -> Result<(), Error> {\n  \
-        a := Content.Text(\"hi\")\n  print(json.encode(a))\n  \
+        a := Content.Text(\"hi\")\n  print(json.encode(a)?)\n  \
         arena {\n    \
         b: Content := json.decode(\"[{\\\"kind\\\":\\\"text\\\",\\\"text\\\":\\\"hello\\\"},{\\\"kind\\\":\\\"img\\\",\\\"text\\\":\\\"x\\\"}]\")?\n    \
-        print(json.encode(b))\n    \
-        round := json.encode(b)\n    b2: Content := json.decode(round)?\n    print(json.encode(b2))\n  }\n  \
+        print(json.encode(b)?)\n    \
+        round := json.encode(b)?\n    b2: Content := json.decode(round)?\n    print(json.encode(b2)?)\n  }\n  \
         return Ok(())\n}\n";
     let out = build_and_run("json-union-arr-encode", src);
     assert_eq!(out.status.code(), Some(0));
@@ -3286,9 +3286,9 @@ fn json_move_union_field_decode_both_shapes_roundtrip() {
         arena {\n    \
         m: Message := json.decode(\"{\\\"role\\\":\\\"user\\\",\\\"content\\\":[{\\\"kind\\\":\\\"text\\\",\\\"text\\\":\\\"hi\\\"},{\\\"kind\\\":\\\"img\\\",\\\"text\\\":\\\"x\\\"}]}\")?\n    \
         print(m.role)\n    \
-        print(json.encode(m))\n    \
+        print(json.encode(m)?)\n    \
         t: Message := json.decode(\"{\\\"role\\\":\\\"sys\\\",\\\"content\\\":\\\"plain\\\"}\")?\n    \
-        print(json.encode(t))\n  }\n  \
+        print(json.encode(t)?)\n  }\n  \
         return Ok(())\n}\n";
     let out = build_and_run("json-move-union-field", src);
     assert_eq!(out.status.code(), Some(0));
@@ -3365,7 +3365,7 @@ fn json_chat_array_of_move_message_roundtrip() {
         arena {\n    \
         c: Chat := json.decode(\"{\\\"messages\\\":[{\\\"role\\\":\\\"u\\\",\\\"content\\\":\\\"hey\\\"},{\\\"role\\\":\\\"a\\\",\\\"content\\\":[{\\\"kind\\\":\\\"text\\\",\\\"text\\\":\\\"ok\\\"},{\\\"kind\\\":\\\"img\\\",\\\"text\\\":\\\"z\\\"}]}]}\")?\n    \
         print(c.messages.len())\n    \
-        print(json.encode(c))\n  }\n  \
+        print(json.encode(c)?)\n  }\n  \
         return Ok(())\n}\n";
     let out = build_and_run("json-chat-array-message", src);
     assert_eq!(out.status.code(), Some(0));
@@ -3434,7 +3434,7 @@ fn json_scalar_array_fields_decode_encode_roundtrip() {
         v: Vec := json.decode(\"{\\\"name\\\":\\\"e\\\",\\\"xs\\\":[1,2,3],\\\"ys\\\":[1.5,2.5],\\\"flags\\\":[true,false,true]}\")?\n    \
         print(v.xs.len())\n    \
         print(v.ys.len())\n    \
-        print(json.encode(v))\n  }\n  \
+        print(json.encode(v)?)\n  }\n  \
         return Ok(())\n}\n";
     let out = build_and_run("json-scalar-array", src);
     assert_eq!(out.status.code(), Some(0));
@@ -3456,7 +3456,7 @@ fn json_scalar_array_field_widths_and_empty_roundtrip() {
         arena {\n    \
         v: S := json.decode(\"{\\\"a\\\":[],\\\"b\\\":[-5,7],\\\"c\\\":[18446744073709551615,0]}\")?\n    \
         print(v.a.len())\n    \
-        print(json.encode(v))\n  }\n  \
+        print(json.encode(v)?)\n  }\n  \
         return Ok(())\n}\n";
     let out = build_and_run("json-scalar-array-widths", src);
     assert_eq!(out.status.code(), Some(0));
@@ -3481,7 +3481,7 @@ fn json_scalar_array_composes_with_move_struct_array() {
         arena {\n    \
         t: Table := json.decode(\"{\\\"rows\\\":[{\\\"id\\\":1,\\\"vals\\\":[1.0,2.0]},{\\\"id\\\":2,\\\"vals\\\":[3.0]}],\\\"meta\\\":[10,20]}\")?\n    \
         print(t.rows.len())\n    \
-        print(json.encode(t))\n  }\n  \
+        print(json.encode(t)?)\n  }\n  \
         return Ok(())\n}\n";
     let out = build_and_run("json-scalar-array-nested", src);
     assert_eq!(out.status.code(), Some(0));
@@ -3787,4 +3787,39 @@ fn json_doc_view_cannot_escape_arena() {
          }\n\
          fn main() -> i32 = 0\n"
     ));
+}
+
+#[test]
+fn r63_numeric_public_routes() {
+    if !backend_available() { return; }
+    let source = r#"
+import core.json
+Row { small: f32, large: f64 }
+fn main() -> Result<(), Error> {
+  scalar: f32 := json.decode("1.0000000596046448")?
+  print(scalar == 1.0000001)
+  values: array<f32> := json.decode("[1.0000000596046448,-0,1e-45]")?
+  print(values[0] == scalar)
+  input := "[{\"small\":1.0000000596046448,\"large\":0.3},{\"large\":0.3,\"ignored\":1e999,\"small\":1.0000000596046448},{\"small\":1.0000000596046448,\"large\":0.3}]"
+  rows: array<Row> := json.decode(input)?
+  print(rows[0].small == scalar)
+  print(rows[1].small == scalar)
+  print(rows[2].small == scalar)
+  arena {
+    columns: soa<Row> := json.decode(input)?
+    print(columns.small[1] == scalar)
+    scanner: json.scanner<Row> := json.scan(input)
+    print(scanner.small.sum()? == scalar * 3.0)
+    document := json.doc("{\"huge\":1e999,\"finite\":3.4028236e38}")?
+    print(match document.get("huge").as_f64() { Some(_) => false, None => true })
+    print(match document.get("finite").as_f64() { Some(_) => true, None => false })
+  }
+  too_large: Result<f32, Error> := json.decode("3.4028236e38")
+  print(match too_large { Ok(_) => false, Err(_) => true })
+  return Ok(())
+}
+"#;
+    let out = build_and_run("r63-numeric-public", source);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "true\n".repeat(10));
 }

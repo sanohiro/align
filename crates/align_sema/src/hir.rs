@@ -1023,26 +1023,11 @@ pub enum ExprKind {
     /// `template "..."` — build a `str` from static parts and interpolated holes. Each
     /// hole is a local (int or str); lowering picks the right builder write by its type.
     Template(Vec<TemplatePart>),
-    /// `json.encode(value)` for the closed direct-owned record graph. Kept distinct from a surface
-    /// template so checked-HIR validation can replay the owned graph and allocation contract.
-    JsonOwnedEncode {
+    /// Both JSON encoders borrow a canonical source plan and return owned Result<string, Error>.
+    JsonEncode {
         base: LocalId,
-        plan: OwnedJsonGraphPlanV2,
-    },
-    /// `json.encode_bounded(value, max_bytes)` — the same ordered typed encode parts as
-    /// `json.encode`, emitted into an individually owned builder with an inclusive byte ceiling.
-    /// The expression type is `Result<string, Error>`.
-    JsonEncodeBounded {
-        /// The checked local whose complete schema owns the canonical plan below.
-        base: LocalId,
-        parts: Vec<TemplatePart>,
-        max_bytes: Box<Expr>,
-    },
-    /// The bounded encoder for the same closed direct-owned record graph.
-    JsonOwnedEncodeBounded {
-        base: LocalId,
-        plan: OwnedJsonGraphPlanV2,
-        max_bytes: Box<Expr>,
+        plan: JsonEncodePlan,
+        max_bytes: Option<Box<Expr>>,
     },
     /// `json.decode(input)` for struct `struct_id` — parse the `str` `input` into that
     /// struct at runtime. The expression `ty` is `Result<Struct, Error>`.
@@ -1050,7 +1035,7 @@ pub enum ExprKind {
     /// `json.decode(input)` for a direct record containing owned text. Runtime materialization is
     /// always free-standing and therefore carries no input or arena region.
     JsonOwnedDecode {
-        plan: OwnedJsonGraphPlanV2,
+        plan: OwnedJsonGraphPlanV3,
         input: Box<Expr>,
     },
     /// `json.decode(input)` targeting an owned `array<T>` (MMv2 slice 8c) — parse a JSON array of
@@ -2332,23 +2317,29 @@ pub enum StrTrimKind {
 }
 
 /// Checked, deterministic root-first record graph for the recursive owned-JSON route.
-/// Record ids are compiler-local; interface transport uses its independent structural V2 bytes.
+/// Record ids are compiler-local; interface transport uses its independent structural V3 bytes.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-pub struct OwnedJsonGraphPlanV2 {
+pub struct OwnedJsonGraphPlanV3 {
     pub root: u32,
-    pub records: Vec<OwnedJsonGraphRecordV2>,
+    pub records: Vec<OwnedJsonGraphRecordV3>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-pub struct OwnedJsonGraphRecordV2 {
+pub struct OwnedJsonGraphRecordV3 {
     pub id: u32,
-    pub fields: Vec<OwnedJsonGraphFieldV2>,
+    pub fields: Vec<OwnedJsonGraphFieldV3>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-pub struct OwnedJsonGraphFieldV2 {
+pub struct OwnedJsonGraphFieldV3 {
     pub name: String,
     pub ty: crate::Ty,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub enum JsonEncodePlan {
+    Pieces(Vec<TemplatePart>),
+    Owned(OwnedJsonGraphPlanV3),
 }
 
 #[derive(Clone, Debug, serde::Serialize)]

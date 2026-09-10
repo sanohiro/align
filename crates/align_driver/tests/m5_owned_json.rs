@@ -117,7 +117,7 @@ fn main() -> Result<(), Error> {
 fn owned_json_encoders_reject_moved_sources() {
     let declarations =
         "pub Item { text: string }\npub Row<T> { value: T, name: string, count: Option<i64> }\n";
-    for encoder in ["json.encode(row)", "json.encode_bounded(row, 1024)"] {
+    for encoder in ["json.encode(row)?", "json.encode_bounded(row, 1024)"] {
         for (payload, input, action) in [
             ("string", "\"one\"", "taken := row"),
             ("string", "\"one\"", "taken := row.name"),
@@ -174,12 +174,12 @@ fn main() -> Result<(), Error> {
   mut row: Row := json.decode("{\"value\":[{\"text\":\"one\"}],\"count\":42}")?
   print(inspect(row))
   print(match row.count { Some(value) => value, None => 0 })
-  print(json.encode(row))
+  print(json.encode(row)?)
   bounded := json.encode_bounded(row, 1024)?
   print(bounded)
   taken := row
   row = Row { value: None, count: Some(7) }
-  print(json.encode(row))
+  print(json.encode(row)?)
   replaced := json.encode_bounded(row, 1024)?
   print(replaced)
   return Ok(())
@@ -258,7 +258,7 @@ fn recursive_owned_json_c6_graph_manifest() {
     );
 
     for root in 0..manifest.len() as u32 {
-        let plan = align_sema::owned_json_graph_plan_v2(&checked.hir.structs, root)
+        let plan = align_sema::owned_json_graph_plan_v3(&checked.hir.structs, root)
             .unwrap_or_else(|error| panic!("C6 root {root} must form a V2 graph: {error}"));
         assert_eq!(plan.root, root);
         let mut ids = std::collections::HashSet::new();
@@ -295,7 +295,7 @@ OwnedTask {
 }
 fn main() -> Result<(), Error> {
   value: OwnedTask := json.decode("{\"id\":\"task-1\",\"priority\":-7,\"attempts\":3,\"limit\":18446744073709551615,\"enabled\":true,\"argv\":[\"\",\"quote:\\\" slash:\\/ backslash:\\\\ controls:\\b\\f\\n\\r\\t\",\"nul:\\u0000\",\"emoji:\\ud83d\\ude00\"],\"note\":\"\\u20ac\"}")?
-  plain := json.encode(value)
+  plain := json.encode(value)?
   bounded := json.encode_bounded(value, plain.len())?
   rejected := json.encode_bounded(value, plain.len() - 1)
   negative := json.encode_bounded(value, -1)
@@ -334,9 +334,9 @@ fn main() -> Result<(), Error> {
   missing: Value := json.decode("{\"text\":\"a\"}")?
   null_value: Value := json.decode("{\"text\":\"b\",\"note\":null}")?
   empty: Value := json.decode("{\"text\":\"c\",\"note\":\"\"}")?
-  print(json.encode(missing))
-  print(json.encode(null_value))
-  print(json.encode(empty))
+  print(json.encode(missing)?)
+  print(json.encode(null_value)?)
+  print(json.encode(empty)?)
   return Ok(())
 }
 "#;
@@ -363,10 +363,10 @@ Numbers {
 Generic<T> { value: T, note: Option<string> }
 fn main() -> Result<(), Error> {
   numbers: Numbers := json.decode("{\"text\":\"n\",\"i8v\":-128,\"u8v\":255,\"i16v\":-32768,\"u16v\":65535,\"i32v\":-2147483648,\"u32v\":4294967295,\"i64v\":-9223372036854775808,\"u64v\":18446744073709551615}")?
-  print(json.encode(numbers))
+  print(json.encode(numbers)?)
   print(template "{numbers.u64v}")
   generic: Generic<string> := json.decode("{\"value\":\"owned\",\"note\":\"ok\"}")?
-  print(json.encode(generic))
+  print(json.encode(generic)?)
   return Ok(())
 }
 "#;
@@ -529,7 +529,7 @@ Envelope {
 }
 fn main() -> Result<(), Error> {
   value: Envelope := json.decode("{\"version\":1,\"child\":{\"ok\":true,\"text\":\"nul:\\u0000\"},\"note\":null,\"items\":[{\"ok\":false,\"text\":\"\\u20ac\"}],\"counts\":[1,-2],\"names\":[\"a\",\"b\"],\"optional_items\":[{\"ok\":true,\"text\":\"z\"}],\"ignored\":{\"deep\":[1,true,\"ok\"]}}")?
-  plain := json.encode(value)
+  plain := json.encode(value)?
   bounded := json.encode_bounded(value, plain.len())?
   print(plain)
   print(bounded)
@@ -581,8 +581,8 @@ fn owned_json_formation_routing_and_multi_invalid_precedence_are_deterministic()
         ),
         (
             "first-unsupported-field",
-            "import core.json\nBad { first: f64, second: str, owned: string }\nfn main() -> Result<(), Error> { value: Bad := json.decode(\"{}\")?; return Ok(()) }\n",
-            "owned JSON graph has unsupported type f64",
+            "import core.json\nBad { first: char, second: str, owned: string }\nfn main() -> Result<(), Error> { value: Bad := json.decode(\"{}\")?; return Ok(()) }\n",
+            "owned JSON graph has unsupported type char",
             ["unsupported type str", "max_bytes"],
         ),
         (
@@ -593,8 +593,8 @@ fn owned_json_formation_routing_and_multi_invalid_precedence_are_deterministic()
         ),
         (
             "graph-before-bounded-limit",
-            "import core.json\nBad { first: f64, owned: string }\nfn main() -> i32 { value := Bad { first: 1.0, owned: \"x\".clone() }; json.encode_bounded(value, true); return 0 }\n",
-            "owned JSON graph has unsupported type f64",
+            "import core.json\nBad { first: char, owned: string }\nfn main() -> i32 { value := Bad { first: 'x', owned: \"x\".clone() }; json.encode_bounded(value, true); return 0 }\n",
+            "owned JSON graph has unsupported type char",
             ["max_bytes", "must be i64"],
         ),
         (
@@ -616,7 +616,7 @@ fn owned_json_formation_routing_and_multi_invalid_precedence_are_deterministic()
     let existing = check(
         &mut source_map,
         "owned-json-non-selected",
-        "import core.json\nExisting { text: str, score: f64 }\nfn main() -> i32 { value := Existing { text: \"x\", score: 1.5 }; output := json.encode(value); return output.len() as i32 }\n",
+        "import core.json\nExisting { text: str, score: f64 }\nfn main() -> i32 { value := Existing { text: \"x\", score: 1.5 }; output := (json.encode(value) else { return 1 }); return output.len() as i32 }\n",
     );
     assert!(
         !existing.diags.has_errors(),
@@ -641,7 +641,7 @@ fn od() -> Result<i64, Error> {
 }
 fn oe() -> Result<i64, Error> {
   value: Owned := json.decode("{\"text\":\"x\",\"tags\":[]}")?
-  output := json.encode(value)
+  output := json.encode(value)?
   return Ok(if output.len() > 0 { 1 } else { 0 })
 }
 fn oeb() -> Result<i64, Error> {
@@ -663,7 +663,7 @@ fn ad() -> Result<i64, Error> {
 }
 fn be() -> Result<i64, Error> {
   value := Borrowed { text: "x", n: 1 }
-  output := json.encode(value)
+  output := json.encode(value)?
   return Ok(if output.len() > 0 { 1 } else { 0 })
 }
 fn beb() -> Result<i64, Error> {
@@ -673,7 +673,7 @@ fn beb() -> Result<i64, Error> {
 }
 fn fe() -> Result<i64, Error> {
   value := [Fixed { n: 1 }]
-  output := json.encode(value)
+  output := json.encode(value)?
   return Ok(if output.len() > 0 { 1 } else { 0 })
 }
 fn feb() -> Result<i64, Error> {
@@ -687,7 +687,7 @@ fn ud() -> Result<i64, Error> {
 }
 fn ue() -> Result<i64, Error> {
   value := Choice.Count(1)
-  output := json.encode(value)
+  output := json.encode(value)?
   return Ok(if output.len() > 0 { 1 } else { 0 })
 }
 fn ueb() -> Result<i64, Error> {
@@ -768,7 +768,7 @@ import core.json
 Owned { text: string, tags: array<string> }
 fn main() -> Result<(), Error> {
   value: Owned := json.decode("{\"text\":\"process\",\"tags\":[\"a\",\"b\"]}")?
-  print(json.encode(value))
+  print(json.encode(value)?)
   return Ok(())
 }
 "#;
@@ -789,4 +789,42 @@ fn main() -> Result<(), Error> {
             "{\"text\":\"process\",\"tags\":[\"a\",\"b\"]}\n"
         );
     }
+}
+
+#[test]
+fn r63_encoded_result_ownership() {
+    if !backend_available() { return; }
+    let library = r#"
+module owned
+import core.json
+pub Row<T> { text: string, value: T }
+pub fn make(bounded: bool) -> Result<string, Error> {
+  arena {
+    row: Row<f64> := json.decode("{\"text\":\"escaped\\ntext\",\"value\":0.3}")?
+    return if bounded { json.encode_bounded(row, 100) } else { json.encode(row) }
+  }
+}
+"#;
+    let main = r#"
+import owned
+fn keep_error(error: Error) -> Error = error
+fn main() -> Result<(), Error> {
+  mut output := owned.make(false)?
+  print(output)
+  output = owned.make(true).map_err(keep_error)?
+  print(output)
+  mut count := 0
+  loop {
+    if count == 3 { break }
+    output = owned.make(false) else { return Ok(()) }
+    count = count + 1
+  }
+  print(output)
+  discarded := owned.make(false)
+  return Ok(())
+}
+"#;
+    let output = build_per_unit_multi("r63-owned-result-units", &[("owned.align", library), ("main.align", main)], "main.align").link_and_run();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "{\"text\":\"escaped\\ntext\",\"value\":0.3}\n".repeat(3));
 }

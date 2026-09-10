@@ -6,6 +6,6 @@ import core.json
 User { id: i64, name: str, active: bool }
 fn main() -> i32 {
   u := User{id: 7, name: "a\"b", active: true}
-  print(json.encode(u))   // {"id":7,"name":"a\"b","active":true}
+  print((json.encode(u) else { return 1 }))   // {"id":7,"name":"a\"b","active":true}
   return 0
 }

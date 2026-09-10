@@ -33,4 +33,5 @@ crypto-asymmetric-probe = []
 align_hash = { path = "../align_hash" }
 libc = "0.2"
 memchr = "2.8.2"
+minimal-lexical = { version = "=0.2.1", default-features = false }
 regex = "1.13.1"

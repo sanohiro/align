@@ -10843,39 +10843,7 @@ fn hir_body_validator_pipeline_template_json_group() {
         ],
         body_test_expr(
             hir::ExprKind::Template(vec![
-                hir::TemplatePart::Text("{".to_string()),
-                hir::TemplatePart::OptionField {
-                    access: body_test_expr(hir::ExprKind::Local(0), Ty::Option(scalar_integer)),
-                    name: "value".to_string(),
-                },
-                hir::TemplatePart::Text("{".to_string()),
-                hir::TemplatePart::OptionStructField {
-                    access: body_test_expr(
-                        hir::ExprKind::Local(1),
-                        Ty::Option(Scalar::Struct(0)),
-                    ),
-                    name: "record".to_string(),
-                    struct_id: 0,
-                },
-                hir::TemplatePart::PopComma,
-                hir::TemplatePart::Text("}".to_string()),
-                hir::TemplatePart::PopComma,
-                hir::TemplatePart::Text("}".to_string()),
-                hir::TemplatePart::StructArrayField {
-                    access: body_test_expr(
-                        hir::ExprKind::Local(2),
-                        Ty::DynStructArray(0, Layout::Aos),
-                    ),
-                    struct_id: 0,
-                },
-                hir::TemplatePart::ScalarArrayField {
-                    access: body_test_expr(hir::ExprKind::Local(3), Ty::DynArray(scalar_integer)),
-                    elem: scalar_integer,
-                },
-                hir::TemplatePart::UnionValue {
-                    access: body_test_expr(hir::ExprKind::Local(4), Ty::Enum(union_id)),
-                    enum_id: union_id,
-                },
+                hir::TemplatePart::Text("value=".to_string()),
                 hir::TemplatePart::Hole(body_test_expr(hir::ExprKind::Local(5), integer)),
             ]),
             Ty::Str,
@@ -10887,9 +10855,7 @@ fn hir_body_validator_pipeline_template_json_group() {
         "b2b2_json_encode_bounded",
         vec![local(0, "record", Ty::Struct(0))],
         body_test_expr(
-            hir::ExprKind::JsonEncodeBounded {
-                base: 0,
-                parts: vec![
+            hir::ExprKind::JsonEncode { base: 0, plan: align_sema::hir::JsonEncodePlan::Pieces(vec![
                     hir::TemplatePart::Text("{".to_string()),
                     hir::TemplatePart::Text("\"key\":".to_string()),
                     hir::TemplatePart::JsonStr(body_test_expr(
@@ -10908,9 +10874,7 @@ fn hir_body_validator_pipeline_template_json_group() {
                         integer,
                     )),
                     hir::TemplatePart::Text("}".to_string()),
-                ],
-                max_bytes: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
-            },
+                ]), max_bytes: Some(Box::new(body_test_expr(hir::ExprKind::Int(2), integer))) },
             result_string,
         ),
         result_string,
@@ -11289,14 +11253,16 @@ fn hir_body_validator_pipeline_template_json_group() {
     let hir::ExprKind::Template(parts) = &mut expression.kind else {
         panic!("template fixture lost its template")
     };
-    parts.retain(|part| !matches!(part, hir::TemplatePart::PopComma));
+    parts.push(hir::TemplatePart::PopComma);
     assert!(!body_core_metadata_is_valid(&reject));
 
     let mut reject = program.clone();
     let expression = body_value_expression_mut(&mut reject, "b2b2_json_encode_bounded");
-    let hir::ExprKind::JsonEncodeBounded { max_bytes, .. } = &mut expression.kind else {
+    let hir::ExprKind::JsonEncode { plan: align_sema::hir::JsonEncodePlan::Pieces(_), max_bytes, .. } = &mut expression.kind else {
         panic!("bounded encoder fixture lost its discriminator")
     };
+    // This source fixture is the bounded encoder; missing its explicit cap is a broken test setup.
+    let max_bytes = max_bytes.as_mut().expect("bounded fixture has a limit");
     max_bytes.ty = Ty::Bool;
     max_bytes.kind = hir::ExprKind::Bool(true);
     assert!(!body_core_metadata_is_valid(&reject));
@@ -11308,7 +11274,7 @@ fn hir_body_validator_pipeline_template_json_group() {
 
     let mut reject = program.clone();
     let expression = body_value_expression_mut(&mut reject, "b2b2_json_encode_bounded");
-    let hir::ExprKind::JsonEncodeBounded { base, .. } = &mut expression.kind else {
+    let hir::ExprKind::JsonEncode { base, plan: align_sema::hir::JsonEncodePlan::Pieces(_), .. } = &mut expression.kind else {
         panic!("bounded encoder fixture lost its discriminator")
     };
     *base = u32::MAX;
@@ -11316,7 +11282,7 @@ fn hir_body_validator_pipeline_template_json_group() {
 
     let mut reject = program.clone();
     let expression = body_value_expression_mut(&mut reject, "b2b2_json_encode_bounded");
-    let hir::ExprKind::JsonEncodeBounded { parts, .. } = &mut expression.kind else {
+    let hir::ExprKind::JsonEncode { plan: align_sema::hir::JsonEncodePlan::Pieces(parts), .. } = &mut expression.kind else {
         panic!("bounded encoder fixture lost its discriminator")
     };
     parts.clear();
@@ -11324,7 +11290,7 @@ fn hir_body_validator_pipeline_template_json_group() {
 
     let mut reject = program.clone();
     let expression = body_value_expression_mut(&mut reject, "b2b2_json_encode_bounded");
-    let hir::ExprKind::JsonEncodeBounded { parts, .. } = &mut expression.kind else {
+    let hir::ExprKind::JsonEncode { plan: align_sema::hir::JsonEncodePlan::Pieces(parts), .. } = &mut expression.kind else {
         panic!("bounded encoder fixture lost its discriminator")
     };
     let hir::TemplatePart::JsonStr(value) = parts.remove(2) else {
@@ -11335,7 +11301,7 @@ fn hir_body_validator_pipeline_template_json_group() {
 
     let mut reject = program.clone();
     let expression = body_value_expression_mut(&mut reject, "b2b2_json_encode_bounded");
-    let hir::ExprKind::JsonEncodeBounded { parts, .. } = &mut expression.kind else {
+    let hir::ExprKind::JsonEncode { plan: align_sema::hir::JsonEncodePlan::Pieces(parts), .. } = &mut expression.kind else {
         panic!("bounded encoder fixture lost its discriminator")
     };
     parts[1] = hir::TemplatePart::Text("raw".to_string());
@@ -11343,7 +11309,7 @@ fn hir_body_validator_pipeline_template_json_group() {
 
     let mut reject = program.clone();
     let expression = body_value_expression_mut(&mut reject, "b2b2_json_encode_bounded");
-    let hir::ExprKind::JsonEncodeBounded { parts, .. } = &mut expression.kind else {
+    let hir::ExprKind::JsonEncode { plan: align_sema::hir::JsonEncodePlan::Pieces(parts), .. } = &mut expression.kind else {
         panic!("bounded encoder fixture lost its discriminator")
     };
     parts[1] = hir::TemplatePart::Text("\"value\":".to_string());
@@ -11351,7 +11317,7 @@ fn hir_body_validator_pipeline_template_json_group() {
 
     let mut reject = program.clone();
     let expression = body_value_expression_mut(&mut reject, "b2b2_json_encode_bounded");
-    let hir::ExprKind::JsonEncodeBounded { parts, .. } = &mut expression.kind else {
+    let hir::ExprKind::JsonEncode { plan: align_sema::hir::JsonEncodePlan::Pieces(parts), .. } = &mut expression.kind else {
         panic!("bounded encoder fixture lost its discriminator")
     };
     let hir::TemplatePart::JsonStr(access) = &mut parts[2] else {
@@ -11470,7 +11436,7 @@ Owned { text: string, note: Option<string>, tags: array<string>, count: u64 }
 fn owned_decode(input: str) -> Result<Owned, Error> = json.decode(input)
 fn owned_encode(value: Owned) -> i32 {
   output := json.encode(value)
-  return output.len() as i32
+  return match output { Ok(text) => text.len() as i32, Err(_) => -1 }
 }
 fn owned_bounded(value: Owned, limit: i64) -> i32 {
   output := json.encode_bounded(value, limit)
@@ -11523,42 +11489,42 @@ fn main() -> i32 = 0
 
     assert_owned_json_body_mutation(&base, "owned-encode-unknown-base", |program| {
         let expression = body_first_let_init_mut(program, "owned_encode");
-        let hir::ExprKind::JsonOwnedEncode { base, .. } = &mut expression.kind else {
+        let hir::ExprKind::JsonEncode { base, plan: align_sema::hir::JsonEncodePlan::Owned(_), max_bytes: None, .. } = &mut expression.kind else {
             panic!("owned encode fixture lost its discriminator")
         };
         *base = u32::MAX;
     });
     assert_owned_json_body_mutation(&base, "owned-encode-empty-plan", |program| {
         let expression = body_first_let_init_mut(program, "owned_encode");
-        let hir::ExprKind::JsonOwnedEncode { plan, .. } = &mut expression.kind else {
+        let hir::ExprKind::JsonEncode { plan: align_sema::hir::JsonEncodePlan::Owned(plan), max_bytes: None, .. } = &mut expression.kind else {
             panic!("owned encode fixture lost its discriminator")
         };
         plan.records.clear();
     });
     assert_owned_json_body_mutation(&base, "owned-encode-root-mismatch", |program| {
         let expression = body_first_let_init_mut(program, "owned_encode");
-        let hir::ExprKind::JsonOwnedEncode { plan, .. } = &mut expression.kind else {
+        let hir::ExprKind::JsonEncode { plan: align_sema::hir::JsonEncodePlan::Owned(plan), max_bytes: None, .. } = &mut expression.kind else {
             panic!("owned encode fixture lost its discriminator")
         };
         plan.records[0].id = u32::MAX;
     });
     assert_owned_json_body_mutation(&base, "owned-encode-field-name", |program| {
         let expression = body_first_let_init_mut(program, "owned_encode");
-        let hir::ExprKind::JsonOwnedEncode { plan, .. } = &mut expression.kind else {
+        let hir::ExprKind::JsonEncode { plan: align_sema::hir::JsonEncodePlan::Owned(plan), max_bytes: None, .. } = &mut expression.kind else {
             panic!("owned encode fixture lost its discriminator")
         };
         plan.records[0].fields[0].name = "other".to_string();
     });
     assert_owned_json_body_mutation(&base, "owned-encode-field-kind", |program| {
         let expression = body_first_let_init_mut(program, "owned_encode");
-        let hir::ExprKind::JsonOwnedEncode { plan, .. } = &mut expression.kind else {
+        let hir::ExprKind::JsonEncode { plan: align_sema::hir::JsonEncodePlan::Owned(plan), max_bytes: None, .. } = &mut expression.kind else {
             panic!("owned encode fixture lost its discriminator")
         };
         plan.records[0].fields[0].ty = Ty::Str;
     });
     assert_owned_json_body_mutation(&base, "owned-encode-duplicate-record", |program| {
         let expression = body_first_let_init_mut(program, "owned_encode");
-        let hir::ExprKind::JsonOwnedEncode { plan, .. } = &mut expression.kind else {
+        let hir::ExprKind::JsonEncode { plan: align_sema::hir::JsonEncodePlan::Owned(plan), max_bytes: None, .. } = &mut expression.kind else {
             panic!("owned encode fixture lost its discriminator")
         };
         plan.records.push(plan.records[0].clone());
@@ -11569,7 +11535,7 @@ fn main() -> i32 = 0
 
     assert_owned_json_body_mutation(&base, "owned-bounded-wrong-limit", |program| {
         let expression = body_first_let_init_mut(program, "owned_bounded");
-        let hir::ExprKind::JsonOwnedEncodeBounded { max_bytes, .. } = &mut expression.kind else {
+        let hir::ExprKind::JsonEncode { plan: align_sema::hir::JsonEncodePlan::Owned(_), max_bytes: Some(max_bytes), .. } = &mut expression.kind else {
             panic!("owned bounded fixture lost its discriminator")
         };
         max_bytes.kind = hir::ExprKind::Bool(true);
@@ -11580,7 +11546,7 @@ fn main() -> i32 = 0
     });
     assert_owned_json_body_mutation(&base, "owned-bounded-reordered-plan", |program| {
         let expression = body_first_let_init_mut(program, "owned_bounded");
-        let hir::ExprKind::JsonOwnedEncodeBounded { plan, .. } = &mut expression.kind else {
+        let hir::ExprKind::JsonEncode { plan: align_sema::hir::JsonEncodePlan::Owned(plan), max_bytes: Some(_), .. } = &mut expression.kind else {
             panic!("owned bounded fixture lost its discriminator")
         };
         plan.records[0].fields.swap(1, 2);

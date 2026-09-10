@@ -1440,3 +1440,31 @@ fn gate13_cpu_change_misses_only_the_cpu_namespace() {
     let native_hot = emit_all(&proj, &cache, Profile::Release, BuildTarget::Native, &no_exports(), false);
     assert!(native_hot.all_hit(), "the native namespace is independently cacheable");
 }
+
+#[test]
+fn r63_json_identity_matrix() {
+    if !backend() { return; }
+    let original = r#"
+import core.json
+Inner { value: f32 }
+Row { text: string, inner: Inner }
+fn main() -> Result<(), Error> {
+  row: Row := json.decode("{\"text\":\"x\",\"inner\":{\"value\":0.3}}")?
+  print(json.encode(row)?)
+  return Ok(())
+}
+"#;
+    let project = Project::new("r63-json-codegen-identity", &[("main.align", original)], "main.align");
+    let cache = project.cache();
+    let emit = || emit_all(&project, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(!emit().outcome("main").hit);
+    assert!(emit().all_hit());
+    for changed in [original.replace("value: f32", "value: f64"), original.replace("json.encode(row)", "json.encode_bounded(row, 100)")] {
+        project.write("main.align", &changed);
+        let result = emit();
+        assert!(!result.outcome("main").hit);
+        assert_eq!(result.outcome("main").miss_reason, Some(FirstDiff::MirDigest));
+        project.write("main.align", original);
+        assert!(emit().all_hit());
+    }
+}

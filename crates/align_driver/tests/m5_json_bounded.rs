@@ -14,7 +14,7 @@ Inner { score: i64, note: Option<str> }
 Row { id: i64, text: str, active: bool, inner: Inner }
 fn main() -> Result<(), Error> {
   row := Row { id: 7, text: "a\"b\n日本語", active: true, inner: Inner { score: -9, note: None } }
-  ordinary := json.encode(row)
+  ordinary := json.encode(row)?
   bounded := json.encode_bounded(row, ordinary.len())?
   print(ordinary)
   print(bounded)
@@ -42,7 +42,7 @@ Chat { messages: array<Message> }
 Metrics { name: str, ints: array<i64>, floats: array<f64>, flags: array<bool> }
 fn main() -> Result<(), Error> {
   scalar_union := Content.Text("hello\n日本語")
-  scalar_union_plain := json.encode(scalar_union)
+  scalar_union_plain := json.encode(scalar_union)?
   scalar_union_bounded := json.encode_bounded(scalar_union, scalar_union_plain.len())?
   scalar_union_spare := json.encode_bounded(scalar_union, scalar_union_plain.len() + 1)?
   scalar_union_short := json.encode_bounded(scalar_union, scalar_union_plain.len() - 1)
@@ -52,7 +52,7 @@ fn main() -> Result<(), Error> {
   print(match scalar_union_short { Ok(_) => 0, Err(_) => 1 })
 
   fixed := [Point { x: 1, label: "a" }, Point { x: -2, label: "b\"" }]
-  fixed_plain := json.encode(fixed)
+  fixed_plain := json.encode(fixed)?
   fixed_bounded := json.encode_bounded(fixed, fixed_plain.len())?
   fixed_spare := json.encode_bounded(fixed, fixed_plain.len() + 1)?
   fixed_short := json.encode_bounded(fixed, fixed_plain.len() - 1)
@@ -63,7 +63,7 @@ fn main() -> Result<(), Error> {
 
   arena {
     chat: Chat := json.decode("{\"messages\":[{\"role\":\"u\",\"content\":[{\"kind\":\"text\",\"text\":\"hello\"}]},{\"role\":\"a\",\"content\":\"done\"}]}")?
-    chat_plain := json.encode(chat)
+    chat_plain := json.encode(chat)?
     chat_bounded := json.encode_bounded(chat, chat_plain.len())?
     chat_spare := json.encode_bounded(chat, chat_plain.len() + 1)?
     chat_short := json.encode_bounded(chat, chat_plain.len() - 1)
@@ -73,7 +73,7 @@ fn main() -> Result<(), Error> {
     print(match chat_short { Ok(_) => 0, Err(_) => 1 })
 
     metrics: Metrics := json.decode("{\"name\":\"m\",\"ints\":[-1,0,2],\"floats\":[1.5,2.0],\"flags\":[true,false]}")?
-    metrics_plain := json.encode(metrics)
+    metrics_plain := json.encode(metrics)?
     metrics_bounded := json.encode_bounded(metrics, metrics_plain.len())?
     metrics_spare := json.encode_bounded(metrics, metrics_plain.len() + 1)?
     metrics_short := json.encode_bounded(metrics, metrics_plain.len() - 1)
@@ -111,7 +111,7 @@ fn keep_error(e: Error) -> Error = e
 fn returned(row: Row, cap: i64) -> Result<string, Error> = json.encode_bounded(row, cap)
 fn main() -> Result<(), Error> {
   row := Row { id: 7, text: "owned" }
-  plain := json.encode(row)
+  plain := json.encode(row)?
 
   via_return := returned(row, plain.len())?
   print(via_return)
@@ -198,7 +198,7 @@ fn json_encode_bounded_surface_and_schema_fail_closed() {
 
     let ordinary = check_diagnostics(
         "json-encode-schema-control",
-        "import core.json\nBad { value: char }\nfn main() -> i32 {\n  value := Bad { value: 'x' }\n  json.encode(value)\n  return 0\n}\n",
+        "import core.json\nBad { value: char }\nfn main() -> i32 {\n  value := Bad { value: 'x' }\n  (json.encode(value) else { return 1 })\n  return 0\n}\n",
     );
     let bounded = check_diagnostics(
         "json-encode-bounded-schema",
@@ -214,7 +214,7 @@ fn json_encode_bounded_surface_and_schema_fail_closed() {
         ("owned-string-array", "array<string>"),
     ] {
         let ordinary_source = format!(
-            "import core.json\nOwned {{ value: {field_ty} }}\nfn encode(value: Owned) -> i32 {{\n  json.encode(value)\n  return 0\n}}\nfn main() -> i32 = 0\n"
+            "import core.json\nOwned {{ value: {field_ty} }}\nfn encode(value: Owned) -> i32 {{\n  (json.encode(value) else {{ return 1 }})\n  return 0\n}}\nfn main() -> i32 = 0\n"
         );
         let bounded_source = format!(
             "import core.json\nOwned {{ value: {field_ty} }}\nfn encode(value: Owned) -> i32 {{\n  result := json.encode_bounded(value, 64)\n  return 0\n}}\nfn main() -> i32 = 0\n"
@@ -248,14 +248,14 @@ fn main() -> i32 = 0
         align_driver::format_diagnostics(&source_map, &checked.diags)
     );
     let mir = align_mir::print::program_to_string(&lower_to_mir(&checked.hir));
-    assert!(mir.contains("json_encode_bounded"), "{mir}");
+    assert!(mir.contains("json.encode"), "{mir}");
 
     if !backend_available() {
         return;
     }
     let llvm = emit_llvm(source);
-    assert!(llvm.contains("call ptr @align_rt_builder_init_bounded_stack"), "{llvm}");
-    assert!(llvm.contains("call i32 @align_rt_builder_finish_bounded_stack"), "{llvm}");
+    assert!(llvm.contains("call ptr @align_rt_json_builder_init"), "{llvm}");
+    assert!(llvm.contains("call i32 @align_rt_json_builder_finish"), "{llvm}");
     assert!(!llvm.contains("call { ptr, i64 } @align_rt_builder_into_string_stack"), "{llvm}");
 }
 
@@ -296,4 +296,52 @@ fn main() -> Result<(), Error> {
     .link_and_run();
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "{\"id\":9,\"text\":\"unit\"}\n");
+}
+
+#[test]
+fn r63_limit_source_borrow_reservation() {
+    for (schema, setup, action) in [
+        ("Row { text: string, value: f64 }", "mut row := Row { text: \"old\".clone(), value: 0.3 }", "row = Row { text: \"new\".clone(), value: 0.0 }"),
+        ("Row { text: str }", "mut text := \"old\".clone(); view: str := text; row := Row { text: view }", "text = \"new\".clone()"),
+        ("Inner { text: str }\nRow { inner: Inner }", "mut text := \"old\".clone(); view: str := text; row := Row { inner: Inner { text: view } }", "text = \"new\".clone()"),
+        ("Row { values: array<str> }", "mut text := \"{\\\"values\\\":[\\\"old\\\"]}\".clone(); row: Row := json.decode(text)?", "text = \"new\".clone()"),
+    ] {
+        let source = format!("import core.json\n{schema}\nfn main() -> Result<(), Error> {{\n{setup}\nencoded := json.encode_bounded(row, {{ {action}; 100 }})?\nprint(encoded)\nreturn Ok(())\n}}\n");
+        let checked = diff_check_multi("r63-limit-reservation", &[("main.align", &source)], "main.align");
+        for diagnostics in [&checked.whole_diags, &checked.per_unit_diags] {
+            assert!(diagnostics.contains("invalidated before the enclosing operation"), "{source}\n{diagnostics}");
+        }
+        let valid = source.replace(action, "unrelated := 1");
+        let checked = diff_check_multi("r63-limit-independent", &[("main.align", &valid)], "main.align");
+        assert!(!checked.whole_errors && !checked.per_unit_errors, "{}\n{}", checked.whole_diags, checked.per_unit_diags);
+    }
+}
+
+#[test]
+fn r63_encoder_route_matrix() {
+    if !backend_available() { return; }
+    let source = r#"
+import core.json
+Plain { small: f32, value: f64, maybe: Option<f64> }
+Owned { text: string, small: f32, value: f64, maybe: Option<f32>, values: array<f64> }
+fn main() -> Result<(), Error> {
+  plain: Plain := json.decode("{\"small\":1.0000000596046448,\"value\":-0}")?
+  encoded := json.encode(plain)?
+  print(encoded)
+  print(json.encode_bounded(plain, encoded.len())?)
+  owned: Owned := json.decode("{\"text\":\"x\",\"small\":1.0000000596046448,\"value\":0.3,\"maybe\":-0,\"values\":[1.5,2]}")?
+  encoded_owned := json.encode(owned)?
+  print(encoded_owned)
+  print(json.encode_bounded(owned, encoded_owned.len())?)
+  bad := Plain { small: 0.0, value: 0.0 / 0.0, maybe: None }
+  print(match json.encode(bad) { Ok(_) => 0, Err(error) => match error { Invalid => 1, _ => 2 } })
+  print(match json.encode_bounded(bad, 100) { Ok(_) => 0, Err(error) => match error { Invalid => 1, _ => 2 } })
+  return Ok(())
+}
+"#;
+    let expected = "{\"small\":1.0000001,\"value\":-0.0}\n{\"small\":1.0000001,\"value\":-0.0}\n{\"text\":\"x\",\"small\":1.0000001,\"value\":0.3,\"maybe\":-0.0,\"values\":[1.5,2.0]}\n{\"text\":\"x\",\"small\":1.0000001,\"value\":0.3,\"maybe\":-0.0,\"values\":[1.5,2.0]}\n1\n1\n";
+    for output in [build_and_run("r63-encoder-routes", source), build_per_unit_multi("r63-encoder-routes-units", &[("main.align", source)], "main.align").link_and_run()] {
+        assert!(output.status.success(), "{:?}", output);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+    }
 }

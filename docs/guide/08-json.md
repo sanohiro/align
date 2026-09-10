@@ -11,14 +11,21 @@ import core.json
 
 User { id: i64, name: str, active: bool }
 
-fn main() -> i32 {
+fn main() -> Result<(), Error> {
     u := User { id: 7, name: "ada", active: true }
-    print(json.encode(u))       // {"id":7,"name":"ada","active":true}
-    return 0
+    print(json.encode(u)?)      // {"id":7,"name":"ada","active":true}
+    return Ok(())
 }
 ```
 
-`json.encode(x)` renders a struct as a JSON object `str`; string fields are escaped for you. Under the hood it is the string builder from chapter [07](07-strings-and-text.md) — no reflection, no intermediate DOM.
+Both encoders return an owned string through `Result<string, Error>`.
+`json.encode(x)` returns `Result<string, Error>`: success owns the JSON text and
+nonfinite float input returns `Error.Invalid`. Use `?` to propagate that error.
+`json.encode_bounded(x, max_bytes)` also rejects negative or exceeded byte limits.
+The result outlives the source and any enclosing arena; string fields are escaped
+for you. See the [contract](../impl/47-json-numeric-contract.md).
+
+Under the hood it is the string builder from chapter [07](07-strings-and-text.md) — no reflection, no intermediate DOM.
 
 ## Decoding — the type comes from the annotation
 

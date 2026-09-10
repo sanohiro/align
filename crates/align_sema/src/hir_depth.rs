@@ -1172,18 +1172,16 @@ fn walk_body_records<'a>(
                             .map(|part| (BodyRecord::TemplatePart(part), child_depth)),
                     );
                 }
-                ExprKind::JsonEncodeBounded {
-                    parts, max_bytes, ..
-                } => {
+                ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Pieces(parts), max_bytes, .. } => {
                     work.extend(
                         parts
                             .iter()
                             .map(|part| (BodyRecord::TemplatePart(part), child_depth)),
                     );
-                    work.push((BodyRecord::Expr(max_bytes), child_depth));
+                    if let Some(max_bytes) = max_bytes { work.push((BodyRecord::Expr(max_bytes), child_depth)); }
                 }
-                ExprKind::JsonOwnedEncode { .. } => {}
-                ExprKind::JsonOwnedEncodeBounded { max_bytes, .. } => {
+                ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Owned(_), max_bytes: None, .. } => {}
+                ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Owned(_), max_bytes: Some(max_bytes), .. } => {
                     work.push((BodyRecord::Expr(max_bytes), child_depth));
                 }
                 ExprKind::FilePread {

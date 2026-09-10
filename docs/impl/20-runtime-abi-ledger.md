@@ -1,5 +1,15 @@
 # Runtime native ABI ledger
 
+**R63 implementation contract:**
+[Plan 47](47-json-numeric-contract.md) supersedes this document's JSON float
+exclusions, infallible/arena-view encoder result, bounded-only encoder IR/native
+names and V1/V2 JSON transport. Both encoders return owned `Result<string, Error>`;
+§§1–5 fix errors, ownership, V3 descriptor/envelope, interface 11 -> 12, the unified
+HIR/MIR operation and exact ABI rows. §8 owns closure and §9 performance evidence.
+Historical vectors/version transitions and current shipped ABI inventories below
+remain baseline records, not alternate implementation contracts. In particular,
+plan 47 records the replacement ABI counts and rows.
+
 ## Status and authority
 
 This is the exact native symbol/type/attribute appendix for L2b-a2-am-r and
@@ -14,7 +24,7 @@ owned JSON, exclusive filesystem publication, retained-root regular-file access,
 lifecycle, HTTP client
 raw/SSE receive streaming, asymmetric signatures, `std.log`, `core.codec`, `pkg.frame`, `pkg.kv`,
 `pkg.csv`, `pkg.ws`, `pkg.template`, named time/path wire formats, incremental SHA-256 host observation and ordinary directory operations, there
-are 389 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
+are 391 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
 `ArrayBuilderNewIn` and `ArrayBuilderPushBytes`; the four
 AEAD symbols that were previously selected from `AeadCipher × AeadDir` become
 ordinary typed keys; they may no longer bypass the registry. Eighteen always-built
@@ -27,9 +37,8 @@ runtime records have no `RuntimeKey` and instead use the eighteen-variant
 `align_rt_f64_from_bits`, `align_rt_f32_text_len`, `align_rt_f64_text_len`,
 `align_rt_f32_text_write`, and `align_rt_f64_text_write`, plus the four compiler-private
 `core.test` child-control rows recorded below and the package-internal checked TCP timeout row
-`align_rt_tcp_conn_set_io_timeout`. The base native registry therefore has 407 records. Request 12
-adds the keyed bounded-builder stack initializer and consuming status/out-slot finish; both reuse existing ABI shapes
-A51 and A19.
+`align_rt_tcp_conn_set_io_timeout`. The base native registry therefore has 409 records. R63 replaces Request 12's two bounded-only rows with four unified JSON builder rows
+(A127–A130), including separate finite-only f32/f64 writers.
 The explicit `alloc-count` runtime feature may expose seven
 test/benchmark-only definitions: the allocation/free and finder counters plus
 `align_rt_requested_live_reset`, `align_rt_requested_live_bytes`, and
@@ -40,10 +49,10 @@ test/benchmark-only definitions: the allocation/free and finder counters plus
 `i64 @align_rt_test_par_map_workers()`. `task-group-probe` and
 `crypto-asymmetric-probe` change internal Rust state only and add no unmangled native export.
 
-The compiler-visible native registry is always exactly the 407 base records.
+The compiler-visible native registry is always exactly the 409 base records.
 There is no target option, environment variable, Cargo feature, linked-runtime
 inspection, or other ambient input that changes it. The eleven optional probe
-records extend only the verification-time maximum runtime-export table to 418.
+records extend only the verification-time maximum runtime-export table to 420.
 They never gain a `RuntimeKey`, callable/declaration policy, collision
 reservation, or compatible-extern reuse. Their spellings remain ordinary
 program/extern/export identities in a normal build. Probe-feature runtime
@@ -62,7 +71,7 @@ added six keyed rows, `core.codec` then added eight, `pkg.frame` added two, `pkg
 source-reachable unkeyed row, `pkg.csv` added one keyed row, `pkg.ws` added eleven keyed rows, and
 `pkg.template` added five keyed rows. Their runtime
 definitions and registry entries activated atomically at their respective capability boundaries: the current exact counts
-are 389 keyed records, 407 base records, and 418 records in the maximum optional-probe export table.
+are 391 keyed records, 409 base records, and 420 records in the maximum optional-probe export table.
 No new probe category was introduced. The implemented `pkg.kv` row reuses an existing ABI shape. Its two
 independently useful prerequisites first hardened the shared TCP timeout substrate and existing
 TCP-derived writers without changing a symbol, key, shape, attribute, or count.
@@ -929,7 +938,11 @@ from those bodies. `align_rt_str_cmp` is not guarded and always keeps A01.
 | A108 | `i32 @SYM(i32, ptr, ptr, i64, ptr)` | `align_rt_crypto_sign` |
 | A109 | `i32 @SYM(i32, ptr, ptr, i64, ptr, i64, ptr)` | `align_rt_crypto_verify` |
 | A18 | `i32 @SYM(ptr, i64, ptr, ptr, i64, ptr, i64, ptr, i64, i64)` | `align_rt_json_scan_next` |
-| A19 | `i32 @SYM(ptr, ptr)` | `align_rt_builder_finish_bounded_stack`, `align_rt_tcp_accept`, `align_rt_command_run`, `align_rt_io_writer_write_builder`, `align_rt_http_accept`, `align_rt_http_respond`, `align_rt_http_stream_reject` |
+| A19 | `i32 @SYM(ptr, ptr)` | `align_rt_tcp_accept`, `align_rt_command_run`, `align_rt_io_writer_write_builder`, `align_rt_http_accept`, `align_rt_http_respond`, `align_rt_http_stream_reject` |
+| A127 | `ptr @SYM(ptr, i32, i64) {nounwind}` | `align_rt_json_builder_init` |
+| A128 | `i32 @SYM(ptr, ptr) {nounwind}` | `align_rt_json_builder_finish` |
+| A129 | `void @SYM(ptr, float) {nounwind}` | `align_rt_json_builder_write_f32` |
+| A130 | `void @SYM(ptr, double) {nounwind}` | `align_rt_json_builder_write_f64` |
 | A20 | `i32 @SYM(ptr, ptr, i64)` | `align_rt_io_writer_write`, `align_rt_cli_get_bool`, `align_rt_regex_is_match`, `align_rt_http_stream_send`, `align_rt_http_stream_send_event` |
 | A21 | `i32 @SYM(ptr, ptr, i64, i64, ptr)` | `align_rt_http_get_many`, `align_rt_regex_find` |
 | A22 | `i32 @SYM(ptr, ptr, i64, ptr)` | `align_rt_cli_parse`, `align_rt_http_resp_header`, `align_rt_http_client_get`, `align_rt_regex_find_all`, `align_rt_regex_split`, `align_rt_regex_captures`, `align_rt_http_ctx_header`, `align_rt_http_read_stream_header` |
@@ -1126,24 +1139,24 @@ LLVM construction and receives no runtime-feature input.
 
 Tests compare:
 
-- all 389 keys, mapped symbols, LLVM declaration types, and default attributes
+- all 391 keys, mapped symbols, LLVM declaration types, and default attributes
   against this table through the checked-in
   `crates/align_codegen_llvm/tests/golden/runtime_abi_declarations.txt`;
-- the 407 base native symbols against default-feature `align_runtime` exports,
+- the 409 base native symbols against default-feature `align_runtime` exports,
   plus every actual Rust definition's normalized native return and ordered
   parameter types against the declaration golden, failing on either direction's
   difference through `scripts/test-runtime-abi-exports.sh`;
-- the 414 `alloc-count` and 411 `par-map-probe` native symbols against
+- the 416 `alloc-count` and 413 `par-map-probe` native symbols against
   `align_runtime` built with each feature separately, including the eleven exact
   probe signatures above;
-- the 418 maximum native symbols against `align_runtime` built with
+- the 420 maximum native symbols against `align_runtime` built with
   `alloc-count,par-map-probe,task-group-probe`, while proving
   `task-group-probe` adds no unmangled export;
 - rt-LTO off/on attributes for every guarded symbol, with missing,
   declaration-only, wrong-type, internal, private, available-externally, and
   non-C-calling-convention artifact negatives;
-- all 407 identities through the one `RuntimeAbiId`-keyed row iterator and all
-  407 exact registry function types through the production compatibility
+- all 409 identities through the one `RuntimeAbiId`-keyed row iterator and all
+  409 exact registry function types through the production compatibility
   predicate, one return mutation per row, and one mutation of every parameter
   ordinal; source-valid compatible reuse for a keyed builtin and the thirteen
   source-reachable unkeyed rows; exact `ArgsBuild` `str` rejection plus the
@@ -1286,6 +1299,6 @@ flag; MIR reconstructs Result/Option. A closed `FsTreeOutput` discriminator and
 exact schema, input and fresh-scratch producer certification precede native writes.
 Numeric extent/alignment/overlap errors leave output untouched; subsequent
 lexical/mode/native errors leave zero output. No new LLVM pointer attributes or
-probe category is added. Current counts: 389 keyed, 407 base, 414 alloc-count,
-411 par-map-probe, 418 maximum exports. Declaration and native signature/export
+probe category is added. Current counts: 391 keyed, 409 base, 416 alloc-count,
+413 par-map-probe, 420 maximum exports. Declaration and native signature/export
 owners independently verify every symbol and argument ordinal.

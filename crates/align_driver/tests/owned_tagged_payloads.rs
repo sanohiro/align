@@ -1727,7 +1727,7 @@ fn nested_tagged_values_fail_closed_at_unsupported_boundaries() {
                 "Holder { value: Option<Result<i64, bool>> }\n",
                 "fn main() -> i32 {\n",
                 "  holder := Holder { value: Some(Ok(1)) }\n",
-                "  encoded := json.encode(holder)\n",
+                "  encoded := (json.encode(holder) else { return 1 })\n",
                 "  return encoded.len() as i32\n",
                 "}\n",
             ),
