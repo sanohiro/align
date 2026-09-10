@@ -820,6 +820,14 @@ pub enum ColumnBatchInput {
     View { ptr: Operand, len: Operand },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FsTreeOutput {
+    None,
+    Owner(Slot),
+    Metadata(Slot),
+    CursorNext { entry: Slot, present: Slot },
+}
+
 #[derive(Clone, Debug)]
 pub enum Rvalue {
     Use(Operand),
@@ -1972,6 +1980,7 @@ pub enum Rvalue {
     },
     /// `fs.remove_empty_dir(path)` — retained, no-follow removal of exactly one empty directory.
     FsCreateDir { path: Operand },
+    FsTree { kind: align_sema::fs_tree::FsTreeKind, args: Vec<Operand>, output: FsTreeOutput },
     FsIsDir { path: Operand, out: Slot },
     FsRemoveEmptyDir {
         path: Operand,
@@ -8492,6 +8501,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 b.push(Stmt::Let(v, Rvalue::TimeInstant));
                 Operand::Value(v)
             }
+            hir::ExprKind::FsTree { kind, args } => lower_fs_tree(b, *kind, args, e.ty),
             hir::ExprKind::OsHost => {
                 let Ty::Result(Scalar::Struct(id), _) = e.ty else { return Operand::Const(Const::Unit) };
                 let ty = Ty::Struct(id);
@@ -16226,6 +16236,8 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         | Scalar::CodecBoolColumn
         | Scalar::CodecStrColumn
         | Scalar::CryptoDigest
+        | Scalar::FsDirectory
+        | Scalar::FsDirCursor
         | Scalar::CodecEncoder
         | Scalar::SignatureKey(_)
         | Scalar::Regex
@@ -19200,6 +19212,83 @@ fn lower_beneath_handle(
     b.push(Stmt::Let(code, open_rv(root, relative, out)));
 
     emit_open_handle_result(b, code, out, handle_ty, result_ty)
+}
+
+/// Evaluate retained filesystem inputs in source order and reconstruct ordinary result carriers.
+fn lower_fs_tree(b: &mut Builder, kind: align_sema::fs_tree::FsTreeKind, args: &[hir::Expr], result_ty: Ty) -> Operand {
+    let mut operands = Vec::with_capacity(args.len());
+    for argument in args {
+        let operand = lower_required!(b, lower_expr(b, argument), Operand::Const(Const::Unit));
+        operands.push(operand);
+    }
+    let (output, payload_ty) = match kind.output() {
+        align_sema::fs_tree::Output::Directory => { let ty = Ty::FsDirectory; (FsTreeOutput::Owner(b.new_slot(ty)), ty) }
+        align_sema::fs_tree::Output::Cursor => { let ty = Ty::FsDirCursor; (FsTreeOutput::Owner(b.new_slot(ty)), ty) }
+        align_sema::fs_tree::Output::Reader => { let ty = Ty::Reader; (FsTreeOutput::Owner(b.new_slot(ty)), ty) }
+        align_sema::fs_tree::Output::Writer => { let ty = Ty::Writer; (FsTreeOutput::Owner(b.new_slot(ty)), ty) }
+        align_sema::fs_tree::Output::Metadata => {
+            let Some(id) = align_sema::fs_tree::record_id(&b.structs, "fs.metadata") else { b.terminate(Term::Unreachable); return Operand::Const(Const::Unit); };
+            let ty = Ty::Struct(id); (FsTreeOutput::Metadata(b.new_slot(ty)), ty)
+        }
+        align_sema::fs_tree::Output::EntryOption => {
+            let Some(id) = align_sema::fs_tree::record_id(&b.structs, "fs.dir_entry") else { b.terminate(Term::Unreachable); return Operand::Const(Const::Unit); };
+            let ty = Ty::Struct(id);
+            (FsTreeOutput::CursorNext { entry: b.new_slot(ty), present: b.new_slot(Ty::Bool) }, ty)
+        }
+        align_sema::fs_tree::Output::Unit => (FsTreeOutput::None, Ty::Unit),
+    };
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(code, Rvalue::FsTree { kind, args: operands, output }));
+    match output {
+        FsTreeOutput::None => lower_status_result(b, code, result_ty),
+        FsTreeOutput::Owner(out) | FsTreeOutput::Metadata(out) => emit_open_handle_result(b, code, out, payload_ty, result_ty),
+        FsTreeOutput::CursorNext { entry, present } => emit_cursor_result(b, code, entry, present, payload_ty, result_ty),
+    }
+}
+
+fn emit_cursor_result(b: &mut Builder, code: ValueId, entry: Slot, present: Slot, payload_ty: Ty, result_ty: Ty) -> Operand {
+    let Ty::Struct(id) = payload_ty else { b.terminate(Term::Unreachable); return Operand::Const(Const::Unit); };
+    let option_ty = Ty::Option(Scalar::Struct(id));
+    let result = b.new_slot(result_ty);
+    let option = b.new_slot(option_ty);
+    let is_ok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(is_ok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    let ok = b.new_block(); let error = b.new_block(); let join = b.new_block();
+    b.terminate(Term::Branch(Operand::Value(is_ok), ok, error));
+    b.cur = ok;
+    let found = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(found, Rvalue::Load(present)));
+    let some = b.new_block(); let none = b.new_block(); let wrap = b.new_block();
+    b.terminate(Term::Branch(Operand::Value(found), some, none));
+    b.cur = some;
+    let value = b.fresh_value(payload_ty);
+    b.push(Stmt::Let(value, Rvalue::Load(entry)));
+    let optional = b.fresh_value(option_ty);
+    b.push(Stmt::Let(optional, Rvalue::OptionSome(Operand::Value(value))));
+    b.push(Stmt::Store(option, Operand::Value(optional)));
+    b.terminate(Term::Goto(wrap));
+    b.cur = none;
+    let absent = b.fresh_value(option_ty);
+    b.push(Stmt::Let(absent, Rvalue::OptionNone));
+    b.push(Stmt::Store(option, Operand::Value(absent)));
+    b.terminate(Term::Goto(wrap));
+    b.cur = wrap;
+    let payload = b.fresh_value(option_ty);
+    b.push(Stmt::Let(payload, Rvalue::Load(option)));
+    let success = b.fresh_value(result_ty);
+    b.push(Stmt::Let(success, Rvalue::ResultOk(Operand::Value(payload))));
+    b.push(Stmt::Store(result, Operand::Value(success)));
+    b.terminate(Term::Goto(join));
+    b.cur = error;
+    let failure = make_error_from_status(b, code, result_ty);
+    let error_value = b.fresh_value(result_ty);
+    b.push(Stmt::Let(error_value, Rvalue::ResultErr(failure)));
+    b.push(Stmt::Store(result, Operand::Value(error_value)));
+    b.terminate(Term::Goto(join));
+    b.cur = join;
+    let value = b.fresh_value(result_ty);
+    b.push(Stmt::Let(value, Rvalue::Load(result)));
+    Operand::Value(value)
 }
 
 /// Reconstruct the existing `Result<reader/writer, Error>` CFG from a runtime status and handle
@@ -22476,6 +22565,8 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::CodecStrColumn => "codec.str_column".to_string(),
         Ty::CodecEncoder => "codec.encoder".to_string(),
         Ty::CryptoDigest => "crypto.digest".to_string(),
+        Ty::FsDirectory => "fs.directory".to_string(),
+        Ty::FsDirCursor => "fs.dir_cursor".to_string(),
         Ty::SignatureKey(kind) => kind.name().to_string(),
         Ty::ArrayBuilder(element) => {
             format!(

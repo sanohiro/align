@@ -11,7 +11,7 @@ macro_rules! runtime_keys {
         }
 
         impl RuntimeKey {
-            pub const ALL: [Self; 368] = [$(Self::$variant,)*];
+            pub const ALL: [Self; 389] = [$(Self::$variant,)*];
 
             pub const fn logical_name(self) -> &'static str {
                 match self {
@@ -147,17 +147,38 @@ runtime_keys! {
     FreeStringArray => "free_string_array",
     FsCreateDir => "fs_create_dir",
     FsCreatePrivateTempDir => "fs_create_private_temp_dir",
+    FsCursorFree => "fs_cursor_free",
+    FsCursorNext => "fs_cursor_next",
+    FsDirectoryCreateDir => "fs_directory_create_dir",
+    FsDirectoryCreateNew => "fs_directory_create_new",
+    FsDirectoryCursor => "fs_directory_cursor",
+    FsDirectoryFree => "fs_directory_free",
+    FsDirectoryMetadata => "fs_directory_metadata",
+    FsDirectoryMetadataAt => "fs_directory_metadata_at",
+    FsDirectoryOpen => "fs_directory_open",
+    FsDirectoryOpenDir => "fs_directory_open_dir",
+    FsDirectoryOpenRead => "fs_directory_open_read",
+    FsDirectoryOpenReadSingleLink => "fs_directory_open_read_single_link",
+    FsDirectoryRemoveDir => "fs_directory_remove_dir",
+    FsDirectoryRemoveFile => "fs_directory_remove_file",
+    FsDirectorySetMode => "fs_directory_set_mode",
     FsExists => "fs_exists",
+    FsFileMetadata => "fs_file_metadata",
+    FsFileSetMode => "fs_file_set_mode",
     FsIsDir => "fs_is_dir",
     FsReadBytesView => "fs_read_bytes_view",
     FsReadDir => "fs_read_dir",
     FsReadFile => "fs_read_file",
     FsReadFileView => "fs_read_file_view",
+    FsReaderMetadata => "fs_reader_metadata",
+    FsReaderSetMode => "fs_reader_set_mode",
     FsRemove => "fs_remove",
     FsRemoveEmptyDir => "fs_remove_empty_dir",
     FsRenameNoReplace => "fs_rename_no_replace",
     FsWriteFile => "fs_write_file",
     FsWriteFileBuilder => "fs_write_file_builder",
+    FsWriterMetadata => "fs_writer_metadata",
+    FsWriterSetMode => "fs_writer_set_mode",
     GatherI64 => "gather_i64",
     GroupCountI64 => "group_count_i64",
     GroupCountStr => "group_count_str",
@@ -393,7 +414,7 @@ runtime_keys! {
     XmlText => "xml_text",
 }
 
-const _: [(); 368] = [(); RuntimeKey::ALL.len()];
+const _: [(); 389] = [(); RuntimeKey::ALL.len()];
 
 #[cfg(test)]
 mod tests {
@@ -402,7 +423,7 @@ mod tests {
 
     #[test]
     fn runtime_keys_are_complete_unique_and_alphabetical() {
-        assert_eq!(RuntimeKey::ALL.len(), 368);
+        assert_eq!(RuntimeKey::ALL.len(), 389);
         let names: Vec<_> = RuntimeKey::ALL
             .iter()
             .map(|key| key.logical_name())

@@ -155,6 +155,7 @@ enum RuntimeAbiShape {
     A123,
     A124,
     A125,
+    A126,
 }
 
 #[derive(Clone, Copy)]
@@ -852,6 +853,27 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
         RuntimeKey::CryptoDigestNew => RuntimeAbi { key, symbol: "align_rt_crypto_digest_new", shape: RuntimeAbiShape::A47 },
         RuntimeKey::CryptoDigestUpdate => RuntimeAbi { key, symbol: "align_rt_crypto_digest_update", shape: RuntimeAbiShape::A73 },
         RuntimeKey::CryptoDigestFinish => RuntimeAbi { key, symbol: "align_rt_crypto_digest_finish", shape: RuntimeAbiShape::A83 },
+        RuntimeKey::FsDirectoryOpen => RuntimeAbi { key, symbol: "align_rt_fs_directory_open", shape: RuntimeAbiShape::A08 },
+        RuntimeKey::FsDirectoryCursor => RuntimeAbi { key, symbol: "align_rt_fs_directory_cursor", shape: RuntimeAbiShape::A19 },
+        RuntimeKey::FsCursorNext => RuntimeAbi { key, symbol: "align_rt_fs_cursor_next", shape: RuntimeAbiShape::A24 },
+        RuntimeKey::FsDirectoryMetadata => RuntimeAbi { key, symbol: "align_rt_fs_directory_metadata", shape: RuntimeAbiShape::A19 },
+        RuntimeKey::FsDirectoryMetadataAt => RuntimeAbi { key, symbol: "align_rt_fs_directory_metadata_at", shape: RuntimeAbiShape::A22 },
+        RuntimeKey::FsDirectoryOpenDir => RuntimeAbi { key, symbol: "align_rt_fs_directory_open_dir", shape: RuntimeAbiShape::A22 },
+        RuntimeKey::FsDirectoryOpenRead => RuntimeAbi { key, symbol: "align_rt_fs_directory_open_read", shape: RuntimeAbiShape::A22 },
+        RuntimeKey::FsDirectoryOpenReadSingleLink => RuntimeAbi { key, symbol: "align_rt_fs_directory_open_read_single_link", shape: RuntimeAbiShape::A22 },
+        RuntimeKey::FsDirectoryCreateNew => RuntimeAbi { key, symbol: "align_rt_fs_directory_create_new", shape: RuntimeAbiShape::A22 },
+        RuntimeKey::FsDirectoryCreateDir => RuntimeAbi { key, symbol: "align_rt_fs_directory_create_dir", shape: RuntimeAbiShape::A126 },
+        RuntimeKey::FsDirectoryRemoveFile => RuntimeAbi { key, symbol: "align_rt_fs_directory_remove_file", shape: RuntimeAbiShape::A20 },
+        RuntimeKey::FsDirectoryRemoveDir => RuntimeAbi { key, symbol: "align_rt_fs_directory_remove_dir", shape: RuntimeAbiShape::A20 },
+        RuntimeKey::FsDirectorySetMode => RuntimeAbi { key, symbol: "align_rt_fs_directory_set_mode", shape: RuntimeAbiShape::A115 },
+        RuntimeKey::FsReaderMetadata => RuntimeAbi { key, symbol: "align_rt_fs_reader_metadata", shape: RuntimeAbiShape::A19 },
+        RuntimeKey::FsWriterMetadata => RuntimeAbi { key, symbol: "align_rt_fs_writer_metadata", shape: RuntimeAbiShape::A19 },
+        RuntimeKey::FsFileMetadata => RuntimeAbi { key, symbol: "align_rt_fs_file_metadata", shape: RuntimeAbiShape::A19 },
+        RuntimeKey::FsReaderSetMode => RuntimeAbi { key, symbol: "align_rt_fs_reader_set_mode", shape: RuntimeAbiShape::A115 },
+        RuntimeKey::FsWriterSetMode => RuntimeAbi { key, symbol: "align_rt_fs_writer_set_mode", shape: RuntimeAbiShape::A115 },
+        RuntimeKey::FsFileSetMode => RuntimeAbi { key, symbol: "align_rt_fs_file_set_mode", shape: RuntimeAbiShape::A115 },
+        RuntimeKey::FsDirectoryFree => RuntimeAbi { key, symbol: "align_rt_fs_directory_free", shape: RuntimeAbiShape::A62 },
+        RuntimeKey::FsCursorFree => RuntimeAbi { key, symbol: "align_rt_fs_cursor_free", shape: RuntimeAbiShape::A62 },
         RuntimeKey::CryptoDigestFree => RuntimeAbi { key, symbol: "align_rt_crypto_digest_free", shape: RuntimeAbiShape::A62 },
         RuntimeKey::CryptoSha256 => RuntimeAbi {
             key,
@@ -2158,15 +2180,15 @@ pub(super) fn runtime_abis() -> impl Iterator<Item = RuntimeAbi> {
 }
 
 pub(super) fn validate_registry() -> Result<(), String> {
-    if RuntimeKey::ALL.len() != 368 || keyed_runtime_abis().len() != 368 {
+    if RuntimeKey::ALL.len() != 389 || keyed_runtime_abis().len() != 389 {
         return Err("runtime ABI registry invariant: key-count".to_string());
     }
-    if runtime_abis().count() != 386 {
+    if runtime_abis().count() != 407 {
         return Err("runtime ABI registry invariant: base-count".to_string());
     }
 
     let mut keys = HashSet::with_capacity(RuntimeKey::ALL.len());
-    let mut symbols = HashSet::with_capacity(386);
+    let mut symbols = HashSet::with_capacity(407);
     for abi in keyed_runtime_abis() {
         let key = abi
             .runtime_key()
@@ -3788,6 +3810,11 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
             params: &[NativeType::Ptr, NativeType::I64, NativeType::I32],
             return_noalias: false, fn_attrs: &["nounwind"], memory_argmem_read: false, read_ptr_params: &[],
         },
+        RuntimeAbiShape::A126 => RuntimeAbiShapeSpec {
+            ret: NativeReturn::I32,
+            params: &[NativeType::Ptr, NativeType::Ptr, NativeType::I64, NativeType::I32],
+            return_noalias: false, fn_attrs: &[], memory_argmem_read: false, read_ptr_params: &[],
+        },
         RuntimeAbiShape::A125 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
             params: &[NativeType::Ptr, NativeType::Ptr, NativeType::I64, NativeType::I32],
@@ -3848,17 +3875,17 @@ mod tests {
         );
         validate_registry().unwrap();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 386);
+        assert_eq!(rows.len(), 407);
         assert_eq!(
             rows.iter().map(|row| row.key).collect::<HashSet<_>>().len(),
-            386
+            407
         );
         assert_eq!(
             rows.iter()
                 .map(|row| row.symbol)
                 .collect::<HashSet<_>>()
                 .len(),
-            386
+            407
         );
         for (key, row) in RuntimeKey::ALL.into_iter().zip(keyed_runtime_abis()) {
             assert_eq!(row.key, RuntimeAbiId::Keyed(key));
@@ -3888,7 +3915,7 @@ mod tests {
     fn runtime_abi_extern_type_matrix_is_exact_for_every_row_and_ordinal() {
         let ctx = inkwell::context::Context::create();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 386);
+        assert_eq!(rows.len(), 407);
 
         for row in rows {
             let symbol = row.symbol;

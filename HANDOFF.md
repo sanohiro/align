@@ -1,10 +1,17 @@
 # Session handoff
 
+`std.fs` retained raw tree access (R64) is implemented under
+[plan 45](docs/impl/45-retained-byte-tree-plan.md): owned directory/cursor handles,
+independent raw-name enumeration, descriptor metadata/modes and relative operations.
+The owner suite covers whole/per-unit transport, malformed HIR/MIR, native failure
+precedence and cleanup with omitted-Drop negative controls. Consumer traversal,
+snapshot policy and adoption remain external. R65 platform/lifecycle qualification
+remains the next unclosed product-cutover boundary.
+
 `std.fs` ordinary directory operations are implemented: `fs.create_dir` creates
 one directory under normal umask rules; `fs.is_dir` returns a fallible followed
 metadata type observation. [Plan 43](docs/impl/43-ordinary-directory-plan.md)
-owns the exact contract and path/permission/whole-per-unit/IR owners. Retained
-raw tree access remains R64; Align-llm adoption is external.
+owns the exact contract and path/permission/whole-per-unit/IR owners. Align-llm adoption is external.
 
 `std.os` host observation is implemented: `os.host()` returns the qualified
 ordinary owned `os.host_info` record, with exact uname text and optional online CPU
@@ -26,8 +33,8 @@ SHA-256 (R29) is implemented under [plan 41](docs/impl/41-incremental-sha256-pla
 Move-record and owned-string slice views (R67) are implemented under
 [plan 44](docs/impl/44-move-record-slice-plan.md), retaining source ownership and
 using existing field/shared-call readers without implicit copies.
-Retained-tree exact contracts and verified-process platform/lifecycle proof must
-close before their implementation; R63 remains subject to the settled-decision
+Retained-tree access follows plan 45. Verified-process platform/lifecycle proof
+must close before R65 implementation; R63 remains subject to the settled-decision
 reopen protocol. Consumer adoption is separate.
 
 **Bound `if` results (2026-09-09):** the Category A bound-local transfer gap is

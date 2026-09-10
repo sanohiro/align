@@ -1385,6 +1385,11 @@ const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("xml.reader", 0, BuiltinCapability::Opaque),
     ("codec.encoder", 0, BuiltinCapability::Opaque),
     ("crypto.digest", 0, BuiltinCapability::Opaque),
+    ("fs.directory", 0, BuiltinCapability::Opaque),
+    ("fs.dir_cursor", 0, BuiltinCapability::Opaque),
+    ("fs.dir_entry", 0, BuiltinCapability::Opaque),
+    ("fs.metadata", 0, BuiltinCapability::Opaque),
+    ("fs.entry_kind", 0, BuiltinCapability::Opaque),
     ("rs256_private_key", 0, BuiltinCapability::Opaque),
     ("crypto.rs256_private_key", 0, BuiltinCapability::Opaque),
     ("rs256_public_key", 0, BuiltinCapability::Opaque),
@@ -2685,6 +2690,7 @@ pub fn summary_to_source(
                         | "crypto.ed25519_public_key" => {
                             builtin_type_imports.insert("std.crypto".to_string());
                         }
+                        "fs.directory" | "fs.dir_cursor" | "fs.dir_entry" | "fs.metadata" | "fs.entry_kind" => { builtin_type_imports.insert("std.fs".to_string()); }
                         "os.host_info" => { builtin_type_imports.insert("std.os".to_string()); }
                         "regex.regex_match" => {
                             builtin_type_imports.insert("std.regex".to_string());

@@ -788,6 +788,7 @@ fn walk_body_records<'a>(
                     payload: operands, ..
                 }
                 | ExprKind::Call { args: operands, .. }
+                | ExprKind::FsTree { args: operands, .. }
                 | ExprKind::StructLit {
                     fields: operands, ..
                 }

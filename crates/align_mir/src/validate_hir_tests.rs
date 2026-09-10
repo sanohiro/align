@@ -16037,6 +16037,8 @@ const fn delegation_scalar_sweep_tripwire(scalar: &Scalar) {
         | Scalar::CodecBoolColumn
         | Scalar::CodecStrColumn
         | Scalar::CryptoDigest
+        | Scalar::FsDirectory
+        | Scalar::FsDirCursor
         | Scalar::CodecEncoder
         | Scalar::Buffer
         | Scalar::SignatureKey(_)
@@ -18381,6 +18383,47 @@ fn move_slice_records_reject_forged_shapes() -> Result<(), &'static str> {
         let hir::ExprKind::ElemField { path, .. } = &mut expression.kind else { return Err("nested field"); };
         *path = invalid;
         assert_body_entrypoints_empty("malformed complete nested HIR path", &bad);
+    }
+    Ok(())
+}
+
+#[test]
+fn retained_tree_records() -> Result<(), &'static str> {
+    let base = checked_source_program("import std.fs\nfn root(path: str) -> Result<fs.directory,Error> = fs.open_directory(path)\nfn next(cursor: fs.dir_cursor) -> Result<Option<fs.dir_entry>,Error> = cursor.next()\nfn mode(directory: fs.directory) -> Result<(),Error> = directory.create_dir(\"x\",448)\nfn main() {}\n");
+    assert!(!is_empty(&lower_program(&base)));
+    for name in ["root", "next", "mode"] {
+        for mutation in 0..4 {
+            let mut bad = base.clone();
+            let expression = bad.fns.iter_mut().find(|function| function.name == name).ok_or("operation")?.body.value.as_mut().ok_or("tail")?;
+            let hir::ExprKind::FsTree { args, kind } = &mut expression.kind else { return Err("filesystem record"); };
+            match mutation {
+                0 => expression.ty = Ty::Bool,
+                1 => args.clear(),
+                2 => args[0] = native_i64(),
+                _ => *kind = align_sema::fs_tree::FsTreeKind::FileSetMode,
+            }
+            assert_body_entrypoints_empty("malformed retained filesystem record", &bad);
+        }
+    }
+    for source in ["fn main() {}", "import std.fs\nfn get() -> Result<fs.directory, Error> = fs.open_directory(\".\")\nfn main() {}"] {
+        let schema = checked_source_program(source);
+        for name in ["fs.dir_entry", "fs.metadata"] {
+            let id = schema.structs.iter().position(|definition| definition.name == name).ok_or("schema")?;
+            for mutation in 0..6 {
+                let mut bad = schema.clone();
+                let definition = &mut bad.structs[id];
+                match mutation {
+                    0 => definition.fields.clear(),
+                    1 => definition.fields[0].ty = Ty::Raw,
+                    2 => definition.source_name = "lookalike".to_string(),
+                    3 => definition.name = "lookalike".to_string(),
+                    4 => definition.c_repr = true,
+                    _ => definition.align = Some(16),
+                }
+                assert!(!validate_hir::global_type_metadata_is_valid(&bad));
+                assert_body_entrypoints_empty("malformed reserved filesystem schema", &bad);
+            }
+        }
     }
     Ok(())
 }

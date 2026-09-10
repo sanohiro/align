@@ -23,7 +23,8 @@ pub(crate) fn global_type_metadata_is_valid(program: &hir::Program) -> bool {
     && program.structs.iter().all(|definition| {
         !(definition.name == "os.host_info" || definition.source_name == "os.host_info")
             || align_sema::host_info_schema_valid(definition)
-    }) && Validator::new(program).validate()
+    }) && align_sema::fs_tree_schemas_valid(&program.structs, &program.enums)
+    && Validator::new(program).validate()
 }
 
 /// Validate the placement of body-independent HIR types.
@@ -1807,6 +1808,8 @@ impl<'a> PlacementValidator<'a> {
             | Scalar::CodecBoolColumn
             | Scalar::CodecStrColumn
             | Scalar::CryptoDigest
+            | Scalar::FsDirectory
+            | Scalar::FsDirCursor
             | Scalar::CodecEncoder
             | Scalar::Regex
             | Scalar::Captures
@@ -1876,6 +1879,8 @@ impl<'a> PlacementValidator<'a> {
             | Scalar::CodecBoolColumn
             | Scalar::CodecStrColumn
             | Scalar::CryptoDigest
+            | Scalar::FsDirectory
+            | Scalar::FsDirCursor
             | Scalar::CodecEncoder => true,
             Scalar::HttpReadStream | Scalar::HttpSseStream => false,
             Scalar::DynArray(PrimScalar::String) => false,
@@ -1981,6 +1986,8 @@ impl<'a> PlacementValidator<'a> {
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
             | Ty::CryptoDigest
+            | Ty::FsDirectory
+            | Ty::FsDirCursor
             | Ty::CodecEncoder
             | Ty::Buffer
             | Ty::SignatureKey(_)
@@ -2478,6 +2485,8 @@ impl<'a> Validator<'a> {
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
             | Ty::CryptoDigest
+            | Ty::FsDirectory
+            | Ty::FsDirCursor
             | Ty::CodecEncoder
             | Ty::Buffer
             | Ty::SignatureKey(_)
@@ -2550,6 +2559,8 @@ impl<'a> Validator<'a> {
             | Scalar::CodecBoolColumn
             | Scalar::CodecStrColumn
             | Scalar::CryptoDigest
+            | Scalar::FsDirectory
+            | Scalar::FsDirCursor
             | Scalar::CodecEncoder
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
@@ -3526,6 +3537,8 @@ impl<'a> BodyValidator<'a> {
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
             | Ty::CryptoDigest
+            | Ty::FsDirectory
+            | Ty::FsDirCursor
             | Ty::CodecEncoder
             | Ty::Buffer
             | Ty::SignatureKey(_)
@@ -3846,6 +3859,8 @@ impl<'a> BodyValidator<'a> {
             | Scalar::CodecBoolColumn
             | Scalar::CodecStrColumn
             | Scalar::CryptoDigest
+            | Scalar::FsDirectory
+            | Scalar::FsDirCursor
             | Scalar::CodecEncoder
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
@@ -4603,7 +4618,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::FsWriteFile { .. }
             | hir::ExprKind::FsExists { .. }
             | hir::ExprKind::FsRemove { .. }
-            | hir::ExprKind::FsCreateDir { .. } | hir::ExprKind::FsIsDir { .. }
+            | hir::ExprKind::FsTree { .. } | hir::ExprKind::FsCreateDir { .. } | hir::ExprKind::FsIsDir { .. }
             | hir::ExprKind::FsRemoveEmptyDir { .. }
             | hir::ExprKind::FsReadDir { .. }
             | hir::ExprKind::RenameNoReplace { .. }
@@ -4986,7 +5001,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::ArrayBuilderBuild(..)
             | hir::ExprKind::FsExists { .. }
             | hir::ExprKind::FsRemove { .. }
-            | hir::ExprKind::FsCreateDir { .. } | hir::ExprKind::FsIsDir { .. }
+            | hir::ExprKind::FsTree { .. } | hir::ExprKind::FsCreateDir { .. } | hir::ExprKind::FsIsDir { .. }
             | hir::ExprKind::FsRemoveEmptyDir { .. }
             | hir::ExprKind::FsReadDir { .. }
             | hir::ExprKind::RenameNoReplace { .. }
@@ -9052,6 +9067,24 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::FsRemove { path } => {
                 (path.ty == Ty::Str).then(|| result(Ty::Unit, &[path]))?
             }
+            hir::ExprKind::FsTree { kind, args } => {
+                let inputs = kind.inputs();
+                if inputs.len() != args.len() { return None; }
+                for (input, argument) in inputs.iter().zip(args) {
+                    if self.expr_flow(argument)?.falls && !align_sema::fs_tree::input_matches(*input, argument.ty) { return None; }
+                    if let align_sema::fs_tree::Input::Owner(ty) = input {
+                        if !self.local_handle_place(context, argument, *ty) { return None; }
+                        if kind.exclusive() {
+                            let hir::ExprKind::Local(id) = argument.kind else { return None; };
+                            let function = self.program.fns.get(context.function)?;
+                            if let Some(position) = function.params.iter().position(|parameter| *parameter == id)
+                                && !matches!(function.param_modes.get(position), Some(align_ast::ParamMode::ByValue | align_ast::ParamMode::BorrowMut)) { return None; }
+                        }
+                    }
+                }
+                let expected = align_sema::fs_tree::result_type(*kind, &self.program.structs, &self.program.enums, &self.program.tagged_types)?;
+                strict(expected, &args.iter().collect::<Vec<_>>())
+            }
             hir::ExprKind::FsCreateDir { path }
             | hir::ExprKind::FsRemoveEmptyDir { path } => {
                 (path.ty == Ty::Str).then(|| result(Ty::Unit, &[path]))?
@@ -9855,6 +9888,8 @@ impl<'a> BodyValidator<'a> {
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
             | Ty::CryptoDigest
+            | Ty::FsDirectory
+            | Ty::FsDirCursor
             | Ty::CodecEncoder
             | Ty::Buffer
             | Ty::SignatureKey(_)

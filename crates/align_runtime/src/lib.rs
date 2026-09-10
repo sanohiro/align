@@ -22,6 +22,8 @@ mod crypto_asymmetric;
 mod crypto_digest;
 mod os_host;
 mod fs_directory;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod fs_retained_tree;
 pub use crypto_asymmetric::*;
 mod csv;
 pub use csv::*;
@@ -8969,8 +8971,13 @@ impl BeneathPath {
 /// A positive length and non-null pointer must describe a readable immutable byte range.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 unsafe fn abi_beneath_path(ptr: *const u8, len: i64, root: bool) -> Result<BeneathPath, i32> {
+    unsafe { abi_beneath_path_impl(ptr, len, root, true) }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+unsafe fn abi_beneath_path_impl(ptr: *const u8, len: i64, root: bool, utf8: bool) -> Result<BeneathPath, i32> {
     let n = safe_len(len).map_err(|_| AL_INVALID)?;
-    if n == 0 || ptr.is_null() {
+    if n == 0 || ptr.is_null() || ptr.addr().checked_add(n).is_none() {
         return Err(AL_INVALID);
     }
     let capacity = n
@@ -8978,7 +8985,7 @@ unsafe fn abi_beneath_path(ptr: *const u8, len: i64, root: bool) -> Result<Benea
         .filter(|capacity| *capacity <= isize::MAX.unsigned_abs())
         .ok_or(AL_INVALID)?;
     let source = unsafe { std::slice::from_raw_parts(ptr, n) };
-    if std::str::from_utf8(source).is_err() || source.contains(&0) {
+    if (utf8 && std::str::from_utf8(source).is_err()) || source.contains(&0) {
         return Err(AL_INVALID);
     }
 
