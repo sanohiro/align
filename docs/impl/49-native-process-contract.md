@@ -571,3 +571,14 @@ storage. No throughput or delivery-latency promise is introduced.
 
 `scripts/test-process-native.sh` is the local/CI parity owner on Linux and macOS;
 it builds the runtime before running native and whole/per-unit process suites.
+
+### Reopened native observation test axis
+
+The capture/readiness owner uses `printf x; exec sleep 30`, so one PID owns the
+pipe writer and a shell descendant cannot race the EOF assertion. It observes
+pipe readiness separately from process status. The retained-group owner compares
+its pre-reap result with an independent native `kill(-pid, 0)` while WNOWAIT pins
+the terminal leader; kernel-specific ESRCH or EPERM is encoded through the shared
+error model. Reaping then unconditionally revokes the API authority with Invalid.
+These cells distinguish native observation, error encoding, pipe lifetime and
+owner lifetime on both Linux and macOS without promising a zombie-group result.

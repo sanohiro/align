@@ -952,7 +952,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn live_capture_and_pending_wait() {
-        let mut command = command("printf x; sleep 1");
+        let mut command = command("printf x; exec sleep 30");
         command.new_session = true;
         let mut child = launch(&command, true, false).unwrap();
         assert!(child.new_session);
@@ -992,8 +992,8 @@ pub(crate) mod tests {
             child.wait().unwrap().termination.signaled,
             i64::from(libc::SIGKILL)
         );
-        // Reaping the leader does not imply every group member has finished
-        // closing its inherited pipe. Observe stdout readiness independently.
+        // This fixture has one process: exec preserves the writer PID. Observe
+        // pipe EOF independently of the terminal-status notification.
         assert_eq!(unsafe { super::super::process_live::align_rt_child_poll(
             &mut *child, 1, 1_000_000_000, observed.as_mut_ptr().cast(),
         ) }, 0);
@@ -1088,10 +1088,14 @@ pub(crate) mod tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::yield_now();
         }
-        // Darwin may report ESRCH for a group containing only its unreaped zombie.
-        // The API preserves that native observation; loss of authority is Invalid.
-        let probe = child.signal(0, true);
-        assert!(probe == Ok(()) || probe == Err(super::super::AL_CODE + libc::ESRCH), "{probe:?}");
+        // The unreaped leader pins this group identity. Compare with the native
+        // observation: zombie-only groups differ across kernels (including EPERM).
+        let native = if unsafe { libc::kill(-child.pid, 0) } == 0 {
+            Ok(())
+        } else {
+            Err(io_error_to_status(&std::io::Error::last_os_error()))
+        };
+        assert_eq!(child.signal(0, true), native);
         for signal in [-1, super::super::MAX_SIGNAL + 1, i64::MAX] {
             assert_eq!(child.signal(signal, true), Err(AL_INVALID));
         }
