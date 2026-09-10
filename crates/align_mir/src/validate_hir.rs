@@ -1810,7 +1810,7 @@ impl<'a> PlacementValidator<'a> {
             | Scalar::CryptoDigest
             | Scalar::FsDirectory
             | Scalar::FsDirCursor
-            | Scalar::ProcessSignalSubscription
+            | Scalar::ProcessSignalSubscription | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command
             | Scalar::CodecEncoder
             | Scalar::Regex
             | Scalar::Captures
@@ -1882,7 +1882,7 @@ impl<'a> PlacementValidator<'a> {
             | Scalar::CryptoDigest
             | Scalar::FsDirectory
             | Scalar::FsDirCursor
-            | Scalar::ProcessSignalSubscription
+            | Scalar::ProcessSignalSubscription | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command
             | Scalar::CodecEncoder => true,
             Scalar::HttpReadStream | Scalar::HttpSseStream => false,
             Scalar::DynArray(PrimScalar::String) => false,
@@ -1990,7 +1990,7 @@ impl<'a> PlacementValidator<'a> {
             | Ty::CryptoDigest
             | Ty::FsDirectory
             | Ty::FsDirCursor
-            | Ty::ProcessSignalSubscription
+            | Ty::ProcessSignalSubscription | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
             | Ty::CodecEncoder
             | Ty::Buffer
             | Ty::SignatureKey(_)
@@ -2488,7 +2488,7 @@ impl<'a> Validator<'a> {
             | Ty::CryptoDigest
             | Ty::FsDirectory
             | Ty::FsDirCursor
-            | Ty::ProcessSignalSubscription
+            | Ty::ProcessSignalSubscription | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
             | Ty::CodecEncoder
             | Ty::Buffer
             | Ty::SignatureKey(_)
@@ -2563,7 +2563,7 @@ impl<'a> Validator<'a> {
             | Scalar::CryptoDigest
             | Scalar::FsDirectory
             | Scalar::FsDirCursor
-            | Scalar::ProcessSignalSubscription
+            | Scalar::ProcessSignalSubscription | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command
             | Scalar::CodecEncoder
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
@@ -3542,7 +3542,7 @@ impl<'a> BodyValidator<'a> {
             | Ty::CryptoDigest
             | Ty::FsDirectory
             | Ty::FsDirCursor
-            | Ty::ProcessSignalSubscription
+            | Ty::ProcessSignalSubscription | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
             | Ty::CodecEncoder
             | Ty::Buffer
             | Ty::SignatureKey(_)
@@ -3865,7 +3865,7 @@ impl<'a> BodyValidator<'a> {
             | Scalar::CryptoDigest
             | Scalar::FsDirectory
             | Scalar::FsDirCursor
-            | Scalar::ProcessSignalSubscription
+            | Scalar::ProcessSignalSubscription | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command
             | Scalar::CodecEncoder
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
@@ -9077,9 +9077,15 @@ impl<'a> BodyValidator<'a> {
                 for (index,(input,argument)) in kind.inputs().iter().zip(args).enumerate() {
                     let expected = input_type(*input,&self.program.structs,&self.program.enums)?;
                     if !self.expr_flow(argument)?.falls { continue; }
-                    if !self.body_ty_matches(argument.ty,expected) { return None; }
+                    if !align_sema::process_live::view_input_matches(*input,argument.ty).unwrap_or_else(||self.body_ty_matches(argument.ty,expected)) { return None; }
                     if let Input::Owner(ty) = input {
-                        if index==0 && !self.local_handle_place(context,argument,*ty) { return None; }
+                        if index==0 && kind.local_receiver() && !self.local_handle_place(context,argument,*ty) { return None; }
+                        if kind.consumes(index) {
+                            let hir::ExprKind::Local(id) = argument.kind else { return None; };
+                            let function = self.program.fns.get(context.function)?;
+                            if let Some(position) = function.params.iter().position(|parameter| *parameter==id)
+                                && function.param_modes.get(position)!=Some(&align_ast::ParamMode::ByValue) { return None; }
+                        }
                         if index==0 && kind.exclusive() {
                             let hir::ExprKind::Local(id) = argument.kind else { return None; };
                             let function = self.program.fns.get(context.function)?;
@@ -9905,7 +9911,7 @@ impl<'a> BodyValidator<'a> {
             | Ty::CryptoDigest
             | Ty::FsDirectory
             | Ty::FsDirCursor
-            | Ty::ProcessSignalSubscription
+            | Ty::ProcessSignalSubscription | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
             | Ty::CodecEncoder
             | Ty::Buffer
             | Ty::SignatureKey(_)

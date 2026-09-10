@@ -1,6 +1,7 @@
 //! Producer-owned schemas for native process observations.
 use crate::{IntTy, Scalar, Ty, hir};
 pub const COPY_NAMES: &[&str] = &[
+    "fs.memory_kind",
     "process.termination",
     "process.wait_result",
     "process.readiness",
@@ -22,6 +23,20 @@ pub fn termination_definition() -> hir::EnumDef {
                     signed: true,
                 })],
                 field_base: if index == 0 { 1 } else { 2 },
+            })
+            .collect(),
+    }
+}
+pub fn memory_kind_definition() -> hir::EnumDef {
+    hir::EnumDef {
+        name: "fs.memory_kind".into(),
+        source_name: "fs.memory_kind".into(),
+        variants: ["Data", "Executable"]
+            .into_iter()
+            .map(|name| hir::EnumVariant {
+                name: name.into(),
+                payload: Vec::new(),
+                field_base: 1,
             })
             .collect(),
     }
@@ -103,7 +118,11 @@ pub fn record_definitions(termination: u32) -> Vec<hir::StructDef> {
 }
 pub fn schemas_valid(structs: &[hir::StructDef], enums: &[hir::EnumDef]) -> bool {
     let mut termination_id = None;
-    for expected in [termination_definition(), signal_definition()] {
+    for expected in [
+        termination_definition(),
+        signal_definition(),
+        memory_kind_definition(),
+    ] {
         let mut found = false;
         for (id, actual) in enums.iter().enumerate() {
             if actual.name == expected.name || actual.source_name == expected.source_name {
@@ -177,6 +196,19 @@ pub enum ProcessLiveKind {
     SignalNew,
     SignalNext,
     SignalClose,
+    MemoryNew,
+    MemoryWrite,
+    MemorySeal,
+    SealedLen,
+    SealedReadAt,
+    Executable,
+    ImageLen,
+    ImageReadAt,
+    CommandImage,
+    CurrentImage,
+    UserNamespace,
+    InheritFile,
+    InheritNamespace,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Input {
@@ -187,8 +219,29 @@ pub enum Input {
     Readiness,
     Signal,
     SignalSet,
+    MemoryKind,
+    Bytes,
+    Argv,
+    Text,
 }
 impl ProcessLiveKind {
+    pub fn local_receiver(self) -> bool {
+        !matches!(self, Self::Executable | Self::CommandImage)
+    }
+    pub fn consumes(self, index: usize) -> bool {
+        self == Self::MemorySeal && index == 0
+    }
+    pub fn module(self) -> &'static str {
+        match self {
+            Self::MemoryNew
+            | Self::MemoryWrite
+            | Self::MemorySeal
+            | Self::SealedLen
+            | Self::SealedReadAt => "std.fs",
+            _ => "std.process",
+        }
+    }
+
     pub fn inputs(self) -> &'static [Input] {
         use Input::*;
         match self {
@@ -206,13 +259,32 @@ impl ProcessLiveKind {
             Self::SignalNumber => &[Signal],
             Self::ProcessTable => &[Integer],
             Self::SignalNew => &[SignalSet],
+            Self::MemoryNew => &[MemoryKind, Integer],
+            Self::MemoryWrite => &[Owner(Ty::FsMemoryWriter), Bytes],
+            Self::MemorySeal => &[Owner(Ty::FsMemoryWriter)],
+            Self::SealedLen | Self::Executable => &[Owner(Ty::FsSealedFile)],
+            Self::SealedReadAt => &[Owner(Ty::FsSealedFile), Integer, OutBytes],
+            Self::ImageLen => &[Owner(Ty::ProcessImage)],
+            Self::ImageReadAt => &[Owner(Ty::ProcessImage), Integer, OutBytes],
+            Self::CommandImage => &[Owner(Ty::ProcessImage), Argv],
+            Self::CurrentImage => &[],
+            Self::UserNamespace => &[Text],
+            Self::InheritFile => &[Owner(Ty::Command), Owner(Ty::FsSealedFile), Integer],
+            Self::InheritNamespace => {
+                &[Owner(Ty::Command), Owner(Ty::ProcessUserNamespace), Integer]
+            }
             Self::SignalNext | Self::SignalClose => &[Owner(Ty::ProcessSignalSubscription)],
         }
     }
     pub fn pure(self) -> bool {
         matches!(
             self,
-            Self::ChildId | Self::RunOutputStatus | Self::RunBytesStatus | Self::SignalNumber
+            Self::ChildId
+                | Self::RunOutputStatus
+                | Self::RunBytesStatus
+                | Self::SignalNumber
+                | Self::SealedLen
+                | Self::ImageLen
         )
     }
     pub fn fallible(self) -> bool {
@@ -229,6 +301,9 @@ impl ProcessLiveKind {
                 | Self::ChildReadStdout
                 | Self::ChildReadStderr
                 | Self::ChildPoll
+                | Self::MemoryWrite
+                | Self::InheritFile
+                | Self::InheritNamespace
                 | Self::SignalNext
                 | Self::SignalClose
         )
@@ -243,6 +318,11 @@ impl ProcessLiveKind {
                 | Self::ChildKillGroup
                 | Self::SignalNumber
                 | Self::SignalClose
+                | Self::MemoryWrite
+                | Self::InheritFile
+                | Self::InheritNamespace
+                | Self::SealedLen
+                | Self::ImageLen
         )
     }
     pub fn from_method(receiver: Ty, name: &str) -> Option<Self> {
@@ -263,6 +343,14 @@ impl ProcessLiveKind {
             (Ty::RunBytes, "status") => Self::RunBytesStatus,
             (Ty::ProcessSignalSubscription, "next") => Self::SignalNext,
             (Ty::ProcessSignalSubscription, "close") => Self::SignalClose,
+            (Ty::FsMemoryWriter, "write") => Self::MemoryWrite,
+            (Ty::FsMemoryWriter, "seal") => Self::MemorySeal,
+            (Ty::FsSealedFile, "len") => Self::SealedLen,
+            (Ty::FsSealedFile, "read_at") => Self::SealedReadAt,
+            (Ty::ProcessImage, "len") => Self::ImageLen,
+            (Ty::ProcessImage, "read_at") => Self::ImageReadAt,
+            (Ty::Command, "inherit_file") => Self::InheritFile,
+            (Ty::Command, "inherit_namespace") => Self::InheritNamespace,
             _ => return None,
         })
     }
@@ -275,6 +363,11 @@ pub fn input_type(input: Input, structs: &[hir::StructDef], enums: &[hir::EnumDe
             signed: true,
         }),
         Input::Bool => Ty::Bool,
+        Input::Text | Input::Bytes => Ty::Str,
+        Input::Argv => Ty::Slice(Scalar::Str),
+        Input::MemoryKind => {
+            Ty::Enum(u32::try_from(enums.iter().position(|e| e.name == "fs.memory_kind")?).ok()?)
+        }
         Input::OutBytes => Ty::Slice(Scalar::Int(IntTy {
             bits: 8,
             signed: false,
@@ -300,6 +393,17 @@ pub fn payload_type(
         CommandNewSession | CommandStdoutTo | CommandStderrTo | ChildKillGroup => Ty::Unit,
         CommandStart => Ty::Child,
         SignalNew => Ty::ProcessSignalSubscription,
+        MemoryNew => Ty::FsMemoryWriter,
+        MemoryWrite | InheritFile | InheritNamespace => Ty::Unit,
+        MemorySeal => Ty::FsSealedFile,
+        Executable => Ty::ProcessImage,
+        CommandImage => Ty::Command,
+        CurrentImage => Ty::Reader,
+        UserNamespace => Ty::ProcessUserNamespace,
+        SealedLen | ImageLen | SealedReadAt | ImageReadAt => Ty::Int(IntTy {
+            bits: 64,
+            signed: true,
+        }),
         SignalClose => Ty::Unit,
         SignalNext => Ty::Option(Scalar::Enum(
             u32::try_from(enums.iter().position(|e| e.name == "process.signal")?).ok()?,
@@ -351,4 +455,23 @@ pub fn result_type(
     };
     let error = u32::try_from(enums.iter().position(|e| e.name == "Error")?).ok()?;
     Some(Ty::Result(scalar, Scalar::Enum(error)))
+}
+
+// Variable byte/argv view forms share one native descriptor layout.
+pub fn view_input_matches(input: Input, ty: Ty) -> Option<bool> {
+    match input {
+        Input::Bytes => Some(
+            ty == Ty::Str
+                || ty
+                    == Ty::Slice(Scalar::Int(IntTy {
+                        bits: 8,
+                        signed: false,
+                    })),
+        ),
+        Input::Argv => Some(matches!(
+            ty,
+            Ty::Slice(Scalar::Str) | Ty::DynArray(Scalar::Str)
+        )),
+        _ => None,
+    }
 }

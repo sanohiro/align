@@ -379,7 +379,7 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             | Scalar::CryptoDigest
             | Scalar::FsDirectory
             | Scalar::FsDirCursor
-            | Scalar::ProcessSignalSubscription
+            | Scalar::ProcessSignalSubscription | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command
             | Scalar::CodecEncoder
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
@@ -533,7 +533,7 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             | Ty::CryptoDigest
             | Ty::FsDirectory
             | Ty::FsDirCursor
-            | Ty::ProcessSignalSubscription
+            | Ty::ProcessSignalSubscription | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
             | Ty::CodecEncoder
             | Ty::Buffer
             | Ty::SignatureKey(_)

@@ -5248,7 +5248,7 @@ fn native_owner_mir_contract<'a>(
     match value {
         Rvalue::ProcessLive { kind, args, out } => {
             contract.result = if kind.fallible() { i32_ty } else if out.is_some() { Ty::Unit }
-                else if matches!(kind,align_sema::process_live::ProcessLiveKind::ChildId | align_sema::process_live::ProcessLiveKind::SignalNumber) { i64_ty } else { Ty::Unit };
+                else if matches!(kind,align_sema::process_live::ProcessLiveKind::ChildId | align_sema::process_live::ProcessLiveKind::SignalNumber | align_sema::process_live::ProcessLiveKind::SealedLen | align_sema::process_live::ProcessLiveKind::ImageLen) { i64_ty } else { Ty::Unit };
             for (index,(input,operand)) in kind.inputs().iter().zip(args).enumerate() {
                 use align_sema::process_live::Input;
                 if *input==Input::OutBytes {
@@ -5259,8 +5259,8 @@ fn native_owner_mir_contract<'a>(
                 }
                 let actual = xml_operand_base_ty(function,operand).unwrap_or(Ty::Error);
                 let expected = match input { Input::Owner(ty) => *ty, Input::Integer => i64_ty,
-                    Input::Bool => Ty::Bool, Input::OutBytes => bytes, Input::Readiness | Input::Signal | Input::SignalSet => actual };
-                let requirement = if index==0 && kind.exclusive() && matches!(input,Input::Owner(_)) { write } else { read };
+                    Input::Bool => Ty::Bool, Input::OutBytes => bytes, Input::Readiness | Input::Signal | Input::SignalSet | Input::MemoryKind | Input::Bytes | Input::Argv => actual, Input::Text => Ty::Str };
+                let requirement = if kind.consumes(index) { consume } else if index==0 && kind.exclusive() && matches!(input,Input::Owner(_)) { write } else { read };
                 contract.operands.push((operand,expected,requirement));
             }
             if let Some(out) = out { contract.outputs.push((*out,function.slots.get(*out as usize).copied().unwrap_or(Ty::Error))); }
@@ -11204,7 +11204,7 @@ fn validate_host_mir(program: &Program) -> Result<(), CodegenError> {
                     None => !kind.scratch() };
                 if payload.is_none() || !output_valid || function.value_tys.get(*value as usize).copied()!=native_ty
                     || args.len()!=kind.inputs().len() || kind.inputs().iter().zip(args).any(|(input,operand)|
-                        xml_operand_base_ty(function,operand)!=input_type(*input,&program.structs,&program.enums)) {
+                        xml_operand_base_ty(function,operand).is_none_or(|actual| !align_sema::process_live::view_input_matches(*input,actual).unwrap_or(Some(actual)==input_type(*input,&program.structs,&program.enums)))) {
                     return Err(CodegenError::Lowering("malformed live process producer".to_string()));
                 }
             }
@@ -12893,7 +12893,7 @@ fn validate_tagged_program_inner(
                 | Scalar::CryptoDigest
                 | Scalar::FsDirectory
                 | Scalar::FsDirCursor
-                | Scalar::ProcessSignalSubscription
+                | Scalar::ProcessSignalSubscription | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command
                 | Scalar::CodecEncoder
                 | Scalar::SignatureKey(_)
                 | Scalar::Regex
@@ -13040,7 +13040,7 @@ fn validate_tagged_program_inner(
                         | Ty::CryptoDigest
                         | Ty::FsDirectory
                         | Ty::FsDirCursor
-                        | Ty::ProcessSignalSubscription
+                        | Ty::ProcessSignalSubscription | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
                         | Ty::CodecEncoder
                         | Ty::SignatureKey(_)
                         | Ty::StrFinder
@@ -16364,7 +16364,7 @@ fn tagged_child(payload: Scalar) -> Option<u32> {
         | Scalar::CryptoDigest
         | Scalar::FsDirectory
         | Scalar::FsDirCursor
-        | Scalar::ProcessSignalSubscription
+        | Scalar::ProcessSignalSubscription | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command
         | Scalar::CodecEncoder
         | Scalar::SignatureKey(_)
         | Scalar::Regex
@@ -16584,7 +16584,7 @@ fn abi_type<'c>(
         | Ty::CryptoDigest
         | Ty::FsDirectory
         | Ty::FsDirCursor
-        | Ty::ProcessSignalSubscription
+        | Ty::ProcessSignalSubscription | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
         | Ty::CodecEncoder
         | Ty::ArrayBuilder(_)
         | Ty::VecArrayBuilder(..)
@@ -16951,7 +16951,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::Reader | Scalar::Writer | Scalar::Logger | Scalar::XmlReader => {
             unreachable!("an I/O/logger/XML handle is not a box/array payload")
         }
-        Scalar::Buffer | Scalar::CryptoDigest | Scalar::FsDirectory | Scalar::FsDirCursor | Scalar::ProcessSignalSubscription | Scalar::CodecEncoder | Scalar::SignatureKey(_) => {
+        Scalar::Buffer | Scalar::CryptoDigest | Scalar::FsDirectory | Scalar::FsDirCursor | Scalar::ProcessSignalSubscription | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command | Scalar::CodecEncoder | Scalar::SignatureKey(_) => {
             unreachable!("a buffer/key handle is not a box/array payload")
         }
         Scalar::CodecBatch
@@ -17067,6 +17067,10 @@ fn handle_free_key(ty: Ty) -> Option<RuntimeKey> {
         Ty::FsDirectory => RuntimeKey::FsDirectoryFree,
         Ty::FsDirCursor => RuntimeKey::FsCursorFree,
         Ty::ProcessSignalSubscription => RuntimeKey::ProcessSignalFree,
+        Ty::FsMemoryWriter => RuntimeKey::FsMemoryFree,
+        Ty::FsSealedFile => RuntimeKey::FsSealedFree,
+        Ty::ProcessImage => RuntimeKey::ProcessImageFree,
+        Ty::ProcessUserNamespace => RuntimeKey::ProcessUserNamespaceFree,
         Ty::SignatureKey(_) => RuntimeKey::CryptoKeyFree,
         Ty::File => RuntimeKey::IoFileFree,
         Ty::Regex => RuntimeKey::RegexFree,
@@ -24191,7 +24195,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let mut native_args = Vec::new();
                 for (input,operand) in kind.inputs().iter().zip(args) {
                     match input {
-                        Input::OutBytes => {
+                        Input::OutBytes | Input::Bytes | Input::Text | Input::Argv => {
                             let (pointer,length) = self.split_str(operand)?;
                             native_args.push(pointer.into()); native_args.push(length.into());
                         }
@@ -24206,7 +24210,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             }
                             native_args.push(mask.into());
                         }
-                        Input::Signal => {
+                        Input::Signal | Input::MemoryKind => {
                             let record = self.operand(operand)?.into_struct_value();
                             native_args.push(self.builder.build_extract_value(record,0,"signal.tag").map_err(|e|self.err(e))?.into());
                         }
@@ -24238,6 +24242,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     ProcessLiveKind::SignalNew => RuntimeKey::ProcessSignals,
                     ProcessLiveKind::SignalNext => RuntimeKey::ProcessSignalNext,
                     ProcessLiveKind::SignalClose => RuntimeKey::ProcessSignalClose,
+                    ProcessLiveKind::MemoryNew => RuntimeKey::FsMemoryFile,
+                    ProcessLiveKind::MemoryWrite => RuntimeKey::FsMemoryWrite,
+                    ProcessLiveKind::MemorySeal => RuntimeKey::FsMemorySeal,
+                    ProcessLiveKind::SealedLen => RuntimeKey::FsSealedLen,
+                    ProcessLiveKind::SealedReadAt => RuntimeKey::FsSealedReadAt,
+                    ProcessLiveKind::Executable => RuntimeKey::ProcessExecutable,
+                    ProcessLiveKind::ImageLen => RuntimeKey::ProcessImageLen,
+                    ProcessLiveKind::ImageReadAt => RuntimeKey::ProcessImageReadAt,
+                    ProcessLiveKind::CommandImage => RuntimeKey::CommandImage,
+                    ProcessLiveKind::CurrentImage => RuntimeKey::ProcessCurrentImage,
+                    ProcessLiveKind::UserNamespace => RuntimeKey::ProcessUserNamespace,
+                    ProcessLiveKind::InheritFile => RuntimeKey::CommandInheritFile,
+                    ProcessLiveKind::InheritNamespace => RuntimeKey::CommandInheritNamespace,
+
                 };
                 let call = self.builder.build_call(self.runtime(key),&native_args,"process.live").map_err(|e|self.err(e))?;
                 if !kind.fallible() && (kind.scratch() || *kind==ProcessLiveKind::CommandNewSession) {
@@ -26525,7 +26543,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             | Ty::CryptoDigest
             | Ty::FsDirectory
             | Ty::FsDirCursor
-            | Ty::ProcessSignalSubscription
+            | Ty::ProcessSignalSubscription | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
             | Ty::CodecEncoder
             | Ty::ArrayBuilder(_)
             | Ty::VecArrayBuilder(..)
@@ -44202,7 +44220,7 @@ fn main() -> i32 = 0
     #[test]
     fn live_process_mir_contract_matrix() -> Result<(), &'static str> {
         use align_sema::process_live::ProcessLiveKind;
-        let base=mir("import std.process\nfn read(borrow mut child: child,out bytes:slice<u8>) -> Result<Option<i64>,Error> = child.read_stdout(bytes)\nfn status(borrow output:run_bytes) -> process.wait_result = output.status()\nfn signals(selection: process.signal_set) -> Result<process.signal_subscription,Error> = process.signals(selection)\nfn next(borrow mut subscription: process.signal_subscription) -> Result<Option<process.signal>,Error> = subscription.next()\nfn close(borrow mut subscription: process.signal_subscription) -> Result<(),Error> = subscription.close()\nfn main() {}\n");
+        let base=mir("import std.process\nimport std.fs\nfn memory(kind: fs.memory_kind, cap:i64) -> Result<fs.memory_writer,Error> = fs.memory_file(kind,cap)\nfn write(borrow mut writer:fs.memory_writer, data:str) -> Result<(),Error> = writer.write(data)\nfn seal(writer:fs.memory_writer) -> Result<fs.sealed_file,Error> = writer.seal()\nfn length(borrow file:fs.sealed_file) -> i64 = file.len()\nfn positional(borrow file:fs.sealed_file, out bytes:slice<u8>) -> Result<i64,Error> = file.read_at(0,bytes)\nfn executable(borrow file:fs.sealed_file) -> Result<process.image,Error> = process.executable(file)\nfn image_length(borrow image:process.image) -> i64 = image.len()\nfn image_read(borrow image:process.image, out bytes:slice<u8>) -> Result<i64,Error> = image.read_at(0,bytes)\nfn image_command(borrow image:process.image, args:slice<str>) -> Result<command,Error> = process.command_image(image,args)\nfn current() -> Result<reader,Error> = process.current_image()\nfn namespace(path:str) -> Result<process.user_namespace,Error> = process.user_namespace(path)\nfn inherit(borrow mut command:command, borrow file:fs.sealed_file, slot:i64) -> Result<(),Error> = command.inherit_file(file,slot)\nfn inherit_ns(borrow mut command:command, borrow ns:process.user_namespace, slot:i64) -> Result<(),Error> = command.inherit_namespace(ns,slot)\nfn read(borrow mut child: child,out bytes:slice<u8>) -> Result<Option<i64>,Error> = child.read_stdout(bytes)\nfn status(borrow output:run_bytes) -> process.wait_result = output.status()\nfn signals(selection: process.signal_set) -> Result<process.signal_subscription,Error> = process.signals(selection)\nfn next(borrow mut subscription: process.signal_subscription) -> Result<Option<process.signal>,Error> = subscription.next()\nfn close(borrow mut subscription: process.signal_subscription) -> Result<(),Error> = subscription.close()\nfn main() {}\n");
         assert!(validate_mir_producers(&base).is_ok(), "{:?}", validate_mir_producers(&base));
         let mut producers=0;
         for (fi,function) in base.fns.iter().enumerate() {
@@ -44215,19 +44233,19 @@ fn main() -> i32 = 0
                         let function=&mut bad.fns[fi];
                         let Stmt::Let(value,Rvalue::ProcessLive { kind,args,out })=&mut function.blocks[bi].stmts[si] else { return Err("process producer"); };
                         match mutation {
-                            0=>args.clear(),
+                            0=>{ if args.is_empty() { args.push(Operand::Const(Const::Unit)); } else { args.clear(); } },
                             1=>*out=if out.is_some() { None } else { Some(u32::MAX) },
                             2=>*out=Some(u32::MAX),
                             3=>*kind=ProcessLiveKind::CommandStart,
                             4=>function.value_tys[*value as usize]=Ty::Bool,
-                            _=>args[0]=Operand::Const(Const::Unit),
+                            _=>{ if args.is_empty() { args.push(Operand::Const(Const::Unit)); } else { args[0]=Operand::Const(Const::Unit); } },
                         }
                         assert_xml_producer_rejected(&bad,"malformed live process producer");
                     }
                 }
             }
         }
-        assert_eq!(producers,5);
+        assert_eq!(producers,18);
         for mode in [align_ast::ParamMode::ByValue,align_ast::ParamMode::Borrow,align_ast::ParamMode::BorrowMut] {
             let mut bad=base.clone();
             let function=bad.fns.iter_mut().find(|function|function.name.as_str()=="read").ok_or("read")?;

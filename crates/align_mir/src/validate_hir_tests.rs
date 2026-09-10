@@ -16007,7 +16007,7 @@ const fn delegation_scalar_sweep_tripwire(scalar: &Scalar) {
         | Scalar::CryptoDigest
         | Scalar::FsDirectory
         | Scalar::FsDirCursor
-        | Scalar::ProcessSignalSubscription
+        | Scalar::ProcessSignalSubscription | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command
         | Scalar::CodecEncoder
         | Scalar::Buffer
         | Scalar::SignatureKey(_)
@@ -18414,9 +18414,9 @@ fn retained_tree_hidden_collection_owners() -> Result<(), &'static str> {
 
 #[test]
 fn live_process_records_and_writable_backing() -> Result<(), &'static str> {
-    let base=checked_source_program("import std.process\nfn start(command: command) -> Result<child,Error> = command.start()\nfn read(borrow mut child: child,out bytes:slice<u8>) -> Result<Option<i64>,Error> = child.read_stdout(bytes)\nfn result(borrow output:run_bytes) -> process.wait_result = output.status()\nfn signals(selection: process.signal_set) -> Result<process.signal_subscription,Error> = process.signals(selection)\nfn next(borrow mut subscription: process.signal_subscription) -> Result<Option<process.signal>,Error> = subscription.next()\nfn close(borrow mut subscription: process.signal_subscription) -> Result<(),Error> = subscription.close()\nfn main() {}\n");
+    let base=checked_source_program("import std.process\nimport std.fs\nfn memory(kind: fs.memory_kind, cap:i64) -> Result<fs.memory_writer,Error> = fs.memory_file(kind,cap)\nfn write(borrow mut writer:fs.memory_writer, data:str) -> Result<(),Error> = writer.write(data)\nfn seal(writer:fs.memory_writer) -> Result<fs.sealed_file,Error> = writer.seal()\nfn length(borrow file:fs.sealed_file) -> i64 = file.len()\nfn positional(borrow file:fs.sealed_file, out bytes:slice<u8>) -> Result<i64,Error> = file.read_at(0,bytes)\nfn executable(borrow file:fs.sealed_file) -> Result<process.image,Error> = process.executable(file)\nfn image_length(borrow image:process.image) -> i64 = image.len()\nfn image_read(borrow image:process.image, out bytes:slice<u8>) -> Result<i64,Error> = image.read_at(0,bytes)\nfn image_command(borrow image:process.image, args:slice<str>) -> Result<command,Error> = process.command_image(image,args)\nfn current() -> Result<reader,Error> = process.current_image()\nfn namespace(path:str) -> Result<process.user_namespace,Error> = process.user_namespace(path)\nfn inherit(borrow mut command:command, borrow file:fs.sealed_file, slot:i64) -> Result<(),Error> = command.inherit_file(file,slot)\nfn inherit_ns(borrow mut command:command, borrow ns:process.user_namespace, slot:i64) -> Result<(),Error> = command.inherit_namespace(ns,slot)\nfn start(command: command) -> Result<child,Error> = command.start()\nfn read(borrow mut child: child,out bytes:slice<u8>) -> Result<Option<i64>,Error> = child.read_stdout(bytes)\nfn result(borrow output:run_bytes) -> process.wait_result = output.status()\nfn signals(selection: process.signal_set) -> Result<process.signal_subscription,Error> = process.signals(selection)\nfn next(borrow mut subscription: process.signal_subscription) -> Result<Option<process.signal>,Error> = subscription.next()\nfn close(borrow mut subscription: process.signal_subscription) -> Result<(),Error> = subscription.close()\nfn main() {}\n");
     assert!(!is_empty(&lower_program(&base)));
-    for name in ["start","read","result","signals","next","close"] {
+    for name in ["start","read","result","signals","next","close","memory","write","seal","length","positional","executable","image_length","image_read","image_command","current","namespace","inherit","inherit_ns"] {
         for mutation in 0..5 {
             let mut bad=base.clone();
             let function=bad.fns.iter_mut().find(|function|function.name==name).ok_or("function")?;
@@ -18424,8 +18424,8 @@ fn live_process_records_and_writable_backing() -> Result<(), &'static str> {
             let hir::ExprKind::ProcessLive { kind,args }=&mut expression.kind else { return Err("process record"); };
             match mutation {
                 0=>expression.ty=Ty::Bool,
-                1=>args.clear(),
-                2=>args[0]=native_i64(),
+                1=>{ if args.is_empty() { args.push(native_i64()); } else { args.clear(); } },
+                2=>{ if args.is_empty() { args.push(native_i64()); } else { args[0]=native_i64(); } },
                 3=>*kind=align_sema::process_live::ProcessLiveKind::ProcessTable,
                 _=>args.push(native_i64()),
             }
@@ -18448,7 +18448,7 @@ fn live_process_records_and_writable_backing() -> Result<(), &'static str> {
             assert!(!validate_hir::global_type_metadata_is_valid(&bad));
         }
     }
-    for name in ["process.termination","process.signal"] {
+    for name in ["process.termination","process.signal","fs.memory_kind"] {
         let id=base.enums.iter().position(|definition|definition.name==name).ok_or("sum")?;
         let mut bad=base.clone(); bad.enums[id].variants[0].field_base=99;
         assert!(!validate_hir::global_type_metadata_is_valid(&bad));

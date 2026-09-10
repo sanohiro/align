@@ -138,6 +138,10 @@ struct Prepared {
     environment: Vec<CString>,
     envp: Vec<*const libc::c_char>,
     candidates: Vec<CString>,
+    #[cfg(target_os = "linux")]
+    image: Option<OwnedFd>,
+    #[cfg(target_os = "linux")]
+    bindings: Vec<(i32,OwnedFd)>,
 }
 impl Prepared {
     fn new(command: &Command) -> Result<Self, i32> {
@@ -161,6 +165,7 @@ impl Prepared {
             .find(|(key, _)| key == "PATH")
             .map(|(_, value)| value.as_bytes().to_vec());
         let search = match search {
+            _ if matches!(command.target, super::CommandTarget::Image(_)) || command.target.direct_path() => Vec::new(),
             Some(value) => value,
             None => {
                 let size = unsafe { libc::confstr(libc::_CS_PATH, core::ptr::null_mut(), 0) };
@@ -189,26 +194,34 @@ impl Prepared {
         envp.push(core::ptr::null());
         let mut argv: Vec<_> = command.argv.iter().map(|entry| entry.as_ptr()).collect();
         argv.push(core::ptr::null());
-        let candidates = if command.cmd.as_bytes().contains(&b'/') {
-            vec![command.cmd.clone()]
-        } else {
-            search
-                .split(|byte| *byte == b':')
-                .map(|prefix| {
-                    let mut bytes = prefix.to_vec();
-                    if !bytes.is_empty() {
-                        bytes.push(b'/');
-                    }
-                    bytes.extend_from_slice(command.cmd.as_bytes());
-                    CString::new(bytes).map_err(|_| AL_INVALID)
-                })
-                .collect::<Result<Vec<_>, _>>()?
+        let candidates = match &command.target {
+            super::CommandTarget::Image(_) => Vec::new(),
+            super::CommandTarget::Path(path) if command.target.direct_path() => vec![path.clone()],
+            super::CommandTarget::Path(path) => search.split(|byte| *byte == b':').map(|prefix| {
+                let mut bytes = prefix.to_vec();
+                if !bytes.is_empty() { bytes.push(b'/'); }
+                bytes.extend_from_slice(path.as_bytes());
+                CString::new(bytes).map_err(|_| AL_INVALID)
+            }).collect::<Result<Vec<_>,_>>()?,
         };
+        #[cfg(target_os = "linux")]
+        let minimum = command.inheritance.keys().next_back().copied().unwrap_or(2) + 1;
+        #[cfg(target_os = "linux")]
+        let image = match &command.target {
+            super::CommandTarget::Path(_) => None,
+            super::CommandTarget::Image(fd) => Some(super::process_verified::duplicate(fd, minimum)?),
+        };
+        #[cfg(target_os = "linux")]
+        let bindings = super::process_verified::launch_bindings(command, minimum)?;
         Ok(Self {
             argv,
             environment,
             envp,
             candidates,
+            #[cfg(target_os = "linux")]
+            image,
+            #[cfg(target_os = "linux")]
+            bindings,
         })
     }
 }
@@ -218,7 +231,7 @@ pub(crate) fn launch(
     capture: bool,
     force_group: bool,
 ) -> Result<Box<NativeChild>, i32> {
-    if command.cmd.as_bytes().is_empty()
+    if matches!(&command.target, super::CommandTarget::Path(path) if path.as_bytes().is_empty())
         || command
             .cwd
             .as_ref()
@@ -239,6 +252,10 @@ pub(crate) fn launch(
     if disposition.sa_sigaction == libc::SIG_IGN || disposition.sa_flags & libc::SA_NOCLDWAIT != 0 {
         return Err(AL_INVALID);
     }
+    let minimum = command.inheritance.keys().next_back().copied().unwrap_or(2) + 1;
+    let stage = |fd: OwnedFd| -> Result<OwnedFd,i32> {
+        if fd.as_raw_fd() >= minimum { Ok(fd) } else { super::process_verified::duplicate(&fd, minimum) }
+    };
     let stdin = if capture {
         acquisition()?;
         let raw = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
@@ -251,11 +268,18 @@ pub(crate) fn launch(
     };
     let (stdout, out_read) = standard_output(command.stdout_binding.as_ref(), capture, 1)?;
     let (stderr, err_read) = standard_output(command.stderr_binding.as_ref(), capture, 2)?;
+    let stdin = stdin.map(&stage).transpose()?;
+    let stdout = stdout.map(&stage).transpose()?;
+    let stderr = stderr.map(&stage).transpose()?;
+    let out_read = out_read.map(&stage).transpose()?;
+    let err_read = err_read.map(&stage).transpose()?;
     let mut child = Box::new(NativeChild::new(0));
     child.stdout.fd = out_read;
     child.stderr.fd = err_read;
     let streams = [&stdin, &stdout, &stderr].map(|fd| fd.as_ref().map_or(-1, AsRawFd::as_raw_fd));
     let [error_read, error_write] = pipe()?;
+    let error_read = stage(error_read)?;
+    let error_write = stage(error_write)?;
     nonblocking(&error_read)?;
     let mask = SignalMask::block()?;
     acquisition()?;
@@ -514,14 +538,18 @@ unsafe fn reset_caught() -> i32 {
     }
     0
 }
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) static FORCE_FD_SCAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(target_os = "linux")]
 unsafe fn close_unlisted(error_fd: i32) -> i32 {
     const CLOSE_RANGE_CLOEXEC: u32 = 4;
-    if unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, CLOSE_RANGE_CLOEXEC) } == 0 {
-        return 0;
-    }
-    if !matches!(native_error(), libc::ENOSYS | libc::EINVAL) {
-        return native_error();
+    #[cfg(test)]
+    let force_scan = FORCE_FD_SCAN.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(test))]
+    let force_scan = false;
+    if !force_scan {
+        if unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, CLOSE_RANGE_CLOEXEC) } == 0 { return 0; }
+        if !matches!(native_error(), libc::ENOSYS | libc::EINVAL) { return native_error(); }
     }
     let fd = unsafe {
         libc::open(
@@ -593,8 +621,13 @@ unsafe fn close_unlisted(error_fd: i32) -> i32 {
                     number = next;
                 }
                 if number >= 3 && number != fd && number != error_fd {
-                    unsafe {
-                        libc::close(number);
+                    // Match CLOSE_RANGE_CLOEXEC: staged image/binding sources must
+                    // survive until remapping/exec, while unlisted descriptors
+                    // disappear at exec. Never close a still-needed source here.
+                    let flags = unsafe { libc::fcntl(number, libc::F_GETFD) };
+                    if flags < 0 || unsafe { libc::fcntl(number, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+                        failure = native_error();
+                        break 'scan;
                     }
                 }
             }
@@ -667,9 +700,18 @@ unsafe fn bootstrap(
     if closed != 0 {
         unsafe { report_and_exit(error_fd, closed) }
     }
+    for (destination, source) in &prepared.bindings {
+        if unsafe { libc::dup2(source.as_raw_fd(), *destination) } < 0 {
+            unsafe { report_and_exit(error_fd, native_error()) }
+        }
+    }
     let restored = unsafe { mask.restore_native() };
     if restored != 0 {
         unsafe { report_and_exit(error_fd, restored) }
+    }
+    if let Some(image) = &prepared.image {
+        unsafe { libc::syscall(libc::SYS_execveat, image.as_raw_fd(), c"".as_ptr(), prepared.argv.as_ptr(), prepared.envp.as_ptr(), libc::AT_EMPTY_PATH); }
+        unsafe { report_and_exit(error_fd, native_error()) }
     }
     let mut failure = libc::ENOENT;
     let mut denied = false;
@@ -682,7 +724,7 @@ unsafe fn bootstrap(
             );
         }
         failure = native_error();
-        if command.cmd.as_bytes().contains(&b'/') {
+        if command.target.direct_path() {
             break;
         }
         match failure {
@@ -831,7 +873,8 @@ pub(crate) mod tests {
     }
     pub(crate) fn command(script: &str) -> Command {
         Command {
-            cmd: CString::new("/bin/sh").unwrap(),
+            target: super::super::CommandTarget::Path(CString::new("/bin/sh").unwrap()),
+            inheritance: std::collections::BTreeMap::new(),
             argv: ["sh", "-c", script]
                 .map(|s| CString::new(s).unwrap())
                 .to_vec(),
@@ -1007,12 +1050,12 @@ pub(crate) mod tests {
         let mut command = command("exit 127");
         let mut child = launch(&command, false, false).unwrap();
         assert_eq!(child.wait().unwrap().termination.exited, 127);
-        command.cmd = CString::new("/nonexistent/align-r65-executable").unwrap();
+        command.target = super::super::CommandTarget::Path(CString::new("/nonexistent/align-r65-executable").unwrap());
         assert!(matches!(
             launch(&command, false, false),
             Err(super::super::AL_NOT_FOUND)
         ));
-        command.cmd = CString::new("sh").unwrap();
+        command.target = super::super::CommandTarget::Path(CString::new("sh").unwrap());
         command.env_clear = true;
         command.env.push((
             CString::new("PATH").unwrap(),

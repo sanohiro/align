@@ -11,7 +11,7 @@ macro_rules! runtime_keys {
         }
 
         impl RuntimeKey {
-            pub const ALL: [Self; 409] = [$(Self::$variant,)*];
+            pub const ALL: [Self; 426] = [$(Self::$variant,)*];
 
             pub const fn logical_name(self) -> &'static str {
                 match self {
@@ -107,6 +107,9 @@ runtime_keys! {
     CommandEnv => "command_env",
     CommandEnvClear => "command_env_clear",
     CommandFree => "command_free",
+    CommandImage => "command_image",
+    CommandInheritFile => "command_inherit_file",
+    CommandInheritNamespace => "command_inherit_namespace",
     CommandMaxCapture => "command_max_capture",
     CommandNew => "command_new",
     CommandNewSession => "command_new_session",
@@ -176,6 +179,10 @@ runtime_keys! {
     FsFileMetadata => "fs_file_metadata",
     FsFileSetMode => "fs_file_set_mode",
     FsIsDir => "fs_is_dir",
+    FsMemoryFile => "fs_memory_file",
+    FsMemoryFree => "fs_memory_free",
+    FsMemorySeal => "fs_memory_seal",
+    FsMemoryWrite => "fs_memory_write",
     FsReadBytesView => "fs_read_bytes_view",
     FsReadDir => "fs_read_dir",
     FsReadFile => "fs_read_file",
@@ -185,6 +192,9 @@ runtime_keys! {
     FsRemove => "fs_remove",
     FsRemoveEmptyDir => "fs_remove_empty_dir",
     FsRenameNoReplace => "fs_rename_no_replace",
+    FsSealedFree => "fs_sealed_free",
+    FsSealedLen => "fs_sealed_len",
+    FsSealedReadAt => "fs_sealed_read_at",
     FsWriteFile => "fs_write_file",
     FsWriteFileBuilder => "fs_write_file_builder",
     FsWriterMetadata => "fs_writer_metadata",
@@ -343,8 +353,13 @@ runtime_keys! {
     PrintStr => "print_str",
     ProcessAbort => "process_abort",
     ProcessCpuCount => "process_cpu_count",
+    ProcessCurrentImage => "process_current_image",
     ProcessExec => "process_exec",
+    ProcessExecutable => "process_executable",
     ProcessExit => "process_exit",
+    ProcessImageFree => "process_image_free",
+    ProcessImageLen => "process_image_len",
+    ProcessImageReadAt => "process_image_read_at",
     ProcessSignalClose => "process_signal_close",
     ProcessSignalFree => "process_signal_free",
     ProcessSignalNext => "process_signal_next",
@@ -352,6 +367,8 @@ runtime_keys! {
     ProcessSignals => "process_signals",
     ProcessSpawn => "process_spawn",
     ProcessTable => "process_table",
+    ProcessUserNamespace => "process_user_namespace",
+    ProcessUserNamespaceFree => "process_user_namespace_free",
     RangeFail => "range_fail",
     RegexCaptures => "regex_captures",
     RegexCapturesFree => "regex_captures_free",
@@ -434,7 +451,7 @@ runtime_keys! {
     XmlText => "xml_text",
 }
 
-const _: [(); 409] = [(); RuntimeKey::ALL.len()];
+const _: [(); 426] = [(); RuntimeKey::ALL.len()];
 
 #[cfg(test)]
 mod tests {
@@ -443,7 +460,7 @@ mod tests {
 
     #[test]
     fn runtime_keys_are_complete_unique_and_alphabetical() {
-        assert_eq!(RuntimeKey::ALL.len(), 409);
+        assert_eq!(RuntimeKey::ALL.len(), 426);
         let names: Vec<_> = RuntimeKey::ALL
             .iter()
             .map(|key| key.logical_name())
