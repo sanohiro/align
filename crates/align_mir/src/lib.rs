@@ -1832,6 +1832,9 @@ pub enum Rvalue {
         kind: hir::CodecPutKind,
     },
     CodecEncoderFinish(Operand),
+    CryptoDigestNew,
+    CryptoDigestUpdate { digest: Operand, data: Operand },
+    CryptoDigestFinish(Operand),
     /// Canonical `pkg.frame` join. Runtime writes the ordinary owned dynamic AoS header into `out`
     /// and returns 0, -1 (invalid limit), -2 (limit exceeded), or a defensive positive status.
     FrameInnerJoin {
@@ -3067,7 +3070,8 @@ fn rvalue_capability(rv: &Rvalue) -> Option<Capability> {
                 hir::CompressKind::Zstd => Capability::Zstd,
             })
         }
-        Rvalue::CryptoHash { .. }
+        Rvalue::CryptoDigestNew | Rvalue::CryptoDigestUpdate { .. } | Rvalue::CryptoDigestFinish(_)
+        | Rvalue::CryptoHash { .. }
         | Rvalue::CryptoHmac { .. }
         | Rvalue::CryptoHkdf { .. }
         | Rvalue::CryptoAead { .. }
@@ -3095,7 +3099,7 @@ fn rvalue_capability(rv: &Rvalue) -> Option<Capability> {
 }
 
 /// The capabilities a single function requires — the gated external libraries its builtins or
-/// owned values call into (`libz`/`libzstd`/`libcrypto`/`libssl`). A signature-key Drop calls
+/// owned values call into (`libz`/`libzstd`/`libcrypto`/`libssl`). A crypto-key/digest Drop calls
 /// libcrypto and a client/receive-stream Drop can close TLS even when the function never uses
 /// either handle, so the slot types are part of this answer alongside [`rvalue_capability`]. The
 /// per-function granularity is what the M15 per-unit interface summary unions over a unit's
@@ -3122,7 +3126,7 @@ pub fn function_capabilities(
     }
     if !caps.contains(&Capability::Crypto)
         && f.slots.iter().copied().any(|ty| {
-            align_sema::ty_contains_signature_key(
+            align_sema::ty_contains_crypto_owner(
                 ty,
                 structs,
                 tuples,
@@ -8611,6 +8615,25 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             // `crypto.sha256(data)` / `crypto.sha512(data)` → a fresh owned `array<u8>` `{ptr,len}`
             // returned by value; the bound local `Drop`-frees it (same shape as `rand.sample`). The
             // runtime allocates the digest buffer + aborts on an engine failure.
+            hir::ExprKind::CryptoDigestNew => {
+                let value = b.fresh_value(Ty::CryptoDigest);
+                b.push(Stmt::Let(value, Rvalue::CryptoDigestNew));
+                Operand::Value(value)
+            }
+            hir::ExprKind::CryptoDigestUpdate { digest, data } => {
+                let digest = lower_required!(b, lower_expr(b, digest), Operand::Const(Const::Unit));
+                let data = lower_required!(b, lower_expr(b, data), Operand::Const(Const::Unit));
+                let value = b.fresh_value(Ty::Unit);
+                b.push(Stmt::Let(value, Rvalue::CryptoDigestUpdate { digest, data }));
+                Operand::Const(Const::Unit)
+            }
+            hir::ExprKind::CryptoDigestFinish { digest } => {
+                let operand = lower_required!(b, lower_expr(b, digest), Operand::Const(Const::Unit));
+                null_moved_source(b, digest);
+                let value = b.fresh_value(e.ty);
+                b.push(Stmt::Let(value, Rvalue::CryptoDigestFinish(operand)));
+                Operand::Value(value)
+            }
             hir::ExprKind::CryptoHash { algo, data } => {
                 lower_required_binding!(b, dv = lower_expr(b, data), Operand::Const(Const::Unit));
                 let v = b.fresh_value(e.ty);
@@ -16143,6 +16166,7 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         | Scalar::CodecF64Column
         | Scalar::CodecBoolColumn
         | Scalar::CodecStrColumn
+        | Scalar::CryptoDigest
         | Scalar::CodecEncoder
         | Scalar::SignatureKey(_)
         | Scalar::Regex
@@ -22392,6 +22416,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::CodecBoolColumn => "codec.bool_column".to_string(),
         Ty::CodecStrColumn => "codec.str_column".to_string(),
         Ty::CodecEncoder => "codec.encoder".to_string(),
+        Ty::CryptoDigest => "crypto.digest".to_string(),
         Ty::SignatureKey(kind) => kind.name().to_string(),
         Ty::ArrayBuilder(element) => {
             format!(

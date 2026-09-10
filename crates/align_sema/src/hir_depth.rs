@@ -363,6 +363,7 @@ fn walk_body_records<'a>(
                 | ExprKind::ProcessCpuCount
                 | ExprKind::ProcessAbort
                 | ExprKind::RandSeed
+        | ExprKind::CryptoDigestNew
                 | ExprKind::RawNull
                 | ExprKind::HttpClient
                 | ExprKind::TemplateHtmlNew { .. } => {}
@@ -733,6 +734,7 @@ fn walk_body_records<'a>(
                     rb: rhs,
                 }
                 | ExprKind::CryptoCtEqual { a: lhs, b: rhs }
+        | ExprKind::CryptoDigestUpdate { digest: lhs, data: rhs }
                 | ExprKind::CryptoHmac {
                     key: lhs,
                     data: rhs,
@@ -905,6 +907,7 @@ fn walk_body_records<'a>(
                 | ExprKind::CodecColumnLen { column: recv }
                 | ExprKind::CodecEncoderNew { rows: recv }
                 | ExprKind::CodecEncoderFinish { encoder: recv }
+        | ExprKind::CryptoDigestFinish { digest: recv }
                 | ExprKind::FileCreateRw { path: recv }
                 | ExprKind::FileOpenRw { path: recv }
                 | ExprKind::FileLen { file: recv }

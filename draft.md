@@ -3474,6 +3474,22 @@ crypto.chacha20_poly1305_seal(...) / _open(...)                 // same shape as
 crypto.constant_time_equal(a: bytes, b: bytes) -> bool          // CT — self-hosted
 ```
 
+
+Incremental SHA-256 uses `crypto.sha256_stream() -> crypto.digest`,
+`d.update(data: bytes) -> ()`, and consuming `d.finish() -> array<u8>`.
+The qualified-only `crypto.digest` requires `import std.crypto` and is a Move
+owner of one fixed EVP context. Update accepts str, string auto-borrow, or
+slice<u8>; buffer and array inputs require explicit `.bytes()` or slicing.
+Inputs are not retained and may contain NUL or be empty. Update requires a bound
+owned local or exclusive borrowed parameter; Finish requires a bound owned local
+or by-value parameter and returns exactly 32 independently owned bytes.
+All three operations are Impure. Provider/allocation failure and cumulative
+length exceeding `2^61-1` abort, matching the one-shot digest failure model.
+No clone/reset/algorithm selector is provided. Ordinary owning carriers use the
+existing Move/Drop rules; direct digest collections, tuple/box storage, native
+exposure and parallel capture are excluded. The complete carrier and native
+contract is [plan 41](docs/impl/41-incremental-sha256-plan.md).
+
 The asymmetric signature extension adds six algorithm-and-class-specific Move key types and the
 following exact surface. It shipped on 2026-08-30.
 

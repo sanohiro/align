@@ -19,6 +19,7 @@ pub use time_formats::*;
 mod str_prims;
 pub use str_prims::*;
 mod crypto_asymmetric;
+mod crypto_digest;
 pub use crypto_asymmetric::*;
 mod csv;
 pub use csv::*;

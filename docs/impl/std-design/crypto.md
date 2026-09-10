@@ -583,3 +583,20 @@ contract must agree with `draft.md` §18.2, `docs/language-spec.md`, `docs/open-
 `docs/impl/07-roadmap.md`, `docs/impl/19-hir-validation-ledger.md`,
 `docs/impl/20-runtime-abi-ledger.md`, and the Japanese mirror. Implementation status changes only at
 the capability boundary; it does not rewrite this contract.
+
+## Incremental SHA-256
+
+Incremental SHA-256 uses `crypto.sha256_stream() -> crypto.digest`,
+`d.update(data: bytes) -> ()`, and consuming `d.finish() -> array<u8>`.
+The qualified-only `crypto.digest` requires `import std.crypto` and is a Move
+owner of one fixed EVP context. Update accepts str, string auto-borrow, or
+slice<u8>; buffer and array inputs require explicit `.bytes()` or slicing.
+Inputs are not retained and may contain NUL or be empty. Update requires a bound
+owned local or exclusive borrowed parameter; Finish requires a bound owned local
+or by-value parameter and returns exactly 32 independently owned bytes.
+All three operations are Impure. Provider/allocation failure and cumulative
+length exceeding `2^61-1` abort, matching the one-shot digest failure model.
+No clone/reset/algorithm selector is provided. Ordinary owning carriers use the
+existing Move/Drop rules; direct digest collections, tuple/box storage, native
+exposure and parallel capture are excluded. The complete carrier and native
+contract is [plan 41](../41-incremental-sha256-plan.md).

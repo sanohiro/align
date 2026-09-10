@@ -1813,3 +1813,12 @@ dependent streams retain their exact owner roots through imported helpers.
 This adds no transport, allocation, retry, or runtime ABI policy. The exact
 surface, exclusions, persistence tags and closure matrix are owned by
 `docs/impl/std-design/http-client-composition.md`.
+
+### Incremental SHA-256
+
+Large-file hashing needs bounded retained state, not an input-sized concatenation.
+One `crypto.digest` Move owner exposes explicit creation, nonretaining updates,
+and consuming finalization. Existing exclusive-borrow and recursive cleanup
+machinery owns the lifecycle; SHA-256 stays in the existing EVP engine. Its
+failure model matches the total-or-abort one-shot digest, without adding a second
+recoverable crypto error model. Exact surfaces and closure: plan 41.

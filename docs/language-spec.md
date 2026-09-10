@@ -1251,6 +1251,22 @@ take a `mut` receiver. Only `rand.seed()` is OS-seeded (via `getrandom`/`urandom
 rather than surfacing a `Result`) — `seed_with(s)` is **deterministic**, for tests and
 reproducibility. `lo >= hi` (`range`) and `k < 0` or
 `k > xs.len()` (`sample`) are programmer errors and abort at runtime, like out-of-bounds indexing.
+
+Incremental SHA-256 uses `crypto.sha256_stream() -> crypto.digest`,
+`d.update(data: bytes) -> ()`, and consuming `d.finish() -> array<u8>`.
+The qualified-only `crypto.digest` requires `import std.crypto` and is a Move
+owner of one fixed EVP context. Update accepts str, string auto-borrow, or
+slice<u8>; buffer and array inputs require explicit `.bytes()` or slicing.
+Inputs are not retained and may contain NUL or be empty. Update requires a bound
+owned local or exclusive borrowed parameter; Finish requires a bound owned local
+or by-value parameter and returns exactly 32 independently owned bytes.
+All three operations are Impure. Provider/allocation failure and cumulative
+length exceeding `2^61-1` abort, matching the one-shot digest failure model.
+No clone/reset/algorithm selector is provided. Ordinary owning carriers use the
+existing Move/Drop rules; direct digest collections, tuple/box storage, native
+exposure and parallel capture are excluded. The complete carrier and native
+contract is [plan 41](impl/41-incremental-sha256-plan.md).
+
 `std.crypto`: EVP-backed operations use OpenSSL libcrypto, linked only when a used capability
 requires it. Most work with OpenSSL 3.0; `argon2id` requires the `ARGON2ID` provider added in OpenSSL 3.2
 and returns `Error.Code` when it is unavailable. The designed asymmetric extension adds distinct

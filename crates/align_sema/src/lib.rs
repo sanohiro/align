@@ -238,6 +238,8 @@ pub enum Scalar {
     CodecStrColumn,
     /// A runtime-owned `core.codec` staging encoder. Move and region-free.
     CodecEncoder,
+    /// Owned incremental SHA-256 context; retains no input views.
+    CryptoDigest,
     /// A `buffer` payload (`Result<buffer, Error>` from `encoding.*_decode`). An owned **Move**
     /// handle (a growable byte container); the enclosing `Result`'s `Drop` frees it. Opaque pointer,
     /// like [`Scalar::Reader`]/[`Scalar::Writer`] — owned, never region-tracked (it borrows nothing).
@@ -353,7 +355,7 @@ impl Scalar {
     /// the I/O handles `reader`/`writer`, a decoded `buffer`, a `cli parsed`, a `tcp_conn`, a
     /// `tcp_listener`, a `udp_socket`, or a package-defined resource.
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Logger | Scalar::XmlReader | Scalar::CodecEncoder | Scalar::Buffer | Scalar::SignatureKey(_) | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpClient | Scalar::HttpRequest | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::HttpUpgrade | Scalar::HttpReadStream | Scalar::HttpSseStream | Scalar::ResponseBuilder | Scalar::RunOutput | Scalar::RunBytes | Scalar::Resource(_))
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Logger | Scalar::XmlReader | Scalar::CryptoDigest | Scalar::CodecEncoder | Scalar::Buffer | Scalar::SignatureKey(_) | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpClient | Scalar::HttpRequest | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::HttpUpgrade | Scalar::HttpReadStream | Scalar::HttpSseStream | Scalar::ResponseBuilder | Scalar::RunOutput | Scalar::RunBytes | Scalar::Resource(_))
     }
 }
 
@@ -644,6 +646,8 @@ pub enum Ty {
     CodecStrColumn,
     /// Runtime-owned transactional column staging. A bare Move pointer with no retained region.
     CodecEncoder,
+    /// Owned incremental SHA-256 context; retains no input views.
+    CryptoDigest,
     /// A `reader` (`std.io`) — the one concrete read-source Move type: `io.stdin`, `fs.open` (a
     /// file). An opaque owned handle to a heap reader object owning an fd. `r.read(b: mut buffer)`
     /// fills a caller-owned buffer. `Drop`-freed (a file fd is also closed). Its reads are Impure.
@@ -942,6 +946,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Ty::CodecF64Column
         | Ty::CodecBoolColumn
         | Ty::CodecStrColumn
+        | Ty::CryptoDigest
         | Ty::CodecEncoder
         | Ty::Reader
         | Ty::Buffer
@@ -1015,6 +1020,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Scalar::CodecF64Column
         | Scalar::CodecBoolColumn
         | Scalar::CodecStrColumn
+        | Scalar::CryptoDigest
         | Scalar::CodecEncoder
         | Scalar::Buffer
         | Scalar::SignatureKey(_)
@@ -1084,6 +1090,7 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::CodecBoolColumn => Some(Scalar::CodecBoolColumn),
         Ty::CodecStrColumn => Some(Scalar::CodecStrColumn),
         Ty::CodecEncoder => Some(Scalar::CodecEncoder),
+        Ty::CryptoDigest => Some(Scalar::CryptoDigest),
         // A `buffer` owned handle as a `Result` Ok payload (`encoding.*_decode`).
         Ty::Buffer => Some(Scalar::Buffer),
         Ty::SignatureKey(kind) => Some(Scalar::SignatureKey(kind)),
@@ -1226,6 +1233,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::CodecBoolColumn => Ty::CodecBoolColumn,
         Scalar::CodecStrColumn => Ty::CodecStrColumn,
         Scalar::CodecEncoder => Ty::CodecEncoder,
+        Scalar::CryptoDigest => Ty::CryptoDigest,
         Scalar::Buffer => Ty::Buffer,
         Scalar::SignatureKey(kind) => Ty::SignatureKey(kind),
         Scalar::Regex => Ty::Regex,
@@ -1447,6 +1455,7 @@ pub fn heap_tree_record_error(
                 | Ty::Bool
                 | Ty::Char
                 | Ty::String
+                | Ty::CryptoDigest
                 | Ty::SignatureKey(_) => {}
                 Ty::Struct(id) => work.push(Work::EnterStruct { id, path }),
                 Ty::Option(payload) => work.push(Work::Field {
@@ -2492,6 +2501,7 @@ pub fn drop_plan(
                         | Ty::Writer
                         | Ty::Logger
                         | Ty::XmlReader
+                        | Ty::CryptoDigest
                         | Ty::CodecEncoder
                         | Ty::Reader
                         | Ty::Buffer
@@ -2868,6 +2878,11 @@ pub fn ty_contains_signature_key(
     })
 }
 
+/// A crypto native owner, including contexts that only appear through recursive Drop.
+pub fn ty_contains_crypto_owner(root: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], enums: &[hir::EnumDef], tagged_types: &[hir::TaggedType]) -> bool {
+    ty_contains_leaf(root, structs, tuples, enums, tagged_types, |ty| matches!(ty, Ty::CryptoDigest | Ty::SignatureKey(_)))
+}
+
 /// Whether a reachable value type contains an HTTP client's pooled-connection owner.
 /// MIR uses this for Drop-only link capabilities, including imported aggregate carriers.
 pub fn ty_contains_http_client(
@@ -2988,6 +3003,7 @@ fn ty_contains_leaf(
             | Ty::CodecF64Column
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
+            | Ty::CryptoDigest
             | Ty::CodecEncoder
             | Ty::Reader
             | Ty::Buffer
@@ -3261,6 +3277,7 @@ fn ty_contains_http_upgrade(
             | Ty::CodecF64Column
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
+            | Ty::CryptoDigest
             | Ty::CodecEncoder
             | Ty::Reader
             | Ty::Buffer
@@ -3375,6 +3392,7 @@ fn ty_contains_http_receive_stream(
             | Scalar::CodecF64Column
             | Scalar::CodecBoolColumn
             | Scalar::CodecStrColumn
+            | Scalar::CryptoDigest
             | Scalar::CodecEncoder
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
@@ -3512,6 +3530,7 @@ fn ty_contains_http_receive_stream(
             | Ty::CodecF64Column
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
+            | Ty::CryptoDigest
             | Ty::CodecEncoder
             | Ty::Reader
             | Ty::Buffer
@@ -3595,6 +3614,7 @@ pub fn http_stream_carrier_class(
             | Scalar::CodecF64Column
             | Scalar::CodecBoolColumn
             | Scalar::CodecStrColumn
+            | Scalar::CryptoDigest
             | Scalar::CodecEncoder
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
@@ -3731,6 +3751,7 @@ pub fn http_stream_carrier_class(
             | Ty::CodecF64Column
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
+            | Ty::CryptoDigest
             | Ty::CodecEncoder
             | Ty::Reader
             | Ty::Buffer
@@ -4373,6 +4394,7 @@ pub const BUILTIN_SPELLING_TYS: &[(&str, Ty)] = &[
     ("codec.bool_column", Ty::CodecBoolColumn),
     ("codec.str_column", Ty::CodecStrColumn),
     ("codec.encoder", Ty::CodecEncoder),
+    ("crypto.digest", Ty::CryptoDigest),
     ("buffer", Ty::Buffer),
     ("rs256_private_key", Ty::SignatureKey(SignatureKeyKind::Rs256Private)),
     ("crypto.rs256_private_key", Ty::SignatureKey(SignatureKeyKind::Rs256Private)),
@@ -9095,6 +9117,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                     Ty::CodecBoolColumn => payload.push(Scalar::CodecBoolColumn),
                     Ty::CodecStrColumn => payload.push(Scalar::CodecStrColumn),
                     Ty::CodecEncoder => payload.push(Scalar::CodecEncoder),
+                    Ty::CryptoDigest => payload.push(Scalar::CryptoDigest),
                     Ty::Option(value) => payload.push(Scalar::Tagged(intern_tagged_type(
                         &mut tagged_types,
                         hir::TaggedType::Option(value),
@@ -16385,13 +16408,16 @@ impl EffectScan<'_> {
             // any extern-calling fn is non-Pure), so a hashing closure is rejected by `par_map`
             // (matching `std.compress`; hashing's determinism does not make it pure). Recurse into
             // the byte view.
-            ExprKind::CryptoHash { data, .. } => {
+            ExprKind::CryptoDigestNew => { self.impure_direct = true; }
+            ExprKind::CryptoDigestFinish { digest: data }
+            | ExprKind::CryptoHash { data, .. } => {
                 walk!(data);
                 self.impure_direct = true;
             }
             // `crypto.hmac_sha256` / `crypto.hkdf_sha256` — libcrypto calls, inferred **Impure**
             // (never `Pure`, so excluded from `par_map`, matching `crypto.sha256`). Recurse operands.
-            ExprKind::CryptoHmac { key, data } => {
+            ExprKind::CryptoDigestUpdate { digest: key, data }
+            | ExprKind::CryptoHmac { key, data } => {
                 walk!(key);
                 walk!(data);
                 self.impure_direct = true;
@@ -19804,6 +19830,7 @@ impl<'a> EscapeCheck<'a> {
             | Ty::CodecF64Column
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
+            | Ty::CryptoDigest
             | Ty::CodecEncoder
             | Ty::Child
             | Ty::HttpRequest
@@ -21958,6 +21985,7 @@ impl<'a> EscapeCheck<'a> {
             | Ty::Raw
             | Ty::Builder
             | Ty::Buffer
+            | Ty::CryptoDigest
             | Ty::CodecEncoder
             | Ty::SignatureKey(_)
             // The compiler-internal `str_finder` plan owns a boxed searcher (it copied the needle
@@ -22032,7 +22060,7 @@ impl<'a> EscapeCheck<'a> {
         // accepted owner free-standing. Keep this producer aligned with `region_of` and the
         // checked-HIR allocation-mode contract instead of deriving its Drop mode from lexical
         // allocation context like the ordinary arena-aware collection producers below.
-        if matches!(expression.kind, ExprKind::JsonOwnedDecode { .. }) {
+        if matches!(expression.kind, ExprKind::JsonOwnedDecode { .. } | ExprKind::CryptoDigestFinish { .. }) {
             return Some(true);
         }
         if matches!(
@@ -24034,6 +24062,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpStreamReject { .. }
             | ExprKind::CryptoCtEqual { .. }
             | ExprKind::CryptoRandom { .. }
+            | ExprKind::CryptoDigestNew | ExprKind::CryptoDigestUpdate { .. } | ExprKind::CryptoDigestFinish { .. }
             | ExprKind::CryptoHash { .. }
             | ExprKind::CryptoHmac { .. }
             | ExprKind::CryptoHkdf { .. }
@@ -24511,6 +24540,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpStreamReject { .. }
             | ExprKind::CryptoCtEqual { .. }
             | ExprKind::CryptoRandom { .. }
+            | ExprKind::CryptoDigestNew | ExprKind::CryptoDigestUpdate { .. } | ExprKind::CryptoDigestFinish { .. }
             | ExprKind::CryptoHash { .. }
             | ExprKind::CryptoHmac { .. }
             | ExprKind::CryptoHkdf { .. }
@@ -28058,11 +28088,14 @@ impl<'a> EscapeCheck<'a> {
             // `crypto.sha256`/`sha512` return a fresh *owned* `array<u8>` that borrows nothing (it
             // owns its heap buffer, `Drop`-freed) — freely returnable, like `rand.sample`. Just
             // recurse into the byte view so any escape *inside* it is still checked.
-            ExprKind::CryptoHash { data, .. } => self.walk(data, depth),
+            ExprKind::CryptoDigestNew => {},
+            ExprKind::CryptoDigestFinish { digest: data }
+            | ExprKind::CryptoHash { data, .. } => self.walk(data, depth),
             // `crypto.hmac_sha256` returns a fresh owned `array<u8>` (borrows nothing);
             // `crypto.hkdf_sha256` a fresh owned `buffer` inside a `Result` — both freely returnable.
             // Recurse into the operands so any escape inside them is still checked.
-            ExprKind::CryptoHmac { key, data } => {
+            ExprKind::CryptoDigestUpdate { digest: key, data }
+            | ExprKind::CryptoHmac { key, data } => {
                 self.walk(key, depth);
                 self.walk(data, depth);
             }
@@ -30120,7 +30153,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         // The runtime materializes a fresh `array<RowPair>` in Result::Ok and retains neither
         // codec view. `RowPair` is scalar-only, so the generation starts without borrowed content;
         // Result::Err carries no storage header.
-        ExprKind::FrameInnerJoin { .. } => {
+        ExprKind::FrameInnerJoin { .. } | ExprKind::CryptoDigestFinish { .. } => {
             StorageVariantPolicy::Fresh(StorageContentInitializer::FreshEmpty)
         }
 
@@ -30363,6 +30396,8 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::HttpStreamReject { .. }
         | ExprKind::CryptoCtEqual { .. }
         | ExprKind::CryptoRandom { .. }
+        | ExprKind::CryptoDigestNew
+        | ExprKind::CryptoDigestUpdate { .. }
         | ExprKind::CryptoHash { .. }
         | ExprKind::CryptoHmac { .. }
         | ExprKind::CryptoHkdf { .. }
@@ -32450,6 +32485,10 @@ impl<'a> MoveCheck<'a> {
             let hir_depth::BodyEvent::ExprEnter(expression) = event else {
                 continue;
             };
+            if let ExprKind::CryptoDigestUpdate { digest, .. } = &expression.kind {
+                arguments.insert(Self::expr_key(digest));
+                places.insert(Self::expr_key(digest));
+            }
             if let Some(reader) = Self::reader_action_receiver(expression) {
                 arguments.insert(Self::expr_key(reader));
                 places.insert(Self::expr_key(reader));
@@ -35073,6 +35112,7 @@ impl<'a> MoveCheck<'a> {
     fn value_snapshot_needed(&self, e: &Expr) -> bool {
         let storage_paths = storage_type_paths(e.ty, self.storage_type_context());
         matches!(e.kind, ExprKind::BorrowedIndex { .. })
+            || self.borrow_mut_place_snapshots.contains(&Self::expr_key(e))
             || e.ty.is_array_builder()
             || !storage_paths.headers.is_empty()
             || !storage_paths.carriers.is_empty()
@@ -37753,7 +37793,8 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::HttpUpgradeWrite { .. } | ExprKind::HttpUpgradeDeadline { .. }
             | ExprKind::HttpUpgradeShutdown { .. }
             | ExprKind::HttpStreamFinish { .. } | ExprKind::HttpStreamReject { .. } | ExprKind::CryptoCtEqual { .. }
-            | ExprKind::CryptoRandom { .. } | ExprKind::CryptoHash { .. } | ExprKind::CryptoHmac { .. }
+            | ExprKind::CryptoRandom { .. } | ExprKind::CryptoDigestNew | ExprKind::CryptoDigestUpdate { .. } | ExprKind::CryptoDigestFinish { .. }
+            | ExprKind::CryptoHash { .. } | ExprKind::CryptoHmac { .. }
             | ExprKind::CryptoHkdf { .. } | ExprKind::CryptoAead { .. } | ExprKind::CryptoArgon2 { .. }
             | ExprKind::CryptoPrivateKeyFromPem { .. } | ExprKind::CryptoPublicKeyFromPem { .. }
             | ExprKind::CryptoPublicKeyFromJwk { .. } | ExprKind::CryptoSign { .. }
@@ -44483,10 +44524,13 @@ impl<'a> MoveCheck<'a> {
             ExprKind::CryptoRandom { out } => move_expr!(self, out, moved, false, false),
             // `crypto.sha256`/`sha512` borrow the byte view (never consume it). Recurse non-consuming
             // to catch a use-after-move *inside* the operand.
+            ExprKind::CryptoDigestNew => {},
+            ExprKind::CryptoDigestFinish { digest } => move_expr!(self, digest, moved, true, true),
             ExprKind::CryptoHash { data, .. } => move_expr!(self, data, moved, false, false),
             // `crypto.hmac_sha256`/`hkdf_sha256` borrow every operand (never consume). Recurse
             // non-consuming to catch a use-after-move inside them.
-            ExprKind::CryptoHmac { key, data } => {
+            ExprKind::CryptoDigestUpdate { digest: key, data }
+            | ExprKind::CryptoHmac { key, data } => {
                 move_expr!(self, key, moved, false, false);
                 move_expr!(self, data, moved, false, false);
             }
@@ -50495,6 +50539,7 @@ impl<'a, 't> Checker<'a, 't> {
                     "constant_time_equal"
                         | "random"
                         | "sha256"
+                        | "sha256_stream"
                         | "sha512"
                         | "hmac_sha256"
                         | "hkdf_sha256"
@@ -51051,6 +51096,9 @@ impl<'a, 't> Checker<'a, 't> {
         };
         let recv_expr = self.check_expr(recv, recv_expected);
         let recv_ty = recv_expr.ty;
+        if recv_ty == Ty::CryptoDigest {
+            return self.check_crypto_digest_method(recv_expr, method, args, span);
+        }
         // Codec names overlap ordinary value methods. Reuse this checked receiver on
         // fallback: rechecking its AST would leave orphan locals from the discarded HIR.
         if matches!(
@@ -60008,7 +60056,47 @@ impl<'a, 't> Checker<'a, 't> {
     /// - `random(out: mut buffer)` — fill the whole `buffer` `out` with OS CSPRNG bytes. `out` is a
     ///   `buffer` value, borrowed and filled in place through its handle (not consumed, like
     ///   `reader.read`'s buffer). **Impure** (reads OS entropy); yields [`Ty::Unit`].
+    fn check_crypto_digest_method(&mut self, digest: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let arity = match method {
+            "update" => 1,
+            "finish" => 0,
+            _ => {
+                self.diags.error(format!("'.{method}()' is not a method on crypto.digest"), span);
+                return err;
+            }
+        };
+        if args.len() != arity {
+            self.diags.error(format!("'crypto.digest.{method}' expects {arity} arguments, got {}", args.len()), span);
+            return err;
+        }
+        let data = if method == "update" {
+            let Some(data) = self.check_byte_view(&args[0], "crypto.digest.update") else { return err };
+            Some(data)
+        } else { None };
+        if !matches!(digest.kind, ExprKind::Local(_)) {
+            self.diags.error("bind the crypto digest to a local before using it".to_string(), span);
+            return err;
+        }
+        if let Some(data) = data {
+            if !self.require_exclusive_handle_receiver(&digest, "crypto.digest", method, "mutate") {
+                return err;
+            }
+            Expr { kind: ExprKind::CryptoDigestUpdate { digest: Box::new(digest), data: Box::new(data) }, ty: Ty::Unit, span }
+        } else {
+            Expr { kind: ExprKind::CryptoDigestFinish { digest: Box::new(digest) }, ty: Ty::DynArray(Scalar::Int(IntTy { bits: 8, signed: false })), span }
+        }
+    }
+
     fn check_crypto_op(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        if method == "sha256_stream" {
+            if !args.is_empty() {
+                self.diags.error("'crypto.sha256_stream' expects no arguments".to_string(), span);
+                return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+            }
+            return Expr { kind: ExprKind::CryptoDigestNew, ty: Ty::CryptoDigest, span };
+        }
+
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         // `sha256`/`sha512` (Slice 2) — the EVP digests; delegate to the shared hash builder.
         if matches!(method, "sha256" | "sha512") {
@@ -65229,8 +65317,11 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(b);
             }
             ExprKind::CryptoRandom { out } => self.finalize_expr(out),
-            ExprKind::CryptoHash { data, .. } => self.finalize_expr(data),
-            ExprKind::CryptoHmac { key, data } => {
+            ExprKind::CryptoDigestNew => {},
+            ExprKind::CryptoDigestFinish { digest: data }
+            | ExprKind::CryptoHash { data, .. } => self.finalize_expr(data),
+            ExprKind::CryptoDigestUpdate { digest: key, data }
+            | ExprKind::CryptoHmac { key, data } => {
                 self.finalize_expr(key);
                 self.finalize_expr(data);
             }
@@ -66351,6 +66442,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::CodecBoolColumn => "codec.bool_column".to_string(),
         Ty::CodecStrColumn => "codec.str_column".to_string(),
         Ty::CodecEncoder => "codec.encoder".to_string(),
+        Ty::CryptoDigest => "crypto.digest".to_string(),
         Ty::Reader => "reader".to_string(),
         Ty::Buffer => "buffer".to_string(),
         Ty::SignatureKey(kind) => kind.name().to_string(),
@@ -66759,6 +66851,7 @@ fn resolved_type_source_spelling(
             Ty::CodecBoolColumn => "codec.bool_column".to_string(),
             Ty::CodecStrColumn => "codec.str_column".to_string(),
             Ty::CodecEncoder => "codec.encoder".to_string(),
+            Ty::CryptoDigest => "crypto.digest".to_string(),
             Ty::Reader => "reader".to_string(),
             Ty::Buffer => "buffer".to_string(),
             Ty::ArrayBuilder(elem) => format!(
@@ -67107,7 +67200,7 @@ fn subst_param_ty(
         Ty::Box(s) => Ty::Box(subst_scalar(s, args, tagged_types)),
         Ty::Slice(s) => {
             let element = subst_collection_element_ty(s, args, tagged_types);
-            if ty_contains_signature_key(element, structs, &[], enums, tagged_types) {
+            if ty_contains_crypto_owner(element, structs, &[], enums, tagged_types) {
                 Ty::Error
             } else {
                 collection_scalar_type(element)
@@ -67126,7 +67219,7 @@ fn subst_param_ty(
         Ty::ArrayBuilder(s) => {
             let element = subst_collection_element_ty(s, args, tagged_types);
             if !matches!(element, Ty::Struct(_))
-                && ty_contains_signature_key(element, structs, &[], enums, tagged_types)
+                && ty_contains_crypto_owner(element, structs, &[], enums, tagged_types)
             {
                 Ty::Error
             } else {
@@ -67180,7 +67273,7 @@ fn dynamic_array_type(
             Some(Ty::DynFixedStructArray(id, length))
         }
         Ty::Slice(elem) => scalar_to_prim(elem).map(Ty::DynSliceArray),
-        other if ty_contains_signature_key(other, structs, &[], enums, tagged_types) => None,
+        other if ty_contains_crypto_owner(other, structs, &[], enums, tagged_types) => None,
         other => collection_scalar_type(other).map(Ty::DynArray),
     }
 }
@@ -67197,7 +67290,7 @@ fn fixed_array_type(
 ) -> Option<Ty> {
     match element {
         Ty::Struct(id) => Some(Ty::StructArray(id, length)),
-        other if ty_contains_signature_key(other, structs, &[], enums, tagged_types) => None,
+        other if ty_contains_crypto_owner(other, structs, &[], enums, tagged_types) => None,
         other => collection_scalar_type(other).map(|scalar| Ty::Array(scalar, length)),
     }
 }
@@ -67875,12 +67968,12 @@ fn scalar_arg(
     // handle would double-`close` its fd), exactly like `tcp_listener` / `http response`.
     if matches!(ty, Ty::SignatureKey(_)) && !allow_param {
         diags.error(
-            format!("{what} cannot be `{}` — a signature key is a single owner, not a collection element", ty_name(ty)),
+            format!("{what} cannot be `{}` — a crypto key or digest is a single owner, not a collection element", ty_name(ty)),
             span,
         );
         return None;
     }
-    if matches!(ty, Ty::CliCommand | Ty::Command) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Logger | Ty::XmlReader | Ty::CodecBatch | Ty::CodecI64Column | Ty::CodecF64Column | Ty::CodecBoolColumn | Ty::CodecStrColumn | Ty::CodecEncoder | Ty::Buffer | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::HttpReadStream | Ty::HttpSseStream | Ty::ResponseBuilder | Ty::RunOutput | Ty::RunBytes) && !allow_param) {
+    if matches!(ty, Ty::CliCommand | Ty::Command) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Logger | Ty::XmlReader | Ty::CodecBatch | Ty::CodecI64Column | Ty::CodecF64Column | Ty::CodecBoolColumn | Ty::CodecStrColumn | Ty::CryptoDigest | Ty::CodecEncoder | Ty::Buffer | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::HttpReadStream | Ty::HttpSseStream | Ty::ResponseBuilder | Ty::RunOutput | Ty::RunBytes) && !allow_param) {
         diags.error(
             format!("{what} cannot be `{}` — an owned I/O handle/buffer is bound to one local, not collected into an array/slice/box (bind it to a local)", ty_name(ty)),
             span,
@@ -67925,7 +68018,7 @@ fn collection_scalar_arg(
     span: Span,
     diags: &mut Diagnostics,
 ) -> Option<Scalar> {
-    if ty_contains_signature_key(
+    if ty_contains_crypto_owner(
         ty,
         tables.structs,
         tables.tuples,
@@ -67934,7 +68027,7 @@ fn collection_scalar_arg(
     ) {
         diags.error(
             format!(
-                "{what} cannot be `{}` — a signature key is a single owner, not a collection element",
+                "{what} cannot be `{}` — a crypto key or digest is a single owner, not a collection element",
                 ty_name(ty)
             ),
             span,
@@ -67976,6 +68069,7 @@ fn collection_scalar_type(ty: Ty) -> Option<Scalar> {
             | Ty::CodecF64Column
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
+            | Ty::CryptoDigest
             | Ty::CodecEncoder
             | Ty::Regex
             | Ty::Captures
@@ -68570,6 +68664,13 @@ fn resolve_type(
             _ => unreachable!(),
         };
     }
+    if path.segments.len() == 2 && path.segments[0].name == "crypto" && path.segments[1].name == "digest" {
+        if !args.is_empty() || !cx.builtin_imports.contains("std.crypto") {
+            diags.error("crypto.digest requires import std.crypto and takes no type arguments".to_string(), span);
+            return Ty::Error;
+        }
+        return Ty::CryptoDigest;
+    }
     // A qualified type `mod.Type` (or `a.b.Type`) is always a user type — never a builtin keyword or
     // a generic parameter. Resolve it via the type table (import + `pub` checked) directly.
     if path.segments.len() > 1 {
@@ -68695,7 +68796,7 @@ fn resolve_type(
                 return Ty::Error;
             }
             if !matches!(inner, Ty::Struct(_))
-                && ty_contains_signature_key(
+                && ty_contains_crypto_owner(
                     inner,
                     cx.structs,
                     cx.tuples,
@@ -68705,7 +68806,7 @@ fn resolve_type(
             {
                 diags.error(
                     format!(
-                        "array_builder element cannot be `{}` — a signature key is a single owner, not a builder element",
+                        "array_builder element cannot be `{}` — a crypto key or digest is a single owner, not a builder element",
                         ty_name(inner)
                     ),
                     span,
@@ -69393,6 +69494,7 @@ pub const MOVE_HANDLE_TYPES: &[Ty] = &[
     Ty::Logger,
     Ty::XmlReader,
     Ty::CodecEncoder,
+    Ty::CryptoDigest,
     Ty::Reader,
     Ty::Buffer,
     Ty::SignatureKey(SignatureKeyKind::Rs256Private),
@@ -69814,6 +69916,7 @@ fn enum_payload_ok(
         | Scalar::CodecF64Column
         | Scalar::CodecBoolColumn
         | Scalar::CodecStrColumn
+        | Scalar::CryptoDigest
         | Scalar::CodecEncoder => true,
         // An owned scalar `array<T>` payload (J2) makes the enum Move (tag-switched drop). Flat
         // scalar-element arrays are admitted; bare `array<string>` is excluded because its
