@@ -39910,7 +39910,10 @@ Query { data: i64 }
 fn metadata(query: Query) -> i32 = 0
 fn main() -> i32 = 0
 "#);
-        for definition in &mut program.enums {
+        for definition in program.enums.iter_mut().filter(|definition| matches!(
+            definition.name.as_str(), "Driver" | "DriverRestriction" | "MetaStatementClass"
+                | "MetaQueryState" | "MetaQueryEntry" | "MetaNullability"
+        )) {
             definition.source_name = format!("pkg.db${}", definition.source_name);
         }
         let row = program.structs.iter().position(|definition| definition.source_name == "QueryMeta")

@@ -7,9 +7,8 @@ fn retained_tree_operations_round_trip() {
     if !backend_available() {
         return;
     }
-    let root = std::env::temp_dir().join(format!("align-retained-driver-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir(&root).expect("fixture directory");
+    let fixture = private_project("roundtrip", &[], "main.align");
+    let root = fixture.dir.clone();
     let source = r#"
 import std.fs
 pub fn main(args: array<str>) -> Result<(), Error> {
@@ -48,7 +47,6 @@ pub fn main(args: array<str>) -> Result<(), Error> {
         source,
         &[root.to_str().expect("fixture UTF-8")],
     );
-    let _ = std::fs::remove_dir_all(root);
     assert_eq!(
         out.status.code(),
         Some(0),
@@ -97,8 +95,14 @@ fn main() -> Result<(), Error> {
     );
     if backend_available() {
         let whole = build_and_run_multi("retained-carriers-whole", files, "main.align");
-        let unit =
-            build_per_unit_multi("retained-carriers-unit", files, "main.align").link_and_run();
+        let built = build_per_unit_multi("retained-carriers-unit", files, "main.align");
+        assert!(
+            !built
+                .link_libs_union()
+                .iter()
+                .any(|library| library == "crypto")
+        );
+        let unit = built.link_and_run();
         assert_eq!(
             whole.status.code(),
             Some(0),
@@ -260,7 +264,7 @@ fn run_retained_cleanup_probe(
     per_unit: bool,
     omit: Option<&str>,
 ) -> std::process::Output {
-    let project = Proj::new(
+    let project = private_project(
         "retained-cleanup-probe",
         &[("helper.align", CLEANUP_HELPER), ("main.align", main)],
         "main.align",
@@ -383,7 +387,8 @@ fn metadata_matches_native_fields() {
     if !backend_available() {
         return;
     }
-    let path = std::env::temp_dir().join(format!("align-retained-metadata-{}", std::process::id()));
+    let fixture = private_project("metadata", &[], "main.align");
+    let path = fixture.dir.join("payload");
     std::fs::write(&path, b"metadata").expect("fixture file");
     let source = r#"import std.fs
 fn main(args: array<str>) -> Result<(), Error> {
@@ -403,7 +408,6 @@ fn main(args: array<str>) -> Result<(), Error> {
         &[path.to_str().expect("fixture UTF-8")],
     );
     let native = std::fs::metadata(&path).expect("native metadata");
-    std::fs::remove_file(path).expect("remove fixture");
     assert_eq!(
         out.status.code(),
         Some(0),
@@ -432,7 +436,7 @@ fn interfaces_and_cache() {
     }
     let helper = "module helper\nimport std.fs\npub fn open() -> Result<fs.directory, Error> = fs.open_directory(\".\")\n";
     let main = "import helper\nimport std.fs\nfn main() -> Result<(), Error> { directory := helper.open()?; cursor := directory.cursor()?; entry := cursor.next()?; return Ok(()) }\n";
-    let project = Proj::new(
+    let project = private_project(
         "retained-cache",
         &[("helper.align", helper), ("main.align", main)],
         "main.align",
@@ -447,4 +451,64 @@ fn interfaces_and_cache() {
     assert!(!thin_build(&project, &cache, 1).all_hit());
     project.write("helper.align", helper);
     assert!(thin_build(&project, &cache, 1).all_hit());
+}
+
+/// Acquire a private directory exclusively before arming the existing project cleanup owner.
+/// Canonicalizing this acquired root keeps fixture setup separate from no-follow path admission.
+fn private_project(tag: &str, files: &[(&str, &str)], entry: &str) -> Proj {
+    use std::os::unix::fs::DirBuilderExt;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nonce = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("fixture clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "align-retained-private-{}-{time}-{nonce}-{tag}",
+        std::process::id()
+    ));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .expect("acquire private fixture");
+    let mut project = Proj {
+        dir,
+        entry: entry.to_string(),
+    };
+    project.dir = std::fs::canonicalize(&project.dir).expect("canonicalize acquired fixture");
+    for (name, source) in files {
+        project.write(name, source);
+    }
+    project
+}
+
+#[test]
+fn opaque_sum_collection_exclusions() {
+    for owner in ["fs.directory", "fs.dir_cursor"] {
+        for container in ["slice<Choice>", "array<Choice>", "array_builder<Choice>"] {
+            let source = format!(
+                "import std.fs\nChoice {{ Held({owner}), Empty }}\nfn inspect(values: {container}) {{}}\nfn main() {{}}\n"
+            );
+            let copy_source = source.replace(&format!("Held({owner})"), "Held(i64)");
+            assert!(
+                !check_errs("retained-copy-sum-control", &copy_source),
+                "invalid fixture syntax: {container}"
+            );
+            let checked = diff_check_multi(
+                "retained-sum-exclusion",
+                &[("main.align", &source)],
+                "main.align",
+            );
+            assert!(
+                checked.whole_errors && checked.per_unit_errors,
+                "{owner} {container} unexpectedly admitted: {} / {}",
+                checked.whole_diags,
+                checked.per_unit_diags
+            );
+        }
+        let source = format!(
+            "import std.fs\nChoice {{ Held({owner}), Empty }}\nfn generic<T>(values: slice<T>) {{}}\nfn inspect(value: Choice) {{ values := [value]; generic(values) }}\nfn main() {{}}\n"
+        );
+        assert!(check_errs("retained-generic-sum-exclusion", &source));
+    }
 }

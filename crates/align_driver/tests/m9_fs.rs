@@ -44,9 +44,10 @@ struct TempDir {
 impl TempDir {
     fn new(name: &str) -> TempDir {
         let path = std::env::temp_dir().join(format!("align-m9fs-dir-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
+        std::fs::create_dir(&path).expect("acquire temp dir");
+        let mut directory = TempDir { path };
+        directory.path = std::fs::canonicalize(&directory.path).expect("canonicalize acquired directory");
+        directory
     }
     fn str(&self) -> String {
         self.path.display().to_string()

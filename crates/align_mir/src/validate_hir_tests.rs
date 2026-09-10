@@ -11828,10 +11828,10 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        // Incremental SHA-256 adds three operations; keep this count synchronized with
+        // FsTree adds one closed operation family; keep this count synchronized with
         // the exhaustive validation, source-shape, replay-clone, and canonical-graph matches.
         variants,
-        333,
+        334,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -18423,6 +18423,21 @@ fn retained_tree_records() -> Result<(), &'static str> {
                 assert!(!validate_hir::global_type_metadata_is_valid(&bad));
                 assert_body_entrypoints_empty("malformed reserved filesystem schema", &bad);
             }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn retained_tree_hidden_collection_owners() -> Result<(), &'static str> {
+    for owner in ["fs.directory", "fs.dir_cursor"] {
+        let base = checked_source_program(&format!("import std.fs\nChoice {{ Held({owner}), Empty }}\nContainer {{ values: slice<i64> }}\nfn main() {{}}\n"));
+        let id = u32::try_from(base.enums.iter().position(|definition| definition.name == "Choice").ok_or("choice")?).map_err(|_| "enum ID")?;
+        for ty in [Ty::Slice(Scalar::Enum(id)), Ty::Array(Scalar::Enum(id), 1), Ty::DynArray(Scalar::Enum(id))] {
+            let mut bad = base.clone();
+            bad.structs.iter_mut().find(|definition| definition.name == "Container").ok_or("container")?.fields[0].ty = ty;
+            assert!(!validate_hir::type_placement_metadata_is_valid(&bad), "hidden {owner}: {ty:?}");
+            assert_body_entrypoints_empty("hidden filesystem collection owner", &bad);
         }
     }
     Ok(())

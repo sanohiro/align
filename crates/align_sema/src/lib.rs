@@ -2904,6 +2904,14 @@ pub fn ty_contains_crypto_owner(root: Ty, structs: &[StructDef], tuples: &[hir::
     ty_contains_leaf(root, structs, tuples, enums, tagged_types, |ty| matches!(ty, Ty::CryptoDigest | Ty::SignatureKey(_)))
 }
 
+/// Restricted native owners cannot enter scalar collections, including through sum payloads.
+/// Dedicated AoS record-container formation remains the existing explicit exception.
+pub fn ty_contains_restricted_collection_owner(root: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], enums: &[hir::EnumDef], tagged_types: &[hir::TaggedType]) -> bool {
+    ty_contains_leaf(root, structs, tuples, enums, tagged_types, |ty|
+        matches!(ty, Ty::CryptoDigest | Ty::SignatureKey(_) | Ty::FsDirectory | Ty::FsDirCursor))
+}
+
+
 /// Whether a reachable value type contains an HTTP client's pooled-connection owner.
 /// MIR uses this for Drop-only link capabilities, including imported aggregate carriers.
 pub fn ty_contains_http_client(
@@ -67389,7 +67397,7 @@ fn subst_param_ty(
         Ty::Box(s) => Ty::Box(subst_scalar(s, args, tagged_types)),
         Ty::Slice(s) => {
             let element = subst_collection_element_ty(s, args, tagged_types);
-            if ty_contains_crypto_owner(element, structs, &[], enums, tagged_types) {
+            if ty_contains_restricted_collection_owner(element, structs, &[], enums, tagged_types) {
                 Ty::Error
             } else {
                 collection_scalar_type(element)
@@ -67408,7 +67416,7 @@ fn subst_param_ty(
         Ty::ArrayBuilder(s) => {
             let element = subst_collection_element_ty(s, args, tagged_types);
             if !matches!(element, Ty::Struct(_))
-                && ty_contains_crypto_owner(element, structs, &[], enums, tagged_types)
+                && ty_contains_restricted_collection_owner(element, structs, &[], enums, tagged_types)
             {
                 Ty::Error
             } else {
@@ -67462,7 +67470,7 @@ fn dynamic_array_type(
             Some(Ty::DynFixedStructArray(id, length))
         }
         Ty::Slice(elem) => scalar_to_prim(elem).map(Ty::DynSliceArray),
-        other if ty_contains_crypto_owner(other, structs, &[], enums, tagged_types) => None,
+        other if ty_contains_restricted_collection_owner(other, structs, &[], enums, tagged_types) => None,
         other => collection_scalar_type(other).map(Ty::DynArray),
     }
 }
@@ -67479,7 +67487,7 @@ fn fixed_array_type(
 ) -> Option<Ty> {
     match element {
         Ty::Struct(id) => Some(Ty::StructArray(id, length)),
-        other if ty_contains_crypto_owner(other, structs, &[], enums, tagged_types) => None,
+        other if ty_contains_restricted_collection_owner(other, structs, &[], enums, tagged_types) => None,
         other => collection_scalar_type(other).map(|scalar| Ty::Array(scalar, length)),
     }
 }
@@ -68157,7 +68165,7 @@ fn scalar_arg(
     // handle would double-`close` its fd), exactly like `tcp_listener` / `http response`.
     if matches!(ty, Ty::SignatureKey(_)) && !allow_param {
         diags.error(
-            format!("{what} cannot be `{}` — a crypto key or digest is a single owner, not a collection element", ty_name(ty)),
+            format!("{what} cannot be `{}` — a restricted native handle is a single owner, not a collection element", ty_name(ty)),
             span,
         );
         return None;
@@ -68207,7 +68215,7 @@ fn collection_scalar_arg(
     span: Span,
     diags: &mut Diagnostics,
 ) -> Option<Scalar> {
-    if ty_contains_crypto_owner(
+    if ty_contains_restricted_collection_owner(
         ty,
         tables.structs,
         tables.tuples,
@@ -68216,7 +68224,7 @@ fn collection_scalar_arg(
     ) {
         diags.error(
             format!(
-                "{what} cannot be `{}` — a crypto key or digest is a single owner, not a collection element",
+                "{what} cannot be `{}` — a restricted native handle is a single owner, not a collection element",
                 ty_name(ty)
             ),
             span,
@@ -68995,7 +69003,7 @@ fn resolve_type(
                 return Ty::Error;
             }
             if !matches!(inner, Ty::Struct(_))
-                && ty_contains_crypto_owner(
+                && ty_contains_restricted_collection_owner(
                     inner,
                     cx.structs,
                     cx.tuples,
@@ -69005,7 +69013,7 @@ fn resolve_type(
             {
                 diags.error(
                     format!(
-                        "array_builder element cannot be `{}` — a crypto key or digest is a single owner, not a builder element",
+                        "array_builder element cannot be `{}` — a restricted native handle is a single owner, not a builder element",
                         ty_name(inner)
                     ),
                     span,

@@ -1779,7 +1779,7 @@ impl<'a> PlacementValidator<'a> {
             Scalar::Enum(id) => {
                 self.program.enums.get(id as usize).is_some()
                     && (!matches!(mode, ScalarPlacement::Collection)
-                        || !align_sema::ty_contains_crypto_owner(
+                        || !align_sema::ty_contains_restricted_collection_owner(
                             Ty::Enum(id),
                             &self.program.structs,
                             &self.program.tuples,

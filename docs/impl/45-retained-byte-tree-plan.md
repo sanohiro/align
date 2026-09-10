@@ -301,3 +301,15 @@ so CursorNext's two disjoint slots use the same proof as existing single outputs
 The exhaustive storage policy inventory advances to 334 variants. No safety
 strategy or accepted public contract changed during implementation. The legacy
 read_dir slice rejection fixture is updated to the already-shipped R67 contract.
+
+The one full-diff review found three P2 corrections, closed together without a
+contract or strategy change. New driver fixtures now acquire one private directory
+exclusively before arming cleanup; acquired roots are canonicalized before strict
+no-follow admission (including a symlinked TMPDIR owner). The native fixture follows
+the same admission rule. Recursive non-record collection formation and checked-HIR
+placement now share `ty_contains_restricted_collection_owner` for both filesystem
+owners and the existing crypto owners. Crypto-only link dependency discovery keeps
+its separate predicate. `opaque_sum_collection_exclusions` and
+`retained_tree_hidden_collection_owners` cover both opaque twins hidden in sums;
+restoring the prior crypto-only predicate makes the source owner fail. Existing
+AoS record-container ownership remains admitted and covered by cleanup controls.

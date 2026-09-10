@@ -655,7 +655,8 @@ mod tests {
             Ok(Self(path))
         }
         fn open(&self) -> Result<*mut c_void, Box<dyn std::error::Error>> {
-            let path = self.0.as_os_str().as_bytes();
+            let canonical = std::fs::canonicalize(&self.0)?;
+            let path = canonical.as_os_str().as_bytes();
             let mut owner = core::ptr::null_mut();
             assert_eq!(
                 unsafe {
