@@ -50646,12 +50646,19 @@ mod r63_tests {
             let b = unsafe { align_rt_json_builder_init(header.0.as_mut_ptr(), mode, if mode == 0 { 0 } else { 64 }) };
             unsafe { align_rt_builder_write(b, b"{}".as_ptr(), 2) };
             let grow = unsafe { (*b).buf.ptr };
-            let before = header.0;
+            // Builder padding and the inactive Option payload need not be initialized.
+            // Compare every defined field without reading its raw object representation.
+            let state = || unsafe {
+                let value = &*b;
+                (value.buf.ptr, value.buf.len, value.buf.cap, value.buf.limit,
+                 value.buf.encode_failed, value.arena)
+            };
+            let before = state();
             assert_eq!(unsafe { align_rt_json_builder_finish(b, b.cast()) }, AL_INVALID);
-            assert_eq!(header.0, before);
+            assert_eq!(state(), before);
             let mut out = AlignStr { ptr: core::ptr::null(), len: -1 };
             assert_eq!(unsafe { align_rt_json_builder_finish(b, (&mut out as *mut AlignStr).cast::<u8>().wrapping_add(1).cast()) }, AL_INVALID);
-            assert_eq!(header.0, before);
+            assert_eq!(state(), before);
             assert_eq!(out.len, -1);
             assert_eq!(unsafe { align_rt_json_builder_finish(b, &mut out) }, 0);
             assert_eq!(out.ptr, grow, "success transfers the original allocation");
