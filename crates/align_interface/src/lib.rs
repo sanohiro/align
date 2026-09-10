@@ -1417,6 +1417,7 @@ const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("tcp_listener", 0, BuiltinCapability::Opaque),
     ("udp_socket", 0, BuiltinCapability::Opaque),
     ("child", 0, BuiltinCapability::Opaque),
+    ("process.signal_subscription", 0, BuiltinCapability::Opaque),
     ("command", 0, BuiltinCapability::Opaque),
     ("run_output", 0, BuiltinCapability::Opaque),
     ("run_bytes", 0, BuiltinCapability::Opaque),
@@ -1472,6 +1473,8 @@ fn bare_nominal_alias_prefers_local(path: &str) -> bool {
     matches!(
         path,
         "Error"
+            | "command"
+            | "run_output"
             | "argon2_params"
             | "regex_match"
             | "rs256_private_key"
@@ -1607,8 +1610,8 @@ impl<'a> CapabilityAnalysis<'a> {
                     // through its spelling bridge. A hand-written name table here was a second model
                     // of the very bit this analysis validates, so a new droppable builtin surface
                     // type would have rejected every valid interface that returns it.
-                    if let Some(owns_droppable) =
-                        align_sema::builtin_spelling_needs_return_cleanup(path)
+                    if !(bare_nominal_alias_prefers_local(path) && self.index.local(path).is_some())
+                        && let Some(owns_droppable) = align_sema::builtin_spelling_needs_return_cleanup(path)
                     {
                         result.intrinsic |= owns_droppable;
                         continue;
@@ -2001,7 +2004,8 @@ impl<'a> CapabilityAnalysis<'a> {
                 IType::Tuple(elements) => work.extend(elements),
                 IType::Fn { .. } => {}
                 IType::Named { path, args } => {
-                    if align_sema::builtin_spelling_is_move(path) == Some(true)
+                    if !(bare_nominal_alias_prefers_local(path) && self.index.local(path).is_some())
+                        && align_sema::builtin_spelling_is_move(path) == Some(true)
                         && align_sema::builtin_spelling_needs_return_cleanup(path) == Some(false)
                     {
                         return true;
@@ -2700,6 +2704,7 @@ pub fn summary_to_source(
                             builtin_type_imports.insert("std.crypto".to_string());
                         }
                         "fs.directory" | "fs.dir_cursor" | "fs.dir_entry" | "fs.metadata" | "fs.entry_kind" => { builtin_type_imports.insert("std.fs".to_string()); }
+                        "process.signal_subscription" => { builtin_type_imports.insert("std.process".to_string()); }
                         "os.host_info" => { builtin_type_imports.insert("std.os".to_string()); }
                         "process.termination" | "process.wait_result" | "process.readiness" | "process.signal" | "process.signal_set" | "process.snapshot" | "command" | "run_output" => { builtin_type_imports.insert("std.process".to_string()); }
                         "regex.regex_match" => {

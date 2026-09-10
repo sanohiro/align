@@ -169,9 +169,13 @@ pub(super) unsafe fn spawn(
     let mut actions = Actions::new()?;
     let attributes = Attributes::new(command, force_group, mask, timed)?;
     for (source, destination) in streams.iter().zip(0..3) {
-        checked(if *source < 0 {
-            unsafe { libc::posix_spawn_file_actions_addclose(&mut actions.0, destination) }
-        } else if timed {
+        // An absent standard descriptor is already closed. Darwin executes close
+        // actions strictly (EBADF aborts spawn); SETEXEC would also close it twice.
+        // CLOEXEC_DEFAULT leaves only the explicitly inherited/duplicated streams.
+        if *source < 0 {
+            continue;
+        }
+        checked(if timed {
             unsafe { posix_spawn_file_actions_addinherit_np(&mut actions.0, destination) }
         } else {
             unsafe { libc::posix_spawn_file_actions_adddup2(&mut actions.0, *source, destination) }

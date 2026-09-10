@@ -320,7 +320,11 @@ key|ProcessAbort|process_abort|declare void @align_rt_process_abort() #1
 key|ProcessCpuCount|process_cpu_count|declare i64 @align_rt_process_cpu_count()
 key|ProcessExec|process_exec|declare i32 @align_rt_process_exec(ptr, i64, ptr, i64)
 key|ProcessExit|process_exit|declare void @align_rt_process_exit(i64) #1
+key|ProcessSignalClose|process_signal_close|declare i32 @align_rt_process_signal_close(ptr)
+key|ProcessSignalFree|process_signal_free|declare void @align_rt_process_signal_free(ptr)
+key|ProcessSignalNext|process_signal_next|declare i32 @align_rt_process_signal_next(ptr, ptr)
 key|ProcessSignalNumber|process_signal_number|declare i64 @align_rt_process_signal_number(i32)
+key|ProcessSignals|process_signals|declare i32 @align_rt_process_signals(i32, ptr)
 key|ProcessSpawn|process_spawn|declare i32 @align_rt_process_spawn(ptr, i64, ptr, i64, ptr)
 key|ProcessTable|process_table|declare i32 @align_rt_process_table(i64, ptr)
 key|RangeFail|range_fail|declare void @align_rt_range_fail(i64, i64, i64) #1

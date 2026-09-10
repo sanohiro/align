@@ -246,6 +246,8 @@ pub enum Scalar {
     FsDirectory,
     /// Independently positioned raw-name directory cursor.
     FsDirCursor,
+    /// Exclusive process-global signal observation lease; opaque non-Send Move owner.
+    ProcessSignalSubscription,
     /// A `buffer` payload (`Result<buffer, Error>` from `encoding.*_decode`). An owned **Move**
     /// handle (a growable byte container); the enclosing `Result`'s `Drop` frees it. Opaque pointer,
     /// like [`Scalar::Reader`]/[`Scalar::Writer`] — owned, never region-tracked (it borrows nothing).
@@ -361,7 +363,7 @@ impl Scalar {
     /// the I/O handles `reader`/`writer`, a decoded `buffer`, a `cli parsed`, a `tcp_conn`, a
     /// `tcp_listener`, a `udp_socket`, or a package-defined resource.
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Logger | Scalar::XmlReader | Scalar::CryptoDigest | Scalar::FsDirectory | Scalar::FsDirCursor | Scalar::CodecEncoder | Scalar::Buffer | Scalar::SignatureKey(_) | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpClient | Scalar::HttpRequest | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::HttpUpgrade | Scalar::HttpReadStream | Scalar::HttpSseStream | Scalar::ResponseBuilder | Scalar::RunOutput | Scalar::RunBytes | Scalar::Resource(_))
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Logger | Scalar::XmlReader | Scalar::CryptoDigest | Scalar::FsDirectory | Scalar::FsDirCursor | Scalar::ProcessSignalSubscription | Scalar::CodecEncoder | Scalar::Buffer | Scalar::SignatureKey(_) | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpClient | Scalar::HttpRequest | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::HttpUpgrade | Scalar::HttpReadStream | Scalar::HttpSseStream | Scalar::ResponseBuilder | Scalar::RunOutput | Scalar::RunBytes | Scalar::Resource(_))
     }
 }
 
@@ -658,6 +660,8 @@ pub enum Ty {
     FsDirectory,
     /// Independently positioned raw-name directory cursor.
     FsDirCursor,
+    /// Exclusive process-global signal observation lease; opaque non-Send Move owner.
+    ProcessSignalSubscription,
     /// A `reader` (`std.io`) — the one concrete read-source Move type: `io.stdin`, `fs.open` (a
     /// file). An opaque owned handle to a heap reader object owning an fd. `r.read(b: mut buffer)`
     /// fills a caller-owned buffer. `Drop`-freed (a file fd is also closed). Its reads are Impure.
@@ -959,6 +963,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Ty::CryptoDigest
         | Ty::FsDirectory
         | Ty::FsDirCursor
+        | Ty::ProcessSignalSubscription
         | Ty::CodecEncoder
         | Ty::Reader
         | Ty::Buffer
@@ -1035,6 +1040,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Scalar::CryptoDigest
         | Scalar::FsDirectory
         | Scalar::FsDirCursor
+        | Scalar::ProcessSignalSubscription
         | Scalar::CodecEncoder
         | Scalar::Buffer
         | Scalar::SignatureKey(_)
@@ -1107,6 +1113,7 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::CryptoDigest => Some(Scalar::CryptoDigest),
         Ty::FsDirectory => Some(Scalar::FsDirectory),
         Ty::FsDirCursor => Some(Scalar::FsDirCursor),
+        Ty::ProcessSignalSubscription => Some(Scalar::ProcessSignalSubscription),
         // A `buffer` owned handle as a `Result` Ok payload (`encoding.*_decode`).
         Ty::Buffer => Some(Scalar::Buffer),
         Ty::SignatureKey(kind) => Some(Scalar::SignatureKey(kind)),
@@ -1252,6 +1259,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::CryptoDigest => Ty::CryptoDigest,
         Scalar::FsDirectory => Ty::FsDirectory,
         Scalar::FsDirCursor => Ty::FsDirCursor,
+        Scalar::ProcessSignalSubscription => Ty::ProcessSignalSubscription,
         Scalar::Buffer => Ty::Buffer,
         Scalar::SignatureKey(kind) => Ty::SignatureKey(kind),
         Scalar::Regex => Ty::Regex,
@@ -1476,6 +1484,7 @@ pub fn heap_tree_record_error(
                 | Ty::CryptoDigest
                 | Ty::FsDirectory
                 | Ty::FsDirCursor
+                | Ty::ProcessSignalSubscription
                 | Ty::SignatureKey(_) => {}
                 Ty::Struct(id) => work.push(Work::EnterStruct { id, path }),
                 Ty::Option(payload) => work.push(Work::Field {
@@ -2528,6 +2537,7 @@ pub fn drop_plan(
                         | Ty::CryptoDigest
                         | Ty::FsDirectory
                         | Ty::FsDirCursor
+                        | Ty::ProcessSignalSubscription
                         | Ty::CodecEncoder
                         | Ty::Reader
                         | Ty::Buffer
@@ -2913,7 +2923,7 @@ pub fn ty_contains_crypto_owner(root: Ty, structs: &[StructDef], tuples: &[hir::
 /// Dedicated AoS record-container formation remains the existing explicit exception.
 pub fn ty_contains_restricted_collection_owner(root: Ty, structs: &[StructDef], tuples: &[hir::TupleDef], enums: &[hir::EnumDef], tagged_types: &[hir::TaggedType]) -> bool {
     ty_contains_leaf(root, structs, tuples, enums, tagged_types, |ty|
-        matches!(ty, Ty::CryptoDigest | Ty::SignatureKey(_) | Ty::FsDirectory | Ty::FsDirCursor))
+        matches!(ty, Ty::CryptoDigest | Ty::SignatureKey(_) | Ty::FsDirectory | Ty::FsDirCursor | Ty::ProcessSignalSubscription))
 }
 
 
@@ -3040,6 +3050,7 @@ fn ty_contains_leaf(
             | Ty::CryptoDigest
             | Ty::FsDirectory
             | Ty::FsDirCursor
+            | Ty::ProcessSignalSubscription
             | Ty::CodecEncoder
             | Ty::Reader
             | Ty::Buffer
@@ -3316,6 +3327,7 @@ fn ty_contains_http_upgrade(
             | Ty::CryptoDigest
             | Ty::FsDirectory
             | Ty::FsDirCursor
+            | Ty::ProcessSignalSubscription
             | Ty::CodecEncoder
             | Ty::Reader
             | Ty::Buffer
@@ -3433,6 +3445,7 @@ fn ty_contains_http_receive_stream(
             | Scalar::CryptoDigest
             | Scalar::FsDirectory
             | Scalar::FsDirCursor
+            | Scalar::ProcessSignalSubscription
             | Scalar::CodecEncoder
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
@@ -3573,6 +3586,7 @@ fn ty_contains_http_receive_stream(
             | Ty::CryptoDigest
             | Ty::FsDirectory
             | Ty::FsDirCursor
+            | Ty::ProcessSignalSubscription
             | Ty::CodecEncoder
             | Ty::Reader
             | Ty::Buffer
@@ -3659,6 +3673,7 @@ pub fn http_stream_carrier_class(
             | Scalar::CryptoDigest
             | Scalar::FsDirectory
             | Scalar::FsDirCursor
+            | Scalar::ProcessSignalSubscription
             | Scalar::CodecEncoder
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
@@ -3798,6 +3813,7 @@ pub fn http_stream_carrier_class(
             | Ty::CryptoDigest
             | Ty::FsDirectory
             | Ty::FsDirCursor
+            | Ty::ProcessSignalSubscription
             | Ty::CodecEncoder
             | Ty::Reader
             | Ty::Buffer
@@ -4444,6 +4460,7 @@ pub const BUILTIN_SPELLING_TYS: &[(&str, Ty)] = &[
     ("crypto.digest", Ty::CryptoDigest),
     ("fs.directory", Ty::FsDirectory),
     ("fs.dir_cursor", Ty::FsDirCursor),
+    ("process.signal_subscription", Ty::ProcessSignalSubscription),
     ("buffer", Ty::Buffer),
     ("rs256_private_key", Ty::SignatureKey(SignatureKeyKind::Rs256Private)),
     ("crypto.rs256_private_key", Ty::SignatureKey(SignatureKeyKind::Rs256Private)),
@@ -6201,6 +6218,7 @@ struct BuiltinNominalAlias {
 
 const BUILTIN_NOMINAL_ALIASES: &[BuiltinNominalAlias] = &[
     BuiltinNominalAlias { bare: "fs.dir_entry", explicit: "fs.dir_entry", canonical: "fs.dir_entry", required_import: Some("std.fs") },
+    BuiltinNominalAlias { bare: "process.signal_subscription", explicit: "process.signal_subscription", canonical: "process.signal_subscription", required_import: Some("std.process") },
     BuiltinNominalAlias { bare: "process.termination", explicit: "process.termination", canonical: "process.termination", required_import: Some("std.process") },
     BuiltinNominalAlias { bare: "process.wait_result", explicit: "process.wait_result", canonical: "process.wait_result", required_import: Some("std.process") },
     BuiltinNominalAlias { bare: "process.readiness", explicit: "process.readiness", canonical: "process.readiness", required_import: Some("std.process") },
@@ -9227,6 +9245,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                     Ty::CryptoDigest => payload.push(Scalar::CryptoDigest),
                     Ty::FsDirectory => payload.push(Scalar::FsDirectory),
                     Ty::FsDirCursor => payload.push(Scalar::FsDirCursor),
+                    Ty::ProcessSignalSubscription => payload.push(Scalar::ProcessSignalSubscription),
                     Ty::Option(value) => payload.push(Scalar::Tagged(intern_tagged_type(
                         &mut tagged_types,
                         hir::TaggedType::Option(value),
@@ -19947,6 +19966,7 @@ impl<'a> EscapeCheck<'a> {
             | Ty::CryptoDigest
             | Ty::FsDirectory
             | Ty::FsDirCursor
+            | Ty::ProcessSignalSubscription
             | Ty::CodecEncoder
             | Ty::Child
             | Ty::HttpRequest
@@ -22104,6 +22124,7 @@ impl<'a> EscapeCheck<'a> {
             | Ty::CryptoDigest
             | Ty::FsDirectory
             | Ty::FsDirCursor
+            | Ty::ProcessSignalSubscription
             | Ty::CodecEncoder
             | Ty::SignatureKey(_)
             // The compiler-internal `str_finder` plan owns a boxed searcher (it copied the needle
@@ -50589,8 +50610,8 @@ impl<'a, 't> Checker<'a, 't> {
             // `std.process` — `process.cpu_count()` -> i64: the parallelism available to this
             // process (affinity/quota aware, always >= 1). The number a `task_group` worker count is
             // sized against, since the runtime's task pool is sized from the same source.
-            if module == "process" && matches!(method, "table" | "signal_number") {
-                let kind = if method == "table" { process_live::ProcessLiveKind::ProcessTable } else { process_live::ProcessLiveKind::SignalNumber };
+            if module == "process" && matches!(method, "table" | "signal_number" | "signals") {
+                let kind = match method { "table" => process_live::ProcessLiveKind::ProcessTable, "signals" => process_live::ProcessLiveKind::SignalNew, _ => process_live::ProcessLiveKind::SignalNumber };
                 return self.check_process_live(kind, None, args, span);
             }
             if module == "process" && method == "cpu_count" {
@@ -51197,6 +51218,9 @@ impl<'a, 't> Checker<'a, 't> {
         // named user method on another value still resolves normally.
         if matches!(method, "next" | "range" | "shuffle" | "sample") {
             let recv_expr = self.check_expr(recv, None);
+            if recv_expr.ty == Ty::ProcessSignalSubscription && method == "next" {
+                return self.check_process_live(process_live::ProcessLiveKind::SignalNext, Some(recv_expr), args, span);
+            }
             if recv_expr.ty == Ty::FsDirCursor && method == "next" {
                 return self.check_fs_tree(fs_tree::FsTreeKind::CursorNext, Some(recv_expr), args, span);
             }
@@ -66711,6 +66735,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::CryptoDigest => "crypto.digest".to_string(),
         Ty::FsDirectory => "fs.directory".to_string(),
         Ty::FsDirCursor => "fs.dir_cursor".to_string(),
+        Ty::ProcessSignalSubscription => "process.signal_subscription".to_string(),
         Ty::Reader => "reader".to_string(),
         Ty::Buffer => "buffer".to_string(),
         Ty::SignatureKey(kind) => kind.name().to_string(),
@@ -67122,6 +67147,7 @@ fn resolved_type_source_spelling(
             Ty::CryptoDigest => "crypto.digest".to_string(),
         Ty::FsDirectory => "fs.directory".to_string(),
         Ty::FsDirCursor => "fs.dir_cursor".to_string(),
+        Ty::ProcessSignalSubscription => "process.signal_subscription".to_string(),
             Ty::Reader => "reader".to_string(),
             Ty::Buffer => "buffer".to_string(),
             Ty::ArrayBuilder(elem) => format!(
@@ -68243,7 +68269,7 @@ fn scalar_arg(
         );
         return None;
     }
-    if matches!(ty, Ty::CliCommand | Ty::Command) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Logger | Ty::XmlReader | Ty::CodecBatch | Ty::CodecI64Column | Ty::CodecF64Column | Ty::CodecBoolColumn | Ty::CodecStrColumn | Ty::CryptoDigest | Ty::FsDirectory | Ty::FsDirCursor | Ty::CodecEncoder | Ty::Buffer | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::HttpReadStream | Ty::HttpSseStream | Ty::ResponseBuilder | Ty::RunOutput | Ty::RunBytes) && !allow_param) {
+    if matches!(ty, Ty::CliCommand | Ty::Command) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Logger | Ty::XmlReader | Ty::CodecBatch | Ty::CodecI64Column | Ty::CodecF64Column | Ty::CodecBoolColumn | Ty::CodecStrColumn | Ty::CryptoDigest | Ty::FsDirectory | Ty::FsDirCursor | Ty::ProcessSignalSubscription | Ty::CodecEncoder | Ty::Buffer | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::HttpReadStream | Ty::HttpSseStream | Ty::ResponseBuilder | Ty::RunOutput | Ty::RunBytes) && !allow_param) {
         diags.error(
             format!("{what} cannot be `{}` — an owned I/O handle/buffer is bound to one local, not collected into an array/slice/box (bind it to a local)", ty_name(ty)),
             span,
@@ -68342,6 +68368,7 @@ fn collection_scalar_type(ty: Ty) -> Option<Scalar> {
             | Ty::CryptoDigest
             | Ty::FsDirectory
             | Ty::FsDirCursor
+            | Ty::ProcessSignalSubscription
             | Ty::CodecEncoder
             | Ty::Regex
             | Ty::Captures
@@ -68822,6 +68849,14 @@ fn resolve_type(
         }
     };
     let name = path.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+    if path.segments.len()==2 && path.segments[0].name=="process" && name=="signal_subscription" {
+        if !cx.builtin_imports.contains("std.process") || !args.is_empty() {
+            diags.error("process.signal_subscription requires import std.process and takes no type arguments".to_string(),span);
+            return Ty::Error;
+        }
+        return Ty::ProcessSignalSubscription;
+    }
+
     // The builtin `core.json` types `json.doc` / `json.kind` (J4) are written qualified but are not
     // user module types — resolve them directly (before the import/`pub` check, which would reject
     // `json` as an un-imported module). `json.doc` needs no type arguments; `json.kind` is the builtin
@@ -69784,6 +69819,7 @@ pub const MOVE_HANDLE_TYPES: &[Ty] = &[
     Ty::CryptoDigest,
     Ty::FsDirectory,
     Ty::FsDirCursor,
+    Ty::ProcessSignalSubscription,
     Ty::Reader,
     Ty::Buffer,
     Ty::SignatureKey(SignatureKeyKind::Rs256Private),
@@ -70208,6 +70244,7 @@ fn enum_payload_ok(
         | Scalar::CryptoDigest
         | Scalar::FsDirectory
         | Scalar::FsDirCursor
+        | Scalar::ProcessSignalSubscription
         | Scalar::CodecEncoder => true,
         // An owned scalar `array<T>` payload (J2) makes the enum Move (tag-switched drop). Flat
         // scalar-element arrays are admitted; bare `array<string>` is excluded because its

@@ -786,9 +786,9 @@ pub unsafe extern "C" fn align_rt_command_start(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    fn isolated(name: &str, marker: &str) {
+    pub(crate) fn isolated(name: &str, marker: &str) {
         use std::os::unix::process::CommandExt;
         struct Guard(std::process::Child, bool);
         impl Drop for Guard {
@@ -819,7 +819,7 @@ mod tests {
             if let Some(status) = guard.0.try_wait().unwrap() {
                 // Reaping ends signal authority, including on an unsuccessful test exit.
                 guard.1 = false;
-                assert!(status.success());
+                assert!(status.success(), "isolated native owner failed: {status:?}");
                 return;
             }
             assert!(
@@ -829,7 +829,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
-    fn command(script: &str) -> Command {
+    pub(crate) fn command(script: &str) -> Command {
         Command {
             cmd: CString::new("/bin/sh").unwrap(),
             argv: ["sh", "-c", script]
@@ -854,12 +854,14 @@ mod tests {
                 libc::close(1);
                 libc::close(2);
             }
-            let mut child = launch(&command("exit 7"), false, false).unwrap();
-            assert_eq!(child.wait().unwrap().termination.exited, 7);
-            let mut captured = launch(&command("exit 8"), true, false).unwrap();
-            captured.stdout.fd.take();
-            captured.stderr.fd.take();
-            assert_eq!(captured.wait().unwrap().termination.exited, 8);
+            for (capture, timeout) in [(false,0),(true,0),(false,1_000_000_000),(true,1_000_000_000)] {
+                let mut configuration = command("exit 7");
+                configuration.timeout_ns = timeout;
+                let mut child = launch(&configuration, capture, false).unwrap();
+                child.stdout.fd.take();
+                child.stderr.fd.take();
+                assert_eq!(child.wait().unwrap().termination.exited, 7);
+            }
             std::process::exit(0);
         }
         isolated(NAME, "ALIGN_R65_CLOSED_STDIO");
@@ -950,7 +952,7 @@ mod tests {
     }
     #[test]
     fn live_capture_and_pending_wait() {
-        let mut command = command("printf x; sleep 1");
+        let mut command = command("printf x; exec sleep 30");
         command.new_session = true;
         let mut child = launch(&command, true, false).unwrap();
         assert!(child.new_session);
@@ -990,6 +992,12 @@ mod tests {
             child.wait().unwrap().termination.signaled,
             i64::from(libc::SIGKILL)
         );
+        // This fixture has one process: exec preserves the writer PID. Observe
+        // pipe EOF independently of the terminal-status notification.
+        assert_eq!(unsafe { super::super::process_live::align_rt_child_poll(
+            &mut *child, 1, 1_000_000_000, observed.as_mut_ptr().cast(),
+        ) }, 0);
+        assert_eq!(observed[0], 1);
         assert_eq!(child.stdout.read(&mut bytes).unwrap(), Some(0));
         assert_eq!(child.stdout.read(&mut bytes).unwrap(), Some(0));
         assert_eq!(child.signal(0, true), Err(AL_INVALID));
@@ -1037,8 +1045,15 @@ mod tests {
             std::thread::yield_now();
         }
         let mut byte = [0];
-        assert_eq!(child.stdout.read(&mut byte).unwrap(), Some(0));
         let mut readiness = [0u8; 3];
+        // Terminal status is not a pipe-lifetime witness. Cache stdout EOF only
+        // after its own readiness; another concurrent native launch can retain a
+        // transient pre-exec duplicate even after this child has exited.
+        assert_eq!(unsafe { super::super::process_live::align_rt_child_poll(
+            &mut *child, 1, 5_000_000_000, readiness.as_mut_ptr().cast(),
+        ) }, 0);
+        assert_eq!(readiness, [1,0,0]);
+        assert_eq!(child.stdout.read(&mut byte).unwrap(), Some(0));
         assert_eq!(
             unsafe {
                 super::super::process_live::align_rt_child_poll(
@@ -1055,6 +1070,10 @@ mod tests {
         assert_eq!(byte, [b'x']);
         let result = child.wait().unwrap();
         assert_eq!(result.termination.exited, 0);
+        assert_eq!(unsafe { super::super::process_live::align_rt_child_poll(
+            &mut *child, 2, 5_000_000_000, readiness.as_mut_ptr().cast(),
+        ) }, 0);
+        assert_eq!(readiness, [0,1,0]);
         assert_eq!(child.stderr.read(&mut byte).unwrap(), Some(0));
         for (interest, timeout) in [(0, 0), (8, 0), (1, -1)] {
             assert_eq!(
@@ -1080,7 +1099,14 @@ mod tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::yield_now();
         }
-        assert_eq!(child.signal(0, true), Ok(()));
+        // The unreaped leader pins this group identity. Compare with the native
+        // observation: zombie-only groups differ across kernels (including EPERM).
+        let native = if unsafe { libc::kill(-child.pid, 0) } == 0 {
+            Ok(())
+        } else {
+            Err(io_error_to_status(&std::io::Error::last_os_error()))
+        };
+        assert_eq!(child.signal(0, true), native);
         for signal in [-1, super::super::MAX_SIGNAL + 1, i64::MAX] {
             assert_eq!(child.signal(signal, true), Err(AL_INVALID));
         }

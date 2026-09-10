@@ -276,3 +276,37 @@ pub fn main() {
         );
     }
 }
+
+#[test]
+fn user_nominals_keep_precedence_over_process_owner_spellings() {
+    for name in ["command", "run_output"] {
+        let helper = format!(
+            r#"module helper
+pub {name}<T> {{ value: T }}
+pub fn make(value: str) -> {name}<str> = {name} {{ value: value }}
+pub fn view(borrow value: {name}<str>) -> str = value.value
+"#
+        );
+        let main = r#"import helper
+fn main() {
+    record := helper.make("retained")
+    print(helper.view(record))
+}
+"#;
+        let files = [("helper.align", helper.as_str()), ("main.align", main)];
+        let checked = diff_check_multi(&format!("process-nominal-{name}"), &files, "main.align");
+        assert!(
+            !checked.whole_errors && !checked.per_unit_errors,
+            "{}\n{}",
+            checked.whole_diags,
+            checked.per_unit_diags
+        );
+        if backend_available() {
+            let output =
+                build_per_unit_multi(&format!("process-nominal-run-{name}"), &files, "main.align")
+                    .link_and_run();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "retained\n");
+        }
+    }
+}

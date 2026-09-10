@@ -1810,6 +1810,7 @@ impl<'a> PlacementValidator<'a> {
             | Scalar::CryptoDigest
             | Scalar::FsDirectory
             | Scalar::FsDirCursor
+            | Scalar::ProcessSignalSubscription
             | Scalar::CodecEncoder
             | Scalar::Regex
             | Scalar::Captures
@@ -1881,6 +1882,7 @@ impl<'a> PlacementValidator<'a> {
             | Scalar::CryptoDigest
             | Scalar::FsDirectory
             | Scalar::FsDirCursor
+            | Scalar::ProcessSignalSubscription
             | Scalar::CodecEncoder => true,
             Scalar::HttpReadStream | Scalar::HttpSseStream => false,
             Scalar::DynArray(PrimScalar::String) => false,
@@ -1988,6 +1990,7 @@ impl<'a> PlacementValidator<'a> {
             | Ty::CryptoDigest
             | Ty::FsDirectory
             | Ty::FsDirCursor
+            | Ty::ProcessSignalSubscription
             | Ty::CodecEncoder
             | Ty::Buffer
             | Ty::SignatureKey(_)
@@ -2485,6 +2488,7 @@ impl<'a> Validator<'a> {
             | Ty::CryptoDigest
             | Ty::FsDirectory
             | Ty::FsDirCursor
+            | Ty::ProcessSignalSubscription
             | Ty::CodecEncoder
             | Ty::Buffer
             | Ty::SignatureKey(_)
@@ -2559,6 +2563,7 @@ impl<'a> Validator<'a> {
             | Scalar::CryptoDigest
             | Scalar::FsDirectory
             | Scalar::FsDirCursor
+            | Scalar::ProcessSignalSubscription
             | Scalar::CodecEncoder
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
@@ -3537,6 +3542,7 @@ impl<'a> BodyValidator<'a> {
             | Ty::CryptoDigest
             | Ty::FsDirectory
             | Ty::FsDirCursor
+            | Ty::ProcessSignalSubscription
             | Ty::CodecEncoder
             | Ty::Buffer
             | Ty::SignatureKey(_)
@@ -3859,6 +3865,7 @@ impl<'a> BodyValidator<'a> {
             | Scalar::CryptoDigest
             | Scalar::FsDirectory
             | Scalar::FsDirCursor
+            | Scalar::ProcessSignalSubscription
             | Scalar::CodecEncoder
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
@@ -9898,6 +9905,7 @@ impl<'a> BodyValidator<'a> {
             | Ty::CryptoDigest
             | Ty::FsDirectory
             | Ty::FsDirCursor
+            | Ty::ProcessSignalSubscription
             | Ty::CodecEncoder
             | Ty::Buffer
             | Ty::SignatureKey(_)

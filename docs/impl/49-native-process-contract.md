@@ -1,6 +1,6 @@
 # Native process observation and control
 
-Status: **IMPLEMENTING — common child capability; signal subscription follows separately**.
+Status: **IMPLEMENTING — common child capability and explicit signal subscription**.
 Baseline: `4cb14895a06e67f32ee72383b53afe72cd8e5555`.
 This ledger owns the common Linux/macOS capability selected from R65. It refines
 [plan 48](48-process-portability-and-lifecycle-plan.md). No administrator account, registered service, privileged helper, VM,
@@ -533,3 +533,64 @@ observed totals of 1,048,576 and 67,108,864 bytes. Fresh-process maximum RSS was
 11,864 and 11,868 KiB respectively. This is a local bounded-retention observation,
 not a throughput promise or a cross-platform benchmark result. Native macOS code
 and test compilation is checked separately; execution remains a macOS owner run.
+
+
+## Signal capability implementation evidence
+
+`process_signal.rs` owns the permanent generation/selected/pending word and the
+retryable disposition-restoration state. Creation and restoration take the
+existing process-launch lock before the subscription reservation, preserving
+one lock order; handlers take neither lock. `ProcessLiveKind` shares exact
+producer signatures among source checking, checked HIR, MIR and LLVM.
+
+The closure matrix above maps signal cells to these concrete owners:
+
+- `m11_process_signals::signal_owner_import_move_close_and_drop` covers imported
+  natural records, Result, generic transfer, owned/borrowed helpers, overlap,
+  explicit idempotent close and Drop-only release in whole/per-unit executables.
+- `native_delivery_and_child_disposition_reset` covers actual parent delivery,
+  Option<signal> ABI, and default dispositions in the executed child.
+- `signal_owner_rejects_forbidden_carriers_and_shared_mutation` covers direct
+  collections, tuple/box/out placement, printing, duplicate moves and shared or
+  immutable mutation. The existing recursive native-control classifier owns
+  Send, C layout and closure restrictions.
+- Runtime `process_signal::tests` covers field-order coalescing, stale captured
+  generations, selected-bit cancellation, exhaustion, empty/overlap/blocked
+  selection, every partial installation and restoration position, restored
+  pending-signal redelivery, retry progress, foreign-action detection and
+  malformed/aliased native outputs rejected before state changes.
+- `live_process_records_and_writable_backing` and
+  `live_process_mir_contract_matrix` include all three signal operations in their
+  malformed receiver, arity, output and producer-kind sweeps. Canonical graph
+  owners encode and independently decode [76]/[54], rejecting their next unknown
+  neighbors. The native export/declaration owner covers the four new entries.
+
+The signal owner allocates one fixed native shell at explicit construction;
+next and close allocate no buffers and retain no queue or owner-backed handler
+storage. No throughput or delivery-latency promise is introduced.
+
+`scripts/test-process-native.sh` is the local/CI parity owner on Linux and macOS;
+it builds the runtime before running native and whole/per-unit process suites.
+
+### Reopened native observation test axis
+
+The capture/readiness owner uses `printf x; exec sleep 30`, so one PID owns the
+pipe writer and a shell descendant cannot race the EOF assertion. It observes
+pipe readiness separately from process status. The retained-group owner compares
+its pre-reap result with an independent native `kill(-pid, 0)` while WNOWAIT pins
+the terminal leader; kernel-specific ESRCH or EPERM is encoded through the shared
+error model. Reaping then unconditionally revokes the API authority with Invalid.
+These cells distinguish native observation, error encoding, pipe lifetime and
+owner lifetime on both Linux and macOS without promising a zombie-group result.
+
+Darwin registration/exit transition closure: XNU proc_exit drains process
+references before potentially blocking exit cleanup and before publishing wait
+status. An EVFILT_PROC ESRCH can therefore precede a WNOWAIT termination result.
+The pinned direct-child owner retains a fixed missed-event bit and samples only
+that child's WNOWAIT status in at-most-1ms native wait chunks within the original
+finite poll budget. It does not wait for exit during launch, reap to manufacture
+readiness, restart the deadline, scan processes or add a helper. Other registration
+errors retain normal native-error behavior. The parameterized native
+registration_exit_window_retains_finite_status_observation owner injects ESRCH
+while status is pending, verifies zero/finite timeout and subsequent termination,
+and checks an independent permission error is preserved.

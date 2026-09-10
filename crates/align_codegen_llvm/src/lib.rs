@@ -5259,7 +5259,7 @@ fn native_owner_mir_contract<'a>(
                 }
                 let actual = xml_operand_base_ty(function,operand).unwrap_or(Ty::Error);
                 let expected = match input { Input::Owner(ty) => *ty, Input::Integer => i64_ty,
-                    Input::Bool => Ty::Bool, Input::OutBytes => bytes, Input::Readiness | Input::Signal => actual };
+                    Input::Bool => Ty::Bool, Input::OutBytes => bytes, Input::Readiness | Input::Signal | Input::SignalSet => actual };
                 let requirement = if index==0 && kind.exclusive() && matches!(input,Input::Owner(_)) { write } else { read };
                 contract.operands.push((operand,expected,requirement));
             }
@@ -12893,6 +12893,7 @@ fn validate_tagged_program_inner(
                 | Scalar::CryptoDigest
                 | Scalar::FsDirectory
                 | Scalar::FsDirCursor
+                | Scalar::ProcessSignalSubscription
                 | Scalar::CodecEncoder
                 | Scalar::SignatureKey(_)
                 | Scalar::Regex
@@ -13039,6 +13040,7 @@ fn validate_tagged_program_inner(
                         | Ty::CryptoDigest
                         | Ty::FsDirectory
                         | Ty::FsDirCursor
+                        | Ty::ProcessSignalSubscription
                         | Ty::CodecEncoder
                         | Ty::SignatureKey(_)
                         | Ty::StrFinder
@@ -16362,6 +16364,7 @@ fn tagged_child(payload: Scalar) -> Option<u32> {
         | Scalar::CryptoDigest
         | Scalar::FsDirectory
         | Scalar::FsDirCursor
+        | Scalar::ProcessSignalSubscription
         | Scalar::CodecEncoder
         | Scalar::SignatureKey(_)
         | Scalar::Regex
@@ -16581,6 +16584,7 @@ fn abi_type<'c>(
         | Ty::CryptoDigest
         | Ty::FsDirectory
         | Ty::FsDirCursor
+        | Ty::ProcessSignalSubscription
         | Ty::CodecEncoder
         | Ty::ArrayBuilder(_)
         | Ty::VecArrayBuilder(..)
@@ -16947,7 +16951,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::Reader | Scalar::Writer | Scalar::Logger | Scalar::XmlReader => {
             unreachable!("an I/O/logger/XML handle is not a box/array payload")
         }
-        Scalar::Buffer | Scalar::CryptoDigest | Scalar::FsDirectory | Scalar::FsDirCursor | Scalar::CodecEncoder | Scalar::SignatureKey(_) => {
+        Scalar::Buffer | Scalar::CryptoDigest | Scalar::FsDirectory | Scalar::FsDirCursor | Scalar::ProcessSignalSubscription | Scalar::CodecEncoder | Scalar::SignatureKey(_) => {
             unreachable!("a buffer/key handle is not a box/array payload")
         }
         Scalar::CodecBatch
@@ -17062,6 +17066,7 @@ fn handle_free_key(ty: Ty) -> Option<RuntimeKey> {
         Ty::CryptoDigest => RuntimeKey::CryptoDigestFree,
         Ty::FsDirectory => RuntimeKey::FsDirectoryFree,
         Ty::FsDirCursor => RuntimeKey::FsCursorFree,
+        Ty::ProcessSignalSubscription => RuntimeKey::ProcessSignalFree,
         Ty::SignatureKey(_) => RuntimeKey::CryptoKeyFree,
         Ty::File => RuntimeKey::IoFileFree,
         Ty::Regex => RuntimeKey::RegexFree,
@@ -24190,10 +24195,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             let (pointer,length) = self.split_str(operand)?;
                             native_args.push(pointer.into()); native_args.push(length.into());
                         }
-                        Input::Readiness => {
+                        Input::Readiness | Input::SignalSet => {
                             let record = self.operand(operand)?.into_struct_value();
                             let mut mask = self.ctx.i32_type().const_zero();
-                            for index in 0..3 {
+                            for index in 0..if *input == Input::SignalSet { 4 } else { 3 } {
                                 let bit = self.builder.build_extract_value(record,index,"interest").map_err(|e|self.err(e))?.into_int_value();
                                 let bit = self.builder.build_int_z_extend(bit,self.ctx.i32_type(),"interest.bit").map_err(|e|self.err(e))?;
                                 let shifted = self.builder.build_left_shift(bit,self.ctx.i32_type().const_int(u64::from(index),false),"interest.shift").map_err(|e|self.err(e))?;
@@ -24230,6 +24235,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     ProcessLiveKind::RunBytesStatus => RuntimeKey::RunBytesStatus,
                     ProcessLiveKind::SignalNumber => RuntimeKey::ProcessSignalNumber,
                     ProcessLiveKind::ProcessTable => RuntimeKey::ProcessTable,
+                    ProcessLiveKind::SignalNew => RuntimeKey::ProcessSignals,
+                    ProcessLiveKind::SignalNext => RuntimeKey::ProcessSignalNext,
+                    ProcessLiveKind::SignalClose => RuntimeKey::ProcessSignalClose,
                 };
                 let call = self.builder.build_call(self.runtime(key),&native_args,"process.live").map_err(|e|self.err(e))?;
                 if !kind.fallible() && (kind.scratch() || *kind==ProcessLiveKind::CommandNewSession) {
@@ -26517,6 +26525,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             | Ty::CryptoDigest
             | Ty::FsDirectory
             | Ty::FsDirCursor
+            | Ty::ProcessSignalSubscription
             | Ty::CodecEncoder
             | Ty::ArrayBuilder(_)
             | Ty::VecArrayBuilder(..)
@@ -44193,7 +44202,7 @@ fn main() -> i32 = 0
     #[test]
     fn live_process_mir_contract_matrix() -> Result<(), &'static str> {
         use align_sema::process_live::ProcessLiveKind;
-        let base=mir("import std.process\nfn read(borrow mut child: child,out bytes:slice<u8>) -> Result<Option<i64>,Error> = child.read_stdout(bytes)\nfn status(borrow output:run_bytes) -> process.wait_result = output.status()\nfn main() {}\n");
+        let base=mir("import std.process\nfn read(borrow mut child: child,out bytes:slice<u8>) -> Result<Option<i64>,Error> = child.read_stdout(bytes)\nfn status(borrow output:run_bytes) -> process.wait_result = output.status()\nfn signals(selection: process.signal_set) -> Result<process.signal_subscription,Error> = process.signals(selection)\nfn next(borrow mut subscription: process.signal_subscription) -> Result<Option<process.signal>,Error> = subscription.next()\nfn close(borrow mut subscription: process.signal_subscription) -> Result<(),Error> = subscription.close()\nfn main() {}\n");
         assert!(validate_mir_producers(&base).is_ok(), "{:?}", validate_mir_producers(&base));
         let mut producers=0;
         for (fi,function) in base.fns.iter().enumerate() {
@@ -44207,7 +44216,7 @@ fn main() -> i32 = 0
                         let Stmt::Let(value,Rvalue::ProcessLive { kind,args,out })=&mut function.blocks[bi].stmts[si] else { return Err("process producer"); };
                         match mutation {
                             0=>args.clear(),
-                            1=>*out=None,
+                            1=>*out=if out.is_some() { None } else { Some(u32::MAX) },
                             2=>*out=Some(u32::MAX),
                             3=>*kind=ProcessLiveKind::CommandStart,
                             4=>function.value_tys[*value as usize]=Ty::Bool,
@@ -44218,7 +44227,7 @@ fn main() -> i32 = 0
                 }
             }
         }
-        assert_eq!(producers,2);
+        assert_eq!(producers,5);
         for mode in [align_ast::ParamMode::ByValue,align_ast::ParamMode::Borrow,align_ast::ParamMode::BorrowMut] {
             let mut bad=base.clone();
             let function=bad.fns.iter_mut().find(|function|function.name.as_str()=="read").ok_or("read")?;

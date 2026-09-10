@@ -174,6 +174,9 @@ pub enum ProcessLiveKind {
     RunBytesStatus,
     SignalNumber,
     ProcessTable,
+    SignalNew,
+    SignalNext,
+    SignalClose,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Input {
@@ -183,6 +186,7 @@ pub enum Input {
     OutBytes,
     Readiness,
     Signal,
+    SignalSet,
 }
 impl ProcessLiveKind {
     pub fn inputs(self) -> &'static [Input] {
@@ -201,6 +205,8 @@ impl ProcessLiveKind {
             Self::RunBytesStatus => &[Owner(Ty::RunBytes)],
             Self::SignalNumber => &[Signal],
             Self::ProcessTable => &[Integer],
+            Self::SignalNew => &[SignalSet],
+            Self::SignalNext | Self::SignalClose => &[Owner(Ty::ProcessSignalSubscription)],
         }
     }
     pub fn pure(self) -> bool {
@@ -223,6 +229,8 @@ impl ProcessLiveKind {
                 | Self::ChildReadStdout
                 | Self::ChildReadStderr
                 | Self::ChildPoll
+                | Self::SignalNext
+                | Self::SignalClose
         )
     }
     pub fn scratch(self) -> bool {
@@ -234,6 +242,7 @@ impl ProcessLiveKind {
                 | Self::ChildId
                 | Self::ChildKillGroup
                 | Self::SignalNumber
+                | Self::SignalClose
         )
     }
     pub fn from_method(receiver: Ty, name: &str) -> Option<Self> {
@@ -252,6 +261,8 @@ impl ProcessLiveKind {
             (Ty::Child, "group_members") => Self::ChildGroupMembers,
             (Ty::RunOutput, "status") => Self::RunOutputStatus,
             (Ty::RunBytes, "status") => Self::RunBytesStatus,
+            (Ty::ProcessSignalSubscription, "next") => Self::SignalNext,
+            (Ty::ProcessSignalSubscription, "close") => Self::SignalClose,
             _ => return None,
         })
     }
@@ -269,6 +280,7 @@ pub fn input_type(input: Input, structs: &[hir::StructDef], enums: &[hir::EnumDe
             signed: false,
         })),
         Input::Readiness => Ty::Struct(crate::fs_tree::record_id(structs, "process.readiness")?),
+        Input::SignalSet => Ty::Struct(crate::fs_tree::record_id(structs, "process.signal_set")?),
         Input::Signal => {
             Ty::Enum(u32::try_from(enums.iter().position(|e| e.name == "process.signal")?).ok()?)
         }
@@ -287,6 +299,11 @@ pub fn payload_type(
     Some(match kind {
         CommandNewSession | CommandStdoutTo | CommandStderrTo | ChildKillGroup => Ty::Unit,
         CommandStart => Ty::Child,
+        SignalNew => Ty::ProcessSignalSubscription,
+        SignalClose => Ty::Unit,
+        SignalNext => Ty::Option(Scalar::Enum(
+            u32::try_from(enums.iter().position(|e| e.name == "process.signal")?).ok()?,
+        )),
         ChildId | SignalNumber => Ty::Int(IntTy {
             bits: 64,
             signed: true,
