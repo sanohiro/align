@@ -146,7 +146,7 @@ unsafe fn candidates(
         if failure == 0 {
             return Ok(pid);
         }
-        if command.cmd.as_bytes().contains(&b'/') {
+        if command.target.direct_path() {
             return Err(failure);
         }
         match failure {

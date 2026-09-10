@@ -16170,7 +16170,7 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         | Scalar::CryptoDigest
         | Scalar::FsDirectory
         | Scalar::FsDirCursor
-        | Scalar::ProcessSignalSubscription
+        | Scalar::ProcessSignalSubscription | Scalar::FsMemoryWriter | Scalar::FsSealedFile | Scalar::ProcessImage | Scalar::ProcessUserNamespace | Scalar::Command
         | Scalar::CodecEncoder
         | Scalar::SignatureKey(_)
         | Scalar::Regex
@@ -19155,16 +19155,20 @@ fn lower_beneath_handle(
 /// Evaluate retained filesystem inputs in source order and reconstruct ordinary result carriers.
 fn lower_process_live(b: &mut Builder, kind: align_sema::process_live::ProcessLiveKind, args: &[hir::Expr], result_ty: Ty) -> Operand {
     let mut operands = Vec::with_capacity(args.len());
-    for argument in args {
-        operands.push(lower_required!(b, lower_expr(b,argument),Operand::Const(Const::Unit)));
+    for (index,argument) in args.iter().enumerate() {
+        let operand = if kind.consumes(index) { lower_expr(b,argument) } else { lower_borrowed_owned(b,argument) };
+        if !lowering_continues(b) { return Operand::Const(Const::Unit); }
+        operands.push(operand);
     }
+    for (index,argument) in args.iter().enumerate() { if kind.consumes(index) { null_moved_source(b,argument); } }
     let Some(payload) = align_sema::process_live::payload_type(kind,&b.structs,&b.enums) else {
         b.terminate(Term::Unreachable); return Operand::Const(Const::Unit);
     };
     let out = kind.scratch().then(|| b.new_slot(payload));
     let native_ty = if kind.fallible() { status_ty() } else if out.is_some() { Ty::Unit } else { payload };
     let value = b.fresh_value(native_ty);
-    b.push(Stmt::Let(value,Rvalue::ProcessLive { kind, args: operands, out }));
+    b.push(Stmt::Let(value,Rvalue::ProcessLive { kind, args: operands.clone(), out }));
+    for operand in &operands { drop_borrow_owners(b,operand); }
     if kind.fallible() {
         if let Some(out) = out { emit_open_handle_result(b,value,out,payload,result_ty) }
         else { lower_status_result(b,value,result_ty) }
@@ -22516,6 +22520,10 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::FsDirectory => "fs.directory".to_string(),
         Ty::FsDirCursor => "fs.dir_cursor".to_string(),
         Ty::ProcessSignalSubscription => "process.signal_subscription".to_string(),
+        Ty::FsMemoryWriter => "fs.memory_writer".to_string(),
+        Ty::FsSealedFile => "fs.sealed_file".to_string(),
+        Ty::ProcessImage => "process.image".to_string(),
+        Ty::ProcessUserNamespace => "process.user_namespace".to_string(),
         Ty::SignatureKey(kind) => kind.name().to_string(),
         Ty::ArrayBuilder(element) => {
             format!(

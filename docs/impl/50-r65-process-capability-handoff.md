@@ -1,6 +1,6 @@
 # R65: process capability implementation handoff
 
-Status: **IMPLEMENTING — reviewed design; common child capability in progress**.
+Status: **IMPLEMENTING — common and signal capabilities implemented; verified launch acceptance in progress**.
 Baseline: Align `4cb14895a06e67f32ee72383b53afe72cd8e5555`.
 This is the plan of record for completing R65. It selects the scope and remaining
 native mechanisms; [plan 49](49-native-process-contract.md) owns the exact common
@@ -271,6 +271,12 @@ retain the native entry. No dynamic dispatch or user-visible lifetime syntax.
 | process.user_namespace | 80 / 58 | Close namespace fd. |
 | process.child_scope | 81 / 59 | Complete scope cleanup/restoration above. |
 | process.member | 82 / 60 | Close process pidfd only. |
+| command (existing owner) | existing Ty 38 / new Scalar 61 | Existing command cleanup. |
+
+command_image returns the existing command owner inside Result, so its Scalar
+leaf is added to the ordinary native-owner carrier machinery. The existing
+canonical Ty tag is unchanged. Scalar 61 follows the six reserved R65 leaves;
+this does not create another command type or constructor ownership model.
 
 Plan 49 reserves 76/54 for signal_subscription. Canonical leaf goldens are the
 listed bytes; independent encode/decode checks reject unknown neighbors. Interface
@@ -388,7 +394,7 @@ import std.fs
 import std.process
 
 fn admit_image(borrow mut input: reader, max_bytes: i64) -> Result<process.image, Error> {
-    pending := fs.memory_file(fs.memory_kind.Executable, max_bytes)?
+    mut pending := fs.memory_file(fs.memory_kind.Executable, max_bytes)?
     mut chunk := buffer(65536)
     loop {
         count := input.read(chunk)?
@@ -474,3 +480,48 @@ HANDOFF and the external request register. R65 is design-ready (ACCEPTED in the
 register); it becomes ALIGN_MERGED only when all four capabilities are implemented
 and merged. Consumer verification remains consumer-owned. A request-batch release
 build is required after implementation, not for this design-only handoff.
+
+## Verified-launch implementation evidence
+
+The capability uses process_verified.rs for the native sealed/image/namespace
+owners and the shared process_launch Prepared/bootstrap path for their sole
+execution consumer. ProcessLiveKind owns HIR/MIR/native operation identity;
+MemorySeal consumes its receiver and MIR nulls that source once on both results.
+All other owner inputs use the existing stable shared/exclusive borrow rules.
+
+The closure matrix above is closed for capability 3 by these owners:
+
+- m11_process_verified::formation_and_carriers covers all four new leaves plus
+  command in imported generic record/sum/Option/Result carriers and forbidden
+  direct collection/tuple/box/out/multiple-move forms.
+- borrowed_arguments_remain_live_until_action rejects later-argument consumption
+  of an earlier image/file/namespace loan and shared write/seal attempts.
+- owned_control_flow_and_temporary_cleanup executes if/match/else/?/map_err,
+  loops, early exits, replacement, owned helpers and native cleanup under both
+  compilation modes. A MIR mutation removes a real sealed Drop and must expose
+  residual fds; the unmodified programs retain the initial fd count.
+- memory_seal_positional_read_and_consume and native seals_caps_poison_aliases_and_positional_prefix
+  cover cap rejection without poisoning, actual hard-error poisoning, empty and
+  positional reads, unchanged suffixes, mmap rejection, final native size and
+  write/grow/shrink/execute-bit alias attacks.
+- retained_executable_command_and_descriptor_authority and native inheritance_matrix
+  cover retained sources, repeated fd-selected execution, independent readonly
+  offsets, ordered/sparse slots, duplicate/range rejection and source fd flags.
+  The native ELF owner rejects each header discriminator before descriptor exec.
+- current_image_binding executes after unlinking only the fixture-owned running
+  executable; opened_namespace_and_running_main_image checks the native main
+  object and namespace type admission. Prepared namespace sandbox integration
+  retains the unprivileged qualification recorded in section 7.
+- native_layout_and_ranges checks alignment/overlap/ranges before output mutation.
+  live_process_records_and_writable_backing and live_process_mir_contract_matrix
+  mutate every new producer; canonical leaf goldens independently encode/decode
+  all four types and command Scalar 61. The declaration/export owner checks all
+  444 native signatures and each optional export profile.
+
+The fixed_scratch_resource_measurement local probe writes 4 MiB and 64 MiB with
+64 KiB scratch. RSS was 8072 -> 9404 KiB at the cold 4 MiB case and 9532 -> 9532
+KiB at 64 MiB. This is resource evidence, not a timing or correctness threshold.
+Native unsupported-acquisition cases are in the shared macOS suite; valid inputs
+return the platform ENOTSUP code and invalid input still takes precedence.
+Capability 4 owns the scope-specific matrix rows; this capability adds no scope
+constructor or partially usable descendant owner.

@@ -24,6 +24,7 @@ mod crypto_digest;
 mod os_host;
 mod process_live;
 mod process_signal;
+mod process_verified;
 mod process_launch;
 mod process_table;
 mod fs_directory;
@@ -15085,7 +15086,7 @@ pub unsafe extern "C" fn align_rt_process_spawn(
         Ok(value) => value, Err(error) => return error,
     };
     unsafe { *out = core::ptr::null_mut(); }
-    let command = Command { cmd, argv, cwd: None, timeout_ns: 0, max_capture_bytes: None,
+    let command = Command { target: CommandTarget::Path(cmd), inheritance: std::collections::BTreeMap::new(), argv, cwd: None, timeout_ns: 0, max_capture_bytes: None,
         env: Vec::new(), env_clear: false, new_session: false, stdout_binding: None, stderr_binding: None };
     match process_launch::launch(&command,false,false) {
         Ok(child) => { unsafe { *out = Box::into_raw(child); } 0 }
@@ -15188,17 +15189,20 @@ pub unsafe extern "C" fn align_rt_process_exec(
 // The #1 correctness point is the TWO-pipe concurrent `poll` drain (P7): a child that fills its
 // stderr pipe while the parent only reads stdout would deadlock — so both fds are drained together.
 
-/// A `command` (`std.process` Slice 4) — a Move builder handle owning the `execvp` lookup path
-/// (`cmd`), the child's full marshalled argv (incl. `argv[0]`, P5), and an optional working
-/// directory. Built by [`align_rt_command_new`], configured by [`align_rt_command_cwd`], run by
-/// [`align_rt_command_run`], freed by [`align_rt_command_free`]. Slice 4 carries argv + cwd; Slice 5
-/// adds `timeout_ns`; Slice 6 adds the `env` overrides + `env_clear`. `cmd` is stored SEPARATELY from `argv` because the `execvp`
-/// lookup path and `argv[0]` are independent (P5): the child runs `execvp(cmd, argv)`.
+/// A Move command owns its selected path or image, full argv (including argv[0]),
+/// configuration and explicit inherited authorities. Each launch prepares an
+/// independent descriptor map; cached configuration is never mutated by launch.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // Image acquisition fails before construction on unsupported hosts.
+enum CommandTarget { Path(std::ffi::CString), Image(std::os::fd::OwnedFd) }
+impl CommandTarget {
+    fn direct_path(&self) -> bool { matches!(self, Self::Path(path) if path.as_bytes().contains(&b'/')) }
+}
 pub struct Command {
+    target: CommandTarget,
+    inheritance: std::collections::BTreeMap<i32, process_verified::Inheritance>,
     new_session: bool,
     stdout_binding: Option<std::os::fd::OwnedFd>,
     stderr_binding: Option<std::os::fd::OwnedFd>,
-    cmd: std::ffi::CString,
     argv: Vec<std::ffi::CString>,
     cwd: Option<std::ffi::CString>,
     /// The run timeout in nanoseconds set by [`align_rt_command_timeout`], or `0` for "no timeout"
@@ -15857,7 +15861,7 @@ pub unsafe extern "C" fn align_rt_command_new(
     };
     Box::into_raw(Box::new(Command {
         new_session: false, stdout_binding: None, stderr_binding: None,
-        cmd: cmd_c,
+        target: CommandTarget::Path(cmd_c), inheritance: std::collections::BTreeMap::new(),
         argv: argv_owned,
         cwd: None,
         timeout_ns: 0,

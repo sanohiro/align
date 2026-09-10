@@ -26,7 +26,8 @@ independent-review corrections are complete. The next work is the four coherent
 implementation capabilities in plan 50: common process operations, explicit
 signals, verified launch authority, then the exclusive child scope. No further
 platform/helper design decision is deferred to the implementation model.
-Implementation is in progress in capability 1 (the common native process workflow).
+Common process operations and explicit signal ownership are implemented. Verified
+launch authority is in acceptance; exclusive child_scope follows as capability 4.
 Consumer adoption remains external.
 
 `std.fs` ordinary directory operations are implemented: `fs.create_dir` creates

@@ -164,6 +164,7 @@ enum RuntimeAbiShape {
     A132,
     A133,
     A134,
+    A135,
 }
 
 #[derive(Clone, Copy)]
@@ -629,6 +630,23 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
         RuntimeKey::ProcessSignalNext => RuntimeAbi { key, symbol: "align_rt_process_signal_next", shape: RuntimeAbiShape::A19 },
         RuntimeKey::ProcessSignalClose => RuntimeAbi { key, symbol: "align_rt_process_signal_close", shape: RuntimeAbiShape::A03 },
         RuntimeKey::ProcessSignalFree => RuntimeAbi { key, symbol: "align_rt_process_signal_free", shape: RuntimeAbiShape::A62 },
+        RuntimeKey::FsMemoryFile => RuntimeAbi { key, symbol: "align_rt_fs_memory_file", shape: RuntimeAbiShape::A135 },
+        RuntimeKey::FsMemoryWrite => RuntimeAbi { key, symbol: "align_rt_fs_memory_write", shape: RuntimeAbiShape::A20 },
+        RuntimeKey::FsMemorySeal => RuntimeAbi { key, symbol: "align_rt_fs_memory_seal", shape: RuntimeAbiShape::A19 },
+        RuntimeKey::FsMemoryFree => RuntimeAbi { key, symbol: "align_rt_fs_memory_free", shape: RuntimeAbiShape::A62 },
+        RuntimeKey::FsSealedLen => RuntimeAbi { key, symbol: "align_rt_fs_sealed_len", shape: RuntimeAbiShape::A29 },
+        RuntimeKey::FsSealedReadAt => RuntimeAbi { key, symbol: "align_rt_fs_sealed_read_at", shape: RuntimeAbiShape::A12 },
+        RuntimeKey::FsSealedFree => RuntimeAbi { key, symbol: "align_rt_fs_sealed_free", shape: RuntimeAbiShape::A62 },
+        RuntimeKey::ProcessExecutable => RuntimeAbi { key, symbol: "align_rt_process_executable", shape: RuntimeAbiShape::A19 },
+        RuntimeKey::ProcessImageLen => RuntimeAbi { key, symbol: "align_rt_process_image_len", shape: RuntimeAbiShape::A29 },
+        RuntimeKey::ProcessImageReadAt => RuntimeAbi { key, symbol: "align_rt_process_image_read_at", shape: RuntimeAbiShape::A12 },
+        RuntimeKey::ProcessImageFree => RuntimeAbi { key, symbol: "align_rt_process_image_free", shape: RuntimeAbiShape::A62 },
+        RuntimeKey::CommandImage => RuntimeAbi { key, symbol: "align_rt_command_image", shape: RuntimeAbiShape::A22 },
+        RuntimeKey::ProcessCurrentImage => RuntimeAbi { key, symbol: "align_rt_process_current_image", shape: RuntimeAbiShape::A03 },
+        RuntimeKey::ProcessUserNamespace => RuntimeAbi { key, symbol: "align_rt_process_user_namespace", shape: RuntimeAbiShape::A08 },
+        RuntimeKey::ProcessUserNamespaceFree => RuntimeAbi { key, symbol: "align_rt_process_user_namespace_free", shape: RuntimeAbiShape::A62 },
+        RuntimeKey::CommandInheritFile => RuntimeAbi { key, symbol: "align_rt_command_inherit_file", shape: RuntimeAbiShape::A20 },
+        RuntimeKey::CommandInheritNamespace => RuntimeAbi { key, symbol: "align_rt_command_inherit_namespace", shape: RuntimeAbiShape::A20 },
         RuntimeKey::ProcessTable => RuntimeAbi { key, symbol: "align_rt_process_table", shape: RuntimeAbiShape::A119 },
         RuntimeKey::ChildWait => RuntimeAbi {
             key,
@@ -2200,15 +2218,15 @@ pub(super) fn runtime_abis() -> impl Iterator<Item = RuntimeAbi> {
 }
 
 pub(super) fn validate_registry() -> Result<(), String> {
-    if RuntimeKey::ALL.len() != 409 || keyed_runtime_abis().len() != 409 {
+    if RuntimeKey::ALL.len() != 426 || keyed_runtime_abis().len() != 426 {
         return Err("runtime ABI registry invariant: key-count".to_string());
     }
-    if runtime_abis().count() != 427 {
+    if runtime_abis().count() != 444 {
         return Err("runtime ABI registry invariant: base-count".to_string());
     }
 
     let mut keys = HashSet::with_capacity(RuntimeKey::ALL.len());
-    let mut symbols = HashSet::with_capacity(427);
+    let mut symbols = HashSet::with_capacity(444);
     for abi in keyed_runtime_abis() {
         let key = abi
             .runtime_key()
@@ -3842,6 +3860,10 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
             ret: NativeReturn::I32, params: &[NativeType::Ptr, NativeType::I32, NativeType::I64, NativeType::Ptr],
             return_noalias: false, fn_attrs: &[], memory_argmem_read: false, read_ptr_params: &[],
         },
+        RuntimeAbiShape::A135 => RuntimeAbiShapeSpec {
+            ret: NativeReturn::I32, params: &[NativeType::I32,NativeType::I64,NativeType::Ptr],
+            return_noalias: false, fn_attrs: &[], memory_argmem_read: false, read_ptr_params: &[],
+        },
         RuntimeAbiShape::A134 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32, params: &[NativeType::I32, NativeType::Ptr],
             return_noalias: false, fn_attrs: &[], memory_argmem_read: false, read_ptr_params: &[],
@@ -3923,17 +3945,17 @@ mod tests {
         );
         validate_registry().unwrap();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 427);
+        assert_eq!(rows.len(), 444);
         assert_eq!(
             rows.iter().map(|row| row.key).collect::<HashSet<_>>().len(),
-            427
+            444
         );
         assert_eq!(
             rows.iter()
                 .map(|row| row.symbol)
                 .collect::<HashSet<_>>()
                 .len(),
-            427
+            444
         );
         for (key, row) in RuntimeKey::ALL.into_iter().zip(keyed_runtime_abis()) {
             assert_eq!(row.key, RuntimeAbiId::Keyed(key));
@@ -3963,7 +3985,7 @@ mod tests {
     fn runtime_abi_extern_type_matrix_is_exact_for_every_row_and_ordinal() {
         let ctx = inkwell::context::Context::create();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 427);
+        assert_eq!(rows.len(), 444);
 
         for row in rows {
             let symbol = row.symbol;
