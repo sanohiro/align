@@ -271,7 +271,8 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   print(\"spawned\")
   return Ok(())
 }";
-    let out = build_and_run_args("m11proc-drop", prog, &["/bin/true"]);
+    let Some(tru) = coreutil("true") else { return };
+    let out = build_and_run_args("m11proc-drop", prog, &[&tru]);
     assert!(out.status.success(), "drop-without-wait: status={} stdout={} stderr={}", out.status, String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "spawned");
 }
@@ -460,9 +461,8 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 /// recycled pid, so no stray signal is sent. The first wait succeeds; the `kill`'s `Err` arm runs.
 #[test]
 fn kill_after_wait_is_err() {
-    if !backend_available() || !std::path::Path::new("/bin/true").exists() {
-        return;
-    }
+    if !backend_available() { return; }
+    let Some(tru) = coreutil("true") else { return };
     let prog = "\
 import std.process
 pub fn main(args: array<str>) -> Result<(), Error> {
@@ -480,7 +480,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   }
   return Ok(())
 }";
-    let out = build_and_run_args("m11proc-kill-reaped", prog, &["/bin/true"]);
+    let out = build_and_run_args("m11proc-kill-reaped", prog, &[&tru]);
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0\nkill-err", "kill after wait (reaped) → clean Err");
 }
 
