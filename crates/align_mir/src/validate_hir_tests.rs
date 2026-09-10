@@ -16007,6 +16007,7 @@ const fn delegation_scalar_sweep_tripwire(scalar: &Scalar) {
         | Scalar::CryptoDigest
         | Scalar::FsDirectory
         | Scalar::FsDirCursor
+        | Scalar::ProcessSignalSubscription
         | Scalar::CodecEncoder
         | Scalar::Buffer
         | Scalar::SignatureKey(_)
@@ -18413,9 +18414,9 @@ fn retained_tree_hidden_collection_owners() -> Result<(), &'static str> {
 
 #[test]
 fn live_process_records_and_writable_backing() -> Result<(), &'static str> {
-    let base=checked_source_program("import std.process\nfn start(command: command) -> Result<child,Error> = command.start()\nfn read(borrow mut child: child,out bytes:slice<u8>) -> Result<Option<i64>,Error> = child.read_stdout(bytes)\nfn result(borrow output:run_bytes) -> process.wait_result = output.status()\nfn main() {}\n");
+    let base=checked_source_program("import std.process\nfn start(command: command) -> Result<child,Error> = command.start()\nfn read(borrow mut child: child,out bytes:slice<u8>) -> Result<Option<i64>,Error> = child.read_stdout(bytes)\nfn result(borrow output:run_bytes) -> process.wait_result = output.status()\nfn signals(selection: process.signal_set) -> Result<process.signal_subscription,Error> = process.signals(selection)\nfn next(borrow mut subscription: process.signal_subscription) -> Result<Option<process.signal>,Error> = subscription.next()\nfn close(borrow mut subscription: process.signal_subscription) -> Result<(),Error> = subscription.close()\nfn main() {}\n");
     assert!(!is_empty(&lower_program(&base)));
-    for name in ["start","read","result"] {
+    for name in ["start","read","result","signals","next","close"] {
         for mutation in 0..5 {
             let mut bad=base.clone();
             let function=bad.fns.iter_mut().find(|function|function.name==name).ok_or("function")?;

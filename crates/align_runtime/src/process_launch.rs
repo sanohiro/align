@@ -786,9 +786,9 @@ pub unsafe extern "C" fn align_rt_command_start(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    fn isolated(name: &str, marker: &str) {
+    pub(crate) fn isolated(name: &str, marker: &str) {
         use std::os::unix::process::CommandExt;
         struct Guard(std::process::Child, bool);
         impl Drop for Guard {

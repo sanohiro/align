@@ -1581,6 +1581,7 @@ fn decode_scalar(cursor: &mut DecodeCursor<'_>) -> Result<Scalar, CanonicalCodec
         51 => Ok(Scalar::CryptoDigest),
         52 => Ok(Scalar::FsDirectory),
         53 => Ok(Scalar::FsDirCursor),
+        54 => Ok(Scalar::ProcessSignalSubscription),
         _ => Err(CanonicalCodecError::UnknownTag),
     }
 }
@@ -1737,6 +1738,7 @@ fn decode_ty(cursor: &mut DecodeCursor<'_>) -> Result<Ty, CanonicalCodecError> {
         73 => Ok(Ty::CryptoDigest),
         74 => Ok(Ty::FsDirectory),
         75 => Ok(Ty::FsDirCursor),
+        76 => Ok(Ty::ProcessSignalSubscription),
         _ => Err(CanonicalCodecError::UnknownTag),
     }
 }
@@ -2549,6 +2551,7 @@ fn scalar(
             Scalar::CryptoDigest => leaf!(51),
             Scalar::FsDirectory => leaf!(52),
             Scalar::FsDirCursor => leaf!(53),
+            Scalar::ProcessSignalSubscription => leaf!(54),
             Scalar::HttpUpgrade => leaf!(47),
             Scalar::XmlReader => leaf!(48),
             Scalar::HttpClient => leaf!(49),
@@ -2791,6 +2794,7 @@ fn ty(
             Ty::CryptoDigest => leaf!(73),
             Ty::FsDirectory => leaf!(74),
             Ty::FsDirCursor => leaf!(75),
+            Ty::ProcessSignalSubscription => leaf!(76),
             Ty::HttpUpgrade => leaf!(71),
             Ty::XmlReader => leaf!(72),
             Ty::Param(_) | Ty::SoaParam(_) | Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error => {
@@ -3626,6 +3630,7 @@ mod tests {
             Ty::CryptoDigest,
             Ty::FsDirectory,
             Ty::FsDirCursor,
+            Ty::ProcessSignalSubscription,
             Ty::Reader,
             Ty::Buffer,
             Ty::ArrayBuilder(Scalar::Bool),
@@ -3710,6 +3715,7 @@ mod tests {
             Scalar::CryptoDigest,
             Scalar::FsDirectory,
             Scalar::FsDirCursor,
+            Scalar::ProcessSignalSubscription,
             Scalar::Buffer,
             Scalar::Regex,
             Scalar::Captures,
@@ -3748,7 +3754,7 @@ mod tests {
             assert_eq!(CanonicalTy::decode(&expected).as_ref(), Ok(&encoded));
             assert!(CanonicalTy::decode(&expected[..6]).is_err());
         }
-        for tag in 54..=u8::MAX {
+        for tag in 55..=u8::MAX {
             assert!(CanonicalTy::decode(&[3, 0, 0, 0, 0, 4, tag]).is_err());
         }
 
@@ -3799,6 +3805,8 @@ mod tests {
             (Ty::CryptoDigest, vec![3, 0, 0, 0, 0, 73]),
             (Ty::FsDirectory, vec![3, 0, 0, 0, 0, 74]),
             (Ty::FsDirCursor, vec![3, 0, 0, 0, 0, 75]),
+            (Ty::ProcessSignalSubscription, vec![3, 0, 0, 0, 0, 76]),
+            (Ty::Option(Scalar::ProcessSignalSubscription), vec![3, 0, 0, 0, 0, 4, 54]),
             (Ty::Option(Scalar::FsDirectory), vec![3, 0, 0, 0, 0, 4, 52]),
             (Ty::Option(Scalar::FsDirCursor), vec![3, 0, 0, 0, 0, 4, 53]),
             (Ty::Option(Scalar::CryptoDigest), vec![3, 0, 0, 0, 0, 4, 51]),
@@ -3888,8 +3896,8 @@ mod tests {
         error(&[3, 0, 0, 0, 0, 0xff], CanonicalCodecError::UnknownTag);
         error(&[3, 0, 0, 0, 0, 63], CanonicalCodecError::Truncated);
         error(&[3, 0, 0, 0, 0, 4, 39], CanonicalCodecError::Truncated);
-        error(&[3, 0, 0, 0, 0, 76], CanonicalCodecError::UnknownTag);
-        error(&[3, 0, 0, 0, 0, 4, 54], CanonicalCodecError::UnknownTag);
+        error(&[3, 0, 0, 0, 0, 77], CanonicalCodecError::UnknownTag);
+        error(&[3, 0, 0, 0, 0, 4, 55], CanonicalCodecError::UnknownTag);
         error(&[3, 0, 0, 0, 0], CanonicalCodecError::Truncated);
         error(
             &[3, 0, 0, 0, 0, 71, 0],
@@ -4248,7 +4256,7 @@ mod tests {
             Scalar::Logger => [40],
             Scalar::CodecBatch => [41], Scalar::CodecI64Column => [42],
             Scalar::CodecF64Column => [43], Scalar::CodecBoolColumn => [44],
-            Scalar::CodecStrColumn => [45], Scalar::CodecEncoder => [46], Scalar::CryptoDigest => [51], Scalar::FsDirectory => [52], Scalar::FsDirCursor => [53],
+            Scalar::CodecStrColumn => [45], Scalar::CodecEncoder => [46], Scalar::CryptoDigest => [51], Scalar::FsDirectory => [52], Scalar::FsDirCursor => [53], Scalar::ProcessSignalSubscription => [54],
             Scalar::HttpUpgrade => [47],
             Scalar::XmlReader => [48],
             Scalar::HttpClient => [49],
@@ -4308,7 +4316,7 @@ mod tests {
             Ty::Logger => [64],
             Ty::CodecBatch => [65], Ty::CodecI64Column => [66],
             Ty::CodecF64Column => [67], Ty::CodecBoolColumn => [68],
-            Ty::CodecStrColumn => [69], Ty::CodecEncoder => [70], Ty::CryptoDigest => [73], Ty::FsDirectory => [74], Ty::FsDirCursor => [75],
+            Ty::CodecStrColumn => [69], Ty::CodecEncoder => [70], Ty::CryptoDigest => [73], Ty::FsDirectory => [74], Ty::FsDirCursor => [75], Ty::ProcessSignalSubscription => [76],
             Ty::HttpUpgrade => [71], Ty::XmlReader => [72],
             Ty::dyn_aggregate_array(AggregateArrayElem::FixedStructArray(1, 2))
                 => [59, 3, 1, 0x10, 0, 0, 2, 0, 0, 0],

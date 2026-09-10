@@ -16170,6 +16170,7 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         | Scalar::CryptoDigest
         | Scalar::FsDirectory
         | Scalar::FsDirCursor
+        | Scalar::ProcessSignalSubscription
         | Scalar::CodecEncoder
         | Scalar::SignatureKey(_)
         | Scalar::Regex
@@ -22514,6 +22515,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::CryptoDigest => "crypto.digest".to_string(),
         Ty::FsDirectory => "fs.directory".to_string(),
         Ty::FsDirCursor => "fs.dir_cursor".to_string(),
+        Ty::ProcessSignalSubscription => "process.signal_subscription".to_string(),
         Ty::SignatureKey(kind) => kind.name().to_string(),
         Ty::ArrayBuilder(element) => {
             format!(

@@ -379,6 +379,7 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             | Scalar::CryptoDigest
             | Scalar::FsDirectory
             | Scalar::FsDirCursor
+            | Scalar::ProcessSignalSubscription
             | Scalar::CodecEncoder
             | Scalar::Buffer
             | Scalar::SignatureKey(_)
@@ -532,6 +533,7 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             | Ty::CryptoDigest
             | Ty::FsDirectory
             | Ty::FsDirCursor
+            | Ty::ProcessSignalSubscription
             | Ty::CodecEncoder
             | Ty::Buffer
             | Ty::SignatureKey(_)

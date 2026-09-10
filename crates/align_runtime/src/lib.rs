@@ -23,6 +23,7 @@ mod crypto_asymmetric;
 mod crypto_digest;
 mod os_host;
 mod process_live;
+mod process_signal;
 mod process_launch;
 mod process_table;
 mod fs_directory;

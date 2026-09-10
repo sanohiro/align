@@ -502,6 +502,12 @@ jobs:
           scripts/run-quiet.sh "CI test: owned JSON" --
           scripts/cargo.sh test -p align_driver --test m5_owned_json --locked
 
+      - name: Native process and signal regressions
+        timeout-minutes: 15
+        run: >
+          scripts/run-quiet.sh "CI test: native process and signals" --
+          scripts/test-process-native.sh
+
       - name: Bounded PR test gate
         if: matrix.lint
         run: scripts/test-pr.sh

@@ -1,6 +1,6 @@
 # Native process observation and control
 
-Status: **IMPLEMENTING — common child capability; signal subscription follows separately**.
+Status: **IMPLEMENTING — common child capability and explicit signal subscription**.
 Baseline: `4cb14895a06e67f32ee72383b53afe72cd8e5555`.
 This ledger owns the common Linux/macOS capability selected from R65. It refines
 [plan 48](48-process-portability-and-lifecycle-plan.md). No administrator account, registered service, privileged helper, VM,
@@ -533,3 +533,41 @@ observed totals of 1,048,576 and 67,108,864 bytes. Fresh-process maximum RSS was
 11,864 and 11,868 KiB respectively. This is a local bounded-retention observation,
 not a throughput promise or a cross-platform benchmark result. Native macOS code
 and test compilation is checked separately; execution remains a macOS owner run.
+
+
+## Signal capability implementation evidence
+
+`process_signal.rs` owns the permanent generation/selected/pending word and the
+retryable disposition-restoration state. Creation and restoration take the
+existing process-launch lock before the subscription reservation, preserving
+one lock order; handlers take neither lock. `ProcessLiveKind` shares exact
+producer signatures among source checking, checked HIR, MIR and LLVM.
+
+The closure matrix above maps signal cells to these concrete owners:
+
+- `m11_process_signals::signal_owner_import_move_close_and_drop` covers imported
+  natural records, Result, generic transfer, owned/borrowed helpers, overlap,
+  explicit idempotent close and Drop-only release in whole/per-unit executables.
+- `native_delivery_and_child_disposition_reset` covers actual parent delivery,
+  Option<signal> ABI, and default dispositions in the executed child.
+- `signal_owner_rejects_forbidden_carriers_and_shared_mutation` covers direct
+  collections, tuple/box/out placement, printing, duplicate moves and shared or
+  immutable mutation. The existing recursive native-control classifier owns
+  Send, C layout and closure restrictions.
+- Runtime `process_signal::tests` covers field-order coalescing, stale captured
+  generations, selected-bit cancellation, exhaustion, empty/overlap/blocked
+  selection, every partial installation and restoration position, restored
+  pending-signal redelivery, retry progress, foreign-action detection and
+  malformed/aliased native outputs rejected before state changes.
+- `live_process_records_and_writable_backing` and
+  `live_process_mir_contract_matrix` include all three signal operations in their
+  malformed receiver, arity, output and producer-kind sweeps. Canonical graph
+  owners encode and independently decode [76]/[54], rejecting their next unknown
+  neighbors. The native export/declaration owner covers the four new entries.
+
+The signal owner allocates one fixed native shell at explicit construction;
+next and close allocate no buffers and retain no queue or owner-backed handler
+storage. No throughput or delivery-latency promise is introduced.
+
+`scripts/test-process-native.sh` is the local/CI parity owner on Linux and macOS;
+it builds the runtime before running native and whole/per-unit process suites.
