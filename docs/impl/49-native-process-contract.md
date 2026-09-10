@@ -594,3 +594,10 @@ errors retain normal native-error behavior. The parameterized native
 registration_exit_window_retains_finite_status_observation owner injects ESRCH
 while status is pending, verifies zero/finite timeout and subsequent termination,
 and checks an independent permission error is preserved.
+
+Native-observation matrix class audit: every capture `Some(0)` assertion in the
+process native/driver owners was enumerated. Live-capture and cached-readiness
+fixtures observe each requested pipe independently before asserting EOF; neither
+root status nor reap supplies that witness. The native owner wrapper collects
+both runtime and all driver results, preserving failure status, so one failing
+fixture cannot hide unexecuted platform obligations.
