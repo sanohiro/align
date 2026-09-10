@@ -829,7 +829,7 @@ pub(crate) mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
-    fn command(script: &str) -> Command {
+    pub(crate) fn command(script: &str) -> Command {
         Command {
             cmd: CString::new("/bin/sh").unwrap(),
             argv: ["sh", "-c", script]

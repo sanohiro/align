@@ -105,6 +105,7 @@ pub struct NativeChild {
     pub(crate) stdout: Capture,
     pub(crate) stderr: Capture,
     pub(crate) event: Option<OwnedFd>,
+    event_missed: bool,
 }
 impl NativeChild {
     pub(crate) fn new(pid: libc::pid_t) -> Self {
@@ -119,6 +120,7 @@ impl NativeChild {
             stdout: Capture::default(),
             stderr: Capture::default(),
             event: None,
+            event_missed: false,
         }
     }
     pub(crate) fn status(&mut self) -> Result<Option<Termination>, i32> {
@@ -331,6 +333,34 @@ pub(crate) fn disjoint<A, B>(a: *const A, b: *const B) -> bool {
 mod tests {
     use super::*;
     use core::mem::{align_of, offset_of, size_of};
+    #[test]
+    fn registration_exit_window_retains_finite_status_observation() {
+        let command = crate::process_launch::tests::command("exec sleep 30");
+        let mut child = crate::process_launch::launch(&command, false, false).unwrap();
+        let event = std::fs::File::open("/dev/null").unwrap().into();
+        assert_eq!(
+            child.finish_event_registration(
+                event,
+                Err(std::io::Error::from_raw_os_error(libc::EACCES))
+            ),
+            Err(crate::AL_DENIED)
+        );
+        let event = std::fs::File::open("/dev/null").unwrap().into();
+        child
+            .finish_event_registration(event, Err(std::io::Error::from_raw_os_error(libc::ESRCH)))
+            .unwrap();
+        assert!(child.event_missed);
+        assert!(child.observed.is_none());
+        assert_eq!(child.poll(4, 0).unwrap().status, 0);
+        assert_eq!(child.poll(4, 5_000_000).unwrap().status, 0);
+        child.signal(i64::from(libc::SIGKILL), false).unwrap();
+        assert_eq!(child.poll(4, 1_000_000_000).unwrap().status, 1);
+        assert_eq!(
+            child.wait().unwrap().termination.signaled,
+            i64::from(libc::SIGKILL)
+        );
+        assert_eq!(child.poll(4, 0).unwrap().status, 1);
+    }
     #[test]
     fn native_status_layout_and_domains() {
         assert_eq!(
@@ -686,16 +716,35 @@ impl NativeChild {
             change.filter = libc::EVFILT_PROC;
             change.flags = libc::EV_ADD | libc::EV_ENABLE;
             change.fflags = libc::NOTE_EXIT;
-            if unsafe { libc::kevent(fd, &change, 1, core::ptr::null_mut(), 0, core::ptr::null()) }
-                < 0
+            let registered = if unsafe {
+                libc::kevent(fd, &change, 1, core::ptr::null_mut(), 0, core::ptr::null())
+            } < 0
             {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) || self.status()?.is_none() {
-                    return Err(io_error_to_status(&error));
-                }
-            }
-            self.event = Some(event);
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            };
+            self.finish_event_registration(event, registered)?;
         }
+        Ok(())
+    }
+    #[cfg(any(target_os = "macos", test))]
+    fn finish_event_registration(
+        &mut self,
+        event: OwnedFd,
+        registered: Result<(), std::io::Error>,
+    ) -> Result<(), i32> {
+        if let Err(error) = registered {
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(io_error_to_status(&error));
+            }
+            // XNU drains proc references before completing exit (which may block).
+            // EVFILT_PROC can thus report ESRCH before waitid exposes termination.
+            // The unreaped owner still pins the PID: retain a bounded status fallback.
+            self.status()?;
+            self.event_missed = true;
+        }
+        self.event = Some(event);
         Ok(())
     }
     fn poll(&mut self, interest: i32, wait_ns: i64) -> Result<Readiness, i32> {
@@ -740,7 +789,7 @@ impl NativeChild {
                     revents: 0,
                 },
                 libc::pollfd {
-                    fd: if interest & 4 != 0 {
+                    fd: if interest & 4 != 0 && !self.event_missed {
                         self.event.as_ref().map(AsRawFd::as_raw_fd).unwrap_or(-1)
                     } else {
                         -1
@@ -750,6 +799,11 @@ impl NativeChild {
                 },
             ];
             let remaining = budget.saturating_sub(started.elapsed());
+            let remaining = if self.event_missed && interest & 4 != 0 {
+                remaining.min(std::time::Duration::from_millis(1))
+            } else {
+                remaining
+            };
             let timeout = if immediate {
                 0
             } else {
