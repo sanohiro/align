@@ -538,14 +538,18 @@ unsafe fn reset_caught() -> i32 {
     }
     0
 }
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) static FORCE_FD_SCAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(target_os = "linux")]
 unsafe fn close_unlisted(error_fd: i32) -> i32 {
     const CLOSE_RANGE_CLOEXEC: u32 = 4;
-    if unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, CLOSE_RANGE_CLOEXEC) } == 0 {
-        return 0;
-    }
-    if !matches!(native_error(), libc::ENOSYS | libc::EINVAL) {
-        return native_error();
+    #[cfg(test)]
+    let force_scan = FORCE_FD_SCAN.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(test))]
+    let force_scan = false;
+    if !force_scan {
+        if unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, CLOSE_RANGE_CLOEXEC) } == 0 { return 0; }
+        if !matches!(native_error(), libc::ENOSYS | libc::EINVAL) { return native_error(); }
     }
     let fd = unsafe {
         libc::open(
@@ -617,8 +621,13 @@ unsafe fn close_unlisted(error_fd: i32) -> i32 {
                     number = next;
                 }
                 if number >= 3 && number != fd && number != error_fd {
-                    unsafe {
-                        libc::close(number);
+                    // Match CLOSE_RANGE_CLOEXEC: staged image/binding sources must
+                    // survive until remapping/exec, while unlisted descriptors
+                    // disappear at exec. Never close a still-needed source here.
+                    let flags = unsafe { libc::fcntl(number, libc::F_GETFD) };
+                    if flags < 0 || unsafe { libc::fcntl(number, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+                        failure = native_error();
+                        break 'scan;
                     }
                 }
             }

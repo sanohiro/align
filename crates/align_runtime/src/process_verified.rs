@@ -858,7 +858,8 @@ mod tests {
         let command = unsafe { Box::from_raw(command) };
         drop(image);
         drop(file);
-        for _ in 0..2 {
+        for fallback in [false, true] {
+            crate::process_launch::FORCE_FD_SCAN.store(fallback, std::sync::atomic::Ordering::Relaxed);
             let mut child = super::super::process_launch::launch(&command, false, false).unwrap();
             assert_eq!(child.wait().unwrap().termination.exited, 0);
         }
@@ -982,7 +983,8 @@ mod tests {
                 AL_INVALID
             );
         }
-        for _ in 0..2 {
+        for fallback in [false, true] {
+            crate::process_launch::FORCE_FD_SCAN.store(fallback, std::sync::atomic::Ordering::Relaxed);
             let bindings = launch_bindings(&command, 18).unwrap();
             assert_eq!(
                 bindings.iter().map(|(slot, _)| *slot).collect::<Vec<_>>(),
