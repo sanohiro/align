@@ -374,3 +374,26 @@ Request 56 adds one A08 owned-string constructor and one A04 unit-result remover
 HIR/MIR/runtime identities and complete checked-HIR/whole/per-unit/export coverage. Its exact prefix,
 platform-root, randomness, allocation-before-mutation, no-follow removal, race boundary, and
 ownership matrix are in [`36-fs-private-temp-plan.md`](../36-fs-private-temp-plan.md).
+
+### Ordinary directory creation and type observation
+
+`fs.create_dir(path: str) -> Result<(), Error>` creates exactly one directory.
+It requests Unix mode 0777 filtered by the existing process umask and native ACL
+policy, without changing umask or creating missing ancestors. An existing entry
+of any kind is an error, including an existing directory or symlink.
+
+`fs.is_dir(path: str) -> Result<bool, Error>` follows ordinary path/symlink
+resolution. A successful directory metadata observation returns true; a successful
+other-kind observation returns false. Missing, denied, non-directory-ancestor,
+broken-link, loop and other query failures remain errors. This observes type,
+not writability, stable identity or future access.
+
+Both require `import std.fs`, are Impure, take one required path and retain no
+input. Owned strings auto-borrow as str. Reject empty paths, embedded NUL and
+invalid UTF-8 before filesystem I/O. Relative paths use the current cwd; dot,
+dot-dot, repeated and trailing separators have ordinary OS semantics. No path
+normalization, environment expansion, recursion, caching or cwd mutation occurs.
+Native path marshalling may allocate proportional to the explicit path; OOM keeps
+the normal hard-error policy. Errors use the existing errno mapping, including
+Code(EEXIST). No new owner, type tag or Error variant is added. The exact contract
+and closure are in [ordinary directory operations](../43-ordinary-directory-plan.md).

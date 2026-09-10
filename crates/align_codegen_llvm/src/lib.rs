@@ -5229,6 +5229,15 @@ fn native_owner_mir_contract<'a>(
             contract.result = i32_ty;
             contract.out = Some((*out, function.slots.get(*out as usize).copied().unwrap_or(Ty::Error)));
         }
+        Rvalue::FsCreateDir { path } => {
+            contract.result = i32_ty;
+            contract.operands = vec![(path, Ty::Str, read)];
+        }
+        Rvalue::FsIsDir { path, out } => {
+            contract.result = i32_ty;
+            contract.out = Some((*out,Ty::Bool));
+            contract.operands = vec![(path, Ty::Str, read)];
+        }
         Rvalue::CryptoDigestNew => contract.result = Ty::CryptoDigest,
         Rvalue::CryptoDigestUpdate { digest, data } => {
             let data_ty = match xml_operand_base_ty(function, data) {
@@ -5403,6 +5412,7 @@ fn xml_written_slots(rvalue: &Rvalue) -> Vec<(Slot, XmlAccessProvenance)> {
         | Rvalue::WriterCreateExclusive { out, .. }
         | Rvalue::WriterCreateExclusiveBeneath { out, .. }
         | Rvalue::CodecEncoderNew { out, .. }
+        | Rvalue::FsIsDir { out, .. }
         | Rvalue::OsHost { out }
         | Rvalue::FrameInnerJoin { out, .. }
         | Rvalue::FileCreateRw { out, .. }
@@ -9715,6 +9725,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::FsWriteFileBuilder { .. }
             | Rvalue::FsExists { .. }
             | Rvalue::FsRemove { .. }
+            | Rvalue::FsCreateDir { .. } | Rvalue::FsIsDir { .. }
             | Rvalue::FsRemoveEmptyDir { .. }
             | Rvalue::RenameNoReplace { .. }
             | Rvalue::FsReadDir { .. }
@@ -23966,6 +23977,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.runtime(RuntimeKey::FsRemove), &[p_ptr.into(), p_len.into()], "frm")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("fs_remove returns i32")
+            }
+            Rvalue::FsCreateDir { path } => {
+                let (pointer,length) = self.split_str(path)?;
+                self.builder.build_call(self.runtime(RuntimeKey::FsCreateDir), &[pointer.into(),length.into()], "mkdir")
+                    .map_err(|e|self.err(e))?.try_as_basic_value().basic().ok_or_else(||self.err("create_dir ABI result"))?
+            }
+            Rvalue::FsIsDir { path, out } => {
+                let (pointer,length) = self.split_str(path)?;
+                let output = *self.slots.get(out).ok_or_else(||self.err("missing is_dir output"))?;
+                self.builder.build_call(self.runtime(RuntimeKey::FsIsDir), &[pointer.into(),length.into(),output.into()], "isdir")
+                    .map_err(|e|self.err(e))?.try_as_basic_value().basic().ok_or_else(||self.err("is_dir ABI result"))?
             }
             Rvalue::FsRemoveEmptyDir { path } => {
                 let (p_ptr, p_len) = self.split_str(path)?;
@@ -43802,6 +43824,36 @@ fn main() -> i32 = 0
             assert_eq!(data.offset_of_element(&structure, permutation[index]), Some(expected));
         }
         Ok(())
+    }
+
+    #[test]
+    fn ordinary_directory_mir_gate() {
+        let base = mir("import std.fs\nfn create(path: str) -> Result<(),Error> = fs.create_dir(path)\nfn query(path: str) -> Result<bool,Error> = fs.is_dir(path)\nfn main() {}\n");
+        assert!(validate_mir_producers(&base).is_ok());
+        let mut seen = 0;
+        for (index,function) in base.fns.iter().enumerate() {
+            for (block_index,block) in function.blocks.iter().enumerate() {
+                for (statement_index,statement) in block.stmts.iter().enumerate() {
+                    let Stmt::Let(value,rvalue) = statement else { continue };
+                    if !matches!(rvalue,Rvalue::FsCreateDir { .. } | Rvalue::FsIsDir { .. }) { continue; }
+                    seen += 1;
+                    let mut bad = base.clone();
+                    bad.fns[index].value_tys[*value as usize] = Ty::Bool;
+                    assert_xml_producer_rejected(&bad,"directory status type");
+                    let mut bad = base.clone();
+                    if let Stmt::Let(_,Rvalue::FsCreateDir { path } | Rvalue::FsIsDir { path, .. }) = &mut bad.fns[index].blocks[block_index].stmts[statement_index] {
+                        *path = Operand::Const(align_mir::Const::Bool(false));
+                    }
+                    assert_xml_producer_rejected(&bad,"directory path type");
+                    if let Rvalue::FsIsDir { out, .. } = rvalue {
+                        let mut bad = base.clone();
+                        bad.fns[index].slots[*out as usize] = Ty::String;
+                        assert_xml_producer_rejected(&bad,"directory out type");
+                    }
+                }
+            }
+        }
+        assert_eq!(seen,2);
     }
 
 }

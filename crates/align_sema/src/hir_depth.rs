@@ -918,6 +918,8 @@ fn walk_body_records<'a>(
                 | ExprKind::BufferLen { buffer: recv }
                 | ExprKind::FsExists { path: recv }
                 | ExprKind::FsRemove { path: recv }
+                | ExprKind::FsCreateDir { path: recv }
+                | ExprKind::FsIsDir { path: recv }
                 | ExprKind::FsRemoveEmptyDir { path: recv }
                 | ExprKind::FsReadDir { path: recv }
                 | ExprKind::DnsResolve { host: recv }

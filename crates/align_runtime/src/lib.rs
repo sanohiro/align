@@ -21,6 +21,7 @@ pub use str_prims::*;
 mod crypto_asymmetric;
 mod crypto_digest;
 mod os_host;
+mod fs_directory;
 pub use crypto_asymmetric::*;
 mod csv;
 pub use csv::*;

@@ -325,3 +325,22 @@ whole/per-unit/cache parity、Linux/macOS descriptor-walk owner、および alig
 `c6d-request18-adoption` が必要である。完全な matrix は
 [`29-fs-retained-root-plan.md`](../29-fs-retained-root-plan.md) にある。新契約は throughput ではなく safety と
 ownership なので benchmark は不要である。
+
+### 通常のディレクトリ作成と型の観測
+
+`fs.create_dir(path: str) -> Result<(), Error>` はディレクトリを一つだけ作る。
+Unix mode 0777 を現在の umask と OS の ACL 規則で制限する。umask は変更せず、
+欠落した親は作らない。既存ディレクトリ・ファイル・symlink はいずれもエラー。
+
+`fs.is_dir(path: str) -> Result<bool, Error>` は通常のパスと symlink を辿る。
+metadata の取得が成功したディレクトリなら true、他の種類なら false。
+欠落・権限不足・非ディレクトリの祖先・壊れたリンク・リンクループなどの失敗はエラー。
+書き込み可能性・安定した識別子・将来のアクセスは保証しない。
+
+両方とも `import std.fs` が必要な Impure 操作で、必須のパス引数を一つだけ借用し、
+保持しない。string は str として自動借用する。空パス・NUL・不正な UTF-8 は
+I/O 前に拒否する。相対パスは現在の cwd、dot/dot-dot・連続区切り・末尾区切りは
+通常の OS 規則を使う。正規化・環境変数展開・再帰処理・キャッシュ・cwd 変更はない。
+ネイティブ形式への変換は明示パス長に比例する割り当てを行いうる。OOM は既存の即時停止。
+既存の errno 対応（既存エントリなら Code(EEXIST)）を使い、新しい所有型や Error variant
+は追加しない。[正本と検証計画](../../43-ordinary-directory-plan.md) を参照。

@@ -11831,7 +11831,7 @@ fn request11_expr_kind_inventory_tripwire() {
         // Incremental SHA-256 adds three operations; keep this count synchronized with
         // the exhaustive validation, source-shape, replay-clone, and canonical-graph matches.
         variants,
-        331,
+        333,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -18320,5 +18320,26 @@ fn host_schema_rejects_malformed_records() -> Result<(), &'static str> {
     let mut bad = checked_source_program("import std.os\nfn get() -> Result<os.host_info, Error> = os.host()\nfn main() {}\n");
     bad.fns.iter_mut().find(|f| f.name == "get").ok_or("get")?.body.value.as_mut().ok_or("host tail")?.ty = Ty::Bool;
     assert_body_entrypoints_empty("host wrong result", &bad);
+    Ok(())
+}
+
+#[test]
+fn ordinary_directory_records_reject_malformed_types() -> Result<(), &'static str> {
+    let base = checked_source_program("import std.fs\nfn create(path: str) -> Result<(),Error> = fs.create_dir(path)\nfn query(path: str) -> Result<bool,Error> = fs.is_dir(path)\nfn main() {}\n");
+    assert!(!is_empty(&lower_program(&base)));
+    for name in ["create","query"] {
+        for wrong_result in [false,true] {
+            let mut bad = base.clone();
+            let expression = bad.fns.iter_mut().find(|f| f.name == name).ok_or("directory function")?.body.value.as_mut().ok_or("directory tail")?;
+            if wrong_result { expression.ty = Ty::Bool; }
+            else {
+                match &mut expression.kind {
+                    hir::ExprKind::FsCreateDir { path } | hir::ExprKind::FsIsDir { path } => **path = native_i64(),
+                    _ => return Err("directory operation"),
+                }
+            }
+            assert_body_entrypoints_empty("malformed directory record",&bad);
+        }
+    }
     Ok(())
 }

@@ -11,7 +11,7 @@ macro_rules! runtime_keys {
         }
 
         impl RuntimeKey {
-            pub const ALL: [Self; 366] = [$(Self::$variant,)*];
+            pub const ALL: [Self; 368] = [$(Self::$variant,)*];
 
             pub const fn logical_name(self) -> &'static str {
                 match self {
@@ -145,8 +145,10 @@ runtime_keys! {
     Free => "free",
     FreeResponseArray => "free_response_array",
     FreeStringArray => "free_string_array",
+    FsCreateDir => "fs_create_dir",
     FsCreatePrivateTempDir => "fs_create_private_temp_dir",
     FsExists => "fs_exists",
+    FsIsDir => "fs_is_dir",
     FsReadBytesView => "fs_read_bytes_view",
     FsReadDir => "fs_read_dir",
     FsReadFile => "fs_read_file",
@@ -391,7 +393,7 @@ runtime_keys! {
     XmlText => "xml_text",
 }
 
-const _: [(); 366] = [(); RuntimeKey::ALL.len()];
+const _: [(); 368] = [(); RuntimeKey::ALL.len()];
 
 #[cfg(test)]
 mod tests {
@@ -400,7 +402,7 @@ mod tests {
 
     #[test]
     fn runtime_keys_are_complete_unique_and_alphabetical() {
-        assert_eq!(RuntimeKey::ALL.len(), 366);
+        assert_eq!(RuntimeKey::ALL.len(), 368);
         let names: Vec<_> = RuntimeKey::ALL
             .iter()
             .map(|key| key.logical_name())

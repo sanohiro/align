@@ -13,6 +13,11 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+- **Ordinary directory operations:** `fs.create_dir` creates one directory with normal
+  umask semantics; `fs.is_dir` returns Result<bool,Error>, preserving metadata errors.
+  Both follow ordinary path semantics and grant no retained or write authority.
+  [Plan 43](impl/43-ordinary-directory-plan.md) owns the exact boundary.
+
 - **Owned host observation:** `std.os` exposes only `os.host() -> Result<os.host_info, Error>`
   in this boundary. The qualified ordinary Move record owns exact uname strings and optional
   online CPU facts. No inferred CPU description, ambient configuration, or authenticated
