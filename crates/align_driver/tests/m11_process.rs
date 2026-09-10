@@ -272,7 +272,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   return Ok(())
 }";
     let out = build_and_run_args("m11proc-drop", prog, &["/bin/true"]);
-    assert!(out.status.success(), "drop-without-wait exits cleanly (the reap does not hang)");
+    assert!(out.status.success(), "drop-without-wait: status={} stdout={} stderr={}", out.status, String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "spawned");
 }
 
