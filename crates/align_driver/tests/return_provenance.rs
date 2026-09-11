@@ -46,6 +46,202 @@ fn main() -> i32 {
     }
 }
 
+#[test]
+fn unavailable_callback_provenance_preserves_readers_across_units() {
+    for imported in [false, true] {
+        let helpers = "fn apply(text: str, action: fn(str) -> str) -> str = action(text)\nfn capture(action: fn() -> str) -> str = action()\nfn generic<T>(text: str, action: fn(str) -> str, value: T) -> str = action(text)\n";
+        let library = format!("module views\n{}", helpers.replace("fn ", "pub fn "));
+        let prefix = if imported { "views." } else { "" };
+        let declarations = if imported { "import views\n" } else { helpers };
+        let source = format!(
+            r#"{declarations}
+fn identity(text: str) -> str = text
+fn fixed(text: str) -> str = "fixed"
+Holder<T> {{ callback: T }}
+fn make() -> Holder<fn(str) -> str> = Holder {{ callback: fixed }}
+fn replace(borrow mut text: str) {{ text = "replacement" }}
+fn main() -> i32 {{
+  owner := "retained".clone()
+  text: str := owner
+  result := {prefix}apply(text, identity)
+  captured := fn {{ text }}
+  other := {prefix}capture(captured)
+  constant := {prefix}apply(text, fixed)
+  monomorph := {prefix}generic(text, identity, 0)
+  if result != "retained" {{ return 1 }}
+  if other != "retained" {{ return 2 }}
+  if constant != "fixed" {{ return 3 }}
+  if monomorph != "retained" {{ return 4 }}
+  holder := make()
+  mut header := holder.callback("x")
+  replace(header)
+  if header != "replacement" {{ return 5 }}
+  return 0
+}}
+"#
+        );
+        let mut files = vec![("main.align", source.as_str())];
+        if imported {
+            files.push(("views.align", library.as_str()));
+        }
+        let checked = diff_check_multi("unavailable-callback-readers", &files, "main.align");
+        assert!(
+            !checked.whole_errors && !checked.per_unit_errors,
+            "imported={imported}\nwhole:\n{}\nper-unit:\n{}",
+            checked.whole_diags,
+            checked.per_unit_diags
+        );
+        if backend_available() {
+            for output in [
+                build_and_run_multi("unavailable-callback-whole", &files, "main.align"),
+                build_per_unit_multi("unavailable-callback-units", &files, "main.align")
+                    .link_and_run(),
+            ] {
+                assert!(
+                    output.status.success(),
+                    "status {:?}: {}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn unavailable_callbacks_do_not_erase_argument_or_capture_lifetimes() {
+    for capture in [false, true] {
+        let operation = if capture {
+            "callback := fn { text }; return views.capture(callback)"
+        } else {
+            "return views.apply(text, identity)"
+        };
+        let source = format!(
+            "import views\nfn identity(text: str) -> str = text\nfn invalid() -> str {{ owner := \"local\".clone(); text: str := owner; {operation} }}\nfn main() -> i32 = 0\n"
+        );
+        let files = [
+            (
+                "views.align",
+                "module views\npub fn apply(text: str, callback: fn(str) -> str) -> str = callback(text)\npub fn capture(callback: fn() -> str) -> str = callback()\n",
+            ),
+            ("main.align", source.as_str()),
+        ];
+        let checked = diff_check_multi("unavailable-callback-escape", &files, "main.align");
+        assert!(checked.whole_errors && checked.per_unit_errors);
+        assert!(
+            checked
+                .whole_diags
+                .contains("cannot return a view that borrows local storage")
+        );
+        assert!(
+            checked
+                .per_unit_diags
+                .contains("cannot return a view that borrows local storage")
+        );
+    }
+}
+
+#[test]
+fn unknown_callback_join_retains_argument_and_capture_lifetimes() {
+    for capture in [false, true] {
+        let helper = if capture {
+            r#"fn fixed() -> str = "fixed"
+fn invalid(action: fn() -> str, flag: bool) -> str {
+  mut selected := fixed
+  if flag { selected = action }
+  return selected()
+}
+fn escape(flag: bool) -> str {
+  owner := "local".clone()
+  text: str := owner
+  action := fn { text }
+  return invalid(action, flag)
+}
+"#
+        } else {
+            r#"fn fixed(text: str) -> str = "fixed"
+fn escape(action: fn(str) -> str, flag: bool) -> str {
+  owner := "local".clone()
+  text: str := owner
+  mut selected := fixed
+  if flag { selected = action }
+  return selected(text)
+}
+"#
+        };
+        let main = if capture {
+            "fn main() -> i32 { text := escape(true); return text.len() as i32 }"
+        } else {
+            "fn identity(text: str) -> str = text\nfn main() -> i32 { text := escape(identity, true); return text.len() as i32 }"
+        };
+        let source = format!("{helper}{main}\n");
+        let checked = diff_check_multi(
+            "unknown-callback-join-escape",
+            &[("main.align", source.as_str())],
+            "main.align",
+        );
+        assert!(
+            checked.whole_errors && checked.per_unit_errors,
+            "capture={capture}\nwhole:\n{}\nper-unit:\n{}",
+            checked.whole_diags,
+            checked.per_unit_diags
+        );
+        for diagnostics in [&checked.whole_diags, &checked.per_unit_diags] {
+            assert!(
+                diagnostics.contains("cannot return a view that borrows local storage"),
+                "{diagnostics}"
+            );
+        }
+    }
+}
+
+#[test]
+fn shared_string_callbacks_preserve_structural_results() {
+    let source = r#"
+View { text: str, number: i64 }
+Choice { Text(str), Empty }
+fn view(text: str) -> View = View { text: text, number: 7 }
+fn choice(text: str) -> Choice = Choice.Text(text)
+fn fallible(text: str) -> Result<str, i64> = Ok(text)
+fn apply_view(text: str, action: fn(str) -> View) -> View = action(text)
+fn apply_choice(text: str, action: fn(str) -> Choice) -> Choice = action(text)
+fn apply_result(text: str, action: fn(str) -> Result<str, i64>) -> Result<str, i64> = action(text)
+fn main() -> i32 {
+  owner := "retained".clone()
+  text: str := owner
+  record := apply_view(text, view)
+  if record.text != "retained" { return 1 }
+  selected := match apply_choice(text, choice) { Text(value) => value, Empty => "empty" }
+  if selected != "retained" { return 2 }
+  result := apply_result(text, fallible) else "error"
+  if result != "retained" { return 4 }
+  return 0
+}
+"#;
+    let files = [("main.align", source)];
+    let checked = diff_check_multi("shared-string-structural", &files, "main.align");
+    assert!(
+        !checked.whole_errors && !checked.per_unit_errors,
+        "whole:\n{}\nper-unit:\n{}",
+        checked.whole_diags,
+        checked.per_unit_diags
+    );
+    if backend_available() {
+        for output in [
+            build_and_run_multi("shared-string-structural-whole", &files, "main.align"),
+            build_per_unit_multi("shared-string-structural-units", &files, "main.align")
+                .link_and_run(),
+        ] {
+            assert!(
+                output.status.success(),
+                "status {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
 fn roots(params: &[u32], captures: &[u32]) -> ReturnBorrowSummary {
     ReturnBorrowSummary::Roots {
         params: params.to_vec(),
