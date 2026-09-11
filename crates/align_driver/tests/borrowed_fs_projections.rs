@@ -63,9 +63,32 @@ fn shared_retained_owners_do_not_grant_exclusive_or_escaping_authority() {
     for source in [
         "import std.fs\nfn bad(borrow c: fs.dir_cursor) -> Result<Option<fs.dir_entry>,Error> = c.next()\nfn main() {}",
         "import std.fs\nRow { directory: fs.directory }\nfn consume(row: Row) {}\nfn bad(rows: slice<Row>) { consume(rows[0]) }\nfn main() {}",
-        "import std.fs\nRow { directory: fs.directory, text: string }\nfn text(borrow row: Row) -> str = row.text\nfn bad() -> Result<str,Error> { rows := [Row { directory: fs.open_directory(\".\")?, text: \"gone\".clone() }]; return Ok(text(rows[0])) }\nfn main() {}",
     ] {
         let checked=diff_check_multi("fs-indexed-invalid",&[("main.align",source)],"main.align");
         assert!(checked.whole_errors && checked.per_unit_errors,"accepted {source}");
+    }
+}
+
+#[test]
+fn retained_record_view_escape_reaches_lifetime_check() {
+    let source = r#"import std.fs
+Row { directory: fs.directory, text: string }
+fn text(borrow row: Row) -> str { value: str := row.text; return value }
+fn observe() -> Result<RETURN_TYPE,Error> {
+  rows := [Row { directory: fs.open_directory(".")?, text: "local".clone() }]
+  view: slice<Row> := rows
+  FINISH
+}
+fn main() {}
+"#;
+    let local = source.replace("RETURN_TYPE", "()")
+        .replace("FINISH", "print(text(view[0])); return Ok(())");
+    let good = diff_check_multi("fs-view-local", &[("main.align", &local)], "main.align");
+    assert!(!good.whole_errors && !good.per_unit_errors, "{} {}", good.whole_diags, good.per_unit_diags);
+    let escaping = source.replace("RETURN_TYPE", "str")
+        .replace("FINISH", "return Ok(text(view[0]))");
+    let bad = diff_check_multi("fs-view-escape", &[("main.align", &escaping)], "main.align");
+    for diagnostics in [&bad.whole_diags, &bad.per_unit_diags] {
+        assert!(diagnostics.contains("cannot return a view that borrows local storage"), "{diagnostics}");
     }
 }
