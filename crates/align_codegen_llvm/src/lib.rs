@@ -9958,7 +9958,13 @@ impl<'a> XmlAccessAnalyzer<'a> {
             bits: 8,
             signed: false,
         }));
-        let expected_result = xml_out_producer_result_ty(rvalue);
+        let native_contract = native_owner_mir_contract(self.graph.function, rvalue);
+        // Native value and out-slot queries must use the same instruction ABI. An
+        // infallible scratch writer returns Unit, not an errno-status integer.
+        let expected_result = native_contract
+            .as_ref()
+            .map(|contract| contract.result)
+            .or_else(|| xml_out_producer_result_ty(rvalue));
         let result_is_unique = expected_result.is_some()
             && self.graph.function.value_tys.get(value as usize) == expected_result.as_ref()
             && self.graph.primary_definitions.get(value as usize) == Some(&1)
@@ -9990,9 +9996,11 @@ impl<'a> XmlAccessAnalyzer<'a> {
             return;
         }
 
-        if let Some(contract) = native_owner_mir_contract(self.graph.function, rvalue) {
+        if let Some(contract) = native_contract {
+            // The exact output type and selected path were authenticated above.
+            // Structural projections follow that type, not a second opcode list;
+            // an opaque handle cannot acquire fields through this path.
             if !contract.outputs.contains(&(slot, slot_ty))
-                || (!path.is_empty() && !matches!(rvalue, Rvalue::OsHost { .. } | Rvalue::FsTree { .. } | Rvalue::ProcessLive { .. }))
                 || contract.access != recorded_access {
                 equation.invalid = true;
             }
@@ -44232,6 +44240,125 @@ fn main() -> i32 = 0
         }
         assert!(nested_reads > 0, "nested field path mutation covered no load");
         assert!(reads > 0, "String projection mutation covered no load");
+        Ok(())
+    }
+
+    #[test]
+    fn process_status_producer_contracts() -> Result<(), &'static str> {
+        for (owner, operation) in [
+            ("run_output", "owner.status()"),
+            ("run_bytes", "owner.status()"),
+            ("child", "owner.wait()?"),
+        ] {
+            let mode = if owner == "child" { "borrow mut" } else { "borrow" };
+            for read in [
+                "match status.termination { Exited(code) => code, Signaled(signal) => 128 + signal }",
+                "status.max_rss_bytes else 0",
+                "exit_code(status)",
+            ] {
+                let source = format!(
+                    "import std.process\nSnapshot {{ code: i64, text: string }}\n\
+                     fn exit_code(status: process.wait_result) -> i64 = match status.termination {{ Exited(code) => code, Signaled(signal) => 128 + signal }}\n\
+                     fn snapshot({mode} owner: {owner}) -> Result<Snapshot, Error> {{\n\
+                       status := {operation}\ncode := {read}\n\
+                       Ok(Snapshot {{ code: code, text: \"owned\".clone() }})\n}}\n"
+                );
+                let base = mir(&source);
+                assert!(
+                    validate_mir_producers(&base).is_ok(),
+                    "{owner}/{read}: {:?}",
+                    validate_mir_producers(&base)
+                );
+                assert!(validate_thin_partition_program(&base, &[]).is_ok());
+                let mut producers = 0;
+                let mut projections = 0;
+                let mut clones = 0;
+                for (fi, function) in base.fns.iter().enumerate() {
+                    for (bi, block) in function.blocks.iter().enumerate() {
+                        for (si, statement) in block.stmts.iter().enumerate() {
+                            let Stmt::Let(value, rvalue) = statement else {
+                                continue;
+                            };
+                            if matches!(
+                                rvalue,
+                                Rvalue::ProcessLive { .. } | Rvalue::ChildWait { .. }
+                            ) {
+                                producers += 1;
+                                for mutation in 0..5 {
+                                    let mut bad = base.clone();
+                                    let function = &mut bad.fns[fi];
+                                    if mutation == 0 {
+                                        function.value_tys[*value as usize] = if owner == "child" {
+                                            Ty::Unit
+                                        } else {
+                                            Ty::Int(IntTy {
+                                                bits: 32,
+                                                signed: true,
+                                            })
+                                        };
+                                    } else {
+                                        let (receiver, out) = match &mut function.blocks[bi].stmts[si] {
+                                            Stmt::Let(_, Rvalue::ProcessLive { args, out, .. }) => {
+                                                (&mut args[0], out.as_mut().ok_or("status out")?)
+                                            }
+                                            Stmt::Let(_, Rvalue::ChildWait { child, out }) => {
+                                                (child, out)
+                                            }
+                                            _ => return Err("status producer"),
+                                        };
+                                        match mutation {
+                                            1 => function.slots[*out as usize] = Ty::String,
+                                            2 => *out = u32::MAX,
+                                            3 => *receiver = Operand::Const(Const::Unit),
+                                            _ => {
+                                                let Ty::Struct(id) = function.slots[*out as usize]
+                                                else {
+                                                    return Err("wait record");
+                                                };
+                                                bad.structs[id as usize].fields[0].ty = Ty::Raw;
+                                            }
+                                        }
+                                    }
+                                    assert_xml_producer_rejected(
+                                        &bad,
+                                        "status result/output/receiver/schema",
+                                    );
+                                }
+                            }
+                            if function.name.as_str() == "snapshot"
+                                && matches!(rvalue, Rvalue::Field(_, _))
+                            {
+                                projections += 1;
+                                let mut bad = base.clone();
+                                let Stmt::Let(_, Rvalue::Field(_, path)) =
+                                    &mut bad.fns[fi].blocks[bi].stmts[si]
+                                else {
+                                    return Err("field projection");
+                                };
+                                *path = vec![u32::MAX];
+                                assert_xml_producer_rejected(&bad, "status selected field");
+                            }
+                            if let Rvalue::StrClone(input) = rvalue {
+                                clones += 1;
+                                let mut bad = base.clone();
+                                bad.fns[fi].blocks[bi].stmts[si] =
+                                    Stmt::Let(*value, Rvalue::Use(input.clone()));
+                                assert_xml_producer_rejected(
+                                    &bad,
+                                    "borrowed text cannot mint String ownership",
+                                );
+                            }
+                        }
+                    }
+                }
+                assert_eq!(producers, 1, "{owner}/{read}");
+                assert!(
+                    projections > 0 || read == "exit_code(status)",
+                    "{owner}/{read}"
+                );
+                assert_eq!(clones, 1, "{owner}/{read}");
+            }
+        }
         Ok(())
     }
 

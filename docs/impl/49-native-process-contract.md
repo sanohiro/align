@@ -601,3 +601,36 @@ fixtures observe each requested pipe independently before asserting EOF; neither
 root status nor reap supplies that witness. The native owner wrapper collects
 both runtime and all driver results, preserving failure status, so one failing
 fixture cannot hide unexecuted platform obligations.
+
+## Captured-status producer certification (R68)
+
+The existing Copy `wait_result` contract includes composition with independently
+owned return records. At `f83f5c3c`, captured-status out-slot certification assumes
+an i32 instruction result although both infallible accessors return Unit; the
+separate ChildWait producer rejects selected paths into its now-structured output.
+The investigation compared all 83 out-slot variants and all 48 ProcessLive kinds.
+Only RunOutputStatus/RunBytesStatus disagree on result type; ChildWait is the
+additional native-record projection omission. This repair preserves the public
+contract, native ABI, ownership strategy and existing malformed-input gates.
+
+One capability closes both omissions in `add_out_producer`: use the native
+contract's instruction result and exact output slot/type, and authenticate each
+selected path against that output's type graph. Do not maintain a second opcode
+list for which authenticated native outputs may expose their fields. Opaque
+owners still have no structural fields. Input readability/authority, unique
+producer identity, selected type, sibling validation and cleanup proofs remain
+required. This is an author-side closure pass under the already-reviewed native
+and producer contracts; its independent boundary check joins the preflight review.
+
+| Closure axis | Implementation and regression owner |
+|---|---|
+| Type formation, instruction result and exact native output | `native_owner_mir_contract` supplies the result to `add_out_producer`; `process_status_producer_contracts` checks both accessors, ChildWait, native sibling shapes and malformed result/output/receiver/schema/selected paths. |
+| Copy record field, enum payload and optional RSS | The existing selected-type graph authenticates every native output projection; `process_status_producer_contracts` crosses all three producers with termination/RSS/helper reads and whole/per-unit rejection checks. |
+| Construction, move-in/out, source nulling, replacement and return | `process_status_owned_composition` returns captured and literal clones through imported helpers and a generic identity; its returned record is moved, replaced and dropped using existing MIR cleanup. |
+| `if`, `match`, `else`, `?`, `map_err`, joins and early exits | The driver composition owner crosses captured run/run_bytes, child wait, success/error and nested error fallback, with conditional record return, loop replacement and propagation. Existing general control-flow owners retain the unchanged lowering rules. |
+| Allocation and Drop on success/failure | `process_status_owned_composition` runs whole/per-unit native programs with positive alloc/free deltas and an omitted-record-Drop negative control. Existing native process owners retain child/output-shell cleanup coverage; no new allocation or performance promise is introduced. |
+| Imported interfaces and generic instances | The same driver owner compiles a separate helper unit with Copy process signatures, owned record returns and generic identity, then executes whole/per-unit binaries. Existing compiler/source-key identity invalidates changed compiler artifacts; interface format and runtime ABI stay unchanged. |
+| Borrowed escapes and malformed producers | `process_status_borrowed_escape_rejected` keeps captured-view escapes rejected in whole/per-unit checking. `process_status_producer_contracts`, existing live-process and foreign-native producer mutations preserve failure before LLVM emission. |
+
+The actual align-llm pin change and verification-loop acceptance remain
+consumer-owned. No consumer implementation change is part of this capability.
