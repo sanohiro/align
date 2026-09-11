@@ -2923,7 +2923,7 @@ pub fn build_interface_summaries(
             return (Vec::new(), diags);
         }
     };
-    let producer_certifications = match align_codegen_llvm::validate_mir_producers(&mir) {
+    let producer_certifications = match align_mir::producer::validate_mir_producers(&mir) {
         Ok(certifications) => certifications,
         Err(reason) => {
             diags.error(
@@ -3586,7 +3586,7 @@ fn walk_inner(
                 }
             };
             let producer_certifications =
-                match align_codegen_llvm::validate_mir_producers(&mir) {
+                match align_mir::producer::validate_mir_producers(&mir) {
                     Ok(certifications) => certifications,
                     Err(reason) => {
                         diags.error(
@@ -4761,7 +4761,7 @@ impl RehydrateCtx {
         let sources: HashMap<String, String> =
             HashMap::from([(unit.path.clone(), unit.src.clone())]);
         let target = current_owned_json_target().map_err(|_| RehydrateFailure::Summary)?;
-        let producer_certifications = align_codegen_llvm::validate_mir_producers(&mir)
+        let producer_certifications = align_mir::producer::validate_mir_producers(&mir)
             .map_err(|_| RehydrateFailure::Summary)?;
         let mut built = align_interface::build_summaries_with_effects(
             &unit_module,
