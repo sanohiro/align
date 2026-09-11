@@ -23747,7 +23747,7 @@ mod tests {
     }
 
     #[test]
-    fn readonly_static_descriptor_checked_hir_replay() {
+    fn readonly_static_descriptor_checked_hir_replay() -> Result<(), &'static str> {
         for method in ["descriptor_id", "sqlite_sql", "postgres_sql"] {
             for write in [false, true] {
                 let sink = if write { "bytes[0] = 65" } else { "print(bytes[0])" };
@@ -23760,7 +23760,7 @@ mod tests {
                 ]);
                 assert!(!diagnostics.has_errors(), "{method}/{write}: {:?}", diagnostics.iter().collect::<Vec<_>>());
                 assert!(hir_program_is_valid(&hir));
-                let function = hir.fns.iter_mut().find(|f| f.name.starts_with("pkg.db$probe$")).expect("concrete probe");
+                let function = hir.fns.iter_mut().find(|f| f.name.starts_with("pkg.db$probe$")).ok_or("concrete probe")?;
                 let block = match function.body.value.as_deref_mut() {
                     Some(hir::Expr { kind: hir::ExprKind::Unsafe(block), .. }) => block,
                     other => panic!("unsafe fixture block: {other:?}"),
@@ -23780,6 +23780,7 @@ mod tests {
                 assert_eq!(lower_program_checked(&hir, false, None).is_ok(), !write, "{method}/{write}");
             }
         }
+        Ok(())
     }
 
     #[test]
