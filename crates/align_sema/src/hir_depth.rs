@@ -2556,6 +2556,7 @@ mod tests {
                         named_return_region: &named_return_region,
                         named_param_modes: &named_param_modes,
                         named_borrow_mut_retention: &named_borrow_mut_retention,
+                        callable_targets: &[],
                         fn_types: &program.fn_types,
                         tuples: &program.tuples,
                         structs: &program.structs,

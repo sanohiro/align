@@ -11438,6 +11438,7 @@ fn run_body_analysis_passes(
                 named_return_region: &named_return_region,
                 named_param_modes: &named_param_modes,
                 named_borrow_mut_retention: borrow_mut_retention,
+                callable_targets: &callable.targets_by_type,
                 fn_types,
                 tuples,
                 structs,
@@ -12685,7 +12686,31 @@ fn struct_path_type(root: Ty, path: &[u32], structs: &[StructDef]) -> Option<Ty>
     Some(ty)
 }
 
-type CallableTargetSet = std::collections::BTreeMap<u32, hir::ReturnBorrowSummary>;
+#[derive(Clone, Default, PartialEq, Eq)]
+struct CallableTargetSet {
+    targets: std::collections::BTreeMap<u32, hir::ReturnBorrowSummary>,
+    unavailable: bool,
+}
+
+impl CallableTargetSet {
+    fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl std::ops::Deref for CallableTargetSet {
+    type Target = std::collections::BTreeMap<u32, hir::ReturnBorrowSummary>;
+    fn deref(&self) -> &Self::Target {
+        &self.targets
+    }
+}
+
+impl std::ops::DerefMut for CallableTargetSet {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.targets
+    }
+}
+
 type CallableTransferSet = std::collections::BTreeMap<u32, hir::ReturnBorrowSummary>;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -12714,7 +12739,8 @@ fn join_fn_type_targets(
         return false;
     };
     let before = current.clone();
-    for (&target, summary) in incoming {
+    current.unavailable |= incoming.unavailable;
+    for (&target, summary) in &incoming.targets {
         current
             .entry(target)
             .and_modify(|existing| *existing = join_return_summary(existing, summary))
@@ -12744,12 +12770,53 @@ fn infer_fn_value_return_provenance(
         .filter_map(|(index, name)| u32::try_from(index).ok().map(|index| (name, index)))
         .collect::<std::collections::HashMap<_, _>>();
     let mut targets = vec![CallableTargetSet::new(); program.fn_types.len()];
-    let max_passes = program
-        .fn_types
-        .len()
-        .saturating_add(program.fns.iter().map(|function| function.locals.len()).sum())
-        .saturating_add(1);
-    for _ in 0..max_passes {
+    let tables = EffectTypeTables {
+        structs: &program.structs,
+        enums: &program.enums,
+        tuples: &program.tuples,
+        tagged_types: &program.tagged_types,
+    };
+    let mut open_inputs = Vec::new();
+    for function in &program.fns {
+        let captures = match function.origin {
+            hir::FnOrigin::Lifted { capture_count } => capture_count as usize,
+            _ => 0,
+        };
+        for local in function
+            .params
+            .iter()
+            .take(function.params.len().saturating_sub(captures))
+        {
+            if let Some(local) = function.locals.get(*local as usize) {
+                open_inputs.push(local.ty);
+            }
+        }
+        // Return lifetime summaries do not identify callable targets inside aggregates.
+        for event in hir_depth::body_events(&function.body) {
+            if let hir_depth::BodyEvent::ExprExit { expression, .. } = event
+                && matches!(
+                    expression.kind,
+                    ExprKind::Call { .. } | ExprKind::CallFnValue { .. } | ExprKind::RawCall { .. }
+                )
+            {
+                open_inputs.push(expression.ty);
+            }
+        }
+    }
+    open_inputs.extend(
+        program
+            .imported_fns
+            .iter()
+            .flat_map(|function| function.params.iter().copied()),
+    );
+    for ty in open_inputs {
+        for (_, id) in fn_effect_leaf_paths(ty, tables, false) {
+            if let Some(target) = targets.get_mut(id as usize) {
+                target.unavailable = true;
+            }
+        }
+    }
+    loop {
         let mut changed = false;
         for function in &program.fns {
             let events = hir_depth::body_events(&function.body);
@@ -12787,7 +12854,8 @@ fn infer_fn_value_return_provenance(
                         CallableTargetSet::new(),
                         |mut joined, child| {
                             let child = fn_type_targets(child, &function.locals, &targets);
-                            for (target, summary) in child {
+                            joined.unavailable |= child.unavailable;
+                            for (target, summary) in child.targets {
                                 joined
                                     .entry(target)
                                     .and_modify(|existing| {
@@ -13021,7 +13089,10 @@ fn infer_fn_value_return_provenance(
             break;
         }
     }
-    for (function, target_set) in program.fn_types.iter_mut().zip(&targets) {
+    for (function, target_set) in program.fn_types.iter_mut().zip(&mut targets) {
+        if target_set.unavailable {
+            target_set.targets.clear();
+        }
         let summary = target_set.values().fold(
             hir::ReturnBorrowSummary::None,
             |joined, summary| join_return_summary(&joined, summary),
@@ -18783,6 +18854,8 @@ struct EscapeCheck<'a> {
     /// Exact same-program mutable-retention roots. Missing callees keep the conservative
     /// all-compatible-input call-site check.
     named_borrow_mut_retention: &'a BorrowMutRetentionMap,
+    /// Analysis-only target availability, shared with borrow and storage inference.
+    callable_targets: &'a [CallableTargetSet],
     /// Settled function-value signatures. Parameter roots select call arguments; capture roots are
     /// resolved through `EscapeState::callable_capture_region`.
     fn_types: &'a [hir::FnTy],
@@ -23083,6 +23156,22 @@ impl<'a> EscapeCheck<'a> {
                 |region, argument| region.shorter(self.region_of(argument, depth)),
             );
         };
+        if self.callable_type_id(callee)
+            .and_then(|id| self.callable_targets.get(id as usize))
+            .is_none_or(|targets| targets.is_empty())
+        {
+            // Empty target sets are unavailable, unlike a concrete target with an
+            // empty summary. The region checker must use the same fallback as the
+            // storage/lifetime checker, including after a known/unknown join.
+            return args.iter().enumerate().fold(
+                self.callable_capture_return_region(callee, depth),
+                |region, (index, argument)| {
+                    let mode = function.params.get(index).map(|(mode, _)| *mode)
+                        .unwrap_or(ast::ParamMode::ByValue);
+                    region.shorter(self.call_return_root_region(argument, mode, depth))
+                },
+            );
+        }
         match &function.return_region {
             hir::ReturnRegionSummary::None => Region::Static,
             hir::ReturnRegionSummary::Roots { params, captures } => {
@@ -30195,7 +30284,7 @@ fn call_storage_selection(
                 selection.fallback_all = true;
                 return selection;
             };
-            for (&target, summary) in targets {
+            for (&target, summary) in &targets.targets {
                 add_summary(summary, args.len(), Some(target), true);
             }
         }
@@ -30208,7 +30297,7 @@ fn call_storage_selection(
                 selection.fallback_all = true;
                 return selection;
             };
-            for (&target, summary) in targets {
+            for (&target, summary) in &targets.targets {
                 add_summary(summary, 1, Some(target), true);
             }
         }
@@ -37106,7 +37195,7 @@ impl<'a> MoveCheck<'a> {
         // The callable expression completed before argument zero. A later eager argument may
         // rebind its source local, but the runtime invokes the already-evaluated environment.
         let environment = self.completed_value_fact(callee);
-        for (&target, summary) in targets {
+        for (&target, summary) in &targets.targets {
             let hir::ReturnBorrowSummary::Roots { params, captures } = summary else {
                 continue;
             };
@@ -74331,6 +74420,68 @@ fn main() -> i32 = 0
         let f = parse_file(toks, &mut d);
         let p = check_file(&f, &mut d);
         (p, d)
+    }
+
+    #[test]
+    fn callable_availability_keeps_unknown_alternatives() {
+        let source = r#"
+fn identity(text: str) -> str = text
+fn joined(text: str, unknown: fn(str) -> str, flag: bool) -> str {
+  known := identity
+  mut selected := known
+  if flag { selected = unknown }
+  return selected(text)
+}
+fn length(text: str, unknown: fn(str) -> i64) -> i64 = unknown(text)
+fn main() -> i32 { _ := joined("x", identity, true); return 0 }
+"#;
+        let (program, diagnostics) = check(source);
+        assert!(!diagnostics.has_errors());
+        let mut observed = 0;
+        let mut selected_id = None;
+        for function in &program.fns {
+            for local in &function.locals {
+                let Ty::Fn(id) = local.ty else { continue };
+                let signature = &program.fn_types[id as usize];
+                match (function.name.as_str(), local.name.as_str()) {
+                    ("joined", "known") => {
+                        observed += 1;
+                        assert!(matches!(
+                            signature.return_borrow,
+                            hir::ReturnBorrowSummary::Roots { .. }
+                        ));
+                    }
+                    ("joined", "unknown" | "selected") => {
+                        observed += 1;
+                        if local.name == "selected" {
+                            selected_id = Some(id);
+                        }
+                        assert_eq!(signature.return_borrow, hir::ReturnBorrowSummary::None);
+                    }
+                    ("length", "unknown") => {
+                        observed += 1;
+                        assert_eq!(signature.return_borrow, hir::ReturnBorrowSummary::None);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(observed, 4);
+        assert!(checked_hir_body_facts_are_valid(&program));
+        if let Some(id) = selected_id {
+            let mut forged = program;
+            forged.fn_types[id as usize].return_borrow = hir::ReturnBorrowSummary::Roots {
+                params: vec![0],
+                captures: vec![],
+            };
+            forged.fn_types[id as usize].return_region = hir::ReturnRegionSummary::Roots {
+                params: vec![0],
+                captures: vec![],
+            };
+            assert!(!checked_hir_body_facts_are_valid(&forged));
+        } else {
+            assert!(selected_id.is_some(), "missing selected callable");
+        }
     }
 
     #[test]

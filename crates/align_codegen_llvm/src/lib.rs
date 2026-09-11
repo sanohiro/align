@@ -4620,36 +4620,141 @@ fn xml_signature_matches_facts(
         && signature.return_cleanup == facts.cleanup
 }
 
-/// Callable storage may join origins, but cannot forget a returned owner root.
+/// A closed by-value result domain whose protected leaves need only shared reads.
+/// Do not use an empty ownership-leaf inventory as a proof: it also omits raw pointers
+/// and mutable numeric slices. Nominal identity and nested callable ABI stay exact.
+fn xml_shared_string_result(program: &Program, root: Ty) -> bool {
+    let mut pending = vec![(root, false)];
+    let mut active = HashSet::new();
+    let mut complete = HashSet::new();
+    let mut has_string = false;
+    while let Some((ty, exit)) = pending.pop() {
+        if exit {
+            active.remove(&ty);
+            complete.insert(ty);
+            continue;
+        }
+        if complete.contains(&ty) {
+            continue;
+        }
+        if !active.insert(ty) {
+            return false;
+        }
+        pending.push((ty, true));
+        match ty {
+            Ty::Str => has_string = true,
+            Ty::Unit | Ty::Bool | Ty::Char => {}
+            Ty::Int(IntTy {
+                bits: 8 | 16 | 32 | 64,
+                ..
+            })
+            | Ty::Float(FloatTy { bits: 32 | 64 }) => {}
+            Ty::Struct(id) => {
+                let Some(definition) = program.structs.get(id as usize) else {
+                    return false;
+                };
+                pending.extend(definition.fields.iter().map(|field| (field.ty, false)));
+            }
+            Ty::Tuple(id) => {
+                let Some(definition) = program.tuples.get(id as usize) else {
+                    return false;
+                };
+                pending.extend(definition.elems.iter().map(|ty| (scalar_to_ty(*ty), false)));
+            }
+            Ty::Enum(id) => {
+                let Some(definition) = program.enums.get(id as usize) else {
+                    return false;
+                };
+                pending.extend(definition.variants.iter().flat_map(|variant| {
+                    variant.payload.iter().map(|ty| (scalar_to_ty(*ty), false))
+                }));
+            }
+            Ty::Option(payload) => pending.push((scalar_to_ty(payload), false)),
+            Ty::Result(ok, error) => {
+                pending.push((scalar_to_ty(ok), false));
+                pending.push((scalar_to_ty(error), false));
+            }
+            Ty::Tagged(id) => {
+                let Some(definition) = program.tagged_types.get(id as usize) else {
+                    return false;
+                };
+                match definition {
+                    hir::TaggedType::Option(payload) => {
+                        pending.push((scalar_to_ty(*payload), false))
+                    }
+                    hir::TaggedType::Result(ok, error) => {
+                        pending.push((scalar_to_ty(*ok), false));
+                        pending.push((scalar_to_ty(*error), false));
+                    }
+                }
+            }
+            _ => return false,
+        }
+    }
+    has_string
+}
+
+/// Callable storage may join origins. Only shared string results may forget a root.
 /// Concrete callable construction and canonical ABI identity remain exact.
 fn xml_callable_flow_matches(program: &Program, actual: Ty, expected: Ty) -> bool {
-    if actual == expected { return true; }
-    let (Ty::Fn(actual), Ty::Fn(expected)) = (actual, expected) else { return false; };
+    if actual == expected {
+        return true;
+    }
+    let (Ty::Fn(actual), Ty::Fn(expected)) = (actual, expected) else {
+        return false;
+    };
     if canonical_ty(Ty::Fn(actual), program).is_err()
         || canonical_ty(Ty::Fn(expected), program).is_err()
-    { return false; }
-    let (Some(actual), Some(expected)) = (xml_fn_type_facts(program, actual), xml_fn_type_facts(program, expected))
-        else { return false; };
+    {
+        return false;
+    }
+    let (Some(actual), Some(expected)) = (
+        xml_fn_type_facts(program, actual),
+        xml_fn_type_facts(program, expected),
+    ) else {
+        return false;
+    };
     let roots_fit = |ap: &[u32], ac: &[u32], ep: &[u32], ec: &[u32]| {
         ap.iter().all(|root| ep.binary_search(root).is_ok())
             && ac.iter().all(|root| ec.binary_search(root).is_ok())
     };
-    let borrow_fits = match (&actual.borrow, &expected.borrow) {
-        (hir::ReturnBorrowSummary::None, _) => true,
-        (hir::ReturnBorrowSummary::Roots { params: ap, captures: ac },
-         hir::ReturnBorrowSummary::Roots { params: ep, captures: ec }) => roots_fit(ap, ac, ep, ec),
-        _ => false,
-    };
-    let region_fits = match (&actual.region, &expected.region) {
-        (hir::ReturnRegionSummary::None, _) => true,
-        (hir::ReturnRegionSummary::Roots { params: ap, captures: ac },
-         hir::ReturnRegionSummary::Roots { params: ep, captures: ec }) => roots_fit(ap, ac, ep, ec),
-        _ => false,
-    };
-    actual.modes == expected.modes && actual.cleanup == expected.cleanup
+    let shared_result = xml_shared_string_result(program, expected.ret);
+    let borrow_fits = (shared_result && expected.borrow == hir::ReturnBorrowSummary::None)
+        || match (&actual.borrow, &expected.borrow) {
+            (hir::ReturnBorrowSummary::None, _) => true,
+            (
+                hir::ReturnBorrowSummary::Roots {
+                    params: ap,
+                    captures: ac,
+                },
+                hir::ReturnBorrowSummary::Roots {
+                    params: ep,
+                    captures: ec,
+                },
+            ) => roots_fit(ap, ac, ep, ec),
+            _ => false,
+        };
+    let region_fits = (shared_result && expected.region == hir::ReturnRegionSummary::None)
+        || match (&actual.region, &expected.region) {
+            (hir::ReturnRegionSummary::None, _) => true,
+            (
+                hir::ReturnRegionSummary::Roots {
+                    params: ap,
+                    captures: ac,
+                },
+                hir::ReturnRegionSummary::Roots {
+                    params: ep,
+                    captures: ec,
+                },
+            ) => roots_fit(ap, ac, ep, ec),
+            _ => false,
+        };
+    actual.modes == expected.modes
+        && actual.cleanup == expected.cleanup
         && source_tys_match(&actual.params, &expected.params, program).unwrap_or(false)
         && source_ty_matches(actual.ret, expected.ret, program).unwrap_or(false)
-        && borrow_fits && region_fits
+        && borrow_fits
+        && region_fits
 }
 
 fn xml_closure_borrow_summary(
@@ -6597,7 +6702,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 .iter()
                 .zip(&facts.params)
                 .all(|(operand, expected)| {
-                    xml_operand_base_ty(self.graph.function, operand) == Some(*expected)
+                    xml_operand_base_ty(self.graph.function, operand).is_some_and(|actual|
+                        actual == *expected || xml_callable_flow_matches(self.graph.program, actual, *expected))
                 });
         let cleanup_matches = match (cleanup, facts.cleanup) {
             (None, hir::ReturnCleanupAbi::None) => true,
@@ -6650,6 +6756,16 @@ impl<'a> XmlAccessAnalyzer<'a> {
             if !canonical_borrow {
                 self.check_whole_operand(equation, argument, *expected);
             }
+        }
+        if callee.is_some() && selected_ty == Ty::Str
+            && xml_shared_string_result(self.graph.program, facts.ret)
+        {
+            // An empty function-value summary can mean an opaque target. Even a
+            // populated summary may contain an empty alternative. Authenticate the
+            // invocation above, then publish only shared access without inspecting an
+            // opaque capture environment. Writable backing has its own buffer proof.
+            equation.seed = merge_xml_access(equation.seed, XmlAccessProvenance::Shared);
+            return;
         }
         let mut captured_sources = Vec::new();
         if !captures.is_empty() {
@@ -14981,7 +15097,11 @@ fn callable_preflight(
                         let result = function.value_tys.get(*value as usize).copied();
                         let types_match = match argument_types.as_deref() {
                             Some(actual) => {
-                                source_tys_match(actual, &declaration.signature.params, program)?
+                                actual.len() == declaration.signature.params.len()
+                                    && actual.iter().zip(&declaration.signature.params).all(|(actual, expected)| {
+                                        source_ty_matches(*actual, *expected, program).unwrap_or(false)
+                                            || xml_callable_flow_matches(program, *actual, *expected)
+                                    })
                             }
                             None => false,
                         };
@@ -15018,7 +15138,11 @@ fn callable_preflight(
                         let cleanup_ty = function.value_tys.get(*cleanup as usize).copied();
                         let types_match = match argument_types.as_deref() {
                             Some(actual) => {
-                                source_tys_match(actual, &declaration.signature.params, program)?
+                                actual.len() == declaration.signature.params.len()
+                                    && actual.iter().zip(&declaration.signature.params).all(|(actual, expected)| {
+                                        source_ty_matches(*actual, *expected, program).unwrap_or(false)
+                                            || xml_callable_flow_matches(program, *actual, *expected)
+                                    })
                             }
                             None => false,
                         };
@@ -38114,6 +38238,253 @@ fn main() -> i32 = 0
                 _ => panic!("out producer inventory changed shape"),
             }
             assert_xml_producer_rejected(&detached, &format!("{name} detached out slot"));
+        }
+    }
+
+    #[test]
+    fn shared_string_callback_domain_and_nested_identity() -> Result<(), &'static str> {
+        let mut program = mir(
+            "fn apply(text: str, action: fn(str) -> str) -> str = action(text)\nfn identity(text: str) -> str = text\nfn main() -> i32 { _ := apply(\"x\", identity); return 0 }\n",
+        );
+        let rooted = u32::try_from(
+            program
+                .fn_types
+                .iter()
+                .position(|ty| matches!(ty.return_borrow, hir::ReturnBorrowSummary::Roots { .. }))
+                .ok_or("rooted callable")?,
+        )
+        .map_err(|_| "type id")?;
+        let empty = u32::try_from(
+            program
+                .fn_types
+                .iter()
+                .position(|ty| {
+                    ty.ret == Ty::Str && ty.return_borrow == hir::ReturnBorrowSummary::None
+                })
+                .ok_or("empty callable")?,
+        )
+        .map_err(|_| "type id")?;
+        assert!(xml_callable_flow_matches(
+            &program,
+            Ty::Fn(rooted),
+            Ty::Fn(empty)
+        ));
+        let integer = Scalar::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        for excluded in [
+            Ty::Unit,
+            scalar_to_ty(integer),
+            Ty::Raw,
+            Ty::String,
+            Ty::Slice(integer),
+            Ty::Slice(Scalar::Str),
+            Ty::DynArray(Scalar::Str),
+            Ty::Array(Scalar::Str, 2),
+            Ty::Fn(rooted),
+            Ty::Struct(u32::MAX),
+        ] {
+            assert!(
+                !xml_shared_string_result(&program, excluded),
+                "{excluded:?}"
+            );
+        }
+        assert!(xml_shared_string_result(&program, Ty::Str));
+        assert!(xml_shared_string_result(&program, Ty::Option(Scalar::Str)));
+        assert!(xml_shared_string_result(
+            &program,
+            Ty::Result(Scalar::Str, integer)
+        ));
+        let tuple = u32::try_from(program.tuples.len()).map_err(|_| "tuple id")?;
+        program.tuples.push(hir::TupleDef {
+            elems: vec![Scalar::Str, integer],
+        });
+        assert!(xml_shared_string_result(&program, Ty::Tuple(tuple)));
+        let tagged = u32::try_from(program.tagged_types.len()).map_err(|_| "tagged id")?;
+        program
+            .tagged_types
+            .push(hir::TaggedType::Option(Scalar::Tagged(tagged)));
+        assert!(!xml_shared_string_result(&program, Ty::Tagged(tagged)));
+        program.tagged_types.pop();
+        for result in [false, true] {
+            let mut outer = program.fn_types[empty as usize].clone();
+            outer.params = if result {
+                vec![]
+            } else {
+                vec![(align_ast::ParamMode::ByValue, Scalar::Fn(rooted))]
+            };
+            outer.ret = if result { Ty::Fn(rooted) } else { Ty::Unit };
+            let first = u32::try_from(program.fn_types.len()).map_err(|_| "type id")?;
+            program.fn_types.push(outer.clone());
+            let exact = u32::try_from(program.fn_types.len()).map_err(|_| "type id")?;
+            program.fn_types.push(outer.clone());
+            if result {
+                outer.ret = Ty::Fn(empty);
+            } else {
+                outer.params[0].1 = Scalar::Fn(empty);
+            }
+            let different = u32::try_from(program.fn_types.len()).map_err(|_| "type id")?;
+            program.fn_types.push(outer);
+            assert!(xml_callable_flow_matches(
+                &program,
+                Ty::Fn(first),
+                Ty::Fn(exact)
+            ));
+            assert!(!xml_callable_flow_matches(
+                &program,
+                Ty::Fn(first),
+                Ty::Fn(different)
+            ));
+            assert!(!xml_callable_flow_matches(
+                &program,
+                Ty::Fn(different),
+                Ty::Fn(first)
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shared_string_callbacks_cannot_publish_writable_backing() -> Result<(), &'static str> {
+        // Certification only: never execute a write through a potentially static string.
+        for expression in [
+            "action(text)",
+            "apply(text, action)",
+            "if flag { action(text) } else { apply(text, action) }",
+        ] {
+            let source = format!(
+                r#"
+import std.process
+fn apply(text: str, action: fn(str) -> str) -> str = action(text)
+fn probe(borrow mut c: child, text: str, action: fn(str) -> str, flag: bool) -> Result<Option<i64>, Error> {{
+  value := {expression}
+  mut bytes := value.bytes()
+  mut storage := [0 as u8]
+  return c.read_stdout(storage)
+}}
+fn main() -> i32 = 0
+"#
+            );
+            let mut program = mir(&source);
+            assert!(validate_mir_producers(&program).is_ok());
+            let function = program
+                .fns
+                .iter_mut()
+                .find(|function| function.name.as_str() == "probe")
+                .ok_or("probe function")?;
+            let byte_view = function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .find_map(|statement| {
+                    if let Stmt::Let(value, Rvalue::Use(operand)) = statement
+                        && function.value_tys.get(*value as usize)
+                            == Some(&Ty::Slice(Scalar::Int(IntTy {
+                                bits: 8,
+                                signed: false,
+                            })))
+                        && xml_operand_base_ty(function, operand) == Some(Ty::Str)
+                    {
+                        Some(*value)
+                    } else {
+                        None
+                    }
+                })
+                .ok_or("returned string byte view")?;
+            let mut changed = false;
+            for statement in function
+                .blocks
+                .iter_mut()
+                .flat_map(|block| &mut block.stmts)
+            {
+                if let Stmt::Let(_, Rvalue::ProcessLive { kind, args, .. }) = statement {
+                    for (input, argument) in kind.inputs().iter().zip(args) {
+                        if *input == align_sema::process_live::Input::OutBytes {
+                            *argument = Operand::Value(byte_view);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            assert!(changed);
+            assert_xml_producer_rejected(&program, expression);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shared_string_callback_invocations_authenticate_producers() {
+        let base = mir(r#"
+fn apply(text: str, action: fn(str) -> str) -> str = action(text)
+fn identity(text: str) -> str = text
+fn main() -> i32 {
+  value := apply("hello", identity)
+  return if value.len() == 5 { 0 } else { 1 }
+}
+"#);
+        assert!(validate_mir_producers(&base).is_ok());
+        assert!(emit_llvm_ir(&base, &BuildTarget::Baseline, false, &[], None).is_ok());
+        for mutation in [
+            "copied-signature",
+            "constructor-summary",
+            "raw-argument",
+            "raw-callee",
+            "mode",
+        ] {
+            let mut forged = base.clone();
+            let mut changed = false;
+            for function in &mut forged.fns {
+                for statement in function
+                    .blocks
+                    .iter_mut()
+                    .flat_map(|block| &mut block.stmts)
+                {
+                    match statement {
+                        Stmt::Let(_, Rvalue::CallIndirect { signature, .. })
+                            if mutation == "copied-signature" =>
+                        {
+                            signature.return_borrow = hir::ReturnBorrowSummary::Roots {
+                                params: vec![0],
+                                captures: vec![],
+                            };
+                            signature.return_region = hir::ReturnRegionSummary::Roots {
+                                params: vec![0],
+                                captures: vec![],
+                            };
+                            changed = true;
+                        }
+                        Stmt::Let(_, Rvalue::FnAddr { signature, .. })
+                            if mutation == "constructor-summary" =>
+                        {
+                            signature.return_borrow = hir::ReturnBorrowSummary::None;
+                            signature.return_region = hir::ReturnRegionSummary::None;
+                            changed = true;
+                        }
+                        Stmt::Let(_, Rvalue::CallIndirect { args, .. })
+                            if mutation == "raw-argument" =>
+                        {
+                            args[0] = Operand::Value(u32::MAX);
+                            changed = true;
+                        }
+                        Stmt::Let(_, Rvalue::CallIndirect { callee, .. })
+                            if mutation == "raw-callee" =>
+                        {
+                            *callee = Operand::Value(u32::MAX);
+                            changed = true;
+                        }
+                        Stmt::Let(_, Rvalue::CallIndirect { signature, .. })
+                            if mutation == "mode" =>
+                        {
+                            signature.param_modes[0] = align_ast::ParamMode::BorrowMut;
+                            changed = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            assert!(changed, "missing mutation {mutation}");
+            assert_xml_producer_rejected(&forged, mutation);
         }
     }
 
