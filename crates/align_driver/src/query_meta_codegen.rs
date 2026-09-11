@@ -12,7 +12,7 @@ use align_interface::{
 use align_mir::{Block, Const, Function, Operand, Program, ProgramCall, Rvalue, Stmt, Term};
 use align_sema::{IntTy, Scalar, Ty, hir};
 
-use align_codegen_llvm::QueryMetaTypes as MetaTypes;
+use align_mir::QueryMetaTypes as MetaTypes;
 
 fn enum_variant(program: &Program, enum_id: u32, name: &str) -> Result<u32, String> {
     program

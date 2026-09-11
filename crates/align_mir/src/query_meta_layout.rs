@@ -1,6 +1,6 @@
 //! Shared D12 QueryMeta layout authority for thunk production and native-view validation.
 
-use align_mir::Program;
+use crate::Program;
 use align_sema::{IntTy, Scalar, Ty};
 
 const QUERY_META_FIELDS: [&str; 24] = [
