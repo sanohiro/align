@@ -1,5 +1,13 @@
 # Checked-HIR validation ledger
 
+**R69–R76: capability A implemented; B/C planned:**
+[Plan 54 §5–7](54-r69-r76-prerequisite-batch-plan.md#5-compiler-representation-and-native-abi)
+owns the five FsTree cases, access/identity qualified schemas, OsIdentity,
+Utf8Lossy/Sha1 discriminators and shared filesystem-owner projection closure.
+The five FsTree cases and OsIdentity are implemented with exact argument/result
+and globally reserved schema validation. The ExprKind sweep contains 332 variants.
+Utf8Lossy/Sha1 and shared projection remain planned.
+
 **R65 planned contract:** [plan 50](50-r65-process-capability-handoff.md) and
 [plan 49](49-native-process-contract.md), designed and ready for implementation, own the new
 closed operation schemas, writable out provenance, receiver families, Move

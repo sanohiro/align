@@ -1444,6 +1444,8 @@ const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("Error", 0, BuiltinCapability::Opaque),
     ("core.Error", 0, BuiltinCapability::Opaque),
     ("os.host_info", 0, BuiltinCapability::Opaque),
+    ("os.identity_info", 0, BuiltinCapability::Opaque),
+    ("fs.access_mode", 0, BuiltinCapability::Opaque),
     ("argon2_params", 0, BuiltinCapability::Opaque),
     ("crypto.argon2_params", 0, BuiltinCapability::Opaque),
     ("regex_match", 0, BuiltinCapability::Opaque),
@@ -2713,9 +2715,9 @@ pub fn summary_to_source(
                         | "crypto.ed25519_public_key" => {
                             builtin_type_imports.insert("std.crypto".to_string());
                         }
-                        "fs.memory_writer" | "fs.sealed_file" | "fs.memory_kind" | "fs.directory" | "fs.dir_cursor" | "fs.dir_entry" | "fs.metadata" | "fs.entry_kind" => { builtin_type_imports.insert("std.fs".to_string()); }
+                        "fs.memory_writer" | "fs.sealed_file" | "fs.memory_kind" | "fs.directory" | "fs.dir_cursor" | "fs.dir_entry" | "fs.metadata" | "fs.access_mode" | "fs.entry_kind" => { builtin_type_imports.insert("std.fs".to_string()); }
                         "process.child_scope" | "process.member" | "process.member_info" | "process.reaped" | "process.image" | "process.user_namespace" | "process.signal_subscription" => { builtin_type_imports.insert("std.process".to_string()); }
-                        "os.host_info" => { builtin_type_imports.insert("std.os".to_string()); }
+                        "os.host_info" | "os.identity_info" => { builtin_type_imports.insert("std.os".to_string()); }
                         "process.termination" | "process.wait_result" | "process.readiness" | "process.signal" | "process.signal_set" | "process.snapshot" | "command" | "run_output" => { builtin_type_imports.insert("std.process".to_string()); }
                         "regex.regex_match" => {
                             builtin_type_imports.insert("std.regex".to_string());

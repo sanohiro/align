@@ -1,5 +1,14 @@
 # Session handoff
 
+**Active implementation batch — R69–R76 (2026-09-11):**
+[Plan 54](docs/impl/54-r69-r76-prerequisite-batch-plan.md) covers all eight
+new consumer requests, including the five blockers and three nonblockers. It
+defines three complete capability PRs: retained/credential operations, owned
+byte transforms, then shared projections. Implementation and merges are authorized. Capability A is implemented with
+verification in progress; B and C follow after its merge.
+Read its exact ledger, native-platform qualifications and owner checklist before
+coding. Consumer adoption remains external; no new release is selected.
+
 **Future std/pkg review (planned, no implementation scheduled):**
 [Plan 51](docs/impl/51-package-composition-review-plan.md) records the overlap
 assessment and existing-module priority: std.process, std.fs, then demonstrated

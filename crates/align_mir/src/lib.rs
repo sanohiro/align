@@ -827,6 +827,8 @@ pub enum FsTreeOutput {
     None,
     Owner(Slot),
     Metadata(Slot),
+    Bytes(Slot),
+    Bool(Slot),
     CursorNext { entry: Slot, present: Slot },
 }
 
@@ -2164,8 +2166,11 @@ pub enum Rvalue {
     },
     /// `time.now()` — wall-clock UNIX-epoch nanoseconds (`CLOCK_REALTIME`), an `i64`. Impure.
     TimeNow,
-    /// `process.cpu_count()` — the parallelism available to this process, an `i64` (>= 1). Impure.
+    /// Native owned host observation, reconstructed as a Result from status and scratch.
     OsHost { out: Slot },
+    /// Native Copy real-credential observation; scratch is the exact identity_info record.
+    OsIdentity { out: Slot },
+    /// `process.cpu_count()` — the parallelism available to this process, an `i64` (>= 1). Impure.
     ProcessCpuCount,
     /// `time.instant()` — monotonic-clock nanoseconds (`CLOCK_MONOTONIC`), an `i64`. Impure.
     TimeInstant,
@@ -8434,12 +8439,12 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             }
             hir::ExprKind::ProcessLive { kind, args } => lower_process_live(b, *kind, args, e.ty),
             hir::ExprKind::FsTree { kind, args } => lower_fs_tree(b, *kind, args, e.ty),
-            hir::ExprKind::OsHost => {
+            hir::ExprKind::OsHost | hir::ExprKind::OsIdentity => {
                 let Ty::Result(Scalar::Struct(id), _) = e.ty else { return Operand::Const(Const::Unit) };
                 let ty = Ty::Struct(id);
                 let out = b.new_slot(ty);
                 let status = b.fresh_value(status_ty());
-                b.push(Stmt::Let(status, Rvalue::OsHost { out }));
+                b.push(Stmt::Let(status, if matches!(e.kind, hir::ExprKind::OsIdentity) { Rvalue::OsIdentity { out } } else { Rvalue::OsHost { out } }));
                 emit_open_handle_result(b, status, out, ty, e.ty)
             }
             hir::ExprKind::ProcessCpuCount => {
@@ -19199,13 +19204,18 @@ fn lower_fs_tree(b: &mut Builder, kind: align_sema::fs_tree::FsTreeKind, args: &
             let ty = Ty::Struct(id);
             (FsTreeOutput::CursorNext { entry: b.new_slot(ty), present: b.new_slot(Ty::Bool) }, ty)
         }
+        align_sema::fs_tree::Output::OwnedBytes => {
+            let ty = Ty::DynArray(Scalar::Int(IntTy { bits:8, signed:false }));
+            (FsTreeOutput::Bytes(b.new_slot(ty)),ty)
+        }
+        align_sema::fs_tree::Output::Bool => (FsTreeOutput::Bool(b.new_slot(Ty::Bool)),Ty::Bool),
         align_sema::fs_tree::Output::Unit => (FsTreeOutput::None, Ty::Unit),
     };
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::FsTree { kind, args: operands, output }));
     match output {
         FsTreeOutput::None => lower_status_result(b, code, result_ty),
-        FsTreeOutput::Owner(out) | FsTreeOutput::Metadata(out) => emit_open_handle_result(b, code, out, payload_ty, result_ty),
+        FsTreeOutput::Owner(out) | FsTreeOutput::Metadata(out) | FsTreeOutput::Bytes(out) | FsTreeOutput::Bool(out) => emit_open_handle_result(b, code, out, payload_ty, result_ty),
         FsTreeOutput::CursorNext { entry, present } => emit_cursor_result(b, code, entry, present, payload_ty, result_ty),
     }
 }

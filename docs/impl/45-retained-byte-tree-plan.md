@@ -1,5 +1,11 @@
 # Retained byte-path filesystem operations
 
+Implemented extensions: [plan 54](54-r69-r76-prerequisite-batch-plan.md)
+owns read_link, metadata_follow, access, access_at and create_symlink, including
+the exact access_mode record, native real-credential semantics and output ABI.
+The nineteen-operation base below plus those five additions form the current
+24-operation surface. Ordinary metadata still does not predict write permission.
+
 Status: exact F2/R64 contract selected by plan 40; implemented with local owner
 verification. Consumer adoption is separate. The unrelated candidate objects reported in the
 external register are unavailable here and do not certify this implementation.

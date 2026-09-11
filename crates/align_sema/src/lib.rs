@@ -4570,6 +4570,7 @@ pub fn builtin_spelling_needs_return_cleanup(head: &str) -> Option<bool> {
         let ty = if head == "fs.metadata" { Ty::Struct(0) } else { Ty::Enum(0) };
         return Some(needs_drop_flag(ty, &[fs_metadata_definition(0)], &[], &[fs_entry_kind_definition()], &[]));
     }
+    if matches!(head, "os.identity_info" | "fs.access_mode") { return Some(false); }
     if head == "os.host_info" { return Some(needs_drop_flag(Ty::Struct(0), &[host_info_definition()], &[], &[], &[])); }
     let ty = builtin_spelling_ty(head)?;
     Some(needs_drop_flag(ty, &[], &[], &[], &[]))
@@ -4592,6 +4593,7 @@ pub fn builtin_spelling_is_move(head: &str) -> Option<bool> {
         let ty = if head == "fs.metadata" { Ty::Struct(0) } else { Ty::Enum(0) };
         return Some(ty_is_move(ty, &[fs_metadata_definition(0)], &[], &[fs_entry_kind_definition()], &[]));
     }
+    if matches!(head, "os.identity_info" | "fs.access_mode") { return Some(false); }
     if head == "os.host_info" { return Some(ty_is_move(Ty::Struct(0), &[host_info_definition()], &[], &[], &[])); }
     let ty = builtin_spelling_ty(head)?;
     Some(ty_is_move(ty, &[], &[], &[], &[]))
@@ -6277,6 +6279,8 @@ const BUILTIN_NOMINAL_ALIASES: &[BuiltinNominalAlias] = &[
     BuiltinNominalAlias { bare: "fs.metadata", explicit: "fs.metadata", canonical: "fs.metadata", required_import: Some("std.fs") },
     BuiltinNominalAlias { bare: "fs.entry_kind", explicit: "fs.entry_kind", canonical: "fs.entry_kind", required_import: Some("std.fs") },
     BuiltinNominalAlias { bare: "os.host_info", explicit: "os.host_info", canonical: "os.host_info", required_import: Some("std.os") },
+    BuiltinNominalAlias { bare: "os.identity_info", explicit: "os.identity_info", canonical: "os.identity_info", required_import: Some("std.os") },
+    BuiltinNominalAlias { bare: "fs.access_mode", explicit: "fs.access_mode", canonical: "fs.access_mode", required_import: Some("std.fs") },
     BuiltinNominalAlias {
         bare: "Error",
         explicit: "core.Error",
@@ -8774,6 +8778,12 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
 
     struct_ids.insert("os.host_info".to_string(), structs.len() as u32);
     structs.push(host_info_definition());
+    for definition in [identity_info_definition(), fs_access_mode_definition()] {
+        if let Ok(id) = u32::try_from(structs.len()) {
+            struct_ids.insert(definition.name.clone(), id);
+            structs.push(definition);
+        } else { diags.error("observation builtin type table capacity exceeded".to_string(), Span::new(0,0,0)); }
+    }
 
     // The builtin `argon2_params` struct (M11 std.crypto Slice 5) — a plain **Copy** struct of four
     // `i64` tuning knobs for `crypto.argon2id` (`m_cost` KiB, `t_cost` iterations, `parallelism`
@@ -16280,7 +16290,7 @@ impl EffectScan<'_> {
                 walk!(value);
                 self.impure_direct = true;
             }
-            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::ProcessCpuCount => self.impure_direct = true,
+            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::ProcessCpuCount => self.impure_direct = true,
             ExprKind::TimeSleep { ns } => {
                 walk!(ns);
                 self.impure_direct = true;
@@ -22336,7 +22346,7 @@ impl<'a> EscapeCheck<'a> {
         // accepted owner free-standing. Keep this producer aligned with `region_of` and the
         // checked-HIR allocation-mode contract instead of deriving its Drop mode from lexical
         // allocation context like the ordinary arena-aware collection producers below.
-        if matches!(expression.kind, ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. } | ExprKind::OsHost | ExprKind::JsonOwnedDecode { .. } | ExprKind::CryptoDigestFinish { .. }) {
+        if native_storage_is_individual(&expression.kind) {
             return Some(true);
         }
         if matches!(
@@ -24261,7 +24271,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::EnvGet { .. }
             | ExprKind::EnvSet { .. }
             | ExprKind::TimeNow
-            | ExprKind::OsHost | ExprKind::ProcessCpuCount
+            | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::ProcessCpuCount
             | ExprKind::TimeInstant
             | ExprKind::TimeSleep { .. }
             | ExprKind::ProcessExit { .. }
@@ -24718,7 +24728,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::EnvGet { .. }
             | ExprKind::EnvSet { .. }
             | ExprKind::TimeNow
-            | ExprKind::OsHost | ExprKind::ProcessCpuCount
+            | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::ProcessCpuCount
             | ExprKind::TimeInstant
             | ExprKind::TimeSleep { .. }
             | ExprKind::ProcessExit { .. }
@@ -28057,7 +28067,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(name, depth);
                 self.walk(value, depth);
             }
-            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::ProcessCpuCount => {}
+            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::ProcessCpuCount => {}
             ExprKind::TimeSleep { ns } => self.walk(ns, depth),
             // `process.exit` diverges and its `code` is a scalar `i64` (nothing escapes); `abort`
             // has no operand.
@@ -30357,6 +30367,14 @@ fn storage_header_descriptors_compatible(
             && indexed_backing_compatible(expected.ty, candidate.ty, tagged_types))
 }
 
+// These native producers allocate independent owners even inside a lexical arena.
+// Escape/Drop selection and generation release must agree on the same provenance.
+fn native_storage_is_individual(kind: &ExprKind) -> bool {
+    matches!(kind, ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. }
+        | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::JsonOwnedDecode { .. }
+        | ExprKind::CryptoDigestFinish { .. })
+}
+
 /// Compile-time-closed storage inventory for every checked-HIR expression variant. This match has
 /// no wildcard by design: adding an [`ExprKind`] cannot silently inherit a producer or forwarding
 /// default. Type-directed header/carrier paths are added by [`classify_storage_expression`].
@@ -30465,7 +30483,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         // The runtime materializes a fresh `array<RowPair>` in Result::Ok and retains neither
         // codec view. `RowPair` is scalar-only, so the generation starts without borrowed content;
         // Result::Err carries no storage header.
-        ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. } | ExprKind::OsHost | ExprKind::FrameInnerJoin { .. } | ExprKind::CryptoDigestFinish { .. } => {
+        ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. } | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::FrameInnerJoin { .. } | ExprKind::CryptoDigestFinish { .. } => {
             StorageVariantPolicy::Fresh(StorageContentInitializer::FreshEmpty)
         }
 
@@ -36577,6 +36595,7 @@ impl<'a> MoveCheck<'a> {
                     .into_iter()
                     .collect()
             } else if result.header_kind != Some(StorageHeaderKind::OwnedOpaque)
+                && !native_storage_is_individual(&expression.kind)
                 && result.initializer != StorageContentInitializer::CallSummary
                 && let Some(arena) = active_arena
             {
@@ -38340,7 +38359,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::TcpAccept { .. } | ExprKind::UdpBind { .. } | ExprKind::UdpSendTo { .. }
             | ExprKind::UdpRecvFrom { .. } | ExprKind::PathJoin { .. } | ExprKind::PathNormalize { .. }
             | ExprKind::EnvGet { .. } | ExprKind::EnvSet { .. } | ExprKind::TimeNow | ExprKind::TimeInstant
-            | ExprKind::OsHost | ExprKind::ProcessCpuCount | ExprKind::TimeSleep { .. } | ExprKind::ProcessExit { .. }
+            | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::ProcessCpuCount | ExprKind::TimeSleep { .. } | ExprKind::ProcessExit { .. }
             | ExprKind::ProcessAbort | ExprKind::ProcessSpawn { .. } | ExprKind::ChildWait { .. }
             | ExprKind::ChildKill { .. } | ExprKind::ProcessExec { .. }
             // `process.command` (owns the handle) / `c.cwd` (`()`) / `c.run` (owns its `Result`) /
@@ -44788,7 +44807,7 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, name, moved, false, false);
                 move_expr!(self, value, moved, false, false);
             }
-            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::ProcessCpuCount => {}
+            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::ProcessCpuCount => {}
             ExprKind::TimeSleep { ns } => move_expr!(self, ns, moved, false, false),
             // `process.exit(code)` reads a scalar `i64` (never consumed); `abort` reads nothing.
             ExprKind::ProcessExit { code } => {
@@ -50927,17 +50946,18 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.process", &format!("process.{method}"), span);
                 return self.check_process_op(method, args, span);
             }
-            if module == "os" && method == "host" {
-                self.require_import("std.os", "os.host", span);
+            if module == "os" && matches!(method, "host" | "identity") {
+                self.require_import("std.os", &format!("os.{method}"), span);
+                let name = if method == "host" { "os.host_info" } else { "os.identity_info" };
                 if !args.is_empty() {
-                    self.diags.error("'os.host' takes no arguments".to_string(), span);
+                    self.diags.error(format!("'os.{method}' takes no arguments"), span);
                     return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
                 }
-                let Some(&id) = self.struct_ids.get("os.host_info") else {
-                    self.diags.error("missing builtin os.host_info".to_string(), span);
+                let Some(&id) = self.struct_ids.get(name) else {
+                    self.diags.error(format!("missing builtin {name}"), span);
                     return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
                 };
-                return Expr { kind: ExprKind::OsHost,
+                return Expr { kind: if method == "host" { ExprKind::OsHost } else { ExprKind::OsIdentity },
                     ty: Ty::Result(Scalar::Struct(id), Scalar::Enum(self.error_enum_id)), span };
             }
             // `std.process` — `process.cpu_count()` -> i64: the parallelism available to this
@@ -59436,13 +59456,18 @@ impl<'a, 't> Checker<'a, 't> {
                     let Some(value) = self.check_byte_view(argument, "retained filesystem path") else { return invalid; };
                     value
                 }
+                fs_tree::Input::Bound => self.check_expr(argument, Some(Ty::Int(IntTy { bits: 64, signed: true }))),
+                fs_tree::Input::AccessMode => {
+                    let expected = fs_tree::record_id(self.structs,"fs.access_mode").map(Ty::Struct);
+                    self.check_expr(argument, expected)
+                }
                 fs_tree::Input::Mode => self.check_expr(argument, Some(Ty::Int(IntTy { bits: 32, signed: false }))),
                 fs_tree::Input::Owner(_) => {
                     self.diags.error("missing filesystem receiver".to_string(), span);
                     return invalid;
                 }
             };
-            if !fs_tree::input_matches(*input, self.resolve(value.ty)) && !hir_expr_diverges(&value) {
+            if !fs_tree::input_matches(*input, self.resolve(value.ty), self.structs) && !hir_expr_diverges(&value) {
                 self.diags.error("retained filesystem argument has the wrong type".to_string(), argument.span);
                 return invalid;
             }
@@ -65682,7 +65707,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(name);
                 self.finalize_expr(value);
             }
-            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::ProcessCpuCount => {}
+            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::ProcessCpuCount => {}
             ExprKind::TimeSleep { ns } => self.finalize_expr(ns),
             ExprKind::ProcessExit { code } => self.finalize_expr(code),
             ExprKind::ProcessAbort => {}
@@ -72016,7 +72041,7 @@ mod tests {
         // JsonEncode replaces three variants with one fresh owned Result producer.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 331,
+            variants, 332,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 
@@ -81691,17 +81716,42 @@ pub fn fs_tree_schemas_valid(structs: &[hir::StructDef], enums: &[hir::EnumDef])
             kind_id = Some(id);
         }
     }
-    for name in ["fs.dir_entry", "fs.metadata"] {
+    for name in ["fs.dir_entry", "fs.metadata", "fs.access_mode"] {
         let mut found = false;
         for definition in structs {
             if definition.name == name || definition.source_name == name {
                 if found { return false; }
                 found = true;
                 let expected = if name == "fs.dir_entry" { fs_dir_entry_definition() }
+                    else if name == "fs.access_mode" { fs_access_mode_definition() }
                     else { let Some(id) = kind_id else { return false; }; fs_metadata_definition(id) };
                 if !matching(definition, &expected) { return false; }
             }
         }
     }
     true
+}
+
+/// Exact qualified Copy schemas for native observations.
+pub fn identity_info_definition() -> hir::StructDef {
+    copy_observation_definition("os.identity_info", &["real_uid", "real_gid"], Ty::Int(IntTy { bits: 64, signed: true }))
+}
+pub fn fs_access_mode_definition() -> hir::StructDef {
+    copy_observation_definition("fs.access_mode", &["read", "write", "execute"], Ty::Bool)
+}
+fn copy_observation_definition(name: &str, fields: &[&str], ty: Ty) -> hir::StructDef {
+    hir::StructDef { name: name.to_string(), source_name: name.to_string(),
+        fields: fields.iter().map(|name| hir::FieldDef { name: (*name).to_string(), ty }).collect(),
+        align: None, c_repr: false }
+}
+fn observation_schema_matches(actual: &hir::StructDef, expected: hir::StructDef) -> bool {
+    actual.name == expected.name && actual.source_name == expected.source_name
+        && actual.align.is_none() && !actual.c_repr && actual.fields.len() == expected.fields.len()
+        && actual.fields.iter().zip(expected.fields).all(|(a,b)| a.name == b.name && a.ty == b.ty)
+}
+pub fn identity_info_schema_valid(actual: &hir::StructDef) -> bool {
+    observation_schema_matches(actual,identity_info_definition())
+}
+pub fn fs_access_mode_schema_valid(actual: &hir::StructDef) -> bool {
+    observation_schema_matches(actual,fs_access_mode_definition())
 }

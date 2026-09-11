@@ -13,6 +13,18 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+**R69–R76 contract (2026-09-11; native observations implemented).**
+[Plan 54](impl/54-r69-r76-prerequisite-batch-plan.md) owns all eight requests:
+retained link bytes/followed metadata/real-ID access/exclusive symlink creation,
+ordinary real UID/GID, owned maximal-subpart UTF-8 replacement decoding, EVP
+SHA-1 and shared directory/cursor projections with canonical Str slicing.
+The additions preserve the Error/Move/borrow models and existing library layers.
+Opaque shared projection is a capability completion under plans 28/44/45; whole
+Move extraction, exclusive indexed borrowing and arbitrary opaque carriers stay
+excluded. Historical implementation inventories are superseded only when the
+corresponding capability is implemented. The exact ledger, not a client proposal,
+fixes native admission, allocation, error precedence and verification.
+
 **R63 contract (2026-09-10).**
 [`R63 exact contract`](impl/47-json-numeric-contract.md) is authoritative for JSON numeric conversion and encoder results.
 Both `json.encode(value)` and `json.encode_bounded(value, max_bytes: i64)` return

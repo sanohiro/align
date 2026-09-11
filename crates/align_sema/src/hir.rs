@@ -1524,6 +1524,8 @@ pub enum ExprKind {
     /// `task_group` worker count must be sized against — the runtime's own pool is sized from the
     /// same source, so more long-lived tasks than this would never all start.
     OsHost,
+    /// Current real UID/GID as the ordinary qualified Copy record.
+    OsIdentity,
     ProcessCpuCount,
     /// `time.sleep(ns)` — suspend the calling thread for `ns` nanoseconds (the `ty` is
     /// [`crate::Ty::Unit`]). A negative `ns` is a no-op; `EINTR` resumes for the remaining time.

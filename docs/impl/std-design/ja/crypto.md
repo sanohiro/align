@@ -2,6 +2,14 @@
 
 # std.crypto — implementation design (M11)
 
+**採用した追加設計（実装は未着手）:**
+`crypto.sha1(data: bytes) -> array<u8>` は既存の EVP エンジン、byte-view 入力規則、
+確保・プロバイダー失敗時の終了方針を使い、独立して所有する20バイトのダイジェストを返す。
+sha256 と同じく std.crypto を必要とする Impure 操作。
+正確な契約と検証は [Plan 54](../../54-r69-r76-prerequisite-batch-plan.md) が所有する。
+既存のオブジェクト形式との相互運用が用途であり、Git の framing/hex 出力はアプリケーション側に残る。
+SHA-1 を耐衝突性が必要な安全上の識別に採用しない。ストリーミングや別エンジンは追加しない。
+
 > 🌐 [English](../crypto.md) · **日本語**
 
 > **ステータス:** M11 の symmetric/hash/KDF surface と post-pkg.db の asymmetric signature

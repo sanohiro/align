@@ -85,6 +85,38 @@ unsafe fn write_observation(out: *mut core::ffi::c_void, query: impl FnOnce() ->
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct IdentityInfo { real_uid: i64, real_gid: i64 }
+
+fn identity_fields(uid: i128, gid: i128) -> Result<IdentityInfo,i32> {
+    let real_uid = i64::try_from(uid).ok().filter(|id| *id>=0).ok_or(AL_INVALID)?;
+    let real_gid = i64::try_from(gid).ok().filter(|id| *id>=0).ok_or(AL_INVALID)?;
+    Ok(IdentityInfo { real_uid, real_gid })
+}
+
+/// # Safety
+/// Out is fresh exclusive writable 16-byte scratch aligned to 8.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_os_identity(out: *mut core::ffi::c_void) -> i32 {
+    if out.is_null() || !out.addr().is_multiple_of(core::mem::align_of::<IdentityInfo>())
+        || out.addr().checked_add(core::mem::size_of::<IdentityInfo>()).is_none() { return AL_INVALID; }
+    let out = out.cast::<IdentityInfo>();
+    unsafe { out.write(IdentityInfo::default()); }
+    #[cfg(any(target_os="linux",target_os="macos"))]
+    let observed = {
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        identity_fields(i128::from(uid),i128::from(gid))
+    };
+    #[cfg(not(any(target_os="linux",target_os="macos")))]
+    let observed: Result<IdentityInfo,i32> = Err(AL_INVALID);
+    match observed {
+        Ok(value) => { unsafe { out.write(value); } 0 }
+        Err(error) => error,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,4 +176,21 @@ mod tests {
             assert_eq!(unsafe { align_rt_os_host(address as *mut core::ffi::c_void) }, AL_INVALID);
         }
     }
+    #[test]
+    fn identity_layout_conversion_and_observation() {
+        assert_eq!((size_of::<IdentityInfo>(),align_of::<IdentityInfo>()),(16,8));
+        assert_eq!((offset_of!(IdentityInfo,real_uid),offset_of!(IdentityInfo,real_gid)),(0,8));
+        for bad in [-1,i128::from(i64::MAX)+1] {
+            assert_eq!(identity_fields(bad,0),Err(AL_INVALID));
+            assert_eq!(identity_fields(0,bad),Err(AL_INVALID));
+        }
+        let mut out=IdentityInfo::default();
+        assert_eq!(unsafe { align_rt_os_identity((&mut out as *mut IdentityInfo).cast()) },0);
+        assert_eq!(out.real_uid,i64::from(unsafe { libc::getuid() }));
+        assert_eq!(out.real_gid,i64::from(unsafe { libc::getgid() }));
+        for address in [0,1,usize::MAX-7] {
+            assert_eq!(unsafe { align_rt_os_identity(address as *mut core::ffi::c_void) },AL_INVALID);
+        }
+    }
+
 }

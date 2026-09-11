@@ -180,6 +180,10 @@ fn early_mode(directory: fs.directory) -> Result<(), Error> {
 }
 fn early() -> Result<(), Error> {
   directory := fs.open_directory(".")?
+  directory.create_symlink("observation-link", "unresolved")?
+  link_bytes := arena { directory.read_link("observation-link", 10)? }
+  directory.remove_file("observation-link")?
+  if link_bytes.len() != 10 { return Err(Error.Invalid) }
   cursor := directory.cursor()?
   entry := cursor.next()? else { return Err(Error.Invalid) }
   if entry.name.len() == 0 { return Err(Error.Invalid) }
@@ -246,7 +250,7 @@ fn main() -> i32 {
     );
     if backend_available() {
         for per_unit in [false, true] {
-            for omit in [None, Some("directory"), Some("cursor"), Some("entry")] {
+            for omit in [None, Some("directory"), Some("cursor"), Some("entry"), Some("link-bytes")] {
                 let out = run_retained_cleanup_probe(main, per_unit, omit);
                 assert_eq!(
                     out.status.code(),
@@ -298,6 +302,7 @@ fn run_retained_cleanup_probe(
                     block.stmts.retain(|statement| {
                         let remove = matches!(statement, align_mir::Stmt::Drop(slot) if match (omit, function.slots[*slot as usize]) {
                             ("directory", align_sema::Ty::FsDirectory) | ("cursor", align_sema::Ty::FsDirCursor) => true,
+                            ("link-bytes", align_sema::Ty::DynArray(align_sema::Scalar::Int(integer))) => integer.bits == 8 && !integer.signed,
                             ("entry", align_sema::Ty::Struct(id)) => program.structs[id as usize].name == "fs.dir_entry",
                             _ => false,
                         });

@@ -22,6 +22,11 @@ pub enum FsTreeKind {
     ReaderSetMode,
     WriterSetMode,
     FileSetMode,
+    DirectoryReadLink,
+    DirectoryMetadataFollow,
+    DirectoryAccess,
+    DirectoryAccessAt,
+    DirectoryCreateSymlink,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Input {
@@ -29,6 +34,8 @@ pub enum Input {
     Text,
     Bytes,
     Mode,
+    Bound,
+    AccessMode,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Output {
@@ -39,10 +46,12 @@ pub enum Output {
     Metadata,
     EntryOption,
     Unit,
+    OwnedBytes,
+    Bool,
 }
 
 impl FsTreeKind {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 24] = [
         Self::DirectoryOpen,
         Self::DirectoryCursor,
         Self::CursorNext,
@@ -62,10 +71,20 @@ impl FsTreeKind {
         Self::ReaderSetMode,
         Self::WriterSetMode,
         Self::FileSetMode,
+        Self::DirectoryReadLink,
+        Self::DirectoryMetadataFollow,
+        Self::DirectoryAccess,
+        Self::DirectoryAccessAt,
+        Self::DirectoryCreateSymlink,
     ];
     pub fn inputs(self) -> &'static [Input] {
         use Input::*;
         match self {
+            Self::DirectoryReadLink => &[Owner(Ty::FsDirectory), Bytes, Bound],
+            Self::DirectoryMetadataFollow => &[Owner(Ty::FsDirectory), Bytes],
+            Self::DirectoryAccess => &[Owner(Ty::FsDirectory), AccessMode],
+            Self::DirectoryAccessAt => &[Owner(Ty::FsDirectory), Bytes, AccessMode],
+            Self::DirectoryCreateSymlink => &[Owner(Ty::FsDirectory), Bytes, Bytes],
             Self::DirectoryOpen => &[Text],
             Self::DirectoryCursor | Self::DirectoryMetadata => &[Owner(Ty::FsDirectory)],
             Self::CursorNext => &[Owner(Ty::FsDirCursor)],
@@ -88,6 +107,10 @@ impl FsTreeKind {
     }
     pub fn output(self) -> Output {
         match self {
+            Self::DirectoryReadLink => Output::OwnedBytes,
+            Self::DirectoryMetadataFollow => Output::Metadata,
+            Self::DirectoryAccess | Self::DirectoryAccessAt => Output::Bool,
+            Self::DirectoryCreateSymlink => Output::Unit,
             Self::DirectoryOpen | Self::DirectoryOpenDir => Output::Directory,
             Self::DirectoryCursor => Output::Cursor,
             Self::CursorNext => Output::EntryOption,
@@ -109,6 +132,11 @@ impl FsTreeKind {
     }
     pub fn from_method(receiver: Ty, name: &str) -> Option<Self> {
         Some(match (receiver, name) {
+            (Ty::FsDirectory, "read_link") => Self::DirectoryReadLink,
+            (Ty::FsDirectory, "metadata_follow") => Self::DirectoryMetadataFollow,
+            (Ty::FsDirectory, "access") => Self::DirectoryAccess,
+            (Ty::FsDirectory, "access_at") => Self::DirectoryAccessAt,
+            (Ty::FsDirectory, "create_symlink") => Self::DirectoryCreateSymlink,
             (Ty::FsDirectory, "cursor") => Self::DirectoryCursor,
             (Ty::FsDirectory, "metadata") => Self::DirectoryMetadata,
             (Ty::FsDirectory, "metadata_at") => Self::DirectoryMetadataAt,
@@ -135,8 +163,10 @@ impl FsTreeKind {
     }
 }
 
-pub fn input_matches(input: Input, ty: Ty) -> bool {
+pub fn input_matches(input: Input, ty: Ty, structs: &[hir::StructDef]) -> bool {
     match input {
+        Input::Bound => ty == Ty::Int(IntTy { bits: 64, signed: true }),
+        Input::AccessMode => matches!(ty, Ty::Struct(id) if structs.get(id as usize).is_some_and(crate::fs_access_mode_schema_valid)),
         Input::Owner(expected) => ty == expected,
         Input::Text => ty == Ty::Str,
         Input::Bytes => matches!(
@@ -192,6 +222,8 @@ pub fn result_type(
                 .ok()?,
             )
         }
+        Output::OwnedBytes => Scalar::DynArray(crate::PrimScalar::Int(IntTy { bits: 8, signed: false })),
+        Output::Bool => Scalar::Bool,
         Output::Unit => Scalar::Unit,
     };
     Some(Ty::Result(ok, Scalar::Enum(error)))
