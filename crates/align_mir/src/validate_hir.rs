@@ -12600,7 +12600,11 @@ impl<'a> BodyValidator<'a> {
         mode: align_ast::ParamMode,
         allow_projected_move: bool,
     ) -> bool {
-        let (root, field, fixed_element_field, dynamic_element_field, fixed_literal_element_field) = match &argument.kind {
+        // Sema materializes `str` and `slice<T>` borrow arguments as transparent view wrappers.
+        // Replay the stability check against their physical source place so a checked field path
+        // remains a borrow of the enclosing local rather than being mistaken for a temporary.
+        let place = align_sema::borrow_argument_source(argument);
+        let (root, field, fixed_element_field, dynamic_element_field, fixed_literal_element_field) = match &place.kind {
             hir::ExprKind::Local(local) => (*local, false, false, false, false),
             hir::ExprKind::Field { root, .. } => (*root, true, false, false, false),
             hir::ExprKind::ElemField { recv, index, .. }

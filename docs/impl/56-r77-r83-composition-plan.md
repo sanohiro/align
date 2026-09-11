@@ -36,7 +36,7 @@ still contain "XML" for the shared resource analysis. Do not repair these cases
 in the LLVM emitter or classify them as XML-library defects. Plans 52 and 53
 continue to own read-only backing and independently founded initialization.
 
-On this branch the focused owner `owned_borrowed_composition` passes all 13
+On this branch the focused owner `owned_borrowed_composition` passes all 18
 whole/per-unit cases, including the seven-field R83 provider witness. The current
 optimized compiler also accepts the align-llm evaluation-inputs source in
 per-unit mode (`17 unit(s)`, warnings only). These are provider/compiler checks;
@@ -203,21 +203,22 @@ do not claim actual namespace inheritance there.
 ## 4. Implementation closure matrix
 
 The matrix remains the closure record for this implementation. The focused driver
-target `owned_borrowed_composition` now covers 13 whole/per-unit cases; existing
+target `owned_borrowed_composition` now covers 18 whole/per-unit cases; existing
 native and malformed-IR owners are reused where they detect the same defect. The
-remaining cells below are consumer-owned or require faithful provider witnesses;
-a table-driven owner may close several rows, and no fixture is added per Cartesian
+remaining cells below are consumer-owned or require platform-specific provider
+execution; the faithful provider witnesses are included in the focused target. A
+table-driven owner may close several rows, and no fixture is added per Cartesian
 product cell.
 
 | Axis | Required cases and implementation evidence | Owner |
 | --- | --- | --- |
 | Type formation and validation | R82 exact handle / still-excluded handle; finite/deep/invalid nominal graphs and deterministic rejection. R78 enum-field rejection remains unchanged. | Extend sema `borrowed_payload_classifier_admits_only_ordinary_dynamic_array_graphs` and its HIR mutation twins; reuse the existing heap-record rejection owner as an unchanged-domain control. |
 | Construction and move-in | R82 None/Some and record-containing optional owner through already-admitted recursive carriers. Existing builder zero/one/multiple pushes remain controls; no element-domain widening. | `owned_borrowed_composition::admitted_carrier_domains`; existing builder owners. |
-| Read and argument projection | R77 physical String/logical Str, R79 every signal, R81 two owners, R82 shared namespace; direct/nested/indexed and local/imported calls; the original owner remains reusable. | `owned_borrowed_composition::shared_reads_and_calls`; `borrowed_params`, `move_record_slices`, `m11_process_live` controls. |
+| Read and argument projection | R77 physical String/logical Str, R79 every signal, R81 two owners, R82 shared namespace; direct/nested/indexed and local/imported calls; the original owner remains reusable. `StrBorrow`/`ArrayToSlice` call wrappers normalize to their physical place through `align_sema::borrow_argument_source` in sema, checked-HIR replay and MIR lowering. | `owned_borrowed_composition::shared_reads_and_calls`; `borrowed_config_forwarding_returns_independent_argv`; `borrowed_params`, `move_record_slices`, `m11_process_live` controls. |
 | Move-out, source nulling and Drop | Move records transfer once; projected Move bindings have no owning local/expression cleanup; Copy signal loads add none. Partial builder, source expiry, normal return and early Err release every actual owner once. | Existing builder/resource cleanup counters and malformed cleanup owners plus `admitted_carrier_domains`. |
-| Replacement and joins | R80 scalar copy and a faithful provider witness for non-loop nested Option assignment; branch replacement, self-assignment, zero/one/multiple iterations, old generation invalidation, still-live sibling roots and consumed builder freeze. | `owned_borrowed_composition::fresh_storage_and_replacement`; sema generation invariant owner, `borrowed_replacement`, `move_return_cleanup`. |
+| Replacement and joins | R80 scalar copy and the non-loop nested Option assignment; branch replacement, self-assignment, zero/one/multiple iterations, old generation invalidation, still-live sibling roots and consumed builder freeze. | `owned_borrowed_composition::scalar_to_array_replacement_does_not_retain_the_loop_iteration_owner`; `owned_borrowed_composition::owned_option_branch_replacement_keeps_nested_members`; sema generation invariant owner, `borrowed_replacement`, `move_return_cleanup`. |
 | Every control carrier | `if`, `match`, `else`, `?`, `map_err`, branch/loop joins, early return/break, absent/error arms and non-fallthrough operands. Reuse admitted source forms; do not introduce new syntax or broaden unrelated carrier formation. | Parameterized driver variants and existing `return_provenance`/owned-tagged owners. |
-| Call and return composition | R81 borrowed field/slice parameter/owned argument controls; R83 bound/direct/local/imported wrappers and independent owned versus genuinely borrowed results. Reduced Template field6, full-evaluator Document field1/argument and measurement field31 failures are distinct; R81 source collection has its own provider witness. | `owned_borrowed_composition::owned_results_across_calls`; MIR call-component and return-leaf mutations. |
+| Call and return composition | R81 borrowed field/slice parameter/owned argument controls, including Config and task-source expansion; R83 bound/direct/local/imported wrappers and independent owned versus genuinely borrowed results. The full-evaluator Document metadata/digest path and the 32-field measurement final digest are distinct owners from the seven-field Template witness. | `owned_borrowed_composition::borrowed_config_forwarding_returns_independent_argv`; `owned_borrowed_composition::borrowed_task_source_expansion_keeps_owned_rows_and_source_reusable`; `owned_borrowed_composition::faithful_document_digest_and_template_return_path_is_admitted`; `owned_borrowed_composition::owned_measurement_final_digest_field_is_certified_after_canonicalization`; MIR call-component and return-leaf mutations. |
 | Malformed source/IR | Wrong same-shaped root, stale generation, inactive valid variant, invalid ordinal/type, missing output/cleanup, forged owned read, uninitialized argument/out slot, unseeded and seeded cycles. No compiler panic or optimistic fallback. | Existing checked-HIR owners and MIR producer mutation owners; run each producer negative at publication, whole-program emission and ThinLTO entrypoints. |
 | Read-only and mutable authority | Literal/static/mapped read-only twins, fresh byte-copy writable twin, descriptor copy retaining read-only backing, plain by-value slice versus BorrowMut/Out header/backing, excluded borrowed-owner writes/transfers. | `constants_aggregate` #1026 owners, plans 52/53 producer mutations and composition escape negatives. |
 | Generic and interface transport | Concrete generic admitted records/nested views, imported non-generic summaries, imported generic source rechecking, renamed same-shaped types and source definition mutation/restoration. Exact nominal identity/modes/cleanup survive. | Composition driver whole/per-unit twins and existing interface canonical-graph owners. No new codec fields. |
@@ -233,13 +234,16 @@ owner tests establish the language contract; the align-llm owner separately
 records real-client acceptance after one combined adoption. Do not replace a
 consumer's schema, safety check, digest or ownership with a convenient control.
 
-The provider now includes a seven-field R83 witness in
+The provider now includes the seven-field R83 witness and the faithful
+Document/measurement witnesses in
 `crates/align_driver/tests/owned_borrowed_composition.rs`. The same shape was
 checked with the baseline `21b3151e` compiler and still fails in `wrap` with
 `producer return leaf String at [ResultOk, OptionSome, StructField(6)]`; the
-branch passes it in whole and per-unit modes. This closes the reduced provider
-shape only. The full evaluator, measurement digest, source collection and
-borrowed Config witnesses below remain separate acceptance work.
+branch passes it in whole and per-unit modes. The source-collection and borrowed
+Config witnesses exercise direct field-to-view forwarding, while the full
+Document and 32-field measurement witnesses exercise the distinct field1 and
+field31 paths. Real consumer smoke, managed-pin adoption and platform namespace
+execution remain external acceptance work.
 
 | Request / additional witness | Required client acceptance |
 | --- | --- |
@@ -258,8 +262,7 @@ borrowed Config witnesses below remain separate acceptance work.
 | Consolidated cutover | Client's final A2 functional integration after the provider batch is adopted. This does not move application supervision, measurement assembly, publication or Python retirement into native Align. |
 
 The standalone appendix does not reproduce the appended application graphs.
-The provider still needs a faithful, baseline-failing witness for each of these
-distinct shapes, retaining the failing typed call and ownership path:
+The provider witnesses below retain each selected typed call and ownership path:
 
 - R80 non-loop FILE_SET owned Option replacement and final Evidence transfer.
 - R81 borrowed Config field forwarding into validation/argv builders.
@@ -269,29 +272,30 @@ distinct shapes, retaining the failing typed call and ownership path:
 - R83 measurement finalization, including the owned digest at
   `[ResultOk, StructField(31)]` and the actual field/call dependencies.
 
-These faithful witnesses remain **unresolved implementation acceptance work**;
-the request register does not supply standalone sources for them. Their absence
-is not a new design decision or a reason to assume one generic minimal case
-covers them. A synthetic look-alike, matching diagnostic text, or passing control
-is insufficient. If a witness cannot be reconstructed from the recorded evidence,
-record that cell as unresolved and obtain a consumer-supplied reduction through
-the request register; do not change consumer source or silently mark it closed.
+- `owned_borrowed_composition::owned_option_branch_replacement_keeps_nested_members`
+  preserves nested members through the non-loop Option replacement.
+- `owned_borrowed_composition::borrowed_config_forwarding_returns_independent_argv`
+  and `borrowed_task_source_expansion_keeps_owned_rows_and_source_reusable` keep
+  the borrowed source reusable after independent output construction.
+- `owned_borrowed_composition::faithful_document_digest_and_template_return_path_is_admitted`
+  retains the resource-backed Document and nested optional selectors.
+- `owned_borrowed_composition::owned_measurement_final_digest_field_is_certified_after_canonicalization`
+  retains the exact 32-field result shape and final `content_sha256` replacement.
 
-Provider completion requires those witnesses and the selected compiler owners.
-After the combined provider merge, the consumer performs one adoption and the
-real smoke/A2 checks in the table. Those later checks gate ALIGN_LLM_VERIFIED and
-CLOSED, not provider pre-merge readiness. Missing consumer adoption alone does
-not prevent ALIGN_MERGED. No provider result claims that later client work passed.
+These close the provider-side composition cells. The real align-llm smoke suites,
+managed-pin adoption, canonical measurement goldens and platform-specific native
+execution remain consumer-owned. They gate ALIGN_LLM_VERIFIED and CLOSED after the
+provider commit is merged; no provider result claims that later client work passed.
 
 ## 6. Implementation and remaining handoff
 
 1. The request register and all seven appendix sources were refreshed before
    coding. Its consumer repository remains read-only except for the provider
    answer/status update permitted by `AGENTS.md`.
-2. The focused driver owner now records the selected positive/negative paths,
-   including the baseline-confirmed seven-field R83 witness. The full evaluator,
-   measurement, source-collection and Config witnesses named in §5 are still
-   required before provider completion.
+2. The focused driver owner records the selected positive/negative paths,
+   including the Config, source-collection, full Document and 32-field measurement
+   witnesses named in §5. Provider-side composition acceptance is complete; real
+   consumer adoption remains external.
 3. Shared projection/read authority (R77/R79), fresh/transferred storage facts
    (R80), shared call arguments and owned return leaves (R81/R83), and the R82
    namespace carrier are implemented together. The MIR producer remains the
@@ -300,9 +304,10 @@ not prevent ALIGN_MERGED. No provider result claims that later client work passe
    MIR and the specification: dynamic slice/AoS views use runtime indices, and
    fixed `StructArray` Move-field call places require integer literals.
 5. The author matrix-to-diff pass and focused owner checks are complete for the
-   implemented surface. A fresh independent review found two P2 closure issues;
-   both code fixes are now applied, and the final review status is recorded in
-   §8. Repository preflight remains the publication step for a later push.
+   implemented surface. The view-wrapper source is normalized once by
+   `align_sema::borrow_argument_source` and replayed by checked HIR and MIR, so
+   direct field forwarding cannot diverge between stages. Repository preflight
+   remains the publication step for the final pushed SHA.
 
 Deliver one consolidated capability PR, not one PR per request or a dormant
 producer/consumer chain. More than roughly 1,000 handwritten lines is plausible:
@@ -350,37 +355,39 @@ The baseline compiler rebuild succeeded. The seven original standalone sources
 have the check/per-unit outcomes in §1; all seven syntax-format successfully.
 The seven-field R83 provider witness was also run through the baseline binary and
 reproduced the `StructField(6)` producer rejection before the branch repair.
-On this branch, `owned_borrowed_composition` passes all 13 whole/per-unit cases,
+On this branch, `owned_borrowed_composition` passes all 18 whole/per-unit cases,
 the producer and codegen malformed Store/Load owners pass, and the current
 optimized compiler accepts the align-llm evaluation-inputs source in per-unit
 mode (`17 unit(s)`, warnings only). These checks do not claim consumer execution,
 DB verification or align-llm adoption.
 
 The author ledger-to-prose and matrix-to-diff pass covers the implemented rows
-against §§3–6 and leaves the appended consumer witnesses explicitly pending.
+against §§3–6. The appended provider witnesses now pass in whole/per-unit modes;
+consumer adoption and platform-specific runtime owners remain explicitly pending.
 The appendix matches the seven baseline inputs, local links resolve, and
-`git diff --check` passes. A final register rescan still ends at R83. Independent
-inspection found two P2 implementation-closure issues; both are addressed by the
-fixed-index contract/HIR parity and the malformed Store/Load owner below. A
-follow-up inspection is requested after this correction; no clean rereview is
-claimed until that inspection reports one.
+`git diff --check` passes. A final register rescan still ends at R83. The prior
+inspection found two P2 implementation-closure issues; the follow-up repairs
+normalize view-wrapper source places and add the missing provider owners. A fresh
+inspection of the final candidate is still required before publication; no clean
+status is claimed here.
 
 | Finding | Closure |
 | --- | --- |
 | R78 admission was still scheduled despite the unmet reopen prerequisite. | §2 records Category B/B4 deferral; §§3–7 select only the other six requests. Specifications and mirrors retain the enum exclusion, and the register keeps R78 PROPOSED. |
-| Only two unreduced additions were named, and provider/consumer completion could become circular. | §5 enumerates FILE_SET, Config, collect_task, full evaluator and measurement witnesses. Provider completion requires faithful provider owners; real client smoke/A2 follows the single merged adoption and stays externally owned. |
+| Only two unreduced additions were named, and provider/consumer completion could become circular. | §5 enumerates FILE_SET, Config, collect_task, full evaluator and measurement witnesses. Provider owners now close those cells; real client smoke/A2 follows the single merged adoption and stays externally owned. |
 
 The initial reviewer inspected all seven contracts, added clients, sema/MIR
 seams, readiness/cache rules and native namespace boundaries without builds or
-tests. Its two P2 findings are the implementation closure recorded above; the
-new malformed owner uses the existing whole/per-unit/ThinLTO rejection helper.
+tests. Its two P2 findings and the follow-up provider closure are recorded above;
+the owner suite uses the existing whole/per-unit/ThinLTO rejection helpers.
 
 ## Appendix A. Exact reported standalone sources
 
 These are diagnostic inputs, not passing normative examples. Each is a separate
 module/file. The baseline outcomes and control limitations are recorded in §1
-and §8. The selected forms are retained by the provider owner; the appended
-consumer graphs still require the faithful witnesses listed in §5.
+and §8. The selected forms and faithful provider witnesses are retained by the
+provider owner; the appended consumer graphs still require real client adoption
+and runtime acceptance listed in §5.
 
 ### R77
 

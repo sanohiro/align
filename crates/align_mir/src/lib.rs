@@ -10642,13 +10642,18 @@ fn lower_borrowed_place(b: &mut Builder, e: &hir::Expr, mode: align_ast::ParamMo
             },
         }));
     }
-    let is_projection = match &e.kind {
+    // View coercions carry the same storage place as their source. Strip the transparent wrapper
+    // before forming the borrowed descriptor; retaining `e.ty` below preserves the logical
+    // `str`/`slice<T>` type at the call ABI while the place path still names the Config/record
+    // field that owns the bytes.
+    let source = align_sema::borrow_argument_source(e);
+    let is_projection = match &source.kind {
         hir::ExprKind::Local(local) => b.borrowed_bindings.contains_key(local),
         hir::ExprKind::Field { root, .. } => b.borrowed_bindings.contains_key(root),
         hir::ExprKind::ElemField { .. } => true,
         _ => false,
     };
-    let mut place = match &e.kind {
+    let mut place = match &source.kind {
         hir::ExprKind::Local(local) => {
             b.borrowed_bindings
                 .get(local)

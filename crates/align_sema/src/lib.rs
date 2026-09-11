@@ -4641,6 +4641,19 @@ pub fn borrow_transparent_value(e: &hir::Expr) -> Option<&hir::Expr> {
     }
 }
 
+/// Return the physical place behind a call-boundary view coercion. `str` and `slice<T>` arguments
+/// are represented as `StrBorrow`/`ArrayToSlice` wrappers, but those nodes add no storage or
+/// ownership. The sema stability gate, checked-HIR replay, and MIR place lowering all use this
+/// one source so a direct field path cannot be classified as a temporary in one stage and a place
+/// in another.
+pub fn borrow_argument_source(e: &hir::Expr) -> &hir::Expr {
+    let mut source = e;
+    while let hir::ExprKind::StrBorrow(inner) | hir::ExprKind::ArrayToSlice(inner) = &source.kind {
+        source = inner;
+    }
+    source
+}
+
 /// Whether a borrowing use of this expression can select a **fresh owned value** — one with no
 /// binding of its own, for which MIR allocates a hidden owner slot (`new_synthetic_owner`). Direct
 /// bound places are borrowed from their binding instead; a block is transparent to its value (see
@@ -49474,7 +49487,13 @@ impl<'a, 't> Checker<'a, 't> {
                     | "pkg.template$write"
                     | "pkg.template$raw"
             );
-        let root = match &argument.kind {
+        // `str` and `slice<T>` call arguments are represented by view wrappers around the
+        // physical source (`StrBorrow` / `ArrayToSlice`). The wrapper owns no storage of its
+        // own, so stability must be checked against the place underneath it. Looking only at
+        // the outer node made a stable borrowed record field look like a temporary and rejected
+        // direct forwarding such as `validate(config.workspace, config.readonly_roots)`.
+        let place = borrow_argument_source(argument);
+        let root = match &place.kind {
             ExprKind::Local(local) => Some(*local),
             ExprKind::Field { root, .. } => Some(*root),
             ExprKind::ElemField { recv, .. } => match recv.kind {
@@ -49496,7 +49515,7 @@ impl<'a, 't> Checker<'a, 't> {
             return;
         };
         if mode == ast::ParamMode::BorrowMut
-            && matches!(argument.kind, ExprKind::Field { .. })
+            && matches!(place.kind, ExprKind::Field { .. })
             && ty_is_move(
                 argument.ty,
                 self.structs,
@@ -49514,7 +49533,7 @@ impl<'a, 't> Checker<'a, 't> {
             );
         }
         let indexed_move_field = matches!(
-            &argument.kind,
+            &place.kind,
             ExprKind::ElemField {
                 recv,
                 ..
@@ -49525,7 +49544,7 @@ impl<'a, 't> Checker<'a, 't> {
                     | Ty::DynStructArray(_, Layout::Aos)
             )
         );
-        if matches!(argument.kind, ExprKind::ElemField { .. })
+        if matches!(place.kind, ExprKind::ElemField { .. })
             && ty_is_move(
                 argument.ty,
                 self.structs,
