@@ -14719,7 +14719,8 @@ fn hir_body_validator_native() {
         ],
         Ty::Unit,
     ));
-    assert!(!body_core_metadata_is_valid(&reject));
+    // Writability is a shared body-fact proof, not a structural HIR predicate.
+    assert!(body_core_metadata_is_valid(&reject));
 
     let mut reject = program.clone();
     reject.fns.push(body_tail_case(
@@ -18454,4 +18455,41 @@ fn live_process_records_and_writable_backing() -> Result<(), &'static str> {
         assert!(!validate_hir::global_type_metadata_is_valid(&bad));
     }
     Ok(())
+}
+
+#[test]
+fn readonly_origin_checked_hir_replay() {
+    for projection in [false, true] {
+        for write in [false, true] {
+            let construction = if projection {
+                "holder := Holder { text: input }; mut view := holder.text.bytes()"
+            } else {
+                "mut view := input.bytes()"
+            };
+            let sink = if write { "view[0] = 65" } else { "print(view[0])" };
+            let source = format!("Holder {{ text: str }}\nfn probe(input: str) {{ {construction}; {sink} }}\nfn main() -> i32 = 0\n");
+            let mut program = checked_source_program(&source);
+            assert!(align_sema::checked_hir_body_facts_are_valid(&program));
+            let function = program.fns.iter_mut().find(|f| f.name == "probe").unwrap();
+            let hir::Stmt::Let { init, .. } = &mut function.body.stmts[0] else {
+                panic!("fixture lost its binding");
+            };
+            let input = if projection {
+                let hir::ExprKind::StructLit { fields, .. } = &mut init.kind else {
+                    panic!("fixture lost its record");
+                };
+                &mut fields[0]
+            } else {
+                let hir::ExprKind::StrBytes { inner } = &mut init.kind else {
+                    panic!("fixture lost its byte view");
+                };
+                inner.as_mut()
+            };
+            assert_eq!(input.ty, Ty::Str);
+            input.kind = hir::ExprKind::Str("xx".to_string());
+            assert!(body_core_metadata_is_valid(&program));
+            assert_eq!(align_sema::checked_hir_body_facts_are_valid(&program), !write,
+                "projection={projection} write={write}");
+        }
+    }
 }

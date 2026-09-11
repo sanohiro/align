@@ -573,3 +573,23 @@ fn a_map_into_a_constant_view_is_rejected() {
         "fn dbl(x: i64) -> i64 = x * 2\nTABLE := [1, 2, 3]\nfn main() -> i32 {\n  mut s := TABLE\n  [1, 2, 3].map(dbl).map_into(s)\n  return 0\n}\n",
     ));
 }
+
+
+#[test]
+fn readonly_origin_whole_unit_parity() {
+    for owned in [false, true] {
+        let backing = if owned { "tables.BYTES.to_array()" } else { "tables.BYTES" };
+        let source = format!("module main\nimport tables\nHolder {{ view: slice<u8> }}\nfn modify<T>(borrow mut view: slice<u8>, value: T) {{ view[0] = 65 }}\nfn main() -> i32 {{ mut backing := {backing}; holder := Holder {{ view: backing }}; mut view := holder.view; modify(view, (65 as u8)); return 0 }}\n");
+        let name = format!("readonly-unit-{owned}");
+        let result = diff_check_multi(&name, &[
+            ("tables.align", "module tables\npub BYTES: slice<u8> := [1, 2]\n"),
+            ("main.align", &source),
+        ], "main.align");
+        assert_eq!(result.whole_errors, !owned, "{}", result.whole_diags);
+        assert_eq!(result.per_unit_errors, !owned, "{}", result.per_unit_diags);
+        if !owned {
+            assert!(result.whole_diags.contains("read-only view"));
+            assert!(result.per_unit_diags.contains("read-only view"));
+        }
+    }
+}

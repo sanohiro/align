@@ -12610,7 +12610,8 @@ fn summary_from_roots(roots: &BorrowRoots, explicit_params: u32) -> hir::ReturnB
             BorrowRoot::Param(index) | BorrowRoot::ParamStorage(index) => {
                 captures.push(index - explicit_params)
             }
-            BorrowRoot::Local(_)
+            BorrowRoot::ReadOnly
+            | BorrowRoot::Local(_)
             | BorrowRoot::Observation(_)
             | BorrowRoot::EndedObservation(..)
             | BorrowRoot::StorageLocal(..)
@@ -13268,7 +13269,7 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
             .unwrap_or(hir::ReturnBorrowSummary::None);
         function.mutable_retention = named_borrow_mut_retention.get(&function.name)
             .and_then(|destinations| destinations.iter().map(|roots| {
-                roots.iter().map(|root| match *root {
+                roots.iter().filter(|root| **root != BorrowRoot::ReadOnly).map(|root| match *root {
                     BorrowRoot::Param(index) => Some(hir::MutableRetentionRoot::Contained(index)),
                     BorrowRoot::ParamStorage(index) => Some(hir::MutableRetentionRoot::Storage(index)),
                     _ => None,
@@ -18163,6 +18164,7 @@ impl EscapeState {
         };
         let local_fallback = matches!(live, BorrowRoot::Local(_) | BorrowRoot::StorageLocal(..));
         let mut resolved = match live {
+            BorrowRoot::ReadOnly => EscapeResolvedStorage::empty(false),
             BorrowRoot::Param(parameter) => {
                 let mut resolved = EscapeResolvedStorage::empty(false);
                 resolved.content.regions = EscapeRegionFact::from_direct(Region::Caller(parameter));
@@ -18184,7 +18186,7 @@ impl EscapeState {
                 resolved
             }
             BorrowRoot::Observation(generation) => {
-                self.resolve_storage_reference(&StorageGenerationRef { generation, content_path: Vec::new() }, visiting)
+                self.resolve_storage_reference(&StorageGenerationRef::root(generation), visiting)
             }
             BorrowRoot::EndedLocal(..)
             | BorrowRoot::EndedStorageLocal(..)
@@ -28933,6 +28935,9 @@ enum BorrowRoot {
     EndedParam(u32, BorrowEnd),
     EndedParamStorage(u32, BorrowEnd),
     EndedObservation(StorageGeneration, BorrowEnd),
+    /// Analysis-only read-only storage origin. This is not an owner or an alias identity;
+    /// it never expires and is removed at lifetime-only and public-summary boundaries.
+    ReadOnly,
 }
 
 type BorrowRoots = std::collections::BTreeSet<BorrowRoot>;
@@ -28969,6 +28974,7 @@ fn exact_borrow_mut_source_indices(
     summary?
         .get(destination)?
         .iter()
+        .filter(|root| **root != BorrowRoot::ReadOnly)
         .map(|root| match *root {
             BorrowRoot::Param(source) if (source as usize) < argument_count => {
                 Some(BorrowMutRetentionSource::Contained(source as usize))
@@ -29032,6 +29038,7 @@ impl BorrowRoot {
 
     fn ended(&self, how: BorrowEnd) -> Self {
         match self {
+            Self::ReadOnly => Self::ReadOnly,
             Self::Local(local) => Self::EndedLocal(*local, how),
             Self::StorageLocal(generation, local, path) => {
                 Self::EndedStorageLocal(generation.clone(), *local, path.clone(), how)
@@ -29051,6 +29058,7 @@ impl BorrowRoot {
 
     fn live(&self) -> Option<Self> {
         match self {
+            Self::ReadOnly => Some(Self::ReadOnly),
             Self::Local(_)
             | Self::StorageLocal(..)
             | Self::IterTemp(_)
@@ -29068,6 +29076,7 @@ impl BorrowRoot {
 
     fn ended_source(&self) -> Option<(Self, BorrowEnd)> {
         match self {
+            Self::ReadOnly => None,
             Self::EndedLocal(local, how) => Some((Self::Local(*local), *how)),
             Self::EndedStorageLocal(generation, local, path, how) => {
                 Some((Self::StorageLocal(generation.clone(), *local, path.clone()), *how))
@@ -29298,6 +29307,9 @@ struct StorageGenerationRef {
     /// value that addresses one `StructField` inside the SoA generation, while an ordinary array
     /// or slice header addresses that generation's empty content path.
     content_path: StoragePath,
+    /// A call's lifetime summary does not certify which selected storage supplies its bytes.
+    /// Keep lifetime dependency edges, but erase local writability evidence on that edge.
+    erase_readonly: bool,
 }
 
 impl StorageGenerationRef {
@@ -29305,6 +29317,7 @@ impl StorageGenerationRef {
         Self {
             generation,
             content_path: Vec::new(),
+            erase_readonly: false,
         }
     }
 
@@ -29313,6 +29326,7 @@ impl StorageGenerationRef {
         Self {
             generation,
             content_path,
+            erase_readonly: false,
         }
     }
 
@@ -29320,6 +29334,7 @@ impl StorageGenerationRef {
         Self {
             generation: renames.apply(&self.generation),
             content_path: self.content_path.clone(),
+            erase_readonly: self.erase_readonly,
         }
     }
 
@@ -29442,6 +29457,19 @@ struct ProjectedHeaderFact {
 }
 
 impl ProjectedHeaderFact {
+    fn erase_readonly_origins(&mut self) {
+        for leaf in self.leaves.values_mut() {
+            leaf.fallback_roots.remove(&BorrowRoot::ReadOnly);
+            leaf.generations = std::mem::take(&mut leaf.generations)
+                .into_iter()
+                .map(|mut reference| {
+                    reference.erase_readonly = true;
+                    reference
+                })
+                .collect();
+        }
+    }
+
     fn from_leaf(path: StoragePath, leaf: StorageHeaderLeaf) -> Self {
         Self {
             leaves: [(path, leaf)].into_iter().collect(),
@@ -30999,6 +31027,24 @@ impl BorrowFact {
             .collect()
     }
 
+    /// Lifetime dependencies may conservatively flatten across a materializer, while the
+    /// read-only property must retain its selected element/field path.
+    fn flatten_lifetimes(mut self) -> Self {
+        let mut lifetimes = self.flatten();
+        lifetimes.remove(&BorrowRoot::ReadOnly);
+        self.direct.retain(|root| *root == BorrowRoot::ReadOnly);
+        for roots in self.projected.values_mut() {
+            roots.retain(|root| *root == BorrowRoot::ReadOnly);
+        }
+        self.projected.retain(|_, roots| !roots.is_empty());
+        self.direct.extend(lifetimes);
+        self
+    }
+
+    fn without_readonly_origin(self) -> Self {
+        self.without_root_sources(&[BorrowRoot::ReadOnly].into())
+    }
+
     fn without_root_sources(mut self, excluded: &BorrowRoots) -> Self {
         let retain = |root: &BorrowRoot| {
             !excluded.contains(root)
@@ -31068,6 +31114,25 @@ struct MoveValueFact {
 }
 
 impl MoveValueFact {
+    fn without_readonly_origin(mut self) -> Self {
+        self.non_storage = self.non_storage.without_readonly_origin();
+        self.headers.erase_readonly_origins();
+        self
+    }
+
+    fn through_reference(
+        &self,
+        reference: &StorageGenerationRef,
+        path: &[BorrowProjection],
+    ) -> Self {
+        let selected = self.project_path(path);
+        if reference.erase_readonly {
+            selected.without_readonly_origin()
+        } else {
+            selected
+        }
+    }
+
     fn join(&self, other: &Self) -> Self {
         Self {
             non_storage: self.non_storage.join(&other.non_storage),
@@ -31393,7 +31458,7 @@ impl MoveControlEdge {
 
 impl BorrowState {
     fn summary_roots(&self, roots: BorrowRoots) -> BorrowRoots {
-        roots.into_iter().flat_map(|root| {
+        roots.into_iter().filter(|root| *root != BorrowRoot::ReadOnly).flat_map(|root| {
             if let BorrowRoot::Observation(generation) = &root {
                 self.storage.directory.entries.get(generation)
                     .into_iter().flat_map(|entry| entry.caller_origins.iter().copied())
@@ -31587,7 +31652,7 @@ impl BorrowState {
                         continue;
                     }
                     if let Some(content) = state.storage.contents.entries.get(generation) {
-                        let selected = content.project_path(&reference.content_path);
+                        let selected = content.through_reference(reference, &reference.content_path);
                         let nested = resolve(state, &selected.headers, visiting);
                         let resolved = selected.join(&nested);
                         result.non_storage.join_at(path, &resolved.non_storage);
@@ -32106,7 +32171,7 @@ impl BorrowState {
     }
 
     fn invalidate_roots(&mut self, roots: &BorrowRoots, how: BorrowEnd) {
-        self.invalidate_matching(how, |root| roots.contains(root));
+        self.invalidate_matching(how, |root| *root != BorrowRoot::ReadOnly && roots.contains(root));
     }
 
     fn invalidate_roots_except_local(
@@ -33807,8 +33872,8 @@ impl<'a> MoveCheck<'a> {
             storage.direct.insert(root);
         }
         MoveExpressionCompletion {
-            value,
-            storage,
+            value: value.without_readonly_origin(),
+            storage: storage.without_readonly_origin(),
             backing,
         }
     }
@@ -33872,6 +33937,11 @@ impl<'a> MoveCheck<'a> {
             self.validate_value_snapshot(action_key, snapshot, action.span);
             if modes.get(index) == Some(&ast::ParamMode::BorrowMut) {
                 self.validate_mutable_place_snapshot(action_key, snapshot, action.span);
+            }
+        }
+        for (argument, mode) in args.iter().zip(modes) {
+            if matches!(mode, ast::ParamMode::Out | ast::ParamMode::BorrowMut) {
+                self.reject_readonly_view_write(argument);
             }
         }
         let value_argument_facts = args
@@ -34507,9 +34577,65 @@ impl<'a> MoveCheck<'a> {
         self.borrows.update_fact(local, current.join(&incoming));
     }
 
+    /// Read-only origin belongs to the selected view's backing, not to views stored
+    /// inside an independently owned collection. Lifetime roots remain separate.
+    fn readonly_view_backing(
+        &self,
+        ty: Ty,
+        headers: &ProjectedHeaderFact,
+        fact: &BorrowFact,
+    ) -> bool {
+        if !matches!(
+            expand_tagged_ty(ty, self.tagged_types),
+            Ty::Slice(_) | Ty::Soa(_) | Ty::SoaParam(_)
+        ) {
+            return false;
+        }
+        if let Some(header) = headers.leaves.get(&Vec::new()) {
+            if header.fallback_roots.contains(&BorrowRoot::ReadOnly) {
+                return true;
+            }
+            if !header.generations.is_empty() {
+                // Generation contents may include read-only strings. The allocation
+                // addressed by this header is still independently writable.
+                return false;
+            }
+        }
+        fact.direct.contains(&BorrowRoot::ReadOnly)
+    }
+
+    fn reject_readonly_view_write(&mut self, target: &Expr) {
+        if self.readonly_view_backing(
+            target.ty,
+            &self.completed_headers(target),
+            &self.completed_value_fact(target),
+        ) {
+            self.diags.error(
+                "cannot write through a read-only view (e.g., a constant table or mmap view); copy it into an owned array to modify".to_string(),
+                target.span,
+            );
+        }
+    }
+
+    fn reject_readonly_local_write(&mut self, local: LocalId, span: Span) {
+        let Some(record) = self.f.locals.get(local as usize) else {
+            return;
+        };
+        if self.readonly_view_backing(
+            record.ty,
+            &self.local_headers(local),
+            &self.local_borrow_fact(local),
+        ) {
+            self.diags.error(
+                "cannot write through a read-only view (e.g., a constant table or mmap view); copy it into an owned array to modify".to_string(),
+                span,
+            );
+        }
+    }
+
     fn backing_root_local(&self, root: &BorrowRoot) -> Option<LocalId> {
         match root {
-            BorrowRoot::Observation(_) | BorrowRoot::EndedObservation(..) => None,
+            BorrowRoot::ReadOnly | BorrowRoot::Observation(_) | BorrowRoot::EndedObservation(..) => None,
             BorrowRoot::Local(local) | BorrowRoot::StorageLocal(_, local, _) => Some(*local),
             BorrowRoot::ParamStorage(position) => {
                 self.f.params.get(*position as usize).copied()
@@ -34525,7 +34651,7 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn roots_intersect(left: &BorrowRoots, right: &BorrowRoots) -> bool {
-        left.iter().any(|root| right.contains(root))
+        left.iter().any(|root| *root != BorrowRoot::ReadOnly && right.contains(root))
     }
 
     fn mutable_backing_evidence(
@@ -35229,6 +35355,14 @@ impl<'a> MoveCheck<'a> {
             // contributes its own local's storage on top of that.
             _ => roots.extend(self.borrow_sources(e)),
         }
+        if matches!(e.kind, ExprKind::Field { .. } | ExprKind::TupleIndex { .. } | ExprKind::Index { .. } | ExprKind::ElemField { .. }) {
+            roots.remove(&BorrowRoot::ReadOnly);
+            if !matches!(expand_tagged_ty(e.ty, self.tagged_types), Ty::String | Ty::Buffer)
+                && self.borrow_fact(e).direct.contains(&BorrowRoot::ReadOnly)
+            {
+                roots.insert(BorrowRoot::ReadOnly);
+            }
+        }
         roots
     }
 
@@ -35237,6 +35371,7 @@ impl<'a> MoveCheck<'a> {
     /// immutable views mutates its header/fields, not the allocation region those views name.
     fn borrow_mut_invalidation_roots(&self, argument: &Expr) -> BorrowRoots {
         self.borrow_mut_alias_roots(argument)
+            .into_iter().filter(|root| *root != BorrowRoot::ReadOnly).collect()
     }
 
     fn completed_borrow_mut_invalidation_roots(
@@ -35244,7 +35379,7 @@ impl<'a> MoveCheck<'a> {
         argument: &Expr,
         storage: &BorrowFact,
     ) -> BorrowRoots {
-        if argument.ty.is_array_builder()
+        let mut roots = if argument.ty.is_array_builder()
             || matches!(
                 expand_tagged_ty(argument.ty, self.tagged_types),
                 Ty::Resource(_)
@@ -35255,7 +35390,9 @@ impl<'a> MoveCheck<'a> {
                 .unwrap_or_else(|| storage.live_roots())
         } else {
             storage.live_roots()
-        }
+        };
+        roots.remove(&BorrowRoot::ReadOnly);
+        roots
     }
 
     /// Flatten the owner-local provenance carried by a borrow-producing expression. Producers are
@@ -35321,12 +35458,12 @@ impl<'a> MoveCheck<'a> {
         }
         if let Some(stages) = pipeline_stages(&e.kind) {
             for capture in stage_capture_exprs(stages) {
-                fact.direct.extend(self.borrow_sources(capture));
+                fact.direct.extend(self.borrow_sources(capture).into_iter().filter(|root| *root != BorrowRoot::ReadOnly));
             }
         }
         if !matches!(e.kind, ExprKind::Closure { .. }) {
             for capture in node_captures(&e.kind) {
-                fact.direct.extend(self.borrow_sources(capture));
+                fact.direct.extend(self.borrow_sources(capture).into_iter().filter(|root| *root != BorrowRoot::ReadOnly));
             }
         }
         fact.join(&self.borrow_fact_inner(e))
@@ -35602,7 +35739,7 @@ impl<'a> MoveCheck<'a> {
                     .contents
                     .entries
                     .get(&reference.generation)
-                    .map(|content| content.project_path(&reference.content_path).headers)
+                    .map(|content| content.through_reference(reference, &reference.content_path).headers)
             })
             .fold(ProjectedHeaderFact::default(), |current, selected| {
                 current.join(&selected)
@@ -35823,7 +35960,7 @@ impl<'a> MoveCheck<'a> {
                     let path = reference.select_content_path(
                         element_path.iter().chain(&suffix).copied(),
                     );
-                    selected.join(&content.project_path(&path))
+                    selected.join(&content.through_reference(reference, &path))
                 })
             })
     }
@@ -35837,7 +35974,7 @@ impl<'a> MoveCheck<'a> {
             self.named_return_borrow,
             self.callable_targets,
         );
-        let (argument_headers, callee) = match &expression.kind {
+        let (mut argument_headers, callee) = match &expression.kind {
             ExprKind::Call { args, .. } | ExprKind::RawCall { args, .. } => (
                 args.iter()
                     .map(|argument| self.completed_headers(argument))
@@ -35858,7 +35995,10 @@ impl<'a> MoveCheck<'a> {
             ),
             _ => (Vec::new(), None),
         };
-        let callable_headers = callee.map(|callee| self.completed_headers(callee));
+        let mut callable_headers = callee.map(|callee| self.completed_headers(callee));
+        for headers in argument_headers.iter_mut().chain(callable_headers.iter_mut()) {
+            headers.erase_readonly_origins();
+        }
         if let Some(callable) = &callable_headers {
             extend_call_storage_selection_from_targets(
                 &mut selection,
@@ -36137,6 +36277,22 @@ impl<'a> MoveCheck<'a> {
         expression: &Expr,
         fact: &BorrowFact,
     ) -> ProjectedHeaderFact {
+        if matches!(expression.kind, ExprKind::ConstArray { .. } | ExprKind::FsReadBytesView { .. }) {
+            // These views have no releasable local owner. Preserve a backing-property header
+            // through joins with writable generations without inventing an allocation lifetime.
+            let paths = storage_type_paths(expression.ty, self.storage_type_context());
+            if !paths.valid {
+                return ProjectedHeaderFact::default();
+            }
+            return ProjectedHeaderFact {
+                leaves: paths.headers.into_iter().map(|header| {
+                    (header.path, StorageHeaderLeaf::unknown_typed(
+                        [BorrowRoot::ReadOnly].into(),
+                        StorageHeaderDescriptor { ty: header.ty, kind: header.kind },
+                    ))
+                }).collect(),
+            };
+        }
         if matches!(expression.kind, ExprKind::ResultMapErr { .. }) {
             return self.form_result_map_err_completion(expression, fact);
         }
@@ -36478,6 +36634,7 @@ impl<'a> MoveCheck<'a> {
             return;
         }
         let message = match root {
+            BorrowRoot::ReadOnly => return,
             BorrowRoot::Observation(_) | BorrowRoot::EndedObservation(..) => {
                 "value snapshot was invalidated before the enclosing operation: its reader observation ended".to_string()
             }
@@ -36733,7 +36890,7 @@ impl<'a> MoveCheck<'a> {
             self.normalize_borrow_fact(source.ty, self.borrow_fact(source))
                 .project_array_elements()
         } else {
-            BorrowFact::from_direct(self.borrow_sources(source))
+            self.borrow_fact(source).flatten_lifetimes()
         };
         // A materializing pipeline copies element values into fresh storage. Retain owners used by
         // those values, but not the source collection/header generation itself. Completed value
@@ -36760,7 +36917,8 @@ impl<'a> MoveCheck<'a> {
                 }
                 StageKind::Where { .. } | StageKind::WhereStrContains { .. } => {}
                 StageKind::Map { .. } => {
-                    fact = BorrowFact::from_direct(fact.flatten());
+                    // The callback's lifetime union is not an exact writability summary.
+                    fact = BorrowFact::from_direct(fact.without_readonly_origin().flatten());
                 }
             }
             element_ty = stage.out_ty;
@@ -36887,15 +37045,15 @@ impl<'a> MoveCheck<'a> {
             _ => callee.ty,
         };
         let Ty::Fn(id) = ty else {
-            return BorrowFact::from_direct(unresolved().flatten());
+            return BorrowFact::from_direct(unresolved().flatten()).without_readonly_origin();
         };
         let Some(targets) = self.callable_targets.get(id as usize) else {
-            return BorrowFact::from_direct(unresolved().flatten());
+            return BorrowFact::from_direct(unresolved().flatten()).without_readonly_origin();
         };
         if targets.is_empty() {
             // A function-typed parameter has no concrete target set. Keep the settled fail-closed
             // fallback over every compatible explicit input and the callable environment itself.
-            return BorrowFact::from_direct(unresolved().flatten());
+            return BorrowFact::from_direct(unresolved().flatten()).without_readonly_origin();
         }
         let mut fact = BorrowFact::default();
         // The callable expression completed before argument zero. A later eager argument may
@@ -36919,7 +37077,7 @@ impl<'a> MoveCheck<'a> {
                 );
             }
         }
-        fact
+        fact.without_readonly_origin()
     }
 
     fn parallel_argument_fact(&self, argument: &Expr, mode: Option<ast::ParamMode>) -> BorrowFact {
@@ -37066,7 +37224,7 @@ impl<'a> MoveCheck<'a> {
 
     fn root_is_region_capability(&self, root: &BorrowRoot) -> bool {
         let local = match root {
-            BorrowRoot::Observation(_) | BorrowRoot::EndedObservation(..) => None,
+            BorrowRoot::ReadOnly | BorrowRoot::Observation(_) | BorrowRoot::EndedObservation(..) => None,
             BorrowRoot::Local(local)
             | BorrowRoot::StorageLocal(_, local, _)
             | BorrowRoot::EndedLocal(local, _)
@@ -37099,6 +37257,25 @@ impl<'a> MoveCheck<'a> {
     fn borrow_fact_inner(&self, e: &Expr) -> BorrowFact {
         match &e.kind {
             ExprKind::Local(id) => self.local_borrow_fact(*id),
+            ExprKind::ArrayBuilderBuild(builder) => self.borrow_fact(builder).flatten_lifetimes(),
+            ExprKind::ArrayGroupAgg { base, key_field, .. }
+            | ExprKind::ArrayGroupAggMulti { base, key_field, .. } => {
+                let mut source = self.local_borrow_fact(*base);
+                if let Some(local) = self.f.locals.get(*base as usize)
+                    && self.fixed_array_shape(local.ty).is_some()
+                {
+                    source = self.normalize_borrow_fact(local.ty, source).project_array_elements();
+                }
+                let mut fact = BorrowFact::from_direct(self.local_storage_roots(*base))
+                    .without_readonly_origin();
+                if source.project_exact(BorrowProjection::StructField(*key_field))
+                    .flatten().contains(&BorrowRoot::ReadOnly)
+                {
+                    fact = fact.join(&BorrowFact::from_direct([BorrowRoot::ReadOnly].into())
+                        .prefixed(BorrowProjection::TupleElement(0)));
+                }
+                fact
+            }
             ExprKind::ResourceBorrow { owner, .. } => {
                 BorrowFact::from_direct(self.storage_roots(owner))
             }
@@ -37197,6 +37374,19 @@ impl<'a> MoveCheck<'a> {
                 if self.fixed_array_shape(recv.ty).is_some() =>
             {
                 self.project_fixed_element_field_fact(recv, index, path, e.ty)
+            }
+            ExprKind::Index { recv, .. } | ExprKind::ElemField { recv, .. } => {
+                // The legacy fallback names the whole collection for lifetime safety. Its
+                // static property cannot freeze an unselected sibling in the element record.
+                let mut fact = BorrowFact::from_direct(self.borrow_sources_inner(e))
+                    .without_readonly_origin()
+                    .join(&self.indexed_generation_content(e).non_storage);
+                if self.completed_headers(recv).leaves.values().any(|header| {
+                    header.fallback_roots.contains(&BorrowRoot::ReadOnly)
+                }) {
+                    fact.direct.insert(BorrowRoot::ReadOnly);
+                }
+                fact
             }
             ExprKind::StructLit { struct_id, fields } => {
                 let valid = e.ty == Ty::Struct(*struct_id)
@@ -37418,11 +37608,11 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ArraySortBy { source, stages, .. }
             | ExprKind::ArrayParMap { source, stages, .. } => {
                 let (_, element) = self.pipeline_element_fact(source, stages);
-                BorrowFact::from_direct(element.flatten())
+                element.flatten_lifetimes()
             }
             ExprKind::ArrayPartition { source, stages, .. } => {
                 let (_, element) = self.pipeline_element_fact(source, stages);
-                let roots = BorrowFact::from_direct(element.flatten());
+                let roots = element.flatten_lifetimes();
                 roots
                     .clone()
                     .prefixed(BorrowProjection::TupleElement(0))
@@ -37430,7 +37620,7 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::ArrayToSoa { source, .. } => {
                 let (_, element) = self.pipeline_element_fact(source, &[]);
-                BorrowFact::from_direct(element.flatten())
+                element.flatten_lifetimes()
             }
             ExprKind::ArrayChunks { source, .. } => {
                 BorrowFact::from_direct(self.storage_roots(source))
@@ -37585,6 +37775,7 @@ impl<'a> MoveCheck<'a> {
                 }
             }
         }
+        roots.remove(&BorrowRoot::ReadOnly);
         roots
     }
 
@@ -37925,14 +38116,15 @@ impl<'a> MoveCheck<'a> {
             //   OWNS its fd (`c.reader()`/`.buffered()`, which do borrow, are handled above);
             //   `fs.read_*_view` returns an mmap view bound to the enclosing arena, whose lifetime
             //   the escape check enforces via `region_of`; `OptionNone` carries no payload.
-            ExprKind::Str(..) | ExprKind::FnValue(..) | ExprKind::OptionNone
-            | ExprKind::ConstArray { .. } | ExprKind::ReaderStdin | ExprKind::ReaderOpen { .. }
+            ExprKind::Str(..) | ExprKind::ConstArray { .. }
+            | ExprKind::FsReadFileView { .. } | ExprKind::FsReadBytesView { .. } => {
+                [BorrowRoot::ReadOnly].into()
+            }
+            ExprKind::FnValue(..) | ExprKind::OptionNone | ExprKind::ReaderStdin | ExprKind::ReaderOpen { .. }
             | ExprKind::ReaderOpenBeneath { .. }
             | ExprKind::ReaderOpenBeneathSingleLink { .. }
             | ExprKind::WriterStd { .. } | ExprKind::WriterCreate { .. } | ExprKind::CreateExclusive { .. }
-            | ExprKind::CreateExclusiveBeneath { .. }
-            | ExprKind::FsReadFileView { .. }
-            | ExprKind::FsReadBytesView { .. } => BorrowRoots::new(),
+            | ExprKind::CreateExclusiveBeneath { .. } => BorrowRoots::new(),
             // (2) Results whose type never borrows (scalars, `Unit`, freshly owned `string` /
             //   `buffer` / `array<string>` / Move handles), so the `ty_may_borrow` gate at the top of
             //   `borrow_sources` — this function's ONLY caller — has already returned an empty set
@@ -38339,7 +38531,7 @@ impl<'a> MoveCheck<'a> {
                         .contents
                         .entries
                         .get(&reference.generation)
-                        .map(|content| content.project_path(&reference.content_path))
+                        .map(|content| content.through_reference(reference, &reference.content_path))
                 })
                 .reduce(|left, right| left.join(&right))
                 .unwrap_or_default();
@@ -38653,6 +38845,7 @@ impl<'a> MoveCheck<'a> {
         field_path: &[u32],
         value: &Expr,
     ) {
+        self.reject_readonly_local_write(base, index.span);
         self.mark_borrow_mut_modified(base);
         self.update_generation_collection_contents(base, index, field_path, value);
         let backing = self.local_mutable_backing(base);
@@ -38912,7 +39105,7 @@ impl<'a> MoveCheck<'a> {
     ) {
         for root in roots {
             let owner = match root {
-                BorrowRoot::Observation(_) | BorrowRoot::EndedObservation(..) => None,
+                BorrowRoot::ReadOnly | BorrowRoot::Observation(_) | BorrowRoot::EndedObservation(..) => None,
                 BorrowRoot::Local(owner) | BorrowRoot::StorageLocal(_, owner, _) => Some(*owner),
                 BorrowRoot::Param(position) | BorrowRoot::ParamStorage(position) => {
                     self.f.params.get(*position as usize).copied()
@@ -38961,7 +39154,7 @@ impl<'a> MoveCheck<'a> {
             .end_generations(generations, BorrowEnd::Consumed);
         for root in storage_roots {
             match root {
-                BorrowRoot::Observation(_) | BorrowRoot::EndedObservation(..) => {}
+                BorrowRoot::ReadOnly | BorrowRoot::Observation(_) | BorrowRoot::EndedObservation(..) => {}
                 BorrowRoot::Local(owner) => {
                     self.invalidate_mutable_place(owner, &[]);
                     if !generation_backed {
@@ -39089,7 +39282,7 @@ impl<'a> MoveCheck<'a> {
     /// local not yet bound on this path has no live borrower to invalidate.
     fn invalidate_iteration_drops(state: &mut BorrowState, drops: &[LocalId], depth: u32) {
         let ended = |root: &BorrowRoot| match root {
-            BorrowRoot::Observation(_) | BorrowRoot::EndedObservation(..) => false,
+            BorrowRoot::ReadOnly | BorrowRoot::Observation(_) | BorrowRoot::EndedObservation(..) => false,
             BorrowRoot::Local(id) => drops.contains(id),
             BorrowRoot::StorageLocal(..) => false,
             BorrowRoot::IterTemp(d) => *d >= depth,
@@ -39192,6 +39385,7 @@ impl<'a> MoveCheck<'a> {
             .get(local as usize)
             .map_or("<borrow>", |l| l.name.as_str());
         let msg = match (root, how) {
+            (BorrowRoot::ReadOnly, _) => return,
             (BorrowRoot::Observation(_) | BorrowRoot::EndedObservation(..), _) => format!(
                 "use of invalidated borrow '{borrower}': its reader was advanced, replaced, consumed, or dropped; create a new view from the current reader"
             ),
@@ -39351,6 +39545,7 @@ impl<'a> MoveCheck<'a> {
             return;
         };
         let message = match root {
+            BorrowRoot::ReadOnly => return,
             BorrowRoot::Observation(_) | BorrowRoot::EndedObservation(..) => {
                 "pipeline source snapshot was invalidated before terminal action: its reader observation ended".to_string()
             }
@@ -41655,6 +41850,13 @@ impl<'a> MoveCheck<'a> {
     /// Opaque handle interiors are deliberately absent: only operations that replace a visible
     /// source place or write a caller-visible collection backing end a place reservation.
     fn apply_builtin_mutation_action(&mut self, expression: &Expr) {
+        if let ExprKind::ProcessLive { kind, args } = &expression.kind {
+            for (input, argument) in kind.inputs().iter().zip(args) {
+                if matches!(input, process_live::Input::OutBytes) {
+                    self.reject_readonly_view_write(argument);
+                }
+            }
+        }
         if let ExprKind::XmlNext { reader } = &expression.kind {
             self.advance_reader_observation(expression, reader);
             return;
@@ -41673,17 +41875,27 @@ impl<'a> MoveCheck<'a> {
             SourceVisibleMutationAction::Builder { builder, retained } => {
                 self.invalidate_builder_storage(builder);
                 if let ExprKind::Local(local) = builder.kind {
-                    self.join_local_borrow_fallback(local, retained);
+                    let retained = if matches!(expression.kind, ExprKind::ArrayBuilderAppend { .. }) {
+                        self.pipeline_element_fact(retained, &[]).1
+                    } else {
+                        self.borrow_fact(retained)
+                    }.flatten_lifetimes();
+                    if self.local_may_borrow(local) {
+                        let current = self.borrows.facts.get(&local).cloned().unwrap_or_default();
+                        self.borrows.update_fact(local, current.join(&retained));
+                    }
                 }
             }
             SourceVisibleMutationAction::Source(destination) => {
                 self.invalidate_source_mutation_target(destination);
             }
             SourceVisibleMutationAction::Shuffle { source, collection } => {
+                self.reject_readonly_view_write(collection);
                 self.invalidate_source_mutation_target(source);
                 self.invalidate_collection_mutation_target(collection);
             }
             SourceVisibleMutationAction::Collection(destination) => {
+                self.reject_readonly_view_write(destination);
                 self.invalidate_collection_mutation_target(destination);
             }
         }
@@ -45010,15 +45222,6 @@ struct Checker<'a, 't> {
     /// local it borrows. Used by the `out` no-alias check so `fill(a, s)` (where `s` views `a`)
     /// is caught even though `s` and `a` are different locals.
     slice_bases: std::collections::HashMap<LocalId, LocalId>,
-    /// Slice/bytes locals that (transitively) view **read-only** storage — a constant table
-    /// (`ExprKind::ConstArray`, in per-unit rodata) or a string literal's bytes (`"lit".bytes()`).
-    /// Such a view owns nothing *and* its backing storage is not writable, so writing through it
-    /// (`s[i] = v`, or passing it to an `out slice<T>` parameter) would store into the `constant`
-    /// global — a SIGSEGV at `-O0` and a silently-dropped write at `-O2`. Populated at binding (and a
-    /// slice reassignment) and **only ever grown** (insert-only, so a value read-only on any reaching
-    /// path stays flagged — sound-conservative), then checked at the two write sites. The mutable
-    /// backing-buffer analogue for an arena `mmap` view is a pre-existing follow-up (open-questions).
-    readonly_locals: std::collections::HashSet<LocalId>,
     /// Reader locals bound from `r.buffered()` (or `?`/block tails thereof). `read_line` requires a
     /// buffered receiver; since a buffered and an unbuffered reader share [`Ty::Reader`] (mirroring
     /// the buffered *writer* — one type, many constructors), this per-local provenance set is what
@@ -45190,7 +45393,6 @@ impl<'a, 't> Checker<'a, 't> {
             wait_state: Vec::new(),
             task_group_fallible: Vec::new(),
             slice_bases: std::collections::HashMap::new(),
-            readonly_locals: std::collections::HashSet::new(),
             buffered_readers: std::collections::HashSet::new(),
             loops: Vec::new(),
             loop_fallthrough: std::collections::HashSet::new(),
@@ -46053,14 +46255,6 @@ impl<'a, 't> Checker<'a, 't> {
                     if local_ty == Ty::Reader && init_is_buffered_reader(&init) {
                         self.buffered_readers.insert(local);
                     }
-                    // Record read-only-view provenance (`s := TABLE`, `b := "x".bytes()`, a sub-slice
-                    // of either) so a later `s[i] = v` / `out`-argument write to constant rodata is
-                    // rejected. Insert-only (monotone): once read-only, a later reassignment cannot
-                    // clear it (a straight-line overwrite could, but a branch join could not — keeping
-                    // it conservative avoids a false-negative soundness hole).
-                    if self.hir_is_readonly_view(&init) {
-                        self.readonly_locals.insert(local);
-                    }
                     // doc-13 §8.4 (S3): pool an all-constant local array literal into per-unit rodata
                     // (the #514 mechanism), so a lookup table costs one memcpy — which LLVM elides to
                     // a direct rodata read for a non-mutated binding — instead of `n` element stores
@@ -46229,12 +46423,6 @@ impl<'a, 't> Checker<'a, 't> {
                                     json_scan_spelling,
                                 ),
                             };
-                            // Reassigning a read-only view (`s = TABLE`) taints the slice local
-                            // read-only too. Insert-only: a later `s = writable` cannot clear it, so a
-                            // write reachable from the read-only assignment on any path is rejected.
-                            if matches!(ty, Ty::Slice(_)) && self.hir_is_readonly_view(&v) {
-                                self.readonly_locals.insert(id);
-                            }
                             stmts.push(Stmt::Assign {
                                 local: id,
                                 value: v,
@@ -46713,12 +46901,6 @@ impl<'a, 't> Checker<'a, 't> {
                     format!("cannot assign to an element of immutable '{name}' (declare with `mut`, or use an `out` parameter)"),
                     place.span,
                 );
-            }
-            // A `mut` binding does not make a **read-only view** writable: a slice viewing a constant
-            // table (or a string literal's bytes) points at the `constant` rodata global, so a store
-            // through it faults / is dropped. Reject the element write (soundness).
-            if self.reject_readonly_dst(id, place.span, "write to an element of") {
-                return Place::Err;
             }
             // `v[lane] = x` — write one lane of a `mut` vector (a constant lane in `0..N`, M6).
             if let Ty::Vec(s, n) = local_ty {
@@ -47773,61 +47955,6 @@ impl<'a, 't> Checker<'a, 't> {
 
     /// The root buffer local an HIR expression borrows, if it resolves to one (a local or an
     /// array→slice borrow). Used to record slice provenance for the `out` no-alias check.
-    /// Reject a write to a **read-only view** destination `id` (a local viewing a constant table or a
-    /// string literal's bytes). Returns `true` (after reporting) when the write must be rejected. The
-    /// single guard shared by every slice-write entry point (`s[i] = v`, `s.store(i, v)`,
-    /// `pipeline.map_into(s)`), so a new write site cannot silently miss the read-only check.
-    fn reject_readonly_dst(&mut self, id: LocalId, span: Span, verb: &str) -> bool {
-        if self.readonly_locals.contains(&id) || self.readonly_locals.contains(&self.root_local(id)) {
-            let name = self.locals[id as usize].name.clone();
-            self.diags.error(
-                format!("cannot {verb} '{name}': it is a read-only view (e.g., a constant table or mmap view); copy it into an owned array to modify"),
-                span,
-            );
-            return true;
-        }
-        false
-    }
-
-    /// Whether a checked expression is a **read-only view** — it (transitively) borrows constant
-    /// rodata (a `ConstArray` table, or a string-literal's bytes) rather than writable storage.
-    /// Writing through such a view stores into a `constant` global, so the two write sites
-    /// (`check_place` element assignment, and an `out slice<T>` argument) reject it. A control-flow
-    /// value is read-only if *any* reaching arm is (a write must be rejected if any path could target
-    /// rodata).
-    fn hir_is_readonly_view(&self, e: &Expr) -> bool {
-        match &e.kind {
-            // A constant table lives in per-unit read-only rodata.
-            ExprKind::ConstArray { .. } => true,
-            // `"literal".bytes()` (a `str` constant substitutes to a `str` literal) views the
-            // literal's rodata; a runtime `string`'s bytes are writable and out of scope.
-            ExprKind::StrBytes { inner } => matches!(inner.kind, ExprKind::Str(_)) || self.hir_is_readonly_view(inner),
-            // A bound local carries the provenance recorded at its binding (and any root it borrows).
-            ExprKind::Local(id) => {
-                self.readonly_locals.contains(id) || self.readonly_locals.contains(&self.root_local(*id))
-            }
-            // A borrow / sub-slice of a read-only view is itself read-only.
-            ExprKind::SliceRange { recv, .. } | ExprKind::ArrayToSlice(recv) => self.hir_is_readonly_view(recv),
-            ExprKind::Block(b)
-            | ExprKind::Arena(b)
-            | ExprKind::NamedArena { block: b, .. }
-            | ExprKind::Unsafe(b) => {
-                b.value.as_ref().is_some_and(|v| self.hir_is_readonly_view(v))
-            }
-            ExprKind::If { then, els, .. } => {
-                then.value.as_ref().is_some_and(|v| self.hir_is_readonly_view(v))
-                    || els.value.as_ref().is_some_and(|v| self.hir_is_readonly_view(v))
-            }
-            ExprKind::Match { arms, .. } => arms.iter().any(|a| self.hir_is_readonly_view(&a.body)),
-            ExprKind::ElseUnwrap { opt, fallback } => {
-                self.hir_is_readonly_view(opt) || self.hir_is_readonly_view(fallback)
-            }
-            ExprKind::Try(inner) => self.hir_is_readonly_view(inner),
-            ExprKind::FsReadFileView { .. } | ExprKind::FsReadBytesView { .. } => true,
-            _ => false,
-        }
-    }
-
     fn expr_root_local(&self, e: &Expr) -> Option<LocalId> {
         match &e.kind {
             ExprKind::Local(id) => Some(self.root_local(*id)),
@@ -49456,23 +49583,6 @@ impl<'a, 't> Checker<'a, 't> {
                 )
             })
             .collect();
-        // An `out slice<T>` parameter is written by the callee, so its argument must be writable
-        // storage. A read-only view of a constant table (or a string literal's bytes) points at the
-        // `constant` rodata global — passing it as `out` would have the callee store into read-only
-        // memory. Reject it (the call-site half of the read-only-view rule; the element-write half is
-        // in `check_place`).
-        for (i, mode) in param_modes.iter().enumerate() {
-            if mode.is_out()
-                && matches!(param_tys.get(i).map(|t| self.resolve(*t)), Some(Ty::Slice(_)))
-                && checked.get(i).is_some_and(|a| self.hir_is_readonly_view(a))
-            {
-                let sp = args.get(i).map(|a| a.span).unwrap_or(span);
-                self.diags.error(
-                    format!("cannot pass a read-only view of a constant table as the `out` argument to '{name}': an `out` buffer is written by the callee (copy the constant into an owned array first)"),
-                    sp,
-                );
-            }
-        }
         for (index, mode) in param_modes.iter().copied().enumerate() {
             if let Some(argument) = checked.get(index) {
                 self.validate_borrow_argument(argument, mode, &name);
@@ -54254,9 +54364,6 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(format!("cannot store into immutable '{name}' (declare with `mut`, or use an `out` parameter)"), recv.span);
             return err;
         }
-        if self.reject_readonly_dst(id, recv.span, "store into") {
-            return err;
-        }
         let idx = self.check_expr(i, Some(Ty::Int(IntTy { bits: 64, signed: true })));
         if !idx.ty.is_int_like() && idx.ty != Ty::Error {
             self.diags.error(format!("a store index must be an integer, got {}", ty_name(idx.ty)), i.span);
@@ -56076,9 +56183,6 @@ impl<'a, 't> Checker<'a, 't> {
                 format!("cannot write into immutable '{name}' (declare with `mut`, or use an `out` parameter)"),
                 dst_arg.span,
             );
-            return err;
-        }
-        if self.reject_readonly_dst(dst_id, dst_arg.span, "write into") {
             return err;
         }
         // A stageless inline literal source used the quiet declaration hint above; the checked
@@ -59129,7 +59233,7 @@ impl<'a, 't> Checker<'a, 't> {
                         && (!matches!(self.resolve(local.ty),Ty::Slice(_)) || self.current_params.iter().position(|param|*param==id)
                             .is_some_and(|index|matches!(self.current_param_modes.get(index),Some(ast::ParamMode::Out))))
                 });
-                if !writable || self.hir_is_readonly_view(&value) {
+                if !writable {
                     self.diags.error("process byte reads require a writable array/slice or out parameter".to_string(),argument.span); return invalid;
                 }
             }
@@ -60993,9 +61097,6 @@ impl<'a, 't> Checker<'a, 't> {
                         format!("cannot shuffle immutable '{name}' (declare with `mut`, or use an `out` parameter)"),
                         xs_arg.span,
                     );
-                    return err;
-                }
-                if self.reject_readonly_dst(xid, xs_arg.span, "shuffle") {
                     return err;
                 }
                 Expr { kind: ExprKind::RandShuffle { rng: Box::new(recv_expr), xs: Box::new(xs), elem: scalar_to_ty(es) }, ty: Ty::Unit, span }
@@ -72854,7 +72955,7 @@ fn main() -> i32 = 0
             checker.form_storage_completion(&carrier_call, &BorrowFact::default());
         assert_eq!(
             carrier_headers.leaves[&Vec::new()].generations,
-            [StorageGenerationRef::root(selected_generation.clone())]
+            [StorageGenerationRef { erase_readonly: true, ..StorageGenerationRef::root(selected_generation.clone()) }]
                 .into_iter()
                 .collect(),
             "a call carrier retains only the return-summary-selected generation",
@@ -72925,7 +73026,7 @@ fn main() -> i32 = 0
         );
         assert_eq!(
             mixed_headers.leaves[&carrier_path].generations,
-            [StorageGenerationRef::root(selected_generation.clone())]
+            [StorageGenerationRef { erase_readonly: true, ..StorageGenerationRef::root(selected_generation.clone()) }]
                 .into_iter()
                 .collect(),
             "a mixed carrier sibling keeps the exact selected source without suppressing owned formation",
@@ -72973,7 +73074,7 @@ fn main() -> i32 = 0
                 .headers
                 .leaves[&vec![BorrowProjection::StructField(0)]]
                 .generations,
-            [StorageGenerationRef::root(nested_source)]
+            [StorageGenerationRef { erase_readonly: true, ..StorageGenerationRef::root(nested_source) }]
                 .into_iter()
                 .collect(),
             "owned call content normalizes a selected direct view into the exact nested field path",
@@ -74159,6 +74260,500 @@ fn main() -> i32 = 0
         let f = parse_file(toks, &mut d);
         let p = check_file(&f, &mut d);
         (p, d)
+    }
+
+    #[test]
+    fn readonly_origin_local_matrix() {
+        for (name, source, readonly) in [
+            (
+                "literal_str_local",
+                r###"module probe
+S { table: slice<u8> }
+fn bytes() -> slice<u8> = "xx".bytes()
+fn write(borrow mut v: slice<u8>) { v[0] = 65 }
+fn main() -> i32 {
+ text := "xx"
+ mut v := text.bytes()
+ v[0] = 65
+ return 0
+}
+"###,
+                true,
+            ),
+            (
+                "literal_record",
+                r###"module probe
+S { table: slice<u8> }
+fn bytes() -> slice<u8> = "xx".bytes()
+fn write(borrow mut v: slice<u8>) { v[0] = 65 }
+fn main() -> i32 {
+ mut s := S { table: "xx".bytes() }
+ mut v := s.table
+ v[0] = 65
+ return 0
+}
+"###,
+                true,
+            ),
+            (
+                "literal_mut_helper",
+                r###"module probe
+S { table: slice<u8> }
+fn bytes() -> slice<u8> = "xx".bytes()
+fn write(borrow mut v: slice<u8>) { v[0] = 65 }
+fn main() -> i32 {
+ mut v := "xx".bytes()
+ write(v)
+ return 0
+}
+"###,
+                true,
+            ),
+            (
+                "loop_readonly",
+                r###"module probe
+fn main() -> i32 {
+ mut backing := [(1 as u8), (2 as u8)].to_array()
+ mut view: slice<u8> := backing
+ mut n := 0
+ loop {
+ if n == 2 { break }
+ view[0] = 65
+ view = "xx".bytes()
+ n = n + 1
+ }
+ return 0
+}
+"###,
+                true,
+            ),
+            (
+                "field_store_readonly",
+                r###"module probe
+S { data: slice<u8> }
+fn main() -> i32 {
+ mut backing := [(1 as u8), (2 as u8)].to_array()
+ mut s := S { data: backing }
+ s.data = "xx".bytes()
+ mut view := s.data
+ view[0] = 65
+ return 0
+}
+"###,
+                true,
+            ),
+            (
+                "string_array_view",
+                r###"module probe
+fn main() -> i32 {
+ words := ["xx", "yy"].to_array()
+ mut view := words[0].bytes()
+ view[0] = 65
+ return 0
+}
+"###,
+                true,
+            ),
+            (
+                "record_writable_sibling",
+                r###"module probe
+S { ro: slice<u8>, rw: slice<u8> }
+fn main() -> i32 {
+ mut backing := [(1 as u8), (2 as u8)].to_array()
+ s := S { ro: "xx".bytes(), rw: backing }
+ mut view := s.rw
+ view[0] = 65
+ return 0
+}
+"###,
+                false,
+            ),
+            (
+                "copied_array",
+                r###"module probe
+fn main() -> i32 {
+ mut view := "xx".bytes().to_array()
+ view[0] = 65
+ return 0
+}
+"###,
+                false,
+            ),
+            (
+                "copied_string",
+                r###"module probe
+fn main() -> i32 {
+ text := "xx".clone()
+ mut view := text.bytes()
+ view[0] = 65
+ return 0
+}
+"###,
+                false,
+            ),
+            (
+                "owned_control",
+                r###"module probe
+S { table: slice<u8> }
+fn bytes() -> slice<u8> = "xx".bytes()
+fn write(borrow mut v: slice<u8>) { v[0] = 65 }
+fn main() -> i32 {
+ mut v := [(1 as u8), (2 as u8)].to_array()
+ v[0] = 65
+ return 0
+}
+"###,
+                false,
+            ),
+        ] {
+            let (_, diagnostics) = check(source);
+            let messages = diagnostics
+                .iter()
+                .map(|item| item.message.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(diagnostics.has_errors(), readonly, "{name}: {messages:?}");
+            if readonly {
+                assert!(
+                    messages
+                        .iter()
+                        .any(|message| message.contains("read-only view")),
+                    "{name}: {messages:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn readonly_origin_carrier_matrix() {
+        let cases = [
+            (
+                "builder",
+                "mut builder: array_builder<str> := array_builder(out); builder.push(input); values := builder.build(); mut view := values[0].bytes(); view[0] = 65",
+            ),
+            (
+                "builder_append",
+                "values := [input].to_array(); mut builder: array_builder<str> := array_builder(out); builder.append(values[0..values.len()]); output := builder.build(); mut view := output[0].bytes(); view[0] = 65",
+            ),
+            (
+                "json_record",
+                "value: Record := json.decode(input)?; mut view := value.text.bytes(); view[0] = 65",
+            ),
+            (
+                "json_array",
+                "values: array<Record> := json.decode(input)?; mut view := values[0].text.bytes(); view[0] = 65",
+            ),
+            (
+                "json_doc",
+                "doc := json.doc(input)?; text := doc.get(\"text\").as_str() else { return Ok(1) }; mut view := text.bytes(); view[0] = 65",
+            ),
+            (
+                "json_elems",
+                "doc := json.doc(input)?; values := doc.elems(); text := values[0].as_str() else { return Ok(1) }; mut view := text.bytes(); view[0] = 65",
+            ),
+            (
+                "json_key",
+                "doc := json.doc(input)?; text := doc.key(0) else { return Ok(1) }; mut view := text.bytes(); view[0] = 65",
+            ),
+            (
+                "json_at",
+                "doc := json.doc(input)?; text := doc.at(0).as_str() else { return Ok(1) }; mut view := text.bytes(); view[0] = 65",
+            ),
+            (
+                "json_union",
+                "value: Choice := json.decode(input)?; text := match value { Text(t) => t, Number(_) => input }; mut view := text.bytes(); view[0] = 65",
+            ),
+            (
+                "group",
+                "rows: soa<Record> := json.decode(input)?; grouped := rows.group_by(.text).sum(.score); mut view := grouped.0[0].bytes(); view[0] = 65",
+            ),
+            (
+                "dictionary",
+                "rows: array<Record> := json.decode(input)?; encoded := rows.dict_encode(.text); grouped := encoded.group_by(.text).sum(.score); mut view := grouped.0[0].bytes(); view[0] = 65",
+            ),
+            (
+                "owned_decode",
+                "value: Owned := json.decode(input)?; mut view := value.text.bytes(); view[0] = 65",
+            ),
+            (
+                "option",
+                "text := Some(input) else input; mut view := text.bytes(); view[0] = 65",
+            ),
+            (
+                "result_map_err",
+                "value: Result<str, Error> := Ok(input); text := value.map_err(fn e: Error { e })?; mut view := text.bytes(); view[0] = 65",
+            ),
+            (
+                "partition",
+                "(left, right) := [input].partition(fn text: str { true }); mut view := left[0].bytes(); view[0] = 65",
+            ),
+            (
+                "record_sibling",
+                "values := [Pair { ro: \"literal\", rw: input }].to_array(); mut view := values[0].rw.bytes(); view[0] = 65",
+            ),
+            (
+                "builder_sibling",
+                "mut builder: array_builder<Pair> := array_builder(out); builder.push(Pair { ro: \"literal\", rw: input }); values := builder.build(); mut view := values[0].rw.bytes(); view[0] = 65",
+            ),
+            (
+                "group_sibling",
+                "values := [Pair { ro: \"literal\", rw: input }].to_array(); grouped := values.group_by(.rw).count(); mut view := grouped.0[0].bytes(); view[0] = 65",
+            ),
+            (
+                "dictionary_sibling",
+                "values := [Pair { ro: \"literal\", rw: input }].to_array(); encoded := values.dict_encode(.rw); grouped := encoded.group_by(.rw).count(); mut view := grouped.0[0].bytes(); view[0] = 65",
+            ),
+            (
+                "owned_slots",
+                "mut values := [input].to_array(); values[0] = \"replacement\"",
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (name, body) in cases {
+            for owned in [false, true] {
+                let literal = match name {
+                    "json_record" => r#"{"text":"xx","score":1}"#,
+                    "json_array" | "group" | "dictionary" => r#"[{"text":"xx","score":1}]"#,
+                    "json_doc" | "owned_decode" => r#"{"text":"xx"}"#,
+                    "json_elems" | "json_at" => r#"["xx"]"#,
+                    "json_key" => r#"{"xx":0}"#,
+                    "json_union" => r#""xx""#,
+                    _ => "xx",
+                };
+                let input = if owned {
+                    format!("owner := {literal:?}.clone(); input: str := owner")
+                } else {
+                    format!("input := {literal:?}")
+                };
+                let source = format!(
+                    "import core.json\nPair {{ ro: str, rw: str }}\nRecord {{ text: str, score: i64 }}\nOwned {{ text: string }}\nChoice {{ Text(str), Number(i64) }}\nfn probe() -> Result<i32, Error> {{ arena out {{ {input}; {body}; }}; return Ok(0) }}\nfn main() -> i32 = 0\n"
+                );
+                let (_, diagnostics) = check(&source);
+                let messages = diagnostics
+                    .iter()
+                    .map(|item| item.message.as_str())
+                    .collect::<Vec<_>>();
+                let expected = !owned && !matches!(name, "owned_slots" | "owned_decode");
+                if diagnostics.has_errors() != expected
+                    || (expected
+                        && !messages
+                            .iter()
+                            .any(|message| message.contains("read-only view")))
+                {
+                    failures.push(format!("{name} owned={owned}: {messages:?}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn readonly_origin_control_matrix() {
+        let cases = [
+            (
+                "branch",
+                "if flag { view = \"xx\".bytes() }; view[0] = 65",
+                true,
+            ),
+            (
+                "join_value",
+                "view = if flag { \"xx\".bytes() } else { backing[0..2] }; view[0] = 65",
+                true,
+            ),
+            (
+                "match",
+                "opt := Some(flag); view = match opt { Some(value) => \"xx\".bytes(), None => backing[0..2] }; view[0] = 65",
+                true,
+            ),
+            (
+                "break",
+                "view = loop { break \"xx\".bytes() }; view[0] = 65",
+                true,
+            ),
+            (
+                "replace",
+                "view = \"xx\".bytes(); view = backing[0..2]; view[0] = 65",
+                false,
+            ),
+            (
+                "constant_join",
+                "if flag { view = TABLE }; view[0] = 65",
+                true,
+            ),
+            (
+                "block_store",
+                "result := { view = \"xx\".bytes(); view[0] = 65; 0 }; print(result)",
+                true,
+            ),
+        ];
+        for (name, body, readonly) in cases {
+            let source = format!(
+                "TABLE: slice<u8> := [1, 2]\nfn probe(flag: bool) {{ mut backing := [(1 as u8), (2 as u8)].to_array(); mut view: slice<u8> := backing; {body} }}\nfn main() -> i32 = 0\n"
+            );
+            let (_, diagnostics) = check(&source);
+            let messages = diagnostics
+                .iter()
+                .map(|item| item.message.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(diagnostics.has_errors(), readonly, "{name}: {messages:?}");
+            if readonly {
+                assert!(
+                    messages
+                        .iter()
+                        .any(|message| message.contains("read-only view")),
+                    "{name}: {messages:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn readonly_origin_projection_matrix() {
+        for swapped in [false, true] {
+            for owned in [false, true] {
+                let fields = if swapped {
+                    "rw: str, ro: str"
+                } else {
+                    "ro: str, rw: str"
+                };
+                let source = format!(
+                    "S {{ {fields} }}\nfn main() -> i32 {{ owner := \"xx\".clone(); text: str := owner; s := S {{ ro: \"xx\", rw: text }}; mut view := s.{}.bytes(); view[0] = 65; return 0 }}\n",
+                    if owned { "rw" } else { "ro" }
+                );
+                let (_, diagnostics) = check(&source);
+                assert_eq!(
+                    diagnostics.has_errors(),
+                    !owned,
+                    "{}",
+                    diagnostics
+                        .iter()
+                        .map(|item| item.message.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+            }
+        }
+        for (body, readonly) in [
+            (
+                "values := [\"xx\"]; mut view := values[0].bytes(); view[0] = 65",
+                true,
+            ),
+            (
+                "pair := (\"xx\", 1); mut view := pair.0.bytes(); view[0] = 65",
+                true,
+            ),
+            ("mut values := [\"xx\"]; values[0] = \"yy\"", false),
+            (
+                "owner := \"xx\".clone(); text: str := owner; values := [text]; mut view := values[0].bytes(); view[0] = 65",
+                false,
+            ),
+        ] {
+            let (_, diagnostics) = check(&format!("fn main() -> i32 {{ {body}; return 0 }}\n"));
+            let messages = diagnostics
+                .iter()
+                .map(|item| item.message.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(diagnostics.has_errors(), readonly, "{body}: {messages:?}");
+            if readonly {
+                assert!(
+                    messages
+                        .iter()
+                        .any(|message| message.contains("read-only view")),
+                    "{body}: {messages:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn readonly_origin_sink_matrix() {
+        for owned in [false, true] {
+            let init = if owned { "TABLE.to_array()" } else { "TABLE" };
+            for (name, sink) in [
+                ("index", "view[0] = 65"),
+                ("out", "set(view)"),
+                ("borrow_mut", "modify(view)"),
+                ("indirect", "writer := modify; writer(view)"),
+                (
+                    "vector",
+                    "value: vec2<u8> := [65, 65]; view.store(0, value)",
+                ),
+                ("shuffle", "mut rng := rand.seed_with(1); rng.shuffle(view)"),
+                ("native", "child.read_stdout(view)?"),
+                (
+                    "map_into",
+                    "source := [(3 as u8), (4 as u8)]; source.map_into(view)",
+                ),
+            ] {
+                let setup = if matches!(name, "native" | "map_into") {
+                    "mut original := [(1 as u8), (2 as u8)].to_array(); mut view: slice<u8> := original; view = backing"
+                } else {
+                    "mut view: slice<u8> := backing"
+                };
+                let source = format!(
+                    "import std.rand\nimport std.process\nTABLE: slice<u8> := [1, 2]\nfn set(out view: slice<u8>) {{ view[0] = 65 }}\nfn modify(borrow mut view: slice<u8>) {{ view[0] = 65 }}\nfn probe(borrow mut child: child) -> Result<(), Error> {{ mut backing := {init}; {setup}; {sink}; return Ok(()) }}\nfn main() -> i32 = 0\n"
+                );
+                let (_, diagnostics) = check(&source);
+                let messages = diagnostics
+                    .iter()
+                    .map(|item| item.message.as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    diagnostics.has_errors(),
+                    !owned,
+                    "{name} owned={owned}: {messages:?}"
+                );
+                if !owned {
+                    assert!(
+                        messages
+                            .iter()
+                            .any(|message| message.contains("read-only view")),
+                        "{name}: {messages:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn readonly_origin_lifetime_separation() {
+        let readonly: BorrowRoots = [BorrowRoot::ReadOnly].into();
+        assert!(!MoveCheck::roots_intersect(&readonly, &readonly));
+        assert_eq!(
+            BorrowRoot::ReadOnly.ended(BorrowEnd::Consumed),
+            BorrowRoot::ReadOnly
+        );
+        let source = "Holder { text: str }\nfn put(borrow mut dst: Holder) { dst.text = \"literal\" }\nfn main() -> i32 = 0\n";
+        let (program, diagnostics) = check(source);
+        assert!(!diagnostics.has_errors());
+        let function = program.fns.iter().find(|f| f.name == "put").unwrap();
+        assert_eq!(function.mutable_retention, Some(vec![vec![]]));
+        assert_eq!(function.return_borrow, hir::ReturnBorrowSummary::None);
+        // A lifetime summary may name an aggregate containing unrelated constant text.
+        // It must not claim that every result aliases that text's bytes.
+        let (_, diagnostics) = check(
+            "Holder { ro: str, rw: str }\nfn choose_text(value: Holder) -> str = value.rw\nfn main() -> i32 { owner := \"xx\".clone(); text: str := owner; value := Holder { ro: \"literal\", rw: text }; mut view := choose_text(value).bytes(); view[0] = 65; return 0 }\n",
+        );
+        assert!(
+            !diagnostics.has_errors(),
+            "{}",
+            diagnostics
+                .iter()
+                .map(|item| item.message.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let (_, diagnostics) = check(
+            "Holder { ro: array<str>, rw: array<str> }\nfn choose_text(borrow value: Holder) -> slice<str> { result: slice<str> := value.rw; return result }\nfn main() -> i32 { owner := \"xx\".clone(); text: str := owner; arena { ro := [\"literal\"].to_array(); rw := [text].to_array(); value := Holder { ro: ro, rw: rw }; words := choose_text(value); mut view := words[0].bytes(); view[0] = 65 }; return 0 }\n",
+        );
+        assert!(
+            !diagnostics.has_errors(),
+            "{}",
+            diagnostics
+                .iter()
+                .map(|item| item.message.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
 
     #[test]
