@@ -285,3 +285,26 @@ The view-conversion owner also pairs literal bytes with an owned byte copy throu
 `as_str().bytes()`. `storage_roots` obtains a collection view's static backing
 property from its selected header, independently of retained element origins.
 Owned allocations stay writable without erasing readonly text payload paths.
+
+
+## Static descriptor origin closure
+
+Compiler-owned descriptor ID, SQLite SQL and PostgreSQL SQL views are static
+read-only storage. `StaticDescriptorView` must seed the same local read-only
+origin as a literal, independently of its raw descriptor pointer. The trusted
+bridge's unsafe pointer access does not authorize an ordinary safe indexed
+write to that storage. This closes a local producer omission; ordinary function
+result laundering remains boundary 2.
+
+| Axis | Implementation / owner |
+|---|---|
+| Formation / all producers | Preserve descriptor shape, offset and trusted-origin validation. `readonly_static_descriptor_origin_matrix` covers offsets 16/32/48 through the actual three descriptor operations. |
+| Projection / replacement / writable copies | Reuse the local projected-fact engine. The owner crosses direct, record and slice views, readonly writes, readers and explicit owned copies. No new allocation or copy is inserted. |
+| Generic / imported / whole-per-unit | Concrete generic bridge bodies retain the origin after instantiation; `readonly_static_descriptor_whole_unit_parity` checks the three operations through both frontends. |
+| Malformed HIR / replay | `readonly_static_descriptor_checked_hir_replay` mutates a checked writable producer to StaticDescriptorView while keeping its valid descriptor pointer/offset. Structural validation must still pass and body replay must reject only the write. |
+| Control / ownership / ABI | Existing local control, carrier, lifetime-separation and call-summary owners remain authoritative. No IR shape, runtime operation, lifetime summary, interface byte or ABI changes. |
+
+The pre-fix compiler accepts the three static-view write witnesses. Keep them
+compile-only, with no generated executable run. The source/replay owner must
+fail when the new origin seed is removed. This local closure is independently
+useful and does not claim the deferred interprocedural proof.
