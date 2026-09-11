@@ -5304,12 +5304,9 @@ impl<'a> BodyValidator<'a> {
     }
 
     fn writable_slice_local(&self, context: &BodyContext, expression: &hir::Expr) -> bool {
-        let hir::ExprKind::Local(id) = expression.kind else {
-            return false;
-        };
+        // Read-only backing is checked by the shared checked-HIR body-fact replay.
         self.source_mut_local(context, expression, expression.ty)
             && matches!(expression.ty, Ty::Slice(_))
-            && !self.readonly_slice_local(context, id)
     }
 
     fn local_assignments(&self, context: &BodyContext) -> Vec<(hir::LocalId, &hir::Expr)> {
@@ -5403,77 +5400,6 @@ impl<'a> BodyValidator<'a> {
         }
 
         assignments
-    }
-
-    fn readonly_slice_local(&self, context: &BodyContext, target: hir::LocalId) -> bool {
-        let assignments = self.local_assignments(context);
-        let mut readonly = HashSet::new();
-        for (local, expression) in assignments {
-            if self.readonly_view_expression(expression, &readonly) {
-                readonly.insert(local);
-            }
-        }
-        readonly.contains(&target)
-    }
-
-    fn readonly_view_expression(
-        &self,
-        root: &hir::Expr,
-        readonly_locals: &HashSet<hir::LocalId>,
-    ) -> bool {
-        let mut work = vec![root];
-        let mut seen = HashSet::new();
-        while let Some(expression) = work.pop() {
-            if !seen.insert(ptr_key(expression)) {
-                continue;
-            }
-            match &expression.kind {
-                hir::ExprKind::ConstArray { .. }
-                | hir::ExprKind::FsReadFileView { .. }
-                | hir::ExprKind::FsReadBytesView { .. } => return true,
-                hir::ExprKind::Local(id) => {
-                    if readonly_locals.contains(id) {
-                        return true;
-                    }
-                }
-                hir::ExprKind::StrBytes { inner } => {
-                    if matches!(inner.kind, hir::ExprKind::Str(_)) {
-                        return true;
-                    }
-                    work.push(inner);
-                }
-                hir::ExprKind::SliceRange { recv, .. }
-                | hir::ExprKind::ArrayToSlice(recv)
-                | hir::ExprKind::Try(recv) => work.push(recv),
-                hir::ExprKind::Block(block)
-                | hir::ExprKind::Arena(block)
-                | hir::ExprKind::NamedArena { block, .. }
-                | hir::ExprKind::Unsafe(block) => {
-                    if let Some(value) = block.value.as_deref() {
-                        work.push(value);
-                    }
-                }
-                hir::ExprKind::If { then, els, .. } => {
-                    if let Some(value) = then.value.as_deref() {
-                        work.push(value);
-                    }
-                    if let Some(value) = els.value.as_deref() {
-                        work.push(value);
-                    }
-                }
-                hir::ExprKind::Match { arms, .. } => {
-                    for arm in arms {
-                        work.push(&arm.body);
-                    }
-                }
-                hir::ExprKind::ElseUnwrap { opt, fallback } => {
-                    work.push(opt);
-                    work.push(fallback);
-                }
-                _ => {}
-            }
-        }
-        false
     }
 
     fn reader_place(&self, expression: &hir::Expr, context: &BodyContext) -> bool {

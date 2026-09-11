@@ -696,9 +696,10 @@ as a scalar (so element positions accept the `AREA := W*H` capability); the elem
 (`[1,2,3]` → `slice<i64>`) or taken from a `slice<T>` annotation. An `array<T>` annotation is rejected
 with guidance (a top-level array constant is a static `slice<T>` view). **Read-only enforcement:** the
 view is `Static` rodata, so writing through it (`TABLE[i] = v`, or an `out slice<T>` argument) is
-rejected even through a `mut` binding / sub-slice / rebind — a `readonly_locals` provenance set,
-grown at binding and slice reassignment (insert-only → sound-conservative), checked at `check_place`
-and the `out`-argument site; the same rule covers a string literal's `.bytes()` view. Cross-unit: a
+rejected even through a `mut` binding / sub-slice / rebind. The shared body-fact analysis
+tracks local read-only origins through projections and control flow, including explicit
+`borrow mut` / `out` view arguments; the same rule covers a string literal's `.bytes()` view.
+See `impl/52-readonly-view-provenance-plan.md` for local coverage and the call-boundary follow-up. Cross-unit: a
 `pub` aggregate constant exports its initializer source (`IConst.value_src`, already folded into
 `interface_hash`), so each consumer rematerializes it against its own rodata and an edit invalidates
 dependents for free — no `FORMAT_VERSION` bump. A `pub` constant's value is part of the exported
@@ -721,10 +722,10 @@ Record: `draft.md` §3 (Constants) / §12, `docs/language-spec.md`, `docs/design
 
 **Open follow-up (pre-existing, exposed here):** the read-only-view write check flags *compile-time
 constant* provenance (`ConstArray`, a string literal's bytes) traced within a function. The broader
-analogue — a slice viewing a **non-writable arena `mmap` view** (`fs.read_file_view`), or a constant
-laundered through a plain (non-`out`) `slice<T>` parameter across a call — is not yet flagged (it needs
-whole-program / buffer-writability provenance). Neither is introduced by aggregate constants; both are
-pre-existing holes. Record here rather than blocking S1.
+call-boundary analogue — a constant or **non-writable arena `mmap` view** laundered through
+an ordinary function result or a plain slice parameter — still needs interprocedural
+buffer-writability provenance. Local mapped-view origins are checked. Plan 52 records the
+separate interface-backed follow-up; absence of a local origin is not proof of writability.
 
 ### Bitwise & shift operators (DONE 2026-06-26)
 **Decision: integer operators `& | ^ << >>` + unary `~`, NOT bitset methods.** Bit work on integers
