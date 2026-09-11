@@ -511,6 +511,11 @@ FD leak witness. Native fs tests own raw targets, cap boundaries, occupied entri
 all masks, denial/error partition, numerical/alias admission, rename, no-follow
 ancestors, FIFO metadata and Linux open-unlinked procfs identity. `os_host` owns
 identity layout, checked conversion and native credential equality.
+The isolated unavailable-access owner injects ENOSYS/EINVAL at the native-call
+boundary for self and final-relative queries. It asserts exact status, zero
+output, query count and parent/target FD cleanup. Mutating refusal to false or
+omitting final-FD Drop makes this owner fail. The driver fixture also observes
+and checks access on a FIFO under its existing child deadline.
 
 Author investigation found lexical arenas incorrectly assigned generation-release
 boundaries to independent native allocations. The existing independent-storage
@@ -523,3 +528,10 @@ macOS native execution has not yet been obtained; XNU source inspection is not
 execution evidence. Privileged Linux credential/ACL fixtures are unavailable in
 the current Docker setup. These are not recorded as passing. Ordinary macOS
 mask/no-follow/rename/FIFO execution remains a publication prerequisite above.
+
+
+Independent capability-A code review found one P2 owner gap: pure errno mapping
+alone did not exercise unavailable native access through exported operations.
+The isolated native-call injection owner above closes that finding; no production
+strategy or public contract changed. Author gate corrections also parenthesize
+the access mask and synchronize the second exhaustive ExprKind inventory owner.

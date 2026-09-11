@@ -25,6 +25,8 @@ pub fn observe<T>(borrow directory: fs.directory, marker: T) -> Result<array<u8>
     Err(_) => {},
     Ok(_) => { return Err(Error.Invalid) },
   }
+  pipe := directory.metadata_follow("fifo")?
+  if !directory.access_at("fifo", mode)? { return Err(Error.Invalid) }
   directory.remove_file("link")?
   return Ok(target)
 }
@@ -35,6 +37,9 @@ fn observations_across_units_and_owner_expiry() {
     let fixture = private_project("fs-observations", &[], "main.align");
     let root = std::fs::canonicalize(&fixture.dir).expect("canonical fixture");
     std::fs::write(root.join("payload"),b"hello").expect("payload");
+    use std::os::unix::ffi::OsStrExt;
+    let fifo=std::ffi::CString::new(root.join("fifo").as_os_str().as_bytes()).expect("FIFO path");
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(),0o600) },0);
     let source = format!(r#"import std.fs
 import helper
 fn main() -> Result<(), Error> {{
@@ -108,4 +113,3 @@ fn private_project(tag: &str, files: &[(&str, &str)], entry: &str) -> Proj {
     }
     project
 }
-

@@ -11799,10 +11799,10 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        // R63 replaces three encoder variants with one operation. The exhaustive validation,
-        // source-shape, replay-clone, and canonical-graph matches handle both plans and limits.
+        // R63 unifies encoders; native identity adds one nullary observation. Exhaustive
+        // validation, source-shape, replay-clone and canonical-graph passes cover it.
         variants,
-        331,
+        332,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }

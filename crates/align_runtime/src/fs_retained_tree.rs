@@ -715,7 +715,7 @@ pub unsafe extern "C" fn align_rt_fs_directory_create_symlink(
 
 fn access_mode(read: u8, write: u8, execute: u8) -> Result<i32,i32> {
     if read > 1 || write > 1 || execute > 1 || (read|write|execute)==0 { return Err(AL_INVALID); }
-    Ok(i32::from(read)*libc::R_OK | i32::from(write)*libc::W_OK | i32::from(execute)*libc::X_OK)
+    Ok((i32::from(read)*libc::R_OK) | (i32::from(write)*libc::W_OK) | (i32::from(execute)*libc::X_OK))
 }
 
 /// Only access-query errors can mean a completed negative decision.
@@ -728,13 +728,34 @@ fn access_result(result: i32, errno: i32) -> Result<bool,i32> {
     }
 }
 
-fn native_access(fd: i32, name: &core::ffi::CStr, mode: i32, flags: i32) -> Result<bool,i32> {
+#[cfg(test)]
+struct AccessRefusal { flags: i32, errno: i32, queries: usize, hits: usize }
+#[cfg(test)]
+thread_local! {
+    static ACCESS_REFUSAL: core::cell::RefCell<Option<AccessRefusal>> = const { core::cell::RefCell::new(None) };
+}
+
+fn native_access_call(fd: i32, name: &core::ffi::CStr, mode: i32, flags: i32) -> (i32,i32) {
+    #[cfg(test)]
+    if let Some(errno) = ACCESS_REFUSAL.with(|state| {
+        let mut state=state.borrow_mut();
+        let refusal=state.as_mut()?;
+        refusal.queries += 1;
+        if flags != refusal.flags { return None; }
+        refusal.hits += 1;
+        Some(refusal.errno)
+    }) { return (-1,errno); }
     #[cfg(target_os="linux")]
     let result = unsafe { libc::syscall(libc::SYS_faccessat2,fd,name.as_ptr(),mode,flags) };
     #[cfg(target_os="macos")]
     let result = unsafe { libc::faccessat(fd,name.as_ptr(),mode,flags) };
     let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
-    access_result(if result == 0 {0} else {-1},errno)
+    (if result == 0 {0} else {-1},errno)
+}
+
+fn native_access(fd: i32, name: &core::ffi::CStr, mode: i32, flags: i32) -> Result<bool,i32> {
+    let (result,errno)=native_access_call(fd,name,mode,flags);
+    access_result(result,errno)
 }
 
 fn relative_access(directory: &Directory, path: &BeneathPath, mode: i32) -> Result<bool,i32> {
@@ -1522,6 +1543,65 @@ mod tests {
             let observed=unsafe { metadata.assume_init() };
             let native=beneath_stat_fd(opened.as_raw_fd()).map_err(|e|format!("stat: {e}"))?;
             assert_eq!(observed,super::metadata(&native).map_err(|e|format!("metadata: {e}"))?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_access_refuses_without_fallback_or_fd_leak() -> TestResult {
+        const CHILD: &str="ALIGN_TEST_ACCESS_REFUSAL_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            struct Child(std::process::Child);
+            impl Drop for Child {
+                fn drop(&mut self) { let _=self.0.kill(); let _=self.0.wait(); }
+            }
+            let mut child=Child(std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact","fs_retained_tree::tests::unavailable_access_refuses_without_fallback_or_fd_leak","--test-threads=1"])
+                .env(CHILD,"1").spawn()?);
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(10);
+            loop {
+                if std::time::Instant::now() >= deadline { return Err("access refusal child exceeded deadline".into()); }
+                match child.0.try_wait() {
+                    Ok(Some(status)) => { assert!(status.success()); return Ok(()); }
+                    Ok(None) => {},
+                    Err(error) if error.kind()==std::io::ErrorKind::Interrupted => {},
+                    Err(error) => return Err(error.into()),
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        struct Injection;
+        impl Drop for Injection { fn drop(&mut self) { ACCESS_REFUSAL.with(|state| *state.borrow_mut()=None); } }
+        let fixture=Fixture::new()?;
+        std::fs::create_dir(fixture.0.join("nested"))?;
+        std::fs::write(fixture.0.join("nested/file"),b"permitted")?;
+        let owner=OwnedDirectory(fixture.open()?);
+        let fd_count=|| -> std::io::Result<usize> { Ok(std::fs::read_dir("/dev/fd")?.count()) };
+        #[cfg(target_os="linux")]
+        let final_flags=libc::AT_EMPTY_PATH;
+        #[cfg(target_os="macos")]
+        let final_flags=0x0800;
+        for errno in [libc::ENOSYS,libc::EINVAL] {
+            for relative in [false,true] {
+                let before=fd_count()?;
+                let injection=Injection;
+                ACCESS_REFUSAL.with(|state| *state.borrow_mut()=Some(AccessRefusal {
+                    flags: if relative { final_flags } else { 0 }, errno,queries:0,hits:0,
+                }));
+                let mut out=77;
+                let actual=unsafe { if relative {
+                    align_rt_fs_directory_access_at(owner.0,b"nested/file".as_ptr(),11,1,0,0,&mut out)
+                } else { align_rt_fs_directory_access(owner.0,1,0,0,&mut out) } };
+                assert_eq!(actual,io_error_to_status(&std::io::Error::from_raw_os_error(errno)));
+                assert_eq!(out,0);
+                ACCESS_REFUSAL.with(|state| {
+                    let state=state.borrow(); let state=state.as_ref().expect("armed injection");
+                    assert_eq!(state.hits,1);
+                    assert_eq!(state.queries,if relative {3} else {1});
+                });
+                drop(injection);
+                assert_eq!(fd_count()?,before,"temporary parent/target descriptor leaked");
+            }
         }
         Ok(())
     }
