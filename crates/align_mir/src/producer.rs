@@ -10812,10 +10812,11 @@ mod tests {
 
         // A read-only dependency still needs a founded source. Removing the owner seed must not
         // turn the borrowed Store/Load chain into an unconditional success.
-        equations
-            .get_mut(&XmlAccessNode::Slot(0, Vec::new()))
-            .expect("source equation")
-            .seed = None;
+        let source_equation = match equations.get_mut(&XmlAccessNode::Slot(0, Vec::new())) {
+            Some(equation) => equation,
+            None => panic!("source equation"),
+        };
+        source_equation.seed = None;
         let (_, invalid) = solve_xml_access_equations(&equations);
         assert!(invalid.contains(&XmlAccessNode::Slot(1, Vec::new())));
     }
@@ -10829,16 +10830,25 @@ mod tests {
         let hir = align_sema::check_file(&ast, &mut diagnostics);
         assert!(!diagnostics.has_errors());
         let mut malformed = crate::lower_program(&hir);
-        let function = malformed
+        let function = match malformed
             .fns
             .iter_mut()
             .find(|function| function.name.as_str() == "forward")
-            .expect("forward MIR");
+        {
+            Some(function) => function,
+            None => panic!("forward MIR"),
+        };
         let source_slot = function.params[0];
-        let destination_slot = u32::try_from(function.slots.len()).expect("slot id");
+        let destination_slot = match u32::try_from(function.slots.len()) {
+            Ok(slot) => slot,
+            Err(_) => panic!("slot id"),
+        };
         function.slots.push(Ty::String);
         function.slot_align.push(None);
-        let loaded_value = u32::try_from(function.value_tys.len()).expect("value id");
+        let loaded_value = match u32::try_from(function.value_tys.len()) {
+            Ok(value) => value,
+            Err(_) => panic!("value id"),
+        };
         function.value_tys.push(Ty::String);
         let borrowed = Operand::BorrowedPlace(Box::new(crate::BorrowedPlace {
             slot: source_slot,
@@ -10846,11 +10856,14 @@ mod tests {
             ty: Ty::String,
             cleanup: None,
         }));
-        let entry = function
+        let entry = match function
             .blocks
             .iter_mut()
             .find(|block| block.id == function.entry)
-            .expect("forward entry block");
+        {
+            Some(block) => block,
+            None => panic!("forward entry block"),
+        };
         entry.stmts.insert(1, Stmt::Store(destination_slot, borrowed));
         entry
             .stmts
@@ -10861,8 +10874,10 @@ mod tests {
             }
         }
 
-        let error = validate_mir_producers(&malformed)
-            .expect_err("a borrowed Store/Load chain must not certify an owned return");
+        let error = match validate_mir_producers(&malformed) {
+            Ok(_) => panic!("a borrowed Store/Load chain must not certify an owned return"),
+            Err(error) => error,
+        };
         assert!(
             error.to_string().contains("producer return leaf")
                 || error.to_string().contains("producer return does not transfer"),

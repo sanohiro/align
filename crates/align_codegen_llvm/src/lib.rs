@@ -26011,16 +26011,25 @@ fn main() -> i32 = 0
         let mut malformed = mir(
             "fn forward(value: string) -> string = value\nfn main() -> i32 = 0\n",
         );
-        let function = malformed
+        let function = match malformed
             .fns
             .iter_mut()
             .find(|function| function.name.as_str() == "forward")
-            .expect("forward MIR");
+        {
+            Some(function) => function,
+            None => panic!("forward MIR"),
+        };
         let source_slot = function.params[0];
-        let destination_slot = u32::try_from(function.slots.len()).expect("slot id");
+        let destination_slot = match u32::try_from(function.slots.len()) {
+            Ok(slot) => slot,
+            Err(_) => panic!("slot id"),
+        };
         function.slots.push(Ty::String);
         function.slot_align.push(None);
-        let loaded_value = u32::try_from(function.value_tys.len()).expect("value id");
+        let loaded_value = match u32::try_from(function.value_tys.len()) {
+            Ok(value) => value,
+            Err(_) => panic!("value id"),
+        };
         function.value_tys.push(Ty::String);
         let borrowed = Operand::BorrowedPlace(Box::new(align_mir::BorrowedPlace {
             slot: source_slot,
@@ -26028,11 +26037,14 @@ fn main() -> i32 = 0
             ty: Ty::String,
             cleanup: None,
         }));
-        let entry = function
+        let entry = match function
             .blocks
             .iter_mut()
             .find(|block| block.id == function.entry)
-            .expect("forward entry block");
+        {
+            Some(block) => block,
+            None => panic!("forward entry block"),
+        };
         entry.stmts.insert(1, Stmt::Store(destination_slot, borrowed));
         entry
             .stmts
