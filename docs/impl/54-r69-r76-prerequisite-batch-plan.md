@@ -1,10 +1,11 @@
 # R69–R76 implementation handoff
 
-Status: all non-macOS capabilities are implemented in one draft handoff PR.
-The owner explicitly requested publication on 2026-09-11 without waiting for
-macOS; native macOS implementation corrections and qualification are delegated
-to another environment. This supersedes the earlier pre-push platform gate and
-three-PR merge sequence, without changing any public platform contract.
+Status: the combined provider implementation has passed its local macOS owner set.
+On 2026-09-11 the owner approved preserving the strict final-link refusal
+contract: `access_at` supports Linux and explicitly returns `Error.Code(ENOTSUP)`
+on macOS. Retained-self `access` remains supported on both hosts. This replaces
+the earlier assumed macOS relative-access strategy; useful macOS R72 relative
+observations remain deferred. The original one-PR handoff and draft state remain.
 Provider baseline: `8c9e24ee094b107e00c6685f3a034e5843eac6a4`.
 Consumer adoption remains external.
 
@@ -15,17 +16,16 @@ Consumer adoption remains external.
 | R69 | The registered `Pending { directory, path }` example still fails `check-per-unit` at `inspect(items[0])`. | Extend existing shared place projection to both retained filesystem owner leaves, with the same storage-generation proof. | C |
 | R70, blocking | The closed `FsTreeKind` table has no link read or followed metadata operation. | Bounded exact raw link bytes and explicit final-link-following metadata. | A |
 | R71 | Direct borrowed `Option<string>` slicing passes `check-per-unit` but fails codegen; the `str` helper prints PASS. | Normalize the borrowed descriptor before string byte/boundary operations; preserve the physical-type validator. | C |
-| R72, blocking | No retained real-credential access operation. Mode metadata is not an access decision. | Explicit real-ID permission observations using native access checks, including ACLs. | A |
+| R72, blocking | No retained real-credential access operation. Mode metadata is not an access decision. | Native real-ID/ACL self observations on Linux/macOS; strict relative observations on Linux, explicit unsupported refusal on macOS. | A |
 | R73, blocking | `std.os` exposes host facts, not current real UID/GID. | One ordinary Copy identity record. | A |
 | R74 | No retained symlink creation; currently nonblocking. | Exclusive final-entry creation with exact target bytes. | A |
 | R75, blocking | Strict byte validation and private SSE decoding do not supply a generic owned replacement decoder. | One pure bytes-to-owned-string transform with maximal-subpart substitution. | B |
 | R76, blocking | Closed one-shot hash discriminator has SHA-256/SHA-512 only. | Add SHA-1 through the same EVP engine and owned-array result. | B |
 
-Deliver **one coordinated non-macOS implementation PR**, followed by the owner's
-separate macOS completion. A, B and C remain closure-matrix groups: retained
-native authority, owned byte transforms and shared compiler projections.
-Keeping one handoff avoids repeated integration and gates while the macOS owner
-completes the platform boundary. The larger-than-1,000-line diff contains the
+Deliver **one coordinated implementation PR**, including the approved macOS
+refusal correction. A, B and C remain closure-matrix groups: retained native
+authority, owned byte transforms and shared compiler projections. Keeping one
+handoff avoids repeated integration and gates at the platform boundary. The larger-than-1,000-line diff contains the
 complete source-to-native schema and ownership proof; no dormant producer is
 split from its consumers. It stays draft until the platform handoff is complete.
 
@@ -59,7 +59,7 @@ order; a terminating operand skips later operands and native work.
 | `directory.metadata_follow(path: bytes) -> Result<fs.metadata, Error>` | `std.fs`; Impure shared receiver. Existing complete Copy metadata record; follows the final entry's link chain, including Linux procfs magic links. Opens no target contents. | Plan 45 grammar/ancestor admission; normal native stat errors. Final traversal may escape the retained root. No descriptor, mutation or identity-stable pair with read_link is returned. |
 | `fs.access_mode { read: bool, write: bool, execute: bool }` | Qualified-only ordinary Copy record. Exact three fields in declaration order, all required; ordinary user construction. | No source integer mask, existence-only mode, inferred policy or effective-ID option. |
 | `directory.access(mode: fs.access_mode) -> Result<bool, Error>` | `std.fs`; Impure shared receiver. Real-credential observation anchored at the retained directory, using native `.` lookup semantics. | Empty mode Invalid. Native directory search required by `.` lookup is part of this observation, even for a read-only mask. Section 3 fixes false versus Error. |
-| `directory.access_at(path: bytes, mode: fs.access_mode) -> Result<bool, Error>` | Same effect/borrowing. Relative real-ID access observation with retained, no-follow ancestors and final symlink refusal. No content open. | Complete path then mode, then ancestor admission/access and final observation. A retained root replaces ancestors above that root; this is not a replay of access on its original absolute pathname. |
+| `directory.access_at(path: bytes, mode: fs.access_mode) -> Result<bool, Error>` | Same effect/borrowing. Relative real-ID access observation with retained, no-follow ancestors and final symlink refusal. No content open. | Complete path then mode. Linux then performs ancestor admission/access and final observation; the retained root replaces ancestors above it. macOS returns Error.Code(ENOTSUP) before any access query or ancestor acquisition, for every otherwise valid path/mask. |
 | `os.identity_info { real_uid: i64, real_gid: i64 }` | Qualified-only ordinary Copy record, fields in this order. All fields present on success, nonnegative; ordinary construction and transport. | No account name, effective ID, authentication token or unavailable sentinel. |
 | `os.identity() -> Result<os.identity_info, Error>` | `import std.os`; Impure. Native getuid then getgid; no heap allocation, credential mutation, account lookup or subprocess. | Checked conversions in field order; unrepresentable values or unsupported platform Invalid. Pair is not an atomic credential snapshot. |
 | `directory.create_symlink(path: bytes, target: bytes) -> Result<(), Error>` | `std.fs`; Impure shared receiver. Call-scoped exact raw target bytes. Create only an absent final entry; no returned owner. | Validate complete relative destination before nonempty, NUL-free target; then retain ancestors and symlinkat. Existing file/directory/link is unchanged and yields native existing-entry Error. No overwrite or rollback unlink. |
@@ -98,8 +98,10 @@ already initialized caller owner: output scratch must be fresh and exclusive.
 
 No retry loop hides native failures or turns them into absence. Native heap OOM
 uses existing terminal behavior. Unsupported required native operations preserve
-their native Error (`Code(ENOSYS)` or the mapped unsupported-flag error); do not
-fall back to mode-bit emulation, /proc pathname reconstruction or content opens.
+their native Error (`Code(ENOSYS)` or the mapped unsupported-flag error).
+macOS `access_at` returns `Code(ENOTSUP)` after complete path/mask validation
+and before filesystem work because no adequate native primitive is selected.
+Do not fall back to mode-bit emulation, pathname reconstruction or content opens.
 
 ### 3.2 Link bytes and followed metadata
 
@@ -137,7 +139,7 @@ publication. A racing occupied final entry remains untouched by failed symlinkat
 
 Do not use `AT_EACCESS`, temporarily switch credentials, infer from mode bits,
 or use glibc's historical faccessat emulation: that emulation can omit ACLs.
-Use a direct Linux faccessat2 syscall and native macOS faccessat. All requested
+Use a direct Linux faccessat2 syscall and native macOS faccessat for self access. All requested
 bits are conjunctive. Native supplementary groups, ACLs, mount restrictions,
 root execute rules and credential semantics are preserved. Real credentials
 can change between calls; there is no atomic permission snapshot or reservation
@@ -147,7 +149,7 @@ Self: query `(directory_fd, ".", requested_mode, 0)` on both hosts. This anchors
 the observation after pathname replacement, opens no new content descriptor,
 and includes the kernel's `.` search semantics stated in the public ledger.
 
-Relative: retain each ancestor as in plan 45. Before selecting each next name,
+Linux relative: retain each ancestor as in plan 45. Before selecting each next name,
 observe real-ID X_OK on the current retained directory using the self syscall.
 A negative search decision returns Ok(false); a failed effective-credential
 ancestor admission remains its ordinary Error. Keep the last parent retained
@@ -161,20 +163,29 @@ descriptor with faccessat2 `(fd, "", mode, AT_EMPTY_PATH)`. A final substitution
 cannot redirect this descriptor check. Linux 5.8+ supplies the required syscall;
 older/unavailable kernels refuse instead of emulating a weaker answer.
 
-macOS final: `faccessat(parent, name, mode, AT_SYMLINK_NOFOLLOW_ANY)` rejects
-symlinks in the kernel lookup, including a racing final link; ELOOP maps to
-Invalid for this operation. The flag is 0x0800 in the public XNU fcntl header
-and is present in macOS 15's XNU implementation, matching current CI. Prefer
-the SDK/libc constant; if a Rust binding lacks it, use one named platform-local
-constant with the source reference and native owner. Do not replace it with
-AT_SYMLINK_NOFOLLOW plus stat-before/stat-after: that can accept a link swapped
-only during the access call. An unavailable flag refuses explicitly. Neither
-host opens target contents or promises identity continuity into a later action.
+macOS relative: after the common numeric/output/disjointness admission, complete
+relative-path validation and mask validation, return `Error.Code(ENOTSUP)`.
+Do not query parent search permissions, acquire ancestors, inspect the final
+entry or open target contents. Every otherwise valid input receives the same
+unsupported error, including missing paths, inaccessible ancestors, symlinks,
+regular files and FIFOs. Numeric/alias rejection preserves caller scratch;
+after admission every error leaves the Bool scratch zero, without publishing
+`Ok(false)`. Path marshalling retains its existing temporary allocation and Drop;
+there is no descriptor or result allocation. Self access remains native.
+
+`AT_SYMLINK_NOFOLLOW_ANY` does not provide the required terminal-link refusal:
+XNU combines it with NOFOLLOW, leaving a terminal symlink eligible for `access1`.
+The flag prevents following links, not observing the final link itself.
+Neither stat-before/stat-after nor reconstructing a pathname proves the identity
+observed during the access call. No weaker macOS success path is selected.
+Resuming useful macOS relative access requires a native primitive and owners
+that prove real-ID/ACL semantics, no content open and racing final-link refusal.
 
 Exact false/error partition is **stage-specific**. Only a native access query's
 EACCES, EPERM, EROFS or ETXTBSY becomes Ok(false); native zero becomes Ok(true).
 All other query errno values use the existing shared Error mapping, except the
-operation's symlink ELOOP refusal above. Missing final entry is NotFound. Any
+operation's symlink ELOOP refusal. For Linux relative access a missing final
+entry is NotFound; macOS relative access has already refused before lookup. Any
 lexical/shape/kind failure is Invalid. Errors in path admission, descriptor
 acquisition, fstat or conversion remain Errors, even when their errno is EACCES
 or EPERM. This prevents a failed observation from masquerading as a completed
@@ -186,13 +197,17 @@ it need not reveal whether the inaccessible final name exists.
 At baseline, Linux native probes confirmed O_PATH admission/fstat of a FIFO
 without a content open and faccessat2 AT_EMPTY_PATH support. The same probe
 showed a symlink O_PATH descriptor can itself pass an access check: the explicit
-fstat/symlink refusal is therefore mandatory. macOS behavior is grounded in
-source inspection, not claimed as an executed host test. Required platform
-owners below remain required for macOS completion; the owner has authorized
-the non-macOS draft publication before those runs.
+fstat/symlink refusal is therefore mandatory. Native macOS 26.6.2 (25G83)
+qualification reproduced successful `faccessat(fd, "link", R_OK, 0x0800)` on a
+terminal symlink. XNU macOS 15 source confirms the same NOFOLLOW lookup path;
+source inspection is not a macOS 15 execution claim. The earlier plan's claim
+that this flag rejects a final link was incorrect. Independent adversarial
+inspection confirmed the defect and the explicit unsupported boundary before
+implementation; the owner approved that platform contract on 2026-09-11.
 
 References: [Linux access/faccessat2](https://man7.org/linux/man-pages/man2/access.2.html),
 [Apple macOS 15 faccessat implementation](https://github.com/apple-oss-distributions/xnu/blob/xnu-11215.1.10/bsd/vfs/vfs_syscalls.c),
+[Apple macOS 15 lookup](https://github.com/apple-oss-distributions/xnu/blob/xnu-11215.1.10/bsd/vfs/vfs_lookup.c),
 [Apple fcntl flags](https://github.com/apple-oss-distributions/xnu/blob/xnu-11215.1.10/bsd/sys/fcntl.h),
 [readlinkat](https://man7.org/linux/man-pages/man2/readlink.2.html),
 [Linux syscall count type](https://github.com/torvalds/linux/blob/v6.12/fs/stat.c), and
@@ -386,7 +401,7 @@ owners. Each command remains within the repository's 30-minute test budget.
 | --- | --- | --- | --- |
 | Formation / validation | New driver `fs_observation_extensions`, `m11_os_identity`: exact import/arity/modes/reserved schemas, wrong fields/order/types, empty mode, bytes admission. | Extend `m10_encoding`, `m11_crypto`: imports, byte-view forms, wrong args, ordinary owned results, effect checks (lossy Pure, SHA-1 Impure). | Extend `move_record_slices`, `fs_retained_tree`, `return_provenance`: directory/cursor leaves, nested struct/Option/Result/sum/array carriers and excluded siblings. |
 | Native values / errors | Extend runtime `fs_retained_tree::tests`: raw link, bound±1, dangling/missing, procfs open-unlinked identity; cap i32::MAX boundary tested by pure admission and allocation/syscall refusal witnesses without gigabyte allocation; stat FIFO nonblocking; exclusive symlink occupied matrix; self/path/all seven masks; query error partition versus admission errors. New runtime os_identity exact getuid/getgid oracle. | Runtime exact UTF-8 vectors/splits and checked sizing; SHA-1 published digests/padding/binary vectors; provider-failure subprocess and independent framed Git test. | Driver direct/helper Some/None and owned/borrowed String twins, empty/in-bounds/multibyte boundaries; invalid bounds in isolated subprocess; owner queue shared metadata and independently owned cursors after rename. |
-| Authority / platform | Linux/macOS native access oracle; parent path replacement; symlink substitution at final access; ACL/group/real-vs-effective fixture; no content open/FIFO/device activation; no credential/cwd/environment mutation. | Borrowed data unchanged; no retained arena/source pointers; no unintended libcrypto linkage for lossy-only code, SHA-1 links the existing EVP capability. | Original owner remains sole owner; reject eager index/later-argument invalidation, same-source slice-header rebind, backing replacement, shared cursor.next, exclusive indexed access and escaped views. |
+| Authority / platform | Linux/macOS self-access oracle; Linux relative-access oracle and final-link refusal; macOS pre-I/O unsupported refusal; parent path replacement; applicable ACL/group/real-vs-effective fixture; no content open/FIFO/device activation; no credential/cwd/environment mutation. | Borrowed data unchanged; no retained arena/source pointers; no unintended libcrypto linkage for lossy-only code, SHA-1 links the existing EVP capability. | Original owner remains sole owner; reject eager index/later-argument invalidation, same-source slice-header rebind, backing replacement, shared cursor.next, exclusive indexed access and escaped views. |
 | Construction / move / Drop / replace / return | Bytes result in records/Option/Result/arrays; temporary descriptor release on every failure; read_link output survives directory/arena end. Copy mode/identity have no Drop. Reuse `fs_retained_tree::ownership_cleanup_and_negative_controls`; add omitted-output-Drop and failure descriptor witnesses. | Existing string/array owner path: move-in/out, source nulling, replacement, return, arena expiry; allocation witness detects a second complete output copy and omitted Drop. | Existing collection handles close once, borrowed element creates no cleanup; repeated projection and shared call remain allocation-free; omitted source Drop must fail the cleanup witness. |
 | Control paths / ordering | Receiver, path, cap/mode/target once left-to-right; if/match/else/?/map_err/loop joins and early return/break/abort before native side effects. | Owned result flow through all ordinary control paths; eager divergence does not allocate; invalid UTF-8 is accepted data, not Error control flow. | Same control paths for view lifetimes; active-arm and source-generation proof; receiver/index/bounds/later args once; discriminator reachability, fallthrough vs divergence, expected type/source-order and already-invalid subtrees. |
 | Checked HIR | Reserved schemas globally, exact FsTree kind/args/result, OsIdentity and every child/effect/move/escape/depth/replay visitor; variant-sweep tripwire. | Closed transform/hash cases; forged lossy decode direction and wrong result/effect; no unknown-kind Hex/SHA-512 fallback. | Classifier producer/replay agreement; malformed ids/cycles, wrong root/path/index/mode/active arm/retention and later-operand facts fail closed. |
@@ -399,16 +414,39 @@ container with the narrowly required permissions, and must compare real and
 effective identities plus supplementary groups. macOS native owners use its ACL
 facilities; privileged identity separation may use an explicitly available
 isolated fixture. Record unsupported privileged fixtures as unavailable, never
-as passing; ordinary macOS mask/no-follow/rename/FIFO owners are mandatory.
-Test the false partition with a pure errno mapping owner in addition to actual
-native denial. Linux syscall-unavailable and macOS flag-unavailable paths need
-injected refusal controls. Do not claim a macOS host run from XNU inspection.
+as passing; ordinary macOS self-mask/no-follow/rename/FIFO and relative-refusal
+owners are mandatory. Test the false partition with a pure errno mapping owner
+in addition to actual native denial. Linux syscall-unavailable and macOS
+self-call-unavailable paths retain injected refusal controls. macOS relative
+access instead proves unconditional refusal and zero native access calls.
+Do not claim a macOS host run from XNU inspection.
 
 Before a new required CI/platform job, ship and run a matching local script.
 Use existing service/container and platform verification tools, not CI as the
 first behavior test. If the implementer lacks the needed host, complete local
 portable/native ownership work and record that precise platform-validation
 prerequisite in the draft handoff; do not silently weaken the contract.
+
+### 7.1 Reopened macOS final-access boundary
+
+Axis: `macos-final-access-authority`. The platform contract change above closes
+the mistaken inference from a flag name to terminal-symlink refusal. No source
+signature, IR shape, ABI layout, Move/Copy rule or Linux strategy changes.
+
+| Cell | Implementation / exact owner |
+| --- | --- |
+| Numeric/alias admission before writes; full path then mask before unsupported | Existing `prepare` / `abi_beneath_path_impl` / `access_mode`; `access_queries_and_validation` canaries and `unavailable_access_refuses_without_fallback_or_fd_leak` invalid path/mask matrix. |
+| All seven masks and regular/directory/missing/denied/link/FIFO paths | macOS `relative_access` refuses ENOTSUP; `unavailable_access_refuses_without_fallback_or_fd_leak` crosses these inputs, zeros scratch and asserts zero native calls. |
+| No parent acquisition, access observation, final content open or mutation | Refusal precedes the Linux-only traversal; the same owner arms the ancestor failure hook and access-call counter; missing/denied ancestors cannot change the result. |
+| Retained-self masks, rename, native errors and cleanup | `access_queries_and_validation`, `observations_retain_inode_and_reject_ancestor_links`, `unavailable_access_refuses_without_fallback_or_fd_leak`; Linux relative injection/FD ownership retained. |
+| Whole/per-unit, imported generic calls, error propagation and remaining observations | `fs_observation_extensions::observations_across_units_and_owner_expiry` expects the exact macOS Error.Code and continues link bytes, followed FIFO metadata, creation and receiver expiry. Existing `fs_retained_tree` and `m11_os_identity` owners retain storage/return/Drop/interface coverage. |
+| Local / macOS 15 qualification | `scripts/test-fs-observations.sh` runs runtime fs_retained_tree/os_host and all three driver owners; the macOS 15 CI leg runs this same script. Local host evidence is recorded separately from that CI execution. |
+| Representation / ownership / malformed IR | Unchanged; existing capability-A matrix owners remain applicable. Only temporary path marshalling occurs before macOS refusal and is dropped on return. No new native owner or allocation promise. |
+
+The independent preimplementation review accepted this boundary and required
+uniform refusal before parent queries, unchanged scratch/error precedence, and
+explicitly deferred useful macOS R72 relative observations. The author maps each
+obligation above to one invariant-level owner rather than duplicating fixtures.
 
 ## 8. Execution instructions for the implementation model
 
@@ -508,10 +546,12 @@ all masks, denial/error partition, numerical/alias admission, rename, no-follow
 ancestors, FIFO metadata and Linux open-unlinked procfs identity. `os_host` owns
 identity layout, checked conversion and native credential equality.
 The isolated unavailable-access owner injects ENOSYS/EINVAL at the native-call
-boundary for self and final-relative queries. It asserts exact status, zero
+boundary for self queries on both hosts and final-relative queries on Linux.
+The macOS relative branch asserts unconditional pre-I/O ENOTSUP. It asserts exact status, zero
 output, query count and parent/target FD cleanup. Mutating refusal to false or
 omitting final-FD Drop makes this owner fail. The driver fixture also observes
-and checks access on a FIFO under its existing child deadline.
+FIFO metadata and checks the platform-specific access disposition under its
+existing child deadline.
 
 Author investigation found lexical arenas incorrectly assigned generation-release
 boundaries to independent native allocations. The existing independent-storage
@@ -519,12 +559,10 @@ predicate now governs both Drop selection and generation release; the arena-retu
 link-byte owner fails without this correction. This is an existing allocation
 contract repair, not a new allocation mode.
 
-Platform verification prerequisite: the implementation environment is Linux.
-macOS native execution has not yet been obtained; XNU source inspection is not
-execution evidence. Privileged Linux credential/ACL fixtures are unavailable in
-the current Docker setup. These are not recorded as passing. Ordinary macOS
-mask/no-follow/rename/FIFO execution remains required for macOS completion,
-not for the explicitly authorized non-macOS draft publication.
+Platform qualification is recorded in §10. The original Linux environment did
+not execute macOS owners or privileged Linux credential/ACL fixtures. Those
+historical limits do not count as passing evidence. macOS relative access is now
+explicitly unsupported under §3.3, rather than an unverified success path.
 
 
 Independent capability-A code review found one P2 owner gap: pure errno mapping
@@ -571,6 +609,36 @@ and lifetime obligations; no new IR shape or writable-byte authority is added.
 
 Author matrix-to-diff pass: formation, construction, move/return, Drop, replacement,
 control joins, monomorphization, interface transport, malformed input and allocation
-parity close through the owners above and the existing matrix owners. The native
-macOS execution cells remain explicitly assigned to the separate implementer.
-Privileged credential/ACL fixtures remain unavailable in this Linux environment.
+parity close through the owners above and the existing matrix owners. The macOS boundary follows §7.1 and the execution record in §10.
+Privileged Linux credential/ACL fixtures remain outside the available evidence.
+
+
+## 10. macOS qualification and remaining scope
+
+Native host: macOS 26.6.2 (25G83), Apple Silicon, local APFS. This is not a
+macOS 15 execution claim. The original owner set exposed two failures: terminal
+symlink acceptance in access_at, and an uncanonicalized temporary-root fixture
+that failed the existing no-follow constructor before the rename observation.
+The former is closed by the owner-approved §3.3 platform refusal; the latter by
+canonicalizing the test's acquired root, preserving production root admission.
+
+The 27 tests selected by `scripts/test-fs-observations.sh` pass locally: runtime
+`fs_retained_tree` (11) and `os_host` (5); driver `fs_observation_extensions` (2),
+`fs_retained_tree` (7), and `m11_os_identity` (2). They cover all seven self-access
+masks, exact macOS relative refusal before native work, invalid input/output
+rules, retained rename and ancestor no-follow, raw link bytes/exclusive creation,
+FIFO metadata, identity, whole/per-unit transport and allocation/FD cleanup.
+The final-access refusal owner fails against the original macOS success path.
+CI's macOS 15 leg now executes this exact script, independently of the ordinary
+platform build and other owners; its result belongs to the PR checks.
+
+Additional local batch owners passed: `borrowed_fs_projections` (3),
+`m10_encoding` (18), `m11_crypto` (38),
+`return_provenance::borrowed_optional_string_ranges_match_plain_views` (1), and
+runtime `batch_byte_transform_tests` (3). A native APFS ACL experiment denied
+all write-containing self-access masks while permitting read/search masks; this
+is native API evidence, not an Align runtime ACL test. Privileged real/effective
+credential separation and privileged Linux ACL fixtures were unavailable and are
+not claimed passing. Useful macOS relative R72 access remains deferred until an
+adequate native primitive and its owners exist. Consumer integration remains
+external; this handoff authorizes no merge or versioned release.

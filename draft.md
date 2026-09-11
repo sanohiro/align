@@ -1,6 +1,6 @@
 # Align Language Specification Draft v0.1
 
-**R69–R76 batch: non-macOS implementation complete; macOS handoff pending:**
+**R69–R76 provider batch:**
 [Plan 54](docs/impl/54-r69-r76-prerequisite-batch-plan.md) owns the exact next
 provider batch: retained raw link reading/followed metadata/exclusive symlink
 creation, explicit real-ID access observations, `os.identity`, owned UTF-8
@@ -8,9 +8,11 @@ replacement decoding and one-shot SHA-1. Its shared projection contract admits
 the existing directory/cursor owner leaves without Move extraction or mutable
 indexed borrowing; borrowed string slicing preserves the existing Str view.
 All signatures, ownership, platform limits and errors are fixed in that ledger.
-Retained link/follow/access/creation, identity, replacement decoding, SHA-1 and
-shared projection are implemented. Native macOS qualification remains delegated
-to the separate platform implementer; see the plan’s handoff.
+Retained link/follow/creation, self access, identity, replacement decoding,
+SHA-1 and shared projection are implemented. Strict relative `access_at` supports
+Linux; on macOS it returns `Error.Code(ENOTSUP)` after complete path/mask validation
+and before filesystem work. `false` remains a completed negative permission
+observation, never an unsupported sentinel. The plan records platform evidence.
 
 ## 1. Vision
 

@@ -758,6 +758,15 @@ fn native_access(fd: i32, name: &core::ffi::CStr, mode: i32, flags: i32) -> Resu
     access_result(result,errno)
 }
 
+#[cfg(target_os="macos")]
+fn relative_access(_directory: &Directory, _path: &BeneathPath, _mode: i32) -> Result<bool,i32> {
+    // XNU's AT_SYMLINK_NOFOLLOW_ANY permits access to the final symlink itself.
+    // Plan 54 §3.3 requires refusal before any filesystem observation when no
+    // native operation can preserve real-ID/ACL checks and final-link refusal.
+    Err(AL_CODE + libc::ENOTSUP)
+}
+
+#[cfg(target_os="linux")]
 fn relative_access(directory: &Directory, path: &BeneathPath, mode: i32) -> Result<bool,i32> {
     let mut retained = None;
     let mut fd = directory.fd.0;
@@ -771,7 +780,6 @@ fn relative_access(directory: &Directory, path: &BeneathPath, mode: i32) -> Resu
         }
     }
     let name = path.component_ptr(last);
-    #[cfg(target_os="linux")]
     let result = {
         let raw = unsafe { libc::openat(fd,name,libc::O_PATH|libc::O_NOFOLLOW|libc::O_CLOEXEC) };
         if raw < 0 { return Err(io_error_to_status(&std::io::Error::last_os_error())); }
@@ -779,12 +787,6 @@ fn relative_access(directory: &Directory, path: &BeneathPath, mode: i32) -> Resu
         let observed = beneath_stat_fd(target.0)?;
         if observed.st_mode & libc::S_IFMT == libc::S_IFLNK { return Err(AL_INVALID); }
         native_access(target.0,c"",mode,libc::AT_EMPTY_PATH)
-    };
-    #[cfg(target_os="macos")]
-    let result = {
-        // Public macOS 15 XNU bsd/sys/fcntl.h; absent from some Rust libc versions.
-        const AT_SYMLINK_NOFOLLOW_ANY: i32 = 0x0800;
-        native_access(fd,unsafe { core::ffi::CStr::from_ptr(name) },mode,AT_SYMLINK_NOFOLLOW_ANY)
     };
     drop(retained);
     result
@@ -1481,16 +1483,31 @@ mod tests {
         std::fs::write(fixture.0.join("file"),b"data")?;
         std::fs::set_permissions(fixture.0.join("file"),std::fs::Permissions::from_mode(0o400))?;
         std::os::unix::fs::symlink("file",fixture.0.join("link"))?;
+        #[cfg(target_os="linux")]
         let native_path = std::ffi::CString::new(fixture.0.join("file").as_os_str().as_bytes())?;
         for bits in 1u8..8 {
             let (r,w,x) = (bits&1,(bits>>1)&1,(bits>>2)&1);
             let mode=access_mode(r,w,x).map_err(|e| format!("mode: {e}"))?;
-            let oracle=unsafe { libc::access(native_path.as_ptr(),mode) } == 0;
-            let mut out=77;
-            assert_eq!(unsafe { align_rt_fs_directory_access_at(owner.0,b"file".as_ptr(),4,r,w,x,&mut out) },0);
-            assert_eq!(out,u8::from(oracle));
+            let directory_fd=unsafe { (*owner.0.cast::<Directory>()).fd.0 };
+            let self_oracle=unsafe { libc::faccessat(directory_fd,c".".as_ptr(),mode,0) } == 0;
+            let mut self_out=77;
+            assert_eq!(unsafe { align_rt_fs_directory_access(owner.0,r,w,x,&mut self_out) },0);
+            assert_eq!(self_out,u8::from(self_oracle));
+            #[cfg(target_os="linux")]
+            {
+                let oracle=unsafe { libc::access(native_path.as_ptr(),mode) } == 0;
+                let mut out=77;
+                assert_eq!(unsafe { align_rt_fs_directory_access_at(owner.0,b"file".as_ptr(),4,r,w,x,&mut out) },0);
+                assert_eq!(out,u8::from(oracle));
+            }
         }
-        for (path,r,w,x) in [(b"link".as_slice(),1,0,0),(b"file",0,0,0),(b"file",2,0,0),(b"../file",1,0,0)] {
+        #[cfg(target_os="linux")]
+        {
+            let mut out=77;
+            assert_eq!(unsafe { align_rt_fs_directory_access_at(owner.0,b"link".as_ptr(),4,1,0,0,&mut out) },AL_INVALID);
+            assert_eq!(out,0);
+        }
+        for (path,r,w,x) in [(b"file".as_slice(),0,0,0),(b"file",2,0,0),(b"file",0,2,0),(b"file",0,0,2),(b"../file",1,0,0)] {
             let mut out=77;
             assert_eq!(unsafe { align_rt_fs_directory_access_at(owner.0,path.as_ptr(),i64::try_from(path.len())?,r,w,x,&mut out) },AL_INVALID);
             assert_eq!(out,0);
@@ -1516,7 +1533,8 @@ mod tests {
         use std::os::fd::AsRawFd;
         let fixture=Fixture::new()?;
         std::fs::create_dir(fixture.0.join("root"))?;
-        let root=std::ffi::CString::new(fixture.0.join("root").as_os_str().as_bytes())?;
+        let canonical_root=std::fs::canonicalize(fixture.0.join("root"))?;
+        let root=std::ffi::CString::new(canonical_root.as_os_str().as_bytes())?;
         let mut raw=core::ptr::null_mut();
         assert_eq!(unsafe { align_rt_fs_directory_open(root.as_ptr().cast(),i64::try_from(root.as_bytes().len())?,&mut raw) },0);
         let owner=OwnedDirectory(raw);
@@ -1528,8 +1546,13 @@ mod tests {
         assert_eq!(unsafe { align_rt_fs_directory_metadata_follow(owner.0,b"file".as_ptr(),4,metadata.as_mut_ptr().cast()) },0);
         assert_eq!(unsafe { metadata.assume_init() }.size,8);
         let mut allowed=0;
-        assert_eq!(unsafe { align_rt_fs_directory_access_at(owner.0,b"file".as_ptr(),4,1,0,0,&mut allowed) },0);
+        assert_eq!(unsafe { align_rt_fs_directory_access(owner.0,1,0,0,&mut allowed) },0);
         assert_eq!(allowed,1);
+        let relative_status=unsafe { align_rt_fs_directory_access_at(owner.0,b"file".as_ptr(),4,1,0,0,&mut allowed) };
+        #[cfg(target_os="linux")]
+        assert_eq!((relative_status,allowed),(0,1));
+        #[cfg(target_os="macos")]
+        assert_eq!((relative_status,allowed),(AL_CODE+libc::ENOTSUP,0));
         std::os::unix::fs::symlink("../root",fixture.0.join("moved/ancestor"))?;
         assert_ne!(unsafe { align_rt_fs_directory_metadata_follow(owner.0,b"ancestor/file".as_ptr(),13,metadata.as_mut_ptr().cast()) },0);
         assert_ne!(unsafe { align_rt_fs_directory_access_at(owner.0,b"ancestor/file".as_ptr(),13,1,0,0,&mut allowed) },0);
@@ -1580,9 +1603,12 @@ mod tests {
         #[cfg(target_os="linux")]
         let final_flags=libc::AT_EMPTY_PATH;
         #[cfg(target_os="macos")]
-        let final_flags=0x0800;
+        let final_flags=0;
         for errno in [libc::ENOSYS,libc::EINVAL] {
             for relative in [false,true] {
+                // macOS has no final access syscall; its unconditional refusal
+                // is exercised below, separately from native self-call errors.
+                if relative && cfg!(target_os="macos") { continue; }
                 let before=fd_count()?;
                 let injection=Injection;
                 ACCESS_REFUSAL.with(|state| *state.borrow_mut()=Some(AccessRefusal {
@@ -1602,6 +1628,51 @@ mod tests {
                 drop(injection);
                 assert_eq!(fd_count()?,before,"temporary parent/target descriptor leaked");
             }
+        }
+        #[cfg(target_os="macos")]
+        {
+            struct Restore(std::path::PathBuf);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    let _=std::fs::set_permissions(&self.0,std::fs::Permissions::from_mode(0o700));
+                    *BENEATH_TEST_FAILPOINT.lock().unwrap()=None;
+                }
+            }
+            std::os::unix::fs::symlink("nested/file",fixture.0.join("link"))?;
+            std::os::unix::fs::symlink("nested",fixture.0.join("ancestor"))?;
+            std::fs::create_dir(fixture.0.join("denied"))?;
+            let restore=Restore(fixture.0.join("denied"));
+            std::fs::set_permissions(&restore.0,std::fs::Permissions::from_mode(0))?;
+            let fifo=std::ffi::CString::new(fixture.0.join("fifo").as_os_str().as_bytes())?;
+            assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(),0o600) },0);
+            let before=fd_count()?;
+            let injection=Injection;
+            ACCESS_REFUSAL.with(|state| *state.borrow_mut()=Some(AccessRefusal {
+                flags:0,errno:libc::EIO,queries:0,hits:0,
+            }));
+            *BENEATH_TEST_FAILPOINT.lock().unwrap()=Some(BeneathTestFailpoint::DirectoryObserve);
+            for path in [b"nested/file".as_slice(),b"nested",b"missing",b"absent/file",b"denied/file",b"link",b"ancestor/file",b"fifo"] {
+                for bits in 1u8..8 {
+                    let mut out=77;
+                    assert_eq!(unsafe { align_rt_fs_directory_access_at(owner.0,path.as_ptr(),i64::try_from(path.len())?,bits&1,(bits>>1)&1,(bits>>2)&1,&mut out) },AL_CODE+libc::ENOTSUP);
+                    assert_eq!(out,0);
+                }
+            }
+            for path in [b"".as_slice(),b"/absolute",b"nested/../file",b"nested//file",b"nested/",b"bad\0name"] {
+                for bits in [0u8,1,8] {
+                    let mut out=77;
+                    assert_eq!(unsafe { align_rt_fs_directory_access_at(owner.0,path.as_ptr(),i64::try_from(path.len())?,bits,0,0,&mut out) },AL_INVALID);
+                    assert_eq!(out,0);
+                }
+            }
+            ACCESS_REFUSAL.with(|state| {
+                let state=state.borrow(); let state=state.as_ref().expect("armed injection");
+                assert_eq!((state.queries,state.hits),(0,0));
+            });
+            drop(injection);
+            drop(restore);
+            assert_eq!(fd_count()?,before,"unsupported access acquired a descriptor");
+            assert_eq!(std::fs::read(fixture.0.join("nested/file"))?,b"permitted");
         }
         Ok(())
     }

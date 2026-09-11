@@ -16,7 +16,11 @@ Paths/targets use bytes; `fs.access_mode` has required read/write/execute Bool
 fields. Results are respectively owned bytes, existing Copy metadata, Bool,
 Bool and unit, all under Result/Error. Receivers are shared and inputs call-scoped.
 The ledger fixes real-ID/ACL semantics, final-link policy, bounds, allocation,
-native errors and platform qualification. The operations below form the preceding
+native errors and platform qualification. Self `access` supports Linux/macOS;
+strict relative `access_at` supports Linux. macOS `access_at` returns
+`Error.Code(ENOTSUP)` after complete path/mask validation and before filesystem
+work, including for missing entries and symlinks. It never reports unsupported
+as `false` or substitutes final-link permissions. The operations below form the preceding
 baseline; application tree policy remains application code.
 
 > 🌐 **English** · [Japanese](./ja/fs.md)

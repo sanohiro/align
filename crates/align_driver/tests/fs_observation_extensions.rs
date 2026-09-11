@@ -11,9 +11,10 @@ pub fn observe<T>(borrow directory: fs.directory, marker: T) -> Result<array<u8>
   info := directory.metadata_follow("link")?
   if info.size != 5 { return Err(Error.Invalid) }
   mode := read_mode()
-  if !directory.access_at("payload", mode)? { return Err(Error.Invalid) }
+  expect_access(directory.access_at("payload", mode), false)?
   if !directory.access(fs.access_mode { read: false, write: true, execute: true })? { return Err(Error.Invalid) }
-  match directory.access_at("link", mode) {
+  expect_access(directory.access_at("link", mode), true)?
+  match directory.access_at("../invalid", mode) {
     Err(error) => { match error { Invalid => {}, _ => { return Err(Error.Invalid) } } },
     _ => { return Err(Error.Invalid) },
   }
@@ -26,7 +27,7 @@ pub fn observe<T>(borrow directory: fs.directory, marker: T) -> Result<array<u8>
     Ok(_) => { return Err(Error.Invalid) },
   }
   pipe := directory.metadata_follow("fifo")?
-  if !directory.access_at("fifo", mode)? { return Err(Error.Invalid) }
+  expect_access(directory.access_at("fifo", mode), false)?
   directory.remove_file("link")?
   return Ok(target)
 }
@@ -53,7 +54,27 @@ fn main() -> Result<(), Error> {{
   return Ok(())
 }}
 "#, root.to_str().expect("fixture path"));
-    let files = &[("helper.align",HELPER),("main.align",source.as_str())];
+    // Both platforms compile the same calls through an imported generic body;
+    // only the assertion of their documented runtime disposition differs.
+    let assertion=if cfg!(target_os="macos") {
+        format!(r#"match result {{
+          Err(error) => {{ match error {{ Code(code) => {{ if code == {} {{ return Ok(()) }} }}, _ => {{}} }} }},
+          _ => {{}},
+        }}
+        return Err(Error.Invalid)"#,libc::ENOTSUP)
+    } else {
+        r#"if link {
+          match result {
+            Err(error) => { match error { Invalid => { return Ok(()) }, _ => {} } },
+            _ => {},
+          }
+          return Err(Error.Invalid)
+        }
+        if !result? { return Err(Error.Invalid) }
+        return Ok(())"#.to_string()
+    };
+    let helper=format!("{HELPER}\npub fn expect_access(result: Result<bool, Error>, link: bool) -> Result<(), Error> {{\n{assertion}\n}}\n");
+    let files = &[("helper.align",helper.as_str()),("main.align",source.as_str())];
     let checked = diff_check_multi("fs-observations",files,"main.align");
     assert!(!checked.whole_errors && !checked.per_unit_errors,"whole:{}\nunit:{}",checked.whole_diags,checked.per_unit_diags);
     if backend_available() {

@@ -13,7 +13,11 @@ temporary-directory lifecycle は [`../36-fs-private-temp-plan.md`](../36-fs-pri
 path/target は bytes、`fs.access_mode` は必須の read/write/execute Bool フィールドを持つ。
 結果は順に所有 bytes、既存の Copy metadata、Bool、Bool、unit で、すべて Result/Error を使う。
 receiver は共有借用、入力の借用は呼び出し中だけ。実 UID/GID と ACL の意味、最終リンクの扱い、
-上限、確保、ネイティブエラー、対応環境は台帳が定める。以下は拡張前の基準となる既存操作であり、
+上限、確保、ネイティブエラー、対応環境は台帳が定める。自身への `access` は Linux/macOS に対応し、
+最終リンクを拒否する相対 `access_at` は Linux に対応する。macOS の `access_at` は path/mask を
+完全に検証した後、ファイルシステム操作の前に `Error.Code(ENOTSUP)` を返す。対象が存在しない場合や
+シンボリックリンクの場合も同じであり、未対応を `false` として返したり、最終リンク自体の権限で
+代用したりしない。以下は拡張前の基準となる既存操作であり、
 これらの拡張にアプリケーションの木走査ポリシーは含まれない。
 
 > 🌐 [English](../fs.md) · **日本語**
