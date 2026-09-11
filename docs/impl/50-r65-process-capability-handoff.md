@@ -1,5 +1,10 @@
 # R65: process capability implementation handoff
 
+The [R82 shared carrier](56-r77-r83-composition-plan.md) implementation composes
+an optional retained namespace with this plan's existing shared inheritance
+operation. It changes no constructor, descriptor transaction, platform contract
+or native ABI.
+
 Status: **IMPLEMENTING — common and signal capabilities implemented; verified launch acceptance in progress**.
 Baseline: Align `4cb14895a06e67f32ee72383b53afe72cd8e5555`.
 This is the plan of record for completing R65. It selects the scope and remaining

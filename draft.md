@@ -367,6 +367,14 @@ current result behavior. Views derived from the payload follow the existing infe
 and region rules. A free-standing or otherwise owning scrutinee keeps the existing consuming match
 behavior.
 
+R82 shared-carrier completion is implemented in the consolidated R77–R83
+provider branch. [Plan 56](docs/impl/56-r77-r83-composition-plan.md) adds only
+`process.user_namespace` to the existing recursively admitted borrowed-payload
+grammar. Stable optional and record-contained shared matches retain the source
+owner; the existing explicit `inherit_namespace` call owns its native duplicate.
+No owner extraction, exclusive indexed borrow, new handle family or native
+operation is added.
+
 Stable `buffer` and `writer` fields, including nested fields and checked borrowed
 match projections, support their existing non-consuming receivers: buffer
 `.bytes()`/`.len()` and writer `.write(...)`/`.flush()`. The original owner keeps
@@ -388,8 +396,10 @@ created; `.clone()` remains the explicit path to an owned result. Other whole Mo
 unavailable as ordinary values.
 
 An explicit shared-`borrow` call may take one indexed Move element from an ordinary dynamic scalar
-or AoS record array: `inspect(values[i])` is valid only when the selected direct, imported, or
-function-value target's corresponding parameter is `borrow` and `values` is a stable local,
+or AoS record array. A source-formed fixed AoS record array admits the same call place only for an
+indexed Move field with an integer-literal index, such as `inspect(rows[0].field)`; a whole fixed
+Move element remains unavailable. The selected direct, imported, or function-value target's
+corresponding parameter must be `borrow`, and the base must be a stable local,
 borrowed/projection binding, or struct-field path. The complete array root is reserved from the
 once-only index evaluation through every later call argument and the call action: an operation that
 might move, drop, replace, transfer, or mutably borrow an overlapping root is rejected, while
@@ -2565,6 +2575,11 @@ layout/alignment, and every direct or nested view are rejected before constructi
 generic record is tested only after monomorphization; there is no new generic bound or runtime
 dictionary.
 
+R78's request for payload-free enum fields remains deferred/PROPOSED; the
+closed enum-field exclusion above is unchanged. [Plan 56](docs/impl/56-r77-r83-composition-plan.md) records
+the assessment and plan 23's unmet reopening prerequisite. No enum-field
+admission, layout, ownership or cleanup change is selected for this batch.
+
 A `string` or Move record element is **moved** into the builder by `push`: its complete source is
 nulled, and every reachable string or dynamic-array owner must be free-standing before the growth
 side effect.
@@ -4295,7 +4310,16 @@ collection formation and other specialized collection forms are unchanged.
 `view[i].field` reads Copy leaves and projects owned string leaves as `str`.
 `slice<string>[i]` likewise produces `str`. An entire Move record is addressable
 only as the immediate argument to an explicit shared `borrow` parameter under
-the existing borrowed-payload classifier and stable-local/field-place rules.
+the existing borrowed-payload classifier and stable-local/field-place rules. A
+Move field of an indexed AoS record may also be passed directly to that shared
+parameter: `inspect(rows[i].policy)` addresses the selected field in caller-owned
+storage. The receiver must be a stable local or field place, the complete index
+and field path are checked once, and no field value, cleanup bit, clone, or owner
+transfer is created. Ordinary slice/dynamic AoS record views accept a checked runtime
+index; a fixed `StructArray` uses its static element path and therefore requires an
+integer-literal index (the existing fixed-resource exception remains unchanged).
+By-value reads, `borrow mut`, temporary or nested-index bases, and other unsupported
+collection layouts remain rejected.
 Whole Move-value loads, mutable element borrows, writes and materializing or
 by-value pipeline consumers remain rejected. Explicitly cloning a projected
 `str` produces an independent owned string.

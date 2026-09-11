@@ -63,6 +63,15 @@ Option や array を要素とする array は対象外である。正確な ledg
 §7.6 にあり、直接 string-array field を持つ record に対する既存の Option/Result/user-sum payload
 も閉じる。完全な capability は 2026-08-14 に実装された。
 
+R78 の payload-free enum field 対応依頼は保留/PROPOSED のままであり、既存の
+閉じた enum-field 除外規則は変わらない。[Plan 56](../../56-r77-r83-composition-plan.md) に
+調査結果と plan 23 の未充足の再検討条件を記録する。この batch では enum field の
+受理、layout、所有権、cleanup の変更を選択していない。
+
+残る6件の composition request は provider branch に実装済みである。indexed Move field の
+shared-call place は slice/AoS view では runtime 添字、source-formed な固定 `StructArray` view
+では整数リテラル添字を使う。provider owner と consumer 側の未完了境界は plan 56 に記録する。
+
 region 形式（必須L6、**実装済み**）:
 
 ```text
@@ -78,7 +87,7 @@ storage: field 'f' owns independent heap storage`。設計は
 
 ## Type & ownership classification
 
-- Fixed array は Copy 値である。**Move 要素** を持つ fixed array（所有権付きフィールドを持つ `[User{name}]` など）は、要素ごとの drop が実装されるまで拒否される。
+- Fixed array は Copy 値である。所有権付きフィールドを持つ source-formed な Move struct 固定配列（`[User{name}]` など）には再帰的な要素 Drop がある。Move 要素全体の読み取りは、下記の明示的な shared-call place に限定される。
 - Dynamic `array<T>` は再帰的な Drop を持つ Move 型である（str 要素の配列は deep-free される。#339 の前例を参照）。
 - `array_builder<T>` は1つの Move owner である。heap 形式は通常の型付き parameter/return を
   move でき、helper は同じ owner を `borrow mut` 経由で変更できる。builder は aggregate field
@@ -113,9 +122,9 @@ storage: field 'f' owns independent heap storage`。設計は
 `region_of(xs[a..b]) = region_of(xs)`、`region_of(chunks elem) = region_of(source storage)` — これは #297 で導入された storage と element の区別に基づく（str 配列の *要素* は配列の *storage* よりも長生きする可能性がある）。`to_array` / `sort` / `partition` の結果は owned となる（region なし）。`map_into` は呼び出し側の region を介して書き込みを行い、**no-alias を証明する**。呼び出し側の out-disjointness チェックは、#328 の call-laundered-aliasing 修正以降、意図的に保守的なものになっている。その敵対的なケースを再実行せずにチェックを緩めてはならない。
 `zip(...).map_into(dst)` では、すべての source と `dst` が重複しないことが証明される。ランタイムの source 読み込みは 1 つの input-vs-output スコープを共有し、source 同士のエイリアスは許可されており、互いに disjoint であるとは宣言されない。
 
-## 仕様先行(未実装)
+## 仕様先行（未実装の範囲）
 
-- **Move 要素** のコレクションの slicing と通常の whole-value indexing は未対応である。ただし、plan 30 で受理され実装待ちの `array<string>[i] -> str` view は例外である。Move record 配列では、直接 field view と明示的な shared-borrow call-place の形式が引き続き使用できる。固定長の Move struct 配列と所有 struct-array フィールドには再帰的な要素 drop が実装済みである。残る問題はコレクションの破棄ではなく、要素全体に対する public view type または所有権移動の規則である。
+- **Move 要素** のコレクションの slicing と通常の whole-value indexing は未対応である。ただし、plan 30 で受理・実装済みの `array<string>[i] -> str` view は例外である。Move record 配列では、直接 field view と明示的な shared-borrow call-place の形式が引き続き使用できる。dynamic な slice/AoS record view は Move field に checked runtime index を使え、source-formed な固定 `StructArray` は static element path のため整数リテラル添字だけを受理する。既存の fixed-resource exception は変わらない。固定長の Move struct 配列と所有 struct-array フィールドには再帰的な要素 drop が実装済みである。残る問題はコレクションの破棄ではなく、要素全体に対する public view type または所有権移動の規則である。
 - **非プリミティブな leaf**（str / owned / nested-Move）を持つ dynamic `array<Struct>` における要素フィールドの書き込み — `StoreElemFieldPtr` はプリミティブ leaf 専用である（#316）。
 - ネストした要素書き込み `arr[i].a.x = v` は動作する。しかし、ネストした **soa** 列や、テスト済みの形式を超える chained projection 経由での要素書き込みは未対応 — `08-nested-structs.md` の deferred リストを参照。
 - `soa` 列は汎用パス（generic path）経由では範囲スライスできない（列のウィンドウは実装済みの `s.field[a..b]` を経由する。未対応なのは汎用的な `check_slice_range` のアームのみである）。

@@ -1293,6 +1293,10 @@ chain would either publish an unsafe record type or duplicate the same nominal-l
 and Drop proof across dormant boundaries; one consumer-complete capability has lower integration
 risk and less duplicated evidence.
 
+[Plan 56](56-r77-r83-composition-plan.md) assesses R78 payload-free enum fields
+and defers reopening under plan 23 row B4. The implemented closed grammar below
+remains unchanged; this batch does not authorize enum-field admission.
+
 ### 7.6 Recursive owned heap-record builder
 
 Status: implemented 2026-08-14 for align-llm Request 10.

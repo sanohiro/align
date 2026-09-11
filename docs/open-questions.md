@@ -13,6 +13,23 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+**R77–R83 composition implementation (2026-09-12).**
+[Plan 56](impl/56-r77-r83-composition-plan.md) owns the consolidated repair and
+acceptance matrix. Readiness, shared read authority, fresh/transferred ownership
+and retained view lifetimes remain separate proofs; MIR owns certification. The
+provider branch implements R77/R79/R80/R81/R82/R83, including an indexed Move
+field as an explicit shared call-place that points into caller-owned AoS storage.
+Dynamic slice/AoS views use checked runtime indices; source-formed fixed
+`StructArray` places require an integer-literal index, while the existing
+fixed-resource exception remains unchanged.
+R82 admits the existing `process.user_namespace` leaf in the shared-payload
+grammar without extraction or new native behavior. R78 remains
+deferred/PROPOSED under plan 23 row B4: no qualifying mechanical occurrences
+have been recorded, and the owner has not explicitly overridden the reopening
+prerequisite. The older heap-record enum exclusion below remains unchanged.
+The other closed type domains, allocation model and native ABI remain unchanged;
+consumer adoption and merged-release status remain external/publication steps.
+
 **R69–R76 contract (2026-09-11; macOS access boundary corrected).**
 [Plan 54](impl/54-r69-r76-prerequisite-batch-plan.md) owns all eight requests:
 retained link bytes/followed metadata/real-ID access/exclusive symlink creation,
@@ -4726,8 +4743,9 @@ record surface.
 
 The dynamic-aggregate extension also permits an indexed Move element of an admitted ordinary
 dynamic array only as the argument to an explicit shared-`borrow` parameter on a direct, imported,
-or function-value target. Its base must be a stable local, borrowed/projection binding, or
-struct-field path. The complete source root is reserved from once-only index evaluation through all
+or function-value target. A source-formed fixed `StructArray` admits the same call place only for an
+indexed Move field with an integer-literal index; a whole fixed Move element remains unavailable.
+Its base must be a stable local, borrowed/projection binding, or struct-field path. The complete source root is reserved from once-only index evaluation through all
 later arguments and the call action; a move, Drop, replacement, transfer, or mutable borrow that
 might overlap it is rejected, while unrelated mutation remains valid. MIR emits the existing bounds
 failure at the indexed argument position only after index fallthrough, carries no pointer through

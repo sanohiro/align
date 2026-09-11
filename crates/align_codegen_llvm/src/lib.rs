@@ -21087,8 +21087,36 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 ));
             }
         };
-        if element_ty != place.element_ty {
-            return Err(self.err("borrowed element place type disagrees with its array base"));
+        let selected = if place.field_path.is_empty() {
+            element_ty
+        } else {
+            let mut ty = element_ty;
+            for (depth, field) in place.field_path.iter().copied().enumerate() {
+                let Ty::Struct(id) = ty else {
+                    return Err(self.err(
+                        "borrowed element field path crosses a non-record",
+                    ));
+                };
+                let field_ty = self
+                    .structs
+                    .get(id as usize)
+                    .and_then(|definition| definition.fields.get(field as usize))
+                    .map(|field| field.ty)
+                    .ok_or_else(|| self.err("borrowed element field path is out of bounds"))?;
+                if depth + 1 < place.field_path.len() && !matches!(field_ty, Ty::Struct(_)) {
+                    return Err(self.err(
+                        "borrowed element field path crosses a non-record",
+                    ));
+                }
+                ty = field_ty;
+            }
+            ty
+        };
+        let view_retype = selected == Ty::String && place.element_ty == Ty::Str;
+        if selected != place.element_ty && !view_retype {
+            return Err(self.err(
+                "borrowed element place type disagrees with its array base or field path",
+            ));
         }
         if !matches!(self.checked_operand_ty(&place.index)?, Ty::Int(_)) {
             return Err(self.err("borrowed element place index is not an integer"));
@@ -21134,7 +21162,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 struct_id = next;
             }
         }
-        if leaf != Some(place.ty) {
+        let view_retype = leaf == Some(Ty::String) && place.ty == Ty::Str;
+        if leaf != Some(place.ty) && !view_retype {
             return Err(self.err("borrowed fixed element type disagrees with its field path"));
         }
         if place
@@ -21522,16 +21551,71 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let index = self.operand(&place.index)?.into_int_value();
         // MIR's successful bounds block dominates this call action. This GEP has no independent
         // bounds decision and is formed only now, after every later argument has fallen through.
-        unsafe {
+        let physical_element_ty = match place.base.ty {
+            Ty::Slice(element) | Ty::DynArray(element) => align_sema::scalar_to_ty(element),
+            Ty::DynStructArray(id, align_sema::Layout::Aos) => Ty::Struct(id),
+            _ => {
+                return Err(self.err(
+                    "borrowed element place base is not an ordinary array or slice",
+                ));
+            }
+        };
+        let element = unsafe {
             self.builder
                 .build_gep(
-                    self.llvm_type(place.element_ty),
+                    self.llvm_type(physical_element_ty),
                     data,
                     &[index],
                     "borrow.element.ptr",
                 )
                 .map_err(|error| self.err(error))
+        }?;
+        if place.field_path.is_empty() {
+            return Ok(element);
         }
+        let mut struct_id = match place.base.ty {
+            Ty::Slice(Scalar::Struct(id)) | Ty::DynStructArray(id, align_sema::Layout::Aos) => {
+                id
+            }
+            _ => {
+                return Err(self.err(
+                    "borrowed element field path base is not an AoS record array",
+                ));
+            }
+        };
+        let mut pointer = element;
+        for (depth, field) in place.field_path.iter().copied().enumerate() {
+            let structure = self
+                .structs
+                .get(struct_id as usize)
+                .ok_or_else(|| self.err("borrowed element field path is out of bounds"))?;
+            let field_ty = structure
+                .fields
+                .get(field as usize)
+                .map(|field| field.ty)
+                .ok_or_else(|| self.err("borrowed element field path is out of bounds"))?;
+            let struct_ty = self
+                .struct_types
+                .get(struct_id as usize)
+                .copied()
+                .ok_or_else(|| self.err("borrowed element field path struct id is out of bounds"))?;
+            pointer = self
+                .builder
+                .build_struct_gep(
+                    struct_ty,
+                    pointer,
+                    self.checked_pfield(struct_id, field)?,
+                    "borrow.element.field",
+                )
+                .map_err(|error| self.err(error))?;
+            if depth + 1 < place.field_path.len() {
+                let Ty::Struct(next) = field_ty else {
+                    return Err(self.err("borrowed element field path crosses a non-record"));
+                };
+                struct_id = next;
+            }
+        }
+        Ok(pointer)
     }
 
     fn borrowed_fixed_element_ptr(
@@ -24886,6 +24970,7 @@ fn main() -> Result<(), Error> {
                         }),
                     )),
                     element_ty: expected,
+                    field_path: Vec::new(),
                     guard: align_mir::BorrowedElementGuard {
                         reservation: u32::MAX,
                         len: Operand::Const(Const::Int(
@@ -25922,6 +26007,50 @@ fn main() -> i32 = 0
     }
 
     #[test]
+    fn producer_borrowed_store_load_cannot_regain_owned_return_authority() {
+        let mut malformed = mir(
+            "fn forward(value: string) -> string = value\nfn main() -> i32 = 0\n",
+        );
+        let function = malformed
+            .fns
+            .iter_mut()
+            .find(|function| function.name.as_str() == "forward")
+            .expect("forward MIR");
+        let source_slot = function.params[0];
+        let destination_slot = u32::try_from(function.slots.len()).expect("slot id");
+        function.slots.push(Ty::String);
+        function.slot_align.push(None);
+        let loaded_value = u32::try_from(function.value_tys.len()).expect("value id");
+        function.value_tys.push(Ty::String);
+        let borrowed = Operand::BorrowedPlace(Box::new(align_mir::BorrowedPlace {
+            slot: source_slot,
+            path: Vec::new(),
+            ty: Ty::String,
+            cleanup: None,
+        }));
+        let entry = function
+            .blocks
+            .iter_mut()
+            .find(|block| block.id == function.entry)
+            .expect("forward entry block");
+        entry.stmts.insert(1, Stmt::Store(destination_slot, borrowed));
+        entry
+            .stmts
+            .insert(2, Stmt::Let(loaded_value, Rvalue::Load(destination_slot)));
+        for block in &mut function.blocks {
+            if let Term::ReturnWithCleanup(pair) = &mut block.term {
+                pair.0 = Operand::Value(loaded_value);
+            }
+        }
+
+        assert!(
+            validate_mir_producers(&malformed).is_err(),
+            "a borrowed Store/Load chain must not certify an owned return"
+        );
+        assert_xml_producer_rejected(&malformed, "borrowed Store/Load owner authority");
+    }
+
+    #[test]
     fn producer_http_headers_retype_is_one_way() {
         assert!(xml_ty_is_view_retype(
             Ty::HttpRequestCtx,
@@ -26143,6 +26272,7 @@ fn main() -> i32 = 0
                             base: *place,
                             index: Operand::Const(Const::Int(0, Ty::Int(IntTy { bits: 64, signed: true }))),
                             element_ty: Ty::Str,
+                            field_path: Vec::new(),
                             guard: align_mir::BorrowedElementGuard {
                                 reservation: 0,
                                 len: Operand::Const(Const::Int(1, Ty::Int(IntTy { bits: 64, signed: true }))),

@@ -2913,6 +2913,10 @@ pub struct BorrowedElementPlace {
     pub base: BorrowedPlace,
     pub index: Operand,
     pub element_ty: Ty,
+    /// Optional logical field path within the dynamic record element. An empty path denotes the
+    /// whole element; a non-empty path is emitted only for an explicit shared borrow, so a Move
+    /// field is addressed in place without loading or duplicating its owner.
+    pub field_path: Vec<u32>,
     /// Stable reservation identity plus the checked array length. Backends reconstruct the exact
     /// successful bounds edge after MIR rewrites and prove it dominates the call action before
     /// forming a pointer; the descriptor itself remains pointer-free.
@@ -6031,6 +6035,46 @@ fn lower_borrowed_owned_with_chunks_plan(
         Operand::Value(value)
     } else {
         operand
+    }
+}
+
+/// Recover the stable descriptor place for a dynamic array/slice receiver. The returned place
+/// points at the array header itself; a dynamic element projection adds its runtime index and
+/// field path separately so no owned descriptor is copied into a temporary.
+fn borrowed_array_base_place(b: &Builder, receiver: &hir::Expr) -> Option<BorrowedPlace> {
+    match &receiver.kind {
+        hir::ExprKind::Local(local) => Some(
+            b.borrowed_bindings
+                .get(local)
+                .cloned()
+                .unwrap_or(BorrowedPlace {
+                    slot: *local,
+                    path: Vec::new(),
+                    ty: receiver.ty,
+                    cleanup: None,
+                }),
+        ),
+        hir::ExprKind::Field { root, path } => {
+            let mut place = b
+                .borrowed_bindings
+                .get(root)
+                .cloned()
+                .unwrap_or(BorrowedPlace {
+                    slot: *root,
+                    path: Vec::new(),
+                    ty: receiver.ty,
+                    cleanup: None,
+                });
+            place.path.extend(
+                path.iter()
+                    .copied()
+                    .map(hir::BorrowedPathSegment::StructField),
+            );
+            place.ty = receiver.ty;
+            place.cleanup = None;
+            Some(place)
+        }
+        _ => None,
     }
 }
 
@@ -10591,6 +10635,7 @@ fn lower_borrowed_place(b: &mut Builder, e: &hir::Expr, mode: align_ast::ParamMo
             base: base_place,
             index,
             element_ty: base.element_ty,
+            field_path: Vec::new(),
             guard: BorrowedElementGuard {
                 reservation,
                 len: checked_len,
@@ -10635,8 +10680,89 @@ fn lower_borrowed_place(b: &mut Builder, e: &hir::Expr, mode: align_ast::ParamMo
             place
         }
         hir::ExprKind::ElemField {
-            recv, index, path, ..
+            recv,
+            index,
+            path,
+            struct_id,
+            ..
         } => {
+            // An AoS/slice element-field projection is a place only at an explicit shared-borrow
+            // call boundary. Copy leaves retain the existing temporary descriptor path; a Move
+            // leaf is handled below by an in-place field pointer so no owner is loaded or copied.
+            let record_view = matches!(
+                recv.ty,
+                Ty::Slice(Scalar::Struct(_)) | Ty::DynStructArray(..) | Ty::Soa(_)
+            );
+            if record_view {
+                let move_field = needs_drop_flag(
+                    e.ty,
+                    &b.structs,
+                    &b.tuples,
+                    &b.enums,
+                    &b.tagged_types,
+                );
+                let dynamic_move_field = move_field
+                    && !path.is_empty()
+                    && matches!(
+                        recv.ty,
+                        Ty::Slice(Scalar::Struct(_)) | Ty::DynStructArray(_, Layout::Aos)
+                    );
+                if dynamic_move_field {
+                    if mode != align_ast::ParamMode::Borrow {
+                        return Operand::Const(Const::Unit);
+                    }
+                    let Some(base_place) = borrowed_array_base_place(b, recv) else {
+                        return Operand::Const(Const::Unit);
+                    };
+                    if checked_struct_field_path(b, *struct_id, path).is_none() {
+                        b.terminate(Term::Unreachable);
+                        return Operand::Const(Const::Unit);
+                    }
+                    let reservation = b.fresh_borrow_reservation();
+                    b.push(Stmt::BorrowedElementReservation {
+                        token: reservation,
+                        root: base_place.slot,
+                    });
+                    let index = lower_expr(b, index);
+                    if !lowering_continues(b) {
+                        return Operand::Const(Const::Unit);
+                    }
+                    let len = b.fresh_value(i64_ty());
+                    b.push(Stmt::Let(
+                        len,
+                        Rvalue::SliceLen(Operand::BorrowedPlace(Box::new(
+                            base_place.clone(),
+                        ))),
+                    ));
+                    let checked_len = Operand::Value(len);
+                    emit_bounds_check(b, &index, checked_len.clone());
+                    return Operand::BorrowedElementPlace(Box::new(BorrowedElementPlace {
+                        base: base_place,
+                        index,
+                        element_ty: e.ty,
+                        field_path: path.clone(),
+                        guard: BorrowedElementGuard {
+                            reservation,
+                            len: checked_len,
+                        },
+                    }));
+                }
+                if mode != align_ast::ParamMode::Borrow || move_field {
+                    return Operand::Const(Const::Unit);
+                }
+                let value = lower_index_field(b, e, recv, index, path, *struct_id, e.ty);
+                if !lowering_continues(b) {
+                    return Operand::Const(Const::Unit);
+                }
+                let slot = b.new_slot(e.ty);
+                b.push(Stmt::Store(slot, value));
+                return Operand::BorrowedPlace(Box::new(BorrowedPlace {
+                    slot,
+                    path: Vec::new(),
+                    ty: e.ty,
+                    cleanup: None,
+                }));
+            }
             let (hir::ExprKind::Local(base), hir::ExprKind::Int(index)) =
                 (&recv.kind, &index.kind)
             else {
