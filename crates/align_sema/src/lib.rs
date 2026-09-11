@@ -35355,7 +35355,18 @@ impl<'a> MoveCheck<'a> {
             // contributes its own local's storage on top of that.
             _ => roots.extend(self.borrow_sources(e)),
         }
-        if matches!(e.kind, ExprKind::Field { .. } | ExprKind::TupleIndex { .. } | ExprKind::Index { .. } | ExprKind::ElemField { .. }) {
+        if self.mutable_collection_ty(e.ty)
+            || matches!(expand_tagged_ty(e.ty, self.tagged_types), Ty::String | Ty::Buffer)
+        {
+            // A byte/string view observes the selected allocation, not view origins retained
+            // in its element contents. Owned copies and numeric SoA columns stay writable.
+            let readonly = matches!(expand_tagged_ty(e.ty, self.tagged_types), Ty::Slice(_) | Ty::Soa(_) | Ty::SoaParam(_))
+                && self.readonly_view_backing(e.ty, &self.completed_headers(e), &self.borrow_fact(e));
+            roots.remove(&BorrowRoot::ReadOnly);
+            if readonly {
+                roots.insert(BorrowRoot::ReadOnly);
+            }
+        } else if matches!(e.kind, ExprKind::Field { .. } | ExprKind::TupleIndex { .. } | ExprKind::Index { .. } | ExprKind::ElemField { .. }) {
             roots.remove(&BorrowRoot::ReadOnly);
             if !matches!(expand_tagged_ty(e.ty, self.tagged_types), Ty::String | Ty::Buffer)
                 && self.borrow_fact(e).direct.contains(&BorrowRoot::ReadOnly)
@@ -35917,27 +35928,21 @@ impl<'a> MoveCheck<'a> {
         let (recv, index, field_path) = match &expression.kind {
             ExprKind::Index { recv, index } => (recv.as_ref(), index.as_ref(), &[][..]),
             ExprKind::ElemField {
-                recv,
-                index,
-                path,
-                ..
+                recv, index, path, ..
             } => (recv.as_ref(), index.as_ref(), path.as_slice()),
             _ => return MoveValueFact::default(),
         };
+        self.collection_generation_content(recv, Some(index), field_path)
+    }
+
+    fn collection_generation_content(
+        &self,
+        recv: &Expr,
+        index: Option<&Expr>,
+        field_path: &[u32],
+    ) -> MoveValueFact {
         let headers = self.completed_headers(recv);
         let fixed = self.fixed_array_shape(recv.ty);
-        let element_paths = if let Some((_, len)) = fixed {
-            self.exact_fixed_index(index, len).map_or_else(
-                || {
-                    (0..len)
-                        .map(|candidate| vec![BorrowProjection::ArrayElement(candidate)])
-                        .collect::<Vec<_>>()
-                },
-                |exact| vec![vec![BorrowProjection::ArrayElement(exact)]],
-            )
-        } else {
-            vec![Vec::new()]
-        };
         let suffix = field_path
             .iter()
             .copied()
@@ -35955,14 +35960,49 @@ impl<'a> MoveCheck<'a> {
                     .get(&reference.generation)
                     .map(|content| (reference, content))
             })
-            .fold(MoveValueFact::default(), |selected, (reference, content)| {
-                element_paths.iter().fold(selected, |selected, element_path| {
-                    let path = reference.select_content_path(
-                        element_path.iter().chain(&suffix).copied(),
-                    );
-                    selected.join(&content.through_reference(reference, &path))
-                })
-            })
+            .fold(
+                MoveValueFact::default(),
+                |selected, (reference, content)| {
+                    // A slice/range keeps its allocation's fixed element paths. Its offset is
+                    // unavailable here, so join those slots instead of selecting the empty path
+                    // (or treating its index as an absolute index into the backing array).
+                    let backing_fixed = self
+                        .borrows
+                        .storage
+                        .directory
+                        .entries
+                        .get(&reference.generation)
+                        .and_then(|entry| entry.descriptor)
+                        .and_then(|descriptor| {
+                            self.projected_storage_result_ty(descriptor.ty, &reference.content_path)
+                        })
+                        .and_then(|ty| self.fixed_array_shape(ty));
+                    let element_paths = if let Some((_, len)) = fixed.or(backing_fixed) {
+                        let exact = fixed
+                            .and(index)
+                            .and_then(|index| self.exact_fixed_index(index, len));
+                        exact.map_or_else(
+                            || {
+                                (0..len)
+                                    .map(|candidate| {
+                                        vec![BorrowProjection::ArrayElement(candidate)]
+                                    })
+                                    .collect::<Vec<_>>()
+                            },
+                            |exact| vec![vec![BorrowProjection::ArrayElement(exact)]],
+                        )
+                    } else {
+                        vec![Vec::new()]
+                    };
+                    element_paths
+                        .iter()
+                        .fold(selected, |selected, element_path| {
+                            let path = reference
+                                .select_content_path(element_path.iter().chain(&suffix).copied());
+                            selected.join(&content.through_reference(reference, &path))
+                        })
+                },
+            )
     }
 
     fn selected_move_call_headers(
@@ -36890,7 +36930,14 @@ impl<'a> MoveCheck<'a> {
             self.normalize_borrow_fact(source.ty, self.borrow_fact(source))
                 .project_array_elements()
         } else {
-            self.borrow_fact(source).flatten_lifetimes()
+            let mut fact = self.borrow_fact(source).without_readonly_origin().flatten_lifetimes()
+                .join(&self.collection_generation_content(source, None, &[]).non_storage);
+            if self.completed_headers(source).leaves.values().any(|header| {
+                header.fallback_roots.contains(&BorrowRoot::ReadOnly)
+            }) {
+                fact.direct.insert(BorrowRoot::ReadOnly);
+            }
+            fact
         };
         // A materializing pipeline copies element values into fresh storage. Retain owners used by
         // those values, but not the source collection/header generation itself. Completed value
@@ -37257,6 +37304,18 @@ impl<'a> MoveCheck<'a> {
     fn borrow_fact_inner(&self, e: &Expr) -> BorrowFact {
         match &e.kind {
             ExprKind::Local(id) => self.local_borrow_fact(*id),
+            ExprKind::ArrayReduce { source, init, .. } => {
+                let lifetimes = self.borrow_fact(source).without_readonly_origin().flatten();
+                let initial = self.borrow_fact(init).flatten_lifetimes();
+                let initial = if matches!(expand_tagged_ty(e.ty, self.tagged_types), Ty::Result(..))
+                    && expand_tagged_ty(e.ty, self.tagged_types) != expand_tagged_ty(init.ty, self.tagged_types)
+                {
+                    initial.prefixed(BorrowProjection::ResultOk)
+                } else {
+                    initial
+                };
+                BorrowFact::from_direct(lifetimes).join(&initial)
+            }
             ExprKind::ArrayBuilderBuild(builder) => self.borrow_fact(builder).flatten_lifetimes(),
             ExprKind::ArrayGroupAgg { base, key_field, .. }
             | ExprKind::ArrayGroupAggMulti { base, key_field, .. } => {
@@ -37875,8 +37934,20 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ArrayParMap { source, .. }
             | ExprKind::ArraySort { source, .. }
             | ExprKind::ArraySortBy { source, .. } => self.borrow_sources(source),
-            ExprKind::ArrayReduce { source, init, .. } | ExprKind::ArrayScan { source, init, .. } => {
-                union(vec![source, init])
+            ExprKind::ArrayReduce { source, init, .. } => {
+                // An empty reduce returns its local initial accumulator unchanged. Nonempty
+                // results cross a callback boundary; source lifetimes do not prove writability.
+                let mut roots = self.borrow_sources(source);
+                roots.remove(&BorrowRoot::ReadOnly);
+                roots.extend(self.borrow_sources(init));
+                roots
+            }
+            ExprKind::ArrayScan { source, init, .. } => {
+                // Every stored scan element is a callback result (the initial value is never
+                // emitted). Preserve lifetime dependencies without guessing returned bytes.
+                let mut roots = union(vec![source, init]);
+                roots.remove(&BorrowRoot::ReadOnly);
+                roots
             }
             // `r.sample(xs, k)` copies `k` element *values* out of `xs` into a fresh owned array —
             // the same materializing shape as `.to_array()` above, so the result inherits `xs`'s
@@ -74712,6 +74783,114 @@ fn main() -> i32 {
                 }
             }
         }
+    }
+
+    #[test]
+    fn readonly_origin_view_conversion_matrix() {
+        for owned in [false, true] {
+            for dynamic in [false, true] {
+                for view in ["base", "base[0..base.len()]", "base[1..2]"] {
+                    for materializer in [
+                        "mut bytes := values[0].bytes()",
+                        "copied := values.to_array(); mut bytes := copied[0].bytes()",
+                        "mut builder: array_builder<str> := array_builder(out); builder.append(values); copied := builder.build(); mut bytes := copied[0].bytes()",
+                    ] {
+                        let init = if owned {
+                            "owner := \"xx\".clone(); input: str := owner"
+                        } else {
+                            "input := \"xx\""
+                        };
+                        let copy = if dynamic { ".to_array()" } else { "" };
+                        let source = format!(
+                            "fn main() -> i32 {{ arena out {{ {init}; base := [input, input]{copy}; values: slice<str> := {view}; {materializer}; bytes[0] = 65 }}; return 0 }}\n"
+                        );
+                        let (_, diagnostics) = check(&source);
+                        let messages = diagnostics
+                            .iter()
+                            .map(|item| item.message.as_str())
+                            .collect::<Vec<_>>();
+                        assert_eq!(
+                            diagnostics.has_errors(),
+                            !owned,
+                            "dynamic={dynamic} {view} {materializer}: {messages:?}"
+                        );
+                        if !owned {
+                            assert!(
+                                messages
+                                    .iter()
+                                    .any(|message| message.contains("read-only view")),
+                                "{messages:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        for owned in [false, true] {
+            let copy = if owned { ".to_array()" } else { "" };
+            let source = format!("fn main() -> i32 {{ backing := \"xx\".bytes(){copy}; source: slice<u8> := backing; text := source.as_str() else {{ return 1 }}; mut view := text.bytes(); view[0] = 65; return 0 }}\n");
+            let (_, diagnostics) = check(&source);
+            assert_eq!(diagnostics.has_errors(), !owned, "{}", diagnostics.iter().map(|item| item.message.as_str()).collect::<Vec<_>>().join("\n"));
+            if !owned {
+                assert!(diagnostics.iter().any(|item| item.message.contains("read-only view")));
+            }
+        }
+
+    }
+
+    #[test]
+    fn readonly_origin_accumulator_matrix() {
+        for projected in [false, true] {
+            for scan in [false, true] {
+                let collection = if projected {
+                    "[Row { text: \"literal\" }].text"
+                } else {
+                    "[\"literal\"]"
+                };
+                let operation = if scan { "scan" } else { "reduce" };
+                let selected = if scan { "result[0]" } else { "result" };
+                let source = format!(
+                    "Row {{ text: str }}\nfn keep(acc: str, item: str) -> str = acc\nfn main() -> i32 {{ arena {{ owner := \"xx\".clone(); text: str := owner; result := {collection}.{operation}(text, keep); mut view := {selected}.bytes(); view[0] = 65 }}; return 0 }}\n"
+                );
+                let (_, diagnostics) = check(&source);
+                assert!(
+                    !diagnostics.has_errors(),
+                    "{operation} projected={projected}: {}",
+                    diagnostics
+                        .iter()
+                        .map(|item| item.message.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+            }
+        }
+        let (_, diagnostics) = check(
+            "Holder { ro: str, rw: str }\nfn keep(acc: Holder, item: i64) -> Holder = acc\nfn main() -> i32 { owner := \"xx\".clone(); text: str := owner; init := Holder { ro: \"literal\", rw: text }; result := [1].reduce(init, keep); mut view := result.rw.bytes(); view[0] = 65; return 0 }\n",
+        );
+        assert!(
+            !diagnostics.has_errors(),
+            "{}",
+            diagnostics
+                .iter()
+                .map(|item| item.message.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        // The callback may swap fields: only static properties retain initial paths;
+        // lifetime roots must remain the conservative union of both initial fields.
+        let (program, diagnostics) = check("Holder { left: str, right: str }\nfn swap(acc: Holder, item: i64) -> Holder = Holder { left: acc.right, right: acc.left }\nfn swapped(left: str, right: str) -> str { init := Holder { left: left, right: right }; result := [1].reduce(init, swap); return result.left }\nfn main() -> i32 = 0\n");
+        assert!(!diagnostics.has_errors());
+        let function = program.fns.iter().find(|f| f.name == "swapped").unwrap();
+        assert_eq!(function.return_borrow, hir::ReturnBorrowSummary::Roots { params: vec![0, 1], captures: vec![] });
+        // Empty reduce returns its initial accumulator without invoking the callback.
+        let (_, diagnostics) = check(
+            "fn keep(acc: str, item: str) -> str = acc\nfn main() -> i32 { words := [\"unused\"]; result := words[0..0].reduce(\"literal\", keep); mut view := result.bytes(); view[0] = 65; return 0 }\n",
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|item| item.message.contains("read-only view"))
+        );
     }
 
     #[test]

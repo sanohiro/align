@@ -256,3 +256,32 @@ covers all its original sinks and malformed counterparts.
   witnesses are compile-only; existing owned-storage runtime owners remain the
   execution controls. The finite generation/path domain and existing deep CFG
   owners remain the termination proof, with no numeric analysis cutoff.
+
+
+## Review finding closure
+
+The first full code review identified two local transfer corrections under the
+existing strategy. Both are covered by the revised owner matrices:
+
+- Fixed-to-slice and range conversions retain the allocation's fixed
+  `ArrayElement` content paths. `collection_generation_content` selects from
+  the generation descriptor as well as the receiver type; a view with an unknown
+  offset joins backing slots while preserving field paths. Index reads,
+  materialization and builder append share that normalization.
+  `readonly_origin_view_conversion_matrix` crosses fixed/dynamic storage,
+  full/offset views and direct/copy/builder consumers with literal/owned twins.
+  Checked-HIR replay includes the same fixed-to-slice producer mutation.
+- Reduce/scan callback results do not inherit a source element's read-only
+  property from a lifetime union. An empty reduce can return its initial
+  accumulator directly, so that local alternative remains. Scan emits only
+  post-callback values. `readonly_origin_accumulator_matrix` covers both
+  terminals, projected sources, writable initial values and the read-only
+  empty-reduce initial value. Initial field paths apply only to static properties:
+  callbacks may swap fields, so lifetime roots still flatten conservatively.
+  The accumulator owner pins the exported two-parameter lifetime union after a
+  swapping reducer. Callback writability provenance remains boundary 2.
+
+The view-conversion owner also pairs literal bytes with an owned byte copy through
+`as_str().bytes()`. `storage_roots` obtains a collection view's static backing
+property from its selected header, independently of retained element origins.
+Owned allocations stay writable without erasing readonly text payload paths.
