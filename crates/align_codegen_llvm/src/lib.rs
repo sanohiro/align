@@ -24261,13 +24261,13 @@ fn main() -> i32 = 0
     fn runtime_abi_dedicated_consumers_leave_only_the_deferred_string_seams() {
         let source = include_str!("lib.rs");
         let implementation = source
-            .split_once("#[cfg(test)]")
+            .split_once("\n#[cfg(test)]\nmod tests {")
             .expect("test module boundary exists")
             .0;
         let string_lookups: Vec<_> = implementation.match_indices("self.funcs[").collect();
         assert!(string_lookups.is_empty(), "unexpected mixed string lookup: {string_lookups:?}");
-        assert!(source.contains(".program_funcs\n                    .get(name)"));
-        assert!(source.contains(".generated_funcs\n                    .get(&tramp_id)"));
+        assert!(implementation.contains(".program_funcs\n                    .get(name)"));
+        assert!(implementation.contains(".generated_funcs\n                    .get(&tramp_id)"));
         let compact: String = implementation.split_whitespace().collect();
         assert!(
             !compact.contains("self.funcs.get(\""),
@@ -24275,11 +24275,11 @@ fn main() -> i32 = 0
         );
         assert!(!include_str!("drop_codegen.rs").contains("self.funcs["));
 
-        let wrapper = source
-            .split_once("fn emit_main_wrapper")
+        let wrapper = implementation
+            .split_once("\nfn emit_main_wrapper")
             .expect("main wrapper exists")
             .1
-            .split_once("fn validate_tagged_program")
+            .split_once("\nfn int_type")
             .expect("main wrapper boundary exists")
             .0;
         assert_eq!(wrapper.matches("UnkeyedRuntimeKey::ReportError").count(), 1);
