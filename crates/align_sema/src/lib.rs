@@ -38215,7 +38215,13 @@ impl<'a> MoveCheck<'a> {
                 }
             }
             ExprKind::RawPointerLoad { .. } => BorrowRoots::new(),
-            ExprKind::StaticDescriptorView { ptr, .. } => self.borrow_sources(ptr),
+            ExprKind::StaticDescriptorView { ptr, .. } => {
+                // Descriptor text is compiler-owned static storage, regardless of the raw
+                // pointer used to reach its header. Safe view writes cannot change that storage.
+                let mut roots = self.borrow_sources(ptr);
+                roots.insert(BorrowRoot::ReadOnly);
+                roots
+            },
             ExprKind::Spawn { closure, .. } => self.borrow_sources(closure),
             ExprKind::Closure { captures, .. } => {
                 let mut roots = BorrowRoots::new();
@@ -74532,6 +74538,40 @@ fn main() -> i32 { _ := joined("x", identity, true); return 0 }
             assert!(!checked_hir_body_facts_are_valid(&forged));
         } else {
             assert!(selected_id.is_some(), "missing selected callable");
+        }
+    }
+
+    #[test]
+    fn readonly_static_descriptor_origin_matrix() {
+        for method in ["descriptor_id", "sqlite_sql", "postgres_sql"] {
+            for projection in ["direct", "record", "slice"] {
+                for action in ["read", "write", "owned"] {
+                    let project = match projection {
+                        "record" => "holder := Holder { text: text }; selected := holder.text",
+                        "slice" => "words := [text, text]; values: slice<str> := words; selected := values[0]",
+                        _ => "selected := text",
+                    };
+                    let view = if action == "owned" {
+                        "owned := selected.clone(); mut bytes := owned.bytes()"
+                    } else {
+                        "mut bytes := selected.bytes()"
+                    };
+                    let sink = if action == "read" { "print(bytes[0])" } else { "bytes[0] = 65" };
+                    let db = format!("module pkg.db\nimport pkg.db.internal.descriptor\npub command<P> {{}}\npub Holder {{ text: str }}\npub fn probe<P>(statement: command<P>) {{ unsafe {{ text := pkg.db.internal.descriptor.{method}(statement); {project}; {view}; {sink} }} }}\n");
+                    let main = "module main\nimport pkg.db\nParams { value: i64 }\nfn witness(statement: pkg.db.command<Params>) { pkg.db.probe(statement) }\nfn main() -> i32 = 0\n";
+                    let (_, diagnostics) = check_modules(&[
+                        ("pkg.db.internal.descriptor", "module pkg.db.internal.descriptor\n", false),
+                        ("pkg.db", &db, false),
+                        ("main", main, true),
+                    ]);
+                    let messages = diagnostics.iter().map(|d| d.message.as_str()).collect::<Vec<_>>();
+                    assert_eq!(diagnostics.has_errors(), action == "write", "{method}/{projection}/{action}: {messages:?}");
+                    if action == "write" {
+                        assert_eq!(messages.iter().filter(|message| message.contains("read-only view")).count(), 1,
+                            "{method}/{projection}: {messages:?}");
+                    }
+                }
+            }
         }
     }
 

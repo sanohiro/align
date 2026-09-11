@@ -593,3 +593,30 @@ fn readonly_origin_whole_unit_parity() {
         }
     }
 }
+
+
+#[test]
+fn readonly_static_descriptor_whole_unit_parity() {
+    for method in ["descriptor_id", "sqlite_sql", "postgres_sql"] {
+        for owned in [false, true] {
+            let view = if owned {
+                "owned := text.clone(); mut bytes := owned.bytes()"
+            } else {
+                "mut bytes := text.bytes()"
+            };
+            let db = format!("module pkg.db\nimport pkg.db.internal.descriptor\npub command<P> {{}}\npub fn probe<P>(statement: command<P>) {{ unsafe {{ text := pkg.db.internal.descriptor.{method}(statement); {view}; bytes[0] = 65 }} }}\n");
+            let main = "module main\nimport pkg.db\nParams { value: i64 }\nfn witness(statement: pkg.db.command<Params>) { pkg.db.probe(statement) }\nfn main() -> i32 = 0\n";
+            let result = diff_check_multi(&format!("readonly-descriptor-{method}-{owned}"), &[
+                ("pkg/db/internal/descriptor.align", "module pkg.db.internal.descriptor\n"),
+                ("pkg/db.align", &db),
+                ("main.align", main),
+            ], "main.align");
+            assert_eq!(result.whole_errors, !owned, "{}", result.whole_diags);
+            assert_eq!(result.per_unit_errors, !owned, "{}", result.per_unit_diags);
+            if !owned {
+                assert!(result.whole_diags.contains("read-only view"), "{}", result.whole_diags);
+                assert!(result.per_unit_diags.contains("read-only view"), "{}", result.per_unit_diags);
+            }
+        }
+    }
+}
