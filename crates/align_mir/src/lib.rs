@@ -2299,7 +2299,7 @@ pub enum Rvalue {
     CryptoRandom {
         out: Operand,
     },
-    /// `crypto.sha256(data)` / `crypto.sha512(data)` — the cryptographic digest of the byte view
+    /// `crypto.sha1(data)` / `crypto.sha256(data)` / `crypto.sha512(data)` — the cryptographic digest of the byte view
     /// `data` (`{ptr,len}`), a fresh *owned* `array<u8>` of fixed length (32 / 64) returned by value
     /// as a `{ptr,len}` (like [`Self::RandSample`]). `algo` param-swaps the EVP digest. The bound
     /// local `Drop`-frees the array. Impure (a libcrypto call).
@@ -8583,7 +8583,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 b.push(Stmt::Let(v, Rvalue::CryptoRandom { out: o }));
                 Operand::Const(Const::Unit)
             }
-            // `crypto.sha256(data)` / `crypto.sha512(data)` → a fresh owned `array<u8>` `{ptr,len}`
+            // `crypto.sha1(data)` / `crypto.sha256(data)` / `crypto.sha512(data)` → a fresh owned `array<u8>` `{ptr,len}`
             // returned by value; the bound local `Drop`-frees it (same shape as `rand.sample`). The
             // runtime allocates the digest buffer + aborts on an engine failure.
             hir::ExprKind::CryptoDigestNew => {
@@ -12343,6 +12343,18 @@ fn lower_slice_range(
     if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
     }
+    // A borrowed String place has a physical owning leaf even when its logical type is Str.
+    // Materialize only its Copy descriptor before length and UTF-8 boundary byte operations.
+    let base = if result_ty == Ty::Str {
+        let base=match base {
+            Operand::BorrowedPlace(mut place) => { place.ty=Ty::Str; Operand::BorrowedPlace(place) }
+            other => other,
+        };
+        let value=b.fresh_value(Ty::Str);
+        inherit_borrow_owners(b,value,[&base]);
+        b.push(Stmt::Let(value,Rvalue::Use(base)));
+        Operand::Value(value)
+    } else { base };
     let base_len = b.fresh_value(i64_ty());
     b.push(Stmt::Let(base_len, Rvalue::SliceLen(base.clone())));
     let start_op = match start {

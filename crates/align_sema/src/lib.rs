@@ -1707,7 +1707,8 @@ pub fn borrowed_sum_payload_is_admissible(
     ) -> bool {
         match ty {
             Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Unit | Ty::Str | Ty::String
-            | Ty::Slice(_) | Ty::Raw | Ty::Rng | Ty::Buffer | Ty::Writer | Ty::ProcessMember => true,
+            | Ty::Slice(_) | Ty::Raw | Ty::Rng | Ty::Buffer | Ty::Writer | Ty::ProcessMember
+            | Ty::FsDirectory | Ty::FsDirCursor => true,
             Ty::Struct(id) => {
                 if !active_structs.insert(id) {
                     return false;
@@ -11010,6 +11011,20 @@ fn compact_abstract_nominal_instances(
     fn remap_expr_metadata(expr: &mut Expr, remap: &NominalRemap, valid: &mut bool) {
         remap_ty(&mut expr.ty, remap, valid);
         match &mut expr.kind {
+            ExprKind::Match { borrowed_place, arms, .. } => {
+                if let Some(place) = borrowed_place {
+                    remap_ty(&mut place.sum_ty, remap, valid);
+                }
+                for arm in arms {
+                    for binding in &mut arm.borrowed_bindings {
+                        remap_ty(&mut binding.static_ty, remap, valid);
+                    }
+                }
+            }
+            ExprKind::BorrowedIndex { base, .. } => {
+                remap_ty(&mut base.array_ty, remap, valid);
+                remap_ty(&mut base.element_ty, remap, valid);
+            }
             ExprKind::Call { type_args, .. } => {
                 for ty in type_args {
                     remap_ty(ty, remap, valid);
@@ -30372,7 +30387,7 @@ fn storage_header_descriptors_compatible(
 fn native_storage_is_individual(kind: &ExprKind) -> bool {
     matches!(kind, ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. }
         | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::JsonOwnedDecode { .. }
-        | ExprKind::CryptoDigestFinish { .. })
+        | ExprKind::CryptoDigestFinish { .. } | ExprKind::CryptoHash { .. })
 }
 
 /// Compile-time-closed storage inventory for every checked-HIR expression variant. This match has
@@ -30483,7 +30498,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         // The runtime materializes a fresh `array<RowPair>` in Result::Ok and retains neither
         // codec view. `RowPair` is scalar-only, so the generation starts without borrowed content;
         // Result::Err carries no storage header.
-        ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. } | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::FrameInnerJoin { .. } | ExprKind::CryptoDigestFinish { .. } => {
+        ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. } | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::FrameInnerJoin { .. } | ExprKind::CryptoDigestFinish { .. } | ExprKind::CryptoHash { .. } => {
             StorageVariantPolicy::Fresh(StorageContentInitializer::FreshEmpty)
         }
 
@@ -30724,7 +30739,6 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::CryptoRandom { .. }
         | ExprKind::CryptoDigestNew
         | ExprKind::CryptoDigestUpdate { .. }
-        | ExprKind::CryptoHash { .. }
         | ExprKind::CryptoHmac { .. }
         | ExprKind::CryptoHkdf { .. }
         | ExprKind::CryptoAead { .. }
@@ -51013,7 +51027,7 @@ impl<'a, 't> Checker<'a, 't> {
             if module == "encoding"
                 && matches!(
                     method,
-                    "base64_encode" | "base64_decode" | "base64url_encode" | "base64url_decode" | "hex_encode" | "hex_decode" | "percent_encode_path" | "percent_encode" | "percent_decode" | "form_encode" | "form_decode" | "html_escape" | "utf8_valid"
+                    "base64_encode" | "base64_decode" | "base64url_encode" | "base64url_decode" | "hex_encode" | "hex_decode" | "percent_encode_path" | "percent_encode" | "percent_decode" | "form_encode" | "form_decode" | "html_escape" | "utf8_valid" | "utf8_decode_lossy"
                 )
             {
                 self.require_import("std.encoding", &format!("encoding.{method}"), span);
@@ -51099,6 +51113,7 @@ impl<'a, 't> Checker<'a, 't> {
                     method,
                     "constant_time_equal"
                         | "random"
+                        | "sha1"
                         | "sha256"
                         | "sha256_stream"
                         | "sha512"
@@ -60592,7 +60607,9 @@ impl<'a, 't> Checker<'a, 't> {
             "percent_encode_path" => hir::EncodingKind::PercentPath,
             "form_encode" | "form_decode" => hir::EncodingKind::Form,
             "html_escape" => hir::EncodingKind::Html,
-            _ => hir::EncodingKind::Hex, // hex_encode / hex_decode / utf8_valid (unused for utf8_valid)
+            "utf8_decode_lossy" => hir::EncodingKind::Utf8Lossy,
+            "hex_encode" | "hex_decode" | "utf8_valid" => hir::EncodingKind::Hex,
+            _ => { self.diags.error(format!("unknown encoding operation: {method}"),span); return err; }
         };
         // `utf8_valid(b)` — a byte-only check (`slice<u8>`); trivially true for a `str`, so it takes
         // raw `bytes` (`draft.md` §18.2: "check before turning bytes into str").
@@ -60771,7 +60788,7 @@ impl<'a, 't> Checker<'a, 't> {
 
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         // `sha256`/`sha512` (Slice 2) — the EVP digests; delegate to the shared hash builder.
-        if matches!(method, "sha256" | "sha512") {
+        if matches!(method, "sha1" | "sha256" | "sha512") {
             return self.check_crypto_hash(method, args, span);
         }
         // `hmac_sha256`/`hkdf_sha256` (Slice 3) — delegate to their builders.
@@ -60975,7 +60992,10 @@ impl<'a, 't> Checker<'a, 't> {
     /// back a `{ptr,len}` heap array; the runtime re-checks the length matches).
     fn check_crypto_hash(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        let algo = if method == "sha256" { hir::HashAlgo::Sha256 } else { hir::HashAlgo::Sha512 };
+        let algo = match method {
+            "sha1" => hir::HashAlgo::Sha1, "sha256" => hir::HashAlgo::Sha256, "sha512" => hir::HashAlgo::Sha512,
+            _ => { self.diags.error(format!("unknown hash operation: {method}"),span); return err; }
+        };
         if args.len() != 1 {
             self.diags
                 .error(format!("'crypto.{method}' expects 1 argument (the data), got {}", args.len()), span);
@@ -67886,7 +67906,8 @@ fn subst_param_ty(
         Ty::Box(s) => Ty::Box(subst_scalar(s, args, tagged_types)),
         Ty::Slice(s) => {
             let element = subst_collection_element_ty(s, args, tagged_types);
-            if ty_contains_restricted_collection_owner(element, structs, &[], enums, tagged_types) {
+            if !matches!(element, Ty::Struct(_))
+                && ty_contains_restricted_collection_owner(element, structs, &[], enums, tagged_types) {
                 Ty::Error
             } else {
                 collection_scalar_type(element)
@@ -69850,6 +69871,11 @@ fn resolve_type(
             };
             if reject_abstract_nominal_container(inner, "slice", cx, span, diags) {
                 return Ty::Error;
+            }
+            // An existing AoS record owner can be viewed without copying its native fields.
+            // Direct handles and sum elements still use the restricted scalar domain below.
+            if let Ty::Struct(id) = inner {
+                return Ty::Slice(Scalar::Struct(id));
             }
             match collection_scalar_arg(
                 inner,
@@ -78188,6 +78214,10 @@ fn exit_branch(flag: bool) -> i64 {
             }],
         }];
         for admitted in [
+            Ty::FsDirectory,
+            Ty::FsDirCursor,
+            Ty::Option(Scalar::FsDirectory),
+            Ty::Result(Scalar::FsDirCursor,Scalar::Bool),
             Ty::Buffer,
             Ty::Writer,
             Ty::DynArray(Scalar::Int(IntTy { bits: 64, signed: true })),

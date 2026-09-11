@@ -379,3 +379,41 @@ pub fn main() -> Result<(), Error> {
         "&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt;\na &amp; b\nsay &quot;hi&quot;\nplain 日本\n"
     );
 }
+
+#[test]
+fn lossy_utf8_imported_owned_and_pure() {
+    let helper=r#"module helper
+import std.encoding
+pub fn decode<T>(input: str, marker: T) -> string = arena { encoding.utf8_decode_lossy(input) }
+"#;
+    let main=r#"import helper
+import std.encoding
+extern "C" fn align_rt_alloc_count() -> i64
+fn lossy_length(x: i64) -> i64 = encoding.utf8_decode_lossy("x").len()
+fn main() -> Result<(),Error> {
+  source := encoding.hex_decode("e18041eda08000f09f92a9")?
+  before := unsafe { align_rt_alloc_count() }
+  decoded := arena { encoding.utf8_decode_lossy(source.bytes()) }
+  if unsafe { align_rt_alloc_count() } - before != 1 { return Err(Error.Invalid) }
+  print(encoding.hex_encode(decoded))
+  print(helper.decode("valid",1))
+  items := [1,2]
+  result := items[0..2].par_map(lossy_length).sum()
+  print(result)
+  return Ok(())
+}
+"#;
+    let files=&[("helper.align",helper),("main.align",main)];
+    let checked=diff_check_multi("lossy-imported",files,"main.align");
+    assert!(!checked.whole_errors && !checked.per_unit_errors,"{} {}",checked.whole_diags,checked.per_unit_diags);
+    if backend_available() {
+        for unit in [false,true] {
+            let out=if unit { build_per_unit_multi("lossy-unit",files,"main.align").link_and_run() } else { build_and_run_multi("lossy-whole",files,"main.align") };
+            assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+            assert_eq!(out.stdout,b"efbfbd41efbfbdefbfbdefbfbd00f09f92a9\nvalid\n2\n");
+        }
+    }
+    for source in ["fn main() { x := encoding.utf8_decode_lossy(1) }", "import std.encoding\nfn main() { x := encoding.utf8_decode_lossy(1) }", "import std.encoding\nfn main() { x := encoding.utf8_decode_lossy() }"] {
+        assert!(check_errs("lossy-invalid",source));
+    }
+}

@@ -14382,7 +14382,7 @@ fn hir_body_validator_native() {
             assert!(!body_core_metadata_is_valid(&reject), "{prefix}{kind:?} result");
         }
     }
-    for kind in [hir::EncodingKind::Html, hir::EncodingKind::PercentPath] {
+    for kind in [hir::EncodingKind::Utf8Lossy, hir::EncodingKind::Html, hir::EncodingKind::PercentPath] {
         let mut reject = program.clone();
         let expression = body_statement_expression_mut(&mut reject, "native_encoding_decode");
         let hir::ExprKind::Try(expression) = &mut expression.kind else { panic!("decoder try fixture") };

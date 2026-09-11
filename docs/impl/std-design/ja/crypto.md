@@ -2,7 +2,7 @@
 
 # std.crypto — implementation design (M11)
 
-**採用した追加設計（実装は未着手）:**
+**実装済みの追加機能:**
 `crypto.sha1(data: bytes) -> array<u8>` は既存の EVP エンジン、byte-view 入力規則、
 確保・プロバイダー失敗時の終了方針を使い、独立して所有する20バイトのダイジェストを返す。
 sha256 と同じく std.crypto を必要とする Impure 操作。

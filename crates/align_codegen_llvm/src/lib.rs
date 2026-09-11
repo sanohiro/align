@@ -7212,6 +7212,20 @@ impl<'a> XmlAccessAnalyzer<'a> {
         let slice_index_noalias = matches!(&definition, Rvalue::SliceIndexNoalias { .. });
         match definition {
             Rvalue::Use(operand) => {
+                if let Operand::BorrowedPlace(place)=&operand {
+                    let physical=self.graph.function.slots.get(place.slot as usize)
+                        .and_then(|root| xml_borrowed_path(self.graph.program,*root,&place.path))
+                        .map(|(ty,_)| ty);
+                    if result_ty == Ty::Str && place.ty == Ty::Str && path.is_empty()
+                        && matches!(physical,Some(Ty::String | Ty::Str)) {
+                        // Read the authenticated descriptor, retaining its founded slot/arm proof.
+                        // A descriptor read grants shared access, never owner-transfer authority.
+                        self.check_read_operand(&mut equation,&operand,Ty::Str);
+                        equation.seed=Some(XmlAccessProvenance::Shared);
+                    } else { equation.invalid=true; }
+                    return equation;
+                }
+
                 let Some(source_ty) = xml_operand_base_ty(self.graph.function, &operand) else {
                     equation.invalid = true;
                     return equation;
@@ -24821,6 +24835,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     align_sema::hir::EncodingKind::PercentPath => RuntimeKey::PercentEncodePath,
                     align_sema::hir::EncodingKind::Form => RuntimeKey::FormEncode,
                     align_sema::hir::EncodingKind::Html => RuntimeKey::HtmlEscape,
+                    align_sema::hir::EncodingKind::Utf8Lossy => RuntimeKey::Utf8DecodeLossy,
                 };
                 let (dp, dl) = self.split_str(data)?;
                 self.builder
@@ -24837,7 +24852,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     align_sema::hir::EncodingKind::Form => RuntimeKey::FormDecode,
                     // `html_escape` is encode-only — sema maps no `*_decode` method to `Html`, so an
                     // `EncodingDecode` node can never carry it.
-                    align_sema::hir::EncodingKind::Html | align_sema::hir::EncodingKind::PercentPath => {
+                    align_sema::hir::EncodingKind::Utf8Lossy | align_sema::hir::EncodingKind::Html | align_sema::hir::EncodingKind::PercentPath => {
                         return Err(self.err("encode-only kind in decoder"));
                     },
                 };
@@ -24897,6 +24912,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::CryptoHash { algo, data } => {
                 let (dp, dl) = self.split_str(data)?;
                 let f = match algo {
+                    align_sema::hir::HashAlgo::Sha1 => self.runtime(RuntimeKey::CryptoSha1),
                     align_sema::hir::HashAlgo::Sha256 => self.runtime(RuntimeKey::CryptoSha256),
                     align_sema::hir::HashAlgo::Sha512 => self.runtime(RuntimeKey::CryptoSha512),
                 };
@@ -45231,6 +45247,41 @@ fn main() -> i32 = 0
                 assert_xml_producer_rejected(&bad, "filesystem reserved schema");
             }
         }
+    }
+
+    #[test]
+    fn borrowed_string_descriptor_materialization_gate() -> Result<(), &'static str> {
+        let base=mir("fn view(borrow value: Option<string>) -> str = match value { Some(text) => text[0..1], None => \"\" }\nfn main() {}\n");
+        assert!(validate_mir_producers(&base).is_ok());
+        let mut seen=0;
+        for (fi,function) in base.fns.iter().enumerate() {
+            for (bi,block) in function.blocks.iter().enumerate() {
+                for (si,statement) in block.stmts.iter().enumerate() {
+                    let Stmt::Let(value,Rvalue::Use(Operand::BorrowedPlace(_)))=statement else { continue; };
+                    seen+=1;
+                    for mutation in 0..7 {
+                        let mut bad=base.clone();
+                        let f=&mut bad.fns[fi];
+                        if mutation==0 { f.value_tys[*value as usize]=Ty::String; }
+                        else if mutation==6 {
+                            for block in &mut f.blocks { block.stmts.retain(|statement| !matches!(statement,Stmt::Store(..))); block.stmt_lines.clear(); }
+                        } else {
+                            let Stmt::Let(_,Rvalue::Use(Operand::BorrowedPlace(place)))=&mut f.blocks[bi].stmts[si] else { return Err("use"); };
+                            match mutation {
+                                1 => place.ty=Ty::String,
+                                2 => place.slot=u32::MAX,
+                                3 => place.path.clear(),
+                                4 => place.path.push(hir::BorrowedPathSegment::StructField(u32::MAX)),
+                                _ => place.cleanup=Some(u32::MAX),
+                            }
+                        }
+                        assert_xml_producer_rejected(&bad,"forged borrowed String descriptor");
+                    }
+                }
+            }
+        }
+        assert!(seen>0);
+        Ok(())
     }
 
 }

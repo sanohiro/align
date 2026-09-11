@@ -1,6 +1,6 @@
 # Borrowed slices of existing Move elements
 
-Selected next extension, not yet implemented: [plan 54 §6](54-r69-r76-prerequisite-batch-plan.md#6-shared-projection-contract-r69-and-r71)
+Implemented extension: [plan 54 §6](54-r69-r76-prerequisite-batch-plan.md#6-shared-projection-contract-r69-and-r71)
 admits shared indexed calls for existing records owning directory/cursor handles,
 including slice receivers. It preserves separate header/backing-generation
 reservation and excludes whole Move reads or mutable indexed borrowing.

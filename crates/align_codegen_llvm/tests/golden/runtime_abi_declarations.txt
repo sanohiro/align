@@ -116,6 +116,7 @@ key|CryptoPrivateKeyFromPem|crypto_private_key_from_pem|declare i32 @align_rt_cr
 key|CryptoPublicKeyFromJwk|crypto_public_key_from_jwk|declare i32 @align_rt_crypto_public_key_from_jwk(i32, ptr, i64, ptr, i64, ptr)
 key|CryptoPublicKeyFromPem|crypto_public_key_from_pem|declare i32 @align_rt_crypto_public_key_from_pem(i32, ptr, i64, ptr)
 key|CryptoRandom|crypto_random|declare void @align_rt_crypto_random(ptr)
+key|CryptoSha1|crypto_sha1|declare { ptr, i64 } @align_rt_crypto_sha1(ptr, i64)
 key|CryptoSha256|crypto_sha256|declare { ptr, i64 } @align_rt_crypto_sha256(ptr, i64)
 key|CryptoSha512|crypto_sha512|declare { ptr, i64 } @align_rt_crypto_sha512(ptr, i64)
 key|CryptoSign|crypto_sign|declare i32 @align_rt_crypto_sign(i32, ptr, ptr, i64, ptr)
@@ -430,6 +431,7 @@ key|UdpRecvFrom|udp_recv_from|declare i64 @align_rt_udp_recv_from(ptr, ptr)
 key|UdpSendTo|udp_send_to|declare i64 @align_rt_udp_send_to(ptr, ptr, i64, ptr, i64, i64)
 key|UdpSocketFree|udp_socket_free|declare void @align_rt_udp_socket_free(ptr)
 key|Utf8BoundaryFail|utf8_boundary_fail|declare void @align_rt_utf8_boundary_fail(i64, i64) #1
+key|Utf8DecodeLossy|utf8_decode_lossy|declare { ptr, i64 } @align_rt_utf8_decode_lossy(ptr, i64)
 key|Utf8Valid|utf8_valid|declare i32 @align_rt_utf8_valid(ptr readonly captures(none), i64) #4
 key|XmlAttributeCount|xml_attribute_count|declare i64 @align_rt_xml_attribute_count(ptr)
 key|XmlAttributeName|xml_attribute_name|declare i32 @align_rt_xml_attribute_name(ptr, ptr, i64)

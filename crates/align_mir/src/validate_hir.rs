@@ -4927,7 +4927,7 @@ impl<'a> BodyValidator<'a> {
                 hir::CliFlagKind::Bool => default.is_none(),
                 hir::CliFlagKind::I64 | hir::CliFlagKind::Str => default.is_some(),
             },
-            hir::ExprKind::EncodingDecode { kind, .. } => !matches!(kind, hir::EncodingKind::Html | hir::EncodingKind::PercentPath),
+            hir::ExprKind::EncodingDecode { kind, .. } => !matches!(kind, hir::EncodingKind::Utf8Lossy | hir::EncodingKind::Html | hir::EncodingKind::PercentPath),
             hir::ExprKind::BytesRead { .. } => true,
             hir::ExprKind::BufferPut { .. }
             | hir::ExprKind::Compress { .. }
@@ -9244,7 +9244,7 @@ impl<'a> BodyValidator<'a> {
                 (byte_view(data.ty)).then(|| strict(Ty::String, &[data]))?
             }
             hir::ExprKind::EncodingDecode { input, kind } => {
-                (input.ty == Ty::Str && !matches!(kind, hir::EncodingKind::Html | hir::EncodingKind::PercentPath))
+                (input.ty == Ty::Str && !matches!(kind, hir::EncodingKind::Utf8Lossy | hir::EncodingKind::Html | hir::EncodingKind::PercentPath))
                     .then(|| result(Ty::Buffer, &[input]))?
             }
             hir::ExprKind::Utf8Valid { data } => {

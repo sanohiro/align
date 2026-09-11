@@ -44,7 +44,7 @@ fn identity_formation_and_effect() {
         "import std.os\nfn main() { x := os.identity(1) }",
         "import std.os\nfn take(x: identity_info) {}\nfn main() {}",
         "import std.os\nfn main() { x := os.identity_info { real_uid: true, real_gid: 1 } }",
-        "import std.os\nfn main() { xs := [1,2]; ys := xs.par_map(|x| { id := os.identity() else { return x }; x }) }",
+        "import std.os\nfn observed(x: i64) -> i64 { id := os.identity() else { return x }; return id.real_uid }\nfn main() { xs := [1,2]; ys := xs[0..2].par_map(observed).sum() }",
     ] {
         let checked=diff_check_multi("identity-invalid",&[("main.align",source)],"main.align");
         assert!(checked.whole_errors && checked.per_unit_errors,"accepted: {source}");

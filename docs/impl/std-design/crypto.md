@@ -4,7 +4,7 @@ module.
 
 # std.crypto — implementation design (M11)
 
-**Selected addition, implementation pending:**
+**Implemented addition:**
 `crypto.sha1(data: bytes) -> array<u8>` returns an independently owned 20-byte
 digest through the existing EVP engine, byte-view admission and terminal
 allocation/provider-failure policy. It is Impure and requires std.crypto, like

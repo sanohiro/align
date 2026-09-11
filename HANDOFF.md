@@ -1,13 +1,13 @@
 # Session handoff
 
-**Active implementation batch — R69–R76 (2026-09-11):**
-[Plan 54](docs/impl/54-r69-r76-prerequisite-batch-plan.md) covers all eight
-new consumer requests, including the five blockers and three nonblockers. It
-defines three complete capability PRs: retained/credential operations, owned
-byte transforms, then shared projections. Implementation and merges are authorized. Capability A is implemented with
-verification in progress; B and C follow after its merge.
-Read its exact ledger, native-platform qualifications and owner checklist before
-coding. Consumer adoption remains external; no new release is selected.
+**R69–R76 non-macOS handoff (2026-09-11):**
+[Plan 54](docs/impl/54-r69-r76-prerequisite-batch-plan.md) owns all eight requests.
+Retained/credential operations, owned UTF-8 replacement decoding/SHA-1 and shared
+projections are implemented together. The owner requested a draft PR containing
+all non-macOS work and delegated macOS implementation corrections and native
+qualification to another environment. That supersedes the earlier three-PR
+sequence and macOS-before-publication gate; macOS completion still precedes merge.
+Consumer adoption remains external; no versioned release is requested.
 
 **Future std/pkg review (planned, no implementation scheduled):**
 [Plan 51](docs/impl/51-package-composition-review-plan.md) records the overlap

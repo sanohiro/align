@@ -997,6 +997,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
             let name = match algo {
                 align_sema::hir::HashAlgo::Sha256 => "sha256",
                 align_sema::hir::HashAlgo::Sha512 => "sha512",
+                align_sema::hir::HashAlgo::Sha1 => "sha1",
             };
             format!("crypto_{name}({})", operand_str(data))
         }

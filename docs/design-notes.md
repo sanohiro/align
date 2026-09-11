@@ -8,8 +8,8 @@ later action. Explicit followed metadata grants observation outside a retained
 root without descriptor authority. Replacement decoding owns its output under
 one exact Unicode partition; SHA-1 interoperates with an existing object format
 through the settled EVP engine. Shared directory/cursor projections keep their
-original collection owner. Retained/native observations are implemented; the transform and projection
-contracts remain planned.
+original collection owner. All three capabilities are implemented; native macOS qualification remains
+pending in the platform handoff.
 
 Bound owned `if` results reuse the existing branch-local transfer. Static may-moved
 sets reject unsafe later reads, but cannot decide replacement cleanup at runtime:

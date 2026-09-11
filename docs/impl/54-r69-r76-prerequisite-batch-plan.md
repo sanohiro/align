@@ -1,12 +1,12 @@
 # R69–R76 implementation handoff
 
-Status: design reviewed; both findings resolved. Capability A is implemented;
-local verification and independent code review precede publication. B and C remain planned. This document owns the
-complete eight-request batch, including the three nonblocking requests. Provider
-baseline: `8c9e24ee094b107e00c6685f3a034e5843eac6a4`; consumer register read at
-`e39120fce311094c84e84cc281a37ba3953b03f1` on 2026-09-11. The user requested
-design first and subsequently authorized implementation, PRs and merges for the
-complete batch.
+Status: all non-macOS capabilities are implemented in one draft handoff PR.
+The owner explicitly requested publication on 2026-09-11 without waiting for
+macOS; native macOS implementation corrections and qualification are delegated
+to another environment. This supersedes the earlier pre-push platform gate and
+three-PR merge sequence, without changing any public platform contract.
+Provider baseline: `8c9e24ee094b107e00c6685f3a034e5843eac6a4`.
+Consumer adoption remains external.
 
 ## 1. Scope and capability boundaries
 
@@ -21,18 +21,13 @@ complete batch.
 | R75, blocking | Strict byte validation and private SSE decoding do not supply a generic owned replacement decoder. | One pure bytes-to-owned-string transform with maximal-subpart substitution. | B |
 | R76, blocking | Closed one-shot hash discriminator has SHA-256/SHA-512 only. | Add SHA-1 through the same EVP engine and owned-array result. | B |
 
-Deliver **one coordinated batch in three complete capability PRs**, in A, B, C
-order. Each PR includes source admission, native/compiler implementation, trust
-validation and its owners; never split a dormant producer from its consumers.
-A groups retained filesystem/credential observations and creation; B groups the
-two ordinary owned byte transforms; C groups shared projection admission and
-physical descriptor normalization. These isolate native authority, byte
-transforms, and compiler borrowing as distinct failure domains. Eight separate
-request PRs would repeat proof and gates; one giant PR would entangle unrelated
-failure recovery. A and C may exceed 1,000 handwritten lines because exact
-schema/operation validation spans compiler layers and owner tests. Their complete
-boundaries avoid duplicated ABI/ownership proof. This is a planning division,
-not permission for incomplete or special-case implementations.
+Deliver **one coordinated non-macOS implementation PR**, followed by the owner's
+separate macOS completion. A, B and C remain closure-matrix groups: retained
+native authority, owned byte transforms and shared compiler projections.
+Keeping one handoff avoids repeated integration and gates while the macOS owner
+completes the platform boundary. The larger-than-1,000-line diff contains the
+complete source-to-native schema and ownership proof; no dormant producer is
+split from its consumers. It stays draft until the platform handoff is complete.
 
 All three consume already-shipped plans 28, 42, 44 and 45, the checked-HIR/runtime
 ledgers, and ordinary string/hash ownership. No later milestone is required.
@@ -193,7 +188,8 @@ without a content open and faccessat2 AT_EMPTY_PATH support. The same probe
 showed a symlink O_PATH descriptor can itself pass an access check: the explicit
 fstat/symlink refusal is therefore mandatory. macOS behavior is grounded in
 source inspection, not claimed as an executed host test. Required platform
-owners below must run before that implementation is pushed.
+owners below remain required for macOS completion; the owner has authorized
+the non-macOS draft publication before those runs.
 
 References: [Linux access/faccessat2](https://man7.org/linux/man-pages/man2/access.2.html),
 [Apple macOS 15 faccessat implementation](https://github.com/apple-oss-distributions/xnu/blob/xnu-11215.1.10/bsd/vfs/vfs_syscalls.c),
@@ -362,7 +358,7 @@ copy or source nulling.
 Complete the corresponding **narrow read-materialization proof** in the LLVM
 producer validator's Use case: result exactly Str, logical borrowed place
 exactly Str, authenticated physical path leaf exactly String or Str. Route this
-case through existing `read_source`/`add_read_operand`, with the complete live
+case through the existing read-operand proof (`check_read_operand`), with the complete live
 root/path/active-arm/cleanup check and founded storage dependency. The generic
 `source()` function currently rejects BorrowedPlace and must continue doing so;
 do not make arbitrary borrowed descriptors into owner-transfer evidence. Keep
@@ -412,7 +408,7 @@ Before a new required CI/platform job, ship and run a matching local script.
 Use existing service/container and platform verification tools, not CI as the
 first behavior test. If the implementer lacks the needed host, complete local
 portable/native ownership work and record that precise platform-validation
-prerequisite before publication; do not silently weaken the contract.
+prerequisite in the draft handoff; do not silently weaken the contract.
 
 ## 8. Execution instructions for the implementation model
 
@@ -432,7 +428,7 @@ prerequisite before publication; do not silently weaken the contract.
 5. For each candidate, run its owner checklist and align-self-review before the
    one fresh full-diff independent review. Combine valid findings in one coherent
    fix. Complete the matrix-to-diff pass, final-SHA preflight, wrapper-opened PR,
-   CI and merge before starting the next capability. Reopen the matrix for a
+   CI and draft publication for the combined non-macOS handoff. Reopen the matrix for a
    strategy/IR-shape/P1 redesign, not repeated one-line review patch rounds.
 6. Owner commands: A uses new driver `fs_observation_extensions` and
    `m11_os_identity` plus existing `fs_retained_tree`, and their focused runtime
@@ -441,7 +437,7 @@ prerequisite before publication; do not silently weaken the contract.
    and relevant sema/MIR/LLVM lib owners. Use `scripts/cargo.sh`, then the normal
    `scripts/pre-pr.sh` owner/gate/isolated-Clippy flow. No mandatory full nightly
    or unrelated DB suite; respect the actual DB-scope classifier.
-7. Once all three are merged, run exactly `cargo build --release --workspace`.
+7. Once the non-macOS batch is complete, run exactly `cargo build --release --workspace`.
    Update only the sibling request register with shipped signatures, limits,
    ownership and PRs, leaving that edit uncommitted. No version/tag/release is
    requested. Consumer adoption must not be performed to make the register green.
@@ -527,7 +523,8 @@ Platform verification prerequisite: the implementation environment is Linux.
 macOS native execution has not yet been obtained; XNU source inspection is not
 execution evidence. Privileged Linux credential/ACL fixtures are unavailable in
 the current Docker setup. These are not recorded as passing. Ordinary macOS
-mask/no-follow/rename/FIFO execution remains a publication prerequisite above.
+mask/no-follow/rename/FIFO execution remains required for macOS completion,
+not for the explicitly authorized non-macOS draft publication.
 
 
 Independent capability-A code review found one P2 owner gap: pure errno mapping
@@ -535,3 +532,45 @@ alone did not exercise unavailable native access through exported operations.
 The isolated native-call injection owner above closes that finding; no production
 strategy or public contract changed. Author gate corrections also parenthesize
 the access mask and synchronize the second exhaustive ExprKind inventory owner.
+
+### Capabilities B/C implementation closure
+
+EncodingEncode(Utf8Lossy) uses a two-pass maximal-subpart visitor: count with
+checked arithmetic, allocate exactly once, then initialize every output byte.
+The encode-only discriminator is rejected in EncodingDecode. CryptoHash(Sha1)
+uses the existing EVP engine and independently owned 20-byte array. All one-shot
+hash siblings now use independent heap-generation facts across lexical arenas.
+`m10_encoding`, `m11_crypto` and runtime `batch_byte_transform_tests` own whole/
+per-unit imports, generic calls, effects, byte forms, CPython replacement vectors,
+scalar splits, SHA-1 binary/padding vectors, a provider-refusal child process and
+explicit application Git framing.
+`fs_retained_tree::ownership_cleanup_and_negative_controls` includes arena-returned
+lossy text and digest bytes and fails when their Drop is omitted. The ABI golden
+and registry inventories include both A84 native rows.
+
+The shared payload classifier adds only FsDirectory/FsDirCursor. Existing owning
+record arrays can form record slices through source and generic type formation;
+direct native-handle and sum collection elements retain their exclusions.
+Abstract-nominal compaction remaps both BorrowedIndex types and all borrowed
+match/place binding types, preventing stale concrete IDs in imported programs.
+`borrowed_fs_projections` owns imported generic/function-value indexed calls,
+borrowed Option records and shared/exclusive/escape boundaries; `fs_retained_tree`
+includes fixed-record-to-slice use and allocation/FD cleanup. Existing
+`move_record_slices` covers header/backing reservation, eager operands, control
+joins, interface/cache behavior and owner invalidation without a new owner path.
+
+String ranges materialize a Copy Str descriptor before byte-boundary operations.
+The producer validator authenticates the physical String/Str path and founded
+slot/arm facts, caps authority at Shared, and keeps generic BorrowedPlace source
+inference fail-closed. `return_provenance::borrowed_optional_string_ranges_match_plain_views`
+owns direct/helper, whole/per-unit, empty/None and invalid UTF-8-boundary twins.
+`borrowed_string_descriptor_materialization_gate` rejects forged result/physical
+claims, slots, paths, cleanup and missing initialization through all publication
+entrypoints. Existing move-slice and borrowed-sum owners retain control-generation
+and lifetime obligations; no new IR shape or writable-byte authority is added.
+
+Author matrix-to-diff pass: formation, construction, move/return, Drop, replacement,
+control joins, monomorphization, interface transport, malformed input and allocation
+parity close through the owners above and the existing matrix owners. The native
+macOS execution cells remain explicitly assigned to the separate implementer.
+Privileged credential/ACL fixtures remain unavailable in this Linux environment.

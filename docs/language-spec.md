@@ -2,13 +2,13 @@
 
 A summary of `draft.md` (the authoritative detailed spec). For detail and the latest version, always refer to `draft.md`.
 
-**Native observations implemented; transforms/projections planned:** [R69–R76 plan 54](impl/54-r69-r76-prerequisite-batch-plan.md)
+**Non-macOS implementation complete; macOS handoff pending:** [R69–R76 plan 54](impl/54-r69-r76-prerequisite-batch-plan.md)
 specifies retained link/followed-metadata/access/symlink operations, real UID/GID,
 owned UTF-8 replacement decoding and one-shot SHA-1. Existing directory/cursor
 owners gain shared projection only; borrowed string slicing retains its Str
 view. The plan fixes the exact signatures, ownership, errors and platform limits.
-Retained/native observations are implemented; byte transforms and shared
-projection remain planned.
+All three capabilities are implemented. Native macOS qualification remains
+pending in the plan’s platform handoff.
 
 ## Purpose
 

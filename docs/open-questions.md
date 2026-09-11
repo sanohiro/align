@@ -13,7 +13,7 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
-**R69–R76 contract (2026-09-11; native observations implemented).**
+**R69–R76 contract (2026-09-11; non-macOS implementation complete).**
 [Plan 54](impl/54-r69-r76-prerequisite-batch-plan.md) owns all eight requests:
 retained link bytes/followed metadata/real-ID access/exclusive symlink creation,
 ordinary real UID/GID, owned maximal-subpart UTF-8 replacement decoding, EVP

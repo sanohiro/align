@@ -1,10 +1,10 @@
 # Borrow-safe dynamic aggregate projection
 
-Selected next extension, not yet implemented: [plan 54 §6](54-r69-r76-prerequisite-batch-plan.md#6-shared-projection-contract-r69-and-r71)
+Implemented extension: [plan 54 §6](54-r69-r76-prerequisite-batch-plan.md#6-shared-projection-contract-r69-and-r71)
 adds FsDirectory/FsDirCursor leaves uniformly to the current shared-payload
 grammar and fixes borrowed string descriptor normalization. All source-generation,
 shared-only and no-owner-materialization obligations remain. Historical grammar
-below is the implemented baseline until that capability lands.
+below is superseded by that explicit leaf extension.
 
 Current slice extension: [plan 44](44-move-record-slice-plan.md) admits views of
 existing AoS Move-record and owned-string collections. It extends the receiver
