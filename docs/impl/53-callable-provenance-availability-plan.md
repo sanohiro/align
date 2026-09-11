@@ -82,3 +82,30 @@ positive and compile-only negative boundaries. The sema owner
 summaries by replay. Existing callable-constructor, capture, cleanup and deep
 owners remain required. Option shapes have internal domain coverage; this
 capability does not widen source function-value formation restrictions.
+
+## Initialization proof closure
+
+The producer review found that a Shared access seed could authenticate its own
+uninitialized argument or closure capture through a call/store cycle. Access
+classification is not an initialization proof. Before access propagation, a
+finite monotone readiness worklist must ground operation inputs independently:
+a value-producing operation requires all input-check nodes plus a seed, absence,
+or an ordinary source. Storage remains an OR join of entry/ordinary stores and
+separately gated action seeds. A native output or complete element-field write
+cannot make an unrelated entry/store wait for that action's inputs. Static
+absence is a founded alternative; it never supplies READ or WRITE authority.
+Cached evidence is reusable only after both readiness and capability validation.
+
+The owner matrix adds initialized/uninitialized twins for indirect argument
+values, borrowed-place arguments and closure captures; each is checked at
+publication, whole-program emission and ThinLTO validation. Existing direct-call
+cycles, native outputs, field assembly, absent payloads, Out buffers and seeded
+storage joins remain required owners. This corrects the existing initialization
+invariant without adding a source or IR contract.
+
+This capability can exceed 1,000 changed handwritten lines once its producer
+closure owners are included. The callback admission, conservative source
+lifetime analysis and independent initialization proof must be reviewed and
+merged together: publishing only the admission would expose the lost-lifetime
+or circular-proof defect, while a dormant intermediate creates no useful
+consumer and duplicates the same cross-boundary evidence.

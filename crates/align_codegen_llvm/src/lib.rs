@@ -4326,6 +4326,11 @@ enum XmlAccessSource {
 
 #[derive(Debug, Default)]
 struct XmlAccessEquation {
+    // Operation inputs must be initialized before the operation can found a result.
+    requires_inputs: bool,
+    // Storage joins can have several action-derived seeds. None also permits an
+    // independent entry/ordinary-store seed; Some retains each action's own inputs.
+    seed_inputs: Option<Vec<Vec<XmlAccessNode>>>,
     copied_scalar: bool,
     seed: Option<XmlAccessProvenance>,
     dependencies: Vec<XmlAccessNode>,
@@ -4425,13 +4430,58 @@ fn solve_xml_access_equations(
         }
     }
 
+    // Initialization is independent of access. In particular, a Shared call result
+    // cannot provide the evidence for its own input or a closure's captured input.
+    // Each node becomes ready once: operations require all checked inputs, while
+    // storage joins keep independently founded entry/store alternatives available.
+    let can_initialize = |equation: &XmlAccessEquation, ready: &HashSet<XmlAccessNode>| {
+        !equation.invalid
+            && (!equation.requires_inputs
+                || equation
+                    .checks
+                    .iter()
+                    .all(|(input, _)| ready.contains(input)))
+            && (equation.absent
+                || (equation.seed.is_some()
+                    && equation.seed_inputs.as_ref().is_none_or(|alternatives| {
+                        alternatives
+                            .iter()
+                            .any(|inputs| inputs.iter().all(|input| ready.contains(input)))
+                    }))
+                || equation
+                    .dependencies
+                    .iter()
+                    .any(|input| ready.contains(input)))
+    };
+    let mut initialized = HashSet::new();
+    let mut initialization_ready = VecDeque::new();
+    for (node, equation) in equations {
+        if can_initialize(equation, &initialized) {
+            initialized.insert(node.clone());
+            initialization_ready.push_back(node.clone());
+        }
+    }
+    while let Some(changed) = initialization_ready.pop_front() {
+        if let Some(parents) = validation_reverse.get(&changed) {
+            for parent in parents {
+                if !initialized.contains(parent)
+                    && equations
+                        .get(parent)
+                        .is_some_and(|equation| can_initialize(equation, &initialized))
+                {
+                    initialized.insert(parent.clone());
+                    initialization_ready.push_back(parent.clone());
+                }
+            }
+        }
+    }
     // Presence and access form one monotone finite-height lattice. Do not mix absence into this
     // worklist: an authenticated discriminator projects MaybeAbsent to Present, so feeding a
     // provisional absence through that projection made the former single-state solver oscillate.
     let mut present = HashMap::<XmlAccessNode, XmlAccessProvenance>::new();
     let mut present_ready = VecDeque::new();
     for (node, equation) in equations {
-        if !equation.invalid
+        if !equation.invalid && initialized.contains(node)
             && let Some(seed) = equation.seed
         {
             present.insert(node.clone(), equation.produced_access(seed));
@@ -4521,6 +4571,7 @@ fn solve_xml_access_equations(
         .iter()
         .filter(|(node, equation)| {
             equation.invalid
+                || !initialized.contains(*node)
                 || !values.contains_key(*node)
                 || values.get(*node) == Some(&XmlProducerState::Invalid)
                 || (equation.copied_scalar && values.get(*node).copied()
@@ -10613,16 +10664,6 @@ impl<'a> XmlAccessAnalyzer<'a> {
             return equation;
         };
         let producers = producers.clone();
-        for (value, producer) in producers {
-            self.add_out_producer(
-                &mut equation,
-                slot,
-                slot_ty,
-                selected_ty,
-                &path,
-                (value, producer),
-            );
-        }
         for operand in root_stores {
             if !xml_operand_base_ty(self.graph.function, &operand)
                 .is_some_and(|actual| xml_callable_flow_matches(self.graph.program, actual, slot_ty)) {
@@ -10734,9 +10775,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 );
             }
         }
-        if whole_element_from_fields {
-            equation.seed = merge_xml_access(equation.seed, XmlAccessProvenance::Owned);
-        }
+        let field_seed_inputs = whole_element_from_fields.then(||
+            equation.checks.iter().map(|(input, _)| input.clone()).collect::<Vec<_>>());
         for (elements, element_ty) in constant_stores {
             let valid_shape = match slot_ty {
                 Ty::Array(element, length) => {
@@ -10756,6 +10796,34 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 continue;
             }
             equation.seed = merge_xml_access(equation.seed, XmlAccessProvenance::Shared);
+        }
+        let independent_seed = equation.seed.is_some();
+        let mut seed_inputs = Vec::new();
+        if let Some(inputs) = field_seed_inputs {
+            equation.seed = merge_xml_access(equation.seed, XmlAccessProvenance::Owned);
+            seed_inputs.push(inputs);
+        }
+        for (value, producer) in producers {
+            let start = equation.checks.len();
+            self.add_out_producer(
+                &mut equation,
+                slot,
+                slot_ty,
+                selected_ty,
+                &path,
+                (value, producer),
+            );
+            seed_inputs.push(
+                equation
+                    .checks
+                    .iter()
+                    .skip(start)
+                    .map(|(input, _)| input.clone())
+                    .collect(),
+            );
+        }
+        if !independent_seed && !seed_inputs.is_empty() {
+            equation.seed_inputs = Some(seed_inputs);
         }
         if equation.seed.is_none() && equation.dependencies.is_empty() && !equation.invalid {
             equation.invalid = true;
@@ -10791,7 +10859,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             }
             self.equations
                 .insert(node.clone(), XmlAccessEquation::default());
-            let equation = match &node {
+            let mut equation = match &node {
                 XmlAccessNode::Value(value, path) => {
                     let mut equation = self.value_equation(*value, path.clone());
                     // A scalar SSA result copies bits out of storage; it does not inherit the
@@ -10817,6 +10885,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 XmlAccessNode::BufferValue(value, path) => self.buffer_value_equation(*value, path.clone()),
                 XmlAccessNode::BufferSlot(slot, path) => self.buffer_slot_equation(*slot, path.clone()),
             };
+            equation.requires_inputs = matches!(node,
+                XmlAccessNode::Value(..) | XmlAccessNode::CaptureValue(..) | XmlAccessNode::BufferValue(..));
             self.equations.insert(node, equation);
         }
 
@@ -38239,6 +38309,145 @@ fn main() -> i32 = 0
             }
             assert_xml_producer_rejected(&detached, &format!("{name} detached out slot"));
         }
+    }
+
+    #[test]
+    fn native_output_initialization_preserves_independent_stores() {
+        let bytes = Ty::Slice(Scalar::Int(IntTy {
+            bits: 8,
+            signed: false,
+        }));
+        for seeded in [false, true] {
+            let mut program = xml_out_producer_program(
+                Rvalue::BytesAsStr {
+                    bytes: Operand::Value(2),
+                    out: 1,
+                },
+                vec![bytes],
+                Ty::Str,
+            );
+            let function = &mut program.fns[0];
+            function.value_tys.extend([bytes, Ty::Str]);
+            let mut statements = Vec::new();
+            if seeded {
+                statements.push(Stmt::Let(3, Rvalue::StrLit("initial".into())));
+                statements.push(Stmt::Store(1, Operand::Value(3)));
+            }
+            statements.extend([
+                Stmt::Let(1, Rvalue::Load(1)),
+                Stmt::Let(2, Rvalue::Use(Operand::Value(1))),
+                Stmt::Let(
+                    0,
+                    Rvalue::BytesAsStr {
+                        bytes: Operand::Value(2),
+                        out: 1,
+                    },
+                ),
+            ]);
+            function.blocks[0]
+                .stmt_lines
+                .resize(statements.len(), (1, 1));
+            function.blocks[0].stmts = statements;
+            if seeded {
+                assert!(validate_mir_producers(&program).is_ok());
+                assert!(validate_resource_rvalues(&program).is_ok());
+                assert!(validate_thin_partition_program(&program, &[]).is_ok());
+            } else {
+                assert_xml_producer_rejected(&program, "uninitialized native output cycle");
+            }
+        }
+    }
+
+    #[test]
+    fn shared_string_callback_cycles_require_grounded_inputs() -> Result<(), &'static str> {
+        for kind in ["argument-place", "argument-value", "capture"] {
+            let source = if kind == "capture" {
+                "fn forward(text: str) -> string { action := fn { text }; return action().clone() }\nfn main() -> i32 = 0\n"
+            } else {
+                "fn forward(text: str, action: fn(str) -> str) -> string = action(text).clone()\nfn main() -> i32 = 0\n"
+            };
+            let base = mir(source);
+            for seeded in [false, true] {
+                let mut program = base.clone();
+                let function = program
+                    .fns
+                    .iter_mut()
+                    .find(|function| function.name.as_str() == "forward")
+                    .ok_or("forward function")?;
+                let slot = u32::try_from(function.slots.len()).map_err(|_| "slot id")?;
+                function.slots.push(Ty::Str);
+                function.slot_align.push(None);
+                let loaded = u32::try_from(function.value_tys.len()).map_err(|_| "value id")?;
+                function.value_tys.push(Ty::Str);
+                let mut changed = false;
+                for block in &mut function.blocks {
+                    let mut statements = Vec::new();
+                    for mut statement in std::mem::take(&mut block.stmts) {
+                        if let Stmt::Let(_, Rvalue::Closure { captures, .. }) = &mut statement
+                            && kind == "capture"
+                        {
+                            if seeded {
+                                statements.push(Stmt::Store(slot, Operand::Arg(0)));
+                            }
+                            statements.push(Stmt::Let(loaded, Rvalue::Load(slot)));
+                            *captures.get_mut(0).ok_or("capture")? = Operand::Value(loaded);
+                        }
+                        let mut result = None;
+                        if let Stmt::Let(value, Rvalue::CallIndirect { args, .. }) = &mut statement
+                        {
+                            if kind != "capture" {
+                                if seeded {
+                                    statements.push(Stmt::Store(slot, Operand::Arg(0)));
+                                }
+                                *args.get_mut(0).ok_or("argument")? = if kind == "argument-place" {
+                                    Operand::BorrowedPlace(Box::new(align_mir::BorrowedPlace {
+                                        slot,
+                                        path: Vec::new(),
+                                        ty: Ty::Str,
+                                        cleanup: None,
+                                    }))
+                                } else {
+                                    statements.push(Stmt::Let(loaded, Rvalue::Load(slot)));
+                                    Operand::Value(loaded)
+                                };
+                            }
+                            result = Some(*value);
+                        }
+                        statements.push(statement);
+                        if let Some(value) = result {
+                            statements.push(Stmt::Store(slot, Operand::Value(value)));
+                            changed = true;
+                        }
+                    }
+                    if !block.stmt_lines.is_empty() {
+                        block.stmt_lines.resize(statements.len(), (1, 1));
+                    }
+                    block.stmts = statements;
+                }
+                assert!(changed);
+                if seeded {
+                    assert!(
+                        validate_mir_producers(&program).is_ok(),
+                        "{kind}: seeded publication"
+                    );
+                    assert!(
+                        validate_resource_rvalues(&program).is_ok(),
+                        "{kind}: seeded whole"
+                    );
+                    assert!(
+                        validate_thin_partition_program(&program, &[]).is_ok(),
+                        "{kind}: seeded units"
+                    );
+                } else {
+                    assert!(
+                        validate_mir_producers(&program).is_err(),
+                        "{kind}: uninitialized publication"
+                    );
+                    assert_xml_producer_rejected(&program, kind);
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
