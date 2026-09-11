@@ -974,6 +974,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::TimeFormat { kind, ns, out } => format!("time_format({kind:?}, {}, s{out})", operand_str(ns)),
         Rvalue::TimeParse { kind, input, out } => format!("time_parse({kind:?}, {}, s{out})", operand_str(input)),
         Rvalue::TimeNow => "time_now()".to_string(),
+        Rvalue::OsIdentity { out } => format!("os_identity({out:?})"),
         Rvalue::OsHost { out } => format!("os_host({out:?})"),
         Rvalue::ProcessCpuCount => "process_cpu_count()".to_string(),
         Rvalue::TimeInstant => "time_instant()".to_string(),
@@ -996,6 +997,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
             let name = match algo {
                 align_sema::hir::HashAlgo::Sha256 => "sha256",
                 align_sema::hir::HashAlgo::Sha512 => "sha512",
+                align_sema::hir::HashAlgo::Sha1 => "sha1",
             };
             format!("crypto_{name}({})", operand_str(data))
         }

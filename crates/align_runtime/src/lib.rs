@@ -13076,6 +13076,39 @@ pub unsafe extern "C" fn align_rt_base64url_encode(ptr: *const u8, len: i64) -> 
     unsafe { owned_str_exact(out_len, |out| base64_encode_into(data, &BASE64_URL, false, out)) }
 }
 
+/// Visit exact valid runs and maximal ill-formed subparts without allocating intermediate text.
+fn utf8_lossy_parts(mut data: &[u8], mut emit: impl FnMut(&[u8])) {
+    while !data.is_empty() {
+        match core::str::from_utf8(data) {
+            Ok(_) => { emit(data); break; }
+            Err(error) => {
+                let (valid,rest)=data.split_at(error.valid_up_to());
+                emit(valid);
+                emit(b"\xef\xbf\xbd");
+                data=&rest[error.error_len().unwrap_or(rest.len())..];
+            }
+        }
+    }
+}
+
+/// UTF-8 maximal-subpart replacement, returned as independently owned text.
+/// # Safety
+/// ptr/len must describe a valid byte view for this call, as for other encoding transforms.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_utf8_decode_lossy(ptr: *const u8, len: i64) -> AlignStr {
+    let data=unsafe { bytes_view(ptr,len) };
+    let mut count=Some(0usize);
+    utf8_lossy_parts(data,|part| { count=count.and_then(|n| n.checked_add(part.len())); });
+    let Some(count)=count.filter(|n| *n <= isize::MAX.unsigned_abs() && i64::try_from(*n).is_ok()) else { align_rt_alloc_size_fail(); };
+    unsafe { owned_str_exact(count,|out| {
+        let mut offset=0;
+        utf8_lossy_parts(data,|part| {
+            for (destination,byte) in out[offset..][..part.len()].iter_mut().zip(part) { destination.write(*byte); }
+            offset+=part.len();
+        });
+    }) }
+}
+
 /// `encoding.hex_encode(data)` — lower-case hex. Returns an owned `string`.
 ///
 /// # Safety
@@ -18229,9 +18262,9 @@ pub unsafe extern "C" fn align_rt_crypto_random(b: *mut Buffer) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// std.crypto (M11 Slice 2) — sha256 / sha512 via OpenSSL libcrypto (EVP). The keystone-library
-// strategy (crypto.md): borrow the constant-time-audited engine rather than self-host a hash. Both
-// hashes share one wrapper over the EVP one-shot digest `EVP_Q_digest` (OpenSSL >= 3.0), which
+// std.crypto — sha1 / sha256 / sha512 via OpenSSL libcrypto (EVP). The keystone-library
+// strategy (crypto.md): reuse the existing engine rather than self-host a hash. All three
+// digests share one wrapper over the EVP one-shot digest `EVP_Q_digest` (OpenSSL >= 3.0), which
 // fetches the algorithm by name and hashes the whole input in a single call — no `EVP_MD_CTX`
 // lifecycle to leak. The driver always links `-lcrypto` (crypto.md: a universal system lib in the
 // `-lz`/`-lzstd` always-link class). A digest failure here has no valid-input case (hashing any
@@ -18260,14 +18293,14 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/// Shared one-shot EVP digest, param-swapped by `name` (`c"SHA256"` / `c"SHA512"`) and its expected
-/// output length `expect_len` (32 / 64). Views the `{data_ptr, data_len}` byte argument (null /
+/// Shared one-shot EVP digest, param-swapped by `name` (`c"SHA1"` / `c"SHA256"` / `c"SHA512"`) and its expected
+/// output length `expect_len` (20 / 32 / 64). Views the `{data_ptr, data_len}` byte argument (null /
 /// empty tolerated — the empty input is a valid, well-known hash), runs `EVP_Q_digest` into a stack
 /// buffer, then copies the digest into a freshly heap-allocated owned `array<u8>` `{ptr, len}` (the
 /// caller's bound local `Drop`-frees it via `align_rt_free`, like `rand.sample`'s array).
 ///
 /// A `rc != 1` (engine failure — no valid-input path produces it) or a digest length that does not
-/// match `expect_len` (defensive: the fixed 32/64 the caller's type promises) **aborts** rather than
+/// match `expect_len` (defensive: the fixed 20/32/64 the caller's type promises) **aborts** rather than
 /// return a wrong-length or wrong-value digest.
 ///
 /// # Safety
@@ -18304,6 +18337,14 @@ unsafe fn crypto_digest(name: &core::ffi::CStr, expect_len: usize, data_ptr: *co
     let out = align_rt_alloc(expect_len as i64);
     unsafe { core::ptr::copy_nonoverlapping(md.as_ptr(), out, expect_len) };
     AlignStr { ptr: out as *const u8, len: expect_len as i64 }
+}
+
+/// One-shot 20-byte SHA-1 digest for object-format interoperability.
+/// # Safety
+/// data_ptr/data_len must describe a valid byte view, as for the other EVP digest operations.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_crypto_sha1(data_ptr: *const u8, data_len: i64) -> AlignStr {
+    unsafe { crypto_digest(c"SHA1",20,data_ptr,data_len) }
 }
 
 /// `crypto.sha256(data)` — the 32-byte SHA-256 digest of the byte view `data`, as an owned
@@ -50420,4 +50461,157 @@ mod r63_tests {
         }
     }
 
+}
+
+#[cfg(test)]
+mod batch_byte_transform_tests {
+    use super::*;
+    fn provider_child(mode: &str, timeout: std::time::Duration) -> (u32, std::io::Result<std::process::Output>) {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) { let _=self.0.kill(); let _=self.0.wait(); }
+        }
+        let mut child=Child(std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", "batch_byte_transform_tests::unavailable_digest_provider_aborts", "--nocapture"])
+            .env("ALIGN_SHA1_PROVIDER_REFUSAL_CHILD",mode)
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped())
+            .spawn().expect("provider refusal child"));
+        let deadline=std::time::Instant::now()+timeout;
+        let pid=child.0.id();
+        let result=(|| {
+            let mut stderr=child.0.stderr.take().expect("piped stderr");
+            let fd=stderr.as_raw_fd();
+            let flags=unsafe { libc::fcntl(fd,libc::F_GETFL) };
+            if flags<0 || unsafe { libc::fcntl(fd,libc::F_SETFL,flags|libc::O_NONBLOCK) }<0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut bytes=Vec::new();
+            let mut status=None;
+            let mut eof=false;
+            loop {
+                if std::time::Instant::now()>=deadline {
+                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut,"provider refusal child exceeded deadline"));
+                }
+                let mut buffer=[0u8;1024];
+                match stderr.read(&mut buffer) {
+                    Ok(0) => eof=true,
+                    Ok(count) => {
+                        if bytes.len()+count>16*1024 { return Err(std::io::Error::other("excessive provider diagnostics")); }
+                        bytes.extend_from_slice(&buffer[..count]);
+                    }
+                    Err(error) if matches!(error.kind(),std::io::ErrorKind::WouldBlock|std::io::ErrorKind::Interrupted) => {},
+                    Err(error) => return Err(error),
+                }
+                if status.is_none() {
+                    match child.0.try_wait() {
+                        Ok(value) => status=value,
+                        Err(error) if error.kind()==std::io::ErrorKind::Interrupted => {},
+                        Err(error) => return Err(error),
+                    }
+                }
+                if let Some(status)=status {
+                    if eof { return Ok(std::process::Output { status,stdout:Vec::new(),stderr:bytes }); }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        })();
+        drop(child);
+        (pid,result)
+    }
+
+    #[test]
+    fn provider_refusal_deadline_kills_and_reaps() {
+        let (pid,result)=provider_child("hang",std::time::Duration::from_millis(100));
+        assert_eq!(result.expect_err("nonterminating child must time out").kind(),std::io::ErrorKind::TimedOut);
+        assert_eq!(unsafe { libc::waitpid(i32::try_from(pid).expect("pid"),core::ptr::null_mut(),libc::WNOHANG) },-1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(),Some(libc::ECHILD));
+    }
+
+    #[test]
+    fn unavailable_digest_provider_aborts() {
+        const CHILD: &str = "ALIGN_SHA1_PROVIDER_REFUSAL_CHILD";
+        if let Some(mode)=std::env::var_os(CHILD) {
+            if mode=="hang" { loop { std::thread::park(); } }
+            unsafe extern "C" {
+                fn EVP_set_default_properties(ctx: *mut c_void, properties: *const c_char) -> c_int;
+            }
+            // This process is disposable: the impossible provider property affects no other test.
+            assert_eq!(unsafe { EVP_set_default_properties(core::ptr::null_mut(), c"provider=align_missing_provider".as_ptr()) }, 1);
+            unsafe { align_rt_crypto_sha1(b"abc".as_ptr(), 3); }
+            panic!("unavailable provider returned a digest");
+        }
+        let (_,output)=provider_child("refuse",std::time::Duration::from_secs(10));
+        let output=output.expect("provider refusal child");
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("crypto: EVP digest failed"));
+    }
+    fn decode(hex: &str) -> Vec<u8> { hex.as_bytes().chunks_exact(2).map(|pair| u8::from_str_radix(core::str::from_utf8(pair).expect("ASCII"),16).expect("hex")).collect() }
+    #[test]
+    fn replacement_vectors_and_every_scalar_split() {
+        // Expected bytes independently generated with CPython's UTF-8 replace decoder.
+        for (input,expected) in [
+            ("",""),
+            ("00","00"),
+            ("c0af","efbfbdefbfbd"),
+            ("e180","efbfbd"),
+            ("eda080","efbfbdefbfbdefbfbd"),
+            ("f4908080","efbfbdefbfbdefbfbdefbfbd"),
+            ("e18041","efbfbd41"),
+            ("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff","000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7fefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbdefbfbd"),
+            ("efbbbf68656c6c6f00efbfbd","efbbbf68656c6c6f00efbfbd"),
+            ("c2a2","c2a2"),
+            ("c2","efbfbd"),
+            ("a2","efbfbd"),
+            ("e282ac","e282ac"),
+            ("e2","efbfbd"),
+            ("82ac","efbfbdefbfbd"),
+            ("e282","efbfbd"),
+            ("ac","efbfbd"),
+            ("f09f92a9","f09f92a9"),
+            ("f0","efbfbd"),
+            ("9f92a9","efbfbdefbfbdefbfbd"),
+            ("f09f","efbfbd"),
+            ("92a9","efbfbdefbfbd"),
+            ("f09f92","efbfbd"),
+            ("a9","efbfbd"),
+            ("e1","efbfbd"),
+            ("8041","efbfbd41"),
+            ("41","41"),
+            ("f4","efbfbd"),
+            ("908080","efbfbdefbfbdefbfbd"),
+            ("f490","efbfbdefbfbd"),
+            ("8080","efbfbdefbfbd"),
+            ("f49080","efbfbdefbfbdefbfbd"),
+            ("80","efbfbd"),
+        ] {
+            let input=decode(input); let expected=decode(expected);
+            let out=unsafe { align_rt_utf8_decode_lossy(input.as_ptr(),i64::try_from(input.len()).expect("length")) };
+            let actual=unsafe { bytes_view(out.ptr,out.len) };
+            assert_eq!(actual,expected,"input={input:?}");
+            if !input.is_empty() { assert_ne!(out.ptr,input.as_ptr()); }
+            unsafe { align_rt_free(out.ptr.cast_mut()); }
+        }
+    }
+    #[test]
+    fn sha1_known_and_padding_vectors() {
+        for (input,expected) in [
+            ("","da39a3ee5e6b4b0d3255bfef95601890afd80709"),
+            ("616263","a9993e364706816aba3e25717850c26c9cd0d89d"),
+            ("6162636462636465636465666465666765666768666768696768696a68696a6b696a6b6c6a6b6c6d6b6c6d6e6c6d6e6f6d6e6f706e6f7071","84983e441c3bd26ebaae4aa1f95129e5e54670f1"),
+            ("6100ff","afdda83d63fa1a141271f2b89f2d1a822d317c0c"),
+            ("61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161","c1c8bbdc22796e28c0e15163d20899b65621d65a"),
+            ("6161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161","c2db330f6083854c99d4b5bfb6e8f29f201be699"),
+            ("616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161","03f09f5b158a7a8cdad920bddc29b81c18a551f5"),
+            ("61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161","0098ba824b5c16427bd7a1122a5a442a25ec644d"),
+            ("6161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161","11655326c708d70319be2610e8a57d9a5b959d3b"),
+        ] {
+            let input=decode(input); let expected=decode(expected);
+            let out=unsafe { align_rt_crypto_sha1(input.as_ptr(),i64::try_from(input.len()).expect("length")) };
+            assert_eq!(out.len,20);
+            assert_eq!(unsafe { bytes_view(out.ptr,out.len) },expected);
+            unsafe { align_rt_free(out.ptr.cast_mut()); }
+        }
+    }
 }

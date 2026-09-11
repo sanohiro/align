@@ -5797,3 +5797,39 @@ fn main() -> i32 {
     // `align_sema::tests::storage_generation_move_action_directory_matrix`.
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
+
+#[test]
+fn borrowed_optional_string_ranges_match_plain_views() {
+    let helper=r#"module helper
+pub fn direct(borrow value: Option<string>, start: i64, end: i64) -> str {
+  return match value { Some(text) => text[start..end], None => "none" }
+}
+fn range(text: str, start: i64, end: i64) -> str = text[start..end]
+pub fn indirect(borrow value: Option<string>, start: i64, end: i64) -> str {
+  return match value { Some(text) => range(text,start,end), None => "none" }
+}
+"#;
+    let main=r#"import helper
+fn main() {
+  value := Some("A日本語Z".clone())
+  print(helper.direct(value,1,10))
+  print(helper.indirect(value,1,10))
+  print(helper.direct(value,1,1))
+  empty: Option<string> := None
+  print(helper.direct(empty,0,0))
+}
+"#;
+    let files=&[("helper.align",helper),("main.align",main)];
+    let checked=diff_check_multi("optional-range",files,"main.align");
+    assert!(!checked.whole_errors && !checked.per_unit_errors,"{} {}",checked.whole_diags,checked.per_unit_diags);
+    if backend_available() {
+        for unit in [false,true] {
+            let out=if unit { build_per_unit_multi("optional-range-unit",files,"main.align").link_and_run() } else { build_and_run_multi("optional-range-whole",files,"main.align") };
+            assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+            assert_eq!(out.stdout,"日本語\n日本語\n\nnone\n".as_bytes());
+        }
+        let bad=main.replace("helper.direct(value,1,10)","helper.direct(value,2,10)");
+        let out=build_and_run_multi("optional-range-boundary",&[("helper.align",helper),("main.align",&bad)],"main.align");
+        assert!(!out.status.success());
+    }
+}

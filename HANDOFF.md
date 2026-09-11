@@ -1,5 +1,15 @@
 # Session handoff
 
+**R69–R76 macOS qualification (2026-09-11):**
+[Plan 54](docs/impl/54-r69-r76-prerequisite-batch-plan.md) owns all eight requests
+and the native evidence. The owner approved retaining strict final-link refusal:
+`access_at` supports Linux and returns `Error.Code(ENOTSUP)` on macOS after input
+validation and before filesystem work. XNU's no-follow flag permits observing
+the final symlink itself; the earlier macOS strategy was incorrect. Self
+`access` remains supported on Linux/macOS. Useful macOS R72 relative observations
+are deferred; consumer adoption remains external. The combined implementation
+stays draft. No merge or versioned release is requested by this handoff.
+
 **Future std/pkg review (planned, no implementation scheduled):**
 [Plan 51](docs/impl/51-package-composition-review-plan.md) records the overlap
 assessment and existing-module priority: std.process, std.fs, then demonstrated

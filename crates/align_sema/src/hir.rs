@@ -1524,6 +1524,8 @@ pub enum ExprKind {
     /// `task_group` worker count must be sized against — the runtime's own pool is sized from the
     /// same source, so more long-lived tasks than this would never all start.
     OsHost,
+    /// Current real UID/GID as the ordinary qualified Copy record.
+    OsIdentity,
     ProcessCpuCount,
     /// `time.sleep(ns)` — suspend the calling thread for `ns` nanoseconds (the `ty` is
     /// [`crate::Ty::Unit`]). A negative `ns` is a no-op; `EINTR` resumes for the remaining time.
@@ -1980,13 +1982,13 @@ pub enum ExprKind {
     /// (not consumed — like `reader.read`'s buffer). **Impure** (reads OS entropy), so an
     /// rng-filling closure is never `Pure` and is excluded from `par_map`.
     CryptoRandom { out: Box<Expr> },
-    /// `crypto.sha256(data)` / `crypto.sha512(data)` — the cryptographic digest of the byte view
+    /// `crypto.sha1(data)` / `crypto.sha256(data)` / `crypto.sha512(data)` — the cryptographic digest of the byte view
     /// `data` (`str` / owned `string` auto-borrowed / `slice<u8>`), as a freshly heap-allocated owned
-    /// `array<u8>` of fixed length (32 for SHA-256, 64 for SHA-512). The `ty` is
+    /// `array<u8>` of fixed length (20 for SHA-1, 32 for SHA-256, 64 for SHA-512). The `ty` is
     /// [`crate::Ty::DynArray`] of `u8` — an *owned, dynamic-length* array carrying its known length
     /// (the ideal fixed-`array<u8; N>` form is not expressible with the current runtime-return ABI,
     /// which hands back a `{ptr,len}` heap array; the length is fixed by `algo` and re-checked in the
-    /// runtime — crypto.md "Fixed-size digests as `array<u8>`"). `algo` selects SHA-256 vs SHA-512.
+    /// runtime — crypto.md "Fixed-size digests as `array<u8>`"). `algo` selects SHA-1, SHA-256 or SHA-512.
     /// Wraps OpenSSL libcrypto's one-shot `EVP_Q_digest`. **Impure** (a C-engine call — never `Pure`,
     /// so excluded from `par_map`, matching `std.compress`; the determinism of hashing does not make
     /// it pure). `data` is borrowed, never consumed.
@@ -2117,6 +2119,8 @@ pub enum AeadDir {
 /// (they match `..`); only sema dispatch, codegen, and the runtime distinguish the two.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum HashAlgo {
+    /// SHA-1 interoperability digest: 20 bytes via EVP.
+    Sha1,
     /// SHA-256 (FIPS 180-4) — a 32-byte digest. EVP name `"SHA256"`.
     Sha256,
     /// SHA-512 (FIPS 180-4) — a 64-byte digest. EVP name `"SHA512"`.
@@ -2162,6 +2166,8 @@ impl TimeFormatKind {
 /// decode alike (the direction is the node, the alphabet is this `kind`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum EncodingKind {
+    /// Maximal-subpart UTF-8 replacement to independently owned text; encode-only.
+    Utf8Lossy,
     /// Standard Base64 (RFC 4648 §4): `A-Za-z0-9+/`, `=` padding on encode.
     Base64,
     /// URL/filename-safe Base64 (RFC 4648 §5): `-`/`_`, no padding on encode.

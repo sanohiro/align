@@ -1,5 +1,21 @@
 # Align Design Notes
 
+The selected [R69–R76 batch](impl/54-r69-r76-prerequisite-batch-plan.md) closes
+generic OS and byte-transform gaps while leaving traversal, permission policy,
+supervision, redaction and Git framing in application Align code. Retained access
+uses real native credentials and ACLs; a permission observation cannot reserve a
+later action. Explicit followed metadata grants observation outside a retained
+root without descriptor authority. Replacement decoding owns its output under
+one exact Unicode partition; SHA-1 interoperates with an existing object format
+through the settled EVP engine. Shared directory/cursor projections keep their
+original collection owner. Real-ID/ACL self access is supported on Linux/macOS.
+Strict relative access is Linux-supported; macOS explicitly refuses with
+`Error.Code(ENOTSUP)` after input validation and before filesystem work. Native
+qualification disproved the assumption that XNU's `AT_SYMLINK_NOFOLLOW_ANY`
+rejects the final symlink itself. Preserve one final-link contract instead of
+publishing a weaker macOS success path; a permission observation is still no
+reservation for a later action. Useful macOS relative access remains deferred.
+
 Bound owned `if` results reuse the existing branch-local transfer. Static may-moved
 sets reject unsafe later reads, but cannot decide replacement cleanup at runtime:
 the selected source is cleared before the old destination's ownership bit is tested.

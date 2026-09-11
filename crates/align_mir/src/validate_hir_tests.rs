@@ -11799,10 +11799,10 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        // R63 replaces three encoder variants with one operation. The exhaustive validation,
-        // source-shape, replay-clone, and canonical-graph matches handle both plans and limits.
+        // R63 unifies encoders; native identity adds one nullary observation. Exhaustive
+        // validation, source-shape, replay-clone and canonical-graph passes cover it.
         variants,
-        331,
+        332,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -14382,7 +14382,7 @@ fn hir_body_validator_native() {
             assert!(!body_core_metadata_is_valid(&reject), "{prefix}{kind:?} result");
         }
     }
-    for kind in [hir::EncodingKind::Html, hir::EncodingKind::PercentPath] {
+    for kind in [hir::EncodingKind::Utf8Lossy, hir::EncodingKind::Html, hir::EncodingKind::PercentPath] {
         let mut reject = program.clone();
         let expression = body_statement_expression_mut(&mut reject, "native_encoding_decode");
         let hir::ExprKind::Try(expression) = &mut expression.kind else { panic!("decoder try fixture") };
@@ -18377,7 +18377,7 @@ fn retained_tree_records() -> Result<(), &'static str> {
     }
     for source in ["fn main() {}", "import std.fs\nfn get() -> Result<fs.directory, Error> = fs.open_directory(\".\")\nfn main() {}"] {
         let schema = checked_source_program(source);
-        for name in ["fs.dir_entry", "fs.metadata"] {
+        for name in ["fs.dir_entry", "fs.metadata", "fs.access_mode", "os.identity_info"] {
             let id = schema.structs.iter().position(|definition| definition.name == name).ok_or("schema")?;
             for mutation in 0..6 {
                 let mut bad = schema.clone();
@@ -18392,6 +18392,28 @@ fn retained_tree_records() -> Result<(), &'static str> {
                 }
                 assert!(!validate_hir::global_type_metadata_is_valid(&bad));
                 assert_body_entrypoints_empty("malformed reserved filesystem schema", &bad);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn observation_extension_records() -> Result<(), &'static str> {
+    let base=checked_source_program("import std.fs\nimport std.os\nfn links(borrow d: fs.directory) -> Result<array<u8>,Error> = d.read_link(\"x\",7)\nfn follow(borrow d: fs.directory) -> Result<fs.metadata,Error> = d.metadata_follow(\"x\")\nfn access(borrow d: fs.directory) -> Result<bool,Error> = d.access(fs.access_mode { read: true, write: false, execute: false })\nfn at(borrow d: fs.directory) -> Result<bool,Error> = d.access_at(\"x\",fs.access_mode { read: true, write: false, execute: false })\nfn link(borrow d: fs.directory) -> Result<(),Error> = d.create_symlink(\"x\",\"y\")\nfn identity() -> Result<os.identity_info,Error> = os.identity()\nfn main() {}\n");
+    assert!(!is_empty(&lower_program(&base)));
+    for name in ["links","follow","access","at","link","identity"] {
+        let mut bad=base.clone();
+        bad.fns.iter_mut().find(|f|f.name==name).ok_or("function")?.body.value.as_mut().ok_or("tail")?.ty=Ty::Bool;
+        assert_body_entrypoints_empty("observation result",&bad);
+        let original=base.fns.iter().find(|f|f.name==name).ok_or("function")?.body.value.as_ref().ok_or("tail")?;
+        if let hir::ExprKind::FsTree { args, .. }=&original.kind {
+            for index in 0..args.len() {
+                let mut bad=base.clone();
+                let expression=bad.fns.iter_mut().find(|f|f.name==name).ok_or("function")?.body.value.as_mut().ok_or("tail")?;
+                let hir::ExprKind::FsTree { args, .. }=&mut expression.kind else { return Err("kind"); };
+                args[index].ty=Ty::Raw;
+                assert_body_entrypoints_empty("observation argument",&bad);
             }
         }
     }

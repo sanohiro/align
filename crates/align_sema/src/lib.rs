@@ -1707,7 +1707,8 @@ pub fn borrowed_sum_payload_is_admissible(
     ) -> bool {
         match ty {
             Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Unit | Ty::Str | Ty::String
-            | Ty::Slice(_) | Ty::Raw | Ty::Rng | Ty::Buffer | Ty::Writer | Ty::ProcessMember => true,
+            | Ty::Slice(_) | Ty::Raw | Ty::Rng | Ty::Buffer | Ty::Writer | Ty::ProcessMember
+            | Ty::FsDirectory | Ty::FsDirCursor => true,
             Ty::Struct(id) => {
                 if !active_structs.insert(id) {
                     return false;
@@ -4570,6 +4571,7 @@ pub fn builtin_spelling_needs_return_cleanup(head: &str) -> Option<bool> {
         let ty = if head == "fs.metadata" { Ty::Struct(0) } else { Ty::Enum(0) };
         return Some(needs_drop_flag(ty, &[fs_metadata_definition(0)], &[], &[fs_entry_kind_definition()], &[]));
     }
+    if matches!(head, "os.identity_info" | "fs.access_mode") { return Some(false); }
     if head == "os.host_info" { return Some(needs_drop_flag(Ty::Struct(0), &[host_info_definition()], &[], &[], &[])); }
     let ty = builtin_spelling_ty(head)?;
     Some(needs_drop_flag(ty, &[], &[], &[], &[]))
@@ -4592,6 +4594,7 @@ pub fn builtin_spelling_is_move(head: &str) -> Option<bool> {
         let ty = if head == "fs.metadata" { Ty::Struct(0) } else { Ty::Enum(0) };
         return Some(ty_is_move(ty, &[fs_metadata_definition(0)], &[], &[fs_entry_kind_definition()], &[]));
     }
+    if matches!(head, "os.identity_info" | "fs.access_mode") { return Some(false); }
     if head == "os.host_info" { return Some(ty_is_move(Ty::Struct(0), &[host_info_definition()], &[], &[], &[])); }
     let ty = builtin_spelling_ty(head)?;
     Some(ty_is_move(ty, &[], &[], &[], &[]))
@@ -6277,6 +6280,8 @@ const BUILTIN_NOMINAL_ALIASES: &[BuiltinNominalAlias] = &[
     BuiltinNominalAlias { bare: "fs.metadata", explicit: "fs.metadata", canonical: "fs.metadata", required_import: Some("std.fs") },
     BuiltinNominalAlias { bare: "fs.entry_kind", explicit: "fs.entry_kind", canonical: "fs.entry_kind", required_import: Some("std.fs") },
     BuiltinNominalAlias { bare: "os.host_info", explicit: "os.host_info", canonical: "os.host_info", required_import: Some("std.os") },
+    BuiltinNominalAlias { bare: "os.identity_info", explicit: "os.identity_info", canonical: "os.identity_info", required_import: Some("std.os") },
+    BuiltinNominalAlias { bare: "fs.access_mode", explicit: "fs.access_mode", canonical: "fs.access_mode", required_import: Some("std.fs") },
     BuiltinNominalAlias {
         bare: "Error",
         explicit: "core.Error",
@@ -8774,6 +8779,12 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
 
     struct_ids.insert("os.host_info".to_string(), structs.len() as u32);
     structs.push(host_info_definition());
+    for definition in [identity_info_definition(), fs_access_mode_definition()] {
+        if let Ok(id) = u32::try_from(structs.len()) {
+            struct_ids.insert(definition.name.clone(), id);
+            structs.push(definition);
+        } else { diags.error("observation builtin type table capacity exceeded".to_string(), Span::new(0,0,0)); }
+    }
 
     // The builtin `argon2_params` struct (M11 std.crypto Slice 5) — a plain **Copy** struct of four
     // `i64` tuning knobs for `crypto.argon2id` (`m_cost` KiB, `t_cost` iterations, `parallelism`
@@ -11000,6 +11011,20 @@ fn compact_abstract_nominal_instances(
     fn remap_expr_metadata(expr: &mut Expr, remap: &NominalRemap, valid: &mut bool) {
         remap_ty(&mut expr.ty, remap, valid);
         match &mut expr.kind {
+            ExprKind::Match { borrowed_place, arms, .. } => {
+                if let Some(place) = borrowed_place {
+                    remap_ty(&mut place.sum_ty, remap, valid);
+                }
+                for arm in arms {
+                    for binding in &mut arm.borrowed_bindings {
+                        remap_ty(&mut binding.static_ty, remap, valid);
+                    }
+                }
+            }
+            ExprKind::BorrowedIndex { base, .. } => {
+                remap_ty(&mut base.array_ty, remap, valid);
+                remap_ty(&mut base.element_ty, remap, valid);
+            }
             ExprKind::Call { type_args, .. } => {
                 for ty in type_args {
                     remap_ty(ty, remap, valid);
@@ -16280,7 +16305,7 @@ impl EffectScan<'_> {
                 walk!(value);
                 self.impure_direct = true;
             }
-            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::ProcessCpuCount => self.impure_direct = true,
+            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::ProcessCpuCount => self.impure_direct = true,
             ExprKind::TimeSleep { ns } => {
                 walk!(ns);
                 self.impure_direct = true;
@@ -22336,7 +22361,7 @@ impl<'a> EscapeCheck<'a> {
         // accepted owner free-standing. Keep this producer aligned with `region_of` and the
         // checked-HIR allocation-mode contract instead of deriving its Drop mode from lexical
         // allocation context like the ordinary arena-aware collection producers below.
-        if matches!(expression.kind, ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. } | ExprKind::OsHost | ExprKind::JsonOwnedDecode { .. } | ExprKind::CryptoDigestFinish { .. }) {
+        if native_storage_is_individual(&expression.kind) {
             return Some(true);
         }
         if matches!(
@@ -24261,7 +24286,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::EnvGet { .. }
             | ExprKind::EnvSet { .. }
             | ExprKind::TimeNow
-            | ExprKind::OsHost | ExprKind::ProcessCpuCount
+            | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::ProcessCpuCount
             | ExprKind::TimeInstant
             | ExprKind::TimeSleep { .. }
             | ExprKind::ProcessExit { .. }
@@ -24718,7 +24743,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::EnvGet { .. }
             | ExprKind::EnvSet { .. }
             | ExprKind::TimeNow
-            | ExprKind::OsHost | ExprKind::ProcessCpuCount
+            | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::ProcessCpuCount
             | ExprKind::TimeInstant
             | ExprKind::TimeSleep { .. }
             | ExprKind::ProcessExit { .. }
@@ -28057,7 +28082,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(name, depth);
                 self.walk(value, depth);
             }
-            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::ProcessCpuCount => {}
+            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::ProcessCpuCount => {}
             ExprKind::TimeSleep { ns } => self.walk(ns, depth),
             // `process.exit` diverges and its `code` is a scalar `i64` (nothing escapes); `abort`
             // has no operand.
@@ -30357,6 +30382,14 @@ fn storage_header_descriptors_compatible(
             && indexed_backing_compatible(expected.ty, candidate.ty, tagged_types))
 }
 
+// These native producers allocate independent owners even inside a lexical arena.
+// Escape/Drop selection and generation release must agree on the same provenance.
+fn native_storage_is_individual(kind: &ExprKind) -> bool {
+    matches!(kind, ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. }
+        | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::JsonOwnedDecode { .. }
+        | ExprKind::CryptoDigestFinish { .. } | ExprKind::CryptoHash { .. })
+}
+
 /// Compile-time-closed storage inventory for every checked-HIR expression variant. This match has
 /// no wildcard by design: adding an [`ExprKind`] cannot silently inherit a producer or forwarding
 /// default. Type-directed header/carrier paths are added by [`classify_storage_expression`].
@@ -30465,7 +30498,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         // The runtime materializes a fresh `array<RowPair>` in Result::Ok and retains neither
         // codec view. `RowPair` is scalar-only, so the generation starts without borrowed content;
         // Result::Err carries no storage header.
-        ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. } | ExprKind::OsHost | ExprKind::FrameInnerJoin { .. } | ExprKind::CryptoDigestFinish { .. } => {
+        ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. } | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::FrameInnerJoin { .. } | ExprKind::CryptoDigestFinish { .. } | ExprKind::CryptoHash { .. } => {
             StorageVariantPolicy::Fresh(StorageContentInitializer::FreshEmpty)
         }
 
@@ -30706,7 +30739,6 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::CryptoRandom { .. }
         | ExprKind::CryptoDigestNew
         | ExprKind::CryptoDigestUpdate { .. }
-        | ExprKind::CryptoHash { .. }
         | ExprKind::CryptoHmac { .. }
         | ExprKind::CryptoHkdf { .. }
         | ExprKind::CryptoAead { .. }
@@ -36577,6 +36609,7 @@ impl<'a> MoveCheck<'a> {
                     .into_iter()
                     .collect()
             } else if result.header_kind != Some(StorageHeaderKind::OwnedOpaque)
+                && !native_storage_is_individual(&expression.kind)
                 && result.initializer != StorageContentInitializer::CallSummary
                 && let Some(arena) = active_arena
             {
@@ -38340,7 +38373,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::TcpAccept { .. } | ExprKind::UdpBind { .. } | ExprKind::UdpSendTo { .. }
             | ExprKind::UdpRecvFrom { .. } | ExprKind::PathJoin { .. } | ExprKind::PathNormalize { .. }
             | ExprKind::EnvGet { .. } | ExprKind::EnvSet { .. } | ExprKind::TimeNow | ExprKind::TimeInstant
-            | ExprKind::OsHost | ExprKind::ProcessCpuCount | ExprKind::TimeSleep { .. } | ExprKind::ProcessExit { .. }
+            | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::ProcessCpuCount | ExprKind::TimeSleep { .. } | ExprKind::ProcessExit { .. }
             | ExprKind::ProcessAbort | ExprKind::ProcessSpawn { .. } | ExprKind::ChildWait { .. }
             | ExprKind::ChildKill { .. } | ExprKind::ProcessExec { .. }
             // `process.command` (owns the handle) / `c.cwd` (`()`) / `c.run` (owns its `Result`) /
@@ -44788,7 +44821,7 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, name, moved, false, false);
                 move_expr!(self, value, moved, false, false);
             }
-            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::ProcessCpuCount => {}
+            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::ProcessCpuCount => {}
             ExprKind::TimeSleep { ns } => move_expr!(self, ns, moved, false, false),
             // `process.exit(code)` reads a scalar `i64` (never consumed); `abort` reads nothing.
             ExprKind::ProcessExit { code } => {
@@ -50927,17 +50960,18 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.process", &format!("process.{method}"), span);
                 return self.check_process_op(method, args, span);
             }
-            if module == "os" && method == "host" {
-                self.require_import("std.os", "os.host", span);
+            if module == "os" && matches!(method, "host" | "identity") {
+                self.require_import("std.os", &format!("os.{method}"), span);
+                let name = if method == "host" { "os.host_info" } else { "os.identity_info" };
                 if !args.is_empty() {
-                    self.diags.error("'os.host' takes no arguments".to_string(), span);
+                    self.diags.error(format!("'os.{method}' takes no arguments"), span);
                     return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
                 }
-                let Some(&id) = self.struct_ids.get("os.host_info") else {
-                    self.diags.error("missing builtin os.host_info".to_string(), span);
+                let Some(&id) = self.struct_ids.get(name) else {
+                    self.diags.error(format!("missing builtin {name}"), span);
                     return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
                 };
-                return Expr { kind: ExprKind::OsHost,
+                return Expr { kind: if method == "host" { ExprKind::OsHost } else { ExprKind::OsIdentity },
                     ty: Ty::Result(Scalar::Struct(id), Scalar::Enum(self.error_enum_id)), span };
             }
             // `std.process` — `process.cpu_count()` -> i64: the parallelism available to this
@@ -50993,7 +51027,7 @@ impl<'a, 't> Checker<'a, 't> {
             if module == "encoding"
                 && matches!(
                     method,
-                    "base64_encode" | "base64_decode" | "base64url_encode" | "base64url_decode" | "hex_encode" | "hex_decode" | "percent_encode_path" | "percent_encode" | "percent_decode" | "form_encode" | "form_decode" | "html_escape" | "utf8_valid"
+                    "base64_encode" | "base64_decode" | "base64url_encode" | "base64url_decode" | "hex_encode" | "hex_decode" | "percent_encode_path" | "percent_encode" | "percent_decode" | "form_encode" | "form_decode" | "html_escape" | "utf8_valid" | "utf8_decode_lossy"
                 )
             {
                 self.require_import("std.encoding", &format!("encoding.{method}"), span);
@@ -51079,6 +51113,7 @@ impl<'a, 't> Checker<'a, 't> {
                     method,
                     "constant_time_equal"
                         | "random"
+                        | "sha1"
                         | "sha256"
                         | "sha256_stream"
                         | "sha512"
@@ -59436,13 +59471,18 @@ impl<'a, 't> Checker<'a, 't> {
                     let Some(value) = self.check_byte_view(argument, "retained filesystem path") else { return invalid; };
                     value
                 }
+                fs_tree::Input::Bound => self.check_expr(argument, Some(Ty::Int(IntTy { bits: 64, signed: true }))),
+                fs_tree::Input::AccessMode => {
+                    let expected = fs_tree::record_id(self.structs,"fs.access_mode").map(Ty::Struct);
+                    self.check_expr(argument, expected)
+                }
                 fs_tree::Input::Mode => self.check_expr(argument, Some(Ty::Int(IntTy { bits: 32, signed: false }))),
                 fs_tree::Input::Owner(_) => {
                     self.diags.error("missing filesystem receiver".to_string(), span);
                     return invalid;
                 }
             };
-            if !fs_tree::input_matches(*input, self.resolve(value.ty)) && !hir_expr_diverges(&value) {
+            if !fs_tree::input_matches(*input, self.resolve(value.ty), self.structs) && !hir_expr_diverges(&value) {
                 self.diags.error("retained filesystem argument has the wrong type".to_string(), argument.span);
                 return invalid;
             }
@@ -60567,7 +60607,9 @@ impl<'a, 't> Checker<'a, 't> {
             "percent_encode_path" => hir::EncodingKind::PercentPath,
             "form_encode" | "form_decode" => hir::EncodingKind::Form,
             "html_escape" => hir::EncodingKind::Html,
-            _ => hir::EncodingKind::Hex, // hex_encode / hex_decode / utf8_valid (unused for utf8_valid)
+            "utf8_decode_lossy" => hir::EncodingKind::Utf8Lossy,
+            "hex_encode" | "hex_decode" | "utf8_valid" => hir::EncodingKind::Hex,
+            _ => { self.diags.error(format!("unknown encoding operation: {method}"),span); return err; }
         };
         // `utf8_valid(b)` — a byte-only check (`slice<u8>`); trivially true for a `str`, so it takes
         // raw `bytes` (`draft.md` §18.2: "check before turning bytes into str").
@@ -60746,7 +60788,7 @@ impl<'a, 't> Checker<'a, 't> {
 
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         // `sha256`/`sha512` (Slice 2) — the EVP digests; delegate to the shared hash builder.
-        if matches!(method, "sha256" | "sha512") {
+        if matches!(method, "sha1" | "sha256" | "sha512") {
             return self.check_crypto_hash(method, args, span);
         }
         // `hmac_sha256`/`hkdf_sha256` (Slice 3) — delegate to their builders.
@@ -60950,7 +60992,10 @@ impl<'a, 't> Checker<'a, 't> {
     /// back a `{ptr,len}` heap array; the runtime re-checks the length matches).
     fn check_crypto_hash(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        let algo = if method == "sha256" { hir::HashAlgo::Sha256 } else { hir::HashAlgo::Sha512 };
+        let algo = match method {
+            "sha1" => hir::HashAlgo::Sha1, "sha256" => hir::HashAlgo::Sha256, "sha512" => hir::HashAlgo::Sha512,
+            _ => { self.diags.error(format!("unknown hash operation: {method}"),span); return err; }
+        };
         if args.len() != 1 {
             self.diags
                 .error(format!("'crypto.{method}' expects 1 argument (the data), got {}", args.len()), span);
@@ -65682,7 +65727,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(name);
                 self.finalize_expr(value);
             }
-            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::ProcessCpuCount => {}
+            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::ProcessCpuCount => {}
             ExprKind::TimeSleep { ns } => self.finalize_expr(ns),
             ExprKind::ProcessExit { code } => self.finalize_expr(code),
             ExprKind::ProcessAbort => {}
@@ -67861,7 +67906,8 @@ fn subst_param_ty(
         Ty::Box(s) => Ty::Box(subst_scalar(s, args, tagged_types)),
         Ty::Slice(s) => {
             let element = subst_collection_element_ty(s, args, tagged_types);
-            if ty_contains_restricted_collection_owner(element, structs, &[], enums, tagged_types) {
+            if !matches!(element, Ty::Struct(_))
+                && ty_contains_restricted_collection_owner(element, structs, &[], enums, tagged_types) {
                 Ty::Error
             } else {
                 collection_scalar_type(element)
@@ -69825,6 +69871,11 @@ fn resolve_type(
             };
             if reject_abstract_nominal_container(inner, "slice", cx, span, diags) {
                 return Ty::Error;
+            }
+            // An existing AoS record owner can be viewed without copying its native fields.
+            // Direct handles and sum elements still use the restricted scalar domain below.
+            if let Ty::Struct(id) = inner {
+                return Ty::Slice(Scalar::Struct(id));
             }
             match collection_scalar_arg(
                 inner,
@@ -72016,7 +72067,7 @@ mod tests {
         // JsonEncode replaces three variants with one fresh owned Result producer.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 331,
+            variants, 332,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 
@@ -78163,6 +78214,10 @@ fn exit_branch(flag: bool) -> i64 {
             }],
         }];
         for admitted in [
+            Ty::FsDirectory,
+            Ty::FsDirCursor,
+            Ty::Option(Scalar::FsDirectory),
+            Ty::Result(Scalar::FsDirCursor,Scalar::Bool),
             Ty::Buffer,
             Ty::Writer,
             Ty::DynArray(Scalar::Int(IntTy { bits: 64, signed: true })),
@@ -81691,17 +81746,42 @@ pub fn fs_tree_schemas_valid(structs: &[hir::StructDef], enums: &[hir::EnumDef])
             kind_id = Some(id);
         }
     }
-    for name in ["fs.dir_entry", "fs.metadata"] {
+    for name in ["fs.dir_entry", "fs.metadata", "fs.access_mode"] {
         let mut found = false;
         for definition in structs {
             if definition.name == name || definition.source_name == name {
                 if found { return false; }
                 found = true;
                 let expected = if name == "fs.dir_entry" { fs_dir_entry_definition() }
+                    else if name == "fs.access_mode" { fs_access_mode_definition() }
                     else { let Some(id) = kind_id else { return false; }; fs_metadata_definition(id) };
                 if !matching(definition, &expected) { return false; }
             }
         }
     }
     true
+}
+
+/// Exact qualified Copy schemas for native observations.
+pub fn identity_info_definition() -> hir::StructDef {
+    copy_observation_definition("os.identity_info", &["real_uid", "real_gid"], Ty::Int(IntTy { bits: 64, signed: true }))
+}
+pub fn fs_access_mode_definition() -> hir::StructDef {
+    copy_observation_definition("fs.access_mode", &["read", "write", "execute"], Ty::Bool)
+}
+fn copy_observation_definition(name: &str, fields: &[&str], ty: Ty) -> hir::StructDef {
+    hir::StructDef { name: name.to_string(), source_name: name.to_string(),
+        fields: fields.iter().map(|name| hir::FieldDef { name: (*name).to_string(), ty }).collect(),
+        align: None, c_repr: false }
+}
+fn observation_schema_matches(actual: &hir::StructDef, expected: hir::StructDef) -> bool {
+    actual.name == expected.name && actual.source_name == expected.source_name
+        && actual.align.is_none() && !actual.c_repr && actual.fields.len() == expected.fields.len()
+        && actual.fields.iter().zip(expected.fields).all(|(a,b)| a.name == b.name && a.ty == b.ty)
+}
+pub fn identity_info_schema_valid(actual: &hir::StructDef) -> bool {
+    observation_schema_matches(actual,identity_info_definition())
+}
+pub fn fs_access_mode_schema_valid(actual: &hir::StructDef) -> bool {
+    observation_schema_matches(actual,fs_access_mode_definition())
 }

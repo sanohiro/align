@@ -1,5 +1,14 @@
 # std.os
 
+**Implemented identity observation:**
+`os.identity() -> Result<os.identity_info, Error>` observes current real UID/GID,
+in that order, through native getuid/getgid. It is Impure, requires std.os,
+allocates nothing and changes no credentials. The qualified ordinary Copy record
+has exactly `real_uid: i64`, `real_gid: i64`, both nonnegative on success.
+Checked-conversion/unsupported-platform failure is Invalid; the pair is not an
+atomic or authenticated identity. [Plan 54](../54-r69-r76-prerequisite-batch-plan.md)
+owns its exact ABI and verification. The implemented host surface follows.
+
 `os.host() -> Result<os.host_info, Error>` requires `import std.os` and is Impure.
 The qualified-only ordinary Move record has declaration-order fields
 `system: string`, `release: string`, `machine: string`, `cpu: Option<string>`,

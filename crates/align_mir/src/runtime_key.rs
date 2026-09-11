@@ -11,7 +11,7 @@ macro_rules! runtime_keys {
         }
 
         impl RuntimeKey {
-            pub const ALL: [Self; 435] = [$(Self::$variant,)*];
+            pub const ALL: [Self; 443] = [$(Self::$variant,)*];
 
             pub const fn logical_name(self) -> &'static str {
                 match self {
@@ -141,6 +141,7 @@ runtime_keys! {
     CryptoPublicKeyFromJwk => "crypto_public_key_from_jwk",
     CryptoPublicKeyFromPem => "crypto_public_key_from_pem",
     CryptoRandom => "crypto_random",
+    CryptoSha1 => "crypto_sha1",
     CryptoSha256 => "crypto_sha256",
     CryptoSha512 => "crypto_sha512",
     CryptoSign => "crypto_sign",
@@ -163,16 +164,21 @@ runtime_keys! {
     FsCreatePrivateTempDir => "fs_create_private_temp_dir",
     FsCursorFree => "fs_cursor_free",
     FsCursorNext => "fs_cursor_next",
+    FsDirectoryAccess => "fs_directory_access",
+    FsDirectoryAccessAt => "fs_directory_access_at",
     FsDirectoryCreateDir => "fs_directory_create_dir",
     FsDirectoryCreateNew => "fs_directory_create_new",
+    FsDirectoryCreateSymlink => "fs_directory_create_symlink",
     FsDirectoryCursor => "fs_directory_cursor",
     FsDirectoryFree => "fs_directory_free",
     FsDirectoryMetadata => "fs_directory_metadata",
     FsDirectoryMetadataAt => "fs_directory_metadata_at",
+    FsDirectoryMetadataFollow => "fs_directory_metadata_follow",
     FsDirectoryOpen => "fs_directory_open",
     FsDirectoryOpenDir => "fs_directory_open_dir",
     FsDirectoryOpenRead => "fs_directory_open_read",
     FsDirectoryOpenReadSingleLink => "fs_directory_open_read_single_link",
+    FsDirectoryReadLink => "fs_directory_read_link",
     FsDirectoryRemoveDir => "fs_directory_remove_dir",
     FsDirectoryRemoveFile => "fs_directory_remove_file",
     FsDirectorySetMode => "fs_directory_set_mode",
@@ -335,6 +341,7 @@ runtime_keys! {
     LogLineBuilder => "log_line_builder",
     LogNew => "log_new",
     OsHost => "os_host",
+    OsIdentity => "os_identity",
     ParMap => "par_map",
     ParMapFilter => "par_map_filter",
     ParMapReduce => "par_map_reduce",
@@ -449,6 +456,7 @@ runtime_keys! {
     UdpSendTo => "udp_send_to",
     UdpSocketFree => "udp_socket_free",
     Utf8BoundaryFail => "utf8_boundary_fail",
+    Utf8DecodeLossy => "utf8_decode_lossy",
     Utf8Valid => "utf8_valid",
     XmlAttributeCount => "xml_attribute_count",
     XmlAttributeName => "xml_attribute_name",
@@ -460,7 +468,7 @@ runtime_keys! {
     XmlText => "xml_text",
 }
 
-const _: [(); 435] = [(); RuntimeKey::ALL.len()];
+const _: [(); 443] = [(); RuntimeKey::ALL.len()];
 
 #[cfg(test)]
 mod tests {
@@ -469,7 +477,7 @@ mod tests {
 
     #[test]
     fn runtime_keys_are_complete_unique_and_alphabetical() {
-        assert_eq!(RuntimeKey::ALL.len(), 435);
+        assert_eq!(RuntimeKey::ALL.len(), 443);
         let names: Vec<_> = RuntimeKey::ALL
             .iter()
             .map(|key| key.logical_name())

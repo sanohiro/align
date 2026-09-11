@@ -2,6 +2,16 @@
 
 A summary of `draft.md` (the authoritative detailed spec). For detail and the latest version, always refer to `draft.md`.
 
+**R69–R76 provider implementation:** [R69–R76 plan 54](impl/54-r69-r76-prerequisite-batch-plan.md)
+specifies retained link/followed-metadata/access/symlink operations, real UID/GID,
+owned UTF-8 replacement decoding and one-shot SHA-1. Existing directory/cursor
+owners gain shared projection only; borrowed string slicing retains its Str
+view. The plan fixes the exact signatures, ownership, errors and platform limits.
+Self `access` is supported on Linux/macOS. Strict relative `access_at` supports
+Linux; macOS returns `Error.Code(ENOTSUP)` after complete path/mask validation
+and before filesystem work. Unsupported is an error, distinct from a completed
+negative permission observation (`false`). The plan records platform evidence.
+
 ## Purpose
 
 Align is an AOT-compiled language designed to align the following.

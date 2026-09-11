@@ -1138,3 +1138,37 @@ fn argon2id_wrong_shape_rejected() {
         "redeclaring the reserved `argon2_params` type must error"
     );
 }
+
+#[test]
+fn sha1_imported_owned_and_git_framing() {
+    let helper=r#"module helper
+import std.crypto
+pub fn digest<T>(data: str, marker: T) -> array<u8> = arena { crypto.sha1(data) }
+"#;
+    let main=r#"import std.crypto
+import std.encoding
+import helper
+fn main() -> Result<(),Error> {
+  digest := helper.digest("abc",1)
+  print(digest.len())
+  print(encoding.hex_encode(digest[0..digest.len()]))
+  framed := encoding.hex_decode("626c6f62203300616263")?
+  blob := crypto.sha1(framed.bytes())
+  print(encoding.hex_encode(blob[0..blob.len()]))
+  return Ok(())
+}
+"#;
+    let files=&[("helper.align",helper),("main.align",main)];
+    let checked=diff_check_multi("sha1-imported",files,"main.align");
+    assert!(!checked.whole_errors && !checked.per_unit_errors,"{} {}",checked.whole_diags,checked.per_unit_diags);
+    if backend_available() {
+        for unit in [false,true] {
+            let out=if unit { build_per_unit_multi("sha1-unit",files,"main.align").link_and_run() } else { build_and_run_multi("sha1-whole",files,"main.align") };
+            assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+            assert_eq!(out.stdout,b"20\na9993e364706816aba3e25717850c26c9cd0d89d\nf2ba8f84ab5c1bce84a7b441cb1959cfc7093b7f\n");
+        }
+    }
+    for source in ["fn main() { x := crypto.sha1(\"a\") }", "import std.crypto\nfn main() { x := crypto.sha1(1) }", "import std.crypto\nfn hashed(x: i64) -> i64 = crypto.sha1(\"x\").len()\nfn main() { xs := [1,2]; ys := xs[0..2].par_map(hashed).sum() }"] {
+        assert!(check_errs("sha1-invalid",source));
+    }
+}

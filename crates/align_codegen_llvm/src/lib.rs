@@ -5358,12 +5358,13 @@ fn fs_tree_output_slots(output: align_mir::FsTreeOutput) -> Vec<Slot> {
     use align_mir::FsTreeOutput::*;
     match output {
         None => Vec::new(),
-        Owner(slot) | Metadata(slot) => vec![slot],
+        Owner(slot) | Metadata(slot) | Bytes(slot) | Bool(slot) => vec![slot],
         CursorNext { entry, present } => vec![entry, present],
     }
 }
 
 fn native_owner_mir_contract<'a>(
+    program: &Program,
     function: &Function,
     value: &'a Rvalue,
 ) -> Option<NativeOwnerMirContract<'a>> {
@@ -5445,14 +5446,14 @@ fn native_owner_mir_contract<'a>(
             contract.result = i32_ty;
             for (input, operand) in kind.inputs().iter().zip(args) {
                 let actual = xml_operand_base_ty(function, operand).unwrap_or(Ty::Error);
-                let expected = if align_sema::fs_tree::input_matches(*input, actual) { actual } else { Ty::Error };
+                let expected = if align_sema::fs_tree::input_matches(*input, actual, &program.structs) { actual } else { Ty::Error };
                 let requirement = if kind.exclusive() && matches!(input, align_sema::fs_tree::Input::Owner(_)) { write } else { read };
                 contract.operands.push((operand, expected, requirement));
             }
             contract.outputs = fs_tree_output_slots(*output).into_iter().map(|slot|
                 (slot, function.slots.get(slot as usize).copied().unwrap_or(Ty::Error))).collect();
         }
-        Rvalue::OsHost { out } => {
+        Rvalue::OsHost { out } | Rvalue::OsIdentity { out } => {
             // Exact nominal schema is independently certified by validate_host_mir.
             contract.result = i32_ty;
             contract.outputs = vec![(*out, function.slots.get(*out as usize).copied().unwrap_or(Ty::Error))];
@@ -5645,6 +5646,7 @@ fn xml_written_slots(rvalue: &Rvalue) -> Vec<(Slot, XmlAccessProvenance)> {
         | Rvalue::CodecEncoderNew { out, .. }
         | Rvalue::FsIsDir { out, .. }
         | Rvalue::OsHost { out }
+        | Rvalue::OsIdentity { out }
         | Rvalue::FrameInnerJoin { out, .. }
         | Rvalue::FileCreateRw { out, .. }
         | Rvalue::FileOpenRw { out, .. }
@@ -7180,7 +7182,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             return equation;
         }
         let definition = (*definition).clone();
-        if let Some(contract) = native_owner_mir_contract(self.graph.function, &definition) {
+        if let Some(contract) = native_owner_mir_contract(self.graph.program, self.graph.function, &definition) {
             if result_ty != contract.result || !path.is_empty()
                 || contract.outputs.iter().any(|&(slot, ty)| {
                     self.graph.function.slots.get(slot as usize) != Some(&ty)
@@ -7210,6 +7212,20 @@ impl<'a> XmlAccessAnalyzer<'a> {
         let slice_index_noalias = matches!(&definition, Rvalue::SliceIndexNoalias { .. });
         match definition {
             Rvalue::Use(operand) => {
+                if let Operand::BorrowedPlace(place)=&operand {
+                    let physical=self.graph.function.slots.get(place.slot as usize)
+                        .and_then(|root| xml_borrowed_path(self.graph.program,*root,&place.path))
+                        .map(|(ty,_)| ty);
+                    if result_ty == Ty::Str && place.ty == Ty::Str && path.is_empty()
+                        && matches!(physical,Some(Ty::String | Ty::Str)) {
+                        // Read the authenticated descriptor, retaining its founded slot/arm proof.
+                        // A descriptor read grants shared access, never owner-transfer authority.
+                        self.check_read_operand(&mut equation,&operand,Ty::Str);
+                        equation.seed=Some(XmlAccessProvenance::Shared);
+                    } else { equation.invalid=true; }
+                    return equation;
+                }
+
                 let Some(source_ty) = xml_operand_base_ty(self.graph.function, &operand) else {
                     equation.invalid = true;
                     return equation;
@@ -9956,6 +9972,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::CodecEncoderPut { .. }
             | Rvalue::CodecEncoderFinish(..)
             | Rvalue::OsHost { .. }
+            | Rvalue::OsIdentity { .. }
             | Rvalue::FrameInnerJoin { .. }
             | Rvalue::IoCopy(..)
             | Rvalue::FileCreateRw { .. }
@@ -10125,7 +10142,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             bits: 8,
             signed: false,
         }));
-        let native_contract = native_owner_mir_contract(self.graph.function, rvalue);
+        let native_contract = native_owner_mir_contract(self.graph.program, self.graph.function, rvalue);
         // Native value and out-slot queries must use the same instruction ABI. An
         // infallible scratch writer returns Unit, not an errno-status integer.
         let expected_result = native_contract
@@ -11424,6 +11441,8 @@ fn validate_host_mir(program: &Program) -> Result<(), CodegenError> {
             let slot_ty = |slot: Slot| function.slots.get(slot as usize).copied();
             let valid_output = match (kind.output(), *output) {
                 (Output::Unit, FsTreeOutput::None) => true,
+                (Output::Bool, FsTreeOutput::Bool(slot)) => slot_ty(slot) == Some(Ty::Bool),
+                (Output::OwnedBytes, FsTreeOutput::Bytes(slot)) => slot_ty(slot) == Some(Ty::DynArray(Scalar::Int(IntTy { bits:8, signed:false }))),
                 (Output::Directory, FsTreeOutput::Owner(slot)) => slot_ty(slot) == Some(Ty::FsDirectory),
                 (Output::Cursor, FsTreeOutput::Owner(slot)) => slot_ty(slot) == Some(Ty::FsDirCursor),
                 (Output::Reader, FsTreeOutput::Owner(slot)) => slot_ty(slot) == Some(Ty::Reader),
@@ -11438,7 +11457,7 @@ fn validate_host_mir(program: &Program) -> Result<(), CodegenError> {
             if !valid_output || args.len() != kind.inputs().len()
                 || function.value_tys.get(*value as usize).copied() != Some(Ty::Int(IntTy { bits: 32, signed: true }))
                 || kind.inputs().iter().zip(args).any(|(input, operand)|
-                    xml_operand_base_ty(function, operand).is_none_or(|ty| !input_matches(*input, ty))) {
+                    xml_operand_base_ty(function, operand).is_none_or(|ty| !input_matches(*input, ty, &program.structs))) {
                 return Err(CodegenError::Lowering("malformed retained filesystem producer".to_string()));
             }
         }
@@ -11459,6 +11478,25 @@ fn validate_host_mir(program: &Program) -> Result<(), CodegenError> {
                     || function.slots.get(*out as usize).copied() != host.map(Ty::Struct)
                     || function.value_tys.get(*value as usize).copied() != Some(Ty::Int(IntTy { bits: 32, signed: true }))) {
                 return Err(CodegenError::Lowering("malformed os.host producer".to_string()));
+            }
+        }
+    }
+    let mut identity = None;
+    for (id, definition) in program.structs.iter().enumerate() {
+        if definition.name == "os.identity_info" || definition.source_name == "os.identity_info" {
+            if identity.is_some() || !align_sema::identity_info_schema_valid(definition) {
+                return Err(CodegenError::Lowering("malformed os.identity_info schema".to_string()));
+            }
+            identity = u32::try_from(id).ok();
+        }
+    }
+    for function in &program.fns {
+        for statement in function.blocks.iter().flat_map(|block| &block.stmts) {
+            if let Stmt::Let(value, Rvalue::OsIdentity { out }) = statement
+                && (identity.is_none()
+                    || function.slots.get(*out as usize).copied() != identity.map(Ty::Struct)
+                    || function.value_tys.get(*value as usize).copied() != Some(Ty::Int(IntTy { bits: 32, signed: true }))) {
+                return Err(CodegenError::Lowering("malformed os.identity producer".to_string()));
             }
         }
     }
@@ -11975,7 +12013,7 @@ fn validate_resource_rvalues_component(
                     .get(*value as usize)
                     .copied()
                     .ok_or_else(|| fail(function, "result value id is absent"))?;
-                if native_owner_mir_contract(function, rvalue).is_some()
+                if native_owner_mir_contract(program, function, rvalue).is_some()
                     && !OperandRequirement::READ.is_satisfied_by(xml_access(&Operand::Value(*value), result))
                 {
                     return Err(fail(function, &format!("native owner producer contract mismatch: {rvalue:?}")));
@@ -24492,13 +24530,25 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             native_args.push(pointer.into());
                             native_args.push(length.into());
                         }
-                        Input::Owner(_) | Input::Mode => native_args.push(self.operand(operand)?.into()),
+                        Input::AccessMode => {
+                            let mode = self.operand(operand)?.into_struct_value();
+                            for field in 0..3 {
+                                let flag = self.builder.build_extract_value(mode,field,"access.flag").map_err(|e|self.err(e))?.into_int_value();
+                                native_args.push(self.builder.build_int_z_extend(flag,self.ctx.i8_type(),"access.byte").map_err(|e|self.err(e))?.into());
+                            }
+                        }
+                        Input::Owner(_) | Input::Mode | Input::Bound => native_args.push(self.operand(operand)?.into()),
                     }
                 }
                 for slot in fs_tree_output_slots(*output) {
                     native_args.push((*self.slots.get(&slot).ok_or_else(|| self.err("missing filesystem output"))?).into());
                 }
                 let key = match kind {
+                    FsTreeKind::DirectoryReadLink => RuntimeKey::FsDirectoryReadLink,
+                    FsTreeKind::DirectoryMetadataFollow => RuntimeKey::FsDirectoryMetadataFollow,
+                    FsTreeKind::DirectoryAccess => RuntimeKey::FsDirectoryAccess,
+                    FsTreeKind::DirectoryAccessAt => RuntimeKey::FsDirectoryAccessAt,
+                    FsTreeKind::DirectoryCreateSymlink => RuntimeKey::FsDirectoryCreateSymlink,
                     FsTreeKind::DirectoryOpen => RuntimeKey::FsDirectoryOpen,
                     FsTreeKind::DirectoryCursor => RuntimeKey::FsDirectoryCursor,
                     FsTreeKind::CursorNext => RuntimeKey::FsCursorNext,
@@ -24785,6 +24835,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     align_sema::hir::EncodingKind::PercentPath => RuntimeKey::PercentEncodePath,
                     align_sema::hir::EncodingKind::Form => RuntimeKey::FormEncode,
                     align_sema::hir::EncodingKind::Html => RuntimeKey::HtmlEscape,
+                    align_sema::hir::EncodingKind::Utf8Lossy => RuntimeKey::Utf8DecodeLossy,
                 };
                 let (dp, dl) = self.split_str(data)?;
                 self.builder
@@ -24801,7 +24852,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     align_sema::hir::EncodingKind::Form => RuntimeKey::FormDecode,
                     // `html_escape` is encode-only — sema maps no `*_decode` method to `Html`, so an
                     // `EncodingDecode` node can never carry it.
-                    align_sema::hir::EncodingKind::Html | align_sema::hir::EncodingKind::PercentPath => {
+                    align_sema::hir::EncodingKind::Utf8Lossy | align_sema::hir::EncodingKind::Html | align_sema::hir::EncodingKind::PercentPath => {
                         return Err(self.err("encode-only kind in decoder"));
                     },
                 };
@@ -24861,6 +24912,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::CryptoHash { algo, data } => {
                 let (dp, dl) = self.split_str(data)?;
                 let f = match algo {
+                    align_sema::hir::HashAlgo::Sha1 => self.runtime(RuntimeKey::CryptoSha1),
                     align_sema::hir::HashAlgo::Sha256 => self.runtime(RuntimeKey::CryptoSha256),
                     align_sema::hir::HashAlgo::Sha512 => self.runtime(RuntimeKey::CryptoSha512),
                 };
@@ -26099,6 +26151,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let pointer = *self.slots.get(out).ok_or_else(|| self.err("missing host output slot"))?;
                 self.builder.build_call(self.runtime(RuntimeKey::OsHost), &[pointer.into()], "host")
                     .map_err(|e| self.err(e))?.try_as_basic_value().basic().ok_or_else(|| self.err("host ABI result"))?
+            }
+            Rvalue::OsIdentity { out } => {
+                let pointer = *self.slots.get(out).ok_or_else(|| self.err("missing identity output slot"))?;
+                self.builder.build_call(self.runtime(RuntimeKey::OsIdentity), &[pointer.into()], "identity")
+                    .map_err(|e| self.err(e))?.try_as_basic_value().basic().ok_or_else(|| self.err("identity ABI result"))?
             }
             Rvalue::ProcessCpuCount => self
                 .builder
@@ -37270,7 +37327,7 @@ fn main() -> i32 = 0
                 let Stmt::Let(value, rvalue) = statement else {
                     continue;
                 };
-                let Some(contract) = native_owner_mir_contract(function, rvalue) else {
+                let Some(contract) = native_owner_mir_contract(&base, function, rvalue) else {
                     continue;
                 };
                 operations += 1;
@@ -37344,7 +37401,7 @@ fn main() -> i32 = 0
         for (index, function) in base.fns.iter().enumerate() {
             for statement in function.blocks.iter().flat_map(|block| &block.stmts) {
                 let Stmt::Let(value, rvalue) = statement else { continue; };
-                if native_owner_mir_contract(function, rvalue).is_none() { continue; }
+                if native_owner_mir_contract(&base, function, rvalue).is_none() { continue; }
                 operations += 1;
                 let mut bad = base.clone();
                 bad.fns[index].value_tys[*value as usize] = Ty::Bool;
@@ -45027,6 +45084,44 @@ fn main() -> i32 = 0
     }
 
     #[test]
+    fn identity_mir_gate_rejects_forged_schema() -> Result<(), &'static str> {
+        for source in ["fn main() {}\n", "import std.os\nfn get() -> Result<os.identity_info, Error> = os.identity()\nfn main() {}\n"] {
+            let base = mir(source);
+            assert!(validate_mir_producers(&base).is_ok());
+            let id = base.structs.iter().position(align_sema::identity_info_schema_valid).ok_or("host schema")?;
+            for mutation in 0..7 {
+                let mut bad = base.clone();
+                let record = &mut bad.structs[id];
+                match mutation {
+                    0 => record.name = "lookalike".to_string(),
+                    1 => record.source_name = "lookalike".to_string(),
+                    2 => record.fields.swap(0,1),
+                    3 => record.fields[0].ty = Ty::Str,
+                    4 => record.c_repr = true,
+                    5 => record.align = Some(16),
+                    _ => { record.fields.pop(); },
+                }
+                assert_xml_producer_rejected(&bad, "forged host schema");
+            }
+            for (index,function) in base.fns.iter().enumerate() {
+                for statement in function.blocks.iter().flat_map(|b| &b.stmts) {
+                    if let Stmt::Let(value, Rvalue::OsIdentity { out }) = statement {
+                        let mut bad = base.clone();
+                        bad.fns[index].value_tys[*value as usize] = Ty::Bool;
+                        assert_xml_producer_rejected(&bad, "host result");
+                        for ty in [Ty::Raw, Ty::String, Ty::Unit] {
+                            let mut bad = base.clone();
+                            bad.fns[index].slots[*out as usize] = ty;
+                            assert_xml_producer_rejected(&bad, "host out slot");
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn host_layout_matches_native_contract() -> Result<(), String> {
         let context = Context::create();
         let machine = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).map_err(|e| format!("{e:?}"))?;
@@ -45080,6 +45175,11 @@ fn main() -> i32 = 0
     fn retained_tree_mir_gate() {
         let mut source = String::from("import std.fs\nfn main() {}\nfn root(path: str) -> Result<fs.directory, Error> = fs.open_directory(path)\n");
         for (name, owner, method, args, result) in [
+            ("links", "fs.directory", "read_link", "\"x\", 4", "array<u8>"),
+            ("follow", "fs.directory", "metadata_follow", "\"x\"", "fs.metadata"),
+            ("access", "fs.directory", "access", "fs.access_mode { read: true, write: false, execute: false }", "bool"),
+            ("access_at", "fs.directory", "access_at", "\"x\", fs.access_mode { read: true, write: false, execute: false }", "bool"),
+            ("symlink", "fs.directory", "create_symlink", "\"x\", \"y\"", "()"),
             ("cursor", "fs.directory", "cursor", "", "fs.dir_cursor"),
             ("next", "fs.dir_cursor", "next", "", "Option<fs.dir_entry>"),
             ("dm", "fs.directory", "metadata", "", "fs.metadata"),
@@ -45120,6 +45220,7 @@ fn main() -> i32 = 0
                         assert_xml_producer_rejected(&bad, "filesystem operand ordinal");
                     }
                     for replacement in [align_mir::FsTreeOutput::None, align_mir::FsTreeOutput::Owner(u32::MAX),
+                        align_mir::FsTreeOutput::Bytes(u32::MAX), align_mir::FsTreeOutput::Bool(u32::MAX),
                         align_mir::FsTreeOutput::Metadata(u32::MAX), align_mir::FsTreeOutput::CursorNext { entry: u32::MAX, present: u32::MAX }] {
                         if replacement == *output { continue; }
                         let mut bad = base.clone();
@@ -45138,7 +45239,7 @@ fn main() -> i32 = 0
             }
         }
         assert_eq!(seen.len(), align_sema::fs_tree::FsTreeKind::ALL.len());
-        for name in ["fs.metadata", "fs.dir_entry"] {
+        for name in ["fs.metadata", "fs.dir_entry", "fs.access_mode"] {
             for index in 0..base.structs.len() {
                 if base.structs[index].name != name { continue; }
                 let mut bad = base.clone();
@@ -45146,6 +45247,41 @@ fn main() -> i32 = 0
                 assert_xml_producer_rejected(&bad, "filesystem reserved schema");
             }
         }
+    }
+
+    #[test]
+    fn borrowed_string_descriptor_materialization_gate() -> Result<(), &'static str> {
+        let base=mir("fn view(borrow value: Option<string>) -> str = match value { Some(text) => text[0..1], None => \"\" }\nfn main() {}\n");
+        assert!(validate_mir_producers(&base).is_ok());
+        let mut seen=0;
+        for (fi,function) in base.fns.iter().enumerate() {
+            for (bi,block) in function.blocks.iter().enumerate() {
+                for (si,statement) in block.stmts.iter().enumerate() {
+                    let Stmt::Let(value,Rvalue::Use(Operand::BorrowedPlace(_)))=statement else { continue; };
+                    seen+=1;
+                    for mutation in 0..7 {
+                        let mut bad=base.clone();
+                        let f=&mut bad.fns[fi];
+                        if mutation==0 { f.value_tys[*value as usize]=Ty::String; }
+                        else if mutation==6 {
+                            for block in &mut f.blocks { block.stmts.retain(|statement| !matches!(statement,Stmt::Store(..))); block.stmt_lines.clear(); }
+                        } else {
+                            let Stmt::Let(_,Rvalue::Use(Operand::BorrowedPlace(place)))=&mut f.blocks[bi].stmts[si] else { return Err("use"); };
+                            match mutation {
+                                1 => place.ty=Ty::String,
+                                2 => place.slot=u32::MAX,
+                                3 => place.path.clear(),
+                                4 => place.path.push(hir::BorrowedPathSegment::StructField(u32::MAX)),
+                                _ => place.cleanup=Some(u32::MAX),
+                            }
+                        }
+                        assert_xml_producer_rejected(&bad,"forged borrowed String descriptor");
+                    }
+                }
+            }
+        }
+        assert!(seen>0);
+        Ok(())
     }
 
 }

@@ -4,6 +4,15 @@ module.
 
 # std.crypto — implementation design (M11)
 
+**Implemented addition:**
+`crypto.sha1(data: bytes) -> array<u8>` returns an independently owned 20-byte
+digest through the existing EVP engine, byte-view admission and terminal
+allocation/provider-failure policy. It is Impure and requires std.crypto, like
+sha256. [Plan 54](../54-r69-r76-prerequisite-batch-plan.md) owns the exact
+contract and owners. This serves existing object-format interoperability;
+Git framing/hex output stay in application code and SHA-1 is not selected for
+collision-resistant security identity. No streaming or new engine is added.
+
 > 🌐 **English** · [Japanese](./ja/crypto.md)
 
 > **Status:** complete for the M11 symmetric/hash/KDF surface and the post-pkg.db asymmetric

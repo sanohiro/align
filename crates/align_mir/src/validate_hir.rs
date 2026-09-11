@@ -19,7 +19,9 @@ fn source_shapes_match(
 
 /// Validate the program-global HIR type domain before MIR construction.
 pub(crate) fn global_type_metadata_is_valid(program: &hir::Program) -> bool {
-    program.structs.iter().filter(|definition| definition.name == "os.host_info").count() <= 1
+    program.structs.iter().filter(|d| d.name == "os.identity_info").count() <= 1
+    && program.structs.iter().all(|d| !(d.name == "os.identity_info" || d.source_name == "os.identity_info") || align_sema::identity_info_schema_valid(d))
+    && program.structs.iter().filter(|definition| definition.name == "os.host_info").count() <= 1
     && program.structs.iter().all(|definition| {
         !(definition.name == "os.host_info" || definition.source_name == "os.host_info")
             || align_sema::host_info_schema_valid(definition)
@@ -4648,6 +4650,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::TimeNow
             | hir::ExprKind::TimeInstant
             | hir::ExprKind::OsHost
+            | hir::ExprKind::OsIdentity
             | hir::ExprKind::ProcessCpuCount
             | hir::ExprKind::TimeSleep { .. }
             | hir::ExprKind::ProcessExit { .. }
@@ -4924,7 +4927,7 @@ impl<'a> BodyValidator<'a> {
                 hir::CliFlagKind::Bool => default.is_none(),
                 hir::CliFlagKind::I64 | hir::CliFlagKind::Str => default.is_some(),
             },
-            hir::ExprKind::EncodingDecode { kind, .. } => !matches!(kind, hir::EncodingKind::Html | hir::EncodingKind::PercentPath),
+            hir::ExprKind::EncodingDecode { kind, .. } => !matches!(kind, hir::EncodingKind::Utf8Lossy | hir::EncodingKind::Html | hir::EncodingKind::PercentPath),
             hir::ExprKind::BytesRead { .. } => true,
             hir::ExprKind::BufferPut { .. }
             | hir::ExprKind::Compress { .. }
@@ -5028,6 +5031,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::TimeNow
             | hir::ExprKind::TimeInstant
             | hir::ExprKind::OsHost
+            | hir::ExprKind::OsIdentity
             | hir::ExprKind::ProcessCpuCount
             | hir::ExprKind::TimeSleep { .. }
             | hir::ExprKind::ProcessExit { .. }
@@ -9027,7 +9031,7 @@ impl<'a> BodyValidator<'a> {
                 let inputs = kind.inputs();
                 if inputs.len() != args.len() { return None; }
                 for (input, argument) in inputs.iter().zip(args) {
-                    if self.expr_flow(argument)?.falls && !align_sema::fs_tree::input_matches(*input, argument.ty) { return None; }
+                    if self.expr_flow(argument)?.falls && !align_sema::fs_tree::input_matches(*input, argument.ty, &self.program.structs) { return None; }
                     if let align_sema::fs_tree::Input::Owner(ty) = input {
                         if !self.local_handle_place(context, argument, *ty) { return None; }
                         if kind.exclusive() {
@@ -9131,6 +9135,10 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::EnvSet { name, value } => {
                 (name.ty == Ty::Str && value.ty == Ty::Str)
                     .then(|| result(Ty::Unit, &[name, value]))?
+            }
+            hir::ExprKind::OsIdentity => {
+                let id = self.program.structs.iter().position(align_sema::identity_info_schema_valid)?;
+                result(Ty::Struct(u32::try_from(id).ok()?), &[])
             }
             hir::ExprKind::OsHost => {
                 let id = self.program.structs.iter().position(align_sema::host_info_schema_valid)?;
@@ -9236,7 +9244,7 @@ impl<'a> BodyValidator<'a> {
                 (byte_view(data.ty)).then(|| strict(Ty::String, &[data]))?
             }
             hir::ExprKind::EncodingDecode { input, kind } => {
-                (input.ty == Ty::Str && !matches!(kind, hir::EncodingKind::Html | hir::EncodingKind::PercentPath))
+                (input.ty == Ty::Str && !matches!(kind, hir::EncodingKind::Utf8Lossy | hir::EncodingKind::Html | hir::EncodingKind::PercentPath))
                     .then(|| result(Ty::Buffer, &[input]))?
             }
             hir::ExprKind::Utf8Valid { data } => {

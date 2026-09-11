@@ -1,5 +1,13 @@
 # std.os
 
+**実装済みの identity 観測:**
+`os.identity() -> Result<os.identity_info, Error>` は getuid/getgid の順で現在の実 UID/GID を観測する。
+std.os を必要とする Impure 操作で、メモリ確保も資格情報の変更もない。
+修飾名のみの通常の Copy レコードは `real_uid: i64`、`real_gid: i64` の順に2フィールドを持ち、
+成功値はどちらも非負。表現不能な変換や非対応環境は Invalid。組は原子的な観測や認証を保証しない。
+正確な ABI と検証条件は [Plan 54](../../54-r69-r76-prerequisite-batch-plan.md) が所有する。
+以下は実装済みの host 操作である。
+
 `os.host() -> Result<os.host_info, Error>` は `import std.os` が必要な Impure 操作。
 引数・既定値はない。修飾名のみの通常の Move レコード `os.host_info` は、宣言順に
 `system: string`、`release: string`、`machine: string`、`cpu: Option<string>`、

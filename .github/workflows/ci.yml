@@ -508,6 +508,13 @@ jobs:
           scripts/run-quiet.sh "CI test: native process and signals" --
           scripts/test-process-native.sh
 
+      - name: Retained filesystem and identity regressions (macOS)
+        if: runner.os == 'macOS'
+        timeout-minutes: 15
+        run: >
+          scripts/run-quiet.sh "CI test: retained filesystem and identity" --
+          scripts/test-fs-observations.sh
+
       - name: Bounded PR test gate
         if: matrix.lint
         run: scripts/test-pr.sh

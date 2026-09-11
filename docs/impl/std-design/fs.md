@@ -8,6 +8,21 @@ private temporary-directory lifecycle is owned by
 
 # std.fs — explicit trusted filesystem boundaries
 
+**Implemented extensions:**
+[Plan 54](../54-r69-r76-prerequisite-batch-plan.md) specifies
+`read_link(path, max_bytes)`, `metadata_follow(path)`, `access(mode)`,
+`access_at(path, mode)` and `create_symlink(path, target)` on retained directories.
+Paths/targets use bytes; `fs.access_mode` has required read/write/execute Bool
+fields. Results are respectively owned bytes, existing Copy metadata, Bool,
+Bool and unit, all under Result/Error. Receivers are shared and inputs call-scoped.
+The ledger fixes real-ID/ACL semantics, final-link policy, bounds, allocation,
+native errors and platform qualification. Self `access` supports Linux/macOS;
+strict relative `access_at` supports Linux. macOS `access_at` returns
+`Error.Code(ENOTSUP)` after complete path/mask validation and before filesystem
+work, including for missing entries and symlinks. It never reports unsupported
+as `false` or substitutes final-link permissions. The operations below form the preceding
+baseline; application tree policy remains application code.
+
 > 🌐 **English** · [Japanese](./ja/fs.md)
 
 > **Status:** Request 14 IMPLEMENTED 2026-08-19 (design PR #859, merged as

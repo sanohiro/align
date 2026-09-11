@@ -1,5 +1,13 @@
 # Runtime native ABI ledger
 
+**R69–R76: all eight native rows implemented:**
+[Plan 54 §5](54-r69-r76-prerequisite-batch-plan.md#5-compiler-representation-and-native-abi)
+fixes eight exported symbols and their exact shapes, scratch layouts and
+ownership. Six native-observation rows and the lossy/SHA-1 rows are implemented.
+`align_rt_utf8_decode_lossy` and `align_rt_crypto_sha1` both use shape A84,
+returning independently owned pointer/length results from borrowed bytes. Canonical leaf tags are unchanged. Current inventory: 443 keyed,
+461 base, 468 alloc-count, 465 par-map-probe and 472 maximum exports.
+
 **R65 planned contract:** [plan 50](50-r65-process-capability-handoff.md) and
 [plan 49](49-native-process-contract.md), designed and ready for implementation, own the new
 closed operation schemas, writable out provenance, receiver families, Move
@@ -31,7 +39,7 @@ owned JSON, exclusive filesystem publication, retained-root regular-file access,
 lifecycle, HTTP client
 raw/SSE receive streaming, asymmetric signatures, `std.log`, `core.codec`, `pkg.frame`, `pkg.kv`,
 `pkg.csv`, `pkg.ws`, `pkg.template`, named time/path wire formats, incremental SHA-256 host observation and ordinary directory operations, there
-are 426 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
+are 443 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
 `ArrayBuilderNewIn` and `ArrayBuilderPushBytes`; the four
 AEAD symbols that were previously selected from `AeadCipher × AeadDir` become
 ordinary typed keys; they may no longer bypass the registry. Eighteen always-built
@@ -44,7 +52,7 @@ runtime records have no `RuntimeKey` and instead use the eighteen-variant
 `align_rt_f64_from_bits`, `align_rt_f32_text_len`, `align_rt_f64_text_len`,
 `align_rt_f32_text_write`, and `align_rt_f64_text_write`, plus the four compiler-private
 `core.test` child-control rows recorded below and the package-internal checked TCP timeout row
-`align_rt_tcp_conn_set_io_timeout`. The base native registry therefore has 444 records. R63 replaces Request 12's two bounded-only rows with four unified JSON builder rows
+`align_rt_tcp_conn_set_io_timeout`. The base native registry therefore has 461 records. R63 replaces Request 12's two bounded-only rows with four unified JSON builder rows
 (A127–A130), including separate finite-only f32/f64 writers.
 The explicit `alloc-count` runtime feature may expose seven
 test/benchmark-only definitions: the allocation/free and finder counters plus
@@ -56,10 +64,10 @@ test/benchmark-only definitions: the allocation/free and finder counters plus
 `i64 @align_rt_test_par_map_workers()`. `task-group-probe` and
 `crypto-asymmetric-probe` change internal Rust state only and add no unmangled native export.
 
-The compiler-visible native registry is always exactly the 444 base records.
+The compiler-visible native registry is always exactly the 461 base records.
 There is no target option, environment variable, Cargo feature, linked-runtime
 inspection, or other ambient input that changes it. The eleven optional probe
-records extend only the verification-time maximum runtime-export table to 455.
+records extend only the verification-time maximum runtime-export table to 472.
 They never gain a `RuntimeKey`, callable/declaration policy, collision
 reservation, or compatible-extern reuse. Their spellings remain ordinary
 program/extern/export identities in a normal build. Probe-feature runtime
@@ -78,7 +86,7 @@ added six keyed rows, `core.codec` then added eight, `pkg.frame` added two, `pkg
 source-reachable unkeyed row, `pkg.csv` added one keyed row, `pkg.ws` added eleven keyed rows, and
 `pkg.template` added five keyed rows. Their runtime
 definitions and registry entries activated atomically at their respective capability boundaries: the current exact counts
-are 426 keyed records, 444 base records, and 455 records in the maximum optional-probe export table.
+are 443 keyed records, 461 base records, and 472 records in the maximum optional-probe export table.
 No new probe category was introduced. The implemented `pkg.kv` row reuses an existing ABI shape. Its two
 independently useful prerequisites first hardened the shared TCP timeout substrate and existing
 TCP-derived writers without changing a symbol, key, shape, attribute, or count.
@@ -1355,7 +1363,7 @@ A08; the four owner frees use A62. None adds native attributes or optional expor
 
 ### R65 exclusive child scope
 
-Nine keyed rows bring the current inventory to 435 keyed, 453 base, 460
+Nine keyed rows brought the plan-50 inventory to 435 keyed, 453 base, 460
 alloc-count, 457 par-map-probe and 464 maximum exports. Plan 50 owns the
 exact signatures and record order. CommandStartScope uses A19; ScopeOwnerId
 uses A29; ScopeChildren and ScopeReap use A08; ProcessMemberKill uses A04;
@@ -1366,3 +1374,25 @@ exclusive lease until cleanup and restoration complete. MemberInfo is a natural
 16-byte owned record; Reaped is a 48-byte Copy record with status at offset 8.
 The two canonical leaves are Ty 81/82 and Scalar 59/60. No attributes or optional
 exports are added.
+
+
+## Retained observations and identity (plan 54 capability A)
+
+These six keys are inserted alphabetically in RuntimeKey::ALL and in the
+independent declaration golden. All have the ordinary nounwind attribute and
+no curated parameter attributes. No new probe export or canonical type tag is added.
+
+| RuntimeKey | Symbol | Shape |
+| --- | --- | --- |
+| FsDirectoryAccess | align_rt_fs_directory_access | A136: `i32(ptr, i8, i8, i8, ptr)` |
+| FsDirectoryAccessAt | align_rt_fs_directory_access_at | A137: `i32(ptr, ptr, i64, i8, i8, i8, ptr)` |
+| FsDirectoryCreateSymlink | align_rt_fs_directory_create_symlink | A120: `i32(ptr, ptr, i64, ptr, i64)` |
+| FsDirectoryMetadataFollow | align_rt_fs_directory_metadata_follow | A22: `i32(ptr, ptr, i64, ptr)` |
+| FsDirectoryReadLink | align_rt_fs_directory_read_link | A21: `i32(ptr, ptr, i64, i64, ptr)` |
+| OsIdentity | align_rt_os_identity | A03: `i32(ptr)` |
+
+Plan 54 fixes input ordering, numeric/disjointness validation, zero-on-content-error
+scratch, exact output layouts, ownership, native error partition and platform
+requirements. The three access bytes are normalized read/write/execute values,
+not native masks. Identity output has i64 fields at offsets 0 and 8, size 16,
+alignment 8. Read-link output is an independently owned byte-array header.

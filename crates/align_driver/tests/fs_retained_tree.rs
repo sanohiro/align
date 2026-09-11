@@ -161,6 +161,8 @@ const _: extern "C" fn() -> i64 = align_runtime::align_rt_alloc_count;
 const _: extern "C" fn() -> i64 = align_runtime::align_rt_free_count;
 const CLEANUP_HELPER: &str = r#"module helper
 import std.fs
+import std.encoding
+import std.crypto
 pub Holder { directory: fs.directory }
 CursorHolder { cursor: fs.dir_cursor }
 Choice { Held(fs.directory), Empty }
@@ -178,8 +180,15 @@ fn early_mode(directory: fs.directory) -> Result<(), Error> {
   directory.create_dir("../invalid", { return Ok(()); 448 })?
   return Err(Error.Invalid)
 }
+fn inspect_holder(borrow holder: Holder) -> i64 = 1
 fn early() -> Result<(), Error> {
   directory := fs.open_directory(".")?
+  directory.create_symlink("observation-link", "unresolved")?
+  link_bytes := arena { directory.read_link("observation-link", 10)? }
+  decoded := arena { encoding.utf8_decode_lossy("independent") }
+  digest := arena { crypto.sha1("independent") }
+  directory.remove_file("observation-link")?
+  if link_bytes.len() != 10 { return Err(Error.Invalid) }
   cursor := directory.cursor()?
   entry := cursor.next()? else { return Err(Error.Invalid) }
   if entry.name.len() == 0 { return Err(Error.Invalid) }
@@ -197,6 +206,8 @@ pub fn exercise() -> Result<(), Error> {
   owned := optional else { return Err(Error.Invalid) }
   selected := if true { fs.open_directory(".")? } else { fs.open_directory(".")? }
   fixed := [Holder { directory: fs.open_directory(".")? }]
+  fixed_view: slice<Holder> := fixed
+  if inspect_holder(fixed_view[0]) != 1 { return Err(Error.Invalid) }
   mut builder: array_builder<CursorHolder> := array_builder()
   builder.push(CursorHolder { cursor: owned.cursor()? })
   cursor_rows := builder.build()
@@ -246,7 +257,7 @@ fn main() -> i32 {
     );
     if backend_available() {
         for per_unit in [false, true] {
-            for omit in [None, Some("directory"), Some("cursor"), Some("entry")] {
+            for omit in [None, Some("directory"), Some("cursor"), Some("entry"), Some("link-bytes"), Some("decoded")] {
                 let out = run_retained_cleanup_probe(main, per_unit, omit);
                 assert_eq!(
                     out.status.code(),
@@ -298,6 +309,8 @@ fn run_retained_cleanup_probe(
                     block.stmts.retain(|statement| {
                         let remove = matches!(statement, align_mir::Stmt::Drop(slot) if match (omit, function.slots[*slot as usize]) {
                             ("directory", align_sema::Ty::FsDirectory) | ("cursor", align_sema::Ty::FsDirCursor) => true,
+                            ("decoded", align_sema::Ty::String) => true,
+                            ("link-bytes", align_sema::Ty::DynArray(align_sema::Scalar::Int(integer))) => integer.bits == 8 && !integer.signed,
                             ("entry", align_sema::Ty::Struct(id)) => program.structs[id as usize].name == "fs.dir_entry",
                             _ => false,
                         });
