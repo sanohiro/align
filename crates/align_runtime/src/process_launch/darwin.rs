@@ -196,11 +196,11 @@ pub(super) unsafe fn spawn(
     if pid != 0 {
         return Ok(pid);
     }
-    if let Some(cwd) = &command.cwd {
-        if unsafe { libc::chdir(cwd.as_ptr()) } != 0 {
-            unsafe {
-                report_and_exit(error_fd, native_error());
-            }
+    if let Some(cwd) = &command.cwd
+        && unsafe { libc::chdir(cwd.as_ptr()) } != 0
+    {
+        unsafe {
+            report_and_exit(error_fd, native_error());
         }
     }
     if command.new_session {

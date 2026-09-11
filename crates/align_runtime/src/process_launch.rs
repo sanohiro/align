@@ -336,8 +336,11 @@ fn launch_inner(command: &Command, capture: bool, force_group: bool, scoped: boo
         }
     }
     child.started = std::time::Instant::now();
-    child.pid =
+    // Linux's raw syscall returns c_long; Darwin's fork returns pid_t (i32).
+    #[allow(clippy::useless_conversion)]
+    let child_pid =
         i32::try_from(pid).unwrap_or_else(|_| super::panic_abort("invalid native child PID"));
+    child.pid = child_pid;
     if !scoped {
         reservation.children = reservation.children.checked_add(1)
             .unwrap_or_else(|| super::panic_abort("process owner count overflow"));

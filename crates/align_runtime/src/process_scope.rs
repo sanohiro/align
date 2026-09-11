@@ -125,7 +125,7 @@ fn start(command: &Command) -> Result<Box<Scope>, i32> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        return Err(status(libc::ENOTSUP));
+        Err(status(libc::ENOTSUP))
     }
     #[cfg(target_os = "linux")]
     {
@@ -435,11 +435,11 @@ impl Member {
 }
 impl Drop for Scope {
     fn drop(&mut self) {
-        if self.closed {
-            return;
-        }
         #[cfg(target_os = "linux")]
         {
+            if self.closed {
+                return;
+            }
             self.root.stdout.fd.take();
             self.root.stderr.fd.take();
             loop {

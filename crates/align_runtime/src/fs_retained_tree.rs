@@ -186,7 +186,7 @@ fn metadata(stat: &libc::stat) -> Result<Metadata, i32> {
             .filter(|n| *n < 1_000_000_000)
             .ok_or(AL_INVALID)
     };
-    let mode = u32::try_from(stat.st_mode).map_err(|_| AL_INVALID)?;
+    let mode = u32::from(stat.st_mode);
     let kind = match stat.st_mode & libc::S_IFMT {
         libc::S_IFREG => 0,
         libc::S_IFDIR => 1,
@@ -196,7 +196,7 @@ fn metadata(stat: &libc::stat) -> Result<Metadata, i32> {
     Ok(Metadata {
         device,
         inode: u64::try_from(stat.st_ino).map_err(|_| AL_INVALID)?,
-        links: u64::try_from(stat.st_nlink).map_err(|_| AL_INVALID)?,
+        links: u64::from(stat.st_nlink),
         size: i64::try_from(stat.st_size).map_err(|_| AL_INVALID)?,
         modified_seconds: i64::try_from(stat.st_mtime).map_err(|_| AL_INVALID)?,
         changed_seconds: i64::try_from(stat.st_ctime).map_err(|_| AL_INVALID)?,

@@ -480,9 +480,10 @@ obligation above to one invariant-level owner rather than duplicating fixtures.
    ownership and PRs, leaving that edit uncommitted. No version/tag/release is
    requested. Consumer adoption must not be performed to make the register green.
 
-The user has authorized implementation and PRs through merge. The batch
-completion condition is all eight provider requirements closed, not merely the
-first blocker. A reproduced additional compiler defect is recorded and assessed
+This platform handoff authorizes implementation, verification and updating the
+same draft PR branch; it does not authorize merge or a versioned release. Batch
+completion follows the approved platform ledger, with useful macOS relative
+R72 access explicitly deferred rather than claimed delivered. A reproduced additional compiler defect is recorded and assessed
 against the owning matrix; speculative API expansion is not another batch item.
 
 ## 9. Source-of-truth propagation and consumer handoff

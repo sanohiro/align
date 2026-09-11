@@ -50466,10 +50466,74 @@ mod r63_tests {
 #[cfg(test)]
 mod batch_byte_transform_tests {
     use super::*;
+    fn provider_child(mode: &str, timeout: std::time::Duration) -> (u32, std::io::Result<std::process::Output>) {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) { let _=self.0.kill(); let _=self.0.wait(); }
+        }
+        let mut child=Child(std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", "batch_byte_transform_tests::unavailable_digest_provider_aborts", "--nocapture"])
+            .env("ALIGN_SHA1_PROVIDER_REFUSAL_CHILD",mode)
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped())
+            .spawn().expect("provider refusal child"));
+        let deadline=std::time::Instant::now()+timeout;
+        let pid=child.0.id();
+        let result=(|| {
+            let mut stderr=child.0.stderr.take().expect("piped stderr");
+            let fd=stderr.as_raw_fd();
+            let flags=unsafe { libc::fcntl(fd,libc::F_GETFL) };
+            if flags<0 || unsafe { libc::fcntl(fd,libc::F_SETFL,flags|libc::O_NONBLOCK) }<0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut bytes=Vec::new();
+            let mut status=None;
+            let mut eof=false;
+            loop {
+                if std::time::Instant::now()>=deadline {
+                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut,"provider refusal child exceeded deadline"));
+                }
+                let mut buffer=[0u8;1024];
+                match stderr.read(&mut buffer) {
+                    Ok(0) => eof=true,
+                    Ok(count) => {
+                        if bytes.len()+count>16*1024 { return Err(std::io::Error::other("excessive provider diagnostics")); }
+                        bytes.extend_from_slice(&buffer[..count]);
+                    }
+                    Err(error) if matches!(error.kind(),std::io::ErrorKind::WouldBlock|std::io::ErrorKind::Interrupted) => {},
+                    Err(error) => return Err(error),
+                }
+                if status.is_none() {
+                    match child.0.try_wait() {
+                        Ok(value) => status=value,
+                        Err(error) if error.kind()==std::io::ErrorKind::Interrupted => {},
+                        Err(error) => return Err(error),
+                    }
+                }
+                if let Some(status)=status {
+                    if eof { return Ok(std::process::Output { status,stdout:Vec::new(),stderr:bytes }); }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        })();
+        drop(child);
+        (pid,result)
+    }
+
+    #[test]
+    fn provider_refusal_deadline_kills_and_reaps() {
+        let (pid,result)=provider_child("hang",std::time::Duration::from_millis(100));
+        assert_eq!(result.expect_err("nonterminating child must time out").kind(),std::io::ErrorKind::TimedOut);
+        assert_eq!(unsafe { libc::waitpid(i32::try_from(pid).expect("pid"),core::ptr::null_mut(),libc::WNOHANG) },-1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(),Some(libc::ECHILD));
+    }
+
     #[test]
     fn unavailable_digest_provider_aborts() {
         const CHILD: &str = "ALIGN_SHA1_PROVIDER_REFUSAL_CHILD";
-        if std::env::var_os(CHILD).is_some() {
+        if let Some(mode)=std::env::var_os(CHILD) {
+            if mode=="hang" { loop { std::thread::park(); } }
             unsafe extern "C" {
                 fn EVP_set_default_properties(ctx: *mut c_void, properties: *const c_char) -> c_int;
             }
@@ -50478,9 +50542,8 @@ mod batch_byte_transform_tests {
             unsafe { align_rt_crypto_sha1(b"abc".as_ptr(), 3); }
             panic!("unavailable provider returned a digest");
         }
-        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
-            .args(["--exact", "batch_byte_transform_tests::unavailable_digest_provider_aborts", "--nocapture"])
-            .env(CHILD, "1").output().expect("provider refusal child");
+        let (_,output)=provider_child("refuse",std::time::Duration::from_secs(10));
+        let output=output.expect("provider refusal child");
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("crypto: EVP digest failed"));
     }
