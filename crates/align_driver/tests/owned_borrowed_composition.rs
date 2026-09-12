@@ -149,21 +149,26 @@ fn main() -> i32 {
         );
         let files = &[("main.align", source)];
         assert_eq!(
-            build_per_unit_multi("r81-borrowed-task-source-collection-unit", files, "main.align")
-                .link_and_run()
-                .status
-                .code(),
+            build_per_unit_multi(
+                "r81-borrowed-task-source-collection-unit",
+                files,
+                "main.align"
+            )
+            .link_and_run()
+            .status
+            .code(),
             Some(42)
         );
     }
 }
 
 #[test]
-fn faithful_document_digest_and_template_return_path_is_admitted() {
+fn faithful_document_digest_and_template_return_path_is_admitted()
+-> Result<(), Box<dyn std::error::Error>> {
     // R83's full evaluator witness keeps the resource-backed Document shape, nested optional
-    // selectors, and the owned template's seven string leaves. It is a source/per-unit owner;
-    // execution stays in the existing filesystem/native owners.
-    let source = r#"module faithful_document_digest_template
+    // selectors, and the owned template's seven string leaves. Execute the actual native
+    // read/digest/decode graph, including an imported owned return after all source owners expire.
+    let source = r#"module document
 import core.json
 import std.crypto
 import std.encoding
@@ -172,11 +177,11 @@ import std.time
 
 Document { text: string, sha256: string, metadata: fs.metadata }
 Profile { Diagnostics, EditSet, Policy }
-Headers {
+pub Headers {
   STATUS: string, POLICY: Option<string>, EDITSET: Option<string>, SUMMARY: string,
   STDOUT: string, STDERR: string,
 }
-Template {
+pub Template {
   schema_version: i64, artifact_kind: string, template_id: string, preamble_text: string,
   section_headers: Headers, closing_text: string, content_sha256: string,
 }
@@ -254,18 +259,84 @@ fn wrap(borrow root: fs.directory, borrow manifest: Manifest, deadline: i64, bor
   }
 }
 
-fn main() {}
+pub fn select(root_path: str, case: i64) -> Result<Option<Template>, Error> {
+  root := fs.open_directory(root_path)?
+  manifest := Manifest {
+    path: if case == 0 { None } else { Some("document.json".clone()) },
+    hash: if case == 2 { None } else { Some(if case == 3 { "wrong".clone() } else { "EXPECTED_HASH".clone() }) },
+    kind: if case == 4 { None } else { Some("PROVIDER_EDIT".clone()) },
+  }
+  mut remaining := if case == 5 { 1 } else { DOCUMENT_LENGTH }
+  return wrap(root, manifest, time.instant() + 5000000000, remaining)
+}
 "#;
-    assert_clean("r83-faithful-document-digest-template", source);
+    let document = r#"{"schema_version":1,"artifact_kind":"REPAIR","template_id":"template","preamble_text":"before","section_headers":{"STATUS":"status","POLICY":"policy","EDITSET":null,"SUMMARY":"summary","STDOUT":"stdout","STDERR":"stderr"},"closing_text":"after","content_sha256":"payload-digest"}"#;
+    let helper = source
+        .replace(
+            "EXPECTED_HASH",
+            "d48a434fcb457ce65356cceeb7673165b152c048ff23c516ed8e6e4ff996aa35",
+        )
+        .replace("DOCUMENT_LENGTH", &document.len().to_string());
+    let project = composition_project("document")?;
+    std::fs::write(project.dir.join("document.json"), document)?;
+    std::fs::write(project.dir.join("document.align"), &helper)?;
+    let main = format!(
+        r#"import document
+import std.fs
+fn invalid(value: Result<Option<document.Template>, Error>) -> bool = match value {{
+  Err(error) => match error {{ Invalid => true, _ => false }},
+  Ok(_) => false,
+}}
+fn inspect(borrow value: document.Template) {{
+  print(value.schema_version == 1 && value.artifact_kind == "REPAIR" &&
+    value.template_id == "template" && value.preamble_text == "before" &&
+    value.closing_text == "after" && value.content_sha256 == "payload-digest")
+  print(value.section_headers.STATUS == "status" && value.section_headers.SUMMARY == "summary" &&
+    value.section_headers.STDOUT == "stdout" && value.section_headers.STDERR == "stderr")
+  print(match value.section_headers.POLICY {{ Some(text) => text == "policy", None => false }})
+  print(match value.section_headers.EDITSET {{ None => true, Some(_) => false }})
+}}
+fn main() -> Result<(), Error> {{
+  root := {:?}
+  print(match document.select(root, 0)? {{ None => true, Some(_) => false }})
+  print(invalid(document.select(root, 2)))
+  print(invalid(document.select(root, 3)))
+  print(invalid(document.select(root, 4)))
+  print(invalid(document.select(root, 5)))
+  selected := document.select(root, 1)?
+  // Neither the file nor the root, manifest, reader, decoded text or Document owns the result.
+  fs.remove({:?})?
+  match selected {{
+    None => {{ return Err(Error.Invalid) }},
+    Some(value) => inspect(value),
+  }}
+  return Ok(())
+}}
+"#,
+        project.dir.display().to_string(),
+        project.dir.join("document.json").display().to_string()
+    );
+    std::fs::write(project.dir.join("main.align"), main)?;
+    for mode in ["whole", "unit", "thin"] {
+        std::fs::write(project.dir.join("document.json"), document)?;
+        run_composition_mode(
+            &project,
+            mode,
+            0,
+            "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n",
+        )?;
+    }
+    Ok(())
 }
 
 #[test]
-fn owned_measurement_final_digest_field_is_certified_after_canonicalization() {
+fn owned_measurement_final_digest_field_is_certified_after_canonicalization()
+-> Result<(), Box<dyn std::error::Error>> {
     // R83's second blocking consumer returns the 32-field TaskMeasurement after canonicalizing
     // it and assigning content_sha256 (the final StructField(31) in the provider record). Keep the
     // nested identity records and optional edit/completion leaves so this exercises the actual
     // owned-result shape rather than another short Template surrogate.
-    let source = r#"module owned_measurement_final_digest
+    let source = r#"module measurement
 import core.json
 import std.crypto
 import std.encoding
@@ -355,7 +426,7 @@ fn build() -> Result<TaskMeasurement, Error> {
   return Ok(value)
 }
 
-fn main() -> i32 {
+pub fn inspect() -> i32 {
   result := build()
   return match result {
     Err(_) => 0,
@@ -363,23 +434,157 @@ fn main() -> i32 {
   }
 }
 "#;
-    assert_clean("r83-owned-measurement-final-digest", source);
-    if backend_available() {
-        assert_eq!(
-            build_and_run("r83-owned-measurement-final-digest", source)
-                .status
-                .code(),
-            Some(42)
-        );
-        let files = &[("main.align", source)];
-        assert_eq!(
-            build_per_unit_multi("r83-owned-measurement-final-digest-unit", files, "main.align")
-                .link_and_run()
-                .status
-                .code(),
-            Some(42)
-        );
+    let project = composition_project("measurement")?;
+    std::fs::write(project.dir.join("measurement.align"), source)?;
+    std::fs::write(
+        project.dir.join("main.align"),
+        "import measurement\nfn main() -> i32 = measurement.inspect()\n",
+    )?;
+    for mode in ["whole", "unit", "thin"] {
+        run_composition_mode(&project, mode, 42, "")?;
     }
+    Ok(())
+}
+
+// Acquire one private directory atomically; Proj's Drop owns only that acquired directory.
+fn composition_project(name: &str) -> std::io::Result<Proj> {
+    loop {
+        let dir = std::env::temp_dir().join(format!(
+            "align-composition-{name}-{}-{}",
+            std::process::id(),
+            thin_nonce()
+        ));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {
+                let mut project = Proj {
+                    dir,
+                    entry: "main.align".to_string(),
+                };
+                // The retained-directory API rejects symlink components, including macOS
+                // temporary-root aliases. Keep cleanup armed if canonicalization fails.
+                project.dir = std::fs::canonicalize(&project.dir)?;
+                return Ok(project);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn run_composition_mode(
+    project: &Proj,
+    mode: &str,
+    expected_code: i32,
+    expected_stdout: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let entry = project.dir.join(&project.entry);
+    let source = std::fs::read_to_string(&entry)?;
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, &entry.display().to_string(), &source);
+    assert!(
+        !checked.diags.has_errors(),
+        "{mode}: {}",
+        align_driver::format_diagnostics(&sm, &checked.diags)
+    );
+    if !backend_available() {
+        let mut sm = SourceMap::new();
+        let checked = check_per_unit(&mut sm, &entry.display().to_string(), &source);
+        assert!(
+            !checked.diags.has_errors(),
+            "{mode}: {}",
+            align_driver::format_diagnostics(&sm, &checked.diags)
+        );
+        return Ok(());
+    }
+    let (objects, libraries) = if mode == "whole" {
+        let mir = lower_to_mir(&checked.hir);
+        let object = project.dir.join("whole.o");
+        emit_object_file(
+            &mir,
+            &object,
+            BuildTarget::Baseline,
+            Profile::Release,
+            &[],
+            false,
+        )?;
+        (vec![object], mir.link_libs)
+    } else if mode == "unit" {
+        let mut sm = SourceMap::new();
+        let walk = build_per_unit(&mut sm, &entry.display().to_string(), &source);
+        assert!(
+            !walk.diags.has_errors(),
+            "{mode}: {}",
+            align_driver::format_diagnostics(&sm, &walk.diags)
+        );
+        let mut objects = Vec::new();
+        let mut libraries = Vec::new();
+        for (index, unit) in walk.units.iter().enumerate() {
+            let object = project.dir.join(format!("unit{index}.o"));
+            emit_object_file(
+                &unit.mir,
+                &object,
+                BuildTarget::Baseline,
+                Profile::Release,
+                &[],
+                false,
+            )?;
+            objects.push(object);
+            for library in &unit.mir.link_libs {
+                if !libraries.contains(library) {
+                    libraries.push(library.clone());
+                }
+            }
+        }
+        (objects, libraries)
+    } else {
+        assert_eq!(mode, "thin");
+        let built = thin_build(project, &project.cache(), 1);
+        (built.objs, built.link_libs)
+    };
+    let executable = project.dir.join(format!("run-{mode}"));
+    let refs: Vec<_> = objects.iter().map(|path| path.as_path()).collect();
+    link_objects(
+        &align_driver::CDriver::default(),
+        &refs,
+        &executable,
+        &libraries,
+        Profile::Release,
+    )?;
+    let stdout_path = project.dir.join(format!("{mode}.stdout"));
+    let stderr_path = project.dir.join(format!("{mode}.stderr"));
+    let mut command = std::process::Command::new(executable);
+    command.stdout(std::fs::File::create(&stdout_path)?);
+    command.stderr(std::fs::File::create(&stderr_path)?);
+    // The finite document/measurement programs spawn no descendants. File-backed output avoids
+    // a blocked pipe, and the guard is armed before any post-spawn fallible action.
+    struct Running(std::process::Child);
+    impl Drop for Running {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = Running(command.spawn()?);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.0.try_wait()? {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{mode} composition child timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let stdout = std::fs::read_to_string(stdout_path)?;
+    let stderr = std::fs::read_to_string(stderr_path)?;
+    assert_eq!(
+        status.code(),
+        Some(expected_code),
+        "{mode}: stdout={stdout} stderr={stderr}"
+    );
+    assert_eq!(stdout, expected_stdout, "{mode}: stderr={stderr}");
+    Ok(())
 }
 
 fn assert_clean(name: &str, source: &str) {
@@ -959,10 +1164,14 @@ fn main() -> i32 {
         );
         let files = &[("main.align", source)];
         assert_eq!(
-            build_per_unit_multi("r83-faithful-owned-document-return-unit", files, "main.align")
-                .link_and_run()
-                .status
-                .code(),
+            build_per_unit_multi(
+                "r83-faithful-owned-document-return-unit",
+                files,
+                "main.align"
+            )
+            .link_and_run()
+            .status
+            .code(),
             Some(7)
         );
     }
@@ -1031,10 +1240,14 @@ fn main() -> i32 {
         );
         let files = &[("main.align", source)];
         assert_eq!(
-            build_per_unit_multi("r80-owned-option-branch-replacement-unit", files, "main.align")
-                .link_and_run()
-                .status
-                .code(),
+            build_per_unit_multi(
+                "r80-owned-option-branch-replacement-unit",
+                files,
+                "main.align"
+            )
+            .link_and_run()
+            .status
+            .code(),
             Some(42)
         );
     }

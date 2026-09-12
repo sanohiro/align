@@ -115,6 +115,166 @@ pub fn main() -> Result<(), Error> {
 }
 
 #[test]
+fn borrowed_namespace_carriers_preserve_descriptor_authority() {
+    let helper = r#"module helper
+import std.fs
+import std.process
+Namespace { value: Option<process.user_namespace> }
+Commands { first: command, second: command }
+fn descriptors() -> Result<i64, Error> {
+    entries := fs.read_dir("/proc/self/fd")?
+    return Ok(entries.len())
+}
+fn invalid(value: Result<(), Error>) -> bool = match value {
+    Err(error) => match error { Invalid => true, _ => false },
+    Ok(_) => false,
+}
+fn attach(borrow mut target: command, borrow source: Option<process.user_namespace>, slot: i64, expected: i64) -> Result<(), Error> {
+    return match source {
+        None => if slot == 0 { Ok(()) } else { Err(Error.Invalid) },
+        Some(value) => {
+            if descriptors()? != expected { return Err(Error.Invalid) }
+            target.inherit_namespace(value, slot)
+        },
+    }
+}
+fn attach_record(borrow mut target: command, borrow source: Namespace, slot: i64, expected: i64) -> Result<(), Error> {
+    return match source.value {
+        None => if slot == 0 { Ok(()) } else { Err(Error.Invalid) },
+        Some(value) => {
+            if descriptors()? != expected { return Err(Error.Invalid) }
+            target.inherit_namespace(value, slot)
+        },
+    }
+}
+pub fn absent() -> Result<(), Error> {
+    mut target := process.command("/bin/sh", ["sh", "-c", "exit 0"])
+    source: Option<process.user_namespace> := None
+    attach(target, source, 0, 0)?
+    if !invalid(attach(target, source, 7, 0)) { return Err(Error.Invalid) }
+    record := Namespace { value: source }
+    attach_record(target, record, 0, 0)?
+    if !invalid(attach_record(target, record, 7, 0)) { return Err(Error.Invalid) }
+    return Ok(())
+}
+fn prepare() -> Result<Commands, Error> {
+    mut first := process.command("/bin/sh", ["sh", "-c", "test -e /dev/fd/7 && printf ready"])
+    mut second := process.command("/bin/sh", ["sh", "-c", "test -e /dev/fd/7 && printf ready"])
+    first.timeout_ns(5_000_000_000)
+    second.timeout_ns(5_000_000_000)
+    before := descriptors()?
+    source: Option<process.user_namespace> := Some(process.user_namespace("/proc/self/ns/user")?)
+    if descriptors()? != before + 1 { return Err(Error.Invalid) }
+    if !invalid(attach(first, source, 2, before + 1)) { return Err(Error.Invalid) }
+    if descriptors()? != before + 1 { return Err(Error.Invalid) }
+    attach(first, source, 7, before + 1)?
+    if descriptors()? != before + 2 { return Err(Error.Invalid) }
+    if !invalid(attach(first, source, 7, before + 2)) { return Err(Error.Invalid) }
+    if descriptors()? != before + 2 { return Err(Error.Invalid) }
+    record := Namespace { value: source }
+    if !invalid(attach_record(second, record, 1024, before + 2)) { return Err(Error.Invalid) }
+    if descriptors()? != before + 2 { return Err(Error.Invalid) }
+    attach_record(second, record, 7, before + 2)?
+    if descriptors()? != before + 3 { return Err(Error.Invalid) }
+    if !invalid(attach_record(second, record, 7, before + 3)) { return Err(Error.Invalid) }
+    if descriptors()? != before + 3 { return Err(Error.Invalid) }
+    return Ok(Commands { first: first, second: second })
+}
+fn run_commands() -> Result<(), Error> {
+    before := descriptors()?
+    commands := prepare()?
+    // The shared source has expired; only the two explicit command duplicates remain.
+    if descriptors()? != before + 2 { return Err(Error.Invalid) }
+    first_command := commands.first
+    second_command := commands.second
+    first := first_command.run()?
+    second := second_command.run()?
+    again_first := first_command.run()?
+    again_second := second_command.run()?
+    if first.stdout() != "ready" || second.stdout() != "ready" ||
+        again_first.stdout() != "ready" || again_second.stdout() != "ready" {
+        return Err(Error.Invalid)
+    }
+    return Ok(())
+}
+pub fn present() -> Result<(), Error> {
+    before := descriptors()?
+    absent()?
+    if descriptors()? != before { return Err(Error.Invalid) }
+    run_commands()?
+    if descriptors()? != before { return Err(Error.Invalid) }
+    return Ok(())
+}
+"#;
+    let main = if cfg!(target_os = "linux") {
+        "import helper\nfn main() -> Result<(), Error> { helper.present()?\nprint(true)\nOk(()) }\n"
+    } else {
+        "import helper\nfn main() -> Result<(), Error> { helper.absent()?\nprint(true)\nOk(()) }\n"
+    };
+    let files = [("helper.align", helper), ("main.align", main)];
+    let checked = diff_check_multi("verified-borrowed-namespace", &files, "main.align");
+    assert!(
+        !checked.whole_errors && !checked.per_unit_errors,
+        "{}\n{}",
+        checked.whole_diags,
+        checked.per_unit_diags
+    );
+    if backend_available() {
+        for output in [
+            build_and_run_multi("verified-borrowed-namespace", &files, "main.align"),
+            build_per_unit_multi("verified-borrowed-namespace-unit", &files, "main.align")
+                .link_and_run(),
+        ] {
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "true\n");
+        }
+    }
+}
+
+#[test]
+fn borrowed_namespace_payloads_cannot_move_or_escape() {
+    for (name, parameter, selected) in [
+        ("direct", "Option<process.user_namespace>", "source"),
+        ("record", "Namespace", "source.value"),
+    ] {
+        for (action, body) in [
+            (
+                "move",
+                format!(
+                    "fn take(value: process.user_namespace) {{}}\nfn bad(borrow source: {parameter}) {{ match {selected} {{ None => {{}}, Some(value) => take(value), }} }}"
+                ),
+            ),
+            (
+                "escape",
+                format!(
+                    "fn bad(borrow source: {parameter}) -> Result<process.user_namespace, Error> {{ return match {selected} {{ None => Err(Error.Invalid), Some(value) => Ok(value), }} }}"
+                ),
+            ),
+        ] {
+            let source = format!(
+                "import std.process\nNamespace {{ value: Option<process.user_namespace> }}\n{body}\nfn main() {{}}\n"
+            );
+            let checked = diff_check_multi(
+                &format!("verified-borrowed-namespace-{name}-{action}"),
+                &[("main.align", &source)],
+                "main.align",
+            );
+            assert!(
+                checked.whole_errors && checked.per_unit_errors,
+                "{name}/{action} accepted: {}\n{}",
+                checked.whole_diags,
+                checked.per_unit_diags
+            );
+        }
+    }
+}
+
+#[test]
 fn formation_and_carriers() {
     for ty in [
         "fs.memory_writer",

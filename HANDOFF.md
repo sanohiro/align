@@ -26,27 +26,34 @@ The implementation review's native response reported CLEAN after a file-view
 pagination error, but the wrapper rejected that run as INCOMPLETE and retained
 its evidence. It is not a completed review checkpoint. Author inspection also
 found and repaired caller-relative `--output` resolution when invoked from a
-subdirectory; a shared Codex/agy owner closes that case. Complete the unfinished
-review scope before publication; do not use the raw CLEAN response to bypass
-the cycle guard.
+subdirectory; a shared Codex/agy owner closes that case. An independent
+inspection-only continuation completed the uncertain and changed scope with no
+new findings. The original native run remains INCOMPLETE; its raw CLEAN response
+is not a completed host checkpoint.
 
-**R77–R83 consolidated implementation (2026-09-12):**
+**R77–R83 provider composition (2026-09-12):**
 [Plan 56](docs/impl/56-r77-r83-composition-plan.md) includes all seven new requests
-and the appended R80/R81/R83 client cases. Align main implements the six
-selected requests: shared reads, fresh/transferred storage, owned call/return
+and the appended R80/R81/R83 client cases. The implementation merged in #1027
+covers the six selected requests: shared reads, fresh/transferred storage, owned call/return
 certification and the shared namespace carrier. Indexed Move-field calls use
 checked runtime indices for dynamic slice/AoS views and integer-literal indices
 for source-formed fixed `StructArray` places. R78 remains PROPOSED because plan
 23's prerequisite for reopening its deliberate enum exclusion is unmet. The
-focused provider owner now passes 22 whole/per-unit composition cases, including
+focused provider owners cover whole/per-unit composition, including
 the non-loop Option replacement, borrowed Config/task-source forwarding, the
 resource-backed Document path and the 32-field measurement final-digest path.
+R82's native owner exercises direct and record-contained Some carriers, explicit
+descriptor duplication, invalid/duplicate-slot failures, source expiry and final
+descriptor release on Linux. R83's Document owner executes real file reads,
+digest validation and imported None/Err/Some returns after source expiry; it and
+the measurement owner cover whole/per-unit/ThinLTO execution.
 `align_sema::borrow_argument_source` is the shared sema/checked-HIR/MIR seam for
 `StrBorrow`/`ArrayToSlice` field arguments; mutable owning view retypes are rejected,
-and fixed-array slice calls use a materialized descriptor slot. Real client smoke/A2 acceptance,
-managed-pin adoption and platform-specific namespace execution remain external.
-The six selected repairs are merged in #1027; the optimized workspace build
-passed on merged main. Consumer adoption remains external.
+and fixed-array slice calls use a materialized descriptor slot. Real client
+smoke/A2 acceptance, managed-pin adoption and application namespace integration
+remain external. The Linux provider owners pass; macOS retains the portable None
+owner and existing native namespace refusal contract, without a new local macOS
+execution claim.
 
 **R69–R76 macOS qualification (2026-09-11):**
 [Plan 54](docs/impl/54-r69-r76-prerequisite-batch-plan.md) owns all eight requests

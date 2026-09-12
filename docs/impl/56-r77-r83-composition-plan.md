@@ -1,9 +1,10 @@
 # R77–R83 owned and borrowed composition
 
-Status: provider implementation complete on branch `feat/r77-r83-composition`.
+Status: provider implementation merged in #1027.
 R77/R79/R80/R81/R82/R83 are implemented in one provider wave with focused owner
-coverage; R78 is assessed and deferred under plan 23. The branch is not merged,
-and no align-llm consumer adoption or end-to-end client acceptance is claimed.
+coverage; R78 is assessed and deferred under plan 23. R82 native descriptor
+lifecycle and R83 reachable whole/per-unit/ThinLTO owners qualify the provider
+paths below on Linux; align-llm adoption and end-to-end client acceptance remain external.
 
 ## 1. Scope and evidence
 
@@ -36,17 +37,16 @@ still contain "XML" for the shared resource analysis. Do not repair these cases
 in the LLVM emitter or classify them as XML-library defects. Plans 52 and 53
 continue to own read-only backing and independently founded initialization.
 
-On this branch the focused owner `owned_borrowed_composition` passes all 22
-whole/per-unit cases, including the seven-field R83 provider witness. The current
-optimized compiler also accepts the align-llm evaluation-inputs source in
-per-unit mode (`17 unit(s)`, warnings only). These are provider/compiler checks;
-the blocking consumer smoke owners, source-collection witness, full evaluator
-admission and measurement digest remain align-llm-owned and pending.
+The focused owner `owned_borrowed_composition` covers the seven-field R83
+witness and the faithful Document/measurement graphs. The latter execute in
+whole/per-unit/ThinLTO modes. `m11_process_verified` covers R82's shared Some
+carrier through actual Linux descriptor duplication and source expiry. These are
+provider owners; application smoke, managed-pin adoption and A2 remain
+align-llm-owned.
 
 ## 2. Authoritative public-contract ledger
 
-These records describe the six selected targets and the R78 deferral. Existing acceptance remains
-as reported above until the implementation and its owners pass. No new syntax,
+These records describe the six implemented targets and the R78 deferral. No new syntax,
 user-visible type qualifier, implicit clone, runtime descriptor, native helper,
 ambient option, or public function signature is introduced.
 
@@ -212,12 +212,11 @@ do not claim actual namespace inheritance there.
 ## 4. Implementation closure matrix
 
 The matrix remains the closure record for this implementation. The focused driver
-target `owned_borrowed_composition` now covers 22 whole/per-unit cases; existing
-native and malformed-IR owners are reused where they detect the same defect. The
-remaining cells below are consumer-owned or require platform-specific provider
-execution; the faithful provider witnesses are included in the focused target. A
-table-driven owner may close several rows, and no fixture is added per Cartesian
-product cell.
+targets `owned_borrowed_composition` and `m11_process_verified` cover the provider
+composition and native namespace paths; existing malformed-IR owners are reused
+where they detect the same defect. The faithful Document and measurement owners
+execute in whole/per-unit/ThinLTO modes. A table-driven owner may close several
+rows, and no fixture is added per Cartesian product cell.
 
 | Axis | Required cases and implementation evidence | Owner |
 | --- | --- | --- |
@@ -233,7 +232,7 @@ product cell.
 | Read-only and mutable authority | Literal/static/mapped read-only twins, fresh byte-copy writable twin, descriptor copy retaining read-only backing, plain by-value slice versus BorrowMut/Out header/backing, excluded borrowed-owner writes/transfers. | `constants_aggregate` #1026 owners, plans 52/53 producer mutations and composition escape negatives. |
 | Generic and interface transport | Concrete generic admitted records/nested views, indexed Move-field chains with an unbound `T`, imported non-generic summaries, imported generic source rechecking, renamed same-shaped types and source definition mutation/restoration. Exact nominal identity/modes/cleanup survive. | Composition driver whole/per-unit twins and existing interface canonical-graph owners. No new codec fields. |
 | Whole / per-unit / ThinLTO | Check and execute reachable positive programs in both ordinary modes; R83 also uses ThinLTO. Negative producer mutations fail before lowering/native execution in all three entrypoints. An unused/public-only function is insufficient native-execution evidence. | Composition target plus existing three-entrypoint producer helper. |
-| Native provenance and allocation | R82 repeated independent commands, duplicate/invalid slot failure leaving source and command unchanged, source Drop after duplication, None/no hidden syscall, descriptor counts. R77/R80/R81/R83 add no allocation beyond the written clone/copy/build/decode; R79 adds none; R78 changes nothing. | Extend/reuse `m11_process_verified` and runtime `process_verified` ownership controls. Linux actual fd owner, macOS portable/refusal owner. |
+| Native provenance and allocation | R82 repeated independent commands, duplicate/invalid slot failure leaving source and command unchanged, source Drop after duplication, None/no hidden syscall, descriptor counts. R77/R80/R81/R83 add no allocation beyond the written clone/copy/build/decode; R79 adds none; R78 changes nothing. | `m11_process_verified::borrowed_namespace_carriers_preserve_descriptor_authority` and `borrowed_namespace_payloads_cannot_move_or_escape`; existing runtime `process_verified` controls. Linux actual fd owner, macOS portable/refusal owner. |
 | Termination and cached proof | Iterative finite type/equation traversal; no recursive rediscovery loop, success on founded joins, rejection of unseeded cycles; equivalent results for query orders and cached/uncached proof. | MIR invariant owner with bounded/deep graphs and existing plan 53 cycle twins. No new performance claim or benchmark gate. |
 
 ## 5. Complete client acceptance map
@@ -249,11 +248,11 @@ Document/measurement witnesses in
 `crates/align_driver/tests/owned_borrowed_composition.rs`. The same shape was
 checked with the baseline `21b3151e` compiler and still fails in `wrap` with
 `producer return leaf String at [ResultOk, OptionSome, StructField(6)]`; the
-branch passes it in whole and per-unit modes. The source-collection and borrowed
+merged implementation accepts it in whole and per-unit modes. The source-collection and borrowed
 Config witnesses exercise direct field-to-view forwarding, while the full
 Document and 32-field measurement witnesses exercise the distinct field1 and
-field31 paths. Real consumer smoke, managed-pin adoption and platform namespace
-execution remain external acceptance work.
+field31 paths. Real consumer smoke, managed-pin adoption and application namespace
+integration remain external acceptance work.
 
 | Request / additional witness | Required client acceptance |
 | --- | --- |
@@ -288,14 +287,21 @@ The provider witnesses below retain each selected typed call and ownership path:
   and `borrowed_task_source_expansion_keeps_owned_rows_and_source_reusable` keep
   the borrowed source reusable after independent output construction.
 - `owned_borrowed_composition::faithful_document_digest_and_template_return_path_is_admitted`
-  retains the resource-backed Document and nested optional selectors.
+  executes the resource-backed Document read/hash/decode path through an imported
+  helper, checks None/Err/Some and uses the owned result after source expiry in
+  whole/per-unit/ThinLTO modes.
 - `owned_borrowed_composition::owned_measurement_final_digest_field_is_certified_after_canonicalization`
-  retains the exact 32-field result shape and final `content_sha256` replacement.
+  executes the exact 32-field result shape and final `content_sha256` replacement
+  through an imported module in whole/per-unit/ThinLTO modes.
+- `m11_process_verified::borrowed_namespace_carriers_preserve_descriptor_authority`
+  exercises direct and record-contained Some carriers, independent command
+  duplicates, source expiry, failure preservation and final descriptor counts.
+  `borrowed_namespace_payloads_cannot_move_or_escape` checks both carrier shapes.
 
-These close the provider-side composition cells. The real align-llm smoke suites,
-managed-pin adoption, canonical measurement goldens and platform-specific native
-execution remain consumer-owned. They gate ALIGN_LLM_VERIFIED and CLOSED after the
-provider commit is merged; no provider result claims that later client work passed.
+These owners cover the provider-side composition cells. The real align-llm smoke
+suites, managed-pin adoption, canonical measurement goldens and application
+namespace integration remain consumer-owned. They gate ALIGN_LLM_VERIFIED and
+CLOSED; no provider result claims that later client work passed.
 
 ## 6. Implementation and remaining handoff
 
@@ -304,8 +310,8 @@ provider commit is merged; no provider result claims that later client work pass
    answer/status update permitted by `AGENTS.md`.
 2. The focused driver owner records the selected positive/negative paths,
    including the Config, source-collection, full Document and 32-field measurement
-   witnesses named in §5. Provider-side composition acceptance is complete; real
-   consumer adoption remains external.
+   witnesses named in §5. R82 native and R83 reachable execution owners complement
+   that coverage; real consumer adoption remains external.
 3. Shared projection/read authority (R77/R79), fresh/transferred storage facts
    (R80), shared call arguments and owned return leaves (R81/R83), and the R82
    namespace carrier are implemented together. The MIR producer remains the
@@ -316,8 +322,7 @@ provider commit is merged; no provider result claims that later client work pass
 5. The author matrix-to-diff pass and focused owner checks are complete for the
    implemented surface. The view-wrapper source is normalized once by
    `align_sema::borrow_argument_source` and replayed by checked HIR and MIR, so
-   direct field forwarding cannot diverge between stages. Repository preflight
-   remains the publication step for the final pushed SHA.
+   direct field forwarding cannot diverge between stages.
 
 Deliver one consolidated capability PR, not one PR per request or a dormant
 producer/consumer chain. More than roughly 1,000 handwritten lines is plausible:
@@ -339,7 +344,7 @@ namespace owners when its carrier is implemented. Do not run an unrelated DB
 service gate or whole workspace suite just to author this design. Code publication
 still follows the then-applicable repository gate and explicit owner direction.
 A request batch implementation requires the normal final optimized workspace
-build; it is still required before this branch is published.
+build.
 
 ## 7. Documentation and completion
 
@@ -352,9 +357,8 @@ evidence and point to this extension; the HIR ledger records the implemented
 replay obligations. Runtime ABI/JSON codec ledgers need no new record because
 their contracts do not change. HANDOFF records this capability boundary once.
 
-R77/R79/R80/R81/R82/R83 are `IMPLEMENTING` on this unmerged provider branch;
-they become `ALIGN_MERGED` only with a merged provider commit and become
-verified/closed only with recorded client acceptance. R78 remains `PROPOSED`
+R77/R79/R80/R81/R82/R83 have a merged provider implementation in #1027;
+verified/closed status still requires recorded client acceptance. R78 remains `PROPOSED`
 under plan 23. Do not advance a row merely because a control or unrelated real
 client passes. Recheck the register before publication so additional numbered
 requests or appended acceptance are handled together.
@@ -365,23 +369,31 @@ The baseline compiler rebuild succeeded. The seven original standalone sources
 have the check/per-unit outcomes in §1; all seven syntax-format successfully.
 The seven-field R83 provider witness was also run through the baseline binary and
 reproduced the `StructField(6)` producer rejection before the branch repair.
-On this branch, `owned_borrowed_composition` passes all 22 whole/per-unit cases,
-the producer and codegen malformed Store/Load owners pass, and the current
-optimized compiler accepts the align-llm evaluation-inputs source in per-unit
-mode (`17 unit(s)`, warnings only). These checks do not claim consumer execution,
-DB verification or align-llm adoption.
+The original provider verification recorded 22 passing composition cases and
+passing producer/codegen malformed Store/Load owners. The optimized compiler
+also accepted the align-llm evaluation-inputs source in per-unit mode
+(`17 unit(s)`, warnings only). That evidence did not exercise the faithful
+Document's native path or R82's Some carrier. The provider owners now execute
+those paths and add R83 ThinLTO coverage, as mapped in §§4–5.
+
+The Linux follow-up verification passed all nine `m11_process_verified` tests
+and all 22 composition tests across focused runs. Both R83 native owners passed
+whole/per-unit/ThinLTO execution with imported modules, so ThinLTO exercises a
+multi-unit build. The R82 owner verifies source expiry, command reuse and final
+descriptor counts. Its macOS None path is present but was not executed on this
+host. Provider checks do not claim consumer execution, DB verification or
+align-llm adoption.
 
 The author ledger-to-prose and matrix-to-diff pass covers the implemented rows
-against §§3–6. The appended provider witnesses now pass in whole/per-unit modes;
-consumer adoption and platform-specific runtime owners remain explicitly pending.
+against §§3–6. The appended provider owners cover the execution modes and native
+lifecycle paths listed above; consumer adoption remains external.
 The appendix matches the seven baseline inputs, local links resolve, and
 `git diff --check` passes. A final register rescan still ends at R83. The fresh
 inspection of the `409defb0` candidate found four implementation-closure issues:
 mutable owning view retypes, fixed-array slice descriptors, root view-retype
 authentication and generic indexed-field dispatch. The follow-up repairs close
-those four classes with focused owner cases. The final candidate's full and
-changed-slice host inspections reported no actionable defects; release build,
-preflight and publication remain.
+those four classes with focused owner cases. The implementation's full and
+changed-slice host inspections reported no actionable defects.
 
 | Finding | Closure |
 | --- | --- |
@@ -391,7 +403,7 @@ preflight and publication remain.
 The initial reviewer inspected all seven contracts, added clients, sema/MIR
 seams, readiness/cache rules and native namespace boundaries without builds or
 tests. Its findings and the follow-up provider closure are recorded above; the
-final candidate received a clean host inspection, and the owner suite uses the
+merged implementation received a clean host inspection, and the owner suite uses the
 existing whole/per-unit/ThinLTO rejection helpers.
 
 ## Appendix A. Exact reported standalone sources
