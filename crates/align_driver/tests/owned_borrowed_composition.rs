@@ -456,10 +456,14 @@ fn composition_project(name: &str) -> std::io::Result<Proj> {
         ));
         match std::fs::create_dir(&dir) {
             Ok(()) => {
-                return Ok(Proj {
+                let mut project = Proj {
                     dir,
                     entry: "main.align".to_string(),
-                });
+                };
+                // The retained-directory API rejects symlink components, including macOS
+                // temporary-root aliases. Keep cleanup armed if canonicalization fails.
+                project.dir = std::fs::canonicalize(&project.dir)?;
+                return Ok(project);
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
