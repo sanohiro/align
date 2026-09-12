@@ -1708,7 +1708,7 @@ pub fn borrowed_sum_payload_is_admissible(
         match ty {
             Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Unit | Ty::Str | Ty::String
             | Ty::Slice(_) | Ty::Raw | Ty::Rng | Ty::Buffer | Ty::Writer | Ty::ProcessMember
-            | Ty::ProcessUserNamespace | Ty::FsDirectory | Ty::FsDirCursor => true,
+            | Ty::ProcessUserNamespace | Ty::FsDirectory | Ty::FsDirCursor | Ty::Command => true,
             Ty::Struct(id) => {
                 if !active_structs.insert(id) {
                     return false;
@@ -16245,7 +16245,7 @@ impl EffectScan<'_> {
             }
             ExprKind::ArrayBuilderBuild(builder) => walk!(builder),
             ExprKind::FsReadFile { path } | ExprKind::FsCreatePrivateTempDir { prefix: path }
-            | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
+            | ExprKind::ReaderOpen { path, .. } | ExprKind::WriterCreate { path }
             | ExprKind::CreateExclusive { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path }
             | ExprKind::FsCreateDir { path } | ExprKind::FsIsDir { path } | ExprKind::FsRemoveEmptyDir { path } | ExprKind::FsReadDir { path }
@@ -28053,7 +28053,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(index, depth);
             }
             ExprKind::FsReadFile { path } | ExprKind::FsCreatePrivateTempDir { prefix: path }
-            | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
+            | ExprKind::ReaderOpen { path, .. } | ExprKind::WriterCreate { path }
             | ExprKind::CreateExclusive { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path }
             | ExprKind::FsCreateDir { path } | ExprKind::FsIsDir { path } | ExprKind::FsRemoveEmptyDir { path } | ExprKind::FsReadDir { path }
@@ -45208,7 +45208,7 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, index, moved, false, false);
             }
             ExprKind::FsReadFile { path } | ExprKind::FsCreatePrivateTempDir { prefix: path }
-            | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
+            | ExprKind::ReaderOpen { path, .. } | ExprKind::WriterCreate { path }
             | ExprKind::CreateExclusive { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path }
             | ExprKind::FsCreateDir { path } | ExprKind::FsIsDir { path } | ExprKind::FsRemoveEmptyDir { path } | ExprKind::FsReadDir { path }
@@ -48873,9 +48873,11 @@ impl<'a, 't> Checker<'a, 't> {
         let sname = self.structs[id as usize].name.clone();
 
         let mut values: Vec<Option<Expr>> = (0..layout.len()).map(|_| None).collect();
+        let mut source_order = Vec::with_capacity(fields.len());
         for fi in fields {
             match layout.iter().position(|(n, _)| *n == fi.name.name) {
                 Some(idx) => {
+                    source_order.push(idx);
                     if values[idx].is_some() {
                         self.diags
                             .error(format!("duplicate field '{}'", fi.name.name), fi.span);
@@ -48908,7 +48910,7 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
         }
-        Expr { kind: ExprKind::StructLit { struct_id: id, fields: out }, ty: Ty::Struct(id), span }
+        self.ordered_struct_literal(id, out, &source_order, span)
     }
 
     /// A generic struct literal `Pair { a: 1, b: 2 }`: check each field value, infer the type
@@ -48918,9 +48920,11 @@ impl<'a, 't> Checker<'a, 't> {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let mut subst: Vec<Option<Ty>> = vec![None; tmpl.type_params.len()];
         let mut values: Vec<Option<Expr>> = (0..tmpl.fields.len()).map(|_| None).collect();
+        let mut source_order = Vec::with_capacity(fields.len());
         for fi in fields {
             match tmpl.fields.iter().position(|f| f.name == fi.name.name) {
                 Some(idx) => {
+                    source_order.push(idx);
                     if values[idx].is_some() {
                         self.diags.error(format!("duplicate field '{}'", fi.name.name), fi.span);
                     }
@@ -48966,7 +48970,33 @@ impl<'a, 't> Checker<'a, 't> {
             }
         }
         let id = self.instantiate_struct(name, tmpl, &args, span);
-        Expr { kind: ExprKind::StructLit { struct_id: id, fields: out }, ty: Ty::Struct(id), span }
+        self.ordered_struct_literal(id, out, &source_order, span)
+    }
+
+    /// Snapshot source-ordered initializers before rearranging fields for the HIR layout.
+    /// Already ordered literals need no extra bindings. The ordinary Let/Block machinery owns
+    /// type finalization, provenance, source nulling, early-exit cleanup and final field transfer.
+    fn ordered_struct_literal(&mut self, id: u32, mut fields: Vec<Expr>, order: &[usize], span: Span) -> Expr {
+        let direct = |fields| Expr {
+            kind: ExprKind::StructLit { struct_id: id, fields }, ty: Ty::Struct(id), span,
+        };
+        if order.iter().copied().eq(0..fields.len()) || self.diags.has_errors() {
+            return direct(fields);
+        }
+        let mut stmts = Vec::with_capacity(fields.len());
+        for &index in order {
+            let Some(field) = fields.get_mut(index) else { return direct(fields); };
+            let local = self.declare(&format!("$field{}", self.locals.len()), field.ty, false);
+            // Synthetic names are never source-visible, including to later nested captures.
+            self.scope.pop();
+            let snapshot = Expr { kind: ExprKind::Local(local), ty: field.ty, span: field.span };
+            let init = std::mem::replace(field, snapshot);
+            stmts.push(Stmt::Let { local, init });
+        }
+        Expr {
+            kind: ExprKind::Block(Block { stmts, value: Some(Box::new(direct(fields))) }),
+            ty: Ty::Struct(id), span,
+        }
     }
 
     /// A binary op with a **vector** operand: returns its `(element, width)` after broadcasting a
@@ -51380,10 +51410,10 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.fs", "fs.create_private_temp_dir", span);
                 return self.check_fs_create_private_temp_dir(args, span);
             }
-            // `fs.open(path)` -> Result<reader, Error>; `fs.create(path)` -> Result<writer, Error>.
-            if module == "fs" && (method == "open" || method == "create") {
+            // `fs.open/open_regular(path)` -> Result<reader, Error>; `fs.create(path)` -> Result<writer, Error>.
+            if module == "fs" && matches!(method, "open" | "open_regular" | "create") {
                 self.require_import("std.fs", &format!("fs.{method}"), span);
-                return self.check_fs_open_create(method == "create", args, span);
+                return self.check_fs_open_create(method, args, span);
             }
             // `fs.create_exclusive(path)` -> Result<writer, Error>; the final entry must be absent.
             if module == "fs" && method == "create_exclusive" {
@@ -60043,21 +60073,24 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// `fs.open(path)` -> `Result<reader, Error>` / `fs.create(path)` -> `Result<writer, Error>`.
+    /// `fs.open/open_regular(path)` -> `Result<reader, Error>` / `fs.create(path)` -> `Result<writer, Error>`.
     /// Open (`create` = create/truncate) `path` (a `str`, owned `string` auto-borrowed); the handle
     /// owns its fd (closed on `Drop`). A builtin, dispatched like `fs.read_file`.
-    fn check_fs_open_create(&mut self, create: bool, args: &[ast::Expr], span: Span) -> Expr {
-        let name = if create { "fs.create" } else { "fs.open" };
+    fn check_fs_open_create(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let name = format!("fs.{method}");
         if args.len() != 1 {
             self.diags
                 .error(format!("'{name}' expects 1 argument (the path), got {}", args.len()), span);
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         }
         let path = self.check_str_init(&args[0]);
-        let (kind, ok) = if create {
+        if path.ty == Ty::Error {
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        }
+        let (kind, ok) = if method == "create" {
             (ExprKind::WriterCreate { path: Box::new(path) }, Scalar::Writer)
         } else {
-            (ExprKind::ReaderOpen { path: Box::new(path) }, Scalar::Reader)
+            (ExprKind::ReaderOpen { path: Box::new(path), regular_only: method == "open_regular" }, Scalar::Reader)
         };
         Expr {
             kind,
@@ -62881,6 +62914,13 @@ impl<'a, 't> Checker<'a, 't> {
         let ExprKind::Local(local) = receiver.kind else {
             return false;
         };
+        if self.borrowed_projection_places.contains_key(&local) {
+            self.diags.error(
+                format!("cannot {action} borrowed match payload '{handle_type}' in '{method}'"),
+                receiver.span,
+            );
+            return false;
+        }
         let Some(position) = self
             .current_params
             .iter()
@@ -66194,7 +66234,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(index);
             }
             ExprKind::FsReadFile { path } | ExprKind::FsCreatePrivateTempDir { prefix: path }
-            | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
+            | ExprKind::ReaderOpen { path, .. } | ExprKind::WriterCreate { path }
             | ExprKind::CreateExclusive { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path }
             | ExprKind::FsCreateDir { path } | ExprKind::FsIsDir { path } | ExprKind::FsRemoveEmptyDir { path } | ExprKind::FsReadDir { path }

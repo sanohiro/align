@@ -288,6 +288,10 @@ User {
 
 There is no class / inheritance.
 
+Record initializer expressions evaluate once, in written order, capturing each value before
+evaluating the next initializer. Field layout and JSON output retain declaration order.
+A later initializer cannot read an owner consumed by an earlier initializer.
+
 An owned `array<string>` is a valid ordinary struct field. Its Drop walks the initialized strings
 before freeing the array buffer. The shipped borrowed JSON schema still excludes it; the shipped
 direct-owned JSON route in §18.1 admits it in a closed flat record. The accepted recursive owned
@@ -349,7 +353,7 @@ common unwrap / propagate cases.
 When the scrutinee is a stable place whose complete root/path pair has a direct shared or exclusive
 borrow fact — either the borrowed parameter itself or a checked struct-field path below it — `match`
 performs a read-only projection. A descendant field's borrow fact does not promote an owning parent
-or a mixed-provenance local. The selected payload must be a Copy scalar/view, `string`, `buffer`, `writer`, an ordinary
+or a mixed-provenance local. The selected payload must be a Copy scalar/view, `string`, `buffer`, `writer`, `command`, an ordinary
 dynamic scalar/AoS-record array, or a finite acyclic struct, `Option`, `Result`, or user sum whose
 reachable leaves recursively have those forms. The array element must satisfy the same closed
 grammar. Fixed and specialized arrays, tuples, other collections, resources, other opaque handles, and
@@ -3058,6 +3062,7 @@ fs.read_bytes_view(path: str) -> Result<bytes, Error>
   // `str` view would reject. Same arena region rule — the view cannot escape the arena.
 fs.write_file(path: str, data: str | bytes | builder) -> Result<(), Error>
 fs.open(path: str)   -> Result<reader, Error>
+fs.open_regular(path: str) -> Result<reader, Error>
 fs.create(path: str) -> Result<writer, Error>
 fs.create_exclusive(path: str) -> Result<writer, Error>
 fs.rename_no_replace(source: str, destination: str) -> Result<(), Error>
@@ -4380,3 +4385,17 @@ are Impure and use the existing Error model. Observations grant no snapshot,
 writability, source immutability or identity-conditional deletion guarantee.
 The exact validation precedence, ownership, platform/race limits and ABI are in
 [the retained byte-tree ledger](docs/impl/45-retained-byte-tree-plan.md).
+
+### Ordinary-path regular-file admission
+
+`fs.open_regular(path: str) -> Result<reader, Error>` is Impure and supports Linux/macOS.
+It resolves ordinary relative/absolute paths, dot components and symlinks. It opens read-only
+with nonblocking admission, checks the opened descriptor is a regular file, restores blocking
+mode and returns that same descriptor as an owned reader. Non-regular objects return
+`Error.Invalid` without waiting for a FIFO writer; ordinary open errors retain the existing
+mapping. UTF-8 and embedded-NUL validation precede filesystem operations. An empty path keeps
+ordinary OS error mapping. No entry is created or content written. The result retains no path
+lifetime; existing reader Drop closes its close-on-exec descriptor. Pathname replacement may
+select either object at open, but only the selected regular descriptor can be returned.
+This is not a sandbox, a stable-content guarantee or an interruptibility guarantee for remote
+filesystem operations. Application code owns admission policy beyond regular-file kind.

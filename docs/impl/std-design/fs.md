@@ -81,6 +81,21 @@ fs.remove_empty_dir(path: str) -> Result<(), Error>
 
 ## Public contract
 
+### Ordinary-path regular-file admission
+
+`fs.open_regular(path: str) -> Result<reader, Error>` is Impure and supports Linux/macOS.
+It resolves ordinary relative/absolute paths, dot components and symlinks. It opens read-only
+with nonblocking admission, checks the opened descriptor is a regular file, restores blocking
+mode and returns that same descriptor as an owned reader. Non-regular objects return
+`Error.Invalid` without waiting for a FIFO writer; ordinary open errors retain the existing
+mapping. UTF-8 and embedded-NUL validation precede filesystem operations. An empty path keeps
+ordinary OS error mapping. No entry is created or content written. The result retains no path
+lifetime; existing reader Drop closes its close-on-exec descriptor. Pathname replacement may
+select either object at open, but only the selected regular descriptor can be returned.
+This is not a sandbox, a stable-content guarantee or an interruptibility guarantee for remote
+filesystem operations. Application code owns admission policy beyond regular-file kind.
+
+
 ### `create_exclusive`
 
 `create_exclusive` performs one native exclusive open equivalent to

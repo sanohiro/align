@@ -11920,6 +11920,19 @@ fn hir_body_validator_native() {
         body_test_expr(
             hir::ExprKind::ReaderOpen {
                 path: Box::new(native_str()),
+                regular_only: false,
+            },
+            native_result(Ty::Reader, error),
+        ),
+        Vec::new(),
+        native_result(Ty::Reader, error)
+    );
+    add!(
+        "native_reader_open_regular",
+        body_test_expr(
+            hir::ExprKind::ReaderOpen {
+                path: Box::new(native_str()),
+                regular_only: true,
             },
             native_result(Ty::Reader, error),
         ),
@@ -18607,6 +18620,32 @@ fn readonly_text_bytes_checked_hir_replay() -> Result<(), &'static str> {
             assert!(body_core_metadata_is_valid(&program), "{name}/{write} must remain structurally valid");
             assert_eq!(align_sema::checked_hir_body_facts_are_valid(&program), !write, "{name}/{write}");
             assert_eq!(lower_program_checked(&program, false, None).is_ok(), !write, "{name}/{write}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn reordered_record_snapshots_replay_ownership_and_initialization() -> Result<(), &'static str> {
+    let base = checked_source_program(r#"
+Inner { text: string }
+Outer { value: Inner, digest: string }
+fn build(value: Inner) -> Outer = Outer { digest: value.text.clone(), value: value }
+fn main() {}
+"#);
+    assert!(!is_empty(&lower_program(&base)));
+    for mutation in 0..2 {
+        let mut malformed = base.clone();
+        let function = malformed.fns.iter_mut().find(|f| f.name == "build").ok_or("build")?;
+        let expression = function.body.value.as_mut().ok_or("tail")?;
+        let hir::ExprKind::Block(block) = &mut expression.kind else { panic!("source-order snapshots"); };
+        assert_eq!(block.stmts.len(), 2);
+        if mutation == 0 { block.stmts.swap(0, 1); } else { block.stmts.remove(0); }
+        assert_replay_rejects_without_mutating(malformed.clone(), "invalid record initializer snapshots");
+        let source_map = SourceMap::new();
+        for lowered in [lower_program(&malformed), lower_program_located(&malformed, &source_map),
+            lower_program_per_unit(&malformed), lower_program_per_unit_located(&malformed, &source_map)] {
+            assert!(is_empty(&lowered), "invalid snapshot mutation {mutation} published MIR");
         }
     }
     Ok(())

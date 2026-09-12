@@ -30,6 +30,8 @@ mod process_launch;
 mod process_table;
 mod fs_directory;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+mod fs_regular;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod fs_retained_tree;
 pub use crypto_asymmetric::*;
 mod csv;
@@ -10269,6 +10271,23 @@ pub unsafe extern "C" fn align_rt_io_reader_open(path: *const u8, path_len: i64,
         }
         Err(e) => io_error_to_status(&e),
     }
+}
+
+/// `fs.open_regular(path)` admits a regular file using the same descriptor it returns.
+/// Ordinary path resolution follows symlinks; nonblocking admission never waits for a FIFO writer.
+///
+/// # Safety
+/// Positive input ranges must be live and readable. `out` must designate one live writable reader
+/// pointer slot. Numerical range/alignment/overlap rejection leaves output untouched; after that
+/// preflight every failure leaves null. A successful result transfers one owned reader to the caller.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_reader_open_regular(
+    path: *const u8, path_len: i64, out: *mut *mut Reader,
+) -> i32 {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    { unsafe { fs_regular::open(path, path_len, out) } }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    { let _ = (path, path_len, out); AL_INVALID }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

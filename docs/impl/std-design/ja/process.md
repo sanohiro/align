@@ -678,3 +678,7 @@ implementation acceptance と consumer adoption には次が必要である:
 4. align-llm は、named merged implementation commit を pin し、focused helper/adapter target が 65,536/262,144
    bound、timeout/cap precedence、process-group cleanup、arbitrary-byte tier を証明し、その capability wave の final
    `make ci` が通った後だけ request を進められる。
+
+`Option<command>` と既存のレコード・直和の入れ子を共有借用で match すると、読み取り専用の
+command を射影する。`start_scope` は既存の共有 receiver と明示的な child_scope の所有権を
+維持する。match は command の複製・所有権移転や、設定変更・消費を許可しない。

@@ -744,7 +744,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::FsCreatePrivateTempDir { prefix, out } => {
             format!("fs_create_private_temp_dir({}, -> _{out})", operand_str(prefix))
         }
-        Rvalue::ReaderOpen { path, out } => format!("fs_open({}, -> _{out})", operand_str(path)),
+        Rvalue::ReaderOpen { path, regular_only, out } => format!("{}({}, -> _{out})", if *regular_only { "fs_open_regular" } else { "fs_open" }, operand_str(path)),
         Rvalue::ReaderOpenBeneath {
             root,
             relative,

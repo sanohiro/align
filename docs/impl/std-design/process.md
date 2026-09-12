@@ -723,3 +723,8 @@ Implementation acceptance and consumer adoption require:
 4. align-llm may advance the request only after it pins the named merged implementation commit and
    its focused helper/adapter target proves the 65,536/262,144 bounds, timeout/cap precedence,
    process-group cleanup, and arbitrary-byte tier before the capability wave's final `make ci`.
+
+Shared matching of an optional `command` (including existing admitted record/sum carriers)
+projects a read-only command. `start_scope` retains its existing shared receiver and explicit
+child-scope ownership. Matching never clones or transfers the command and cannot authorize
+configuration mutation or consumption.

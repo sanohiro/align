@@ -1920,3 +1920,17 @@ process workflows remain supported; Linux-only kernel guarantees have a stated
 unsupported-host result instead of an administrator-service prerequisite. This
 supersedes the earlier extra PID-namespace/init proposal and its unnecessary
 bootstrap/deployment obligations. The design and independent-review corrections are complete; implementation follows plans 49–50.
+
+## Client admission and initializer order
+
+Record construction evaluates source expressions in written order and only then arranges their
+values in declaration order. Existing local ownership and cleanup implement these snapshots;
+layout cannot silently reorder a clone after the move of its source. Shared optional commands
+reuse the same read-only payload projection as other admitted handles. JSON encoding reads that
+projection and keeps its independently owned output.
+
+Ordinary-path `fs.open_regular` complements the strict retained-root constructors: it preserves
+ordinary symlinks/dot paths while binding regular-file admission to the returned descriptor.
+Nonblocking open precedes descriptor metadata so a FIFO cannot wait for a writer first.
+The filesystem operation supplies safe fd ownership; application command policy remains in Align.
+See [plan 58](impl/58-r84-r88-client-batch-plan.md).

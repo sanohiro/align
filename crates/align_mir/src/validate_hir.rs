@@ -8688,7 +8688,7 @@ impl<'a> BodyValidator<'a> {
                 (prefix.ty == Ty::Str).then(|| result(Ty::String, &[prefix.as_ref()]))?
             }
             hir::ExprKind::ReaderStdin => (expression.ty == Ty::Reader).then_some((Ty::Reader, true, Vec::new())),
-            hir::ExprKind::ReaderOpen { path } => {
+            hir::ExprKind::ReaderOpen { path, .. } => {
                 (path.ty == Ty::Str).then(|| result(Ty::Reader, &[path.as_ref()]))?
             }
             hir::ExprKind::ReaderOpenBeneath { root, relative } => (root.ty == Ty::Str

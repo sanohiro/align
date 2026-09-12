@@ -893,7 +893,7 @@ fn walk_body_records<'a>(
                 | ExprKind::JsonScan { input: recv, .. }
                 | ExprKind::FsReadFile { path: recv }
                 | ExprKind::FsCreatePrivateTempDir { prefix: recv }
-                | ExprKind::ReaderOpen { path: recv }
+                | ExprKind::ReaderOpen { path: recv, .. }
                 | ExprKind::WriterCreate { path: recv }
                 | ExprKind::CreateExclusive { path: recv }
                 | ExprKind::ReaderBuffered { reader: recv }

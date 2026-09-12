@@ -182,6 +182,10 @@ User  { id: i64, name: str }              // struct (field: Type bodies)
 Shape { Circle(f32), Rect(f32, f32) }     // sum type (variant bodies)
 ```
 
+Record initializer expressions evaluate once, in written order, capturing each value before
+evaluating the next initializer. Field layout and JSON output retain declaration order.
+A later initializer cannot read an owner consumed by an earlier initializer.
+
 A sum type models variation (there is no class / inheritance). Construct with `Type.Variant`
 (`Shape.Circle(3.0)`); branch with an exhaustive `match` expression (every variant covered or a
 `_` wildcard — a missing variant is a compile error). Several variants share one arm with an
@@ -191,7 +195,7 @@ types; `match` works on them, with `else`-unwrap and `?` as the common-case shor
 When the scrutinee is a stable place whose complete root/path pair has a direct shared or exclusive
 borrow fact — the borrowed parameter itself or a checked struct-field path below it — `match` reads
 the tag and active payload in place. A descendant field fact does not promote an owning parent or a
-mixed-provenance local. Borrowed mode admits Copy scalars/views, `string`, `buffer`, `writer`, ordinary dynamic scalar
+mixed-provenance local. Borrowed mode admits Copy scalars/views, `string`, `buffer`, `writer`, `command`, ordinary dynamic scalar
 and AoS record arrays, and finite acyclic structs and tagged values built recursively from those
 forms; array elements obey the same closed grammar. Fixed and specialized arrays, tuples, other
 collections, resources, other opaque handles, and other unsupported Move shapes retain the borrowed-place
@@ -1911,3 +1915,17 @@ are Impure and use the existing Error model. Observations grant no snapshot,
 writability, source immutability or identity-conditional deletion guarantee.
 The exact validation precedence, ownership, platform/race limits and ABI are in
 [the retained byte-tree ledger](impl/45-retained-byte-tree-plan.md).
+
+### Ordinary-path regular-file admission
+
+`fs.open_regular(path: str) -> Result<reader, Error>` is Impure and supports Linux/macOS.
+It resolves ordinary relative/absolute paths, dot components and symlinks. It opens read-only
+with nonblocking admission, checks the opened descriptor is a regular file, restores blocking
+mode and returns that same descriptor as an owned reader. Non-regular objects return
+`Error.Invalid` without waiting for a FIFO writer; ordinary open errors retain the existing
+mapping. UTF-8 and embedded-NUL validation precede filesystem operations. An empty path keeps
+ordinary OS error mapping. No entry is created or content written. The result retains no path
+lifetime; existing reader Drop closes its close-on-exec descriptor. Pathname replacement may
+select either object at open, but only the selected regular descriptor can be returned.
+This is not a sandbox, a stable-content guarantee or an interruptibility guarantee for remote
+filesystem operations. Application code owns admission policy beyond regular-file kind.
