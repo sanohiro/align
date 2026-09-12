@@ -2643,6 +2643,7 @@ for script in \
   scripts/test-apt-llvm.sh \
   scripts/test-binaries-lib.sh \
   scripts/test-pr-workflow.sh \
+  scripts/test-review-bounded.sh \
   scripts/test-pr.sh \
   scripts/verify-prebuilt-cache-layout.sh
 do
@@ -2653,3 +2654,4 @@ done
 # one day; its branches are executed here, root-free and offline, so the same
 # self-test step that guards the PR machinery also guards the installer.
 bash "$repo_root/scripts/test-apt-llvm.sh"
+bash "$repo_root/scripts/test-review-bounded.sh"

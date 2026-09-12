@@ -1,7 +1,7 @@
 # Repository Agent Instructions
 
-This file is the canonical repository guidance for both Claude Code and Codex.
-`AGENTS.md` is a compatibility symlink for Codex. Shared guidance must be edited
+This file is the canonical repository guidance for Claude Code, Codex, and
+Antigravity CLI (`agy`). `AGENTS.md` is their compatibility symlink. Shared guidance must be edited
 here, not copied between tool-specific files.
 
 Project skills are canonical under `.claude/skills/`. Matching entries under
@@ -684,3 +684,54 @@ formatting churn, or elapsed agent activity.
   fresh independent adversarial subagent; do not pretend to invoke a user-only
   composer command from inside the turn. Use a second reviewer only under the
   review rules above.
+
+### Antigravity review adapter
+
+Use `scripts/review-bounded.sh --provider agy [--base REF]` for one fresh,
+inspection-only review with `gemini-3.8-flash-high`. The default provider remains
+`codex`; `--provider codex` selects it explicitly. Both providers share the
+existing review-cycle records, merge-base binding, changed-slice continuation,
+reopening rule, progress watchdog, and process cleanup. Switching providers
+does not authorize another complete review of an already reviewed ancestor.
+
+The native `.agents/agents/align-reviewer/agent.md` definition refers to `AGENTS.md`
+and exposes only file viewing and text search. It grants no shell, write, MCP,
+or delegation tools. Do not use `--continue`, `--conversation`, permission
+bypasses, or a planning-mode prompt as a substitute for these tool restrictions.
+Authenticate with an interactive `agy` session before using the wrapper; the
+wrapper does not change personal settings or credentials.
+
+The wrapper supplies the exact committed diff as a retained file. agy emits a
+stream with the selected model, agent, conversation identity and tool activity. Only a
+successful single-turn terminal result with exactly one final, unfenced
+`ALIGN_REVIEW_VERDICT=CLEAN` or `ALIGN_REVIEW_VERDICT=FINDINGS` line can complete
+the review. Error, cancellation, timeout, denied inspection, malformed output,
+or changed Git state leaves an incomplete record. Retain raw output and stderr
+for diagnosis; raw model text is not an attestation. There is no default wrapper
+wall-clock maximum; the existing explicit maximum and stall knobs apply. agy
+1.2.1 requires a finite print wait: the wrapper selects its maximum whole-hour
+duration, leaving operational stopping to the shared watchdog. Zero is not an
+unlimited agy wait; it can return partial output with SUCCESS and exit zero.
+
+Implementation closure matrix for the shared host-review boundary:
+
+| Invariant | Implementation owner | Focused acceptance |
+| --- | --- | --- |
+| Canonical guidance and fresh read-only agy authority | Native agent and wrapper launch | Agent/flag and live injected-defect owners; no resume, write, shell or delegation tools |
+| Exact HEAD, merge base and unchanged tracked/untracked work | Common wrapper Git checks | Git failure, HEAD/worktree drift, advancing base, subdirectory and linked-worktree owners |
+| One provider-independent review cycle | Existing ancestry and completion records | Existing workflow owner plus cross-provider changed-slice and incomplete-ancestor controls |
+| Only complete native results become attestations | agy stream validator and common finalization | Success/findings, wrong identity/model/tools, failed/partial/duplicate/fenced/trailing result controls |
+| Every launched process is owned until cleanup | Common process groups, watchdog and signal traps | Progress, stall, explicit maximum, interrupt and TERM-resistant helper owners |
+| Failure retains evidence without a usable CLEAN marker | Separate raw output and normalized review log | Failed-exit-after-CLEAN and interrupted-output owners |
+
+The focused owner is `bash scripts/test-review-bounded.sh`; the existing
+`bash scripts/test-pr-workflow.sh` includes it alongside Codex and PR-attestation
+regressions. Run the combined owner once for this shared boundary. The explicit
+`bash scripts/test-review-bounded.sh --live` qualification uses the installed,
+authenticated agy on an isolated committed defect; it is not a routine network
+CI gate. This is one shared review capability: keeping launch, result validation
+and cleanup together avoids a second review state machine and duplicated proof.
+The native configuration and event schema follow the official
+[custom-agent specification](https://antigravity.google/docs/subagents) and
+[headless CLI contract](https://antigravity.google/docs/cli/headless/), qualified
+against installed agy 1.2.1.
