@@ -29059,7 +29059,7 @@ enum BorrowRoot {
     /// provenance so an exact mutable-retention summary can translate it through the call-site
     /// argument's storage roots without pinning an unrelated aggregate header.
     ParamStorage(u32),
-    /// A cursor observation, independent of which place releases the native owner.
+    /// A cursor or validated-text observation, independent of its storage release place.
     Observation(StorageGeneration),
     /// An already-ended root carried by a completion-time value snapshot. Keeping this marker in
     /// the fact lets projection and named-summary selection transport the invalidation without
@@ -29155,6 +29155,11 @@ struct MoveCheckResult {
 }
 
 impl BorrowRoot {
+    fn is_text_validation(&self) -> bool {
+        matches!(self, Self::Observation(generation) | Self::EndedObservation(generation, _)
+            if generation.is_text_validation())
+    }
+
     fn release(generation: &StorageGeneration, release: &MoveReleasePlace) -> Option<Self> {
         match release {
             MoveReleasePlace::Local { local, path } => {
@@ -29278,6 +29283,9 @@ type StoragePath = Vec<BorrowProjection>;
 /// owned leaves distinct without allocating an unbounded generation per loop iteration.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 enum StorageOrigin {
+    TextValidation {
+        expression: usize,
+    },
     Producer {
         expression: usize,
         result_path: Box<[BorrowProjection]>,
@@ -29296,6 +29304,7 @@ enum StorageOrigin {
 impl StorageOrigin {
     fn path(&self) -> &[BorrowProjection] {
         match self {
+            Self::TextValidation { .. } => &[],
             Self::Producer { result_path, .. }
             | Self::InlinePlace {
                 path: result_path,
@@ -29356,6 +29365,11 @@ enum StorageGeneration {
 }
 
 impl StorageGeneration {
+    fn is_text_validation(&self) -> bool {
+        matches!(self, Self::Current(StorageOrigin::TextValidation { .. })
+            | Self::Prior(StorageOrigin::TextValidation { .. }))
+    }
+
     fn path(&self) -> &[BorrowProjection] {
         match self {
             Self::Current(origin) | Self::Prior(origin) => origin.path(),
@@ -31175,13 +31189,13 @@ impl BorrowFact {
     }
 
     /// Lifetime dependencies may conservatively flatten across a materializer, while the
-    /// read-only property must retain its selected element/field path.
+    /// read-only and text-validity properties must retain their selected element/field paths.
     fn flatten_lifetimes(mut self) -> Self {
         let mut lifetimes = self.flatten();
-        lifetimes.remove(&BorrowRoot::ReadOnly);
-        self.direct.retain(|root| *root == BorrowRoot::ReadOnly);
+        lifetimes.retain(|root| *root != BorrowRoot::ReadOnly && !root.is_text_validation());
+        self.direct.retain(|root| *root == BorrowRoot::ReadOnly || root.is_text_validation());
         for roots in self.projected.values_mut() {
-            roots.retain(|root| *root == BorrowRoot::ReadOnly);
+            roots.retain(|root| *root == BorrowRoot::ReadOnly || root.is_text_validation());
         }
         self.projected.retain(|_, roots| !roots.is_empty());
         self.direct.extend(lifetimes);
@@ -31343,8 +31357,82 @@ struct StorageHeaderDescriptor {
     kind: StorageHeaderKind,
 }
 
+/// Completed byte backing, separate from both its current release place and stored view contents.
+/// Unknown is an alternative, so fallback lifetime roots can never prove it disjoint.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct TextValidationBacking {
+    generations: std::collections::BTreeSet<StorageGeneration>,
+    fallback_roots: BorrowRoots,
+    lifetime_roots: BorrowRoots,
+    unknown: bool,
+}
+
+impl TextValidationBacking {
+    fn join(&self, other: &Self) -> Self {
+        Self {
+            generations: self
+                .generations
+                .union(&other.generations)
+                .cloned()
+                .collect(),
+            fallback_roots: self
+                .fallback_roots
+                .union(&other.fallback_roots)
+                .cloned()
+                .collect(),
+            lifetime_roots: self
+                .lifetime_roots
+                .union(&other.lifetime_roots)
+                .cloned()
+                .collect(),
+            unknown: self.unknown || other.unknown,
+        }
+    }
+
+    fn rename_generations(&mut self, renames: &StorageGenerationRenames) {
+        self.generations = self
+            .generations
+            .iter()
+            .map(|generation| renames.apply(generation))
+            .collect();
+        rename_borrow_roots(&mut self.fallback_roots, renames);
+        rename_borrow_roots(&mut self.lifetime_roots, renames);
+    }
+
+    fn may_overlap(&self, other: &Self) -> bool {
+        fn external(generation: &StorageGeneration) -> bool {
+            matches!(
+                generation,
+                StorageGeneration::CallerStorage { .. } | StorageGeneration::ParameterValue { .. }
+            )
+        }
+        fn external_root(root: &BorrowRoot) -> bool {
+            matches!(root, BorrowRoot::Param(_) | BorrowRoot::ParamStorage(_))
+        }
+        self.unknown
+            || other.unknown
+            || self.generations.iter().any(|left| {
+                other
+                    .generations
+                    .iter()
+                    .any(|right| left == right || (external(left) && external(right)))
+            })
+            || self.fallback_roots.iter().any(|left| {
+                other
+                    .fallback_roots
+                    .iter()
+                    .any(|right| left == right || (external_root(left) && external_root(right)))
+            })
+            || (self.generations.iter().any(external)
+                && other.fallback_roots.iter().any(external_root))
+            || (other.generations.iter().any(external)
+                && self.fallback_roots.iter().any(external_root))
+    }
+}
+
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 struct MoveGenerationEntry {
+    text_validation: Option<TextValidationBacking>,
     /// Exact header shape represented by this generation. `None` is a sticky fail-closed join of
     /// incompatible descriptors; consumers must then avoid selecting the generation by type.
     descriptor: Option<StorageHeaderDescriptor>,
@@ -31369,6 +31457,7 @@ impl MoveGenerationEntry {
             .filter_map(|release| BorrowRoot::release(generation, release))
             .collect();
         Self {
+            text_validation: None,
             descriptor,
             releases,
             historical_release_roots,
@@ -31386,6 +31475,14 @@ impl MoveGenerationEntry {
         let mut historical_release_roots = self.historical_release_roots.clone();
         historical_release_roots.extend(other.historical_release_roots.iter().cloned());
         Self {
+            text_validation: match (&self.text_validation, &other.text_validation) {
+                (Some(left), Some(right)) => Some(left.join(right)),
+                (Some(backing), None) | (None, Some(backing)) => Some(TextValidationBacking {
+                    unknown: true,
+                    ..backing.clone()
+                }),
+                (None, None) => None,
+            },
             descriptor: (self.descriptor == other.descriptor)
                 .then_some(self.descriptor)
                 .flatten(),
@@ -31402,6 +31499,9 @@ impl MoveGenerationEntry {
 
     fn rename_generations(&mut self, renames: &StorageGenerationRenames) {
         rename_borrow_roots(&mut self.historical_release_roots, renames);
+        if let Some(backing) = &mut self.text_validation {
+            backing.rename_generations(renames);
+        }
     }
 }
 
@@ -31604,16 +31704,126 @@ impl MoveControlEdge {
 }
 
 impl BorrowState {
-    fn summary_roots(&self, roots: BorrowRoots) -> BorrowRoots {
-        roots.into_iter().filter(|root| *root != BorrowRoot::ReadOnly).flat_map(|root| {
-            if let BorrowRoot::Observation(generation) = &root {
-                self.storage.directory.entries.get(generation)
-                    .into_iter().flat_map(|entry| entry.caller_origins.iter().copied())
-                    .map(BorrowRoot::ParamStorage).collect::<BorrowRoots>()
-            } else {
-                [root].into()
+    fn expand_text_validation_roots(&self, roots: BorrowRoots) -> BorrowRoots {
+        let mut pending = roots.into_iter().collect::<Vec<_>>();
+        let mut visited = BorrowRoots::new();
+        let mut result = BorrowRoots::new();
+        while let Some(root) = pending.pop() {
+            if root == BorrowRoot::ReadOnly || !visited.insert(root.clone()) {
+                continue;
             }
-        }).collect()
+            match &root {
+                BorrowRoot::Observation(generation)
+                | BorrowRoot::EndedObservation(generation, _)
+                    if generation.is_text_validation() =>
+                {
+                    let underlying = self
+                        .storage
+                        .directory
+                        .entries
+                        .get(generation)
+                        .and_then(|entry| entry.text_validation.as_ref())
+                        .map_or_else(
+                            || [BorrowRoot::IterTemp(0)].into(),
+                            |backing| backing.lifetime_roots.clone(),
+                        );
+                    let ended = root.ended_source().map(|(_, how)| how);
+                    pending.extend(underlying.into_iter().map(|source| {
+                        ended.map_or_else(|| source.clone(), |how| source.ended(how))
+                    }));
+                }
+                _ => {
+                    result.insert(root);
+                }
+            }
+        }
+        result
+    }
+
+    fn summary_roots(&self, roots: BorrowRoots) -> BorrowRoots {
+        self.expand_text_validation_roots(roots)
+            .into_iter()
+            .flat_map(|root| {
+                if let BorrowRoot::Observation(generation) = &root {
+                    self.storage
+                        .directory
+                        .entries
+                        .get(generation)
+                        .into_iter()
+                        .flat_map(|entry| entry.caller_origins.iter().copied())
+                        .map(BorrowRoot::ParamStorage)
+                        .collect::<BorrowRoots>()
+                } else {
+                    [root].into()
+                }
+            })
+            .collect()
+    }
+
+    /// End validity, never storage ownership. Include carried identities whose directory entry
+    /// is missing so malformed/incomplete bookkeeping cannot provide a disjointness proof.
+    fn invalidate_validated_text(&mut self, target: &TextValidationBacking) {
+        let mut observations = self
+            .storage
+            .directory
+            .entries
+            .keys()
+            .filter(|generation| generation.is_text_validation())
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut add_roots = |roots: &BorrowRoots| {
+            observations.extend(roots.iter().filter_map(|root| match root {
+                BorrowRoot::Observation(generation) if generation.is_text_validation() => {
+                    Some(generation.clone())
+                }
+                _ => None,
+            }));
+        };
+        for roots in self
+            .sources
+            .values()
+            .chain(self.value_sources.values())
+            .chain(self.pipeline_sources.values())
+        {
+            add_roots(roots);
+        }
+        for fact in self.facts.values() {
+            add_roots(&fact.flatten());
+        }
+        for headers in self
+            .headers
+            .values()
+            .chain(self.value_headers.values())
+            .chain(self.pipeline_headers.values())
+        {
+            for leaf in headers.leaves.values() {
+                add_roots(&leaf.fallback_roots);
+            }
+        }
+        for content in self.storage.contents.entries.values() {
+            add_roots(&content.non_storage.flatten());
+            for leaf in content.headers.leaves.values() {
+                add_roots(&leaf.fallback_roots);
+            }
+        }
+        let mut roots = BorrowRoots::new();
+        for generation in observations {
+            let overlaps = self
+                .storage
+                .directory
+                .entries
+                .get(&generation)
+                .and_then(|entry| entry.text_validation.as_ref())
+                .is_none_or(|backing| backing.may_overlap(target));
+            if overlaps {
+                if let Some(entry) = self.storage.directory.entries.get_mut(&generation) {
+                    entry.ended = Some(BorrowEnd::Consumed);
+                }
+                roots.insert(BorrowRoot::Observation(generation));
+            }
+        }
+        self.invalidate_roots(&roots, BorrowEnd::Consumed);
+        self.mark_matching_roots_ended(BorrowEnd::Consumed, |root| roots.contains(root));
     }
 
     fn begin_value_headers(&mut self, snapshot: usize, headers: ProjectedHeaderFact) {
@@ -31745,6 +31955,13 @@ impl BorrowState {
         loop {
             let before = reachable.len();
             for generation in reachable.clone() {
+                if let Some(backing) = self.storage.directory.entries.get(&generation)
+                    .and_then(|entry| entry.text_validation.as_ref())
+                {
+                    reachable.extend(backing.generations.iter().cloned());
+                    add_roots(&mut reachable, &backing.fallback_roots);
+                    add_roots(&mut reachable, &backing.lifetime_roots);
+                }
                 if let Some(content) = self.storage.contents.entries.get(&generation) {
                     add_headers(&mut reachable, &content.headers);
                     add_roots(&mut reachable, &content.non_storage.flatten());
@@ -32767,6 +32984,27 @@ impl<'a> MoveCheck<'a> {
         if child_snapshots.is_empty() {
             return;
         }
+        // A completed result without borrowed state has already used its text inputs. Their validity
+        // obligation does not survive as an operand of the next enclosing operation. Byte
+        // conversion similarly retains lifetime but no longer observes UTF-8 validity.
+        if !self.value_snapshot_needed(expression) || matches!(expression.kind, ExprKind::StrBytes { .. }) {
+            for key in child_snapshots {
+                if let Some(roots) = self.borrows.value_sources.get_mut(key) {
+                    roots.retain(|root| !root.is_text_validation());
+                }
+                if let Some(invalid) = self.borrows.invalid_value_sources.get_mut(key) {
+                    invalid.retain(|root, _| !root.is_text_validation());
+                }
+                for facts in [&mut self.walked_value_facts, &mut self.walked_storage_facts] {
+                    if let Some(fact) = facts.get_mut(key) {
+                        fact.direct.retain(|root| !root.is_text_validation());
+                        for roots in fact.projected.values_mut() {
+                            roots.retain(|root| !root.is_text_validation());
+                        }
+                    }
+                }
+            }
+        }
         let frontier = self.snapshot_headers(child_snapshots.iter().copied());
         let retained = self.completed_headers(expression);
         self.borrows.end_abandoned_staging_releases(
@@ -33599,6 +33837,9 @@ impl<'a> MoveCheck<'a> {
         }
         match &expression.kind {
             ExprKind::Local(local) => self.local_mutable_backing(*local),
+            ExprKind::BufferBytes { buffer } => {
+                MutableBackingFact::known(self.storage_roots(buffer))
+            }
             ExprKind::ArrayToSlice(inner)
             | ExprKind::SliceRange { recv: inner, .. } => {
                 self.mutable_backing(inner)
@@ -34155,6 +34396,15 @@ impl<'a> MoveCheck<'a> {
             })
             .collect::<Vec<_>>();
 
+        let text_targets = args.iter().zip(modes)
+            .filter(|(_, mode)| matches!(mode, ast::ParamMode::Out | ast::ParamMode::BorrowMut))
+            .filter(|(argument, _)| self.borrow_mut_uses_reachable_storage(argument)
+                || !storage_type_paths(argument.ty, self.storage_type_context()).headers.is_empty()
+                || matches!(argument.kind, ExprKind::BorrowedIndex { .. }))
+            .map(|(argument, _)| self.completed_text_call_backing(argument)).collect::<Vec<_>>();
+        for target in &text_targets {
+            self.borrows.invalidate_validated_text(target);
+        }
         let mut post_argument_completions = pre_argument_completions.clone();
         let destinations = modes
             .iter()
@@ -34486,7 +34736,7 @@ impl<'a> MoveCheck<'a> {
         }
         for (index, _, roots) in &exclusive_roots {
             let roots = roots.iter().filter(|root| {
-                !matches!(root, BorrowRoot::Observation(_))
+                !matches!(root, BorrowRoot::Observation(generation) if !generation.is_text_validation())
                     || destinations.iter().any(|(destination, ..)| destination == index)
             }).cloned().collect::<BorrowRoots>();
             if args.get(*index).is_some_and(|argument| {
@@ -36720,7 +36970,7 @@ impl<'a> MoveCheck<'a> {
 
     fn record_value_completion(&mut self, expression: &Expr, fact: BorrowFact) {
         let key = Self::expr_key(expression);
-        let (fact, mut storage, backing) = self
+        let (fact, mut storage, mut backing) = self
             .pending_call_completions
             .remove(&key)
             .map_or_else(
@@ -36737,7 +36987,27 @@ impl<'a> MoveCheck<'a> {
                     )
                 },
             );
-        let fact = fact.join(&self.indexed_generation_content(expression).non_storage);
+        let mut fact = fact.join(&self.indexed_generation_content(expression).non_storage);
+        if let ExprKind::BytesAsStr { bytes } = &expression.kind {
+            let mut dependency = self.completed_text_backing(bytes);
+            let origin = StorageOrigin::TextValidation { expression: key };
+            let renames = StorageGenerationRenames::from_origins([origin.clone()]);
+            self.apply_generation_renames(&renames);
+            dependency.rename_generations(&renames);
+            fact.rename_generations(&renames);
+            storage.rename_generations(&renames);
+            backing.rename_generations(&renames);
+            let generation = StorageGeneration::current(origin);
+            self.borrows.storage.directory.entries.insert(generation.clone(), MoveGenerationEntry {
+                text_validation: Some(dependency),
+                ..MoveGenerationEntry::default()
+            });
+            // Storage tables have identical key sets even for observations with no owned header.
+            self.borrows.storage.contents.entries.insert(generation.clone(), MoveValueFact::default());
+            fact = self.normalize_borrow_fact(expression.ty, fact);
+            fact.join_at(&[BorrowProjection::ResultOk],
+                &BorrowFact::from_direct([BorrowRoot::Observation(generation)].into()));
+        }
         if self.mutable_collection_ty(expression.ty) {
             storage
                 .direct
@@ -36823,6 +37093,9 @@ impl<'a> MoveCheck<'a> {
         }
         let message = match root {
             BorrowRoot::ReadOnly => return,
+            ref root if root.is_text_validation() => {
+                "value snapshot was invalidated before the enclosing operation: validated bytes were modified; revalidate the bytes or copy the text before modification".to_string()
+            }
             BorrowRoot::Observation(_) | BorrowRoot::EndedObservation(..) => {
                 "value snapshot was invalidated before the enclosing operation: its reader observation ended".to_string()
             }
@@ -37316,8 +37589,7 @@ impl<'a> MoveCheck<'a> {
                         self.enums,
                         self.tagged_types,
                     ) {
-                        self.parallel_transfer_roots
-                            .extend(self.borrow_sources(argument));
+                        self.parallel_transfer_roots.extend(self.borrows.expand_text_validation_roots(self.borrow_sources(argument)));
                     }
                 }
             }
@@ -37326,8 +37598,7 @@ impl<'a> MoveCheck<'a> {
         for index in params.iter().copied() {
             if let Some(argument) = arguments.get(index as usize) {
                 let mode = modes.and_then(|modes| modes.get(index as usize)).copied();
-                self.parallel_transfer_roots
-                    .extend(self.parallel_argument_fact(argument, mode).flatten());
+                self.parallel_transfer_roots.extend(self.borrows.expand_text_validation_roots(self.parallel_argument_fact(argument, mode).flatten()));
             }
         }
     }
@@ -37414,7 +37685,7 @@ impl<'a> MoveCheck<'a> {
         let roots = self
             .indirect_parallel_transfer_fact_from_facts(callee, &facts)
             .flatten();
-        self.parallel_transfer_roots.extend(roots);
+        self.parallel_transfer_roots.extend(self.borrows.expand_text_validation_roots(roots));
     }
 
     fn named_parallel_capture_roots(&self, target: &str, captures: &[Expr]) -> BorrowRoots {
@@ -38030,6 +38301,7 @@ impl<'a> MoveCheck<'a> {
                 // UnknownView formation preserves the lifetime roots and read-only
                 // property together in the byte view's typed backing header.
                 let mut roots = self.storage_roots(inner);
+                roots.retain(|root| !root.is_text_validation());
                 roots.insert(BorrowRoot::ReadOnly);
                 roots
             },
@@ -39092,9 +39364,11 @@ impl<'a> MoveCheck<'a> {
     ) {
         self.reject_readonly_local_write(base, index.span);
         self.mark_borrow_mut_modified(base);
-        self.update_generation_collection_contents(base, index, field_path, value);
         let backing = self.local_mutable_backing(base);
         let storage = BorrowFact::from_direct(self.local_storage_roots(base));
+        let text_backing = self.text_backing(&self.local_headers(base), &storage, &backing);
+        self.borrows.invalidate_validated_text(&text_backing);
+        self.update_generation_collection_contents(base, index, field_path, value);
         let observers = self.mutable_observer_locals(&backing, &storage);
         for local in self.resolved_mutable_destinations(&backing, &observers) {
             self.invalidate_mutable_place(local, &[]);
@@ -39247,12 +39521,138 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
+    fn text_backing(
+        &self,
+        headers: &ProjectedHeaderFact,
+        storage: &BorrowFact,
+        backing: &MutableBackingFact,
+    ) -> TextValidationBacking {
+        let mut result = TextValidationBacking {
+            lifetime_roots: storage.flatten(),
+            unknown: true,
+            ..TextValidationBacking::default()
+        };
+        if let Some(header) = headers.leaves.get(&Vec::new()) {
+            result.generations.extend(
+                header
+                    .generations
+                    .iter()
+                    .map(|reference| reference.generation.clone()),
+            );
+            if header.known && !header.generations.is_empty() {
+                result.unknown = false;
+                return result;
+            }
+        }
+        // Only independently authenticated backing facts close an unknown header. Lifetime
+        // fallbacks from an arbitrary call do not identify the complete allocation alternatives.
+        if !backing.unknown && !backing.roots.is_empty() {
+            result.unknown = false;
+            for root in &backing.roots {
+                match root {
+                    BorrowRoot::StorageLocal(generation, ..) => {
+                        result.generations.insert(generation.clone());
+                    }
+                    BorrowRoot::Local(_) | BorrowRoot::Param(_) | BorrowRoot::ParamStorage(_) => {
+                        result.fallback_roots.insert(root.clone());
+                    }
+                    BorrowRoot::ReadOnly => {}
+                    _ => result.unknown = true,
+                }
+            }
+        }
+        result
+    }
+
+    fn completed_text_backing(&self, expression: &Expr) -> TextValidationBacking {
+        let headers = self.completed_headers(expression);
+        let storage = self.completed_storage_fact(expression);
+        let backing = if headers.leaves.is_empty()
+            && self.is_move_ty(expression.ty)
+            && !ty_may_borrow(
+                expression.ty,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            )
+            && matches!(expression.kind, ExprKind::Local(_) | ExprKind::Field { .. })
+        {
+            // Native owning handles have no collection header. A completed owner place is
+            // authenticated identity; an arbitrary view-returning call is not.
+            MutableBackingFact::known(storage.live_roots())
+        } else {
+            self.completed_backing_fact(expression)
+        };
+        self.text_backing(&headers, &storage, &backing)
+    }
+
+    /// A declared mutable call can write through views contained in its argument. This is a
+    /// reachable-storage effect, unlike a local element store which writes only its selected
+    /// collection backing. Freeze the complete finite header graph before any call transition.
+    fn completed_text_call_backing(&self, expression: &Expr) -> TextValidationBacking {
+        let mut result = self.completed_text_backing(expression);
+        let headers = self.completed_headers(expression);
+        let root_authenticated = !result.unknown;
+        let mut pending = headers
+            .leaves
+            .into_iter()
+            .map(|(path, leaf)| (path.is_empty(), leaf))
+            .collect::<Vec<_>>();
+        let mut visited = std::collections::BTreeSet::new();
+        while let Some((root, leaf)) = pending.pop() {
+            if !(leaf.known || root && root_authenticated) {
+                result.unknown = true;
+            }
+            if leaf.descriptor.is_some_and(|descriptor| {
+                self.collection_element_ty(descriptor.ty)
+                    .is_some_and(|element| {
+                        !storage_type_paths(element, self.storage_type_context())
+                            .headers
+                            .is_empty()
+                    })
+            }) {
+                // Materialized collection contents currently preserve lifetime roots even when
+                // they have no complete header graph. The outer allocation's known identity is
+                // not a certificate for every writable view stored in its elements.
+                result.unknown = true;
+            }
+            for reference in leaf.generations {
+                if !visited.insert(reference.clone()) {
+                    continue;
+                }
+                result.generations.insert(reference.generation.clone());
+                if let Some(content) = self
+                    .borrows
+                    .storage
+                    .contents
+                    .entries
+                    .get(&reference.generation)
+                {
+                    let selected = content.through_reference(&reference, &reference.content_path);
+                    pending.extend(
+                        selected
+                            .headers
+                            .leaves
+                            .into_values()
+                            .map(|leaf| (false, leaf)),
+                    );
+                } else {
+                    result.unknown = true;
+                }
+            }
+        }
+        result
+    }
+
     /// Invalidate exact-place reservations for every collection header that can observe a write to
     /// the completed target. Backing/storage facts come from operand completion, so a later eager
     /// sibling cannot retarget an already-evaluated slice alias before the action runs.
     fn invalidate_collection_mutation_target(&mut self, target: &Expr) {
         let backing = self.completed_backing_fact(target);
         let storage = self.completed_storage_fact(target);
+        let text_backing = self.text_backing(&self.completed_headers(target), &storage, &backing);
+        self.borrows.invalidate_validated_text(&text_backing);
         let observers = self.mutable_observer_locals(&backing, &storage);
         let mut destinations = self.resolved_mutable_destinations(&backing, &observers);
         if self.mutable_actual_observes_completion(target, &backing, &storage)
@@ -39631,6 +40031,9 @@ impl<'a> MoveCheck<'a> {
             .map_or("<borrow>", |l| l.name.as_str());
         let msg = match (root, how) {
             (BorrowRoot::ReadOnly, _) => return,
+            (ref root, _) if root.is_text_validation() => format!(
+                "use of invalidated borrow '{borrower}': validated bytes were modified; revalidate the bytes or copy the text before modification"
+            ),
             (BorrowRoot::Observation(_) | BorrowRoot::EndedObservation(..), _) => format!(
                 "use of invalidated borrow '{borrower}': its reader was advanced, replaced, consumed, or dropped; create a new view from the current reader"
             ),
@@ -39791,6 +40194,9 @@ impl<'a> MoveCheck<'a> {
         };
         let message = match root {
             BorrowRoot::ReadOnly => return,
+            ref root if root.is_text_validation() => {
+                "pipeline source snapshot was invalidated before terminal action: validated bytes were modified; revalidate the bytes or copy the text before modification".to_string()
+            }
             BorrowRoot::Observation(_) | BorrowRoot::EndedObservation(..) => {
                 "pipeline source snapshot was invalidated before terminal action: its reader observation ended".to_string()
             }
@@ -41919,8 +42325,7 @@ impl<'a> MoveCheck<'a> {
                 self.finish_successful_aggregate_action(expression, moved);
             }
             ExprKind::Spawn { closure, .. } => {
-                self.parallel_transfer_roots
-                    .extend(self.borrow_sources(closure));
+                self.parallel_transfer_roots.extend(self.borrows.expand_text_validation_roots(self.borrow_sources(closure)));
                 let required = self
                     .indirect_parallel_transfer_fact_from_facts(closure, &[])
                     .flatten();
@@ -41956,7 +42361,7 @@ impl<'a> MoveCheck<'a> {
                 let roots = self
                     .indirect_parallel_transfer_fact_from_facts(f, &arguments)
                     .flatten();
-                self.parallel_transfer_roots.extend(roots);
+                self.parallel_transfer_roots.extend(self.borrows.expand_text_validation_roots(roots));
             }
             _ => {}
         }
@@ -42099,6 +42504,8 @@ impl<'a> MoveCheck<'a> {
             for (input, argument) in kind.inputs().iter().zip(args) {
                 if matches!(input, process_live::Input::OutBytes) {
                     self.reject_readonly_view_write(argument);
+                    let backing = self.completed_text_backing(argument);
+                    self.borrows.invalidate_validated_text(&backing);
                 }
             }
         }
@@ -43098,12 +43505,12 @@ impl<'a> MoveCheck<'a> {
                         );
                     }
                     if falls_through && let ExprKind::ArrayParMap { stages, .. } = &wrapper.kind {
-                        self.parallel_transfer_roots.extend(self.pipeline_source_roots(source));
+                        self.parallel_transfer_roots.extend(self.borrows.expand_text_validation_roots(self.pipeline_source_roots(source)));
                         for capture in stage_capture_exprs(stages) {
-                            self.parallel_transfer_roots.extend(self.borrow_sources(capture));
+                            self.parallel_transfer_roots.extend(self.borrows.expand_text_validation_roots(self.borrow_sources(capture)));
                         }
                         for capture in node_captures(&wrapper.kind) {
-                            self.parallel_transfer_roots.extend(self.borrow_sources(capture));
+                            self.parallel_transfer_roots.extend(self.borrows.expand_text_validation_roots(self.borrow_sources(capture)));
                         }
                     }
                     if falls_through && matches!(wrapper.kind, ExprKind::ArrayMapInto { .. }) {
@@ -44290,15 +44697,12 @@ impl<'a> MoveCheck<'a> {
                 }
                 if !self.collecting_move_children && matches!(e.kind, ExprKind::ArrayParMap { .. })
                 {
-                    self.parallel_transfer_roots
-                        .extend(self.pipeline_source_roots(source));
+                    self.parallel_transfer_roots.extend(self.borrows.expand_text_validation_roots(self.pipeline_source_roots(source)));
                     for capture in stage_capture_exprs(stages) {
-                        self.parallel_transfer_roots
-                            .extend(self.borrow_sources(capture));
+                        self.parallel_transfer_roots.extend(self.borrows.expand_text_validation_roots(self.borrow_sources(capture)));
                     }
                     for capture in node_captures(&e.kind) {
-                        self.parallel_transfer_roots
-                            .extend(self.borrow_sources(capture));
+                        self.parallel_transfer_roots.extend(self.borrows.expand_text_validation_roots(self.borrow_sources(capture)));
                     }
                     if let ExprKind::ArrayParMap {
                         stages,
@@ -44653,8 +45057,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::Spawn { closure, .. } => {
                 move_expr!(self, closure, moved, false, false);
                 if !self.collecting_move_children {
-                    self.parallel_transfer_roots
-                        .extend(self.borrow_sources(closure));
+                    self.parallel_transfer_roots.extend(self.borrows.expand_text_validation_roots(self.borrow_sources(closure)));
                 }
             }
             // A sum-type construction moves each payload into the variant, exactly like a struct
@@ -44689,7 +45092,7 @@ impl<'a> MoveCheck<'a> {
                     let roots = self
                         .indirect_parallel_transfer_fact_from_facts(f, &arguments)
                         .flatten();
-                    self.parallel_transfer_roots.extend(roots);
+                    self.parallel_transfer_roots.extend(self.borrows.expand_text_validation_roots(roots));
                 }
             }
             // `t.get()` moves the result out of the task when `R` is an owned/move type, so it
@@ -44779,7 +45182,7 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, input, moved, false, false);
                 move_expr!(self, arena, moved, false, false);
                 move_expr!(self, options, moved, false, false);
-                self.parallel_transfer_roots.extend(self.storage_roots(arena));
+                self.parallel_transfer_roots.extend(self.borrows.expand_text_validation_roots(self.storage_roots(arena)));
             }
             ExprKind::TemplateHtmlNew { .. } => {}
             ExprKind::TemplateHtmlWrite { output, value, .. }
@@ -74968,6 +75371,517 @@ fn main() -> i32 {
                 {
                     failures.push(format!("{name} owned={owned} copied={copied}: {messages:?}"));
                 }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn validated_text_observation_state_closure() {
+        let owner_origin = StorageOrigin::InlinePlace {
+            local: 1,
+            path: Box::new([]),
+        };
+        let validation_origin = StorageOrigin::TextValidation { expression: 2 };
+        let owner = StorageGeneration::current(owner_origin.clone());
+        let observation = StorageGeneration::current(validation_origin.clone());
+        let dependency = TextValidationBacking {
+            generations: [owner.clone()].into(),
+            lifetime_roots: [BorrowRoot::Local(1)].into(),
+            ..TextValidationBacking::default()
+        };
+        let mut state = BorrowState::default();
+        state.assign(
+            0,
+            BorrowFact::from_direct([BorrowRoot::Observation(observation.clone())].into())
+                .prefixed(BorrowProjection::ResultOk),
+        );
+        state
+            .storage
+            .directory
+            .entries
+            .insert(owner.clone(), MoveGenerationEntry::default());
+        state
+            .storage
+            .contents
+            .entries
+            .insert(owner.clone(), MoveValueFact::default());
+        state.storage.directory.entries.insert(
+            observation.clone(),
+            MoveGenerationEntry {
+                text_validation: Some(dependency.clone()),
+                ..MoveGenerationEntry::default()
+            },
+        );
+        state
+            .storage
+            .contents
+            .entries
+            .insert(observation.clone(), MoveValueFact::default());
+        state.retain_reachable_storage_with(&MoveValueFact::default());
+        assert!(
+            state.storage.directory.entries.contains_key(&owner),
+            "observation retains its backing record without an owner header"
+        );
+        assert_eq!(
+            state.summary_roots([BorrowRoot::Observation(observation)].into()),
+            [BorrowRoot::Local(1)].into()
+        );
+        let renames = StorageGenerationRenames::from_origins([
+            owner_origin.clone(),
+            validation_origin.clone(),
+        ]);
+        state.rename_generations(&renames);
+        let prior = StorageGeneration::prior(validation_origin);
+        assert!(
+            state
+                .storage
+                .directory
+                .entries
+                .contains_key(&StorageGeneration::prior(owner_origin))
+        );
+        let carried = state
+            .facts
+            .get(&0)
+            .cloned()
+            .unwrap_or_default()
+            .flatten_lifetimes();
+        assert!(
+            carried
+                .project_exact(BorrowProjection::ResultErr)
+                .flatten()
+                .is_empty()
+        );
+        assert!(
+            carried
+                .project_exact(BorrowProjection::ResultOk)
+                .flatten()
+                .contains(&BorrowRoot::Observation(prior.clone()))
+        );
+        for missing in ["none", "dependency", "entry"] {
+            for overlap in [false, true] {
+                let mut candidate = state.clone();
+                if missing == "entry" {
+                    candidate.storage.directory.entries.remove(&prior);
+                } else if missing == "dependency" {
+                    candidate
+                        .storage
+                        .directory
+                        .entries
+                        .insert(prior.clone(), MoveGenerationEntry::default());
+                }
+                let mut target = dependency.clone();
+                if overlap {
+                    target.rename_generations(&renames);
+                }
+                candidate.invalidate_validated_text(&target);
+                assert_eq!(
+                    candidate.invalid.contains_key(&0),
+                    overlap || missing != "none",
+                    "{missing}/{overlap}"
+                );
+                assert!(
+                    !candidate.invalid.contains_key(&1),
+                    "ending text must not consume its byte owner"
+                );
+            }
+        }
+        let incomplete = MoveGenerationEntry::default().join(&MoveGenerationEntry {
+            text_validation: Some(dependency.clone()),
+            ..MoveGenerationEntry::default()
+        });
+        assert!(
+            incomplete
+                .text_validation
+                .is_some_and(|backing| backing.unknown && backing.may_overlap(&dependency))
+        );
+    }
+
+    #[test]
+    fn validated_text_observation_local_matrix() {
+        let cases = [
+            (
+                "alias",
+                "text := alias.as_str() else { return }; alias[0] = 255; print(text)",
+                true,
+            ),
+            (
+                "older_alias",
+                "older := alias; text := older.as_str() else { return }; alias[0] = 255; print(text)",
+                true,
+            ),
+            (
+                "retained_result",
+                "result := alias.as_str(); alias[0] = 255; text := result else { return }; print(text)",
+                true,
+            ),
+            (
+                "earlier_use",
+                "text := alias.as_str() else { return }; print(text); alias[0] = 255",
+                false,
+            ),
+            (
+                "byte_reuse",
+                "text := alias.as_str() else { return }; alias[0] = 255; print(alias[0])",
+                false,
+            ),
+            (
+                "byte_conversion",
+                "text := alias.as_str() else { return }; bytes := text.bytes(); alias[0] = 255; print(bytes[0])",
+                false,
+            ),
+            (
+                "late_byte_conversion",
+                "text := alias.as_str() else { return }; alias[0] = 255; print(text.bytes()[0])",
+                true,
+            ),
+            (
+                "revalidation",
+                "text := alias.as_str() else { return }; print(text); alias[0] = 67; fresh := alias.as_str() else { return }; print(fresh)",
+                false,
+            ),
+            (
+                "owned_copy",
+                "text := (alias.as_str() else { return }).clone(); alias[0] = 255; print(text)",
+                false,
+            ),
+            (
+                "disjoint",
+                "text := alias.as_str() else { return }; mut other := [(67 as u8), (68 as u8)].to_array(); other[0] = 255; print(text)",
+                false,
+            ),
+            (
+                "rebind",
+                "text := alias.as_str() else { return }; other := [(67 as u8), (68 as u8)].to_array(); alias = other; alias[0] = 255; print(text)",
+                false,
+            ),
+            (
+                "range",
+                "text := alias[0..1].as_str() else { return }; alias[0] = 255; print(text)",
+                true,
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (storage, setup) in [
+            (
+                "array",
+                "owner := [(65 as u8), (66 as u8)].to_array(); mut alias: slice<u8> := owner",
+            ),
+            (
+                "fixed",
+                "mut owner := [(65 as u8), (66 as u8)]; mut alias: slice<u8> := owner",
+            ),
+            (
+                "buffer",
+                "mut owner := buffer(8); owner.put_u8(65); owner.put_u8(66); mut alias := owner.bytes()",
+            ),
+        ] {
+            for (name, body, stale) in cases {
+                let (_, diagnostics) = check(&format!("fn main() {{ {setup}; {body} }}\n"));
+                let messages = diagnostics
+                    .iter()
+                    .map(|item| item.message.as_str())
+                    .collect::<Vec<_>>();
+                if diagnostics.has_errors() != stale
+                    || (stale
+                        && !messages
+                            .iter()
+                            .any(|message| message.contains("validated bytes were modified")))
+                {
+                    failures.push(format!("{storage}/{name}: {messages:?}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn validated_text_observation_backing_identity_matrix() {
+        let cases = [
+            (
+                "moved",
+                "fn main() { owner := [(65 as u8)].to_array(); alias: slice<u8> := owner; text := alias.as_str() else { return }; mut transferred := owner; transferred[0] = 255; print(text) }",
+                true,
+            ),
+            (
+                "moved_clean",
+                "fn main() { owner := [(65 as u8)].to_array(); alias: slice<u8> := owner; text := alias.as_str() else { return }; transferred := owner; print(transferred.len()); print(text) }",
+                false,
+            ),
+            (
+                "parameter_aliases",
+                "fn probe(left: slice<u8>, right: slice<u8>) { text := left.as_str() else { return }; mut alias := right; alias[0] = 255; print(text) }\nfn main() { owner := [(65 as u8)].to_array(); alias: slice<u8> := owner; probe(alias, alias) }",
+                true,
+            ),
+            (
+                "parameter_fresh",
+                "fn probe(left: slice<u8>) { text := left.as_str() else { return }; mut right := [(65 as u8)].to_array(); right[0] = 255; print(text) }\nfn main() {}",
+                false,
+            ),
+            (
+                "prior_execution",
+                "fn probe(flag: bool) { owner := [(65 as u8)].to_array(); mut alias: slice<u8> := owner; mut saved: str := \"safe\"; mut again := flag; loop { fresh := alias.as_str() else { return }; print(saved); saved = fresh; alias[0] = 255; if again { again = false } else { break } } }\nfn main() {}",
+                true,
+            ),
+            (
+                "json",
+                "import core.json\nfn main() { owner := [(34 as u8), (65 as u8), (66 as u8), (34 as u8)].to_array(); mut alias: slice<u8> := owner; text := alias.as_str() else { return }; arena { doc := json.doc(text) else { return }; selected := doc.as_str() else { return }; alias[1] = 255; print(selected) } }",
+                true,
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (name, source, stale) in cases {
+            let (_, diagnostics) = check(source);
+            let messages = diagnostics
+                .iter()
+                .map(|item| item.message.as_str())
+                .collect::<Vec<_>>();
+            if diagnostics.has_errors() != stale
+                || (stale
+                    && !messages
+                        .iter()
+                        .any(|message| message.contains("validated bytes were modified")))
+            {
+                failures.push(format!("{name}: {messages:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn validated_text_observation_projection_matrix() {
+        let mut failures = Vec::new();
+        for (name, selection, stale) in [
+            (
+                "field",
+                "holder := Texts { selected: text, independent: \"ok\" }; selected := holder.selected",
+                true,
+            ),
+            (
+                "sibling",
+                "holder := Texts { selected: text, independent: \"ok\" }; selected := holder.independent",
+                false,
+            ),
+            ("array", "values := [text]; selected := values[0]", true),
+            (
+                "option",
+                "wrapped := Some(text); selected := wrapped else { return }",
+                true,
+            ),
+            (
+                "result",
+                "wrapped: Result<str, Error> := Ok(text); selected := wrapped else { return }",
+                true,
+            ),
+            ("trim", "selected := text.trim()", true),
+            ("range", "selected := text[0..1]", true),
+            ("identity", "selected := identity(text)", true),
+            ("owned", "selected := text.clone()", false),
+        ] {
+            let source = format!(
+                "Texts {{ selected: str, independent: str }}\nfn identity(value: str) -> str = value\nfn main() {{ owner := [(65 as u8), (66 as u8)].to_array(); mut alias: slice<u8> := owner; text := alias.as_str() else {{ return }}; {selection}; alias[0] = 255; print(selected) }}\n"
+            );
+            let (_, diagnostics) = check(&source);
+            let messages = diagnostics
+                .iter()
+                .map(|item| item.message.as_str())
+                .collect::<Vec<_>>();
+            if diagnostics.has_errors() != stale
+                || (stale
+                    && !messages
+                        .iter()
+                        .any(|message| message.contains("validated bytes were modified")))
+            {
+                failures.push(format!("{name}: {messages:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn validated_text_observation_sink_matrix() {
+        let mut failures = Vec::new();
+        for (name, sink) in [
+            ("index", "target[0] = 255"),
+            (
+                "vector",
+                "value: vec2<u8> := [255, 255]; target.store(0, value)",
+            ),
+            (
+                "map_into",
+                "source := [(255 as u8), (255 as u8)]; source.map_into(target)",
+            ),
+            (
+                "shuffle",
+                "mut rng := rand.seed_with(1); rng.shuffle(target)",
+            ),
+            ("out", "set(target)"),
+            ("borrow_mut", "modify(target)"),
+            ("indirect_borrow_mut", "writer := modify; writer(target)"),
+            ("native_out", "child.read_stdout(target)?"),
+        ] {
+            for disjoint in [false, true] {
+                let selection = if disjoint { "other" } else { "alias" };
+                let source = format!(
+                    "import std.rand\nimport std.process\nfn set(out view: slice<u8>) {{ view[0] = 255 }}\nfn modify(borrow mut view: slice<u8>) {{ view[0] = 255 }}\nfn probe(borrow mut child: child) -> Result<(), Error> {{ mut owner := [(65 as u8), (66 as u8)].to_array(); alias: slice<u8> := owner; text := alias.as_str()?; mut other := [(67 as u8), (68 as u8)].to_array(); mut target: slice<u8> := {selection}; {sink}; print(text); return Ok(()) }}\nfn main() {{}}\n"
+                );
+                let (_, diagnostics) = check(&source);
+                let messages = diagnostics
+                    .iter()
+                    .map(|item| item.message.as_str())
+                    .collect::<Vec<_>>();
+                if diagnostics.has_errors() == disjoint
+                    || (!disjoint
+                        && !name.contains("borrow_mut")
+                        && !messages
+                            .iter()
+                            .any(|message| message.contains("validated bytes were modified")))
+                {
+                    failures.push(format!("{name}/disjoint={disjoint}: {messages:?}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn validated_text_observation_mutable_call_contents() {
+        for (mode, ty) in [("out", "slice<Holder>"), ("borrow mut", "array<Holder>")] {
+            for copied in [false, true] {
+                let copy = if copied { ".clone()" } else { "" };
+                let source = format!(
+                    "Holder {{ data: slice<u8> }}\nfn write({mode} items: {ty}) {{ mut selected := items[0].data; selected[0] = 255 }}\nfn main() {{ owner := [(65 as u8)].to_array(); alias: slice<u8> := owner; mut items := [Holder {{ data: alias }}].to_array(); text := (alias.as_str() else {{ return }}){copy}; write(items); print(text) }}\n"
+                );
+                let (_, diagnostics) = check(&source);
+                assert_eq!(
+                    diagnostics.has_errors(),
+                    !copied,
+                    "{mode}/{copied} must distinguish copied text from a contained byte view"
+                );
+                if !copied {
+                    assert!(
+                        diagnostics
+                            .iter()
+                            .any(|item| item.message.contains("invalidated")),
+                        "{mode}: {:?}",
+                        diagnostics
+                            .iter()
+                            .map(|item| &item.message)
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn validated_text_observation_completion_matrix() {
+        let mut failures = Vec::new();
+        for (name, body, stale) in [
+            (
+                "scalar_mutation",
+                "mut number := 0; touch(number); print(text)",
+                false,
+            ),
+            (
+                "bytes_eager",
+                "consume_bytes(text.bytes(), { alias[0] = 255; 0 })",
+                false,
+            ),
+            (
+                "clone_eager",
+                "consume_text(text.clone(), { alias[0] = 255; 0 })",
+                false,
+            ),
+            (
+                "map_err",
+                "wrapped: Result<str, Error> := Ok(text); mapped := wrapped.map_err(fn error: Error { error }); alias[0] = 255; selected := mapped else { return }; print(selected)",
+                true,
+            ),
+            (
+                "array_late",
+                "values := [text]; alias[0] = 255; print(values[0])",
+                true,
+            ),
+            (
+                "array_sibling",
+                "values := [text, \"safe\"]; selected := values[1]; alias[0] = 255; print(selected)",
+                false,
+            ),
+            (
+                "struct_array",
+                "values := [Texts { selected: text }]; selected := values[0].selected; alias[0] = 255; print(selected)",
+                true,
+            ),
+        ] {
+            let source = format!(
+                "Texts {{ selected: str }}\nfn touch(borrow mut number: i64) {{ number = 1 }}\nfn consume_bytes(value: slice<u8>, number: i64) {{ print(value[0]); print(number) }}\nfn consume_text(value: str, number: i64) {{ print(value); print(number) }}\nfn main() {{ owner := [(65 as u8), (66 as u8)].to_array(); mut alias: slice<u8> := owner; text := alias.as_str() else {{ return }}; {body} }}\n"
+            );
+            let (_, diagnostics) = check(&source);
+            let messages = diagnostics
+                .iter()
+                .map(|item| item.message.as_str())
+                .collect::<Vec<_>>();
+            if diagnostics.has_errors() != stale
+                || (stale
+                    && !messages
+                        .iter()
+                        .any(|message| message.contains("validated bytes were modified")))
+            {
+                failures.push(format!("{name}: {messages:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn validated_text_observation_control_matrix() {
+        let mut failures = Vec::new();
+        for (name, body, stale) in [
+            ("branch", "if flag { alias[0] = 255 }; print(text)", true),
+            (
+                "match",
+                "match Some(flag) { Some(value) => { alias[0] = 255 }, None => {} }; print(text)",
+                true,
+            ),
+            (
+                "diverging",
+                "if flag { alias[0] = 255; return }; print(text)",
+                false,
+            ),
+            (
+                "loop_backedge",
+                "mut running := flag; loop { print(text); if running { alias[0] = 255; running = false } else { break } }",
+                true,
+            ),
+            ("break", "loop { alias[0] = 255; break }; print(text)", true),
+            ("eager", "consume(text, { alias[0] = 255; 0 })", true),
+            (
+                "completed_scalar",
+                "consume_scalar(text.len(), { alias[0] = 255; 0 })",
+                false,
+            ),
+            (
+                "loop_fresh",
+                "mut running := flag; loop { fresh := alias.as_str() else { return }; print(fresh); alias[0] = 67; if running { running = false } else { break } }",
+                false,
+            ),
+        ] {
+            let source = format!(
+                "fn consume(text: str, value: i64) {{ print(text); print(value) }}\nfn consume_scalar(length: i64, value: i64) {{ print(length); print(value) }}\nfn probe(flag: bool) {{ owner := [(65 as u8), (66 as u8)].to_array(); mut alias: slice<u8> := owner; text := alias.as_str() else {{ return }}; {body} }}\nfn main() {{}}\n"
+            );
+            let (_, diagnostics) = check(&source);
+            let messages = diagnostics
+                .iter()
+                .map(|item| item.message.as_str())
+                .collect::<Vec<_>>();
+            if diagnostics.has_errors() != stale
+                || (stale
+                    && !messages
+                        .iter()
+                        .any(|message| message.contains("validated bytes were modified")))
+            {
+                failures.push(format!("{name}: {messages:?}"));
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));

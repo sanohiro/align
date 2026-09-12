@@ -18529,6 +18529,61 @@ fn readonly_origin_checked_hir_replay() -> Result<(), &'static str> {
 }
 
 #[test]
+fn validated_text_observation_checked_hir_replay() -> Result<(), &'static str> {
+    for mutated in [false, true] {
+        let mutation = if mutated {
+            "alias[0] = 255"
+        } else {
+            "print(alias[0])"
+        };
+        let source = format!(
+            "fn probe() {{ owner := [(65 as u8), (66 as u8)].to_array(); mut alias: slice<u8> := owner; text := alias.as_str() else {{ return }}; {mutation}; selected := \"safe\"; print(selected) }}\nfn main() {{}}\n"
+        );
+        let mut program = checked_source_program(&source);
+        assert!(align_sema::checked_hir_body_facts_are_valid(&program));
+        let function = program
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "probe")
+            .ok_or("missing text observation probe")?;
+        let text = function
+            .locals
+            .iter()
+            .position(|local| local.name == "text")
+            .ok_or("missing validated text local")?;
+        let selected = function
+            .locals
+            .iter()
+            .position(|local| local.name == "selected")
+            .ok_or("missing selected text local")?;
+        let init = function
+            .body
+            .stmts
+            .iter_mut()
+            .find_map(|statement| match statement {
+                hir::Stmt::Let { local, init, .. } if *local as usize == selected => Some(init),
+                _ => None,
+            })
+            .ok_or("missing selected text binding")?;
+        assert_eq!(init.ty, function.locals[text].ty);
+        init.kind = hir::ExprKind::Local(u32::try_from(text).map_err(|_| "local overflow")?);
+        assert!(
+            body_core_metadata_is_valid(&program),
+            "same-typed local substitution"
+        );
+        assert_eq!(
+            align_sema::checked_hir_body_facts_are_valid(&program),
+            !mutated
+        );
+        assert_eq!(
+            lower_program_checked(&program, false, None).is_ok(),
+            !mutated
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn readonly_text_bytes_checked_hir_replay() -> Result<(), &'static str> {
     for (name, receiver, publication) in [
         ("text", "source: str", "source.bytes()"),

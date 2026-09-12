@@ -4,8 +4,11 @@
 now retains read-only origins when text publishes `.bytes()`, including owned
 and returned text. Explicit byte-element copies remain writable and source
 lifetimes remain tracked. Native buffer views keep their existing contract.
-Ordinary slice argument/result laundering and invalidation of validated text
-after an older byte-alias write remain separate open boundaries.
+[Plan 57](docs/impl/57-validated-text-observation-plan.md) now rejects use of
+locally validated text after an overlapping byte write, including retained
+aliases and explicit mutable calls. Raw byte reuse, revalidation and owned text
+copies remain available. Ordinary slice argument/result laundering, hidden
+callee writes and callee-created validation remain interprocedural boundaries.
 
 **Antigravity host review integration (2026-09-12):**
 `scripts/review-bounded.sh --provider agy` supports fresh inspection with

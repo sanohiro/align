@@ -6,6 +6,101 @@ mod common;
 use common::*;
 
 #[test]
+fn validated_text_observation_whole_unit_parity() {
+    for imported in [false, true] {
+        for copied in [false, true] {
+            let copy = if copied { ".clone()" } else { "" };
+            let helper = "pub fn identity(value: str) -> str = value\n";
+            let call = if imported {
+                "views.identity"
+            } else {
+                "identity"
+            };
+            let imports = if imported { "import views\n" } else { helper };
+            let main = format!(
+                "module main\n{imports}fn probe<T>(marker: T) {{ owner := [(65 as u8), (66 as u8)].to_array(); mut alias: slice<u8> := owner; text := alias.as_str() else {{ return }}; selected := {call}(text){copy}; alias[0] = 255; print(selected) }}\nfn main() {{ probe(0) }}\n"
+            );
+            let helper_module = format!("module views\n{helper}");
+            let files = if imported {
+                vec![
+                    ("views.align", helper_module.as_str()),
+                    ("main.align", main.as_str()),
+                ]
+            } else {
+                vec![("main.align", main.as_str())]
+            };
+            let name = format!("text-observation-{imported}-{copied}");
+            let result = diff_check_multi(&name, &files, "main.align");
+            assert_eq!(
+                result.whole_errors, !copied,
+                "{name}: {}",
+                result.whole_diags
+            );
+            assert_eq!(
+                result.per_unit_errors, !copied,
+                "{name}: {}",
+                result.per_unit_diags
+            );
+            if !copied {
+                assert!(
+                    result.whole_diags.contains("validated bytes were modified"),
+                    "{}",
+                    result.whole_diags
+                );
+                assert!(
+                    result
+                        .per_unit_diags
+                        .contains("validated bytes were modified"),
+                    "{}",
+                    result.per_unit_diags
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn validated_text_observation_safe_execution() {
+    let source = r#"module main
+fn main() {
+    owner := [(65 as u8), (66 as u8)].to_array()
+    mut alias: slice<u8> := owner
+    text := alias.as_str() else { return }
+    copy := text.clone()
+    bytes := text.bytes()
+    print(text)
+    alias[0] = 255
+    print(bytes[0])
+    print(copy)
+    alias[0] = 67
+    fresh := alias.as_str() else { return }
+    print(fresh)
+}
+"#;
+    let files = [("main.align", source)];
+    let checked = diff_check_multi("text-observation-safe", &files, "main.align");
+    assert!(
+        !checked.whole_errors && !checked.per_unit_errors,
+        "{}\n{}",
+        checked.whole_diags,
+        checked.per_unit_diags
+    );
+    if backend_available() {
+        for output in [
+            build_and_run_multi("text-observation-safe", &files, "main.align"),
+            build_per_unit_multi("text-observation-safe-unit", &files, "main.align").link_and_run(),
+        ] {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "AB\n255\nAB\nCB\n");
+        }
+    }
+}
+
+#[test]
 fn buffer_view_used_after_source_reassign_is_rejected() {
     let src = "\
 fn main() -> i32 {
