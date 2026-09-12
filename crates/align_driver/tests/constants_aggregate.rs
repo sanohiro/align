@@ -622,9 +622,13 @@ fn readonly_static_descriptor_whole_unit_parity() {
 }
 
 #[test]
-fn readonly_text_bytes_whole_unit_parity() {
+fn readonly_view_publication_whole_unit_parity() {
     for (name, owner_ty, publication) in [
         ("text", "string", "source.bytes()"),
+        ("response", "http_response", "source.body()"),
+        ("context", "http_request_ctx", "source.body()"),
+        ("stdout", "run_bytes", "source.stdout()"),
+        ("stderr", "run_bytes", "source.stderr()"),
     ] {
         for imported in [false, true] {
             for action in ["read", "write", "copy"] {

@@ -339,13 +339,13 @@ existing native/owner contracts remain unchanged by this repair.
 
 | Axis | Implementation / owner |
 | --- | --- |
-| Formation / origins | `StrBytes` adds the marker while retaining every source root. `readonly_text_bytes_matrix` crosses local/field/range/sibling projections, reads, rejected writes and explicit copies. No type, HIR, MIR or ABI change. |
+| Formation / origins | `StrBytes` adds the marker while retaining every source root. `readonly_view_publication_matrix` crosses local/field/range/sibling projections, reads, rejected writes and explicit copies. No type, HIR, MIR or ABI change. |
 | Safe destinations | `readonly_origin_sink_matrix` covers owned text and copied-byte twins at indexed stores, Out, direct/indirect BorrowMut, SIMD store, shuffle, native OutBytes and map_into. Existing type, mutability, range and no-alias checks remain authoritative. |
 | Backing versus contents | Local/carrier/projection/conversion owners distinguish cloning text from materializing writable byte elements. Descriptor-slot and disjoint raw-byte sibling writes remain valid; reduce/scan and lifetime-summary controls retain that distinction. |
 | Replacement / control | `readonly_origin_control_matrix` covers literal/owned-text origins through existing branches, Try/map_err, loops and completed operands. |
-| Ownership / source expiry | `readonly_text_bytes_matrix` retains owned-text escape and replacement rejection with independent copy controls. `copied_text_bytes_are_writable_after_source_expiry` executes copied-byte writes after text expiry in both frontends. Existing m5 str_bytes owners retain zero-copy reads and lifetime rejection. No runtime allocation, source nulling, Drop or replacement behavior changes. |
-| Generic / imported / whole / per-unit | `readonly_text_bytes_whole_unit_parity` checks local/imported concrete generic bodies, reads, writes and explicit copies. No interface/cache field changes. |
-| Checked HIR | `readonly_text_bytes_checked_hir_replay` substitutes borrowed/owned text byte producers for a writable slice input. Structural validity must pass before shared body-fact replay rejects the write. Existing projected and static-descriptor replay owners remain covered. |
+| Ownership / source expiry | `readonly_view_publication_matrix` retains owned-text escape and replacement rejection with independent copy controls. `copied_text_bytes_are_writable_after_source_expiry` executes copied-byte writes after text expiry in both frontends. Existing m5 str_bytes owners retain zero-copy reads and lifetime rejection. No runtime allocation, source nulling, Drop or replacement behavior changes. |
+| Generic / imported / whole / per-unit | `readonly_view_publication_whole_unit_parity` checks local/imported concrete generic bodies, reads, writes and explicit copies. No interface/cache field changes. |
+| Checked HIR | `readonly_view_publication_checked_hir_replay` substitutes borrowed/owned text byte producers for a writable slice input. Structural validity must pass before shared body-fact replay rejects the write. Existing projected and static-descriptor replay owners remain covered. |
 | Native contract separation | Existing `struct_handle_fields::borrowed_handle_receivers_preserve_nested_and_optional_owners` and `consumer_borrow_boundaries::derived_view_mutation_preserves_disjoint_owner_facts` remain unchanged and must pass: text protection must not freeze native buffer views or remove their allocation-free mutation path. |
 | Cost / deferred boundaries | Reuse finite projected facts and the existing worklist; no new analysis, iteration bound or performance promise. Ordinary slice argument/result writability is boundary 2. |
 
@@ -355,3 +355,46 @@ text while leaving ordinary byte aliases usable. That separate failure domain
 is not closed by marking subsequent `StrBytes` views read-only; its local
 observation repair is specified in [plan 57](57-validated-text-observation-plan.md).
 Hidden callee validation/write effects remain interprocedural work.
+
+## Read-only native byte publication
+
+`draft.md` section 12 declares `bytes` a read-only byte view. HTTP response and
+request-context bodies and process byte-capture streams expose that view over
+immutable owner storage. Their Rust providers publish shared `Vec::as_ptr`
+derivatives; allocation ownership does not authorize writing through those
+pointers. The four direct-write witnesses pass both frontends at `2c414e36`.
+Keep them compile-only. Readers and explicit `.to_array()` copies are controls.
+
+| HIR origin | Native pointer producer | Result |
+| --- | --- | --- |
+| `RunBytesStdout` | `align_rt_run_bytes_stdout`: captured `out.as_ptr()` | Source-bound read-only `slice<u8>` |
+| `RunBytesStderr` | `align_rt_run_bytes_stderr`: captured `err.as_ptr()` | Source-bound read-only `slice<u8>` |
+| `HttpRespBody` | `align_rt_http_resp_body`: bounded body `as_ptr()`, or response buffer `as_ptr()` plus body offset | Source-bound read-only `slice<u8>` |
+| `HttpCtxBody` | `align_rt_http_ctx_body`: request buffer `as_ptr()` plus body offset | Source-bound read-only `slice<u8>` |
+
+These operations retain `UnknownView` formation. `borrow_sources_inner` adds
+`BorrowRoot::ReadOnly` to the resulting view while preserving every existing
+source root, exactly as the text-byte origin does. Do not mark the releasing
+owner or an unrelated sibling read-only. Existing projected facts, completed
+operands, replacement and CFG joins carry the property; existing destinations
+report the same read-only-view diagnostic. No new qualifier, allocation, copy,
+ownership transfer, nulling, Drop, runtime operation, MIR shape, interface field
+or cache format is introduced.
+
+Plan 37/R61's writable `BufferBytes` contract remains distinct and unchanged.
+Text-derived byte views and mapped byte views already have read-only origins.
+Decoder, compression and crypto buffer results retain writable buffer storage;
+native reader/SSE/Upgrade output still writes the caller's buffer. Materialized
+JSON element arrays use fresh arena storage, and generated column batches use
+raw allocator-owned storage; neither is one of these shared Rust byte getters.
+Unsafe raw/resource construction and ordinary helper argument/result origin
+transport remain the separate interprocedural boundary.
+
+| Axis | Implementation and owner |
+| --- | --- |
+| Formation / exact native producers | The four origin arms preserve source roots and add one permission marker. `readonly_view_publication_matrix` adds all four to the existing text read/write/copy and local/field/range/sibling matrix. |
+| Every destination | `readonly_origin_sink_matrix` crosses these origins and owned-copy controls with indexed store, Out, direct/indirect BorrowMut, SIMD store, shuffle, native OutBytes and map_into. Existing mutability, bounds and no-alias checks remain prerequisites. |
+| Ownership / escape / replacement / control | The publication owner retains source-expiry versus owned-copy controls; existing projected/control and validated-text owners retain replacement, joins and eager-use rules. The native buffer owners named above retain writable shared views and independent source lifetimes. |
+| Generic / imported / whole / per-unit | `readonly_view_publication_whole_unit_parity` checks each publication inside local/imported concrete generic bodies, with reader, rejected-write and owned-copy peers. No plain-slice call-result authority is inferred. |
+| Checked HIR / malformed replay | `readonly_view_publication_checked_hir_replay` substitutes each exact native producer for an accepted writable slice input. Structural validation passes before body-fact replay and checked lowering reject only writes. |
+| ABI / allocation / implementation boundary | Only the existing local origin seed changes; all native getters retain their implementation and ABI. The already-reviewed projected-fact strategy and existing owner matrices are reused, with one author matrix-to-diff pass and one preflight review. No performance promise or benchmark gate. |

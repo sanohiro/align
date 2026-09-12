@@ -38315,15 +38315,23 @@ impl<'a> MoveCheck<'a> {
                 roots.insert(BorrowRoot::ReadOnly);
                 roots
             },
+            ExprKind::HttpRespBody { resp: owner }
+            | ExprKind::HttpCtxBody { ctx: owner }
+            | ExprKind::RunBytesStdout { out: owner }
+            | ExprKind::RunBytesStderr { out: owner } => {
+                // These native getters publish shared byte storage. Preserve the
+                // owner's lifetime without granting writes through its view.
+                let mut roots = self.storage_roots(owner);
+                roots.insert(BorrowRoot::ReadOnly);
+                roots
+            },
             ExprKind::BufferBytes { buffer }
             | ExprKind::CliGetStr { parsed: buffer, .. }
             | ExprKind::HttpRespHeader { resp: buffer, .. }
-            | ExprKind::HttpRespBody { resp: buffer }
             | ExprKind::HttpReadStreamHeader { stream: buffer, .. }
             | ExprKind::HttpSseStreamLastEventId { stream: buffer }
             | ExprKind::HttpCtxMethod { ctx: buffer }
             | ExprKind::HttpCtxPath { ctx: buffer }
-            | ExprKind::HttpCtxBody { ctx: buffer }
             // `ctx.headers()` carries the ctx's storage provenance (http.md item 10 ⑤): without this
             // arm `hs := ctx.headers()` records no borrow at all, so `ctx.respond(rb)` would not
             // invalidate it and a later `hs.get(…)` would read a freed buffer. `hs.get(name)` reads
@@ -38339,8 +38347,6 @@ impl<'a> MoveCheck<'a> {
             // buffers, so they carry `out`'s storage provenance (region-bound in `region_of`).
             | ExprKind::RunOutputStdout { out: buffer }
             | ExprKind::RunOutputStderr { out: buffer } => self.storage_roots(buffer),
-            ExprKind::RunBytesStdout { out: buffer }
-            | ExprKind::RunBytesStderr { out: buffer } => self.storage_roots(buffer),
             ExprKind::HttpClientRequestStream { client, .. } => self.storage_roots(client),
             ExprKind::HttpReadStreamSse { stream } => self.storage_roots(stream),
             ExprKind::HttpSseStreamNext { buffer, .. } => self.storage_roots(buffer),
@@ -75947,9 +75953,13 @@ fn main() -> i32 {
     }
 
     #[test]
-    fn readonly_text_bytes_matrix() {
+    fn readonly_view_publication_matrix() {
         for (name, owner_ty, publication) in [
             ("text", "string", "owner.bytes()"),
+            ("response", "http_response", "owner.body()"),
+            ("context", "http_request_ctx", "owner.body()"),
+            ("stdout", "run_bytes", "owner.stdout()"),
+            ("stderr", "run_bytes", "owner.stderr()"),
         ] {
             for (projection, select) in [
                 ("local", "selected := published"),
@@ -76132,7 +76142,14 @@ fn main() -> i32 {
 
     #[test]
     fn readonly_origin_sink_matrix() {
-        for publication in ["TABLE", "text.bytes()"] {
+        for (receiver, publication) in [
+            ("", "TABLE"),
+            ("", "text.bytes()"),
+            (", borrow owner: http_response", "owner.body()"),
+            (", borrow owner: http_request_ctx", "owner.body()"),
+            (", borrow owner: run_bytes", "owner.stdout()"),
+            (", borrow owner: run_bytes", "owner.stderr()"),
+        ] {
             for owned in [false, true] {
                 let init = if owned { format!("{publication}.to_array()") } else { publication.to_string() };
                 for (name, sink) in [
@@ -76157,7 +76174,7 @@ fn main() -> i32 {
                         "mut view: slice<u8> := backing"
                     };
                     let source = format!(
-                        "import std.rand\nimport std.process\nTABLE: slice<u8> := [1, 2]\nfn set(out view: slice<u8>) {{ view[0] = 65 }}\nfn modify(borrow mut view: slice<u8>) {{ view[0] = 65 }}\nfn probe(borrow mut child: child) -> Result<(), Error> {{ text := \"xx\".clone(); mut backing := {init}; {setup}; {sink}; return Ok(()) }}\nfn main() -> i32 = 0\n"
+                        "import std.rand\nimport std.process\nTABLE: slice<u8> := [1, 2]\nfn set(out view: slice<u8>) {{ view[0] = 65 }}\nfn modify(borrow mut view: slice<u8>) {{ view[0] = 65 }}\nfn probe(borrow mut child: child{receiver}) -> Result<(), Error> {{ text := \"xx\".clone(); mut backing := {init}; {setup}; {sink}; return Ok(()) }}\nfn main() -> i32 = 0\n"
                     );
                     let (_, diagnostics) = check(&source);
                     let messages = diagnostics

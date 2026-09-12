@@ -18618,10 +18618,14 @@ fn validated_text_observation_checked_hir_replay() -> Result<(), &'static str> {
 }
 
 #[test]
-fn readonly_text_bytes_checked_hir_replay() -> Result<(), &'static str> {
+fn readonly_view_publication_checked_hir_replay() -> Result<(), &'static str> {
     for (name, receiver, publication) in [
         ("text", "source: str", "source.bytes()"),
         ("owned", "borrow source: string", "source.bytes()"),
+        ("response", "borrow source: http_response", "source.body()"),
+        ("context", "borrow source: http_request_ctx", "source.body()"),
+        ("stdout", "borrow source: run_bytes", "source.stdout()"),
+        ("stderr", "borrow source: run_bytes", "source.stderr()"),
     ] {
         for write in [false, true] {
             let sink = if write { "bytes[0] = 65" } else { "print(bytes[0])" };
