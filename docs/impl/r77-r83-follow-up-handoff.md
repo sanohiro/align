@@ -98,8 +98,8 @@ behavior. Matching itself must neither duplicate nor close a descriptor.
 
 Merge readiness now has the provider cells in plan 56 and the focused owner
 evidence. Consumer managed-pin adoption, application smoke owners and A2 remain
-separate consumer work after the combined provider delivery.
-Do not advance to ALIGN_MERGED before a real merge or to VERIFIED/CLOSED based on
-an explicit local provider override. This handoff records provider work only; the
-candidate still requires its final review, preflight and branch publication. It
-does not change align-llm code, pin, commits or branches.
+separate consumer work after the combined provider delivery. The final candidate
+has a clean host review and still requires the release build, preflight and branch
+publication. Do not advance to ALIGN_MERGED before a real merge or to
+VERIFIED/CLOSED based on an explicit local provider override. This handoff records
+provider work only; it does not change align-llm code, pin, commits or branches.

@@ -15,7 +15,8 @@ resource-backed Document path and the 32-field measurement final-digest path.
 `StrBorrow`/`ArrayToSlice` field arguments; mutable owning view retypes are rejected,
 and fixed-array slice calls use a materialized descriptor slot. Real client smoke/A2 acceptance,
 managed-pin adoption and platform-specific namespace execution remain external.
-No merge or consumer adoption is claimed by this branch.
+The final candidate has a clean host review; release build, preflight and push
+remain. No merge or consumer adoption is claimed by this branch.
 
 **R69–R76 macOS qualification (2026-09-11):**
 [Plan 54](docs/impl/54-r69-r76-prerequisite-batch-plan.md) owns all eight requests

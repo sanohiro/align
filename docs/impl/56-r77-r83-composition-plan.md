@@ -1,6 +1,6 @@
 # R77–R83 owned and borrowed composition
 
-Status: implementation in progress on branch `feat/r77-r83-composition`.
+Status: provider implementation complete on branch `feat/r77-r83-composition`.
 R77/R79/R80/R81/R82/R83 are implemented in one provider wave with focused owner
 coverage; R78 is assessed and deferred under plan 23. The branch is not merged,
 and no align-llm consumer adoption or end-to-end client acceptance is claimed.
@@ -379,9 +379,9 @@ The appendix matches the seven baseline inputs, local links resolve, and
 inspection of the `409defb0` candidate found four implementation-closure issues:
 mutable owning view retypes, fixed-array slice descriptors, root view-retype
 authentication and generic indexed-field dispatch. The follow-up repairs close
-those four classes with focused owner cases; a fresh inspection of the final
-candidate is still required before publication, and no clean status is claimed
-here.
+those four classes with focused owner cases. The final candidate's full and
+changed-slice host inspections reported no actionable defects; release build,
+preflight and publication remain.
 
 | Finding | Closure |
 | --- | --- |
@@ -390,8 +390,9 @@ here.
 
 The initial reviewer inspected all seven contracts, added clients, sema/MIR
 seams, readiness/cache rules and native namespace boundaries without builds or
-tests. Its two P2 findings and the follow-up provider closure are recorded above;
-the owner suite uses the existing whole/per-unit/ThinLTO rejection helpers.
+tests. Its findings and the follow-up provider closure are recorded above; the
+final candidate received a clean host inspection, and the owner suite uses the
+existing whole/per-unit/ThinLTO rejection helpers.
 
 ## Appendix A. Exact reported standalone sources
 
