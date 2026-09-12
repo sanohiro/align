@@ -11304,13 +11304,13 @@ impl<'a> BodyValidator<'a> {
         match root {
             Ty::DynStructArray(id, align_sema::Layout::Aos) => {
                 return matches!(parts, [hir::TemplatePart::StructArrayField { access, struct_id }]
-                    if *struct_id == id && access.ty == root
+                    if *struct_id == id && self.body_ty_matches(access.ty, root)
                     && matches!(access.kind, hir::ExprKind::Local(local) if local == base));
             }
             Ty::DynArray(element) => {
                 return align_sema::json_encode_array_element(element)
                     && matches!(parts, [hir::TemplatePart::ScalarArrayField { access, elem }]
-                        if *elem == element && access.ty == root
+                        if self.body_scalar_matches(*elem, element) && self.body_ty_matches(access.ty, root)
                         && matches!(access.kind, hir::ExprKind::Local(local) if local == base));
             }
             _ => {}

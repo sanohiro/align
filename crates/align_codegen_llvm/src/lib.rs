@@ -32465,6 +32465,7 @@ fn main() -> i32 = 0
     /// keep the second layer honest.
     #[test]
     fn an_unrenderable_json_descriptor_payload_is_an_error_not_a_panic() {
+        // Unsupported scalar-array tags fail MIR preflight before descriptor construction.
         // `array<char>`: no JSON leaf rendering at all.
         let char_arr = Ty::DynArray(Scalar::Char);
         let err = codegen_program(
@@ -32489,7 +32490,7 @@ fn main() -> i32 = 0
         )
         .expect_err("a `char` array element has no JSON descriptor tag");
         assert!(
-            err.to_string().contains("is not an encodable/decodable payload type"),
+            err.to_string().contains("json.encode MIR metadata invalid"),
             "got: {err}"
         );
 
@@ -32525,7 +32526,7 @@ fn main() -> i32 = 0
             vec![],
         )
         .expect_err("a payload-less union variant has no descriptor arm");
-        assert!(err.to_string().contains("carries no payload"), "got: {err}");
+        assert!(err.to_string().contains("json.encode MIR metadata invalid"), "got: {err}");
     }
 
     #[test]
