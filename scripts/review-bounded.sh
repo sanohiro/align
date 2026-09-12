@@ -83,6 +83,12 @@ if [[ "$(uname -s)" == "Darwin" && -x "/Applications/Xcode.app/Contents/Develope
     review_developer_dir="/Applications/Xcode.app/Contents/Developer"
   fi
 fi
+# Resolve an explicit relative output from the caller before normalizing the
+# provider's working directory. In particular, ../.git from a subdirectory
+# must retain the same meaning for both providers.
+if [[ -n "$output" && "$output" != /* ]]; then
+  output="$(pwd -P)/$output"
+fi
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 repo_root="$(pwd -P)"

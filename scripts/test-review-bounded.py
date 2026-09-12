@@ -309,6 +309,16 @@ class WrapperOwner(unittest.TestCase):
         self.assertTrue(path.read_text().rstrip().endswith("ALIGN_REVIEW_VERDICT=CLEAN"))
         self.assertEqual(git(linked, "status", "--porcelain"), "")
 
+    def test_caller_relative_output(self):
+        for provider in ("agy", "codex"):
+            with self.subTest(provider=provider):
+                self.run_review(provider=provider, cwd=self.repo / ".agents",
+                                args=("--output", "../.git/custom-review.log"))
+                log = (self.repo / ".git/custom-review.log").read_text()
+                self.assertIn(f"ALIGN_REVIEW_HEAD={self.head}", log)
+                self.assertTrue(log.rstrip().endswith("ALIGN_REVIEW_VERDICT=CLEAN"))
+                self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+
     def child_running(self):
         pid = int((self.parent / "child-pid").read_text())
         result = subprocess.run(["ps", "-p", str(pid), "-o", "stat="], text=True,

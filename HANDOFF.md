@@ -11,8 +11,9 @@ normal completion, stalls, explicit maxima and signals, including helpers that
 ignore TERM. agy 1.2.1's zero-timeout SUCCESS/partial-result behavior is covered.
 The guide owns the exact contract and implementation closure matrix.
 
-Verification: the 22 focused owner tests and the combined
-`bash scripts/test-pr-workflow.sh` passed. The explicit
+Verification: all 23 focused owner tests passed. The combined
+`bash scripts/test-pr-workflow.sh` passed before the caller-relative output
+correction below; the focused owner covers that correction for both providers. The explicit
 `bash scripts/test-review-bounded.sh --live` qualification passed with installed,
 authenticated agy 1.2.1: a fresh high-model review found the committed duration
 conversion defect, reported FINDINGS and preserved the fixture's source.
@@ -20,6 +21,14 @@ Native events, conversation identity and diagnostics are retained under the
 local Git directory. The qualification remains an explicit local command;
 routine CI runs the deterministic owner. No align-llm work belongs to this
 capability.
+
+The implementation review's native response reported CLEAN after a file-view
+pagination error, but the wrapper rejected that run as INCOMPLETE and retained
+its evidence. It is not a completed review checkpoint. Author inspection also
+found and repaired caller-relative `--output` resolution when invoked from a
+subdirectory; a shared Codex/agy owner closes that case. Complete the unfinished
+review scope before publication; do not use the raw CLEAN response to bypass
+the cycle guard.
 
 **R77–R83 consolidated implementation (2026-09-12):**
 [Plan 56](docs/impl/56-r77-r83-composition-plan.md) includes all seven new requests
