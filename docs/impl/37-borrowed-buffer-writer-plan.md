@@ -196,3 +196,77 @@ whose independent array backing remains live after replacement of the buffer-own
 record. No tuple surface is widened. The fix preserves the previously reviewed
 root-map/fallback strategy and changes its field predicate to inspect the selected
 type independently from header presence.
+
+## Native writable buffer publication
+
+The existing writable `buffer.bytes()` contract requires a writable native
+pointer derivation. `align_rt_buffer_bytes` publishes
+[`Vec::as_ptr`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.as_ptr),
+whose Rust contract forbids writes through that pointer or its derivatives. The getter
+must remain shared: a captured `slice<Item>` can address a fixed array of
+buffer-owning records from parallel readers. A direct `Vec::as_mut_ptr` call
+inside the getter would introduce overlapping exclusive Rust borrows.
+
+### Reopened axis: shared publication and exclusive storage updates
+
+The initial strategy review confirmed that shared-call exclusion was missing.
+Use one private storage wrapper containing the owning Vec and a cached writable
+raw pointer. Construction derives the pointer with `Vec::as_mut_ptr` before
+publication. Shared access exposes only immutable Vec operations and copies the
+cached pointer. Exclusive Vec access goes through a `with_mut` closure and a private guard;
+its Drop refreshes the cached pointer using `Vec::as_mut_ptr`, including
+unwinding and replacement. The guard cannot escape or be forgotten by callers,
+and the closure cannot return a borrowed Vec or byte reference.
+The wrapper deliberately has no `DerefMut`. Keep its fields private in its own
+module, so every existing or future mutable Vec operation must enter that closure.
+A view of spare capacity may escape as a raw pointer under the existing unsafe
+initialization contract; the completed write commits its length through the same
+guard. No byte slice or exclusive reference is constructed by the shared getter.
+
+The wrapper retains Vec ownership and destruction. Its Send/Sync implementations
+require the same rules as Vec: safe shared access cannot mutate bytes; mutating
+raw views requires the caller's existing exclusion and live-storage proof. Buffer
+mutation or replacement expires prior source views under the existing checker.
+Repeated shared publication preserves live raw aliases while storage is stable.
+
+This native repair serves an already shipped consumer independently of the
+interprocedural access interpreter. It changes no source admission, runtime ABI,
+allocation, copy, interface or cleanup rule. Text and mapped/static getters
+retain their read-only contracts. Every Buffer constructor uses the wrapper,
+including decoded and signature bytes, and all native fills use its exclusive
+guard. The Buffer shell still fits the existing 64-byte accounting bound.
+
+| Axis | Implementation and owner |
+|---|---|
+| Pointer permission / aliases | Private storage wrapper and `align_rt_buffer_bytes`; native `buffer_byte_views_preserve_writable_aliases` publishes twice, writes through both, and verifies shared bytes and stable storage. The Rust API contract supplies the permission proof; ordinary execution alone cannot distinguish the old forbidden derivation. |
+| Shared calls | `buffer_byte_views_allow_shared_publication` invokes the getter concurrently with separate output slots and no byte writes. Existing source capture rules admit a slice of fixed buffer-owning records; preserve a whole/per-unit parallel-reader owner for that case. |
+| Construction / mutation | All Buffer literals wrap their Vec. Wrapper owner covers growth, whole-Vec replacement, truncation, clearing, spare-capacity initialization, and unwind refresh. Lack of `DerefMut` is the compile-time tripwire against bypassing pointer refresh. Existing buffer codec and reader owners cover native publication. |
+| Empty / malformed | Native view owner covers empty storage, null buffer and null output; it never dereferences an empty payload. No new validation order or unsafe input admission. |
+| Borrowed / generic / whole-per-unit | Existing `struct_handle_fields` borrowed receiver and optional-array-generic owners plus `consumer_borrow_boundaries::derived_view_mutation_preserves_disjoint_owner_facts` retain source behavior. |
+| Move / replacement / Drop / exits | Vec and guard Drop own backing and pointer refresh; existing buffer owner lifetime and cleanup tests retain compiler control-flow authority. Guard is internal and no new source ownership mode is added. |
+| Native ABI / cost | Same A72 and descriptor layout, no export or source allocation/copy. No new performance claim or benchmark gate. |
+
+Author inspection covers every Buffer constructor, mutable data access and
+native-output publication. It must also check early failures after spare-capacity
+writes, so neither a failing fill nor a successful read can publish a stale
+pointer. Native tests are behavior controls, not a claim of Miri qualification.
+
+### Native output initialization closure
+
+Author inspection and independent review also confirmed that HTTP read/SSE
+constructed `&mut [u8]` over reserved but uninitialized capacity. The pointer
+refresh must not preserve that invalid reference. Carry
+`&mut [MaybeUninit<u8>]` through streaming framing, read and SSE output helpers;
+use initialized-byte writes, and form a normal byte slice only for the completed
+SSE ID range after its exact writes. The internal one-byte SSE framing consumer
+reads its slot only after `Payload(1)`. Native fills receive the reserved
+spare-capacity slice inside `with_mut`, and successful prefix/event counts alone
+commit Vec length. Failure/EOF keeps source-visible length zero and refreshes the
+pointer after the output borrow ends. No full-window zeroing or copy is added.
+
+The existing framing-boundary and SSE direct-decode owners now use genuinely
+uninitialized output windows, observing only successful published ranges. The
+native HTTP read/SSE success, EOF, malformed framing, capacity and timeout owners
+exercise the same Buffer path. These owners close initialization and publication
+alongside pointer permission; the changed private Rust output signatures are the
+compile-time check against passing uninitialized storage as ordinary byte slices.

@@ -873,3 +873,44 @@ fn borrowed_handle_receiver_cache_replays_and_invalidates_body_edits() {
         assert_eq!(output.stdout, if index == 2 { b"B" } else { b"A" });
     }
 }
+
+#[test]
+fn borrowed_buffer_views_support_parallel_shared_readers() {
+    let helper = r#"module shared_buffer
+pub Item { data: buffer }
+pub fn length(borrow item: Item) -> i64 = item.data.bytes().len()
+pub fn read(items: slice<Item>) -> i64 {
+  return [1, 2].par_map(fn x { x + length(items[0]) }).sum()
+}
+"#;
+    let source = r#"module main
+import shared_buffer
+fn main() {
+  mut data := buffer(8)
+  data.put_u8(65)
+  items := [shared_buffer.Item { data: data }]
+  print(shared_buffer.read(items))
+}
+"#;
+    let files = [("shared_buffer.align", helper), ("main.align", source)];
+    let checked = diff_check_multi("buffer-shared-parallel", &files, "main.align");
+    assert!(
+        !checked.whole_errors && !checked.per_unit_errors,
+        "{}\n{}",
+        checked.whole_diags,
+        checked.per_unit_diags
+    );
+    if backend_available() {
+        for output in [
+            build_and_run_multi("buffer-shared-parallel-whole", &files, "main.align"),
+            build_per_unit_multi("buffer-shared-parallel-units", &files, "main.align").link_and_run(),
+        ] {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "5\n");
+        }
+    }
+}
