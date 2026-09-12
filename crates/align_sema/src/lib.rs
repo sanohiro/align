@@ -39601,7 +39601,7 @@ impl<'a> MoveCheck<'a> {
             .collect::<Vec<_>>();
         let mut visited = std::collections::BTreeSet::new();
         while let Some((root, leaf)) = pending.pop() {
-            if !leaf.known && !(root && root_authenticated) {
+            if !(leaf.known || root && root_authenticated) {
                 result.unknown = true;
             }
             if leaf.descriptor.is_some_and(|descriptor| {
