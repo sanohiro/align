@@ -1,12 +1,13 @@
 # Read-only view provenance
 
-Status: local capability implementation; interprocedural capability remains deferred.
+Status: local capability and read-only text-byte origins are implemented.
+Interprocedural capability remains deferred.
 
 ## Existing contract and reproduced failures
 
 `draft.md` §3 requires rejection of writes through constant tables and literal
 byte views, including rebound views. Mutability of a local changes the view
-binding, not the underlying allocation. Owned copies remain writable. This is
+binding, not the underlying allocation. Explicit owned byte copies remain writable. This is
 an implementation repair, not a new type, allocator, ownership model or syntax.
 
 At `177224089629a269bc404f2958b8bfc67b79dcbe`, the following checks successfully
@@ -66,8 +67,8 @@ part of either capability.
 | Surface | Exact rule |
 |---|---|
 | Fact | A set of read-only storage origins at typed value paths. The empty path denotes the value's own pointed-to storage; element/field payload paths denote contained values and must not taint unrelated writable backing or sibling fields. |
-| Origins | ConstArray marks its backing read-only and literal `str` values mark their bytes; mapped file/byte views use the existing read-only classification. Fresh owned string/array/buffer storage is writable; a shallow array copy preserves contained view origins while replacing only its own backing origin. |
-| Propagation | Local/field/tuple/active tagged projections select facts; constructors prefix them. Array-to-slice and subviews preserve backing origins. String/byte view conversions preserve byte origins. Value-carrying wrappers, if/match/else, Try/map_err and loop breaks join all reaching values. |
+| Origins | ConstArray marks its backing read-only and literal `str` values mark their bytes; mapped file/byte views use the existing read-only classification. Fresh owned array/buffer storage retains its existing writable contract. Text byte views remain read-only even when their source owns the allocation. A shallow array copy preserves contained view origins while replacing only its own backing origin. |
+| Propagation | Local/field/tuple/active tagged projections select facts; constructors prefix them. Array-to-slice and subviews preserve backing origins. String/byte view conversions preserve byte origins; `.bytes()` publications also establish the read-only origin specified below. Value-carrying wrappers, if/match/else, Try/map_err and loop breaks join all reaching values. |
 | Local assignment | Reuse existing path-local assignment, generation-content updates and CFG joins. Every reaching read-only alternative survives a join; a definite replacement may install a writable view. Backedges cannot hide a read-only assignment that textually follows a write. |
 | Precision and termination | Distinguish a collection's backing from its contained views and ordinary disjoint fields. Dynamic element indices may conservatively join. Recursive type/value paths need a finite, explicitly conservative representation; never use an iteration timeout as a clean verdict. |
 | Writes | Check indexed/element-field stores, vector stores, map_into and every existing safe intrinsic destination that writes through a view, plus Out/BorrowMut view arguments. Raw/unsafe operations retain their existing explicit unsafe contract. Preserve each operation's existing mutability, no-alias, range and element-type validation. |
@@ -167,11 +168,11 @@ an extra public boundary.
 | Existing storage initializer / local family | Required transfer and owner |
 |---|---|
 | FixedLiteral / Aggregate / Forwarded | Constructors prefix selected child facts; field/tuple/tagged/element reads select them. A pooled local array is still writable allocated storage; ConstArray alone marks its backing read-only. `readonly_origin_projection_matrix` covers writable backing containing literal str and independent sibling storage. |
-| BuilderElement | ArrayBuilderPush joins the value's fact into the destination builder's element-content edge; Append joins only the source's element facts, not its backing flag. Build transfers those contents to the result's element edge under fresh writable backing. Moves/rebinds retain the same conservative content dependencies. `readonly_origin_carrier_matrix` crosses push/append/build, intervening aliases/moves and loop mutation, with independently cloned string elements as writable-byte controls. |
-| JsonDecoded | Borrowed JSON record/array/union/scanner results derive their view-bearing payloads from the input byte origin. New record/array backing is writable; deep owned decode has no input-backed string leaves. `readonly_origin_carrier_matrix` covers literal versus owned-input twins, aggregate/array/union projection, and an owned-decoding control. Existing mapped-view source owners cover the independent origin. Scanner materialization is rejected by the existing J5 owner; scalar reductions expose no byte view, and callback escape is boundary 2. |
+| BuilderElement | ArrayBuilderPush joins the value's fact into the destination builder's element-content edge; Append joins only the source's element facts, not its backing flag. Build transfers those contents to the result's element edge under fresh writable backing. Moves/rebinds retain the same conservative content dependencies. `readonly_origin_carrier_matrix` crosses push/append/build, intervening aliases/moves and loop mutation. Literal and independently cloned string elements both publish read-only bytes; explicit byte materialization supplies the writable controls. |
+| JsonDecoded | Borrowed JSON record/array/union/scanner results derive their view-bearing payloads from the input byte origin. New record/array backing is writable; deep owned decode has no input-backed string leaves, but its text still publishes read-only bytes. `readonly_origin_carrier_matrix` covers literal versus owned-input twins, aggregate/array/union projection, and an owned-decoding control with explicit byte materialization for writes. Existing mapped-view source owners cover the independent origin. Scanner materialization is rejected by the existing J5 owner; scalar reductions expose no byte view, and callback escape is boundary 2. |
 | JsonDocElements / CarrierSource | JsonDoc carries a typed input-byte-content fact, separate from the document owner's storage. Get/At preserve it in their direct json.doc result (including Missing); AsStr/Key expose it as byte-view origin through OptionSome; Elems gives fresh array backing with borrowed document-content facts per element. The same classifier inventories other opaque carriers that expose retained views. `readonly_origin_carrier_matrix` covers get/at/as_str/key/elems chains and scalar-only reads. |
 | PipelineElement / PartitionElement / SoaColumns / GroupAggregation | Existing element-preserving transformations copy/move the element facts into the exact result column/element path, never the input collection's backing flag. Group/dictionary borrowed keys retain their selected key-view origin. Deep owned leaf copies clear only those copied leaf origins. Callback-produced values and callback mutations remain the explicit interprocedural boundary; do not guess their behavior from all argument descendants. `readonly_origin_carrier_matrix` covers stage-free copies, partition/column/group-key and dictionary projection where admitted. |
-| CloneIn / FreshEmpty | A copied storage allocation has fresh writable backing; preserve any shallow-copied view contents. Deep string/buffer/owned decoding copies produce writable bytes. Empty construction contributes no read-only content. Closest shallow/deep copy pairs are mandatory. |
+| CloneIn / FreshEmpty | A copied storage allocation has fresh backing; preserve any shallow-copied view contents. Explicit byte-element copies produce writable array storage. Deep string/owned decoding copies detach source ownership but their text-byte views remain read-only. Buffer copies retain their existing writable-byte contract. Empty construction contributes no read-only content. Closest shallow/deep copy pairs are mandatory. |
 | CallSummary / UnknownView / Missing | Ordinary call provenance stays boundary 2. Missing local materializer or retained-carrier semantics is an implementation error to resolve from the exhaustive storage-variant inventory, never an excuse to drop known local origins. Unknown local views retain conservative input-derived read-only content where the existing operation borrows those inputs. |
 
 Builder/dictionary mutation must enqueue every dependent result/projection when
@@ -269,7 +270,8 @@ existing strategy. Both are covered by the revised owner matrices:
   offset joins backing slots while preserving field paths. Index reads,
   materialization and builder append share that normalization.
   `readonly_origin_view_conversion_matrix` crosses fixed/dynamic storage,
-  full/offset views and direct/copy/builder consumers with literal/owned twins.
+  full/offset views and direct/copy/builder consumers with read-only text views
+  and explicit owned-byte-copy twins.
   Checked-HIR replay includes the same fixed-to-slice producer mutation.
 - Reduce/scan callback results do not inherit a source element's read-only
   property from a lifetime union. An empty reduce can return its initial
@@ -281,10 +283,12 @@ existing strategy. Both are covered by the revised owner matrices:
   The accumulator owner pins the exported two-parameter lifetime union after a
   swapping reducer. Callback writability provenance remains boundary 2.
 
-The view-conversion owner also pairs literal bytes with an owned byte copy through
-`as_str().bytes()`. `storage_roots` obtains a collection view's static backing
-property from its selected header, independently of retained element origins.
-Owned allocations stay writable without erasing readonly text payload paths.
+The view-conversion owner also rejects writes through `as_str().bytes()` after
+either literal bytes or an owned byte copy. An explicit `.to_array()` after that
+text publication supplies the independently writable twin. `storage_roots`
+obtains a collection view's static backing property from its selected header,
+independently of retained element origins. Owned array backing stays writable
+without erasing read-only text payload paths.
 
 
 ## Static descriptor origin closure
@@ -301,10 +305,52 @@ result laundering remains boundary 2.
 | Formation / all producers | Preserve descriptor shape, offset and trusted-origin validation. `readonly_static_descriptor_origin_matrix` covers offsets 16/32/48 through the actual three descriptor operations. |
 | Projection / replacement / writable copies | Reuse the local projected-fact engine. The owner crosses direct, record and slice views, readonly writes, readers and explicit owned copies. No new allocation or copy is inserted. |
 | Generic / imported / whole-per-unit | Concrete generic bridge bodies retain the origin after instantiation; `readonly_static_descriptor_whole_unit_parity` checks the three operations through both frontends. |
-| Malformed HIR / replay | `readonly_static_descriptor_checked_hir_replay` mutates a checked writable producer to StaticDescriptorView while keeping its valid descriptor pointer/offset. Structural validation must still pass and body replay must reject only the write. |
+| Malformed HIR / replay | `readonly_static_descriptor_checked_hir_replay` substitutes bytes from a checked StaticDescriptorView for a writable slice input while keeping its valid descriptor pointer/offset. Structural validation must still pass and body replay must reject only the write. |
 | Control / ownership / ABI | Existing local control, carrier, lifetime-separation and call-summary owners remain authoritative. No IR shape, runtime operation, lifetime summary, interface byte or ABI changes. |
 
 The pre-fix compiler accepts the three static-view write witnesses. Keep them
 compile-only, with no generated executable run. The source/replay owner must
 fail when the new origin seed is removed. This local closure is independently
 useful and does not claim the deferred interprocedural proof.
+
+## Read-only text-byte closure
+
+`draft.md` §12 requires `str` and owned text to remain valid UTF-8. Rebinding
+`text.bytes()` as a mutable slice cannot authorize changing that text's bytes.
+The compile-only owned-string witness at `2e2d8d51` accepts a write of 255 in
+both frontends. It must never execute. Explicit `.bytes().to_array()` remains a
+writable owned copy. Text returned by an ordinary function is subject to the
+same rule when its `.bytes()` conversion occurs locally.
+
+This closure covers `StrBytes`, independently of the text's literal, owned,
+borrowed, decoded or native-getter origin. It preserves the operation's existing
+`UnknownView` classification and source lifetime roots. `borrow_sources_inner`
+adds `BorrowRoot::ReadOnly`; `form_storage_completion` retains those roots in
+the selected typed fallback header. The ownerless constant/mapped-view shortcut
+would incorrectly discard text-owner lifetimes. Existing projections, completed
+operands, replacement and CFG joins preserve the marker. Primitive materializing
+copies detach their byte contents from the original text.
+
+The native byte getters are a different contract. In particular, plan 37 and
+Request 61 require writable buffer views for a borrowed numeric-stream owner
+without an added allocation or copy. Do not infer that these getters share the
+text invariant, or substitute copying for that accepted capability. Their
+existing native/owner contracts remain unchanged by this repair.
+
+| Axis | Implementation / owner |
+| --- | --- |
+| Formation / origins | `StrBytes` adds the marker while retaining every source root. `readonly_text_bytes_matrix` crosses local/field/range/sibling projections, reads, rejected writes and explicit copies. No type, HIR, MIR or ABI change. |
+| Safe destinations | `readonly_origin_sink_matrix` covers owned text and copied-byte twins at indexed stores, Out, direct/indirect BorrowMut, SIMD store, shuffle, native OutBytes and map_into. Existing type, mutability, range and no-alias checks remain authoritative. |
+| Backing versus contents | Local/carrier/projection/conversion owners distinguish cloning text from materializing writable byte elements. Descriptor-slot and disjoint raw-byte sibling writes remain valid; reduce/scan and lifetime-summary controls retain that distinction. |
+| Replacement / control | `readonly_origin_control_matrix` covers literal/owned-text origins through existing branches, Try/map_err, loops and completed operands. |
+| Ownership / source expiry | `readonly_text_bytes_matrix` retains owned-text escape and replacement rejection with independent copy controls. `copied_text_bytes_are_writable_after_source_expiry` executes copied-byte writes after text expiry in both frontends. Existing m5 str_bytes owners retain zero-copy reads and lifetime rejection. No runtime allocation, source nulling, Drop or replacement behavior changes. |
+| Generic / imported / whole / per-unit | `readonly_text_bytes_whole_unit_parity` checks local/imported concrete generic bodies, reads, writes and explicit copies. No interface/cache field changes. |
+| Checked HIR | `readonly_text_bytes_checked_hir_replay` substitutes borrowed/owned text byte producers for a writable slice input. Structural validity must pass before shared body-fact replay rejects the write. Existing projected and static-descriptor replay owners remain covered. |
+| Native contract separation | Existing `struct_handle_fields::borrowed_handle_receivers_preserve_nested_and_optional_owners` and `consumer_borrow_boundaries::derived_view_mutation_preserves_disjoint_owner_facts` remain unchanged and must pass: text protection must not freeze native buffer views or remove their allocation-free mutation path. |
+| Cost / deferred boundaries | Reuse finite projected facts and the existing worklist; no new analysis, iteration bound or performance promise. Ordinary slice argument/result writability is boundary 2. |
+
+A writable byte allocation validated by `as_str()` has a distinct observation
+invariant: a later write through an older byte alias must expire the validated
+text while leaving ordinary byte aliases usable. That separate failure domain
+is not closed by marking subsequent `StrBytes` views read-only. Cross-call
+validation/write effects also remain interprocedural work.

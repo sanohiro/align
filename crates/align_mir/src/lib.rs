@@ -23913,8 +23913,8 @@ mod tests {
         for method in ["descriptor_id", "sqlite_sql", "postgres_sql"] {
             for write in [false, true] {
                 let sink = if write { "bytes[0] = 65" } else { "print(bytes[0])" };
-                let db = format!("module pkg.db\nimport pkg.db.internal.descriptor\npub command<P> {{}}\npub fn probe<P>(statement: command<P>, input: str) {{ unsafe {{ static_text := pkg.db.internal.descriptor.{method}(statement); text := input; mut bytes := text.bytes(); {sink} }} }}\n");
-                let main = "module main\nimport pkg.db\nParams { value: i64 }\nfn witness(statement: pkg.db.command<Params>, input: str) { pkg.db.probe(statement, input) }\nfn main() -> i32 = 0\n";
+                let db = format!("module pkg.db\nimport pkg.db.internal.descriptor\npub command<P> {{}}\npub fn probe<P>(statement: command<P>, input: slice<u8>) {{ unsafe {{ static_text := pkg.db.internal.descriptor.{method}(statement); static_bytes := static_text.bytes(); mut bytes := input; {sink} }} }}\n");
+                let main = "module main\nimport pkg.db\nParams { value: i64 }\nfn witness(statement: pkg.db.command<Params>, input: slice<u8>) { pkg.db.probe(statement, input) }\nfn main() -> i32 = 0\n";
                 let (mut hir, diagnostics) = check_modules(&[
                     ("pkg.db.internal.descriptor", false, "module pkg.db.internal.descriptor\n"),
                     ("pkg.db", false, &db),
@@ -23925,16 +23925,16 @@ mod tests {
                 let function = hir.fns.iter_mut().find(|f| f.name.starts_with("pkg.db$probe$")).ok_or("concrete probe")?;
                 let block = match function.body.value.as_deref_mut() {
                     Some(hir::Expr { kind: hir::ExprKind::Unsafe(block), .. }) => block,
-                    other => panic!("unsafe fixture block: {other:?}"),
+                    _ => return Err("unsafe fixture block"),
                 };
-                let origin = match &block.stmts[0] {
+                let origin = match &block.stmts[1] {
                     hir::Stmt::Let { init, .. } => {
-                        assert!(matches!(init.kind, hir::ExprKind::StaticDescriptorView { .. }));
+                        assert!(matches!(init.kind, hir::ExprKind::StrBytes { .. }));
                         init.clone()
                     }
-                    other => panic!("static fixture origin: {other:?}"),
+                    _ => return Err("static fixture origin"),
                 };
-                let hir::Stmt::Let { init, .. } = &mut block.stmts[1] else { panic!("input binding") };
+                let hir::Stmt::Let { init, .. } = &mut block.stmts[2] else { return Err("input binding") };
                 assert_eq!(init.ty, origin.ty);
                 *init = origin;
                 assert!(validate_hir::body_core_metadata_is_valid(&hir), "mutation must retain structural validity");

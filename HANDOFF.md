@@ -1,5 +1,12 @@
 # Session handoff
 
+**Read-only text bytes:** [plan 52](docs/impl/52-readonly-view-provenance-plan.md)
+now retains read-only origins when text publishes `.bytes()`, including owned
+and returned text. Explicit byte-element copies remain writable and source
+lifetimes remain tracked. Native buffer views keep their existing contract.
+Ordinary slice argument/result laundering and invalidation of validated text
+after an older byte-alias write remain separate open boundaries.
+
 **R77–R83 provider composition (2026-09-12):**
 [Plan 56](docs/impl/56-r77-r83-composition-plan.md) includes all seven new requests
 and the appended R80/R81/R83 client cases. The implementation merged in #1027

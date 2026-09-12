@@ -18484,39 +18484,74 @@ fn readonly_origin_checked_hir_replay() -> Result<(), &'static str> {
     for projection in ["direct", "record", "slice"] {
         for write in [false, true] {
             let construction = match projection {
-                "record" => "holder := Holder { text: input }; mut view := holder.text.bytes()",
-                "slice" => "words := [input, input]; values: slice<str> := words; mut view := values[0].bytes()",
-                _ => "mut view := input.bytes()",
+                "record" => "holder := Holder { view: input }; mut view := holder.view",
+                "slice" => "items := [Holder { view: input }, Holder { view: input }]; values: slice<Holder> := items; mut view := values[0].view",
+                _ => "mut view := input",
             };
             let sink = if write { "view[0] = 65" } else { "print(view[0])" };
-            let source = format!("Holder {{ text: str }}\nfn probe(input: str) {{ {construction}; {sink} }}\nfn main() -> i32 = 0\n");
+            let source = format!("Holder {{ view: slice<u8> }}\nfn probe(input: slice<u8>) {{ readonly := \"xx\".bytes(); {construction}; {sink} }}\nfn main() -> i32 = 0\n");
             let mut program = checked_source_program(&source);
             assert!(align_sema::checked_hir_body_facts_are_valid(&program));
             let function = program.fns.iter_mut().find(|f| f.name == "probe").ok_or("missing probe fixture")?;
-            let hir::Stmt::Let { init, .. } = &mut function.body.stmts[0] else {
-                panic!("fixture lost its binding");
+            let hir::Stmt::Let { init: origin, .. } = &function.body.stmts[0] else {
+                return Err("fixture lost its readonly origin");
+            };
+            let origin = origin.clone();
+            let hir::Stmt::Let { init, .. } = &mut function.body.stmts[1] else {
+                return Err("fixture lost its binding");
             };
             let input = if projection == "record" {
                 let hir::ExprKind::StructLit { fields, .. } = &mut init.kind else {
-                    panic!("fixture lost its record");
+                    return Err("fixture lost its record");
                 };
                 &mut fields[0]
             } else if projection == "slice" {
                 let hir::ExprKind::ArrayLit { elems, .. } = &mut init.kind else {
-                    panic!("fixture lost its array");
+                    return Err("fixture lost its array");
                 };
-                &mut elems[0]
+                let hir::ExprKind::StructLit { fields, .. } = &mut elems[0].kind else {
+                    return Err("fixture lost its element record");
+                };
+                &mut fields[0]
             } else {
-                let hir::ExprKind::StrBytes { inner } = &mut init.kind else {
-                    panic!("fixture lost its byte view");
-                };
-                inner.as_mut()
+                init
             };
-            assert_eq!(input.ty, Ty::Str);
-            input.kind = hir::ExprKind::Str("xx".to_string());
+            assert_eq!(input.ty, origin.ty);
+            *input = origin;
             assert!(body_core_metadata_is_valid(&program));
             assert_eq!(align_sema::checked_hir_body_facts_are_valid(&program), !write,
                 "projection={projection} write={write}");
+            assert_eq!(lower_program_checked(&program, false, None).is_ok(), !write,
+                "projection={projection} write={write}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn readonly_text_bytes_checked_hir_replay() -> Result<(), &'static str> {
+    for (name, receiver, publication) in [
+        ("text", "source: str", "source.bytes()"),
+        ("owned", "borrow source: string", "source.bytes()"),
+    ] {
+        for write in [false, true] {
+            let sink = if write { "bytes[0] = 65" } else { "print(bytes[0])" };
+            let source = format!("fn probe(input: slice<u8>, {receiver}) {{ published := {publication}; mut bytes := input; {sink} }}\nfn main() -> i32 = 0\n");
+            let mut program = checked_source_program(&source);
+            assert!(align_sema::checked_hir_body_facts_are_valid(&program));
+            let function = program.fns.iter_mut().find(|f| f.name == "probe").ok_or("publication probe")?;
+            let hir::Stmt::Let { init: origin, .. } = &function.body.stmts[0] else {
+                return Err("publication origin");
+            };
+            let origin = origin.clone();
+            let hir::Stmt::Let { init, .. } = &mut function.body.stmts[1] else {
+                return Err("publication input");
+            };
+            assert_eq!(init.ty, origin.ty);
+            *init = origin;
+            assert!(body_core_metadata_is_valid(&program), "{name}/{write} must remain structurally valid");
+            assert_eq!(align_sema::checked_hir_body_facts_are_valid(&program), !write, "{name}/{write}");
+            assert_eq!(lower_program_checked(&program, false, None).is_ok(), !write, "{name}/{write}");
         }
     }
     Ok(())
