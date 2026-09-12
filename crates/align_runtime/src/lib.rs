@@ -42983,8 +42983,11 @@ mod tests {
             }
             if let Some(event) = published {
                 // Successful publication initializes exactly this prefix, never the spare tail.
+                let initialized = output
+                    .get(..event.total)
+                    .expect("published SSE length exceeds caller capacity");
                 let output = unsafe {
-                    core::slice::from_raw_parts(output.as_ptr().cast::<u8>(), event.total)
+                    core::slice::from_raw_parts(initialized.as_ptr().cast::<u8>(), initialized.len())
                 };
                 events.push(DirectSseEvent {
                     event: output[event.event_start..event.event_start + event.event_len].to_vec(),
