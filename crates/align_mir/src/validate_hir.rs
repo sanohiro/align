@@ -2798,6 +2798,10 @@ struct BodyContext {
     /// Only the direct integer-literal child of unary `-` may carry the positive magnitude one
     /// past the signed maximum. Sema uses that exact HIR shape for `INT_MIN`.
     signed_min_magnitude: bool,
+    /// A Move-valued indexed field is valid only as the direct operand of a shared-borrow call.
+    /// Child expressions clear this bit, so casts, wrappers, stores and returns cannot turn a
+    /// read-only field place into an owning value.
+    allow_indexed_move_field_borrow: bool,
 }
 
 struct BatchPlanCall<'a> {
@@ -3314,6 +3318,7 @@ impl<'a> BodyValidator<'a> {
                 spawn: None,
                 pooled_initializer: None,
                 signed_min_magnitude: false,
+                allow_indexed_move_field_borrow: false,
             };
             if !self.walk_block(&function.body, context.clone()) {
                 return reject();
@@ -3377,6 +3382,7 @@ impl<'a> BodyValidator<'a> {
                         hir::Stmt::Let { local, .. } => Some(*local),
                         _ => None,
                     };
+                    child_context.allow_indexed_move_field_borrow = false;
                     let mut children = statement_children(statement);
                     while let Some(child) = children.pop() {
                         work.push(BodyWork::EnterExpr(child, child_context.clone()));
@@ -6406,6 +6412,7 @@ impl<'a> BodyValidator<'a> {
             spawn: None,
             pooled_initializer: None,
             signed_min_magnitude: false,
+            allow_indexed_move_field_borrow: false,
         };
         let mut work = vec![BodyWork::EnterBlock(root, context)];
         while let Some(item) = work.pop() {
@@ -6445,6 +6452,23 @@ impl<'a> BodyValidator<'a> {
         false
     }
 
+    fn direct_call_arg_is_shared_borrow(&self, function: &str, index: usize) -> bool {
+        self.resolve_signature(function)
+            .and_then(|signature| signature.modes.get(index).copied())
+            .is_some_and(|mode| mode == align_ast::ParamMode::Borrow)
+    }
+
+    fn function_value_arg_is_shared_borrow(&self, callee: &hir::Expr, index: usize) -> bool {
+        let Ty::Fn(function) = callee.ty else {
+            return false;
+        };
+        self.program
+            .fn_types
+            .get(function as usize)
+            .and_then(|signature| signature.params.get(index).map(|(mode, _)| *mode))
+            .is_some_and(|mode| mode == align_ast::ParamMode::Borrow)
+    }
+
     fn push_expression_children(
         &self,
         expression: &'a hir::Expr,
@@ -6456,6 +6480,7 @@ impl<'a> BodyValidator<'a> {
                 let mut child_context = $child_context;
                 child_context.pooled_initializer = None;
                 child_context.signed_min_magnitude = false;
+                child_context.allow_indexed_move_field_borrow = false;
                 work.push(BodyWork::EnterExpr($child, child_context));
             }};
         }
@@ -6465,6 +6490,7 @@ impl<'a> BodyValidator<'a> {
                 child_context.pooled_initializer = None;
                 child_context.signed_min_magnitude = *op == align_ast::UnOp::Neg
                     && matches!(expr.kind, hir::ExprKind::Int(_));
+                child_context.allow_indexed_move_field_borrow = false;
                 work.push(BodyWork::EnterExpr(expr, child_context));
             }
             hir::ExprKind::Cast(expr)
@@ -6519,8 +6545,13 @@ impl<'a> BodyValidator<'a> {
                 }
             }
             hir::ExprKind::CallFnValue { callee, args } => {
-                for arg in args.iter().rev() {
-                    push_expr!(arg, context.clone());
+                for (index, arg) in args.iter().enumerate().rev() {
+                    let mut arg_context = context.clone();
+                    arg_context.pooled_initializer = None;
+                    arg_context.signed_min_magnitude = false;
+                    arg_context.allow_indexed_move_field_borrow = self
+                        .function_value_arg_is_shared_borrow(callee, index);
+                    work.push(BodyWork::EnterExpr(arg, arg_context));
                 }
                 push_expr!(callee, context.clone());
             }
@@ -6545,12 +6576,14 @@ impl<'a> BodyValidator<'a> {
                     .task_group_fallible
                     .push(self.task_group_is_fallible(block));
                 child.pooled_initializer = None;
+                child.allow_indexed_move_field_borrow = false;
                 work.push(BodyWork::EnterBlock(block, child));
             }
             hir::ExprKind::Match { scrutinee, arms, .. } => {
                 for arm in arms.iter().rev() {
                     let mut arm_context = context.clone();
                     arm_context.pooled_initializer = None;
+                    arm_context.allow_indexed_move_field_borrow = false;
                     work.push(BodyWork::EnterArm(arm, scrutinee, arm_context));
                 }
                 push_expr!(scrutinee, context.clone());
@@ -6570,17 +6603,24 @@ impl<'a> BodyValidator<'a> {
                 });
                 push_expr!(closure, child);
             }
-            hir::ExprKind::Call { args, .. } => {
-                for arg in args.iter().rev() {
-                    push_expr!(arg, context.clone());
+            hir::ExprKind::Call { func, args, .. } => {
+                for (index, arg) in args.iter().enumerate().rev() {
+                    let mut arg_context = context.clone();
+                    arg_context.pooled_initializer = None;
+                    arg_context.signed_min_magnitude = false;
+                    arg_context.allow_indexed_move_field_borrow =
+                        self.direct_call_arg_is_shared_borrow(func, index);
+                    work.push(BodyWork::EnterExpr(arg, arg_context));
                 }
             }
             hir::ExprKind::If { cond, then, els } => {
                 let mut else_context = context.clone();
                 else_context.pooled_initializer = None;
+                else_context.allow_indexed_move_field_borrow = false;
                 work.push(BodyWork::EnterBlock(els, else_context));
                 let mut then_context = context.clone();
                 then_context.pooled_initializer = None;
+                then_context.allow_indexed_move_field_borrow = false;
                 work.push(BodyWork::EnterBlock(then, then_context));
                 push_expr!(cond, context.clone());
             }
@@ -6591,6 +6631,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::Unsafe(block) => {
                 let mut child = context.clone();
                 child.pooled_initializer = None;
+                child.allow_indexed_move_field_borrow = false;
                 if matches!(
                     &expression.kind,
                     hir::ExprKind::Arena(_) | hir::ExprKind::NamedArena { .. }
@@ -6605,6 +6646,7 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::Loop { body, .. } => {
                 let mut child = context.clone();
                 child.pooled_initializer = None;
+                child.allow_indexed_move_field_borrow = false;
                 child.loop_targets.push(LoopTarget {
                     ty: expression.ty,
                     arena_depth: context.arena_depth,
@@ -6955,6 +6997,7 @@ impl<'a> BodyValidator<'a> {
             ($child:expr) => {{
                 let mut child_context = context.clone();
                 child_context.pooled_initializer = None;
+                child_context.allow_indexed_move_field_borrow = false;
                 work.push(BodyWork::EnterExpr($child, child_context));
             }};
         }
@@ -7139,6 +7182,11 @@ impl<'a> BodyValidator<'a> {
                 for (index, ((mode, scalar), arg)) in function.params.iter().zip(&arg_flows).enumerate() {
                     let expected = align_sema::scalar_to_ty(*scalar);
                     if !self.body_ty_matches(arg.ty, expected) {
+                        return None;
+                    }
+                    if *mode == align_ast::ParamMode::ByValue
+                        && self.indexed_move_element_field(&args[index])
+                    {
                         return None;
                     }
                     if *mode == align_ast::ParamMode::Out
@@ -7391,6 +7439,11 @@ impl<'a> BodyValidator<'a> {
                     .enumerate()
                 {
                     if !self.body_ty_matches(actual.ty, *expected) {
+                        return None;
+                    }
+                    if *mode == align_ast::ParamMode::ByValue
+                        && self.indexed_move_element_field(&args[index])
+                    {
                         return None;
                     }
                     if *mode == align_ast::ParamMode::Out
@@ -10696,9 +10749,42 @@ impl<'a> BodyValidator<'a> {
                 if leaf == Ty::String {
                     leaf = Ty::Str;
                 }
+                let indexed_move_field = matches!(
+                    receiver.ty,
+                        Ty::Slice(Scalar::Struct(_))
+                        | Ty::StructArray(..)
+                        | Ty::DynStructArray(_, Layout::Aos)
+                ) && align_sema::ty_is_move(
+                    leaf,
+                    &self.program.structs,
+                    &self.program.tuples,
+                    &self.program.enums,
+                    &self.program.tagged_types,
+                );
+                // Fixed struct-array element fields use the stack-slot lowering and therefore
+                // retain sema's literal-index restriction. Dynamic AoS/slice views have the
+                // checked runtime-index path; a malformed HIR must not bypass that distinction.
+                let fixed_resource_field = matches!(
+                    (receiver.ty, leaf),
+                    (Ty::StructArray(..), Ty::Resource(_))
+                );
+                if indexed_move_field
+                    && !fixed_resource_field
+                    && matches!(receiver.ty, Ty::StructArray(..))
+                    && !matches!(index.kind, hir::ExprKind::Int(_))
+                {
+                    return None;
+                }
+                if indexed_move_field
+                    && !fixed_resource_field
+                    && !context.allow_indexed_move_field_borrow
+                {
+                    return None;
+                }
                 if !(self.ty_copy_ok(leaf, context)
                     || matches!(leaf, Ty::Resource(_))
-                        && matches!(receiver.ty, Ty::StructArray(..)))
+                        && matches!(receiver.ty, Ty::StructArray(..))
+                    || indexed_move_field)
                 {
                     return None;
                 }
@@ -12485,6 +12571,28 @@ impl<'a> BodyValidator<'a> {
             .is_some_and(|local| local.id == id && local.is_mut)
     }
 
+    fn indexed_move_element_field(&self, expression: &hir::Expr) -> bool {
+        let hir::ExprKind::ElemField { recv, .. } = &expression.kind else {
+            return false;
+        };
+        let indexed_record = matches!(
+            recv.ty,
+            Ty::Slice(Scalar::Struct(_))
+                | Ty::StructArray(..)
+                | Ty::DynStructArray(_, Layout::Aos)
+        );
+        indexed_record
+            && !(matches!(recv.ty, Ty::StructArray(..))
+                && matches!(expression.ty, Ty::Resource(_)))
+            && align_sema::ty_is_move(
+            expression.ty,
+            &self.program.structs,
+            &self.program.tuples,
+            &self.program.enums,
+            &self.program.tagged_types,
+        )
+    }
+
     fn borrow_arg_is_valid(
         &self,
         context: &BodyContext,
@@ -12492,21 +12600,49 @@ impl<'a> BodyValidator<'a> {
         mode: align_ast::ParamMode,
         allow_projected_move: bool,
     ) -> bool {
-        let (root, field, fixed_element_field) = match &argument.kind {
-            hir::ExprKind::Local(local) => (*local, false, false),
-            hir::ExprKind::Field { root, .. } => (*root, true, false),
-            hir::ExprKind::ElemField { recv, .. }
-                if matches!(recv.ty, Ty::StructArray(..)) =>
+        // Sema materializes `str` and `slice<T>` borrow arguments as transparent view wrappers.
+        // Replay the stability check against their physical source place so a checked field path
+        // remains a borrow of the enclosing local rather than being mistaken for a temporary.
+        let place = align_sema::borrow_argument_source(argument);
+        if mode == align_ast::ParamMode::BorrowMut
+            && align_sema::borrow_argument_is_owning_view_retype(argument)
+        {
+            return false;
+        }
+        let (root, field, fixed_element_field, dynamic_element_field, fixed_literal_element_field) = match &place.kind {
+            hir::ExprKind::Local(local) => (*local, false, false, false, false),
+            hir::ExprKind::Field { root, .. } => (*root, true, false, false, false),
+            hir::ExprKind::ElemField { recv, index, .. }
+                if matches!(
+                    recv.ty,
+                    Ty::Slice(Scalar::Struct(_))
+                        | Ty::StructArray(..)
+                        | Ty::DynStructArray(..)
+                        | Ty::Soa(_)
+                ) =>
             {
-                let hir::ExprKind::Local(root) = recv.kind else {
-                    return false;
+                let root = match recv.kind {
+                    hir::ExprKind::Local(root) | hir::ExprKind::Field { root, .. } => root,
+                    _ => return false,
                 };
-                (root, true, true)
+                (
+                    root,
+                    true,
+                    true,
+                    matches!(
+                        recv.ty,
+                        Ty::Slice(Scalar::Struct(_))
+                            | Ty::StructArray(..)
+                            | Ty::DynStructArray(_, Layout::Aos)
+                    ),
+                    matches!(recv.ty, Ty::StructArray(..))
+                        && matches!(index.kind, hir::ExprKind::Int(_)),
+                )
             }
             hir::ExprKind::BorrowedIndex { base, .. }
                 if mode == align_ast::ParamMode::Borrow =>
             {
-                (base.root_local, false, false)
+                (base.root_local, false, false, false, false)
             }
             _ => return false,
         };
@@ -12529,7 +12665,11 @@ impl<'a> BodyValidator<'a> {
         match mode {
             align_ast::ParamMode::Borrow => {
                 argument.ty != Ty::ArenaHandle
-                    && (!fixed_element_field || allow_projected_move || !move_pointee)
+                    && (!fixed_element_field
+                        || allow_projected_move
+                        || !move_pointee
+                        || dynamic_element_field
+                        || fixed_literal_element_field)
             }
             align_ast::ParamMode::BorrowMut => {
                 local.is_mut && (allow_projected_move || !(field && move_pointee))

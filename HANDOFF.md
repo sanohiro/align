@@ -1,5 +1,23 @@
 # Session handoff
 
+**R77–R83 consolidated implementation (2026-09-12; branch-local):**
+[Plan 56](docs/impl/56-r77-r83-composition-plan.md) includes all seven new requests
+and the appended R80/R81/R83 client cases. The provider branch implements the six
+selected requests: shared reads, fresh/transferred storage, owned call/return
+certification and the shared namespace carrier. Indexed Move-field calls use
+checked runtime indices for dynamic slice/AoS views and integer-literal indices
+for source-formed fixed `StructArray` places. R78 remains PROPOSED because plan
+23's prerequisite for reopening its deliberate enum exclusion is unmet. The
+focused provider owner now passes 22 whole/per-unit composition cases, including
+the non-loop Option replacement, borrowed Config/task-source forwarding, the
+resource-backed Document path and the 32-field measurement final-digest path.
+`align_sema::borrow_argument_source` is the shared sema/checked-HIR/MIR seam for
+`StrBorrow`/`ArrayToSlice` field arguments; mutable owning view retypes are rejected,
+and fixed-array slice calls use a materialized descriptor slot. Real client smoke/A2 acceptance,
+managed-pin adoption and platform-specific namespace execution remain external.
+The final candidate has a clean host review; release build, preflight and push
+remain. No merge or consumer adoption is claimed by this branch.
+
 **R69–R76 macOS qualification (2026-09-11):**
 [Plan 54](docs/impl/54-r69-r76-prerequisite-batch-plan.md) owns all eight requests
 and the native evidence. The owner approved retaining strict final-link refusal:
@@ -7,8 +25,7 @@ and the native evidence. The owner approved retaining strict final-link refusal:
 validation and before filesystem work. XNU's no-follow flag permits observing
 the final symlink itself; the earlier macOS strategy was incorrect. Self
 `access` remains supported on Linux/macOS. Useful macOS R72 relative observations
-are deferred; consumer adoption remains external. The combined implementation
-stays draft. No merge or versioned release is requested by this handoff.
+are deferred; consumer adoption remains external. The combined implementation is merged. Consumer adoption remains external.
 
 **Future std/pkg review (planned, no implementation scheduled):**
 [Plan 51](docs/impl/51-package-composition-review-plan.md) records the overlap

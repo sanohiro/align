@@ -1708,7 +1708,7 @@ pub fn borrowed_sum_payload_is_admissible(
         match ty {
             Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Unit | Ty::Str | Ty::String
             | Ty::Slice(_) | Ty::Raw | Ty::Rng | Ty::Buffer | Ty::Writer | Ty::ProcessMember
-            | Ty::FsDirectory | Ty::FsDirCursor => true,
+            | Ty::ProcessUserNamespace | Ty::FsDirectory | Ty::FsDirCursor => true,
             Ty::Struct(id) => {
                 if !active_structs.insert(id) {
                     return false;
@@ -4639,6 +4639,32 @@ pub fn borrow_transparent_value(e: &hir::Expr) -> Option<&hir::Expr> {
         hir::ExprKind::Block(b) | hir::ExprKind::Unsafe(b) => b.value.as_deref(),
         _ => None,
     }
+}
+
+/// Return the physical place behind a call-boundary view coercion. `str` and `slice<T>` arguments
+/// are represented as `StrBorrow`/`ArrayToSlice` wrappers, but those nodes add no storage or
+/// ownership. The sema stability gate, checked-HIR replay, and MIR place lowering all use this
+/// one source so a direct field path cannot be classified as a temporary in one stage and a place
+/// in another.
+pub fn borrow_argument_source(e: &hir::Expr) -> &hir::Expr {
+    let mut source = e;
+    while let hir::ExprKind::StrBorrow(inner) | hir::ExprKind::ArrayToSlice(inner) = &source.kind {
+        source = inner;
+    }
+    source
+}
+
+/// Whether an exclusive borrow would relabel physical owning storage as a non-owning view. MIR
+/// can materialize a fixed-array descriptor, but a dynamic array or owned string header cannot be
+/// replaced through a view without bypassing its cleanup bit. Shared borrowing and existing view
+/// bindings remain valid; this predicate is only an exclusive-call boundary rule.
+pub fn borrow_argument_is_owning_view_retype(e: &hir::Expr) -> bool {
+    matches!(
+        (borrow_argument_source(e).ty, e.ty),
+        (Ty::String, Ty::Str | Ty::Slice(_))
+            | (Ty::DynArray(_), Ty::Slice(_))
+            | (Ty::DynStructArray(_, Layout::Aos), Ty::Slice(_))
+    )
 }
 
 /// Whether a borrowing use of this expression can select a **fresh owned value** — one with no
@@ -37066,7 +37092,20 @@ impl<'a> MoveCheck<'a> {
         // facts deliberately include that generation even for a primitive dynamic collection so
         // an eager mutable call can reserve it; leaking the same root into a materialized result
         // would make a later source reassignment invalidate independent ArrayToSoa/ToArray output.
-        let mut fact = self.element_argument_fact(fact, &self.mutable_backing(source));
+        // Primitive elements cannot retain any owner at all, so clear the complete source fact in
+        // that case. This is what lets `slice<u8>.to_array()` leave a loop iteration's `buffer`
+        // owner behind while still preserving roots for `str` and `slice` elements.
+        let mut fact = if ty_may_borrow(
+            element_ty,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        ) {
+            self.element_argument_fact(fact, &self.mutable_backing(source))
+        } else {
+            BorrowFact::default()
+        };
         for stage in stages {
             match &stage.kind {
                 StageKind::Project { field } => {
@@ -48065,7 +48104,7 @@ impl<'a, 't> Checker<'a, 't> {
         // not materialized.
         if let Some((arr, index, mut names)) = peel_index_field_chain(recv) {
             names.push(field);
-            return self.check_index_field(arr, index, &names, expected, span);
+            return self.check_index_field(arr, index, &names, expected, span, false);
         }
         // Resolve the receiver to a struct **place** — a local, or a nested field path `l.a.b`.
         let (root, mut path, recv_ty) = match self.resolve_place(recv) {
@@ -49413,12 +49452,29 @@ impl<'a, 't> Checker<'a, 't> {
         mode: ast::ParamMode,
         json_scan_spelling: Option<String>,
     ) -> Expr {
-        if mode == ast::ParamMode::Borrow
-            && let ast::ExprKind::Index { recv, index } = &argument.kind
-        {
-            let checked = self.check_indexed_borrow_argument(recv, index, argument.span);
-            self.constrain(checked.ty, expected, argument.span);
-            return checked;
+        if mode == ast::ParamMode::Borrow {
+            if let Some((receiver, index, fields)) = peel_index_field_chain(argument)
+                && !fields.is_empty()
+            {
+                // A dynamic Move field is a valid shared place only when the complete
+                // `arr[index].field` expression is the explicit borrow argument. Ordinary value
+                // checking remains closed so a by-value read cannot duplicate the field owner.
+                let checked = self.check_index_field(
+                    receiver,
+                    index,
+                    &fields,
+                    expected,
+                    argument.span,
+                    true,
+                );
+                self.constrain(checked.ty, expected, argument.span);
+                return checked;
+            }
+            if let ast::ExprKind::Index { recv, index } = &argument.kind {
+                let checked = self.check_indexed_borrow_argument(recv, index, argument.span);
+                self.constrain(checked.ty, expected, argument.span);
+                return checked;
+            }
         }
         self.check_arg_with_json_scan_source_spelling(
             argument,
@@ -49444,11 +49500,17 @@ impl<'a, 't> Checker<'a, 't> {
                     | "pkg.template$write"
                     | "pkg.template$raw"
             );
-        let root = match &argument.kind {
+        // `str` and `slice<T>` call arguments are represented by view wrappers around the
+        // physical source (`StrBorrow` / `ArrayToSlice`). The wrapper owns no storage of its
+        // own, so stability must be checked against the place underneath it. Looking only at
+        // the outer node made a stable borrowed record field look like a temporary and rejected
+        // direct forwarding such as `validate(config.workspace, config.readonly_roots)`.
+        let place = borrow_argument_source(argument);
+        let root = match &place.kind {
             ExprKind::Local(local) => Some(*local),
             ExprKind::Field { root, .. } => Some(*root),
             ExprKind::ElemField { recv, .. } => match recv.kind {
-                ExprKind::Local(local) => Some(local),
+                ExprKind::Local(local) | ExprKind::Field { root: local, .. } => Some(local),
                 _ => None,
             },
             ExprKind::BorrowedIndex { base, .. } if mode == ast::ParamMode::Borrow => {
@@ -49465,8 +49527,23 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return;
         };
+        // A mutable view cannot safely overwrite an owning collection/string header: the
+        // callee's replacement would bypass the owner's cleanup bit and leave the physical owner
+        // dangling or double-dropped. Fixed arrays are materialized as a separate slice descriptor
+        // by MIR, so their inline backing remains a valid writable view; dynamic arrays and owned
+        // strings must be passed with their owning type (or through an existing view binding).
         if mode == ast::ParamMode::BorrowMut
-            && matches!(argument.kind, ExprKind::Field { .. })
+            && borrow_argument_is_owning_view_retype(argument)
+        {
+            self.diags.error(
+                format!(
+                    "cannot exclusively borrow owning storage through a view for '{display}'; pass the owning type or an existing view"
+                ),
+                argument.span,
+            );
+        }
+        if mode == ast::ParamMode::BorrowMut
+            && matches!(place.kind, ExprKind::Field { .. })
             && ty_is_move(
                 argument.ty,
                 self.structs,
@@ -49483,7 +49560,19 @@ impl<'a, 't> Checker<'a, 't> {
                 argument.span,
             );
         }
-        if matches!(argument.kind, ExprKind::ElemField { .. })
+        let indexed_move_field = matches!(
+            &place.kind,
+            ExprKind::ElemField {
+                recv,
+                ..
+            } if matches!(
+                recv.ty,
+                Ty::Slice(Scalar::Struct(_))
+                    | Ty::StructArray(..)
+                    | Ty::DynStructArray(_, Layout::Aos)
+            )
+        );
+        if matches!(place.kind, ExprKind::ElemField { .. })
             && ty_is_move(
                 argument.ty,
                 self.structs,
@@ -49492,6 +49581,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.tagged_types,
             )
             && !template_move_borrow
+            && !indexed_move_field
         {
             self.diags.error(
                 format!("cannot borrow a Move field from a fixed array for '{display}'"),
@@ -50041,7 +50131,7 @@ impl<'a, 't> Checker<'a, 't> {
                 // may still bind the slot.
                 self.reject_bare_array_value(a, None, "a generic argument");
                 if param_modes[i] == ast::ParamMode::Borrow
-                    && matches!(a.kind, ast::ExprKind::Index { .. })
+                    && peel_index_field_chain(a).is_some()
                 {
                     self.check_call_argument_for_mode(
                         a,
@@ -64087,7 +64177,15 @@ impl<'a, 't> Checker<'a, 't> {
     /// bounds-checked element-field load; only the field (a scalar or a `str` view) is read. The
     /// result inherits the array's region (a `str` field views the array's input), so it cannot
     /// escape that input.
-    fn check_index_field(&mut self, arr: &ast::Expr, index: &ast::Expr, fields: &[&ast::Ident], expected: Option<Ty>, span: Span) -> Expr {
+    fn check_index_field(
+        &mut self,
+        arr: &ast::Expr,
+        index: &ast::Expr,
+        fields: &[&ast::Ident],
+        expected: Option<Ty>,
+        span: Span,
+        allow_indexed_move_borrow: bool,
+    ) -> Expr {
         let err = Expr { kind: ExprKind::Local(u32::MAX), ty: Ty::Error, span };
         let r = self.check_expr(arr, None);
         let i = self.check_array_index_expr(index);
@@ -64146,11 +64244,19 @@ impl<'a, 't> Checker<'a, 't> {
         if leaf_ty == Ty::String {
             leaf_ty = Ty::Str;
         }
-        // Fail closed for every other Move leaf. A runtime element index cannot record which
-        // aggregate slot transferred ownership, so copying any recursive Drop plan would leave
-        // both the result and the array owning the same payload.
+        // Fail closed for every other Move leaf unless this exact expression is the argument of
+        // an explicit shared borrow from a dynamic AoS/slice record array. That call boundary can
+        // retain a pointer to the selected field while the array root stays live and unchanged;
+        // by-value reads still cannot identify which runtime element surrendered its owner.
+        let indexed_move_borrow = allow_indexed_move_borrow
+            && (matches!(
+                r.ty,
+                Ty::Slice(Scalar::Struct(_)) | Ty::DynStructArray(_, Layout::Aos)
+            ) || (matches!(r.ty, Ty::StructArray(..))
+                && matches!(index.kind, ast::ExprKind::Int(_))));
         if drop_plan(leaf_ty, self.structs, self.enums, self.tagged_types).needs_drop()
             && !(matches!(leaf_ty, Ty::Resource(_)) && matches!(r.ty, Ty::StructArray(..)))
+            && !indexed_move_borrow
         {
             self.diags.error(
                 format!(
@@ -78256,8 +78362,10 @@ fn exit_branch(flag: bool) -> i64 {
         for admitted in [
             Ty::FsDirectory,
             Ty::FsDirCursor,
+            Ty::ProcessUserNamespace,
             Ty::Option(Scalar::FsDirectory),
             Ty::Result(Scalar::FsDirCursor,Scalar::Bool),
+            Ty::Option(Scalar::ProcessUserNamespace),
             Ty::Buffer,
             Ty::Writer,
             Ty::DynArray(Scalar::Int(IntTy { bits: 64, signed: true })),

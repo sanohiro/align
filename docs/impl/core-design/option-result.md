@@ -46,6 +46,14 @@ read the active payload in place and leaves the source owner unchanged; it is sp
 arbitrary new Move-element collection layouts, and L2's dynamic path-selected return cleanup remain
 separately owned restrictions; new library handles must not add compiler-known exceptions.
 
+R82 shared-carrier completion is implemented on the consolidated provider
+branch. [Plan 56](../56-r77-r83-composition-plan.md) adds only
+`process.user_namespace` to the existing recursively admitted borrowed-payload
+grammar. Stable optional and record-contained shared matches retain the source
+owner; the existing explicit `inherit_namespace` call owns its native duplicate.
+No owner extraction, exclusive indexed borrow, new handle family or native
+operation is added.
+
 The historical checkpoint boundary was exact: L1a first admitted only `Option<string>` as an owned
 struct-field leaf, then L1b admitted Move structs/sums as Option/Result/user-sum payloads and
 completed their tagged control flow.

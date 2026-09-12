@@ -1,5 +1,12 @@
 # Borrowed slices of existing Move elements
 
+The [R77–R83 composition](56-r77-r83-composition-plan.md) implementation closes
+shared text/call certification without widening by-value Move-element reads. It
+adds only explicit shared-call places for indexed Move fields: dynamic slice/AoS
+views use checked runtime indices, while fixed `StructArray` places require an
+integer-literal index. R78's enum-field deferral and the shared namespace-carrier
+completion remain recorded here as the adjacent contract boundary.
+
 Implemented extension: [plan 54 §6](54-r69-r76-prerequisite-batch-plan.md#6-shared-projection-contract-r69-and-r71)
 admits shared indexed calls for existing records owning directory/cursor handles,
 including slice receivers. It preserves separate header/backing-generation
@@ -62,7 +69,7 @@ table or optional field product; those ledger dimensions are N/A.
 
 | Axis | Exact owner |
 | --- | --- |
-| Formation and carrier domain | align_driver `move_record_slices::formation_and_type_domain`: dynamic/fixed existing record arrays, annotation/call/field coercion, explicit bounds/re-slicing, String sibling, Copy controls; reject specialized/opaque/sum/nested owning element views and Move whole-value reads. No new owner construction, replacement or Drop behavior outside the view. |
+| Formation and carrier domain | align_driver `move_record_slices::formation_and_type_domain`: dynamic/fixed existing record arrays, annotation/call/field coercion, explicit bounds/re-slicing, String sibling, Copy controls; indexed Move-field shared calls use checked runtime indices for dynamic slice/AoS views and integer-literal indices for fixed `StructArray`; reject specialized/opaque/sum/nested owning element views and Move whole-value reads. No new owner construction, replacement or Drop behavior outside the view. |
 | Borrowed places and consumers | `move_record_slices::field_and_shared_calls`: direct/nested Copy and string fields, direct/imported/function-value shared helpers, helper returned view, generic concrete and symbolic callers, forbidden move/mutable borrow; preserve the existing payload classifier. |
 | Other slice consumers | Existing `align_sema::tests::move_copy_positions_are_rejected` plus `move_record_slices::formation_and_type_domain` pin unchanged domains for to_array/chunks/shuffle/sample/map_into and callback/pipeline consumers, using Move-record/String twins. No whole Move-slice clone, element materialization or callback ownership is admitted. |
 | Roots and invalidation | `move_record_slices::source_generation_and_retention`: direct/field/projected/slice-parameter sources, return and mutable retention; source move, replacement, element mutation and exclusive borrowing; input/frame/arena escape; unrelated-root positives. Exact direct and imported/indirect fallback summaries. |

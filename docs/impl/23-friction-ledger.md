@@ -202,6 +202,23 @@ A proposal built on this row would have to show that the sites are ones a
 pipeline should have covered. The count alone does not show that, and this row
 should not be cited as though it did.
 
+### B4 — enum fields in heap-built records
+
+| | |
+|---|---|
+| Restriction | The closed heap-record builder field grammar excludes user sums/enums, including payload-free enums. |
+| Settled reference | `docs/open-questions.md`, heap-record/recursive owned-record extensions SETTLED 2026-08-14; `17-library-boundary-prerequisites.md` §7.6 closed exclusions. |
+| Workaround shape | No qualifying mechanical rewrite recorded. R78 instead selects a boolean data representation. |
+| Occurrences | None qualifying in the supplied R78 report. Evidence reviewed: `../align-llm/docs/align-requests.md`, Request 78, `prompt_worktree.Entry` (2026-09-11). |
+| Count | **0 qualifying sites, 0 qualifying programs** in that report; this is not a new full-corpus scan. |
+| Status | Below reopen threshold; retain current restriction. R78 remains PROPOSED. |
+
+Changing the data representation requires a program design choice and is excluded
+from this ledger's mechanical count. The request to aggregate all new reports
+is not an explicit override of the reopen protocol. The consolidated assessment
+and disposition are in [plan 56](56-r77-r83-composition-plan.md); that batch does
+not implement enum-field admission or claim the threshold has been reached.
+
 ## Maintaining this file
 
 - Add a row the first time a restriction produces a mechanical workaround in real

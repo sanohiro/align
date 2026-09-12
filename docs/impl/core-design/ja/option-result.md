@@ -35,6 +35,13 @@ non-entry module は独自の `Error` を宣言でき、その場合 bare lookup
 
 `Option<T>` / `Result<T,E>` は通常のジェネリックな sum 型である（モノモルフィゼーションされる）。[`../../17-library-boundary-prerequisites.md`](../../17-library-boundary-prerequisites.md) の L1a/L1b は完了している。ひとつの再帰的なタグ付き `DropPlan` が有限かつ非再帰な Move payloadを受け入れ、tagged container自体をMoveとし、活性payloadだけをDropし、構築および owning-place の `match` / `else` / `?` でmove元を無効化する。admitted borrowed-place の `match` は既存の borrow ABI で活性payloadをその場で読み、source ownerを変更しない。この契約は [`26-borrowed-sum-projection-plan.md`](../26-borrowed-sum-projection-plan.md) が定める。recursive type、任意の新しいMove-element collection layout、L2のdynamic path-selected return cleanupは別の担当restrictionとして残る。新しいlibrary handleへcompiler-known exceptionを追加してはならない。
 
+R82 の shared-carrier 対応は統合 provider branch に実装済みである。
+[Plan 56](../../56-r77-r83-composition-plan.md) は既存の再帰的 borrowed-payload grammar に
+`process.user_namespace` だけを追加する。安定した optional/record-contained place の
+shared match は source owner を保持し、既存の明示的 `inherit_namespace` 呼び出しが
+native duplicate を所有する。owner の取り出し、exclusive indexed borrow、新しい
+handle family や native operation は追加しない。
+
 historical checkpoint境界は厳密だった。L1aがまず所有権付きstruct field leafとして
 `Option<string>` だけを許可し、L1bがMove struct/sumをOption/Result/user sumのpayloadとして
 許可してtagged control flowを完成させた。

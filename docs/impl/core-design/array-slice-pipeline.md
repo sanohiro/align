@@ -66,6 +66,16 @@ Options or arrays remain outside this capability. The exact ledger and implement
 §7.6; they also close existing Option/Result/user-sum payloads over a record with a direct string
 array field. The complete capability shipped on 2026-08-14.
 
+R78's request for payload-free enum fields remains deferred/PROPOSED; the
+closed enum-field exclusion above is unchanged. [Plan 56](../56-r77-r83-composition-plan.md) records
+the assessment and plan 23's unmet reopening prerequisite. No enum-field
+admission, layout, ownership or cleanup change is selected for this batch.
+
+The other six composition requests are implemented on the provider branch. Their
+indexed Move-field call place is dynamic-indexed for slice/AoS views and
+integer-literal-indexed for source-formed fixed `StructArray` views; the provider
+owner and consumer-pending boundary are recorded in plan 56.
+
 Region form (required L6, **shipped**):
 
 ```text
@@ -83,8 +93,9 @@ removed outright (no alias survives, per the no-backward-compat rule).
 
 ## Type & ownership classification
 
-- Fixed arrays are Copy values; **Move-element** fixed arrays (`[User{name}]` with owned fields)
-  are rejected pending per-element drop.
+- Fixed arrays are Copy values; source-formed fixed arrays of Move structs (`[User{name}]` with
+  owned fields) have recursive element Drop. Whole Move-element reads remain restricted to the
+  explicit shared-call places described below.
 - Dynamic `array<T>` is a Move type with recursive Drop (str-element arrays deep-free, #339
   precedent).
 - `array_builder<T>` is one Move owner. The heap form may move through an ordinary typed parameter
@@ -136,11 +147,13 @@ input-vs-output scope; sources are allowed to alias one another and are never de
 ## Spec'd but not implemented
 
 - Slicing **Move-element** collections and ordinary whole-value indexing of every Move element
-  remain unsupported except for the accepted, implementation-pending plan-30
-  `array<string>[i] -> str` view. Move-record arrays retain their direct-field view and explicit
-  shared-borrow call-place forms. Fixed arrays of Move structs and owned struct-array fields already
-  have recursive element drop; the remaining gap is a public view type or transfer rule for the
-  whole element, not missing destruction for the collection itself.
+  remain unsupported except for the implemented plan-30 `array<string>[i] -> str` view. Move-record
+  arrays retain their direct-field view and explicit shared-borrow call-place forms. Dynamic
+  slice/AoS record views accept a checked runtime index for a Move field; a source-formed fixed
+  `StructArray` uses its static element path and requires an integer-literal index. The existing
+  fixed-resource exception remains unchanged. Fixed arrays of Move structs and owned struct-array
+  fields already have recursive element drop; the remaining gap is a public view type or transfer
+  rule for the whole element, not missing destruction for the collection itself.
 - Dynamic `array<Struct>` element-field writes with a **non-primitive leaf** (str/owned/nested-
   Move) — `StoreElemFieldPtr` is primitive-leaf-only (#316).
 - Nested element write `arr[i].a.x = v` works; nested **soa** columns and element write via

@@ -208,6 +208,14 @@ its current result behavior. Views derived from an admitted payload follow the e
 owner-generation and region rules. A free-standing or otherwise owning scrutinee retains the
 existing consuming match behavior.
 
+R82 shared-carrier completion is implemented in the consolidated R77–R83
+provider branch. [Plan 56](impl/56-r77-r83-composition-plan.md) adds only
+`process.user_namespace` to the existing recursively admitted borrowed-payload
+grammar. Stable optional and record-contained shared matches retain the source
+owner; the existing explicit `inherit_namespace` call owns its native duplicate.
+No owner extraction, exclusive indexed borrow, new handle family or native
+operation is added.
+
 Stable `buffer` and `writer` fields, including nested fields and checked borrowed
 match projections, support their existing non-consuming receivers: buffer
 `.bytes()`/`.len()` and writer `.write(...)`/`.flush()`. The original owner keeps
@@ -228,8 +236,10 @@ behavior match every ordinary dynamic-array index. Other whole Move elements are
 values.
 
 An indexed Move element of an admitted ordinary dynamic array may be passed only to an explicit
-shared-`borrow` parameter selected by a direct, imported, or function-value call. The array base
-must be a stable local, borrowed/projection binding, or struct-field path. Its complete root is
+shared-`borrow` parameter selected by a direct, imported, or function-value call. A source-formed
+fixed `StructArray` admits the same call place only for an indexed Move field with an integer-literal
+index, such as `inspect(rows[0].field)`; a whole fixed Move element remains unavailable. The array
+base must be a stable local, borrowed/projection binding, or struct-field path. Its complete root is
 reserved from once-only index evaluation through every later argument and the call action; any
 possibly overlapping move, Drop, replacement, transfer, or mutable borrow is rejected. MIR emits
 the existing bounds check at the indexed argument's source position only after the index falls
@@ -364,7 +374,9 @@ the source generation and every contained region through ordinary indexing, retu
 destination retention. A terminating index forms no bounds action or result.
 
 An indexed Move element is a stable call place only for an explicit shared-`borrow` parameter on a
-direct, imported, or function-value target and a stable ordinary dynamic-array base. The base root
+direct, imported, or function-value target and a stable ordinary dynamic-array base. A source-formed
+fixed `StructArray` admits only an indexed Move field at an integer-literal index; a whole fixed Move
+element remains unavailable. The base root
 cannot be invalidated during once-only index evaluation, any later argument, or the call action.
 MIR checks bounds at the indexed argument position after index fallthrough, revalidates the root
 after later arguments, and forms the pointer only at the call. A terminating index forms none of
@@ -1066,6 +1078,11 @@ arena chunks with no hidden heap allocation and performs one documented compacti
 a helper may push through a `borrow mut` parameter but cannot store, return, or consume that borrowed
 builder. The heap owner may move through an ordinary typed parameter or return; the region-backed
 owner cannot outlive its explicit region and therefore retains its existing boundary restrictions.
+
+R78's request for payload-free enum fields remains deferred/PROPOSED; the
+closed enum-field exclusion above is unchanged. [Plan 56](impl/56-r77-r83-composition-plan.md) records
+the assessment and plan 23's unmet reopening prerequisite. No enum-field
+admission, layout, ownership or cleanup change is selected for this batch.
 
 `core.hash`: one canonical non-crypto mixer (`wyhash`) over a byte view — `hash64(str|slice<u8>) ->
 u64`, `hash128(...) -> (u64, u64)`. No `Hash` trait; deterministic within a build; not crypto/DoS-
@@ -1824,7 +1841,16 @@ collection formation and other specialized collection forms are unchanged.
 `view[i].field` reads Copy leaves and projects owned string leaves as `str`.
 `slice<string>[i]` likewise produces `str`. An entire Move record is addressable
 only as the immediate argument to an explicit shared `borrow` parameter under
-the existing borrowed-payload classifier and stable-local/field-place rules.
+the existing borrowed-payload classifier and stable-local/field-place rules. A
+Move field of an indexed AoS record may also be passed directly to that shared
+parameter: `inspect(rows[i].policy)` addresses the selected field in caller-owned
+storage. The receiver must be a stable local or field place, the complete index
+and field path are checked once, and no field value, cleanup bit, clone, or owner
+transfer is created. Ordinary slice/dynamic AoS record views accept a checked runtime
+index; a fixed `StructArray` uses its static element path and therefore requires an
+integer-literal index (the existing fixed-resource exception remains unchanged).
+By-value reads, `borrow mut`, temporary or nested-index bases, and other unsupported
+collection layouts remain rejected.
 Whole Move-value loads, mutable element borrows, writes and materializing or
 by-value pipeline consumers remain rejected. Explicitly cloning a projected
 `str` produces an independent owned string.

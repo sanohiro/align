@@ -1,5 +1,19 @@
 # Align Design Notes
 
+The [R77–R83 composition batch](impl/56-r77-r83-composition-plan.md) separates
+initialized reads, ownership, storage generations and contained-view lifetimes.
+A shared source need not taint an independently owned result; a fresh outer
+container must still retain its contained views. The implementation also admits
+an indexed Move field only as an explicit shared call-place, keeping the field in
+caller-owned storage with no implicit copy or transfer. Dynamic slice/AoS views
+use checked runtime indices; source-formed fixed `StructArray` places require an
+integer-literal index. R82 composes the existing
+shared namespace operation through admitted carriers. R78 is an explicit proposed
+change to the closed enum-field exclusion, not an implementation regression; it
+remains deferred because plan 23's reopening prerequisite is unmet. The other
+six requests are implemented on the provider branch and share one acceptance
+matrix; consumer adoption remains external.
+
 The selected [R69–R76 batch](impl/54-r69-r76-prerequisite-batch-plan.md) closes
 generic OS and byte-transform gaps while leaving traversal, permission policy,
 supervision, redaction and Git framing in application Align code. Retained access

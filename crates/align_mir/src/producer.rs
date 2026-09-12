@@ -412,6 +412,9 @@ enum XmlAccessNode {
 enum XmlAccessSource {
     Seed(XmlAccessProvenance),
     Node(XmlAccessNode),
+    /// A borrowed place may be materialized only with shared authority.  Keep this distinct
+    /// from an ordinary dependency so a later Store/Load cannot regain the owner's Move proof.
+    ReadNode(XmlAccessNode),
     Invalid,
 }
 
@@ -425,6 +428,7 @@ struct XmlAccessEquation {
     copied_scalar: bool,
     seed: Option<XmlAccessProvenance>,
     dependencies: Vec<XmlAccessNode>,
+    read_dependencies: Vec<XmlAccessNode>,
     checks: Vec<(XmlAccessNode, OperandRequirement)>,
     invalid: bool,
     absent: bool,
@@ -500,10 +504,24 @@ fn solve_xml_access_equations(
     HashMap<XmlAccessNode, XmlProducerState>,
     HashSet<XmlAccessNode>,
 ) {
+    fn read_only_access(access: XmlAccessProvenance) -> XmlAccessProvenance {
+        match access {
+            XmlAccessProvenance::Owned
+            | XmlAccessProvenance::Shared
+            | XmlAccessProvenance::Exclusive => XmlAccessProvenance::Shared,
+            XmlAccessProvenance::Unreadable => XmlAccessProvenance::Unreadable,
+            XmlAccessProvenance::Mixed => XmlAccessProvenance::Mixed,
+        }
+    }
+
     let mut validation_reverse = HashMap::<XmlAccessNode, Vec<XmlAccessNode>>::new();
     let mut reverse = HashMap::<XmlAccessNode, Vec<XmlAccessNode>>::new();
     for (node, equation) in equations {
-        for dependency in &equation.dependencies {
+        for dependency in equation
+            .dependencies
+            .iter()
+            .chain(&equation.read_dependencies)
+        {
             reverse
                 .entry(dependency.clone())
                 .or_default()
@@ -542,6 +560,7 @@ fn solve_xml_access_equations(
                 || equation
                     .dependencies
                     .iter()
+                    .chain(&equation.read_dependencies)
                     .any(|input| ready.contains(input)))
     };
     let mut initialized = HashSet::new();
@@ -596,6 +615,14 @@ fn solve_xml_access_equations(
                     .copied()
                     .map_or(current, |access| merge_xml_access(current, access))
             });
+            let next = equation
+                .read_dependencies
+                .iter()
+                .fold(next, |current, dependency| {
+                    present.get(dependency).copied().map_or(current, |access| {
+                        merge_xml_access(current, read_only_access(access))
+                    })
+                });
             if let Some(next) = next.map(|access| equation.produced_access(access))
                 && present.get(parent) != Some(&next)
             {
@@ -2110,6 +2137,13 @@ impl<'a> XmlAccessAnalyzer<'a> {
             let source = self.buffer_node(node);
             Self::add_source(equation, source);
         }
+        for node in std::mem::take(&mut equation.read_dependencies) {
+            let source = match self.buffer_node(node) {
+                XmlAccessSource::Node(node) => XmlAccessSource::ReadNode(node),
+                source => source,
+            };
+            Self::add_source(equation, source);
+        }
     }
 
     fn buffer_value_equation(&mut self, value: ValueId, path: Vec<XmlAccessPathSegment>) -> XmlAccessEquation {
@@ -2154,12 +2188,14 @@ impl<'a> XmlAccessAnalyzer<'a> {
             Rvalue::Use(operand) | Rvalue::SubSlice { base: operand, .. } => {
                 equation.seed = None;
                 equation.dependencies.clear();
+                equation.read_dependencies.clear();
                 let source = self.buffer_source(&operand, path);
                 Self::add_source(&mut equation, source);
             }
             Rvalue::Select { a, b, .. } => {
                 equation.seed = None;
                 equation.dependencies.clear();
+                equation.read_dependencies.clear();
                 for operand in [&a, &b] {
                     let source = self.buffer_source(operand, path.clone());
                     Self::add_source(&mut equation, source);
@@ -2229,7 +2265,12 @@ impl<'a> XmlAccessAnalyzer<'a> {
             let source = self.buffer_source(&operand, Vec::new());
             Self::add_source(&mut equation, source);
         }
-        if equation.seed.is_none() && equation.dependencies.is_empty() { equation.invalid = true; }
+        if equation.seed.is_none()
+            && equation.dependencies.is_empty()
+            && equation.read_dependencies.is_empty()
+        {
+            equation.invalid = true;
+        }
         equation
     }
 
@@ -2239,6 +2280,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 equation.seed = merge_xml_access(equation.seed, access);
             }
             XmlAccessSource::Node(node) => equation.dependencies.push(node),
+            XmlAccessSource::ReadNode(node) => equation.read_dependencies.push(node),
             XmlAccessSource::Invalid => equation.invalid = true,
         }
     }
@@ -2254,7 +2296,9 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                 }
             }
-            XmlAccessSource::Node(node) => equation.checks.push((node, requirement)),
+            XmlAccessSource::Node(node) | XmlAccessSource::ReadNode(node) => {
+                equation.checks.push((node, requirement))
+            }
             XmlAccessSource::Invalid => equation.invalid = true,
         }
     }
@@ -2293,7 +2337,16 @@ impl<'a> XmlAccessAnalyzer<'a> {
         expected: Ty,
         path: Vec<XmlAccessPathSegment>,
     ) {
-        let source = self.source(operand, expected, path);
+        // A borrowed descriptor is a read-only place, not an SSA value.  Aggregate extraction
+        // (enum/result/option payloads and struct fields) still needs to follow its exact storage
+        // path; routing it through `source` would reject every nested Copy read as an invalid
+        // transfer.  `read_source` retains the descriptor's cleanup/storage dependency while
+        // keeping ownership authority out of the produced value.
+        let source = if matches!(operand, Operand::BorrowedPlace(_)) {
+            self.read_source(equation, operand, expected, path)
+        } else {
+            self.source(operand, expected, path)
+        };
         Self::add_source(equation, source);
     }
 
@@ -2303,7 +2356,14 @@ impl<'a> XmlAccessAnalyzer<'a> {
         operand: &Operand,
         expected: Ty,
     ) {
-        let source = self.check_source(operand, expected);
+        // Scalar and predicate operations read borrowed descriptors without transferring the
+        // underlying owner. Keep the ordinary source path for SSA/argument values, but authenticate
+        // a borrowed place through its storage projection and cleanup flag.
+        let source = if matches!(operand, Operand::BorrowedPlace(_)) {
+            self.read_source(equation, operand, expected, Vec::new())
+        } else {
+            self.check_source(operand, expected)
+        };
         Self::add_required_source(equation, source, OperandRequirement::READ);
     }
 
@@ -2342,7 +2402,9 @@ impl<'a> XmlAccessAnalyzer<'a> {
             Self::add_required_source(equation, cleanup, OperandRequirement::READ);
         }
         storage_path.extend(path);
-        self.queue(XmlAccessNode::Slot(place.slot, storage_path))
+        let node = XmlAccessNode::Slot(place.slot, storage_path);
+        self.queue(node.clone());
+        XmlAccessSource::ReadNode(node)
     }
 
     fn add_read_operand(
@@ -2741,6 +2803,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
         if let Some(captured) = captured {
             equation.seed = None;
             equation.dependencies.clear();
+            equation.read_dependencies.clear();
             if let Some(captured) = captured {
                 if captured.is_empty() { equation.seed = Some(XmlAccessProvenance::Owned); }
                 for (operand, ty) in captured {
@@ -2753,7 +2816,11 @@ impl<'a> XmlAccessAnalyzer<'a> {
         }
         // An opaque parameter capability does not authenticate an environment.
         // Every reaching producer must validate its own returned captures.
-        if equation.seed.is_some() || (equation.dependencies.is_empty() && !equation.absent) {
+        if equation.seed.is_some()
+            || (equation.dependencies.is_empty()
+                && equation.read_dependencies.is_empty()
+                && !equation.absent)
+        {
             equation.invalid = true;
         }
         equation.seed = None;
@@ -2769,6 +2836,25 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 | XmlAccessNode::BufferValue(..) | XmlAccessNode::BufferSlot(..) => {
                     XmlAccessSource::Invalid
                 }
+            };
+            Self::add_source(&mut equation, source);
+        }
+        for dependency in std::mem::take(&mut equation.read_dependencies) {
+            let source = match dependency {
+                XmlAccessNode::Value(value, path) => {
+                    let node = XmlAccessNode::CaptureValue(value, path);
+                    self.queue(node.clone());
+                    XmlAccessSource::ReadNode(node)
+                }
+                XmlAccessNode::Slot(slot, path) => {
+                    let node = XmlAccessNode::CaptureSlot(slot, path);
+                    self.queue(node.clone());
+                    XmlAccessSource::ReadNode(node)
+                }
+                XmlAccessNode::CaptureValue(..)
+                | XmlAccessNode::CaptureSlot(..)
+                | XmlAccessNode::BufferValue(..)
+                | XmlAccessNode::BufferSlot(..) => XmlAccessSource::Invalid,
             };
             Self::add_source(&mut equation, source);
         }
@@ -6777,8 +6863,17 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 .is_some_and(|actual| xml_callable_flow_matches(self.graph.program, actual, slot_ty)) {
                 equation.invalid = true;
             } else {
-                self.check_whole_operand(&mut equation, &operand, slot_ty);
-                self.add_operand(&mut equation, &operand, selected_ty, path.clone());
+                if matches!(operand, Operand::BorrowedPlace(_)) {
+                    // A match binding may materialize a physical Move leaf from a borrowed
+                    // aggregate before it is retyped to a view (`string` -> `str`). It has read
+                    // authority only; treating the descriptor as a transferable whole value
+                    // would reject the valid borrowed source (and could later mint ownership).
+                    self.check_whole_read_operand(&mut equation, &operand, slot_ty);
+                    self.add_read_operand(&mut equation, &operand, selected_ty, path.clone());
+                } else {
+                    self.check_whole_operand(&mut equation, &operand, slot_ty);
+                    self.add_operand(&mut equation, &operand, selected_ty, path.clone());
+                }
             }
         }
         for (fields, operand) in field_stores {
@@ -6933,7 +7028,11 @@ impl<'a> XmlAccessAnalyzer<'a> {
         if !independent_seed && !seed_inputs.is_empty() {
             equation.seed_inputs = Some(seed_inputs);
         }
-        if equation.seed.is_none() && equation.dependencies.is_empty() && !equation.invalid {
+        if equation.seed.is_none()
+            && equation.dependencies.is_empty()
+            && equation.read_dependencies.is_empty()
+            && !equation.invalid
+        {
             equation.invalid = true;
         }
         equation
@@ -6948,6 +7047,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             XmlAccessSource::Seed(access) => return XmlProducerState::Present(access),
             XmlAccessSource::Invalid => return XmlProducerState::Invalid,
             XmlAccessSource::Node(node) => node,
+            XmlAccessSource::ReadNode(node) => node,
         };
         while let Some(node) = self.pending.pop_front() {
             if self.equations.contains_key(&node) {
@@ -7142,6 +7242,58 @@ fn xml_borrowed_access(
             (place.slot, path, selected)
         }
         Operand::BorrowedElementPlace(place) => {
+            let Some(root) = graph
+                .function
+                .slots
+                .get(place.base.slot as usize)
+                .copied()
+            else {
+                return XmlProducerState::Invalid;
+            };
+            let Some((base_selected, _)) =
+                xml_borrowed_path(graph.program, root, &place.base.path)
+            else {
+                return XmlProducerState::Invalid;
+            };
+            let base_retype = xml_borrowed_place_ty_is_view_retype(base_selected, place.base.ty);
+            if base_selected != place.base.ty && !base_retype {
+                return XmlProducerState::Invalid;
+            }
+            let physical_element = match base_selected {
+                Ty::Slice(element) | Ty::DynArray(element) => scalar_to_ty(element),
+                Ty::DynStructArray(id, Layout::Aos) => Ty::Struct(id),
+                _ => return XmlProducerState::Invalid,
+            };
+            let selected = if place.field_path.is_empty() {
+                physical_element
+            } else {
+                let mut selected = physical_element;
+                for (depth, field) in place.field_path.iter().copied().enumerate() {
+                    let Ty::Struct(id) = selected else {
+                        return XmlProducerState::Invalid;
+                    };
+                    let Some(field_ty) = graph
+                        .program
+                        .structs
+                        .get(id as usize)
+                        .and_then(|definition| definition.fields.get(field as usize))
+                        .map(|field| field.ty)
+                    else {
+                        return XmlProducerState::Invalid;
+                    };
+                    if depth + 1 < place.field_path.len()
+                        && !matches!(field_ty, Ty::Struct(_))
+                    {
+                        return XmlProducerState::Invalid;
+                    }
+                    selected = field_ty;
+                }
+                selected
+            };
+            let view_retype = xml_borrowed_place_ty_is_view_retype(selected, place.element_ty);
+            if selected != place.element_ty && !view_retype {
+                return XmlProducerState::Invalid;
+            }
             return xml_borrowed_access(
                 graph,
                 &Operand::BorrowedPlace(Box::new(place.base.clone())),
@@ -7175,7 +7327,7 @@ fn xml_borrowed_access(
                 ty = next;
                 path.push(XmlAccessPathSegment::StructField(*field));
             }
-            if ty != place.ty {
+            if ty != place.ty && !(ty == Ty::String && place.ty == Ty::Str) {
                 return XmlProducerState::Invalid;
             }
             // This restricted resource-field call derives borrow authority from the owning
@@ -7309,13 +7461,7 @@ fn xml_borrowed_descriptor_path_valid(
     // exact type here so a relabeled whole value cannot bypass producer authentication.
     !path.is_empty()
         || selected == place.ty
-        || (!element_base
-            && matches!(
-                (selected, place.ty),
-                (Ty::Array(element, _), Ty::Slice(view))
-                    | (Ty::DynArray(element), Ty::Slice(view))
-                    if element == view
-            ))
+        || (!element_base && xml_borrowed_place_ty_is_view_retype(selected, place.ty))
 }
 
 fn xml_return_cleanup_companion(
@@ -8079,7 +8225,16 @@ fn validate_resource_rvalues_component(
                                 && leaves.iter().all(|(selected, path)| {
                                     let state =
                                         cached_path_access(operand, *selected, path.clone());
-                                    xml_mode_requirement(program, *selected, *mode)
+                                    // A Copy carrier such as `slice<Row>` exposes Move leaves
+                                    // (`String`) without transferring those elements. For an
+                                    // owning carrier, retain each selected leaf's own authority:
+                                    // a nested `str` remains a read-only view even when its
+                                    // sibling is an owning `string`. This keeps the requirement
+                                    // per leaf while suppressing element transfer only for the
+                                    // non-owning carrier.
+                                    let requirement_ty =
+                                        if parameter_moves { *selected } else { *expected };
+                                    xml_mode_requirement(program, requirement_ty, *mode)
                                         .is_satisfied_by(state)
                                 })
                         })
@@ -10415,6 +10570,9 @@ fn operands_match_modes(
                 (Operand::BorrowedElementPlace(place), align_ast::ParamMode::Borrow) => {
                     place.base.cleanup.is_none() && place.element_ty == *ty
                 }
+                (Operand::BorrowedFixedElementPlace(place), align_ast::ParamMode::Borrow) => {
+                    place.cleanup.is_none() && place.ty == *ty
+                }
                 (Operand::BorrowedPlace(place), align_ast::ParamMode::BorrowMut) => {
                     let move_pointee = align_sema::needs_drop_flag(
                         *ty,
@@ -10587,6 +10745,138 @@ mod tests {
                 assert!(invalid.contains(&copied) && invalid.contains(&storage));
             }
         }
+    }
+
+    #[test]
+    fn producer_borrowed_materialization_caps_transfer_authority() {
+        let source = XmlAccessNode::Slot(0, Vec::new());
+        let materialized = XmlAccessNode::Slot(1, Vec::new());
+        let loaded = XmlAccessNode::Value(0, Vec::new());
+        let consumed = XmlAccessNode::Value(1, Vec::new());
+        let mut equations = HashMap::from([
+            (
+                source.clone(),
+                XmlAccessEquation {
+                    seed: Some(XmlAccessProvenance::Owned),
+                    ..XmlAccessEquation::default()
+                },
+            ),
+            (
+                materialized.clone(),
+                XmlAccessEquation {
+                    read_dependencies: vec![source],
+                    ..XmlAccessEquation::default()
+                },
+            ),
+            (
+                loaded.clone(),
+                XmlAccessEquation {
+                    dependencies: vec![materialized.clone()],
+                    ..XmlAccessEquation::default()
+                },
+            ),
+            (
+                consumed.clone(),
+                XmlAccessEquation {
+                    dependencies: vec![loaded.clone()],
+                    checks: vec![
+                        (
+                            loaded.clone(),
+                            OperandRequirement {
+                                read: true,
+                                move_value: true,
+                                ..OperandRequirement::default()
+                            },
+                        ),
+                    ],
+                    ..XmlAccessEquation::default()
+                },
+            ),
+        ]);
+        let (values, invalid) = solve_xml_access_equations(&equations);
+        assert_eq!(
+            values.get(&materialized),
+            Some(&XmlProducerState::Present(XmlAccessProvenance::Shared))
+        );
+        assert_eq!(
+            values.get(&loaded),
+            Some(&XmlProducerState::Present(XmlAccessProvenance::Shared))
+        );
+        assert!(invalid.contains(&consumed), "borrowed owner reached a move use");
+
+        // A read-only dependency still needs a founded source. Removing the owner seed must not
+        // turn the borrowed Store/Load chain into an unconditional success.
+        let source_equation = match equations.get_mut(&XmlAccessNode::Slot(0, Vec::new())) {
+            Some(equation) => equation,
+            None => panic!("source equation"),
+        };
+        source_equation.seed = None;
+        let (_, invalid) = solve_xml_access_equations(&equations);
+        assert!(invalid.contains(&XmlAccessNode::Slot(1, Vec::new())));
+    }
+
+    #[test]
+    fn producer_rejects_borrowed_store_load_before_owned_return() {
+        let mut diagnostics = align_diag::Diagnostics::new();
+        let source = "fn forward(value: string) -> string = value\nfn main() -> i32 = 0\n";
+        let tokens = align_lexer::tokenize(0, source, &mut diagnostics);
+        let ast = align_parser::parse_file(tokens, &mut diagnostics);
+        let hir = align_sema::check_file(&ast, &mut diagnostics);
+        assert!(!diagnostics.has_errors());
+        let mut malformed = crate::lower_program(&hir);
+        let function = match malformed
+            .fns
+            .iter_mut()
+            .find(|function| function.name.as_str() == "forward")
+        {
+            Some(function) => function,
+            None => panic!("forward MIR"),
+        };
+        let source_slot = function.params[0];
+        let destination_slot = match u32::try_from(function.slots.len()) {
+            Ok(slot) => slot,
+            Err(_) => panic!("slot id"),
+        };
+        function.slots.push(Ty::String);
+        function.slot_align.push(None);
+        let loaded_value = match u32::try_from(function.value_tys.len()) {
+            Ok(value) => value,
+            Err(_) => panic!("value id"),
+        };
+        function.value_tys.push(Ty::String);
+        let borrowed = Operand::BorrowedPlace(Box::new(crate::BorrowedPlace {
+            slot: source_slot,
+            path: Vec::new(),
+            ty: Ty::String,
+            cleanup: None,
+        }));
+        let entry = match function
+            .blocks
+            .iter_mut()
+            .find(|block| block.id == function.entry)
+        {
+            Some(block) => block,
+            None => panic!("forward entry block"),
+        };
+        entry.stmts.insert(1, Stmt::Store(destination_slot, borrowed));
+        entry
+            .stmts
+            .insert(2, Stmt::Let(loaded_value, Rvalue::Load(destination_slot)));
+        for block in &mut function.blocks {
+            if let Term::ReturnWithCleanup(pair) = &mut block.term {
+                pair.0 = Operand::Value(loaded_value);
+            }
+        }
+
+        let error = match validate_mir_producers(&malformed) {
+            Ok(_) => panic!("a borrowed Store/Load chain must not certify an owned return"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("producer return leaf")
+                || error.to_string().contains("producer return does not transfer"),
+            "unexpected malformed-store diagnostic: {error}"
+        );
     }
 
     #[test]
