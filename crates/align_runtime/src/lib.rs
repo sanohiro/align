@@ -14,6 +14,8 @@
 // `docs/impl/07-roadmap.md`). ONE source of truth: this same file is compiled into the staticlib
 // here. `pub use` re-exports `safe_slice` (used by `str_cmp`/`str_contains`/… below) and the four
 // `align_rt_str_*` symbols.
+mod buffer_storage;
+use buffer_storage::BufferStorage;
 mod json_number;
 mod time_formats;
 pub use time_formats::*;
@@ -2012,7 +2014,7 @@ pub unsafe extern "C" fn align_rt_udp_recv_from(sock: *mut UdpSocket, buf: *mut 
             // `recvfrom` initialized exactly the returned prefix (possibly truncated to `cap`).
             let n = n as usize;
             assert!(n <= b.cap, "recvfrom returned more bytes than its destination length");
-            unsafe { b.data.set_len(n) };
+            b.data.with_mut(|data| unsafe { data.set_len(n) });
             b.len = n;
             return n as i64;
         }
@@ -10419,8 +10421,8 @@ pub unsafe extern "C" fn align_rt_io_reader_read(r: *mut Reader, b: *mut Buffer)
     // to before (an unbuffered reader has an empty lookahead, so this is skipped).
     if r.buffered && r.start < r.filled {
         let n = (r.filled - r.start).min(b.cap);
-        b.data.clear();
-        b.data.extend_from_slice(&r.buf[r.start..r.start + n]);
+        b.data.with_mut(|data| data.clear());
+        b.data.with_mut(|data| data.extend_from_slice(&r.buf[r.start..r.start + n]));
         b.len = n;
         r.start += n;
         return n as i64;
@@ -10436,7 +10438,7 @@ pub unsafe extern "C" fn align_rt_io_reader_read(r: *mut Reader, b: *mut Buffer)
         let n = unsafe { read(r.fd, dst as *mut core::ffi::c_void, b.cap) };
         if n >= 0 {
             // `read` initialized exactly `n <= cap <= capacity` bytes at `dst`.
-            unsafe { b.data.set_len(n as usize) };
+            b.data.with_mut(|data| unsafe { data.set_len(n as usize) });
             b.len = n as usize;
             return n as i64;
         }
@@ -10504,7 +10506,7 @@ pub unsafe extern "C" fn align_rt_io_reader_read_line(r: *mut Reader, b: *mut Bu
         }
     }
     // `b` is the output sink: reset it to the line body we accumulate (one memcpy per refill span).
-    b.data.clear();
+    b.data.with_mut(|data| data.clear());
     b.len = 0;
     // Bytes consumed from the stream, INCLUDING the terminator — the return value.
     let mut consumed: i64 = 0;
@@ -10514,17 +10516,17 @@ pub unsafe extern "C" fn align_rt_io_reader_read_line(r: *mut Reader, b: *mut Bu
         let hay = &r.buf[r.start..r.filled];
         if let Some(rel) = memchr::memchr(b'\n', hay) {
             // Line body is `buf[start..start+rel]` (everything before the `\n`).
-            b.data.extend_from_slice(&r.buf[r.start..r.start + rel]);
+            b.data.with_mut(|data| data.extend_from_slice(&r.buf[r.start..r.start + rel]));
             // Strip exactly one trailing `\r` (CRLF). Checking the *accumulated* output (not just
             // this span) handles a `\r` that landed in a previous refill with the `\n` at a span
             // boundary. A lone `\r` mid-body, or a `\r` not immediately before the `\n`, is kept.
             if b.data.last() == Some(&b'\r') {
-                b.data.pop();
+                b.data.with_mut(|data| data.pop());
             }
             consumed += rel as i64 + 1; // body span + the `\n` (the stripped `\r`, if any, is inside `rel`)
             r.start += rel + 1;
             if b.data.len() > READ_LINE_CAP {
-                b.data.clear();
+                b.data.with_mut(|data| data.clear());
                 b.len = 0;
                 return -(AL_INVALID as i64);
             }
@@ -10533,11 +10535,11 @@ pub unsafe extern "C" fn align_rt_io_reader_read_line(r: *mut Reader, b: *mut Bu
             return consumed;
         }
         // No `\n` in the lookahead: take all of it into the body, then refill.
-        b.data.extend_from_slice(hay);
+        b.data.with_mut(|data| data.extend_from_slice(hay));
         consumed += hay.len() as i64;
         r.start = r.filled; // fully consumed
         if b.data.len() > READ_LINE_CAP {
-            b.data.clear();
+            b.data.with_mut(|data| data.clear());
             b.len = 0;
             return -(AL_INVALID as i64);
         }
@@ -10555,7 +10557,7 @@ pub unsafe extern "C" fn align_rt_io_reader_read_line(r: *mut Reader, b: *mut Bu
             }
             Ok(_) => {} // lookahead refilled (`start = 0`, `filled = n`); loop and rescan
             Err(status) => {
-                b.data.clear();
+                b.data.with_mut(|data| data.clear());
                 b.len = 0;
                 return -(status as i64);
             }
@@ -11136,7 +11138,7 @@ pub unsafe extern "C" fn align_rt_io_copy(r: *mut Reader, w: *mut Writer) -> i64
     if data.try_reserve_exact(BUF_WRITER_CAP).is_err() {
         return -(AL_INVALID as i64);
     }
-    let mut buf = Buffer { data, cap: BUF_WRITER_CAP, len: 0 };
+    let mut buf = Buffer { data: data.into(), cap: BUF_WRITER_CAP, len: 0 };
 
     // Fast-path dispatch site (post-M9): on Linux, if `rfd` is a regular file and `w`'s fd is a
     // pipe/socket, a `sendfile`/`splice` loop would replace the read+write below — same result,
@@ -11272,7 +11274,7 @@ pub unsafe extern "C" fn align_rt_io_file_pread(f: *mut RwFile, b: *mut Buffer, 
             // `pread` initialized exactly the returned prefix; EOF publishes an empty Vec.
             let n = n as usize;
             assert!(n <= b.cap, "pread returned more bytes than its destination length");
-            unsafe { b.data.set_len(n) };
+            b.data.with_mut(|data| unsafe { data.set_len(n) });
             b.len = n;
             return n as i64;
         }
@@ -11359,7 +11361,7 @@ pub unsafe extern "C" fn align_rt_io_file_free(f: *mut RwFile) {
 /// the caller-owned sink a `reader.read` fills. `cap` is the read window; `len` is how many bytes
 /// the last read produced (`.bytes()` views `data[..len]`). A Move type, `Drop`-freed.
 pub struct Buffer {
-    data: Vec<u8>,
+    data: BufferStorage,
     cap: usize,
     len: usize,
 }
@@ -11372,12 +11374,17 @@ impl Buffer {
     /// Prepare the caller-selected read window as raw spare capacity. No byte becomes part of the
     /// initialized Vec until the syscall reports how many it wrote.
     fn prepare_uninit_window(&mut self) -> Option<*mut u8> {
-        self.data.clear();
-        if self.data.capacity() < self.cap && self.data.try_reserve_exact(self.cap).is_err() {
+        let output = self.data.with_mut(|data| {
+            data.clear();
+            if data.capacity() < self.cap && data.try_reserve_exact(self.cap).is_err() {
+                return None;
+            }
+            Some(data.as_mut_ptr())
+        });
+        if output.is_none() {
             self.len = 0;
-            return None;
         }
-        Some(self.data.spare_capacity_mut().as_mut_ptr().cast::<u8>())
+        output
     }
 }
 
@@ -11394,7 +11401,7 @@ pub extern "C" fn align_rt_buffer_new(cap: i64) -> *mut Buffer {
         Ok(()) => requested,
         Err(_) => 0,
     };
-    let buffer = Box::into_raw(Box::new(Buffer { data, cap, len: 0 }));
+    let buffer = Box::into_raw(Box::new(Buffer { data: data.into(), cap, len: 0 }));
     #[cfg(feature = "alloc-count")]
     requested_live_insert(1, buffer.cast(), 64usize.saturating_add(cap));
     buffer
@@ -11415,7 +11422,9 @@ pub unsafe extern "C" fn align_rt_buffer_bytes(b: *mut Buffer, out: *mut AlignSt
         return;
     }
     let b = unsafe { &*b };
-    unsafe { *out = AlignStr { ptr: b.data.as_ptr(), len: b.len as i64 } };
+    // Shared readers may call this concurrently. Copy the pointer established by the last
+    // exclusive storage update; as_ptr forbids writes, and as_mut_ptr needs an exclusive borrow.
+    unsafe { *out = AlignStr { ptr: b.data.writable_ptr(), len: b.len as i64 } };
 }
 
 /// `b.len()` — the number of bytes the buffer currently holds (the last read's count).
@@ -11477,14 +11486,14 @@ pub unsafe extern "C" fn align_rt_buffer_put(b: *mut Buffer, bits: u64, width: i
         _ => return,
     };
     let b = unsafe { &mut *b };
-    b.data.truncate(b.len);
+    b.data.with_mut(|data| data.truncate(b.len));
     let le = bits.to_le_bytes();
     if be != 0 {
         let mut tmp = le;
         tmp[..w].reverse();
-        b.data.extend_from_slice(&tmp[..w]);
+        b.data.with_mut(|data| data.extend_from_slice(&tmp[..w]));
     } else {
-        b.data.extend_from_slice(&le[..w]);
+        b.data.with_mut(|data| data.extend_from_slice(&le[..w]));
     }
     b.len = b.data.len();
     b.cap = b.cap.max(b.len);
@@ -11523,15 +11532,15 @@ pub unsafe extern "C" fn align_rt_buffer_append(b: *mut Buffer, ptr: *const u8, 
         let snapshot =
             aliases_buffer.then(|| unsafe { core::slice::from_raw_parts(ptr, n) }.to_vec());
 
-        b.data.truncate(b.len);
+        b.data.with_mut(|data| data.truncate(b.len));
         if let Some(src) = snapshot {
-            b.data.extend_from_slice(&src);
+            b.data.with_mut(|data| data.extend_from_slice(&src));
         } else {
             let src = unsafe { core::slice::from_raw_parts(ptr, n) };
-            b.data.extend_from_slice(src);
+            b.data.with_mut(|data| data.extend_from_slice(src));
         }
     } else {
-        b.data.truncate(b.len);
+        b.data.with_mut(|data| data.truncate(b.len));
     }
     b.len = b.data.len();
     b.cap = b.cap.max(b.len);
@@ -11607,7 +11616,7 @@ unsafe fn owned_str_exact(fill_len: usize, fill: impl FnOnce(&mut [core::mem::Ma
 /// views all of it and `.len()` is its length). Freed by `align_rt_buffer_free` like every `buffer`.
 fn buffer_from_vec(v: Vec<u8>) -> *mut Buffer {
     let n = v.len();
-    Box::into_raw(Box::new(Buffer { data: v, cap: n, len: n }))
+    Box::into_raw(Box::new(Buffer { data: v.into(), cap: n, len: n }))
 }
 
 // --- core.codec ------------------------------------------------------------------------------
@@ -18274,9 +18283,9 @@ pub unsafe extern "C" fn align_rt_crypto_random(b: *mut Buffer) {
     // Span the full capacity, exactly like `reader.read`. `buffer(cap)` already reserved `cap`, so
     // this `resize` never reallocates (and so never fails).
     if b.data.len() != b.cap {
-        b.data.resize(b.cap, 0);
+        b.data.with_mut(|data| data.resize(b.cap, 0));
     }
-    fill_os_random(&mut b.data[..b.cap]);
+    b.data.with_mut(|data| fill_os_random(&mut data[..b.cap]));
     b.len = b.cap;
 }
 
@@ -21017,7 +21026,7 @@ impl HttpResponseDecoder {
     /// Consume already-received wire bytes into a caller-owned unpublished output window. Returns
     /// the wire byte count consumed. Payload bytes are copied de-framed; syntax/cap failure may
     /// leave bytes in the unpublished window, but the ABI keeps `buffer.len == 0` on that path.
-    fn feed_stream(&mut self, input: &[u8], output: &mut [u8], written: &mut usize) -> Result<usize, HttpParseErr> {
+    fn feed_stream(&mut self, input: &[u8], output: &mut [core::mem::MaybeUninit<u8>], written: &mut usize) -> Result<usize, HttpParseErr> {
         debug_assert!(self.streaming);
         let mut pos = 0usize;
         while pos < input.len() && !self.complete() {
@@ -21033,7 +21042,7 @@ impl HttpResponseDecoder {
                         .min(output.len() - *written);
                     self.stream_charge_payload(take)?;
                     output[*written..*written + take]
-                        .copy_from_slice(&input[pos..pos + take]);
+                        .write_copy_of_slice(&input[pos..pos + take]);
                     *written += take;
                     pos += take;
                     let left = remaining - take as u64;
@@ -21050,7 +21059,7 @@ impl HttpResponseDecoder {
                     let take = (input.len() - pos).min(output.len() - *written);
                     self.stream_charge_payload(take)?;
                     output[*written..*written + take]
-                        .copy_from_slice(&input[pos..pos + take]);
+                        .write_copy_of_slice(&input[pos..pos + take]);
                     *written += take;
                     pos += take;
                 }
@@ -21081,7 +21090,7 @@ impl HttpResponseDecoder {
                         .min(output.len() - *written);
                     self.stream_charge_payload(take)?;
                     output[*written..*written + take]
-                        .copy_from_slice(&input[pos..pos + take]);
+                        .write_copy_of_slice(&input[pos..pos + take]);
                     *written += take;
                     pos += take;
                     let left = remaining - take as u64;
@@ -22790,14 +22799,14 @@ fn http_sse_lossy_len(input: &[u8]) -> Result<usize, i32> {
     Ok(length)
 }
 
-fn http_sse_write_lossy(input: &[u8], output: &mut [u8], cursor: &mut usize) -> Result<(), i32> {
+fn http_sse_write_lossy(input: &[u8], output: &mut [core::mem::MaybeUninit<u8>], cursor: &mut usize) -> Result<(), i32> {
     let mut decoded = HttpSseUtf8::new(input);
     while let Some(bytes) = decoded.next_bytes() {
         let end = cursor.checked_add(bytes.len()).ok_or(AL_INVALID)?;
         let Some(target) = output.get_mut(*cursor..end) else {
             return Err(AL_HTTP_BODY_LIMIT);
         };
-        target.copy_from_slice(bytes);
+        target.write_copy_of_slice(bytes);
         *cursor = end;
     }
     Ok(())
@@ -22989,7 +22998,12 @@ impl HttpSseState {
         let mut cursor = 0usize;
         http_sse_write_lossy(
             source,
-            &mut self.committed_id.storage[..length],
+            // The helper only initializes slots; the retained allocation stays initialized.
+            unsafe {
+                core::slice::from_raw_parts_mut(
+                    self.committed_id.storage.as_mut_ptr().cast(), length,
+                )
+            },
             &mut cursor,
         )?;
         if cursor != length {
@@ -23010,7 +23024,7 @@ impl HttpSseState {
 
     fn dispatch_block(
         &mut self,
-        output: &mut [u8],
+        output: &mut [core::mem::MaybeUninit<u8>],
         output_capacity: usize,
     ) -> Result<Option<HttpSsePublished>, i32> {
         let plan = http_sse_plan_block(self.block.as_slice())?;
@@ -23049,7 +23063,7 @@ impl HttpSseState {
         let mut cursor = 0usize;
         let event_start = cursor;
         if plan.event_len == 0 {
-            output[..b"message".len()].copy_from_slice(b"message");
+            output[..b"message".len()].write_copy_of_slice(b"message");
             cursor = b"message".len();
         } else {
             let event = plan.event.ok_or(AL_INVALID)?.bytes(self.block.as_slice())?;
@@ -23079,7 +23093,7 @@ impl HttpSseState {
                 http_sse_write_lossy(&block[value_start..line_end], output, &mut cursor)?;
                 data_seen += 1;
                 if data_seen < plan.data_fields {
-                    output[cursor] = b'\n';
+                    output[cursor].write(b'\n');
                     cursor += 1;
                 }
             }
@@ -23090,14 +23104,19 @@ impl HttpSseState {
             http_sse_write_lossy(id.bytes(self.block.as_slice())?, output, &mut cursor)?;
         } else {
             let committed = self.committed_id.as_slice();
-            output[cursor..cursor + committed.len()].copy_from_slice(committed);
+            output[cursor..cursor + committed.len()].write_copy_of_slice(committed);
             cursor += committed.len();
         }
         if cursor != total {
             return Err(AL_INVALID);
         }
         if plan.id.is_some() {
-            self.commit_id_from_output(&output[id_start..id_start + id_len], output_capacity);
+            // Every byte of this range was initialized by the completed lossy ID write above.
+            let id = &output[id_start..id_start + id_len];
+            let initialized = unsafe {
+                core::slice::from_raw_parts(id.as_ptr().cast::<u8>(), id.len())
+            };
+            self.commit_id_from_output(initialized, output_capacity);
         }
         if let Some(retry_ms) = plan.retry_ms {
             self.retry_ms = Some(retry_ms);
@@ -23119,7 +23138,7 @@ impl HttpSseState {
     fn feed_line_byte(
         &mut self,
         byte: u8,
-        output: &mut [u8],
+        output: &mut [core::mem::MaybeUninit<u8>],
         output_capacity: usize,
     ) -> Result<HttpSseFeed, i32> {
         if self.skip_lf {
@@ -23150,7 +23169,7 @@ impl HttpSseState {
     fn feed_source_byte(
         &mut self,
         byte: u8,
-        output: &mut [u8],
+        output: &mut [core::mem::MaybeUninit<u8>],
         output_capacity: usize,
     ) -> Result<HttpSseFeed, i32> {
         if self.bom_decided {
@@ -23266,7 +23285,7 @@ impl HttpReadStream {
     /// co-reads.
     fn read_body_step(
         &mut self,
-        output: &mut [u8],
+        output: &mut [core::mem::MaybeUninit<u8>],
         max_wire_read: usize,
         defer_payload_completion: bool,
     ) -> Result<HttpBodyStep, i32> {
@@ -23357,7 +23376,7 @@ impl HttpReadStream {
         }
     }
 
-    fn read_into(&mut self, output: &mut [u8]) -> Result<usize, i32> {
+    fn read_into(&mut self, output: &mut [core::mem::MaybeUninit<u8>]) -> Result<usize, i32> {
         match self.state {
             HttpReadStreamState::Complete => return Ok(0),
             HttpReadStreamState::Failed(status) => return Err(status),
@@ -23402,7 +23421,7 @@ impl HttpReadStream {
 
     fn next_sse(
         &mut self,
-        output: &mut [u8],
+        output: &mut [core::mem::MaybeUninit<u8>],
         output_capacity: usize,
     ) -> Result<Option<HttpSsePublished>, i32> {
         match self.state {
@@ -23440,12 +23459,13 @@ impl HttpReadStream {
                 }
             }
 
-            let mut byte = [0u8; 1];
+            let mut byte = [core::mem::MaybeUninit::<u8>::uninit(); 1];
             match self.read_body_step(&mut byte, usize::MAX, true) {
                 Ok(HttpBodyStep::Payload(1)) => {
                     processed += 1;
                     let feed = self.sse.as_mut().ok_or(AL_INVALID)?.feed_source_byte(
-                        byte[0],
+                        // Payload(1) proves the sole output slot was written.
+                        unsafe { byte[0].assume_init() },
                         output,
                         output_capacity,
                     );
@@ -23784,13 +23804,14 @@ pub unsafe extern "C" fn align_rt_http_read_stream_read(
     if stream.sse.is_some() {
         return AL_INVALID;
     }
-    buffer.data.clear();
-    let output = unsafe {
-        core::slice::from_raw_parts_mut(buffer.data.spare_capacity_mut().as_mut_ptr().cast(), buffer.cap)
-    };
-    match stream.read_into(output) {
+    let result = buffer.data.with_mut(|data| {
+        data.clear();
+        let output = &mut data.spare_capacity_mut()[..buffer.cap];
+        stream.read_into(output)
+    });
+    match result {
         Ok(written) => {
-            unsafe { buffer.data.set_len(written) };
+            buffer.data.with_mut(|data| unsafe { data.set_len(written) });
             buffer.len = written;
             unsafe { *count = written as i64 };
             0
@@ -23925,17 +23946,15 @@ pub unsafe extern "C" fn align_rt_http_sse_stream_next(
     if stream.sse.is_none() {
         return AL_INVALID;
     }
-    buffer.data.clear();
-    let output = unsafe {
-        core::slice::from_raw_parts_mut(
-            buffer.data.spare_capacity_mut().as_mut_ptr().cast(),
-            buffer.cap,
-        )
-    };
-    match stream.next_sse(output, buffer.cap) {
+    let result = buffer.data.with_mut(|data| {
+        data.clear();
+        let output = &mut data.spare_capacity_mut()[..buffer.cap];
+        stream.next_sse(output, buffer.cap)
+    });
+    match result {
         Ok(None) => 0,
         Ok(Some(event)) => {
-            unsafe { buffer.data.set_len(event.total) };
+            buffer.data.with_mut(|data| unsafe { data.set_len(event.total) });
             buffer.len = event.total;
             let base = buffer.data.as_ptr();
             unsafe {
@@ -23961,7 +23980,7 @@ pub unsafe extern "C" fn align_rt_http_sse_stream_next(
             0
         }
         Err(status) => {
-            buffer.data.clear();
+            buffer.data.with_mut(|data| data.clear());
             buffer.len = 0;
             status
         }
@@ -26640,7 +26659,7 @@ pub unsafe extern "C" fn align_rt_http_upgrade_read_exact(
         return status;
     }
     buffer.len = 0;
-    buffer.data.clear();
+    buffer.data.with_mut(|data| data.clear());
     if count == 0 {
         return 0;
     }
@@ -26662,7 +26681,7 @@ pub unsafe extern "C" fn align_rt_http_upgrade_read_exact(
             continue;
         }
         if n == 0 {
-            buffer.data.clear();
+            buffer.data.with_mut(|data| data.clear());
             return upgrade.fail(AL_NOT_FOUND);
         }
         let error = std::io::Error::last_os_error();
@@ -26677,7 +26696,7 @@ pub unsafe extern "C" fn align_rt_http_upgrade_read_exact(
         }
         return upgrade.fail(io_read_write_status(&error));
     }
-    unsafe { buffer.data.set_len(count) };
+    buffer.data.with_mut(|data| unsafe { data.set_len(count) });
     buffer.len = count;
     0
 }
@@ -28395,9 +28414,9 @@ mod tests {
         assert_eq!(unsafe { align_rt_io_reader_open(path_bytes.as_ptr(), path_bytes.len() as i64, &mut r) }, 0);
         // Constructors maintain `capacity >= cap`; deliberately violate that private invariant to
         // pin the release-build guard immediately before the raw syscall write.
-        let b = Box::into_raw(Box::new(Buffer { data: Vec::new(), cap: 5, len: 0 }));
+        let b = Box::into_raw(Box::new(Buffer { data: Vec::new().into(), cap: 5, len: 0 }));
         assert_eq!(unsafe { align_rt_io_reader_read(r, b) }, 5);
-        assert_eq!(unsafe { &*b }.data, b"guard");
+        assert_eq!(unsafe { &*b }.data.as_slice(), b"guard");
         assert!(unsafe { &*b }.data.capacity() >= 5);
 
         unsafe { align_rt_buffer_free(b) };
@@ -42488,7 +42507,7 @@ mod tests {
             wire.extend_from_slice(b"1\r\nx\r\n");
         }
         wire.extend_from_slice(b"1;x=y\r\ny\r\n");
-        let mut output = vec![0u8; ORDINARY + 2];
+        let mut output = vec![core::mem::MaybeUninit::<u8>::uninit(); ORDINARY + 2];
         let mut written = 0usize;
         let consumed = decoder
             .feed_stream(&wire, &mut output, &mut written)
@@ -42931,7 +42950,7 @@ mod tests {
                     );
                 }
             };
-            let mut output = vec![0u8; capacity];
+            let mut output = vec![core::mem::MaybeUninit::<u8>::uninit(); capacity];
             let mut processed = 0usize;
             let mut published = None;
             while position < body.len() {
@@ -42963,6 +42982,13 @@ mod tests {
                 }
             }
             if let Some(event) = published {
+                // Successful publication initializes exactly this prefix, never the spare tail.
+                let initialized = output
+                    .get(..event.total)
+                    .expect("published SSE length exceeds caller capacity");
+                let output = unsafe {
+                    core::slice::from_raw_parts(initialized.as_ptr().cast::<u8>(), initialized.len())
+                };
                 events.push(DirectSseEvent {
                     event: output[event.event_start..event.event_start + event.event_len].to_vec(),
                     data: output[event.data_start..event.data_start + event.data_len].to_vec(),
@@ -46632,7 +46658,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         assert_eq!(unsafe { align_rt_http_upgrade_shutdown(out) }, 0);
         assert_eq!(unsafe { align_rt_http_upgrade_shutdown(out) }, 0, "clean shutdown is idempotent");
         unsafe {
-            (*buffer).data = b"old".to_vec();
+            (*buffer).data = b"old".to_vec().into();
             (*buffer).len = 3;
         }
         assert_eq!(unsafe { align_rt_http_upgrade_read_exact(out, buffer, 1) }, AL_INVALID);

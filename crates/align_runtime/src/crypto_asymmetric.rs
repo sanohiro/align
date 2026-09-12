@@ -1995,7 +1995,7 @@ fn buffer_owner(value: Vec<u8>) -> Result<*mut Buffer, c_int> {
     let cap = value.capacity();
     unsafe {
         storage.write(Buffer {
-            data: value,
+            data: value.into(),
             cap,
             len,
         })
