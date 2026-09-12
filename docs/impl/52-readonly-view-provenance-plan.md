@@ -352,5 +352,6 @@ existing native/owner contracts remain unchanged by this repair.
 A writable byte allocation validated by `as_str()` has a distinct observation
 invariant: a later write through an older byte alias must expire the validated
 text while leaving ordinary byte aliases usable. That separate failure domain
-is not closed by marking subsequent `StrBytes` views read-only. Cross-call
-validation/write effects also remain interprocedural work.
+is not closed by marking subsequent `StrBytes` views read-only; its local
+observation repair is specified in [plan 57](57-validated-text-observation-plan.md).
+Hidden callee validation/write effects remain interprocedural work.
