@@ -1,5 +1,12 @@
 # Session handoff
 
+**Read-only text bytes:** [plan 52](docs/impl/52-readonly-view-provenance-plan.md)
+now retains read-only origins when text publishes `.bytes()`, including owned
+and returned text. Explicit byte-element copies remain writable and source
+lifetimes remain tracked. Native buffer views keep their existing contract.
+Ordinary slice argument/result laundering and invalidation of validated text
+after an older byte-alias write remain separate open boundaries.
+
 **Antigravity host review integration (2026-09-12):**
 `scripts/review-bounded.sh --provider agy` supports fresh inspection with
 `gemini-3.8-flash-high`; Codex remains the default. The native agent uses

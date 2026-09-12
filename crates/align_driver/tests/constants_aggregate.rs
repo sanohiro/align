@@ -600,7 +600,7 @@ fn readonly_static_descriptor_whole_unit_parity() {
     for method in ["descriptor_id", "sqlite_sql", "postgres_sql"] {
         for owned in [false, true] {
             let view = if owned {
-                "owned := text.clone(); mut bytes := owned.bytes()"
+                "mut bytes := text.bytes().to_array()"
             } else {
                 "mut bytes := text.bytes()"
             };
@@ -617,6 +617,93 @@ fn readonly_static_descriptor_whole_unit_parity() {
                 assert!(result.whole_diags.contains("read-only view"), "{}", result.whole_diags);
                 assert!(result.per_unit_diags.contains("read-only view"), "{}", result.per_unit_diags);
             }
+        }
+    }
+}
+
+#[test]
+fn readonly_text_bytes_whole_unit_parity() {
+    for (name, owner_ty, publication) in [
+        ("text", "string", "source.bytes()"),
+    ] {
+        for imported in [false, true] {
+            for action in ["read", "write", "copy"] {
+                let operation = match action {
+                    "read" => "return bytes[0] as i64",
+                    "write" => "bytes[0] = 255; return bytes[0] as i64",
+                    _ => "mut copied := bytes.to_array(); copied[0] = 255; return copied[0] as i64",
+                };
+                // The publication happens inside the checked body, including after imported
+                // generic instantiation. No plain-slice call/result writability is assumed.
+                let probe = format!(
+                    "pub Holder {{ view: slice<u8> }}\npub fn probe<T>(borrow source: {owner_ty}, marker: T) -> i64 {{ published := {publication}; holder := Holder {{ view: published }}; mut bytes := holder.view[0..holder.view.len()]; {operation} }}\n"
+                );
+                let main = if imported {
+                    format!(
+                        "module main\nimport views\nfn witness(borrow source: {owner_ty}) -> i64 = views.probe(source, 0)\nfn main() {{}}\n"
+                    )
+                } else {
+                    format!(
+                        "module main\n{probe}\nfn witness(borrow source: {owner_ty}) -> i64 = probe(source, 0)\nfn main() {{}}\n"
+                    )
+                };
+                let helper = format!(
+                    "module views\n{probe}"
+                );
+                let files = if imported {
+                    vec![("views.align", helper.as_str()), ("main.align", main.as_str())]
+                } else {
+                    vec![("main.align", main.as_str())]
+                };
+                let case = format!("readonly-publication-{name}-{imported}-{action}");
+                let checked = diff_check_multi(&case, &files, "main.align");
+                let rejected = action == "write";
+                assert_eq!(checked.whole_errors, rejected, "{case}: {}", checked.whole_diags);
+                assert_eq!(checked.per_unit_errors, rejected, "{case}: {}", checked.per_unit_diags);
+                if rejected {
+                    assert!(checked.whole_diags.contains("read-only view"), "{case}: {}", checked.whole_diags);
+                    assert!(checked.per_unit_diags.contains("read-only view"), "{case}: {}", checked.per_unit_diags);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn copied_text_bytes_are_writable_after_source_expiry() {
+    let helper = r#"module copies
+pub fn text() -> array<u8> {
+    source := "AB".clone()
+    mut copy := source.bytes().to_array()
+    copy[0] = 255
+    print(source)
+    return copy
+}
+"#;
+    let main = r#"module main
+import copies
+fn main() {
+    mut text := copies.text()
+    text[1] = 128
+    print(text[0] == 255 && text[1] == 128)
+}
+"#;
+    let files = [("copies.align", helper), ("main.align", main)];
+    let checked = diff_check_multi("readonly-publication-owned-copies", &files, "main.align");
+    assert!(
+        !checked.whole_errors && !checked.per_unit_errors,
+        "{}\n{}",
+        checked.whole_diags,
+        checked.per_unit_diags
+    );
+    if backend_available() {
+        for output in [
+            build_and_run_multi("readonly-publication-owned-copies", &files, "main.align"),
+            build_per_unit_multi("readonly-publication-owned-copies-unit", &files, "main.align")
+                .link_and_run(),
+        ] {
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "AB\ntrue\n");
         }
     }
 }

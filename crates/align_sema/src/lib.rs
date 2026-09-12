@@ -38025,7 +38025,14 @@ impl<'a> MoveCheck<'a> {
             ExprKind::StrBorrow(inner)
             | ExprKind::ArrayToSlice(inner)
             | ExprKind::SliceRange { recv: inner, .. } => self.storage_roots(inner),
-            ExprKind::StrBytes { inner } => self.storage_roots(inner),
+            ExprKind::StrBytes { inner } => {
+                // Text retains its UTF-8 invariant even when its owner is mutable.
+                // UnknownView formation preserves the lifetime roots and read-only
+                // property together in the byte view's typed backing header.
+                let mut roots = self.storage_roots(inner);
+                roots.insert(BorrowRoot::ReadOnly);
+                roots
+            },
             ExprKind::BufferBytes { buffer }
             | ExprKind::CliGetStr { parsed: buffer, .. }
             | ExprKind::HttpRespHeader { resp: buffer, .. }
@@ -74658,7 +74665,7 @@ fn main() -> i32 { _ := joined("x", identity, true); return 0 }
                         _ => "selected := text",
                     };
                     let view = if action == "owned" {
-                        "owned := selected.clone(); mut bytes := owned.bytes()"
+                        "mut bytes := selected.bytes().to_array()"
                     } else {
                         "mut bytes := selected.bytes()"
                     };
@@ -74808,7 +74815,7 @@ fn main() -> i32 {
  return 0
 }
 "###,
-                false,
+                true,
             ),
             (
                 "owned_control",
@@ -74928,7 +74935,7 @@ fn main() -> i32 {
         ];
         let mut failures = Vec::new();
         for (name, body) in cases {
-            for owned in [false, true] {
+            for (owned, copied) in [(false, false), (true, false), (true, true)] {
                 let literal = match name {
                     "json_record" => r#"{"text":"xx","score":1}"#,
                     "json_array" | "group" | "dictionary" => r#"[{"text":"xx","score":1}]"#,
@@ -74943,6 +74950,7 @@ fn main() -> i32 {
                 } else {
                     format!("input := {literal:?}")
                 };
+                let body = if copied { body.replace(".bytes()", ".bytes().to_array()") } else { body.to_string() };
                 let source = format!(
                     "import core.json\nPair {{ ro: str, rw: str }}\nRecord {{ text: str, score: i64 }}\nOwned {{ text: string }}\nChoice {{ Text(str), Number(i64) }}\nfn probe() -> Result<i32, Error> {{ arena out {{ {input}; {body}; }}; return Ok(0) }}\nfn main() -> i32 = 0\n"
                 );
@@ -74951,18 +74959,81 @@ fn main() -> i32 {
                     .iter()
                     .map(|item| item.message.as_str())
                     .collect::<Vec<_>>();
-                let expected = !owned && !matches!(name, "owned_slots" | "owned_decode");
+                let expected = !copied && name != "owned_slots";
                 if diagnostics.has_errors() != expected
                     || (expected
                         && !messages
                             .iter()
                             .any(|message| message.contains("read-only view")))
                 {
-                    failures.push(format!("{name} owned={owned}: {messages:?}"));
+                    failures.push(format!("{name} owned={owned} copied={copied}: {messages:?}"));
                 }
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn readonly_text_bytes_matrix() {
+        for (name, owner_ty, publication) in [
+            ("text", "string", "owner.bytes()"),
+        ] {
+            for (projection, select) in [
+                ("local", "selected := published"),
+                ("field", "holder := Views { ro: published, rw: writable }; selected := holder.ro"),
+                ("range", "selected := published[0..published.len()]"),
+                ("sibling", "holder := Views { ro: published, rw: writable }; selected := holder.rw"),
+            ] {
+                for action in ["read", "write", "copy"] {
+                    let body = match action {
+                        "read" => "print(selected.len())",
+                        "write" => "mut view := selected; view[0] = 255",
+                        _ => "mut view := selected.to_array(); view[0] = 255",
+                    };
+                    let source = format!(
+                        "Views {{ ro: slice<u8>, rw: slice<u8> }}\nfn probe(owner: {owner_ty}) {{ backing := [(1 as u8), (2 as u8)].to_array(); writable: slice<u8> := backing; published := {publication}; {select}; {body} }}\nfn main() {{}}\n"
+                    );
+                    let (_, diagnostics) = check(&source);
+                    let messages = diagnostics.iter().map(|item| item.message.as_str()).collect::<Vec<_>>();
+                    let readonly = action == "write" && projection != "sibling";
+                    assert_eq!(diagnostics.has_errors(), readonly, "{name}/{projection}/{action}: {messages:?}");
+                    if readonly {
+                        assert_eq!(messages.iter().filter(|message| message.contains("read-only view")).count(), 1,
+                            "{name}/{projection}/{action}: {messages:?}");
+                    }
+                }
+            }
+            // The permission marker must not erase the releasing owner's lifetime.
+            // Copying primitive bytes is the independent return control.
+            for copied in [false, true] {
+                let result = if copied { "array<u8>" } else { "slice<u8>" };
+                let copy = if copied { ".to_array()" } else { "" };
+                let source = format!(
+                    "fn view(owner: {owner_ty}) -> {result} = {publication}{copy}\nfn main() {{}}\n"
+                );
+                let (_, diagnostics) = check(&source);
+                let messages = diagnostics.iter().map(|item| item.message.as_str()).collect::<Vec<_>>();
+                assert_eq!(diagnostics.has_errors(), !copied, "{name}/escape/copied={copied}: {messages:?}");
+                if !copied {
+                    assert!(messages.iter().any(|message| message.contains("cannot return") || message.contains("escape")),
+                        "{name}/escape: {messages:?}");
+                }
+            }
+        }
+        for (setup, mutation) in [
+            ("mut owner := \"xx\".clone()", "owner = \"yy\".clone()"),
+        ] {
+            for copied in [false, true] {
+                let copy = if copied { ".to_array()" } else { "" };
+                let source = format!("fn main() {{ {setup}; view := owner.bytes(){copy}; {mutation}; print(view.len()) }}\n");
+                let (_, diagnostics) = check(&source);
+                let messages = diagnostics.iter().map(|item| item.message.as_str()).collect::<Vec<_>>();
+                assert_eq!(diagnostics.has_errors(), !copied, "{setup}/mutation/copied={copied}: {messages:?}");
+                if !copied {
+                    assert!(messages.iter().any(|message| message.contains("invalidated borrow")), "{messages:?}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -75004,23 +75075,26 @@ fn main() -> i32 {
                 true,
             ),
         ];
-        for (name, body, readonly) in cases {
-            let source = format!(
-                "TABLE: slice<u8> := [1, 2]\nfn probe(flag: bool) {{ mut backing := [(1 as u8), (2 as u8)].to_array(); mut view: slice<u8> := backing; {body} }}\nfn main() -> i32 = 0\n"
-            );
-            let (_, diagnostics) = check(&source);
-            let messages = diagnostics
-                .iter()
-                .map(|item| item.message.as_str())
-                .collect::<Vec<_>>();
-            assert_eq!(diagnostics.has_errors(), readonly, "{name}: {messages:?}");
-            if readonly {
-                assert!(
-                    messages
-                        .iter()
-                        .any(|message| message.contains("read-only view")),
-                    "{name}: {messages:?}"
+        for publication in ["text.bytes()", "\"xx\".bytes()"] {
+            for (name, body, readonly) in cases {
+                let body = body.replace("\"xx\".bytes()", "published");
+                let source = format!(
+                    "TABLE: slice<u8> := [1, 2]\nfn probe(flag: bool) {{ text := \"xx\".clone(); published := {publication}; mut backing := [(1 as u8), (2 as u8)].to_array(); mut view: slice<u8> := backing; {body} }}\nfn main() -> i32 = 0\n"
                 );
+                let (_, diagnostics) = check(&source);
+                let messages = diagnostics
+                    .iter()
+                    .map(|item| item.message.as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(diagnostics.has_errors(), readonly, "{publication}/{name}: {messages:?}");
+                if readonly {
+                    assert!(
+                        messages
+                            .iter()
+                            .any(|message| message.contains("read-only view")),
+                        "{name}: {messages:?}"
+                    );
+                }
             }
         }
     }
@@ -75030,12 +75104,12 @@ fn main() -> i32 {
         for swapped in [false, true] {
             for owned in [false, true] {
                 let fields = if swapped {
-                    "rw: str, ro: str"
+                    "rw: slice<u8>, ro: slice<u8>"
                 } else {
-                    "ro: str, rw: str"
+                    "ro: slice<u8>, rw: slice<u8>"
                 };
                 let source = format!(
-                    "S {{ {fields} }}\nfn main() -> i32 {{ owner := \"xx\".clone(); text: str := owner; s := S {{ ro: \"xx\", rw: text }}; mut view := s.{}.bytes(); view[0] = 65; return 0 }}\n",
+                    "S {{ {fields} }}\nfn main() -> i32 {{ owner := \"xx\".bytes().to_array(); bytes: slice<u8> := owner; s := S {{ ro: \"xx\".bytes(), rw: bytes }}; mut view := s.{}; view[0] = 65; return 0 }}\n",
                     if owned { "rw" } else { "ro" }
                 );
                 let (_, diagnostics) = check(&source);
@@ -75062,7 +75136,7 @@ fn main() -> i32 {
             ),
             ("mut values := [\"xx\"]; values[0] = \"yy\"", false),
             (
-                "owner := \"xx\".clone(); text: str := owner; values := [text]; mut view := values[0].bytes(); view[0] = 65",
+                "owner := \"xx\".clone(); text: str := owner; values := [text]; mut view := values[0].bytes().to_array(); view[0] = 65",
                 false,
             ),
         ] {
@@ -75085,49 +75159,51 @@ fn main() -> i32 {
 
     #[test]
     fn readonly_origin_sink_matrix() {
-        for owned in [false, true] {
-            let init = if owned { "TABLE.to_array()" } else { "TABLE" };
-            for (name, sink) in [
-                ("index", "view[0] = 65"),
-                ("out", "set(view)"),
-                ("borrow_mut", "modify(view)"),
-                ("indirect", "writer := modify; writer(view)"),
-                (
-                    "vector",
-                    "value: vec2<u8> := [65, 65]; view.store(0, value)",
-                ),
-                ("shuffle", "mut rng := rand.seed_with(1); rng.shuffle(view)"),
-                ("native", "child.read_stdout(view)?"),
-                (
-                    "map_into",
-                    "source := [(3 as u8), (4 as u8)]; source.map_into(view)",
-                ),
-            ] {
-                let setup = if matches!(name, "native" | "map_into") {
-                    "mut original := [(1 as u8), (2 as u8)].to_array(); mut view: slice<u8> := original; view = backing"
-                } else {
-                    "mut view: slice<u8> := backing"
-                };
-                let source = format!(
-                    "import std.rand\nimport std.process\nTABLE: slice<u8> := [1, 2]\nfn set(out view: slice<u8>) {{ view[0] = 65 }}\nfn modify(borrow mut view: slice<u8>) {{ view[0] = 65 }}\nfn probe(borrow mut child: child) -> Result<(), Error> {{ mut backing := {init}; {setup}; {sink}; return Ok(()) }}\nfn main() -> i32 = 0\n"
-                );
-                let (_, diagnostics) = check(&source);
-                let messages = diagnostics
-                    .iter()
-                    .map(|item| item.message.as_str())
-                    .collect::<Vec<_>>();
-                assert_eq!(
-                    diagnostics.has_errors(),
-                    !owned,
-                    "{name} owned={owned}: {messages:?}"
-                );
-                if !owned {
-                    assert!(
-                        messages
-                            .iter()
-                            .any(|message| message.contains("read-only view")),
-                        "{name}: {messages:?}"
+        for publication in ["TABLE", "text.bytes()"] {
+            for owned in [false, true] {
+                let init = if owned { format!("{publication}.to_array()") } else { publication.to_string() };
+                for (name, sink) in [
+                    ("index", "view[0] = 65"),
+                    ("out", "set(view)"),
+                    ("borrow_mut", "modify(view)"),
+                    ("indirect", "writer := modify; writer(view)"),
+                    (
+                        "vector",
+                        "value: vec2<u8> := [65, 65]; view.store(0, value)",
+                    ),
+                    ("shuffle", "mut rng := rand.seed_with(1); rng.shuffle(view)"),
+                    ("native", "child.read_stdout(view)?"),
+                    (
+                        "map_into",
+                        "source := [(3 as u8), (4 as u8)]; source.map_into(view)",
+                    ),
+                ] {
+                    let setup = if matches!(name, "native" | "map_into") {
+                        "mut original := [(1 as u8), (2 as u8)].to_array(); mut view: slice<u8> := original; view = backing"
+                    } else {
+                        "mut view: slice<u8> := backing"
+                    };
+                    let source = format!(
+                        "import std.rand\nimport std.process\nTABLE: slice<u8> := [1, 2]\nfn set(out view: slice<u8>) {{ view[0] = 65 }}\nfn modify(borrow mut view: slice<u8>) {{ view[0] = 65 }}\nfn probe(borrow mut child: child) -> Result<(), Error> {{ text := \"xx\".clone(); mut backing := {init}; {setup}; {sink}; return Ok(()) }}\nfn main() -> i32 = 0\n"
                     );
+                    let (_, diagnostics) = check(&source);
+                    let messages = diagnostics
+                        .iter()
+                        .map(|item| item.message.as_str())
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        diagnostics.has_errors(),
+                        !owned,
+                        "{publication}/{name} owned={owned}: {messages:?}"
+                    );
+                    if !owned {
+                        assert!(
+                            messages
+                                .iter()
+                                .any(|message| message.contains("read-only view")),
+                            "{name}: {messages:?}"
+                        );
+                    }
                 }
             }
         }
@@ -75139,18 +75215,18 @@ fn main() -> i32 {
             for dynamic in [false, true] {
                 for view in ["base", "base[0..base.len()]", "base[1..2]"] {
                     for materializer in [
-                        "mut bytes := values[0].bytes()",
-                        "copied := values.to_array(); mut bytes := copied[0].bytes()",
-                        "mut builder: array_builder<str> := array_builder(out); builder.append(values); copied := builder.build(); mut bytes := copied[0].bytes()",
+                        "mut bytes := values[0].data",
+                        "copied := values.to_array(); mut bytes := copied[0].data",
+                        "mut builder: array_builder<Bytes> := array_builder(out); builder.push(values[0]); copied := builder.build(); mut bytes := copied[0].data",
                     ] {
                         let init = if owned {
-                            "owner := \"xx\".clone(); input: str := owner"
+                            "owner := \"xx\".bytes().to_array(); input: slice<u8> := owner"
                         } else {
-                            "input := \"xx\""
+                            "input := \"xx\".bytes()"
                         };
                         let copy = if dynamic { ".to_array()" } else { "" };
                         let source = format!(
-                            "fn main() -> i32 {{ arena out {{ {init}; base := [input, input]{copy}; values: slice<str> := {view}; {materializer}; bytes[0] = 65 }}; return 0 }}\n"
+                            "Bytes {{ data: slice<u8> }}\nfn main() -> i32 {{ arena out {{ {init}; base := [Bytes {{ data: input }}, Bytes {{ data: input }}]{copy}; values: slice<Bytes> := {view}; {materializer}; bytes[0] = 65 }}; return 0 }}\n"
                         );
                         let (_, diagnostics) = check(&source);
                         let messages = diagnostics
@@ -75178,10 +75254,8 @@ fn main() -> i32 {
             let copy = if owned { ".to_array()" } else { "" };
             let source = format!("fn main() -> i32 {{ backing := \"xx\".bytes(){copy}; source: slice<u8> := backing; text := source.as_str() else {{ return 1 }}; mut view := text.bytes(); view[0] = 65; return 0 }}\n");
             let (_, diagnostics) = check(&source);
-            assert_eq!(diagnostics.has_errors(), !owned, "{}", diagnostics.iter().map(|item| item.message.as_str()).collect::<Vec<_>>().join("\n"));
-            if !owned {
-                assert!(diagnostics.iter().any(|item| item.message.contains("read-only view")));
-            }
+            assert!(diagnostics.has_errors(), "{}", diagnostics.iter().map(|item| item.message.as_str()).collect::<Vec<_>>().join("\n"));
+            assert!(diagnostics.iter().any(|item| item.message.contains("read-only view")));
         }
 
     }
@@ -75196,9 +75270,15 @@ fn main() -> i32 {
                     "[\"literal\"]"
                 };
                 let operation = if scan { "scan" } else { "reduce" };
-                let selected = if scan { "result[0]" } else { "result" };
+                let (reducer, initial, selected) = if scan {
+                    // Scan admits scalar accumulators. An unused readonly text input must not
+                    // taint the fresh byte array populated by scalar callback results.
+                    ("fn keep(acc: u8, item: str) -> u8 = acc", "(65 as u8)", "result")
+                } else {
+                    ("fn keep(acc: Accumulator, item: str) -> Accumulator = acc", "Accumulator { bytes: bytes }", "result.bytes")
+                };
                 let source = format!(
-                    "Row {{ text: str }}\nfn keep(acc: str, item: str) -> str = acc\nfn main() -> i32 {{ arena {{ owner := \"xx\".clone(); text: str := owner; result := {collection}.{operation}(text, keep); mut view := {selected}.bytes(); view[0] = 65 }}; return 0 }}\n"
+                    "Row {{ text: str }}\nAccumulator {{ bytes: slice<u8> }}\n{reducer}\nfn main() -> i32 {{ arena {{ owner := \"xx\".bytes().to_array(); bytes: slice<u8> := owner; result := {collection}.{operation}({initial}, keep); mut view: slice<u8> := {selected}; view[0] = 65 }}; return 0 }}\n"
                 );
                 let (_, diagnostics) = check(&source);
                 assert!(
@@ -75213,7 +75293,7 @@ fn main() -> i32 {
             }
         }
         let (_, diagnostics) = check(
-            "Holder { ro: str, rw: str }\nfn keep(acc: Holder, item: i64) -> Holder = acc\nfn main() -> i32 { owner := \"xx\".clone(); text: str := owner; init := Holder { ro: \"literal\", rw: text }; result := [1].reduce(init, keep); mut view := result.rw.bytes(); view[0] = 65; return 0 }\n",
+            "Holder { ro: slice<u8>, rw: slice<u8> }\nfn keep(acc: Holder, item: i64) -> Holder = acc\nfn main() -> i32 { owner := \"xx\".bytes().to_array(); bytes: slice<u8> := owner; init := Holder { ro: \"literal\".bytes(), rw: bytes }; result := [1].reduce(init, keep); mut view := result.rw; view[0] = 65; return 0 }\n",
         );
         assert!(
             !diagnostics.has_errors(),
@@ -75258,7 +75338,7 @@ fn main() -> i32 {
         // A lifetime summary may name an aggregate containing unrelated constant text.
         // It must not claim that every result aliases that text's bytes.
         let (_, diagnostics) = check(
-            "Holder { ro: str, rw: str }\nfn choose_text(value: Holder) -> str = value.rw\nfn main() -> i32 { owner := \"xx\".clone(); text: str := owner; value := Holder { ro: \"literal\", rw: text }; mut view := choose_text(value).bytes(); view[0] = 65; return 0 }\n",
+            "Holder { ro: slice<u8>, rw: slice<u8> }\nfn choose_text(value: Holder) -> slice<u8> = value.rw\nfn main() -> i32 { owner := \"xx\".bytes().to_array(); bytes: slice<u8> := owner; value := Holder { ro: \"literal\".bytes(), rw: bytes }; mut view := choose_text(value); view[0] = 65; return 0 }\n",
         );
         assert!(
             !diagnostics.has_errors(),
@@ -75270,7 +75350,7 @@ fn main() -> i32 {
                 .join("\n")
         );
         let (_, diagnostics) = check(
-            "Holder { ro: array<str>, rw: array<str> }\nfn choose_text(borrow value: Holder) -> slice<str> { result: slice<str> := value.rw; return result }\nfn main() -> i32 { owner := \"xx\".clone(); text: str := owner; arena { ro := [\"literal\"].to_array(); rw := [text].to_array(); value := Holder { ro: ro, rw: rw }; words := choose_text(value); mut view := words[0].bytes(); view[0] = 65 }; return 0 }\n",
+            "Bytes { data: slice<u8> }\nHolder { ro: array<Bytes>, rw: array<Bytes> }\nfn choose_text(borrow value: Holder) -> slice<Bytes> { result: slice<Bytes> := value.rw; return result }\nfn main() -> i32 { owner := \"xx\".bytes().to_array(); bytes: slice<u8> := owner; arena { ro := [Bytes { data: \"literal\".bytes() }].to_array(); rw := [Bytes { data: bytes }].to_array(); value := Holder { ro: ro, rw: rw }; words := choose_text(value); mut view := words[0].data; view[0] = 65 }; return 0 }\n",
         );
         assert!(
             !diagnostics.has_errors(),
