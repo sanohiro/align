@@ -1,8 +1,29 @@
 # Session handoff
 
-**R77–R83 consolidated implementation (2026-09-12; branch-local):**
+**Antigravity host review integration (2026-09-12):**
+`scripts/review-bounded.sh --provider agy` supports fresh inspection with
+`gemini-3.8-flash-high`; Codex remains the default. The native agent uses
+`AGENTS.md`'s canonical `CLAUDE.md` guidance and only file-view/search tools.
+Both providers retain the same review-cycle, HEAD/merge-base and changed-slice
+rules. Raw output is retained separately from validated attestations;
+incomplete/failed runs cannot publish CLEAN, and process-group cleanup covers
+normal completion, stalls, explicit maxima and signals, including helpers that
+ignore TERM. agy 1.2.1's zero-timeout SUCCESS/partial-result behavior is covered.
+The guide owns the exact contract and implementation closure matrix.
+
+Verification: the 22 focused owner tests and the combined
+`bash scripts/test-pr-workflow.sh` passed. The explicit
+`bash scripts/test-review-bounded.sh --live` qualification passed with installed,
+authenticated agy 1.2.1: a fresh high-model review found the committed duration
+conversion defect, reported FINDINGS and preserved the fixture's source.
+Native events, conversation identity and diagnostics are retained under the
+local Git directory. The qualification remains an explicit local command;
+routine CI runs the deterministic owner. No align-llm work belongs to this
+capability.
+
+**R77–R83 consolidated implementation (2026-09-12):**
 [Plan 56](docs/impl/56-r77-r83-composition-plan.md) includes all seven new requests
-and the appended R80/R81/R83 client cases. The provider branch implements the six
+and the appended R80/R81/R83 client cases. Align main implements the six
 selected requests: shared reads, fresh/transferred storage, owned call/return
 certification and the shared namespace carrier. Indexed Move-field calls use
 checked runtime indices for dynamic slice/AoS views and integer-literal indices
@@ -15,8 +36,8 @@ resource-backed Document path and the 32-field measurement final-digest path.
 `StrBorrow`/`ArrayToSlice` field arguments; mutable owning view retypes are rejected,
 and fixed-array slice calls use a materialized descriptor slot. Real client smoke/A2 acceptance,
 managed-pin adoption and platform-specific namespace execution remain external.
-The final candidate has a clean host review; release build, preflight and push
-remain. No merge or consumer adoption is claimed by this branch.
+The six selected repairs are merged in #1027; the optimized workspace build
+passed on merged main. Consumer adoption remains external.
 
 **R69–R76 macOS qualification (2026-09-11):**
 [Plan 54](docs/impl/54-r69-r76-prerequisite-batch-plan.md) owns all eight requests
