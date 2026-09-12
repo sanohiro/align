@@ -8,11 +8,12 @@ certification and the shared namespace carrier. Indexed Move-field calls use
 checked runtime indices for dynamic slice/AoS views and integer-literal indices
 for source-formed fixed `StructArray` places. R78 remains PROPOSED because plan
 23's prerequisite for reopening its deliberate enum exclusion is unmet. The
-focused provider owner now passes 18 whole/per-unit composition cases, including
+focused provider owner now passes 22 whole/per-unit composition cases, including
 the non-loop Option replacement, borrowed Config/task-source forwarding, the
 resource-backed Document path and the 32-field measurement final-digest path.
 `align_sema::borrow_argument_source` is the shared sema/checked-HIR/MIR seam for
-`StrBorrow`/`ArrayToSlice` field arguments. Real client smoke/A2 acceptance,
+`StrBorrow`/`ArrayToSlice` field arguments; mutable owning view retypes are rejected,
+and fixed-array slice calls use a materialized descriptor slot. Real client smoke/A2 acceptance,
 managed-pin adoption and platform-specific namespace execution remain external.
 No merge or consumer adoption is claimed by this branch.
 

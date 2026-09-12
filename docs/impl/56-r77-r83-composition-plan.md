@@ -36,7 +36,7 @@ still contain "XML" for the shared resource analysis. Do not repair these cases
 in the LLVM emitter or classify them as XML-library defects. Plans 52 and 53
 continue to own read-only backing and independently founded initialization.
 
-On this branch the focused owner `owned_borrowed_composition` passes all 18
+On this branch the focused owner `owned_borrowed_composition` passes all 22
 whole/per-unit cases, including the seven-field R83 provider witness. The current
 optimized compiler also accepts the align-llm evaluation-inputs source in
 per-unit mode (`17 unit(s)`, warnings only). These are provider/compiler checks;
@@ -116,6 +116,15 @@ same conversion. The existing `BorrowedElementPlace` carries an internal
 `field_path` for the dynamic AoS path; fixed `StructArray` literals use the
 existing `BorrowedFixedElementPlace`. Neither representation changes a public
 signature, interface field or runtime ABI.
+
+At an explicit `borrow mut` boundary, preserve the physical owner contract. An
+owned `string` or dynamic array cannot be relabeled as a mutable `str`/`slice<T>`
+place because a whole-view replacement would bypass the owner's cleanup bit;
+sema and checked-HIR replay reject that shape. Fixed arrays are inline storage,
+so MIR materializes a `{ptr,len}` descriptor in a call-local Copy slot before
+passing the view. Element writes still reach the fixed backing, while a view
+header replacement remains confined to the descriptor. The producer path accepts
+only the complete canonical view-retype predicate for a root descriptor.
 
 For R79/R81/R83, trace the first failing typed producer equation, not the final
 diagnostic's application field name. The current `value_equation` handles
@@ -203,7 +212,7 @@ do not claim actual namespace inheritance there.
 ## 4. Implementation closure matrix
 
 The matrix remains the closure record for this implementation. The focused driver
-target `owned_borrowed_composition` now covers 18 whole/per-unit cases; existing
+target `owned_borrowed_composition` now covers 22 whole/per-unit cases; existing
 native and malformed-IR owners are reused where they detect the same defect. The
 remaining cells below are consumer-owned or require platform-specific provider
 execution; the faithful provider witnesses are included in the focused target. A
@@ -214,14 +223,15 @@ product cell.
 | --- | --- | --- |
 | Type formation and validation | R82 exact handle / still-excluded handle; finite/deep/invalid nominal graphs and deterministic rejection. R78 enum-field rejection remains unchanged. | Extend sema `borrowed_payload_classifier_admits_only_ordinary_dynamic_array_graphs` and its HIR mutation twins; reuse the existing heap-record rejection owner as an unchanged-domain control. |
 | Construction and move-in | R82 None/Some and record-containing optional owner through already-admitted recursive carriers. Existing builder zero/one/multiple pushes remain controls; no element-domain widening. | `owned_borrowed_composition::admitted_carrier_domains`; existing builder owners. |
-| Read and argument projection | R77 physical String/logical Str, R79 every signal, R81 two owners, R82 shared namespace; direct/nested/indexed and local/imported calls; the original owner remains reusable. `StrBorrow`/`ArrayToSlice` call wrappers normalize to their physical place through `align_sema::borrow_argument_source` in sema, checked-HIR replay and MIR lowering. | `owned_borrowed_composition::shared_reads_and_calls`; `borrowed_config_forwarding_returns_independent_argv`; `borrowed_params`, `move_record_slices`, `m11_process_live` controls. |
+| Read and argument projection | R77 physical String/logical Str, R79 every signal, R81 two owners, R82 shared namespace; direct/nested/indexed and local/imported calls; the original owner remains reusable. `StrBorrow`/`ArrayToSlice` call wrappers normalize to their physical place through `align_sema::borrow_argument_source` in sema, checked-HIR replay and MIR lowering. Fixed-array slice calls use a materialized descriptor slot, and root view retypes use the canonical producer predicate. | `owned_borrowed_composition::shared_reads_and_calls`; `borrowed_config_forwarding_returns_independent_argv`; `borrowed_fixed_array_to_slice_materializes_a_descriptor`; `borrowed_string_root_view_retype_is_certified`; `borrowed_params`, `move_record_slices`, `m11_process_live` controls. |
+| Mutable view and generic argument boundaries | An exclusive call may not relabel an owned `string` or dynamic array as a view; an existing view remains writable under the ordinary generation rules. A fixed array may be passed through the materialized descriptor, and an unbound generic `borrow T` argument routes `arr[i].field` through the same indexed-field checker as concrete parameters. Sema, checked-HIR replay, MIR and producer validation agree on these shapes. | `owned_borrowed_composition::mutable_owned_view_retypes_are_rejected_before_lowering`; `owned_borrowed_composition::generic_borrow_accepts_an_indexed_move_field_chain`; `return_provenance` mutable-slice controls; checked-HIR mutation owners. |
 | Move-out, source nulling and Drop | Move records transfer once; projected Move bindings have no owning local/expression cleanup; Copy signal loads add none. Partial builder, source expiry, normal return and early Err release every actual owner once. | Existing builder/resource cleanup counters and malformed cleanup owners plus `admitted_carrier_domains`. |
 | Replacement and joins | R80 scalar copy and the non-loop nested Option assignment; branch replacement, self-assignment, zero/one/multiple iterations, old generation invalidation, still-live sibling roots and consumed builder freeze. | `owned_borrowed_composition::scalar_to_array_replacement_does_not_retain_the_loop_iteration_owner`; `owned_borrowed_composition::owned_option_branch_replacement_keeps_nested_members`; sema generation invariant owner, `borrowed_replacement`, `move_return_cleanup`. |
 | Every control carrier | `if`, `match`, `else`, `?`, `map_err`, branch/loop joins, early return/break, absent/error arms and non-fallthrough operands. Reuse admitted source forms; do not introduce new syntax or broaden unrelated carrier formation. | Parameterized driver variants and existing `return_provenance`/owned-tagged owners. |
 | Call and return composition | R81 borrowed field/slice parameter/owned argument controls, including Config and task-source expansion; R83 bound/direct/local/imported wrappers and independent owned versus genuinely borrowed results. The full-evaluator Document metadata/digest path and the 32-field measurement final digest are distinct owners from the seven-field Template witness. | `owned_borrowed_composition::borrowed_config_forwarding_returns_independent_argv`; `owned_borrowed_composition::borrowed_task_source_expansion_keeps_owned_rows_and_source_reusable`; `owned_borrowed_composition::faithful_document_digest_and_template_return_path_is_admitted`; `owned_borrowed_composition::owned_measurement_final_digest_field_is_certified_after_canonicalization`; MIR call-component and return-leaf mutations. |
 | Malformed source/IR | Wrong same-shaped root, stale generation, inactive valid variant, invalid ordinal/type, missing output/cleanup, forged owned read, uninitialized argument/out slot, unseeded and seeded cycles. No compiler panic or optimistic fallback. | Existing checked-HIR owners and MIR producer mutation owners; run each producer negative at publication, whole-program emission and ThinLTO entrypoints. |
 | Read-only and mutable authority | Literal/static/mapped read-only twins, fresh byte-copy writable twin, descriptor copy retaining read-only backing, plain by-value slice versus BorrowMut/Out header/backing, excluded borrowed-owner writes/transfers. | `constants_aggregate` #1026 owners, plans 52/53 producer mutations and composition escape negatives. |
-| Generic and interface transport | Concrete generic admitted records/nested views, imported non-generic summaries, imported generic source rechecking, renamed same-shaped types and source definition mutation/restoration. Exact nominal identity/modes/cleanup survive. | Composition driver whole/per-unit twins and existing interface canonical-graph owners. No new codec fields. |
+| Generic and interface transport | Concrete generic admitted records/nested views, indexed Move-field chains with an unbound `T`, imported non-generic summaries, imported generic source rechecking, renamed same-shaped types and source definition mutation/restoration. Exact nominal identity/modes/cleanup survive. | Composition driver whole/per-unit twins and existing interface canonical-graph owners. No new codec fields. |
 | Whole / per-unit / ThinLTO | Check and execute reachable positive programs in both ordinary modes; R83 also uses ThinLTO. Negative producer mutations fail before lowering/native execution in all three entrypoints. An unused/public-only function is insufficient native-execution evidence. | Composition target plus existing three-entrypoint producer helper. |
 | Native provenance and allocation | R82 repeated independent commands, duplicate/invalid slot failure leaving source and command unchanged, source Drop after duplication, None/no hidden syscall, descriptor counts. R77/R80/R81/R83 add no allocation beyond the written clone/copy/build/decode; R79 adds none; R78 changes nothing. | Extend/reuse `m11_process_verified` and runtime `process_verified` ownership controls. Linux actual fd owner, macOS portable/refusal owner. |
 | Termination and cached proof | Iterative finite type/equation traversal; no recursive rediscovery loop, success on founded joins, rejection of unseeded cycles; equivalent results for query orders and cached/uncached proof. | MIR invariant owner with bounded/deep graphs and existing plan 53 cycle twins. No new performance claim or benchmark gate. |
@@ -355,7 +365,7 @@ The baseline compiler rebuild succeeded. The seven original standalone sources
 have the check/per-unit outcomes in §1; all seven syntax-format successfully.
 The seven-field R83 provider witness was also run through the baseline binary and
 reproduced the `StructField(6)` producer rejection before the branch repair.
-On this branch, `owned_borrowed_composition` passes all 18 whole/per-unit cases,
+On this branch, `owned_borrowed_composition` passes all 22 whole/per-unit cases,
 the producer and codegen malformed Store/Load owners pass, and the current
 optimized compiler accepts the align-llm evaluation-inputs source in per-unit
 mode (`17 unit(s)`, warnings only). These checks do not claim consumer execution,
@@ -365,11 +375,13 @@ The author ledger-to-prose and matrix-to-diff pass covers the implemented rows
 against §§3–6. The appended provider witnesses now pass in whole/per-unit modes;
 consumer adoption and platform-specific runtime owners remain explicitly pending.
 The appendix matches the seven baseline inputs, local links resolve, and
-`git diff --check` passes. A final register rescan still ends at R83. The prior
-inspection found two P2 implementation-closure issues; the follow-up repairs
-normalize view-wrapper source places and add the missing provider owners. A fresh
-inspection of the final candidate is still required before publication; no clean
-status is claimed here.
+`git diff --check` passes. A final register rescan still ends at R83. The fresh
+inspection of the `409defb0` candidate found four implementation-closure issues:
+mutable owning view retypes, fixed-array slice descriptors, root view-retype
+authentication and generic indexed-field dispatch. The follow-up repairs close
+those four classes with focused owner cases; a fresh inspection of the final
+candidate is still required before publication, and no clean status is claimed
+here.
 
 | Finding | Closure |
 | --- | --- |

@@ -84,10 +84,13 @@ behavior. Matching itself must neither duplicate nor close a descriptor.
 4. Plan 56's matrix now names the actual provider owners and records the wrapper
    normalization seam. Mark consumer adoption and platform-specific execution
    as external rather than treating them as provider failures.
-5. The demonstrated defect was repaired under the existing strategy: sema,
+5. The demonstrated defects were repaired under the existing strategy: sema,
    checked-HIR replay and MIR all use `align_sema::borrow_argument_source` to
-   normalize `StrBorrow`/`ArrayToSlice` before stable-place validation and lowering.
-   No public signature, IR shape, ABI or runtime operation changed.
+   normalize `StrBorrow`/`ArrayToSlice` before stable-place validation and lowering;
+   fixed-array views receive a materialized descriptor, mutable owning view retypes
+   are rejected, root retypes use the canonical producer predicate, and generic
+   indexed-field arguments use the field checker. No public signature, IR shape,
+   ABI or runtime operation changed.
 6. Use the narrow owner first, then the repository gates appropriate to the final
    code diff. Keep the 30-minute test budget; no unrelated DB service gate.
    At implementation-batch completion run `cargo build --release --workspace`

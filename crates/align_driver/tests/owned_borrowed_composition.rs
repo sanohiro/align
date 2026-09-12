@@ -403,6 +403,130 @@ fn assert_rejected(name: &str, source: &str) {
 }
 
 #[test]
+fn borrowed_fixed_array_to_slice_materializes_a_descriptor() {
+    let source = r#"module borrowed_fixed_array_slice
+fn inspect(borrow values: slice<i64>) -> i64 = values[0]
+fn main() -> i32 {
+  mut values := [42]
+  value := inspect(values)
+  if value == 42 && values[0] == 42 { return 42 }
+  return 0
+}
+"#;
+    assert_clean("fixed-array-to-borrowed-slice", source);
+    if backend_available() {
+        assert_eq!(
+            build_and_run("fixed-array-to-borrowed-slice", source)
+                .status
+                .code(),
+            Some(42)
+        );
+        let files = &[("main.align", source)];
+        assert_eq!(
+            build_per_unit_multi("fixed-array-to-borrowed-slice-unit", files, "main.align")
+                .link_and_run()
+                .status
+                .code(),
+            Some(42)
+        );
+    }
+}
+
+#[test]
+fn borrowed_string_root_view_retype_is_certified() {
+    let source = r#"module borrowed_string_root_view
+fn inspect(borrow value: str) -> i64 = value.len()
+fn main() -> i32 {
+  owner := "forty-two".clone()
+  length := inspect(owner)
+  if length == 9 && owner == "forty-two" { return 42 }
+  return 0
+}
+"#;
+    assert_clean("borrowed-string-root-view", source);
+    if backend_available() {
+        assert_eq!(
+            build_and_run("borrowed-string-root-view", source)
+                .status
+                .code(),
+            Some(42)
+        );
+        let files = &[("main.align", source)];
+        assert_eq!(
+            build_per_unit_multi("borrowed-string-root-view-unit", files, "main.align")
+                .link_and_run()
+                .status
+                .code(),
+            Some(42)
+        );
+    }
+}
+
+#[test]
+fn mutable_owned_view_retypes_are_rejected_before_lowering() {
+    let string_source = r#"module reject_mutable_string_view
+fn replace(borrow mut value: str) { value = "new" }
+fn main() -> i32 {
+  mut owner := "old".clone()
+  replace(owner)
+  return 0
+}
+"#;
+    let string_diagnostics = check_diagnostics("reject-mut-string-view", string_source);
+    assert!(
+        string_diagnostics.contains("cannot exclusively borrow owning storage through a view"),
+        "an owned string must not be relabeled as a mutable str place:\n{string_diagnostics}"
+    );
+    assert_rejected("reject-mut-string-view", string_source);
+
+    let array_source = r#"module reject_mutable_dynamic_view
+fn touch(borrow mut values: slice<i64>) { values = [] }
+fn main() -> i32 {
+  mut owner := [1].to_array()
+  touch(owner)
+  return 0
+}
+"#;
+    let array_diagnostics = check_diagnostics("reject-mut-dynamic-view", array_source);
+    assert!(
+        array_diagnostics.contains("cannot exclusively borrow owning storage through a view"),
+        "an owned dynamic array must not be relabeled as a mutable slice place:\n{array_diagnostics}"
+    );
+    assert_rejected("reject-mut-dynamic-view", array_source);
+}
+
+#[test]
+fn generic_borrow_accepts_an_indexed_move_field_chain() {
+    let source = r#"module generic_indexed_move_field
+Row { child: string }
+fn observe<T>(borrow value: T) -> i64 = 42
+fn main() -> i32 {
+  rows := [Row { child: "answer".clone() }]
+  result := observe(rows[0].child)
+  if result == 42 { return 42 }
+  return 0
+}
+"#;
+    assert_clean("generic-indexed-move-field", source);
+    if backend_available() {
+        assert_eq!(
+            build_and_run("generic-indexed-move-field", source)
+                .status
+                .code(),
+            Some(42)
+        );
+        let files = &[("main.align", source)];
+        assert_eq!(
+            build_per_unit_multi("generic-indexed-move-field-unit", files, "main.align")
+                .link_and_run()
+                .status
+                .code(),
+            Some(42)
+        );
+    }
+}
+
+#[test]
 fn fixed_record_field_borrow_keeps_the_physical_string_owner() {
     let source = r#"module borrowed_fixed_record_projection
 Row { text: string, score: i64 }

@@ -4654,6 +4654,19 @@ pub fn borrow_argument_source(e: &hir::Expr) -> &hir::Expr {
     source
 }
 
+/// Whether an exclusive borrow would relabel physical owning storage as a non-owning view. MIR
+/// can materialize a fixed-array descriptor, but a dynamic array or owned string header cannot be
+/// replaced through a view without bypassing its cleanup bit. Shared borrowing and existing view
+/// bindings remain valid; this predicate is only an exclusive-call boundary rule.
+pub fn borrow_argument_is_owning_view_retype(e: &hir::Expr) -> bool {
+    matches!(
+        (borrow_argument_source(e).ty, e.ty),
+        (Ty::String, Ty::Str | Ty::Slice(_))
+            | (Ty::DynArray(_), Ty::Slice(_))
+            | (Ty::DynStructArray(_, Layout::Aos), Ty::Slice(_))
+    )
+}
+
 /// Whether a borrowing use of this expression can select a **fresh owned value** — one with no
 /// binding of its own, for which MIR allocates a hidden owner slot (`new_synthetic_owner`). Direct
 /// bound places are borrowed from their binding instead; a block is transparent to its value (see
@@ -49514,6 +49527,21 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return;
         };
+        // A mutable view cannot safely overwrite an owning collection/string header: the
+        // callee's replacement would bypass the owner's cleanup bit and leave the physical owner
+        // dangling or double-dropped. Fixed arrays are materialized as a separate slice descriptor
+        // by MIR, so their inline backing remains a valid writable view; dynamic arrays and owned
+        // strings must be passed with their owning type (or through an existing view binding).
+        if mode == ast::ParamMode::BorrowMut
+            && borrow_argument_is_owning_view_retype(argument)
+        {
+            self.diags.error(
+                format!(
+                    "cannot exclusively borrow owning storage through a view for '{display}'; pass the owning type or an existing view"
+                ),
+                argument.span,
+            );
+        }
         if mode == ast::ParamMode::BorrowMut
             && matches!(place.kind, ExprKind::Field { .. })
             && ty_is_move(
@@ -50103,7 +50131,7 @@ impl<'a, 't> Checker<'a, 't> {
                 // may still bind the slot.
                 self.reject_bare_array_value(a, None, "a generic argument");
                 if param_modes[i] == ast::ParamMode::Borrow
-                    && matches!(a.kind, ast::ExprKind::Index { .. })
+                    && peel_index_field_chain(a).is_some()
                 {
                     self.check_call_argument_for_mode(
                         a,

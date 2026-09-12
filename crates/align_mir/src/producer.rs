@@ -7461,13 +7461,7 @@ fn xml_borrowed_descriptor_path_valid(
     // exact type here so a relabeled whole value cannot bypass producer authentication.
     !path.is_empty()
         || selected == place.ty
-        || (!element_base
-            && matches!(
-                (selected, place.ty),
-                (Ty::Array(element, _), Ty::Slice(view))
-                    | (Ty::DynArray(element), Ty::Slice(view))
-                    if element == view
-            ))
+        || (!element_base && xml_borrowed_place_ty_is_view_retype(selected, place.ty))
 }
 
 fn xml_return_cleanup_companion(
