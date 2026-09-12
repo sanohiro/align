@@ -65,6 +65,14 @@ language/runtime contract を定義しない。
 
 ## Owned JSON record
 
+**動的配列ルート（R87）。** 両エンコーダーは JSON レコードフィールドと同じ既存の要素文法で
+動的配列を借用する。対応する整数・浮動小数点・bool・str・string と受理済み AoS レコードが対象。
+ルートの出力バイトは埋め込まれた配列値と一致し、空配列は `[]`。入力は再利用でき、所有する出力は
+入力の寿命を越えられる。上限との完全一致は成功し、負の上限・超過・選択された非有限浮動小数点は
+部分出力を公開せず `Error.Invalid` を返す。暗黙のコピー・ラッパー・新しい要素構成・decode の拡張はない。
+オーナーが明示的に制限を再検討し、plan 59 が従来の bare 動的配列 encode の除外を置き換える。
+V3 グラフは引き続き要素レコードを表し、型付き入力が配列コンテナを検証する。
+
 **R63 の契約（2026-09-10）。**
 [詳細契約](../../47-json-numeric-contract.md) を数値変換と encode の正本とする。
 `json.encode(value)` と `json.encode_bounded(value, max_bytes: i64)` は共に
@@ -228,8 +236,8 @@ mid-array パース失敗時に `buf[0..count]` の既 materialize 要素を解�
 エンドツーエンドで閉じる**（`Chat` が byte-identical にラウンドトリップ）。borrowed/nested/AoS route は
 bare-`string` 要素の array field を引き続き拒否する。Request 10 は standalone deep Drop を再利用して通常の
 owned record construction ではこの field を有効にし、Request 9 は closed direct-owned flat-record JSON
-route だけでこの field を受理する。bare
-`array<Move-struct>` の `json.encode` とそのフィールド上の pipeline は制限される
+route だけでこの field を受理する。R87 は既存の配列フィールドが要素レコードを受理する場合、
+bare `array<Move-struct>` のルートも受理する。独立した pipeline の制限は変更しない
 （decode→encode パススルーは動作）。
 
 **`array<scalar>` フィールド（JSON 完全対応 T1b + `array<str>`, align-llm Request 3）。** 構造体フィールドは
@@ -254,8 +262,8 @@ enclosing arena に exact-size materialize されるので、所有スパイン�
 `array<char>`（JSON 形式なし）と、**top-level** の `array<str> := json.decode`
 （構造体 FIELD は囲む構造体の入力 region 束縛に乗るが、top-level 配列の結果はその region を自身で運ぶ必要がある —
 scalar の top-level 配列は意図的に `Static`/返却可能なので、top-level の `array<str>` は別途 region を運ぶ slice に
-なる）。v1 制限: 所有 scalar-array フィールド上の `.sum()`/pipeline と bare `array<scalar>` の `json.encode` は
-制限（decode + `.len()` + フィールドとしての encode は動作）。
+なる）。v1 制限: 所有 scalar-array フィールド上の `.sum()`/pipeline は制限される。
+R87 は動的 scalar-array の bare ルートを対応するフィールドと同じ要素文法・出力バイトで受理する。
 
 **`Option<T>` フィールド（REST-gateway runway, Slice B）。** 構造体フィールドは `Option<T>`（payload は
 scalar / `str` / ネスト構造体）であってよい。**null ポリシー:** decode はキー欠落→`None`、JSON `null`→

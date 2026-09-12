@@ -10,6 +10,11 @@ Historical vectors/version transitions and current shipped ABI inventories below
 remain baseline records, not alternate implementation contracts. In particular,
 plan 47 records the replacement ABI counts and rows.
 
+**R87 root composition:** [plan 59](59-json-array-root-composition-plan.md) admits
+dynamic AoS arrays of accepted element records to both encoders. The V3 graph
+remains rooted at the element record; the typed source authenticates the array.
+This supersedes earlier direct-record-only encoding root restrictions here.
+
 Status: **ACCEPTED DESIGN; IMPLEMENTATION PENDING**.
 
 This document is the plan of record for align-llm Request 13. It replaces the

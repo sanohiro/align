@@ -25,10 +25,11 @@ CLI argument, callback, codec customization, or parallel execution is introduced
 | `value.as_f64() -> Option<f64>` where `value: json.doc` | Existing `json.doc` value accessor; numeric token conversion uses the same finite f64 conversion. | Some(finite) or None for wrong kind/out-of-range. | Copy result; no materialized text, no new allocation. Raw document accepts grammar-valid large numbers for navigation/skipping. | Existing tape/number-span accessor; no new wire or type. | N2, N3. |
 | Owned record grammar | Add f32/f64 to every existing scalar position of the selected recursive owned graph, including Option and dynamic array elements. Existing nonempty/natural/acyclic/depth-128 rules stay. | Unsupported graph is a compile-time error before native table construction/allocation. | Float Copy; existing string/record/Option/array Drop plans. No mixed borrowed-text graphs, new containers or custom codecs. | V3 descriptor/envelope, complete reachable structural graph identity, nominal exported-root association. | G1–G3, T1. |
 
-Encoding retains the existing source-root domain: a direct record, fixed
-struct-array, or accepted shape-directed sum. Nested arrays/records and union
+Encoding accepts a direct record, fixed struct-array, or accepted shape-directed sum;
+R87 [plan 59](59-json-array-root-composition-plan.md) also admits dynamic arrays with
+the same element grammar as existing array fields. Nested arrays/records and union
 payloads follow their existing declared schema. This work does not add bare
-scalar/dynamic-array encode, a JSON tree type, or a new ownership carrier. Decode
+scalar encode, a JSON tree type, or a new ownership carrier. Decode
 and document navigation retain their broader existing root domains. A JSON
 conversion targets a declared representation; arbitrary precision is not added.
 

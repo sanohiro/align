@@ -2490,7 +2490,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | crate::TemplatePiece::StructArrayField { array: operand, .. }
             | crate::TemplatePiece::ScalarArrayField { array: operand, .. }
             | crate::TemplatePiece::UnionValue { value: operand, .. }
-            | crate::TemplatePiece::OwnedJsonObject { value: operand, .. } => Some(operand),
+            | crate::TemplatePiece::OwnedJsonRecords { value: operand, .. } => Some(operand),
         };
         if let Some(operand) = operand {
             let Some(expected) = operand_ty(operand) else {
@@ -10515,8 +10515,8 @@ pub fn template_piece_is_type_safe(
         crate::TemplatePiece::StrHole(operand) => operand_ty(operand) == Some(Ty::Str),
         crate::TemplatePiece::CharHole(operand) => operand_ty(operand) == Some(Ty::Char),
         crate::TemplatePiece::JsonStrHole(operand) => operand_ty(operand) == Some(Ty::Str),
-        crate::TemplatePiece::OwnedJsonObject { value, plan } => {
-            operand_ty(value) == Some(Ty::Struct(plan.root))
+        crate::TemplatePiece::OwnedJsonRecords { value, plan } => {
+            matches!(operand_ty(value), Some(Ty::Struct(id) | Ty::DynStructArray(id, align_sema::Layout::Aos)) if id == plan.root)
                 && align_sema::owned_json_graph_plan_v3(&program.structs, plan.root)
                     .is_ok_and(|rebuilt| rebuilt == *plan)
         }
@@ -10543,6 +10543,7 @@ pub fn template_piece_is_type_safe(
         }
         crate::TemplatePiece::ScalarArrayField { array, elem } => {
             operand_ty(array) == Some(Ty::DynArray(*elem))
+                && align_sema::json_encode_array_element(*elem)
         }
         crate::TemplatePiece::UnionValue { value, enum_id } => {
             program.enums.get(*enum_id as usize).is_some()
@@ -10817,6 +10818,7 @@ mod tests {
 
     #[test]
     fn producer_json_borrowed_root_requires_initialized_exact_place() -> Result<(), &'static str> {
+        for array in [false, true] {
         let source = r#"import core.json
 Record { text: string }
 Carrier { record: Option<Record> }
@@ -10825,8 +10827,9 @@ fn encode(borrow input: Carrier) -> Result<string, Error> {
 }
 fn main() {}
 "#;
+        let source = if array { source.replace("Option<Record>", "Option<array<Record>>") } else { source.to_owned() };
         let mut diagnostics = align_diag::Diagnostics::new();
-        let tokens = align_lexer::tokenize(0, source, &mut diagnostics);
+        let tokens = align_lexer::tokenize(0, &source, &mut diagnostics);
         let ast = align_parser::parse_file(tokens, &mut diagnostics);
         let hir = align_sema::check_file(&ast, &mut diagnostics);
         assert!(!diagnostics.has_errors(), "{:?}", diagnostics.iter().collect::<Vec<_>>());
@@ -10846,7 +10849,7 @@ fn main() {}
                 for statement in &mut block.stmts {
                     if let Stmt::Let(_, Rvalue::JsonEncode { pieces, .. }) = statement {
                         for piece in pieces {
-                            if let crate::TemplatePiece::OwnedJsonObject {
+                            if let crate::TemplatePiece::OwnedJsonRecords {
                                 value: Operand::BorrowedPlace(place), ..
                             } = piece {
                                 match mutation {
@@ -10862,6 +10865,7 @@ fn main() {}
             }
             assert!(changed, "owner must mutate the actual JSON projection");
             assert!(validate_mir_producers(&malformed).is_err(), "accepted mutation {mutation}");
+        }
         }
         Ok(())
     }

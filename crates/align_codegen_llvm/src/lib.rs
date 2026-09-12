@@ -20306,31 +20306,31 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .build_call(self.runtime(RuntimeKey::BuilderWriteJsonStr), &[bptr.into(), ptr.into(), len.into()], "")
                         .map_err(|e| self.err(e))?;
                 }
-                align_mir::TemplatePiece::OwnedJsonObject { value, plan } => {
-                    if self.f.operand_ty(value) != Ty::Struct(plan.root) {
-                        return Err(
-                            self.err("owned JSON V3 root operand type does not match its plan")
-                        );
+                align_mir::TemplatePiece::OwnedJsonRecords { value, plan } => {
+                    let ty = self.f.operand_ty(value);
+                    if !matches!(ty, Ty::Struct(id) | Ty::DynStructArray(id, Layout::Aos) if id == plan.root) {
+                        return Err(self.err("owned JSON V3 root operand type does not match its plan"));
                     }
-                    let sty = self
-                        .struct_types
-                        .get(plan.root as usize)
-                        .copied()
+                    let sty = self.struct_types.get(plan.root as usize).copied()
                         .ok_or_else(|| self.err("owned JSON V3 plan references an unknown root"))?;
                     let root = self.operand(value)?;
-                    let slot = self.alloca_at_entry(sty.into(), "owned_json_v3_root")?;
-                    self.builder
-                        .build_store(slot, root)
-                        .map_err(|e| self.err(e))?;
                     let table = self.emit_owned_desc_graph(plan)?;
                     let count = i64t.const_int(table.n_fields, false);
-                    self.builder
-                        .build_call(
-                            self.runtime(RuntimeKey::JsonEncodeObject),
-                            &[bptr.into(), slot.into(), table.descs.into(), count.into()],
-                            "",
-                        )
-                        .map_err(|e| self.err(e))?;
+                    if matches!(ty, Ty::DynStructArray(..)) {
+                        let array = root.into_struct_value();
+                        let ptr = self.builder.build_extract_value(array, 0, "owned_json_ptr").map_err(|e| self.err(e))?;
+                        let len = self.builder.build_extract_value(array, 1, "owned_json_len").map_err(|e| self.err(e))?;
+                        let stride = i64t.const_int(self.element_allocation_size(sty.into()), false);
+                        self.builder.build_call(self.runtime(RuntimeKey::JsonEncodeStructArray),
+                            &[bptr.into(), ptr.into(), len.into(), table.descs.into(), count.into(), stride.into()], "")
+                            .map_err(|e| self.err(e))?;
+                    } else {
+                        let slot = self.alloca_at_entry(sty.into(), "owned_json_v3_root")?;
+                        self.builder.build_store(slot, root).map_err(|e| self.err(e))?;
+                        self.builder.build_call(self.runtime(RuntimeKey::JsonEncodeObject),
+                            &[bptr.into(), slot.into(), table.descs.into(), count.into()], "")
+                            .map_err(|e| self.err(e))?;
+                    }
                 }
                 // `json.encode` `Option<T>` field: when `Some`, append `"name":<payload>,`; else
                 // nothing. The payload is rendered per its scalar kind exactly like the plain holes
@@ -20513,12 +20513,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let null = self.ctx.ptr_type(AddressSpace::default()).const_null();
                     // NOTE the discarded `sub` pointer: this writer takes a bare tag, so an element
                     // kind that needs a sub-descriptor cannot be rendered here. That is why sema's
-                    // `json_encodable_scalar` admits only int / float / bool / `str` elements — an
+                    // `json_encode_array_element` admits only numeric / bool / text elements — an
                     // `array<enum>` used to reach this line, hand the runtime kind 6 with a NULL
                     // sub, and silently print `[null,null]` (a payload-less enum aborted instead, in
                     // `emit_json_union`). Encoding `array<enum>` properly means passing `sub` and
                     // teaching `json_encode_scalar_array` about it — a feature, not hardening.
-                    let (etag, _) = self.json_payload_tag_sub(scalar_to_ty(*elem), null)?;
+                    let etag = if *elem == Scalar::String {
+                        // Encoding only reads the owned string's 16-byte text header.
+                        (8 << 8) | 16
+                    } else {
+                        self.json_payload_tag_sub(scalar_to_ty(*elem), null)?.0
+                    };
                     let etag = self.ctx.i32_type().const_int(etag, false);
                     self.builder
                         .build_call(self.runtime(RuntimeKey::JsonEncodeScalarArray), &[bptr.into(), ptr.into(), len.into(), etag.into()], "")
@@ -32460,6 +32465,7 @@ fn main() -> i32 = 0
     /// keep the second layer honest.
     #[test]
     fn an_unrenderable_json_descriptor_payload_is_an_error_not_a_panic() {
+        // Unsupported scalar-array tags fail MIR preflight before descriptor construction.
         // `array<char>`: no JSON leaf rendering at all.
         let char_arr = Ty::DynArray(Scalar::Char);
         let err = codegen_program(
@@ -32484,7 +32490,7 @@ fn main() -> i32 = 0
         )
         .expect_err("a `char` array element has no JSON descriptor tag");
         assert!(
-            err.to_string().contains("is not an encodable/decodable payload type"),
+            err.to_string().contains("json.encode MIR metadata invalid"),
             "got: {err}"
         );
 
@@ -32520,7 +32526,7 @@ fn main() -> i32 = 0
             vec![],
         )
         .expect_err("a payload-less union variant has no descriptor arm");
-        assert!(err.to_string().contains("carries no payload"), "got: {err}");
+        assert!(err.to_string().contains("json.encode MIR metadata invalid"), "got: {err}");
     }
 
     #[test]

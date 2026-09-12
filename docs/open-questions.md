@@ -47,6 +47,17 @@ work. The earlier XNU final-link-refusal assumption was disproved by native
 qualification. Self `access` remains supported on Linux/macOS; no alternate
 error/ownership model or weaker platform-dependent success guarantee is added.
 
+**Dynamic array roots (R87).** Both encoders borrow a dynamic array using the same
+existing element grammar as its JSON record field: supported integers, floats,
+bool, str, string, and accepted AoS record schemas. Root bytes equal the embedded
+array value bytes; empty arrays encode as `[]`. Input remains reusable and the
+owned output may outlive it. Exact-fit bounds succeed; negative/exceeded bounds
+and selected nonfinite floats return `Error.Invalid` without partial output.
+There is no implicit copy, wrapper, new element constructor or decode expansion.
+The owner reopened this restriction explicitly; plan 59 supersedes earlier bare
+dynamic-array encoding exclusions. Its V3 graph still describes the element
+record, while the typed source authenticates the array container.
+
 **R63 contract (2026-09-10).**
 [`R63 exact contract`](impl/47-json-numeric-contract.md) is authoritative for JSON numeric conversion and encoder results.
 Both `json.encode(value)` and `json.encode_bounded(value, max_bytes: i64)` return
@@ -60,8 +71,7 @@ signed zero and subnormals; a nonfinite rounded result returns `Error.Code(1)`.
 numbers remain navigable/skippable. JSON number grammar rejects leading zeros.
 Finite encode retains source-width shortest-significand fixed-point spelling,
 including `.0` and `-0.0`; ordinary templates/print are unchanged. Owned graphs
-admit f32/f64 at every existing scalar/Option/array leaf. Root/container exclusions
-otherwise remain. Descriptor/envelope V3 and interface 11 -> 12 replace V2 without
+admit f32/f64 at every existing scalar/Option/array leaf. Other root/container exclusions remain. Descriptor/envelope V3 and interface 11 -> 12 replace V2 without
 compatibility paths. This amendment supersedes earlier float exclusions,
 infallible `encode -> str`, V1/V2 transport and rollout descriptions below;
 older golden vectors remain historical. The owner explicitly reopened R63, so
@@ -3631,7 +3641,7 @@ nonblocking read-only open, descriptor regular-kind admission and blocking resto
 publishing the same close-on-exec owned reader. Nonregular returns Invalid; ordinary OS errors
 retain their mapping. Input UTF-8/NUL validation precedes filesystem work. No path lifetime,
 sandbox, content stability or remote-operation interruptibility is promised. Plan 58 owns the
-exact native ABI and acceptance. The J3b bare owned-record-array JSON restriction remains.
+exact native ABI and acceptance. Plan 59 supersedes the J3b bare dynamic-array encoding restriction following explicit owner approval.
 
 ## Open (to be decided)
 
@@ -5606,7 +5616,7 @@ runtime decode error path deep-frees each element (`drop_decoded_owned` kind-5, 
 `sub_owns_buffers` walk) and the mid-array partial (`decode_struct_array_value`'s `cleanup_partial`)
 before bailing. The J3a pass-0c-3 rejection is lifted; `array<string>` (bare-string element) stays
 deferred at 0b-2. **The OpenAI chat gateway now closes end-to-end** (`Chat` round-trips byte-identically).
-v1 limits: `json.encode` of a bare `array<Move-struct>` and pipelines over such a field stay restricted
+Historical v1 limits (bare-array encoding superseded by R87/plan 59): `json.encode` of a bare `array<Move-struct>` and pipelines over such a field were restricted
 (decode→encode passthrough works). Tests: `m5.rs` (full gateway round-trip, standalone-local drop,
 `array<string>`-element rejection), runtime alloc-count deep-free gates (a shared `ALLOC_COUNT_LOCK`
 serializes the count-asserting tests). **T1b (part 1) — SHIPPED: `array<scalar>` struct fields** (`array<i64>` / `array<f64>` / `array<bool>` —
@@ -5621,8 +5631,8 @@ runtime loop (`ScalarArrayField` template piece → `align_rt_json_encode_scalar
 for inspection. `array<str>` fields are now shipped by Request 7: clean elements borrow the input
 and selected escaped elements materialize in the enclosing arena; a top-level `array<str>` target
 and `array<char>` remain deferred. v1
-limits: `.sum()`/pipelines over an owned scalar-array field and `json.encode` of a bare `array<scalar>`
-stay restricted. Tests: `m5.rs` T1b, `cache_codegen` gate2d, runtime alloc-count. **T1b (part 2) — SHIPPED: top-level (bare) scalar decode targets** (`x: i64 := json.decode("42")?` for
+historical limits: `.sum()`/pipelines over an owned scalar-array field and bare scalar-array encoding
+were restricted. R87/plan 59 supersedes the encoding exclusion only. Tests: `m5.rs` T1b, `cache_codegen` gate2d, runtime alloc-count. **T1b (part 2) — SHIPPED: top-level (bare) scalar decode targets** (`x: i64 := json.decode("42")?` for
 int / float / bool). Parses the WHOLE input as one JSON number / bool; the value is `Copy` (copied out,
 not a view), so the result is `Static` / returnable. New HIR/MIR `JsonDecodeScalar` → runtime
 `align_rt_json_decode_scalar` (via the shared per-scalar `write_value` — same range/sign/float-width

@@ -2253,6 +2253,16 @@ fn json_encodable_scalar(s: Scalar) -> bool {
     matches!(s, Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Str)
 }
 
+/// Scalar element grammar for encoding an existing dynamic array, without decoding ownership.
+pub fn json_encode_array_element(s: Scalar) -> bool {
+    match s {
+        Scalar::Int(integer) => matches!(integer.bits, 8 | 16 | 32 | 64),
+        Scalar::Float(float) => matches!(float.bits, 32 | 64),
+        Scalar::Bool | Scalar::Str | Scalar::String => true,
+        _ => false,
+    }
+}
+
 /// The canonical recursive cleanup classification for a resolved owned value.
 ///
 /// This is deliberately representation-independent: MIR owns *when* cleanup runs and LLVM owns
@@ -58674,12 +58684,8 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// `json.encode(s)` — encode a flat struct into a JSON object `str`. Desugars to the
-    /// string-builder `template` machinery: static JSON syntax interleaved with per-field
-    /// value holes (`str` fields are emitted as JSON-escaped string literals). M5: fields
-    /// must be int/float/bool/str; nested structs/arrays/options are not supported yet. The
-    /// result is arena-backed inside an `arena {}`; otherwise MIR retains it in a hidden owned
-    /// string for the lifetime of the returned `str` view.
+    /// Borrow a statically admitted JSON source and return independently owned output.
+    /// Both encoders share schema selection, canonical bytes and fallible builder cleanup.
     fn check_json_encode(&mut self, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         if args.len() != 1 {
@@ -58707,14 +58713,18 @@ impl<'a, 't> Checker<'a, 't> {
     ) -> Option<(Vec<TemplatePart>, LocalId, Ty, OwnedJsonRoute)> {
         let Some((base, ty)) = self.place_local(value) else {
             self.diags
-                .error(format!("'{}' expects a struct or struct-array value (a local binding)", dir.name()), value.span);
+                .error(format!("'{}' expects an encodable record, array or sum value (a local binding)", dir.name()), value.span);
             return None;
+        };
+        let route = match ty {
+            Ty::Struct(sid) | Ty::DynStructArray(sid, Layout::Aos) => self.owned_json_route(sid, value.span, dir)?,
+            _ => OwnedJsonRoute::Existing,
         };
         let mut parts = vec![];
         let mut ok = true;
         match ty {
             // A single struct → a JSON object.
-            Ty::Struct(sid) => match self.owned_json_route(sid, value.span, dir)? {
+            Ty::Struct(sid) => match &route {
                 OwnedJsonRoute::Existing => {
                     self.json_object_parts(
                         base,
@@ -58730,6 +58740,19 @@ impl<'a, 't> Checker<'a, 't> {
                 }
                 OwnedJsonRoute::Owned(_) => {}
             },
+            Ty::DynStructArray(sid, Layout::Aos) => {
+                if matches!(&route, OwnedJsonRoute::Existing) {
+                    if !self.json_struct_fields_ok(sid, value.span, dir) {
+                        return None;
+                    }
+                    let access = Expr { kind: ExprKind::Local(base), ty, span: value.span };
+                    parts.push(TemplatePart::StructArrayField { access, struct_id: sid });
+                }
+            }
+            Ty::DynArray(elem) if json_encode_array_element(elem) => {
+                let access = Expr { kind: ExprKind::Local(base), ty, span: value.span };
+                parts.push(TemplatePart::ScalarArrayField { access, elem });
+            }
             // A fixed struct-array → a JSON array of objects (unrolled; length is static).
             Ty::StructArray(sid, n) => {
                 parts.push(TemplatePart::Text("[".to_string()));
@@ -58753,7 +58776,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
             _ => {
                 self.diags
-                    .error(format!("'{}' expects a struct or struct-array, got {}", dir.name(), ty_name(ty)), value.span);
+                    .error(format!("'{}' expects an encodable record, array or sum, got {}", dir.name(), ty_name(ty)), value.span);
                 return None;
             }
         }
@@ -58762,10 +58785,6 @@ impl<'a, 't> Checker<'a, 't> {
         if !ok {
             return None;
         }
-        let route = match ty {
-            Ty::Struct(sid) => self.owned_json_route(sid, value.span, dir)?,
-            _ => OwnedJsonRoute::Existing,
-        };
         Some((parts, base, ty, route))
     }
 

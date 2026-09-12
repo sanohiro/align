@@ -76,6 +76,17 @@ separate trusted measurement boundary; it does not define this language or runti
 
 ## Owned JSON records
 
+**Dynamic array roots (R87).** Both encoders borrow a dynamic array using the same
+existing element grammar as its JSON record field: supported integers, floats,
+bool, str, string, and accepted AoS record schemas. Root bytes equal the embedded
+array value bytes; empty arrays encode as `[]`. Input remains reusable and the
+owned output may outlive it. Exact-fit bounds succeed; negative/exceeded bounds
+and selected nonfinite floats return `Error.Invalid` without partial output.
+There is no implicit copy, wrapper, new element constructor or decode expansion.
+The owner reopened this restriction explicitly; plan 59 supersedes earlier bare
+dynamic-array encoding exclusions. Its V3 graph still describes the element
+record, while the typed source authenticates the array container.
+
 **R63 contract (2026-09-10).**
 [R63 exact contract](../47-json-numeric-contract.md) is authoritative for JSON numeric conversion and encoder results.
 Both `json.encode(value)` and `json.encode_bounded(value, max_bytes: i64)` return
@@ -89,8 +100,7 @@ signed zero and subnormals; a nonfinite rounded result returns `Error.Code(1)`.
 numbers remain navigable/skippable. JSON number grammar rejects leading zeros.
 Finite encode retains source-width shortest-significand fixed-point spelling,
 including `.0` and `-0.0`; ordinary templates/print are unchanged. Owned graphs
-admit f32/f64 at every existing scalar/Option/array leaf. Root/container exclusions
-otherwise remain. Descriptor/envelope V3 and interface 11 -> 12 replace V2 without
+admit f32/f64 at every existing scalar/Option/array leaf. Other root/container exclusions remain. Descriptor/envelope V3 and interface 11 -> 12 replace V2 without
 compatibility paths. This amendment supersedes earlier float exclusions,
 infallible `encode -> str`, V1/V2 transport and rollout descriptions below;
 older golden vectors remain historical. The owner explicitly reopened R63, so
@@ -246,8 +256,8 @@ chat gateway closes end-to-end** (`Chat` round-trips byte-identically). The borr
 routes still reject a bare-`string`-element array field. Request 10 makes that field valid for
 ordinary owned record construction by reusing the standalone deep Drop; Request 9 admits it only
 through the closed direct-owned flat-record JSON route.
-`json.encode` of a bare `array<Move-struct>` and pipelines over such a field stay restricted
-(decode→encode passthrough works).
+R87 admits a bare `array<Move-struct>` root wherever the existing array field grammar accepts
+its element record. The separate pipeline restriction is unchanged (decode→encode passthrough works).
 
 **`array<scalar>` fields (JSON completeness T1b + `array<str>`, align-llm Request 3).** A struct field
 may be an owned `array<i64>` / `array<f64>` / `array<bool>` (the align-LLM data shapes — embeddings,
@@ -275,8 +285,8 @@ form); a **top-level** `array<str> := json.decode`
 (a struct FIELD rides the enclosing struct's input-region binding, but a top-level array result would
 have to carry that region itself — the scalar top-level array is deliberately `Static`/returnable, so
 `array<str>` at top level is a separate region-carrying slice). v1 limits: `.sum()`/pipelines over an
-owned scalar-array field and `json.encode` of a bare `array<scalar>` stay restricted (decode + `.len()`
-+ encode-as-field work).
+owned scalar-array field stay restricted. R87 admits bare dynamic scalar-array roots with the same
+element grammar and bytes as their corresponding fields.
 
 **`Option<T>` fields (REST-gateway runway, Slice B).** A struct field may be an `Option<T>` (payload
 scalar / `str` / nested struct). **Null policy:** decode maps a missing key → `None`, JSON `null` →

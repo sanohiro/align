@@ -5,7 +5,8 @@ Baseline: `31280502`. Consumer register: Requests 84–88.
 
 ## Capability and public contract ledger
 
-Deliver R84/R85/R86/R88 as one provider batch. R87 requests reopening the
+Deliver R84/R85/R86/R88 as one provider batch. The following R87 deferral records
+that batch boundary; the owner subsequently reopened it in plan 59 on 2026-09-12. R87 requests reopening the
 explicit bare owned-record-array JSON restriction in core-design/json.md and the Settled J3b v1 limits in docs/open-questions.md;
 its one consumer witness supplies no plan-23 threshold. Keep R87 PROPOSED,
 with its existing rejection and embedded-record control. No consumer code or
@@ -121,7 +122,7 @@ local Move/Drop rather than introducing another ownership representation.
 | Numerical preflight before output/bytes; UTF-8/NUL before fd operations | `fs_regular::open`; `regular_reader_abi_preflight` including overlap and multi-invalid input |
 | Same opened descriptor, regular-only, restored flags, every failure closes, EINTR retries | `fs_regular::acquire` / `syscall`; `regular_reader_native_matrix` and its isolated child cover all four operation classes, fd closure, both pathname replacements, flags and FIFO deadline |
 | Exact ABI inventory and independently compiled signature/export parity | `IoReaderOpenRegular`, A08 declaration golden, runtime export; runtime-ABI unit owners and `scripts/test-runtime-abi-exports.sh` (also refresh its stale preceding inventory counts) |
-| Explicit deferred grammar | `owned_array_json_root_remains_explicitly_deferred`; R87 stays PROPOSED under plan 23 |
+| Explicit deferred grammar | Original R87 deferral, superseded by plan 59 and `json_dynamic_array_root_matrix` |
 
 No compiler cache/schema field changes. Existing allocation/Drop behavior is
 retained for synthetic locals, shared projections and reader storage. No new

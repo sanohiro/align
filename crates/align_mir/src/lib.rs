@@ -2828,8 +2828,8 @@ pub enum TemplatePiece {
     FloatHole(Operand),
     /// A `str` operand emitted as a JSON string literal (quoted + escaped). From `json.encode`.
     JsonStrHole(Operand),
-    /// One recursive owned-record root rendered through the validated V3 descriptor graph.
-    OwnedJsonObject {
+    /// One owned record or AoS record array rendered through the validated V3 element graph.
+    OwnedJsonRecords {
         value: Operand,
         plan: hir::OwnedJsonGraphPlanV3,
     },
@@ -2853,16 +2853,16 @@ pub enum TemplatePiece {
     /// Drop a single trailing `,` — the "omit `None`" comma fixup before an `Option`-bearing object's
     /// closing `}`.
     PopComma,
-    /// `json.encode` of an `array<Struct>` field (REST-gateway runway Slice C): emit the owned AoS
+    /// `json.encode` of an `array<Struct>` root or field: emit the owned AoS
     /// `array` (`{ptr,len}`) as `[{...},...]` via the runtime descriptor-driven encoder. `struct_id`
     /// is the element struct (codegen emits its schema + element stride for the runtime call).
     StructArrayField {
         array: Operand,
         struct_id: u32,
     },
-    /// `json.encode` of an `array<scalar>` field (JSON completeness T1b): emit the owned scalar buffer
+    /// `json.encode` of an `array<scalar>` root or field: emit the owned scalar buffer
     /// (`{ptr,len}`) as `[e0,e1,…]` via the runtime encoder. `elem` is the element scalar
-    /// (int/float/bool); codegen packs its kind/width/sign into the runtime call's element tag. The
+    /// (numeric/bool/text); codegen packs its kind/width/sign into the runtime call's element tag. The
     /// structural Program fingerprint includes `elem`.
     ScalarArrayField {
         array: Operand,
@@ -7131,8 +7131,9 @@ fn owned_json_piece(
 ) -> TemplatePiece {
     // A shared match binding is a projection into its source, not an initialized local slot.
     // Use the ordinary local read so JSON and every other borrowed consumer select the same place.
-    let value = lower_local(b, base, Ty::Struct(plan.root));
-    TemplatePiece::OwnedJsonObject { value, plan: plan.clone() }
+    let source_ty = b.slots.get(base as usize).copied().unwrap_or(Ty::Error);
+    let value = lower_local(b, base, source_ty);
+    TemplatePiece::OwnedJsonRecords { value, plan: plan.clone() }
 }
 
 #[inline(never)]

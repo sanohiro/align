@@ -1934,3 +1934,13 @@ ordinary symlinks/dot paths while binding regular-file admission to the returned
 Nonblocking open precedes descriptor metadata so a FIFO cannot wait for a writer first.
 The filesystem operation supplies safe fd ownership; application command policy remains in Align.
 See [plan 58](impl/58-r84-r88-client-batch-plan.md).
+
+### JSON dynamic-array root composition (R87)
+
+A value already encodable as an array field retains that grammar at the root.
+Requiring a wrapper exposes an accidental compiler boundary to Human and AI
+without improving Compiler or Hardware reasoning. Both encoders therefore borrow
+the existing array and reuse the same static schema and runtime writer, producing
+one independently owned result. No hidden clone or alternate JSON API is added.
+[Plan 59](impl/59-json-array-root-composition-plan.md) fixes this owner-approved
+capability; unsupported element shapes and decode ownership remain unchanged.
