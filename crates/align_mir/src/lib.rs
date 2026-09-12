@@ -10648,30 +10648,30 @@ fn lower_borrowed_place(b: &mut Builder, e: &hir::Expr, mode: align_ast::ParamMo
     // The descriptor still points at the caller's inline elements, so indexed writes through a
     // `borrow mut slice<T>` update the original fixed array while whole-header replacement stays
     // confined to this call-local view slot.
-    if let hir::ExprKind::ArrayToSlice(inner) = &e.kind {
-        if matches!(inner.ty, Ty::Array(..) | Ty::StructArray(..)) {
-            if !matches!(inner.kind, hir::ExprKind::ArrayLit { .. } | hir::ExprKind::Local(_)) {
-                b.terminate(Term::Unreachable);
-                return Operand::Const(Const::Unit);
-            }
-            let (source_slot, length) = array_source_slot(b, inner);
-            if !lowering_continues(b) {
-                return Operand::Const(Const::Unit);
-            }
-            let descriptor = b.fresh_value(e.ty);
-            b.push(Stmt::Let(
-                descriptor,
-                Rvalue::MakeSlice(source_slot, length),
-            ));
-            let descriptor_slot = b.new_slot(e.ty);
-            b.push(Stmt::Store(descriptor_slot, Operand::Value(descriptor)));
-            return Operand::BorrowedPlace(Box::new(BorrowedPlace {
-                slot: descriptor_slot,
-                path: Vec::new(),
-                ty: e.ty,
-                cleanup: None,
-            }));
+    if let hir::ExprKind::ArrayToSlice(inner) = &e.kind
+        && matches!(inner.ty, Ty::Array(..) | Ty::StructArray(..))
+    {
+        if !matches!(inner.kind, hir::ExprKind::ArrayLit { .. } | hir::ExprKind::Local(_)) {
+            b.terminate(Term::Unreachable);
+            return Operand::Const(Const::Unit);
         }
+        let (source_slot, length) = array_source_slot(b, inner);
+        if !lowering_continues(b) {
+            return Operand::Const(Const::Unit);
+        }
+        let descriptor = b.fresh_value(e.ty);
+        b.push(Stmt::Let(
+            descriptor,
+            Rvalue::MakeSlice(source_slot, length),
+        ));
+        let descriptor_slot = b.new_slot(e.ty);
+        b.push(Stmt::Store(descriptor_slot, Operand::Value(descriptor)));
+        return Operand::BorrowedPlace(Box::new(BorrowedPlace {
+            slot: descriptor_slot,
+            path: Vec::new(),
+            ty: e.ty,
+            cleanup: None,
+        }));
     }
     // View coercions carry the same storage place as their source. Strip the transparent wrapper
     // before forming the borrowed descriptor; retaining `e.ty` below preserves the logical
