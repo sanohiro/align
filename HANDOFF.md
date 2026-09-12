@@ -1,5 +1,15 @@
 # Session handoff
 
+**R84–R88 client admission and composition:**
+[Plan 58](docs/impl/58-r84-r88-client-batch-plan.md) implements shared
+`Option<command>` observation, borrowed optional JSON encoding, source-ordered
+record initializer snapshots, and `fs.open_regular(path)`. The reader follows
+ordinary paths and symlinks, admits only the opened regular descriptor, and
+refuses a FIFO without waiting for a writer. Linux/macOS share the native owner;
+whole/per-unit owners cover composition and source expiry. R87 remains PROPOSED
+under the settled bare owned-record-array JSON restriction and plan 23.
+Consumer P8/A2/A4/A5 cutover and managed-pin adoption remain external.
+
 **Read-only text bytes:** [plan 52](docs/impl/52-readonly-view-provenance-plan.md)
 now retains read-only origins when text publishes `.bytes()`, including owned
 and returned text. Explicit byte-element copies remain writable and source

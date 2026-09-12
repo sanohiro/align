@@ -10816,6 +10816,57 @@ mod tests {
     }
 
     #[test]
+    fn producer_json_borrowed_root_requires_initialized_exact_place() -> Result<(), &'static str> {
+        let source = r#"import core.json
+Record { text: string }
+Carrier { record: Option<Record> }
+fn encode(borrow input: Carrier) -> Result<string, Error> {
+    match input.record { None => Err(Error.Invalid), Some(value) => json.encode(value) }
+}
+fn main() {}
+"#;
+        let mut diagnostics = align_diag::Diagnostics::new();
+        let tokens = align_lexer::tokenize(0, source, &mut diagnostics);
+        let ast = align_parser::parse_file(tokens, &mut diagnostics);
+        let hir = align_sema::check_file(&ast, &mut diagnostics);
+        assert!(!diagnostics.has_errors(), "{:?}", diagnostics.iter().collect::<Vec<_>>());
+        let program = crate::lower_program(&hir);
+        assert!(!program.fns.is_empty());
+        validate_mir_producers(&program).map_err(|_| "valid projected JSON input")?;
+        for mutation in 0..3 {
+            let mut malformed = program.clone();
+            let function = malformed.fns.iter_mut().find(|f| f.name.as_str() == "encode")
+                .ok_or("encode function")?;
+            let empty_slot = u32::try_from(function.slots.len()).map_err(|_| "slot index")?;
+            let root_ty = function.slots[function.params[0] as usize];
+            function.slots.push(root_ty);
+            function.slot_align.push(None);
+            let mut changed = false;
+            for block in &mut function.blocks {
+                for statement in &mut block.stmts {
+                    if let Stmt::Let(_, Rvalue::JsonEncode { pieces, .. }) = statement {
+                        for piece in pieces {
+                            if let crate::TemplatePiece::OwnedJsonObject {
+                                value: Operand::BorrowedPlace(place), ..
+                            } = piece {
+                                match mutation {
+                                    0 => place.slot = empty_slot,
+                                    1 => place.ty = Ty::Bool,
+                                    _ => place.path.push(align_sema::hir::BorrowedPathSegment::StructField(u32::MAX)),
+                                }
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(changed, "owner must mutate the actual JSON projection");
+            assert!(validate_mir_producers(&malformed).is_err(), "accepted mutation {mutation}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn producer_rejects_borrowed_store_load_before_owned_return() {
         let mut diagnostics = align_diag::Diagnostics::new();
         let source = "fn forward(value: string) -> string = value\nfn main() -> i32 = 0\n";

@@ -5,8 +5,8 @@
 fixes eight exported symbols and their exact shapes, scratch layouts and
 ownership. Six native-observation rows and the lossy/SHA-1 rows are implemented.
 `align_rt_utf8_decode_lossy` and `align_rt_crypto_sha1` both use shape A84,
-returning independently owned pointer/length results from borrowed bytes. Canonical leaf tags are unchanged. Current inventory: 443 keyed,
-461 base, 468 alloc-count, 465 par-map-probe and 472 maximum exports.
+returning independently owned pointer/length results from borrowed bytes. Canonical leaf tags are unchanged. R88 adds the ordinary-path regular-reader row (plan 58). Current inventory: 444 keyed,
+462 base, 469 alloc-count, 466 par-map-probe and 473 maximum exports.
 
 **R65 planned contract:** [plan 50](50-r65-process-capability-handoff.md) and
 [plan 49](49-native-process-contract.md), designed and ready for implementation, own the new
@@ -39,7 +39,7 @@ owned JSON, exclusive filesystem publication, retained-root regular-file access,
 lifecycle, HTTP client
 raw/SSE receive streaming, asymmetric signatures, `std.log`, `core.codec`, `pkg.frame`, `pkg.kv`,
 `pkg.csv`, `pkg.ws`, `pkg.template`, named time/path wire formats, incremental SHA-256 host observation and ordinary directory operations, there
-are 443 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
+are 444 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
 `ArrayBuilderNewIn` and `ArrayBuilderPushBytes`; the four
 AEAD symbols that were previously selected from `AeadCipher × AeadDir` become
 ordinary typed keys; they may no longer bypass the registry. Eighteen always-built
@@ -52,7 +52,7 @@ runtime records have no `RuntimeKey` and instead use the eighteen-variant
 `align_rt_f64_from_bits`, `align_rt_f32_text_len`, `align_rt_f64_text_len`,
 `align_rt_f32_text_write`, and `align_rt_f64_text_write`, plus the four compiler-private
 `core.test` child-control rows recorded below and the package-internal checked TCP timeout row
-`align_rt_tcp_conn_set_io_timeout`. The base native registry therefore has 461 records. R63 replaces Request 12's two bounded-only rows with four unified JSON builder rows
+`align_rt_tcp_conn_set_io_timeout`. The base native registry therefore has 462 records. R63 replaces Request 12's two bounded-only rows with four unified JSON builder rows
 (A127–A130), including separate finite-only f32/f64 writers.
 The explicit `alloc-count` runtime feature may expose seven
 test/benchmark-only definitions: the allocation/free and finder counters plus
@@ -64,10 +64,10 @@ test/benchmark-only definitions: the allocation/free and finder counters plus
 `i64 @align_rt_test_par_map_workers()`. `task-group-probe` and
 `crypto-asymmetric-probe` change internal Rust state only and add no unmangled native export.
 
-The compiler-visible native registry is always exactly the 461 base records.
+The compiler-visible native registry is always exactly the 462 base records.
 There is no target option, environment variable, Cargo feature, linked-runtime
 inspection, or other ambient input that changes it. The eleven optional probe
-records extend only the verification-time maximum runtime-export table to 472.
+records extend only the verification-time maximum runtime-export table to 473.
 They never gain a `RuntimeKey`, callable/declaration policy, collision
 reservation, or compatible-extern reuse. Their spellings remain ordinary
 program/extern/export identities in a normal build. Probe-feature runtime
@@ -86,7 +86,7 @@ added six keyed rows, `core.codec` then added eight, `pkg.frame` added two, `pkg
 source-reachable unkeyed row, `pkg.csv` added one keyed row, `pkg.ws` added eleven keyed rows, and
 `pkg.template` added five keyed rows. Their runtime
 definitions and registry entries activated atomically at their respective capability boundaries: the current exact counts
-are 443 keyed records, 461 base records, and 472 records in the maximum optional-probe export table.
+are 444 keyed records, 462 base records, and 473 records in the maximum optional-probe export table.
 No new probe category was introduced. The implemented `pkg.kv` row reuses an existing ABI shape. Its two
 independently useful prerequisites first hardened the shared TCP timeout substrate and existing
 TCP-derived writers without changing a symbol, key, shape, attribute, or count.
@@ -1396,3 +1396,23 @@ scratch, exact output layouts, ownership, native error partition and platform
 requirements. The three access bytes are normalized read/write/execute values,
 not native masks. Identity output has i64 fields at offsets 0 and 8, size 16,
 alignment 8. Read-link output is an independently owned byte-array header.
+
+## Ordinary-path regular reader (R88)
+
+| Key | Native symbol | Exact declaration |
+| --- | --- | --- |
+| `IoReaderOpenRegular` | `align_rt_io_reader_open_regular` | A08: `i32 @SYM(ptr, i64, ptr)` |
+
+The input is an immutable UTF-8 path view; the output is a reader-pointer slot.
+Numerical output alignment/extent, input length/extent and disjointness validation
+precede reads and writes. Malformed numerical inputs leave output untouched;
+after preflight it is cleared and every semantic/native failure leaves null.
+UTF-8/NUL validation precedes open. Zero-length null input represents an empty
+path; positive null, negative length, scratch-length overflow and overlap reject.
+Linux/macOS use ordinary path resolution, read-only nonblocking close-on-exec open,
+fd stat regular-kind admission, and blocking restoration on that same descriptor.
+Each open/stat/fcntl interruption retries. Primary errors retain their status while
+RAII performs existing single-close cleanup; close errors do not replace them.
+Success publishes the existing owned reader layout and Drop, retaining no input.
+Transient NUL-terminated path scratch and the reader handle are the allocations.
+No new ABI attributes, wire format, runtime layout or probe category is added.

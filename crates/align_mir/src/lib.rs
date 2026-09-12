@@ -1703,10 +1703,11 @@ pub enum Rvalue {
         prefix: Operand,
         out: Slot,
     },
-    /// `fs.open(path)`: open `path` for reading, writing the owned `reader` handle into `out`.
+    /// `fs.open(path)` / `fs.open_regular(path)`: open for reading and publish the owned reader.
     /// Yields an `i32` errno-status (0 = ok; see [`make_error_from_status`]).
     ReaderOpen {
         path: Operand,
+        regular_only: bool,
         out: Slot,
     },
     /// `fs.open_beneath(root, relative)`: descriptor-relative regular-file open below a retained
@@ -7107,17 +7108,31 @@ fn lower_template_parts(
     Some(pieces)
 }
 
+fn lower_local(b: &mut Builder, id: hir::LocalId, requested_ty: Ty) -> Operand {
+    if let Some(place) = b.borrowed_bindings.get(&id) {
+        return Operand::BorrowedPlace(Box::new(place.clone()));
+    }
+    // Mutable callable storage accumulates origins after an earlier Local
+    // expression was typed. Preserve that storage contract on the MIR read.
+    let ty = match (requested_ty, b.slots.get(id as usize).copied()) {
+        (Ty::Fn(origin), Some(ty @ Ty::Fn(_)))
+            if b.ctx.fn_types.get(origin as usize).is_some() => ty,
+        _ => requested_ty,
+    };
+    let v = b.fresh_value(ty);
+    b.push(Stmt::Let(v, Rvalue::Load(id)));
+    Operand::Value(v)
+}
+
 fn owned_json_piece(
     b: &mut Builder,
     base: hir::LocalId,
     plan: &hir::OwnedJsonGraphPlanV3,
 ) -> TemplatePiece {
-    let value = b.fresh_value(Ty::Struct(plan.root));
-    b.push(Stmt::Let(value, Rvalue::Load(base)));
-    TemplatePiece::OwnedJsonObject {
-        value: Operand::Value(value),
-        plan: plan.clone(),
-    }
+    // A shared match binding is a projection into its source, not an initialized local slot.
+    // Use the ordinary local read so JSON and every other borrowed consumer select the same place.
+    let value = lower_local(b, base, Ty::Struct(plan.root));
+    TemplatePiece::OwnedJsonObject { value, plan: plan.clone() }
 }
 
 #[inline(never)]
@@ -8024,11 +8039,12 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                     Rvalue::FsCreatePrivateTempDir { prefix, out }
                 })
             }
-            // `fs.open` / `fs.create` — the runtime writes the reader/writer handle into `out` and
+            // `fs.open` / `fs.open_regular` / `fs.create` — the runtime writes the reader/writer handle into `out` and
             // returns an errno-status; wrap into `Result<reader/writer, Error>` (like `fs.read_file`).
-            hir::ExprKind::ReaderOpen { path } => {
+            hir::ExprKind::ReaderOpen { path, regular_only } => {
                 lower_open_handle(b, path, Ty::Reader, e.ty, |p, out| Rvalue::ReaderOpen {
                     path: p,
+                    regular_only: *regular_only,
                     out,
                 })
             }
@@ -8940,21 +8956,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             | hir::ExprKind::HttpStreamSend { .. }
             | hir::ExprKind::HttpStreamFinish { .. } => lower_http(b, e),
             hir::ExprKind::Bool(v) => Operand::Const(Const::Bool(*v)),
-            hir::ExprKind::Local(id) => {
-                if let Some(place) = b.borrowed_bindings.get(id) {
-                    return Operand::BorrowedPlace(Box::new(place.clone()));
-                }
-                // Mutable callable storage accumulates origins after an earlier Local
-                // expression was typed. Preserve that storage contract on the MIR read.
-                let ty = match (e.ty, b.slots.get(*id as usize).copied()) {
-                    (Ty::Fn(origin), Some(ty @ Ty::Fn(_)))
-                        if b.ctx.fn_types.get(origin as usize).is_some() => ty,
-                    _ => e.ty,
-                };
-                let v = b.fresh_value(ty);
-                b.push(Stmt::Let(v, Rvalue::Load(*id)));
-                Operand::Value(v)
-            }
+            hir::ExprKind::Local(id) => lower_local(b, *id, e.ty),
             hir::ExprKind::Unary { .. } => lower_unary_spine(b, e),
             hir::ExprKind::Cast(inner) => {
                 let from = inner.ty;

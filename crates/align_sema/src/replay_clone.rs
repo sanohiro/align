@@ -906,7 +906,7 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         ExprKind::FsCreatePrivateTempDir { prefix } => {
             ExprKind::FsCreatePrivateTempDir { prefix: boxed!(prefix) }
         }
-        ExprKind::ReaderOpen { path } => ExprKind::ReaderOpen { path: boxed!(path) },
+        ExprKind::ReaderOpen { path, regular_only } => ExprKind::ReaderOpen { path: boxed!(path), regular_only: *regular_only },
         ExprKind::ReaderOpenBeneath { root, relative } => ExprKind::ReaderOpenBeneath {
             root: boxed!(root),
             relative: boxed!(relative),
@@ -2663,7 +2663,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::JsonScan { input: recv, .. }
         | ExprKind::FsReadFile { path: recv }
         | ExprKind::FsCreatePrivateTempDir { prefix: recv }
-        | ExprKind::ReaderOpen { path: recv }
+        | ExprKind::ReaderOpen { path: recv, .. }
         | ExprKind::WriterCreate { path: recv }
         | ExprKind::CreateExclusive { path: recv }
         | ExprKind::ReaderBuffered { reader: recv }

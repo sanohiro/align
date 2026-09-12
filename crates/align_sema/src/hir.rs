@@ -1173,7 +1173,8 @@ pub enum ExprKind {
     ReaderStdin,
     /// `fs.open(path)` — open `path` (a `str`) for reading; the `ty` is `Result<reader, Error>`. The
     /// returned `reader` owns its fd (closed on `Drop`). Impure (touches the filesystem).
-    ReaderOpen { path: Box<Expr> },
+    /// `regular_only` selects ordinary-path descriptor regular-file admission before publication.
+    ReaderOpen { path: Box<Expr>, regular_only: bool },
     /// `fs.open_beneath(root, relative)` — open a regular file below one retained directory
     /// without following root, intermediate, or final symlinks. Both paths are borrowed for the
     /// call; the `ty` is `Result<reader, Error>` and the returned reader owns its fd. Impure.

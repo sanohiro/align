@@ -13686,7 +13686,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 )?
             }
             // fs.open / fs.create — write the handle into `out`, return an i32 errno-status.
-            Rvalue::ReaderOpen { path, out } => self.gen_open_handle(RuntimeKey::IoReaderOpen, path, *out)?,
+            Rvalue::ReaderOpen { path, regular_only, out } => self.gen_open_handle(
+                if *regular_only { RuntimeKey::IoReaderOpenRegular } else { RuntimeKey::IoReaderOpen }, path, *out)?,
             Rvalue::ReaderOpenBeneath {
                 root,
                 relative,
@@ -26719,7 +26720,7 @@ fn main() -> i32 = 0
                         *value = if writer {
                             Rvalue::WriterCreate { path: data, out }
                         } else {
-                            Rvalue::ReaderOpen { path: data, out }
+                            Rvalue::ReaderOpen { path: data, out, regular_only: false }
                         };
                         replaced = true;
                     }

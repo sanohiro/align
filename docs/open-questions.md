@@ -3618,6 +3618,21 @@ accepted the fifth repair with no P0–P3 finding. This item is Settled and auth
 in the recorded prerequisite order. Both shared prerequisites, the package source, and the ABI row
 are active.
 
+
+### Client admission and initializer order (2026-09-12)
+
+Record initializer expressions evaluate once in written order, with completed values captured
+before later expressions. Layout and JSON output remain in declaration order; reads after a
+source move reject. `command` joins the existing recursive shared-match payload grammar with
+no clone, consumption or mutation authority.
+
+`fs.open_regular(path: str) -> Result<reader, Error>` uses ordinary path resolution on Linux/macOS,
+nonblocking read-only open, descriptor regular-kind admission and blocking restoration before
+publishing the same close-on-exec owned reader. Nonregular returns Invalid; ordinary OS errors
+retain their mapping. Input UTF-8/NUL validation precedes filesystem work. No path lifetime,
+sandbox, content stability or remote-operation interruptibility is promised. Plan 58 owns the
+exact native ABI and acceptance. The J3b bare owned-record-array JSON restriction remains.
+
 ## Open (to be decided)
 
 ### SQLite collation identity and persisted-index migration — pending (post-D14, consumer-gated)
