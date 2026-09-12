@@ -2195,3 +2195,17 @@ are reserved and validated globally even without a filesystem operation. Both
 opaque owners use the existing structural Move carrier and cleanup rules.
 The HIR owner is `retained_tree_records`; the LLVM owner is
 `retained_tree_mir_gate`, including closed output discriminators and scratch types.
+
+### R87 dynamic-array JSON root certification
+
+`JsonEncodePlan::Pieces` accepts a dynamic array root only as one complete
+`StructArrayField` or `ScalarArrayField`, with exact `Local(base)` identity and
+exact declared array/element type. Scalar encoding admits valid integer/float
+widths, bool, str and string; this allowance does not widen decode descriptors.
+`JsonEncodePlan::Owned` authenticates exactly `Struct(plan.root)` or
+`DynStructArray(plan.root, Aos)` against the rebuilt V3 record graph. The MIR
+`OwnedJsonRecords` piece preserves this union, borrowed-place provenance and
+initialization. LLVM selects the existing object/array writer from that type.
+Plan 59 owns the public boundary; `json_array_root_checked_hir_requires_exact_source_and_element`,
+the parameterized owned-JSON mutation sweep and borrowed-root producer owner
+reject source, element, graph, layout and initialization mismatches.

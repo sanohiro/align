@@ -331,7 +331,7 @@ pub fn json_encode_sequence_is_valid(pieces: &[TemplatePiece]) -> bool {
                     | TemplatePiece::FloatHole(_)
                     | TemplatePiece::BoolHole(_)
                     | TemplatePiece::JsonStrHole(_)
-                    | TemplatePiece::OwnedJsonObject { .. }
+                    | TemplatePiece::OwnedJsonRecords { .. }
                     | TemplatePiece::StructArrayField { .. }
                     | TemplatePiece::ScalarArrayField { .. }
                     | TemplatePiece::UnionValue { .. },

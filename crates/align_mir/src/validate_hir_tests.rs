@@ -11446,6 +11446,7 @@ fn assert_owned_json_body_mutation(
 
 #[test]
 fn owned_json_checked_hir_mutation_sweep_fails_closed_at_all_lowering_entrypoints() {
+    for array in [false, true] {
     let source = r#"
 import core.json
 Owned { text: string, note: Option<string>, tags: array<string>, count: u64 }
@@ -11460,7 +11461,8 @@ fn owned_bounded(value: Owned, limit: i64) -> i32 {
 }
 fn main() -> i32 = 0
 "#;
-    let base = checked_source_program(source);
+    let source = if array { source.replace("value: Owned", "value: array<Owned>") } else { source.to_owned() };
+    let base = checked_source_program(&source);
     assert!(
         align_sema::checked_hir_body_facts_are_valid(&base),
         "the producer's owned JSON HIR must survive independent replay",
@@ -11567,6 +11569,7 @@ fn main() -> i32 = 0
         };
         plan.records[0].fields.swap(1, 2);
     });
+    }
 }
 
 fn push_process_wait_schema(program: &mut hir::Program) -> Ty {
@@ -18667,4 +18670,33 @@ fn main() {}
         }
     }
     Ok(())
+}
+
+#[test]
+fn json_array_root_checked_hir_requires_exact_source_and_element() {
+    for element in ["i64", "string", "Row"] {
+        let source = format!("import core.json\nRow {{ value: i64 }}\nfn encode(borrow values: array<{element}>) -> Result<string, Error> {{ output := json.encode(values)\n output }}\nfn main() {{}}\n");
+        let base = checked_source_program(&source);
+        assert!(body_core_metadata_is_valid(&base));
+        assert!(!is_empty(&lower_program(&base)));
+        for mutation in 0..4 {
+            assert_owned_json_body_mutation(&base, "array-root-source", |program| {
+                let expression = body_first_let_init_mut(program, "encode");
+                let hir::ExprKind::JsonEncode { base, plan: hir::JsonEncodePlan::Pieces(parts), .. } = &mut expression.kind else {
+                    panic!("array root fixture plan")
+                };
+                if mutation == 0 { *base = u32::MAX; return; }
+                if mutation == 1 { parts.insert(0, hir::TemplatePart::Text("[".to_owned())); return; }
+                match &mut parts[0] {
+                    hir::TemplatePart::ScalarArrayField { access, elem } => {
+                        if mutation == 2 { *elem = Scalar::Char; } else { access.ty = Ty::Bool; }
+                    }
+                    hir::TemplatePart::StructArrayField { access, struct_id } => {
+                        if mutation == 2 { *struct_id = u32::MAX; } else { access.ty = Ty::Bool; }
+                    }
+                    _ => panic!("array root complete piece"),
+                }
+            });
+        }
+    }
 }

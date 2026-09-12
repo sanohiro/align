@@ -5765,7 +5765,7 @@ impl<'a> BodyValidator<'a> {
                 self.program.structs.get(*struct_id as usize).is_some()
                     && self.json_struct_descriptor_ok(*struct_id, true)
             }
-            hir::TemplatePart::ScalarArrayField { elem, .. } => self.json_array_element_ok(*elem),
+            hir::TemplatePart::ScalarArrayField { elem, .. } => align_sema::json_encode_array_element(*elem),
             hir::TemplatePart::UnionValue { enum_id, .. } => {
                 self.program.enums.get(*enum_id as usize).is_some()
                     && self.json_union_descriptor_ok(*enum_id, true)
@@ -5794,7 +5794,8 @@ impl<'a> BodyValidator<'a> {
         context: &BodyContext,
     ) -> bool {
         self.local_ok(context, base)
-            && self.local_type(context, base) == Some(Ty::Struct(plan.root))
+            && matches!(self.local_type(context, base),
+                Some(Ty::Struct(id) | Ty::DynStructArray(id, align_sema::Layout::Aos)) if id == plan.root)
             && self.owned_json_plan_ok(plan)
     }
 
@@ -5872,7 +5873,9 @@ impl<'a> BodyValidator<'a> {
         }
 
         if parts.len() == 1 {
-            return matches!(&parts[0], hir::TemplatePart::UnionValue { .. });
+            return matches!(&parts[0], hir::TemplatePart::UnionValue { .. }
+                | hir::TemplatePart::StructArrayField { .. }
+                | hir::TemplatePart::ScalarArrayField { .. });
         }
 
         // Record whether each object has an Option field at its own level. The producer switches
@@ -11124,7 +11127,7 @@ impl<'a> BodyValidator<'a> {
                 }
                 hir::TemplatePart::ScalarArrayField { access, elem } => {
                     let flow = self.expr_flow(access)?;
-                    if flow.ty != Ty::DynArray(*elem) || !self.json_array_element_ok(*elem) {
+                    if flow.ty != Ty::DynArray(*elem) || !align_sema::json_encode_array_element(*elem) {
                         return None;
                     }
                     flows.push(flow);
@@ -11298,6 +11301,20 @@ impl<'a> BodyValidator<'a> {
         let Some(root) = self.local_type(context, base) else {
             return false;
         };
+        match root {
+            Ty::DynStructArray(id, align_sema::Layout::Aos) => {
+                return matches!(parts, [hir::TemplatePart::StructArrayField { access, struct_id }]
+                    if *struct_id == id && access.ty == root
+                    && matches!(access.kind, hir::ExprKind::Local(local) if local == base));
+            }
+            Ty::DynArray(element) => {
+                return align_sema::json_encode_array_element(element)
+                    && matches!(parts, [hir::TemplatePart::ScalarArrayField { access, elem }]
+                        if *elem == element && access.ty == root
+                        && matches!(access.kind, hir::ExprKind::Local(local) if local == base));
+            }
+            _ => {}
+        }
         let mut work = match root {
             Ty::Struct(id) => vec![Work::Object { id, elem: None, path: Vec::new() }],
             Ty::StructArray(id, len) => vec![Work::Array { id, len, next: 0 }],
@@ -11515,7 +11532,7 @@ impl<'a> BodyValidator<'a> {
                 }
                 hir::TemplatePart::ScalarArrayField { access, elem } => {
                     let flow = self.expr_flow(access)?;
-                    if flow.ty != Ty::DynArray(*elem) || !self.json_array_element_ok(*elem) {
+                    if flow.ty != Ty::DynArray(*elem) || !align_sema::json_encode_array_element(*elem) {
                         return None;
                     }
                     flow

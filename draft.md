@@ -1841,6 +1841,17 @@ one explicit unescaped append. Contextual language-template parsing remains defe
 
 ## 14. JSON
 
+**Dynamic array roots (R87).** Both encoders borrow a dynamic array using the same
+existing element grammar as its JSON record field: supported integers, floats,
+bool, str, string, and accepted AoS record schemas. Root bytes equal the embedded
+array value bytes; empty arrays encode as `[]`. Input remains reusable and the
+owned output may outlive it. Exact-fit bounds succeed; negative/exceeded bounds
+and selected nonfinite floats return `Error.Invalid` without partial output.
+There is no implicit copy, wrapper, new element constructor or decode expansion.
+The owner reopened this restriction explicitly; plan 59 supersedes earlier bare
+dynamic-array encoding exclusions. Its V3 graph still describes the element
+record, while the typed source authenticates the array container.
+
 **R63 contract (2026-09-10).**
 [R63 exact contract](docs/impl/47-json-numeric-contract.md) is authoritative for JSON numeric conversion and encoder results.
 Both `json.encode(value)` and `json.encode_bounded(value, max_bytes: i64)` return
@@ -1854,8 +1865,7 @@ signed zero and subnormals; a nonfinite rounded result returns `Error.Code(1)`.
 numbers remain navigable/skippable. JSON number grammar rejects leading zeros.
 Finite encode retains source-width shortest-significand fixed-point spelling,
 including `.0` and `-0.0`; ordinary templates/print are unchanged. Owned graphs
-admit f32/f64 at every existing scalar/Option/array leaf. Root/container exclusions
-otherwise remain. Descriptor/envelope V3 and interface 11 -> 12 replace V2 without
+admit f32/f64 at every existing scalar/Option/array leaf. Other root/container exclusions remain. Descriptor/envelope V3 and interface 11 -> 12 replace V2 without
 compatibility paths. This amendment supersedes earlier float exclusions,
 infallible `encode -> str`, V1/V2 transport and rollout descriptions below;
 older golden vectors remain historical. The owner explicitly reopened R63, so
