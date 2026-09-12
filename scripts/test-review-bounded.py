@@ -337,10 +337,12 @@ class WrapperOwner(unittest.TestCase):
         (self.parent / "child-pid").unlink()
         self.env.update(ALIGN_REVIEW_STALL_SECONDS="60", ALIGN_REVIEW_MAX_SECONDS="1",
                         ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS="30")
+        # A one-second maximum can expire before Python starts a helper.
+        # Exercise that deadline independently; the case above owns resistant
+        # helper cleanup without assuming it starts inside the maximum.
         started = time.monotonic()
-        self.run_review("resistant-stall", expected=124)
+        self.run_review("stall", expected=124)
         self.assertLess(time.monotonic() - started, 12)
-        self.assertFalse(self.child_running())
         self.assert_incomplete()
 
     def test_progress(self):
