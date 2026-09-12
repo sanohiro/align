@@ -7568,8 +7568,18 @@ impl<'a> BodyValidator<'a> {
                             &self.program.enums,
                             &self.program.tagged_types,
                         ) => elems.iter().all(|element| {
+                            // Source-ordered field snapshots wrap an in-place constructor in
+                            // ordinary blocks. Their statements/flow were validated above; the
+                            // terminal value must still construct this exact struct, not copy a
+                            // pre-existing Move record. MIR's guarded element materializer owns
+                            // the completed block value until the entire array succeeds.
+                            let mut constructor = element;
+                            while let hir::ExprKind::Block(block) = &constructor.kind {
+                                let Some(tail) = block.value.as_deref() else { return false };
+                                constructor = tail;
+                            }
                             matches!(
-                                element.kind,
+                                constructor.kind,
                                 hir::ExprKind::StructLit { struct_id, .. } if struct_id == id
                             )
                         }),

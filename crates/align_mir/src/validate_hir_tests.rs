@@ -9451,9 +9451,8 @@ fn hir_body_validator_storage_vector_array() {
 
     assert!(body_core_metadata_is_valid(&program));
 
-    // Sema admits a Move struct only when every element is a direct struct literal, which lets MIR
-    // construct owned fields in their final slots. A typed wrapper around the same value would
-    // require a whole-value move/null path, so handcrafted HIR must not widen that contract.
+    // Reordered source fields normalize to block-wrapped constructors. The guarded array
+    // materializer accepts that construction, but a wrapper cannot admit a pre-existing local.
     let mut wrapped_move_struct = program.clone();
     let expression = body_statement_expression_mut(
         &mut wrapped_move_struct,
@@ -9474,8 +9473,27 @@ fn hir_body_validator_storage_vector_array() {
     }
     assert!(wrapped, "Move-struct fixture must contain one array element");
     assert!(
+        body_core_metadata_is_valid(&wrapped_move_struct),
+        "a block-wrapped Move-struct constructor must pass HIR validation",
+    );
+    let Some(function) = wrapped_move_struct.fns.iter_mut()
+        .find(|function| function.name == "move_struct_array_literal_case")
+    else { panic!("Move-array owner function"); };
+    let Ok(local) = u32::try_from(function.locals.len()) else { panic!("fixture local id"); };
+    function.locals.push(hir::Local {
+        id: local, name: "existing".to_string(), ty: Ty::Struct(move_struct),
+        is_mut: false, is_param: false, align: None,
+    });
+    let expression = body_statement_expression_mut(&mut wrapped_move_struct, "move_struct_array_literal_case");
+    let hir::ExprKind::ArrayLit { elems, .. } = &mut expression.kind else { panic!("array fixture"); };
+    let Some(element) = elems.first_mut() else { panic!("element fixture"); };
+    let hir::ExprKind::Block(block) = &mut element.kind else { panic!("wrapped fixture"); };
+    let Some(init) = block.value.take() else { panic!("constructor fixture"); };
+    block.stmts.push(hir::Stmt::Let { local, init: *init });
+    block.value = Some(Box::new(body_test_expr(hir::ExprKind::Local(local), Ty::Struct(move_struct))));
+    assert!(
         !body_core_metadata_is_valid(&wrapped_move_struct),
-        "a wrapped Move-struct fixed-array element must fail before MIR lowering",
+        "a block cannot launder an existing Move-struct local into fixed-array admission",
     );
 
     // No scalar Move value has a fixed-array element Drop path. This handcrafted HIR keeps the

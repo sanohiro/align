@@ -290,6 +290,56 @@ pub fn produce() -> i64 {
 }
 
 #[test]
+fn reordered_record_initializers_in_fixed_arrays() {
+    for generic in [false, true] {
+        let declaration = if generic {
+            "User<T> { name: T, age: i64 }"
+        } else {
+            "User { name: string, age: i64 }"
+        };
+        for early in [false, true] {
+            let age = if early { "fail()?" } else { "2" };
+            let helper = format!(
+                r#"module helper
+{declaration}
+fn fail() -> Result<i64, Error> = Err(Error.Invalid)
+pub fn produce() -> Result<(), Error> {{
+    mut users := [User {{ age: 1, name: "a".clone() }}, User {{ name: "b".clone(), age: {age} }}]
+    users[0].name = "c".clone()
+    print(users[0].name)
+    print(users[1].name)
+    Ok(())
+}}
+"#
+            );
+            let main = format!(
+                r#"import helper
+extern "C" fn align_rt_alloc_count() -> i64
+extern "C" fn align_rt_free_count() -> i64
+fn main() {{
+    before_alloc := unsafe {{ align_rt_alloc_count() }}
+    before_free := unsafe {{ align_rt_free_count() }}
+    print(match helper.produce() {{ Err(_) => true, Ok(_) => false }})
+    print(unsafe {{ align_rt_alloc_count() }} - before_alloc)
+    print(unsafe {{ align_rt_free_count() }} - before_free)
+}}
+"#
+            );
+            run_both(
+                "r86-fixed-array",
+                &helper,
+                &main,
+                if early {
+                    "true\n2\n2\n"
+                } else {
+                    "c\nb\nfalse\n3\n3\n"
+                },
+            );
+        }
+    }
+}
+
+#[test]
 fn regular_reader_survives_path_owner_and_keeps_normal_resolution() {
     let fixture = private_fixture();
     let root = std::fs::canonicalize(&fixture.dir).expect("fixture root");

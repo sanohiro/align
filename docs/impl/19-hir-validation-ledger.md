@@ -1170,7 +1170,7 @@ The `ArrayLit` producer and validator close the ownership boundary by element cl
 |---|---|---|
 | Copy scalar, `str`, or function value | Admit; copy each element into the fixed slot. | cumulative array/closure owners |
 | owned `string` | Reject before checked HIR; no fixed-array per-element scalar Drop path exists. | `align_mir::tests::fixed_array_move_shapes_match_the_hir_gate` and `align_mir::validate_hir_tests::hir_body_validator_storage_vector_array` |
-| recursively Move struct | Admit only when each element is constructed in place; reject copying a pre-existing value. | `owned_structs_arrays` |
+| recursively Move struct | Admit only when each element is constructed in place, including validated Block/Let source-order snapshots whose tail constructs the exact struct; reject copying a pre-existing value. | `owned_structs_arrays`, `client_admission_composition::reordered_record_initializers_in_fixed_arrays` |
 | owned `array<T>` or another scalar Move value | Reject before checked HIR; no fixed-array per-element null/drop lowering exists. | `align_mir::tests::fixed_array_move_shapes_match_the_hir_gate` |
 | Move enum, resource/ref, or owned native handle | Reject before checked HIR; the fixed collection has no tag/resource-specific per-element transfer path. | `align_mir::validate_hir_tests::hir_body_validator_storage_vector_array` plus cumulative tagged/resource owners |
 | slice-bearing non-struct | Reject before checked HIR; per-element view provenance is not representable. | cumulative borrow-liveness owners |

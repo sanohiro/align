@@ -126,3 +126,19 @@ local Move/Drop rather than introducing another ownership representation.
 No compiler cache/schema field changes. Existing allocation/Drop behavior is
 retained for synthetic locals, shared projections and reader storage. No new
 benchmark or consumer-side acceptance is claimed.
+
+## Candidate review resolution
+
+The independent full-diff inspection found one P2: fixed Move-struct array HIR
+validation still required a direct StructLit, so a source-normalized constructor
+failed validation. The source witness reproduced the per-unit failure. The array
+validator now unwraps validated Block tails and still requires construction of the
+exact element struct; a Local/call remains outside that in-place admission.
+MIR's existing guarded element materializer already owns block-valued temporaries,
+so no ownership strategy or source grammar changes. The sibling sweep covered
+Copy arrays, direct/nested StructLit stores, consumed aggregate materialization,
+source nulling and per-element cleanup. `reordered_record_initializers_in_fixed_arrays`
+covers ordinary/generic constructors, field replacement, successful completion and
+later-element early exit in both compilation modes, with positive allocation/free
+counts proving that completed owners are released. Existing malformed-array owners
+retain rejection of copying pre-existing Move elements.
