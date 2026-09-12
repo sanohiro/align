@@ -60,13 +60,18 @@ fn main() {
     // M15 S3b: bake a content digest of the whole runtime source tree so `align_driver` can detect a
     // stale `libalign_runtime.a` by CONTENT (not mtime) at link time — killing the false-stale
     // papercut where a touch/checkout bumps source mtimes without changing content.
-    let runtime_src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../align_runtime/src");
+    // Cargo can reuse this executable across checkouts sharing a target directory. Resolve
+    // its inputs from the current invocation, not the checkout that compiled the executable.
+    let manifest = PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo"),
+    );
+    let runtime_src = manifest.join("../align_runtime/src");
     let digest = runtime_src_digest(&runtime_src).unwrap_or_default();
     println!("cargo:rustc-env=ALIGN_RUNTIME_SRC_DIGEST={digest}");
     // Re-run (re-bake the digest) whenever any runtime source file changes.
     println!("cargo:rerun-if-changed={}", runtime_src.display());
 
-    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../align_runtime/src/str_prims.rs");
+    let src = runtime_src.join("str_prims.rs");
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR set by cargo")).join("str_prims.bc");
     // rustc that cargo is driving this build with — the same LLVM major as inkwell, by construction.
     let rustc = std::env::var("RUSTC").expect("RUSTC set by cargo");
