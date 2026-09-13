@@ -10810,6 +10810,10 @@ fn lower_borrowed_place(b: &mut Builder, e: &hir::Expr, mode: align_ast::ParamMo
                 && !matches!(index.kind, hir::ExprKind::Int(_))
                 && !needs_drop_flag(e.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
             {
+                if !matches!(recv.kind, hir::ExprKind::Local(_) | hir::ExprKind::ArrayLit { .. }) {
+                    b.terminate(Term::Unreachable);
+                    return Operand::Const(Const::Unit);
+                }
                 let value = lower_index_field(b, e, recv, index, path, *struct_id, e.ty);
                 if !lowering_continues(b) {
                     return Operand::Const(Const::Unit);
@@ -24736,6 +24740,57 @@ fn main() -> i32 = 0
                 "{name} emitted a later sibling or parent action: {function:#?}"
             );
         }
+    }
+
+    #[test]
+    fn malformed_fixed_copy_borrow_receiver_fails_closed() -> Result<(), String> {
+        let mut diagnostics = Diagnostics::new();
+        let tokens = tokenize(
+            0,
+            "Row { value: i64 }\n\
+fn take(borrow value: i64) -> i64 = value\n\
+fn caller(i: i64) -> i64 {\n\
+  rows := [Row { value: 42 }]\n\
+  return take(rows[i].value)\n\
+}\n\
+fn main() -> i32 = 0\n",
+            &mut diagnostics,
+        );
+        let file = parse_file(tokens, &mut diagnostics);
+        let checked = check_file(&file, &mut diagnostics);
+        assert!(
+            !diagnostics.has_errors(),
+            "{:?}",
+            diagnostics.iter().map(|diagnostic| &diagnostic.message).collect::<Vec<_>>()
+        );
+        for invalid in [
+            hir::ExprKind::Bool(false),
+            hir::ExprKind::Field { root: 0, path: vec![0] },
+        ] {
+            let mut malformed = checked.clone();
+            let caller = malformed.fns.iter_mut().find(|f| f.name == "caller").ok_or("caller")?;
+            let Some(hir::Stmt::Return(Some(call))) = caller.body.stmts.last_mut() else {
+                panic!("expected return");
+            };
+            let hir::ExprKind::Call { args, .. } = &mut call.kind else {
+                panic!("expected call");
+            };
+            let hir::ExprKind::ElemField { recv, .. } = &mut args[0].kind else {
+                panic!("expected field");
+            };
+            recv.kind = invalid;
+            assert!(!validate_hir::body_only_metadata_is_valid(&malformed));
+            // Also exercise the internal continuation guard, without the public HIR preflight.
+            let lowered = lower_program_unchecked(&malformed, None, false);
+            let caller = lowered.fns.iter().find(|f| f.name.as_str() == "caller").ok_or("caller")?;
+            assert!(caller.blocks.iter().any(|b| matches!(b.term, Term::Unreachable)));
+            assert!(caller.blocks.iter().all(|b| !matches!(b.term, Term::Branch(..))));
+            assert!(caller.blocks.iter().flat_map(|b| &b.stmts).all(|s| !matches!(
+                s,
+                Stmt::Let(_, Rvalue::IndexField(..) | Rvalue::Call(..))
+            )));
+        }
+        Ok(())
     }
 
     #[test]
