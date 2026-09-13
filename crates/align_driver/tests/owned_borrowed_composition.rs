@@ -668,6 +668,73 @@ fn main() -> i32 {
 }
 
 #[test]
+fn fixed_copy_field_borrow_evaluates_computed_indices() {
+    let helper = r#"module helper
+pub fn text(borrow value: str) -> i64 = value.len()
+pub fn number(borrow value: i64) -> i64 = value
+pub fn generic<T>(borrow value: T) -> i64 = 7
+"#;
+    let source = r#"module main
+import helper
+Inner { text: string, number: i64 }
+Row { inner: Inner }
+fn early() -> i64 {
+  rows := [Row { inner: Inner { text: "early".clone(), number: 0 } }]
+  return helper.text(rows[{ return 9 }].inner.text)
+}
+fn main() -> i32 {
+  rows := [Row { inner: Inner { text: "answer".clone(), number: 42 } }]
+  mut visits := 0
+  length := helper.text(rows[{ visits = visits + 1; 0 }].inner.text)
+  index := 0
+  number := helper.number(rows[index].inner.number)
+  generic := helper.generic(rows[{ 0 }].inner.number)
+  if length == 6 && number == 42 && generic == 7 && visits == 1 &&
+    early() == 9 && rows[0].inner.text == "answer" { return 42 }
+  return 0
+}
+"#;
+    let files = &[("main.align", source), ("helper.align", helper)];
+    if backend_available() {
+        let whole = build_and_run_multi("fixed-copy-borrow-index", files, "main.align");
+        assert_eq!(whole.status.code(), Some(42), "{whole:?}");
+        let unit = build_per_unit_multi("fixed-copy-borrow-index-unit", files, "main.align")
+            .link_and_run();
+        assert_eq!(unit.status.code(), Some(42), "{unit:?}");
+    }
+}
+
+#[test]
+fn fixed_copy_field_borrow_checks_bounds() {
+    if !backend_available() {
+        return;
+    }
+    for index in [-1, 1] {
+        let source = format!(
+            r#"module main
+Row {{ text: str }}
+fn take(borrow value: str, later: i64) {{ print(value) }}
+fn main() -> i32 {{
+  rows := [Row {{ text: "unreachable" }}]
+  index := {index}
+  take(rows[index].text, {{ print("later"); 0 }})
+  return 0
+}}
+"#
+        );
+        assert_clean("fixed-copy-borrow-bounds", &source);
+        let whole = build_and_run("fixed-copy-borrow-bounds", &source);
+        let files = &[("main.align", source.as_str())];
+        let unit = build_per_unit_multi("fixed-copy-borrow-bounds-unit", files, "main.align")
+            .link_and_run();
+        for output in [whole, unit] {
+            assert!(!output.status.success(), "index {index}: {output:?}");
+            assert!(output.stdout.is_empty(), "index {index}: {output:?}");
+        }
+    }
+}
+
+#[test]
 fn mutable_owned_view_retypes_are_rejected_before_lowering() {
     let string_source = r#"module reject_mutable_string_view
 fn replace(borrow mut value: str) { value = "new" }

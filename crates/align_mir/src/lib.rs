@@ -10802,6 +10802,27 @@ fn lower_borrowed_place(b: &mut Builder, e: &hir::Expr, mode: align_ast::ParamMo
                     cleanup: None,
                 }));
             }
+            // Computed fixed-array indices already support Copy field reads. Borrow the same
+            // bounds-checked value in a call-local slot, as for dynamic Copy fields above. Move
+            // and exclusive arguments still require their original storage place below.
+            if mode == align_ast::ParamMode::Borrow
+                && matches!(recv.ty, Ty::StructArray(..))
+                && !matches!(index.kind, hir::ExprKind::Int(_))
+                && !needs_drop_flag(e.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
+            {
+                let value = lower_index_field(b, e, recv, index, path, *struct_id, e.ty);
+                if !lowering_continues(b) {
+                    return Operand::Const(Const::Unit);
+                }
+                let slot = b.new_slot(e.ty);
+                b.push(Stmt::Store(slot, value));
+                return Operand::BorrowedPlace(Box::new(BorrowedPlace {
+                    slot,
+                    path: Vec::new(),
+                    ty: e.ty,
+                    cleanup: None,
+                }));
+            }
             let (hir::ExprKind::Local(base), hir::ExprKind::Int(index)) =
                 (&recv.kind, &index.kind)
             else {
