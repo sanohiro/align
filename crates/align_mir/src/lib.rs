@@ -24743,6 +24743,29 @@ fn main() -> i32 = 0
     }
 
     #[test]
+    fn sse_observation_result_shape_is_validated() -> Result<(), String> {
+        let mut diagnostics = Diagnostics::new();
+        let tokens = tokenize(
+            0,
+            "fn next(events: http_sse_stream, borrow mut out: buffer) -> Result<Option<http_sse_event>, Error> = events.next(out)\nfn main() -> i32 = 0\n",
+            &mut diagnostics,
+        );
+        let file = parse_file(tokens, &mut diagnostics);
+        let checked = check_file(&file, &mut diagnostics);
+        assert!(!diagnostics.has_errors(), "{:?}", diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>());
+        for per_unit in [false, true] {
+            assert!(lower_program_checked(&checked, per_unit, None).is_ok());
+            for field in 0..4 {
+                let mut malformed = checked.clone();
+                let event = malformed.structs.iter_mut().find(|s| s.name == "http_sse_event").ok_or("event")?;
+                event.fields.get_mut(field).ok_or("field")?.ty = Ty::Bool;
+                assert!(lower_program_checked(&malformed, per_unit, None).is_err(), "per_unit={per_unit}, field={field}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn malformed_fixed_copy_borrow_receiver_fails_closed() -> Result<(), String> {
         let mut diagnostics = Diagnostics::new();
         let tokens = tokenize(

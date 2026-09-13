@@ -50,6 +50,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
     next := events.next(out)?
     match next {
       Some(event) => {
+        copied_event := event.event.clone()
         io.stdout.write(event.event)?
         io.stdout.write(\"|\")?
         io.stdout.write(event.data)?
@@ -60,6 +61,10 @@ pub fn main(args: array<str>) -> Result<(), Error> {
           Some(value) => print(value),
           None => print(-1),
         }
+        mut alias := out.bytes()
+        alias[0] = 255
+        io.stdout.write(copied_event)?
+        io.stdout.write(\"\\n\")?
       },
       None => { break },
     }
@@ -95,9 +100,57 @@ pub fn main(args: array<str>) -> Result<(), Error> {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "200\ntext/event-stream\nupdate|one\ntwo|delivered|1500\nmessage||delivered|1500\ndelivered\n1500\n",
+        "200\ntext/event-stream\nupdate|one\ntwo|delivered|1500\nupdate\nmessage||delivered|1500\nmessage\ndelivered\n1500\n",
     );
     assert!(request.starts_with(b"GET /events HTTP/1.1\r\n"));
+}
+
+#[test]
+fn sse_text_observation_whole_unit_parity() {
+    for imported in [false, true] {
+        for copied in [false, true] {
+            for field in ["event", "data", "last_event_id"] {
+                let helper = "pub fn identity(value: str) -> str = value\n";
+                let (imports, call) = if imported {
+                    ("import views\n", "views.identity")
+                } else {
+                    (helper, "identity")
+                };
+                let copy = if copied { ".clone()" } else { "" };
+                let main = format!(
+                    "module main\n{imports}\
+                     fn probe<T>(marker: T, events: http_sse_stream) -> Result<(), Error> {{\n\
+                       mut out := buffer(64)\n\
+                       item := events.next(out)? else {{ return Ok(()) }}\n\
+                       selected := {call}(item.{field}){copy}\n\
+                       mut alias := out.bytes()\n\
+                       alias[0] = 255\n\
+                       print(selected)\n\
+                       return Ok(())\n\
+                     }}\n\
+                     fn inspect(events: http_sse_stream) -> Result<(), Error> = probe(0, events)\n\
+                     fn main() -> i32 = 0\n"
+                );
+                let views = format!("module views\n{helper}");
+                let files = if imported {
+                    vec![("views.align", views.as_str()), ("main.align", main.as_str())]
+                } else {
+                    vec![("main.align", main.as_str())]
+                };
+                let name = format!("sse-text-{imported}-{copied}-{field}");
+                let result = diff_check_multi(&name, &files, "main.align");
+                for (mode, errors, diagnostics) in [
+                    ("whole", result.whole_errors, &result.whole_diags),
+                    ("per-unit", result.per_unit_errors, &result.per_unit_diags),
+                ] {
+                    assert_eq!(errors, !copied, "{name}/{mode}: {diagnostics}");
+                    if !copied {
+                        assert!(diagnostics.contains("validated bytes were modified"), "{name}/{mode}: {diagnostics}");
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]
