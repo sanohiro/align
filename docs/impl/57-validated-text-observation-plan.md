@@ -266,3 +266,27 @@ receiver reads; independently selected values remain independent.
 [Plan 60](60-validated-codec-observation-plan.md) reuses the same byte-validation
 state for codec envelopes with a distinct `Codec` kind. This plan's UTF-8
 formation and derivative rules keep their existing source contract.
+
+## SSE publication closure
+
+`HttpSseStreamNext` is a second native producer of validated text on caller-writable
+Buffer storage. Its event/data/last_event_id fields are UTF-8 text over the newly
+published output generation. The completed successful payload must acquire the
+same UTF-8 observation used by BytesAsStr. This follows the existing observation
+strategy; it changes no source type, runtime validation, layout or ownership.
+The native stream-owned last_event_id getter and headers remain separate backing.
+
+| Applicable cell | Implementation and regression owner |
+| --- | --- |
+| Successful formation and three text fields | record_value_completion creates one UTF-8 observation on the post-action Buffer backing; attach it to the result's typed borrowing leaves, not the inline retry scalar. validated_text_observation_sse_matrix covers every text field and retained Result/Option carriers. |
+| Action ordering and stale aliases | Use current Buffer storage after source_visible_mutation_action, never the pre-action completed Buffer argument. The same matrix covers existing byte aliases, new getters, repeated next, and output reuse; http_sse_stream owns source/native lifetime behavior. |
+| Mutation and projection | Reuse all existing indexed/range and declared Out/BorrowMut invalidators. The SSE matrix checks overlapping writes, disjoint owners, descriptor rebinding, completed text-to-bytes and late conversion. |
+| Completion and control | Preserve owned copies and completed scalar/text reads; reject stale eager arguments. The SSE matrix covers if/match/else/?/map_err carriers and branch/loop joins through the existing worklists. None/Err cannot acquire a live text payload. |
+| Move, Drop, replacement and return | Observation has no release place; existing Buffer/stream Move/nulling/Drop and lifetime owners remain prerequisites. Expand only the successful text leaves into their Buffer lifetime roots for summaries. Existing http_sse_stream cursor/owner tests and the new whole/per-unit driver matrix close native generation reuse and returned views. |
+| Generic, checked-HIR and interface | Source checking and checked-HIR replay use the same formation rule after substitution; no new HIR/wire record or summary field. The driver matrix covers whole/per-unit rejection and admitted generic/borrowed forwarding. Ordinary hidden writes and callee-created observation transport remain deferred to the interprocedural plan. |
+| Native sibling producers | BufferBytes and raw HTTP reads publish unvalidated bytes; read_line returns a count; stream-owned/header and HTTP response text have read-only native backing. JSON/codec derivatives inherit input validation. Only SSE next publishes fresh text into a caller-writable Buffer in this inventory. |
+| Malformed input and cost | Existing exact SSE result/operand HIR validation remains mandatory. sse_observation_result_shape_is_validated rejects inconsistent result shape; no new allocation/ABI/performance promise or benchmark gate. |
+
+The author pass must correlate the result leaf paths with the builtin event record
+and cover all three text fields plus the scalar retry control. Invalid UTF-8
+witnesses are compile-only. Execute only admitted copy/earlier-read controls.

@@ -37031,12 +37031,35 @@ impl<'a> MoveCheck<'a> {
             );
         let mut fact = fact.join(&self.indexed_generation_content(expression).non_storage);
         let validation = match &expression.kind {
-            ExprKind::BytesAsStr { bytes } => Some((ByteValidationKind::Utf8, bytes)),
-            ExprKind::CodecOpen { input } => Some((ByteValidationKind::Codec, input)),
+            ExprKind::BytesAsStr { bytes } => Some((
+                ByteValidationKind::Utf8,
+                self.completed_byte_backing(bytes),
+                vec![vec![BorrowProjection::ResultOk]],
+            )),
+            ExprKind::CodecOpen { input } => Some((
+                ByteValidationKind::Codec,
+                self.completed_byte_backing(input),
+                vec![vec![BorrowProjection::ResultOk]],
+            )),
+            ExprKind::HttpSseStreamNext { buffer, .. } => {
+                // The native action publishes UTF-8 text in the new Buffer generation. The
+                // completed argument still names the pre-action generation; read the current
+                // owner place instead, just as the pending SSE result completion does.
+                let roots = self.storage_roots(buffer);
+                let storage = BorrowFact::from_direct(roots.clone());
+                Some((
+                    ByteValidationKind::Utf8,
+                    self.byte_backing(
+                        &ProjectedHeaderFact::default(),
+                        &storage,
+                        &MutableBackingFact::known(roots),
+                    ),
+                    self.borrow_leaf_paths(expression.ty),
+                ))
+            }
             _ => None,
         };
-        if let Some((kind, input)) = validation {
-            let mut dependency = self.completed_byte_backing(input);
+        if let Some((kind, mut dependency, paths)) = validation {
             let origin = StorageOrigin::ByteValidation { expression: key, kind };
             let renames = StorageGenerationRenames::from_origins([origin.clone()]);
             self.apply_generation_renames(&renames);
@@ -37052,8 +37075,10 @@ impl<'a> MoveCheck<'a> {
             // Storage tables have identical key sets even for observations with no owned header.
             self.borrows.storage.contents.entries.insert(generation.clone(), MoveValueFact::default());
             fact = self.normalize_borrow_fact(expression.ty, fact);
-            fact.join_at(&[BorrowProjection::ResultOk],
-                &BorrowFact::from_direct([BorrowRoot::Observation(generation)].into()));
+            let observation = BorrowFact::from_direct([BorrowRoot::Observation(generation)].into());
+            for path in paths {
+                fact.join_at(&path, &observation);
+            }
         }
         if self.mutable_collection_ty(expression.ty) {
             storage
@@ -75761,6 +75786,66 @@ fn main() -> i32 {
                 ));
                 let messages = diagnostics.iter().map(|item| item.message.as_str()).collect::<Vec<_>>();
                 if diagnostics.has_errors() != stale || (stale && !messages.iter().any(|message| message.contains("validated codec bytes were modified"))) {
+                    failures.push(format!("{storage}/{name}: {messages:?}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn validated_text_observation_sse_matrix() {
+        let next = "item := events.next(out)? else { return Ok(()) }; mut alias := out.bytes()";
+        let cases = [
+            ("event", format!("{next}; alias[0] = 255; print(item.event)"), true),
+            ("data", format!("{next}; alias[0] = 255; print(item.data)"), true),
+            ("id", format!("{next}; alias[0] = 255; print(item.last_event_id)"), true),
+            ("result", "result := events.next(out); mut alias := out.bytes(); alias[0] = 255; item := result? else { return Ok(()) }; print(item.event)".to_owned(), true),
+            ("option", "option := events.next(out)?; mut alias := out.bytes(); alias[0] = 255; item := option else { return Ok(()) }; print(item.data)".to_owned(), true),
+            ("earlier_read", format!("{next}; print(item.event); alias[0] = 255"), false),
+            ("copy", format!("{next}; copy := item.data.clone(); alias[0] = 255; print(copy)"), false),
+            ("scalar", format!("{next}; retry := item.retry_ms; alias[0] = 255; print(retry else {{ 0 }})"), false),
+            ("scalar_projection", format!("{next}; alias[0] = 255; print(item.retry_ms else {{ 0 }})"), false),
+            ("byte_conversion", format!("{next}; bytes := item.event.bytes(); alias[0] = 255; print(bytes[0])"), false),
+            ("late_conversion", format!("{next}; alias[0] = 255; print(item.event.bytes()[0])"), true),
+            ("disjoint", format!("{next}; mut other := [(0 as u8)].to_array(); other[0] = 255; print(item.event)"), false),
+            ("rebind", format!("{next}; other := alias.to_array(); alias = other; alias[0] = 255; print(item.event)"), false),
+            ("range", format!("{next}; mut range := alias[0..1]; range[0] = 255; print(item.data)"), true),
+            ("declared_out", format!("{next}; write(alias); print(item.event)"), true),
+            ("declared_borrow_mut", format!("{next}; write_mut(alias); print(item.event)"), true),
+            ("eager", format!("{next}; consume(item.event, {{ alias[0] = 255; alias[0] }})"), true),
+            ("branch", format!("{next}; if choose {{ alias[0] = 255 }}; print(item.event)"), true),
+            ("loop", format!("{next}; loop {{ alias[0] = 255; break }}; print(item.event)"), true),
+            ("fresh_next", "first := events.next(out)? else { return Ok(()) }; print(first.event); fresh := events.next(out)? else { return Ok(()) }; print(fresh.event)".to_owned(), false),
+            ("loop_fresh", "loop { item := events.next(out)? else { break }; print(item.event) }".to_owned(), false),
+            ("map_err", "item := events.next(out).map_err(keep_error)? else { return Ok(()) }; mut alias := out.bytes(); alias[0] = 255; print(item.event)".to_owned(), true),
+            ("match", "match events.next(out) { Ok(option) => match option { Some(item) => { mut alias := out.bytes(); alias[0] = 255; print(item.event) }, None => {} }, Err(error) => {} }".to_owned(), true),
+            ("absent_payloads", "match events.next(out) { Ok(option) => match option { Some(item) => print(item.event), None => { mut alias := out.bytes(); alias[0] = 255; print(0) } }, Err(error) => { mut alias := out.bytes(); alias[0] = 255; print(1) } }".to_owned(), false),
+        ];
+        let mut failures = Vec::new();
+        for (storage, parameters, setup) in [
+            ("parameter", ", borrow mut out: buffer", ""),
+            ("local", "", "mut out := buffer(64);"),
+        ] {
+            for (name, body, stale) in &cases {
+                let (_, diagnostics) = check(&format!(
+                    "fn write(out bytes: slice<u8>) {{ bytes[0] = 255 }}\n\
+                     fn write_mut(borrow mut bytes: slice<u8>) {{ bytes[0] = 255 }}\n\
+                     fn consume(text: str, byte: u8) {{ print(text); print(byte) }}\n\
+                     fn keep_error(error: Error) -> Error = error\n\
+                     fn inspect(events: http_sse_stream, choose: bool{parameters}) -> Result<(), Error> {{ {setup} {body}; Ok(()) }}\n\
+                     fn main() -> i32 = 0\n"
+                ));
+                let messages = diagnostics.iter().map(|item| item.message.as_str()).collect::<Vec<_>>();
+                // BorrowMut already ends the source lifetime; retain that earlier diagnostic.
+                let expected = if *name == "declared_borrow_mut" {
+                    "invalidated borrow"
+                } else {
+                    "validated bytes were modified"
+                };
+                if diagnostics.has_errors() != *stale
+                    || (*stale && !messages.iter().any(|message| message.contains(expected)))
+                {
                     failures.push(format!("{storage}/{name}: {messages:?}"));
                 }
             }
