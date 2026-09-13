@@ -75677,6 +75677,14 @@ fn main() -> i32 {
                 if let Some(error) = codec_observation_failure(&source, !disjoint, !name.contains("borrow_mut")) {
                     failures.push(format!("{name}/{disjoint}: {error}"));
                 }
+                let (_, diagnostics) = check(&source);
+                for diagnostic in diagnostics.iter() {
+                    if diagnostic.message.contains("unknown origin")
+                        || diagnostic.message.contains("process byte reads require")
+                    {
+                        failures.push(format!("{name}/{disjoint}: write admission failed: {}", diagnostic.message));
+                    }
+                }
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
