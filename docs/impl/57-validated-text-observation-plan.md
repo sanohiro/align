@@ -45,14 +45,14 @@ no stale text is subsequently used.
 | Surface | Exact rule |
 | --- | --- |
 | Formation | On completion of `BytesAsStr`, after its byte operand completes and is checked, create a fresh analysis observation of that completed byte backing. Attach it only to the `ResultOk` text leaf, never the error payload or source byte value. A runtime Err carries no observable text. |
-| Identity | A distinct `StorageOrigin::TextValidation { expression }` uses the immutable HIR expression address. Existing `Current`/`Prior` recency distinguishes a fresh execution from retained prior executions of that site. No source span, local name, runtime counter or serialized identity is used. |
+| Identity | A distinct `StorageOrigin::ByteValidation { expression, kind: Utf8 }` uses the immutable HIR expression address. Existing `Current`/`Prior` recency distinguishes a fresh execution from retained prior executions of that site. No source span, local name, runtime counter or serialized identity is used. |
 | Dependency | A validation record retains a snapshot of the selected byte backing: stable generation alternatives plus unresolved fallback roots and an explicit unknown alternative. Allocation identity is separate from its current release place and from contained-view provenance. Byte subranges conservatively share their backing identity. |
 | Mutation | At an admitted write action, end every reaching validation observation whose backing may overlap the completed write target. Any unknown alternative prevents a disjointness proof. Known disjoint generation alternatives remain independent; unequal symbolic caller-storage keys alone do not prove disjointness. Fallback evidence uses the existing alias-root rules without flattening contained view owners into known backing. |
-| Value flow | `BorrowRoot::Observation`/`EndedObservation` transport the validation identity through the existing projected `BorrowFact`, local/header/content facts, pipeline snapshots and eager completion snapshots. The distinct origin identifies a text observation for diagnostics and filtering; cursor observations keep their existing behavior. |
+| Value flow | `BorrowRoot::Observation`/`EndedObservation` transport the validation identity through the existing projected `BorrowFact`, local/header/content facts, pipeline snapshots and eager completion snapshots. The distinct byte-validation origin carries a UTF-8 or codec kind for diagnostics. Validation-only filtering handles both kinds; cursor observations keep their existing behavior. |
 | Invalidation | Mark matching roots ended in all fact lanes and their diagnostic indexes. Do not end the backing allocation, its owner generation or unrelated raw-byte aliases. Mutation does not retroactively reject an earlier completed text use; subsequent text use and an enclosing operation with an invalidated eager operand reject. |
 | Revalidation | A later validation creates a live Current observation; old values keep an ended Prior observation. Rebinding a byte descriptor before a write changes only that descriptor's target and cannot retarget an earlier validation. |
 | Text derivatives | Borrowing, trimming, slicing and borrowed decoded text preserve input validity observations whenever the result still observes those bytes. Existing owned text copies detach source dependencies. A plain scalar result does not retain a text-use obligation. |
-| Return to bytes | `str.bytes()` validates use of its text operand, then removes only text-validity observations from its resulting byte facts. Source lifetime, cursor observation and read-only authority remain. Bytes completed before a later write remain usable as bytes. Converting an already invalid text value still rejects at the operand use. |
+| Return to bytes | `str.bytes()` validates use of its text operand, then removes both UTF-8 and codec byte-validation observations from its resulting byte facts. Source lifetime, cursor observation and read-only authority remain. Bytes completed before a later write remain usable as bytes. Converting an already invalid text value still rejects at the operand use. |
 | Diagnostics | A stale text local or completed operand reports that its validated bytes were modified and asks for revalidation or an explicit owned string copy. Keep source locations and existing one-root-error suppression. Do not describe the event as reader advancement, owner movement or reallocation. |
 | Runtime and ABI | Compiler-only state. No allocation, copying, owner transfer, nulling, Drop, native ABI, emitted layout or evaluation-order change. Existing structural, lifetime, no-alias, bounds and ownership checks remain prerequisites. |
 | Interfaces and cache | No HIR variant, type record, interface field or format version changes. Local bodies are recomputed after generic substitution and during checked-HIR replay. Existing compiler/artifact identity invalidates changed checker implementations; no new persisted format exists. |
@@ -60,7 +60,7 @@ no stale text is subsequently used.
 ## State integration and finite closure
 
 Keep the record in the existing generation directory, with no release place and
-no owned storage header. Its text backing dependency is optional on ordinary
+no owned storage header. Its byte backing dependency is optional on ordinary
 entries and present on validation entries. Joining two records unions generation
 and fallback alternatives and ORs unknown; a missing or contradictory validation
 record is unknown, never proved disjoint. Invalidation is a may-event and remains
@@ -94,7 +94,7 @@ The owner must prove that distinction rather than infer it from an empty summary
 
 | Existing action | Required integration |
 | --- | --- |
-| `AssignIndex`, `AssignElemField`, `AssignElem` | `update_mutable_collection_contents` snapshots the selected backing before any content transition, then ends overlapping text observations. A descriptor-field replacement alone is not a write into that field's old pointed-to allocation. |
+| `AssignIndex`, `AssignElemField`, `AssignElem` | `update_mutable_collection_contents` snapshots the selected backing before any content transition, then ends overlapping byte-validation observations. A descriptor-field replacement alone is not a write into that field's old pointed-to allocation. |
 | `VecStore`, `ArrayMapInto`, `RandShuffle` | `invalidate_collection_mutation_target` uses operand-completion headers and fallback evidence, before visible mutation. The later syntactic descriptor cannot replace the snapshot. |
 | `ProcessLive` `OutBytes` | Classify every argument declared as OutBytes as a byte write after all operands complete; share the target invalidator with the read-only destination check. Retain the existing native validation/error and no-alias rules. |
 | Direct explicit `Out` arguments | End observations against each pre-call completed destination, whether or not the mutable-retention result contains borrowed content. An empty retention set is not evidence of no byte writes. Source formation continues to reject first-class functions with Out parameters; do not widen that domain. |
@@ -182,8 +182,8 @@ public validity summary, or ownership strategy is introduced.
    as it already preserves read-only paths. Projection, Try, else and map_err
    use the existing typed selectors. A second validity lane would duplicate
    those selectors and their joins without adding a different source contract.
-2. **Exact state.** Add `text_validation: Option<TextValidationBacking>` to
-   `MoveGenerationEntry`. `TextValidationBacking` contains finite sets
+2. **Exact state.** Add `byte_validation: Option<ByteValidationBacking>` to
+   `MoveGenerationEntry`. `ByteValidationBacking` contains finite sets
    `generations: BTreeSet<StorageGeneration>`, `fallback_roots: BorrowRoots`,
    `lifetime_roots: BorrowRoots`, and `unknown: bool`. Join unions each set and
    ORs unknown. One missing side joins as unknown. Renaming maps both generation
@@ -203,7 +203,8 @@ public validity summary, or ownership strategy is introduced.
 4. **Derivatives.** Completed value/storage snapshots carry text roots through
    the existing borrowing-derivative selectors. The derivative matrix proves
    trim, ranges, typed fields and borrowed JSON text. `StrBytes` removes only
-   roots whose generation origin is TextValidation. It preserves cursor,
+   roots whose generation origin is `ByteValidation`, including both UTF-8 and
+   codec kinds. It preserves cursor,
    lifetime and read-only roots and still checks its input before conversion.
 5. **Calls and summaries.** Existing return-origin selection substitutes the
    completed argument fact, retaining its caller-created observation; it does
@@ -235,14 +236,14 @@ have no diff; their unchanged contracts require no new ABI or benchmark owner.
 
 | Extracted obligation group | Implementation | Regression owner |
 | --- | --- | --- |
-| UTF-8 formation; ResultOk only; completion before publication; cached fact preservation | `record_value_completion`, `normalize_borrow_fact`, `borrow_fact_one` | `validated_text_observation_local_matrix`, `validated_text_observation_state_closure` |
-| Backing identity; aliases; unknown alternatives; movement and generation recency | `TextValidationBacking`, `text_backing`, `completed_text_backing`, generation entry join/rename | `validated_text_observation_backing_identity_matrix`, `validated_text_observation_state_closure`, existing storage-generation control owners |
-| Dependency pruning; missing records fail closed; no owner release | `BorrowState::retain_reachable_storage_with`, `invalidate_validated_text` | `validated_text_observation_state_closure`, local byte reuse and owner-transfer controls |
+| UTF-8 formation; ResultOk only; completion before publication; cached fact preservation | `record_value_completion`, `normalize_borrow_fact`, `borrow_fact_one` | `validated_text_observation_local_matrix`, `validated_byte_observation_state_closure` |
+| Backing identity; aliases; unknown alternatives; movement and generation recency | `ByteValidationBacking`, `byte_backing`, `completed_byte_backing`, generation entry join/rename | `validated_text_observation_backing_identity_matrix`, `validated_byte_observation_state_closure`, existing storage-generation control owners |
+| Dependency pruning; missing records fail closed; no owner release | `BorrowState::retain_reachable_storage_with`, `invalidate_validated_bytes` | `validated_byte_observation_state_closure`, local byte reuse and owner-transfer controls |
 | Selected carriers and derivatives; old Result; owned copies; source errors remain | `BorrowFact::flatten_lifetimes`, existing projection/unwrap/derivative selectors, `StrBytes` filtering | `validated_text_observation_projection_matrix`, `validated_text_observation_completion_matrix`, backing-identity JSON case, existing borrowed-buffer owners |
 | Local indexed and collection writes use completed backing | `update_mutable_collection_contents`, `invalidate_collection_mutation_target` | `validated_text_observation_local_matrix`, `validated_text_observation_sink_matrix` |
-| Every native OutBytes and explicit mutable mode; empty retention is a write; no indirect Out widening | `apply_builtin_mutation_action`, `apply_mutable_call_effects`, `completed_text_call_backing` | `validated_text_observation_sink_matrix`, `validated_text_observation_mutable_call_contents`, existing read-only destination owners |
+| Every native OutBytes and explicit mutable mode; empty retention is a write; no indirect Out widening | `apply_builtin_mutation_action`, `apply_mutable_call_effects`, `completed_byte_call_backing` | `validated_text_observation_sink_matrix`, `validated_text_observation_mutable_call_contents`, existing read-only destination owners |
 | Earlier completed uses and scalar results; eager writes; joins, exits, and repeated validation | `finish_child_staging_frontier`, existing eager action/control walkers, generation renaming | `validated_text_observation_control_matrix`, `validated_text_observation_completion_matrix` |
-| Caller-created observation transport; public lifetime and parallel summary conversion; diagnostics | existing return-origin selection, `expand_text_validation_roots`, `summary_roots`, three invalid-use diagnostics | state closure, local identity, whole/unit parity, and eager owners; existing XML owner suite |
+| Caller-created observation transport; public lifetime and parallel summary conversion; diagnostics | existing return-origin selection, `expand_byte_validation_roots`, `summary_roots`, three invalid-use diagnostics | state closure, local identity, whole/unit parity, and eager owners; existing XML owner suite |
 | Generic substitution; structurally valid replay rejects before lowering; safe execution | unchanged body-fact replay entry point consumes the new MoveCheck facts | driver `validated_text_observation_whole_unit_parity`, `validated_text_observation_safe_execution`, MIR `validated_text_observation_checked_hir_replay` |
 | Ordinary hidden writes and callee-created validation | Explicitly deferred to the interprocedural access boundary | No claim that local observations close those effects |
 
@@ -261,3 +262,7 @@ those contained views. Precise composite access effects remain interprocedural
 work. The mutable-call-content owner proves this boundary with both Out and
 BorrowMut. Existing whole-carrier read policy is retained, including whole-array
 receiver reads; independently selected values remain independent.
+
+[Plan 60](60-validated-codec-observation-plan.md) reuses the same byte-validation
+state for codec envelopes with a distinct `Codec` kind. This plan's UTF-8
+formation and derivative rules keep their existing source contract.

@@ -18618,6 +18618,61 @@ fn validated_text_observation_checked_hir_replay() -> Result<(), &'static str> {
 }
 
 #[test]
+fn validated_codec_observation_checked_hir_replay() -> Result<(), &'static str> {
+    for mutated in [false, true] {
+        let mutation = if mutated {
+            "alias[16] = 255"
+        } else {
+            "print(alias[16])"
+        };
+        let source = format!(
+            "import core.codec\nfn probe(safe: codec.batch) -> Result<(), Error> {{ encoder := codec.encoder(0)?; owner := encoder.finish(); mut alias := owner.bytes(); batch := codec.open(alias)?; {mutation}; selected := safe; print(selected.rows()); Ok(()) }}\nfn main() {{}}\n"
+        );
+        let mut program = checked_source_program(&source);
+        assert!(align_sema::checked_hir_body_facts_are_valid(&program));
+        let function = program
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "probe")
+            .ok_or("missing codec observation probe")?;
+        let batch = function
+            .locals
+            .iter()
+            .position(|local| local.name == "batch")
+            .ok_or("missing validated codec local")?;
+        let selected = function
+            .locals
+            .iter()
+            .position(|local| local.name == "selected")
+            .ok_or("missing selected codec local")?;
+        let init = function
+            .body
+            .stmts
+            .iter_mut()
+            .find_map(|statement| match statement {
+                hir::Stmt::Let { local, init, .. } if *local as usize == selected => Some(init),
+                _ => None,
+            })
+            .ok_or("missing selected codec binding")?;
+        assert_eq!(init.ty, function.locals[batch].ty);
+        init.kind = hir::ExprKind::Local(u32::try_from(batch).map_err(|_| "local overflow")?);
+        assert!(
+            body_core_metadata_is_valid(&program),
+            "same-typed local substitution"
+        );
+        assert_eq!(
+            align_sema::checked_hir_body_facts_are_valid(&program),
+            !mutated
+        );
+        assert_eq!(
+            lower_program_checked(&program, false, None).is_ok(),
+            !mutated
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn readonly_view_publication_checked_hir_replay() -> Result<(), &'static str> {
     for (name, receiver, publication) in [
         ("text", "source: str", "source.bytes()"),

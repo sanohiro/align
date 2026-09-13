@@ -5,6 +5,71 @@ mod common;
 use common::*;
 
 #[test]
+fn validated_codec_observation_whole_unit_parity() {
+    for imported in [false, true] {
+        for copied in [false, true] {
+            for modified in [false, true] {
+                let helper = "pub fn identity(value: codec.batch) -> codec.batch = value\n";
+                let imports = if imported { "import views\n" } else { helper };
+                let call = if imported { "views.identity" } else { "identity" };
+                let input = if copied { "alias.to_array()" } else { "alias" };
+                let action = if modified { "alias[16] = 255" } else { "print(alias[16])" };
+                let source = format!("module main\nimport core.codec\n{imports}fn probe<T>(marker: T) -> Result<(), Error> {{ encoder := codec.encoder(0)?; owner := encoder.finish(); mut alias := owner.bytes(); input := {input}; batch := codec.open(input)?; selected := {call}(batch); {action}; print(selected.rows()); Ok(()) }}\nfn main() -> Result<(), Error> = probe(0)\n");
+                let helper_module = format!("module views\nimport core.codec\n{helper}");
+                let files = if imported {
+                    vec![("views.align", helper_module.as_str()), ("main.align", source.as_str())]
+                } else {
+                    vec![("main.align", source.as_str())]
+                };
+                let name = format!("codec-observation-{imported}-{copied}-{modified}");
+                let result = diff_check_multi(&name, &files, "main.align");
+                let stale = modified && !copied;
+                assert_eq!(result.whole_errors, stale, "{name}: {}", result.whole_diags);
+                assert_eq!(result.per_unit_errors, stale, "{name}: {}", result.per_unit_diags);
+                if stale {
+                    assert!(result.whole_diags.contains("validated codec bytes were modified"), "{}", result.whole_diags);
+                    assert!(result.per_unit_diags.contains("validated codec bytes were modified"), "{}", result.per_unit_diags);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn validated_codec_observation_safe_execution() {
+    let source = r#"import core.codec
+fn main() -> Result<(), Error> {
+    encoder := codec.encoder(0)?
+    owner := encoder.finish()
+    mut alias := owner.bytes()
+    copied := alias.to_array()
+    stable := codec.open(copied)?
+    batch := codec.open(alias)?
+    before := batch.rows()
+    alias[16] = 255
+    fresh := codec.open(alias)?
+    print(before)
+    print(stable.rows())
+    print(fresh.rows())
+    print(alias[16])
+    Ok(())
+}
+"#;
+    let files = [("main.align", source)];
+    let checked = diff_check_multi("codec-observation-safe", &files, "main.align");
+    assert!(!checked.whole_errors && !checked.per_unit_errors, "{}\n{}", checked.whole_diags, checked.per_unit_diags);
+    if backend_available() {
+        for output in [
+            build_and_run_multi("codec-observation-safe", &files, "main.align"),
+            build_per_unit_multi("codec-observation-safe-unit", &files, "main.align").link_and_run(),
+        ] {
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "0\n0\n255\n255\n");
+        }
+    }
+}
+
+#[test]
 fn codec_encoder_and_views_round_trip_all_four_kinds() {
     if !backend_available() {
         return;
