@@ -148,3 +148,41 @@ fn arm_generic_and_apple_cpu_select_neon_instructions() {
         assert!(assembly.contains(".2d"), "{cpu} must use NEON i64 lanes: {assembly}");
     }
 }
+
+#[test]
+fn composed_sampler_native_cpu_controls_preserve_scalar_policy_without_byte_traps() {
+    if !backend_available() || !objdump_available() { return; }
+    let cpus: &[&str] = if cfg!(target_arch = "aarch64") { &["generic", "apple-m1"] }
+        else if cfg!(target_arch = "x86_64") { &["x86-64-v2", "x86-64-v3"] }
+        else { return; };
+    let source = fixture("crates/align_driver/tests/fixtures/composed_sampler.align");
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "composed-native", source);
+    assert!(!checked.diags.has_errors(), "{}", align_driver::format_diagnostics(&sm, &checked.diags));
+    let mir = lower_to_mir(&checked.hir);
+    for cpu in cpus {
+        let target = BuildTarget::Cpu((*cpu).to_string());
+        let ir = align_driver::emit_llvm_ir(&mir, target.clone(), Profile::Release, true, &["select".into()], false).unwrap();
+        let function = ir.split("@select(").nth(1).expect("exported sampler").split("\n}").next().unwrap();
+        assert_eq!(function.lines().filter(|line| line.contains("load ptr, ptr %0,")).count(), 1, "{cpu}: {function}");
+        assert!(!function.contains("@align_rt_range_fail"), "{cpu}: logits loop retains a trap");
+        assert!(function.contains("@align_rt_bounds_fail"), "{cpu}: candidate bounds remain");
+        let dir = std::env::temp_dir().join(format!("align-composed-isa-{}-{cpu}", std::process::id()));
+        std::fs::create_dir(&dir).expect("exclusively acquire object directory");
+        let guard = Proj { dir, entry: String::new() };
+        let obj = guard.dir.join("sampler.o");
+        emit_object_file(&mir, &obj, target, Profile::Release, &["select".into()], false).expect("sampler object");
+        let output = std::process::Command::new("objdump").arg("-dr").arg(&obj).output().expect("disassemble");
+        assert!(output.status.success());
+        let assembly = String::from_utf8_lossy(&output.stdout);
+        let function = assembly.split("<select>:").nth(1).or_else(|| assembly.split("<_select>:").nth(1)).expect("native sampler symbol");
+        assert!(!function.contains("align_rt_range_fail"), "{cpu}: {function}");
+        assert!(function.contains("align_rt_bounds_fail"), "{cpu}: {function}");
+        if cfg!(target_arch = "aarch64") {
+            assert!(function.contains("fcvt"), "{cpu}: explicit f32 to f64 conversion remains");
+        } else {
+            assert!(function.contains("cvtss2sd"), "{cpu}: explicit f32 to f64 conversion remains");
+            if *cpu == "x86-64-v2" { assert!(!function.contains("ymm"), "portable x86 reverse control"); }
+        }
+    }
+}

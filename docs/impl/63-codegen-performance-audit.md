@@ -2,6 +2,8 @@
 
 Status: configuration, ThinLTO entry repair, local byte-call promotion and
 restricted byte-range proof implemented, 2026-09-14. Build defaults are unchanged.
+Follow-up comments, composed sampler proofs and the newly supplied native lifetime
+evidence are tracked in [plan 64](64-composed-byte-optimization-plan.md).
 Reference revision: `21d0cf27fb92166370b2705d5c366c2b269d17a3`.
 Input: [issue 1043](https://github.com/sanohiro/align/issues/1043), the
 align-llm request register, and the owner's request to investigate both missed
