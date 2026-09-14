@@ -5290,15 +5290,16 @@ pub fn backend_available() -> bool {
     align_codegen_llvm::is_available()
 }
 
-/// Compile `mir` with debug locations, run `-O2`, and return LLVM's raw optimization-remark strings
+/// Compile `mir` with debug locations, run the selected profile, and return LLVM's raw optimization-remark strings
 /// (`"<file>:<line>:<col>: <message>"`). Process-global side effect — see
 /// [`align_codegen_llvm::collect_opt_remarks`]. Used only by `explain-opt`.
 pub fn collect_opt_remarks(
     mir: &align_mir::Program,
     target: BuildTarget,
+    profile: Profile,
     debug: &DebugInfo,
 ) -> Result<Vec<String>, String> {
-    align_codegen_llvm::collect_opt_remarks(mir, &target, debug).map_err(|e| e.to_string())
+    align_codegen_llvm::collect_opt_remarks(mir, &target, profile, debug).map_err(|e| e.to_string())
 }
 
 /// Write MIR out to an object file (codegen). `target` selects the CPU baseline (portable default
@@ -8662,11 +8663,11 @@ where
 }
 
 /// MIR to LLVM IR text (`alignc emit-llvm`). `optimized` picks the lens: `false` (`--stage raw`)
-/// prints what codegen emitted; `true` (`--stage optimized`) runs the `-O2` pipeline first, so the
+/// prints what codegen emitted; `true` (`--stage optimized`) runs the selected profile pipeline first, so the
 /// output shows what LLVM actually did (inlined, fused, vectorized). `exports` is the same
 /// export-roots list as [`emit_object_file`].
-pub fn emit_llvm_ir(mir: &align_mir::Program, target: BuildTarget, optimized: bool, exports: &[String], rt_lto: bool) -> Result<String, String> {
-    align_codegen_llvm::emit_llvm_ir(mir, &target, optimized, exports, rt_lto_bytes(rt_lto)).map_err(|e| e.to_string())
+pub fn emit_llvm_ir(mir: &align_mir::Program, target: BuildTarget, profile: Profile, optimized: bool, exports: &[String], rt_lto: bool) -> Result<String, String> {
+    align_codegen_llvm::emit_llvm_ir(mir, &target, profile, optimized, exports, rt_lto_bytes(rt_lto)).map_err(|e| e.to_string())
 }
 
 /// The names in `exports` that do not match any function in `mir` (by [`align_mir::Function::name`]).
@@ -10381,8 +10382,8 @@ fn main() -> i32 = 0\n";
         );
         for optimized in [false, true] {
             assert_eq!(
-                emit_llvm_ir(&located, BuildTarget::Baseline, optimized, &[], false).unwrap(),
-                emit_llvm_ir(&cleared, BuildTarget::Baseline, optimized, &[], false).unwrap(),
+                emit_llvm_ir(&located, BuildTarget::Baseline, Profile::Release, optimized, &[], false).unwrap(),
+                emit_llvm_ir(&cleared, BuildTarget::Baseline, Profile::Release, optimized, &[], false).unwrap(),
                 "the located side table must not enter LLVM"
             );
         }

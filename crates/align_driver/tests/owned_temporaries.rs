@@ -25,7 +25,7 @@ fn optimized_llvm(src: &str) -> String {
         align_driver::format_diagnostics(&sm, &checked.diags)
     );
     let mir = align_driver::try_lower_to_mir(&checked.hir).expect("producer-checked HIR must lower");
-    emit_llvm_ir(&mir, BuildTarget::Baseline, true, &[], false).expect("optimized LLVM IR")
+    emit_llvm_ir(&mir, BuildTarget::Baseline, align_driver::Profile::Release, true, &[], false).expect("optimized LLVM IR")
 }
 
 fn function<'a>(mir: &'a str, name: &str) -> &'a str {

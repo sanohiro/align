@@ -1,7 +1,7 @@
 //! `alignc explain-opt` — translate LLVM's optimization remarks into Align's diagnostic voice
 //! (`docs/impl/09-explain-opt.md`, Slice 3b).
 //!
-//! Pipeline: front end → located MIR → codegen(+debug locations) → `default<O2>` with remark
+//! Pipeline: front end → located MIR → codegen(+debug locations) → selected profile with remark
 //! capture → parse each flat `"<file>:<line>:<col>: <message>"` string → classify into a
 //! [`Vec<OptRecord>`] (build first) → render the human report (render second). The default view is
 //! the missed/actionable records plus a one-line success summary plus a bucket count; `--verbose`
@@ -587,7 +587,8 @@ fn after_current_plan_validation<'a, T>(
     }
 }
 
-pub fn run_explain_opt(path: &str, verbose: bool, target: BuildTarget) -> ExitCode {
+pub fn run_explain_opt(path: &str, verbose: bool, target: BuildTarget, profile: crate::Profile,
+) -> ExitCode {
     let src = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -620,9 +621,14 @@ pub fn run_explain_opt(path: &str, verbose: bool, target: BuildTarget) -> ExitCo
                 "current-plan measurement override: buffer donation is disabled; donation rows are not the default plan\n",
             );
         }
+        let _ = writeln!(
+            out,
+            "LLVM observation: per-unit; profile={}; runtime-lto=off",
+            profile.name()
+        );
         for unit in &walk.units {
             let debug = unit_debug(&unit.file);
-            let remarks = match collect_opt_remarks(&unit.mir, target.clone(), &debug) {
+            let remarks = match collect_opt_remarks(&unit.mir, target.clone(), profile, &debug) {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("alignc: {e}");

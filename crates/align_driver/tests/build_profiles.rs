@@ -230,3 +230,73 @@ fn bad_profile_is_a_diagnostic_not_a_panic() {
     assert!(err.contains("unknown --profile 'turbo'"), "diagnostic names the bad value:\n{err}");
     assert!(err.contains("dev, release, fast, small, tiny"), "diagnostic lists the valid names:\n{err}");
 }
+#[test]
+fn inspection_uses_complete_profile_configuration() {
+    if !align_driver::backend_available() {
+        return;
+    }
+    let mut source_map = align_span::SourceMap::new();
+    let checked = check(&mut source_map, "inspection-profiles", KERNEL);
+    assert!(!checked.diags.has_errors());
+    let mir = lower_to_mir(&checked.hir);
+    let exports = vec!["run".to_owned()];
+    for profile in [
+        Profile::Dev,
+        Profile::Release,
+        Profile::Fast,
+        Profile::Small,
+        Profile::Tiny,
+    ] {
+        let raw = align_driver::emit_llvm_ir(
+            &mir,
+            BuildTarget::Baseline,
+            profile,
+            false,
+            &exports,
+            false,
+        )
+        .expect("raw profile IR");
+        let optimized =
+            align_driver::emit_llvm_ir(&mir, BuildTarget::Baseline, profile, true, &exports, false)
+                .expect("optimized profile IR");
+        for ir in [&raw, &optimized] {
+            assert_eq!(
+                ir.contains("optsize"),
+                matches!(profile, Profile::Small | Profile::Tiny),
+                "{profile:?}: {ir}"
+            );
+            assert_eq!(
+                ir.contains("minsize"),
+                profile == Profile::Tiny,
+                "{profile:?}: {ir}"
+            );
+        }
+        assert!(
+            raw.contains("align_fn$3$64626c"),
+            "raw must retain dbl before optimization"
+        );
+        assert_eq!(
+            optimized.contains("align_fn$3$64626c"),
+            profile == Profile::Dev,
+            "selected profile must control inlining: {profile:?}"
+        );
+        let debug = align_driver::DebugInfo {
+            file: "profiles.align".into(),
+            directory: "/".into(),
+        };
+        let remarks =
+            align_driver::collect_opt_remarks(&mir, BuildTarget::Baseline, profile, &debug)
+                .expect("profile remarks");
+        if profile == Profile::Dev {
+            assert!(
+                !remarks.iter().any(|remark| remark.contains("inlined into")),
+                "{remarks:?}"
+            );
+        } else {
+            assert!(
+                remarks.iter().any(|remark| remark.contains("inlined into")),
+                "{profile:?}: {remarks:?}"
+            );
+        }
+    }
+}

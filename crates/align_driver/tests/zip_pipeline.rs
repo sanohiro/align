@@ -48,7 +48,7 @@ fn optimized_llvm(src: &str, exports: &[&str]) -> String {
         align_driver::format_diagnostics(&sm, &checked.diags)
     );
     let exports = exports.iter().map(|name| (*name).to_string()).collect::<Vec<_>>();
-    emit_llvm_ir(&lower_to_mir(&checked.hir), BuildTarget::Baseline, true, &exports, false).expect("optimized LLVM IR")
+    emit_llvm_ir(&lower_to_mir(&checked.hir), BuildTarget::Baseline, align_driver::Profile::Release, true, &exports, false).expect("optimized LLVM IR")
 }
 
 fn function<'a>(mir: &'a str, name: &str) -> &'a str {

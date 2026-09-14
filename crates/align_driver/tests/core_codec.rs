@@ -292,7 +292,7 @@ fn main() -> i32 = 0
         align_driver::format_diagnostics(&sources, &checked.diags),
     );
     let mir = align_driver::try_lower_to_mir(&checked.hir).expect("checked codec HIR");
-    let llvm = emit_llvm_ir(&mir, BuildTarget::Baseline, false, &[], false).expect("LLVM IR");
+    let llvm = emit_llvm_ir(&mir, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false).expect("LLVM IR");
     for call in [
         "call i32 @align_rt_codec_open_v1(ptr",
         "call i32 @align_rt_codec_encoder_new_v1(i64",

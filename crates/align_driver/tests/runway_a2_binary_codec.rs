@@ -380,7 +380,7 @@ fn bounded_byte_object_rejects_forged_put_widths() {
         assert!(!checked.diags.has_errors());
         let original = lower_to_mir(&checked.hir);
         assert_eq!(align_mir::byte_storage::plan(&original.fns[0]).slots().count(), 1);
-        assert!(emit_llvm_ir(&original, BuildTarget::Baseline, false, &[], false).is_ok());
+        assert!(emit_llvm_ir(&original, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false).is_ok());
         let scalar = match claimed {
             "u8" => Ty::Int(IntTy { bits: 8, signed: false }),
             "u64" => Ty::Int(IntTy { bits: 64, signed: false }),
@@ -403,7 +403,7 @@ fn bounded_byte_object_rejects_forged_put_widths() {
         // A matching declared type cannot authorize a wider store: Load still emits actual.
         function.value_tys[input_id.expect("put input") as usize] = scalar;
         assert_eq!(align_mir::byte_storage::plan(function).slots().count(), 1, "forged table reaches backend check");
-        let error = emit_llvm_ir(&mismatched, BuildTarget::Baseline, false, &[], false).expect_err("actual LLVM width/class must be checked");
+        let error = emit_llvm_ir(&mismatched, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false).expect_err("actual LLVM width/class must be checked");
         assert!(error.contains("byte storage put operand does not match scalar width"), "{actual}/{claimed}: {error}");
     }
 

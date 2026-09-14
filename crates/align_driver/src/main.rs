@@ -98,7 +98,8 @@ fn main() -> ExitCode {
         println!("alignc {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
-    // Pull the instrument-PGO flags FIRST (`--pgo-instrument` / `--pgo-use <file.profdata>`, S1):
+    // Validate original compiler-option spellings before stripping flags. Instrument PGO
+    // (`--pgo-instrument` / `--pgo-use <file.profdata>`, S1) remains
     // mutually exclusive; a bare `--pgo-use` is a hard error. It must run before the other flag
     // strippers so `--pgo-use`'s likely-flag guard sees a following flag (`--thin-lto`, `--profile`,
     // …) still present — otherwise that flag would already be removed and the guard would consume the
@@ -106,6 +107,12 @@ fn main() -> ExitCode {
     let delimiter = raw.iter().position(|arg| arg == "--").unwrap_or(raw.len());
     let compiler_args = &raw[..delimiter];
     let program_suffix = &raw[delimiter..];
+    // A later flag stripper must not turn an option following --target-cpu
+    // into a valid CPU value. Validate its lexical shape on the original prefix.
+    if let Err(error) = parse_target(compiler_args) {
+        eprintln!("alignc: {error}");
+        return ExitCode::FAILURE;
+    }
     // Validate PGO on the original prefix without stripping a token that could be a missing
     // --cc value. The compiler never parses flags in the program suffix.
     if let Err(error) = parse_pgo(compiler_args) {
@@ -135,7 +142,13 @@ fn main() -> ExitCode {
     };
     // Pull the `--target-cpu` flag out before positional parsing (so it may sit anywhere up to the
     // program's own args, and `run` does not forward it to the built program).
-    let (target, args) = parse_target(&args);
+    let (target, args) = match parse_target(&args) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("alignc: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     // Pull `--profile <name>` next (also anywhere before the program's own args). A bad value is a
     // hard error here, not a silent fallback.
     let profile_was_explicit = args
@@ -349,6 +362,15 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Refuse an explicit unknown/wrong-architecture CPU before source, cache or
+    // artifact work. The emitter uses this same resolver for direct callers.
+    if matches!(target, BuildTarget::Cpu(_))
+        && let Err(error) = align_codegen_llvm::resolve_target_identity(&target)
+    {
+        eprintln!("alignc: {error}");
+        return ExitCode::FAILURE;
+    }
+
     // Resolve the codegen worker count once (build verbs only); a bad `ALIGNC_JOBS` fails here.
     let jobs = if build_verb {
         match resolve_jobs(jobs_flag) {
@@ -367,7 +389,8 @@ fn main() -> ExitCode {
         (Some("check-per-unit"), Some(p)) => run_check_per_unit(p),
         (Some("emit-interface"), Some(p)) => run_emit_interface(p),
         (Some("emit-mir"), Some(p)) => run_emit_mir(p),
-        (Some("emit-llvm"), Some(p)) => run_emit_llvm(p, args.get(3..).unwrap_or(&[]), target, &exports, rt_lto),
+        (Some("emit-llvm"), Some(p)) => run_emit_llvm(p, args.get(3..).unwrap_or(&[]), target, profile,
+            &exports, rt_lto),
         // `emit-obj <file> [out.o]` — codegen to an object file, no linking and no `main` required
         // (a library / benchmark kernel). Default output is `<stem>.o`.
         (Some("emit-obj"), Some(p)) => run_emit_obj(p, args.get(3).map(String::as_str), target, profile, &exports, rt_lto),
@@ -383,7 +406,7 @@ fn main() -> ExitCode {
         // (vectorized / not, with the reason), translated into the compiler's diagnostic voice.
         (Some("explain-opt"), Some(p)) => {
             let verbose = args.get(3..).unwrap_or(&[]).iter().any(|a| a == "--verbose" || a == "-v");
-            align_driver::explain::run_explain_opt(p, verbose, target)
+            align_driver::explain::run_explain_opt(p, verbose, target, profile)
         }
         // `fmt <file> [--write]` — format source; prints to stdout, or rewrites in place with --write.
         (Some("fmt"), Some(p)) => run_fmt(p, &args[3..]),
@@ -555,6 +578,32 @@ fn parse_test_limits(args: &[String]) -> Result<(ParsedTestLimits, Vec<String>),
 #[cfg(test)]
 mod test_limit_tests {
     use super::*;
+
+    #[test]
+    fn cpu_selection_rejects_missing_values_before_flag_stripping() {
+        for args in [
+            vec!["alignc", "build", "x.align", "--target-cpu"],
+            vec!["alignc", "--target-cpu="],
+            vec!["alignc", "--target-cpu", "--watch", "native"],
+            vec!["alignc", "--target-cpu", "--profile", "fast"],
+            vec!["alignc", "--target-cpu", ""],
+            vec!["alignc", "--target-cpu=bad\0name"],
+            vec!["alignc", "--target-cpu=", "--target-cpu=native"],
+        ] {
+            assert!(parse_target(&strings(&args)).is_err(), "{args:?}");
+        }
+        let (target, rest) = parse_target(&strings(&[
+            "alignc",
+            "build",
+            "x.align",
+            "--target-cpu=baseline",
+            "--target-cpu",
+            "native",
+        ]))
+        .expect("well-formed explicit target");
+        assert_eq!(target, BuildTarget::Native);
+        assert_eq!(rest, strings(&["alignc", "build", "x.align"]));
+    }
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
@@ -874,7 +923,7 @@ fn check_exports_entry(walk: &PerUnitWalk, exports: &[String], path: &str) -> Op
 
 /// Pull `--target-cpu <baseline|native>` (or `--target-cpu=…`) out of `args`, returning the chosen
 /// target and the remaining (positional) arguments. Default = the portable `Baseline`.
-fn parse_target(args: &[String]) -> (BuildTarget, Vec<String>) {
+fn parse_target(args: &[String]) -> Result<(BuildTarget, Vec<String>), String> {
     // `baseline` / `native` are keywords; anything else is passed to LLVM as a CPU name
     // (`x86-64-v3`, `znver3`, …) — the portable-performance tier for a fleet you control.
     let value = |v: &str| match v {
@@ -888,20 +937,24 @@ fn parse_target(args: &[String]) -> (BuildTarget, Vec<String>) {
     while i < args.len() {
         let a = &args[i];
         if let Some(v) = a.strip_prefix("--target-cpu=") {
+            if v.is_empty() || v.as_bytes().contains(&0) {
+                return Err("--target-cpu requires a nonempty CPU name without NUL".into());
+            }
             target = value(v);
         } else if a == "--target-cpu" {
-            if let Some(v) = args.get(i + 1) {
-                target = value(v);
-                i += 1;
-            } else {
-                eprintln!("alignc: missing value for --target-cpu (expected `baseline` or `native`); using baseline");
+            let v = args.get(i + 1).filter(|v| !v.starts_with('-'))
+                .ok_or_else(|| "--target-cpu requires a CPU name".to_owned())?;
+            if v.is_empty() || v.as_bytes().contains(&0) {
+                return Err("--target-cpu requires a nonempty CPU name without NUL".into());
             }
+            target = value(v);
+            i += 1;
         } else {
             rest.push(a.clone());
         }
         i += 1;
     }
-    (target, rest)
+    Ok((target, rest))
 }
 
 /// Pull `--profile <name>` (or `--profile=…`) out of `args`, returning the chosen profile and the
@@ -1762,9 +1815,10 @@ fn run_emit_mir(path: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_emit_llvm(path: &str, rest: &[String], target: BuildTarget, exports: &[String], rt_lto: bool) -> ExitCode {
+fn run_emit_llvm(path: &str, rest: &[String], target: BuildTarget, profile: Profile,
+    exports: &[String], rt_lto: bool) -> ExitCode {
     // `--stage raw|optimized` picks the lens (default `raw` = today's semantics, the pre-opt IR
-    // codegen emitted). `optimized` runs the `-O2` pipeline first (what LLVM did: inlined, fused,
+    // codegen emitted). `optimized` runs the selected profile first (what LLVM did: inlined, fused,
     // vectorized). Any other value is a hard argument error, not a panic.
     let optimized = match parse_stage(rest) {
         Ok(v) => v,
@@ -1787,7 +1841,8 @@ fn run_emit_llvm(path: &str, rest: &[String], target: BuildTarget, exports: &[St
     let mut out = String::new();
     for unit in &walk.units {
         let unit_exports: &[String] = if unit.is_entry { exports } else { &[] };
-        let ir = match emit_llvm_ir(&unit.mir, target.clone(), optimized, unit_exports, rt_lto) {
+        let ir = match emit_llvm_ir(&unit.mir, target.clone(), profile,
+            optimized, unit_exports, rt_lto) {
             Ok(ir) => ir,
             Err(e) => {
                 eprintln!("alignc: {e}");

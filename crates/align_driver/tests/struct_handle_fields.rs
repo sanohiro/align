@@ -753,7 +753,7 @@ int32_t probe_readonly(int32_t fd) {
         };
         let mut objects = Vec::new();
         for (index, program) in programs.iter().enumerate() {
-            let ir = emit_llvm_ir(program, BuildTarget::Baseline, false, &[], false).expect("LLVM");
+            let ir = emit_llvm_ir(program, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false).expect("LLVM");
             let ir = ir
                 .replace("@align_rt_buffer_free(", "@probe_buffer_free(")
                 .replace("@align_rt_io_writer_free(", "@probe_writer_free(")

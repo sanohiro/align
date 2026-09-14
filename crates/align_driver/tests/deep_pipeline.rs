@@ -174,7 +174,7 @@ fn depth_sweep_preserves_fusion_inlining_vectorization_and_small_stack_survival(
             }
 
             let ir =
-                emit_llvm_ir(&mir, target(), true, &names, false).expect("emit optimized LLVM");
+                emit_llvm_ir(&mir, target(), align_driver::Profile::Release, true, &names, false).expect("emit optimized LLVM");
             for name in &names {
                 let body = llvm_function(&ir, name);
                 for line in body.lines().filter(|line| line.contains(" call ")) {

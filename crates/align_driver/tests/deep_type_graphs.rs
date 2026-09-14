@@ -49,8 +49,8 @@ fn emit_llvm_raw_optimized_and_run(
     );
     let mir = lower_to_mir(&checked.hir);
     let raw =
-        emit_llvm_ir(&mir, BuildTarget::Baseline, false, &[], false).expect("emit raw llvm ir");
-    let optimized = emit_llvm_ir(&mir, BuildTarget::Baseline, true, &[], false)
+        emit_llvm_ir(&mir, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false).expect("emit raw llvm ir");
+    let optimized = emit_llvm_ir(&mir, BuildTarget::Baseline, align_driver::Profile::Release, true, &[], false)
         .expect("emit optimized llvm ir");
 
     let directory = std::env::temp_dir();

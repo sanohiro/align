@@ -103,7 +103,7 @@ fn deep_finite_drop_graph_executes_with_one_helper_frame() {
 
     const DEPTH: usize = 4_096;
     let program = deep_drop_program(DEPTH);
-    let ir = emit_llvm_ir(&program, BuildTarget::Baseline, false, &[], false)
+    let ir = emit_llvm_ir(&program, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false)
         .expect("deep Drop graph must emit raw LLVM");
     let helper_name = format!("__align_drop_struct${}", DEPTH - 1);
     assert_eq!(

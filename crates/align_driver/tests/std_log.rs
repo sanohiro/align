@@ -201,7 +201,7 @@ pub fn main() -> Result<(), Error> {
     );
     let mir =
         align_driver::try_lower_to_mir(&checked.hir).expect("checked logger HIR must validate");
-    let llvm = emit_llvm_ir(&mir, BuildTarget::Baseline, false, &[], false).expect("LLVM IR");
+    let llvm = emit_llvm_ir(&mir, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false).expect("LLVM IR");
     assert!(llvm.contains("call ptr @align_rt_log_new(ptr"));
     assert!(llvm.contains("call i32 @align_rt_log_enabled(ptr"));
     assert!(llvm.contains("call i32 @align_rt_log_line(ptr"));

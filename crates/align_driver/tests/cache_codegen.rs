@@ -694,7 +694,7 @@ fn json_scan_copy_row_mir_and_raw_llvm_identity() {
     let cold_walk = build_per_unit(&mut cold_sm, "main.align", source);
     assert!(!cold_walk.diags.has_errors(), "accepted identity fixture failed to check");
     let cold_mir = program_to_string(&cold_walk.units[0].mir);
-    let cold_llvm = emit_llvm_ir(&cold_walk.units[0].mir, BuildTarget::Baseline, false, &[], false).expect("cold raw LLVM");
+    let cold_llvm = emit_llvm_ir(&cold_walk.units[0].mir, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false).expect("cold raw LLVM");
 
     proj.write("main.align", &commented);
     let hot = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
@@ -703,7 +703,7 @@ fn json_scan_copy_row_mir_and_raw_llvm_identity() {
     let hot_walk = build_per_unit(&mut hot_sm, "main.align", &commented);
     assert!(!hot_walk.diags.has_errors(), "commented identity fixture failed to check");
     let hot_mir = program_to_string(&hot_walk.units[0].mir);
-    let hot_llvm = emit_llvm_ir(&hot_walk.units[0].mir, BuildTarget::Baseline, false, &[], false).expect("hot raw LLVM");
+    let hot_llvm = emit_llvm_ir(&hot_walk.units[0].mir, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false).expect("hot raw LLVM");
     assert_eq!(hot_mir, cold_mir, "accepted Copy-row MIR changed across an irrelevant source edit");
     assert_eq!(hot_llvm, cold_llvm, "accepted Copy-row raw LLVM changed across an irrelevant source edit");
     assert_eq!(std::fs::read(&cold.objs[0]).expect("cold object"), std::fs::read(&hot.objs[0]).expect("hot object"));

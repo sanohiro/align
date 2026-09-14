@@ -403,7 +403,7 @@ fn frame_lowering_uses_the_two_exact_keyed_native_rows() {
     let built = build_per_unit_multi("pkg-frame-llvm", &files, "main.align");
     let frame = built.unit("pkg.frame");
     for optimized in [false, true] {
-        let llvm = emit_llvm_ir(&frame.mir, BuildTarget::Baseline, optimized, &[], false)
+        let llvm = emit_llvm_ir(&frame.mir, BuildTarget::Baseline, align_driver::Profile::Release, optimized, &[], false)
             .expect("pkg.frame LLVM IR");
         assert!(
             llvm.contains("call i32 @align_rt_frame_inner_join_i64_v1(ptr")

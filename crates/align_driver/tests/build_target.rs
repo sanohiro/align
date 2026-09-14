@@ -46,3 +46,28 @@ fn the_native_target_builds_and_runs() {
     // The host CPU build must also be correct (it runs on the machine that built it).
     assert_eq!(build_run_with("bt-native", PROG, BuildTarget::Native), Some(14));
 }
+#[test]
+fn explicit_cpu_names_are_validated_before_emission_or_cache_identity() {
+    if !backend_available() {
+        return;
+    }
+    let wrong_arch = if cfg!(target_arch = "aarch64") {
+        "x86-64-v3"
+    } else {
+        "apple-m1"
+    };
+    for name in ["", "not-an-align-cpu", "native\0suffix", wrong_arch] {
+        let error = align_codegen_llvm::resolve_target_identity(&BuildTarget::Cpu(name.into()))
+            .err()
+            .expect("invalid CPU must be a Rust error, not an LLVM fatal error");
+        assert!(error.to_string().contains("CPU"), "{error}");
+    }
+    let cpu = if cfg!(target_arch = "aarch64") {
+        "cortex-a53"
+    } else {
+        "x86-64-v3"
+    };
+    let resolved = align_codegen_llvm::resolve_target_identity(&BuildTarget::Cpu(cpu.into()))
+        .expect("LLVM's matching CPU inventory must remain available");
+    assert_eq!(resolved.cpu, cpu);
+}

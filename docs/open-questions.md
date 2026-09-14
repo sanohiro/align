@@ -2570,6 +2570,14 @@ memos also explore is recorded in the Future section, "Resource-oriented north s
 inference".)
 
 ### Build targets & portability (cloud / Docker) — SETTLED (2026-06-26)
+
+Explicit CPU selectors reject missing, empty, unknown, embedded-NUL and
+wrong-architecture names before artifact work. LLVM validates names for the
+selected architecture. `emit-llvm` and `explain-opt` use the selected profile's
+pipeline, code-generation level and size attributes; raw IR precedes optimization
+but includes those attributes. `explain-opt` reports per-unit observations with
+runtime LTO off; it does not describe a linked ThinLTO executable.
+
 **Decision: the default build targets a safe, portable, per-architecture baseline; anything more is
 opt-in; wide SIMD on a varied fleet comes from runtime dispatch in the library, not a fixed high
 baseline.** Driven by the real deployment model — cloud VMs and containers are *build-once, run on an

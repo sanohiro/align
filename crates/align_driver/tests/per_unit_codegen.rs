@@ -366,14 +366,14 @@ fn gate_e_rt_lto_inlines_in_non_entry_unit() {
     let per = build_per_unit_multi("ge", &[("hot.align", HOT_E), ("main.align", MAIN_E)], "main.align");
     let hot = per.unit("hot");
     // Off-path: the optimized IR of the NON-entry unit still calls the runtime primitive.
-    let off = emit_llvm_ir(&hot.mir, BuildTarget::Baseline, true, &[], false).expect("emit off");
+    let off = emit_llvm_ir(&hot.mir, BuildTarget::Baseline, align_driver::Profile::Release, true, &[], false).expect("emit off");
     assert!(
         off.contains("call i32 @align_rt_str_eq"),
         "flag-off optimized IR should still call align_rt_str_eq:\n{off}"
     );
     // On-path: `--rt-lto` merges the baked bitcode into THIS unit's raw module, so the primitive
     // inlines and the call is gone — the merge is per-unit (hot loops live in arbitrary units).
-    let on = emit_llvm_ir(&hot.mir, BuildTarget::Baseline, true, &[], true).expect("emit on");
+    let on = emit_llvm_ir(&hot.mir, BuildTarget::Baseline, align_driver::Profile::Release, true, &[], true).expect("emit on");
     assert!(
         !on.contains("call i32 @align_rt_str_eq"),
         "under per-unit --rt-lto align_rt_str_eq must inline in the non-entry unit:\n{on}"

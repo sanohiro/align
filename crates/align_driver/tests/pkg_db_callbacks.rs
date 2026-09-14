@@ -859,7 +859,7 @@ fn sqlite_callback_descriptor_and_trampoline_have_the_exact_generated_llvm_shape
     );
     let per_unit_llvm = common::emit_llvm_ir(
         &built.unit("main").mir,
-        common::BuildTarget::Baseline,
+        common::BuildTarget::Baseline, align_driver::Profile::Release,
         false,
         &[],
         false,
@@ -878,7 +878,7 @@ fn sqlite_callback_descriptor_and_trampoline_have_the_exact_generated_llvm_shape
         .expect("per-unit build contains the SQLite package unit");
     let per_unit_sqlite_llvm = common::emit_llvm_ir(
         &sqlite_unit.mir,
-        common::BuildTarget::Baseline,
+        common::BuildTarget::Baseline, align_driver::Profile::Release,
         false,
         &[],
         false,
@@ -904,7 +904,7 @@ fn sqlite_callback_descriptor_and_trampoline_have_the_exact_generated_llvm_shape
         .expect("fixture retains the target-owned callback effect") = align_sema::FnEffect::Impure;
     let stale_error = common::emit_llvm_ir(
         &stale_effect,
-        common::BuildTarget::Baseline,
+        common::BuildTarget::Baseline, align_driver::Profile::Release,
         false,
         &[],
         false,

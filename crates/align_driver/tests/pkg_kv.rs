@@ -1107,10 +1107,10 @@ fn all_public_function_value_forms_preserve_indirect_cleanup_in_whole_and_per_un
     if !backend_available() {
         return;
     }
-    emit_llvm_ir(&whole, BuildTarget::Baseline, false, &[], false)
+    emit_llvm_ir(&whole, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false)
         .expect("whole-program function-value LLVM emission");
     for unit in &per_unit.units {
-        emit_llvm_ir(&unit.mir, BuildTarget::Baseline, false, &[], false)
+        emit_llvm_ir(&unit.mir, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false)
             .unwrap_or_else(|error| panic!("per-unit LLVM emission for `{}`: {error}", unit.unit));
     }
 }

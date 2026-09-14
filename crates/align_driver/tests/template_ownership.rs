@@ -25,7 +25,7 @@ fn optimized_llvm(src: &str) -> String {
     );
     emit_llvm_ir(
         &lower_to_mir(&checked.hir),
-        BuildTarget::Baseline,
+        BuildTarget::Baseline, align_driver::Profile::Release,
         true,
         &[],
         false,

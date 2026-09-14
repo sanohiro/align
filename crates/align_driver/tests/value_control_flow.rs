@@ -250,7 +250,7 @@ fn function_return_completeness_matrix() {
     .map(str::to_string);
     for (path, program) in [("whole-program", &whole), ("per-unit", &per_entry.mir)] {
         for optimized in [false, true] {
-            let llvm = emit_llvm_ir(program, BuildTarget::Baseline, optimized, &exports, false)
+            let llvm = emit_llvm_ir(program, BuildTarget::Baseline, align_driver::Profile::Release, optimized, &exports, false)
                 .unwrap_or_else(|error| panic!("{path} optimized={optimized}: {error}"));
             for name in &exports {
                 let definition = llvm

@@ -143,7 +143,7 @@ fn raw_and_optimized_whole_and_per_unit_c_signatures_are_exact() {
             .expect("per-unit build has an entry artifact");
         for (path, mir) in [("whole", &whole), ("per-unit", &per_entry.mir)] {
             for optimized in [false, true] {
-                let ir = emit_llvm_ir(mir, BuildTarget::Baseline, optimized, &[], false)
+                let ir = emit_llvm_ir(mir, BuildTarget::Baseline, align_driver::Profile::Release, optimized, &[], false)
                     .unwrap_or_else(|error| panic!("{path} {name} LLVM: {error}"));
                 let c_main = definition_line(&ir, "main");
                 let (prefix, remainder) = c_main.split_once("@main(").expect("main signature");

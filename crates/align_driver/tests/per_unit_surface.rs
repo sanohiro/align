@@ -390,13 +390,13 @@ fn emit_llvm_optimized_leaves_cross_unit_call_opaque() {
     let dep = per.unit("util.math");
     let entry = per.unit("main");
 
-    let dep_ir = emit_llvm_ir(&dep.mir, BuildTarget::Baseline, true, &[], false).expect("dep opt ir");
+    let dep_ir = emit_llvm_ir(&dep.mir, BuildTarget::Baseline, align_driver::Profile::Release, true, &[], false).expect("dep opt ir");
     assert!(
         !dep_ir.contains("call") || !dep_ir.contains(&align_symbol("util.math$sq")),
         "the intra-unit private `sq` must inline into `cube` (no surviving call):\n{dep_ir}"
     );
 
-    let entry_ir = emit_llvm_ir(&entry.mir, BuildTarget::Baseline, true, &[], false).expect("entry opt ir");
+    let entry_ir = emit_llvm_ir(&entry.mir, BuildTarget::Baseline, align_driver::Profile::Release, true, &[], false).expect("entry opt ir");
     assert!(
         entry_ir.contains(&align_symbol("util.math$cube")),
         "the cross-unit `pub` call must stay an opaque call to the extern:\n{entry_ir}"
