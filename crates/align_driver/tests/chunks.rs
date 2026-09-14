@@ -132,3 +132,73 @@ fn chunks_over_a_move_element_array_is_diagnosed() {
         );
     }
 }
+
+#[test]
+fn virtual_sequential_consumer_matrix() {
+    if !backend_available() { return; }
+    let functions = r#"
+fn source() -> array<i64> { print(1); return [1, 2, 3, 4, 5].to_array() }
+fn width() -> i64 { print(2); return 2 }
+fn size_generic<T>(xs: slice<T>) -> i64 = xs.len()
+fn size(xs: slice<i64>) -> i64 = size_generic(xs)
+fn sum(xs: slice<i64>) -> i64 = xs.sum()
+fn positive(x: i64) -> bool { print(x); return x > 0 }
+fn add(a: i64, b: i64) -> i64 = a + b
+fn reduce(xs: slice<i64>, n: i64) -> i64 = xs.chunks(n).map(sum).sum()
+"#;
+    let main = r#"
+fn main() -> Result<(), Error> {
+  xs := [1, 2, 3, 4, 5]
+  print(source().chunks(width()).map(sum).sum())
+  print(reduce(xs, 0))
+  print(reduce(xs, -1))
+  print(reduce(xs, 9223372036854775807))
+  print(xs.chunks(2).map(size).any(positive))
+  print(xs.chunks(2).map(size).all(positive))
+  print(xs.chunks(2).map(sum).to_array().sum())
+  print(xs.chunks(2).map(sum).scan(0, add).sum())
+  print(xs.chunks(2).map(sum).min())
+  print(xs.chunks(2).map(sum).max())
+  print(xs.chunks(2).map(sum).reduce(0, add))
+  print(xs.chunks(2).map(sum).sort()[0])
+  (large, small) := xs.chunks(2).map(sum).partition(fn value { value > 4 })
+  print(large.sum())
+  print(small.sum())
+  return Ok(())
+}
+"#;
+    let src = format!("{functions}{main}");
+    let ir = emit_llvm(&src);
+    assert!(!ir.contains("call ptr @align_rt_chunks"), "{ir}");
+    assert!(!ir.lines().any(|line| line.contains("call ") && line.contains("@align_rt_chunks")), "{ir}");
+    let out = build_and_run("virtual-sequential", &src);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n2\n15\n0\n0\n15\n2\n2\n1\ntrue\n2\n2\n1\ntrue\n15\n28\n3\n7\n15\n3\n12\n3\n");
+    let library = format!("module chunks_lib\n{}", functions.replace("fn ", "pub fn "));
+    let caller = "import chunks_lib\nfn main() -> Result<(), Error> { print(chunks_lib.reduce([1, 2, 3, 4, 5], 2)); return Ok(()) }\n";
+    let unit = build_per_unit_multi("virtual-chunks-units", &[("chunks_lib.align", &library), ("main.align", caller)], "main.align");
+    let out = unit.link_and_run();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "15\n");
+}
+
+#[test]
+fn virtual_chunks_binary_tail_matrix() {
+    if !backend_available() { return; }
+    for (label, terminal, succeeds) in [
+        ("sum", ".map(fn word { word.u32_le(0) }).sum()", false),
+        ("any", ".any(fn word { word.u32_le(0) > 0 })", false),
+        ("all", ".all(fn word { word.u32_le(0) == 0 })", false),
+        ("filtered", ".where(fn word { word.len() == 4 }).map(fn word { word.u32_le(0) }).sum()", true),
+        ("conditional", ".any(fn word { word.len() == 4 && word.u32_le(0) > 0 })", true),
+    ] {
+        let src = format!("fn main() -> Result<(), Error> {{ mut b := buffer(0); b.put_u32_le(1); b.put_u8(9); print(b.bytes().chunks(4){terminal}); return Ok(()) }}\n");
+        let ir = emit_llvm(&src);
+        assert!(!ir.lines().any(|line| line.contains("call ") && line.contains("@align_rt_chunks")), "{ir}");
+        let out = build_and_run(&format!("virtual-tail-{label}"), &src);
+        assert_eq!(out.status.success(), succeeds, "{label}: {}", String::from_utf8_lossy(&out.stderr));
+        if !succeeds {
+            assert!(String::from_utf8_lossy(&out.stderr).contains("out of bounds"));
+        }
+    }
+}

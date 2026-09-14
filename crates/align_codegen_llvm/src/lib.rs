@@ -3868,6 +3868,8 @@ fn build_module<'c>(
             slots: HashMap::new(),
             borrow_mut_cleanup_ptrs: HashMap::new(),
             values: HashMap::new(),
+            byte_storage_plan: align_mir::byte_storage::plan(f),
+            byte_storage: HashMap::new(),
             stack_header_slots: stack_headers.slots,
             stack_header_new_values: stack_headers.new_values,
             stack_header_load_values: stack_headers.load_values,
@@ -7802,6 +7804,9 @@ struct FnGen<'c, 'a> {
     /// logical parameter slots.
     borrow_mut_cleanup_ptrs: HashMap<Slot, inkwell::values::PointerValue<'c>>,
     values: HashMap<ValueId, BasicValueEnum<'c>>,
+    /// Complete bounded byte objects selected by MIR; storage never reaches the native Buffer ABI.
+    byte_storage_plan: align_mir::byte_storage::ByteStoragePlan,
+    byte_storage: HashMap<Slot, inkwell::values::PointerValue<'c>>,
     /// Conservative whole-MIR proof for builder headers whose pointer never leaves its defining
     /// function/local. Each selected local gets one reusable 64-byte entry alloca; new/load value
     /// maps choose the stack init and consuming runtime entry points.
@@ -10378,6 +10383,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
             inst.set_alignment(align).map_err(|e| self.err(e))?;
             self.slots.insert(i as Slot, ptr);
         }
+        // Complete byte objects use their MIR-proved extent and alignment-1 accesses.
+        for (slot, size) in self.byte_storage_plan.slots() {
+            let size = u32::try_from(size).map_err(|_| self.err("byte storage size exceeds u32"))?;
+            let ptr = self.builder.build_alloca(self.ctx.i8_type().array_type(size), &format!("byte_storage_{slot}"))
+                .map_err(|e| self.err(e))?;
+            ptr.as_instruction().ok_or_else(|| self.err("byte storage alloca is not an instruction"))?
+                .set_alignment(1).map_err(|e| self.err(e))?;
+            self.byte_storage.insert(slot, ptr);
+        }
         // Runtime-owned payloads keep their existing representation. Only a proven-nonescaping
         // header uses caller storage: one conservative 64-byte/16-aligned buffer per local, reused
         // across reassignments after the previous header has been consumed or dropped.
@@ -10768,6 +10782,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .map_err(|e| self.err(e))?;
                 }
                 Stmt::Drop(slot) => {
+                    if self.byte_storage_plan.contains(*slot) { continue; }
                     let ty = self.f.slots[*slot as usize];
                     if ty == Ty::Builder {
                         // An unfinished builder: free the builder object (null-safe — a moved-out
@@ -11121,9 +11136,74 @@ impl<'c, 'a> FnGen<'c, 'a> {
         Ok(())
     }
 
+    /// Lower only the complete object proof selected by MIR; no stack pointer reaches Buffer ABI.
+    #[inline(never)]
+    fn gen_byte_storage_rvalue(&mut self, id: ValueId, rv: &Rvalue) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
+        if let Some(slot) = self.byte_storage_plan.constructor(id) {
+            return self.byte_storage.get(&slot).copied().map(|ptr| Some(ptr.into()))
+                .ok_or_else(|| self.err("missing proven byte storage"));
+        }
+        if let Some(length) = self.byte_storage_plan.length(id) {
+            let length = u64::try_from(length).map_err(|_| self.err("byte length exceeds u64"))?;
+            let len = self.ctx.i64_type().const_int(length, false);
+            return match rv {
+                Rvalue::BufferLen(_) => Ok(Some(len.into())),
+                Rvalue::BufferBytes(buffer) => {
+                    let ptr = self.operand(buffer)?;
+                    let view = self.builder.build_insert_value(slice_struct_type(self.ctx).get_poison(), ptr, 0, "byte.view.ptr")
+                        .map_err(|e| self.err(e))?;
+                    let view = self.builder.build_insert_value(view, len, 1, "byte.view")
+                        .map_err(|e| self.err(e))?;
+                    Ok(Some(view.into_struct_value().into()))
+                }
+                _ => Err(self.err("invalid byte storage length proof")),
+            };
+        }
+        let offset = self.byte_storage_plan.write_offset(id).ok_or_else(|| self.err("missing byte write proof"))?;
+        let offset = u64::try_from(offset).map_err(|_| self.err("byte offset exceeds u64"))?;
+        let buffer = match rv {
+            Rvalue::BufferPut { buffer, .. } | Rvalue::BufferAppend { buffer, .. } => buffer,
+            _ => return Err(self.err("invalid byte storage write proof")),
+        };
+        let ptr = self.operand(buffer)?.into_pointer_value();
+        let addr = unsafe { self.builder.build_gep(self.ctx.i8_type(), ptr,
+            &[self.ctx.i64_type().const_int(offset, false)], "byte.write.addr").map_err(|e| self.err(e))? };
+        match rv {
+            Rvalue::BufferPut { value, scalar, be, .. } => {
+                let input = self.operand(value)?;
+                let mut bits = if matches!(scalar, Ty::Float(_)) {
+                    let ty = match scalar {
+                        Ty::Float(FloatTy { bits: 32 }) => self.ctx.i32_type(),
+                        Ty::Float(FloatTy { bits: 64 }) => self.ctx.i64_type(),
+                        _ => return Err(self.err("invalid byte storage float width")),
+                    };
+                    self.builder.build_bit_cast(input, ty, "byte.write.bits").map_err(|e| self.err(e))?.into_int_value()
+                } else { input.into_int_value() };
+                if *be && bits.get_type().get_bit_width() > 8 {
+                    bits = self.call_intrinsic("llvm.bswap", &[bits.get_type().into()], &[bits.into()])?.into_int_value();
+                }
+                self.builder.build_store(addr, bits).map_err(|e| self.err(e))?
+                    .set_alignment(1).map_err(|e| self.err(e))?;
+            }
+            Rvalue::BufferAppend { data, .. } => {
+                let (src, len) = self.split_str(data)?;
+                self.builder.build_memcpy(addr, 1, src.into_pointer_value(), 1, len.into_int_value())
+                    .map_err(|e| self.err(e))?;
+            }
+            _ => return Err(self.err("invalid byte storage operation")),
+        }
+        Ok(None)
+    }
+
     /// Lower an rvalue. Returns `None` for a value-less result (a void call).
     /// `result_ty` is the type of the value being defined (needed to build a bare `None`).
     fn gen_rvalue(&mut self, result_id: ValueId, rv: &Rvalue, result_ty: Ty) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
+        if self.byte_storage_plan.constructor(result_id).is_some()
+            || self.byte_storage_plan.write_offset(result_id).is_some()
+            || self.byte_storage_plan.length(result_id).is_some()
+        {
+            return self.gen_byte_storage_rvalue(result_id, rv);
+        }
         let v: BasicValueEnum<'c> = match rv {
             Rvalue::Use(op) => self.operand_by_value(op)?,
             Rvalue::Load(slot) => {

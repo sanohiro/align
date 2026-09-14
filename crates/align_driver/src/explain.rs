@@ -460,7 +460,7 @@ fn plan_explanation(strategy: PlanStrategy, reason: PlanReason) -> &'static str 
             "the current explicit-parallel consumer reads an owned header array"
         }
         (_, PlanReason::PipelineConsumer) => {
-            "the current synchronous pipeline consumer reads an owned header array"
+            "the direct synchronous pipeline consumer derives borrowed chunk views in its loop"
         }
         (_, PlanReason::StoredOrBoundary) => {
             "the chunks value crosses a stored, returned, call, or control-flow boundary"
@@ -726,7 +726,7 @@ mod tests {
             (PlanKind::Chunks, PlanState::Selected, PlanStrategy::VirtualIndex, PlanReason::DirectIndex, "chunks", "selected", "virtual-index", "the direct index consumer needs only one borrowed subview"),
             (PlanKind::Chunks, PlanState::Selected, PlanStrategy::VirtualRangeViews, PlanReason::ParallelConsumer, "chunks", "selected", "virtual-range-views", "the direct explicit-parallel consumer derives borrowed chunk views in its range kernel"),
             (PlanKind::Chunks, PlanState::Selected, PlanStrategy::MaterializedHeaders, PlanReason::ParallelConsumer, "chunks", "selected", "materialized-headers", "the current explicit-parallel consumer reads an owned header array"),
-            (PlanKind::Chunks, PlanState::Selected, PlanStrategy::MaterializedHeaders, PlanReason::PipelineConsumer, "chunks", "selected", "materialized-headers", "the current synchronous pipeline consumer reads an owned header array"),
+            (PlanKind::Chunks, PlanState::Selected, PlanStrategy::VirtualRangeViews, PlanReason::PipelineConsumer, "chunks", "selected", "virtual-range-views", "the direct synchronous pipeline consumer derives borrowed chunk views in its loop"),
             (PlanKind::Chunks, PlanState::Selected, PlanStrategy::MaterializedHeaders, PlanReason::StoredOrBoundary, "chunks", "selected", "materialized-headers", "the chunks value crosses a stored, returned, call, or control-flow boundary"),
             (PlanKind::BufferDonation, PlanState::NotApplicable, PlanStrategy::ArenaOutput, PlanReason::ArenaOwnedOutput, "buffer-donation", "not-applicable", "arena-output", "the output is arena-owned, so source-buffer reuse does not apply"),
             (PlanKind::BufferDonation, PlanState::NotApplicable, PlanStrategy::FreshOutput, PlanReason::UnsupportedSourceOrStageShape, "buffer-donation", "not-applicable", "fresh-output", "this source or stage shape cannot reuse the source buffer"),

@@ -229,3 +229,140 @@ pub fn main() -> Result<(), Error> {
     let errs = check_diagnostics("a2-put-mismatch", prog);
     assert!(errs.contains("expects a u32") || errs.contains("u32"), "diagnostics: {errs}");
 }
+
+#[test]
+fn bounded_byte_object_numeric_matrix() {
+    if !backend_available() { return; }
+    let mut src = String::new();
+    let mut calls = String::new();
+    let mut expected = String::new();
+    for (index, (ty, val, want)) in [
+        ("u16", "4660", "13330"), ("i16", "-2", "-257"),
+        ("u32", "305419896", "2018915346"), ("i32", "-2", "-16777217"),
+        ("u64", "72623859790382856", "578437695752307201"),
+        ("i64", "-2", "-72057594037927937"),
+    ].into_iter().enumerate() {
+        for endian in ["le", "be"] {
+            let opposite = if endian == "le" { "be" } else { "le" };
+            let name = format!("word_{index}_{endian}");
+            // The prefix forces unaligned, mixed-width storage. The opposite-endian read is
+            // checked against an independent byte-reversal oracle, not a same-codec round trip.
+            src.push_str(&format!("fn {name}(x: {ty}) -> {ty} {{\n mut b := buffer(0)\n b.put_u8(7)\n b.put_{ty}_{endian}(x)\n return b.bytes().{ty}_{opposite}(1)\n}}\n"));
+            calls.push_str(&format!(" print({name}({val}))\n"));
+            expected.push_str(&format!("{want}\n"));
+        }
+    }
+    for (ty, input) in [("i8", "-2"), ("u8", "254")] {
+        src.push_str(&format!("fn byte_{ty}(x: {ty}) -> {ty} {{ mut b := buffer(1); b.put_{ty}(x); return b.bytes().{ty}(0) }}\n"));
+        calls.push_str(&format!(" print(byte_{ty}({input}))\n"));
+        expected.push_str(&format!("{input}\n"));
+    }
+    for bits in [32, 64] {
+        src.push_str(&format!("fn float_{bits}(x: u{bits}) -> u{bits} {{\n mut a := buffer(0)\n a.put_u{bits}_be(x)\n number := a.bytes().f{bits}_be(0)\n mut b := buffer(0)\n b.put_f{bits}_le(number)\n return b.bytes().u{bits}_le(0)\n}}\n"));
+        let patterns: &[u64] = if bits == 32 { &[0, 0x80000000, 0x7f800000, 0xff800000, 0x7fc01234, 0x7f801234] }
+            else { &[0, 0x8000000000000000, 0x7ff0000000000000, 0xfff0000000000000, 0x7ff8000000001234, 0x7ff0000000001234] };
+        for pattern in patterns {
+            calls.push_str(&format!(" print(float_{bits}({pattern}))\n"));
+            let printed = i64::from_ne_bytes(pattern.to_ne_bytes());
+            expected.push_str(&format!("{printed}\n"));
+        }
+    }
+    let ir = emit_llvm(&src);
+    assert!(!ir.contains("call ptr @align_rt_buffer_new"), "{ir}");
+    assert!(!ir.contains("call void @align_rt_buffer_free"), "{ir}");
+    src.push_str(&format!("fn main() -> Result<(), Error> {{\n{calls} return Ok(())\n}}\n"));
+    let out = build_and_run("bounded-byte-numeric", &src);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+}
+
+#[test]
+fn bounded_byte_object_control_matrix() {
+    if !backend_available() { return; }
+    let functions = r#"
+fn bits(x: f32) -> u32 {
+  mut b := buffer(4)
+  b.put_f32_le(x)
+  return b.bytes().u32_le(0)
+}
+fn branch(flag: bool) -> u32 {
+  mut b := buffer(0)
+  if flag { b.put_u32_le(7) } else { b.put_u32_be(9) }
+  return b.bytes().u32_le(0)
+}
+fn repeated(n: i64) -> u64 {
+  mut i := 0
+  mut total: u64 := 0
+  loop {
+    if i >= n { break }
+    mut b := buffer(8)
+    b.put_u64_le(i as u64)
+    total = total + b.bytes().u64_le(0)
+    i = i + 1
+  }
+  return total
+}
+fn literal() -> u16 {
+  mut b := buffer(0)
+  b.append("AB")
+  return b.bytes().u16_be(0)
+}
+"#;
+    let ir = emit_llvm_with_exports(functions, &["bits", "branch", "repeated", "literal"]);
+    assert!(!ir.contains("call ptr @align_rt_buffer_new"), "{ir}");
+    assert!(!ir.contains("call void @align_rt_buffer_free"), "{ir}");
+    let optimized = emit_llvm_optimized("fn bits(x: f32) -> u32 { mut b := buffer(4); b.put_f32_le(x); return b.bytes().u32_le(0) }\n", &["bits"]);
+    assert!(optimized.contains("bitcast float"), "{optimized}");
+    assert!(!optimized.contains("call "), "{optimized}");
+    let main = "fn main() -> Result<(), Error> { print(bits(1.5)); print(branch(true)); print(branch(false)); print(repeated(5)); print(literal()); return Ok(()) }\n";
+    let out = build_and_run("bounded-byte-control", &format!("{functions}{main}"));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1069547520\n7\n150994944\n10\n16706\n");
+    // Interface transport imports the scalar helper, never a trusted storage-selection record.
+    let library = format!("module codec\n{}", functions.replace("fn ", "pub fn "));
+    let caller = main.replace("bits(", "codec.bits(").replace("branch(", "codec.branch(")
+        .replace("repeated(", "codec.repeated(").replace("literal(", "codec.literal(");
+    let caller = format!("import codec\n{caller}");
+    let unit = build_per_unit_multi("bounded-byte-units", &[("codec.align", &library), ("main.align", &caller)], "main.align");
+    let objects = unit.emit_objects_with(Profile::Dev, false);
+    let refs: Vec<_> = objects.iter().map(|path| path.as_path()).collect();
+    let exe = unit.dir.join("codec-dev");
+    link_objects(&align_driver::CDriver::default(), &refs, &exe, &unit.link_libs_union(), Profile::Dev).expect("link dev");
+    let output = unit.dir.join("codec-dev.stdout");
+    let stdout = std::fs::File::create(&output).expect("create dev stdout");
+    struct Running(std::process::Child);
+    impl Drop for Running {
+        fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+    }
+    let mut child = Running(std::process::Command::new(&exe).stdout(stdout).spawn().expect("spawn dev"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        assert!(std::time::Instant::now() < deadline, "dev child exceeded deadline");
+        match child.0.try_wait() {
+            Ok(Some(status)) => { assert!(status.success()); break; }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => panic!("poll dev child: {error}"),
+        }
+    }
+    assert_eq!(std::fs::read_to_string(output).expect("read dev stdout"), "1069547520\n7\n150994944\n10\n16706\n");
+    let out = unit.link_and_run();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1069547520\n7\n150994944\n10\n16706\n");
+
+    for (offset, success) in [(0, true), (-1, false), (1, false), (i64::MAX, false)] {
+        let src = format!("fn read(off: i64) -> u32 {{ mut b := buffer(4); b.put_u32_le(7); return b.bytes().u32_le(off) }}\nfn main() -> i32 {{ print(read({offset})); return 0 }}\n");
+        let out = build_and_run(&format!("bounded-read-{offset}"), &src);
+        assert_eq!(out.status.success(), success);
+        if !success { assert!(String::from_utf8_lossy(&out.stderr).contains("out of bounds")); }
+    }
+    for (label, body) in [
+        ("large", "mut b := buffer(65); b.put_u32_le(x); return b.bytes().u32_le(0)"),
+        ("dynamic", "mut b := buffer(x as i64); b.put_u32_le(x); return b.bytes().u32_le(0)"),
+        ("mixed", "mut b := buffer(0); if x > 0 { b.put_u8(1) }; b.put_u32_le(x); return b.bytes().u32_le(0)"),
+        ("escape", "mut b := buffer(4); b.put_u32_le(x); return consume(b.bytes())"),
+    ] {
+        let ir = emit_llvm_with_exports(&format!("fn consume(xs: slice<u8>) -> u32 = xs.u32_le(0)\nfn f(x: u32) -> u32 {{ {body} }}\n"), &["f"]);
+        assert!(ir.contains("call ptr @align_rt_buffer_new"), "{label}: {ir}");
+    }
+}

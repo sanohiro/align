@@ -427,8 +427,8 @@ diagnostic.
 Every `ArrayChunks` HIR expression whose lowering reaches and consumes its
 representation decision produces exactly one record. A source, chunk-size, or
 enclosing eager operand that terminates before that point produces no record.
-Direct length, direct index, and the selected stage-free explicit-parallel form
-are the complete virtual set; every other reached use constructs the existing
+Direct length, direct index, direct synchronous pipelines, and the selected
+stage-free explicit-parallel form are the complete virtual set; every other reached use constructs the existing
 owned `array<slice<T>>` header array.
 
 | State | Strategy | Reason | Exact condition and rendered explanation |
@@ -437,7 +437,7 @@ owned `array<slice<T>>` header array.
 | `Selected` | `virtual-index` | `direct-index` | Direct receiver of one index: “the direct index consumer needs only one borrowed subview” |
 | `Selected` | `virtual-range-views` | `parallel-consumer` | Immediate, stage-free source of a selected range-kernel `par_map`, including direct `par_map(...).sum()`: “the direct explicit-parallel consumer derives borrowed chunk views in its range kernel” |
 | `Selected` | `materialized-headers` | `parallel-consumer` | Any other immediate source of `par_map`, including a rejected sequential fallback or an admitted prior stage: “this explicit-parallel form still reads an owned header array” |
-| `Selected` | `materialized-headers` | `pipeline-consumer` | Immediate source of any other synchronous pipeline stage or terminal: “the current synchronous pipeline consumer reads an owned header array” |
+| `Selected` | `virtual-range-views` | `pipeline-consumer` | Immediate source of any other synchronous pipeline stage or terminal: “the direct synchronous pipeline consumer derives borrowed chunk views in its loop” |
 | `Selected` | `materialized-headers` | `stored-or-boundary` | Every remaining use, including binding, return, call argument, control-flow value, or aggregate storage: “the chunks value crosses a stored, returned, call, or control-flow boundary” |
 
 Consumer-reason precedence is the table order. `direct-len` and `direct-index`
@@ -445,8 +445,8 @@ are recognized before descending into the child and therefore never emit a
 materialization row. For an immediate `par_map`, its existing form selector
 runs before chunks lowering. Only a selected range form with no prior stage
 chooses `virtual-range-views`; every rejected, sequential, or staged form keeps
-`materialized-headers`. For other materialized expressions,
-`pipeline-consumer` precedes `stored-or-boundary`. The chunks decision returned
+`materialized-headers`. Other direct synchronous pipelines select virtual range
+views before the `stored-or-boundary` fallback. The chunks decision returned
 by this table drives both representation and reporting; no consumer repairs a
 published row.
 

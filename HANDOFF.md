@@ -1,5 +1,11 @@
 # Session handoff
 
+**Decode representation costs:** [plan 62](docs/impl/62-decode-optimization-plan.md)
+implements bounded nonescaping byte storage and direct synchronous chunks
+iteration without header arrays. Existing APIs and range failures remain.
+Apple Silicon/Metal consumer timing and pin adoption remain external; the plan
+records local x86-64 measurements and AArch64 instruction inspection.
+
 **R84–R88 client admission and composition:**
 [Plan 58](docs/impl/58-r84-r88-client-batch-plan.md) implements shared
 `Option<command>` observation, borrowed optional JSON encoding, source-ordered
