@@ -149,6 +149,24 @@ fn arm_generic_and_apple_cpu_select_neon_instructions() {
     }
 }
 
+// Mach-O's default disassembler can prefer the section alias `ltmp0` over
+// the exported function. Its explicit Mach-O mode emits bare named labels.
+fn sampler_disassembly(assembly: &str) -> Option<&str> {
+    ["<select>:", "<_select>:", "\n_select:", "\nselect:"]
+        .into_iter().find_map(|label| assembly.split_once(label).map(|(_, body)| body))
+}
+
+#[test]
+fn sampler_disassembly_accepts_named_elf_and_macho_labels_only() {
+    for header in ["0000 <select>:", "0000 <_select>:", "_select:", "select:"] {
+        let text = format!("file/section\n{header}\nbody\n");
+        assert_eq!(sampler_disassembly(&text), Some("\nbody\n"), "{header}");
+    }
+    for text in ["file\n0000 <ltmp0>:\nbody", "file\n_other:\nbody", "call _select"] {
+        assert!(sampler_disassembly(text).is_none(), "must identify the named function: {text}");
+    }
+}
+
 #[test]
 fn composed_sampler_native_cpu_controls_preserve_scalar_policy_without_byte_traps() {
     if !backend_available() || !objdump_available() { return; }
@@ -172,10 +190,13 @@ fn composed_sampler_native_cpu_controls_preserve_scalar_policy_without_byte_trap
         let guard = Proj { dir, entry: String::new() };
         let obj = guard.dir.join("sampler.o");
         emit_object_file(&mir, &obj, target, Profile::Release, &["select".into()], false).expect("sampler object");
-        let output = std::process::Command::new("objdump").arg("-dr").arg(&obj).output().expect("disassemble");
+        let mut command = std::process::Command::new("objdump");
+        if cfg!(target_os = "macos") { command.arg("--macho"); }
+        let output = command.arg("-dr").arg(&obj).output().expect("disassemble");
         assert!(output.status.success());
         let assembly = String::from_utf8_lossy(&output.stdout);
-        let function = assembly.split("<select>:").nth(1).or_else(|| assembly.split("<_select>:").nth(1)).expect("native sampler symbol");
+        let function = sampler_disassembly(&assembly)
+            .unwrap_or_else(|| panic!("native sampler symbol for {cpu}: {assembly}"));
         assert!(!function.contains("align_rt_range_fail"), "{cpu}: {function}");
         assert!(function.contains("align_rt_bounds_fail"), "{cpu}: {function}");
         if cfg!(target_arch = "aarch64") {
