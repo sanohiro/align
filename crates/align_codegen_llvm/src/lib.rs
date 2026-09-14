@@ -3026,6 +3026,31 @@ fn build_module<'c>(
     rt_lto_skip_guarded: bool,
     scope: ModuleScope<'_>,
 ) -> Result<RuntimeDeclarations, CodegenError> {
+    match scope {
+        ModuleScope::Whole | ModuleScope::Test { .. } => validate_tagged_program(program)?,
+        ModuleScope::Function { .. } => validate_partition_tagged_program(program)?,
+    }
+    validate_resource_program(program)?;
+    validate_resource_rvalues(program)?;
+    validate_slice_index_rvalues(program)?;
+    validate_fixed_element_nulling(program)?;
+    let defined = program.fns.iter().filter(|f| scope.defines(f))
+        .map(|f| f.name.clone()).collect();
+    let prepared = align_mir::byte_prepare::prepare(program, &defined);
+    lower_prepared_module(ctx, module, &prepared, tm, debug, exports, rt_lto_skip_guarded, scope)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_prepared_module<'c>(
+    ctx: &'c Context,
+    module: &Module<'c>,
+    program: &Program,
+    tm: &TargetMachine,
+    debug: Option<&DebugInfo>,
+    exports: &[String],
+    rt_lto_skip_guarded: bool,
+    scope: ModuleScope<'_>,
+) -> Result<RuntimeDeclarations, CodegenError> {
     runtime_abi::validate_registry().map_err(CodegenError::Lowering)?;
     match scope {
         ModuleScope::Whole | ModuleScope::Test { .. } => validate_tagged_program(program)?,

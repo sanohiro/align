@@ -148,3 +148,62 @@ fn arm_generic_and_apple_cpu_select_neon_instructions() {
         assert!(assembly.contains(".2d"), "{cpu} must use NEON i64 lanes: {assembly}");
     }
 }
+
+// Mach-O's default disassembler can prefer the section alias `ltmp0` over
+// the exported function. Its explicit Mach-O mode emits bare named labels.
+fn sampler_disassembly(assembly: &str) -> Option<&str> {
+    ["<select>:", "<_select>:", "\n_select:", "\nselect:"]
+        .into_iter().find_map(|label| assembly.split_once(label).map(|(_, body)| body))
+}
+
+#[test]
+fn sampler_disassembly_accepts_named_elf_and_macho_labels_only() {
+    for header in ["0000 <select>:", "0000 <_select>:", "_select:", "select:"] {
+        let text = format!("file/section\n{header}\nbody\n");
+        assert_eq!(sampler_disassembly(&text), Some("\nbody\n"), "{header}");
+    }
+    for text in ["file\n0000 <ltmp0>:\nbody", "file\n_other:\nbody", "call _select"] {
+        assert!(sampler_disassembly(text).is_none(), "must identify the named function: {text}");
+    }
+}
+
+#[test]
+fn composed_sampler_native_cpu_controls_preserve_scalar_policy_without_byte_traps() {
+    if !backend_available() || !objdump_available() { return; }
+    let cpus: &[&str] = if cfg!(target_arch = "aarch64") { &["generic", "apple-m1"] }
+        else if cfg!(target_arch = "x86_64") { &["x86-64-v2", "x86-64-v3"] }
+        else { return; };
+    let source = fixture("crates/align_driver/tests/fixtures/composed_sampler.align");
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "composed-native", source);
+    assert!(!checked.diags.has_errors(), "{}", align_driver::format_diagnostics(&sm, &checked.diags));
+    let mir = lower_to_mir(&checked.hir);
+    for cpu in cpus {
+        let target = BuildTarget::Cpu((*cpu).to_string());
+        let ir = align_driver::emit_llvm_ir(&mir, target.clone(), Profile::Release, true, &["select".into()], false).unwrap();
+        let function = ir.split("@select(").nth(1).expect("exported sampler").split("\n}").next().unwrap();
+        assert_eq!(function.lines().filter(|line| line.contains("load ptr, ptr %0,")).count(), 1, "{cpu}: {function}");
+        assert!(!function.contains("@align_rt_range_fail"), "{cpu}: logits loop retains a trap");
+        assert!(function.contains("@align_rt_bounds_fail"), "{cpu}: candidate bounds remain");
+        let dir = std::env::temp_dir().join(format!("align-composed-isa-{}-{cpu}", std::process::id()));
+        std::fs::create_dir(&dir).expect("exclusively acquire object directory");
+        let guard = Proj { dir, entry: String::new() };
+        let obj = guard.dir.join("sampler.o");
+        emit_object_file(&mir, &obj, target, Profile::Release, &["select".into()], false).expect("sampler object");
+        let mut command = std::process::Command::new("objdump");
+        if cfg!(target_os = "macos") { command.arg("--macho"); }
+        let output = command.arg("-dr").arg(&obj).output().expect("disassemble");
+        assert!(output.status.success());
+        let assembly = String::from_utf8_lossy(&output.stdout);
+        let function = sampler_disassembly(&assembly)
+            .unwrap_or_else(|| panic!("native sampler symbol for {cpu}: {assembly}"));
+        assert!(!function.contains("align_rt_range_fail"), "{cpu}: {function}");
+        assert!(function.contains("align_rt_bounds_fail"), "{cpu}: {function}");
+        if cfg!(target_arch = "aarch64") {
+            assert!(function.contains("fcvt"), "{cpu}: explicit f32 to f64 conversion remains");
+        } else {
+            assert!(function.contains("cvtss2sd"), "{cpu}: explicit f32 to f64 conversion remains");
+            if *cpu == "x86-64-v2" { assert!(!function.contains("ymm"), "portable x86 reverse control"); }
+        }
+    }
+}

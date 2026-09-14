@@ -1,0 +1,158 @@
+// Frozen from sanohiro/align-llm src/runtime/sampler.align at
+// 8a890d169f40fe030c05635a280d3c52fdbf6370 (PR 247). Only the module declaration
+// is omitted so the owner can append an executable harness.
+
+// R8-OLMOE-RUNTIME-SAMPLING (`docs/specs/r8-olmoe-runtime-sampling.md`). This module owns the
+// fixed policy selected by item 51. It is deliberately not a configurable sampler framework: the
+// only consumer evidence is for this exact chain and temperature.
+TOP_K := 40
+TOP_P := 0.95
+MIN_P := 0.05
+TEMPERATURE := 0.3
+WEIGHT_SCALE := 1000000000
+E := 2.718281828459045
+
+pub Selection {
+  token_id: i64,
+  top_k_count: i64,
+  top_p_count: i64,
+  min_p_count: i64,
+  top_token_id: i64,
+}
+
+fn finite_f32(borrow logits: slice<u8>, offset: i64) -> bool {
+  bits := logits.u32_le(offset)
+  return (bits & 2139095040) != 2139095040
+}
+
+// Stable descending insertion keeps candidate identity paired with its F32 logit. Equal logits are
+// ordered by ascending token id so neither the target nor the categorical intervals depend on an
+// implementation-specific sort.
+pub fn select(borrow logits: slice<u8>, borrow mut random: rng) -> Result<Selection, Error> {
+  if logits.len() < 4 || logits.len() % 4 != 0 { return Err(Error.Invalid) }
+  token_count := logits.len() / 4
+  mut ids_builder: array_builder<i64> := array_builder()
+  mut values_builder: array_builder<f64> := array_builder()
+  mut slot := 0
+  loop {
+    if slot >= TOP_K { break }
+    ids_builder.push(-1)
+    values_builder.push(0.0)
+    slot = slot + 1
+  }
+  mut ids := ids_builder.build()
+  mut values := values_builder.build()
+  mut count := 0
+  mut token := 0
+  mut threshold := -1.0e38
+  mut threshold_id := 9223372036854775807
+  loop {
+    if token >= token_count { break }
+    offset := token * 4
+    if !finite_f32(logits, offset) { return Err(Error.Invalid) }
+    value := logits.f32_le(offset) as f64
+    admit := count < TOP_K || value > threshold || (value == threshold && token < threshold_id)
+    if admit {
+      mut insertion := count
+      mut at := 0
+      loop {
+        if at >= count { break }
+        if value > values[at] || (value == values[at] && token < ids[at]) {
+          insertion = at
+          break
+        }
+        at = at + 1
+      }
+      if insertion < TOP_K {
+        if count < TOP_K { count = count + 1 }
+        mut move_at := count - 1
+        loop {
+          if move_at <= insertion { break }
+          ids[move_at] = ids[move_at - 1]
+          values[move_at] = values[move_at - 1]
+          move_at = move_at - 1
+        }
+        ids[insertion] = token
+        values[insertion] = value
+        if count == TOP_K {
+          threshold = values[TOP_K - 1]
+          threshold_id = ids[TOP_K - 1]
+        }
+      }
+    }
+    token = token + 1
+  }
+  if count < 1 { return Err(Error.Invalid) }
+
+  maximum := values[0]
+  mut raw_builder: array_builder<f64> := array_builder()
+  mut raw_total := 0.0
+  mut raw_at := 0
+  loop {
+    if raw_at >= count { break }
+    weight := E.pow(values[raw_at] - maximum)
+    raw_builder.push(weight)
+    raw_total = raw_total + weight
+    raw_at = raw_at + 1
+  }
+  raw := raw_builder.build()
+  if raw_total <= 0.0 { return Err(Error.Invalid) }
+
+  mut top_p_count := count
+  mut cumulative := 0.0
+  mut p_at := 0
+  loop {
+    if p_at >= count { break }
+    cumulative = cumulative + raw[p_at]
+    if cumulative >= raw_total * TOP_P {
+      top_p_count = p_at + 1
+      break
+    }
+    p_at = p_at + 1
+  }
+
+  mut min_p_count := 1
+  mut min_at := 1
+  loop {
+    if min_at >= top_p_count { break }
+    if raw[min_at] < raw[0] * MIN_P { break }
+    min_p_count = min_p_count + 1
+    min_at = min_at + 1
+  }
+
+  mut quantized_builder: array_builder<i64> := array_builder()
+  mut total_weight := 0
+  mut weight_at := 0
+  loop {
+    if weight_at >= min_p_count { break }
+    relative := E.pow((values[weight_at] - maximum) / TEMPERATURE)
+    quantized := (relative * (WEIGHT_SCALE as f64)).round() as i64
+    if quantized < 1 { return Err(Error.Invalid) }
+    quantized_builder.push(quantized)
+    total_weight = total_weight + quantized
+    weight_at = weight_at + 1
+  }
+  weights := quantized_builder.build()
+  if total_weight < 1 { return Err(Error.Invalid) }
+
+  draw := random.range(0, total_weight)
+  mut selected := ids[min_p_count - 1]
+  mut drawn_weight := 0
+  mut draw_at := 0
+  loop {
+    if draw_at >= min_p_count { break }
+    drawn_weight = drawn_weight + weights[draw_at]
+    if draw < drawn_weight {
+      selected = ids[draw_at]
+      break
+    }
+    draw_at = draw_at + 1
+  }
+  return Ok(Selection {
+      token_id: selected,
+      top_k_count: count,
+      top_p_count: top_p_count,
+      min_p_count: min_p_count,
+      top_token_id: ids[0],
+    })
+}

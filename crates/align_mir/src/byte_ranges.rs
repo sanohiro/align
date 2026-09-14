@@ -4,7 +4,7 @@
 use crate::{
     BlockId, Const, DirectCall, Function, Operand, RuntimeKey, Rvalue, Slot, Stmt, Term, ValueId,
 };
-use align_ast::{BinOp, ParamMode};
+use align_ast::BinOp;
 use align_sema::{IntTy, Scalar, Ty};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -36,12 +36,7 @@ struct Facts<'a> {
 
 impl<'a> Facts<'a> {
     fn new(f: &'a Function) -> Option<Self> {
-        if f.blocks.get(f.entry as usize).is_none()
-            || f.param_modes.len() != f.params.len()
-            || f.param_modes
-                .iter()
-                .any(|mode| !matches!(mode, ParamMode::ByValue | ParamMode::Borrow))
-        {
+        if f.blocks.get(f.entry as usize).is_none() || f.param_modes.len() != f.params.len() {
             return None;
         }
         let mut facts = Self {
@@ -67,32 +62,22 @@ impl<'a> Facts<'a> {
                             .push((block.id, position, op));
                     }
                     Stmt::Let(id, rv) => {
-                        f.value_tys.get(*id as usize)?;
+                        let ty = f.value_tys.get(*id as usize)?;
+                        if let Rvalue::Load(slot) = rv
+                            && f.slots.get(*slot as usize) != Some(ty)
+                        {
+                            return None;
+                        }
                         if facts.defs.insert(*id, (block.id, position, rv)).is_some() {
                             return None;
                         }
-                        match rv {
-                            Rvalue::Load(_)
-                            | Rvalue::Use(_)
-                            | Rvalue::SliceLen(_)
-                            | Rvalue::Bin(..)
-                            | Rvalue::Un(..)
-                            | Rvalue::Cast { .. }
-                            | Rvalue::BytesRead { .. } => {}
-                            Rvalue::Call(
-                                DirectCall::Runtime(RuntimeKey::RangeFail | RuntimeKey::BoundsFail),
-                                _,
-                            ) => {}
-                            // In particular no opaque effects or hidden place writes.
-                            _ => return None,
-                        }
                     }
-                    _ => return None,
+                    _ => {}
                 }
             }
         }
-        // Every incoming descriptor is bound exactly once, to its own argument.
-        // Borrow parameters therefore cannot be overwritten through an alias.
+        // Incoming descriptors are bound once. The candidate effect proof below
+        // separately rejects indirect writes; binding alone does not exclude aliases.
         for (arg, slot) in f.params.iter().enumerate() {
             let stores = facts.stores.get(slot)?;
             if stores.len() != 1
@@ -105,8 +90,49 @@ impl<'a> Facts<'a> {
         Some(facts)
     }
 
-    fn rv(&self, op: &Operand) -> Option<&'a Rvalue> {
-        let Operand::Value(id) = op else {
+    fn resolved(&self, mut op: &'a Operand) -> Option<&'a Operand> {
+        let mut seen = BTreeSet::new();
+        loop {
+            let Operand::Value(id) = op else {
+                return Some(op);
+            };
+            if !seen.insert(*id) {
+                return None;
+            }
+            let (block, position, rv) = self.defs.get(id)?;
+            match rv {
+                Rvalue::Use(next)
+                    if self.definition_precedes(next, *block, *position)
+                        && self.ty(op) == self.ty(next) =>
+                {
+                    op = next
+                }
+                Rvalue::Load(slot) if !self.f.params.contains(slot) => {
+                    let Some(stores) = self.stores.get(slot) else {
+                        return Some(op);
+                    };
+                    let [(owner, at, value)] = stores.as_slice() else {
+                        return Some(op);
+                    };
+                    if (if owner == block {
+                        at < position
+                    } else {
+                        self.dominates(*owner, *block)
+                    }) && self.definition_precedes(value, *owner, *at)
+                        && self.ty(op) == self.ty(value)
+                    {
+                        op = value;
+                    } else {
+                        return Some(op);
+                    }
+                }
+                _ => return Some(op),
+            }
+        }
+    }
+
+    fn rv(&self, op: &'a Operand) -> Option<&'a Rvalue> {
+        let Operand::Value(id) = self.resolved(op)? else {
             return None;
         };
         self.defs.get(id).map(|(_, _, rv)| *rv)
@@ -120,21 +146,21 @@ impl<'a> Facts<'a> {
         }
     }
 
-    fn load(&self, op: &Operand, ty: Ty) -> Option<Slot> {
+    fn load(&self, op: &'a Operand, ty: Ty) -> Option<Slot> {
         let Rvalue::Load(slot) = self.rv(op)? else {
             return None;
         };
         (self.ty(op) == Some(ty) && self.f.slots.get(*slot as usize) == Some(&ty)).then_some(*slot)
     }
 
-    fn bin(&self, op: &Operand, kind: BinOp) -> Option<(&'a Operand, &'a Operand)> {
+    fn bin(&self, op: &'a Operand, kind: BinOp) -> Option<(&'a Operand, &'a Operand)> {
         let Rvalue::Bin(actual, left, right) = self.rv(op)? else {
             return None;
         };
         (*actual == kind).then_some((left, right))
     }
 
-    fn length(&self, op: &Operand) -> Option<Slot> {
+    fn length(&self, op: &'a Operand) -> Option<Slot> {
         let Rvalue::SliceLen(source) = self.rv(op)? else {
             return None;
         };
@@ -143,10 +169,20 @@ impl<'a> Facts<'a> {
         }
         let slot = self.load(source, bytes())?;
         // Only a stable incoming byte view is admitted in this capability.
-        self.f.params.contains(&slot).then_some(slot)
+        self.f
+            .params
+            .iter()
+            .position(|s| *s == slot)
+            .filter(|arg| {
+                matches!(
+                    self.f.param_modes[*arg],
+                    align_ast::ParamMode::ByValue | align_ast::ParamMode::Borrow
+                )
+            })
+            .map(|_| slot)
     }
 
-    fn limit(&self, op: &Operand, width: i128) -> Option<Slot> {
+    fn limit(&self, op: &'a Operand, width: i128) -> Option<Slot> {
         let (length, divisor) = self.bin(op, BinOp::Div)?;
         if self.ty(op) != Some(integer()) || !literal(divisor, width) {
             return None;
@@ -217,8 +253,9 @@ impl<'a> Facts<'a> {
         }
     }
 
-    fn expression_precedes(&self, operand: &Operand, block: BlockId, position: usize) -> bool {
+    fn expression_precedes(&self, operand: &'a Operand, block: BlockId, position: usize) -> bool {
         let mut pending = vec![(operand, block, position)];
+        let mut visited = BTreeSet::new();
         while let Some((op, owner, before)) = pending.pop() {
             if !self.definition_precedes(op, owner, before) {
                 return false;
@@ -227,8 +264,24 @@ impl<'a> Facts<'a> {
                 let Some((block, index, rv)) = self.defs.get(id) else {
                     return false;
                 };
+                if !visited.insert((*id, owner, before)) {
+                    continue;
+                }
                 match rv {
                     Rvalue::Load(slot) => {
+                        if !self.f.params.contains(slot)
+                            && let Some(stores) = self.stores.get(slot)
+                            && let [(bound, at, value)] = stores.as_slice()
+                        {
+                            if if *bound == *block {
+                                *at >= *index
+                            } else {
+                                !self.dominates(*bound, *block)
+                            } {
+                                return false;
+                            }
+                            pending.push((value, *bound, *at));
+                        }
                         if self.f.params.contains(slot) {
                             let Some(stores) = self.stores.get(slot) else {
                                 return false;
@@ -311,12 +364,98 @@ impl<'a> Facts<'a> {
         if !matches!(self.f.blocks[step.0 as usize].term, Term::Goto(target) if target == header) {
             return false;
         }
+        if self.f.blocks.iter().any(|block| {
+            block.id != step.0
+                && self.dominates(header, block.id)
+                && successors(&block.term).contains(&header)
+        }) {
+            return false;
+        }
         if step.0 != read && self.reachable(step.0, read, Some(header)) {
             return false;
         }
         // No initialization or step may intervene between admission and a read.
         // For a read in the step block, the caller checks its statement position.
         !self.reachable(admitted, initial.0, Some(header))
+    }
+
+    fn fresh(&self, op: &'a Operand) -> bool {
+        let mut current = op;
+        let mut seen = BTreeSet::new();
+        loop {
+            let Some(resolved) = self.resolved(current) else {
+                return false;
+            };
+            let Operand::Value(id) = resolved else {
+                return false;
+            };
+            if !seen.insert(*id) {
+                return false;
+            }
+            match self.defs.get(id).map(|(_, _, rv)| *rv) {
+                Some(Rvalue::ArrayBuilderNew {
+                    elem: Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char,
+                    region: None,
+                }) => {
+                    return true;
+                }
+                Some(Rvalue::ArrayBuilderBuild { builder }) => current = builder,
+                Some(Rvalue::SlicePtr(source)) => current = source,
+                _ => return false,
+            }
+        }
+    }
+
+    // Check the complete prefix, including loop re-entry. Unknown effects on a
+    // path that can reach this use invalidate the proof; post-scan effects do not.
+    // Fresh owned arrays are disjoint from incoming descriptors and byte owners.
+    fn effects_safe_until(&self, target: BlockId) -> bool {
+        for block in &self.f.blocks {
+            if !self.reachable(self.f.entry, block.id, None)
+                || !self.reachable(block.id, target, None)
+            {
+                continue;
+            }
+            for stmt in &block.stmts {
+                let safe = match stmt {
+                    Stmt::Store(slot, operand) => {
+                        !self.f.params.contains(slot)
+                            || matches!(operand, Operand::Arg(arg) if self.f.params.get(*arg as usize) == Some(slot))
+                    }
+                    Stmt::DropFlagInit(slot) => !self.f.params.contains(slot),
+                    Stmt::PtrStore(ptr, _, _) => self.fresh(ptr),
+                    Stmt::Let(_, rv) => match rv {
+                        Rvalue::Load(_)
+                        | Rvalue::Use(_)
+                        | Rvalue::Un(..)
+                        | Rvalue::Bin(..)
+                        | Rvalue::Cast { .. }
+                        | Rvalue::SliceLen(_)
+                        | Rvalue::SlicePtr(_)
+                        | Rvalue::SliceIndex(..)
+                        | Rvalue::BytesRead { .. } => true,
+                        Rvalue::ArrayBuilderNew { region: None, .. } => true,
+                        Rvalue::ArrayBuilderPush {
+                            builder, scalar, ..
+                        } => {
+                            self.fresh(builder)
+                                && matches!(scalar, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char)
+                        }
+                        Rvalue::ArrayBuilderBuild { builder } => self.fresh(builder),
+                        Rvalue::Call(
+                            DirectCall::Runtime(RuntimeKey::RangeFail | RuntimeKey::BoundsFail),
+                            _,
+                        ) => true,
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if !safe {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     fn safe_guard(&self, block: BlockId) -> Option<BlockId> {
@@ -365,10 +504,14 @@ impl<'a> Facts<'a> {
             return None;
         }
         let slot = self.load(index, integer())?;
-        if !self.defined_in(index, block) {
+        let Operand::Value(index_id) = self.resolved(index)? else {
+            return None;
+        };
+        let (index_block, _, _) = self.defs.get(index_id)?;
+        let source = self.length(length)?;
+        if !self.effects_safe_until(block) {
             return None;
         }
-        let source = self.length(length)?;
         // The actual read must agree with all three checked operands and width.
         let mut read_position = None;
         for (position, statement) in self.f.blocks[*ok as usize].stmts.iter().enumerate() {
@@ -426,6 +569,12 @@ impl<'a> Facts<'a> {
                 || self.limit(limit, width) != Some(source)
                 || !self.arm_dominates(header.id, take_true, block)
                 || !self.dominates(header.id, block)
+                || !self.arm_dominates(header.id, take_true, *index_block)
+                || self.stores.get(&slot)?.iter().any(|(owner, _, value)| {
+                    !literal(value, 0)
+                        && *index_block != block
+                        && self.reachable(*owner, block, Some(*index_block))
+                })
                 || !self.recurrence(slot, header.id, take_true, admitted, *ok)
             {
                 continue;
@@ -444,7 +593,7 @@ impl<'a> Facts<'a> {
     }
 }
 
-fn successors(term: &Term) -> Vec<BlockId> {
+pub(crate) fn successors(term: &Term) -> Vec<BlockId> {
     match term {
         Term::Goto(target) => vec![*target],
         Term::Branch(_, yes, no) => vec![*yes, *no],
@@ -452,8 +601,72 @@ fn successors(term: &Term) -> Vec<BlockId> {
     }
 }
 
-/// Restrict this first recurrence proof to scalar/read-only bodies. Rewriting a
-/// proven branch retains its statements, trap block, IDs and source coordinates;
+pub(crate) fn structurally_valid(function: &Function) -> bool {
+    Facts::new(function).is_some()
+}
+
+/// Reuse a descriptor only at a previously reached dominating load. This is a
+/// Copy aggregate snapshot, not a backing-byte load and not an ABI attribute.
+pub(crate) fn snapshot_descriptors(function: &mut Function) {
+    let edits = {
+        let Some(facts) = Facts::new(function) else {
+            return;
+        };
+        let mut edits = Vec::new();
+        for (arg, slot) in function.params.iter().enumerate() {
+            if function.slots.get(*slot as usize) != Some(&bytes())
+                || !matches!(
+                    function.param_modes[arg],
+                    align_ast::ParamMode::Borrow | align_ast::ParamMode::ByValue
+                )
+            {
+                continue;
+            }
+            let loads: Vec<_> = facts
+                .defs
+                .iter()
+                .filter_map(|(id, (block, at, rv))| {
+                    (matches!(rv, Rvalue::Load(source) if source == slot)
+                        && function.value_tys.get(*id as usize) == Some(&bytes())
+                        && facts.stores.get(slot).is_some_and(|stores| {
+                            stores.first().is_some_and(|(owner, position, _)| {
+                                if owner == block {
+                                    position < at
+                                } else {
+                                    facts.dominates(*owner, *block)
+                                }
+                            })
+                        }))
+                    .then_some((*id, *block, *at))
+                })
+                .collect();
+            for (id, block, at) in &loads {
+                if !facts.effects_safe_until(*block) {
+                    continue;
+                }
+                if let Some((source, _, _)) = loads.iter().find(|(other, before, position)| {
+                    other != id
+                        && (if before == block {
+                            position < at
+                        } else {
+                            facts.dominates(*before, *block)
+                        })
+                }) {
+                    edits.push((*block, *at, *source));
+                }
+            }
+        }
+        edits
+    };
+    for (block, at, source) in edits {
+        if let Stmt::Let(_, rv) = &mut function.blocks[block as usize].stmts[at] {
+            *rv = Rvalue::Use(Operand::Value(source));
+        }
+    }
+}
+
+/// Prove byte recurrences against the effects that can reach each use. Rewriting
+/// a proven branch retains statements, trap blocks, IDs and source coordinates;
 /// there is no hoisted trap, speculative load or unchecked-load IR extension.
 pub fn simplify(function: &mut Function) {
     if !function

@@ -21,6 +21,7 @@ use std::rc::Rc;
 
 pub mod byte_storage;
 pub mod byte_ranges;
+pub mod byte_prepare;
 mod canonical_graph;
 mod generated_id;
 mod json_encode;

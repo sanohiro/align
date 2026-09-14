@@ -617,3 +617,296 @@ fn byte_range_malformed_and_invalidated_proofs_fail_closed() {
         assert_eq!(reached_byte_guards(&bad), 1, "mutation {mutation}");
     }
 }
+
+fn composed_sampler() -> &'static str { fixture("crates/align_driver/tests/fixtures/composed_sampler.align") }
+
+fn composed_program(source: &str) -> align_mir::Program {
+    let mut map = SourceMap::new();
+    let checked = check(&mut map, "composed-byte-owner", source);
+    assert!(!checked.diags.has_errors(), "{}", align_driver::format_diagnostics(&map, &checked.diags));
+    lower_to_mir(&checked.hir)
+}
+
+#[test]
+fn composed_byte_sampler_exposes_both_guards_without_changing_cached_mir() {
+    let sampler = composed_sampler();
+    use align_mir::{DirectCall, Rvalue, Stmt};
+    let original = composed_program(sampler);
+    let before = format!("{original:?}");
+    let defined = original.fns.iter().map(|f| f.name.clone()).collect();
+    let prepared = align_mir::byte_prepare::prepare(&original, &defined);
+    let select = prepared.fns.iter().find(|f| f.name.as_str() == "select").expect("sampler");
+    assert_eq!(reached_byte_guards(select), 0);
+    let descriptor_loads = select.blocks.iter().flat_map(|b| &b.stmts).filter(|s|
+        matches!(s, Stmt::Let(_, Rvalue::Load(slot)) if *slot == select.params[0])).count();
+    assert_eq!(descriptor_loads, 1, "one reached descriptor snapshot");
+    assert!(!select.blocks.iter().flat_map(|b| &b.stmts).any(|s|
+        matches!(s, Stmt::Let(_, Rvalue::Call(DirectCall::Program(name), _)) if name.as_str() == "finite_f32")));
+    assert_eq!(format!("{original:?}"), before);
+    let partition = [select.name.clone()].into_iter().collect();
+    let function_only = align_mir::byte_prepare::prepare(&original, &partition);
+    let select = function_only.fns.iter().find(|f| f.name.as_str() == "select").expect("partition");
+    assert!(select.blocks.iter().flat_map(|b| &b.stmts).any(|s|
+        matches!(s, Stmt::Let(_, Rvalue::Call(DirectCall::Program(name), _)) if name.as_str() == "finite_f32")));
+    assert!(reached_byte_guards(select) > 0, "opaque peer invalidates loop effects");
+    assert_eq!(format!("{original:?}"), before, "Whole then Function uses immutable input");
+    if backend_available() {
+        let optimized = emit_llvm_optimized(sampler, &["select"]);
+        assert!(!optimized.contains("call void @align_rt_range_fail"), "{optimized}");
+        assert!(optimized.contains("fpext float"), "source f64 policy remains");
+        assert!(optimized.contains("call void @align_rt_bounds_fail"), "candidate-array checks remain");
+    }
+}
+
+#[test]
+fn composed_byte_proofs_accept_named_copies_and_ignore_post_loop_effects() {
+    for (label, params, bound, read, after, helper) in [
+        ("post", "", "src.len() / 4", "src.u32_le(i * 4)", "mut b: array_builder<u32> := array_builder(); b.push(result); a := b.build(); return a[0]", ""),
+        ("mut", ", borrow mut other: i64", "src.len() / 4", "src.u32_le(i * 4)", "return result", ""),
+        ("named", "", "n", "src.u32_le(offset)", "return result", ""),
+        ("leaf", "", "n", "read(src, offset)", "return result", "fn read<T>(borrow s: slice<u8>, offset: T) -> u32 { return s.u32_le(offset as i64) }"),
+    ] {
+        let helper = helper.replace("<T>", "").replace("offset: T", "offset: i64").replace("offset as i64", "offset");
+        let source = format!("{helper}\nfn sum(borrow src: slice<u8>{params}) -> u32 {{ n := src.len() / 4; mut result: u32 := 0; mut i := 0; loop {{ if i >= {bound} {{ break }}; offset := i * 4; result = result + {read}; i = i + 1 }}; {after} }}\n");
+        let original = composed_program(&source);
+        let defined = original.fns.iter().map(|f| f.name.clone()).collect();
+        let prepared = align_mir::byte_prepare::prepare(&original, &defined);
+        let function = prepared.fns.iter().find(|f| f.name.as_str() == "sum").expect("sum");
+        assert_eq!(reached_byte_guards(function), 0, "{label}");
+    }
+}
+
+#[test]
+fn composed_sampler_matches_checked_execution_and_rng_advancement() {
+    let sampler = composed_sampler();
+    if !backend_available() { return; }
+    // Adding zero is semantically neutral but outside this MIR recurrence's
+    // accepted scaled-index grammar. The reference retains its reached guards.
+    let reference = sampler[sampler.find("fn finite_f32").expect("reader")..]
+        .replace("finite_f32", "reference_finite")
+        .replace("pub fn select", "fn reference_select")
+        .replace("offset := token * 4", "offset := token * 4 + 0");
+    let ref_mir = composed_program(&format!("{}\n{reference}", &sampler[..sampler.find("fn finite_f32").unwrap()]));
+    let defined = ref_mir.fns.iter().map(|f| f.name.clone()).collect();
+    let prepared = align_mir::byte_prepare::prepare(&ref_mir, &defined);
+    assert!(reached_byte_guards(prepared.fns.iter().find(|f| f.name.as_str() == "reference_select").unwrap()) >= 2);
+    let harness = r#"
+fn compare(bytes: slice<u8>, seed: i64) -> bool {
+  mut actual_rng := rand.seed_with(seed)
+  mut reference_rng := rand.seed_with(seed)
+  actual := actual_select(bytes, actual_rng)
+  reference := reference_select(bytes, reference_rng)
+  same := match actual {
+    Ok(a) => match reference {
+      Ok(b) => a.token_id == b.token_id && a.top_k_count == b.top_k_count && a.top_p_count == b.top_p_count && a.min_p_count == b.min_p_count && a.top_token_id == b.top_token_id,
+      Err(_) => false,
+    },
+    Err(_) => match reference { Ok(_) => false, Err(_) => true },
+  }
+  return same && actual_rng.next() == reference_rng.next()
+}
+fn main() {
+  mut all := true
+  mut mode := 0
+  loop {
+    if mode >= 9 { break }
+    mut n := 0
+    loop {
+      if n > 81 { break }
+      mut b := buffer(0)
+      b.put_u8(0)
+      mut i := 0
+      loop {
+        if i >= n { break }
+        value: f32 := if mode == 0 { i as f32 } else {
+          if mode == 1 { (n - i) as f32 } else {
+          if mode == 2 { 0.0 } else {
+          if mode == 3 { (i % 3) as f32 } else {
+          if mode == 4 { ((i * 7919 + 17) % 43) as f32 } else {
+          if mode == 5 { -0.0 } else {
+          if mode == 6 { 3.4028234e38 } else {
+          if mode == 7 { -3.4028234e38 } else { (i % 7 - 3) as f32 }
+          } } } } } } }
+        b.put_f32_le(value)
+        i = i + 1
+      }
+      bytes := b.bytes()
+      all = all && compare(bytes[1..bytes.len()], 991 + n)
+      n = n + 1
+    }
+    mode = mode + 1
+  }
+  mut bad_at := 0
+  loop {
+    if bad_at >= 41 { break }
+    mut kind := 0
+    loop {
+      if kind >= 3 { break }
+      mut bad := buffer(0)
+      mut i := 0
+      loop {
+        if i >= 41 { break }
+        bits: u32 := if i == bad_at { if kind == 0 { 2139095040 } else { if kind == 1 { 4286578688 } else { 2143289344 } } } else { 1065353216 }
+        bad.put_u32_le(bits)
+        i = i + 1
+      }
+      all = all && compare(bad.bytes(), 7)
+      kind = kind + 1
+    }
+    bad_at = bad_at + 1
+  }
+  mut short := buffer(0)
+  mut tail := 0
+  loop {
+    if tail > 7 { break }
+    all = all && compare(short.bytes(), 19)
+    short.put_u8(0)
+    tail = tail + 1
+  }
+  print(all)
+}
+"#;
+    let actual = sampler.replace("pub fn select", "fn actual_select");
+    let source = format!("import std.rand\n{actual}\n{reference}\n{harness}");
+    let output = build_and_run("composed-sampler-oracle", &source);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "true\n");
+}
+
+#[test]
+fn composed_byte_effects_and_reaching_definitions_fail_closed() {
+    for (label, extra, prefix, middle, bound, offset) in [
+        ("mutable-call", "fn touch(borrow mut x: i64) { x = x + 1 }", "", "touch(i);", "src.len() / 4", "i * 4"),
+        ("unknown-prefix", "fn observe(borrow x: slice<u8>) -> i64 = x.len()", "unused := observe(src);", "", "src.len() / 4", "i * 4"),
+        ("bound-replace", "", "", "n = n + 1;", "n", "i * 4"),
+        ("inclusive", "", "", "", "src.len() / 4 + 1", "i * 4"),
+        ("wrong-step", "", "", "i = i + 1;", "src.len() / 4", "i * 4"),
+        ("overflow-offset", "", "", "", "src.len() / 4", "i * 4 + 9223372036854775807"),
+        ("stale-offset", "", "offset_before := i * 4;", "", "src.len() / 4", "offset_before"),
+    ] {
+        let source = format!("{extra}\nfn sum(borrow src: slice<u8>) -> u32 {{ mut n := src.len() / 4; mut result: u32 := 0; mut i := 0; {prefix} loop {{ if i >= {bound} {{ break }}; {middle} result = result + src.u32_le({offset}); i = i + 1 }}; return result }}\n");
+        let original = composed_program(&source);
+        let defined = original.fns.iter().map(|f| f.name.clone()).collect();
+        let prepared = align_mir::byte_prepare::prepare(&original, &defined);
+        let function = prepared.fns.iter().find(|f| f.name.as_str() == "sum").unwrap();
+        assert!(reached_byte_guards(function) > 0, "{label}");
+    }
+}
+
+#[test]
+fn composed_leaf_exposure_covers_generics_returns_and_has_bounded_growth() {
+    use align_mir::{DirectCall, Rvalue, Stmt};
+    let source = "fn read<T>(unused: T, borrow src: slice<u8>, offset: i64) -> u32 { if offset < 0 { return 0 }; return src.u32_le(offset) }\nfn sum(borrow src: slice<u8>) -> u32 { n := src.len() / 4; mut result: u32 := 0; mut i := 0; loop { if i >= n { break }; result = result + read(true, src, i * 4); i = i + 1 }; return result }\n";
+    let program = composed_program(source);
+    let defined = program.fns.iter().map(|f| f.name.clone()).collect();
+    let prepared = align_mir::byte_prepare::prepare(&program, &defined);
+    assert_eq!(reached_byte_guards(prepared.fns.iter().find(|f| f.name.as_str() == "sum").unwrap()), 0);
+    let mut source = String::from("fn read(borrow src: slice<u8>) -> u32 = src.u32_le(0)\nfn many(borrow src: slice<u8>) -> u32 { mut total: u32 := 0;\n");
+    for _ in 0..40 { source.push_str("total = total + read(src);\n"); }
+    source.push_str("return total }\n");
+    let program = composed_program(&source);
+    let defined = program.fns.iter().map(|f| f.name.clone()).collect();
+    let prepared = align_mir::byte_prepare::prepare(&program, &defined);
+    let many = prepared.fns.iter().find(|f| f.name.as_str() == "many").unwrap();
+    assert_eq!(many.blocks.iter().flat_map(|b| &b.stmts).filter(|s|
+        matches!(s, Stmt::Let(_, Rvalue::Call(DirectCall::Program(name), _)) if name.as_str() == "read")).count(), 8);
+    if backend_available() {
+        let out = build_and_run("composed-leaf-cap", &format!("{source}\nfn main() {{ mut b := buffer(4); b.put_u32_le(3); bytes := b.bytes(); print(many(bytes)) }}"));
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "120\n");
+    }
+}
+
+#[test]
+fn composed_reader_per_unit_and_thin_cache_bind_private_body_edits() {
+    if !backend_available() { return; }
+    let dir = std::env::temp_dir().join(format!("align-composed-cache-{}", std::process::id()));
+    std::fs::create_dir(&dir).expect("exclusively acquire cache owner directory");
+    let project = Proj { dir, entry: "main.align".into() };
+    let library = "module scan\nfn read(borrow src: slice<u8>, off: i64) -> u32 = src.u32_le(off) + 0\npub fn sum(borrow src: slice<u8>) -> u32 { mut total: u32 := 0; n := src.len() / 4; mut i := 0; loop { if i >= n { break }; total = total + read(src, i * 4); i = i + 1 }; return total }\n";
+    let main = "import scan\nfn main() { mut b := buffer(4); b.put_u32_le(7); bytes := b.bytes(); print(scan.sum(bytes)) }\n";
+    project.write("scan.align", library);
+    project.write("main.align", main);
+    let entry = project.dir.join("main.align");
+    let mut map = SourceMap::new();
+    let walk = build_per_unit(&mut map, &entry.display().to_string(), main);
+    assert!(!walk.diags.has_errors(), "{}", align_driver::format_diagnostics(&map, &walk.diags));
+    let scan = walk.units.iter().find(|u| u.unit == "scan").expect("scan unit");
+    let defined = scan.mir.fns.iter().map(|f| f.name.clone()).collect();
+    let prepared = align_mir::byte_prepare::prepare(&scan.mir, &defined);
+    assert!(prepared.fns.iter().any(|f| f.name.as_str().ends_with("sum") && reached_byte_guards(f) == 0));
+    let cache = project.cache();
+    for (round, source, expected, warm) in [
+        ("cold", library.to_string(), "7\n", false),
+        ("warm", library.to_string(), "7\n", true),
+        ("edit", library.replace("+ 0", "+ 1"), "8\n", false),
+        ("revert", library.to_string(), "7\n", true),
+    ] {
+        project.write("scan.align", &source);
+        let built = thin_build(&project, &cache, 2);
+        assert_eq!(built.prelink("scan").hit, warm, "{round}: private body cache identity");
+        assert_eq!(built.run(&project), expected, "{round}");
+    }
+}
+
+#[test]
+fn composed_leaf_malformed_and_effectful_candidates_remain_calls() {
+    use align_mir::{DirectCall, Operand, Rvalue, Stmt, Term};
+    let source = "fn read(borrow src: slice<u8>, offset: i64) -> u32 = src.u32_le(offset)\nfn caller(borrow src: slice<u8>) -> u32 = read(src, 0)\n";
+    let original = composed_program(source);
+    for mutation in 0..7 {
+        let mut program = original.clone();
+        let leaf = program.fns.iter_mut().find(|f| f.name.as_str() == "read").unwrap();
+        match mutation {
+            0 => leaf.blocks[0].term = Term::Goto(0),
+            1 => leaf.blocks[0].term = Term::Goto(u32::MAX),
+            2 => { let duplicate = leaf.blocks[0].stmts[2].clone(); leaf.blocks[0].stmts.push(duplicate); },
+            3 => leaf.blocks[0].stmts.push(Stmt::Drop(0)),
+            4 => leaf.blocks[0].stmts.push(Stmt::Store(0, Operand::Arg(0))),
+            5 => {
+                let Stmt::Let(_, rv) = &mut leaf.blocks[0].stmts[2] else { panic!("descriptor load") };
+                *rv = Rvalue::Load(u32::MAX);
+            }
+            6 => {
+                let caller = program.fns.iter_mut().find(|f| f.name.as_str() == "caller").unwrap();
+                for block in &mut caller.blocks {
+                    for stmt in &mut block.stmts {
+                        if let Stmt::Let(_, Rvalue::Call(DirectCall::Program(_), args)) = stmt { args.clear(); }
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+        let defined = program.fns.iter().map(|f| f.name.clone()).collect();
+        let prepared = align_mir::byte_prepare::prepare(&program, &defined);
+        let caller = prepared.fns.iter().find(|f| f.name.as_str() == "caller").unwrap();
+        assert!(caller.blocks.iter().flat_map(|b| &b.stmts).any(|s|
+            matches!(s, Stmt::Let(_, Rvalue::Call(DirectCall::Program(name), _)) if name.as_str() == "read")), "mutation {mutation}");
+    }
+}
+
+#[test]
+fn composed_leaf_arguments_execute_once_and_keep_early_returns() {
+    if !backend_available() { return; }
+    let source = r#"
+fn tick(borrow mut n: i64) -> i64 { n = n + 1; return n }
+fn read(borrow src: slice<u8>, first: i64, second: i64) -> u32 {
+  if first < 0 { return 99 }
+  return src.u32_le(0) + (first * 10 + second) as u32
+}
+fn main() {
+  mut empty := buffer(0)
+  none := empty.bytes()
+  print(read(none, -1, 0))
+  mut b := buffer(4)
+  b.put_u32_le(3)
+  bytes := b.bytes()
+  mut n := 0
+  print(read(bytes, tick(n), tick(n)))
+  print(n)
+}
+"#;
+    let output = build_and_run("composed-leaf-order", source);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "99\n15\n2\n");
+}
