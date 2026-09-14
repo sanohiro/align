@@ -6,13 +6,14 @@ Plan [62](../../docs/impl/62-decode-optimization-plan.md) owns the measured scop
 
 Compile `kernels.align` with both compiler revisions, using identical target,
 profile and runtime-LTO flags. Export `bits_roundtrip`, `byte_max`, `typed_max`,
-`heap_control` and `fresh_sum`. Link both against the **same production** runtime
-archive. Example Linux commands (substitute compiler and runtime paths):
+`heap_control`, `fresh_sum`, `call_roundtrip`, `byte_loop`, `byte_words_sum` and
+`typed_words_sum`. Link both against the **same production** runtime archive. Example Linux commands (substitute compiler and runtime paths):
 
 ```bash
 alignc emit-obj bench/decode_storage/kernels.align kernels.o --no-rt-lto \
   --export bits_roundtrip --export byte_max --export typed_max \
-  --export heap_control --export fresh_sum
+  --export heap_control --export fresh_sum --export call_roundtrip --export byte_loop \
+  --export byte_words_sum --export typed_words_sum
 cc -O2 bench/decode_storage/main.c kernels.o target/release/libalign_runtime.a \
   -Wl,--gc-sections -lpthread -ldl -lm -lssl -lcrypto -lz -lzstd -o decode-time
 ./decode-time 0 0 2000000
@@ -20,10 +21,17 @@ cc -O2 bench/decode_storage/main.c kernels.o target/release/libalign_runtime.a \
 ./decode-time 2 50000 1000
 ./decode-time 3 0 2000000
 ./decode-time 4 0 1000000
+./decode-time 5 0 2000000
+./decode-time 6 50000 1000
+./decode-time 7 50000 1000
+./decode-time 8 50000 1000
 ```
 
 Modes: 0 = 4-byte conversion, 1 = byte-chunk max, 2 = typed max control,
-3 = forced heap conversion (65-byte capacity), 4 = fresh owned source/chunk sum.
+3 = forced heap conversion (65-byte capacity), 4 = fresh owned source/chunk sum,
+5 = conversion through a local borrowed-byte reader, 6 = the explicit byte max
+loop, 7 = byte-word wrapping sum, 8 = typed-word sum control. Mode 5 owns plan 63's
+local-call allocation claim; compare against revision `0e236129`.
 Max modes also accept sizes 0/1/39/40/41. Compare checksums before interpreting
 times. Use five or more fresh processes per point and report medians; timing
 has no universal pass threshold. Baseline revision is
@@ -46,3 +54,9 @@ not portable). Include Metal command completion/readback, unchanged sampling
 and output publication in a separate end-to-end measurement. Keep model,
 vocabulary, k, logits, seed, compiler revision and CPU target fixed. The Linux
 reference speed ratios cannot predict that end-to-end result.
+
+Plan 63 section 11 records the issue-1043 comparison, including the adverse
+typed-control result and the follow-up with byte-identical control objects
+linked first. Keep whole-module and layout-isolated evidence separate; a change
+in code placement can move a control even when its instruction sequence is
+unchanged. Native CPU selection is tuning, not a universal fastest-mode promise.

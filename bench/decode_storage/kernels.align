@@ -47,3 +47,23 @@ pub fn heap_control(x: f32) -> u32 {
 }
 fn fresh() -> array<i64> = [1, 2, 3, 4, 5].to_array()
 pub fn fresh_sum() -> i64 = fresh().chunks(2).map(fn part { part.sum() }).sum()
+
+fn read_bits(borrow bytes: slice<u8>) -> u32 = bytes.u32_le(0)
+pub fn call_roundtrip(x: f32) -> u32 {
+  mut b := buffer(4)
+  b.put_f32_le(x)
+  bytes := b.bytes()
+  return read_bits(bytes)
+}
+pub fn byte_words_sum(src: slice<u8>) -> u32 {
+  if src.len() % 4 != 0 { return 0 }
+  mut result: u32 := 0
+  mut i := 0
+  loop {
+    if i >= src.len() / 4 { break }
+    result = result + src.u32_le(i * 4)
+    i = i + 1
+  }
+  return result
+}
+pub fn typed_words_sum(src: slice<u32>) -> u32 = src.sum()

@@ -20,6 +20,7 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 pub mod byte_storage;
+pub mod byte_ranges;
 mod canonical_graph;
 mod generated_id;
 mod json_encode;
@@ -3369,7 +3370,7 @@ fn lower_program_checked_with_catalog(
         }
         None => (None, plan_catalog.is_some()),
     };
-    let mir = lower_program_unchecked_with_plans(
+    let mut mir = lower_program_unchecked_with_plans(
         program,
         lines,
         plan_resolver,
@@ -3382,6 +3383,9 @@ fn lower_program_checked_with_catalog(
         || (mir.structs.is_empty() && !program.structs.is_empty())
     {
         return Err(rejected(ValidationPass::LoweringProducedNothing, None));
+    }
+    for function in &mut mir.fns {
+        byte_ranges::simplify(function);
     }
     Ok(mir)
 }

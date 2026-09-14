@@ -3825,6 +3825,11 @@ fn build_module<'c>(
     // Pass 2: define bodies. Move-struct destructors are created lazily while these bodies are
     // emitted, but the authoritative handles are module-wide: every function that drops the same
     // nominal struct must call the one helper rather than cloning its recursive cleanup CFG.
+    // Other ThinLTO partitions are not covered by this artifact's body identity.
+    // Never use their private bodies as cached escape certificates.
+    let byte_calls = align_mir::byte_storage::CallEscapeSummary::new(
+        program.fns.iter().filter(|function| scope.defines(function)),
+    );
     let drop_helpers = std::cell::RefCell::new(HashMap::new());
     for f in program.fns.iter().filter(|function| scope.defines(function)) {
         let builder = ctx.create_builder();
@@ -3883,7 +3888,7 @@ fn build_module<'c>(
             slots: HashMap::new(),
             borrow_mut_cleanup_ptrs: HashMap::new(),
             values: HashMap::new(),
-            byte_storage_plan: align_mir::byte_storage::plan(f),
+            byte_storage_plan: align_mir::byte_storage::plan(f, &byte_calls),
             byte_storage: HashMap::new(),
             stack_header_slots: stack_headers.slots,
             stack_header_new_values: stack_headers.new_values,

@@ -90,8 +90,10 @@ Admission requires a complete def-use/CFG proof for each object lifetime:
 3. Every read has the same initialized-byte and failure behavior as the source.
    A conditional read cannot cause an earlier unconditional trap. Use the
    existing MIR range failure when proof does not eliminate it.
-4. No buffer handle or derived view crosses a user/native call, return, capture,
-   aggregate store or unknown use. The scalar result may cross those boundaries.
+4. No buffer handle or derived view crosses a return, capture, aggregate store
+   or unknown use. Plan 63 extends local calls with a body-derived confinement
+   proof for the backing bytes; opaque imports, foreign calls and other ThinLTO
+   partitions remain conservative. The scalar result may cross boundaries.
    Native readers/writers and capacity observations disqualify the object.
 5. Construction in an outer loop gets distinct logical lifetimes; replacement
    and early exit preserve all unrelated owners. Cyclic byte state or ambiguous
