@@ -11171,14 +11171,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
         match rv {
             Rvalue::BufferPut { value, scalar, be, .. } => {
                 let input = self.operand(value)?;
-                let mut bits = if matches!(scalar, Ty::Float(_)) {
-                    let ty = match scalar {
-                        Ty::Float(FloatTy { bits: 32 }) => self.ctx.i32_type(),
-                        Ty::Float(FloatTy { bits: 64 }) => self.ctx.i64_type(),
-                        _ => return Err(self.err("invalid byte storage float width")),
-                    };
-                    self.builder.build_bit_cast(input, ty, "byte.write.bits").map_err(|e| self.err(e))?.into_int_value()
-                } else { input.into_int_value() };
+                // Authenticate the actual generated value too: a forged value_tys entry may
+                // agree with scalar while its Load/Arg producer still emits a different width.
+                let mut bits = match (*scalar, input) {
+                    (Ty::Int(ty), BasicValueEnum::IntValue(value))
+                        if value.get_type().get_bit_width() == u32::from(ty.bits) => value,
+                    (Ty::Float(FloatTy { bits: 32 }), BasicValueEnum::FloatValue(value))
+                        if value.get_type() == self.ctx.f32_type() =>
+                        self.builder.build_bit_cast(value, self.ctx.i32_type(), "byte.write.bits")
+                            .map_err(|e| self.err(e))?.into_int_value(),
+                    (Ty::Float(FloatTy { bits: 64 }), BasicValueEnum::FloatValue(value))
+                        if value.get_type() == self.ctx.f64_type() =>
+                        self.builder.build_bit_cast(value, self.ctx.i64_type(), "byte.write.bits")
+                            .map_err(|e| self.err(e))?.into_int_value(),
+                    _ => return Err(self.err("byte storage put operand does not match scalar width")),
+                };
                 if *be && bits.get_type().get_bit_width() > 8 {
                     bits = self.call_intrinsic("llvm.bswap", &[bits.get_type().into()], &[bits.into()])?.into_int_value();
                 }

@@ -474,3 +474,17 @@ byte max to scalar `fcmp`/`fcsel` traversal without chunk materialization calls.
 This cross-target instruction check is neither native Mac execution nor a
 Metal synchronization/transfer benchmark. The implementer must measure complete
 sampling with its original logits, model, seed and Metal completion boundary.
+
+
+### Code-review finding closure
+
+The independent committed-candidate review found one P2 producer-width gap:
+a supported but inconsistent `BufferPut.scalar` could budget one byte while the
+actual LLVM integer operand stored eight. The closure checks the constructor,
+put, append, view and length operand/result types before selection, then checks
+the actual generated integer/float class and width before any fixed-storage put.
+Declared value types alone never authorize a store. No ABI or strategy changes.
+`runway_a2_binary_codec::bounded_byte_object_rejects_forged_put_widths` owns
+narrow/wide and integer/float mismatches, forged matching value-type tables with
+real wider Load producers, and every selected operation's result shape. This
+closes the complete reported class in one fix against the original review.

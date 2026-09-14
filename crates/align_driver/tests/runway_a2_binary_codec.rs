@@ -366,3 +366,61 @@ fn literal() -> u16 {
         assert!(ir.contains("call ptr @align_rt_buffer_new"), "{label}: {ir}");
     }
 }
+
+#[test]
+fn bounded_byte_object_rejects_forged_put_widths() {
+    use align_mir::{Operand, Rvalue, Stmt};
+    use align_sema::{FloatTy, IntTy, Ty};
+    if !backend_available() { return; }
+    for (actual, claimed) in [("u64", "u8"), ("u8", "u64"), ("u64", "f64"), ("f64", "u64"), ("f64", "f32"), ("f32", "f64")] {
+        let suffix = if actual == "u8" { "" } else { "_le" };
+        let source = format!("fn f(x: {actual}) -> i64 {{ mut b := buffer(0); b.put_{actual}{suffix}(x); return b.len() }}\n");
+        let mut sm = SourceMap::new();
+        let checked = check(&mut sm, "forged-byte-width", &source);
+        assert!(!checked.diags.has_errors());
+        let original = lower_to_mir(&checked.hir);
+        assert_eq!(align_mir::byte_storage::plan(&original.fns[0]).slots().count(), 1);
+        assert!(emit_llvm_ir(&original, BuildTarget::Baseline, false, &[], false).is_ok());
+        let scalar = match claimed {
+            "u8" => Ty::Int(IntTy { bits: 8, signed: false }),
+            "u64" => Ty::Int(IntTy { bits: 64, signed: false }),
+            "f32" => Ty::Float(FloatTy { bits: 32 }),
+            "f64" => Ty::Float(FloatTy { bits: 64 }),
+            _ => unreachable!(),
+        };
+        let mut mismatched = original.clone();
+        let function = &mut mismatched.fns[0];
+        let mut input_id = None;
+        for block in &mut function.blocks {
+            for statement in &mut block.stmts {
+                if let Stmt::Let(_, Rvalue::BufferPut { scalar: width, value: Operand::Value(value), .. }) = statement {
+                    *width = scalar;
+                    input_id = Some(*value);
+                }
+            }
+        }
+        assert_eq!(align_mir::byte_storage::plan(function).slots().count(), 0, "{actual}/{claimed}");
+        // A matching declared type cannot authorize a wider store: Load still emits actual.
+        function.value_tys[input_id.expect("put input") as usize] = scalar;
+        assert_eq!(align_mir::byte_storage::plan(function).slots().count(), 1, "forged table reaches backend check");
+        let error = emit_llvm_ir(&mismatched, BuildTarget::Baseline, false, &[], false).expect_err("actual LLVM width/class must be checked");
+        assert!(error.contains("byte storage put operand does not match scalar width"), "{actual}/{claimed}: {error}");
+    }
+
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "byte-result-types", "fn f(x: u64) -> u64 { mut b := buffer(0); b.put_u64_le(x); b.append(\"ab\"); n := b.len(); return b.bytes().u64_le(n - 10) }\n");
+    assert!(!checked.diags.has_errors());
+    let program = lower_to_mir(&checked.hir);
+    let function = &program.fns[0];
+    assert_eq!(align_mir::byte_storage::plan(function).slots().count(), 1);
+    let operations: Vec<_> = function.blocks.iter().flat_map(|block| &block.stmts).filter_map(|stmt| match stmt {
+        Stmt::Let(id, Rvalue::BufferNew(_) | Rvalue::BufferPut { .. } | Rvalue::BufferAppend { .. } | Rvalue::BufferBytes(_) | Rvalue::BufferLen(_)) => Some(*id),
+        _ => None,
+    }).collect();
+    assert_eq!(operations.len(), 5);
+    for id in operations {
+        let mut bad = function.clone();
+        bad.value_tys[id as usize] = Ty::Bool;
+        assert_eq!(align_mir::byte_storage::plan(&bad).slots().count(), 0, "result {id}");
+    }
+}

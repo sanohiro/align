@@ -54,6 +54,61 @@ fn related(op: &Operand, values: &BTreeSet<ValueId>, slots: &BTreeSet<Slot>) -> 
     }
 }
 
+fn operand_ty(f: &Function, op: &Operand) -> Option<Ty> {
+    match op {
+        Operand::Value(id) => f.value_tys.get(*id as usize).copied(),
+        Operand::Arg(index) => f
+            .params
+            .get(*index as usize)
+            .and_then(|slot| f.slots.get(*slot as usize))
+            .copied(),
+        Operand::Const(crate::Const::Int(_, ty) | crate::Const::Float(_, ty)) => Some(*ty),
+        Operand::Const(crate::Const::Char(_)) => Some(Ty::Char),
+        Operand::Const(crate::Const::Bool(_)) => Some(Ty::Bool),
+        Operand::Const(crate::Const::Unit) => Some(Ty::Unit),
+        Operand::BorrowedPlace(place) => Some(place.ty),
+        Operand::BorrowedElementPlace(_)
+        | Operand::BorrowedFixedElementPlace(_)
+        | Operand::BorrowedCleanupArg(_) => None,
+    }
+}
+
+/// Result and operand tables qualify admission, but never authenticate emitted LLVM widths.
+/// The backend independently checks the actual put value before touching fixed storage.
+fn operation_types_match(f: &Function, id: ValueId, rv: &Rvalue) -> bool {
+    let bytes = Ty::Slice(align_sema::Scalar::Int(align_sema::IntTy {
+        bits: 8,
+        signed: false,
+    }));
+    let integer = Ty::Int(align_sema::IntTy {
+        bits: 64,
+        signed: true,
+    });
+    let (result, inputs) = match rv {
+        Rvalue::BufferNew(cap) => (Ty::Buffer, operand_ty(f, cap) == Some(integer)),
+        Rvalue::BufferPut {
+            buffer,
+            value,
+            scalar,
+            ..
+        } => (
+            Ty::Unit,
+            operand_ty(f, buffer) == Some(Ty::Buffer)
+                && byte_width(*scalar).is_some()
+                && operand_ty(f, value) == Some(*scalar),
+        ),
+        Rvalue::BufferAppend { buffer, data } => (
+            Ty::Unit,
+            operand_ty(f, buffer) == Some(Ty::Buffer)
+                && operand_ty(f, data).is_some_and(|ty| ty == bytes || ty == Ty::Str),
+        ),
+        Rvalue::BufferBytes(buffer) => (bytes, operand_ty(f, buffer) == Some(Ty::Buffer)),
+        Rvalue::BufferLen(buffer) => (integer, operand_ty(f, buffer) == Some(Ty::Buffer)),
+        _ => return false,
+    };
+    inputs && f.value_tys.get(id as usize) == Some(&result)
+}
+
 fn byte_width(ty: Ty) -> Option<usize> {
     match ty {
         Ty::Int(align_sema::IntTy {
@@ -299,6 +354,25 @@ fn object_plan(
     literals: &BTreeMap<ValueId, usize>,
 ) -> Option<ByteStoragePlan> {
     let handles = nonescaping(f, slot, constructor)?;
+    for block in &f.blocks {
+        for stmt in &block.stmts {
+            if let Stmt::Let(id, rv) = stmt {
+                let belongs = *id == constructor
+                    || match rv {
+                        Rvalue::BufferPut { buffer, .. }
+                        | Rvalue::BufferAppend { buffer, .. }
+                        | Rvalue::BufferBytes(buffer)
+                        | Rvalue::BufferLen(buffer) => {
+                            value(buffer).is_some_and(|id| handles.contains(&id))
+                        }
+                        _ => false,
+                    };
+                if belongs && !operation_types_match(f, *id, rv) {
+                    return None;
+                }
+            }
+        }
+    }
     let mut incoming = vec![None; f.blocks.len()];
     *incoming.get_mut(f.entry as usize)? = Some(Extent::Dead);
     let mut pending = VecDeque::from([f.entry]);
