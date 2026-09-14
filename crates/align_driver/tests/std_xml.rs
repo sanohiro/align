@@ -971,7 +971,7 @@ pub fn main() -> Result<(), Error> {
         align_driver::format_diagnostics(&sources, &checked.diags),
     );
     let mir = align_driver::try_lower_to_mir(&checked.hir).expect("checked XML HIR must validate");
-    let llvm = emit_llvm_ir(&mir, BuildTarget::Baseline, false, &[], false).expect("LLVM IR");
+    let llvm = emit_llvm_ir(&mir, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false).expect("LLVM IR");
     for fragment in [
         "switch i32 %xml.parse.status, label %xml.parse.abort",
         "i32 0, label %xml.parse.ok",

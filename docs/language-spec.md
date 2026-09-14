@@ -12,6 +12,13 @@ Linux; macOS returns `Error.Code(ENOTSUP)` after complete path/mask validation
 and before filesystem work. Unsupported is an error, distinct from a completed
 negative permission observation (`false`). The plan records platform evidence.
 
+Explicit CPU selectors reject missing, empty, unknown, embedded-NUL and
+wrong-architecture names before artifact work. LLVM validates names for the
+selected architecture. `emit-llvm` and `explain-opt` use the selected profile's
+pipeline, code-generation level and size attributes; raw IR precedes optimization
+but includes those attributes. `explain-opt` reports per-unit observations with
+runtime LTO off; it does not describe a linked ThinLTO executable.
+
 ## Purpose
 
 Align is an AOT-compiled language designed to align the following.

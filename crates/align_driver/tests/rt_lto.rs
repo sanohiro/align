@@ -34,7 +34,7 @@ fn ir(name: &str, src: &str, exports: &[&str], optimized: bool, rt_lto: bool) ->
     );
     let mir = lower_to_mir(&checked.hir);
     let exports: Vec<String> = exports.iter().map(|s| s.to_string()).collect();
-    emit_llvm_ir(&mir, BuildTarget::Baseline, optimized, &exports, rt_lto).expect("emit llvm ir")
+    emit_llvm_ir(&mir, BuildTarget::Baseline, align_driver::Profile::Release, optimized, &exports, rt_lto).expect("emit llvm ir")
 }
 
 /// The idiomatic constant-length equality filter — the probe's `str_eq` 2.1× kernel.
@@ -299,7 +299,7 @@ fn gate7_unparseable_bitcode_falls_back_and_reannotates() {
     );
     let mir = lower_to_mir(&checked.hir);
     let exports: Vec<String> = vec!["eq_count".to_string()];
-    let out = align_codegen_llvm::emit_llvm_ir(&mir, &BuildTarget::Baseline, false, &exports, Some(b"not bitcode"))
+    let out = align_codegen_llvm::emit_llvm_ir(&mir, &BuildTarget::Baseline, align_driver::Profile::Release, false, &exports, Some(b"not bitcode"))
         .expect("unparseable --rt-lto bitcode must fall back, not error");
     // The merge did not happen: the runtime symbol stays an opaque declare, not a define.
     let decl = out

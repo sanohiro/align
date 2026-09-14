@@ -198,7 +198,7 @@ fn main() -> i32 {
         );
         let valid = built.unit("main").mir.clone();
         assert!(
-            emit_llvm_ir(&valid, BuildTarget::Baseline, false, &[], false).is_ok(),
+            emit_llvm_ir(&valid, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false).is_ok(),
             "the producer-created fixed element place must reach LLVM"
         );
         for (name, mutate) in [
@@ -219,7 +219,7 @@ fn main() -> i32 {
             };
             mutate(place);
             assert!(
-                emit_llvm_ir(&malformed, BuildTarget::Baseline, false, &[], false).is_err(),
+                emit_llvm_ir(&malformed, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false).is_err(),
                 "malformed fixed element {name} must fail before LLVM pointer construction"
             );
         }
@@ -251,7 +251,7 @@ fn main() -> i32 {
             };
             mutate(slot, index, path);
             assert!(
-                emit_llvm_ir(&malformed, BuildTarget::Baseline, false, &[], false).is_err(),
+                emit_llvm_ir(&malformed, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false).is_err(),
                 "malformed fixed element nulling {name} must fail before LLVM construction"
             );
         }

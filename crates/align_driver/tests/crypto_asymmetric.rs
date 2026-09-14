@@ -485,7 +485,7 @@ fn signature_key_compilation_paths_keep_runtime_calls_in_raw_and_optimized_llvm(
     );
     let mir = lower_to_mir(&checked.hir);
     for (label, optimized) in [("raw", false), ("optimized", true)] {
-        let ir = emit_llvm_ir(&mir, BuildTarget::Baseline, optimized, &[], false)
+        let ir = emit_llvm_ir(&mir, BuildTarget::Baseline, align_driver::Profile::Release, optimized, &[], false)
             .unwrap_or_else(|error| panic!("{label} LLVM emission failed: {error}"));
         for symbol in [
             "@align_rt_crypto_private_key_from_pem",

@@ -2698,7 +2698,7 @@ fn build_lifecycle_executable(name: &str) -> (PathBuf, TempArtifacts) {
     );
     let mir = align_driver::try_lower_to_mir(&checked.hir)
         .unwrap_or_else(|error| panic!("checked lifecycle HIR failed MIR lowering: {error}"));
-    let llvm = emit_llvm_ir(&mir, BuildTarget::Baseline, false, &[], false)
+    let llvm = emit_llvm_ir(&mir, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false)
         .expect("emit timeout ownership LLVM");
     assert!(
         llvm.contains("call i32 @align_rt_tcp_conn_set_io_timeout(ptr"),

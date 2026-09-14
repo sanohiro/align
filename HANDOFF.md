@@ -5,6 +5,10 @@ implements bounded nonescaping byte storage and direct synchronous chunks
 iteration without header arrays. Existing APIs and range failures remain.
 Apple Silicon/Metal consumer timing and pin adoption remain external; the plan
 records local x86-64 measurements and AArch64 instruction inspection.
+Follow-up [issue 1043 investigation](docs/impl/63-codegen-performance-audit.md)
+has implemented ThinLTO entry-wrapper repair and trustworthy CPU/profile
+inspection; broader proved byte storage and byte-range facts remain planned.
+Native/default-policy qualification and foreign update retention remain open.
 
 **R84–R88 client admission and composition:**
 [Plan 58](docs/impl/58-r84-r88-client-batch-plan.md) implements shared

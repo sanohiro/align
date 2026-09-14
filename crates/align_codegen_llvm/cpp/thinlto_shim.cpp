@@ -37,6 +37,8 @@
 #include "llvm/IR/ModuleSummaryIndex.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/LTO/LTO.h"
+#include "llvm/MC/MCSubtargetInfo.h"
+#include "llvm/MC/TargetRegistry.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
@@ -57,6 +59,23 @@
 #include <vector>
 
 using namespace llvm;
+
+// Query the target's CPU inventory without constructing a TargetMachine with an
+// untrusted CPU name (which can terminate the compiler). Inputs are call-scoped
+// NUL-terminated strings; no borrowed memory or target state is retained.
+extern "C" int align_target_cpu_valid(const char *triple, const char *cpu) {
+  if (!triple || !cpu || !*cpu)
+    return 0;
+  std::string error;
+  const Target *target = TargetRegistry::lookupTarget(triple, error);
+  if (!target)
+    return -1;
+  std::unique_ptr<MCSubtargetInfo> info(
+      target->createMCSubtargetInfo(Triple(triple), "", ""));
+  if (!info)
+    return -1;
+  return info->isCPUStringValid(cpu) ? 1 : 0;
+}
 
 namespace {
 // Map a driver opt-level int (0..3) to the middle-end OptimizationLevel. ThinLTO

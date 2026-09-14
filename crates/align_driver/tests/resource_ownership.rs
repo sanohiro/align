@@ -493,9 +493,9 @@ pub fn expose(reference: resource_ref<stmt<i64>>) -> raw { unsafe { return resou
     assert!(producer_mir.contains("resource#0"), "{producer_mir}");
 
     if backend_available() {
-        let producer_ir = emit_llvm_ir(&producer.mir, BuildTarget::Baseline, false, &[], false)
+        let producer_ir = emit_llvm_ir(&producer.mir, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false)
             .expect("producer LLVM");
-        let consumer_ir = emit_llvm_ir(&consumer.mir, BuildTarget::Baseline, false, &[], false)
+        let consumer_ir = emit_llvm_ir(&consumer.mir, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false)
             .expect("consumer LLVM");
         let thunk = "__align_resource_drop$pkg.db$stmt";
         assert!(
@@ -562,7 +562,7 @@ pub fn open<T>() -> stmt<T> { unsafe { return resource.from_raw(raw.alloc(8)) } 
     if backend_available() {
         let producer_ir = emit_llvm_ir(
             &built.unit("pkg.db").mir,
-            BuildTarget::Baseline,
+            BuildTarget::Baseline, align_driver::Profile::Release,
             false,
             &[],
             false,
@@ -570,7 +570,7 @@ pub fn open<T>() -> stmt<T> { unsafe { return resource.from_raw(raw.alloc(8)) } 
         .expect("producer LLVM");
         let consumer_ir = emit_llvm_ir(
             &built.unit("main").mir,
-            BuildTarget::Baseline,
+            BuildTarget::Baseline, align_driver::Profile::Release,
             false,
             &[],
             false,

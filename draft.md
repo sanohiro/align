@@ -116,6 +116,13 @@ back safely) — not from a fixed high baseline. Heavy SIMD work (JSON / UTF-8 /
 copy) lives in the library, written once with portable mechanisms (no per-architecture intrinsics),
 covering x86-64 and aarch64. One good portable default; visible opt-in for more.
 
+Explicit CPU selectors reject missing, empty, unknown, embedded-NUL and
+wrong-architecture names before artifact work. LLVM validates names for the
+selected architecture. `emit-llvm` and `explain-opt` use the selected profile's
+pipeline, code-generation level and size attributes; raw IR precedes optimization
+but includes those attributes. `explain-opt` reports per-unit observations with
+runtime LTO off; it does not describe a linked ThinLTO executable.
+
 ---
 
 ## 4. Basic Syntax

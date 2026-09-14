@@ -262,7 +262,7 @@ remark owner and rendering below the new current-plan lines.
 
 | Surface | Exact S0B contract | Owner and acceptance |
 |---|---|---|
-| CLI | The only command remains `alignc explain-opt <file> [--verbose|-v] [--target-cpu baseline|native|CPU]`; S0B adds no command, option, environment input, profile, or ambient discovery | Existing argument parsing and exit rules remain unchanged. No otherwise-ignored token acquires S0B meaning. |
+| CLI | The only command remains `alignc explain-opt <file> [--verbose|-v] [--target-cpu baseline|native|CPU] [--profile dev|release|fast|small|tiny]`; S0B adds no command, option, environment input, profile, or ambient discovery | Existing argument parsing and exit rules remain unchanged. No otherwise-ignored token acquires S0B meaning. |
 | Output | English UTF-8 text on stdout, with the exact prefix, ordering, and fixed reason sentences below; diagnostics remain on stderr | `align_driver::explain`; exact golden rows cover every admitted state/reason and multi-unit order. |
 | Record model | One ephemeral `PlanRecord` per admitted selector decision actually reached and consumed by lowering, with exact enums, no-row cases, and field-presence rules below | `align_mir` located lowering. No public language type, JSON, wire format, persistence, or reader is added. |
 | Semantics | Observation never changes evaluation, errors, ownership, cleanup, allocation mode, explicit parallel semantics, or the selector result | Existing chunks, donation, and `par_map` owners plus MIR/object identity controls. |
@@ -662,7 +662,7 @@ risk and leaves distinct LLVM-remark behavior unchanged.
 | Cache and ThinLTO | Located mode remains ephemeral, bypasses lowering memoization and persistent caches, and changes no action identity or counters | Empty-cache explain-then-build sequence plus existing cache namespace owners. |
 | Runtime ABI and ownership provenance | No runtime symbol or ABI row changes; records contain no pointer, owner, region, descriptor, or runtime observation | Runtime ABI inventory equality and no-new-key structural assertion. |
 | Allocation parity | Ordinary compilation has an empty, unallocated record buffer; the selected MIR allocation is identical with collection on/off | Normal/located MIR decision comparison and object-byte identity. |
-| Target/profile | Existing target CPU reaches LLVM remarks; current-plan rows are target-independent and `explain-opt` remains fixed at `default<O2>`; range rows name process-lifetime worker availability without reading it | Baseline/native named-target output parity for plan rows, plus one-worker/multi-worker runtime owners; LLVM rows may differ honestly. |
+| Target/profile | Existing target CPU reaches LLVM remarks; current-plan rows are target-independent and `explain-opt` uses the selected profile (pipeline, TargetMachine level and size attributes), with runtime LTO off; range rows name process-lifetime worker availability without reading it | Baseline/native named-target output parity for plan rows, plus one-worker/multi-worker runtime owners; LLVM rows may differ honestly. |
 | Explanation, order, and source absence | Exact one-line grammar, reason explanation in both anchored and source-less verbose rows, reason precedence, total source-option/ordinal order, override banner, duplicate rule, and absent-anchor aggregation | Golden default/verbose, repeat-run, multi-unit, collision, mixed anchored/source-less, and all-source-less fixtures. |
 
 ### Acceptance and proportional verification
@@ -725,3 +725,5 @@ not enumerate this internal schema.
 3. MIR line plumbing + DILocation — bounded plumbing; opt-in protects the baseline.
 4. Remarks capture — process-global cl::opt state, `unsafe extern "C"` handler + C-string
    ownership, test-harness isolation. Highest, but no new deps for v1.
+
+Issue 1043 configuration observation is specified in [plan 63](63-codegen-performance-audit.md#21-complete-inspection-configuration); it supersedes the initial slices' fixed-O2 lens. Its scope preamble precedes current-plan rows, after any override banner.

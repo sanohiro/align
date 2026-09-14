@@ -988,7 +988,7 @@ fn generated_runtime_data_is_producer_owned() {
             "consumer-side static constructor monomorph survived in {}",
             unit.unit
         );
-        let llvm = emit_llvm_ir(&unit.mir, BuildTarget::Baseline, false, &[], false)
+        let llvm = emit_llvm_ir(&unit.mir, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false)
             .expect("descriptor LLVM");
         for descriptor in &unit.static_descriptors {
             let symbol = format!("{}${}", descriptor.unit, descriptor.item);

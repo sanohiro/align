@@ -291,8 +291,8 @@ impl Profile {
 /// is the default triple lowercased. Keeping this one function guarantees the cache key hashes the
 /// EXACT cpu/features codegen will use — `native` is never keyed as the literal string `"native"`, it
 /// is resolved here to the host's concrete cpu + feature set (doc-10 §6.2).
-fn resolve_cpu_features(target: &BuildTarget, triple_lower: &str) -> (String, String) {
-    match target {
+fn resolve_cpu_features(target: &BuildTarget, triple_lower: &str) -> Result<(String, String), CodegenError> {
+    let resolved = match target {
         BuildTarget::Native => (
             TargetMachine::get_host_cpu_name().to_string(),
             TargetMachine::get_host_cpu_features().to_string(),
@@ -308,7 +308,30 @@ fn resolve_cpu_features(target: &BuildTarget, triple_lower: &str) -> (String, St
             };
             (cpu.to_string(), String::new())
         }
+    };
+    // Only explicit names need admission: baseline and native identities come
+    // from this compiler and the initialized LLVM target respectively.
+    if let BuildTarget::Cpu(name) = target {
+        unsafe extern "C" {
+            fn align_target_cpu_valid(
+                triple: *const std::ffi::c_char,
+                cpu: *const std::ffi::c_char,
+            ) -> std::ffi::c_int;
+        }
+        let triple = std::ffi::CString::new(triple_lower)
+            .map_err(|_| CodegenError::Target("target triple contains NUL".into()))?;
+        let cpu = std::ffi::CString::new(name.as_str())
+            .map_err(|_| CodegenError::Target("CPU name contains NUL".into()))?;
+        // SAFETY: LLVM target registration completed before resolution. Both
+        // C strings remain live for this synchronous, non-retaining query.
+        let valid = unsafe { align_target_cpu_valid(triple.as_ptr(), cpu.as_ptr()) };
+        if valid != 1 {
+            return Err(CodegenError::Target(format!(
+                "unknown CPU {name:?} for target {triple_lower}"
+            )));
+        }
     }
+    Ok(resolved)
 }
 
 /// The relocation model codegen uses (kept in sync with [`create_target_machine`]'s `RelocMode::PIC`),
@@ -352,7 +375,7 @@ pub fn resolve_target_identity(target: &BuildTarget) -> Result<ResolvedTarget, C
     ensure_target_initialized()?;
     let triple = TargetMachine::get_default_triple();
     let triple_str = triple.as_str().to_string_lossy().to_string();
-    let (cpu, features) = resolve_cpu_features(target, &triple_str.to_ascii_lowercase());
+    let (cpu, features) = resolve_cpu_features(target, &triple_str.to_ascii_lowercase())?;
     Ok(ResolvedTarget { triple: triple_str, cpu, features, reloc_model: RELOC_MODEL, code_model: CODE_MODEL })
 }
 
@@ -372,15 +395,14 @@ pub fn llvm_version() -> String {
 /// the data-layout machine (`build_module`) and the emission machine (`write_object`) always agree.
 ///
 /// `opt` is the codegen (machine-code) opt level — a separate dimension from the IR pass pipeline
-/// (`Profile::pipeline()`). Object emission threads the profile's [`Profile::codegen_opt_level`];
-/// the diagnostic lenses (`emit_llvm_ir` / `collect_opt_remarks`) pin `Default` so their IR shape
-/// stays profile-independent.
+/// (`Profile::pipeline()`). Object emission and both inspection lenses use the
+/// same profile's [`Profile::codegen_opt_level`].
 fn create_target_machine(target: &BuildTarget, opt: OptimizationLevel) -> Result<TargetMachine, CodegenError> {
     ensure_target_initialized()?;
     let triple = TargetMachine::get_default_triple();
     let t = Target::from_triple(&triple)
         .map_err(|e| CodegenError::Target(format!("triple resolution: {e}")))?;
-    let (cpu, features) = resolve_cpu_features(target, &triple.as_str().to_string_lossy().to_ascii_lowercase());
+    let (cpu, features) = resolve_cpu_features(target, &triple.as_str().to_string_lossy().to_ascii_lowercase())?;
     t.create_target_machine(
         &triple,
         &cpu,
@@ -447,8 +469,7 @@ fn build_program_module<'c>(
         // declares re-curated, no merge) — see its doc comment; nothing left to do here either way.
         link_in_rt_lto(ctx, &module, rt, &runtime)?;
     }
-    // Size profiles get their `optsize`/`minsize` sweep here — object path only, so the diagnostic
-    // lenses (`emit_llvm_ir` / `collect_opt_remarks`) see a byte-identical module structure.
+    // The raw IR lens and object path observe the same pre-optimization size attributes.
     apply_size_attrs(ctx, &module, profile);
     Ok((module, tm))
 }
@@ -1280,7 +1301,7 @@ fn probe_rt_lto<'c>(ctx: &'c Context, bitcode: &[u8]) -> Option<Module<'c>> {
 ///
 /// `optimized` selects the lens: `false` (`--stage raw`) prints exactly what codegen emitted —
 /// pre-optimization, the traditional `emit-llvm` view; `true` (`--stage optimized`) runs the same
-/// `-O2` middle-end pipeline `write_object` uses (via [`run_opt_pipeline`]) before printing, so the
+/// selected middle-end pipeline `write_object` uses (via [`run_opt_pipeline`]) before printing, so the
 /// output is "what LLVM did" — inlined lambdas, fused loops, vectorized `<N x T>` bodies.
 ///
 /// `exports` is the same export-roots list as [`emit_object`] (external linkage instead of
@@ -1293,38 +1314,26 @@ fn probe_rt_lto<'c>(ctx: &'c Context, bitcode: &[u8]) -> Option<Module<'c>> {
 /// produces pre-opt), regardless of `optimized`, so both lenses are available:
 /// - `--stage raw --rt-lto` = post-link / **pre-opt**: the guarded four carry bodies with their
 ///   `rt_contract` attrs shed, `str_cmp` is still an attributed declare — the attr-xor + link view.
-/// - `--stage optimized --rt-lto` = after the one `O2` run: the merged/inlined shape (an
+/// - `--stage optimized --rt-lto` = after the selected profile run: the merged/inlined shape (an
 ///   `x == "literal"` filter with no `call @align_rt_str_eq`).
 ///
 /// `None` is the default path and performs no rt-LTO link or probe. The canonical C1 runtime
 /// declaration order applies to both paths.
-pub fn emit_llvm_ir(program: &Program, target: &BuildTarget, optimized: bool, exports: &[String], rt_lto: Option<&[u8]>) -> Result<String, CodegenError> {
+pub fn emit_llvm_ir(program: &Program, target: &BuildTarget, profile: Profile,
+    optimized: bool, exports: &[String], rt_lto: Option<&[u8]>) -> Result<String, CodegenError> {
     let ctx = Context::create();
-    let module = ctx.create_module("align");
-    // Diagnostic lens: codegen opt pinned to `Default` (no size attrs, pipeline `O2` below) so the
-    // IR-shape suite stays profile-independent and byte-identical.
-    let tm = create_target_machine(target, OptimizationLevel::Default)?;
-    // Probe-then-annotate mirrors `emit_object`. Linked into the raw module (before any opt run) so
-    // `--stage raw --rt-lto` exposes the pre-opt merged shape for the attr-xor gate.
-    let rt_module = rt_lto.and_then(|bc| probe_rt_lto(&ctx, bc));
-    let runtime = build_module(
-        &ctx,
-        &module,
-        program,
-        &tm,
-        None,
-        exports,
-        rt_module.is_some(),
+    let (module, tm) = build_program_module(
+        &ctx, program,
+        target,
+        profile, exports,
+        rt_lto,
         ModuleScope::Whole,
     )?;
-    if let Some(rt) = rt_module {
-        link_in_rt_lto(&ctx, &module, rt, &runtime)?;
-    }
     // No verification of its own: the lens never shows IR it knows is ill-formed, and both of its
     // steps above already verify — `build_module` the module it built, `link_in_rt_lto` the merged
     // one. A third run would re-verify the identical module.
     if optimized {
-        run_opt_pipeline(&module, &tm, "default<O2>")?;
+        run_opt_pipeline(&module, &tm, profile.pipeline())?;
     }
     Ok(module.print_to_string().to_string())
 }
@@ -1337,7 +1346,7 @@ pub struct DebugInfo {
     pub directory: String,
 }
 
-/// Compile `program` with opt-in debug locations, run the `-O2` pipeline, and return LLVM's raw
+/// Compile `program` with opt-in debug locations and the selected profile, and return LLVM's raw
 /// optimization-remark strings (each `"<file>:<line>:<col>: <message>"`) captured via the
 /// diagnostic handler (`docs/impl/09-explain-opt.md`, Slice 3b, Mechanism A). The driver's
 /// `explain-opt` translates these into `OptRecord`s.
@@ -1348,14 +1357,13 @@ pub struct DebugInfo {
 pub fn collect_opt_remarks(
     program: &Program,
     target: &BuildTarget,
+    profile: Profile,
     debug: &DebugInfo,
 ) -> Result<Vec<String>, CodegenError> {
     ensure_remark_cl_opts();
     let ctx = Context::create();
     let module = ctx.create_module("align");
-    // Diagnostic lens: codegen opt pinned to `Default` (see `emit_llvm_ir`), so remark output does
-    // not vary with the build profile.
-    let tm = create_target_machine(target, OptimizationLevel::Default)?;
+    let tm = create_target_machine(target, profile.codegen_opt_level())?;
 
     // Heap-box the sink so its address is stable while it is registered as the handler userdata.
     let mut sink: Box<Vec<String>> = Box::default();
@@ -1382,7 +1390,10 @@ pub fn collect_opt_remarks(
         false,
         ModuleScope::Whole,
     );
-    let ran = built.and_then(|_| run_opt_pipeline(&module, &tm, "default<O2>"));
+    let ran = built.and_then(|_| {
+        apply_size_attrs(&ctx, &module, profile);
+        run_opt_pipeline(&module, &tm, profile.pipeline())
+    });
 
     drop(_detach_guard);
     ran?;
@@ -2992,7 +3003,11 @@ impl ModuleScope<'_> {
     }
 
     fn emits_main_wrapper(self) -> bool {
-        matches!(self, ModuleScope::Whole)
+        match self {
+            ModuleScope::Whole => true,
+            ModuleScope::Function { selected, .. } => selected.as_str() == "main",
+            ModuleScope::Test { .. } => false,
+        }
     }
 
     fn is_test(self) -> bool {
@@ -7525,7 +7540,7 @@ fn link_in_rt_lto<'c>(
 ///
 /// Filters to definitions (`count_basic_blocks() > 0`), so it never touches a native declaration.
 /// Called on the object path (after `build_module`, before the opt pipeline);
-/// the diagnostic lenses never run it, keeping their IR shape profile-independent.
+/// Raw IR and LLVM remarks use the same selected size attributes.
 fn apply_size_attrs<'c>(ctx: &'c Context, module: &Module<'c>, profile: Profile) {
     let names: &[&str] = match profile {
         Profile::Small => &["optsize"],
@@ -22906,13 +22921,13 @@ fn main() -> i32 = 0
     fn borrowed_element_guard_fails_closed_before_pointer_codegen() {
         let source = "Record { value: string }\nfn inspect(borrow record: Record) -> i64 = record.value.len()\nfn use(borrow records: array<Record>) -> i64 = inspect(records[0])\nfn main() -> i32 = 0\n";
         let program = mir(source);
-        emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+        emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
             .unwrap_or_else(|error| panic!("valid borrowed element guard must lower: {error}"));
 
         let looped = mir(
             "Record { value: string }\nfn records() -> array<Record> {\n  mut builder: array_builder<Record> := array_builder()\n  builder.push(Record { value: \"x\".clone() })\n  return builder.build()\n}\nfn inspect(borrow record: Record) -> i64 = record.value.len()\nfn use() -> i64 {\n  mut values := records()\n  mut again := true\n  loop {\n    result := inspect(values[0])\n    if !again { break result }\n    values = records()\n    again = false\n  }\n}\nfn main() -> i32 = 0\n",
         );
-        emit_llvm_ir(&looped, &BuildTarget::Baseline, false, &[], None)
+        emit_llvm_ir(&looped, &BuildTarget::Baseline, Profile::Release, false, &[], None)
             .unwrap_or_else(|error| panic!("post-action mutation in a later loop path is valid: {error}"));
 
         let mut raw_action = mir(source);
@@ -22977,7 +22992,7 @@ fn main() -> i32 = 0
                 }),
             },
         );
-        let raw_error = emit_llvm_ir(&raw_action, &BuildTarget::Baseline, false, &[], None)
+        let raw_error = emit_llvm_ir(&raw_action, &BuildTarget::Baseline, Profile::Release, false, &[], None)
             .expect_err("raw calls must reject forged borrowed-element operands");
         assert!(
             raw_error.to_string().contains("callable metadata invalid"),
@@ -22987,7 +23002,7 @@ fn main() -> i32 = 0
         let mut missing_guard = program.clone();
         borrowed_element_place_mut(&mut missing_guard).guard.reservation = u32::MAX;
         assert_lowering(
-            emit_llvm_ir(&missing_guard, &BuildTarget::Baseline, false, &[], None)
+            emit_llvm_ir(&missing_guard, &BuildTarget::Baseline, Profile::Release, false, &[], None)
                 .expect_err("a descriptor without its exact reservation marker must fail"),
             "borrowed element reservation marker is not unique",
         );
@@ -23016,7 +23031,7 @@ fn main() -> i32 = 0
                 root: place.base.slot,
             });
         assert_lowering(
-            emit_llvm_ir(&duplicate_guard, &BuildTarget::Baseline, false, &[], None)
+            emit_llvm_ir(&duplicate_guard, &BuildTarget::Baseline, Profile::Release, false, &[], None)
                 .expect_err("duplicate reservation identities must fail"),
             "borrowed element reservation marker is not unique",
         );
@@ -23041,7 +23056,7 @@ fn main() -> i32 = 0
         };
         *root = root.saturating_add(1);
         assert_lowering(
-            emit_llvm_ir(&wrong_root, &BuildTarget::Baseline, false, &[], None)
+            emit_llvm_ir(&wrong_root, &BuildTarget::Baseline, Profile::Release, false, &[], None)
                 .expect_err("a reservation marker for another root must fail"),
             "borrowed element reservation marker has the wrong root",
         );
@@ -23052,7 +23067,7 @@ fn main() -> i32 = 0
             Ty::Int(IntTy { bits: 64, signed: true }),
         ));
         assert_lowering(
-            emit_llvm_ir(&wrong_len, &BuildTarget::Baseline, false, &[], None)
+            emit_llvm_ir(&wrong_len, &BuildTarget::Baseline, Profile::Release, false, &[], None)
                 .expect_err("a descriptor with unrelated length evidence must fail"),
             "borrowed element guard length lacks a checked array-length value",
         );
@@ -23063,7 +23078,7 @@ fn main() -> i32 = 0
             .path
             .push(hir::BorrowedPathSegment::StructField(99));
         assert_lowering(
-            emit_llvm_ir(&invalid_base, &BuildTarget::Baseline, false, &[], None)
+            emit_llvm_ir(&invalid_base, &BuildTarget::Baseline, Profile::Release, false, &[], None)
                 .expect_err("a descriptor with an invalid array path must fail"),
             "resource MIR in function 'use' is malformed: XML-capable call argument provenance mismatch",
         );
@@ -23104,7 +23119,7 @@ fn main() -> i32 = 0
         }
         assert!(inserted, "stale-root mutation point missing");
         assert_lowering(
-            emit_llvm_ir(&stale_root, &BuildTarget::Baseline, false, &[], None)
+            emit_llvm_ir(&stale_root, &BuildTarget::Baseline, Profile::Release, false, &[], None)
                 .expect_err("a descriptor whose root generation changed must fail"),
             "borrowed element array root changes between its bounds guard and call action",
         );
@@ -23154,7 +23169,7 @@ fn main() -> i32 = 0
             .stmts
             .insert(call_position + 2, Stmt::DropValue(Operand::Value(alias)));
         assert_lowering(
-            emit_llvm_ir(&dropped_value, &BuildTarget::Baseline, false, &[], None)
+            emit_llvm_ir(&dropped_value, &BuildTarget::Baseline, Profile::Release, false, &[], None)
                 .expect_err("dropping a root-derived value during a reservation must fail"),
             "borrowed element array root changes between its bounds guard and call action",
         );
@@ -23194,7 +23209,7 @@ fn main() -> i32 = 0
             Stmt::DropValue(Operand::BorrowedPlace(Box::new(place))),
         );
         assert_lowering(
-            emit_llvm_ir(&dropped_place, &BuildTarget::Baseline, false, &[], None)
+            emit_llvm_ir(&dropped_place, &BuildTarget::Baseline, Profile::Release, false, &[], None)
                 .expect_err("dropping a direct borrowed root place during a reservation must fail"),
             "borrowed element array root changes between its bounds guard and call action",
         );
@@ -23222,7 +23237,7 @@ fn main() -> i32 = 0
             .stmts
             .insert(reservation_statement + 1, Stmt::DropFlagInit(place.base.slot));
         assert_lowering(
-            emit_llvm_ir(&stale_before_guard, &BuildTarget::Baseline, false, &[], None)
+            emit_llvm_ir(&stale_before_guard, &BuildTarget::Baseline, Profile::Release, false, &[], None)
                 .expect_err("a descriptor whose root changed during index evaluation must fail"),
             "borrowed element array root changes between its bounds guard and call action",
         );
@@ -23268,7 +23283,7 @@ fn main() -> i32 = 0
             .unwrap_or_else(|| panic!("length evidence position"));
         block.stmts.insert(length_position + 1, marker);
         assert_lowering(
-            emit_llvm_ir(&marker_after_length, &BuildTarget::Baseline, false, &[], None)
+            emit_llvm_ir(&marker_after_length, &BuildTarget::Baseline, Profile::Release, false, &[], None)
                 .expect_err("a reservation moved after its length evidence must fail"),
             "borrowed element reservation does not precede its length evidence",
         );
@@ -23305,7 +23320,7 @@ fn main() -> i32 = 0
         };
         peer.slot = root;
         assert_lowering(
-            emit_llvm_ir(&overlapping_action, &BuildTarget::Baseline, false, &[], None)
+            emit_llvm_ir(&overlapping_action, &BuildTarget::Baseline, Profile::Release, false, &[], None)
                 .expect_err("an indexed borrow and same-action borrow-mut peer must conflict"),
             "resource MIR in function 'use' is malformed: XML-capable call argument provenance mismatch",
         );
@@ -23353,7 +23368,7 @@ fn main() -> i32 = 0
             .unwrap_or_else(|| panic!("by-value peer load"));
         *peer_slot = root;
         assert_lowering(
-            emit_llvm_ir(&by_value_action, &BuildTarget::Baseline, false, &[], None)
+            emit_llvm_ir(&by_value_action, &BuildTarget::Baseline, Profile::Release, false, &[], None)
                 .expect_err("a same-action by-value peer must not consume the indexed root"),
             "resource MIR in function 'use' is malformed: XML-capable call argument provenance mismatch",
         );
@@ -23394,7 +23409,7 @@ fn main() -> i32 = 0
         assert!(function.blocks.iter().flat_map(|block| &block.stmts).any(|statement| {
             matches!(statement, Stmt::BorrowedElementReservation { .. })
         }), "the stable reservation marker must survive both rewrites");
-        emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+        emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
             .unwrap_or_else(|error| panic!("rewritten borrowed element guard must lower: {error}"));
     }
 
@@ -23507,7 +23522,7 @@ fn main() -> i32 = 0
     }
 
     fn ir(src: &str) -> String {
-        emit_llvm_ir(&mir(src), &BuildTarget::Baseline, false, &[], None).unwrap()
+        emit_llvm_ir(&mir(src), &BuildTarget::Baseline, Profile::Release, false, &[], None).unwrap()
     }
 
     fn test_resource() -> hir::ResourceDef {
@@ -23527,11 +23542,11 @@ fn main() -> i32 = 0
     fn resource_metadata_fails_closed_before_llvm_construction() {
         let mut valid = mir("fn main() -> i32 = 0\n");
         valid.resources.push(test_resource());
-        let llvm = emit_llvm_ir(&valid, &BuildTarget::Baseline, false, &[], None).unwrap();
+        let llvm = emit_llvm_ir(&valid, &BuildTarget::Baseline, Profile::Release, false, &[], None).unwrap();
         assert!(llvm.contains("__align_resource_drop$pkg$db$conn"));
 
         let rejected = |program: &Program, needle: &str| {
-            let error = emit_llvm_ir(program, &BuildTarget::Baseline, false, &[], None)
+            let error = emit_llvm_ir(program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
                 .expect_err("malformed resource metadata must fail closed");
             assert!(error.to_string().contains(needle), "{error}");
         };
@@ -23582,7 +23597,7 @@ fn main() -> i32 = 0
             return_cleanup: hir::ReturnCleanupAbi::None,
             producer_certified: true,
         });
-        let per_unit = emit_llvm_ir(&per_unit, &BuildTarget::Baseline, false, &[], None).unwrap();
+        let per_unit = emit_llvm_ir(&per_unit, &BuildTarget::Baseline, Profile::Release, false, &[], None).unwrap();
         assert_eq!(declarations(&per_unit), expected);
     }
 
@@ -23651,7 +23666,7 @@ fn main() -> i32 = 0
         ];
         let internal_ir = emit_llvm_ir(
             &internal_program,
-            &BuildTarget::Baseline,
+            &BuildTarget::Baseline, Profile::Release,
             false,
             &[],
             None,
@@ -23675,7 +23690,7 @@ fn main() -> i32 = 0
             "extern \"C\" fn align_rt_print_i64(x: i32)\n\
              fn main() -> i32 = 0\n",
         );
-        let error = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+        let error = emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
             .expect_err("an incompatible fixed-native extern must fail before declaration emission");
         assert_eq!(
             error.to_string(),
@@ -23692,7 +23707,7 @@ fn main() -> i32 = 0
             "extern \"C\" fn align_rt_tcp_conn_set_io_timeout(connection: raw, timeout_ns: i64)\n",
         ] {
             let program = mir(&format!("{declaration}fn main() -> i32 = 0\n"));
-            let error = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+            let error = emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
                 .expect_err("an incompatible timeout extern must fail before declaration emission");
             assert_eq!(
                 error.to_string(),
@@ -23706,7 +23721,7 @@ fn main() -> i32 = 0
         );
         let collision_ir = match emit_llvm_ir(
             &collision,
-            &BuildTarget::Baseline,
+            &BuildTarget::Baseline, Profile::Release,
             false,
             &[],
             None,
@@ -23721,7 +23736,7 @@ fn main() -> i32 = 0
         }));
         let collision = emit_llvm_ir(
             &collision,
-            &BuildTarget::Baseline,
+            &BuildTarget::Baseline, Profile::Release,
             false,
             &["align_rt_tcp_conn_set_io_timeout".to_owned()],
             None,
@@ -23803,7 +23818,7 @@ fn main() -> i32 = 0
                 "extern \"C\" fn consume(value: i64)\nfn main() -> i32 = 0\n",
             );
             program.externs[0].param_modes[0] = mode;
-            let error = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+            let error = emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
                 .expect_err("a C declaration cannot carry an Align borrow ABI");
             assert_lowering(
                 error,
@@ -23836,7 +23851,7 @@ fn main() -> i32 = 0
             }
         }
         assert!(changed, "fixture must contain the borrowed call operand");
-        let error = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+        let error = emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
             .expect_err("a borrowed place with a forged type must fail closed");
         assert_lowering(
             error,
@@ -23854,7 +23869,7 @@ fn main() -> i32 = 0
                       }\n\
                       fn main() -> i32 = 0\n";
         let program = mir(source);
-        let valid = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None);
+        let valid = emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None);
         assert!(
             valid.is_ok(),
             "a matching borrowed array-to-slice projection must lower: {valid:?}"
@@ -23881,7 +23896,7 @@ fn main() -> i32 = 0
             }
         }
         assert!(changed, "fixture must contain the projected slice call operand");
-        let malformed = emit_llvm_ir(&malformed, &BuildTarget::Baseline, false, &[], None);
+        let malformed = emit_llvm_ir(&malformed, &BuildTarget::Baseline, Profile::Release, false, &[], None);
         assert!(
             malformed.is_err(),
             "a slice view forged from an array with another element must fail closed"
@@ -23904,7 +23919,7 @@ fn main() -> i32 = 0
                 "fn inspect(borrow value: Option<{payload}>) -> i64 = match value {{ Some(handle) => {observation}, None => 0 }}\nfn main() {{}}\n"
             );
             let program = mir(&source);
-            assert!(emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None).is_ok());
+            assert!(emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_ok());
             for mutation in 0..3 {
                 let mut forged = program.clone();
                 let mut changed = false;
@@ -23930,7 +23945,7 @@ fn main() -> i32 = 0
                 }
                 assert!(changed, "fixture must exercise the handle projection");
                 assert!(
-                    emit_llvm_ir(&forged, &BuildTarget::Baseline, false, &[], None).is_err(),
+                    emit_llvm_ir(&forged, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_err(),
                     "{payload}/{mutation}"
                 );
             }
@@ -23965,7 +23980,7 @@ fn main() -> i32 = 0
             }
         }
         assert!(changed, "fixture must contain the borrowed sum tag operand");
-        let error = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+        let error = emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
             .expect_err("a forged borrowed sum path must fail closed before GEP construction");
         assert_lowering(error, "borrowed place field path crosses a non-struct type");
     }
@@ -23990,7 +24005,7 @@ fn main() -> i32 = 0
             }
         }
         assert!(changed, "fixture must contain the borrowed sum tag comparison");
-        let error = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+        let error = emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
             .expect_err("a forged borrowed sum variant must fail closed before GEP construction");
         assert_lowering(error, "borrowed enum tag test has an invalid enum or variant");
     }
@@ -24006,7 +24021,7 @@ fn main() -> i32 = 0
             .find(|function| function.name.as_str() == "replace")
             .expect("replace function");
         replace.borrow_mut_cleanup_slots[0] = None;
-        let error = emit_llvm_ir(&callee, &BuildTarget::Baseline, false, &[], None)
+        let error = emit_llvm_ir(&callee, &BuildTarget::Baseline, Profile::Release, false, &[], None)
             .expect_err("a Move BorrowMut callee needs its cleanup proxy");
         assert_lowering(
             error,
@@ -24032,7 +24047,7 @@ fn main() -> i32 = 0
             }
         }
         assert!(changed, "fixture must contain the exclusive borrowed call operand");
-        let error = emit_llvm_ir(&caller, &BuildTarget::Baseline, false, &[], None)
+        let error = emit_llvm_ir(&caller, &BuildTarget::Baseline, Profile::Release, false, &[], None)
             .expect_err("a Move BorrowMut call needs the caller cleanup slot");
         assert_lowering(error, "callable target invalid:7265706c616365");
     }
@@ -24619,7 +24634,7 @@ fn main() -> i32 = 0
                         for optimized in [false, true] {
                             let llvm = emit_llvm_ir(
                                 &mir,
-                                &BuildTarget::Baseline,
+                                &BuildTarget::Baseline, Profile::Release,
                                 optimized,
                                 &[],
                                 None,
@@ -24790,7 +24805,7 @@ fn main() -> i32 = 0
         program.fns = fns;
         program.structs = structs;
         program.enums = enums;
-        emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+        emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
     }
 
     fn template_mir_function(name: &str, rvalue: Rvalue, value_tys: Vec<Ty>) -> Function {
@@ -25927,7 +25942,7 @@ fn main() -> i32 = 0
         assert!(validated.is_ok(), "captured callable producer roots: {validated:?}");
         let partition = validate_thin_partition_program(&base, &[]);
         assert!(partition.is_ok(), "per-unit captured callable roots: {partition:?}");
-        emit_llvm_ir(&base, &BuildTarget::Baseline, false, &[], None)
+        emit_llvm_ir(&base, &BuildTarget::Baseline, Profile::Release, false, &[], None)
             .unwrap_or_else(|error| panic!("captured callable roots must lower: {error}"));
 
         let captured = xml_test_function(&base, "captured");
@@ -26013,7 +26028,7 @@ fn main() -> i32 = 0
         assert!(result.is_ok(), "direct lifted capture root: {result:?}");
         let result = validate_thin_partition_program(&base, &[]);
         assert!(result.is_ok(), "per-unit direct lifted capture root: {result:?}");
-        emit_llvm_ir(&base, &BuildTarget::Baseline, false, &[], None)
+        emit_llvm_ir(&base, &BuildTarget::Baseline, Profile::Release, false, &[], None)
             .unwrap_or_else(|error| panic!("direct lifted capture root must lower: {error}"));
 
         let Some(lifted) = base
@@ -26889,7 +26904,7 @@ fn main() -> i32 = 0
                     "Holder {{ value: {name} }}\nChoice {{ Some({name}), None }}\nfn discard(value: {shape}) {{}}\nfn main() -> i32 = 0\n"
                 );
                 let program = mir(&source);
-                let Ok(ir) = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None) else {
+                let Ok(ir) = emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None) else {
                     panic!("checked HTTP carrier cleanup must emit LLVM");
                 };
                 assert_eq!(
@@ -28292,7 +28307,7 @@ fn main() -> i32 {
 }
 "#);
         assert!(validate_mir_producers(&base).is_ok());
-        assert!(emit_llvm_ir(&base, &BuildTarget::Baseline, false, &[], None).is_ok());
+        assert!(emit_llvm_ir(&base, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_ok());
         for mutation in [
             "copied-signature",
             "constructor-summary",
@@ -29794,7 +29809,7 @@ fn main() -> i32 = 0
             program.resources = vec![resource("rows"), resource("batch")];
             emit_llvm_ir(
                 &program,
-                &BuildTarget::Baseline,
+                &BuildTarget::Baseline, Profile::Release,
                 false,
                 &[],
                 None,
@@ -30080,7 +30095,7 @@ fn main() -> i32 = 0
             program.resources = vec![resource];
             emit_llvm_ir(
                 &program,
-                &BuildTarget::Baseline,
+                &BuildTarget::Baseline, Profile::Release,
                 false,
                 &[],
                 None,
@@ -30727,7 +30742,7 @@ fn main() -> i32 = 0
     #[test]
     fn raw_call_has_typed_bare_pointer_abi_and_fails_closed() {
         let valid = raw_call_program();
-        let llvm = emit_llvm_ir(&valid, &BuildTarget::Baseline, false, &[], None)
+        let llvm = emit_llvm_ir(&valid, &BuildTarget::Baseline, Profile::Release, false, &[], None)
             .expect("valid raw call");
         assert!(
             llvm.contains("call i64 %rawptrval(ptr"),
@@ -30735,7 +30750,7 @@ fn main() -> i32 = 0
         );
 
         let rejected = |program: &Program| {
-            let error = emit_llvm_ir(program, &BuildTarget::Baseline, false, &[], None)
+            let error = emit_llvm_ir(program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
                 .expect_err("malformed raw call must fail before LLVM construction");
             assert!(
                 error.to_string().contains("callable metadata invalid"),
@@ -30789,7 +30804,7 @@ fn main() -> i32 = 0
     #[test]
     fn raw_pointer_load_fails_closed_before_llvm() {
         let rejected = |program: &Program| {
-            let error = emit_llvm_ir(program, &BuildTarget::Baseline, false, &[], None)
+            let error = emit_llvm_ir(program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
                 .expect_err("malformed raw pointer load must fail before LLVM construction");
             assert!(
                 error.to_string().contains("raw pointer load metadata invalid"),
@@ -30979,7 +30994,7 @@ fn main() -> i32 = 0
                 entry: 0,
                 exportable: false,
             }];
-        let err = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+        let err = emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
             .expect_err("a missing nested tagged id must fail closed");
         assert!(
             err.to_string().contains("nested tagged type id 7 is missing"),
@@ -31025,7 +31040,7 @@ fn main() -> i32 = 0
                 entry: 0,
                 exportable: false,
             }];
-        let err = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+        let err = emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
             .expect_err("an embedded missing nested tagged id must fail closed");
         assert!(
             err.to_string().contains("nested tagged type id 7 is missing"),
@@ -31066,7 +31081,7 @@ fn main() -> i32 = 0
                 entry: 0,
                 exportable: false,
             }];
-        let err = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+        let err = emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
             .expect_err("a RawLoad missing nested tagged id must fail closed");
         assert!(
             err.to_string().contains("nested tagged type id 7 is missing"),
@@ -31109,7 +31124,7 @@ fn main() -> i32 = 0
         ] {
             let err = emit_llvm_ir(
                 &program(payload),
-                &BuildTarget::Baseline,
+                &BuildTarget::Baseline, Profile::Release,
                 false,
                 &[],
                 None,
@@ -31183,7 +31198,7 @@ fn main() -> i32 = 0
         for (name, malformed) in [("struct", struct_cycle), ("sum", enum_cycle)] {
             let err = emit_llvm_ir(
                 &malformed,
-                &BuildTarget::Baseline,
+                &BuildTarget::Baseline, Profile::Release,
                 false,
                 &[],
                 None,
@@ -31320,7 +31335,7 @@ fn main() -> i32 = 0
             malformed.fns[0].value_tys.push(ty);
             let err = emit_llvm_ir(
                 &malformed,
-                &BuildTarget::Baseline,
+                &BuildTarget::Baseline, Profile::Release,
                 false,
                 &[],
                 None,
@@ -31349,7 +31364,7 @@ fn main() -> i32 = 0
             });
             let err = emit_llvm_ir(
                 &malformed,
-                &BuildTarget::Baseline,
+                &BuildTarget::Baseline, Profile::Release,
                 false,
                 &[],
                 None,
@@ -31506,7 +31521,7 @@ fn main() -> i32 = 0
             .expect("a deep source-ABI tagged key must not consume the process stack");
         // `build_tagged_types` claims to be stack-bounded at this depth too, and only building the
         // module proves it: a recursive body walk would overflow here long before the verifier ran.
-        emit_llvm_ir(&deep_tagged, &BuildTarget::Baseline, false, &[], None)
+        emit_llvm_ir(&deep_tagged, &BuildTarget::Baseline, Profile::Release, false, &[], None)
             .expect("a deep tagged table must lower without the process stack");
 
         deep.structs[DEEP_GRAPH_LEN - 1].fields[0].ty = Ty::Struct(0);
@@ -31545,7 +31560,7 @@ fn main() -> i32 = 0
                 exportable: false,
             }];
         program.tagged_types = vec![hir::TaggedType::Option(Scalar::String)];
-        let ir = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+        let ir = emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
             .expect("a valid direct nested-tagged slot must lower");
         assert!(
             ir.contains("dropoptissome"),
@@ -31581,7 +31596,7 @@ fn main() -> i32 = 0
         program.tuples = vec![TupleDef {
                 elems: vec![Scalar::DynArray(align_sema::PrimScalar::String)],
             }];
-        let ir = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+        let ir = emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
             .expect("a tuple with an owned string array must lower");
         assert!(
             ir.contains("call void @align_rt_free_string_array"),
@@ -31623,7 +31638,7 @@ fn main() -> i32 = 0
         program.tuples = vec![TupleDef {
                 elems: vec![Scalar::DynStructArray(0)],
             }];
-        let ir = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+        let ir = emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
             .expect("a tuple with an owned Move-struct array must lower");
         assert!(
             ir.contains("dropdeep.head") && ir.contains("dropdeep.ep"),
@@ -31697,7 +31712,7 @@ fn main() -> i32 = 0
         for (name, program) in cases {
             let err = emit_llvm_ir(
                 &program,
-                &BuildTarget::Baseline,
+                &BuildTarget::Baseline, Profile::Release,
                 false,
                 &[],
                 None,
@@ -32620,7 +32635,7 @@ fn main() -> i32 = 0
     fn r63_json_sequence_is_checked_by_every_body_emitter() -> Result<(), CodegenError> {
         let source = "import core.json\nRow { value: f64 }\nfn main() -> Result<(), Error> { row := Row { value: 0.3 }; text := json.encode(row)?; print(text); return Ok(()) }\n";
         let base = mir(source);
-        assert!(emit_llvm_ir(&base, &BuildTarget::Baseline, false, &[], None).is_ok());
+        assert!(emit_llvm_ir(&base, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_ok());
         let output = std::env::temp_dir().join(format!("align-r63-rejected-{}", std::process::id()));
         for mutation in 0..7 {
             let mut bad = base.clone();
@@ -32643,7 +32658,7 @@ fn main() -> i32 = 0
                 }
             }
             assert!(found, "fixture must retain its encoder");
-            assert!(emit_llvm_ir(&bad, &BuildTarget::Baseline, false, &[], None).is_err());
+            assert!(emit_llvm_ir(&bad, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_err());
             assert!(emit_object(&bad, &output, &BuildTarget::Baseline, Profile::Release, &[], None).is_err());
             assert!(emit_test_object(&bad, &[], &output, &BuildTarget::Baseline, Profile::Release, None).is_err());
             assert!(emit_object_pgo(&bad, &output, &BuildTarget::Baseline, Profile::Release, &[], None, pgo::PgoAction::Instrument).is_err());
@@ -32668,7 +32683,7 @@ fn main() -> i32 = 0
         }
         // The ordinary template route must never recover the old infallible JSON writer.
         let mut bad = mir("fn main() { text := \"x\"; marker := 'y'; value := template \"{text}{marker}\"; print(value) }\n");
-        assert!(emit_llvm_ir(&bad, &BuildTarget::Baseline, false, &[], None).is_ok());
+        assert!(emit_llvm_ir(&bad, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_ok());
         let mut found = false;
         for function in &mut bad.fns {
             for statement in function.blocks.iter_mut().flat_map(|block| &mut block.stmts) {
@@ -32679,7 +32694,7 @@ fn main() -> i32 = 0
             }
         }
         assert!(found);
-        assert!(emit_llvm_ir(&bad, &BuildTarget::Baseline, false, &[], None).is_err());
+        assert!(emit_llvm_ir(&bad, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_err());
         Ok(())
     }
 
@@ -32741,7 +32756,7 @@ fn main() -> i32 = 0
                 exportable: false,
             }];
         program.structs = structs;
-        emit_llvm_ir(&program, &BuildTarget::Baseline, optimized, &[], None).unwrap()
+        emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, optimized, &[], None).unwrap()
     }
 
     fn function_body<'a>(ir: &'a str, name: &str) -> &'a str {
@@ -32798,7 +32813,7 @@ fn main() -> i32 = 0
                 entry: 0,
                 exportable: false,
             }];
-        emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None).unwrap()
+        emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None).unwrap()
     }
 
     fn soa_allocation_case_ir(len: Operand, row: StructDef, optimized: bool) -> String {
@@ -32840,7 +32855,7 @@ fn main() -> i32 = 0
                 exportable: false,
             }];
         program.structs = vec![row];
-        emit_llvm_ir(&program, &BuildTarget::Baseline, optimized, &[], None).unwrap()
+        emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, optimized, &[], None).unwrap()
     }
 
     #[test]
@@ -33422,7 +33437,7 @@ fn main() -> i32 = 0
         for optimized in [false, true] {
             let llvm = emit_llvm_ir(
                 &program,
-                &BuildTarget::Baseline,
+                &BuildTarget::Baseline, Profile::Release,
                 optimized,
                 &names,
                 None,
@@ -34203,7 +34218,7 @@ fn main() -> i32 = 0
             return_region: hir::ReturnRegionSummary::None,
             return_cleanup: hir::ReturnCleanupAbi::None,
         });
-        let conflict = emit_llvm_ir(&conflict, &BuildTarget::Baseline, false, &[], None)
+        let conflict = emit_llvm_ir(&conflict, &BuildTarget::Baseline, Profile::Release, false, &[], None)
             .expect_err("stored and extern declarations cannot share one logical target");
         assert_lowering(conflict, "callable declaration conflict:647570");
 
@@ -34212,7 +34227,7 @@ fn main() -> i32 = 0
         );
         let collision = emit_llvm_ir(
             &exported,
-            &BuildTarget::Baseline,
+            &BuildTarget::Baseline, Profile::Release,
             false,
             &["align_rt_print_i64".to_owned()],
             None,
@@ -34232,7 +34247,7 @@ fn main() -> i32 = 0
         ));
         precedence.fns[0].value_tys.push(i64_ty);
         precedence.fns[0].blocks[0].stmt_lines.push((0, 0));
-        let precedence = emit_llvm_ir(&precedence, &BuildTarget::Baseline, false, &[], None)
+        let precedence = emit_llvm_ir(&precedence, &BuildTarget::Baseline, Profile::Release, false, &[], None)
             .expect_err("extern ABI validation must precede callable target validation");
         assert_lowering(
             precedence,
@@ -34255,7 +34270,7 @@ fn main() -> i32 = 0
             return_region: hir::ReturnRegionSummary::None,
             return_cleanup: hir::ReturnCleanupAbi::None,
         });
-        let text = emit_llvm_ir(&fn_value, &BuildTarget::Baseline, false, &[], None)
+        let text = emit_llvm_ir(&fn_value, &BuildTarget::Baseline, Profile::Release, false, &[], None)
             .expect("an occupied generated candidate must probe deterministically");
         assert!(text.contains("align_gen$fnval$6e6f6f70$1"), "{text}");
         assert_eq!(
@@ -34406,7 +34421,7 @@ fn main() -> i32 = 0
     #[test]
     fn move_slice_mir_gate() -> Result<(), &'static str> {
         fn reject(program: &Program, label: &str) {
-            assert!(emit_llvm_ir(program, &BuildTarget::Baseline, false, &[], None).is_err(), "{label}");
+            assert!(emit_llvm_ir(program, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_err(), "{label}");
             let output = std::env::temp_dir().join(format!("align-move-slice-rejected-{}", std::process::id()));
             assert!(emit_object(program, &output, &BuildTarget::Baseline, Profile::Release, &[], None).is_err(), "{label}");
             assert!(emit_prelink_bc(program, &output, &BuildTarget::Baseline, Profile::Release, &[], None, "move-slice-reject").is_err(), "{label}");

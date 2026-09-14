@@ -177,7 +177,7 @@ fn malformed_mir_signature_facts_fail_before_llvm_emission() {
         .find(|function| function.name.as_str() == "buffer$put")
         .expect("put MIR");
     put.param_modes.pop();
-    let error = emit_llvm_ir(&wrong_arity, BuildTarget::Baseline, false, &[], false)
+    let error = emit_llvm_ir(&wrong_arity, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false)
         .expect_err("mode arity mismatch must fail");
     assert!(
         error.contains("parameter modes"),
@@ -194,7 +194,7 @@ fn malformed_mir_signature_facts_fail_before_llvm_emission() {
         params: vec![99],
         captures: vec![],
     };
-    let error = emit_llvm_ir(&malformed_roots, BuildTarget::Baseline, false, &[], false)
+    let error = emit_llvm_ir(&malformed_roots, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false)
         .expect_err("out-of-range roots must fail");
     assert!(
         error.contains("out-of-range return-borrow parameter root"),
@@ -215,7 +215,7 @@ fn malformed_mir_signature_facts_fail_before_llvm_emission() {
         params: vec![],
         captures: vec![0],
     };
-    let error = emit_llvm_ir(&invalid_capture, BuildTarget::Baseline, false, &[], false)
+    let error = emit_llvm_ir(&invalid_capture, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false)
         .expect_err("a non-borrowing return cannot carry capture roots");
     assert!(
         error.contains("cannot borrow"),
@@ -232,7 +232,7 @@ fn malformed_mir_signature_facts_fail_before_llvm_emission() {
         params: vec![0],
         captures: vec![],
     };
-    let error = emit_llvm_ir(&disagreeing_roots, BuildTarget::Baseline, false, &[], false)
+    let error = emit_llvm_ir(&disagreeing_roots, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false)
         .expect_err("L2b-a1 borrow/region disagreement must fail");
     assert!(
         error.contains("disagreeing return-borrow and return-region roots"),
@@ -260,7 +260,7 @@ fn malformed_mir_signature_facts_fail_before_llvm_emission() {
         params: vec![0],
         captures: vec![],
     };
-    let error = emit_llvm_ir(&scalar_mir, BuildTarget::Baseline, false, &[], false)
+    let error = emit_llvm_ir(&scalar_mir, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false)
         .expect_err("provenance on scalar parameter and return types must fail");
     assert!(
         error.contains("cannot borrow"),
@@ -286,7 +286,7 @@ fn malformed_mir_signature_facts_fail_before_llvm_emission() {
         .expect("scalar MIR");
     scalar.ret = Ty::Struct(cycle_id);
     scalar.slots[scalar.params[0] as usize] = Ty::Struct(cycle_id);
-    let error = emit_llvm_ir(&cyclic_mir, BuildTarget::Baseline, false, &[], false)
+    let error = emit_llvm_ir(&cyclic_mir, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false)
         .expect_err("recursive MIR type graphs must fail before provenance classification");
     assert!(
         error.contains("missing or recursive by-value definition"),
@@ -310,7 +310,7 @@ fn malformed_mir_signature_facts_fail_before_llvm_emission() {
         params: vec![0],
         captures: vec![],
     };
-    let error = emit_llvm_ir(&extern_mir, BuildTarget::Baseline, false, &[], false)
+    let error = emit_llvm_ir(&extern_mir, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false)
         .expect_err("unanalyzed extern roots must retain the conservative fallback");
     assert!(
         error.contains("cannot carry return provenance across an unanalyzed extern boundary"),
@@ -379,7 +379,7 @@ fn main() -> i32 = apply(increment, 41) as i32
             }
         }
     }
-    let error = emit_llvm_ir(&malformed, BuildTarget::Baseline, false, &[], false)
+    let error = emit_llvm_ir(&malformed, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false)
         .expect_err("function address arity mismatch must fail");
     assert!(
         error.contains("parameter modes") || error.contains("disagree"),
@@ -404,7 +404,7 @@ fn main() -> i32 = apply(increment, 41) as i32
             }
         }
     }
-    let error = emit_llvm_ir(&invalid_roots, BuildTarget::Baseline, false, &[], false)
+    let error = emit_llvm_ir(&invalid_roots, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false)
         .expect_err("a non-borrowing function-value return cannot carry roots");
     assert!(
         error.contains("cannot borrow"),

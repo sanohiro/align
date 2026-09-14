@@ -103,6 +103,13 @@ alignc size file.align --profile tiny
 
 `emit-mir` is the semantic lens. Raw LLVM IR shows lowering before optimization; optimized IR shows the code LLVM actually shaped. `explain-opt` reports the compiler's current storage and explicit-parallel execution choices, then translates vectorization and other LLVM optimization remarks back to source lines. `size` builds the same artifact as `build` under the selected profile and reports where its bytes went. For standalone objects or IR, repeat `--export name` to keep selected entry-unit functions externally visible.
 
+Explicit CPU selectors reject missing, empty, unknown, embedded-NUL and
+wrong-architecture names before artifact work. LLVM validates names for the
+selected architecture. `emit-llvm` and `explain-opt` use the selected profile's
+pipeline, code-generation level and size attributes; raw IR precedes optimization
+but includes those attributes. `explain-opt` reports per-unit observations with
+runtime LTO off; it does not describe a linked ThinLTO executable.
+
 ## Profiles, targets, and whole-program optimization
 
 ```text

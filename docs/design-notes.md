@@ -814,6 +814,13 @@ it is a conservative portable floor in the codegen plus runtime-adaptive SIMD in
 
 ---
 
+Explicit CPU selectors reject missing, empty, unknown, embedded-NUL and
+wrong-architecture names before artifact work. LLVM validates names for the
+selected architecture. `emit-llvm` and `explain-opt` use the selected profile's
+pipeline, code-generation level and size attributes; raw IR precedes optimization
+but includes those attributes. `explain-opt` reports per-unit observations with
+runtime LTO off; it does not describe a linked ThinLTO executable.
+
 ## The GPU philosophy
 
 Align is not a GPU language.

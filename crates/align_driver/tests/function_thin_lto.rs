@@ -439,3 +439,125 @@ fn shared_codegen_table_change_invalidates_every_function_partition() {
         "one shared-table change must invalidate every function partition"
     );
 }
+/// The source entry's return ABI must not decide whether partitioned builds
+/// contain the C entry wrapper. The second function is the regression trigger.
+#[test]
+fn partitioned_entry_abis_match_the_whole_unit_shortcut() {
+    if !backend_available() {
+        return;
+    }
+    let cases = [
+        ("unit", "fn main() { print(helper()) }", 0),
+        ("i32", "fn main() -> i32 = helper() as i32", 42),
+        (
+            "ok",
+            "fn main() -> Result<(), Error> { print(helper()); return Ok(()) }",
+            0,
+        ),
+        (
+            "err",
+            "fn main() -> Result<(), Error> { return Err(error(helper() as i32)) }",
+            42,
+        ),
+        (
+            "argv",
+            "fn main(args: array<str>) -> Result<(), Error> { if args.len() != 2 { return Err(error(11)) }; if args[1] != \"marker\" { return Err(error(12)) }; return Ok(()) }",
+            0,
+        ),
+    ];
+    for (name, entry, expected) in cases {
+        for shape in 0..3 {
+            let source = match shape {
+                0 => entry.replace("helper()", "42"),
+                1 => format!("{entry}\nfn helper() -> i64 = 42\n"),
+                _ => format!(
+                    "import dep\n{}\n",
+                    entry.replace("helper()", "dep.helper()")
+                ),
+            };
+            let mut files = vec![("main.align", source.as_str())];
+            if shape == 2 {
+                files.push(("dep.align", "module dep\npub fn helper() -> i64 = 42\n"));
+            }
+            let project = Proj::new(&format!("entry-{name}-{shape}"), &files, "main.align");
+            let input = walk(&project);
+            let cache = project.cache();
+            for warm in [false, true] {
+                let built = build_function_thin_lto(
+                    &input.units,
+                    &cache,
+                    &BuildTarget::Baseline,
+                    Profile::Release,
+                    &[],
+                    false,
+                    2,
+                )
+                .expect("entry ThinLTO build");
+                assert_eq!(
+                    built.mode(),
+                    if shape == 0 {
+                        FunctionThinLtoMode::WholeUnit
+                    } else {
+                        FunctionThinLtoMode::Partitioned
+                    }
+                );
+                if warm && shape != 0 {
+                    assert!(
+                        function_prelinks(built.observations())
+                            .values()
+                            .all(|hit| *hit)
+                    );
+                    assert!(
+                        function_backends(built.observations())
+                            .values()
+                            .all(|hit| *hit)
+                    );
+                }
+                let executable = project
+                    .dir
+                    .join(format!("entry{}", std::env::consts::EXE_SUFFIX));
+                built
+                    .link_and_publish(&align_driver::CDriver::default(), &executable)
+                    .expect("entry must link");
+                assert_eq!(
+                    entry_exit(&executable),
+                    expected,
+                    "{name}, shape {shape}, warm {warm}"
+                );
+            }
+        }
+    }
+}
+
+fn entry_exit(executable: &std::path::Path) -> i32 {
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+    // These generated fixtures call no process-spawning operation. Direct child
+    // kill/reap therefore closes their complete process lifetime on every exit.
+    struct Guard(Child);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = Guard(
+        Command::new(executable)
+            .arg("marker")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn entry"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.0.try_wait().expect("poll entry") {
+            return status.code().expect("entry was terminated by a signal");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "entry exceeded its execution deadline"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}

@@ -328,7 +328,7 @@ pub fn emit_llvm_with_exports(src: &str, exports: &[&str]) -> String {
     );
     let mir = lower_to_mir(&checked.hir);
     let exports: Vec<String> = exports.iter().map(|s| s.to_string()).collect();
-    align_driver::emit_llvm_ir(&mir, BuildTarget::Baseline, false, &exports, false)
+    align_driver::emit_llvm_ir(&mir, BuildTarget::Baseline, align_driver::Profile::Release, false, &exports, false)
         .expect("emit llvm ir")
 }
 
@@ -345,7 +345,7 @@ pub fn emit_llvm_optimized(src: &str, exports: &[&str]) -> String {
     );
     let mir = lower_to_mir(&checked.hir);
     let exports: Vec<String> = exports.iter().map(|s| s.to_string()).collect();
-    align_driver::emit_llvm_ir(&mir, BuildTarget::Baseline, true, &exports, false)
+    align_driver::emit_llvm_ir(&mir, BuildTarget::Baseline, align_driver::Profile::Release, true, &exports, false)
         .expect("emit optimized llvm ir")
 }
 
@@ -364,7 +364,7 @@ pub fn emit_llvm_multi(name: &str, files: &[(&str, &str)], entry: &str) -> Strin
         align_driver::format_diagnostics(&sm, &checked.diags)
     );
     let mir = lower_to_mir(&checked.hir);
-    align_driver::emit_llvm_ir(&mir, BuildTarget::Baseline, false, &[], false)
+    align_driver::emit_llvm_ir(&mir, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false)
         .expect("emit multi-file LLVM IR")
 }
 
