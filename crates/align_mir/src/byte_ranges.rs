@@ -174,6 +174,35 @@ impl<'a> Facts<'a> {
             && !self.reachable(self.f.entry, after, Some(before))
     }
 
+    // Delete exactly one arm while searching for a bypass. Deleting the
+    // destination node (or all edges to it) would incorrectly accept equal
+    // successors and rejected arms that rejoin the admitted successor.
+    fn arm_dominates(&self, header: BlockId, take_true: bool, target: BlockId) -> bool {
+        if !self.reachable(self.f.entry, target, None) {
+            return false;
+        }
+        let mut seen = BTreeSet::new();
+        let mut pending = vec![self.f.entry];
+        while let Some(block) = pending.pop() {
+            if !seen.insert(block) {
+                continue;
+            }
+            if block == target {
+                return false;
+            }
+            let term = &self.f.blocks[block as usize].term;
+            if block == header {
+                let Term::Branch(_, yes, no) = term else {
+                    return false;
+                };
+                pending.push(if take_true { *no } else { *yes });
+            } else {
+                pending.extend(successors(term));
+            }
+        }
+        true
+    }
+
     fn definition_precedes(&self, operand: &Operand, block: BlockId, position: usize) -> bool {
         match operand {
             Operand::Value(id) => self.defs.get(id).is_some_and(|(owner, index, _)| {
@@ -232,7 +261,14 @@ impl<'a> Facts<'a> {
         matches!(op, Operand::Value(id) if self.defs.get(id).is_some_and(|(owner, _, _)| *owner == block))
     }
 
-    fn recurrence(&self, slot: Slot, header: BlockId, admitted: BlockId, read: BlockId) -> bool {
+    fn recurrence(
+        &self,
+        slot: Slot,
+        header: BlockId,
+        take_true: bool,
+        admitted: BlockId,
+        read: BlockId,
+    ) -> bool {
         let Some(stores) = self.stores.get(&slot) else {
             return false;
         };
@@ -266,7 +302,7 @@ impl<'a> Facts<'a> {
             || self.ty(step.2) != Some(integer())
             || !self.expression_precedes(step.2, step.0, step.1)
             || !self.defined_in(value, step.0)
-            || !self.dominates(admitted, step.0)
+            || !self.arm_dominates(header, take_true, step.0)
         {
             return false;
         }
@@ -375,21 +411,22 @@ impl<'a> Facts<'a> {
             let Term::Branch(test, yes, no) = &header.term else {
                 continue;
             };
-            let (index, limit, admitted) = if let Some((index, limit)) = self.bin(test, BinOp::Ge) {
-                (index, limit, *no)
-            } else if let Some((index, limit)) = self.bin(test, BinOp::Lt) {
-                (index, limit, *yes)
-            } else {
-                continue;
-            };
+            let (index, limit, admitted, take_true) =
+                if let Some((index, limit)) = self.bin(test, BinOp::Ge) {
+                    (index, limit, *no, false)
+                } else if let Some((index, limit)) = self.bin(test, BinOp::Lt) {
+                    (index, limit, *yes, true)
+                } else {
+                    continue;
+                };
             if self.ty(test) != Some(Ty::Bool)
                 || self.load(index, integer()) != Some(slot)
                 || !self.defined_in(index, header.id)
                 || !self.expression_precedes(test, header.id, header.stmts.len())
                 || self.limit(limit, width) != Some(source)
-                || !self.dominates(admitted, block)
+                || !self.arm_dominates(header.id, take_true, block)
                 || !self.dominates(header.id, block)
-                || !self.recurrence(slot, header.id, admitted, *ok)
+                || !self.recurrence(slot, header.id, take_true, admitted, *ok)
             {
                 continue;
             }

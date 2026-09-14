@@ -479,7 +479,10 @@ is deliberately restricted to scalar/read-only bodies with stable incoming byte
 views and no mutable parameter aliases or opaque effects. It verifies unique
 SSA definitions, participating operand types and dominance, one zero initializer
 and one increment by one, and the original range-failure condition/read identity.
-The step returns to the same admission header. Both `i >= len/w` exit guards and
+The step returns to the same admission header. The admitting branch arm must
+dominate both the read guard and increment: removing exactly that arm must make
+each unreachable from entry. Successor-node dominance is insufficient; equal
+successors and rejected-arm rejoins preserve the original trap. Both `i >= len/w` exit guards and
 `i < len/w` admission guards qualify, for widths 1/2/4/8. Valid view lengths are
 nonnegative, so the admitted index and increment cannot overflow and
 `i*w + w <= len`. The byte read keeps alignment 1.
@@ -498,6 +501,7 @@ source shapes remain optimization opportunities, not unchecked fallbacks.
 | Return/retention, opaque import and aggregate/cleanup/indirect unknown effects | Explicit admitted-operation match and conservative remainder; returned-view control and `imported_byte_readers_remain_opaque_to_per_unit_storage_selection`; existing ownership/producer rejection owners remain |
 | Construction, initialized extent, scalar widths, replacement, fresh loop lifetime and Drop | Existing `object_plan` transfer and budgets unchanged; `bounded_byte_object_control_matrix`, `bounded_byte_object_rejects_forged_put_widths` |
 | Range guard identity, SSA/type/CFG validity, initialization, wrap and alias invalidation | `byte_ranges::Facts`; `byte_range_malformed_and_invalidated_proofs_fail_closed` |
+| Admission provenance for true/false arms, equal successors and rejected-arm rejoins | `Facts::arm_dominates` at both read and increment; parameterized Ge/Lt positive and bypass controls in `byte_range_malformed_and_invalidated_proofs_fail_closed` |
 | Integer/float width, endian, zero/short/partial/unaligned inputs and reached trap | `byte_range_recurrence_preserves_tails_and_eliminates_only_proved_guards`; existing binary-codec trap owners |
 | Whole/per-unit, profile and target execution | Shared lowering route and scope-filtered body summaries; `scripts/test-codegen-performance.sh` runs the same owner set locally and on Linux x86/ARM and native macOS CI |
 | ARM baseline/named CPU instruction selection and x86 reverse direction | `target_cpu_isa`: generic/Apple NEON plus existing v2-without-AVX2 and v3/skylake-with-AVX2 controls; native execution qualification remains distinct |

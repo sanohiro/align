@@ -554,6 +554,37 @@ fn byte_range_malformed_and_invalidated_proofs_fail_closed() {
     let mut valid = base.clone();
     align_mir::byte_ranges::simplify(&mut valid);
     assert_eq!(reached_byte_guards(&valid), 0);
+    // A comparison fact belongs to one branch arm, even when destinations
+    // coincide or a rejected arm rejoins the admitted arm later.
+    for use_lt in [false, true] {
+        let mut oriented = base.clone();
+        let header = oriented.blocks.iter().position(|block| block.stmts.iter().any(
+            |stmt| matches!(stmt, Stmt::Let(_, Rvalue::Bin(BinOp::Ge, _, _)))
+        )).expect("admission header");
+        if use_lt {
+            for stmt in &mut oriented.blocks[header].stmts {
+                if let Stmt::Let(_, Rvalue::Bin(op @ BinOp::Ge, _, _)) = stmt { *op = BinOp::Lt; }
+            }
+            if let Term::Branch(_, yes, no) = &mut oriented.blocks[header].term {
+                std::mem::swap(yes, no);
+            }
+        }
+        let mut positive = oriented.clone();
+        align_mir::byte_ranges::simplify(&mut positive);
+        assert_eq!(reached_byte_guards(&positive), 0, "admitted arm: lt={use_lt}");
+        for rejoin in [false, true] {
+            let mut bad = oriented.clone();
+            let Term::Branch(_, yes, no) = bad.blocks[header].term.clone() else { panic!("header branch") };
+            let (admitted, rejected) = if use_lt { (yes, no) } else { (no, yes) };
+            if rejoin {
+                bad.blocks[rejected as usize].term = Term::Goto(admitted);
+            } else if let Term::Branch(_, yes, no) = &mut bad.blocks[header].term {
+                if use_lt { *no = admitted; } else { *yes = admitted; }
+            }
+            align_mir::byte_ranges::simplify(&mut bad);
+            assert_eq!(reached_byte_guards(&bad), 1, "rejected arm: lt={use_lt}, rejoin={rejoin}");
+        }
+    }
     for mutation in 0..10 {
         let mut bad = base.clone();
         let mut changed = false;
