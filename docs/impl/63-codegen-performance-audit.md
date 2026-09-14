@@ -1,7 +1,7 @@
 # Idiomatic execution performance: issue 1043
 
-Status: configuration and ThinLTO entry repair implemented; byte-storage and
-range-proof extensions remain planned, 2026-09-14. Build defaults are unchanged.
+Status: configuration, ThinLTO entry repair, local byte-call promotion and
+restricted byte-range proof implemented, 2026-09-14. Build defaults are unchanged.
 Reference revision: `21d0cf27fb92166370b2705d5c366c2b269d17a3`.
 Input: [issue 1043](https://github.com/sanohiro/align/issues/1043), the
 align-llm request register, and the owner's request to investigate both missed
@@ -435,7 +435,7 @@ Native Mac measurement and the actual foreign update contract remain pending.
 ## 9. Configuration capability closure
 
 The first capability repairs entry emission and configuration observation as one
-independently useful compiler boundary. Byte storage and range reasoning remain
+independently useful compiler boundary. Byte storage and range reasoning form
 the second capability; foreign retention and native policy qualification stay
 deferred under sections 4 and 5.
 
@@ -462,3 +462,96 @@ Keeping those callers, the shared profile producer and the inspection consumers
 in one capability avoids a temporarily inconsistent public API. Together with
 the investigation ledger the diff may exceed 1,000 lines; splitting this boundary
 would duplicate configuration proof without producing a useful intermediate API.
+
+## 10. Byte-execution capability closure
+
+`CallEscapeSummary` is a private-field, ephemeral compiler analysis over concrete
+MIR bodies covered by the current artifact identity. Logical parameter ordinals
+identify byte roots; the finite greatest fixed point removes confinement facts
+when any body path returns, retains or forwards bytes to an unproved consumer.
+Cycles converge without Rust recursion. Buffer-free artifacts skip this analysis.
+Whole/unit objects may use their local concrete bodies, including instantiated
+generics. Function partitions only use bodies they define; a peer's private body
+is not in the caller's cache key. Imported/foreign effects remain deferred.
+
+The range pass runs in the shared checked-HIR-to-MIR route. Its first admission
+is deliberately restricted to scalar/read-only bodies with stable incoming byte
+views and no mutable parameter aliases or opaque effects. It verifies unique
+SSA definitions, participating operand types and dominance, one zero initializer
+and one increment by one, and the original range-failure condition/read identity.
+The step returns to the same admission header. The admitting branch arm must
+dominate both the read guard and increment: removing exactly that arm must make
+each unreachable from entry. Successor-node dominance is insufficient; equal
+successors and rejected-arm rejoins preserve the original trap. Both `i >= len/w` exit guards and
+`i < len/w` admission guards qualify, for widths 1/2/4/8. Valid view lengths are
+nonnegative, so the admitted index and increment cannot overflow and
+`i*w + w <= len`. The byte read keeps alignment 1.
+
+Only the proved branch becomes `Goto`; statements, value/block IDs, source
+coordinates and the original trap block remain. Structural admission is checked
+again after rewriting, with rollback on rejection. No LLVM assumption, new IR
+variant, speculative read or trap hoisting is introduced. Source replacement,
+extra index writes, unproved aliases, inclusive bounds, different widths or
+unknown operations preserve the original branch. Other valid recurrences and
+source shapes remain optimization opportunities, not unchecked fallbacks.
+
+| Matrix cell | Implementation and owner |
+| --- | --- |
+| Local/forwarded/recursive and concrete generic readers; logical argument ordinal | `CallEscapeSummary`, `argument_confined`; `byte_storage_crosses_proved_local_readers_and_unrelated_indexing` |
+| Return/retention, opaque import and aggregate/cleanup/indirect unknown effects | Explicit admitted-operation match and conservative remainder; returned-view control and `imported_byte_readers_remain_opaque_to_per_unit_storage_selection`; existing ownership/producer rejection owners remain |
+| Construction, initialized extent, scalar widths, replacement, fresh loop lifetime and Drop | Existing `object_plan` transfer and budgets unchanged; `bounded_byte_object_control_matrix`, `bounded_byte_object_rejects_forged_put_widths` |
+| Range guard identity, SSA/type/CFG validity, initialization, wrap and alias invalidation | `byte_ranges::Facts`; `byte_range_malformed_and_invalidated_proofs_fail_closed` |
+| Admission provenance for true/false arms, equal successors and rejected-arm rejoins | `Facts::arm_dominates` at both read and increment; parameterized Ge/Lt positive and bypass controls in `byte_range_malformed_and_invalidated_proofs_fail_closed` |
+| Integer/float width, endian, zero/short/partial/unaligned inputs and reached trap | `byte_range_recurrence_preserves_tails_and_eliminates_only_proved_guards`; existing binary-codec trap owners |
+| Whole/per-unit, profile and target execution | Shared lowering route and scope-filtered body summaries; `scripts/test-codegen-performance.sh` runs the same owner set locally and on Linux x86/ARM and native macOS CI |
+| ARM baseline/named CPU instruction selection and x86 reverse direction | `target_cpu_isa`: generic/Apple NEON plus existing v2-without-AVX2 and v3/skylake-with-AVX2 controls; native execution qualification remains distinct |
+| Allocation and generated-code performance | `bench/decode_storage` modes 5/6/7, with modes 0/1/2/3/8 as controls; section 11 records measurements and limitations |
+
+The capability stays together because both changes consume the same byte-view
+contract and the same binary-codec execution owner, and the native verification
+script closes that consumer across architectures. The roughly 1,000-line diff
+includes the restricted proof, its malformed-input matrix and shared CI/local
+validation. Splitting those from their accepting consumers would duplicate the
+byte-lifetime/range and verification proof without reducing a public ABI boundary.
+
+## 11. Local byte-execution measurements
+
+Linux x86-64 / Ryzen 9 5950X / LLVM 22.1.8, explicit baseline/release with runtime
+LTO off, reference `0e236129`. Both objects link the same production release
+runtime (SHA-256
+`185897ec6cd5ca0be326a47f9286c40e21e6b0d02f4507da247e08ae35b51739`).
+Allocation wrappers run in separate diagnostic executables; three local
+reader conversions change from six allocations/six frees to zero/zero, while
+the 65-byte control remains six/six. All checksums agree.
+
+CPU-0-pinned timing uses five fresh processes per point in shuffled order. Sizes
+0/1/39/40/41/50,000 are swept for scan kernels. Medians for the whole-module object:
+
+| Kernel | Before | After |
+| --- | ---: | ---: |
+| Local reader conversion | 23.584 ns | 1.274 ns |
+| Direct conversion control | 1.329 ns | 1.306 ns |
+| 65-byte heap control | 23.647 ns | 23.476 ns |
+| Explicit f32 byte max, 50,000 values | 10.863 us | 10.717 us |
+| Divisibility-guarded byte-word sum, 50,000 values | 10.883 us | 1.778 us |
+| Typed-word sum control, 50,000 values | 1.805 us | 1.925 us |
+
+The typed control's adverse movement was investigated rather than discarded.
+Its instruction sequence is unchanged, but its loop moves from a 32-byte to
+a 16-byte boundary in the larger object. A second experiment emits unchanged
+controls into a separate object and links it first; the before/after control
+objects have identical SHA-256
+`34ed17311ff92124e5758bfaab38617ae7bc15adac2f87a532ef86222a23e564`.
+Seven pinned processes then measure typed-word sum at 2.750/2.691 us and typed
+f32 max at 10.733/10.733 us. This supports a layout/noise qualification rather
+than a changed typed-sum lowering; it does not promise every final link layout
+improves. In that arrangement local conversion remains 23.482/1.294 ns and byte
+word sum 10.889/1.719 us. The f32 loop varies much more with placement (21.530/
+10.627 us), so no single f32 speedup ratio is claimed.
+
+The optimized integer loop has alignment-1 vector loads and no reached byte-range
+failure. Cross-target LLVM lowering emits NEON `ldp q`, `add.4s` and `addv.4s`
+for both generic AArch64 and Apple M1. This is machine-code inspection, not native
+Mac/Metal timing. Native workload, GPU synchronization and foreign-retention
+qualification from sections 4/5 remain open. Raw commands, checksums, timings,
+assembly and runtime identity are retained in the local issue-1043 audit record.

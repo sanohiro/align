@@ -136,3 +136,15 @@ fn named_cpu_skylake_selects_avx2() {
         "skylake must select 256-bit ymm registers; disasm:\n{d}"
     );
 }
+
+// ARM's portable CPU includes NEON; a generic scheduling model must never be
+// confused with scalar-only instruction selection. The same owner runs on
+// Linux ARM64 and native Apple Silicon through test-codegen-performance.sh.
+#[test]
+fn arm_generic_and_apple_cpu_select_neon_instructions() {
+    if !cfg!(target_arch = "aarch64") || !backend_available() || !objdump_available() { return; }
+    for cpu in ["generic", "apple-m1"] {
+        let assembly = disasm_at(cpu, cpu);
+        assert!(assembly.contains(".2d"), "{cpu} must use NEON i64 lanes: {assembly}");
+    }
+}

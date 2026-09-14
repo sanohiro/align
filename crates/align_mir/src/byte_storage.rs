@@ -2,7 +2,7 @@
 //!
 //! The plan is derived from the actual MIR, never imported as trusted metadata. Unrecognized
 //! uses or ambiguous byte extents select the ordinary Buffer ABI. No new source type is formed.
-use crate::{Function, Operand, Rvalue, Slot, Stmt, Term, ValueId};
+use crate::{DirectCall, Function, Operand, ProgramCall, Rvalue, Slot, Stmt, Term, ValueId};
 use align_sema::Ty;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -33,6 +33,200 @@ impl ByteStoragePlan {
     pub fn length(&self, value: ValueId) -> Option<usize> {
         self.lengths.get(&value).copied()
     }
+}
+
+/// Body-derived, call-scoped escape facts. Only supply bodies covered by the
+/// current artifact identity; opaque imports and other function partitions are absent.
+#[derive(Default)]
+pub struct CallEscapeSummary {
+    confined: BTreeSet<(ProgramCall, usize)>,
+}
+
+impl CallEscapeSummary {
+    pub fn new<'a>(functions: impl IntoIterator<Item = &'a Function>) -> Self {
+        let functions: Vec<_> = functions.into_iter().collect();
+        let mut result = Self::default();
+        if !functions.iter().flat_map(|f| &f.blocks).flat_map(|block| &block.stmts).any(|stmt| {
+            matches!(stmt, Stmt::Let(_, Rvalue::BufferNew(Operand::Const(crate::Const::Int(cap, _)))) if *cap <= OBJECT_LIMIT as i128)
+        }) { return result; }
+        for f in &functions {
+            for (arg, slot) in f.params.iter().enumerate() {
+                if f.slots.get(*slot as usize) == Some(&byte_slice_ty()) && !f.blocks.is_empty() {
+                    result.confined.insert((f.name.clone(), arg));
+                }
+            }
+        }
+        // Greatest fixed point of confinement (equivalently a least fixed point
+        // of may-escape). Each iteration removes a fact; cycles never recurse on
+        // the Rust stack and a later escaping callee invalidates every caller.
+        loop {
+            let before = result.confined.len();
+            for f in &functions {
+                for arg in 0..f.params.len() {
+                    let key = (f.name.clone(), arg);
+                    if result.confined.contains(&key) && !argument_confined(f, arg, &result) {
+                        result.confined.remove(&key);
+                    }
+                }
+            }
+            if result.confined.len() == before {
+                return result;
+            }
+        }
+    }
+
+    fn admits(&self, target: &DirectCall, arg: usize) -> bool {
+        match target {
+            DirectCall::Program(name) => self.confined.contains(&(name.clone(), arg)),
+            DirectCall::Runtime(_) => false,
+        }
+    }
+}
+
+fn byte_slice_ty() -> Ty {
+    Ty::Slice(align_sema::Scalar::Int(align_sema::IntTy {
+        bits: 8,
+        signed: false,
+    }))
+}
+
+fn argument_confined(f: &Function, arg: usize, calls: &CallEscapeSummary) -> bool {
+    let Some(root) = f.params.get(arg) else {
+        return false;
+    };
+    let mut values = BTreeSet::new();
+    let mut slots = BTreeSet::from([*root]);
+    let from_argument = |op: &Operand, values: &BTreeSet<ValueId>, slots: &BTreeSet<Slot>| {
+        matches!(op, Operand::Arg(index) if *index as usize == arg)
+            || related(op, values, slots)
+            || matches!(op, Operand::BorrowedCleanupArg(_))
+    };
+    loop {
+        let before = (values.len(), slots.len());
+        for stmt in f.blocks.iter().flat_map(|block| &block.stmts) {
+            match stmt {
+                Stmt::Let(id, Rvalue::Load(slot)) if slots.contains(slot) => {
+                    values.insert(*id);
+                }
+                Stmt::Let(id, Rvalue::Use(op) | Rvalue::SubSlice { base: op, .. })
+                    if from_argument(op, &values, &slots) =>
+                {
+                    values.insert(*id);
+                }
+                Stmt::Store(slot, op) if from_argument(op, &values, &slots) => {
+                    slots.insert(*slot);
+                }
+                _ => {}
+            }
+        }
+        if before == (values.len(), slots.len()) {
+            break;
+        }
+    }
+    let related = |op: &Operand| from_argument(op, &values, &slots);
+    for block in &f.blocks {
+        for stmt in &block.stmts {
+            let safe = match stmt {
+                // Incoming parameter initialization binds the same caller view.
+                Stmt::Store(slot, Operand::Arg(index))
+                    if slot == root && *index as usize == arg =>
+                {
+                    true
+                }
+                Stmt::Store(slot, op) => {
+                    !related(op)
+                        || (!f.params.contains(slot)
+                            && f.slots.get(*slot as usize) == Some(&byte_slice_ty()))
+                }
+                Stmt::Drop(slot) | Stmt::DropFlagInit(slot) => !slots.contains(slot),
+                Stmt::Let(id, rv) => match rv {
+                    Rvalue::Load(_) | Rvalue::StrLit(_) | Rvalue::RawNull | Rvalue::OptionNone => {
+                        true
+                    }
+                    Rvalue::Use(op) => {
+                        !related(op) || f.value_tys.get(*id as usize) == Some(&byte_slice_ty())
+                    }
+                    Rvalue::SliceLen(_) => true,
+                    Rvalue::BytesRead {
+                        bytes,
+                        offset,
+                        scalar,
+                        ..
+                    } => {
+                        !related(offset)
+                            && (!related(bytes)
+                                || (operand_ty(f, bytes) == Some(byte_slice_ty())
+                                    && byte_width(*scalar).is_some()
+                                    && f.value_tys.get(*id as usize) == Some(scalar)))
+                    }
+                    Rvalue::SubSlice {
+                        base,
+                        start,
+                        len,
+                        elem,
+                    } => {
+                        !related(start)
+                            && !related(len)
+                            && (!related(base)
+                                || (*elem
+                                    == Ty::Int(align_sema::IntTy {
+                                        bits: 8,
+                                        signed: false,
+                                    })
+                                    && operand_ty(f, base) == Some(byte_slice_ty())
+                                    && f.value_tys.get(*id as usize) == Some(&byte_slice_ty())))
+                    }
+                    Rvalue::SliceIndex(base, index) => {
+                        !related(index)
+                            && (!related(base)
+                                || f.value_tys.get(*id as usize)
+                                    == Some(&Ty::Int(align_sema::IntTy {
+                                        bits: 8,
+                                        signed: false,
+                                    })))
+                    }
+                    Rvalue::Index(slot, index) => !slots.contains(slot) && !related(index),
+                    Rvalue::Bin(_, a, b) => !related(a) && !related(b),
+                    Rvalue::Un(_, op)
+                    | Rvalue::Cast { operand: op, .. }
+                    | Rvalue::OptionSome(op)
+                    | Rvalue::OptionIsSome(op)
+                    | Rvalue::OptionUnwrap(op)
+                    | Rvalue::ResultOk(op)
+                    | Rvalue::ResultErr(op)
+                    | Rvalue::ResultIsOk(op)
+                    | Rvalue::ResultUnwrapOk(op)
+                    | Rvalue::ResultUnwrapErr(op) => !related(op),
+                    Rvalue::Select { cond, a, b } => !related(cond) && !related(a) && !related(b),
+                    Rvalue::Call(target, args) => args.iter().enumerate().all(|(index, op)| {
+                        !related(op)
+                            || (operand_ty(f, op) == Some(byte_slice_ty())
+                                && calls.admits(target, index))
+                    }),
+                    Rvalue::CallIndirect { callee, args, .. } => {
+                        !related(callee) && args.iter().all(|op| !related(op))
+                    }
+                    Rvalue::MathOp { operands, .. } => operands.iter().all(|op| !related(op)),
+                    // Includes aggregate/place writes, cleanup-bearing calls,
+                    // callbacks, raw pointers and every new unaudited operation.
+                    _ => false,
+                },
+                _ => false,
+            };
+            if !safe {
+                return false;
+            }
+        }
+        let safe = match &block.term {
+            Term::Goto(_) | Term::Unreachable | Term::Return(None) => true,
+            Term::Branch(op, ..) | Term::Return(Some(op)) => !related(op),
+            Term::ReturnWithCleanup(result) => !related(&result.0) && !related(&result.1),
+        };
+        if !safe {
+            return false;
+        }
+    }
+    true
 }
 
 fn value(op: &Operand) -> Option<ValueId> {
@@ -151,7 +345,12 @@ fn literal_lengths(f: &Function) -> BTreeMap<ValueId, usize> {
     }
 }
 
-fn nonescaping(f: &Function, slot: Slot, constructor: ValueId) -> Option<BTreeSet<ValueId>> {
+fn nonescaping(
+    f: &Function,
+    slot: Slot,
+    constructor: ValueId,
+    calls: &CallEscapeSummary,
+) -> Option<BTreeSet<ValueId>> {
     if f.params.contains(&slot) {
         return None;
     }
@@ -258,7 +457,14 @@ fn nonescaping(f: &Function, slot: Slot, constructor: ValueId) -> Option<BTreeSe
                         !is_related(cond) && !is_related(a) && !is_related(b)
                     }
                     Rvalue::OptionNone => true,
-                    Rvalue::Call(_, args) => args.iter().all(|op| !is_related(op)),
+                    Rvalue::Call(target, args) => args.iter().enumerate().all(|(index, op)| {
+                        !is_related(op)
+                            || (!is_handle(op)
+                                && operand_ty(f, op) == Some(byte_slice_ty())
+                                && calls.admits(target, index))
+                    }),
+                    Rvalue::SliceIndex(base, index) => !is_related(base) && !is_related(index),
+                    Rvalue::Index(base, index) => !slots.contains(base) && !is_related(index),
                     Rvalue::CallIndirect { callee, args, .. } => {
                         !is_related(callee) && args.iter().all(|op| !is_related(op))
                     }
@@ -352,8 +558,9 @@ fn object_plan(
     slot: Slot,
     constructor: ValueId,
     literals: &BTreeMap<ValueId, usize>,
+    calls: &CallEscapeSummary,
 ) -> Option<ByteStoragePlan> {
-    let handles = nonescaping(f, slot, constructor)?;
+    let handles = nonescaping(f, slot, constructor, calls)?;
     for block in &f.blocks {
         for stmt in &block.stmts {
             if let Stmt::Let(id, rv) = stmt {
@@ -432,7 +639,7 @@ fn object_plan(
 
 /// Select complete objects in slot order under a deterministic total stack budget. This is an
 /// optimization selector, not a replacement for source, lifetime or malformed-MIR validation.
-pub fn plan(f: &Function) -> ByteStoragePlan {
+pub fn plan(f: &Function, calls: &CallEscapeSummary) -> ByteStoragePlan {
     let constructors: BTreeSet<_> = f
         .blocks
         .iter()
@@ -472,7 +679,7 @@ pub fn plan(f: &Function) -> ByteStoragePlan {
         if used == FUNCTION_LIMIT {
             break;
         }
-        if let Some(candidate) = object_plan(f, slot, constructor, &literals) {
+        if let Some(candidate) = object_plan(f, slot, constructor, &literals, calls) {
             let size: usize = candidate.slots.values().sum();
             if used + size > FUNCTION_LIMIT {
                 continue;

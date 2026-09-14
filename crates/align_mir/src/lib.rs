@@ -20,6 +20,7 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 pub mod byte_storage;
+pub mod byte_ranges;
 mod canonical_graph;
 mod generated_id;
 mod json_encode;
@@ -3369,7 +3370,7 @@ fn lower_program_checked_with_catalog(
         }
         None => (None, plan_catalog.is_some()),
     };
-    let mir = lower_program_unchecked_with_plans(
+    let mut mir = lower_program_unchecked_with_plans(
         program,
         lines,
         plan_resolver,
@@ -3382,6 +3383,9 @@ fn lower_program_checked_with_catalog(
         || (mir.structs.is_empty() && !program.structs.is_empty())
     {
         return Err(rejected(ValidationPass::LoweringProducedNothing, None));
+    }
+    for function in &mut mir.fns {
+        byte_ranges::simplify(function);
     }
     Ok(mir)
 }
@@ -22926,11 +22930,11 @@ mod tests {
         let source = "fn f(x: u32) -> u32 { mut b := buffer(4); b.put_u32_le(x); return b.bytes().u32_le(0) }\n";
         let program = lower(source);
         let function = &program.fns[0];
-        assert_eq!(byte_storage::plan(function).slots().count(), 1);
+        assert_eq!(byte_storage::plan(function, &byte_storage::CallEscapeSummary::default()).slots().count(), 1);
         // The proof is recomputed from real operands, not a claimed scalar result or source name.
         for operation in ["escape", "unknown", "parameter", "width", "extent", "capacity"] {
             let mut mutated = function.clone();
-            let selected = byte_storage::plan(function);
+            let selected = byte_storage::plan(function, &byte_storage::CallEscapeSummary::default());
             let Some((root, _)) = selected.slots().next() else { panic!("positive byte candidate disappeared") };
             if operation == "parameter" { mutated.params.push(root); }
             for block in &mut mutated.blocks {
@@ -22951,7 +22955,7 @@ mod tests {
                     }
                 }
             }
-            assert_eq!(byte_storage::plan(&mutated).slots().count(), 0, "{operation}");
+            assert_eq!(byte_storage::plan(&mutated, &byte_storage::CallEscapeSummary::default()).slots().count(), 0, "{operation}");
         }
         let mut source = String::from("fn budget() -> i64 {\n");
         for index in 0..17 {
@@ -22959,14 +22963,14 @@ mod tests {
         }
         source.push_str("return 0\n}\n");
         let program = lower(&source);
-        let selected = byte_storage::plan(&program.fns[0]);
+        let selected = byte_storage::plan(&program.fns[0], &byte_storage::CallEscapeSummary::default());
         assert_eq!(selected.slots().count(), 16);
         assert_eq!(selected.slots().map(|(_, size)| size).sum::<usize>(), 1024);
         for (bytes, admitted) in [(0, true), (1, true), (4, true), (8, true), (32, true), (64, true), (65, false), (256, false)] {
             let literal = "a".repeat(bytes);
             let source = format!("fn f() -> i64 {{ mut b := buffer(0); b.append(\"{literal}\"); return b.len() }}\n");
             let program = lower(&source);
-            assert_eq!(byte_storage::plan(&program.fns[0]).slots().count() == 1, admitted, "{bytes}");
+            assert_eq!(byte_storage::plan(&program.fns[0], &byte_storage::CallEscapeSummary::default()).slots().count() == 1, admitted, "{bytes}");
         }
     }
 

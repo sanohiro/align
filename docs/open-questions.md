@@ -2586,7 +2586,7 @@ for the build host's CPU (or a high fixed baseline like AVX2) would `SIGILL` som
 
 - **Default baseline (portable):** `x86-64-v2` (SSE4.2; universal across cloud x86 since ~2010) for
   amd64; `armv8-a` (NEON is mandatory in the base ISA) for arm64. One binary runs across the fleet.
-- **Opt-in, never default:** `--target-cpu native` (fastest on the build host, non-portable — for
+- **Opt-in, never default:** `--target-cpu native` (tuned for the build host, non-portable — for
   source-build-on-host) and higher baselines (`x86-64-v3`/AVX2, v4) for those who control their fleet.
 - **Wide SIMD for the varied fleet = runtime CPU-feature dispatch in the library layer**: one binary
   detects the host CPU and picks the best path (AVX2/NEON), falling back safely. Mechanism = function

@@ -108,7 +108,7 @@ predictor.
 **Build targets and portability.** The default build targets a **safe, portable, per-architecture
 baseline** — `x86-64-v2` (SSE4.2) for amd64, `armv8-a` (NEON included) for arm64 — so one binary
 runs across a varied, unknown fleet (cloud VMs, containers, feature-masked or migrated hosts).
-Anything more is **opt-in, never the default**: `--target-cpu native` (fastest on the build host,
+Anything more is **opt-in, never the default**: `--target-cpu native` (tuned for the build host,
 non-portable) and higher baselines (`x86-64-v3`/AVX2, …) for a fleet you control. Because
 AOT-generated code is fixed at build time, **wide SIMD for a varied fleet comes from runtime
 CPU-feature dispatch in the library layer** (one binary detects AVX2 / NEON at runtime and falls

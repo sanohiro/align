@@ -502,6 +502,13 @@ jobs:
           scripts/run-quiet.sh "CI test: owned JSON" --
           scripts/cargo.sh test -p align_driver --test m5_owned_json --locked
 
+      - name: CPU configuration and byte-execution regressions
+        timeout-minutes: 15
+        shell: bash
+        run: >
+          scripts/run-quiet.sh "CI test: codegen performance contracts" --
+          scripts/test-codegen-performance.sh
+
       - name: Native process and signal regressions
         timeout-minutes: 15
         run: >

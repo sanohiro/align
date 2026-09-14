@@ -360,9 +360,9 @@ fn literal() -> u16 {
         ("large", "mut b := buffer(65); b.put_u32_le(x); return b.bytes().u32_le(0)"),
         ("dynamic", "mut b := buffer(x as i64); b.put_u32_le(x); return b.bytes().u32_le(0)"),
         ("mixed", "mut b := buffer(0); if x > 0 { b.put_u8(1) }; b.put_u32_le(x); return b.bytes().u32_le(0)"),
-        ("escape", "mut b := buffer(4); b.put_u32_le(x); return consume(b.bytes())"),
+        ("escape", "mut b := buffer(4); b.put_u32_le(x); return consume(b.bytes()).u32_le(0)"),
     ] {
-        let ir = emit_llvm_with_exports(&format!("fn consume(xs: slice<u8>) -> u32 = xs.u32_le(0)\nfn f(x: u32) -> u32 {{ {body} }}\n"), &["f"]);
+        let ir = emit_llvm_with_exports(&format!("fn consume(xs: slice<u8>) -> slice<u8> = xs\nfn f(x: u32) -> u32 {{ {body} }}\n"), &["f"]);
         assert!(ir.contains("call ptr @align_rt_buffer_new"), "{label}: {ir}");
     }
 }
@@ -379,7 +379,7 @@ fn bounded_byte_object_rejects_forged_put_widths() {
         let checked = check(&mut sm, "forged-byte-width", &source);
         assert!(!checked.diags.has_errors());
         let original = lower_to_mir(&checked.hir);
-        assert_eq!(align_mir::byte_storage::plan(&original.fns[0]).slots().count(), 1);
+        assert_eq!(align_mir::byte_storage::plan(&original.fns[0], &Default::default()).slots().count(), 1);
         assert!(emit_llvm_ir(&original, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false).is_ok());
         let scalar = match claimed {
             "u8" => Ty::Int(IntTy { bits: 8, signed: false }),
@@ -399,10 +399,10 @@ fn bounded_byte_object_rejects_forged_put_widths() {
                 }
             }
         }
-        assert_eq!(align_mir::byte_storage::plan(function).slots().count(), 0, "{actual}/{claimed}");
+        assert_eq!(align_mir::byte_storage::plan(function, &Default::default()).slots().count(), 0, "{actual}/{claimed}");
         // A matching declared type cannot authorize a wider store: Load still emits actual.
         function.value_tys[input_id.expect("put input") as usize] = scalar;
-        assert_eq!(align_mir::byte_storage::plan(function).slots().count(), 1, "forged table reaches backend check");
+        assert_eq!(align_mir::byte_storage::plan(function, &Default::default()).slots().count(), 1, "forged table reaches backend check");
         let error = emit_llvm_ir(&mismatched, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false).expect_err("actual LLVM width/class must be checked");
         assert!(error.contains("byte storage put operand does not match scalar width"), "{actual}/{claimed}: {error}");
     }
@@ -412,7 +412,7 @@ fn bounded_byte_object_rejects_forged_put_widths() {
     assert!(!checked.diags.has_errors());
     let program = lower_to_mir(&checked.hir);
     let function = &program.fns[0];
-    assert_eq!(align_mir::byte_storage::plan(function).slots().count(), 1);
+    assert_eq!(align_mir::byte_storage::plan(function, &Default::default()).slots().count(), 1);
     let operations: Vec<_> = function.blocks.iter().flat_map(|block| &block.stmts).filter_map(|stmt| match stmt {
         Stmt::Let(id, Rvalue::BufferNew(_) | Rvalue::BufferPut { .. } | Rvalue::BufferAppend { .. } | Rvalue::BufferBytes(_) | Rvalue::BufferLen(_)) => Some(*id),
         _ => None,
@@ -421,6 +421,199 @@ fn bounded_byte_object_rejects_forged_put_widths() {
     for id in operations {
         let mut bad = function.clone();
         bad.value_tys[id as usize] = Ty::Bool;
-        assert_eq!(align_mir::byte_storage::plan(&bad).slots().count(), 0, "result {id}");
+        assert_eq!(align_mir::byte_storage::plan(&bad, &Default::default()).slots().count(), 0, "result {id}");
+    }
+}
+
+#[test]
+fn byte_storage_crosses_proved_local_readers_and_unrelated_indexing() {
+    if !backend_available() { return; }
+    let functions = r#"
+fn shared(borrow bytes: slice<u8>) -> u32 = bytes.u32_le(0)
+fn copied(bytes: slice<u8>) -> u32 = bytes.u32_le(0)
+fn forwarded(borrow bytes: slice<u8>) -> u32 = shared(bytes)
+fn leading<T>(unused: T, borrow bytes: slice<u8>) -> u32 = forwarded(bytes)
+fn recursive(borrow bytes: slice<u8>, n: i64) -> u32 {
+  if n == 0 { return bytes.u32_le(0) }
+  return recursive(bytes, n - 1)
+}
+fn local(x: u32, xs: slice<i64>) -> u32 {
+  mut b := buffer(4)
+  b.put_u32_le(x)
+  bytes := b.bytes()
+  return leading(1, bytes) + copied(bytes) + recursive(bytes, 3) + xs[0] as u32
+}
+"#;
+    let ir = emit_llvm_with_exports(functions, &["local"]);
+    assert!(!ir.contains("call ptr @align_rt_buffer_new"), "{ir}");
+    assert!(!ir.contains("call void @align_rt_buffer_free"), "{ir}");
+    let out = build_and_run("local-byte-readers", &format!("{functions}\nfn main() {{ print(local(17, [3])) }}\n"));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "54\n");
+
+    // Returning a Copy view is an escape even though the slice descriptor's
+    // argument address is never captured. The backing bytes are the proof root.
+    let escaping = r#"
+fn identity(bytes: slice<u8>) -> slice<u8> = bytes
+fn escaping(x: u32) -> u32 {
+  mut b := buffer(4)
+  b.put_u32_le(x)
+  bytes := identity(b.bytes())
+  return bytes.u32_le(0)
+}
+"#;
+    let ir = emit_llvm_with_exports(escaping, &["escaping"]);
+    assert!(ir.contains("call ptr @align_rt_buffer_new"), "{ir}");
+}
+
+#[test]
+fn imported_byte_readers_remain_opaque_to_per_unit_storage_selection() {
+    if !backend_available() { return; }
+    let library = "module reader\npub fn read(borrow bytes: slice<u8>) -> u32 = bytes.u32_le(0)\n";
+    let source = "import reader\nfn use(x: u32) -> u32 { mut b := buffer(4); b.put_u32_le(x); bytes := b.bytes(); return reader.read(bytes) }\nfn main() { print(use(17)) }\n";
+    let unit = build_per_unit_multi("opaque-byte-reader", &[("reader.align", library), ("main.align", source)], "main.align");
+    let entry = unit.walk.units.iter().find(|unit| unit.is_entry).expect("entry");
+    let ir = align_driver::emit_llvm_ir(&entry.mir, BuildTarget::Baseline, Profile::Release, false, &[], false).expect("per-unit byte IR");
+    assert!(ir.contains("call ptr @align_rt_buffer_new"), "{ir}");
+}
+
+fn reached_byte_guards(function: &align_mir::Function) -> usize {
+    use align_mir::{DirectCall, RuntimeKey, Rvalue, Stmt, Term};
+    function.blocks.iter().filter(|block| match block.term {
+        Term::Branch(_, yes, _) => function.blocks[yes as usize].stmts.iter().any(|stmt|
+            matches!(stmt, Stmt::Let(_, Rvalue::Call(DirectCall::Runtime(RuntimeKey::RangeFail), _)))),
+        _ => false,
+    }).count()
+}
+
+#[test]
+fn byte_range_recurrence_preserves_tails_and_eliminates_only_proved_guards() {
+    if !backend_available() { return; }
+    for (scalar, width, reader, put) in [
+        ("u8", 1, "u8", "put_u8"),
+        ("i8", 1, "i8", "put_i8"),
+        ("i16", 2, "i16_le", "put_i16_le"),
+        ("i32", 4, "i32_be", "put_i32_be"),
+        ("i64", 8, "i64_le", "put_i64_le"),
+        ("u16", 2, "u16_be", "put_u16_be"),
+        ("u32", 4, "u32_le", "put_u32_le"),
+        ("u64", 8, "u64_be", "put_u64_be"),
+        ("f32", 4, "f32_le", "put_f32_le"),
+        ("f64", 8, "f64_be", "put_f64_be"),
+    ] {
+        let zero = if scalar.starts_with('f') { "0.0" } else { "0" };
+        let one = if scalar.starts_with('f') { "1.0" } else { "1" };
+        let two = if scalar.starts_with('f') { "2.0" } else { "2" };
+        let kernel = format!("fn sum(src: slice<u8>) -> {scalar} {{ mut result: {scalar} := {zero}; mut i := 0; loop {{ if i >= src.len() / {width} {{ break }}; result = result + src.{reader}(i * {width}); i = i + 1 }}; return result }}\n");
+        let mut map = SourceMap::new();
+        let checked = check(&mut map, "byte-range-kernel", &kernel);
+        assert!(!checked.diags.has_errors(), "{}", align_driver::format_diagnostics(&map, &checked.diags));
+        let mir = lower_to_mir(&checked.hir);
+        assert_eq!(reached_byte_guards(&mir.fns[0]), 0, "{scalar}");
+        let optimized = emit_llvm_optimized(&kernel, &["sum"]);
+        assert!(!optimized.contains("call void @align_rt_range_fail"), "{scalar}: {optimized}");
+        // Empty/short input performs no read; a partial final word is excluded by
+        // the original floor-divided loop bound, including unaligned views.
+        let tail = if width > 1 { "data.put_u8(99);" } else { "" };
+        let source = format!("{kernel}\nfn main() {{ mut b := buffer(0); print(sum(b.bytes())); b.put_u8(0); bytes := b.bytes(); print(sum(bytes[1..1])); print(sum(bytes)); mut data := buffer(0); data.put_u8(0); data.{put}({one}); data.{put}({two}); {tail} values := data.bytes(); print(sum(values[1..values.len()])); }}\n");
+        let output = build_and_run(&format!("byte-range-{scalar}"), &source);
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let numbers: Vec<f64> = String::from_utf8_lossy(&output.stdout).lines().map(|line| line.parse().expect("numeric output")).collect();
+        assert_eq!(numbers, [0.0, 0.0, 0.0, 3.0], "{scalar}");
+    }
+    // An inclusive upper bound reaches an invalid read and must still fail.
+    let bad = "fn scan(src: slice<u8>) -> u32 { mut i := 0; mut result: u32 := 0; loop { if i > src.len() / 4 { break }; result = result + src.u32_le(i * 4); i = i + 1 }; return result }\nfn main() { mut b := buffer(0); b.put_u32_le(7); print(scan(b.bytes())) }\n";
+    let output = build_and_run("byte-range-inclusive-trap", bad);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("out of bounds"));
+}
+
+#[test]
+fn byte_range_malformed_and_invalidated_proofs_fail_closed() {
+    use align_ast::BinOp;
+    use align_mir::{Const, Operand, Rvalue, Stmt, Term};
+    use align_sema::{IntTy, Ty};
+    let source = "fn sum(src: slice<u8>, other: slice<u8>) -> u32 { mut result: u32 := 0; mut i := 1; loop { if i >= src.len() / 4 { break }; result = result + src.u32_le(i * 4); i = i + 1 }; return result }\n";
+    let mut map = SourceMap::new();
+    let checked = check(&mut map, "byte-range-proof", source);
+    assert!(!checked.diags.has_errors());
+    let mut base = lower_to_mir(&checked.hir).fns.remove(0);
+    let integer = Ty::Int(IntTy { bits: 64, signed: true });
+    // Start at one to retain the original checked CFG during source lowering,
+    // then supply the exact zero-based recurrence to the private MIR pass.
+    let mut induction = None;
+    for block in &mut base.blocks {
+        for statement in &mut block.stmts {
+            if let Stmt::Store(slot, Operand::Const(Const::Int(value, ty))) = statement {
+                if *ty == integer && *value == 1 { *value = 0; induction = Some(*slot); }
+            }
+        }
+    }
+    let induction = induction.expect("induction initialization");
+    assert_eq!(reached_byte_guards(&base), 1);
+    let mut valid = base.clone();
+    align_mir::byte_ranges::simplify(&mut valid);
+    assert_eq!(reached_byte_guards(&valid), 0);
+    // A comparison fact belongs to one branch arm, even when destinations
+    // coincide or a rejected arm rejoins the admitted arm later.
+    for use_lt in [false, true] {
+        let mut oriented = base.clone();
+        let header = oriented.blocks.iter().position(|block| block.stmts.iter().any(
+            |stmt| matches!(stmt, Stmt::Let(_, Rvalue::Bin(BinOp::Ge, _, _)))
+        )).expect("admission header");
+        if use_lt {
+            for stmt in &mut oriented.blocks[header].stmts {
+                if let Stmt::Let(_, Rvalue::Bin(op @ BinOp::Ge, _, _)) = stmt { *op = BinOp::Lt; }
+            }
+            if let Term::Branch(_, yes, no) = &mut oriented.blocks[header].term {
+                std::mem::swap(yes, no);
+            }
+        }
+        let mut positive = oriented.clone();
+        align_mir::byte_ranges::simplify(&mut positive);
+        assert_eq!(reached_byte_guards(&positive), 0, "admitted arm: lt={use_lt}");
+        for rejoin in [false, true] {
+            let mut bad = oriented.clone();
+            let Term::Branch(_, yes, no) = bad.blocks[header].term.clone() else { panic!("header branch") };
+            let (admitted, rejected) = if use_lt { (yes, no) } else { (no, yes) };
+            if rejoin {
+                bad.blocks[rejected as usize].term = Term::Goto(admitted);
+            } else if let Term::Branch(_, yes, no) = &mut bad.blocks[header].term {
+                if use_lt { *no = admitted; } else { *yes = admitted; }
+            }
+            align_mir::byte_ranges::simplify(&mut bad);
+            assert_eq!(reached_byte_guards(&bad), 1, "rejected arm: lt={use_lt}, rejoin={rejoin}");
+        }
+    }
+    for mutation in 0..10 {
+        let mut bad = base.clone();
+        let mut changed = false;
+        for block in &mut bad.blocks {
+            for statement in &mut block.stmts {
+                match (mutation, statement) {
+                    (0, Stmt::Store(slot, Operand::Const(Const::Int(value, _)))) if *slot == induction => { *value = -1; changed = true; }
+                    (1, Stmt::Let(_, Rvalue::Bin(BinOp::Add, _, Operand::Const(Const::Int(value, _))))) if *value == 1 => { *value = 2; changed = true; }
+                    (2, Stmt::Let(_, Rvalue::Bin(op @ BinOp::Ge, _, _))) => { *op = BinOp::Gt; changed = true; }
+                    (3, Stmt::Let(_, Rvalue::Bin(BinOp::Mul, _, Operand::Const(Const::Int(value, _))))) => { *value = 8; changed = true; }
+                    (4, Stmt::Let(_, Rvalue::BytesRead { scalar, .. })) => { *scalar = Ty::Int(IntTy { bits: 64, signed: false }); changed = true; }
+                    (5, Stmt::Let(id, Rvalue::Load(slot))) if *slot == induction => { bad.value_tys[*id as usize] = Ty::Int(IntTy { bits: 32, signed: true }); changed = true; }
+                    (6, Stmt::Let(_, Rvalue::Bin(BinOp::Div, _, Operand::Const(Const::Int(value, _))))) => { *value = 2; changed = true; }
+                    _ => {}
+                }
+            }
+        }
+        match mutation {
+            7 => { bad.param_modes[0] = align_ast::ParamMode::BorrowMut; changed = true; }
+            8 => { let statement = bad.blocks[0].stmts[0].clone(); bad.blocks[0].stmts.push(statement); changed = true; }
+            9 => {
+                let guard = bad.blocks.iter_mut().find(|block| matches!(block.term, Term::Branch(_, yes, _) if base.blocks[yes as usize].stmts.iter().any(|stmt| matches!(stmt, Stmt::Let(_, Rvalue::Call(_, _)))))).expect("range guard");
+                let duplicate = guard.stmts.last().expect("guard condition").clone();
+                guard.stmts.push(duplicate); changed = true;
+            }
+            _ => {}
+        }
+        assert!(changed, "mutation {mutation} must reach the proof");
+        align_mir::byte_ranges::simplify(&mut bad);
+        assert_eq!(reached_byte_guards(&bad), 1, "mutation {mutation}");
     }
 }

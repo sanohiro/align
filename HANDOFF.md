@@ -7,7 +7,8 @@ Apple Silicon/Metal consumer timing and pin adoption remain external; the plan
 records local x86-64 measurements and AArch64 instruction inspection.
 Follow-up [issue 1043 investigation](docs/impl/63-codegen-performance-audit.md)
 has implemented ThinLTO entry-wrapper repair and trustworthy CPU/profile
-inspection; broader proved byte storage and byte-range facts remain planned.
+inspection, byte storage through proved local readers, and restricted byte-range
+proofs. The shared native owner runs on x86, Linux ARM and Apple Silicon CI.
 Native/default-policy qualification and foreign update retention remain open.
 
 **R84–R88 client admission and composition:**
