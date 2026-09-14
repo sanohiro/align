@@ -10320,7 +10320,7 @@ fn main() -> i32 = 0\n";
             (align_mir::PlanKind::Chunks, align_mir::PlanState::Selected, align_mir::PlanStrategy::VirtualIndex, align_mir::PlanReason::DirectIndex),
             (align_mir::PlanKind::Chunks, align_mir::PlanState::Selected, align_mir::PlanStrategy::VirtualRangeViews, align_mir::PlanReason::ParallelConsumer),
             (align_mir::PlanKind::Chunks, align_mir::PlanState::Selected, align_mir::PlanStrategy::MaterializedHeaders, align_mir::PlanReason::ParallelConsumer),
-            (align_mir::PlanKind::Chunks, align_mir::PlanState::Selected, align_mir::PlanStrategy::MaterializedHeaders, align_mir::PlanReason::PipelineConsumer),
+            (align_mir::PlanKind::Chunks, align_mir::PlanState::Selected, align_mir::PlanStrategy::VirtualRangeViews, align_mir::PlanReason::PipelineConsumer),
             (align_mir::PlanKind::Chunks, align_mir::PlanState::Selected, align_mir::PlanStrategy::MaterializedHeaders, align_mir::PlanReason::StoredOrBoundary),
             (align_mir::PlanKind::BufferDonation, align_mir::PlanState::NotApplicable, align_mir::PlanStrategy::ArenaOutput, align_mir::PlanReason::ArenaOwnedOutput),
             (align_mir::PlanKind::BufferDonation, align_mir::PlanState::NotApplicable, align_mir::PlanStrategy::FreshOutput, align_mir::PlanReason::UnsupportedSourceOrStageShape),

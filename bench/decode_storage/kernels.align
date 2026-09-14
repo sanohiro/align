@@ -1,0 +1,49 @@
+module decode_optimization_probes
+pub fn fixed_threshold(src: slice<f64>) -> f64 {
+  mut values := [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  mut i: i64 := 0
+  loop {
+    if i >= src.len() { break }
+    if src[i] > values[39] { values[39] = src[i] }
+    i = i + 1
+  }
+  return values[39]
+}
+pub fn slice_threshold(src: slice<f32>, out values: slice<f32>) -> f32 {
+  mut i: i64 := 0
+  loop {
+    if i >= src.len() { break }
+    if src[i] > values[39] { values[39] = src[i] }
+    i = i + 1
+  }
+  return 0.0
+}
+pub fn byte_max(src: slice<u8>) -> f32 {
+  return src.chunks(4).map(fn word { word.f32_le(0) }).max()
+}
+pub fn bits_roundtrip(x: f32) -> u32 {
+  mut b := buffer(4)
+  b.put_f32_le(x)
+  return b.bytes().u32_le(0)
+}
+
+pub fn byte_loop(src: slice<u8>) -> f32 {
+  if src.len() % 4 != 0 { return 0.0 }
+  mut best: f32 := -1.0 / 0.0
+  mut i: i64 := 0
+  loop {
+    if i >= src.len() / 4 { break }
+    x := src.f32_le(i * 4)
+    if x > best { best = x }
+    i = i + 1
+  }
+  return best
+}
+pub fn typed_max(src: slice<f32>) -> f32 = src.max()
+pub fn heap_control(x: f32) -> u32 {
+  mut b := buffer(65)
+  b.put_f32_le(x)
+  return b.bytes().u32_le(0)
+}
+fn fresh() -> array<i64> = [1, 2, 3, 4, 5].to_array()
+pub fn fresh_sum() -> i64 = fresh().chunks(2).map(fn part { part.sum() }).sum()

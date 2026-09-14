@@ -19,6 +19,7 @@ use align_span::{SourceMap, Span};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
+pub mod byte_storage;
 mod canonical_graph;
 mod generated_id;
 mod json_encode;
@@ -3802,12 +3803,12 @@ fn plan_tuple_is_valid(record: &PlanRecord) -> bool {
             PlanKind::Chunks,
             PlanState::Selected,
             PlanStrategy::VirtualRangeViews,
-            PlanReason::ParallelConsumer
+            PlanReason::ParallelConsumer | PlanReason::PipelineConsumer
         ) | (
             PlanKind::Chunks,
             PlanState::Selected,
             PlanStrategy::MaterializedHeaders,
-            PlanReason::ParallelConsumer | PlanReason::PipelineConsumer | PlanReason::StoredOrBoundary
+            PlanReason::ParallelConsumer | PlanReason::StoredOrBoundary
         ) | (
             PlanKind::BufferDonation,
             PlanState::NotApplicable,
@@ -5017,8 +5018,8 @@ fn chunks_plan(consumer: ChunksConsumer) -> ChunksPlan {
             PlanStrategy::VirtualIndex,
             PlanReason::DirectIndex,
         )),
-        ChunksConsumer::Pipeline => ChunksPlan::MaterializedHeaders(decision(
-            PlanStrategy::MaterializedHeaders,
+        ChunksConsumer::Pipeline => ChunksPlan::VirtualRangeViews(decision(
+            PlanStrategy::VirtualRangeViews,
             PlanReason::PipelineConsumer,
         )),
         ChunksConsumer::Parallel => ChunksPlan::MaterializedHeaders(decision(
@@ -12144,7 +12145,7 @@ fn lower_chunks_with_plan(
             Operand::Value(chunk)
         }
         ChunksPlan::VirtualRangeViews(_) => {
-            unreachable!("virtual range chunks must be lowered by its parallel consumer")
+            unreachable!("virtual range chunks must be lowered by its iteration consumer")
         }
         ChunksPlan::MaterializedHeaders(decision) => {
             b.record_plan(expression, decision);
@@ -13160,6 +13161,14 @@ struct SrcSetup {
     /// Per-input scalar source setup for a lazy `zip`; empty for an ordinary single source.
     /// All runtime lengths have already been checked equal to `bound` before loop construction.
     zip: Option<ZipSetup>,
+    virtual_chunks: Option<VirtualChunkSource>,
+}
+
+struct VirtualChunkSource {
+    base: Operand,
+    len: Operand,
+    width: Operand,
+    elem: Ty,
 }
 
 struct ZipSetup {
@@ -13239,6 +13248,26 @@ fn setup_source(
     source: &hir::Expr,
     chunks_consumer: ChunksConsumer,
 ) -> Option<SrcSetup> {
+    if let hir::ExprKind::ArrayChunks { source: base, n, elem } = &source.kind
+        && let ChunksPlan::VirtualRangeViews(decision) = chunks_plan(chunks_consumer)
+    {
+        let base = lower_chunks_source(b, base, *elem);
+        if !lowering_continues(b) { return None; }
+        let width = lower_expr(b, n);
+        if !lowering_continues(b) { return None; }
+        b.record_plan(source, decision);
+        let len = b.fresh_value(i64_ty());
+        b.push(Stmt::Let(len, Rvalue::SliceLen(base.clone())));
+        let len = Operand::Value(len);
+        let bound = lower_chunks_count(b, len.clone(), width.clone());
+        // Only synthetic owners attached to the base are released. A borrowed base has none.
+        let temp_free = (!b.borrow_owners(&base).is_empty()).then(|| base.clone());
+        return Some(SrcSetup {
+            slot: 0, slice_val: None, bound, scalar_slot: false, struct_view: None,
+            temp_free, zip: None,
+            virtual_chunks: Some(VirtualChunkSource { base, len, width, elem: *elem }),
+        });
+    }
     if let hir::ExprKind::ArrayZip { sources, tuple_id } = &source.kind {
         let mut inputs = Vec::with_capacity(sources.len());
         let mut bound: Option<Operand> = None;
@@ -13275,6 +13304,7 @@ fn setup_source(
                 tuple_id: *tuple_id,
                 inputs,
             }),
+            virtual_chunks: None,
         });
     }
     match source.ty {
@@ -13314,6 +13344,7 @@ fn setup_source(
                 struct_view: None,
                 temp_free,
                 zip: None,
+                virtual_chunks: None,
             })
         }
         // An owned, dynamic `array<Struct>`: a `{ptr,len}` view addressed by pointer for field
@@ -13334,6 +13365,7 @@ fn setup_source(
                 struct_view: Some((id, layout)),
                 temp_free: None,
                 zip: None,
+                virtual_chunks: None,
             })
         }
         // A `soa<Struct>` view: a `{ptr,len}` column-major buffer. Same `{ptr,len}` handling as an
@@ -13353,6 +13385,7 @@ fn setup_source(
                 struct_view: Some((id, Layout::Soa)),
                 temp_free: None,
                 zip: None,
+                virtual_chunks: None,
             })
         }
         _ => {
@@ -13368,9 +13401,32 @@ fn setup_source(
                 struct_view: None,
                 temp_free: None,
                 zip: None,
+                virtual_chunks: None,
             })
         }
     }
+}
+
+/// Form a chunk only on the counted loop's in-range edge. For a valid ordinal,
+/// index * width <= source_len - 1, so the product and remaining extent cannot wrap.
+/// Preserve the short final view: its consumer decides whether a read is reached.
+fn lower_virtual_chunk(b: &mut Builder, source: &VirtualChunkSource, index: &Operand) -> Operand {
+    let start = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(start, Rvalue::Bin(BinOp::Mul, index.clone(), source.width.clone())));
+    let remaining = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(remaining, Rvalue::Bin(BinOp::Sub, source.len.clone(), Operand::Value(start))));
+    let short = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(short, Rvalue::Bin(BinOp::Lt, Operand::Value(remaining), source.width.clone())));
+    let len = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(len, Rvalue::Select {
+        cond: Operand::Value(short), a: Operand::Value(remaining), b: source.width.clone(),
+    }));
+    let chunk = b.fresh_value(Ty::Slice(scalar_of(source.elem)));
+    b.push(Stmt::Let(chunk, Rvalue::SubSlice {
+        base: source.base.clone(), start: Operand::Value(start), len: Operand::Value(len), elem: source.elem,
+    }));
+    inherit_borrow_owners(b, chunk, [&source.base]);
+    Operand::Value(chunk)
 }
 
 /// Load one index from every lazy-zip input and assemble the ephemeral tuple in SSA. Runtime slice
@@ -13764,6 +13820,7 @@ fn lower_array_reduce(
         struct_view,
         temp_free,
         zip,
+        virtual_chunks,
     }) = setup_source(b, source, ChunksConsumer::Pipeline)
     else {
         return Operand::Const(Const::Unit);
@@ -13851,7 +13908,9 @@ fn lower_array_reduce(
 
     // A scalar array or a slice loads the element up front; a struct array (stack slot or a
     // `{ptr,len}` `array<Struct>` view) stays addressed by index until a `.field` projection.
-    let mut cur: Option<Operand> = if let Some(zip) = &zip {
+    let mut cur: Option<Operand> = if let Some(chunks) = &virtual_chunks {
+        Some(lower_virtual_chunk(b, chunks, &index))
+    } else if let Some(zip) = &zip {
         Some(lower_zip_element(b, zip, &index, None))
     } else if struct_view.is_some() {
         None
@@ -14517,6 +14576,7 @@ fn lower_array_collect(
         struct_view,
         temp_free,
         zip,
+        virtual_chunks,
     }) = setup_source(b, source, chunks_consumer)
     else {
         return (Operand::Const(Const::Unit), Vec::new());
@@ -14652,7 +14712,9 @@ fn lower_array_collect(
     b.push(Stmt::Let(idx, Rvalue::Load(iv)));
     let index = Operand::Value(idx);
 
-    let mut cur: Option<Operand> = if let Some(zip) = &zip {
+    let mut cur: Option<Operand> = if let Some(chunks) = &virtual_chunks {
+        Some(lower_virtual_chunk(b, chunks, &index))
+    } else if let Some(zip) = &zip {
         Some(lower_zip_element(b, zip, &index, None))
     } else if struct_view.is_some() {
         None
@@ -14922,6 +14984,7 @@ fn lower_array_map_into(
         struct_view,
         temp_free,
         zip,
+        virtual_chunks,
     }) = setup_source(b, source, ChunksConsumer::Pipeline)
     else {
         return Operand::Const(Const::Unit);
@@ -14983,7 +15046,9 @@ fn lower_array_map_into(
     let index = Operand::Value(idx);
 
     // Load the source element (scalar sources); struct sources defer to the first Project stage.
-    let mut cur: Option<Operand> = if let Some(zip) = &zip {
+    let mut cur: Option<Operand> = if let Some(chunks) = &virtual_chunks {
+        Some(lower_virtual_chunk(b, chunks, &index))
+    } else if let Some(zip) = &zip {
         Some(lower_zip_element(b, zip, &index, Some(scope)))
     } else if struct_view.is_some() {
         None
@@ -16028,6 +16093,7 @@ fn lower_array_partition(
         struct_view,
         temp_free,
         zip,
+        virtual_chunks,
     }) = setup_source(b, source, ChunksConsumer::Pipeline)
     else {
         return Operand::Const(Const::Unit);
@@ -16094,7 +16160,9 @@ fn lower_array_partition(
     b.push(Stmt::Let(idx, Rvalue::Load(iv)));
     let index = Operand::Value(idx);
 
-    let mut cur: Option<Operand> = if let Some(zip) = &zip {
+    let mut cur: Option<Operand> = if let Some(chunks) = &virtual_chunks {
+        Some(lower_virtual_chunk(b, chunks, &index))
+    } else if let Some(zip) = &zip {
         Some(lower_zip_element(b, zip, &index, None))
     } else if struct_view.is_some() {
         None
@@ -22853,6 +22921,55 @@ mod tests {
         lower_program(&hir)
     }
 
+    #[test]
+    fn bounded_byte_object_rejects_unaudited_uses() {
+        let source = "fn f(x: u32) -> u32 { mut b := buffer(4); b.put_u32_le(x); return b.bytes().u32_le(0) }\n";
+        let program = lower(source);
+        let function = &program.fns[0];
+        assert_eq!(byte_storage::plan(function).slots().count(), 1);
+        // The proof is recomputed from real operands, not a claimed scalar result or source name.
+        for operation in ["escape", "unknown", "parameter", "width", "extent", "capacity"] {
+            let mut mutated = function.clone();
+            let selected = byte_storage::plan(function);
+            let Some((root, _)) = selected.slots().next() else { panic!("positive byte candidate disappeared") };
+            if operation == "parameter" { mutated.params.push(root); }
+            for block in &mut mutated.blocks {
+                for stmt in &mut block.stmts {
+                    if let Stmt::Let(_, Rvalue::BufferPut { buffer, scalar, .. }) = stmt {
+                        match operation {
+                            "width" => *scalar = Ty::Bool,
+                            "extent" => *stmt = Stmt::Let(999, Rvalue::BufferAppend { buffer: buffer.clone(), data: Operand::Arg(0) }),
+                            _ => {}
+                        }
+                    }
+                    if let Stmt::Let(id, Rvalue::BufferBytes(buffer)) = stmt {
+                        match operation {
+                            "escape" => *stmt = Stmt::Let(*id, Rvalue::Call(DirectCall::Program(ProgramCall::from_validated("opaque")), vec![buffer.clone()])),
+                            "unknown" | "capacity" => *stmt = Stmt::Let(*id, Rvalue::BufferCapacity(buffer.clone())),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            assert_eq!(byte_storage::plan(&mutated).slots().count(), 0, "{operation}");
+        }
+        let mut source = String::from("fn budget() -> i64 {\n");
+        for index in 0..17 {
+            source.push_str(&format!("mut b{index} := buffer(0); b{index}.append(\"{}\")\n", "a".repeat(64)));
+        }
+        source.push_str("return 0\n}\n");
+        let program = lower(&source);
+        let selected = byte_storage::plan(&program.fns[0]);
+        assert_eq!(selected.slots().count(), 16);
+        assert_eq!(selected.slots().map(|(_, size)| size).sum::<usize>(), 1024);
+        for (bytes, admitted) in [(0, true), (1, true), (4, true), (8, true), (32, true), (64, true), (65, false), (256, false)] {
+            let literal = "a".repeat(bytes);
+            let source = format!("fn f() -> i64 {{ mut b := buffer(0); b.append(\"{literal}\"); return b.len() }}\n");
+            let program = lower(&source);
+            assert_eq!(byte_storage::plan(&program.fns[0]).slots().count() == 1, admitted, "{bytes}");
+        }
+    }
+
     fn lower_current_plan(src: &str) -> (Program, SourceMap) {
         let mut diagnostics = Diagnostics::new();
         let mut source_map = SourceMap::new();
@@ -22947,7 +23064,7 @@ mod tests {
             ),
             (
                 ChunksConsumer::Pipeline,
-                PlanStrategy::MaterializedHeaders,
+                PlanStrategy::VirtualRangeViews,
                 PlanReason::PipelineConsumer,
             ),
             (
@@ -22999,7 +23116,7 @@ mod tests {
             ),
             (
                 "fn size(xs: slice<i64>) -> i64 = xs.len()\nfn f(xs: slice<i64>) -> i64 = xs.chunks(2).map(size).sum()\n",
-                PlanStrategy::MaterializedHeaders,
+                PlanStrategy::VirtualRangeViews,
                 PlanReason::PipelineConsumer,
             ),
             (

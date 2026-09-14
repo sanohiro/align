@@ -655,8 +655,8 @@ call only in the future direct-fill/bulk case — header placement alone cannot 
 ### 8.2 SHIPPED 2026-07-16 — virtual `chunks` for direct `.len()` and index
 
 `align_rt_chunks` allocates `ceil(len/n) * 16` bytes and fills every `{ptr,len}` header
-([runtime](../../crates/align_runtime/src/lib.rs#L1348)). The stored-value and pipeline paths still
-use that representation. Before this slice, even an immediate `.len()` or index materialized it, so
+([runtime](../../crates/align_runtime/src/lib.rs#L1348)). Stored values still use that representation. Direct synchronous pipelines now
+derive views in their loop (document 62); explicit parallel selection follows document 11. Before this slice, even an immediate `.len()` or index materialized it, so
 one short chunk paid a heap allocation and `chunks(1)` wrote an entire metadata array that its next
 consumer immediately reread.
 
@@ -676,9 +676,9 @@ path. Fresh owned sources retain their synthetic owner through the returned slic
 fill for both direct shapes, and retain `align_rt_chunks` for `cs := xs.chunks(n)`. Runtime gates pin
 exact and partial chunks, `n = 0`, bounds failure, and an owned temporary source.
 
-A bound/escaping value and pipeline or `par_map` consumer deliberately continue to materialize.
-Virtualizing those iteration sources needs its own end-to-end work/effect-order gate; it is not
-required for the direct-consumer result shipped here. The language question in section 10 remains
+A bound/escaping value continues to materialize. Iteration sources were outside
+this original slice; document 62 now owns synchronous pipeline virtualization and
+document 11 owns the eligible explicit-parallel form. The language question in section 10 remains
 open, and document 11's later explicit-parallel result elision is related but does not itself remove
 these producer headers.
 
@@ -687,7 +687,7 @@ materialization versus the virtual count formula took 613.6 ns versus 1.5 ns for
 (`k=1`, 396x), and 37.9 us versus 1.5 ns for 65,536 headers (about 25,000x). Even one header was
 9.4 ns versus 1.6 ns. With `k=64`, 1,024 source elements/16 headers still measured 17.2 ns versus
 1.5 ns, and 65,536 elements/1,024 headers measured 606.2 ns versus 1.5 ns. This strongly confirms
-the `.len()` fold and direct-index virtualization; pipeline consumers still need their own
+the `.len()` fold and direct-index virtualization; pipeline measurements belong to their own
 end-to-end gate because they do real work after producing each virtual view.
 
 ### 8.3 SHIPPED 2026-07-16 — write single str-group and dictionary results directly
