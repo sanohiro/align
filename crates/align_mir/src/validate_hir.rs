@@ -7236,6 +7236,42 @@ impl<'a> BodyValidator<'a> {
                     return None;
                 }
                 let scrutinee_flow = self.expr_flow(scrutinee)?;
+                if matches!(scrutinee_flow.ty, Ty::Int(_) | Ty::Char) {
+                    if arms.is_empty() {
+                        return None;
+                    }
+                    let mut wildcard = false;
+                    let mut result = None;
+                    let mut breaks = scrutinee_flow.breaks.clone();
+                    let mut any_arm_falls = false;
+                    for arm in arms {
+                        if !arm.variants.is_empty() {
+                            return None;
+                        }
+                        if arm.values.is_empty() {
+                            if wildcard {
+                                return None;
+                            }
+                            wildcard = true;
+                        }
+                        let flow = self.arms.get(&ptr_key(arm))?;
+                        if scrutinee_flow.falls {
+                            breaks.extend(flow.breaks.clone());
+                        }
+                        if scrutinee_flow.falls && flow.falls {
+                            any_arm_falls = true;
+                            if result.is_some_and(|ty| !self.body_ty_matches(ty, flow.ty)) {
+                                return None;
+                            }
+                            result = Some(flow.ty);
+                        }
+                    }
+                    return if !scrutinee_flow.falls || !any_arm_falls {
+                        Some((expression.ty, false, breaks))
+                    } else {
+                        Some((result?, true, breaks))
+                    };
+                }
                 let payloads = self.sum_payloads(scrutinee_flow.ty)?;
                 if arms.is_empty() {
                     return None;
@@ -7246,6 +7282,9 @@ impl<'a> BodyValidator<'a> {
                 let mut breaks = scrutinee_flow.breaks.clone();
                 let mut any_arm_falls = false;
                 for arm in arms {
+                    if !arm.values.is_empty() {
+                        return None;
+                    }
                     if arm.variants.is_empty() {
                         if wildcard {
                             return None;
@@ -12186,6 +12225,25 @@ impl<'a> BodyValidator<'a> {
         scrutinee_ty: Ty,
         context: &BodyContext,
     ) -> bool {
+        if matches!(scrutinee_ty, Ty::Int(_) | Ty::Char) {
+            if !arm.variants.is_empty()
+                || !arm.bindings.is_empty()
+                || !arm.borrowed_bindings.is_empty()
+            {
+                return false;
+            }
+            for val in &arm.values {
+                if let hir::HirValuePattern::Range(start, end) = val
+                    && start > end
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if !arm.values.is_empty() {
+            return false;
+        }
         let Some(payloads) = self.sum_payloads(scrutinee_ty) else {
             return false;
         };

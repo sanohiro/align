@@ -6856,7 +6856,9 @@ impl<'a, 'd> GenericBodyWalker<'a, 'd> {
                                 self.bind(&b.name);
                             }
                         }
-                        ast::MatchPattern::Or { .. } | ast::MatchPattern::Wildcard(_) => {}
+                        ast::MatchPattern::Or { .. }
+                        | ast::MatchPattern::Wildcard(_)
+                        | ast::MatchPattern::Value { .. } => {}
                     }
                     self.walk_expr(&arm.body);
                     self.scopes.pop();
@@ -11887,6 +11889,27 @@ fn borrowed_match_metadata_is_valid(program: &hir::Program) -> bool {
             else {
                 continue;
             };
+            if matches!(scrutinee.ty, Ty::Int(_) | Ty::Char) {
+                if borrowed_place.is_some() {
+                    return false;
+                }
+                for arm in arms {
+                    if !arm.bindings.is_empty()
+                        || !arm.borrowed_bindings.is_empty()
+                        || !arm.variants.is_empty()
+                    {
+                        return false;
+                    }
+                    for val in &arm.values {
+                        if let hir::HirValuePattern::Range(start, end) = val
+                            && start > end
+                        {
+                            return false;
+                        }
+                    }
+                }
+                continue;
+            }
             let stable = stable_borrowed_match_place_for_fn_with_program(
                 function,
                 scrutinee,
@@ -11898,6 +11921,9 @@ fn borrowed_match_metadata_is_valid(program: &hir::Program) -> bool {
             };
             let mut any_projection = false;
             for arm in arms {
+                if !arm.values.is_empty() {
+                    return false;
+                }
                 if arm
                     .bindings
                     .iter()
@@ -12621,6 +12647,7 @@ fn borrowed_match_metadata_equal(expected: &hir::Block, actual: &hir::Block) -> 
                         .zip(actual_arms)
                         .all(|(expected, actual)| {
                             expected.borrowed_bindings == actual.borrowed_bindings
+                                && expected.values == actual.values
                         })
             })
 }
@@ -65478,10 +65505,19 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         let scrutinee_diverges = hir_expr_diverges(&s);
-        let resolved_scrutinee_ty = self.resolve(s.ty);
+        let mut resolved_scrutinee_ty = self.resolve(s.ty);
+        if matches!(resolved_scrutinee_ty, Ty::IntVar(_)) {
+            self.constrain(s.ty, Some(Ty::Int(IntTy { bits: 64, signed: true })), scrutinee.span);
+            resolved_scrutinee_ty = self.resolve(s.ty);
+        }
+        if matches!(resolved_scrutinee_ty, Ty::Int(_) | Ty::Char) {
+            let mut s = s;
+            s.ty = resolved_scrutinee_ty;
+            return self.check_match_value(s, resolved_scrutinee_ty, arms, expected, span);
+        }
         let borrowed_place = self.stable_borrowed_match_place(&s, resolved_scrutinee_ty);
         let Some((type_name, variants)) = self.match_variants(resolved_scrutinee_ty) else {
-            self.diags.error(format!("`match` expects a sum type, got {}", ty_name(s.ty)), scrutinee.span);
+            self.diags.error(format!("`match` expects a sum type, integer, or char, got {}", ty_name(s.ty)), scrutinee.span);
             return err;
         };
         // A **Move** enum matched through a *nested* struct-field place (`match o.inner.c { … }`, J3)
@@ -65661,6 +65697,13 @@ impl<'a, 't> Checker<'a, 't> {
                     }
                     (vec![idx], locals)
                 }
+                ast::MatchPattern::Value { span: pat_span, .. } => {
+                    self.diags.error(
+                        format!("`match` on sum type '{}' expects variant patterns, got value pattern", type_name),
+                        *pat_span,
+                    );
+                    return err;
+                }
             };
             for projection in &borrowed_bindings {
                 if let Some(place) = borrowed_place.as_ref() {
@@ -65696,6 +65739,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
             checked.push(hir::MatchArm {
                 variants: variant_tags,
+                values: Vec::new(),
                 bindings,
                 borrowed_bindings,
                 body,
@@ -65727,6 +65771,205 @@ impl<'a, 't> Checker<'a, 't> {
                 scrutinee: Box::new(s),
                 arms: checked,
                 borrowed_place,
+            },
+            ty,
+            span,
+        }
+    }
+
+    fn check_match_literal(
+        &mut self,
+        lit: &ast::LiteralPat,
+        scrut_ty: Ty,
+        min: i128,
+        max: i128,
+        span: Span,
+    ) -> Option<i128> {
+        match lit {
+            ast::LiteralPat::Int(v) => {
+                if scrut_ty == Ty::Char {
+                    self.diags.error("expected char literal in pattern for char match, found integer literal".to_string(), span);
+                    return None;
+                }
+                if *v < min || *v > max {
+                    self.diags.error(format!("integer literal {} out of range for {}", v, ty_name(scrut_ty)), span);
+                    return None;
+                }
+                Some(*v)
+            }
+            ast::LiteralPat::Char(c) => {
+                if scrut_ty != Ty::Char {
+                    self.diags.error(format!("expected integer literal in pattern for {} match, found char literal", ty_name(scrut_ty)), span);
+                    return None;
+                }
+                Some(i128::from(*c))
+            }
+        }
+    }
+
+    fn check_match_interval_overlap(
+        &mut self,
+        start: i128,
+        end: i128,
+        covered: &mut Vec<(i128, i128)>,
+        span: Span,
+    ) {
+        for (cs, ce) in covered.iter() {
+            if start <= *ce && end >= *cs {
+                self.diags.error(
+                    if start == end {
+                        format!("duplicate or overlapping pattern in `match`: {}", start)
+                    } else {
+                        format!("duplicate or overlapping pattern in `match`: {}..={}", start, end)
+                    },
+                    span,
+                );
+                return;
+            }
+        }
+        covered.push((start, end));
+    }
+
+    fn check_match_value(
+        &mut self,
+        s: Expr,
+        scrut_ty: Ty,
+        arms: &[ast::MatchArm],
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let scrutinee_diverges = hir_expr_diverges(&s);
+
+        let (min_bound, max_bound) = match scrut_ty {
+            Ty::Int(it) => int_range(it),
+            Ty::Char => (0, 0x10FFFF),
+            _ => (0, 0),
+        };
+
+        let mut has_wildcard = false;
+        let mut covered_intervals: Vec<(i128, i128)> = Vec::new();
+        let mut checked: Vec<hir::MatchArm> = Vec::with_capacity(arms.len());
+        let mut result_ty: Option<Ty> = expected;
+        let mut unconstrained_diverging_arms = Vec::new();
+
+        for arm in arms {
+            let scope_mark = self.scope.len();
+            let mut arm_values = Vec::new();
+
+            match &arm.pattern {
+                ast::MatchPattern::Wildcard(_) => {
+                    if has_wildcard {
+                        self.diags.error("duplicate `_` arm".to_string(), arm.span);
+                    }
+                    has_wildcard = true;
+                }
+                ast::MatchPattern::Value { patterns, span: pat_span } => {
+                    if has_wildcard {
+                        self.diags.error(
+                            "unreachable pattern: `_` already matched all remaining values".to_string(),
+                            *pat_span,
+                        );
+                    }
+                    for pat in patterns {
+                        match pat {
+                            ast::ValuePattern::Single(lit, pat_sp) => {
+                                if let Some(val) = self.check_match_literal(lit, scrut_ty, min_bound, max_bound, *pat_sp) {
+                                    self.check_match_interval_overlap(val, val, &mut covered_intervals, *pat_sp);
+                                    arm_values.push(hir::HirValuePattern::Single(val));
+                                }
+                            }
+                            ast::ValuePattern::Range { start, end, span: pat_sp } => {
+                                let s_val = self.check_match_literal(start, scrut_ty, min_bound, max_bound, *pat_sp);
+                                let e_val = self.check_match_literal(end, scrut_ty, min_bound, max_bound, *pat_sp);
+                                if let (Some(sv), Some(ev)) = (s_val, e_val) {
+                                    if sv > ev {
+                                        self.diags.error(
+                                            format!("range pattern start ({}) must be less than or equal to end ({})", sv, ev),
+                                            *pat_sp,
+                                        );
+                                    } else {
+                                        self.check_match_interval_overlap(sv, ev, &mut covered_intervals, *pat_sp);
+                                        arm_values.push(hir::HirValuePattern::Range(sv, ev));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                ast::MatchPattern::Variant { .. } | ast::MatchPattern::Or { .. } => {
+                    self.diags.error(
+                        format!("`match` on '{}' expects value patterns or `_`, got variant pattern", ty_name(scrut_ty)),
+                        arm.span,
+                    );
+                    return err;
+                }
+            }
+
+            let arm_expected = if scrutinee_diverges { None } else { result_ty };
+            let body_errors_before = self.diags.error_count();
+            self.reject_bare_array_value(&arm.body, arm_expected, "a `match` arm value");
+            let body = self.check_completion_expr(&arm.body, arm_expected);
+            let body_is_clean = self.diags.error_count() == body_errors_before;
+            let body_diverges = hir_expr_diverges(&body);
+            if !scrutinee_diverges && result_ty.is_none() && body_diverges && body_is_clean {
+                unconstrained_diverging_arms.push(checked.len());
+            }
+            if !scrutinee_diverges && result_ty.is_none() && body.ty != Ty::Error && !body_diverges {
+                result_ty = Some(body.ty);
+            }
+            self.scope.truncate(scope_mark);
+
+            checked.push(hir::MatchArm {
+                variants: Vec::new(),
+                values: arm_values,
+                bindings: Vec::new(),
+                borrowed_bindings: Vec::new(),
+                body,
+            });
+        }
+
+        if !has_wildcard {
+            let is_exhaustive = if scrut_ty == Ty::Char {
+                false
+            } else {
+                covered_intervals.sort_by_key(|k| k.0);
+                let mut current = min_bound;
+                let mut covered_all = false;
+                for (start, end) in &covered_intervals {
+                    if *start > current {
+                        break;
+                    }
+                    if *end >= current {
+                        if *end >= max_bound {
+                            covered_all = true;
+                            break;
+                        }
+                        current = end.saturating_add(1);
+                    }
+                }
+                covered_all
+            };
+
+            if !is_exhaustive {
+                self.diags.error(
+                    format!("non-exhaustive `match` on '{}': missing `_` wildcard", ty_name(scrut_ty)),
+                    span,
+                );
+            }
+        }
+
+        let ty = result_ty.unwrap_or(Ty::Unit);
+        for index in unconstrained_diverging_arms {
+            self.reconcile_diverging_completion_expr(&checked[index].body, ty);
+        }
+        self.constrain(ty, expected, span);
+
+        Expr {
+            kind: ExprKind::Match {
+                scrutinee: Box::new(s),
+                arms: checked,
+                borrowed_place: None,
             },
             ty,
             span,
@@ -83357,6 +83600,123 @@ fn exit_branch(flag: bool) -> i64 {
         assert_eq!(render(Ty::Tuple(0)), "(i64, bool)");
         assert_eq!(render(Ty::Param(0)), "<unknown type parameter>");
         assert_eq!(render(Ty::Tagged(1)), "Option<<nested tagged type>>");
+    }
+
+    #[test]
+    fn match_value_and_range_patterns_sema() {
+        let valid_src = r#"
+fn classify_byte(b: u8) -> i32 {
+  return match b {
+    0..=32 => 1,
+    33..=126 | 161..=172 => 2,
+    173 => 3,
+    _ => 4,
+  }
+}
+fn classify_char(c: char) -> i32 {
+  return match c {
+    'a'..='z' | 'A'..='Z' => 1,
+    '0'..='9' => 2,
+    _ => 3,
+  }
+}
+"#;
+        let (_, diags) = check(valid_src);
+        assert!(!diags.has_errors(), "{:?}", diags.iter().collect::<Vec<_>>());
+
+        let exhaustive_u8 = r#"
+fn full_u8(b: u8) -> i32 {
+  return match b {
+    0..=127 => 1,
+    128..=255 => 2,
+  }
+}
+"#;
+        let (_, diags) = check(exhaustive_u8);
+        assert!(!diags.has_errors(), "{:?}", diags.iter().collect::<Vec<_>>());
+
+        let non_exhaustive = r#"
+fn partial_u8(b: u8) -> i32 {
+  return match b {
+    0..=127 => 1,
+  }
+}
+"#;
+        let (_, diags) = check(non_exhaustive);
+        assert!(diags.has_errors());
+        assert!(diags.iter().any(|d| d.message.contains("missing `_` wildcard")));
+
+        let char_no_wildcard = r#"
+fn partial_char(c: char) -> i32 {
+  return match c {
+    'a'..='z' => 1,
+  }
+}
+"#;
+        let (_, diags) = check(char_no_wildcard);
+        assert!(diags.has_errors());
+        assert!(diags.iter().any(|d| d.message.contains("missing `_` wildcard")));
+
+        let overlapping = r#"
+fn overlap(x: i32) -> i32 {
+  return match x {
+    0..=10 => 1,
+    5..=15 => 2,
+    _ => 3,
+  }
+}
+"#;
+        let (_, diags) = check(overlapping);
+        assert!(diags.has_errors());
+        assert!(diags.iter().any(|d| d.message.contains("duplicate or overlapping pattern")));
+
+        let inverted_range = r#"
+fn inverted(x: i32) -> i32 {
+  return match x {
+    10..=1 => 1,
+    _ => 2,
+  }
+}
+"#;
+        let (_, diags) = check(inverted_range);
+        assert!(diags.has_errors());
+        assert!(diags.iter().any(|d| d.message.contains("must be less than or equal to end")));
+
+        let sum_type_value_pat = r#"
+fn bad_sum(x: Option<i32>) -> i32 {
+  return match x {
+    1 => 1,
+    _ => 0,
+  }
+}
+"#;
+        let (_, diags) = check(sum_type_value_pat);
+        assert!(diags.has_errors());
+        assert!(diags.iter().any(|d| d.message.contains("expects variant patterns, got value pattern")));
+
+        let int_variant_pat = r#"
+fn bad_int(x: i32) -> i32 {
+  return match x {
+    Some(v) => 1,
+    _ => 0,
+  }
+}
+"#;
+        let (_, diags) = check(int_variant_pat);
+        assert!(diags.has_errors());
+        assert!(diags.iter().any(|d| d.message.contains("expects value patterns or `_`, got variant pattern")));
+
+        let unreachable_after_wildcard = r#"
+fn unreachable_arm(x: i32) -> i32 {
+  return match x {
+    _ => 0,
+    1 => 1,
+  }
+}
+"#;
+        let (_, diags) = check(unreachable_after_wildcard);
+        assert!(diags.has_errors());
+        assert!(diags.iter().any(|d| d.message.contains("unreachable pattern")));
     }
 }
 

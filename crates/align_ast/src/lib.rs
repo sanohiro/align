@@ -216,9 +216,37 @@ pub struct MatchArm {
     pub span: Span,
 }
 
+/// A literal that can appear in a match pattern (integer or character).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiteralPat {
+    Int(i128),
+    Char(u32),
+}
+
+/// A value pattern: either a single literal or an inclusive range (`start..=end`).
+#[derive(Clone, Debug)]
+pub enum ValuePattern {
+    Single(LiteralPat, Span),
+    Range {
+        start: LiteralPat,
+        end: LiteralPat,
+        span: Span,
+    },
+}
+
+impl ValuePattern {
+    pub fn span(&self) -> Span {
+        match self {
+            ValuePattern::Single(_, span) => *span,
+            ValuePattern::Range { span, .. } => *span,
+        }
+    }
+}
+
 /// A `match` arm pattern: an (unqualified) variant name (optionally binding its payload
 /// positionally — `Circle(r)`, `Rect(w, h)`), an or-pattern of bare variant names
-/// (`Red | Green | Blue`, binding nothing), or the `_` wildcard.
+/// (`Red | Green | Blue`, binding nothing), the `_` wildcard, or value patterns (integer/char
+/// literals, inclusive ranges `..=`, and or-patterns of them).
 #[derive(Clone, Debug)]
 pub enum MatchPattern {
     Variant { name: Ident, bindings: Vec<Ident> },
@@ -226,6 +254,8 @@ pub enum MatchPattern {
     /// variant may appear, its payload is simply not bound). Always ≥ 2 alternatives.
     Or { variants: Vec<Ident>, span: Span },
     Wildcard(Span),
+    /// One or more value patterns (single literals or inclusive ranges, separated by `|`).
+    Value { patterns: Vec<ValuePattern>, span: Span },
 }
 
 /// A lambda parameter: a name with an optional type annotation (`x` or `x: T`). The type is

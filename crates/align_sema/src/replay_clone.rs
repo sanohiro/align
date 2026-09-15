@@ -112,6 +112,7 @@ impl ChildValues {
 fn clone_match_arm(clones: &mut ChildValues, arm: &hir::MatchArm) -> Option<hir::MatchArm> {
     Some(hir::MatchArm {
         variants: arm.variants.clone(),
+        values: arm.values.clone(),
         bindings: arm.bindings.clone(),
         borrowed_bindings: arm.borrowed_bindings.clone(),
         body: clones.expr()?,
