@@ -560,9 +560,10 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             recv: boxed!(recv),
         },
         ExprKind::StrBorrow(expr) => ExprKind::StrBorrow(boxed!(expr)),
-        ExprKind::ArrayBuilderNew { elem, region } => ExprKind::ArrayBuilderNew {
+        ExprKind::ArrayBuilderNew { elem, region, capacity } => ExprKind::ArrayBuilderNew {
             elem: *elem,
             region: take_optional_boxed_expr(clones, region.is_some())?,
+            capacity: boxed!(capacity),
         },
         ExprKind::BuilderNew { capacity } => ExprKind::BuilderNew {
             capacity: take_optional_boxed_expr(clones, capacity.is_some())?,
@@ -1072,8 +1073,9 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             offset: boxed!(offset),
         },
         ExprKind::FileLen { file } => ExprKind::FileLen { file: boxed!(file) },
-        ExprKind::BufferNew { capacity } => ExprKind::BufferNew {
+        ExprKind::BufferNew { capacity, fill } => ExprKind::BufferNew {
             capacity: boxed!(capacity),
+            fill: match fill { Some(value) => Some(boxed!(value)), None => None },
         },
         ExprKind::BufferBytes { buffer } => ExprKind::BufferBytes {
             buffer: boxed!(buffer),
@@ -2685,7 +2687,6 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::FileCreateRw { path: recv }
         | ExprKind::FileOpenRw { path: recv }
         | ExprKind::FileLen { file: recv }
-        | ExprKind::BufferNew { capacity: recv }
         | ExprKind::BufferBytes { buffer: recv }
         | ExprKind::StrBytes { inner: recv }
         | ExprKind::BufferLen { buffer: recv }
@@ -2747,7 +2748,8 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             one!(index);
         }
         ExprKind::BorrowedIndex { index, .. } => one!(index),
-        ExprKind::ArrayBuilderNew { region, .. } => optional!(region),
+        ExprKind::ArrayBuilderNew { region, capacity, .. } => { optional!(region); one!(capacity); }
+        ExprKind::BufferNew { capacity, fill } => { one!(capacity); optional!(fill); }
         ExprKind::BuilderNew { capacity } => optional!(capacity),
         ExprKind::SliceRange { recv, start, end } => {
             one!(recv);

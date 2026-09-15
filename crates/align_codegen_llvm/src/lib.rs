@@ -11391,6 +11391,50 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map(|o| self.operand(o))
                     .collect::<Result<_, _>>()?;
                 match fn_ {
+                    align_sema::MathFn::ToBits | align_sema::MathFn::IsFinite
+                    | align_sema::MathFn::IsNan | align_sema::MathFn::IsInfinite => {
+                        let Ty::Float(align_sema::FloatTy { bits: width @ (32 | 64) }) = ty else {
+                            return Err(self.err("float inspection needs a scalar f32 or f64"));
+                        };
+                        let [value] = ops.as_slice() else {
+                            return Err(self.err("float inspection needs exactly one operand"));
+                        };
+                        let integer = if *width == 32 { self.ctx.i32_type() } else { self.ctx.i64_type() };
+                        let bits = self.builder.build_bit_cast(*value, integer, "float.bits")
+                            .map_err(|e| self.err(e))?.into_int_value();
+                        if matches!(fn_, align_sema::MathFn::ToBits) {
+                            bits.into()
+                        } else {
+                            let (exponent, fraction) = if *width == 32 {
+                                (0x7f80_0000, 0x007f_ffff)
+                            } else {
+                                (0x7ff0_0000_0000_0000, 0x000f_ffff_ffff_ffff)
+                            };
+                            let exp_mask = integer.const_int(exponent, false);
+                            let exp = self.builder.build_and(bits, exp_mask, "float.exponent")
+                                .map_err(|e| self.err(e))?;
+                            let special = self.builder.build_int_compare(IntPredicate::EQ, exp, exp_mask, "float.special")
+                                .map_err(|e| self.err(e))?;
+                            match fn_ {
+                                align_sema::MathFn::IsFinite => self.builder.build_not(special, "float.finite")
+                                    .map_err(|e| self.err(e))?.into(),
+                                align_sema::MathFn::IsNan | align_sema::MathFn::IsInfinite => {
+                                    let frac = self.builder.build_and(bits, integer.const_int(fraction, false), "float.fraction")
+                                        .map_err(|e| self.err(e))?;
+                                    let predicate = if matches!(fn_, align_sema::MathFn::IsNan) {
+                                        IntPredicate::NE
+                                    } else {
+                                        IntPredicate::EQ
+                                    };
+                                    let fraction_matches = self.builder.build_int_compare(predicate, frac, integer.const_zero(), "float.fraction.matches")
+                                        .map_err(|e| self.err(e))?;
+                                    self.builder.build_and(special, fraction_matches, "float.class")
+                                        .map_err(|e| self.err(e))?.into()
+                                }
+                                _ => return Err(self.err("invalid float classification operation")),
+                            }
+                        }
+                    }
                     align_sema::MathFn::Abs => {
                         if is_float {
                             self.call_intrinsic("llvm.fabs", &[overload], &[ops[0].into()])?
@@ -13944,10 +13988,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("io_writer_flush returns i32")
             }
-            Rvalue::BufferNew(cap) => {
-                let cap = self.operand(cap)?.into();
+            Rvalue::BufferNew { capacity, fill } => {
+                let mut args = vec![self.operand(capacity)?.into()];
+                let key = if let Some(fill) = fill {
+                    args.push(self.operand(fill)?.into());
+                    RuntimeKey::BufferFilled
+                } else { RuntimeKey::BufferNew };
                 self.builder
-                    .build_call(self.runtime(RuntimeKey::BufferNew), &[cap], "buf")
+                    .build_call(self.runtime(key), &args, "buf")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("buffer_new returns a pointer")
             }
@@ -20728,7 +20776,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
     ) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
         match rv {
             // `array_builder<T>()` — open an empty typed builder sized to the element stride.
-            Rvalue::ArrayBuilderNew { elem, region } => {
+            Rvalue::ArrayBuilderNew { elem, region, capacity } => {
+                let capacity = self.operand(capacity)?;
                 let element_type = self.llvm_type(*elem);
                 let es = self.ctx.i64_type().const_int(self.element_allocation_size(element_type), false);
                 let ea = self
@@ -20741,7 +20790,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .builder
                         .build_call(
                             self.runtime(RuntimeKey::ArrayBuilderNewIn),
-                            &[arena, es.into(), ea.into()],
+                            &[arena, es.into(), ea.into(), capacity.into()],
                             "ab.region",
                         )
                         .map_err(|e| self.err(e))?
@@ -20756,7 +20805,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .builder
                         .build_call(
                             self.runtime(RuntimeKey::ArrayBuilderInitStack),
-                            &[header.into(), es.into()],
+                            &[header.into(), es.into(), capacity.into()],
                             "ab.stack",
                         )
                         .map_err(|e| self.err(e))?
@@ -20767,7 +20816,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 }
                 let v = self
                     .builder
-                    .build_call(self.runtime(RuntimeKey::ArrayBuilderNew), &[es.into()], "ab")
+                    .build_call(self.runtime(RuntimeKey::ArrayBuilderNew), &[es.into(), capacity.into()], "ab")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("array_builder_new returns a pointer");
                 Ok(Some(v))

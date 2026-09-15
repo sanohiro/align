@@ -865,7 +865,8 @@ pub enum Rvalue {
         b: Operand,
     },
     /// A scalar math builtin (`core.math`): `abs` (1 operand) / `min` / `max` (2). `ty` is the
-    /// numeric operand/result type; lowers to the matching LLVM intrinsic (signedness/float from `ty`).
+    /// numeric operand type; float inspection returns bool or the same-width unsigned integer.
+    /// Other operations return `ty`, using its signedness/float kind for intrinsic selection.
     MathOp {
         fn_: align_sema::MathFn,
         ty: Ty,
@@ -1902,7 +1903,7 @@ pub enum Rvalue {
         file: Operand,
     },
     /// `buffer(cap)` — open an owned byte buffer with read window `cap`, yielding an opaque handle.
-    BufferNew(Operand),
+    BufferNew { capacity: Operand, fill: Option<Operand> },
     /// `b.bytes()` — a `slice<u8>` view `{ptr,len}` of the buffer's current contents (borrow).
     BufferBytes(Operand),
     /// `b.len()` — the buffer's current byte count (`i64`).
@@ -1941,6 +1942,7 @@ pub enum Rvalue {
     ArrayBuilderNew {
         elem: Ty,
         region: Option<Operand>,
+        capacity: Operand,
     },
     /// `b.push(v)` — append one primitive scalar or declared-record element. Primitive values use
     /// raw bits in an `i64`; records are copied from their exact in-memory layout through the byte
@@ -8226,14 +8228,18 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 b.push(Stmt::Let(code, Rvalue::WriterFlush(wop)));
                 lower_status_result(b, code, e.ty)
             }
-            hir::ExprKind::BufferNew { capacity } => {
+            hir::ExprKind::BufferNew { capacity, fill } => {
                 lower_required_binding!(
                     b,
                     cap = lower_expr(b, capacity),
                     Operand::Const(Const::Unit)
                 );
                 let v = b.fresh_value(e.ty);
-                b.push(Stmt::Let(v, Rvalue::BufferNew(cap)));
+                let fill = if let Some(fill) = fill {
+                    lower_required_binding!(b, value = lower_expr(b, fill), Operand::Const(Const::Unit));
+                    Some(value)
+                } else { None };
+                b.push(Stmt::Let(v, Rvalue::BufferNew { capacity: cap, fill }));
                 Operand::Value(v)
             }
             hir::ExprKind::BufferBytes { buffer } => {
@@ -11907,16 +11913,18 @@ fn lower_bytes_read(
 #[inline(never)]
 fn lower_array_builder_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
     match &e.kind {
-        hir::ExprKind::ArrayBuilderNew { elem, region } => {
-            let region = region.as_deref().map(|region| {
-                lower_required!(b, lower_expr(b, region), Operand::Const(Const::Unit))
-            });
+        hir::ExprKind::ArrayBuilderNew { elem, region, capacity } => {
+            let region = if let Some(region) = region {
+                Some(lower_required!(b, lower_expr(b, region), Operand::Const(Const::Unit)))
+            } else { None };
+            let capacity = lower_required!(b, lower_expr(b, capacity), Operand::Const(Const::Unit));
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(
                 v,
                 Rvalue::ArrayBuilderNew {
                 elem: elem.ty(),
                 region,
+                capacity,
                 },
             ));
             Operand::Value(v)

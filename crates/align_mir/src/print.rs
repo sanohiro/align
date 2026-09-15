@@ -262,6 +262,10 @@ fn rvalue_str(rv: &Rvalue) -> String {
                 align_sema::MathFn::Trunc => "trunc",
                 align_sema::MathFn::Pow => "pow",
                 align_sema::MathFn::Fma => "fma",
+                align_sema::MathFn::ToBits => "to_bits",
+                align_sema::MathFn::IsFinite => "is_finite",
+                align_sema::MathFn::IsNan => "is_nan",
+                align_sema::MathFn::IsInfinite => "is_infinite",
             };
             let a: Vec<String> = operands.iter().map(operand_str).collect();
             format!("{f}({}) : {}", a.join(", "), ty_name(*ty))
@@ -890,7 +894,10 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::FilePread { file, buffer, offset } => format!("file_pread({}, {}, {})", operand_str(file), operand_str(buffer), operand_str(offset)),
         Rvalue::FilePwrite { file, data, offset } => format!("file_pwrite({}, {}, {})", operand_str(file), operand_str(data), operand_str(offset)),
         Rvalue::FileLen { file } => format!("file_len({})", operand_str(file)),
-        Rvalue::BufferNew(cap) => format!("buffer_new({})", operand_str(cap)),
+        Rvalue::BufferNew { capacity, fill } => match fill {
+            Some(value) => format!("buffer_filled({}, {})", operand_str(capacity), operand_str(value)),
+            None => format!("buffer_new({})", operand_str(capacity)),
+        },
         Rvalue::BufferBytes(buf) => format!("buffer_bytes({})", operand_str(buf)),
         Rvalue::BufferLen(buf) => format!("buffer_len({})", operand_str(buf)),
         Rvalue::BufferCapacity(buf) => format!("buffer_capacity({})", operand_str(buf)),
@@ -901,9 +908,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
             format!("buffer_put{}({}, {})", if *be { "_be" } else { "_le" }, operand_str(buffer), operand_str(value))
         }
         Rvalue::BufferAppend { buffer, data } => format!("buffer_append({}, {})", operand_str(buffer), operand_str(data)),
-        Rvalue::ArrayBuilderNew { elem, region } => format!(
-            "array_builder_new(elem={elem:?}, region={})",
-            region.as_ref().map_or_else(|| "heap".to_string(), operand_str)
+        Rvalue::ArrayBuilderNew { elem, region, capacity } => format!(
+            "array_builder_new(elem={elem:?}, region={}, capacity={})",
+            region.as_ref().map_or_else(|| "heap".to_string(), operand_str), operand_str(capacity)
         ),
         Rvalue::ArrayBuilderPush { builder, value, .. } => format!("array_builder_push({}, {})", operand_str(builder), operand_str(value)),
         Rvalue::ArrayBuilderPushStr { builder, value } => format!("array_builder_push_str({}, {})", operand_str(builder), operand_str(value)),

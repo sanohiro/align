@@ -1,5 +1,13 @@
 # Session handoff
 
+**Open issue batch:** [Plan 65](docs/impl/65-open-issue-batch-plan.md) audits
+all eight open issues (1043, 1047–1053). The first capability implements scalar
+float inspection, initialized buffers, builder capacity, nonzero/paired byte
+loop proofs and proved-lossless cast diagnostics. Safe mutable-storage methods,
+field replacement and disjoint-field calls remain pending on the complete plan
+61 access implementation. Native FFI certification, ordered SIMD and the reported
+Mac frame/SIGPIPE cases remain open.
+
 **Decode representation costs:** [plan 62](docs/impl/62-decode-optimization-plan.md)
 implements bounded nonescaping byte storage and direct synchronous chunks
 iteration without header arrays. Existing APIs and range failures remain.

@@ -381,7 +381,7 @@ trusting the stored bits:
    equality. A projection-only borrowed binding contributes no entry. If two
    expressions share a span, the later producer insertion is
    authoritative; a conflicting handcrafted map cannot choose another value.
-   After this equality check, the `align-production-codegen-v1` encoder emits
+   After this equality check, the `align-production-codegen-v2` encoder emits
    the resulting lookup fact at each expression in the same universal child
    order; it never serializes the map or trusts a separately supplied fact.
 5. Recompute every `Cell<bool>` statement flag after its children:
@@ -670,7 +670,7 @@ source-keyed/located metadata may change when an earlier test edit shifts byte o
 enter the production semantic/codegen key.
 
 The production key projection is one exhaustive structural encoder, not filtered `Debug` text. It
-starts with the versioned domain `align-production-codegen-v1`, visits production Program tables,
+starts with the versioned domain `align-production-codegen-v2`, visits production Program tables,
 functions, statements, and expressions in stored order, encodes every non-`Span` field through the
 existing canonical scalar/sequence encoders, and after each expression encodes the exact tri-state
 `absent | arena | individual` result MIR obtains by looking up that expression's current span in the
@@ -947,6 +947,8 @@ section is a reservation and changes no checked-HIR contract.
 | `MathFn::Round` | One operand. Scalar `F` or vector `V(FS,n)`; result equals operand type. |
 | `MathFn::Trunc` | One operand. Scalar `F` or vector `V(FS,n)`; result equals operand type. |
 | `MathFn::Pow` | Two operands of one exact scalar `F`; vectors reject; result is that `F`. |
+| `MathFn::ToBits` | Exactly one f32/f64 operand; exact u32/u64 result of matching width. Copy and Pure. |
+| `MathFn::IsFinite`, `IsNan`, `IsInfinite` | Exactly one f32/f64 operand; bool result. Vectors and other scalar types reject. Copy and Pure. |
 | `MathFn::Fma` | Exactly three operands of one exact scalar `F` or vector `V(FS,n)`; result equals operand type. |
 | `MatchArm` | `env[variants,bindings,borrowed_bindings]`: variants are distinct in-range tags of the scrutinee sum in preserved source or-pattern order; empty means wildcard. The sum table is the declared user `Enum`, `Option` as ordered `Some(T),None`, or `Result` as ordered `Ok(T),Err(E)`. Wildcard or multi-tag arms have no bindings or `borrowed_bindings`. A one-tag arm has exactly the selected variant payload count of distinct in-range local ids, whose local types equal payload types and whose locals are bound before the arm body, visible only in that arm, and removed before the next sibling or enclosing tail. In borrowed mode, `borrowed_bindings` has one `BorrowedProjection { binding_local, variant, payload_ordinal, static_ty, path }` per binding; its path starts at `RootSlot`, is type-checked segment by segment, and may contain only the canonical struct/sum segments. Its `binding_local` is projection-only and must not appear in `drop_locals`, `drop_individual_locals`, or `drop_individual_exprs`. Its mode, source owner fact, and exact root/path come from the parent `Match.borrowed_place`; the validator independently replays the producer borrow/move flow and rejects any mismatch, absent/extra, duplicate, unsorted, or forged record before MIR. `child[body]`; `post[a reachable fallthrough body type equals the Match result under the structural body-type relation (including `FABI` for fresh function-value ids); a divergent body is context-polymorphic and contributes no result join]`. |
 | `Block` | `env[stmts.len,value presence]`; `child[stmts in stored source order,value if present]`; `post[all retained dead children are structurally valid but contribute no reachable state; each `Let`/`LetTuple` initializer is checked before its binding enters the block scope; an absent reachable tail gives Unit, a present reachable tail gives its type, and an already non-fallthrough block uses its context-selected result type; block exit removes its bindings]`. |
@@ -1286,14 +1288,14 @@ merely because its `Ty` matches.
 | `FilePread` | `env[]; child[file,buffer,offset]`; `LocalHandle(File,file), SourceMutLocal(Buffer,buffer), i64; result ERR(i64); handles borrowed, buffer mutated; Impure`. |
 | `FilePwrite` | `env[]; child[file,data,offset]`; `File, byte-view, i64; result ERR(i64); borrowed; Impure`. |
 | `FileLen` | `env[]; child[file]`; `File; result ERR(i64); borrowed; Impure`. |
-| `BufferNew` | `env[]; child[capacity]`; `i64; result Buffer; new owned allocation; Pure`. |
+| `BufferNew` | `env[fill presence]; child[capacity,fill?]`; capacity is i64; present fill is u8. Result Buffer; fresh owned allocation; Pure. Absent fill retains the empty read window; present fill guarantees initialized length.. |
 | `BufferBytes` | `env[]; child[buffer]`; `Buffer; result bytes; view inherits buffer provenance; Pure`. |
 | `StrBytes` | `env[]; child[inner]`; `Str; result bytes; view inherits string provenance; Pure`. |
 | `BufferLen` | `env[]; child[buffer]`; `Buffer; result i64; borrowed; Pure`. |
 | `BytesRead` | `env[be]`; `child[bytes,offset]`; `bytes,i64; result exact stored read scalar in {i8/u8/i16/u16/i32/u32/i64/u64/f32/f64}; be must be false for one-byte widths; borrowed bounds-checked read; Pure`. |
 | `BufferPut` | `env[be]`; `child[buffer,value]`; `SourceMutLocal(Buffer,buffer); value exact supported binary scalar; be false for one-byte widths; result Unit; buffer mutated; Pure`. |
 | `BufferAppend` | `env[]; child[buffer,data]`; `SourceMutLocal(Buffer,buffer),byte-view; result Unit; data borrowed, buffer mutated; Pure`. |
-| `ArrayBuilderNew` | `env[elem]`: exact nonrecursive descriptor `Scalar(S)` or `Aggregate(Vec(S,N) | Mask(S,N) | FixedArray(S,N) | FixedStructArray(id,N))`. `child[region?]`; with no region, admit exactly primitive Copy scalars, String, or `Scalar(Struct(id))` with `HTR(id)`; with a region, require the descriptor's concrete type to be recursively `RegionPlain`. Result `ArrayBuilder(elem)`; new owned heap allocation or explicitly region-owned allocation; Pure. An unknown/malformed struct/tagged/array id or closed-predicate failure rejects before MIR allocation. |
+| `ArrayBuilderNew` | `env[elem]`: exact nonrecursive descriptor `Scalar(S)` or `Aggregate(Vec(S,N) | Mask(S,N) | FixedArray(S,N) | FixedStructArray(id,N))`. `child[region?,capacity]`; capacity is i64 (omitted source capacity is an explicit zero record); with no region, admit exactly primitive Copy scalars, String, or `Scalar(Struct(id))` with `HTR(id)`; with a region, require the descriptor's concrete type to be recursively `RegionPlain`. Result `ArrayBuilder(elem)`; new owned heap allocation or explicitly region-owned allocation; Pure. An unknown/malformed struct/tagged/array id or closed-predicate failure rejects before MIR allocation. |
 | `ArrayBuilderPush` | `env[moves_value]`; `child[builder,value]`; `SourceMutLocal(ArrayBuilder(elem),builder), value exact `elem.ty()`; `moves_value` iff `elem == Scalar(String)` or `elem == Scalar(Struct(id)) && HTRMove(id)`; result Unit. A true bit consumes and nulls the complete source, a false bit copies the producer-valid value with any region provenance, and the builder is mutated. A wrong bit or malformed recursive record graph rejects before MIR ownership transfer. |
 | `ArrayBuilderAppend` | `env[]; child[builder,data]`; descriptor must be `Scalar(copy elem)`, `SourceMutLocal(ArrayBuilder(elem),builder), data Slice(elem)`; result Unit; data borrowed, builder mutated; Pure. Aggregate descriptors use `push`. |
 | `ArrayBuilderBuild` | `env[]; child[builder]`; `ArrayBuilder(elem)`, consume-any; result `DynStructArray(id,Aos)` for `Scalar(Struct(id))` with the exact same valid id, `DynArray(S)` for every other scalar descriptor, or `DynAggregateArray(elem)` for an aggregate descriptor; transfer the complete producer-valid builder buffer once; Pure. A mismatched/malformed result id rejects before MIR transfer. |

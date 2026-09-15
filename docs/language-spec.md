@@ -718,6 +718,18 @@ suffix. The scalar set is `u8`, `i8`, `u16`/`i16`, `u32`/`i32`, `u64`/`i64`, `f3
 same fail-closed policy as `slice[i]` — check `.len()` first. A read returns a Copy scalar carrying
 no region; the `bytes`/`buffer` stay borrowed. (`draft.md` §12.)
 
+`buffer.filled(length: i64, value: u8) -> buffer` allocates exactly initialized
+length, including zero, with capacity at least length. Nonempty construction
+acquires one payload; initialization is O(length). The handle may allocate.
+Negative/overflowing counts abort before allocation and OOM aborts. The existing
+`buffer(capacity)` remains a best-effort empty read window.
+
+Scalar `f32`/`f64` provide Pure allocation-free `to_bits()` returning `u32`/`u64`
+and `is_finite()`, `is_nan()`, `is_infinite()` returning bool. Exact input bits,
+signed zero and NaN payloads are preserved; classification includes subnormals
+as finite and all quiet/signaling NaNs as NaN. Earlier arithmetic's unspecified
+NaN payload remains unspecified. Vector receivers are excluded.
+
 ### JSON
 
 **Dynamic array roots (R87).** Both encoders borrow a dynamic array using the same
@@ -1076,6 +1088,13 @@ core.math
 
 Every name above is an importable module except `core.array_builder`: `array_builder<T>()` is a
 language-intrinsic global (like `builder()`), listed as a core area rather than an `import` target.
+
+Constructor expressions are `array_builder()`, `array_builder(capacity)`,
+`array_builder(out)`, and `array_builder(out, capacity)`; the expected binding
+supplies T. Capacity is i64 and defaults to zero. It reserves at least that many
+pushes without growth, leaving initialized length zero. Negative counts and
+count × stride/target-size overflow abort before allocation; OOM aborts.
+Arguments evaluate once in order. Element and region rules remain unchanged.
 
 `array_builder<T>()` retains its individually owned heap/zero-copy-freeze form.
 Besides Copy scalars and `string`, it accepts nonempty naturally aligned declared records composed
@@ -1946,3 +1965,7 @@ lifetime; existing reader Drop closes its close-on-exec descriptor. Pathname rep
 select either object at open, but only the selected regular descriptor can be returned.
 This is not a sandbox, a stable-content guarantee or an interruptibility guarantee for remote
 filesystem operations. Application code owns admission policy beyond regular-file kind.
+
+Integer `as` warnings use finalized expression-local known bits: suppress only
+when the entire source interval fits the target. Unknown facts keep the warning;
+execution semantics do not change (plan 65, K).

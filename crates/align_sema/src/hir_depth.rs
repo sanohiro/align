@@ -915,7 +915,6 @@ fn walk_body_records<'a>(
                 | ExprKind::FileCreateRw { path: recv }
                 | ExprKind::FileOpenRw { path: recv }
                 | ExprKind::FileLen { file: recv }
-                | ExprKind::BufferNew { capacity: recv }
                 | ExprKind::BufferBytes { buffer: recv }
                 | ExprKind::StrBytes { inner: recv }
                 | ExprKind::BufferLen { buffer: recv }
@@ -1026,10 +1025,15 @@ fn walk_body_records<'a>(
                     work.push((BodyRecord::Expr(offset), child_depth));
                     work.push((BodyRecord::Expr(value), child_depth));
                 }
-                ExprKind::ArrayBuilderNew { region, .. } => {
+                ExprKind::ArrayBuilderNew { region, capacity, .. } => {
                     if let Some(region) = region {
                         work.push((BodyRecord::Expr(region), child_depth));
                     }
+                    work.push((BodyRecord::Expr(capacity), child_depth));
+                }
+                ExprKind::BufferNew { capacity, fill } => {
+                    work.push((BodyRecord::Expr(capacity), child_depth));
+                    if let Some(value) = fill { work.push((BodyRecord::Expr(value), child_depth)); }
                 }
                 ExprKind::BuilderNew { capacity } => {
                     if let Some(value) = capacity.as_deref() {

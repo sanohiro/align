@@ -462,7 +462,7 @@ unit      one per-unit frontend result              own path/entry/source + each
                                                     external fact maps
 lowering  HIR -> MIR (`lower_to_mir`, per-unit)     current: total `Debug` of the HIR + visibility
                                                     variant; at `core.test` activation: the
-                                                    `align-production-codegen-v1` semantic HIR
+                                                    `align-production-codegen-v2` semantic HIR
                                                     projection + visibility variant
 object    MIR -> object bytes                       `codegen_impl_hash` + target + profile +
                                                     exports + rt_lto

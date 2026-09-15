@@ -12223,6 +12223,7 @@ fn hir_body_validator_native() {
         "native_buffer_new",
         body_test_expr(
             hir::ExprKind::BufferNew {
+                fill: None,
                 capacity: Box::new(native_i64()),
             },
             Ty::Buffer,
@@ -12305,6 +12306,7 @@ fn hir_body_validator_native() {
         "native_array_builder_new",
         body_test_expr(
             hir::ExprKind::ArrayBuilderNew {
+                capacity: Box::new(native_i64()),
                 elem: ArrayBuilderElem::Scalar(Scalar::String),
                 region: None,
             },
@@ -12317,6 +12319,7 @@ fn hir_body_validator_native() {
         "native_heap_record_array_builder_new",
         body_test_expr(
             hir::ExprKind::ArrayBuilderNew {
+                capacity: Box::new(native_i64()),
                 elem: ArrayBuilderElem::Scalar(Scalar::Struct(heap_record)),
                 region: None,
             },
@@ -12343,6 +12346,7 @@ fn hir_body_validator_native() {
                             )),
                             hir::Stmt::Expr(body_test_expr(
                                 hir::ExprKind::ArrayBuilderNew {
+                capacity: Box::new(native_i64()),
                                     elem: ArrayBuilderElem::Scalar(scalar_int(64)),
                                     region: Some(Box::new(native_local(
                                         0,
@@ -18758,4 +18762,64 @@ fn json_array_root_checked_hir_requires_exact_source_and_element() {
             });
         }
     }
+}
+
+#[test]
+fn scalar_inspection_and_capacity_records_reject_forged_operands() {
+    for (source, function) in [
+        ("fn f(x: f32) -> u32 { bits := x.to_bits(); return bits }", "f"),
+        ("fn f() -> i64 { b := buffer.filled(3, 7); return b.len() }", "f"),
+        ("fn f() -> i64 { mut b: array_builder<i64> := array_builder(7); xs := b.build(); return xs.len() }", "f"),
+    ] {
+        let base = checked_source_program(source);
+        assert!(!is_empty(&lower_program(&base)));
+        for mutation in 0..3 {
+            let mut malformed = base.clone();
+            let expression = body_first_let_init_mut(&mut malformed, function);
+            match &mut expression.kind {
+                hir::ExprKind::MathOp { operands, .. } => {
+                    match mutation {
+                        0 => operands.clear(),
+                        1 => operands[0].ty = Ty::Bool,
+                        _ => expression.ty = Ty::Int(IntTy { bits: 64, signed: false }),
+                    }
+                }
+                hir::ExprKind::BufferNew { capacity, fill } => {
+                    match mutation {
+                        0 => capacity.ty = Ty::Bool,
+                        1 => { let Some(fill) = fill.as_mut() else { panic!("filled fixture") }; fill.ty = Ty::Bool; },
+                        _ => expression.ty = Ty::String,
+                    }
+                }
+                hir::ExprKind::ArrayBuilderNew { capacity, region, .. } => {
+                    match mutation {
+                        0 => capacity.ty = Ty::Bool,
+                        1 => *region = Some(Box::new(body_test_expr(hir::ExprKind::Bool(true), Ty::Bool))),
+                        _ => expression.ty = Ty::Buffer,
+                    }
+                }
+                _ => panic!("constructor fixture"),
+            }
+            assert_body_entrypoints_empty("scalar-capacity-forged", &malformed);
+        }
+    }
+}
+
+#[test]
+fn indexed_tagged_copy_values_require_exact_payload_identity() {
+    let source = "fn main() { arena out { mut b: array_builder<Option<i64>> := array_builder(out, 4); b.push(Some(7)); xs := b.build(); print(xs[0] else 0) } }";
+    let hir = checked_source_program(source);
+    let mut mir = lower_program(&hir);
+    let payload = Scalar::Int(IntTy { bits: 64, signed: true });
+    let Some(index) = mir.tagged_types.iter().position(|tag| *tag == hir::TaggedType::Option(payload)) else { panic!("Option descriptor") };
+    let id = u32::try_from(index).unwrap_or(u32::MAX);
+    let source = Ty::DynArray(Scalar::Tagged(id));
+    for noalias in [false, true] {
+        assert!(crate::producer::slice_index_result_matches(&mir, source, Ty::Option(payload), noalias));
+        for result in [Ty::Option(Scalar::Bool), Ty::Option(Scalar::String), Ty::Result(payload, Scalar::Bool), Ty::Bool, Ty::Tagged(u32::MAX)] {
+            assert!(!crate::producer::slice_index_result_matches(&mir, source, result, noalias));
+        }
+    }
+    mir.tagged_types[index] = hir::TaggedType::Option(Scalar::String);
+    assert!(!crate::producer::slice_index_result_matches(&mir, source, Ty::Option(Scalar::String), false));
 }

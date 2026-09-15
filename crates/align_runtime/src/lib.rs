@@ -11407,6 +11407,26 @@ pub extern "C" fn align_rt_buffer_new(cap: i64) -> *mut Buffer {
     buffer
 }
 
+/// `buffer.filled(length, value)` — exactly initialized bytes in one payload acquisition.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_buffer_filled(length: i64, value: u8) -> *mut Buffer {
+    let requested = safe_len(length).unwrap_or_else(|()| align_rt_alloc_size_fail());
+    #[cfg(test)]
+    if requested > 0 && owned_allocator_failpoint() { panic_abort("buffer allocation failed"); }
+    let mut data = Vec::new();
+    if data.try_reserve_exact(requested).is_err() {
+        panic_abort("buffer allocation failed");
+    }
+    data.resize(requested, value);
+    let cap = data.capacity();
+    #[cfg(test)]
+    if owned_allocator_failpoint() { panic_abort("buffer header allocation failed"); }
+    let buffer = Box::into_raw(Box::new(Buffer { data: data.into(), cap, len: requested }));
+    #[cfg(feature = "alloc-count")]
+    requested_live_insert(1, buffer.cast(), 64usize.saturating_add(cap));
+    buffer
+}
+
 /// `b.bytes()` — a `slice<u8>` view of the buffer's current contents (`data[..len]`), written to
 /// `out` as a `{ptr,len}`. The view borrows the buffer (region-tracked; must not outlive it).
 ///
@@ -17540,7 +17560,32 @@ const _: () = assert!(
 );
 const _: () = assert!(core::mem::size_of::<ArrayBuilder>() + core::mem::size_of::<Buffer>() <= 128);
 
+fn array_builder_initial_bytes(capacity: i64, stride: usize) -> (usize, usize) {
+    let count = safe_len(capacity).unwrap_or_else(|()| align_rt_alloc_size_fail());
+    let bytes = count.checked_mul(stride).filter(|bytes| *bytes <= isize::MAX.unsigned_abs())
+        .unwrap_or_else(|| align_rt_alloc_size_fail());
+    (count, bytes)
+}
+
 impl ArrayBuilder {
+    /// Reserve the explicit constructor capacity without inventing initialized elements.
+    unsafe fn initialize_capacity(&mut self, count: usize, bytes: usize) {
+        if count == 0 { return; }
+        self.cap = count;
+        if self.elem_size == 0 { return; }
+        if self.arena.is_null() {
+            let length = i64::try_from(bytes).unwrap_or_else(|_| align_rt_alloc_size_fail());
+            self.data = align_rt_alloc(length);
+        } else {
+            let arena = unsafe { &mut *self.arena };
+            let chunk = arena.alloc_uninit(core::mem::size_of::<RegionArrayBuilderChunk>(), core::mem::align_of::<RegionArrayBuilderChunk>())
+                .cast::<RegionArrayBuilderChunk>();
+            let data = arena.alloc_uninit(bytes, self.elem_align);
+            unsafe { chunk.write(RegionArrayBuilderChunk { next: core::ptr::null_mut(), data, len: 0, cap: count }); }
+            self.head = chunk;
+            self.tail = chunk;
+        }
+    }
     /// Ensure room for `additional` more elements, growing by amortized doubling. Aborts on a
     /// capacity/byte-size overflow (the `checked_*` FFI-growth-math rule) or OOM (via
     /// [`align_rt_realloc`]).
@@ -17656,10 +17701,13 @@ fn array_builder_value(elem_size: i64) -> ArrayBuilder {
 }
 
 /// `array_builder<T>()` — open an empty builder whose element stride is `elem_size` bytes (`>= 1`;
-/// 16 for a `string` element). Growth is deferred to the first `push`/`append`.
+/// 16 for a `string` element). Explicit capacity is reserved before returning; zero defers growth.
 #[unsafe(no_mangle)]
-pub extern "C" fn align_rt_array_builder_new(elem_size: i64) -> *mut ArrayBuilder {
-    let builder = Box::into_raw(Box::new(array_builder_value(elem_size)));
+pub extern "C" fn align_rt_array_builder_new(elem_size: i64, capacity: i64) -> *mut ArrayBuilder {
+    let mut value = array_builder_value(elem_size);
+    let (count, bytes) = array_builder_initial_bytes(capacity, value.elem_size);
+    unsafe { value.initialize_capacity(count, bytes); }
+    let builder = Box::into_raw(Box::new(value));
     #[cfg(feature = "alloc-count")]
     requested_live_insert(2, builder.cast(), 64);
     builder
@@ -17676,6 +17724,7 @@ pub unsafe extern "C" fn align_rt_array_builder_new_in(
     arena: *mut Arena,
     elem_size: i64,
     elem_align: i64,
+    capacity: i64,
 ) -> *mut ArrayBuilder {
     let (Ok(elem_size), Some(elem_align)) = (
         safe_len(elem_size),
@@ -17686,6 +17735,7 @@ pub unsafe extern "C" fn align_rt_array_builder_new_in(
     if arena.is_null() {
         return core::ptr::null_mut();
     }
+    let (count, bytes) = array_builder_initial_bytes(capacity, elem_size);
     let storage = unsafe {
         (&mut *arena).alloc_uninit(
             core::mem::size_of::<ArrayBuilder>(),
@@ -17705,6 +17755,7 @@ pub unsafe extern "C" fn align_rt_array_builder_new_in(
             elem_align,
         });
     }
+    unsafe { (*storage).initialize_capacity(count, bytes); }
     storage
 }
 
@@ -17714,7 +17765,7 @@ pub unsafe extern "C" fn align_rt_array_builder_new_in(
 /// # Safety
 /// `out` must point to at least 64 writable bytes aligned to 16, with no live header value in it.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_array_builder_init_stack(out: *mut u8, elem_size: i64) -> *mut ArrayBuilder {
+pub unsafe extern "C" fn align_rt_array_builder_init_stack(out: *mut u8, elem_size: i64, capacity: i64) -> *mut ArrayBuilder {
     if out.is_null() {
         return core::ptr::null_mut();
     }
@@ -17724,7 +17775,9 @@ pub unsafe extern "C" fn align_rt_array_builder_init_stack(out: *mut u8, elem_si
         "stack ArrayBuilder storage is misaligned"
     );
     let b = out.cast::<ArrayBuilder>();
-    unsafe { b.write(array_builder_value(elem_size)) };
+    let mut value = array_builder_value(elem_size);
+    let (count, bytes) = array_builder_initial_bytes(capacity, value.elem_size);
+    unsafe { value.initialize_capacity(count, bytes); b.write(value); }
     b
 }
 
@@ -31784,9 +31837,51 @@ mod tests {
     }
 
     #[test]
+    fn explicit_constructor_capacity_preserves_payload_and_initialized_prefix() {
+        let _serial = REGION_ARRAY_BUILDER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for capacity in [0usize, 1, 4, 40, 128] {
+            let filled = align_rt_buffer_filled(i64::try_from(capacity).unwrap(), 0xa5);
+            unsafe {
+                assert_eq!((*filled).len, capacity);
+                assert!((*filled).cap >= capacity);
+                let view = (*filled).data.with_mut(|data| data.clone());
+                assert_eq!(view, vec![0xa5; capacity]);
+                align_rt_buffer_free(filled);
+            }
+            for mode in 0..3 {
+                let arena = if mode == 2 { align_rt_arena_begin() } else { core::ptr::null_mut() };
+                let mut storage = StackHeader([0; 64]);
+                let count = i64::try_from(capacity).unwrap();
+                let builder = unsafe { match mode {
+                    0 => align_rt_array_builder_new(8, count),
+                    1 => align_rt_array_builder_init_stack(storage.0.as_mut_ptr(), 8, count),
+                    _ => align_rt_array_builder_new_in(arena, 8, 8, count),
+                } };
+                unsafe {
+                    assert_eq!((*builder).len, 0);
+                    assert!((*builder).cap >= capacity);
+                    let payload = if mode == 2 && capacity > 0 { (*(*builder).head).data } else { (*builder).data };
+                    let tail = (*builder).tail;
+                    for value in 0..capacity { align_rt_array_builder_push(builder, u64::try_from(value).unwrap()); }
+                    assert_eq!((*builder).len, capacity);
+                    assert_eq!((*builder).tail, tail, "initial capacity must not add a chunk");
+                    if mode != 2 { assert_eq!((*builder).data, payload, "initial capacity must not grow"); }
+                    let frozen = if mode == 1 { align_rt_array_builder_build_stack(builder) } else { align_rt_array_builder_build(builder) };
+                    assert_eq!(frozen.len, count);
+                    if capacity > 0 {
+                        if mode != 2 { assert_eq!(frozen.ptr, payload); }
+                        assert_eq!(core::slice::from_raw_parts(frozen.ptr.cast::<u64>(), capacity), (0..u64::try_from(capacity).unwrap()).collect::<Vec<_>>());
+                    }
+                    if mode == 2 { align_rt_arena_end(arena); } else { align_rt_free(frozen.ptr.cast_mut()); }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn stack_array_builder_header_build_transfer_and_unfinished_drop() {
         let mut storage = StackHeader([0; 64]);
-        let b = unsafe { align_rt_array_builder_init_stack(storage.0.as_mut_ptr(), 8) };
+        let b = unsafe { align_rt_array_builder_init_stack(storage.0.as_mut_ptr(), 8, 0) };
         assert_eq!(b.cast::<u8>(), storage.0.as_mut_ptr());
         unsafe {
             align_rt_array_builder_push(b, 10);
@@ -31798,7 +31893,7 @@ mod tests {
         assert_eq!(unsafe { core::slice::from_raw_parts(frozen.ptr.cast::<u64>(), 3) }, [10, 20, 30]);
         unsafe { align_rt_free(frozen.ptr as *mut u8) };
 
-        let b = unsafe { align_rt_array_builder_init_stack(storage.0.as_mut_ptr(), 8) };
+        let b = unsafe { align_rt_array_builder_init_stack(storage.0.as_mut_ptr(), 8, 0) };
         unsafe {
             align_rt_array_builder_push(b, 99);
             align_rt_array_builder_free_stack(b);
@@ -31817,7 +31912,7 @@ mod tests {
         for count in [0usize, 3, 17] {
             let before = REGION_ARRAY_BUILDER_COMPACTIONS.load(Ordering::Relaxed);
             let arena = align_rt_arena_begin();
-            let builder = unsafe { align_rt_array_builder_new_in(arena, 8, 8) };
+            let builder = unsafe { align_rt_array_builder_new_in(arena, 8, 8, 0) };
             assert!(!builder.is_null());
             for value in 0..count {
                 unsafe { align_rt_array_builder_push(builder, value as u64) };
@@ -31856,8 +31951,7 @@ mod tests {
             align_rt_array_builder_new_in(
                 arena,
                 core::mem::size_of::<Pair>() as i64,
-                core::mem::align_of::<Pair>() as i64,
-            )
+                core::mem::align_of::<Pair>() as i64, 0)
         };
         let expected = [Pair { left: 1, right: 2 }, Pair { left: 3, right: 5 }];
         for value in &expected {
@@ -31880,7 +31974,7 @@ mod tests {
     fn region_array_builder_preserves_zero_sized_element_count() {
         let _serial = REGION_ARRAY_BUILDER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let arena = align_rt_arena_begin();
-        let builder = unsafe { align_rt_array_builder_new_in(arena, 0, 8) };
+        let builder = unsafe { align_rt_array_builder_new_in(arena, 0, 8, 0) };
         assert!(!builder.is_null());
         let element = 0u8;
         for _ in 0..3 {
@@ -31896,18 +31990,18 @@ mod tests {
     fn region_array_builder_rejects_invalid_ffi_layout_before_allocation() {
         let _serial = REGION_ARRAY_BUILDER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert!(unsafe {
-            align_rt_array_builder_new_in(core::ptr::null_mut(), 8, 8)
+            align_rt_array_builder_new_in(core::ptr::null_mut(), 8, 8, 0)
         }
         .is_null());
 
         let arena = align_rt_arena_begin();
         for (size, align) in [(-1, 8), (8, 0), (8, -1), (8, 3)] {
             assert!(
-                unsafe { align_rt_array_builder_new_in(arena, size, align) }.is_null(),
+                unsafe { align_rt_array_builder_new_in(arena, size, align, 0) }.is_null(),
                 "invalid layout ({size}, {align}) must fail before allocation",
             );
         }
-        let valid = unsafe { align_rt_array_builder_new_in(arena, 8, 8) };
+        let valid = unsafe { align_rt_array_builder_new_in(arena, 8, 8, 0) };
         assert!(!valid.is_null(), "an earlier invalid request must not poison the arena");
         let byte = 0u8;
         unsafe {
@@ -33291,9 +33385,18 @@ mod tests {
         const MODE: &str = "ALIGN_JSON_OWNED_ALLOC_FAIL_MODE";
         if let Some(mode) = std::env::var_os(MODE) {
             let mode = mode.to_string_lossy();
-            let fail_after = if mode == "decode-growth" { 1 } else { 0 };
+            let fail_after = if matches!(mode.as_ref(), "decode-growth" | "filled-header") { 1 } else { 0 };
             OWNED_ALLOC_FAIL_AFTER.store(fail_after, core::sync::atomic::Ordering::Relaxed);
             match mode.as_ref() {
+                "filled-payload" | "filled-header" => {
+                    let _ = align_rt_buffer_filled(8, 7);
+                }
+                "filled-empty-header" => {
+                    let _ = align_rt_buffer_filled(0, 7);
+                }
+                "builder-capacity" => {
+                    let _ = align_rt_array_builder_new(8, 40);
+                }
                 "allocation" => {
                     let _ = align_rt_alloc(8);
                 }
@@ -33353,7 +33456,7 @@ mod tests {
             panic!("{mode} allocator failpoint returned instead of aborting");
         }
 
-        for mode in ["allocation", "decode-growth", "encode-growth"] {
+        for mode in ["allocation", "decode-growth", "encode-growth", "filled-payload", "filled-header", "filled-empty-header", "builder-capacity"] {
             let mut child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -33368,7 +33471,8 @@ mod tests {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
                 if let Some(status) = child.try_wait().expect("poll owned allocation child") {
-                    assert!(!status.success(), "{mode} allocation failure must abort");
+                    use std::os::unix::process::ExitStatusExt;
+                    assert_eq!(status.signal(), Some(6), "{mode} allocation failure must abort");
                     break;
                 }
                 if std::time::Instant::now() >= deadline {
@@ -40018,7 +40122,7 @@ mod tests {
 
         #[inline(never)]
         fn boxed_array(n: usize) -> i64 {
-            let b = black_box(align_rt_array_builder_new(8));
+            let b = black_box(align_rt_array_builder_new(8, 0));
             for i in 0..n {
                 unsafe { align_rt_array_builder_push(b, i as u64) };
             }
@@ -48520,7 +48624,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
     fn array_builder_unfrozen_string_drop_frees_pushed_strings_no_leak() {
         let before = LIVE_ARRAY_BUILDER_STRINGS.load(core::sync::atomic::Ordering::Relaxed);
         for _ in 0..100 {
-            let b = align_rt_array_builder_new(16);
+            let b = align_rt_array_builder_new(16, 0);
             for s in ["alpha", "beta", "gamma", "delta"] {
                 let (ptr, len) = owned_string_buf(s);
                 unsafe { align_rt_array_builder_push_str(b, ptr, len) };
@@ -48539,7 +48643,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         let before = LIVE_ARRAY_BUILDER_STRINGS.load(core::sync::atomic::Ordering::Relaxed);
         for _ in 0..100 {
             let mut storage = StackHeader([0; 64]);
-            let b = unsafe { align_rt_array_builder_init_stack(storage.0.as_mut_ptr(), 16) };
+            let b = unsafe { align_rt_array_builder_init_stack(storage.0.as_mut_ptr(), 16, 0) };
             for s in ["stack", "header", "deep", "drop"] {
                 let (ptr, len) = owned_string_buf(s);
                 unsafe { align_rt_array_builder_push_str(b, ptr, len) };
@@ -48563,8 +48667,8 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             third: u64,
         }
 
-        let left = align_rt_array_builder_new(core::mem::size_of::<Record>() as i64);
-        let right = align_rt_array_builder_new(core::mem::size_of::<Record>() as i64);
+        let left = align_rt_array_builder_new(core::mem::size_of::<Record>() as i64, 0);
+        let right = align_rt_array_builder_new(core::mem::size_of::<Record>() as i64, 0);
         for value in 0..80_u64 {
             let a = Record {
                 first: value,
@@ -48665,7 +48769,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
     fn array_builder_string_build_then_array_drop_no_leak() {
         let before = LIVE_ARRAY_BUILDER_STRINGS.load(core::sync::atomic::Ordering::Relaxed);
         for _ in 0..100 {
-            let b = align_rt_array_builder_new(16);
+            let b = align_rt_array_builder_new(16, 0);
             for s in ["one", "two", "three"] {
                 let (ptr, len) = owned_string_buf(s);
                 unsafe { align_rt_array_builder_push_str(b, ptr, len) };

@@ -13,6 +13,19 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### Scalar inspection and explicit capacity (issue batch 1049–1053)
+
+Settled by plan 65: scalar f32/f64 `to_bits`, `is_finite`, `is_nan`,
+`is_infinite`; `buffer.filled(length: i64, value: u8)`; expected-type
+`array_builder` constructors with optional i64 capacity in heap and region forms.
+Float operations are Pure and allocate nothing. Filled buffers guarantee length,
+not exact capacity or constant-time zeroing. Builder reserve leaves length zero;
+heap freeze transfers and region freeze compacts. Invalid/overflowing requests
+and OOM abort for these explicit guaranteed allocations. No zeroed alias,
+repeat terminal, turbofish constructor syntax or allocator Result is added.
+Finalized known bits may suppress a proved lossless integer-cast warning.
+
+
 **R77–R83 composition implementation (2026-09-12).**
 [Plan 56](impl/56-r77-r83-composition-plan.md) owns the consolidated repair and
 acceptance matrix. Readiness, shared read authority, fresh/transferred ownership

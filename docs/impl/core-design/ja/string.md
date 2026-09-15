@@ -72,3 +72,20 @@ Pure（I/O なし）。*アロケーションの可視性* というルールは
 ## Test anchors
 
 `m5.rs`（find / rfind のペア、trim ファミリ、ゼロコピーの bytes ビュー、fuse を含む builder、template、エスケープ、UTF-8 のバイト長、print 型の網羅性チェックを含むメソッド）。`lambda.rs:271/280/287/294`（ラムダ内でのアロケーションの拒否 + ラムダ内での arena の許可）。`hash.rs`（ビューの受け入れ）。`fuzz_fmt.rs`（文字列を多用するソースの formatter 往復テスト）。例として `strings.align`、`template.align`。文字列連結の拒否は reducer、名前付き関数、ラムダの各コンテキストで一貫してカバーされている。SIMD スキャンの固定: #310 differential oracle。
+
+## 明示的なコンストラクタ容量
+
+`buffer.filled(length: i64, value: u8) -> buffer` は、指定した長さの初期化済み
+バイト列を返す。確保容量は長さ以上。長さが正ならペイロードを一度確保し、
+ゼロならペイロードは確保しない。Move ハンドル自体は確保を伴い得る。
+初期化は O(length)。負数・サイズのオーバーフローは確保前に停止し、OOM も
+停止する。通常の `buffer(capacity)` は従来どおり best-effort の空の読み取り
+ウィンドウを作る。
+
+期待型で要素型を指定する `array_builder()` と `array_builder(out)` は、末尾に
+省略可能な i64 容量を取る。呼び出しは `array_builder(capacity)` または
+`array_builder(out, capacity)`。省略時はゼロ。初期要素数はゼロのままで、
+少なくとも指定容量回の push が追加拡張なしで収まる。要素数 × stride と
+対象の確保サイズの検査は確保前に行う。heap の build は領域を移譲し、region
+の build は従来どおり連続領域へ実体化する。要素型・寿命・Drop・純粋性の規則は
+変わらない。

@@ -5,8 +5,8 @@
 fixes eight exported symbols and their exact shapes, scratch layouts and
 ownership. Six native-observation rows and the lossy/SHA-1 rows are implemented.
 `align_rt_utf8_decode_lossy` and `align_rt_crypto_sha1` both use shape A84,
-returning independently owned pointer/length results from borrowed bytes. Canonical leaf tags are unchanged. R88 adds the ordinary-path regular-reader row (plan 58). Current inventory: 444 keyed,
-462 base, 469 alloc-count, 466 par-map-probe and 473 maximum exports.
+returning independently owned pointer/length results from borrowed bytes. Canonical leaf tags are unchanged. R88 adds the ordinary-path regular-reader row (plan 58). Current inventory: 445 keyed,
+463 base, 470 alloc-count, 467 par-map-probe and 474 maximum exports.
 
 **R65 planned contract:** [plan 50](50-r65-process-capability-handoff.md) and
 [plan 49](49-native-process-contract.md), designed and ready for implementation, own the new
@@ -39,7 +39,7 @@ owned JSON, exclusive filesystem publication, retained-root regular-file access,
 lifecycle, HTTP client
 raw/SSE receive streaming, asymmetric signatures, `std.log`, `core.codec`, `pkg.frame`, `pkg.kv`,
 `pkg.csv`, `pkg.ws`, `pkg.template`, named time/path wire formats, incremental SHA-256 host observation and ordinary directory operations, there
-are 444 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
+are 445 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
 `ArrayBuilderNewIn` and `ArrayBuilderPushBytes`; the four
 AEAD symbols that were previously selected from `AeadCipher × AeadDir` become
 ordinary typed keys; they may no longer bypass the registry. Eighteen always-built
@@ -52,7 +52,7 @@ runtime records have no `RuntimeKey` and instead use the eighteen-variant
 `align_rt_f64_from_bits`, `align_rt_f32_text_len`, `align_rt_f64_text_len`,
 `align_rt_f32_text_write`, and `align_rt_f64_text_write`, plus the four compiler-private
 `core.test` child-control rows recorded below and the package-internal checked TCP timeout row
-`align_rt_tcp_conn_set_io_timeout`. The base native registry therefore has 462 records. R63 replaces Request 12's two bounded-only rows with four unified JSON builder rows
+`align_rt_tcp_conn_set_io_timeout`. The base native registry therefore has 463 records. R63 replaces Request 12's two bounded-only rows with four unified JSON builder rows
 (A127–A130), including separate finite-only f32/f64 writers.
 The explicit `alloc-count` runtime feature may expose seven
 test/benchmark-only definitions: the allocation/free and finder counters plus
@@ -64,10 +64,10 @@ test/benchmark-only definitions: the allocation/free and finder counters plus
 `i64 @align_rt_test_par_map_workers()`. `task-group-probe` and
 `crypto-asymmetric-probe` change internal Rust state only and add no unmangled native export.
 
-The compiler-visible native registry is always exactly the 462 base records.
+The compiler-visible native registry is always exactly the 463 base records.
 There is no target option, environment variable, Cargo feature, linked-runtime
 inspection, or other ambient input that changes it. The eleven optional probe
-records extend only the verification-time maximum runtime-export table to 473.
+records extend only the verification-time maximum runtime-export table to 474.
 They never gain a `RuntimeKey`, callable/declaration policy, collision
 reservation, or compatible-extern reuse. Their spellings remain ordinary
 program/extern/export identities in a normal build. Probe-feature runtime
@@ -86,7 +86,7 @@ added six keyed rows, `core.codec` then added eight, `pkg.frame` added two, `pkg
 source-reachable unkeyed row, `pkg.csv` added one keyed row, `pkg.ws` added eleven keyed rows, and
 `pkg.template` added five keyed rows. Their runtime
 definitions and registry entries activated atomically at their respective capability boundaries: the current exact counts
-are 444 keyed records, 462 base records, and 473 records in the maximum optional-probe export table.
+are 445 keyed records, 463 base records, and 474 records in the maximum optional-probe export table.
 No new probe category was introduced. The implemented `pkg.kv` row reuses an existing ABI shape. Its two
 independently useful prerequisites first hardened the shared TCP timeout substrate and existing
 TCP-derived writers without changing a symbol, key, shape, attribute, or count.
@@ -986,15 +986,15 @@ from those bodies. `align_rt_str_cmp` is not guarded and always keeps A01.
 | A40 | `i64 @SYM(ptr, ptr, i64, ptr, i64, i64)` | `align_rt_udp_send_to` |
 | A41 | `i64 @SYM(ptr, ptr, i64, ptr, ptr, i64)` | `align_rt_group_sum_i64`, `align_rt_group_min_i64`, `align_rt_group_max_i64`, `align_rt_group_sum_str_cols`, `align_rt_group_min_str_cols`, `align_rt_group_max_str_cols`, `align_rt_group_count_str_cols` |
 | A42 | `noalias ptr @SYM() {nofree nounwind}` | `align_rt_arena_begin`, `align_rt_tg_begin` |
-| A43 | `noalias ptr @SYM(i64) {nofree nounwind}` | `align_rt_alloc`, `align_rt_array_builder_new` |
+| A43 | `noalias ptr @SYM(i64) {nofree nounwind}` | `align_rt_alloc` |
 | A44 | `noalias ptr @SYM(ptr, i64) {nofree nounwind}` | `align_rt_str_finder_new`, `align_rt_builder_new` |
-| A45 | `noalias ptr @SYM(ptr, i64, i64) {nounwind}` | `align_rt_arena_alloc`, `align_rt_array_builder_new_in`, `align_rt_tg_alloc` |
+| A45 | `noalias ptr @SYM(ptr, i64, i64) {nounwind}` | `align_rt_arena_alloc`, `align_rt_tg_alloc` |
 | A46 | `noalias ptr @SYM(ptr, ptr, i64, i64, i64, i64, ptr)` | `align_rt_par_map` |
 | A47 | `ptr @SYM()` | `align_rt_io_reader_stdin`, `align_rt_http_client_new`, `align_rt_crypto_digest_new` |
 | A48 | `ptr @SYM(i32, i32)` | `align_rt_io_writer_std` |
 | A49 | `ptr @SYM(i64)` | `align_rt_buffer_new`, `align_rt_http_response_new` |
 | A50 | `ptr @SYM(ptr)` | `align_rt_tg_wait`, `align_rt_tcp_conn_reader`, `align_rt_tcp_conn_writer`, `align_rt_io_reader_buffered` |
-| A51 | `ptr @SYM(ptr, i64)` | `align_rt_array_builder_init_stack`, `align_rt_builder_init_bounded_stack`, `align_rt_cli_command_new` |
+| A51 | `ptr @SYM(ptr, i64)` | `align_rt_builder_init_bounded_stack`, `align_rt_cli_command_new` |
 | A52 | `ptr @SYM(ptr, i64, ptr, i64)` | `align_rt_command_new`, `align_rt_http_request_new` |
 | A53 | `ptr @SYM(ptr, ptr, i64)` | `align_rt_builder_init_stack` |
 | A54 | `void @SYM() {noreturn}` | `align_rt_div_fail`, `align_rt_alloc_size_fail`, `align_rt_process_abort` |
@@ -1162,7 +1162,7 @@ Tests compare:
 - all 426 keys, mapped symbols, LLVM declaration types, and default attributes
   against this table through the checked-in
   `crates/align_codegen_llvm/tests/golden/runtime_abi_declarations.txt`;
-- the 444 base native symbols against default-feature `align_runtime` exports,
+- the 463 base native symbols against default-feature `align_runtime` exports,
   plus every actual Rust definition's normalized native return and ordered
   parameter types against the declaration golden, failing on either direction's
   difference through `scripts/test-runtime-abi-exports.sh`;
@@ -1175,8 +1175,8 @@ Tests compare:
 - rt-LTO off/on attributes for every guarded symbol, with missing,
   declaration-only, wrong-type, internal, private, available-externally, and
   non-C-calling-convention artifact negatives;
-- all 444 identities through the one `RuntimeAbiId`-keyed row iterator and all
-  444 exact registry function types through the production compatibility
+- all 445 identities through the one `RuntimeAbiId`-keyed row iterator and all
+  445 exact registry function types through the production compatibility
   predicate, one return mutation per row, and one mutation of every parameter
   ordinal; source-valid compatible reuse for a keyed builtin and the thirteen
   source-reachable unkeyed rows; exact `ArgsBuild` `str` rejection plus the
@@ -1416,3 +1416,22 @@ RAII performs existing single-close cleanup; close errors do not replace them.
 Success publishes the existing owned reader layout and Drop, retaining no input.
 Transient NUL-terminated path scratch and the reader handle are the allocations.
 No new ABI attributes, wire format, runtime layout or probe category is added.
+
+## Issue batch constructor ABI
+
+Plan 65 adds one keyed/base export and changes three constructor signatures.
+The Buffer and ArrayBuilder physical layouts are unchanged. Compiler and runtime
+migrate together; no compatibility exports are retained.
+
+| Shape | Exact declaration | Semantics |
+| --- | --- | --- |
+| BufferFilled | `ptr @align_rt_buffer_filled(i64 length, i8 value)` | Validate length against target isize before allocation; OOM aborts. Return one owned handle with exactly initialized length. Zero has no payload; nonzero has one payload acquisition. |
+| ArrayBuilderCapacity | `noalias ptr @align_rt_array_builder_new(i64 stride, i64 capacity) {nofree nounwind}` | Fresh heap header; validated count × stride before any acquisition; initialized length zero; nonzero requested storage reserved. |
+| ArrayBuilderRegionCapacity | `noalias ptr @align_rt_array_builder_new_in(ptr arena, i64 stride, i64 align, i64 capacity) {nounwind}` | Existing arena/stride/alignment validation precedes count/layout validation and allocation. Header and initial chunk belong to the arena; length zero. |
+| ArrayBuilderStackCapacity | `ptr @align_rt_array_builder_init_stack(ptr out, i64 stride, i64 capacity)` | Existing writable 64-byte/16-aligned header precondition; same count/layout validation; heap payload with stack header. |
+
+Capacity zero is the explicit generated argument for omitted source capacity.
+Only initialized prefixes participate in Drop or freeze; the heap payload still
+transfers and the region output still compacts. `explicit_constructor_capacity_preserves_payload_and_initialized_prefix`
+owns header-mode, no-growth, initialization and heap transfer parity.
+Float inspection adds no native export.

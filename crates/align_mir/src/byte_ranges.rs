@@ -321,6 +321,8 @@ impl<'a> Facts<'a> {
         take_true: bool,
         admitted: BlockId,
         read: BlockId,
+        initial_value: i128,
+        increment: i128,
     ) -> bool {
         let Some(stores) = self.stores.get(&slot) else {
             return false;
@@ -328,7 +330,7 @@ impl<'a> Facts<'a> {
         if stores.len() != 2 {
             return false;
         }
-        let Some(initial) = stores.iter().find(|(_, _, op)| literal(op, 0)) else {
+        let Some(initial) = stores.iter().find(|(_, _, op)| literal(op, initial_value)) else {
             return false;
         };
         if !self.dominates(initial.0, header) {
@@ -344,13 +346,13 @@ impl<'a> Facts<'a> {
         }) {
             return false;
         }
-        let Some(step) = stores.iter().find(|entry| !literal(entry.2, 0)) else {
+        let Some(step) = stores.iter().find(|entry| !literal(entry.2, initial_value)) else {
             return false;
         };
         let Some((value, one)) = self.bin(step.2, BinOp::Add) else {
             return false;
         };
-        if !literal(one, 1)
+        if !literal(one, increment)
             || self.load(value, integer()) != Some(slot)
             || self.ty(step.2) != Some(integer())
             || !self.expression_precedes(step.2, step.0, step.1)
@@ -396,6 +398,7 @@ impl<'a> Facts<'a> {
                 Some(Rvalue::ArrayBuilderNew {
                     elem: Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char,
                     region: None,
+                    ..
                 }) => {
                     return true;
                 }
@@ -434,6 +437,7 @@ impl<'a> Facts<'a> {
                         | Rvalue::SlicePtr(_)
                         | Rvalue::SliceIndex(..)
                         | Rvalue::BytesRead { .. } => true,
+                        Rvalue::MathOp { fn_, .. } if fn_.is_float_inspection() => true,
                         Rvalue::ArrayBuilderNew { region: None, .. } => true,
                         Rvalue::ArrayBuilderPush {
                             builder, scalar, ..
@@ -499,15 +503,18 @@ impl<'a> Facts<'a> {
         let width = [1, 2, 4, 8]
             .into_iter()
             .find(|width| literal(amount, *width))?;
-        let (index, factor) = self.bin(start, BinOp::Mul)?;
-        if !literal(factor, width) || self.ty(start) != Some(integer()) {
+        if self.ty(start) != Some(integer()) {
             return None;
         }
-        let slot = self.load(index, integer())?;
-        let Operand::Value(index_id) = self.resolved(index)? else {
-            return None;
+        let (address, scaled) = if let Some((index, factor)) = self.bin(start, BinOp::Mul) {
+            if !literal(factor, width) { return None; }
+            (index, true)
+        } else {
+            (start, false)
         };
-        let (index_block, _, _) = self.defs.get(index_id)?;
+        let address_slot = self.load(address, integer())?;
+        let Operand::Value(address_id) = self.resolved(address)? else { return None };
+        let (address_block, _, _) = self.defs.get(address_id)?;
         let source = self.length(length)?;
         if !self.effects_safe_until(block) {
             return None;
@@ -562,25 +569,47 @@ impl<'a> Facts<'a> {
                 } else {
                     continue;
                 };
-            if self.ty(test) != Some(Ty::Bool)
-                || self.load(index, integer()) != Some(slot)
+            let Some(slot) = self.load(index, integer()) else { continue };
+            let Some(stores) = self.stores.get(&slot) else { continue };
+            let Some(initial) = stores.iter().find_map(|(_, _, value)| {
+                match value {
+                    Operand::Const(Const::Int(n, ty))
+                        if *ty == integer() && *n >= 0 && *n <= i128::from(i64::MAX) / width => Some(*n),
+                    _ => None,
+                }
+            }) else { continue };
+            if (scaled && address_slot != slot)
+                || self.ty(test) != Some(Ty::Bool)
                 || !self.defined_in(index, header.id)
                 || !self.expression_precedes(test, header.id, header.stmts.len())
                 || self.limit(limit, width) != Some(source)
                 || !self.arm_dominates(header.id, take_true, block)
                 || !self.dominates(header.id, block)
-                || !self.arm_dominates(header.id, take_true, *index_block)
-                || self.stores.get(&slot)?.iter().any(|(owner, _, value)| {
-                    !literal(value, 0)
-                        && *index_block != block
-                        && self.reachable(*owner, block, Some(*index_block))
+                || !self.arm_dominates(header.id, take_true, *address_block)
+                || self.stores.get(&address_slot)?.iter().any(|(owner, _, value)| {
+                    !literal(value, if scaled { initial } else { initial * width })
+                        && *address_block != block
+                        && self.reachable(*owner, block, Some(*address_block))
                 })
-                || !self.recurrence(slot, header.id, take_true, admitted, *ok)
+                || !self.recurrence(slot, header.id, take_true, admitted, *ok, initial, 1)
             {
                 continue;
             }
+            if !scaled {
+                if !self.recurrence(address_slot, header.id, take_true, admitted, *ok, initial * width, width) {
+                    continue;
+                }
+                // Both recurrences advance on the same unique latch, so their relation holds
+                // at every admission. A separate update path is deliberately not inferred.
+                let latch = |which: Slot, value: i128| self.stores.get(&which)
+                    .and_then(|entries| entries.iter().find(|(_, _, op)| !literal(op, value)))
+                    .map(|(owner, _, _)| *owner);
+                if latch(slot, initial) != latch(address_slot, initial * width) {
+                    continue;
+                }
+            }
             // A mutable-slot load used by the guard/read must precede the step.
-            let stores = self.stores.get(&slot)?;
+            let stores = self.stores.get(&address_slot)?;
             if stores
                 .iter()
                 .any(|(owner, position, _)| *owner == *ok && *position <= read_position)
