@@ -444,3 +444,30 @@ includes its coordinated schema/ABI migration, all header-mode owners and
 required specification/mirror changes. Keeping this boundary avoids repeatedly
 migrating constructor operands and proving the same numeric byte-loop consumer.
 A/O/W/M/P and complete plan 61 remain a separate, pending capability.
+
+
+### First capability verification and finding closure
+
+The independent implementation inspection found one P2: entering an unrelated
+lambda prematurely defaulted pending `to_bits` relations in the enclosing
+function. Relation propagation now preserves unconstrained components; only
+actual lambda parameters/captures commit their boundary types. The inference
+matrix covers unrelated lambdas, captured results, explicitly typed captures,
+and pipeline parameters in whole-program and per-unit modes. The author swept
+all relation solver/finalization boundaries for the same class. The original
+review verdict remains FINDINGS. The fix also groups the two recurrence
+constants into one argument to close the Clippy arity warning.
+
+Local x86_64 Linux measurements use the production runtime built with Rust
+1.96.0, `scripts/cargo.sh build --release -p align_runtime`, and an optimized
+Rust FFI probe. Nine alternating samples compare identical construction,
+push/initialization, length/value checks and destruction; builder samples run
+10,000 iterations and 607,744-byte buffer samples run eight. Median nanoseconds
+per operation (baseline / revised) are 291.241 / 240.735 for 40 builder elements,
+746.416 / 694.824 for 128 elements, and 2,421,945 / 6,192.75 for byte-at-a-time
+zero filling versus `buffer.filled`. These isolate constructor/runtime costs;
+they are not native ARM, application or compiler-wide speedup promises.
+Correctness owners separately check initialized contents and capacity behavior.
+The local evidence packet retains all nine samples, source and artifact hashes:
+probe `751d60b8e04a795b8a7e2c8300f6e3b37607117f29b146f2e9b8fe2813c4d7a8`,
+runtime `4d4755e37eb6f63b092cc6457b618f685c3adae7502dfa80ca3a8f60f4ad5598`.

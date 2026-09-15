@@ -321,8 +321,7 @@ impl<'a> Facts<'a> {
         take_true: bool,
         admitted: BlockId,
         read: BlockId,
-        initial_value: i128,
-        increment: i128,
+        (initial_value, increment): (i128, i128),
     ) -> bool {
         let Some(stores) = self.stores.get(&slot) else {
             return false;
@@ -591,12 +590,12 @@ impl<'a> Facts<'a> {
                         && *address_block != block
                         && self.reachable(*owner, block, Some(*address_block))
                 })
-                || !self.recurrence(slot, header.id, take_true, admitted, *ok, initial, 1)
+                || !self.recurrence(slot, header.id, take_true, admitted, *ok, (initial, 1))
             {
                 continue;
             }
             if !scaled {
-                if !self.recurrence(address_slot, header.id, take_true, admitted, *ok, initial * width, width) {
+                if !self.recurrence(address_slot, header.id, take_true, admitted, *ok, (initial * width, width)) {
                     continue;
                 }
                 // Both recurrences advance on the same unique latch, so their relation holds

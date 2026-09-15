@@ -118,6 +118,10 @@ fn float_inspection_inference_and_receiver_matrix() {
         "R { x: f32 }\nfn f(r: R) -> u32 = (r.x).to_bits()",
         "fn value() -> f32 = 1.5\nfn f() -> bool = value().is_finite()",
         "fn f() -> bool = (1.5).is_nan()",
+        "fn f() -> u32 { x := 1.5; bits := x.to_bits(); values := [1, 2].map(fn v { v }).to_array(); y: f32 := x; return bits }",
+        "fn f() -> u64 { x := 1.5; bits := x.to_bits(); values := [1, 2].map(fn v { bits }).to_array(); return values[0] }",
+        "fn f() -> u32 { x: f32 := 1.5; values := [1, 2].map(fn v { x.to_bits() }).to_array(); return values[0] }",
+        "fn f() -> u64 { x := 1.5; values := [x.to_bits()].map(fn v { v }).to_array(); return values[0] }",
     ];
     let invalid = [
         "fn f(x: f64) -> u32 = x.to_bits()",

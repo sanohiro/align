@@ -46164,7 +46164,7 @@ impl<'a, 't> Checker<'a, 't> {
         Ty::FloatVar(id)
     }
 
-    fn solve_float_bits_relations(&mut self) {
+    fn solve_float_bits_relations(&mut self, default_unconstrained: bool) {
         let mut pending = std::mem::take(&mut self.float_bits_relations);
         while !pending.is_empty() {
             let count = pending.len();
@@ -46185,6 +46185,10 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
             if unresolved.len() == count {
+                if !default_unconstrained {
+                    self.float_bits_relations = unresolved;
+                    break;
+                }
                 // No remaining component has contextual width information. Default all of them
                 // together so independent literal inspections do not require quadratic rescans.
                 for (source, result, span) in unresolved {
@@ -46234,10 +46238,21 @@ impl<'a, 't> Checker<'a, 't> {
 
     fn finalize(&self, ty: Ty) -> Ty {
         match self.resolve(ty) {
-            Ty::IntVar(_) => Ty::Int(IntTy {
-                bits: 64,
-                signed: true,
-            }),
+            Ty::IntVar(id) => {
+                // A boundary snapshot may need a concrete to_bits result without defaulting
+                // unrelated enclosing variables. Only a selected capture/parameter commits it.
+                for (source, result, _) in &self.float_bits_relations {
+                    if self.resolve(*result) == Ty::IntVar(id) {
+                        let bits = match self.resolve(*source) {
+                            Ty::Float(float) => float.bits,
+                            Ty::FloatVar(_) => 64,
+                            _ => continue,
+                        };
+                        return Ty::Int(IntTy { bits, signed: false });
+                    }
+                }
+                Ty::Int(IntTy { bits: 64, signed: true })
+            },
             Ty::FloatVar(_) => Ty::Float(FloatTy { bits: 64 }),
             other => other,
         }
@@ -46818,7 +46833,7 @@ impl<'a, 't> Checker<'a, 't> {
         };
 
         // Finalize all inferred types to concrete (or default i64).
-        self.solve_float_bits_relations();
+        self.solve_float_bits_relations(true);
         let mut body = body;
         self.finalize_block(&mut body);
         task_wait::validate(&body, self.tagged_types, self.diags);
@@ -55800,7 +55815,7 @@ impl<'a, 't> Checker<'a, 't> {
         }
         // Parameter types must be concrete at the lambda boundary (a function signature can't carry
         // another function's inference variable), so resolve the element type now.
-        self.solve_float_bits_relations();
+        self.solve_float_bits_relations(false);
         let param_tys: Vec<Ty> = expected_params.iter().map(|t| self.finalize(*t)).collect();
 
         // Snapshot the enclosing scope (with finalized types) so a body reference to an enclosing
@@ -55887,7 +55902,7 @@ impl<'a, 't> Checker<'a, 't> {
         };
         self.check_return_completeness(&checked, ret, body.span);
         let mut body_fin = checked;
-        self.solve_float_bits_relations();
+        self.solve_float_bits_relations(true);
         self.finalize_block(&mut body_fin);
         task_wait::validate(&body_fin, self.tagged_types, self.diags);
         // Run the broad unnecessary-heap scan on the lifted lambda body too (parity with the narrow
@@ -56003,6 +56018,18 @@ impl<'a, 't> Checker<'a, 't> {
         self.slice_bases = saved_bases;
         self.buffered_readers = saved_buffered_readers;
         self.capture = saved_capture;
+        // Commit only the values that actually cross this function boundary. Merely taking an
+        // enclosing-scope snapshot must not default unrelated numeric inference variables.
+        for (source, concrete) in expected_params.iter().zip(&param_tys) {
+            self.unify(*source, *concrete, span);
+        }
+        for capture in &capture_ops {
+            if let ExprKind::Local(local) = capture.kind
+                && let Some(source) = self.locals.get(local as usize).map(|local| local.ty)
+            {
+                self.unify(source, capture.ty, capture.span);
+            }
+        }
         if extern_boundary_error {
             // The outer lifted function was appended after any nested lambdas, so popping here
             // removes exactly this rejected function while preserving nested recovery artifacts.
