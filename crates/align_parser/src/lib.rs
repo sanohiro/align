@@ -425,7 +425,7 @@ fn reserved_word(kind: &TokKind) -> Option<&'static str> {
         | TokKind::Ident(_) | TokKind::ColonEq | TokKind::Eq | TokKind::Arrow
         | TokKind::FatArrow | TokKind::LParen | TokKind::RParen | TokKind::LBrace
         | TokKind::RBrace | TokKind::LBracket | TokKind::RBracket | TokKind::Comma
-        | TokKind::Colon | TokKind::Dot | TokKind::DotDot | TokKind::Plus
+        | TokKind::Colon | TokKind::Dot | TokKind::DotDot | TokKind::DotDotEq | TokKind::Plus
         | TokKind::Minus | TokKind::Star | TokKind::Slash | TokKind::Percent
         | TokKind::EqEq | TokKind::NotEq | TokKind::Lt | TokKind::Le | TokKind::Gt
         | TokKind::Ge | TokKind::AndAnd | TokKind::OrOr | TokKind::Amp | TokKind::Pipe
@@ -1860,6 +1860,65 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn at_value_pattern(&self) -> bool {
+        matches!(self.peek(), TokKind::Int(_) | TokKind::Char(_))
+            || (self.peek() == &TokKind::Minus && matches!(self.peek_at(1), TokKind::Int(_)))
+    }
+
+    fn parse_pattern_literal(&mut self) -> Option<(LiteralPat, Span)> {
+        if self.eat(&TokKind::Minus) {
+            let minus_span = self.prev_span();
+            if let TokKind::Int(v) = *self.peek() {
+                let span = minus_span.merge(self.span());
+                self.bump();
+                let Some(val) = v.checked_neg() else {
+                    self.diags.error(format!("integer literal out of range: -{v}"), span);
+                    return None;
+                };
+                Some((LiteralPat::Int(val), span))
+            } else {
+                self.diags.error("expected integer literal after '-' in pattern".to_string(), self.span());
+                None
+            }
+        } else if let TokKind::Int(v) = *self.peek() {
+            let span = self.span();
+            self.bump();
+            Some((LiteralPat::Int(v), span))
+        } else if let TokKind::Char(c) = *self.peek() {
+            let span = self.span();
+            self.bump();
+            Some((LiteralPat::Char(c), span))
+        } else {
+            self.diags.error("expected integer or character literal in pattern".to_string(), self.span());
+            None
+        }
+    }
+
+    fn parse_single_value_pattern(&mut self) -> Option<ValuePattern> {
+        let (start_lit, start_span) = self.parse_pattern_literal()?;
+        if self.eat(&TokKind::DotDotEq) {
+            let (end_lit, end_span) = self.parse_pattern_literal()?;
+            Some(ValuePattern::Range {
+                start: start_lit,
+                end: end_lit,
+                span: start_span.merge(end_span),
+            })
+        } else if self.eat(&TokKind::DotDot) {
+            self.diags.error(
+                "half-open range patterns (`..`) are not supported in match; use inclusive range `..=`".to_string(),
+                self.prev_span(),
+            );
+            let (end_lit, end_span) = self.parse_pattern_literal()?;
+            Some(ValuePattern::Range {
+                start: start_lit,
+                end: end_lit,
+                span: start_span.merge(end_span),
+            })
+        } else {
+            Some(ValuePattern::Single(start_lit, start_span))
+        }
+    }
+
     /// `match scrutinee { Variant => body, _ => body }` — arms are `pattern => expr`, separated by
     /// commas and/or newlines. The scrutinee parses like an `if` condition (a trailing `{` starts
     /// the arms, not a struct literal).
@@ -1882,46 +1941,58 @@ impl<'a> Parser<'a> {
                 break;
             }
             let astart = self.span();
-            let id = self.parse_ident("match pattern (a variant name or `_`)")?;
-            let pattern = if id.name == "_" {
-                MatchPattern::Wildcard(id.span)
-            } else if self.at(&TokKind::Pipe) {
-                // Or-pattern: `A | B | ...` — bare variant names, no bindings.
-                let mut variants = vec![id];
+            let pattern = if self.at_value_pattern() {
+                let first = self.parse_single_value_pattern()?;
+                let pstart = first.span();
+                let mut patterns = vec![first];
                 while self.eat(&TokKind::Pipe) {
                     self.skip_ends();
-                    variants.push(self.parse_ident("a variant name in an or-pattern")?);
+                    patterns.push(self.parse_single_value_pattern()?);
                 }
-                MatchPattern::Or { span: variants[0].span.merge(self.prev_span()), variants }
+                let span = pstart.merge(self.prev_span());
+                MatchPattern::Value { patterns, span }
             } else {
-                // Optional positional payload bindings: `Circle(r)`, `Rect(w, h)`.
-                let mut bindings = Vec::new();
-                if self.eat(&TokKind::LParen) {
-                    loop {
+                let id = self.parse_ident("match pattern (a variant name, literal, or `_`)")?;
+                if id.name == "_" {
+                    MatchPattern::Wildcard(id.span)
+                } else if self.at(&TokKind::Pipe) {
+                    // Or-pattern: `A | B | ...` — bare variant names, no bindings.
+                    let mut variants = vec![id];
+                    while self.eat(&TokKind::Pipe) {
                         self.skip_ends();
-                        if self.at(&TokKind::RParen) || self.at(&TokKind::Eof) {
-                            break;
-                        }
-                        bindings.push(self.parse_ident("a payload binding")?);
-                        if !self.eat(&TokKind::Comma) {
-                            break;
-                        }
+                        variants.push(self.parse_ident("a variant name in an or-pattern")?);
                     }
-                    self.expect(&TokKind::RParen, "')'");
-                    if self.at(&TokKind::Pipe) {
-                        self.diags.error(
-                            "an or-pattern cannot bind a payload; list bare variant names (`A | B`) or use separate arms".to_string(),
-                            self.span(),
-                        );
-                        // Recover: consume the rest of the (invalid) or-pattern tail so parsing
-                        // resumes at `=>` rather than cascading into an "expected '=>'" error.
-                        while self.eat(&TokKind::Pipe) {
+                    MatchPattern::Or { span: variants[0].span.merge(self.prev_span()), variants }
+                } else {
+                    // Optional positional payload bindings: `Circle(r)`, `Rect(w, h)`.
+                    let mut bindings = Vec::new();
+                    if self.eat(&TokKind::LParen) {
+                        loop {
                             self.skip_ends();
-                            let _ = self.parse_ident("a variant name in an or-pattern");
+                            if self.at(&TokKind::RParen) || self.at(&TokKind::Eof) {
+                                break;
+                            }
+                            bindings.push(self.parse_ident("a payload binding")?);
+                            if !self.eat(&TokKind::Comma) {
+                                break;
+                            }
+                        }
+                        self.expect(&TokKind::RParen, "')'");
+                        if self.at(&TokKind::Pipe) {
+                            self.diags.error(
+                                "an or-pattern cannot bind a payload; list bare variant names (`A | B`) or use separate arms".to_string(),
+                                self.span(),
+                            );
+                            // Recover: consume the rest of the (invalid) or-pattern tail so parsing
+                            // resumes at `=>` rather than cascading into an "expected '=>'" error.
+                            while self.eat(&TokKind::Pipe) {
+                                self.skip_ends();
+                                let _ = self.parse_ident("a variant name in an or-pattern");
+                            }
                         }
                     }
+                    MatchPattern::Variant { name: id, bindings }
                 }
-                MatchPattern::Variant { name: id, bindings }
             };
             self.expect(&TokKind::FatArrow, "'=>'");
             let body = Box::new(self.parse_expr(0)?);
@@ -2611,5 +2682,52 @@ fn good() {}"#,
             "after a broken condition, `P {{ a: 5 }}` must still parse as a struct literal, got {:?}",
             init.kind
         );
+    }
+
+    #[test]
+    fn match_value_patterns_parse() {
+        let src = r#"
+fn classify(x: i64) -> i64 {
+  return match x {
+    33..=126 | 161..=172 | 174..=255 => x,
+    0..=32 => 256 + x,
+    127..=160 => 162 + x,
+    173 => 323,
+    -10..=-1 => 0,
+    _ => 256,
+  }
+}
+"#;
+        let (file, err) = parse(src);
+        assert!(!err);
+        let Item::Fn(fd) = &file.items[0] else { panic!() };
+        let FnBody::Block(b) = &fd.body else { panic!() };
+        let Stmt::Return(Some(ret_expr)) = &b.stmts[0] else { panic!() };
+        let ExprKind::Match { arms, .. } = &ret_expr.kind else { panic!() };
+        assert_eq!(arms.len(), 6);
+        match &arms[0].pattern {
+            MatchPattern::Value { patterns, .. } => {
+                assert_eq!(patterns.len(), 3);
+                assert!(matches!(patterns[0], ValuePattern::Range { start: LiteralPat::Int(33), end: LiteralPat::Int(126), .. }));
+                assert!(matches!(patterns[1], ValuePattern::Range { start: LiteralPat::Int(161), end: LiteralPat::Int(172), .. }));
+                assert!(matches!(patterns[2], ValuePattern::Range { start: LiteralPat::Int(174), end: LiteralPat::Int(255), .. }));
+            }
+            other => panic!("expected Value pattern, got {other:?}"),
+        }
+        match &arms[3].pattern {
+            MatchPattern::Value { patterns, .. } => {
+                assert_eq!(patterns.len(), 1);
+                assert!(matches!(patterns[0], ValuePattern::Single(LiteralPat::Int(173), _)));
+            }
+            other => panic!("expected Value pattern, got {other:?}"),
+        }
+        match &arms[4].pattern {
+            MatchPattern::Value { patterns, .. } => {
+                assert_eq!(patterns.len(), 1);
+                assert!(matches!(patterns[0], ValuePattern::Range { start: LiteralPat::Int(-10), end: LiteralPat::Int(-1), .. }));
+            }
+            other => panic!("expected Value pattern, got {other:?}"),
+        }
+        assert!(matches!(arms[5].pattern, MatchPattern::Wildcard(_)));
     }
 }

@@ -22031,6 +22031,19 @@ fn lower_match(
     });
     let join_bb = b.new_block();
     match scrutinee.ty {
+        Ty::Int(_) | Ty::Char => lower_match_value(
+            b,
+            scrutinee.ty,
+            arms,
+            &scrut,
+            (
+                result_slot,
+                result_flag,
+                result_temp_flag,
+                join_bb,
+                borrow_result,
+            ),
+        ),
         Ty::Enum(enum_id) => lower_match_enum(
                 b,
                 enum_id,
@@ -22063,7 +22076,7 @@ fn lower_match(
                 scrutinee,
                 scrut_flag,
         ),
-        // Guarded by sema (`match` requires a sum type); be defensive rather than panic.
+        // Guarded by sema (`match` requires a sum type or integer/char); be defensive rather than panic.
         _ => b.terminate(Term::Goto(join_bb)),
     }
     b.cur = join_bb;
@@ -22447,6 +22460,117 @@ fn bind_local(b: &mut Builder, local: u32, rv: Rvalue, inherited_flag: Option<Op
     match inherited_flag {
         Some(flag) => b.set_drop_flag_operand(local, flag),
         None => b.set_drop_flag(local, b.drop_individual_locals.contains(&local)),
+    }
+}
+
+/// An integer or char `match`: test the scrutinee against each arm's values/ranges and branch
+/// to its body, defaulting to the `_`/last arm.
+fn lower_match_value(
+    b: &mut Builder,
+    ty: Ty,
+    arms: &[hir::MatchArm],
+    scrut: &Operand,
+    target: (
+        Option<Slot>,
+        Option<Slot>,
+        Option<Slot>,
+        BlockId,
+        bool,
+    ),
+) {
+    let (result_slot, result_flag, result_temp_flag, join_bb, borrow_result) = target;
+    if arms.is_empty() {
+        b.terminate(Term::Goto(join_bb));
+        return;
+    }
+
+    let default_idx = arms
+        .iter()
+        .position(|a| a.values.is_empty())
+        .unwrap_or(arms.len().saturating_sub(1));
+
+    let make_const = |val: i128| -> Operand {
+        match ty {
+            Ty::Char => {
+                let c = u32::try_from(val).unwrap_or(0);
+                Operand::Const(Const::Char(c))
+            }
+            _ => Operand::Const(Const::Int(val, ty)),
+        }
+    };
+
+    for (i, arm) in arms.iter().enumerate() {
+        if i == default_idx {
+            continue;
+        }
+        let arm_bb = b.new_block();
+        let next_bb = b.new_block();
+
+        let n = arm.values.len();
+        if n == 0 {
+            b.terminate(Term::Goto(arm_bb));
+        } else {
+            for (k, val_pat) in arm.values.iter().enumerate() {
+                let is_last_pat = k + 1 == n;
+                let on_pat_fail = if is_last_pat { next_bb } else { b.new_block() };
+
+                match val_pat {
+                    hir::HirValuePattern::Single(val) => {
+                        let eq = b.fresh_value(Ty::Bool);
+                        b.push(Stmt::Let(
+                            eq,
+                            Rvalue::Bin(BinOp::Eq, scrut.clone(), make_const(*val)),
+                        ));
+                        b.terminate(Term::Branch(Operand::Value(eq), arm_bb, on_pat_fail));
+                    }
+                    hir::HirValuePattern::Range(start, end) => {
+                        let ge = b.fresh_value(Ty::Bool);
+                        b.push(Stmt::Let(
+                            ge,
+                            Rvalue::Bin(BinOp::Ge, scrut.clone(), make_const(*start)),
+                        ));
+                        let test_end_bb = b.new_block();
+                        b.terminate(Term::Branch(Operand::Value(ge), test_end_bb, on_pat_fail));
+
+                        b.cur = test_end_bb;
+                        let le = b.fresh_value(Ty::Bool);
+                        b.push(Stmt::Let(
+                            le,
+                            Rvalue::Bin(BinOp::Le, scrut.clone(), make_const(*end)),
+                        ));
+                        b.terminate(Term::Branch(Operand::Value(le), arm_bb, on_pat_fail));
+                    }
+                }
+
+                if !is_last_pat {
+                    b.cur = on_pat_fail;
+                }
+            }
+        }
+
+        b.cur = arm_bb;
+        finish_arm(
+            b,
+            &arm.body,
+            result_slot,
+            result_flag,
+            result_temp_flag,
+            join_bb,
+            borrow_result,
+        );
+        b.cur = next_bb;
+    }
+
+    if let Some(d) = arms.get(default_idx) {
+        finish_arm(
+            b,
+            &d.body,
+            result_slot,
+            result_flag,
+            result_temp_flag,
+            join_bb,
+            borrow_result,
+        );
     }
 }
 

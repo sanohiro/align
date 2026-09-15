@@ -928,3 +928,156 @@ fn owned_enum_payload_moves_out_of_match_as_return() {
     let out = build_and_run("enum-bind-moveout", src);
     assert_eq!(out.status.code(), Some(24)); // 7 + 8 + 9
 }
+
+#[test]
+fn match_integer_value_and_range_patterns() {
+    if !backend_available() {
+        return;
+    }
+    let src = r#"
+fn classify(x: i32) -> i32 = match x {
+  0..=9 => 1,
+  10 | 20 | 30 => 2,
+  31..=40 | 50..=60 => 3,
+  100 => 4,
+  _ => 5,
+}
+
+fn main() -> i32 {
+  mut sum := 0
+  sum = sum + classify(5)
+  sum = sum + classify(20)
+  sum = sum + classify(35)
+  sum = sum + classify(55)
+  sum = sum + classify(100)
+  sum = sum + classify(999)
+  return sum
+}
+"#;
+    let out = build_and_run("int-match-ranges", src);
+    assert_eq!(out.status.code(), Some(18));
+}
+
+#[test]
+fn match_char_value_and_range_patterns() {
+    if !backend_available() {
+        return;
+    }
+    let src = r#"
+fn classify_char(c: char) -> i32 = match c {
+  '0'..='9' => 10,
+  'a'..='z' | 'A'..='Z' => 20,
+  '!' | '?' => 30,
+  _ => 40,
+}
+
+fn main() -> i32 {
+  mut sum := 0
+  sum = sum + classify_char('5')
+  sum = sum + classify_char('k')
+  sum = sum + classify_char('!')
+  sum = sum + classify_char('~')
+  return sum
+}
+"#;
+    let out = build_and_run("char-match-ranges", src);
+    assert_eq!(out.status.code(), Some(100));
+}
+
+#[test]
+fn match_exhaustive_u8_no_wildcard() {
+    if !backend_available() {
+        return;
+    }
+    let src = r#"
+fn classify_u8(b: u8) -> i32 = match b {
+  0..=127 => 1,
+  128..=255 => 2,
+}
+
+fn main() -> i32 {
+  return classify_u8(10) + classify_u8(200)
+}
+"#;
+    let out = build_and_run("u8-match-exhaustive", src);
+    assert_eq!(out.status.code(), Some(3));
+}
+
+#[test]
+fn match_negative_and_literal_int() {
+    if !backend_available() {
+        return;
+    }
+    let src = r#"
+fn classify_neg(x: i64) -> i32 = match x {
+  -100..=-1 => 1,
+  0 => 2,
+  1..=100 => 3,
+  _ => 4,
+}
+
+fn main() -> i32 {
+  res := match 42 {
+    42 => 10,
+    _ => 0,
+  }
+  return classify_neg(-50) + classify_neg(0) + classify_neg(50) + classify_neg(200) + res
+}
+"#;
+    let out = build_and_run("int-match-negative-literal", src);
+    assert_eq!(out.status.code(), Some(20));
+}
+
+#[test]
+fn match_integer_overlap_rejected() {
+    let src = r#"
+fn classify(x: i32) -> i32 = match x {
+  0..=10 => 1,
+  5..=15 => 2,
+  _ => 3,
+}
+"#;
+    assert!(check_errs("int-match-overlap", src));
+}
+
+#[test]
+fn match_range_inverted_rejected() {
+    let src = r#"
+fn classify(x: i32) -> i32 = match x {
+  10..=5 => 1,
+  _ => 2,
+}
+"#;
+    assert!(check_errs("int-match-inverted", src));
+}
+
+#[test]
+fn match_integer_non_exhaustive_rejected() {
+    let src = r#"
+fn classify(x: i32) -> i32 = match x {
+  0..=10 => 1,
+}
+"#;
+    assert!(check_errs("int-match-non-exhaustive", src));
+}
+
+#[test]
+fn match_char_non_exhaustive_rejected() {
+    let src = r#"
+fn classify(c: char) -> i32 = match c {
+  'a'..='z' => 1,
+}
+"#;
+    assert!(check_errs("char-match-non-exhaustive", src));
+}
+
+#[test]
+fn match_half_open_range_rejected() {
+    let src = r#"
+fn classify(x: i32) -> i32 = match x {
+  0..10 => 1,
+  _ => 2,
+}
+"#;
+    assert!(check_errs("int-match-half-open", src));
+}

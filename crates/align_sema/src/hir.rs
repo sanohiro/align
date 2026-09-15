@@ -372,14 +372,22 @@ pub struct BorrowedElementBase {
     pub owner_fact: Vec<BorrowedRootFact>,
 }
 
+/// One checked value pattern in an integer or character `match` arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum HirValuePattern {
+    Single(i128),
+    Range(i128, i128),
+}
+
 /// One checked `match` arm. `variants` = the covered variant tags: empty = the `_` wildcard, one
-/// = a simple arm, many = an or-pattern (`A | B`). `bindings` are the locals bound to the variant's
-/// payload (one per payload slot, in order); an or-pattern / wildcard binds nothing. A non-empty
-/// `borrowed_bindings` list marks Move payload bindings that are read-only projections into the
-/// exact stable place recorded by the enclosing `ExprKind::Match`.
+/// = a simple arm, many = an or-pattern (`A | B`). `values` = checked integer/character literals or
+/// ranges. `bindings` are the locals bound to the variant's payload (one per payload slot, in order);
+/// an or-pattern / wildcard binds nothing. A non-empty `borrowed_bindings` list marks Move payload
+/// bindings that are read-only projections into the exact stable place recorded by the enclosing `ExprKind::Match`.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct MatchArm {
     pub variants: Vec<u32>,
+    pub values: Vec<HirValuePattern>,
     pub bindings: Vec<crate::LocalId>,
     pub borrowed_bindings: Vec<BorrowedProjection>,
     pub body: Expr,

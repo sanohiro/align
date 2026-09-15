@@ -145,6 +145,7 @@ pub enum TokKind {
     Colon,
     Dot,
     DotDot,  // .. (half-open range, only inside `[]` for slicing)
+    DotDotEq, // ..= (inclusive range, in match patterns)
     Plus,
     Minus,
     Star,
@@ -715,7 +716,13 @@ impl<'a> Lexer<'a> {
             (b']', _) => (TokKind::RBracket, 1),
             (b',', _) => (TokKind::Comma, 1),
             (b':', _) => (TokKind::Colon, 1),
-            (b'.', Some(b'.')) => (TokKind::DotDot, 2),
+            (b'.', Some(b'.')) => {
+                if self.src.get(self.pos + 2).copied() == Some(b'=') {
+                    (TokKind::DotDotEq, 3)
+                } else {
+                    (TokKind::DotDot, 2)
+                }
+            }
             (b'.', _) => (TokKind::Dot, 1),
             (b'+', _) => (TokKind::Plus, 1),
             (b'-', _) => (TokKind::Minus, 1),
@@ -980,6 +987,26 @@ mod tests {
                 TokKind::DotDot,
                 TokKind::Int(5),
                 TokKind::RBracket,
+                TokKind::End,
+                TokKind::Eof,
+            ]
+        );
+        assert_eq!(
+            kinds("1..=5"),
+            vec![
+                TokKind::Int(1),
+                TokKind::DotDotEq,
+                TokKind::Int(5),
+                TokKind::End,
+                TokKind::Eof,
+            ]
+        );
+        assert_eq!(
+            kinds("'a'..='z'"),
+            vec![
+                TokKind::Char('a' as u32),
+                TokKind::DotDotEq,
+                TokKind::Char('z' as u32),
                 TokKind::End,
                 TokKind::Eof,
             ]

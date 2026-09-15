@@ -1599,6 +1599,7 @@ mod tests {
                     scrutinee: Box::new(leaf()),
                     arms: vec![MatchArm {
                         variants: Vec::new(),
+                        values: Vec::new(),
                         bindings: Vec::new(),
                         borrowed_bindings: Vec::new(),
                         body: child,
@@ -2104,12 +2105,14 @@ mod tests {
                     arms: vec![
                         MatchArm {
                             variants: Vec::new(),
+                            values: Vec::new(),
                             bindings: Vec::new(),
                             borrowed_bindings: Vec::new(),
                             body: expression,
                         },
                         MatchArm {
                             variants: Vec::new(),
+                            values: Vec::new(),
                             bindings: Vec::new(),
                             borrowed_bindings: Vec::new(),
                             body: Expr {
@@ -2130,6 +2133,7 @@ mod tests {
                     arms: vec![
                         MatchArm {
                             variants: Vec::new(),
+                            values: Vec::new(),
                             bindings: Vec::new(),
                             borrowed_bindings: Vec::new(),
                             body: Expr {
@@ -2144,6 +2148,7 @@ mod tests {
                         },
                         MatchArm {
                             variants: Vec::new(),
+                            values: Vec::new(),
                             bindings: Vec::new(),
                             borrowed_bindings: Vec::new(),
                             body: expression,
@@ -2155,6 +2160,7 @@ mod tests {
                     scrutinee: Box::new(expression),
                     arms: vec![MatchArm {
                         variants: Vec::new(),
+                        values: Vec::new(),
                         bindings: Vec::new(),
                         borrowed_bindings: Vec::new(),
                         body: leaf(),

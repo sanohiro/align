@@ -330,9 +330,10 @@ s := Shape.Circle(3.0)
 ### Match
 
 `match` is an expression; every arm yields the match's value (or all arms diverge). Patterns are the
-(unqualified) variants of the scrutinee, binding any payload positionally. **`match` must be
-exhaustive** — cover every variant, or end with a `_` wildcard; a missing variant is a compile
-error. Use `match` for variants and `if` for value conditions (one way each).
+(unqualified) variants of the scrutinee (binding any payload positionally), or integer and character
+values and inclusive ranges (`min..=max`). **`match` must be exhaustive** — cover every variant or
+integer value domain, or end with a `_` wildcard; a missing variant or uncovered value range is a
+compile error.
 
 ```align
 area := match s {
@@ -341,16 +342,28 @@ area := match s {
 }
 ```
 
-Several variants may share one arm with an **or-pattern** — `A | B | ...`, matching if the
-scrutinee is any of them. An or-pattern lists bare variant names and **binds nothing** (a
-payload variant may appear; its payload is simply not bound). Use it for "match the shape, not
-the data"; when you need a binding, write separate arms. Or-patterns count toward exhaustiveness
+Several variants or values may share one arm with an **or-pattern** — `A | B | ...` or `1 | 2 | 5..=10`,
+matching if the scrutinee matches any of them. An or-pattern on variants lists bare variant names and
+**binds nothing** (a payload variant may appear; its payload is simply not bound). Use it for "match the
+shape, not the data"; when you need a binding, write separate arms. Or-patterns count toward exhaustiveness
 like any other arm, so they can partition all the variants with no `_`:
 
 ```align
 warm := match signal {
   Red | Yellow => true,
   Green | Off  => false,
+}
+```
+
+`match` also supports integer and `char` values, inclusive ranges (`min..=max`), and literal or-patterns.
+Integer matches must cover the full type domain or end with `_`; `char` matches require a `_` wildcard:
+
+```align
+category := match b {
+  33..=126 | 161..=172 => 1,
+  0..=32               => 2,
+  173                  => 3,
+  _                    => 4,
 }
 ```
 

@@ -528,7 +528,7 @@ impl<'a> Formatter<'a> {
     fn is_continuation(&self, t: &Token) -> bool {
         use align_lexer::TokKind::*;
         match t.kind {
-            Dot | DotDot => true,
+            Dot | DotDot | DotDotEq => true,
             Plus | Minus | Star | Slash | Percent | EqEq | NotEq | Lt | Le | Gt | Ge | AndAnd
             | OrOr | Amp | Pipe | Caret => !self.ann.unary_ops.contains(&t.span.lo),
             _ => false,
@@ -566,11 +566,11 @@ impl<'a> Formatter<'a> {
         }
 
         // No space before these.
-        if matches!(c, Comma | Colon | Question | Dot | DotDot) {
+        if matches!(c, Comma | Colon | Question | Dot | DotDot | DotDotEq) {
             return "";
         }
         // No space after these.
-        if matches!(p, Dot | DotDot) {
+        if matches!(p, Dot | DotDot | DotDotEq) {
             return "";
         }
         // No space just inside ( and [.
