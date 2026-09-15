@@ -4328,7 +4328,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::BoxClone(_)
             | hir::ExprKind::StrClone(_)
             | hir::ExprKind::CloneIn { .. }
-            | hir::ExprKind::StrPredicate { .. }
+            | hir::ExprKind::StrCharBoundary { .. } | hir::ExprKind::StrPredicate { .. }
             | hir::ExprKind::StrTrim { .. }
             | hir::ExprKind::StrBorrow(_)
             | hir::ExprKind::BuilderNew { .. }
@@ -6704,9 +6704,8 @@ impl<'a> BodyValidator<'a> {
                 push_expr!(offset, context.clone());
                 push_expr!(ptr, context.clone());
             }
-            hir::ExprKind::StrPredicate {
-                haystack, needle, ..
-            } => {
+            hir::ExprKind::StrCharBoundary { receiver: haystack, index: needle }
+            | hir::ExprKind::StrPredicate { haystack, needle, .. } => {
                 push_expr!(needle, context.clone());
                 push_expr!(haystack, context.clone());
             }
@@ -8443,6 +8442,13 @@ impl<'a> BodyValidator<'a> {
                 let ty = value.ty;
                 let (falls, breaks) = strict_flow(&[value, region]);
                 Some((ty, falls, breaks))
+            }
+            hir::ExprKind::StrCharBoundary { receiver, index } => {
+                let left = self.expr_flow(receiver)?;
+                let right = self.expr_flow(index)?;
+                if left.ty != Ty::Str || right.ty != Ty::Int(align_sema::IntTy { bits: 64, signed: true }) { return None; }
+                let (falls, breaks) = strict_flow(&[left, right]);
+                Some((Ty::Bool, falls, breaks))
             }
             hir::ExprKind::StrPredicate { kind, haystack, needle } => {
                 let left = self.expr_flow(haystack)?;

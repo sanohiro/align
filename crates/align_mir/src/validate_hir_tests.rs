@@ -11820,10 +11820,9 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        // R63 unifies encoders; native identity adds one nullary observation. Exhaustive
-        // validation, source-shape, replay-clone and canonical-graph passes cover it.
+        // StrCharBoundary is explicit in validation, source-shape, replay and ownership.
         variants,
-        332,
+        333,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -18822,4 +18821,24 @@ fn indexed_tagged_copy_values_require_exact_payload_identity() {
     }
     mir.tagged_types[index] = hir::TaggedType::Option(Scalar::String);
     assert!(!crate::producer::slice_index_result_matches(&mir, source, Ty::Option(Scalar::String), false));
+}
+
+#[test]
+fn text_boundary_hir_rejects_forged_types_in_every_entrypoint() {
+    let base = checked_source_program("fn f(text: str, index: i64) -> bool { value := text.is_char_boundary(index); return value }");
+    assert!(!is_empty(&lower_program(&base)));
+    for mutation in 0..3 {
+        let mut malformed = base.clone();
+        let expression = body_first_let_init_mut(&mut malformed, "f");
+        let hir::ExprKind::StrCharBoundary { receiver, index } = &mut expression.kind else { panic!("boundary fixture") };
+        match mutation {
+            0 => **receiver = body_test_expr(
+                hir::ExprKind::StrClone(Box::new(body_test_expr(hir::ExprKind::Str("x".into()), Ty::Str))),
+                Ty::String,
+            ),
+            1 => **index = body_test_expr(hir::ExprKind::Int(0), Ty::Int(IntTy { bits: 64, signed: false })),
+            _ => expression.ty = Ty::Int(IntTy { bits: 64, signed: true }),
+        }
+        assert_body_entrypoints_empty("text-boundary-forged", &malformed);
+    }
 }

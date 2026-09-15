@@ -546,6 +546,9 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             value: boxed!(value),
             region: boxed!(region),
         },
+        ExprKind::StrCharBoundary { receiver, index } => ExprKind::StrCharBoundary {
+            receiver: boxed!(receiver), index: boxed!(index),
+        },
         ExprKind::StrPredicate {
             kind,
             haystack,
@@ -2212,6 +2215,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             ptr: lhs,
             offset: rhs,
         }
+        | ExprKind::StrCharBoundary { receiver: lhs, index: rhs }
         | ExprKind::StrPredicate {
             haystack: lhs,
             needle: rhs,

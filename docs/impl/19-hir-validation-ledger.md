@@ -12,7 +12,7 @@ serialized field or optimistic producer evidence.
 owns the five FsTree cases, access/identity qualified schemas, OsIdentity,
 Utf8Lossy/Sha1 discriminators and shared filesystem-owner projection closure.
 The five FsTree cases and OsIdentity are implemented with exact argument/result
-and globally reserved schema validation. The ExprKind sweep contains 332 variants.
+and globally reserved schema validation. The ExprKind sweep contains 333 variants.
 Utf8Lossy/Sha1 use the existing transform/hash validators. Shared filesystem
 projections retain complete place provenance; borrowed String-to-Str normalization
 certifies the physical source and read-only authority before descriptor use.
@@ -1028,6 +1028,7 @@ The result formula in every row is followed by the universal
 | `BoxGet` | `env[]`; `child[box]`; `post[box.ty == Box(S), S is Copy; result scalar_to_ty(S); box borrowed]`. |
 | `BoxClone` | `env[]`; `child[box]`; `post[box.ty == Box(S), S is Copy; result same Box(S); inside arena; source borrowed and destination newly arena-owned]`. |
 | `StrClone` | `env[]`; `child[text]`; `post[text.ty is Str or String; result String; source borrowed without transfer; a fresh owned receiver is kept live only through the copy; result individually owned unless current arena captures it]`. |
+| `StrCharBoundary` | `child[receiver,index]`; `post[receiver Str; index exact signed i64; result Bool; receiver borrowed; strict child completion]`. |
 | `StrPredicate` | `env[kind]`; `child[haystack,needle]`; `post[both Str; Contains/StartsWith/EndsWith/EqIgnoreCase result Bool; Find/Rfind result Option<i64>; both borrowed]`. |
 | `StrTrim` | `env[kind]`; `child[recv]`; `post[recv Str; result Str; view inherits recv roots/region]`. |
 | `StrBorrow` | `env[]`; `child[string]`; `post[string.ty == String; result Str; owned source is borrowed and remains live]`. |

@@ -705,6 +705,20 @@ whitespace (space, `\t`, `\n`, `\x0c`, `\r`; not vertical tab); Unicode-whitespa
 trimming is deliberately package-level, out of core. A `str`/`string` is **always valid
 UTF-8** (a type invariant): a range slice `s[a..b]` uses byte offsets and aborts if a bound
 splits a scalar, so arbitrary-byte work goes through `s.bytes()` (→ `bytes`, no UTF-8 obligation).
+`s.is_char_boundary(index: i64) -> bool` queries a UTF-8 byte boundary without
+allocation. It returns false for negative indices or indices greater than the byte
+length, true at zero and the end, and otherwise tests that the byte is not a
+continuation byte (`(byte & 0xc0) != 0x80`). Endpoints and invalid indices do not
+load bytes. Owned `string` receivers are borrowed as usual. The receiver must
+remain live and valid through index evaluation; a bool result retains no view.
+The operation is Pure and has no fallible result or bounds trap. Ordinary
+`s[a..b]` keeps its range and UTF-8 boundary traps.
+
+`starts_with` and `ends_with` compare bounded bytes without forming an interior
+string slice: an empty needle matches and a longer needle does not. They allocate
+nothing and compare at most the needle's byte length; no particular libc call or
+SIMD speedup is promised.
+
 `str + str` is a **hard error** — `+` never concatenates (a hidden allocation, and a second way to
 build a string); the one way is a `builder`. (`draft.md` §7/§12.)
 
