@@ -1712,6 +1712,20 @@ operation that produces a `str` preserves it (a range slice that would split a s
 The byte types `bytes` / `buffer` carry **no** UTF-8 obligation and are where arbitrary-byte work
 lives (`s.bytes()` views a `str`'s bytes without the invariant).
 
+`s.is_char_boundary(index: i64) -> bool` queries a UTF-8 byte boundary without
+allocation. It returns false for negative indices or indices greater than the byte
+length, true at zero and the end, and otherwise tests that the byte is not a
+continuation byte (`(byte & 0xc0) != 0x80`). Endpoints and invalid indices do not
+load bytes. Owned `string` receivers are borrowed as usual. The receiver must
+remain live and valid through index evaluation; a bool result retains no view.
+The operation is Pure and has no fallible result or bounds trap. Ordinary
+`s[a..b]` keeps its range and UTF-8 boundary traps.
+
+`starts_with` and `ends_with` compare bounded bytes without forming an interior
+string slice: an empty needle matches and a longer needle does not. They allocate
+nothing and compare at most the needle's byte length; no particular libc call or
+SIMD speedup is promised.
+
 A `str` **literal** is a `{ptr, len}` view of bytes placed in the program's read-only data section
 (rodata) — shared, never copied, process-lifetime (`Static`). The same mechanism backs an aggregate
 `slice<T>` constant (§3 Constants): its elements are one rodata table and the constant is a borrowed

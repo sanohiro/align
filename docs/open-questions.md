@@ -13,6 +13,19 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### Total UTF-8 boundary inspection (SETTLED 2026-09-15)
+
+`str.is_char_boundary(index: i64) -> bool` borrows its text receiver (including
+owned strings), is Pure and allocates nothing. Negative/past-end indices return
+false; zero/end return true without a byte load; interior offsets return whether
+`(byte & 0xc0) != 0x80`. Source validity is required through index evaluation;
+no view is retained by the bool. Ordinary range slicing still traps on invalid
+range or UTF-8 boundaries. Existing prefix/suffix methods compare bounded bytes
+and allocate nothing; no exact native instruction or speedup is promised.
+The complete operation is compiler-lowered, with no new runtime export or
+fallible-slice API. Record: draft §12, language digest, core string design and
+[plan 66](impl/66-array-prefix-and-text-boundary-plan.md).
+
 ### Scalar inspection and explicit capacity (issue batch 1049–1053)
 
 Settled by plan 65: scalar f32/f64 `to_bits`, `is_finite`, `is_nan`,

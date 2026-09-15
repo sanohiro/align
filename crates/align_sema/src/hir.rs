@@ -879,6 +879,8 @@ pub enum ExprKind {
     /// auto-borrowed via [`ExprKind::StrBorrow`]); the comparison reads bytes only, so neither is
     /// moved. Backed by the runtime's `memchr`-class scans.
     StrPredicate { kind: StrPredKind, haystack: Box<Expr>, needle: Box<Expr> },
+    /// Total UTF-8 boundary inspection; the index is an exact i64 byte offset.
+    StrCharBoundary { receiver: Box<Expr>, index: Box<Expr> },
     /// `s.trim()` / `s.trim_start()` / `s.trim_end()` — strip ASCII whitespace, yielding a
     /// **borrowed sub-`str`** of `recv` (`ty` = `str`, no allocation). `recv` is a `str` view (an
     /// owned `string` is auto-borrowed via [`ExprKind::StrBorrow`]); the result views the same

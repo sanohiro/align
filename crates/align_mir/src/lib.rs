@@ -9617,6 +9617,13 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 b.push(Stmt::Let(v, Rvalue::CloneIn { value: src, handle }));
                 Operand::Value(v)
             }
+            hir::ExprKind::StrCharBoundary { receiver, index } => {
+                lower_required_binding!(b, h = lower_expr(b, receiver), Operand::Const(Const::Unit));
+                lower_required_binding!(b, i = lower_expr(b, index), Operand::Const(Const::Unit));
+                let result = lower_text_boundary(b, &h, &i);
+                drop_borrow_owners(b, &h);
+                result
+            }
             hir::ExprKind::StrPredicate {
                 kind,
                 haystack,
@@ -12437,73 +12444,74 @@ fn emit_range_bounds_check(b: &mut Builder, start: &Operand, end: &Operand, len:
 /// A byte index is a valid UTF-8 boundary when it is either edge of the string, or the byte at
 /// that index is not a continuation byte (`10xxxxxx`). Range bounds have already been checked by
 /// the caller, so the load is performed only for `0 < index < len`.
-fn emit_utf8_boundary_check(b: &mut Builder, base: &Operand, index: &Operand, len: &Operand) {
-    let at_start = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(
-        at_start,
-        Rvalue::Bin(
-            BinOp::Eq,
-            index.clone(),
-            Operand::Const(Const::Int(0, i64_ty())),
-        ),
-    ));
-    let at_end = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(
-        at_end,
-        Rvalue::Bin(BinOp::Eq, index.clone(), len.clone()),
-    ));
-    let at_edge = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(
-        at_edge,
-        Rvalue::Bin(BinOp::Or, Operand::Value(at_start), Operand::Value(at_end)),
-    ));
+/// The caller has established 0 <= index <= len. Endpoints never load bytes.
+fn emit_utf8_boundary_predicate(b: &mut Builder, base: &Operand, index: &Operand, len: &Operand) -> Operand {
+    let result = b.new_slot(Ty::Bool);
+    b.push(Stmt::Store(result, Operand::Const(Const::Bool(true))));
+    let start = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(start, Rvalue::Bin(BinOp::Eq, index.clone(), index_const(0))));
+    let end = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(end, Rvalue::Bin(BinOp::Eq, index.clone(), len.clone())));
+    let edge = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(edge, Rvalue::Bin(BinOp::Or, Operand::Value(start), Operand::Value(end))));
+    let interior = b.new_block();
+    let done = b.new_block();
+    b.terminate(Term::Branch(Operand::Value(edge), done, interior));
+    b.cur = interior;
+    let byte_ty = Ty::Int(IntTy { bits: 8, signed: false });
+    let byte = b.fresh_value(byte_ty);
+    b.push(Stmt::Let(byte, Rvalue::SliceIndex(base.clone(), index.clone())));
+    let prefix = b.fresh_value(byte_ty);
+    b.push(Stmt::Let(prefix, Rvalue::Bin(BinOp::BitAnd, Operand::Value(byte), Operand::Const(Const::Int(0xc0, byte_ty)))));
+    let boundary = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(boundary, Rvalue::Bin(BinOp::Ne, Operand::Value(prefix), Operand::Const(Const::Int(0x80, byte_ty)))));
+    b.push(Stmt::Store(result, Operand::Value(boundary)));
+    b.terminate(Term::Goto(done));
+    b.cur = done;
+    let value = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(value, Rvalue::Load(result)));
+    Operand::Value(value)
+}
 
-    let check = b.new_block();
+fn lower_text_boundary(b: &mut Builder, base: &Operand, index: &Operand) -> Operand {
+    // Borrowed owning-string fields must become a Copy text descriptor before
+    // inspecting length or bytes; the original receiver retains its owner.
+    let text = b.fresh_value(Ty::Str);
+    b.push(Stmt::Let(text, Rvalue::Use(base.clone())));
+    let base = Operand::Value(text);
+    let length = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(length, Rvalue::SliceLen(base.clone())));
+    let length = Operand::Value(length);
+    let result = b.new_slot(Ty::Bool);
+    b.push(Stmt::Store(result, Operand::Const(Const::Bool(false))));
+    let negative = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(negative, Rvalue::Bin(BinOp::Lt, index.clone(), index_const(0))));
+    let past = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(past, Rvalue::Bin(BinOp::Gt, index.clone(), length.clone())));
+    let invalid = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(invalid, Rvalue::Bin(BinOp::Or, Operand::Value(negative), Operand::Value(past))));
+    let valid = b.new_block();
+    let done = b.new_block();
+    b.terminate(Term::Branch(Operand::Value(invalid), done, valid));
+    b.cur = valid;
+    let boundary = emit_utf8_boundary_predicate(b, &base, index, &length);
+    b.push(Stmt::Store(result, boundary));
+    b.terminate(Term::Goto(done));
+    b.cur = done;
+    let value = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(value, Rvalue::Load(result)));
+    Operand::Value(value)
+}
+
+fn emit_utf8_boundary_check(b: &mut Builder, base: &Operand, index: &Operand, len: &Operand) {
+    let boundary = emit_utf8_boundary_predicate(b, base, index, len);
     let fail = b.new_block();
     let ok = b.new_block();
-    b.terminate(Term::Branch(Operand::Value(at_edge), ok, check));
-
-    b.cur = check;
-    let u8_ty = Ty::Int(IntTy {
-        bits: 8,
-        signed: false,
-    });
-    let byte = b.fresh_value(u8_ty);
-    b.push(Stmt::Let(
-        byte,
-        Rvalue::SliceIndex(base.clone(), index.clone()),
-    ));
-    let prefix = b.fresh_value(u8_ty);
-    b.push(Stmt::Let(
-        prefix,
-        Rvalue::Bin(
-            BinOp::BitAnd,
-            Operand::Value(byte),
-            Operand::Const(Const::Int(0xc0, u8_ty)),
-        ),
-    ));
-    let continuation = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(
-        continuation,
-        Rvalue::Bin(
-            BinOp::Eq,
-            Operand::Value(prefix),
-            Operand::Const(Const::Int(0x80, u8_ty)),
-        ),
-    ));
-    b.terminate(Term::Branch(Operand::Value(continuation), fail, ok));
-
+    b.terminate(Term::Branch(boundary, ok, fail));
     b.cur = fail;
-    let t = b.fresh_value(Ty::Unit);
-    b.push(Stmt::Let(
-        t,
-        Rvalue::Call(
-            DirectCall::Runtime(RuntimeKey::Utf8BoundaryFail),
-            vec![index.clone(), len.clone()],
-        ),
-    ));
+    let value = b.fresh_value(Ty::Unit);
+    b.push(Stmt::Let(value, Rvalue::Call(DirectCall::Runtime(RuntimeKey::Utf8BoundaryFail), vec![index.clone(), len.clone()])));
     b.terminate(Term::Unreachable);
-
     b.cur = ok;
 }
 

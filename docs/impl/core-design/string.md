@@ -18,6 +18,7 @@ arena, an owner, or a builder; allocation inside pipeline lambdas is a compile e
 ```text
 "lit"                      -> str        // single-line only; \n \t \" escapes; UTF-8
 'A' / 'あ'                 -> char       // one Unicode scalar
+s.is_char_boundary(index: i64) -> bool  // total byte-boundary query; no allocation
 s.len()                    -> i64        // BYTE length ("あ".len() == 3)
 s.contains(n) / s.starts_with(n) / s.ends_with(n)      -> bool
 s.eq_ignore_ascii_case(t)  -> bool       // ASCII fold only, not Unicode
@@ -63,6 +64,20 @@ No `Result` in this area. `s[a..b]` out of bounds aborts. Non-UTF-8 *input* is a
 concern (`fs.read_file` → `Error.Invalid`); core string ops assume the invariant and stay
 byte-oriented. Range lowering now enforces the promised O(1) UTF-8-scalar-boundary abort at both
 endpoints (audit 13 §3.1; fixed 2026-07-13).
+
+`s.is_char_boundary(index: i64) -> bool` queries a UTF-8 byte boundary without
+allocation. It returns false for negative indices or indices greater than the byte
+length, true at zero and the end, and otherwise tests that the byte is not a
+continuation byte (`(byte & 0xc0) != 0x80`). Endpoints and invalid indices do not
+load bytes. Owned `string` receivers are borrowed as usual. The receiver must
+remain live and valid through index evaluation; a bool result retains no view.
+The operation is Pure and has no fallible result or bounds trap. Ordinary
+`s[a..b]` keeps its range and UTF-8 boundary traps.
+
+`starts_with` and `ends_with` compare bounded bytes without forming an interior
+string slice: an empty needle matches and a longer needle does not. They allocate
+nothing and compare at most the needle's byte length; no particular libc call or
+SIMD speedup is promised.
 
 ## Regions
 

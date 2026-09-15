@@ -17151,7 +17151,7 @@ impl EffectScan<'_> {
                 walk!(value);
                 walk!(region);
             }
-            ExprKind::StrPredicate { haystack, needle, .. } => {
+            ExprKind::StrCharBoundary { receiver: haystack, index: needle } | ExprKind::StrPredicate { haystack, needle, .. } => {
                 walk!(haystack);
                 walk!(needle);
             }
@@ -24246,7 +24246,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ResourceIntoRaw { .. }
             | ExprKind::BoxGet(..)
             | ExprKind::StrClone(..)
-            | ExprKind::StrPredicate { .. }
+            | ExprKind::StrCharBoundary { .. } | ExprKind::StrPredicate { .. }
             | ExprKind::BuilderNew { .. }
             | ExprKind::BuilderWrite { .. }
             | ExprKind::BuilderToString(..)
@@ -24654,7 +24654,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::BoxClone(..)
             | ExprKind::StrClone(..)
             | ExprKind::CloneIn { .. }
-            | ExprKind::StrPredicate { .. }
+            | ExprKind::StrCharBoundary { .. } | ExprKind::StrPredicate { .. }
             | ExprKind::StrTrim { .. }
             | ExprKind::StrBorrow(..)
             | ExprKind::StrBytes { .. }
@@ -27948,7 +27948,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(builder, depth);
                 self.walk(arg, depth);
             }
-            ExprKind::StrPredicate { haystack, needle, .. } => {
+            ExprKind::StrCharBoundary { receiver: haystack, index: needle } | ExprKind::StrPredicate { haystack, needle, .. } => {
                 self.walk(haystack, depth);
                 self.walk(needle, depth);
             }
@@ -30626,7 +30626,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::HeapNew(_)
         | ExprKind::BoxClone(_)
         | ExprKind::StrClone(_)
-        | ExprKind::StrPredicate { .. }
+        | ExprKind::StrCharBoundary { .. } | ExprKind::StrPredicate { .. }
         | ExprKind::StrTrim { .. }
         | ExprKind::StrBorrow(_)
         | ExprKind::BuilderNew { .. }
@@ -38754,7 +38754,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ResourceRaw { .. }
             | ExprKind::ResourceIntoRaw { .. }
             | ExprKind::HeapNew(..) | ExprKind::BoxGet(..) | ExprKind::BoxClone(..) | ExprKind::StrClone(..)
-            | ExprKind::StrPredicate { .. } | ExprKind::BuilderNew { .. } | ExprKind::BuilderWrite { .. }
+            | ExprKind::StrCharBoundary { .. } | ExprKind::StrPredicate { .. } | ExprKind::BuilderNew { .. } | ExprKind::BuilderWrite { .. }
             | ExprKind::BuilderToString(..) | ExprKind::Select { .. } | ExprKind::VecSumWhere { .. }
             | ExprKind::VecDot { .. } | ExprKind::VecMinMax { .. } | ExprKind::VecSum { .. }
             | ExprKind::VecLoad { .. } | ExprKind::VecStore { .. } | ExprKind::VecLit { .. }
@@ -44755,8 +44755,8 @@ impl<'a> MoveCheck<'a> {
                 }
             }
             ExprKind::WriterStd { .. } | ExprKind::ReaderStdin => {}
-            // Both operands are borrowed (read for bytes), never consumed.
-            ExprKind::StrPredicate { haystack, needle, .. } => {
+            // Text operands are borrowed; scalar indices are Copy. Nothing is consumed.
+            ExprKind::StrCharBoundary { receiver: haystack, index: needle } | ExprKind::StrPredicate { haystack, needle, .. } => {
                 move_expr!(self, haystack, moved, false, false);
                 move_expr!(self, needle, moved, false, false);
             }
@@ -52536,6 +52536,9 @@ impl<'a, 't> Checker<'a, 't> {
             "get" if recv_ty != Ty::HttpClient => self.check_box_get(recv_expr, recv_ty, args, span),
             "clone" => self.check_box_clone(recv_expr, recv_ty, args, span),
             "clone_in" => self.check_clone_in(recv_expr, recv_ty, args, span),
+            "is_char_boundary" if matches!(recv_ty, Ty::Str | Ty::String) => {
+                self.check_str_char_boundary(recv_expr, args, span)
+            }
             "contains" | "starts_with" | "ends_with" | "find" | "rfind" | "eq_ignore_ascii_case"
                 if matches!(recv_ty, Ty::Str | Ty::String) =>
             {
@@ -57937,6 +57940,22 @@ impl<'a, 't> Checker<'a, 't> {
             ty,
             span,
         }
+    }
+
+    /// Total UTF-8 boundary inspection borrows text and checks one i64 index.
+    fn check_str_char_boundary(&mut self, recv: Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.len() != 1 {
+            self.diags.error("'.is_char_boundary()' takes exactly one i64 argument", span);
+            return err;
+        }
+        let index = self.check_expr(&args[0], Some(Ty::Int(IntTy { bits: 64, signed: true })));
+        let receiver = if recv.ty == Ty::String {
+            let rspan = recv.span;
+            Expr { kind: ExprKind::StrBorrow(Box::new(recv)), ty: Ty::Str, span: rspan }
+        } else { recv };
+        if receiver.ty == Ty::Error || index.ty == Ty::Error { return err; }
+        Expr { kind: ExprKind::StrCharBoundary { receiver: Box::new(receiver), index: Box::new(index) }, ty: Ty::Bool, span }
     }
 
     /// `s.contains(n)` / `s.starts_with(p)` / `s.ends_with(s)` / `s.find(n)` — byte-oriented `str`
@@ -66946,7 +66965,7 @@ impl<'a, 't> Checker<'a, 't> {
             },
             k @ (ExprKind::ArrayBuilderNew { .. } | ExprKind::ArrayBuilderPush { .. }
             | ExprKind::ArrayBuilderAppend { .. } | ExprKind::ArrayBuilderBuild(_)) => self.finalize_array_builder(k),
-            ExprKind::StrPredicate { haystack, needle, .. } => {
+            ExprKind::StrCharBoundary { receiver: haystack, index: needle } | ExprKind::StrPredicate { haystack, needle, .. } => {
                 self.finalize_expr(haystack);
                 self.finalize_expr(needle);
             }

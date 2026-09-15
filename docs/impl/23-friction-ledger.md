@@ -219,6 +219,21 @@ is not an explicit override of the reopen protocol. The consolidated assessment
 and disposition are in [plan 56](56-r77-r83-composition-plan.md); that batch does
 not implement enum-field admission or claim the threshold has been reached.
 
+### B5 — value/range patterns in `match`
+
+| | |
+|---|---|
+| Restriction | Match selects sum variants; numeric and character value conditions use if. |
+| Settled reference | `docs/open-questions.md`, “Sum types + exhaustive match”, especially the variants/conditions rule and declined guards; draft section 5's hypothetical integer-pattern wrap rule does not adopt the syntax. |
+| Workaround shape | A constant integer-interval dispatch returning different values becomes an ordered if/return ladder. |
+| Occurrences | `../align-llm/src/tokenizer_qwen2.align:418` (`byte_scalar`) and `:426` (`scalar_byte`), consumer `b00d3fa9`, inspected 2026-09-15 for issue 1055 / Request 90. |
+| Count | **2 inspected sites, 1 program**; not a full-corpus count. `direct_byte` is a boolean predicate and is not counted again. |
+| Status | **refused** under the current admissible widening shape: the requested explicit new pattern syntax is not compiler-derived. The observed count is also below the five-site/two-program threshold. Compiler-derived optimization of the existing if form remains eligible. |
+
+[Plan 66](66-array-prefix-and-text-boundary-plan.md) records the exact audit and
+code-generation evidence. No parser or pattern-semantics change is authorized
+by treating this deliberate restriction as an implementation gap.
+
 ## Maintaining this file
 
 - Add a row the first time a restriction produces a mechanical workaround in real

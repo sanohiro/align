@@ -3034,6 +3034,7 @@ process-local MIR `struct_id` and must decode to the required nominal struct.
 | 25 (reserved; reject) | Native BorrowedElementReservation is validated and omitted. |
 | 26 DropValue | `value:AccessOperand` |
 | 27 SourceEvent | `event:AccessSourceEvent` |
+| 28 ArrayTruncate (plan 66 extension) | `destination:AccessSubject` (Place only), `new_len:AccessOperand` (i64) |
 
 `AccessConstElement` uses tags `0 Integer` with 16 little-endian two's-complement
 bytes, `1 Float` with eight little-endian MIR `f64` bits, `2 Character` with a
@@ -3044,6 +3045,15 @@ the declared element type. The sequence count must equal the fixed destination
 extent. Initializer text leaves retain read-only byte publication; the copied
 fixed-array slot itself is writable. The corresponding `ConstArray` Rvalue has
 read-only backing and cannot reuse the StoreConstArray transfer.
+
+ArrayTruncate's exact source admission, suffix cleanup, retained allocation and
+length-publication contract is owned by [plan 66](66-array-prefix-and-text-boundary-plan.md).
+It is a source semantic operation; native preparation expands its guarded Drop
+and header update only after admission. Place projection validates the existing
+exclusive local/record-field shape; Value subjects and other unsupported place
+forms reject. The destination supplies the dynamic array type and cleanup owner;
+no second element-type or ownership override is serialized. Wire field decoding
+precedes ordinary reference/type checks, source-access admission and execution.
 
 SourceEvent's tag is 27 regardless of the Rust enum's declaration position.
 New Rust variants or secondary fields must fail the closed inventory owner until

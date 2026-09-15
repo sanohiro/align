@@ -1,12 +1,14 @@
 # Session handoff
 
-**Open issue batch:** [Plan 65](docs/impl/65-open-issue-batch-plan.md) audits
-all eight open issues (1043, 1047–1053). The first capability implements scalar
-float inspection, initialized buffers, builder capacity, nonzero/paired byte
-loop proofs and proved-lossless cast diagnostics. Safe mutable-storage methods,
-field replacement and disjoint-field calls remain pending on the complete plan
-61 access implementation. Native FFI certification, ordered SIMD and the reported
-Mac frame/SIGPIPE cases remain open.
+**Open issue batch:** [Plan 65](docs/impl/65-open-issue-batch-plan.md)'s first
+capability is merged in PR 1056: scalar float inspection, initialized buffers,
+builder capacity, byte-loop proofs and proved-lossless cast diagnostics.
+[Plan 66](docs/impl/66-array-prefix-and-text-boundary-plan.md) audits the three
+new issues (1054/1055/1057), taking the inventory to 11: the total text
+boundary predicate is implemented; retain array truncation to the pending complete plan 61 +
+safe mutable-storage capability, and record integer match as refused under the
+current settled-syntax/friction protocol. The numeric slice copy already optimizes to memcpy.
+Foreign certification, ordered SIMD and native Mac investigations remain open.
 
 **Decode representation costs:** [plan 62](docs/impl/62-decode-optimization-plan.md)
 implements bounded nonescaping byte storage and direct synchronous chunks

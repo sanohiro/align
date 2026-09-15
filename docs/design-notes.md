@@ -1,5 +1,11 @@
 # Align Design Notes
 
+UTF-8 byte offsets can be queried with `str.is_char_boundary(i64)` before slicing.
+The total predicate shares MIR boundary logic with ordinary slicing, while
+slicing retains its terminal failure contract. Prefix/suffix comparison already
+needs no interior substring. This adds no second string-slicing or error model;
+[plan 66](impl/66-array-prefix-and-text-boundary-plan.md) owns the closure.
+
 The [R77–R83 composition batch](impl/56-r77-r83-composition-plan.md) separates
 initialized reads, ownership, storage generations and contained-view lifetimes.
 A shared source need not taint an independently owned result; a fresh outer

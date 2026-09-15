@@ -419,6 +419,7 @@ fn walk_body_records<'a>(
                     ptr: lhs,
                     offset: rhs,
                 }
+                | ExprKind::StrCharBoundary { receiver: lhs, index: rhs }
                 | ExprKind::StrPredicate {
                     haystack: lhs,
                     needle: rhs,

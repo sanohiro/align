@@ -15,6 +15,7 @@
 ```text
 "lit"                      -> str        // single-line only; \n \t \" escapes; UTF-8
 'A' / 'あ'                 -> char       // one Unicode scalar
+s.is_char_boundary(index: i64) -> bool  // 全域的なバイト境界判定; アロケーションなし
 s.len()                    -> i64        // BYTE length ("あ".len() == 3)
 s.contains(n) / s.starts_with(n) / s.ends_with(n)      -> bool
 s.eq_ignore_ascii_case(t)  -> bool       // ASCII fold only, not Unicode
@@ -48,6 +49,19 @@ Pure（I/O なし）。*アロケーションの可視性* というルールは
 ## Errors & aborts
 
 この領域では `Result` は使用されない。`s[a..b]` における範囲外アクセス（out of bounds）は abort を引き起こす。非 UTF-8 な *入力* のエラー処理は `std` 境界での関心事である（`fs.read_file` → `Error.Invalid`）。core の文字列操作は不変条件が満たされている前提でバイト指向を保つ。範囲の部分ビュー作成（range lowering）は、仕様どおり O(1) で両端の UTF-8 スカラー境界チェックを行い、違反時は abort する（audit 13 §3.1、2026-07-13 修正済み）。
+
+`s.is_char_boundary(index: i64) -> bool` は UTF-8 のバイト境界を判定する。
+負の位置とバイト長を超える位置は false、0 と末尾は true、それ以外は
+`(byte & 0xc0) != 0x80` を返す。両端と範囲外ではバイトを読まず、
+アロケーションも行わない。所有する `string` は通常どおり借用する。
+位置引数の評価が終わるまで文字列は有効でなければならない。
+結果の bool はビューを保持しない。Pure な操作であり、Result や範囲外停止は
+発生しない。通常の `s[a..b]` の範囲・UTF-8 境界違反による停止は変わらない。
+
+`starts_with` と `ends_with` は内部の文字列スライスを作らず、境界内のバイトを
+比較する。空の検索文字列は一致し、元より長ければ不一致となる。
+アロケーションはなく、比較するバイト数は検索文字列の長さ以下である。
+特定の libc 呼び出しや SIMD による速度向上は保証しない。
 
 ## Regions
 

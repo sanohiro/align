@@ -67,6 +67,8 @@ invented exact counts here.
 | `native-thread-state-scope` | 1 | 1 | Watch; a constructor-scoped native thread-state guard does not cover delayed stream I/O or Drop. Establish the guard at every operation that can invoke the guarded native API, and pin read plus teardown with thread-local counter owners. |
 | `failure-evidence-preservation` | 1 | 1 | Watch; bounded live progress must survive temporary-log cleanup, and interruption paths must replay or preserve every completed and partial failure log before removal. |
 
+| `inference-finalization-scope` | 1 | 1 | Watch; propagate numeric relations without defaulting unrelated enclosing components at a lambda boundary. The whole/per-unit float-inspection inference matrix covers unrelated lambdas, boundary-required captures/parameters, and unconstrained defaults. |
+
 ## Event log
 
 | PR | Reviewed candidate | Severity | Root-cause key | Finding |
@@ -396,6 +398,8 @@ invented exact counts here.
 | #1038 | `fdea5365` | P2 | `source-of-truth-drift` | Generalizing byte validation to UTF-8 and codec kinds must also update adjacent return-to-bytes prose. `StrBytes` removes both validation-only observations while preserving lifetime, cursor and read-only roots; the ledger-to-diff pass covers the complete filtering contract. |
 
 | #1039 | `cabc4475` | P2 | `validation-phase-completeness` | A new fixed-array Copy borrowing path must validate the receiver expression shape before calling the slot resolver. The public HIR gate does not replace the internal malformed-continuation guard; a parameterized forged-receiver owner requires termination before bounds, indexing or calls. |
+
+| #1056 | `b747af9f` | P2 | `inference-finalization-scope` | Entering a lambda must not default unrelated pending float-to-bits relations. Separate propagation from finalization and concretize only the boundary-required components; `float_inspection_inference_and_receiver_matrix` retains whole/per-unit later-f32/u32 and capture/parameter/default controls. |
 
 The rows above are the reviews whose logs are reachable from this checkout's
 `.git/`. Capabilities produced in agent worktrees (#777 and later, other than

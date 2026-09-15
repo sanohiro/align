@@ -1,9 +1,11 @@
 # Open issue batch: storage, byte operations and loop proofs
 
-Status: accepted design; implementation in progress. Scalar inspection,
-constructor capacity, byte recurrence proofs and known-bits diagnostics are
-being implemented as the first capability. Storage access capability remains pending. Audit date: 2026-09-15. Provider baseline:
-`da20aefe1e4054cd132fbbf852217d5ee2c240ac` (includes PRs 1044–1046).
+Status: first capability implemented and merged in PR 1056; safe mutable-storage
+implementation remains pending. Initial audit: 2026-09-15, baseline
+`da20aefe1e4054cd132fbbf852217d5ee2c240ac` (PRs 1044–1046).
+[Plan 66](66-array-prefix-and-text-boundary-plan.md) adds the later issues 1054,
+1055 and 1057 against `61b2de79`, bringing the current inventory to 11 open issues.
+It owns their exact additional public ledger and revised delivery sequence.
 
 This document owns the proposed batch, exact proposed public ledger and closure
 matrix. Existing shipped contracts remain authoritative until implementation.
@@ -13,8 +15,8 @@ interprocedural access analysis; this document consumes its complete design.
 
 ## 1. Complete issue inventory and disposition
 
-All eight open issues and all eight comments on issue 1043 were read. The seven
-new issues had no comments at the snapshot. There were no open PRs. The consumer
+The initial audit read all eight then-open issues and all eight comments on
+issue 1043. The seven new issues had no comments at that snapshot. There were no open PRs. The consumer
 register's new September headings reuse historical Request 63–70 numbers;
 identify this batch by GitHub issue number and dated heading, not number alone.
 
@@ -28,6 +30,12 @@ identify this batch by GitHub issue number and dated heading, not number alone.
 | [1051](https://github.com/sanohiro/align/issues/1051) | Bulk initialized buffers, byte fill/copy and repeated-word fill are missing. Aliased buffer append snapshots its source. A zeroed allocation is not guaranteed constant-time; byte memset cannot form `0xff800000` words. | One filled constructor, byte copy/fill and a uniform typed-fill family. No zeroed alias, capacity-equality or O(1) promise. Preserve ordinary append semantics. |
 | [1052](https://github.com/sanohiro/align/issues/1052) | Float bit/classification methods reject. Existing `align_rt_*_to_bits` symbols are package-internal DB codec ABI helpers, not public methods. | Eight scalar methods, direct MIR/LLVM lowering, no new native float exports or buffer roundtrip. Close on exact-bit/classification and native-register owners. |
 | [1053](https://github.com/sanohiro/align/issues/1053) | Capacity input rejects as a region mismatch. Heap and region headers start at capacity zero; heap growth chooses a minimum of four at first growth. Region builders use chunks and a separate contiguous freeze. | Capacity forms for the existing builder, preserving both storage modes and their type grammars. A repeat terminal is not selected: the issue explicitly permits a capacity constructor instead. Close on bounded push/growth and freeze/Drop owners. |
+
+The follow-up inventory is owned by plan 66: 1054 adds exclusive dynamic-array
+truncation (its numeric bulk-copy witness is already optimized); 1055 syntax is refused
+under the current plan 23 widening rule; 1057 adds a total UTF-8 boundary
+predicate and prefix/suffix guidance. All earlier partial/deferred issue parts
+remain visible above and in section 7.
 
 No GitHub comment, issue closure, consumer code, branch, pin or publication is
 part of this design task. Align's answer belongs in the existing consumer
@@ -363,8 +371,9 @@ is not evidence of a macOS fix. This host did not reproduce or clear it.
 
 ## 8. Batch execution and review
 
-Deliver one coordinated batch with at most two independently useful capability
-PRs, not one PR per issue:
+The initial eight-issue batch has two independently useful capability boundaries.
+Plan 66 extends this sequence with an independent text predicate and folds array
+truncation into the second boundary; it does not reopen the first implementation:
 
 1. **Scalar/constructor/loop capability:** F/B/C/L/K, covering 1052, 1053,
    1049 and the allocation part of 1051. No dependence on the unshipped access

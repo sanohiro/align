@@ -18823,3 +18823,20 @@ fn indexed_tagged_copy_values_require_exact_payload_identity() {
     mir.tagged_types[index] = hir::TaggedType::Option(Scalar::String);
     assert!(!crate::producer::slice_index_result_matches(&mir, source, Ty::Option(Scalar::String), false));
 }
+
+#[test]
+fn text_boundary_hir_rejects_forged_types_in_every_entrypoint() {
+    let base = checked_source_program("fn f(text: str, index: i64) -> bool { value := text.is_char_boundary(index); return value }");
+    assert!(!is_empty(&lower_program(&base)));
+    for mutation in 0..3 {
+        let mut malformed = base.clone();
+        let expression = body_first_let_init_mut(&mut malformed, "f");
+        let hir::ExprKind::StrCharBoundary { receiver, index } = &mut expression.kind else { panic!("boundary fixture") };
+        match mutation {
+            0 => receiver.ty = Ty::String,
+            1 => index.ty = Ty::Int(IntTy { bits: 64, signed: false }),
+            _ => expression.ty = Ty::Int(IntTy { bits: 64, signed: true }),
+        }
+        assert_body_entrypoints_empty("text-boundary-forged", &malformed);
+    }
+}
