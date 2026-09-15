@@ -33350,7 +33350,7 @@ fn main() -> i32 = 0
     }
 
     #[test]
-    fn main_abi_matrix() {
+    fn main_abi_matrix() -> Result<(), &'static str> {
         let direct = ir("fn main() -> i32 = 7\n");
         assert!(direct.contains("define i32 @main()"));
         assert!(!direct.contains("@align_main"));
@@ -33372,7 +33372,7 @@ fn main() -> i32 = 0
             "fn main(args: array<str>) -> Result<(), Error> { return Ok(()) }\n",
         );
         let argv_body = argv.lines().find(|line| line.starts_with("define internal")
-            && line.contains(&format!("@\"{encoded_main}\"("))).expect("argv body");
+            && line.contains(&format!("@\"{encoded_main}\"("))).ok_or("missing argv body")?;
         assert!(argv_body.contains("{ ptr, i64 }"), "{argv_body}");
         assert!(argv_body.contains(&format!("@\"{encoded_main}\"({{ ptr, i64 }}"))
             || argv_body.contains(&format!("@\"{encoded_main}\"(ptr sret(")), "{argv_body}");
@@ -33495,6 +33495,7 @@ fn main() -> i32 = 0
         let mut missing_variant = result_program.clone();
         missing_variant.enums[error_id as usize].variants.pop();
         rejects("error-variant-count", &missing_variant);
+        Ok(())
     }
 
     #[test]

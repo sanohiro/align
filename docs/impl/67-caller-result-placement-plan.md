@@ -257,21 +257,23 @@ emission deliberately performs no IR inlining across the boundary.
 The source witness uses the baseline compiler hash
 `5f54da0a066d0b0d3f9ccbdcff56c3b2dd5b4ccfd2aa1337b6c301fe03cb685c`
 and candidate hash
-`7447b1afd5f741b4e1deaf2d6217d9e346919233f01c01b943063b0a74e32906`.
+`99b906b73f5d82ca0eded8af36dde1cb5cf0689b6f14c4dfb0b525700e8de422`.
 Both emit release/O2 IR with runtime LTO disabled for x86-64-v2, using LLVM
-22.1.8; separately emitted objects are linked by `cc -O2`. Each execution
+22.1.8. Object emission explicitly uses `llc -O2 -mcpu=x86-64-v2
+-filetype=obj -relocation-model=pic`; `cc -O2` links the independently emitted
+objects. The host is a Ryzen 9 5950X under WSL2. Each execution
 performs 3,000,000 calls to `probe`, retaining 6,000,000 constructor and
 6,000,000 borrowed-consumer calls. All nine alternating pairs print digest
-`9000078000000`. Median elapsed time is 83.8 ms before and 36.1 ms after.
+`9000078000000`. Median elapsed time is 66.4 ms before and 24.2 ms after.
 The actual candidate's retargeted apple-m1 caller also has two final aggregate
 regions instead of four, with both 216-byte transfers removed.
 
 The multiple-SSA-use control normalizes the baseline's already-optimized
 caller through the reconstruction path, then runs ordinary O2. It keeps
-fallback storage; the median is 115.3 ms before and 68.3 ms after. This is an
+fallback storage; the median is 67.0 ms before and 57.3 ms after. This is an
 LLVM mechanism control, not an additional source-language optimization claim.
 The one-i64 record reverse control has byte-identical before/after objects;
-its measured medians are 18.9 and 20.5 ms with identical digest `9000000000000`.
+its measured medians are 14.4 and 14.5 ms with identical digest `9000000000000`.
 These short runs overlap unrelated local verification and show scheduling
 noise even for identical objects. No overall workload latency improvement or
 native Mac timing is claimed. The stable acceptance property is the eliminated

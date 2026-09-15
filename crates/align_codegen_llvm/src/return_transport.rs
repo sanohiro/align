@@ -117,26 +117,26 @@ mod tests {
     use inkwell::memory_buffer::MemoryBuffer;
     use inkwell::values::InstructionOpcode;
 
-    fn parse<'ctx>(ctx: &'ctx Context, source: &str) -> Module<'ctx> {
+    fn parse<'ctx>(ctx: &'ctx Context, source: &str) -> Result<Module<'ctx>, String> {
         ctx.create_module_from_ir(MemoryBuffer::create_from_memory_range_copy(
             std::ffi::CString::new(source)
-                .expect("IR without NUL")
+                .map_err(|error| error.to_string())?
                 .as_bytes_with_nul(),
             "return-owner",
         ))
-        .expect("valid LLVM owner")
+        .map_err(|error| error.to_string())
     }
 
-    fn target() -> TargetMachine {
+    fn target() -> Result<TargetMachine, String> {
         crate::create_target_machine(
             &crate::BuildTarget::Baseline,
             inkwell::OptimizationLevel::Default,
         )
-        .expect("native target")
+        .map_err(|error| error.to_string())
     }
 
     #[test]
-    fn materialized_results_forward_without_changing_call_count() {
+    fn materialized_results_forward_without_changing_call_count() -> Result<(), String> {
         let ctx = Context::create();
         let module = parse(
             &ctx,
@@ -158,19 +158,19 @@ entry:
   ret i64 %sum
 }
 "#,
-        );
-        let tm = target();
+        )?;
+        let tm = target()?;
         module.set_data_layout(&tm.get_target_data().get_data_layout());
         module.set_triple(&tm.get_triple());
-        let owned = [module.get_function("make").expect("make")];
-        normalize(&module, &tm, &owned).expect("return normalization");
+        let owned = [module.get_function("make").ok_or("make")?];
+        normalize(&module, &tm, &owned).map_err(|error| error.to_string())?;
         let raw = module.print_to_string().to_string();
         assert!(
             raw.contains("llvm.memcpy"),
             "the full transfer must remain visible: {raw}"
         );
         assert_eq!(raw.matches("call void @make").count(), 2);
-        crate::run_opt_pipeline(&module, &tm, "default<O2>").expect("O2");
+        crate::run_opt_pipeline(&module, &tm, "default<O2>").map_err(|error| error.to_string())?;
         let optimized = module.print_to_string().to_string();
         assert_eq!(optimized.matches("alloca %Big").count(), 2, "{optimized}");
         assert_eq!(
@@ -180,10 +180,11 @@ entry:
         );
         assert!(!optimized.contains("call.result.storage"), "{optimized}");
         assert!(!optimized.contains("llvm.memcpy"), "{optimized}");
+        Ok(())
     }
 
     #[test]
-    fn result_transport_preserves_parameter_contracts_and_indirect_edges() {
+    fn result_transport_preserves_parameter_contracts_and_indirect_edges() -> Result<(), String> {
         let ctx = Context::create();
         let module = parse(
             &ctx,
@@ -198,13 +199,13 @@ entry:
 }
 attributes #0 = { "align.program.return" }
 "#,
-        );
-        let tm = target();
+        )?;
+        let tm = target()?;
         module.set_data_layout(&tm.get_target_data().get_data_layout());
         module.set_triple(&tm.get_triple());
         let owned: Vec<_> = module.get_functions().collect();
-        normalize(&module, &tm, &owned).expect("return normalization");
-        let make = module.get_function("make").expect("rewritten make");
+        normalize(&module, &tm, &owned).map_err(|error| error.to_string())?;
+        let make = module.get_function("make").ok_or("rewritten make")?;
         assert!(make.get_type().get_return_type().is_none());
         for name in ["nonnull", "readonly"] {
             let id = inkwell::attributes::Attribute::get_named_enum_kind_id(name);
@@ -224,12 +225,13 @@ attributes #0 = { "align.program.return" }
             .get_functions()
             .filter(|f| !f.get_name().to_bytes().starts_with(b"llvm."))
             .collect();
-        normalize(&module, &tm, &rewritten).expect("idempotent normalization");
+        normalize(&module, &tm, &rewritten).map_err(|error| error.to_string())?;
         assert_eq!(module.print_to_string().to_string(), raw);
+        Ok(())
     }
 
     #[test]
-    fn observable_aliases_and_native_calls_keep_their_contracts() {
+    fn observable_aliases_and_native_calls_keep_their_contracts() -> Result<(), String> {
         for owned_make in [false, true] {
             let ctx = Context::create();
             let module = parse(
@@ -248,17 +250,18 @@ entry:
   ret i64 %r
 }
 "#,
-            );
-            let tm = target();
+            )?;
+            let tm = target()?;
             module.set_data_layout(&tm.get_target_data().get_data_layout());
             module.set_triple(&tm.get_triple());
             let owned = if owned_make {
-                vec![module.get_function("make").expect("make")]
+                vec![module.get_function("make").ok_or("make")?]
             } else {
                 vec![]
             };
-            normalize(&module, &tm, &owned).expect("return normalization");
-            crate::run_opt_pipeline(&module, &tm, "default<O2>").expect("O2");
+            normalize(&module, &tm, &owned).map_err(|error| error.to_string())?;
+            crate::run_opt_pipeline(&module, &tm, "default<O2>")
+                .map_err(|error| error.to_string())?;
             let text = module.print_to_string().to_string();
             if owned_make {
                 assert_eq!(
@@ -274,10 +277,11 @@ entry:
                 assert!(!text.contains("sret(%Big)"), "{text}");
             }
         }
+        Ok(())
     }
 
     #[test]
-    fn loop_result_storage_is_entry_allocated_on_the_fallback_path() {
+    fn loop_result_storage_is_entry_allocated_on_the_fallback_path() -> Result<(), String> {
         let ctx = Context::create();
         let module = parse(
             &ctx,
@@ -300,13 +304,14 @@ exit:
   ret i64 %sum
 }
 "#,
-        );
-        let tm = target();
+        )?;
+        let tm = target()?;
         module.set_data_layout(&tm.get_target_data().get_data_layout());
         module.set_triple(&tm.get_triple());
-        normalize(&module, &tm, &[module.get_function("make").expect("make")]).expect("normalize");
-        let probe = module.get_function("probe").expect("probe");
-        let entry = probe.get_first_basic_block().expect("entry");
+        normalize(&module, &tm, &[module.get_function("make").ok_or("make")?])
+            .map_err(|error| error.to_string())?;
+        let probe = module.get_function("probe").ok_or("probe")?;
+        let entry = probe.get_first_basic_block().ok_or("entry")?;
         let mut allocations = 0;
         for block in probe.get_basic_blocks() {
             for instruction in block.get_instructions() {
@@ -320,10 +325,11 @@ exit:
         let text = module.print_to_string().to_string();
         assert!(text.contains("llvm.lifetime.start"));
         assert!(text.contains("llvm.lifetime.end"));
+        Ok(())
     }
 
     #[test]
-    fn unsupported_call_edges_refuse_before_module_mutation() {
+    fn unsupported_call_edges_refuse_before_module_mutation() -> Result<(), String> {
         let ctx = Context::create();
         let module = parse(
             &ctx,
@@ -336,8 +342,8 @@ entry:
   ret %Big %r
 }
 "#,
-        );
-        let tm = target();
+        )?;
+        let tm = target()?;
         module.set_data_layout(&tm.get_target_data().get_data_layout());
         module.set_triple(&tm.get_triple());
         let before = module.print_to_string().to_string();
@@ -351,19 +357,20 @@ entry:
             "{error}"
         );
         assert_eq!(module.print_to_string().to_string(), before);
-        let other = parse(&ctx, "declare i64 @other()\n");
-        let wrong_owner = other.get_function("other").expect("other");
+        let other = parse(&ctx, "declare i64 @other()\n")?;
+        let wrong_owner = other.get_function("other").ok_or("other")?;
         assert!(normalize(&module, &tm, &[wrong_owner]).is_err());
         assert_eq!(module.print_to_string().to_string(), before);
+        Ok(())
     }
 
     #[test]
-    fn target_mismatch_and_nonlocal_materialization_do_not_guess() {
+    fn target_mismatch_and_nonlocal_materialization_do_not_guess() -> Result<(), String> {
         let ctx = Context::create();
-        let tm = target();
-        let module = parse(&ctx, "declare { [27 x i64] } @make()\n");
+        let tm = target()?;
+        let module = parse(&ctx, "declare { [27 x i64] } @make()\n")?;
         let before = module.print_to_string().to_string();
-        let error = normalize(&module, &tm, &[module.get_function("make").expect("make")])
+        let error = normalize(&module, &tm, &[module.get_function("make").ok_or("make")?])
             .expect_err("missing target context");
         assert!(
             error
@@ -393,11 +400,11 @@ entry:
 }}
 "#
             );
-            let module = parse(&ctx, &source);
+            let module = parse(&ctx, &source)?;
             module.set_data_layout(&tm.get_target_data().get_data_layout());
             module.set_triple(&tm.get_triple());
-            normalize(&module, &tm, &[module.get_function("make").expect("make")])
-                .expect("fallback");
+            normalize(&module, &tm, &[module.get_function("make").ok_or("make")?])
+                .map_err(|error| error.to_string())?;
             let text = module.print_to_string().to_string();
             assert!(
                 text.contains("load %Big, ptr %call.result.storage"),
@@ -408,12 +415,14 @@ entry:
                 "not a sole adjacent local materialization: {text}"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn native_descriptor_edges_match_generated_definitions_without_new_effect_facts() {
+    fn native_descriptor_edges_match_generated_definitions_without_new_effect_facts()
+    -> Result<(), String> {
         let ctx = Context::create();
-        let tm = target();
+        let tm = target()?;
         let module = parse(
             &ctx,
             r#"
@@ -433,16 +442,16 @@ entry:
 }
 attributes #0 = { "align.native.return" }
 "#,
-        );
+        )?;
         module.set_data_layout(&tm.get_target_data().get_data_layout());
         module.set_triple(&tm.get_triple());
         let owned: Vec<_> = module.get_functions().collect();
-        normalize(&module, &tm, &owned).expect("native normalization");
+        normalize(&module, &tm, &owned).map_err(|error| error.to_string())?;
         let raw = module.print_to_string().to_string();
         let call = raw
             .lines()
             .find(|line| line.contains("call void %callee"))
-            .expect("native edge");
+            .ok_or("native edge")?;
         assert!(call.contains("sret(%Big)"), "{raw}");
         assert!(
             !call.contains("captures("),
@@ -453,19 +462,20 @@ attributes #0 = { "align.native.return" }
             "native fallback keeps the implicit storage lifetime: {raw}"
         );
         assert!(!raw.contains("align.native.return"));
-        crate::run_opt_pipeline(&module, &tm, "default<O2>").expect("native devirtualization");
+        crate::run_opt_pipeline(&module, &tm, "default<O2>").map_err(|error| error.to_string())?;
         let optimized = module.print_to_string().to_string();
         assert!(
             optimized.contains("ret i64 93"),
             "generated target and native caller must agree after devirtualization: {optimized}"
         );
+        Ok(())
     }
 
     /// Link independently emitted implicit and explicit objects in both
     /// directions. This is a native ABI test, including register-return reverse
     /// controls; checking only two rewritten modules could hide ABI drift.
     #[test]
-    fn native_implicit_explicit_return_abi_matrix() {
+    fn native_implicit_explicit_return_abi_matrix() -> Result<(), String> {
         use inkwell::targets::FileType;
         use std::process::Command;
         let shapes = [
@@ -558,11 +568,11 @@ attributes #0 = { "align.native.return" }
         caller.push_str(&format!(" ret i32 %sum{}\n}}\n", shapes.len() - 1));
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
+            .map_err(|error| error.to_string())?
             .as_nanos();
         let dir =
             std::env::temp_dir().join(format!("align-return-abi-{}-{nonce}", std::process::id()));
-        std::fs::create_dir(&dir).expect("exclusively acquire ABI temporary directory");
+        std::fs::create_dir(&dir).map_err(|error| error.to_string())?;
         struct Cleanup(std::path::PathBuf);
         impl Drop for Cleanup {
             fn drop(&mut self) {
@@ -572,21 +582,21 @@ attributes #0 = { "align.native.return" }
         let _cleanup = Cleanup(dir.clone());
         for explicit_provider in [false, true] {
             let ctx = Context::create();
-            let tm = target();
+            let tm = target()?;
             for (name, source, explicit) in [
                 ("provider", &provider, explicit_provider),
                 ("caller", &caller, !explicit_provider),
             ] {
-                let module = parse(&ctx, source);
+                let module = parse(&ctx, source)?;
                 module.set_data_layout(&tm.get_target_data().get_data_layout());
                 module.set_triple(&tm.get_triple());
                 if explicit {
                     let owned: Vec<_> = module.get_functions().collect();
-                    normalize(&module, &tm, &owned).expect("ABI normalization");
+                    normalize(&module, &tm, &owned).map_err(|error| error.to_string())?;
                 }
-                module.verify().expect("ABI IR");
+                module.verify().map_err(|error| error.to_string())?;
                 tm.write_to_file(&module, FileType::Object, &dir.join(format!("{name}.o")))
-                    .expect("ABI object");
+                    .map_err(|error| error.to_string())?;
             }
             let exe = dir.join("probe");
             let link = run_bounded(
@@ -595,18 +605,21 @@ attributes #0 = { "align.native.return" }
                     .arg(dir.join("caller.o"))
                     .arg("-o")
                     .arg(&exe),
-            );
+            )?;
             assert!(link.success(), "native ABI link: {link}");
-            let run = run_bounded(&mut Command::new(&exe));
+            let run = run_bounded(&mut Command::new(&exe))?;
             assert_eq!(
                 run.code(),
                 Some(0),
                 "explicit provider={explicit_provider}: {run:?}"
             );
         }
+        Ok(())
     }
 
-    fn run_bounded(command: &mut std::process::Command) -> std::process::ExitStatus {
+    fn run_bounded(
+        command: &mut std::process::Command,
+    ) -> Result<std::process::ExitStatus, String> {
         use std::time::{Duration, Instant};
         struct Child(std::process::Child);
         impl Drop for Child {
@@ -615,14 +628,14 @@ attributes #0 = { "align.native.return" }
                 let _ = self.0.wait();
             }
         }
-        let mut child = Child(command.spawn().expect("spawn ABI owner"));
+        let mut child = Child(command.spawn().map_err(|error| error.to_string())?);
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             match child.0.try_wait() {
-                Ok(Some(status)) => return status,
+                Ok(Some(status)) => return Ok(status),
                 Ok(None) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) => panic!("ABI child status: {error}"),
+                Err(error) => return Err(format!("ABI child status: {error}")),
             }
             assert!(
                 Instant::now() < deadline,
