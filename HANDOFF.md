@@ -9,6 +9,10 @@ boundary predicate is implemented; retain array truncation to the pending comple
 safe mutable-storage capability, and record integer match as refused under the
 current settled-syntax/friction protocol. The numeric slice copy already optimizes to memcpy.
 Foreign certification, ordered SIMD and native Mac investigations remain open.
+[Plan 67](docs/impl/67-caller-result-placement-plan.md) implements caller result
+placement for already-indirect aggregates, with native ABI cross-link and
+alias-sensitive fallback owners; issue 1047 retains its separate foreign-query
+and client-measurement follow-ups.
 
 **Decode representation costs:** [plan 62](docs/impl/62-decode-optimization-plan.md)
 implements bounded nonescaping byte storage and direct synchronous chunks

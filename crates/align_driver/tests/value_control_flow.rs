@@ -259,12 +259,13 @@ fn function_return_completeness_matrix() {
                         line.starts_with("define ") && line.contains(&format!("@{name}("))
                     })
                     .unwrap_or_else(|| panic!("{path} optimized={optimized}: missing @{name}"));
+                let indirect_result = definition.contains("sret(");
                 assert!(
-                    !definition.split_whitespace().any(|word| word == "void"),
+                    indirect_result || !definition.split_whitespace().any(|word| word == "void"),
                     "{path} optimized={optimized}: {definition}"
                 );
                 assert!(
-                    !llvm_function_body(&llvm, name).contains("ret void"),
+                    indirect_result || !llvm_function_body(&llvm, name).contains("ret void"),
                     "{path} optimized={optimized}: @{name} emitted ret void"
                 );
             }

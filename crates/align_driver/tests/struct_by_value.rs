@@ -129,3 +129,59 @@ fn struct_returned_then_mutated() {
     );
     assert_eq!(build_and_run("returned-mutated", src).status.code(), Some(15));
 }
+
+const RESULT_TABLES: &str = r#"module tables
+pub Big { value: i64, f0: str, f1: str, f2: str, f3: str, f4: str, f5: str, f6: str, f7: str, f8: str, f9: str, f10: str, f11: str, f12: str }
+pub fn make(n: i64) -> Big = Big { value: n, f0: "field0", f1: "field1", f2: "field2", f3: "field3", f4: "field4", f5: "field5", f6: "field6", f7: "field7", f8: "field8", f9: "field9", f10: "field10", f11: "field11", f12: "field12" }
+pub fn consume(borrow item: Big) -> i64 = item.value + item.f0.len() + item.f12.len()
+"#;
+
+#[test]
+fn imported_large_results_materialize_once_and_preserve_indirect_calls() {
+    if !backend_available() { return; }
+    let caller = r#"
+import tables
+fn identity<T>(value: T) -> T = value
+fn main() -> i32 {
+    make := tables.make
+    first := make(10)
+    offset := 1
+    captured := fn n: i64 { tables.make(n + offset) }
+    second := identity(captured(10))
+    a := tables.consume(first)
+    b := tables.consume(second)
+    return (a + b) as i32
+}
+"#;
+    let files = [("tables.align", RESULT_TABLES), ("main.align", caller)];
+    assert_eq!(build_and_run_multi("large-result-whole", &files, "main.align").status.code(), Some(47));
+    let built = build_per_unit_multi("large-result-units", &files, "main.align");
+    assert_eq!(built.link_and_run().status.code(), Some(47));
+}
+
+#[test]
+fn imported_large_result_copy_elimination_keeps_two_live_records() {
+    if !backend_available() { return; }
+    let caller = r#"
+import tables
+pub fn probe(n: i64) -> i64 {
+    first := tables.make(n)
+    second := tables.make(n + 1)
+    a := tables.consume(first)
+    b := tables.consume(second)
+    return a + b
+}
+fn main() -> i32 = probe(10) as i32
+"#;
+    let built = build_per_unit_multi("large-result-placement", &[("tables.align", RESULT_TABLES), ("main.align", caller)], "main.align");
+    assert_eq!(built.link_and_run().status.code(), Some(47));
+    let ir = align_driver::emit_llvm_ir(&built.unit("main").mir, BuildTarget::Baseline,
+        align_driver::Profile::Release, true, &["probe".to_owned()], false).expect("optimized caller");
+    let ir = ir.split("define i64 @probe(").nth(1).expect("exported probe").split("\n}").next().expect("probe body");
+    // External definitions are unavailable in this module: both calls must
+    // survive, and the two records must be independent until both consumers.
+    assert_eq!(ir.lines().filter(|line| line.contains("call void") && line.contains("sret(")).count(), 2, "{ir}");
+    assert_eq!(ir.lines().filter(|line| line.contains("alloca ")).count(), 2, "{ir}");
+    assert!(!ir.contains("llvm.memcpy"), "caller transfers must disappear: {ir}");
+    assert!(!ir.contains("call.result.storage"), "only final records remain: {ir}");
+}

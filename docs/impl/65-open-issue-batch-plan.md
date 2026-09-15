@@ -80,7 +80,10 @@ local x86 object writes fields through `%rdi`, returns that address, and has no
 stack allocation or memcpy. The absence of an explicit LLVM `sret` parameter
 does not prove a missing native indirect return. The warning is source-size
 based and is not evidence of 216 bytes copied twice. The reported Mach-O
-992-byte frame still needs a function/call-chain owner on its original target.
+992-byte frame still needs its exact native function/call-chain owner. The
+subsequent [plan 67 audit](67-caller-result-placement-plan.md) reproduces the
+caller-side copy class and owns its result-placement implementation;
+this earlier constructor-only result did not rule that class out.
 
 ## 3. Proposed public-contract ledger
 
@@ -336,16 +339,17 @@ explicit ThinLTO for cross-unit qualification now. A broader import-inline
 capability must supply its own size/work budget and private-edit invalidation
 owner; it cannot consume an unavailable body because a declaration looks small.
 
-**Large returned records (1047).** Reproduce the specific diagnostic builder
-and its callers with native Mac raw IR, optimized IR and stack/copy inventory.
-Separate required live aggregates and zero initialization from duplicate
-return temporaries. First optimize unobservable temporary destination forwarding
-within the existing ABI; preserve initializer order, selected-error cleanup,
-escaping-address restrictions and by-value isolation. Reuse `struct_by_value`,
-`lint_huge_struct_copy` and `large_drop_codegen` for that owner. A new explicit
-return ABI needs a separate all-call-edge plan covering direct/imported/indirect,
-closure, cleanup-bearing returns and cache fingerprints. It is not justified
-by the warning or frame size alone, and is not included speculatively here.
+**Large returned records (1047).** The new caller disassembly and a provider
+reproduction establish a return-temporary-to-local copy class, separately from
+the constructor's already-direct ABI result writes.
+[Plan 67](67-caller-result-placement-plan.md) now owns the exact evidence,
+return-transport/materialization implementation, all-call-edge closure matrix and
+native ABI qualification gate. It exposes LLVM's existing indirect result convention
+and presents an eligible materialization as memcpy to the existing optimizer;
+sret alone was insufficient in the reverse control. LLVM's target classifier owns the decision; the native gate cross-links
+implicit/explicit callers and definitions in both directions. No new
+source return API, guessed size threshold or foreign effect fact is selected.
+The original Mac build identity/IR and client timing remain pending.
 
 **Ordered SIMD (1048/1043).** The scalar fixes and F do not guarantee LLVM
 vectorizes a fallible argmax. A later vector candidate must validate every lane
