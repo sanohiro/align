@@ -12,7 +12,7 @@ serialized field or optimistic producer evidence.
 owns the five FsTree cases, access/identity qualified schemas, OsIdentity,
 Utf8Lossy/Sha1 discriminators and shared filesystem-owner projection closure.
 The five FsTree cases and OsIdentity are implemented with exact argument/result
-and globally reserved schema validation. The ExprKind sweep contains 332 variants.
+and globally reserved schema validation. The ExprKind sweep contains 333 variants.
 Utf8Lossy/Sha1 use the existing transform/hash validators. Shared filesystem
 projections retain complete place provenance; borrowed String-to-Str normalization
 certifies the physical source and read-only authority before descriptor use.

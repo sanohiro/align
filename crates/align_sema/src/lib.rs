@@ -72890,9 +72890,10 @@ mod tests {
         // Digest New/Update retain no storage; Finish forms an individually owned array
         // with fresh empty content. FsTree also constructs fresh owners without retained inputs.
         // JsonEncode replaces three variants with one fresh owned Result producer.
+        // StrCharBoundary has a scalar result and retains no storage.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 332,
+            variants, 333,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 
