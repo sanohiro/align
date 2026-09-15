@@ -23,6 +23,7 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=cpp/thinlto_shim.cpp");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=cpp/return_transport.cpp");
 
     let llvm_config =
         std::env::var("LLVM_CONFIG").unwrap_or_else(|_| "llvm-config-22".to_string());
@@ -62,6 +63,7 @@ fn main() {
     build
         .cpp(true)
         .file("cpp/thinlto_shim.cpp")
+        .file("cpp/return_transport.cpp")
         .include(&includedir)
         .flag("-std=c++17")
         .flag_if_supported("-fno-exceptions")

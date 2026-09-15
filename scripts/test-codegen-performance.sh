@@ -3,6 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 scripts/cargo.sh build --workspace --locked
+scripts/cargo.sh test --locked -p align_codegen_llvm --lib return_transport::tests
 scripts/cargo.sh test --locked -p align_driver --bin alignc \
   test_limit_tests::cpu_selection_rejects_missing_values_before_flag_stripping -- --exact
 scripts/cargo.sh test --locked -p align_driver \

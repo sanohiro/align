@@ -53,6 +53,26 @@ structurally equal but distinct LLVM types for one Align type makes `insertvalue
 arguments ill-formed; #670 did exactly that for nested tagged values and it went unnoticed until
 #730 made `--rt-lto`, whose merged-module verifier was the pipeline's only one, the default.
 
+### Target-selected indirect results
+
+After ordinary module formation and verification, the shared emission path
+exposes LLVM's already-implicit indirect returns as a leading typed `sret`
+parameter. LLVM 22's own target return classifier supplies the decision; no
+aggregate-size threshold changes the native calling convention. Definitions,
+imported declarations and checked direct/indirect program calls are rewritten
+together, including existing cleanup payloads. Checked raw descriptor calls
+normalize the same machine ABI without new capture, lifetime or coalescing
+facts, so devirtualization to a generated definition remains well typed.
+Runtime/foreign declarations retain their existing contracts.
+
+Each indirect call has an entry-block result slot. General consumers load the
+original SSA aggregate; a sole adjacent whole-local store becomes a full-size
+memcpy. Ordinary LLVM alias analysis and MemCpyOpt can then forward the final
+local's address into the call. Observable old-destination reads retain the
+separate temporary. Source ownership and effect inference are unchanged.
+[Plan 67](67-caller-result-placement-plan.md) owns classification, lifetime,
+native ABI equivalence and the acceptance matrix.
+
 ### Module verification (every profile, on every emit path)
 
 `build_module` verifies the module it just built. Every emit path — object, PGO, ThinLTO prelink,

@@ -37,6 +37,7 @@ mod llvm_build_id;
 /// Instrument-PGO driver-facing surface (production): the safe wrapper over the
 /// C++ shim's `align_pgo_run_pipeline` entry for `--pgo-instrument` / `--pgo-use`.
 pub mod pgo;
+mod return_transport;
 mod runtime_abi;
 /// ThinLTO S0 feasibility spike (feature-gated; historical S0 go/no-go probes).
 #[cfg(feature = "thinlto-spike")]
@@ -3709,8 +3710,7 @@ fn lower_prepared_module<'c>(
             );
             let result_ty =
                 result_struct_type(ctx, ok_s, err_s, &struct_types, &enum_types, tagged_types);
-            let agg = tb
-                .build_indirect_call(result_ty.fn_type(&[ptr.into()], false), thunk, &[env.into()], "r")
+            let agg = return_transport::build_indirect_call(ctx, &tb, result_ty.fn_type(&[ptr.into()], false), thunk, &[env.into()], "r")
                 .map_err(lower)?
                 .try_as_basic_value()
                 .basic()
@@ -3734,14 +3734,13 @@ fn lower_prepared_module<'c>(
         } else if *r == Ty::Unit {
             // A `()`-returning closure is `void(ptr)` in LLVM (not `i32(ptr)`); call it with a void
             // signature and store a dummy into the (i32-sized) slot.
-            tb.build_indirect_call(ctx.void_type().fn_type(&[ptr.into()], false), thunk, &[env.into()], "")
+            return_transport::build_indirect_call(ctx, &tb, ctx.void_type().fn_type(&[ptr.into()], false), thunk, &[env.into()], "")
                 .map_err(lower)?;
             tb.build_store(slot, i32t.const_zero()).map_err(lower)?;
             tb.build_return(Some(&i32t.const_zero())).map_err(lower)?;
         } else {
             let rt = scalar_type(ctx, *r, &struct_types, &enum_types, tagged_types);
-            let res = tb
-                .build_indirect_call(rt.fn_type(&[ptr.into()], false), thunk, &[env.into()], "r")
+            let res = return_transport::build_indirect_call(ctx, &tb, rt.fn_type(&[ptr.into()], false), thunk, &[env.into()], "r")
                 .map_err(lower)?
                 .try_as_basic_value()
                 .basic()
@@ -3979,6 +3978,15 @@ fn lower_prepared_module<'c>(
     // (baked runtime bitcode this run never sees) and a different failure mode (symbol
     // retargeting), so both are kept.
     verify_generated_module(module)?;
+    // The qualified program catalog supplies imported owners. All definitions
+    // here are compiler-generated: runtime bitcode is linked only afterward.
+    // Do not infer ownership from an encoded symbol prefix or a foreign type.
+    let mut return_owners: Vec<_> = program_funcs.iter()
+        .filter(|(name, _)| !program.externs.iter().any(|ext| &ext.name == *name))
+        .map(|(_, function)| *function)
+        .collect();
+    return_owners.extend(module.get_functions().filter(|function| function.count_basic_blocks() != 0));
+    return_transport::normalize(module, tm, &return_owners)?;
     Ok(RuntimeDeclarations { physical_names: runtime_physical_names })
 }
 
@@ -16344,15 +16352,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // that opaque pointers cannot verify, so keep the indirect call Unit-aware just
                     // like the spawn trampoline above.
                     let fn_ty = self.ctx.void_type().fn_type(&param_meta, false);
-                    self.builder
-                        .build_indirect_call(fn_ty, fn_ptr, &argv, "")
+                    return_transport::build_indirect_call(self.ctx, self.builder, fn_ty, fn_ptr, &argv, "")
                         .map_err(|e| self.err(e))?;
                     return Ok(None);
                 }
                 let fn_ty = self.llvm_type(*ret_ty).fn_type(&param_meta, false);
-                let cs = self
-                    .builder
-                    .build_indirect_call(fn_ty, fn_ptr, &argv, "icall")
+                let cs = return_transport::build_indirect_call(self.ctx, self.builder, fn_ty, fn_ptr, &argv, "icall")
                     .map_err(|e| self.err(e))?;
                 return Ok(cs.try_as_basic_value().basic());
             }
@@ -16392,15 +16397,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .collect::<Result<Vec<BasicMetadataValueEnum<'c>>, _>>()?;
                 if *ret_ty == Ty::Unit {
                     let fn_ty = self.ctx.void_type().fn_type(&param_meta, false);
-                    self.builder
-                        .build_indirect_call(fn_ty, fn_ptr, &argv, "")
+                    return_transport::build_native_indirect_call(self.ctx, self.builder, fn_ty, fn_ptr, &argv, "")
                         .map_err(|error| self.err(error))?;
                     return Ok(None);
                 }
                 let fn_ty = self.llvm_type(*ret_ty).fn_type(&param_meta, false);
-                let call = self
-                    .builder
-                    .build_indirect_call(fn_ty, fn_ptr, &argv, "raw.call")
+                let call = return_transport::build_native_indirect_call(self.ctx, self.builder, fn_ty, fn_ptr, &argv, "raw.call")
                     .map_err(|error| self.err(error))?;
                 return Ok(call.try_as_basic_value().basic());
             }
@@ -16460,9 +16462,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     self.llvm_type(*ret_ty),
                     hir::ReturnCleanupAbi::DynamicBit,
                 );
-                let returned = self
-                    .builder
-                    .build_indirect_call(
+                let returned = return_transport::build_indirect_call(
+                        self.ctx,
+                        self.builder,
                         return_ty.fn_type(&param_meta, false),
                         fn_ptr,
                         &argv,
@@ -33348,7 +33350,7 @@ fn main() -> i32 = 0
     }
 
     #[test]
-    fn main_abi_matrix() {
+    fn main_abi_matrix() -> Result<(), &'static str> {
         let direct = ir("fn main() -> i32 = 7\n");
         assert!(direct.contains("define i32 @main()"));
         assert!(!direct.contains("@align_main"));
@@ -33362,13 +33364,18 @@ fn main() -> i32 = 0
 
         let result = ir("fn main() -> Result<(), Error> { return Ok(()) }\n");
         assert!(result.contains("define internal"));
-        assert!(result.contains(&format!("@\"{encoded_main}\"()")));
+        assert!(result.contains(&format!("@\"{encoded_main}\"()"))
+            || result.contains(&format!("@\"{encoded_main}\"(ptr sret(")));
         assert!(result.contains("define i32 @main()"));
 
         let argv = ir(
             "fn main(args: array<str>) -> Result<(), Error> { return Ok(()) }\n",
         );
-        assert!(argv.contains(&format!("@\"{encoded_main}\"({{ ptr, i64 }}")));
+        let argv_body = argv.lines().find(|line| line.starts_with("define internal")
+            && line.contains(&format!("@\"{encoded_main}\"("))).ok_or("missing argv body")?;
+        assert!(argv_body.contains("{ ptr, i64 }"), "{argv_body}");
+        assert!(argv_body.contains(&format!("@\"{encoded_main}\"({{ ptr, i64 }}"))
+            || argv_body.contains(&format!("@\"{encoded_main}\"(ptr sret(")), "{argv_body}");
         assert!(argv.contains("define i32 @main(i32"));
         assert!(argv.contains("ptr %1"));
 
@@ -33488,6 +33495,7 @@ fn main() -> i32 = 0
         let mut missing_variant = result_program.clone();
         missing_variant.enums[error_id as usize].variants.pop();
         rejects("error-variant-count", &missing_variant);
+        Ok(())
     }
 
     #[test]
@@ -33531,12 +33539,13 @@ fn main() -> i32 = 0
                     .unwrap_or_else(|| {
                         panic!("optimized={optimized}: missing @{name}:\n{llvm}")
                     });
+                let indirect_result = definition.contains("sret(");
                 assert!(
-                    !definition.split_whitespace().any(|word| word == "void"),
-                    "optimized={optimized}: @{name} must keep a value-returning signature: {definition}"
+                    indirect_result || !definition.split_whitespace().any(|word| word == "void"),
+                    "optimized={optimized}: @{name} must carry a result: {definition}"
                 );
                 assert!(
-                    !function_body(&llvm, name).contains("ret void"),
+                    indirect_result || !function_body(&llvm, name).contains("ret void"),
                     "optimized={optimized}: @{name} must not emit ret void:\n{}",
                     function_body(&llvm, name)
                 );
