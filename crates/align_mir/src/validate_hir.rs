@@ -4919,7 +4919,7 @@ impl<'a> BodyValidator<'a> {
     fn native_expression_envelope_ok(&self, expression: &hir::Expr) -> bool {
         match &expression.kind {
             hir::ExprKind::WriterStd { fd, .. } => matches!(*fd, 1 | 2),
-            hir::ExprKind::ArrayBuilderNew { elem, region } => {
+            hir::ExprKind::ArrayBuilderNew { elem, region, .. } => {
                 if region.is_some() {
                     self.array_builder_region_elem_ok(*elem)
                 } else {
@@ -8955,8 +8955,14 @@ impl<'a> BodyValidator<'a> {
                 (local(file, Ty::File) && file.ty == Ty::File)
                     .then(|| result(Ty::Int(align_sema::IntTy { bits: 64, signed: true }), &[file]))?
             }
-            hir::ExprKind::BufferNew { capacity } => {
-                (capacity.ty == i64).then(|| strict(Ty::Buffer, &[capacity]))?
+            hir::ExprKind::BufferNew { capacity, fill } => {
+                if capacity.ty != i64 { return None; }
+                if let Some(fill) = fill {
+                    if fill.ty != Ty::Int(align_sema::IntTy { bits: 8, signed: false }) { return None; }
+                    strict(Ty::Buffer, &[capacity, fill])
+                } else {
+                    strict(Ty::Buffer, &[capacity])
+                }
             }
             hir::ExprKind::BufferBytes { buffer } => {
                 (self.handle_receiver_place(buffer, context, Ty::Buffer) && buffer.ty == Ty::Buffer)
@@ -8998,22 +9004,22 @@ impl<'a> BodyValidator<'a> {
                 }
                 strict(Ty::Unit, &[buffer, data])
             }
-            hir::ExprKind::ArrayBuilderNew { elem, region } => {
+            hir::ExprKind::ArrayBuilderNew { elem, region, capacity } => {
                 let valid_elem = if region.is_some() {
                     self.array_builder_region_elem_ok(*elem)
                 } else {
                     self.array_builder_elem_ok(*elem)
                 };
-                if !valid_elem || expression.ty != Ty::array_builder(*elem) {
+                if !valid_elem || expression.ty != Ty::array_builder(*elem) || capacity.ty != i64 {
                     return None;
                 }
                 if let Some(region) = region {
                     if region.ty != Ty::ArenaHandle {
                         return None;
                     }
-                    strict(expression.ty, &[region])
+                    strict(expression.ty, &[region, capacity])
                 } else {
-                    Some((expression.ty, true, Vec::new()))
+                    strict(expression.ty, &[capacity])
                 }
             }
             hir::ExprKind::ArrayBuilderPush {
@@ -13685,6 +13691,8 @@ fn math_result(fn_: hir::MathFn, operands: &[BodyFlow]) -> Option<Ty> {
         hir::MathFn::Min | hir::MathFn::Max => exact(2).then_some(first).filter(|_| numeric),
         hir::MathFn::Pow => (exact(2) && matches!(first, Ty::Float(_))).then_some(first),
         hir::MathFn::Fma => (exact(3) && float).then_some(first),
+        hir::MathFn::ToBits | hir::MathFn::IsFinite | hir::MathFn::IsNan
+        | hir::MathFn::IsInfinite => exact(1).then(|| fn_.float_inspection_result(first)).flatten(),
     }
 }
 

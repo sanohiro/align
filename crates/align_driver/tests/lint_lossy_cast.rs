@@ -8,6 +8,41 @@
 mod common;
 use common::*;
 
+#[test]
+fn finalized_known_bits_suppress_only_proved_lossless_integer_casts() {
+    for (source, target, expression, warns) in [
+        ("u32", "u8", "x & 255", false),
+        ("i64", "u8", "(x >> 8) & 255", false),
+        ("u64", "i8", "x & 127", false),
+        ("u32", "i8", "x & 255", true),
+        ("u32", "u8", "x & 511", true),
+        ("u32", "u8", "(x & 15) << 4", false),
+        ("u32", "u8", "(x & 31) << 4", true),
+        ("u32", "u8", "(x & 15) | 128", false),
+        ("u32", "u8", "(x & 15) ^ 128", false),
+        ("u32", "u8", "(x & 255) + 1", true),
+        // Unknown sign replication is a relational fact, outside this known-bits proof.
+        ("i64", "i8", "x >> 56", true),
+        ("i64", "u8", "x >> 56", true),
+        ("u64", "u8", "x >> 56", false),
+        ("u64", "u8", "x >> 64", true),
+        ("i64", "i8", "(x & 127) | -128", false),
+    ] {
+        let src = format!("fn f(x: {source}) -> {target} = ({expression}) as {target}\n");
+        for per_unit in [false, true] {
+            let mut sm = SourceMap::new();
+            let checked_diags = if per_unit {
+                check_per_unit(&mut sm, "known-bits.align", &src).diags
+            } else {
+                check(&mut sm, "known-bits.align", &src).diags
+            };
+            let rendered = align_driver::format_diagnostics(&sm, &checked_diags);
+            assert!(!checked_diags.has_errors(), "{src}: {rendered}");
+            assert_eq!(rendered.contains("lossy conversion"), warns, "{src}: {rendered}");
+        }
+    }
+}
+
 /// The formatted diagnostics for checking `src` (warnings included).
 fn diags(name: &str, src: &str) -> String {
     let mut sm = SourceMap::new();

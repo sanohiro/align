@@ -3739,7 +3739,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     return equation;
                 };
                 let selection_matches = {
-                    source_selected == selected_ty
+                    slice_index_value_type_matches(self.graph.program, source_selected, selected_ty)
                         || (source_selected == Ty::String && selected_ty == Ty::Str)
                 };
                 let i64_ty = Ty::Int(IntTy {
@@ -5521,7 +5521,16 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.seed = Some(XmlAccessProvenance::Shared);
                 }
             }
-            Rvalue::ArrayBuilderNew { elem, region } => {
+            Rvalue::BufferNew { capacity, fill } => {
+                if result_ty != Ty::Buffer { equation.invalid = true; }
+                self.check_operand(&mut equation, &capacity, Ty::Int(align_sema::IntTy { bits: 64, signed: true }));
+                if let Some(fill) = &fill {
+                    self.check_operand(&mut equation, fill, Ty::Int(align_sema::IntTy { bits: 8, signed: false }));
+                }
+                equation.seed = Some(XmlAccessProvenance::Owned);
+            }
+            Rvalue::ArrayBuilderNew { elem, region, capacity } => {
+                self.check_operand(&mut equation, &capacity, Ty::Int(align_sema::IntTy { bits: 64, signed: true }));
                 let element = xml_selected_ty(
                     self.graph.program,
                     result_ty,
@@ -6038,9 +6047,16 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     self.add_operand(&mut equation, &b, int_ty, Vec::new());
                 }
             }
-            Rvalue::MathOp { ty, operands, .. } => {
+            Rvalue::MathOp { fn_, ty, operands } => {
+                let expected = if fn_.is_float_inspection() {
+                    (operands.len() == 1)
+                        .then(|| fn_.float_inspection_result(ty))
+                        .flatten()
+                } else {
+                    Some(ty)
+                };
                 if !path.is_empty()
-                    || result_ty != ty
+                    || Some(result_ty) != expected
                     || operands.is_empty()
                     || operands
                         .iter()
@@ -6157,7 +6173,6 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::FilePread { .. }
             | Rvalue::FilePwrite { .. }
             | Rvalue::FileLen { .. }
-            | Rvalue::BufferNew(..)
             | Rvalue::BufferBytes(..)
             | Rvalue::BufferLen(..)
             | Rvalue::BufferCapacity(..)
@@ -10334,6 +10349,14 @@ pub fn slice_index_physical_element(source: Ty) -> Option<Ty> {
     }
 }
 
+fn slice_index_value_type_matches(program: &Program, physical: Ty, result: Ty) -> bool {
+    // Collection scalar descriptors intern Option/Result, while a value expression carries
+    // their expanded type. Compare the same validated payload identity on both sides.
+    let physical = align_sema::expand_tagged_ty(physical, &program.tagged_types);
+    let result = align_sema::expand_tagged_ty(result, &program.tagged_types);
+    physical != Ty::Error && result != Ty::Error && physical == result
+}
+
 pub fn slice_index_result_matches(program: &Program, source: Ty, result: Ty, noalias: bool) -> bool {
     let Some(physical) = slice_index_physical_element(source) else {
         return false;
@@ -10344,7 +10367,7 @@ pub fn slice_index_result_matches(program: &Program, source: Ty, result: Ty, noa
     if source == Ty::DynResponseArray {
         return !noalias && result == Ty::HttpResponse;
     }
-    physical == result
+    slice_index_value_type_matches(program, physical, result)
         && align_sema::collection_element_read_ok(
             physical,
             &program.structs,

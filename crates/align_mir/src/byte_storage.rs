@@ -47,7 +47,7 @@ impl CallEscapeSummary {
         let functions: Vec<_> = functions.into_iter().collect();
         let mut result = Self::default();
         if !functions.iter().flat_map(|f| &f.blocks).flat_map(|block| &block.stmts).any(|stmt| {
-            matches!(stmt, Stmt::Let(_, Rvalue::BufferNew(Operand::Const(crate::Const::Int(cap, _)))) if *cap <= OBJECT_LIMIT as i128)
+            matches!(stmt, Stmt::Let(_, Rvalue::BufferNew { capacity: Operand::Const(crate::Const::Int(cap, _)), fill: None }) if *cap <= OBJECT_LIMIT as i128)
         }) { return result; }
         for f in &functions {
             for (arg, slot) in f.params.iter().enumerate() {
@@ -279,7 +279,7 @@ fn operation_types_match(f: &Function, id: ValueId, rv: &Rvalue) -> bool {
         signed: true,
     });
     let (result, inputs) = match rv {
-        Rvalue::BufferNew(cap) => (Ty::Buffer, operand_ty(f, cap) == Some(integer)),
+        Rvalue::BufferNew { capacity: cap, fill: None } => (Ty::Buffer, operand_ty(f, cap) == Some(integer)),
         Rvalue::BufferPut {
             buffer,
             value,
@@ -409,7 +409,7 @@ fn nonescaping(
                     *target == slot || !slots.contains(target)
                 }
                 Stmt::Let(id, rv) => match rv {
-                    Rvalue::BufferNew(_)
+                    Rvalue::BufferNew { fill: None, .. }
                     | Rvalue::Load(_)
                     | Rvalue::StrLit(_)
                     | Rvalue::RawNull => true,
@@ -542,7 +542,7 @@ fn transfer(
     literals: &BTreeMap<ValueId, usize>,
 ) -> Extent {
     match stmt {
-        Stmt::Let(id, Rvalue::BufferNew(_)) if *id == constructor => Extent::Bytes(0),
+        Stmt::Let(id, Rvalue::BufferNew { fill: None, .. }) if *id == constructor => Extent::Bytes(0),
         Stmt::Drop(target) | Stmt::DropFlagInit(target) if *target == slot => Extent::Dead,
         Stmt::Let(_, rv) => match write_width(rv, handles, literals) {
             Some(Some(width)) => state.append(width),
@@ -645,7 +645,7 @@ pub fn plan(f: &Function, calls: &CallEscapeSummary) -> ByteStoragePlan {
         .iter()
         .flat_map(|block| &block.stmts)
         .filter_map(|stmt| {
-            if let Stmt::Let(id, Rvalue::BufferNew(Operand::Const(crate::Const::Int(cap, _)))) =
+            if let Stmt::Let(id, Rvalue::BufferNew { capacity: Operand::Const(crate::Const::Int(cap, _)), fill: None }) =
                 stmt
                 && *cap <= OBJECT_LIMIT as i128
             {

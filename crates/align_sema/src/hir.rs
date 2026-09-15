@@ -55,6 +55,35 @@ pub enum MathFn {
     /// `fma(a, b, c)` — fused multiply-add `a*b + c` with a single rounding (float scalar or
     /// vector). A free builtin (like `dot`/`select`), not a method; one `vfmadd`/`fmla` instruction.
     Fma,
+    /// Exact IEEE representation of a scalar float, as the same-width unsigned integer.
+    ToBits,
+    /// Scalar IEEE classification without floating-point arithmetic.
+    IsFinite,
+    IsNan,
+    IsInfinite,
+}
+
+impl MathFn {
+    pub fn is_float_inspection(self) -> bool {
+        match self {
+            Self::ToBits | Self::IsFinite | Self::IsNan | Self::IsInfinite => true,
+            Self::Abs | Self::Min | Self::Max | Self::Sqrt | Self::Floor | Self::Ceil
+            | Self::Round | Self::Trunc | Self::Pow | Self::Fma => false,
+        }
+    }
+
+    /// Shared checked-HIR/MIR result contract. Inspection admits only concrete scalar floats.
+    pub fn float_inspection_result(self, input: crate::Ty) -> Option<crate::Ty> {
+        let crate::Ty::Float(crate::FloatTy { bits: bits @ (32 | 64) }) = input else {
+            return None;
+        };
+        match self {
+            Self::ToBits => Some(crate::Ty::Int(crate::IntTy { bits, signed: false })),
+            Self::IsFinite | Self::IsNan | Self::IsInfinite => Some(crate::Ty::Bool),
+            Self::Abs | Self::Min | Self::Max | Self::Sqrt | Self::Floor | Self::Ceil
+            | Self::Round | Self::Trunc | Self::Pow | Self::Fma => None,
+        }
+    }
 }
 
 /// A resolved foreign-function declaration (`extern "C" fn name(params) -> ret`). Bodyless: it
@@ -622,7 +651,8 @@ pub enum ExprKind {
         rhs: Box<Expr>,
     },
     /// A scalar math builtin (`core.math`): `x.abs()` (one operand) / `a.min(b)` / `a.max(b)`
-    /// (two operands). All operands and the result share the numeric type (the `Expr`'s `ty`).
+    /// (two operands). Operands share a numeric type. Float inspection instead returns bool or
+    /// the same-width unsigned integer, as specified by `MathFn::float_inspection_result`.
     MathOp {
         fn_: MathFn,
         operands: Vec<Expr>,
@@ -1345,7 +1375,7 @@ pub enum ExprKind {
     /// `buffer(cap)` — open an owned growable byte buffer with read window `cap` (a `str`-less byte
     /// sink for `reader.read`). The `ty` is [`crate::Ty::Buffer`] (an owned Move handle, `Drop`-freed).
     /// Pure (allocation only), like `BuilderNew`.
-    BufferNew { capacity: Box<Expr> },
+    BufferNew { capacity: Box<Expr>, fill: Option<Box<Expr>> },
     /// `b.bytes()` — a `slice<u8>` view of the buffer's current contents. Borrows the buffer
     /// (region-tracked: the view must not outlive `b`). Pure.
     BufferBytes { buffer: Box<Expr> },
@@ -1380,6 +1410,7 @@ pub enum ExprKind {
         /// Explicit destination region for `array_builder(out)`. `None` preserves the existing
         /// individually-owned heap form.
         region: Option<Box<Expr>>,
+        capacity: Box<Expr>,
     },
     /// `b.push(v)` — append one element to a growable `array_builder`, growing it (amortized). The
     /// `ty` is [`crate::Ty::Unit`]. The receiver must be a `mut array_builder` local (mutated in

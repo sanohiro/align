@@ -20,6 +20,7 @@ pub use hir::*;
 mod hir_depth;
 mod replay_clone;
 mod task_wait;
+mod known_bits;
 pub use hir_depth::{
     MAX_CHECKED_HIR_DEPTH, checked_hir_body_depth_is_valid, direct_expr_children,
 };
@@ -11738,7 +11739,7 @@ pub fn production_codegen_projection(program: &hir::Program) -> Option<Vec<u8>> 
         worker.join().ok().flatten()
     })?;
     let mut bytes = Vec::with_capacity(encoded.len() + 64);
-    bytes.extend_from_slice(b"align-production-codegen-v1\0");
+    bytes.extend_from_slice(b"align-production-codegen-v2\0");
     bytes.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
     bytes.extend_from_slice(&encoded);
     bytes.extend_from_slice(&(ownership.len() as u64).to_le_bytes());
@@ -16123,7 +16124,11 @@ impl EffectScan<'_> {
             }
             // Constructing a `writer`/`reader`/`buffer` is allocation only (no I/O → pure, like
             // `BuilderNew`); the reads/writes below reach the OS, so those are impure.
-            ExprKind::WriterStd { .. } | ExprKind::ReaderStdin | ExprKind::BufferNew { .. } => {}
+            ExprKind::WriterStd { .. } | ExprKind::ReaderStdin => {}
+            ExprKind::BufferNew { capacity, fill } => {
+                walk!(capacity);
+                if let Some(fill) = fill { walk!(fill); }
+            }
             ExprKind::WriterWrite { writer, arg, .. } => {
                 walk!(writer);
                 walk!(arg);
@@ -16240,10 +16245,11 @@ impl EffectScan<'_> {
             }
             // `array_builder` new/push/append/build are pure in-memory growth, but their operands
             // may contain calls whose effects still contribute in source order.
-            ExprKind::ArrayBuilderNew { region, .. } => {
+            ExprKind::ArrayBuilderNew { region, capacity, .. } => {
                 if let Some(region) = region {
                     walk!(region);
                 }
+                walk!(capacity);
             }
             ExprKind::ArrayBuilderPush { builder, value, .. } => {
                 walk!(builder);
@@ -27755,10 +27761,11 @@ impl<'a> EscapeCheck<'a> {
     #[inline(never)]
     fn walk_array_builder(&mut self, kind: &'a ExprKind, depth: u32) {
         match kind {
-            ExprKind::ArrayBuilderNew { region, .. } => {
+            ExprKind::ArrayBuilderNew { region, capacity, .. } => {
                 if let Some(region) = region {
                     self.walk(region, depth);
                 }
+                self.walk(capacity, depth);
             }
             ExprKind::ArrayBuilderPush { builder, value, .. } => {
                 self.walk(builder, depth);
@@ -28574,7 +28581,10 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(buffer, depth);
                 self.walk(data, depth);
             }
-            ExprKind::BufferNew { capacity } => self.walk(capacity, depth),
+            ExprKind::BufferNew { capacity, fill } => {
+                self.walk(capacity, depth);
+                if let Some(fill) = fill { self.walk(fill, depth); }
+            },
             k @ (ExprKind::ArrayBuilderNew { .. } | ExprKind::ArrayBuilderPush { .. }
             | ExprKind::ArrayBuilderAppend { .. } | ExprKind::ArrayBuilderBuild(_)) => self.walk_array_builder(k, depth),
             ExprKind::BuilderNew { capacity } => {
@@ -40762,10 +40772,11 @@ impl<'a> MoveCheck<'a> {
     #[inline(never)]
     fn move_array_builder(&mut self, kind: &'a ExprKind, moved: &mut MovedSet) -> bool {
         match kind {
-            ExprKind::ArrayBuilderNew { region, .. } => {
+            ExprKind::ArrayBuilderNew { region, capacity, .. } => {
                 if let Some(region) = region {
                     move_expr!(self, region, moved, false, false);
                 }
+                move_expr!(self, capacity, moved, false, false);
             }
             ExprKind::ArrayBuilderPush { builder, value, .. } => {
                 move_expr!(self, builder, moved, false, false);
@@ -44726,7 +44737,10 @@ impl<'a> MoveCheck<'a> {
                     self.invalidate_storage(buffer);
                 }
             }
-            ExprKind::BufferNew { capacity } => move_expr!(self, capacity, moved, false, false),
+            ExprKind::BufferNew { capacity, fill } => {
+                move_expr!(self, capacity, moved, false, false);
+                if let Some(fill) = fill { move_expr!(self, fill, moved, false, false); }
+            },
             // `array_builder` growth ops — the consume semantics live in an `#[inline(never)]` helper
             // so its arm locals stay out of this recursive frame (#296): the builder is **borrowed**
             // (grown in place); `push`'s value is **consumed** (a `string` moves in, a Copy scalar's
@@ -45894,6 +45908,8 @@ struct Checker<'a, 't> {
     int_vars: Vec<Option<IntTy>>,
     int_parent: Vec<u32>,
     float_vars: Vec<Option<FloatTy>>,
+    /// Deferred equal-width constraints from scalar `to_bits`; solved before numeric defaulting.
+    float_bits_relations: Vec<(Ty, Ty, Span)>,
     float_parent: Vec<u32>,
     /// All locals of the current function (slots), never shrinks.
     locals: Vec<Local>,
@@ -46101,6 +46117,7 @@ impl<'a, 't> Checker<'a, 't> {
             int_vars: Vec::new(),
             int_parent: Vec::new(),
             float_vars: Vec::new(),
+            float_bits_relations: Vec::new(),
             float_parent: Vec::new(),
             locals: Vec::new(),
             current_params: Vec::new(),
@@ -46147,6 +46164,43 @@ impl<'a, 't> Checker<'a, 't> {
         Ty::FloatVar(id)
     }
 
+    fn solve_float_bits_relations(&mut self, default_unconstrained: bool) {
+        let mut pending = std::mem::take(&mut self.float_bits_relations);
+        while !pending.is_empty() {
+            let count = pending.len();
+            let mut unresolved = Vec::new();
+            for (source, result, span) in pending {
+                match (self.resolve(source), self.resolve(result)) {
+                    (Ty::Float(float), _) => {
+                        self.unify(result, Ty::Int(IntTy { bits: float.bits, signed: false }), span);
+                    }
+                    (_, Ty::Int(IntTy { bits: bits @ (32 | 64), signed: false })) => {
+                        self.unify(source, Ty::Float(FloatTy { bits }), span);
+                    }
+                    (Ty::Error, _) | (_, Ty::Error) => {}
+                    (Ty::FloatVar(_), Ty::IntVar(_)) => unresolved.push((source, result, span)),
+                    _ => {
+                        self.diags.error("'to_bits' returns u32 for f32 or u64 for f64".to_string(), span);
+                    }
+                }
+            }
+            if unresolved.len() == count {
+                if !default_unconstrained {
+                    self.float_bits_relations = unresolved;
+                    break;
+                }
+                // No remaining component has contextual width information. Default all of them
+                // together so independent literal inspections do not require quadratic rescans.
+                for (source, result, span) in unresolved {
+                    self.unify(source, Ty::Float(FloatTy { bits: 64 }), span);
+                    self.unify(result, Ty::Int(IntTy { bits: 64, signed: false }), span);
+                }
+                break;
+            }
+            pending = unresolved;
+        }
+    }
+
     /// Union-find root of an int/float var (no path compression — callers only read).
     fn root_int(&self, mut v: u32) -> u32 {
         while self.int_parent[v as usize] != v {
@@ -46184,10 +46238,21 @@ impl<'a, 't> Checker<'a, 't> {
 
     fn finalize(&self, ty: Ty) -> Ty {
         match self.resolve(ty) {
-            Ty::IntVar(_) => Ty::Int(IntTy {
-                bits: 64,
-                signed: true,
-            }),
+            Ty::IntVar(id) => {
+                // A boundary snapshot may need a concrete to_bits result without defaulting
+                // unrelated enclosing variables. Only a selected capture/parameter commits it.
+                for (source, result, _) in &self.float_bits_relations {
+                    if self.resolve(*result) == Ty::IntVar(id) {
+                        let bits = match self.resolve(*source) {
+                            Ty::Float(float) => float.bits,
+                            Ty::FloatVar(_) => 64,
+                            _ => continue,
+                        };
+                        return Ty::Int(IntTy { bits, signed: false });
+                    }
+                }
+                Ty::Int(IntTy { bits: 64, signed: true })
+            },
             Ty::FloatVar(_) => Ty::Float(FloatTy { bits: 64 }),
             other => other,
         }
@@ -46768,6 +46833,7 @@ impl<'a, 't> Checker<'a, 't> {
         };
 
         // Finalize all inferred types to concrete (or default i64).
+        self.solve_float_bits_relations(true);
         let mut body = body;
         self.finalize_block(&mut body);
         task_wait::validate(&body, self.tagged_types, self.diags);
@@ -49508,6 +49574,10 @@ impl<'a, 't> Checker<'a, 't> {
             Pow => "pow",
             // `fma` is a free builtin (`check_fma`), never a method — listed only for exhaustiveness.
             Fma => "fma",
+            ToBits => "to_bits",
+            IsFinite => "is_finite",
+            IsNan => "is_nan",
+            IsInfinite => "is_infinite",
         };
         // `(want_args, float_only)`: `abs`/`min`/`max` accept any numeric; the rest are float-only.
         // `min`/`max`/`pow` take one operand; the others take none.
@@ -49517,6 +49587,7 @@ impl<'a, 't> Checker<'a, 't> {
             Sqrt | Floor | Ceil | Round | Trunc => (0, true),
             Pow => (1, true),
             Fma => (2, true), // free builtin; never reached here
+            ToBits | IsFinite | IsNan | IsInfinite => (0, true),
         };
         let r = self.check_expr(recv, None);
         if r.ty == Ty::Error {
@@ -49577,6 +49648,35 @@ impl<'a, 't> Checker<'a, 't> {
         }
         let ty = operands[0].ty;
         Expr { kind: ExprKind::MathOp { fn_, operands }, ty, span }
+    }
+
+    fn check_float_inspection(&mut self, recv: &ast::Expr, fn_: hir::MathFn, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let receiver = self.check_expr(recv, None);
+        let receiver_ty = self.resolve(receiver.ty);
+        if receiver_ty == Ty::Error {
+            return err;
+        }
+        if !receiver_ty.is_float_like() {
+            self.diags.error(format!("float inspection needs an f32 or f64 receiver, got {}", ty_name(receiver_ty)), recv.span);
+            return err;
+        }
+        if !args.is_empty() {
+            self.diags.error(format!("float inspection takes no arguments, got {}", args.len()), span);
+            return err;
+        }
+        let ty = if fn_ == hir::MathFn::ToBits {
+            let result = self.fresh_int_var();
+            self.float_bits_relations.push((receiver.ty, result, span));
+            // Preserve an already-known receiver width for subsequent source checking.
+            if let Some(concrete) = fn_.float_inspection_result(receiver_ty) {
+                self.unify(result, concrete, span);
+            }
+            result
+        } else {
+            Ty::Bool
+        };
+        Expr { kind: ExprKind::MathOp { fn_, operands: vec![receiver] }, ty, span }
     }
 
     /// `f := fn x: i32 { … }` — a lambda used as a value. Lifts the lambda (its parameter types
@@ -51402,6 +51502,20 @@ impl<'a, 't> Checker<'a, 't> {
             && let Some(module) = single_name(p)
             && !self.name_in_scope(module)
         {
+            if module == "buffer" && method == "filled" {
+                if args.len() != 2 {
+                    self.diags.error("'buffer.filled' expects length and byte value".to_string(), span);
+                    return err;
+                }
+                let length = self.check_expr(&args[0], Some(Ty::Int(IntTy { bits: 64, signed: true })));
+                let value = self.check_expr(&args[1], Some(Ty::Int(IntTy { bits: 8, signed: false })));
+                if self.resolve(length.ty) != Ty::Int(IntTy { bits: 64, signed: true })
+                    || self.resolve(value.ty) != Ty::Int(IntTy { bits: 8, signed: false })
+                {
+                    return err;
+                }
+                return Expr { kind: ExprKind::BufferNew { capacity: Box::new(length), fill: Some(Box::new(value)) }, ty: Ty::Buffer, span };
+            }
             if module == "test" && matches!(method, "expect" | "expect_eq") {
                 self.require_import("core.test", &format!("test.{method}"), span);
                 for argument in args {
@@ -51914,6 +52028,16 @@ impl<'a, 't> Checker<'a, 't> {
             return self.check_scalar_math(recv, hir::MathFn::Max, args, span);
         }
         // Float-only math functions (`core.math`).
+        let inspection = match method {
+            "to_bits" => Some(hir::MathFn::ToBits),
+            "is_finite" => Some(hir::MathFn::IsFinite),
+            "is_nan" => Some(hir::MathFn::IsNan),
+            "is_infinite" => Some(hir::MathFn::IsInfinite),
+            _ => None,
+        };
+        if let Some(fn_) = inspection {
+            return self.check_float_inspection(recv, fn_, args, span);
+        }
         let float_fn = match method {
             "sqrt" => Some(hir::MathFn::Sqrt),
             "floor" => Some(hir::MathFn::Floor),
@@ -55691,6 +55815,7 @@ impl<'a, 't> Checker<'a, 't> {
         }
         // Parameter types must be concrete at the lambda boundary (a function signature can't carry
         // another function's inference variable), so resolve the element type now.
+        self.solve_float_bits_relations(false);
         let param_tys: Vec<Ty> = expected_params.iter().map(|t| self.finalize(*t)).collect();
 
         // Snapshot the enclosing scope (with finalized types) so a body reference to an enclosing
@@ -55711,6 +55836,7 @@ impl<'a, 't> Checker<'a, 't> {
         let saved_int_parent = std::mem::take(&mut self.int_parent);
         let saved_float_vars = std::mem::take(&mut self.float_vars);
         let saved_float_parent = std::mem::take(&mut self.float_parent);
+        let saved_float_bits_relations = std::mem::take(&mut self.float_bits_relations);
         let saved_current_params = std::mem::take(&mut self.current_params);
         let saved_current_param_modes = std::mem::take(&mut self.current_param_modes);
         let saved_borrowed_projection_places =
@@ -55776,6 +55902,7 @@ impl<'a, 't> Checker<'a, 't> {
         };
         self.check_return_completeness(&checked, ret, body.span);
         let mut body_fin = checked;
+        self.solve_float_bits_relations(true);
         self.finalize_block(&mut body_fin);
         task_wait::validate(&body_fin, self.tagged_types, self.diags);
         // Run the broad unnecessary-heap scan on the lifted lambda body too (parity with the narrow
@@ -55803,6 +55930,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.int_parent = saved_int_parent;
                 self.float_vars = saved_float_vars;
                 self.float_parent = saved_float_parent;
+                self.float_bits_relations = saved_float_bits_relations;
                 self.current_params = saved_current_params;
                 self.current_param_modes = saved_current_param_modes;
                 self.borrowed_projection_places = saved_borrowed_projection_places;
@@ -55872,6 +56000,7 @@ impl<'a, 't> Checker<'a, 't> {
         self.int_parent = saved_int_parent;
         self.float_vars = saved_float_vars;
         self.float_parent = saved_float_parent;
+        self.float_bits_relations = saved_float_bits_relations;
         self.current_params = saved_current_params;
         self.current_param_modes = saved_current_param_modes;
         self.borrowed_projection_places = saved_borrowed_projection_places;
@@ -55889,6 +56018,18 @@ impl<'a, 't> Checker<'a, 't> {
         self.slice_bases = saved_bases;
         self.buffered_readers = saved_buffered_readers;
         self.capture = saved_capture;
+        // Commit only the values that actually cross this function boundary. Merely taking an
+        // enclosing-scope snapshot must not default unrelated numeric inference variables.
+        for (source, concrete) in expected_params.iter().zip(&param_tys) {
+            self.unify(*source, *concrete, span);
+        }
+        for capture in &capture_ops {
+            if let ExprKind::Local(local) = capture.kind
+                && let Some(source) = self.locals.get(local as usize).map(|local| local.ty)
+            {
+                self.unify(source, capture.ty, capture.span);
+            }
+        }
         if extern_boundary_error {
             // The outer lifted function was appended after any nested lambdas, so popping here
             // removes exactly this rejected function while preserving nested recovery artifacts.
@@ -57910,7 +58051,7 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(format!("'buffer' capacity must be an integer, got {}", ty_name(c.ty)), cap.span);
             return err;
         }
-        Expr { kind: ExprKind::BufferNew { capacity: Box::new(c) }, ty: Ty::Buffer, span }
+        Expr { kind: ExprKind::BufferNew { capacity: Box::new(c), fill: None }, ty: Ty::Buffer, span }
     }
 
     /// Open an empty growable typed array builder. `array_builder()` preserves the individually
@@ -57918,23 +58059,34 @@ impl<'a, 't> Checker<'a, 't> {
     /// type is inferred from the expected `array_builder<T>` annotation.
     fn check_array_builder_new(&mut self, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        if args.len() > 1 {
-            self.diags.error(format!("'array_builder' takes zero arguments for heap storage or one `region` argument, got {}", args.len()), span);
+        if args.len() > 2 {
+            self.diags.error(format!("'array_builder' expects optional region and capacity, got {} arguments", args.len()), span);
             return err;
         }
-        let region = args.first().map(|argument| self.check_expr(argument, Some(Ty::ArenaHandle)));
-        if let Some(region) = &region {
-            if region.ty == Ty::Error {
+        let integer = Ty::Int(IntTy { bits: 64, signed: true });
+        let first = args.first().map(|argument| {
+            self.check_expr(argument, (args.len() == 2).then_some(Ty::ArenaHandle))
+        });
+        let (region, capacity) = match (first, args.get(1)) {
+            (Some(first), second) if self.resolve(first.ty) == Ty::ArenaHandle => {
+                let capacity = second.map(|argument| self.check_expr(argument, Some(integer)));
+                (Some(first), capacity)
+            }
+            (Some(mut first), None) => {
+                if hir_expr_diverges(&first) {
+                    self.reconcile_diverging_completion_expr(&first, integer);
+                    first.ty = integer;
+                } else if self.unify(first.ty, integer, first.span) == Ty::Error { return err; }
+                (None, Some(first))
+            }
+            (Some(_), Some(second)) => {
+                self.check_expr(second, Some(integer));
                 return err;
             }
-            if region.ty != Ty::ArenaHandle {
-                self.diags.error(
-                    format!("region-backed 'array_builder' expects a `region`, got {}", ty_name(region.ty)),
-                    region.span,
-                );
-                return err;
-            }
-        }
+            (None, _) => (None, None),
+        };
+        let capacity = capacity.unwrap_or(Expr { kind: ExprKind::Int(0), ty: integer, span });
+        if self.resolve(capacity.ty) != integer { return err; }
         let Some(elem) = expected
             .map(|ty| self.resolve(ty))
             .and_then(Ty::array_builder_element)
@@ -57985,7 +58137,7 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         Expr {
-            kind: ExprKind::ArrayBuilderNew { elem, region: region.map(Box::new) },
+            kind: ExprKind::ArrayBuilderNew { elem, region: region.map(Box::new), capacity: Box::new(capacity) },
             ty: Ty::array_builder(elem),
             span,
         }
@@ -65812,10 +65964,11 @@ impl<'a, 't> Checker<'a, 't> {
     #[inline(never)]
     fn finalize_array_builder(&mut self, kind: &mut ExprKind) {
         match kind {
-            ExprKind::ArrayBuilderNew { region, .. } => {
+            ExprKind::ArrayBuilderNew { region, capacity, .. } => {
                 if let Some(region) = region {
                     self.finalize_expr(region);
                 }
+                self.finalize_expr(capacity);
             }
             ExprKind::ArrayBuilderPush { builder, value, .. } => {
                 self.finalize_expr(builder);
@@ -65965,6 +66118,7 @@ impl<'a, 't> Checker<'a, 't> {
                     && numeric_or_char(tgt)
                     && !char_float
                     && !is_numeric_literal(expr)
+                    && !known_bits::lossless_integer_cast(expr, tgt)
                     && let Some(reason) = cast_loss(src, tgt)
                 {
                     self.diags.push(align_diag::Diagnostic::warning(
@@ -66786,7 +66940,10 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(buffer);
                 self.finalize_expr(data);
             }
-            ExprKind::BufferNew { capacity } => self.finalize_expr(capacity),
+            ExprKind::BufferNew { capacity, fill } => {
+                self.finalize_expr(capacity);
+                if let Some(fill) = fill { self.finalize_expr(fill); }
+            },
             k @ (ExprKind::ArrayBuilderNew { .. } | ExprKind::ArrayBuilderPush { .. }
             | ExprKind::ArrayBuilderAppend { .. } | ExprKind::ArrayBuilderBuild(_)) => self.finalize_array_builder(k),
             ExprKind::StrPredicate { haystack, needle, .. } => {

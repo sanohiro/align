@@ -2284,6 +2284,12 @@ wasteful default type  (large literal array left to the i64/f64 default)
 index-walk in loop     (walking an array by index inside `loop` — write it as a pipeline, §4 Loop)
 ```
 
+An integer cast warning is suppressed when finalized expression-local known
+bits prove that every possible source value fits the destination interval.
+Masks, bitwise operations and constant shifts may supply these facts. Unknown
+facts retain the warning; this rule never changes cast execution.
+
+
 ### Convergence Over Expression
 
 Convergence is valued over expressiveness.
@@ -2539,15 +2545,44 @@ eq_ignore_ascii_case
 
 Has a SIMD fast path in the standard implementation.
 
+### Scalar float inspection and initialized bytes
+
+`f32.to_bits() -> u32` and `f64.to_bits() -> u64` preserve the input encoding,
+including signed zero and NaN payloads. Both scalar float types provide
+`is_finite() -> bool`, `is_nan() -> bool`, and `is_infinite() -> bool`.
+Finite includes zeros and subnormals; both infinities are infinite; all quiet
+and signaling NaNs are NaN. These are Pure Copy operations with no allocation
+or arithmetic on the input. They do not prescribe the NaN payload produced by
+an earlier arithmetic operation. Vector receivers are excluded.
+
+`buffer.filled(length: i64, value: u8) -> buffer` constructs exactly `length`
+initialized bytes. Zero length is valid and acquires no payload. A nonempty
+construction acquires one payload and initializes it in O(length) work; the
+Move handle may allocate separately. Capacity is at least length, with no
+allocator-exact equality promise. Invalid/overflowing counts fail before
+allocation; allocation failure aborts. This is Pure explicit allocation.
+The existing `buffer(capacity)` retains its best-effort empty read-window
+contract. There is no separate zeroed constructor.
+
 ### core.array_builder
 
 ```text
-array_builder<T>()      // open an empty growable typed builder
-array_builder<T>(out)   // grow in the explicitly supplied region
+array_builder()                // heap; expected binding supplies T
+array_builder(capacity: i64)    // heap with initial capacity
+array_builder(out: region)      // explicit region
+array_builder(out: region, capacity: i64) // region with initial capacity
 b.push(v)               // append one element (mut receiver)
 b.append(xs: slice<T>)  // bulk-append Copy-scalar elements (mut receiver)
 b.build() -> array<T>   // freeze into an owned array<T> (consumes the builder)
 ```
+
+The constructor's omitted capacity is zero. A specified nonnegative capacity
+reserves space for at least that many pushes without growth; initialized length
+remains zero. Negative counts, count × stride overflow and target allocation-size
+overflow abort before allocation; OOM aborts. Arguments evaluate once in source
+order. Heap freeze still transfers its payload without copying; region freeze
+still materializes one contiguous array in the selected region. Capacity does
+not change element admissibility, ownership, lifetime or effects.
 
 `array_builder<T>` is the **typed** member of the grow-then-freeze family — `builder`
 grows a `string`, `buffer` grows bytes, `array_builder<T>` grows an `array<T>`. It is

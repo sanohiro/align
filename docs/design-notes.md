@@ -1951,3 +1951,18 @@ the existing array and reuse the same static schema and runtime writer, producin
 one independently owned result. No hidden clone or alternate JSON API is added.
 [Plan 59](impl/59-json-array-root-composition-plan.md) fixes this owner-approved
 capability; unsupported element shapes and decode ownership remain unchanged.
+
+## Explicit scalar inspection and constructor capacity
+
+Plan 65 supplies float bit inspection directly as Pure numeric operations;
+constructing a buffer to reinterpret one scalar obscures the operation and adds
+unnecessary allocation. Integer masks drive diagnostic precision only, never a
+new arithmetic or optimizer assumption.
+
+`buffer.filled(length, value)` provides initialized bytes with one payload
+acquisition and linear initialization. It promises neither exact allocator
+capacity nor constant-time zeroing. Existing `buffer(capacity)` stays a
+best-effort empty read window. `array_builder` capacity overloads reserve storage
+without creating initialized elements, for both heap and explicit region modes.
+They preserve heap transfer and region compaction at freeze. New guaranteed
+materializers use terminal allocation failure, matching core's existing model.

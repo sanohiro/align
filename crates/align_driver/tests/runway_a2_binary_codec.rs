@@ -9,6 +9,143 @@
 mod common;
 use common::*;
 
+#[test]
+fn constructor_termination_stops_later_operands_and_allocation() {
+    if !backend_available() { return; }
+    for body in [
+        "b := buffer.filled({ return 7 }, side()); return b.len()",
+        "b := buffer.filled(3, { return 7 }); return b.len()",
+        "mut b: array_builder<i64> := array_builder({ return 7 }); xs := b.build(); return xs.len()",
+        "arena out { mut b: array_builder<i64> := array_builder(out, { return 7 }); xs := b.build(); return xs.len() }",
+    ] {
+        let source = format!("fn side() -> u8 {{ print(99); return 1 }}\nfn early() -> i64 {{ {body} }}\nfn main() {{ print(early()) }}\n");
+        for per_unit in [false, true] {
+            let out = if per_unit {
+                build_per_unit_multi("constructor-termination-unit", &[("main.align", source.as_str())], "main.align").link_and_run()
+            } else { build_and_run("constructor-termination", &source) };
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+        }
+    }
+}
+
+#[test]
+fn filled_buffer_initialization_growth_and_operand_order() {
+    if !backend_available() { return; }
+    let source = "fn size() -> i64 { print(1); return 7 }\nfn byte() -> u8 { print(2); return 165 }\nfn main() -> i32 { mut empty := buffer.filled(0, 255); if empty.len() != 0 { return 1 }; mut b := buffer.filled(size(), byte()); if b.len() != 7 { return 2 }; mut i := 0; loop { if i >= 7 { break }; if b.bytes()[i] != 165 { return 4 }; i = i + 1 }; b.put_u8(33); if b.len() != 8 { return 5 }; if b.bytes()[7] != 33 { return 6 }; return 0 }\n";
+    for per_unit in [false, true] {
+        let out = if per_unit {
+            build_per_unit_multi("filled-buffer-unit", &[("main.align", source)], "main.align").link_and_run()
+        } else { build_and_run("filled-buffer", source) };
+        assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n2\n");
+    }
+    for count in ["-1", "9223372036854775807"] {
+        let out = build_and_run("filled-buffer-invalid", &format!("fn main() {{ b := buffer.filled({count}, 0); print(b.len()) }}"));
+        assert!(!out.status.success());
+        assert!(out.stdout.is_empty());
+    }
+}
+
+#[test]
+fn float_inspection_exact_bits_and_classification() {
+    if !backend_available() { return; }
+    let mut library = String::from("module inspection\n");
+    let mut calls = String::new();
+    for width in [32, 64] {
+        library.push_str(&format!(
+            "pub fn bits{width}(value: f{width}) -> u{width} = value.to_bits()\n\
+             pub fn finite{width}(value: f{width}) -> bool = value.is_finite()\n\
+             pub fn nan{width}(value: f{width}) -> bool = value.is_nan()\n\
+             pub fn infinite{width}(value: f{width}) -> bool = value.is_infinite()\n"
+        ));
+        let patterns: &[u64] = if width == 32 {
+            &[0, 0x80000000, 1, 0x007fffff, 0x00800000, 0x3fc00000, 0x7f7fffff,
+              0x7f800000, 0xff800000, 0x7f800001, 0x7fc01234, 0xffc01234]
+        } else {
+            &[0, 0x8000000000000000, 1, 0x000fffffffffffff, 0x0010000000000000,
+              0x3ff8000000000000, 0x7fefffffffffffff, 0x7ff0000000000000,
+              0xfff0000000000000, 0x7ff0000000000001, 0x7ff8123456789abc,
+              0xfff8123456789abc]
+        };
+        for (index, &bits) in patterns.iter().enumerate() {
+            let (finite, nan, infinite) = if width == 32 {
+                let value = f32::from_bits(u32::try_from(bits).expect("f32 pattern"));
+                (value.is_finite(), value.is_nan(), value.is_infinite())
+            } else {
+                let value = f64::from_bits(bits);
+                (value.is_finite(), value.is_nan(), value.is_infinite())
+            };
+            calls.push_str(&format!(
+                "  mut b{width}_{index} := buffer(8)\n\
+                 b{width}_{index}.put_u{width}_le({bits})\n\
+                 v{width}_{index} := b{width}_{index}.bytes().f{width}_le(0)\n\
+                 if inspection.bits{width}(v{width}_{index}) != {bits} {{ return 1 }}\n\
+                 if inspection.finite{width}(v{width}_{index}) != {finite} {{ return 2 }}\n\
+                 if inspection.nan{width}(v{width}_{index}) != {nan} {{ return 3 }}\n\
+                 if inspection.infinite{width}(v{width}_{index}) != {infinite} {{ return 4 }}\n"
+            ));
+        }
+    }
+    let caller = format!("import inspection\nfn main() -> i32 {{\n{calls} return 0\n}}\n");
+    let files = [("inspection.align", library.as_str()), ("main.align", caller.as_str())];
+    let whole = build_and_run_multi("float-inspection-whole", &files, "main.align");
+    assert_eq!(whole.status.code(), Some(0), "{}", String::from_utf8_lossy(&whole.stderr));
+    let units = build_per_unit_multi("float-inspection-units", &files, "main.align");
+    let out = units.link_and_run();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let src = library.trim_start_matches("module inspection\n").replace("pub fn", "fn");
+    let exports = ["bits32", "bits64", "finite32", "finite64", "nan32", "nan64", "infinite32", "infinite64"];
+    for (optimized, ir) in [(false, emit_llvm_with_exports(&src, &exports)), (true, emit_llvm_optimized(&src, &exports))] {
+        assert!(ir.contains("bitcast float") && ir.contains("bitcast double"), "{ir}");
+        // LLVM may recognize bit classification as register-only fabs/comparison intrinsics.
+        for line in ir.lines().filter(|line| line.contains("call ")) {
+            assert!(optimized && line.contains("@llvm."), "{line}");
+        }
+        if optimized {
+            assert!(!ir.contains("alloca "), "{ir}");
+        }
+    }
+}
+
+#[test]
+fn float_inspection_inference_and_receiver_matrix() {
+    let valid = [
+        "fn f() -> u64 = (1.5).to_bits()",
+        "fn f() -> u32 = (1.5).to_bits()",
+        "fn f() -> u32 { x := 1.5; bits := x.to_bits(); y: f32 := x; return bits }",
+        "fn f() -> u64 { x := 1.5; a := x.to_bits(); b := x.to_bits(); return a | b }",
+        "R { x: f32 }\nfn f(r: R) -> u32 = (r.x).to_bits()",
+        "fn value() -> f32 = 1.5\nfn f() -> bool = value().is_finite()",
+        "fn f() -> bool = (1.5).is_nan()",
+        "fn f() -> u32 { x := 1.5; bits := x.to_bits(); values := [1, 2].map(fn v { v }).to_array(); y: f32 := x; return bits }",
+        "fn f() -> u64 { x := 1.5; bits := x.to_bits(); values := [1, 2].map(fn v { bits }).to_array(); return values[0] }",
+        "fn f() -> u32 { x: f32 := 1.5; values := [1, 2].map(fn v { x.to_bits() }).to_array(); return values[0] }",
+        "fn f() -> u64 { x := 1.5; values := [x.to_bits()].map(fn v { v }).to_array(); return values[0] }",
+    ];
+    let invalid = [
+        "fn f(x: f64) -> u32 = x.to_bits()",
+        "fn f(x: f32) -> i32 = x.to_bits()",
+        "fn f(x: i32) -> bool = x.is_finite()",
+        "fn f(x: bool) -> bool = x.is_nan()",
+        "fn f(x: f32) -> u32 = x.to_bits(1)",
+        "fn f(x: vec4<f32>) -> bool = x.is_finite()",
+    ];
+    for (sources, errors) in [(valid.as_slice(), false), (invalid.as_slice(), true)] {
+        for src in sources {
+            for per_unit in [false, true] {
+                let mut sm = SourceMap::new();
+                let diags = if per_unit {
+                    check_per_unit(&mut sm, "float-method.align", src).diags
+                } else {
+                    check(&mut sm, "float-method.align", src).diags
+                };
+                assert_eq!(diags.has_errors(), errors, "{src}: {}", align_driver::format_diagnostics(&sm, &diags));
+            }
+        }
+    }
+}
+
 /// Encoding every width and both byte orders into a growable buffer, then hex-encoding its bytes,
 /// produces the exact byte layout — LE reverses, BE keeps source order, `u8` has no endian tag.
 #[test]
@@ -414,7 +551,7 @@ fn bounded_byte_object_rejects_forged_put_widths() {
     let function = &program.fns[0];
     assert_eq!(align_mir::byte_storage::plan(function, &Default::default()).slots().count(), 1);
     let operations: Vec<_> = function.blocks.iter().flat_map(|block| &block.stmts).filter_map(|stmt| match stmt {
-        Stmt::Let(id, Rvalue::BufferNew(_) | Rvalue::BufferPut { .. } | Rvalue::BufferAppend { .. } | Rvalue::BufferBytes(_) | Rvalue::BufferLen(_)) => Some(*id),
+        Stmt::Let(id, Rvalue::BufferNew { .. } | Rvalue::BufferPut { .. } | Rvalue::BufferAppend { .. } | Rvalue::BufferBytes(_) | Rvalue::BufferLen(_)) => Some(*id),
         _ => None,
     }).collect();
     assert_eq!(operations.len(), 5);
@@ -529,23 +666,70 @@ fn byte_range_recurrence_preserves_tails_and_eliminates_only_proved_guards() {
 }
 
 #[test]
+fn byte_range_nonzero_and_paired_recurrences() {
+    if !backend_available() { return; }
+    for initial in [0, 1] {
+        for paired in [false, true] {
+            for fallible in [false, true] {
+                let offset = if paired { "offset" } else { "i * 4" };
+                let offset_init = if paired { format!("mut offset := {};", initial * 4) } else { String::new() };
+                let offset_step = if paired { "offset = offset + 4;" } else { "" };
+                let ret = if fallible { "Result<f32, Error>" } else { "f32" };
+                let validate = if fallible { "if !value.is_finite() { return Err(Error.Invalid) };" } else { "" };
+                let result = if fallible { "Ok(total)" } else { "total" };
+                let kernel = format!("fn scan(src: slice<u8>) -> {ret} {{ mut total: f32 := 0.0; mut i := {initial}; {offset_init} loop {{ if i >= src.len() / 4 {{ break }}; value := src.f32_le({offset}); {validate} total = total + value; i = i + 1; {offset_step} }}; return {result} }}\n");
+                let ir = emit_llvm_optimized(&kernel, &["scan"]);
+                assert!(!ir.contains("call void @align_rt_range_fail"), "start={initial}, paired={paired}, fallible={fallible}: {ir}");
+                let use_result = if fallible { "scan(b.bytes()) else -1.0" } else { "scan(b.bytes())" };
+                let source = format!("{kernel} fn main() {{ mut b := buffer(0); print({use_result}); b.put_f32_le(2.0); b.put_f32_le(3.0); b.put_u8(99); print({use_result}); }}");
+                let output = build_and_run("paired-byte-range", &source);
+                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+                let values: Vec<f32> = String::from_utf8_lossy(&output.stdout).lines().map(|line| line.parse().expect("float")).collect();
+                assert_eq!(values, [0.0, if initial == 0 { 5.0 } else { 3.0 }]);
+            }
+        }
+    }
+}
+
+#[test]
+fn paired_byte_ranges_keep_unproved_guards() {
+    for (initial, offset, step, limit) in [
+        ("0", "4", "offset + 4", "src.len() / 4"),
+        ("1", "0", "offset + 4", "src.len() / 4"),
+        ("0", "-4", "offset + 4", "src.len() / 4"),
+        ("0", "0", "offset + 8", "src.len() / 4"),
+        ("0", "0", "offset", "src.len() / 4"),
+        ("0", "0", "offset + 4", "src.len() / 2"),
+        ("seed", "seed * 4", "offset + 4", "src.len() / 4"),
+        ("9223372036854775807", "0", "offset + 4", "src.len() / 4"),
+    ] {
+        let source = format!("fn scan(src: slice<u8>, seed: i64) -> u32 {{ mut i := {initial}; mut offset := {offset}; mut total: u32 := 0; loop {{ if i >= {limit} {{ break }}; total = total + src.u32_le(offset); i = i + 1; offset = {step} }}; return total }}");
+        let mut map = SourceMap::new();
+        let checked = check(&mut map, "paired-negative", &source);
+        assert!(!checked.diags.has_errors(), "{}", align_driver::format_diagnostics(&map, &checked.diags));
+        let mir = lower_to_mir(&checked.hir);
+        assert!(reached_byte_guards(&mir.fns[0]) > 0, "{source}");
+    }
+}
+
+#[test]
 fn byte_range_malformed_and_invalidated_proofs_fail_closed() {
     use align_ast::BinOp;
     use align_mir::{Const, Operand, Rvalue, Stmt, Term};
     use align_sema::{IntTy, Ty};
-    let source = "fn sum(src: slice<u8>, other: slice<u8>) -> u32 { mut result: u32 := 0; mut i := 1; loop { if i >= src.len() / 4 { break }; result = result + src.u32_le(i * 4); i = i + 1 }; return result }\n";
+    let source = "fn sum(src: slice<u8>, other: slice<u8>) -> u32 { mut result: u32 := 0; mut i := 9223372036854775807; loop { if i >= src.len() / 4 { break }; result = result + src.u32_le(i * 4); i = i + 1 }; return result }\n";
     let mut map = SourceMap::new();
     let checked = check(&mut map, "byte-range-proof", source);
     assert!(!checked.diags.has_errors());
     let mut base = lower_to_mir(&checked.hir).fns.remove(0);
     let integer = Ty::Int(IntTy { bits: 64, signed: true });
-    // Start at one to retain the original checked CFG during source lowering,
+    // Start beyond the scalable domain to retain the original checked CFG during source lowering,
     // then supply the exact zero-based recurrence to the private MIR pass.
     let mut induction = None;
     for block in &mut base.blocks {
         for statement in &mut block.stmts {
             if let Stmt::Store(slot, Operand::Const(Const::Int(value, ty))) = statement {
-                if *ty == integer && *value == 1 { *value = 0; induction = Some(*slot); }
+                if *ty == integer && *value == i128::from(i64::MAX) { *value = 0; induction = Some(*slot); }
             }
         }
     }

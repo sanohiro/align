@@ -211,3 +211,18 @@ is still invalid during that interval. Returning a view propagates backing
 lifetimes, not the lifetime of the copied header. Source invalidation and arena
 escape follow existing rules. Receivers and indices/bounds evaluate once in
 source order; early termination performs no later bounds check or action.
+
+## Explicit constructor capacity
+
+`buffer.filled(length: i64, value: u8) -> buffer` returns exactly initialized
+bytes with allocated capacity at least length. It acquires one payload for
+nonzero length, none for zero; the Move handle may allocate. Initialization is
+O(length). Invalid/overflowing counts abort before allocation; OOM aborts.
+The ordinary `buffer(capacity)` remains a best-effort empty read window.
+
+Expected-type `array_builder()` and `array_builder(out)` accept an optional last
+i64 capacity argument: `array_builder(capacity)` and
+`array_builder(out, capacity)`. Omitted capacity is zero. Initial length is zero;
+at least capacity pushes fit without growth. Count × stride and target-size
+checks precede allocation. Heap freeze transfers storage; region freeze retains
+contiguous materialization. Element, lifetime, Drop and purity rules are unchanged.

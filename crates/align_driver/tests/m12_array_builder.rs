@@ -19,6 +19,28 @@ fn code(out: &std::process::Output) -> Option<i32> {
 /// The headline: push i64 elements, freeze into an owned `array<i64>`, and consume it with the
 /// existing pipeline (`.sum()`) — the whole point of grow-then-freeze. Also index the frozen array.
 #[test]
+fn explicit_capacity_keeps_empty_length_and_both_storage_modes() {
+    if !backend_available() { return; }
+    for capacity in [0, 1, 7] {
+        for region in [false, true] {
+            let constructor = if region { format!("array_builder(out, {capacity})") } else { format!("array_builder({capacity})") };
+            let body = format!("mut b: array_builder<i64> := {constructor}; mut i := 0; loop {{ if i >= 17 {{ break }}; b.push(i); i = i + 1 }}; xs := b.build(); print(xs.len()); print(xs.sum());");
+            let body = if region { format!("arena out {{ {body} }}") } else { body };
+            let source = format!("fn main() {{ {body} }}");
+            let out = build_and_run("array-builder-capacity", &source);
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "17\n136\n");
+        }
+    }
+    for capacity in ["-1", "9223372036854775807"] {
+        let source = format!("fn main() {{ mut b: array_builder<i64> := array_builder({capacity}); xs := b.build(); print(xs.len()) }}");
+        let out = build_and_run("array-builder-invalid-capacity", &source);
+        assert!(!out.status.success());
+        assert!(out.stdout.is_empty());
+    }
+}
+
+#[test]
 fn i64_push_build_then_pipeline_sum() {
     if !backend_available() {
         return;
