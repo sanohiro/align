@@ -3222,7 +3222,8 @@ impl<'a> LocalScopeValidator<'a> {
             | hir::ExprKind::JsonEncode { base: local, plan: align_sema::hir::JsonEncodePlan::Owned(_), max_bytes: Some(_), .. }
             | hir::ExprKind::ArrayGroupAgg { base: local, .. }
             | hir::ExprKind::ArrayGroupAggMulti { base: local, .. }
-            | hir::ExprKind::ArrayDictEncode { base: local, .. } => Some(*local),
+            | hir::ExprKind::ArrayDictEncode { base: local, .. }
+            | hir::ExprKind::ArrayTruncate { root: local, .. } => Some(*local),
             _ => None,
         };
         local.is_none_or(|local| self.local_is_initialized(local))
@@ -4339,6 +4340,15 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::TemplateHtmlWrite { .. }
             | hir::ExprKind::TemplateHtmlRaw { .. }
             | hir::ExprKind::TemplateHtmlToString { .. } => true,
+            hir::ExprKind::ArrayTruncate { root, path, .. } => {
+                let place_ty = if path.is_empty() {
+                    self.local_type(context, *root)
+                } else {
+                    self.field_path_ty(self.local_type(context, *root), path)
+                };
+                self.mutable_local_ok(context, *root)
+                    && place_ty.and_then(align_sema::dynamic_array_element_type).is_some()
+            }
             hir::ExprKind::SqliteCallbackDescriptor { target, effect } => {
                 self.sqlite_callback_descriptor_ok(expression.ty, target, effect.get())
             }
@@ -4622,6 +4632,9 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::StrBytes { .. }
             | hir::ExprKind::BufferLen { .. }
             | hir::ExprKind::BytesRead { .. }
+            | hir::ExprKind::BytesSet { .. }
+            | hir::ExprKind::BytesFill { .. }
+            | hir::ExprKind::BytesCopyFrom { .. }
             | hir::ExprKind::BufferPut { .. }
             | hir::ExprKind::BufferAppend { .. }
             | hir::ExprKind::ArrayBuilderNew { .. }
@@ -4934,7 +4947,10 @@ impl<'a> BodyValidator<'a> {
                 hir::CliFlagKind::I64 | hir::CliFlagKind::Str => default.is_some(),
             },
             hir::ExprKind::EncodingDecode { kind, .. } => !matches!(kind, hir::EncodingKind::Utf8Lossy | hir::EncodingKind::Html | hir::EncodingKind::PercentPath),
-            hir::ExprKind::BytesRead { .. } => true,
+            hir::ExprKind::BytesRead { .. }
+            | hir::ExprKind::BytesSet { .. }
+            | hir::ExprKind::BytesFill { .. }
+            | hir::ExprKind::BytesCopyFrom { .. } => true,
             hir::ExprKind::BufferPut { .. }
             | hir::ExprKind::Compress { .. }
             | hir::ExprKind::Decompress { .. }
@@ -6708,6 +6724,10 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::StrPredicate { haystack, needle, .. } => {
                 push_expr!(needle, context.clone());
                 push_expr!(haystack, context.clone());
+            }
+            hir::ExprKind::ArrayTruncate { receiver, new_len, .. } => {
+                push_expr!(new_len, context.clone());
+                push_expr!(receiver, context.clone());
             }
             hir::ExprKind::BuilderNew {
                 capacity: Some(capacity),
@@ -8489,6 +8509,17 @@ impl<'a> BodyValidator<'a> {
                 let (falls, breaks) = strict_flow(&[left, right]);
                 Some((Ty::Bool, falls, breaks))
             }
+            hir::ExprKind::ArrayTruncate { receiver, new_len, .. } => {
+                let recv_flow = self.expr_flow(receiver)?;
+                let len_flow = self.expr_flow(new_len)?;
+                if align_sema::dynamic_array_element_type(recv_flow.ty).is_none()
+                    || len_flow.ty != Ty::Int(align_sema::IntTy { bits: 64, signed: true })
+                {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&[recv_flow, len_flow]);
+                Some((Ty::Unit, falls, breaks))
+            }
             hir::ExprKind::StrPredicate { kind, haystack, needle } => {
                 let left = self.expr_flow(haystack)?;
                 let right = self.expr_flow(needle)?;
@@ -9029,6 +9060,36 @@ impl<'a> BodyValidator<'a> {
                     return None;
                 }
                 strict(expression.ty, &[bytes, offset])
+            }
+            hir::ExprKind::BytesSet { bytes, offset, value, be } => {
+                let width = self.binary_scalar_width(value.ty)?;
+                if expression.ty != Ty::Unit
+                    || bytes.ty != Ty::Slice(u8_scalar)
+                    || offset.ty != i64
+                    || (width == 1 && *be)
+                {
+                    return None;
+                }
+                strict(Ty::Unit, &[bytes, offset, value])
+            }
+            hir::ExprKind::BytesFill { bytes, value, be } => {
+                let width = self.binary_scalar_width(value.ty)?;
+                if expression.ty != Ty::Unit
+                    || bytes.ty != Ty::Slice(u8_scalar)
+                    || (width == 1 && *be)
+                {
+                    return None;
+                }
+                strict(Ty::Unit, &[bytes, value])
+            }
+            hir::ExprKind::BytesCopyFrom { dst, src } => {
+                if expression.ty != Ty::Unit
+                    || dst.ty != Ty::Slice(u8_scalar)
+                    || src.ty != Ty::Slice(u8_scalar)
+                {
+                    return None;
+                }
+                strict(Ty::Unit, &[dst, src])
             }
             hir::ExprKind::BufferPut { buffer, value, be } => {
                 let width = self.binary_scalar_width(value.ty)?;

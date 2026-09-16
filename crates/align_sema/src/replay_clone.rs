@@ -550,6 +550,9 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         ExprKind::StrCharBoundary { receiver, index } => ExprKind::StrCharBoundary {
             receiver: boxed!(receiver), index: boxed!(index),
         },
+        ExprKind::ArrayTruncate { root, path, receiver, new_len } => ExprKind::ArrayTruncate {
+            root: *root, path: path.clone(), receiver: boxed!(receiver), new_len: boxed!(new_len),
+        },
         ExprKind::StrPredicate {
             kind,
             haystack,
@@ -1094,6 +1097,21 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             bytes: boxed!(bytes),
             offset: boxed!(offset),
             be: *be,
+        },
+        ExprKind::BytesSet { bytes, offset, value, be } => ExprKind::BytesSet {
+            bytes: boxed!(bytes),
+            offset: boxed!(offset),
+            value: boxed!(value),
+            be: *be,
+        },
+        ExprKind::BytesFill { bytes, value, be } => ExprKind::BytesFill {
+            bytes: boxed!(bytes),
+            value: boxed!(value),
+            be: *be,
+        },
+        ExprKind::BytesCopyFrom { dst, src } => ExprKind::BytesCopyFrom {
+            dst: boxed!(dst),
+            src: boxed!(src),
         },
         ExprKind::BufferPut { buffer, value, be } => ExprKind::BufferPut {
             buffer: boxed!(buffer),
@@ -2217,6 +2235,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             offset: rhs,
         }
         | ExprKind::StrCharBoundary { receiver: lhs, index: rhs }
+        | ExprKind::ArrayTruncate { receiver: lhs, new_len: rhs, .. }
         | ExprKind::StrPredicate {
             haystack: lhs,
             needle: rhs,
@@ -2885,6 +2904,19 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         ExprKind::BytesRead { bytes, offset, .. } => {
             one!(bytes);
             one!(offset);
+        }
+        ExprKind::BytesSet { bytes, offset, value, .. } => {
+            one!(bytes);
+            one!(offset);
+            one!(value);
+        }
+        ExprKind::BytesFill { bytes, value, .. } => {
+            one!(bytes);
+            one!(value);
+        }
+        ExprKind::BytesCopyFrom { dst, src } => {
+            one!(dst);
+            one!(src);
         }
         ExprKind::UdpSendTo {
             sock,

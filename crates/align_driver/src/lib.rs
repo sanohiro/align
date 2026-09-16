@@ -2265,6 +2265,18 @@ fn test_function_targets(
                 Stmt::Drop(slot) => function.slots.get(*slot as usize).copied(),
                 Stmt::DropValue(operand) => Some(function.operand_ty(operand)),
                 Stmt::DropElem(_, _, struct_id) => Some(align_sema::Ty::Struct(*struct_id)),
+                Stmt::ArrayTruncate { root, path, .. } => {
+                    let mut ty = function.slots.get(*root as usize).copied()?;
+                    for &idx in path {
+                        ty = match ty {
+                            align_sema::Ty::Struct(sid) => {
+                                program.structs.get(sid as usize)?.fields.get(idx as usize)?.ty
+                            }
+                            _ => return None,
+                        };
+                    }
+                    Some(ty)
+                }
                 _ => None,
             };
             let Some(dropped) = dropped else { continue };

@@ -1,7 +1,7 @@
 # Open issue batch: storage, byte operations and loop proofs
 
 Status: first capability implemented and merged in PR 1056; safe mutable-storage
-implementation remains pending. Initial audit: 2026-09-15, baseline
+capability (typed slice stores, bulk fill/copy, and owned field replacement) implemented. Initial audit: 2026-09-15, baseline
 `da20aefe1e4054cd132fbbf852217d5ee2c240ac` (PRs 1044–1046).
 [Plan 66](66-array-prefix-and-text-boundary-plan.md) adds the later issues 1054,
 1055 and 1057 against `61b2de79`, bringing the current inventory to 11 open issues.

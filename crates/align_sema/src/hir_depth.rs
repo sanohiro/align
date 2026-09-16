@@ -420,6 +420,7 @@ fn walk_body_records<'a>(
                     offset: rhs,
                 }
                 | ExprKind::StrCharBoundary { receiver: lhs, index: rhs }
+                | ExprKind::ArrayTruncate { receiver: lhs, new_len: rhs, .. }
                 | ExprKind::StrPredicate {
                     haystack: lhs,
                     needle: rhs,
@@ -1206,6 +1207,19 @@ fn walk_body_records<'a>(
                 ExprKind::BytesRead { bytes, offset, .. } => {
                     work.push((BodyRecord::Expr(bytes), child_depth));
                     work.push((BodyRecord::Expr(offset), child_depth));
+                }
+                ExprKind::BytesSet { bytes, offset, value, .. } => {
+                    work.push((BodyRecord::Expr(bytes), child_depth));
+                    work.push((BodyRecord::Expr(offset), child_depth));
+                    work.push((BodyRecord::Expr(value), child_depth));
+                }
+                ExprKind::BytesFill { bytes, value, .. } => {
+                    work.push((BodyRecord::Expr(bytes), child_depth));
+                    work.push((BodyRecord::Expr(value), child_depth));
+                }
+                ExprKind::BytesCopyFrom { dst, src } => {
+                    work.push((BodyRecord::Expr(dst), child_depth));
+                    work.push((BodyRecord::Expr(src), child_depth));
                 }
                 ExprKind::UdpSendTo {
                     sock,
