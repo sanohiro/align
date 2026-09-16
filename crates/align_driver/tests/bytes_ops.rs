@@ -233,3 +233,111 @@ fn probe(borrow mut d: slice<u8>) {
         "fill_u8 must be rejected with helpful diagnostic"
     );
 }
+
+#[test]
+fn bytes_mutation_on_immutable_receiver_rejected() {
+    // 1. Shared borrow parameter must not be mutated
+    let src1 = "\
+fn probe_set(borrow s: slice<u8>) {
+  s.set_u8(0, 1)
+}
+";
+    let mut sm = SourceMap::new();
+    let checked1 = check(&mut sm, "imm-param-set", src1);
+    assert!(
+        checked1.diags.iter().any(|e| e.message.contains("cannot mutate bytes of immutable 's'")),
+        "set on immutable borrow param must be rejected"
+    );
+
+    let src2 = "\
+fn probe_fill(borrow s: slice<u8>) {
+  s.fill(0)
+}
+";
+    let mut sm = SourceMap::new();
+    let checked2 = check(&mut sm, "imm-param-fill", src2);
+    assert!(
+        checked2.diags.iter().any(|e| e.message.contains("cannot mutate bytes of immutable 's'")),
+        "fill on immutable borrow param must be rejected"
+    );
+
+    // 2. Immutable local binding must not be mutated
+    let src3 = "\
+fn main() -> i32 {
+  mut b := buffer.filled(4, 0)
+  s := b.bytes()
+  s.set_u8(0, 1)
+  return 0
+}
+";
+    let mut sm = SourceMap::new();
+    let checked3 = check(&mut sm, "imm-local-set", src3);
+    assert!(
+        checked3.diags.iter().any(|e| e.message.contains("cannot mutate bytes of immutable 's'")),
+        "set on immutable slice local must be rejected"
+    );
+
+    // 3. Mutable slice borrowing immutable buffer must not be mutated
+    let src4 = "\
+fn main() -> i32 {
+  b := buffer.filled(4, 0)
+  mut s := b.bytes()
+  s.fill(0)
+  return 0
+}
+";
+    let mut sm = SourceMap::new();
+    let checked4 = check(&mut sm, "imm-buffer-fill", src4);
+    assert!(
+        checked4.diags.iter().any(|e| e.message.contains("cannot mutate bytes of immutable 'b'")),
+        "fill on slice with immutable backing buffer must be rejected"
+    );
+
+    // 4. String bytes are immutable
+    let src5 = "\
+fn main() -> i32 {
+  s := \"hello\"
+  s.bytes().fill(0)
+  return 0
+}
+";
+    let mut sm = SourceMap::new();
+    let checked5 = check(&mut sm, "str-bytes-fill", src5);
+    assert!(
+        checked5.diags.iter().any(|e| e.message.contains("cannot mutate immutable string bytes of 's'")),
+        "mutation of string bytes must be rejected"
+    );
+}
+
+#[test]
+fn bytes_copy_from_aliasing_slices_rejected() {
+    // 1. Two slice locals from the same backing buffer
+    let src1 = "\
+fn main() -> i32 {
+  mut b := buffer.filled(8, 0)
+  mut s1 := b.bytes()
+  s2 := b.bytes()
+  s1.copy_from(s2)
+  return 0
+}
+";
+    let mut sm = SourceMap::new();
+    let checked1 = check(&mut sm, "same-buffer-locals", src1);
+    assert!(
+        checked1.diags.iter().any(|e| e.message.contains("cannot copy from overlapping slice: destination and source have the same backing 'b'")),
+        "copy between slices of same buffer must be rejected"
+    );
+
+    // 2. Subslice expressions of the same backing slice parameter
+    let src2 = "\
+fn probe(borrow mut d: slice<u8>) {
+  d[0..4].copy_from(d[2..6])
+}
+";
+    let mut sm = SourceMap::new();
+    let checked2 = check(&mut sm, "subslice-same-param", src2);
+    assert!(
+        checked2.diags.iter().any(|e| e.message.contains("cannot copy from overlapping slice: destination and source have the same backing 'd'")),
+        "copy between overlapping subslices of same param must be rejected"
+    );
+}

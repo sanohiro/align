@@ -18857,15 +18857,7 @@ fn array_truncate_hir_rejects_forged_types_in_every_entrypoint() {
     assert!(!is_empty(&lower_program(&base)));
     for mutation in 0..4 {
         let mut malformed = base.clone();
-        let expression = malformed
-            .fns
-            .iter_mut()
-            .find(|function| function.name.as_str() == "f")
-            .unwrap()
-            .body
-            .value
-            .as_deref_mut()
-            .expect("body value expression");
+        let expression = body_value_expression_mut(&mut malformed, "f");
         let hir::ExprKind::ArrayTruncate { root, receiver, new_len, .. } = &mut expression.kind else { panic!("truncate fixture") };
         let root_id = *root;
         match mutation {
@@ -18873,13 +18865,12 @@ fn array_truncate_hir_rejects_forged_types_in_every_entrypoint() {
             1 => **new_len = body_test_expr(hir::ExprKind::Int(0), Ty::Int(IntTy { bits: 32, signed: true })),
             2 => expression.ty = Ty::Int(IntTy { bits: 64, signed: true }),
             _ => {
-                malformed
+                let func = malformed
                     .fns
                     .iter_mut()
                     .find(|function| function.name.as_str() == "f")
-                    .unwrap()
-                    .locals[root_id as usize]
-                    .is_mut = false;
+                    .unwrap_or_else(|| panic!("missing fn f"));
+                func.locals[root_id as usize].is_mut = false;
             }
         }
         assert_body_entrypoints_empty("array-truncate-forged", &malformed);
@@ -18892,15 +18883,7 @@ fn bytes_ops_hir_rejects_forged_types_in_every_entrypoint() {
     assert!(!is_empty(&lower_program(&base_set)));
     for mutation in 0..3 {
         let mut malformed = base_set.clone();
-        let expression = malformed
-            .fns
-            .iter_mut()
-            .find(|function| function.name.as_str() == "f")
-            .unwrap()
-            .body
-            .value
-            .as_deref_mut()
-            .expect("body value expression");
+        let expression = body_value_expression_mut(&mut malformed, "f");
         let hir::ExprKind::BytesSet { bytes, offset, .. } = &mut expression.kind else { panic!("set fixture") };
         match mutation {
             0 => **bytes = body_test_expr(hir::ExprKind::Int(0), Ty::Int(IntTy { bits: 64, signed: true })),
@@ -18914,15 +18897,7 @@ fn bytes_ops_hir_rejects_forged_types_in_every_entrypoint() {
     assert!(!is_empty(&lower_program(&base_fill)));
     for mutation in 0..2 {
         let mut malformed = base_fill.clone();
-        let expression = malformed
-            .fns
-            .iter_mut()
-            .find(|function| function.name.as_str() == "f")
-            .unwrap()
-            .body
-            .value
-            .as_deref_mut()
-            .expect("body value expression");
+        let expression = body_value_expression_mut(&mut malformed, "f");
         let hir::ExprKind::BytesFill { bytes, .. } = &mut expression.kind else { panic!("fill fixture") };
         match mutation {
             0 => **bytes = body_test_expr(hir::ExprKind::Int(0), Ty::Int(IntTy { bits: 64, signed: true })),
@@ -18935,15 +18910,7 @@ fn bytes_ops_hir_rejects_forged_types_in_every_entrypoint() {
     assert!(!is_empty(&lower_program(&base_copy)));
     for mutation in 0..2 {
         let mut malformed = base_copy.clone();
-        let expression = malformed
-            .fns
-            .iter_mut()
-            .find(|function| function.name.as_str() == "f")
-            .unwrap()
-            .body
-            .value
-            .as_deref_mut()
-            .expect("body value expression");
+        let expression = body_value_expression_mut(&mut malformed, "f");
         let hir::ExprKind::BytesCopyFrom { dst, .. } = &mut expression.kind else { panic!("copy fixture") };
         match mutation {
             0 => **dst = body_test_expr(hir::ExprKind::Int(0), Ty::Int(IntTy { bits: 64, signed: true })),

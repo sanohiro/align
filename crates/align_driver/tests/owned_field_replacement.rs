@@ -274,4 +274,3 @@ fn main() -> i32 {
 ";
     assert_eq!(build_and_run("owned-field-repl-opt-str", src).status.code(), Some(0));
 }
-

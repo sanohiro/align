@@ -48842,6 +48842,9 @@ impl<'a, 't> Checker<'a, 't> {
     /// The root buffer local an HIR expression borrows, if it resolves to one (a local or an
     /// array→slice borrow). Used to record slice provenance for the `out` no-alias check.
     fn expr_root_local(&self, e: &Expr) -> Option<LocalId> {
+        if let Some(inner) = borrow_transparent_value(e) {
+            return self.expr_root_local(inner);
+        }
         match &e.kind {
             ExprKind::Local(id) => Some(self.root_local(*id)),
             ExprKind::ArrayToSlice(inner) => self.expr_root_local(inner),
@@ -48850,7 +48853,23 @@ impl<'a, 't> Checker<'a, 't> {
             // slice binding `s := xs[0..2]` records no provenance and the `out` no-alias check
             // cannot see that `s` and `xs` share a buffer.
             ExprKind::SliceRange { recv, .. } => self.expr_root_local(recv),
+            ExprKind::StrBytes { inner } => self.expr_root_local(inner),
+            ExprKind::BufferBytes { buffer } => self.expr_root_local(buffer),
+            ExprKind::Field { root, .. } => Some(self.root_local(*root)),
+            ExprKind::TupleIndex { recv, .. } => self.expr_root_local(recv),
             _ => None,
+        }
+    }
+
+    fn ast_bytes_call_recv(e: &ast::Expr) -> Option<&ast::Expr> {
+        if let ast::ExprKind::Call { callee, args } = &e.kind
+            && args.is_empty()
+            && let ast::ExprKind::FieldAccess { recv, field } = &callee.kind
+            && field.name == "bytes"
+        {
+            Some(recv)
+        } else {
+            None
         }
     }
 
@@ -48860,11 +48879,68 @@ impl<'a, 't> Checker<'a, 't> {
     /// to the receiver's root recursively. Used by the `out` no-alias check, which runs on the raw
     /// argument AST before it is checked.
     fn arg_root_local(&self, a: &ast::Expr) -> Option<LocalId> {
+        if let Some(inner) = Self::ast_bytes_call_recv(a) {
+            return self.arg_root_local(inner);
+        }
         match &a.kind {
             ast::ExprKind::Path(_) => self.place_local(a).map(|(id, _)| self.root_local(id)),
             ast::ExprKind::SliceRange { recv, .. } => self.arg_root_local(recv),
+            ast::ExprKind::FieldAccess { recv, .. } => self.arg_root_local(recv),
             _ => None,
         }
+    }
+
+    /// Resolve an AST receiver to a mutable slice place `(root_local)`.
+    /// Accepts a named `mut` local, `out` / `borrow mut` parameter, mutable struct field path,
+    /// or a sub-slice / `.bytes()` view rooted in such a mutable place.
+    fn resolve_mutable_slice_place(&mut self, e: &ast::Expr) -> Option<LocalId> {
+        if let Some(inner) = Self::ast_bytes_call_recv(e) {
+            return self.resolve_mutable_slice_place(inner);
+        }
+        match &e.kind {
+            ast::ExprKind::SliceRange { recv, .. } => self.resolve_mutable_slice_place(recv),
+            _ => {
+                let (root, _path, _ty) = self.resolve_place(e)?;
+                Some(root)
+            }
+        }
+    }
+
+    /// Validate that the AST receiver for an in-place slice mutation method is a mutable place.
+    fn check_bytes_mutation_receiver(&mut self, recv_ast: &ast::Expr, method: &str) -> bool {
+        let Some(root) = self.resolve_mutable_slice_place(recv_ast) else {
+            self.diags.error(
+                format!("'.{method}()' needs a mutable place (a named `mut` local, `out` parameter, or mutable field path)"),
+                recv_ast.span,
+            );
+            return false;
+        };
+        let backing = self.root_local(root);
+        if matches!(self.resolve(self.locals[backing as usize].ty), Ty::Str | Ty::String) {
+            let name = self.locals[backing as usize].name.clone();
+            self.diags.error(
+                format!("cannot mutate immutable string bytes of '{name}'"),
+                recv_ast.span,
+            );
+            return false;
+        }
+        if !self.locals[root as usize].is_mut {
+            let name = self.locals[root as usize].name.clone();
+            self.diags.error(
+                format!("cannot mutate bytes of immutable '{name}' (declare with `mut`, or use an `out`/`borrow mut` parameter)"),
+                recv_ast.span,
+            );
+            return false;
+        }
+        if !self.locals[backing as usize].is_mut {
+            let name = self.locals[backing as usize].name.clone();
+            self.diags.error(
+                format!("cannot mutate bytes of immutable '{name}' (declare with `mut`, or use an `out`/`borrow mut` parameter)"),
+                recv_ast.span,
+            );
+            return false;
+        }
+        true
     }
 
     fn place_local(&self, e: &ast::Expr) -> Option<(LocalId, Ty)> {
@@ -52333,7 +52409,7 @@ impl<'a, 't> Checker<'a, 't> {
         {
             let recv_expr = self.check_expr(recv, None);
             if let Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })) = self.resolve(recv_expr.ty) {
-                return self.check_bytes_set(recv_expr, scalar, be, method, args, span);
+                return self.check_bytes_set(recv_expr, recv, scalar, be, method, args, span);
             }
             if recv_expr.ty != Ty::Error {
                 self.diags.error(
@@ -52347,7 +52423,7 @@ impl<'a, 't> Checker<'a, 't> {
         if method == "fill" {
             let recv_expr = self.check_expr(recv, None);
             if let Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })) = self.resolve(recv_expr.ty) {
-                return self.check_bytes_fill_u8(recv_expr, method, args, span);
+                return self.check_bytes_fill_u8(recv_expr, recv, method, args, span);
             }
             if recv_expr.ty != Ty::Error {
                 self.diags.error(
@@ -52381,7 +52457,7 @@ impl<'a, 't> Checker<'a, 't> {
         {
             let recv_expr = self.check_expr(recv, None);
             if let Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })) = self.resolve(recv_expr.ty) {
-                return self.check_bytes_fill_scalar(recv_expr, scalar, be, method, args, span);
+                return self.check_bytes_fill_scalar(recv_expr, recv, scalar, be, method, args, span);
             }
             if recv_expr.ty != Ty::Error {
                 self.diags.error(
@@ -65010,7 +65086,8 @@ impl<'a, 't> Checker<'a, 't> {
 
     /// `bytes.set_<scalar>_<le|be>(off, val)` — bounds-checked binary scalar write to a `bytes`
     /// (`slice<u8>`) view (Plan 65 Row W).
-    fn check_bytes_set(&mut self, recv_expr: Expr, scalar: Ty, be: bool, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+    #[allow(clippy::too_many_arguments)]
+    fn check_bytes_set(&mut self, recv_expr: Expr, recv_ast: &ast::Expr, scalar: Ty, be: bool, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let [off_arg, val_arg] = args else {
             self.diags.error(
@@ -65019,6 +65096,9 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         };
+        if !self.check_bytes_mutation_receiver(recv_ast, method) {
+            return err;
+        }
         let off = self.check_expr(off_arg, Some(Ty::Int(IntTy { bits: 64, signed: true })));
         if off.ty == Ty::Error {
             return err;
@@ -65050,7 +65130,7 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     /// `bytes.fill(val)` — fill a `bytes` (`slice<u8>`) view with a single byte value (Plan 65 Row M).
-    fn check_bytes_fill_u8(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+    fn check_bytes_fill_u8(&mut self, recv_expr: Expr, recv_ast: &ast::Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let [val_arg] = args else {
             self.diags.error(
@@ -65059,6 +65139,9 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         };
+        if !self.check_bytes_mutation_receiver(recv_ast, method) {
+            return err;
+        }
         let u8_ty = Ty::Int(IntTy { bits: 8, signed: false });
         let val = self.check_expr(val_arg, Some(u8_ty));
         if val.ty == Ty::Error {
@@ -65083,7 +65166,8 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     /// `bytes.fill_<scalar>_<le|be>(val)` — pattern fill a `bytes` (`slice<u8>`) view with repeated multi-byte scalar (Plan 65 Row P).
-    fn check_bytes_fill_scalar(&mut self, recv_expr: Expr, scalar: Ty, be: bool, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+    #[allow(clippy::too_many_arguments)]
+    fn check_bytes_fill_scalar(&mut self, recv_expr: Expr, recv_ast: &ast::Expr, scalar: Ty, be: bool, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let [val_arg] = args else {
             self.diags.error(
@@ -65092,6 +65176,9 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         };
+        if !self.check_bytes_mutation_receiver(recv_ast, method) {
+            return err;
+        }
         let val = self.check_expr(val_arg, Some(scalar));
         if val.ty == Ty::Error {
             return err;
@@ -65124,6 +65211,9 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         };
+        if !self.check_bytes_mutation_receiver(recv_ast, method) {
+            return err;
+        }
         let u8_slice = Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false }));
         let src = self.check_expr(src_arg, Some(u8_slice));
         if src.ty == Ty::Error {
@@ -65136,16 +65226,39 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         }
-        if let (Some((r1, p1, _)), Some((r2, p2, _))) = (self.resolve_place(recv_ast), self.resolve_place(src_arg))
-            && r1 == r2
-            && p1 == p2
-        {
+
+        // Backing-buffer alias and disjointness proof (Plan 65 Row M).
+        // Destination and source must resolve to provably distinct, known root buffers.
+        let dst_root = self.expr_root_local(&recv_expr);
+        let src_root = self.expr_root_local(&src);
+        let dst_known = dst_root.is_some_and(|r| self.slice_root_is_known(r));
+        let src_known = src_root.is_some_and(|r| self.slice_root_is_known(r));
+
+        if !dst_known {
             self.diags.error(
-                "cannot copy from overlapping slice: destination and source have the same backing".to_string(),
+                "'.copy_from()' destination is a view of unknown origin; its buffer cannot be proven distinct from the source".to_string(),
+                recv_ast.span,
+            );
+            return err;
+        }
+        if !src_known {
+            self.diags.error(
+                "'.copy_from()' source is a view of unknown origin; its buffer cannot be proven distinct from the destination".to_string(),
+                src_arg.span,
+            );
+            return err;
+        }
+        let dst_r = dst_root.unwrap();
+        let src_r = src_root.unwrap();
+        if dst_r == src_r {
+            let name = self.locals[dst_r as usize].name.clone();
+            self.diags.error(
+                format!("cannot copy from overlapping slice: destination and source have the same backing '{name}'"),
                 span,
             );
             return err;
         }
+
         Expr {
             kind: ExprKind::BytesCopyFrom {
                 dst: Box::new(recv_expr),
