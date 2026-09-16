@@ -2013,7 +2013,8 @@ fn assert_xml_stmt_variant_classified(statement: &Stmt) {
         | Stmt::DropElem(..)
         | Stmt::DropElemField(..)
         | Stmt::BorrowedElementReservation { .. }
-        | Stmt::DropValue(..) => {}
+        | Stmt::DropValue(..)
+        | Stmt::ArrayTruncate { .. } => {}
     }
 }
 
@@ -6177,6 +6178,9 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::BufferLen(..)
             | Rvalue::BufferCapacity(..)
             | Rvalue::BytesRead { .. }
+            | Rvalue::BytesSet { .. }
+            | Rvalue::BytesFill { .. }
+            | Rvalue::BytesCopyFrom { .. }
             | Rvalue::BufferPut { .. }
             | Rvalue::BufferAppend { .. }
             | Rvalue::ArrayBuilderPush { .. }

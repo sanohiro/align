@@ -1,6 +1,6 @@
 # Array prefix mutation and UTF-8 boundary inspection
 
-Status: U/P0 implemented; T and the safe-storage capability remain pending. Audit date: 2026-09-15.
+Status: U/P0 and T implemented. Audit date: 2026-09-15.
 Provider baseline: `61b2de79576fde043d5f310c1300370c02250fc3` (PR 1056).
 Consumer inspected: `b00d3fa9ec0130d762eff6c34712f022ca06172e`.
 This document extends [plan 65](65-open-issue-batch-plan.md). It owns the new

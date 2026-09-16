@@ -173,6 +173,14 @@ fn block_to_string(out: &mut String, b: &Block) {
             Stmt::DropValue(op) => {
                 let _ = writeln!(out, "    drop_value {}", operand_str(op));
             }
+            Stmt::ArrayTruncate { root, path, new_len } => {
+                let _ = writeln!(
+                    out,
+                    "    array_truncate _{root}{} {}",
+                    path_str(path),
+                    operand_str(new_len)
+                );
+            }
             Stmt::ArenaEnd(op) => {
                 let _ = writeln!(out, "    arena_end {}", operand_str(op));
             }
@@ -903,6 +911,15 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::BufferCapacity(buf) => format!("buffer_capacity({})", operand_str(buf)),
         Rvalue::BytesRead { bytes, offset, be, .. } => {
             format!("bytes_read{}({}, {})", if *be { "_be" } else { "_le" }, operand_str(bytes), operand_str(offset))
+        }
+        Rvalue::BytesSet { bytes, offset, value, be, .. } => {
+            format!("bytes_set{}({}, {}, {})", if *be { "_be" } else { "_le" }, operand_str(bytes), operand_str(offset), operand_str(value))
+        }
+        Rvalue::BytesFill { bytes, value, be, .. } => {
+            format!("bytes_fill{}({}, {})", if *be { "_be" } else { "_le" }, operand_str(bytes), operand_str(value))
+        }
+        Rvalue::BytesCopyFrom { dst, src } => {
+            format!("bytes_copy_from({}, {})", operand_str(dst), operand_str(src))
         }
         Rvalue::BufferPut { buffer, value, be, .. } => {
             format!("buffer_put{}({}, {})", if *be { "_be" } else { "_le" }, operand_str(buffer), operand_str(value))

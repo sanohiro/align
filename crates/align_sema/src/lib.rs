@@ -16262,6 +16262,19 @@ impl EffectScan<'_> {
                 walk!(bytes);
                 walk!(offset);
             }
+            ExprKind::BytesSet { bytes, offset, value, .. } => {
+                walk!(bytes);
+                walk!(offset);
+                walk!(value);
+            }
+            ExprKind::BytesFill { bytes, value, .. } => {
+                walk!(bytes);
+                walk!(value);
+            }
+            ExprKind::BytesCopyFrom { dst, src } => {
+                walk!(dst);
+                walk!(src);
+            }
             ExprKind::BufferPut { buffer, value, .. } => {
                 walk!(buffer);
                 walk!(value);
@@ -17181,6 +17194,10 @@ impl EffectScan<'_> {
             ExprKind::StrCharBoundary { receiver: haystack, index: needle } | ExprKind::StrPredicate { haystack, needle, .. } => {
                 walk!(haystack);
                 walk!(needle);
+            }
+            ExprKind::ArrayTruncate { receiver, new_len, .. } => {
+                walk!(receiver);
+                walk!(new_len);
             }
             ExprKind::StrTrim { recv, .. } => walk!(recv),
             ExprKind::Template(parts) => {
@@ -24274,6 +24291,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::BoxGet(..)
             | ExprKind::StrClone(..)
             | ExprKind::StrCharBoundary { .. } | ExprKind::StrPredicate { .. }
+            | ExprKind::ArrayTruncate { .. }
             | ExprKind::BuilderNew { .. }
             | ExprKind::BuilderWrite { .. }
             | ExprKind::BuilderToString(..)
@@ -24333,6 +24351,9 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::BufferNew { .. }
             | ExprKind::BufferLen { .. }
             | ExprKind::BytesRead { .. }
+            | ExprKind::BytesSet { .. }
+            | ExprKind::BytesFill { .. }
+            | ExprKind::BytesCopyFrom { .. }
             | ExprKind::BufferPut { .. }
             | ExprKind::BufferAppend { .. }
             | ExprKind::ArrayBuilderPush { .. }
@@ -24682,6 +24703,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::StrClone(..)
             | ExprKind::CloneIn { .. }
             | ExprKind::StrCharBoundary { .. } | ExprKind::StrPredicate { .. }
+            | ExprKind::ArrayTruncate { .. }
             | ExprKind::StrTrim { .. }
             | ExprKind::StrBorrow(..)
             | ExprKind::StrBytes { .. }
@@ -24783,6 +24805,9 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::BufferNew { .. }
             | ExprKind::BufferLen { .. }
             | ExprKind::BytesRead { .. }
+            | ExprKind::BytesSet { .. }
+            | ExprKind::BytesFill { .. }
+            | ExprKind::BytesCopyFrom { .. }
             | ExprKind::BufferPut { .. }
             | ExprKind::BufferAppend { .. }
             | ExprKind::ArrayBuilderNew { .. }
@@ -27979,6 +28004,10 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(haystack, depth);
                 self.walk(needle, depth);
             }
+            ExprKind::ArrayTruncate { receiver, new_len, .. } => {
+                self.walk(receiver, depth);
+                self.walk(new_len, depth);
+            }
             ExprKind::StrTrim { recv, .. } => self.walk(recv, depth),
             ExprKind::ArrayReduce { source, stages, init, .. }
             | ExprKind::ArrayScan { source, stages, init, .. } => {
@@ -28599,6 +28628,19 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::BytesRead { bytes, offset, .. } => {
                 self.walk(bytes, depth);
                 self.walk(offset, depth);
+            }
+            ExprKind::BytesSet { bytes, offset, value, .. } => {
+                self.walk(bytes, depth);
+                self.walk(offset, depth);
+                self.walk(value, depth);
+            }
+            ExprKind::BytesFill { bytes, value, .. } => {
+                self.walk(bytes, depth);
+                self.walk(value, depth);
+            }
+            ExprKind::BytesCopyFrom { dst, src } => {
+                self.walk(dst, depth);
+                self.walk(src, depth);
             }
             ExprKind::BufferPut { buffer, value, .. } => {
                 self.walk(buffer, depth);
@@ -30654,6 +30696,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::BoxClone(_)
         | ExprKind::StrClone(_)
         | ExprKind::StrCharBoundary { .. } | ExprKind::StrPredicate { .. }
+        | ExprKind::ArrayTruncate { .. }
         | ExprKind::StrTrim { .. }
         | ExprKind::StrBorrow(_)
         | ExprKind::BuilderNew { .. }
@@ -30731,6 +30774,9 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::BufferNew { .. }
         | ExprKind::BufferLen { .. }
         | ExprKind::BytesRead { .. }
+        | ExprKind::BytesSet { .. }
+        | ExprKind::BytesFill { .. }
+        | ExprKind::BytesCopyFrom { .. }
         | ExprKind::BufferPut { .. }
         | ExprKind::BufferAppend { .. }
         | ExprKind::ArrayBuilderNew { .. }
@@ -38781,7 +38827,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ResourceRaw { .. }
             | ExprKind::ResourceIntoRaw { .. }
             | ExprKind::HeapNew(..) | ExprKind::BoxGet(..) | ExprKind::BoxClone(..) | ExprKind::StrClone(..)
-            | ExprKind::StrCharBoundary { .. } | ExprKind::StrPredicate { .. } | ExprKind::BuilderNew { .. } | ExprKind::BuilderWrite { .. }
+            | ExprKind::StrCharBoundary { .. } | ExprKind::StrPredicate { .. } | ExprKind::ArrayTruncate { .. } | ExprKind::BuilderNew { .. } | ExprKind::BuilderWrite { .. }
             | ExprKind::BuilderToString(..) | ExprKind::Select { .. } | ExprKind::VecSumWhere { .. }
             | ExprKind::VecDot { .. } | ExprKind::VecMinMax { .. } | ExprKind::VecSum { .. }
             | ExprKind::VecLoad { .. } | ExprKind::VecStore { .. } | ExprKind::VecLit { .. }
@@ -38802,7 +38848,11 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::IoCopy { .. } | ExprKind::FileCreateRw { .. }
             | ExprKind::FileOpenRw { .. } | ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. }
             | ExprKind::FileLen { .. } | ExprKind::BufferNew { .. } | ExprKind::BufferLen { .. }
-            | ExprKind::BytesRead { .. } | ExprKind::BufferPut { .. } | ExprKind::BufferAppend { .. }
+            | ExprKind::BytesRead { .. }
+            | ExprKind::BytesSet { .. }
+            | ExprKind::BytesFill { .. }
+            | ExprKind::BytesCopyFrom { .. }
+            | ExprKind::BufferPut { .. } | ExprKind::BufferAppend { .. }
             | ExprKind::ArrayBuilderNew { region: None, .. } | ExprKind::ArrayBuilderPush { .. }
             | ExprKind::ArrayBuilderAppend { .. } | ExprKind::FsWriteFile { .. }
             | ExprKind::FsExists { .. } | ExprKind::FsRemove { .. }
@@ -42582,6 +42632,15 @@ impl<'a> MoveCheck<'a> {
             ExprKind::VecStore { dst, .. } | ExprKind::ArrayMapInto { dst, .. } => {
                 Some(SourceVisibleMutationAction::Collection(dst))
             }
+            ExprKind::ArrayTruncate { receiver, .. } => {
+                Some(SourceVisibleMutationAction::Collection(receiver))
+            }
+            ExprKind::BytesSet { bytes, .. } | ExprKind::BytesFill { bytes, .. } => {
+                Some(SourceVisibleMutationAction::Collection(bytes))
+            }
+            ExprKind::BytesCopyFrom { dst, .. } => {
+                Some(SourceVisibleMutationAction::Collection(dst))
+            }
             _ => None,
         }
     }
@@ -44750,6 +44809,28 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, bytes, moved, false, false);
                 move_expr!(self, offset, moved, false, false);
             }
+            ExprKind::BytesSet { bytes, offset, value, .. } => {
+                move_expr!(self, bytes, moved, false, false);
+                move_expr!(self, offset, moved, false, false);
+                move_expr!(self, value, moved, false, false);
+                if !self.collecting_move_children {
+                    self.invalidate_storage(bytes);
+                }
+            }
+            ExprKind::BytesFill { bytes, value, .. } => {
+                move_expr!(self, bytes, moved, false, false);
+                move_expr!(self, value, moved, false, false);
+                if !self.collecting_move_children {
+                    self.invalidate_storage(bytes);
+                }
+            }
+            ExprKind::BytesCopyFrom { dst, src } => {
+                move_expr!(self, dst, moved, false, false);
+                move_expr!(self, src, moved, false, false);
+                if !self.collecting_move_children {
+                    self.invalidate_storage(dst);
+                }
+            }
             ExprKind::BufferPut { buffer, value, .. } => {
                 move_expr!(self, buffer, moved, false, false);
                 move_expr!(self, value, moved, false, false);
@@ -44789,6 +44870,10 @@ impl<'a> MoveCheck<'a> {
             }
             // The receiver is borrowed (the trimmed view aliases its bytes), never consumed.
             ExprKind::StrTrim { recv, .. } => move_expr!(self, recv, moved, false, false),
+            ExprKind::ArrayTruncate { receiver, new_len, .. } => {
+                move_expr!(self, receiver, moved, false, false);
+                move_expr!(self, new_len, moved, false, false);
+            }
             // The receiver is borrowed, not consumed.
             ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => {
@@ -47251,26 +47336,8 @@ impl<'a, 't> Checker<'a, 't> {
                         }
                     }
                     Place::Field { root, path, ty } => {
-                        // Direct field replacement has typed drop-old lowering only for the two
-                        // L1a owned leaves. Gate the final leaf here (not while recursively
-                        // resolving the receiver), so `outer.inner.name = …` can still reach its
-                        // supported `string` leaf through an intermediate Move struct.
-                        if drop_plan(ty, self.structs, self.enums, self.tagged_types).needs_drop()
-                            && !matches!(ty, Ty::String | Ty::Option(Scalar::String))
-                        {
-                            self.diags.error(
-                                format!(
-                                    "field replacement of {} is not supported yet (owned field replacement currently supports only `string` and `Option<string>` leaves; replace the whole struct)",
-                                    self.ty_display(ty)
-                                ),
-                                place.span,
-                            );
-                            let v = self.check_expr(value, None);
-                            stmts.push(Stmt::Expr(v));
-                        } else {
-                            let v = self.check_expr(value, Some(ty));
-                            stmts.push(Stmt::AssignField { root, path, value: v });
-                        }
+                        let v = self.check_expr(value, Some(ty));
+                        stmts.push(Stmt::AssignField { root, path, value: v });
                     }
                     Place::Index { base, index, elem } => {
                         let v = self.check_expr(value, Some(elem));
@@ -52083,6 +52150,9 @@ impl<'a, 't> Checker<'a, 't> {
         if method == "map_into" {
             return self.check_array_map_into(recv, args, span);
         }
+        if method == "truncate" {
+            return self.check_array_truncate(recv, args, span);
+        }
         if method == "to_soa" {
             return self.check_array_to_soa(recv, args, span);
         }
@@ -52252,6 +52322,84 @@ impl<'a, 't> Checker<'a, 't> {
             if recv_expr.ty != Ty::Error {
                 self.diags.error(
                     format!("'.{method}()' is a binary read on a `bytes` (slice<u8>) view, but the receiver is {}", ty_name(recv_expr.ty)),
+                    span,
+                );
+            }
+            return err;
+        }
+        // Binary scalar write on a `bytes` (`slice<u8>`) view (Plan 65 Row W): `b.set_u32_le(off, val)`.
+        if let Some(suffix) = method.strip_prefix("set_")
+            && let Some((scalar, be)) = binary_scalar_suffix(suffix)
+        {
+            let recv_expr = self.check_expr(recv, None);
+            if let Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })) = self.resolve(recv_expr.ty) {
+                return self.check_bytes_set(recv_expr, scalar, be, method, args, span);
+            }
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    format!("'.{method}()' is a binary write on a `bytes` (slice<u8>) view, but the receiver is {}", ty_name(recv_expr.ty)),
+                    span,
+                );
+            }
+            return err;
+        }
+        // In-place byte fill on a `bytes` (`slice<u8>`) view (Plan 65 Row M): `b.fill(val)`.
+        if method == "fill" {
+            let recv_expr = self.check_expr(recv, None);
+            if let Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })) = self.resolve(recv_expr.ty) {
+                return self.check_bytes_fill_u8(recv_expr, method, args, span);
+            }
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    format!("'.fill()' fills a `bytes` (slice<u8>) view, but the receiver is {}", ty_name(recv_expr.ty)),
+                    span,
+                );
+            }
+            return err;
+        }
+        // Single-byte fill forms with scalar suffixes are rejected in favor of .fill(value) (Plan 65 Row P).
+        if method == "fill_u8" || method == "fill_i8" {
+            let recv_expr = self.check_expr(recv, None);
+            if let Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })) = self.resolve(recv_expr.ty) {
+                self.diags.error(
+                    format!("'.{method}()' is not supported; use '.fill(value)' for single-byte fill"),
+                    span,
+                );
+                return err;
+            }
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    format!("'.{method}()' is not a method on {}", ty_name(recv_expr.ty)),
+                    span,
+                );
+            }
+            return err;
+        }
+        // Multi-byte pattern fill on a `bytes` (`slice<u8>`) view (Plan 65 Row P): `b.fill_u32_le(val)`.
+        if let Some(suffix) = method.strip_prefix("fill_")
+            && let Some((scalar, be)) = binary_scalar_suffix(suffix)
+        {
+            let recv_expr = self.check_expr(recv, None);
+            if let Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })) = self.resolve(recv_expr.ty) {
+                return self.check_bytes_fill_scalar(recv_expr, scalar, be, method, args, span);
+            }
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    format!("'.{method}()' is a pattern fill on a `bytes` (slice<u8>) view, but the receiver is {}", ty_name(recv_expr.ty)),
+                    span,
+                );
+            }
+            return err;
+        }
+        // In-place byte copy on a `bytes` (`slice<u8>`) view (Plan 65 Row M): `dst.copy_from(src)`.
+        if method == "copy_from" {
+            let recv_expr = self.check_expr(recv, None);
+            if let Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })) = self.resolve(recv_expr.ty) {
+                return self.check_bytes_copy_from(recv_expr, recv, method, args, span);
+            }
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    format!("'.copy_from()' is a byte copy on a `bytes` (slice<u8>) view, but the receiver is {}", ty_name(recv_expr.ty)),
                     span,
                 );
             }
@@ -57249,6 +57397,66 @@ impl<'a, 't> Checker<'a, 't> {
         }
         Expr {
             kind: ExprKind::ArrayMapInto { source: Box::new(source), stages, dst: Box::new(dst), elem },
+            ty: Ty::Unit,
+            span,
+        }
+    }
+
+    /// `arr.truncate(new_len)` — in-place length reduction on a dynamic array place (Plan 66 ledger T).
+    fn check_array_truncate(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let recv_expr = self.check_expr(recv, None);
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let new_len_expr = if let [len_arg] = args {
+            Some(self.check_expr(len_arg, Some(i64_ty)))
+        } else {
+            None
+        };
+        if recv_expr.ty == Ty::Error || new_len_expr.as_ref().is_some_and(|e| e.ty == Ty::Error) {
+            return err;
+        }
+        let [len_arg] = args else {
+            self.diags.error(
+                format!("'truncate' takes 1 argument (new_len: i64), got {}", args.len()),
+                span,
+            );
+            return err;
+        };
+        let new_len_expr = new_len_expr.expect("single argument present");
+        let Some((root, path, recv_ty)) = self.resolve_place(recv) else {
+            self.diags.error(
+                "'truncate' needs a mutable place (a named `mut` local or mutable field path)".to_string(),
+                recv.span,
+            );
+            return err;
+        };
+        let recv_ty = self.resolve(recv_ty);
+        if dynamic_array_element_type(recv_ty).is_none() {
+            self.diags.error(
+                format!("'truncate' operates on dynamic arrays, got {}", ty_name(recv_ty)),
+                recv.span,
+            );
+            return err;
+        }
+        if !self.locals[root as usize].is_mut {
+            let name = self.locals[root as usize].name.clone();
+            self.diags.error(
+                format!("cannot truncate immutable '{name}' (declare with `mut`)"),
+                recv.span,
+            );
+            return err;
+        }
+        if !self.require_i64_arg(new_len_expr.ty, len_arg.span, "'truncate' length") {
+            return err;
+        }
+        let new_len_expr = Expr { ty: i64_ty, ..new_len_expr };
+        Expr {
+            kind: ExprKind::ArrayTruncate {
+                root,
+                path,
+                receiver: Box::new(recv_expr),
+                new_len: Box::new(new_len_expr),
+            },
             ty: Ty::Unit,
             span,
         }
@@ -64800,6 +65008,154 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::BytesRead { bytes: Box::new(recv_expr), offset: Box::new(off), be }, ty: scalar, span }
     }
 
+    /// `bytes.set_<scalar>_<le|be>(off, val)` — bounds-checked binary scalar write to a `bytes`
+    /// (`slice<u8>`) view (Plan 65 Row W).
+    fn check_bytes_set(&mut self, recv_expr: Expr, scalar: Ty, be: bool, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let [off_arg, val_arg] = args else {
+            self.diags.error(
+                format!("'.{method}()' takes 2 arguments (offset: i64, value: {}), got {}", ty_name(scalar), args.len()),
+                span,
+            );
+            return err;
+        };
+        let off = self.check_expr(off_arg, Some(Ty::Int(IntTy { bits: 64, signed: true })));
+        if off.ty == Ty::Error {
+            return err;
+        }
+        if !self.require_i64_arg(off.ty, off_arg.span, &format!("'.{method}()' offset")) {
+            return err;
+        }
+        let val = self.check_expr(val_arg, Some(scalar));
+        if val.ty == Ty::Error {
+            return err;
+        }
+        if self.resolve(val.ty) != scalar {
+            self.diags.error(
+                format!("'.{method}()' value must be {}, got {}", ty_name(scalar), ty_name(val.ty)),
+                val_arg.span,
+            );
+            return err;
+        }
+        Expr {
+            kind: ExprKind::BytesSet {
+                bytes: Box::new(recv_expr),
+                offset: Box::new(off),
+                value: Box::new(val),
+                be,
+            },
+            ty: Ty::Unit,
+            span,
+        }
+    }
+
+    /// `bytes.fill(val)` — fill a `bytes` (`slice<u8>`) view with a single byte value (Plan 65 Row M).
+    fn check_bytes_fill_u8(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let [val_arg] = args else {
+            self.diags.error(
+                format!("'.{method}()' takes 1 argument (value: u8), got {}", args.len()),
+                span,
+            );
+            return err;
+        };
+        let u8_ty = Ty::Int(IntTy { bits: 8, signed: false });
+        let val = self.check_expr(val_arg, Some(u8_ty));
+        if val.ty == Ty::Error {
+            return err;
+        }
+        if self.resolve(val.ty) != u8_ty {
+            self.diags.error(
+                format!("'.{method}()' value must be u8, got {}", ty_name(val.ty)),
+                val_arg.span,
+            );
+            return err;
+        }
+        Expr {
+            kind: ExprKind::BytesFill {
+                bytes: Box::new(recv_expr),
+                value: Box::new(val),
+                be: false,
+            },
+            ty: Ty::Unit,
+            span,
+        }
+    }
+
+    /// `bytes.fill_<scalar>_<le|be>(val)` — pattern fill a `bytes` (`slice<u8>`) view with repeated multi-byte scalar (Plan 65 Row P).
+    fn check_bytes_fill_scalar(&mut self, recv_expr: Expr, scalar: Ty, be: bool, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let [val_arg] = args else {
+            self.diags.error(
+                format!("'.{method}()' takes 1 argument (value: {}), got {}", ty_name(scalar), args.len()),
+                span,
+            );
+            return err;
+        };
+        let val = self.check_expr(val_arg, Some(scalar));
+        if val.ty == Ty::Error {
+            return err;
+        }
+        if self.resolve(val.ty) != scalar {
+            self.diags.error(
+                format!("'.{method}()' value must be {}, got {}", ty_name(scalar), ty_name(val.ty)),
+                val_arg.span,
+            );
+            return err;
+        }
+        Expr {
+            kind: ExprKind::BytesFill {
+                bytes: Box::new(recv_expr),
+                value: Box::new(val),
+                be,
+            },
+            ty: Ty::Unit,
+            span,
+        }
+    }
+
+    /// `dst.copy_from(src)` — in-place copy between non-overlapping `bytes` (`slice<u8>`) views (Plan 65 Row M).
+    fn check_bytes_copy_from(&mut self, recv_expr: Expr, recv_ast: &ast::Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let [src_arg] = args else {
+            self.diags.error(
+                format!("'.{method}()' takes 1 argument (source: slice<u8>), got {}", args.len()),
+                span,
+            );
+            return err;
+        };
+        let u8_slice = Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false }));
+        let src = self.check_expr(src_arg, Some(u8_slice));
+        if src.ty == Ty::Error {
+            return err;
+        }
+        if self.resolve(src.ty) != u8_slice {
+            self.diags.error(
+                format!("'.{method}()' source must be slice<u8>, got {}", ty_name(src.ty)),
+                src_arg.span,
+            );
+            return err;
+        }
+        if let (Some((r1, p1, _)), Some((r2, p2, _))) = (self.resolve_place(recv_ast), self.resolve_place(src_arg))
+            && r1 == r2
+            && p1 == p2
+        {
+            self.diags.error(
+                "cannot copy from overlapping slice: destination and source have the same backing".to_string(),
+                span,
+            );
+            return err;
+        }
+        Expr {
+            kind: ExprKind::BytesCopyFrom {
+                dst: Box::new(recv_expr),
+                src: Box::new(src),
+            },
+            ty: Ty::Unit,
+            span,
+        }
+    }
+
     /// `buf.put_<scalar>_<le|be>(v)` — append `v`'s bytes to a growable `buffer` (A2, the encode dual
     /// of [`Self::check_bytes_read`]). The receiver must be a `mut buffer` local (mutated in place,
     /// like an `rng` method); `v` must match the scalar `scalar` exactly.
@@ -67194,6 +67550,19 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(bytes);
                 self.finalize_expr(offset);
             }
+            ExprKind::BytesSet { bytes, offset, value, .. } => {
+                self.finalize_expr(bytes);
+                self.finalize_expr(offset);
+                self.finalize_expr(value);
+            }
+            ExprKind::BytesFill { bytes, value, .. } => {
+                self.finalize_expr(bytes);
+                self.finalize_expr(value);
+            }
+            ExprKind::BytesCopyFrom { dst, src } => {
+                self.finalize_expr(dst);
+                self.finalize_expr(src);
+            }
             ExprKind::BufferPut { buffer, value, .. } => {
                 self.finalize_expr(buffer);
                 self.finalize_expr(value);
@@ -67213,6 +67582,10 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(needle);
             }
             ExprKind::StrTrim { recv, .. } => self.finalize_expr(recv),
+            ExprKind::ArrayTruncate { receiver, new_len, .. } => {
+                self.finalize_expr(receiver);
+                self.finalize_expr(new_len);
+            }
             ExprKind::Tuple { elems, .. } => {
                 for el in elems {
                     self.finalize_expr(el);
@@ -69070,7 +69443,7 @@ fn fixed_array_type(
     }
 }
 
-fn dynamic_array_element_type(array: Ty) -> Option<Ty> {
+pub fn dynamic_array_element_type(array: Ty) -> Option<Ty> {
     match array {
         Ty::DynArray(element) => Some(scalar_to_ty(element)),
         Ty::DynStructArray(id, Layout::Aos) => Some(Ty::Struct(id)),
@@ -69079,6 +69452,7 @@ fn dynamic_array_element_type(array: Ty) -> Option<Ty> {
         Ty::DynFixedArray(element, length) => Some(Ty::Array(element, length)),
         Ty::DynFixedStructArray(id, length) => Some(Ty::StructArray(id, length)),
         Ty::DynSliceArray(element) => Some(Ty::Slice(prim_to_scalar(element))),
+        Ty::DynResponseArray => Some(Ty::HttpResponse),
         _ => None,
     }
 }
@@ -73136,7 +73510,7 @@ mod tests {
         // StrCharBoundary has a scalar result and retains no storage.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 333,
+            variants, 337,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 
@@ -81389,19 +81763,27 @@ fn exit_branch(flag: bool) -> i64 {
             "Pair { left: array<i64>, right: array<i64> }\nfn make() -> array<i64> = [1].to_array()\nfn main() -> i32 {\n  arena {\n    mut p := Pair { left: make(), right: make() }\n    p.right = [2].to_array()\n    print(p.left.len())\n  }\n  return 0\n}\n";
         let (_p, d) = check(field_reassign);
         assert!(
-            d.iter()
-                .any(|e| e.message.contains("field replacement of array<i64> is not supported yet")),
-            "owned-array field replacement must fail closed before it can introduce mixed aggregate ownership"
+            d.iter().any(|e| e.message.contains("an owned aggregate cannot change allocation mode through a field assignment")),
+            "mixed allocation mode assignment must be rejected"
         );
 
         let joined_field =
             "Wrap { xs: array<i64> }\nfn make() -> array<i64> = [1].to_array()\nfn run(c: bool) -> i32 {\n  arena {\n    mut w := Wrap { xs: make() }\n    if c {\n      w = Wrap { xs: [2].to_array() }\n    }\n    w.xs = [3].to_array()\n    return 0\n  }\n}\nfn main() -> i32 = run(false)\n";
         let (_p, d) = check(joined_field);
         assert!(
-            d.iter()
-                .any(|e| e.message.contains("field replacement of array<i64> is not supported yet")),
-            "a heap/arena path-dependent aggregate must reject unsupported owned-field mutation"
+            d.iter().any(|e| e.message.contains("an owned aggregate cannot change allocation mode through a field assignment")),
+            "a heap/arena path-dependent aggregate must reject mixed owned-field mutation"
         );
+
+        let uniform_heap =
+            "Pair { left: array<i64>, right: array<i64> }\nfn make() -> array<i64> = [1].to_array()\nfn main() -> i32 {\n  mut p := Pair { left: make(), right: make() }\n  p.right = [2].to_array()\n  print(p.left.len())\n  return 0\n}\n";
+        let (_p, d) = check(uniform_heap);
+        assert!(!d.has_errors(), "uniform heap owned field replacement must succeed: {:?}", d.iter().map(|e| &e.message).collect::<Vec<_>>());
+
+        let uniform_arena =
+            "Pair { left: array<i64>, right: array<i64> }\nfn main() -> i32 {\n  arena {\n    mut p := Pair { left: [1].to_array(), right: [1].to_array() }\n    p.right = [2].to_array()\n    print(p.left.len())\n  }\n  return 0\n}\n";
+        let (_p, d) = check(uniform_arena);
+        assert!(!d.has_errors(), "uniform arena owned field replacement must succeed: {:?}", d.iter().map(|e| &e.message).collect::<Vec<_>>());
     }
 
     #[test]

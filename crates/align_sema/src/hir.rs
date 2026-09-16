@@ -889,6 +889,13 @@ pub enum ExprKind {
     StrPredicate { kind: StrPredKind, haystack: Box<Expr>, needle: Box<Expr> },
     /// Total UTF-8 boundary inspection; the index is an exact i64 byte offset.
     StrCharBoundary { receiver: Box<Expr>, index: Box<Expr> },
+    /// In-place dynamic array length truncation (`arr.truncate(new_len)`).
+    ArrayTruncate {
+        root: LocalId,
+        path: Vec<u32>,
+        receiver: Box<Expr>,
+        new_len: Box<Expr>,
+    },
     /// `s.trim()` / `s.trim_start()` / `s.trim_end()` — strip ASCII whitespace, yielding a
     /// **borrowed sub-`str`** of `recv` (`ty` = `str`, no allocation). `recv` is a `str` view (an
     /// owned `string` is auto-borrowed via [`ExprKind::StrBorrow`]); the result views the same
@@ -1402,6 +1409,12 @@ pub enum ExprKind {
     /// same policy as `slice[i]` (a structural over-read is a bug; a parser checks `.len()` first).
     /// Pure (a memory read, like an index). The `bytes` view and `off` are borrowed, not consumed.
     BytesRead { bytes: Box<Expr>, offset: Box<Expr>, be: bool },
+    /// `bytes.set_<scalar>_<le|be>(off, val)` — in-place binary scalar write to a `slice<u8>` view (Plan 65 Row W).
+    BytesSet { bytes: Box<Expr>, offset: Box<Expr>, value: Box<Expr>, be: bool },
+    /// `bytes.fill(val)` / `bytes.fill_<scalar>_<le|be>(val)` — in-place pattern fill of a `slice<u8>` view (Plan 65 Rows M & P).
+    BytesFill { bytes: Box<Expr>, value: Box<Expr>, be: bool },
+    /// `dst.copy_from(src)` — in-place copy from `src` to `dst` `slice<u8>` view (Plan 65 Row M).
+    BytesCopyFrom { dst: Box<Expr>, src: Box<Expr> },
     /// `buf.put_<scalar>_<le|be>(v)` — append `v`'s bytes to a growable `buffer` in the given byte
     /// order, growing it (the encode dual of [`BytesRead`]). `v`'s scalar type sets the width; `be`
     /// selects big-endian. The `ty` is [`crate::Ty::Unit`]. The receiver must be a `mut buffer`

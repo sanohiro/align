@@ -55,7 +55,7 @@ use align_mir::{
 };
 use align_sema::{
     ArrayBuilderElem, DropPlan, ERROR_VARIANT_CODE, EnumDef, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty,
-    drop_plan, hir, scalar_to_ty, struct_is_move, ty_to_scalar,
+    drop_plan, dynamic_array_element_type, hir, scalar_to_ty, struct_is_move, ty_to_scalar,
 };
 
 use inkwell::AddressSpace;
@@ -11087,6 +11087,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // post-lowering validation recover the reservation's final position after block
                 // compaction or statement fusion without emitting any LLVM instruction.
                 Stmt::BorrowedElementReservation { .. } => {}
+                Stmt::ArrayTruncate { root, path, new_len } => {
+                    self.compile_array_truncate(*root, path, new_len)?;
+                }
             }
         }
         self.current_mir_statement = None;
@@ -14104,6 +14107,184 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
+            Rvalue::BytesSet { bytes, offset, value, scalar, be } => {
+                let (ptr, _len) = self.split_str(bytes)?;
+                let ptr = ptr.into_pointer_value();
+                let off = self.operand(offset)?.into_int_value();
+                let addr = unsafe {
+                    self.builder.build_gep(self.ctx.i8_type(), ptr, &[off], "byteaddr").map_err(|e| self.err(e))?
+                };
+                let is_float = matches!(scalar, Ty::Float(_));
+                let store_int_ty = if is_float {
+                    match scalar { Ty::Float(FloatTy { bits: 32 }) => self.ctx.i32_type(), _ => self.ctx.i64_type() }
+                } else {
+                    int_type(self.ctx, *scalar)
+                };
+                let val_val = self.operand(value)?;
+                let raw_bits = if is_float {
+                    let float_val = val_val.into_float_value();
+                    let fty = match scalar {
+                        Ty::Float(FloatTy { bits: 32 }) => self.ctx.f32_type(),
+                        _ => self.ctx.f64_type(),
+                    };
+                    let fv = if float_val.get_type() != fty {
+                        self.builder.build_float_cast(float_val, fty, "fcast").map_err(|e| self.err(e))?
+                    } else {
+                        float_val
+                    };
+                    self.builder.build_bit_cast(fv, store_int_ty, "fbits").map_err(|e| self.err(e))?.into_int_value()
+                } else {
+                    let int_val = val_val.into_int_value();
+                    if int_val.get_type() != store_int_ty {
+                        self.builder.build_int_cast(int_val, store_int_ty, "cast").map_err(|e| self.err(e))?
+                    } else {
+                        int_val
+                    }
+                };
+                let final_bits = if *be && store_int_ty.get_bit_width() > 8 {
+                    self.call_intrinsic("llvm.bswap", &[store_int_ty.into()], &[raw_bits.into()])?.into_int_value()
+                } else {
+                    raw_bits
+                };
+                let st = self.builder.build_store(addr, final_bits).map_err(|e| self.err(e))?;
+                st.set_alignment(1).map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
+            Rvalue::BytesFill { bytes, value, scalar, be } => {
+                let (ptr, len) = self.split_str(bytes)?;
+                let ptr = ptr.into_pointer_value();
+                let len = len.into_int_value();
+                let width = match scalar {
+                    Ty::Int(IntTy { bits, .. }) | Ty::Float(FloatTy { bits }) => u64::from(*bits) / 8,
+                    _ => return Err(self.err("bytes fill scalar must be a fixed-width int/float")),
+                };
+                let is_float = matches!(scalar, Ty::Float(_));
+                let store_int_ty = if is_float {
+                    match scalar { Ty::Float(FloatTy { bits: 32 }) => self.ctx.i32_type(), _ => self.ctx.i64_type() }
+                } else {
+                    int_type(self.ctx, *scalar)
+                };
+                let val_val = self.operand(value)?;
+                let raw_bits = if is_float {
+                    let float_val = val_val.into_float_value();
+                    let fty = match scalar {
+                        Ty::Float(FloatTy { bits: 32 }) => self.ctx.f32_type(),
+                        _ => self.ctx.f64_type(),
+                    };
+                    let fv = if float_val.get_type() != fty {
+                        self.builder.build_float_cast(float_val, fty, "fcast").map_err(|e| self.err(e))?
+                    } else {
+                        float_val
+                    };
+                    self.builder.build_bit_cast(fv, store_int_ty, "fbits").map_err(|e| self.err(e))?.into_int_value()
+                } else {
+                    let int_val = val_val.into_int_value();
+                    if int_val.get_type() != store_int_ty {
+                        self.builder.build_int_cast(int_val, store_int_ty, "cast").map_err(|e| self.err(e))?
+                    } else {
+                        int_val
+                    }
+                };
+                let final_bits = if *be && store_int_ty.get_bit_width() > 8 {
+                    self.call_intrinsic("llvm.bswap", &[store_int_ty.into()], &[raw_bits.into()])?.into_int_value()
+                } else {
+                    raw_bits
+                };
+
+                let mut all_bytes_equal = width == 1;
+                let mut single_byte_val = None;
+                if width > 1
+                    && let Operand::Const(c) = value
+                {
+                    let raw_u64: Option<u64> = match c {
+                        Const::Int(v, _) => Some(*v as u64),
+                        Const::Float(f, Ty::Float(FloatTy { bits: 32 })) => Some((*f as f32).to_bits() as u64),
+                        Const::Float(f, Ty::Float(FloatTy { bits: 64 })) => Some(f.to_bits()),
+                        _ => None,
+                    };
+                    if let Some(mut bits) = raw_u64 {
+                        if *be {
+                            bits = match width {
+                                2 => (bits as u16).swap_bytes() as u64,
+                                4 => (bits as u32).swap_bytes() as u64,
+                                8 => bits.swap_bytes(),
+                                _ => bits,
+                            };
+                        }
+                        let b0 = (bits & 0xff) as u8;
+                        let mut identical = true;
+                        for i in 1..width {
+                            let bi = ((bits >> (i * 8)) & 0xff) as u8;
+                            if bi != b0 {
+                                identical = false;
+                                break;
+                            }
+                        }
+                        if identical {
+                            all_bytes_equal = true;
+                            single_byte_val = Some(b0);
+                        }
+                    }
+                }
+
+                if all_bytes_equal {
+                    let byte_val = match single_byte_val {
+                        Some(b) => self.ctx.i8_type().const_int(u64::from(b), false),
+                        None => {
+                            if raw_bits.get_type() == self.ctx.i8_type() {
+                                raw_bits
+                            } else {
+                                self.builder.build_int_cast(raw_bits, self.ctx.i8_type(), "byteval").map_err(|e| self.err(e))?
+                            }
+                        }
+                    };
+                    self.builder.build_memset(ptr, 1, byte_val, len).map_err(|e| self.err(e))?;
+                    return Ok(None);
+                }
+
+                // Canonical vectorizable loop indexing by element width with align 1 stores.
+                let zero = self.ctx.i64_type().const_zero();
+                let is_empty = self.builder.build_int_compare(IntPredicate::SLE, len, zero, "fill.is_empty").map_err(|e| self.err(e))?;
+                let head = self.ctx.append_basic_block(self.func, "fill.head");
+                let body = self.ctx.append_basic_block(self.func, "fill.body");
+                let done = self.ctx.append_basic_block(self.func, "fill.done");
+
+                let pred = self.builder.get_insert_block().ok_or_else(|| self.err("no insert block"))?;
+                self.builder.build_conditional_branch(is_empty, done, head).map_err(|e| self.err(e))?;
+
+                self.builder.position_at_end(head);
+                let phi = self.builder.build_phi(self.ctx.i64_type(), "fill.off").map_err(|e| self.err(e))?;
+                phi.add_incoming(&[(&zero, pred)]);
+                let cur_off = phi.as_basic_value().into_int_value();
+                let cond = self.builder.build_int_compare(IntPredicate::SLT, cur_off, len, "fill.cmp").map_err(|e| self.err(e))?;
+                self.builder.build_conditional_branch(cond, body, done).map_err(|e| self.err(e))?;
+
+                self.builder.position_at_end(body);
+                let addr = unsafe {
+                    self.builder.build_gep(self.ctx.i8_type(), ptr, &[cur_off], "fill.addr").map_err(|e| self.err(e))?
+                };
+                let st = self.builder.build_store(addr, final_bits).map_err(|e| self.err(e))?;
+                st.set_alignment(1).map_err(|e| self.err(e))?;
+                let step = self.ctx.i64_type().const_int(width, false);
+                let next_off = self.builder.build_int_add(cur_off, step, "fill.next").map_err(|e| self.err(e))?;
+                let after_body = self.builder.get_insert_block().ok_or_else(|| self.err("no insert block"))?;
+                phi.add_incoming(&[(&next_off, after_body)]);
+                self.builder.build_unconditional_branch(head).map_err(|e| self.err(e))?;
+
+                self.builder.position_at_end(done);
+                return Ok(None);
+            }
+            Rvalue::BytesCopyFrom { dst, src } => {
+                let (dst_ptr, dst_len) = self.split_str(dst)?;
+                let (src_ptr, _src_len) = self.split_str(src)?;
+                let dst_ptr = dst_ptr.into_pointer_value();
+                let src_ptr = src_ptr.into_pointer_value();
+                let dst_len = dst_len.into_int_value();
+                self.builder
+                    .build_memcpy(dst_ptr, 1, src_ptr, 1, dst_len)
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
             // `array_builder<T>` (M12 A6) new/push/push_str/append/build go through ONE
             // `#[inline(never)]` dispatcher, so `gen_rvalue` gains a single tiny arm rather than five
             // inline bodies (the #296 expr-depth lesson, mirroring the file-rvalue dispatcher).
@@ -16966,6 +17147,133 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::StructArray(id, _) => id,
             other => unreachable!("element-field access on non-struct-array slot of type {other:?}"),
         }
+    }
+
+    /// Truncate a dynamic array place in place to `new_len` elements (Plan 66 ledger T).
+    fn compile_array_truncate(
+        &mut self,
+        root: Slot,
+        path: &[u32],
+        new_len: &Operand,
+    ) -> Result<(), CodegenError> {
+        let arr_ptr = if path.is_empty() {
+            *self.slots.get(&root).ok_or_else(|| self.err("missing array slot"))?
+        } else {
+            self.field_path_ptr(root, path)?
+        };
+
+        let mut ty = *self.f.slots.get(root as usize).ok_or_else(|| self.err("invalid slot"))?;
+        for &idx in path {
+            ty = match ty {
+                Ty::Struct(sid) => {
+                    let sdef = self.structs.get(sid as usize).ok_or_else(|| self.err("missing struct def"))?;
+                    let fdef = sdef.fields.get(idx as usize).ok_or_else(|| self.err("missing field def"))?;
+                    fdef.ty
+                }
+                _ => return Err(self.err("path through non-struct")),
+            };
+        }
+        let elem_ty = dynamic_array_element_type(ty).ok_or_else(|| self.err("expected dynamic array type"))?;
+
+        let slice_ty = slice_struct_type(self.ctx);
+        let agg = self
+            .builder
+            .build_load(slice_ty, arr_ptr, "trunc.load")
+            .map_err(|e| self.err(e))?
+            .into_struct_value();
+        let buf_ptr = self
+            .builder
+            .build_extract_value(agg, 0, "trunc.ptr")
+            .map_err(|e| self.err(e))?
+            .into_pointer_value();
+        let old_len = self
+            .builder
+            .build_extract_value(agg, 1, "trunc.old_len")
+            .map_err(|e| self.err(e))?
+            .into_int_value();
+
+        let new_len_val = self.operand(new_len)?.into_int_value();
+
+        let zero = self.ctx.i64_type().const_zero();
+        let is_neg = self
+            .builder
+            .build_int_compare(IntPredicate::SLT, new_len_val, zero, "trunc.is_neg")
+            .map_err(|e| self.err(e))?;
+        let is_over = self
+            .builder
+            .build_int_compare(IntPredicate::SGT, new_len_val, old_len, "trunc.is_over")
+            .map_err(|e| self.err(e))?;
+        let is_invalid = self
+            .builder
+            .build_or(is_neg, is_over, "trunc.is_invalid")
+            .map_err(|e| self.err(e))?;
+
+        let fail_bb = self.ctx.append_basic_block(self.func, "trunc.fail");
+        let ok_bb = self.ctx.append_basic_block(self.func, "trunc.ok");
+        self.builder
+            .build_conditional_branch(is_invalid, fail_bb, ok_bb)
+            .map_err(|e| self.err(e))?;
+
+        self.builder.position_at_end(fail_bb);
+        self.builder
+            .build_call(
+                self.runtime(RuntimeKey::RangeFail),
+                &[zero.into(), new_len_val.into(), old_len.into()],
+                "",
+            )
+            .map_err(|e| self.err(e))?;
+        self.builder.build_unreachable().map_err(|e| self.err(e))?;
+
+        self.builder.position_at_end(ok_bb);
+        let needs_drop = drop_plan(
+            elem_ty,
+            self.structs,
+            self.enums,
+            self.tagged_defs,
+        )
+        .needs_drop();
+
+        if needs_drop {
+            let head = self.ctx.append_basic_block(self.func, "trunc.drop.head");
+            let body = self.ctx.append_basic_block(self.func, "trunc.drop.body");
+            let done = self.ctx.append_basic_block(self.func, "trunc.drop.done");
+            let pred = self.builder.get_insert_block().ok_or_else(|| self.err("no insert block"))?;
+            self.builder.build_unconditional_branch(head).map_err(|e| self.err(e))?;
+
+            self.builder.position_at_end(head);
+            let phi = self.builder.build_phi(self.ctx.i64_type(), "trunc.i").map_err(|e| self.err(e))?;
+            phi.add_incoming(&[(&new_len_val, pred)]);
+            let i_cur = phi.as_basic_value().into_int_value();
+            let cond = self
+                .builder
+                .build_int_compare(IntPredicate::SLT, i_cur, old_len, "trunc.cmp")
+                .map_err(|e| self.err(e))?;
+            self.builder.build_conditional_branch(cond, body, done).map_err(|e| self.err(e))?;
+
+            self.builder.position_at_end(body);
+            let elem_lt = self.llvm_type(elem_ty);
+            let ep = unsafe {
+                self.builder.build_gep(elem_lt, buf_ptr, &[i_cur], "trunc.elem_ptr").map_err(|e| self.err(e))?
+            };
+            self.drop_ty_at(ep, elem_ty)?;
+            let after_body = self.builder.get_insert_block().ok_or_else(|| self.err("no insert block"))?;
+            let one = self.ctx.i64_type().const_int(1, false);
+            let next_i = self.builder.build_int_add(i_cur, one, "trunc.next_i").map_err(|e| self.err(e))?;
+            phi.add_incoming(&[(&next_i, after_body)]);
+            self.builder.build_unconditional_branch(head).map_err(|e| self.err(e))?;
+
+            self.builder.position_at_end(done);
+        }
+
+        let updated_agg = self
+            .builder
+            .build_insert_value(agg, new_len_val, 1, "trunc.new_agg")
+            .map_err(|e| self.err(e))?;
+        self.builder
+            .build_store(arr_ptr, updated_agg)
+            .map_err(|e| self.err(e))?;
+
+        Ok(())
     }
 
     /// `&slot.f0.f1.…` via a chain of struct GEPs (each level needs its pointee struct type — LLVM
@@ -21518,7 +21826,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             | Stmt::NullElemField(slot, ..)
             | Stmt::Drop(slot)
             | Stmt::DropElem(slot, ..)
-            | Stmt::DropElemField(slot, ..) => *slot == root,
+            | Stmt::DropElemField(slot, ..)
+            | Stmt::ArrayTruncate { root: slot, .. } => *slot == root,
             Stmt::StoreElemFieldPtr { base, .. } => Self::mir_operand_is_place_root(base, root),
             Stmt::ArenaEnd(operand)
             | Stmt::RawFree(operand)

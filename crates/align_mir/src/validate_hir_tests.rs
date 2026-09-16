@@ -11828,9 +11828,9 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        // StrCharBoundary is explicit in validation, source-shape, replay and ownership.
+        // StrCharBoundary, ArrayTruncate, BytesSet, BytesFill, BytesCopyFrom are explicit in validation, source-shape, replay and ownership.
         variants,
-        333,
+        337,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -18848,5 +18848,107 @@ fn text_boundary_hir_rejects_forged_types_in_every_entrypoint() {
             _ => expression.ty = Ty::Int(IntTy { bits: 64, signed: true }),
         }
         assert_body_entrypoints_empty("text-boundary-forged", &malformed);
+    }
+}
+
+#[test]
+fn array_truncate_hir_rejects_forged_types_in_every_entrypoint() {
+    let base = checked_source_program("fn f(index: i64) {\n  mut arr := [1, 2, 3].to_array()\n  arr.truncate(index)\n}");
+    assert!(!is_empty(&lower_program(&base)));
+    for mutation in 0..4 {
+        let mut malformed = base.clone();
+        let expression = malformed
+            .fns
+            .iter_mut()
+            .find(|function| function.name.as_str() == "f")
+            .unwrap()
+            .body
+            .value
+            .as_deref_mut()
+            .expect("body value expression");
+        let hir::ExprKind::ArrayTruncate { root, receiver, new_len, .. } = &mut expression.kind else { panic!("truncate fixture") };
+        let root_id = *root;
+        match mutation {
+            0 => **receiver = body_test_expr(hir::ExprKind::Int(0), Ty::Int(IntTy { bits: 64, signed: true })),
+            1 => **new_len = body_test_expr(hir::ExprKind::Int(0), Ty::Int(IntTy { bits: 32, signed: true })),
+            2 => expression.ty = Ty::Int(IntTy { bits: 64, signed: true }),
+            _ => {
+                malformed
+                    .fns
+                    .iter_mut()
+                    .find(|function| function.name.as_str() == "f")
+                    .unwrap()
+                    .locals[root_id as usize]
+                    .is_mut = false;
+            }
+        }
+        assert_body_entrypoints_empty("array-truncate-forged", &malformed);
+    }
+}
+
+#[test]
+fn bytes_ops_hir_rejects_forged_types_in_every_entrypoint() {
+    let base_set = checked_source_program("fn f(borrow mut b: slice<u8>) {\n  b.set_i64_le(0, 1)\n}");
+    assert!(!is_empty(&lower_program(&base_set)));
+    for mutation in 0..3 {
+        let mut malformed = base_set.clone();
+        let expression = malformed
+            .fns
+            .iter_mut()
+            .find(|function| function.name.as_str() == "f")
+            .unwrap()
+            .body
+            .value
+            .as_deref_mut()
+            .expect("body value expression");
+        let hir::ExprKind::BytesSet { bytes, offset, .. } = &mut expression.kind else { panic!("set fixture") };
+        match mutation {
+            0 => **bytes = body_test_expr(hir::ExprKind::Int(0), Ty::Int(IntTy { bits: 64, signed: true })),
+            1 => **offset = body_test_expr(hir::ExprKind::Int(0), Ty::Int(IntTy { bits: 32, signed: true })),
+            _ => expression.ty = Ty::Int(IntTy { bits: 64, signed: true }),
+        }
+        assert_body_entrypoints_empty("bytes-set-forged", &malformed);
+    }
+
+    let base_fill = checked_source_program("fn f(borrow mut b: slice<u8>) {\n  b.fill(0)\n}");
+    assert!(!is_empty(&lower_program(&base_fill)));
+    for mutation in 0..2 {
+        let mut malformed = base_fill.clone();
+        let expression = malformed
+            .fns
+            .iter_mut()
+            .find(|function| function.name.as_str() == "f")
+            .unwrap()
+            .body
+            .value
+            .as_deref_mut()
+            .expect("body value expression");
+        let hir::ExprKind::BytesFill { bytes, .. } = &mut expression.kind else { panic!("fill fixture") };
+        match mutation {
+            0 => **bytes = body_test_expr(hir::ExprKind::Int(0), Ty::Int(IntTy { bits: 64, signed: true })),
+            _ => expression.ty = Ty::Int(IntTy { bits: 64, signed: true }),
+        }
+        assert_body_entrypoints_empty("bytes-fill-forged", &malformed);
+    }
+
+    let base_copy = checked_source_program("fn f(borrow mut d: slice<u8>, borrow s: slice<u8>) {\n  d.copy_from(s)\n}");
+    assert!(!is_empty(&lower_program(&base_copy)));
+    for mutation in 0..2 {
+        let mut malformed = base_copy.clone();
+        let expression = malformed
+            .fns
+            .iter_mut()
+            .find(|function| function.name.as_str() == "f")
+            .unwrap()
+            .body
+            .value
+            .as_deref_mut()
+            .expect("body value expression");
+        let hir::ExprKind::BytesCopyFrom { dst, .. } = &mut expression.kind else { panic!("copy fixture") };
+        match mutation {
+            0 => **dst = body_test_expr(hir::ExprKind::Int(0), Ty::Int(IntTy { bits: 64, signed: true })),
+            _ => expression.ty = Ty::Int(IntTy { bits: 64, signed: true }),
+        }
+        assert_body_entrypoints_empty("bytes-copy-forged", &malformed);
     }
 }

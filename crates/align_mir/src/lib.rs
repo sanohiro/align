@@ -12,7 +12,7 @@
 
 use align_ast::{BinOp, UnOp};
 use align_sema::{
-    DropPlan, FloatTy, IntTy, Layout, Scalar, Ty, drop_plan, enum_is_move, hir,
+    FloatTy, IntTy, Layout, Scalar, Ty, drop_plan, enum_is_move, hir,
     may_need_synthetic_owner, needs_drop_flag, owns_hidden_string, struct_is_move,
 };
 use align_span::{SourceMap, Span};
@@ -706,6 +706,14 @@ pub enum Stmt {
     /// is not backed by a slot — an unbound `.to_array()` temporary consumed in place). Used to
     /// free the materialized buffer right after the loop that consumes it (null-safe).
     DropValue(Operand),
+    /// Truncate a dynamic array place in place to `new_len` elements (Plan 66 ledger T).
+    /// Drops any removed suffix elements ascending from `new_len` to `old_len - 1` if `elem_ty` needs drop,
+    /// then publishes `new_len` in the place's length field.
+    ArrayTruncate {
+        root: Slot,
+        path: Vec<u32>,
+        new_len: Operand,
+    },
 }
 
 /// A length-preserving stage in a fused staged `par_map` range kernel. Captures are flattened into
@@ -1920,6 +1928,26 @@ pub enum Rvalue {
         offset: Operand,
         scalar: Ty,
         be: bool,
+    },
+    /// `bytes.set_<scalar>_<le|be>(off, val)` — in-place binary scalar write to a `slice<u8>` operand (Plan 65 Row W).
+    BytesSet {
+        bytes: Operand,
+        offset: Operand,
+        value: Operand,
+        scalar: Ty,
+        be: bool,
+    },
+    /// `bytes.fill(val)` / `bytes.fill_<scalar>_<le|be>(val)` — in-place pattern fill of a `slice<u8>` operand (Plan 65 Rows M & P).
+    BytesFill {
+        bytes: Operand,
+        value: Operand,
+        scalar: Ty,
+        be: bool,
+    },
+    /// `dst.copy_from(src)` — in-place copy from `src` to `dst` `slice<u8>` operand (Plan 65 Row M).
+    BytesCopyFrom {
+        dst: Operand,
+        src: Operand,
     },
     /// `buf.put_<scalar>_<le|be>(v)` — append the `value` operand's bytes to the growable `buffer`
     /// operand in the given byte order. `scalar` is `value`'s type (sets the width; a float is
@@ -4019,6 +4047,8 @@ pub fn function_embedded_types(f: &Function) -> Vec<Ty> {
                     | Rvalue::JsonDecodeScalar { scalar: elem, .. }
                     | Rvalue::JsonDocAsScalar { scalar: elem, .. }
                     | Rvalue::BytesRead { scalar: elem, .. }
+                    | Rvalue::BytesSet { scalar: elem, .. }
+                    | Rvalue::BytesFill { scalar: elem, .. }
                     | Rvalue::BufferPut { scalar: elem, .. }
                     | Rvalue::ArrayBuilderPush { scalar: elem, .. } => types.push(*elem),
                     Rvalue::ArrayBuilderNew { elem, .. } => types.push(*elem),
@@ -4458,6 +4488,8 @@ fn remap_function_embedded_types(
                     Rvalue::JsonDecodeScalar { scalar, .. }
                     | Rvalue::JsonDocAsScalar { scalar, .. }
                     | Rvalue::BytesRead { scalar, .. }
+                    | Rvalue::BytesSet { scalar, .. }
+                    | Rvalue::BytesFill { scalar, .. }
                     | Rvalue::BufferPut { scalar, .. }
                     | Rvalue::ArrayBuilderPush { scalar, .. } => remap_ty(scalar, remap),
                     Rvalue::ArrayBuilderNew { elem, .. } => remap_ty(elem, remap),
@@ -6548,18 +6580,12 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             }
             // `root.f0.… = value`. A struct-literal value is expanded in place at the path (its
             // leaves stored under the extended path); a scalar value is a single field store.
-            // If the leaf being overwritten has L1a's supported owned Drop plan (`string` or
-            // `Option<string>`), drop the OLD value first and null a moved RHS source after the
-            // replacement is stored. Nested aggregate replacement remains in its owning slice.
+            // If the leaf being overwritten has an active Drop plan, drop the OLD value first
+            // and null a moved RHS source after the replacement is stored.
             let leaf_ty = field_ty_at(b, *root, path);
             let leaf_plan = drop_plan(leaf_ty, &b.structs, &b.enums, &b.tagged_types);
             let drop_old_field = !matches!(value.kind, hir::ExprKind::StructLit { .. })
-                && (matches!(leaf_plan, DropPlan::Leaf(Ty::String))
-                    || matches!(
-                        leaf_plan,
-                        DropPlan::Option(ref payload)
-                            if matches!(payload.as_ref(), DropPlan::Leaf(Ty::String))
-                    ));
+                && leaf_plan.needs_drop();
             if !drop_old_field {
                 store_value_at(b, *root, &mut path.clone(), value);
                 return;
@@ -8265,6 +8291,15 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             hir::ExprKind::BytesRead { bytes, offset, be } => {
                 lower_bytes_read(b, bytes, offset, *be, e.ty)
             }
+            hir::ExprKind::BytesSet { bytes, offset, value, be } => {
+                lower_bytes_set(b, bytes, offset, value, *be)
+            }
+            hir::ExprKind::BytesFill { bytes, value, be } => {
+                lower_bytes_fill(b, bytes, value, *be)
+            }
+            hir::ExprKind::BytesCopyFrom { dst, src } => {
+                lower_bytes_copy_from(b, dst, src)
+            }
             hir::ExprKind::BufferPut { buffer, value, be } => {
                 lower_buffer_put(b, buffer, value, *be)
             }
@@ -9623,6 +9658,24 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 let result = lower_text_boundary(b, &h, &i);
                 drop_borrow_owners(b, &h);
                 result
+            }
+            hir::ExprKind::ArrayTruncate {
+                root,
+                path,
+                receiver: _,
+                new_len,
+            } => {
+                lower_required_binding!(
+                    b,
+                    len_op = lower_expr(b, new_len),
+                    Operand::Const(Const::Unit)
+                );
+                b.push(Stmt::ArrayTruncate {
+                    root: *root,
+                    path: path.clone(),
+                    new_len: len_op,
+                });
+                Operand::Const(Const::Unit)
             }
             hir::ExprKind::StrPredicate {
                 kind,
@@ -11908,6 +11961,149 @@ fn lower_bytes_read(
         },
     ));
     Operand::Value(v)
+}
+
+/// `bytes.set_<scalar>_<le|be>(off, val)` → a bounds-checked binary scalar write to a `slice<u8>` view (Plan 65 Row W).
+fn lower_bytes_set(
+    b: &mut Builder,
+    bytes: &hir::Expr,
+    offset: &hir::Expr,
+    value: &hir::Expr,
+    be: bool,
+) -> Operand {
+    let scalar = value.ty;
+    let width = binary_scalar_width(scalar);
+    let sv = lower_required!(b, lower_expr(b, bytes), Operand::Const(Const::Unit));
+    let off = lower_required!(b, lower_expr(b, offset), Operand::Const(Const::Unit));
+    let val = lower_required!(b, lower_expr(b, value), Operand::Const(Const::Unit));
+    let len = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
+    let end = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(
+        end,
+        Rvalue::Bin(
+            BinOp::Add,
+            off.clone(),
+            Operand::Const(Const::Int(width, i64_ty())),
+        ),
+    ));
+    emit_range_bounds_check(b, &off, &Operand::Value(end), Operand::Value(len));
+    let t = b.fresh_value(Ty::Unit);
+    b.push(Stmt::Let(
+        t,
+        Rvalue::BytesSet {
+            bytes: sv,
+            offset: off,
+            value: val,
+            scalar,
+            be,
+        },
+    ));
+    Operand::Const(Const::Unit)
+}
+
+/// `bytes.fill(val)` / `bytes.fill_<scalar>_<le|be>(val)` → in-place fill of a `slice<u8>` view (Plan 65 Rows M & P).
+fn lower_bytes_fill(
+    b: &mut Builder,
+    bytes: &hir::Expr,
+    value: &hir::Expr,
+    be: bool,
+) -> Operand {
+    let scalar = value.ty;
+    let width = binary_scalar_width(scalar);
+    let sv = lower_required!(b, lower_expr(b, bytes), Operand::Const(Const::Unit));
+    let val = lower_required!(b, lower_expr(b, value), Operand::Const(Const::Unit));
+    let len = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
+    if width > 1 {
+        let rem = b.fresh_value(i64_ty());
+        b.push(Stmt::Let(
+            rem,
+            Rvalue::Bin(
+                BinOp::Rem,
+                Operand::Value(len),
+                Operand::Const(Const::Int(width, i64_ty())),
+            ),
+        ));
+        let zero = Operand::Const(Const::Int(0, i64_ty()));
+        let bad = b.fresh_value(Ty::Bool);
+        b.push(Stmt::Let(
+            bad,
+            Rvalue::Bin(BinOp::Ne, Operand::Value(rem), zero.clone()),
+        ));
+        let fail = b.new_block();
+        let ok = b.new_block();
+        b.terminate(Term::Branch(Operand::Value(bad), fail, ok));
+        b.cur = fail;
+        let t = b.fresh_value(Ty::Unit);
+        b.push(Stmt::Let(
+            t,
+            Rvalue::Call(
+                DirectCall::Runtime(RuntimeKey::RangeFail),
+                vec![
+                    zero,
+                    Operand::Const(Const::Int(width, i64_ty())),
+                    Operand::Value(len),
+                ],
+            ),
+        ));
+        b.terminate(Term::Unreachable);
+        b.cur = ok;
+    }
+    let t = b.fresh_value(Ty::Unit);
+    b.push(Stmt::Let(
+        t,
+        Rvalue::BytesFill {
+            bytes: sv,
+            value: val,
+            scalar,
+            be,
+        },
+    ));
+    Operand::Const(Const::Unit)
+}
+
+/// `dst.copy_from(src)` → in-place copy from `src` to `dst` `slice<u8>` view (Plan 65 Row M).
+fn lower_bytes_copy_from(
+    b: &mut Builder,
+    dst: &hir::Expr,
+    src: &hir::Expr,
+) -> Operand {
+    let dst_op = lower_required!(b, lower_expr(b, dst), Operand::Const(Const::Unit));
+    let src_op = lower_required!(b, lower_expr(b, src), Operand::Const(Const::Unit));
+    let dst_len = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(dst_len, Rvalue::SliceLen(dst_op.clone())));
+    let src_len = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(src_len, Rvalue::SliceLen(src_op.clone())));
+    let mismatch = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        mismatch,
+        Rvalue::Bin(BinOp::Ne, Operand::Value(dst_len), Operand::Value(src_len)),
+    ));
+    let fail = b.new_block();
+    let ok = b.new_block();
+    b.terminate(Term::Branch(Operand::Value(mismatch), fail, ok));
+    b.cur = fail;
+    let zero = Operand::Const(Const::Int(0, i64_ty()));
+    let t = b.fresh_value(Ty::Unit);
+    b.push(Stmt::Let(
+        t,
+        Rvalue::Call(
+            DirectCall::Runtime(RuntimeKey::RangeFail),
+            vec![zero, Operand::Value(src_len), Operand::Value(dst_len)],
+        ),
+    ));
+    b.terminate(Term::Unreachable);
+    b.cur = ok;
+    let t = b.fresh_value(Ty::Unit);
+    b.push(Stmt::Let(
+        t,
+        Rvalue::BytesCopyFrom {
+            dst: dst_op,
+            src: src_op,
+        },
+    ));
+    Operand::Const(Const::Unit)
 }
 
 /// `buf.put_<scalar>_<le|be>(v)` → append `v`'s bytes to the growable buffer. A unit-valued
