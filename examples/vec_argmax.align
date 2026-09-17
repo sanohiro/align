@@ -3,12 +3,18 @@
 // `vec4<f32>` running maxima and the `vec4<i32>` running indices: a mask is one bool lane per lane
 // and has no machine-level element type, so blend legality is lane count plus lane bit width.
 //
-// The index vector is `i32`, so this is exact for every length — unlike the `f32`-index workaround
-// the old nominal mask rule forced, which is exact only below 2^24.
+// A blend needs equal lane widths, and the mask comes from a 32-bit float compare, so the index
+// lanes are `i32`: every index up to 2147483647 is exact. That is 128x the `f32`-index workaround
+// the old nominal mask rule forced (exact only below 2^24), and it is a real bound rather than a
+// silent one — integer overflow is defined wrap in Align, so a longer slice would wrap a lane index
+// negative. This function refuses such an input instead of returning a wrong answer.
 
 fn argmax(borrow xs: slice<f32>) -> i64 {
   n := xs.len()
   if n < 4 { return 0 - 1 }
+  // The last lane index this kernel can represent. `i` never exceeds `n`, so bounding `n` bounds
+  // every `lane` value the loop below produces.
+  if n > 2147483647 { return 0 - 1 }
 
   mut best: vec4<f32> := xs.load(0)
   mut best_at: vec4<i32> := [0, 1, 2, 3]

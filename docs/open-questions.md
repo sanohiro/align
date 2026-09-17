@@ -1513,12 +1513,15 @@ per-element branch (`Rvalue::Select` + `accumulate_mask` in `align_mir`). Fixed 
 `sum`/`count` → `0` (`acc += mask ? value : 0`, `count += mask ? 1 : 0`), `min` → `+∞` / `max` → `−∞`
 (the `extreme_of` fold seed), `any` → `false` / `all` → `true`. Generic `reduce` has no identity for
 its user `f`, so it uses the **accumulator-select** form `acc = mask ? f(acc,v) : acc` (a masked-out
-lane leaves the accumulator unchanged). `min`/`max` also moved from a compare-and-branch update to
-the `select(cur `cmp` acc, cur, acc)` idiom, so the plain (no-`where`) path is branch-free too — one
-lowering, no dual mechanism. For the builtin identity operation itself, results are byte-identical to
-the branch form: same ordered comparison
-(NaN elements still skipped by `min`/`max`), same empty-selection result (`min`/`max` → the extreme
-seed, `reduce` → `init`, `any` → `false`, `all` → `true`). `dot` is out of scope — `a.dot(b)` is a
+lane leaves the accumulator unchanged). `min`/`max` also moved from a compare-and-branch update to a
+branchless idiom, so the plain (no-`where`) path is branch-free too — one lowering, no dual
+mechanism. Empty-selection results are unchanged from the branch form (`min`/`max` → the extreme
+seed, `reduce` → `init`, `any` → `false`, `all` → `true`). **Amended 2026-09-18 (#1082 Part 1):**
+that idiom was `select(cur `cmp` acc, cur, acc)`, an ordered comparison that skipped NaN elements
+and carried no minimum/maximum semantics the backend could widen into a reduction. `min`/`max` now
+reduce with the one `MathFn::Min`/`MathFn::Max` operation the scalar `a.max(b)` method and the
+`vecN<T>` lane reduction already used, so floats propagate NaN and order ±0 deterministically in
+every spelling. `dot` is out of scope — `a.dot(b)` is a
 two-array kernel with no `where`, already branch-free. Generic reducers and `any`/`all` now execute
 only on surviving elements. **Why the safe identity-select shape matters:**
 the single-column `s.where(p).sum()` over `slice<i64>` already vectorized via LLVM if-conversion — no

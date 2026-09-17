@@ -73925,9 +73925,11 @@ mod tests {
         // with fresh empty content. FsTree also constructs fresh owners without retained inputs.
         // JsonEncode replaces three variants with one fresh owned Result producer.
         // StrCharBoundary has a scalar result and retains no storage.
+        // BufferAppendFilled mutates an existing owned buffer and produces Unit, so it shares
+        // BufferAppend's fresh-missing policy.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 337,
+            variants, 338,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 
