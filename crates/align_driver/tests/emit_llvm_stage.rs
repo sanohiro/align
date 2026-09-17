@@ -97,3 +97,101 @@ fn stage_unknown_value_is_a_diagnostic_not_a_panic() {
     // A panic would print a backtrace / "panicked at"; this path must be a plain diagnostic.
     assert!(!err.contains("panicked"), "must not panic:\n{err}");
 }
+
+// ---- Inspection roots: a `main`-less unit reports its OWN code (issue 1086) ---------------------
+
+/// A library unit: `pub fn`s, one private helper, no `main`. Under the link-roots model every one of
+/// these is internal, dead, and eliminated by the optimized lens.
+const LIB: &str = "pub fn k1(x: i64) -> i64 = helper(x) + 1\n\
+     pub fn k2(xs: slice<i64>) -> i64 = xs.map(dbl).sum()\n\
+     fn dbl(x: i64) -> i64 = x * 2\n\
+     fn helper(x: i64) -> i64 = x + 10\n";
+
+fn write_named(test_name: &str, body: &str) -> TempFile {
+    let path = std::env::temp_dir().join(format!("align-stage-{}-{}.align", std::process::id(), test_name));
+    std::fs::write(&path, body).expect("write src");
+    TempFile(path)
+}
+
+/// Roots for *inspecting* a unit are not roots for *linking* an executable. A unit with no `main`
+/// and no `--export` is reported through its own `pub` surface, so `emit-llvm --stage optimized`
+/// emits that unit's bodies instead of an empty module — and says so on stderr.
+#[test]
+fn a_main_less_unit_is_reported_through_its_own_pub_functions() {
+    if !align_driver::backend_available() {
+        return;
+    }
+    let src = write_named("inspection_roots", LIB);
+    let out = alignc()
+        .args(["emit-llvm"])
+        .arg(src.path())
+        .args(["--stage", "optimized"])
+        .output()
+        .expect("run alignc");
+    assert!(out.status.success(), "exit: {:?}", out.status.code());
+    let ir = String::from_utf8_lossy(&out.stdout);
+    let err = String::from_utf8_lossy(&out.stderr);
+    // A `define` line, not merely a mention: a call site or a declaration would satisfy a bare
+    // `contains` while the body was still eliminated, which is exactly the defect.
+    let defined: Vec<&str> = ir
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| l.starts_with("define "))
+        .collect();
+    for root in ["@k1(", "@k2("] {
+        assert!(
+            defined.iter().any(|l| l.contains(root)),
+            "the requested unit's own `pub` body {root} must be defined, not eliminated:\n{ir}"
+        );
+    }
+    // The seeded set is stated, not applied silently, and it goes to stderr so a redirected IR
+    // stream is unchanged.
+    assert!(err.contains("defines no `main`"), "the seeded roots must be stated:\n{err}");
+    assert!(err.contains("2 `pub` function(s)"), "the note names the count:\n{err}");
+    assert!(!ir.contains("defines no `main`"), "the note must not pollute stdout:\n{ir}");
+}
+
+/// An explicit `--export` still narrows the set exactly as before: it wins over the seeded roots,
+/// and every other function keeps the default `internal` linkage.
+#[test]
+fn an_explicit_export_narrows_the_inspection_roots() {
+    if !align_driver::backend_available() {
+        return;
+    }
+    let src = write_named("inspection_roots_narrowed", LIB);
+    let out = alignc()
+        .args(["emit-llvm"])
+        .arg(src.path())
+        .args(["--stage", "optimized", "--export", "k1"])
+        .output()
+        .expect("run alignc");
+    assert!(out.status.success(), "exit: {:?}", out.status.code());
+    let ir = String::from_utf8_lossy(&out.stdout);
+    let err = String::from_utf8_lossy(&out.stderr);
+    let defines = ir.lines().filter(|l| l.trim_start().starts_with("define ")).count();
+    assert_eq!(defines, 1, "only the named root survives:\n{ir}");
+    assert!(ir.contains("@k1("), "the named root is the one emitted:\n{ir}");
+    assert!(
+        !err.contains("defines no `main`"),
+        "an explicit --export seeds nothing, so there is nothing to state:\n{err}"
+    );
+}
+
+/// A unit that defines `main` already has its root: it is reported exactly as it builds, with no
+/// seeded roots and no note. The `{main}` link-roots model is untouched.
+#[test]
+fn a_unit_with_main_is_unchanged_and_says_nothing() {
+    if !align_driver::backend_available() {
+        return;
+    }
+    let src = write_src("main_unit_unchanged");
+    let out = alignc()
+        .args(["emit-llvm"])
+        .arg(src.path())
+        .args(["--stage", "optimized"])
+        .output()
+        .expect("run alignc");
+    assert!(out.status.success(), "exit: {:?}", out.status.code());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("defines no `main`"), "a unit with `main` seeds nothing:\n{err}");
+}

@@ -73,3 +73,91 @@ fn tiny_profile_strips_and_stays_runnable() {
         "tiny must strip every symbol (only the Mach-O header symbol may remain):\n{nm_text}"
     );
 }
+
+// ---- Deployment target: the objects and the image are stamped from ONE resolved value -----------
+
+/// The `minos` field of a Mach-O file's `LC_BUILD_VERSION`, as `"<major>.<minor>"`.
+///
+/// Parsed from the bytes rather than read out of `otool`, so the check is an exact byte-level proof
+/// with no external tool and no output-format drift. 64-bit little-endian Mach-O only, which is
+/// every target this file runs on (`LC_BUILD_VERSION` = `0x32`; `minos` packs `X<<16 | Y<<8 | Z`).
+fn build_version_minos(path: &std::path::Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let u32_at = |at: usize| -> Option<u32> {
+        let slice: [u8; 4] = bytes.get(at..at + 4)?.try_into().ok()?;
+        Some(u32::from_le_bytes(slice))
+    };
+    // 64-bit Mach-O magic (`MH_MAGIC_64`), then `ncmds` and the 32-byte header.
+    if u32_at(0)? != 0xfeed_facf {
+        return None;
+    }
+    let ncmds = u32_at(16)?;
+    let mut at = 32usize;
+    for _ in 0..ncmds {
+        let cmd = u32_at(at)?;
+        let cmdsize = u32_at(at + 4)? as usize;
+        if cmdsize < 8 {
+            return None;
+        }
+        if cmd == 0x32 {
+            let packed = u32_at(at + 12)?;
+            return Some(format!("{}.{}", packed >> 16, (packed >> 8) & 0xff));
+        }
+        at = at.checked_add(cmdsize)?;
+    }
+    None
+}
+
+/// The deployment target is a single-sourced part of the target identity: the triple carries it, the
+/// object is stamped with it, and the linked image agrees — because the link states the same value
+/// instead of inheriting whatever the `cc` driver guesses (issue 1087).
+///
+/// Before this contract the triple was `arm64-apple-darwin<kernel>`, which LLVM ran through its
+/// Darwin → macOS renumbering table, so objects claimed a macOS one major too high while the image
+/// (stamped from the `cc` driver's own injected `-platform_version`) claimed the right one.
+#[test]
+fn objects_and_the_linked_image_carry_the_resolved_deployment_target() {
+    if !macho() || !backend_available() || !cc_available() {
+        return;
+    }
+    let triple = align_codegen_llvm::default_triple().expect("a resolved host triple");
+    assert!(
+        !triple.contains("darwin"),
+        "no triple the compiler constructs may spell the kernel version: {triple}"
+    );
+    let version = triple
+        .rsplit_once("macosx")
+        .map(|(_, v)| v.to_string())
+        .unwrap_or_else(|| panic!("a macOS triple must name its deployment target: {triple}"));
+
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "macho-deploy", "fn main() {\n  print(\"deploy\")\n}\n");
+    assert!(!checked.diags.has_errors(), "unexpected errors");
+    let mir = lower_to_mir(&checked.hir);
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let obj = dir.join(format!("align-macho-deploy-{pid}.o"));
+    let exe = dir.join(format!("align-macho-deploy-{pid}"));
+    emit_object_file(&mir, &obj, BuildTarget::Baseline, Profile::Release, &[], false).expect("codegen");
+    link_executable(&align_driver::CDriver::default(), &obj, &exe, &mir.link_libs, Profile::Release)
+        .expect("link");
+
+    let object_minos = build_version_minos(&obj);
+    let image_minos = build_version_minos(&exe);
+    let ran = std::process::Command::new(&exe).output().expect("run");
+    let _ = std::fs::remove_file(&obj);
+    let _ = std::fs::remove_file(&exe);
+
+    assert_eq!(
+        object_minos.as_deref(),
+        Some(version.as_str()),
+        "the object must be stamped with the resolved deployment target, not a renumbered kernel major"
+    );
+    assert_eq!(
+        image_minos.as_deref(),
+        Some(version.as_str()),
+        "the image must agree with the objects it was linked from"
+    );
+    assert_eq!(ran.status.code(), Some(0), "the stamped binary must still run");
+    assert_eq!(String::from_utf8_lossy(&ran.stdout), "deploy\n");
+}

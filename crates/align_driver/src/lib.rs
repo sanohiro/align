@@ -82,7 +82,7 @@ fn current_owned_json_target() -> Result<align_interface::OwnedJsonTarget, Strin
         ObjectFormat::MachO => align_interface::OwnedJsonObjectFormat::MachO,
     };
     Ok(align_interface::OwnedJsonTarget {
-        triple: align_codegen_llvm::default_triple(),
+        triple: align_codegen_llvm::default_triple().map_err(|e| e.to_string())?,
         object_format,
     })
 }
@@ -4410,7 +4410,7 @@ impl UnitKeyPrefix {
             compiler_fingerprint: cache::compiler_build_id(),
             frontend_schema: align_interface::FORMAT_VERSION,
             env_toggles: unit_cache::UnitKey::current_env_toggles(),
-            target_triple: align_codegen_llvm::default_triple(),
+            target_triple: align_codegen_llvm::default_triple().ok()?,
             object_format,
         })
     }
@@ -5305,13 +5305,18 @@ pub fn backend_available() -> bool {
 /// Compile `mir` with debug locations, run the selected profile, and return LLVM's raw optimization-remark strings
 /// (`"<file>:<line>:<col>: <message>"`). Process-global side effect — see
 /// [`align_codegen_llvm::collect_opt_remarks`]. Used only by `explain-opt`.
+/// `roots` are the inspection roots this unit is reported through (see
+/// [`inspection_export_roots`]); they keep `external` linkage so the unit's own code survives DCE
+/// and the remarks describe the unit the user asked about.
 pub fn collect_opt_remarks(
     mir: &align_mir::Program,
     target: BuildTarget,
     profile: Profile,
     debug: &DebugInfo,
+    roots: &[String],
 ) -> Result<Vec<String>, String> {
-    align_codegen_llvm::collect_opt_remarks(mir, &target, profile, debug).map_err(|e| e.to_string())
+    align_codegen_llvm::collect_opt_remarks(mir, &target, profile, debug, roots)
+        .map_err(|e| e.to_string())
 }
 
 /// Write MIR out to an object file (codegen). `target` selects the CPU baseline (portable default
@@ -8682,6 +8687,117 @@ pub fn emit_llvm_ir(mir: &align_mir::Program, target: BuildTarget, profile: Prof
     align_codegen_llvm::emit_llvm_ir(mir, &target, profile, optimized, exports, rt_lto_bytes(rt_lto)).map_err(|e| e.to_string())
 }
 
+/// Validate explicit `--export` roots against the **entry unit** (M15 S2b): `--export` is
+/// entry-unit-only. Shared by every verb that takes roots (`emit-obj`, `emit-llvm`, `explain-opt`)
+/// so one rejection contract covers all of them. Prints its own diagnostics; returns whether the
+/// export set was rejected.
+pub fn entry_exports_rejected(walk: &PerUnitWalk, exports: &[String], path: &str) -> bool {
+    if exports.is_empty() {
+        return false;
+    }
+    let Some(entry) = walk.units.iter().find(|u| u.is_entry) else {
+        // A clean walk always compiles its entry, so this is unreachable after `walk_or_report`;
+        // fail closed rather than silently drop the exports if it ever is not.
+        eprintln!("alignc: cannot apply --export: no entry unit was compiled");
+        return true;
+    };
+    let not_in_entry = unknown_exports(&entry.mir, exports);
+    if not_in_entry.is_empty() {
+        return false;
+    }
+    // A non-entry unit `u` mangles its functions `u$name`; match the source name against that suffix
+    // (or the bare name defensively) to tell "defined in another unit" apart from "defined nowhere".
+    let mut unknown: Vec<&str> = Vec::new();
+    let mut rejected = false;
+    for name in not_in_entry {
+        let suffix = format!("${name}");
+        if let Some(u) = walk
+            .units
+            .iter()
+            .find(|u| {
+                !u.is_entry
+                    && u.mir.fns.iter().any(|f| {
+                        f.name.as_str() == name || f.name.as_str().ends_with(&suffix)
+                    })
+            })
+        {
+            rejected = true;
+            eprintln!(
+                "alignc: --export '{name}' names a function defined in unit '{u}', not the entry unit; \
+                 --export applies only to the entry unit. Mark it `pub` in `{u}` to export it \
+                 (a non-entry `pub` function already has external linkage).",
+                u = u.unit
+            );
+        } else {
+            unknown.push(name);
+        }
+    }
+    if !unknown.is_empty() {
+        eprintln!("alignc: unknown export(s): {} (not defined in {path})", unknown.join(", "));
+        rejected = true;
+    }
+    rejected
+}
+
+/// The **inspection** roots for one unit: every `pub` function it defines, when it defines no
+/// `main`.
+///
+/// Roots for *linking* an executable and roots for *inspecting* a unit are different questions.
+/// A build needs `{main}` plus `--export`, because that is what the image must keep reachable. An
+/// inspection verb (`emit-llvm`, `explain-opt`) was pointed at one unit and must report *that
+/// unit's* code — but a library unit has no `main`, so under the link-roots model every one of its
+/// functions is internal, dead, and eliminated, while its imports' `pub` functions (already
+/// external under per-unit lowering) survive in full. The verb then reports a large amount of IR,
+/// or a long list of remarks, about a different unit than the one asked about, and calls the
+/// requested unit optimization-free (issue 1086).
+///
+/// The rule is therefore: a unit that defines `main` already has its root and is reported exactly
+/// as it builds; a unit that defines none is reported through its own `pub` surface. An explicit
+/// `--export` always wins — it narrows the set, and the caller applies it instead of this.
+///
+/// Only a function that is both `pub` in the unit's interface AND has a body in its MIR becomes a
+/// root, so a generic `pub` template (whose interface entry has no single lowered function, only
+/// per-instantiation monomorphs under mangled names) can never produce a root that names nothing.
+/// The result is sorted and deduplicated, so the roots — which fold into the codegen cache key —
+/// do not depend on interface iteration order.
+///
+/// Producing verbs are deliberately untouched: `emit-obj` and every build keep the link-roots
+/// model, because their output is linked, not read.
+pub fn inspection_export_roots(unit: &PerUnitArtifact) -> Vec<String> {
+    if unit.mir.fns.iter().any(|f| f.name.as_str() == "main") {
+        return Vec::new();
+    }
+    let mut roots: Vec<String> = unit
+        .summary
+        .fns
+        .iter()
+        .filter(|sig| unit.mir.fns.iter().any(|f| f.name.as_str() == sig.name.as_str()))
+        .map(|sig| sig.name.clone())
+        .collect();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// [`inspection_export_roots`], plus the one-line stderr note that makes the seeded roots visible.
+///
+/// The seeded set changes what the verb reports, so it is stated rather than applied silently: the
+/// note names the unit, the count, and the `--export` flag that narrows the set. It goes to stderr
+/// so a redirected IR or report stream stays exactly what it was. A unit with a `main`, or a run
+/// with an explicit `--export`, seeds nothing and says nothing.
+pub fn inspection_roots_with_note(unit: &PerUnitArtifact, verb: &str) -> Vec<String> {
+    let roots = inspection_export_roots(unit);
+    if !roots.is_empty() {
+        eprintln!(
+            "alignc: note: `{}` defines no `main`, so {verb} reports it through its own {} `pub` \
+             function(s) as inspection roots; pass `--export <fn>` to narrow that set",
+            unit.file,
+            roots.len()
+        );
+    }
+    roots
+}
+
 /// The names in `exports` that do not match any function in `mir` (by [`align_mir::Function::name`]).
 /// Empty ⇒ every requested export root resolves. The fail-closed seam for `--export <name>`: an
 /// unknown name must be a hard, listed error (`alignc: unknown export(s): …`), never a silent no-op
@@ -8814,6 +8930,12 @@ pub struct LinkPlan<'a> {
     pub profile_rt: Option<&'a std::path::Path>,
     /// Which linker `cc` should run.
     pub linker: &'a Linker,
+    /// The `cc` flag that states the resolved Apple deployment target
+    /// (`-mmacosx-version-min=<v>`), or `None` off Apple. Passing it explicitly is what keeps the
+    /// objects and the image stamped from ONE source of truth: the `cc` driver injects its own
+    /// `-platform_version` guess when nothing says otherwise, and a direct `ld` or an
+    /// `ALIGNC_LINKER` override injects nothing at all (issue 1087).
+    pub apple_min_version: Option<&'a str>,
 }
 
 /// The complete `cc` argument vector for one link, as a **pure function** of [`LinkPlan`].
@@ -8825,11 +8947,19 @@ pub struct LinkPlan<'a> {
 /// proof, which matters because `--as-needed` precision differs between linkers and can make an
 /// over-linked library invisible in `DT_NEEDED`.
 pub fn link_command_args(plan: &LinkPlan<'_>) -> Vec<std::ffi::OsString> {
-    let &LinkPlan { objs, exe, runtime, ordered_link_libs, format, profile, profile_rt, linker } = plan;
+    let &LinkPlan {
+        objs, exe, runtime, ordered_link_libs, format, profile, profile_rt, linker,
+        apple_min_version,
+    } = plan;
     let mut args: Vec<std::ffi::OsString> = Vec::new();
     // Linker selection first: `-B`/`-fuse-ld=` are `cc` driver options, position-independent with
     // respect to the inputs, and reading them first makes the argv self-describing.
     args.extend(linker.cc_flags().into_iter().map(std::ffi::OsString::from));
+    // The resolved deployment target, stated rather than inferred. Also a `cc` driver option, so it
+    // sits with the other input-independent flags.
+    if let Some(flag) = apple_min_version {
+        args.push(flag.into());
+    }
     args.extend(objs.iter().map(|obj| obj.as_os_str().to_os_string()));
     args.push(runtime.as_os_str().to_os_string());
     args.push("-o".into());
@@ -8893,6 +9023,9 @@ fn link_objects_inner(cc: &crate::CDriver, objs: &[&std::path::Path], exe: &std:
     // only, and optimization-neutral: `ld.lld` produces an equally optimized image, just faster.
     // Resolved before any argv is built so a requested-but-missing lld fails before the link starts.
     let linker = select_linker(format)?;
+    // The same resolved deployment target the objects were stamped with, stated at the link.
+    let apple_min_version = align_codegen_llvm::target_identity::apple_min_version_flag()
+        .map_err(|e| e.to_string())?;
     let mut cmd = std::process::Command::new(cc.program());
     cmd.args(link_command_args(&LinkPlan {
         objs,
@@ -8903,6 +9036,7 @@ fn link_objects_inner(cc: &crate::CDriver, objs: &[&std::path::Path], exe: &std:
         profile,
         profile_rt,
         linker: &linker,
+        apple_min_version: apple_min_version.as_deref(),
     }));
     let status = cmd
         .status()
@@ -9956,6 +10090,7 @@ mod tests {
             profile: Profile::Release,
             profile_rt: None,
             linker: &Linker::System,
+            apple_min_version: None,
         };
 
         let elf = link_command_args(&base);
@@ -9993,6 +10128,17 @@ mod tests {
             macho,
             ["/tmp/prog.o", "/tmp/libalign_runtime.a", "-o", "/tmp/prog", "-Wl,-dead_strip", "-Wl,-dead_strip_dylibs"]
         );
+
+        // The resolved deployment target is stated to the `cc` driver, before the inputs, so the
+        // image cannot be stamped from the driver's own guess while the objects carry ours.
+        let stamped = link_command_args(&LinkPlan {
+            ordered_link_libs: &[],
+            format: ObjectFormat::MachO,
+            apple_min_version: Some("-mmacosx-version-min=26.0"),
+            ..base
+        });
+        assert_eq!(stamped[0], "-mmacosx-version-min=26.0");
+        assert_eq!(&stamped[1..], &macho[..]);
 
         // ELF stripping profile strips in the link; instrument-PGO appends the archive plus the
         // per-format forced-undefined anchor, after the objects that need it and before the `-l`s.

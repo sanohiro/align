@@ -50,6 +50,9 @@ fn support_libraries_follow_all_archive_inputs() {
                     profile: Profile::Release,
                     profile_rt,
                     linker: &Linker::System,
+                    // The gated `-l` set is what this owner asserts; the deployment stamp is
+                    // orthogonal and pinned by `link_command_args_are_pinned_per_format`.
+                    apple_min_version: None,
                 });
                 let mut tail: Vec<std::ffi::OsString> = expected
                     .iter()
@@ -113,6 +116,7 @@ fn gated_link_argv(name: &str, src: &str, format: ObjectFormat) -> Vec<String> {
         profile: Profile::Release,
         profile_rt: None,
         linker: &Linker::System,
+        apple_min_version: None,
     });
     argv.iter()
         .filter_map(|arg| arg.to_str())

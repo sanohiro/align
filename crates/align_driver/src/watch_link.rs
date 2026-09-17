@@ -299,6 +299,9 @@ fn link_captured(
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let tool = OwnedStage::create(parent, "align-watch-tool")?.release_for_tool();
+    // The same resolved deployment target the objects were stamped with (see `LinkPlan`).
+    let apple_min_version = align_codegen_llvm::target_identity::apple_min_version_flag()
+        .map_err(|e| e.to_string())?;
     let args = crate::link_command_args(&LinkPlan {
         objs,
         exe: tool.path(),
@@ -308,6 +311,7 @@ fn link_captured(
         profile,
         profile_rt,
         linker: &linker,
+        apple_min_version: apple_min_version.as_deref(),
     });
     let status = match run_captured(cc.program(), &args, sink) {
         Ok(status) => status,

@@ -2604,6 +2604,25 @@ pipeline, code-generation level and size attributes; raw IR precedes optimizatio
 but includes those attributes. `explain-opt` reports per-unit observations with
 runtime LTO off; it does not describe a linked ThinLTO executable.
 
+Inspection roots are not link roots. A build and `emit-obj` keep `{main}` plus
+`--export`. When the unit named on the command line defines no `main` and no
+`--export` is given, `emit-llvm` and `explain-opt` root it at every `pub`
+function it defines, so an inspection verb always reports the unit it was
+pointed at rather than an empty module; the seeded set is stated on stderr, and
+an explicit `--export` (accepted by `emit-obj`, `emit-llvm` and `explain-opt`)
+narrows it.
+
+On Apple targets the deployment target is an explicit, single-sourced component
+of the resolved target identity, exactly as the CPU is. Every triple the
+compiler constructs spells the platform's canonical LLVM OS plus that version
+and never `darwin<kernel>`; it resolves to the first of `--deployment-target`,
+the platform's `*_DEPLOYMENT_TARGET` environment variable, the host product
+version, and a documented per-platform floor, at `major.minor` precision, with a
+malformed value at any layer a hard error naming that layer. The machine, every
+module triple, the link flag and the cache key all derive from that one string,
+so the OS patch level is not a build input and the deployment target is.
+`docs/impl/65-open-issue-batch-plan.md` owns the exact rule.
+
 **Decision: the default build targets a safe, portable, per-architecture baseline; anything more is
 opt-in; wide SIMD on a varied fleet comes from runtime dispatch in the library, not a fixed high
 baseline.** Driven by the real deployment model — cloud VMs and containers are *build-once, run on an

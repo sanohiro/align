@@ -69,7 +69,7 @@ alignc: cache: main hit
 alignc: cache: 1 unit(s): 1 hit, 0 miss
 ```
 
-The **frontend cache** stores each unit's checked interface summary, its diagnostics, and its link libraries, so a later process does not re-check that unit. Its identity is frontend-only: the unit's exact source bytes, the transitive interface closure it was checked against, the compiler and interface-format identity, and the target triple. Profile, `--target-cpu`, runtime LTO, and PGO mode are deliberately absent, because none of them changes what the frontend produces — one entry serves every build configuration.
+The **frontend cache** stores each unit's checked interface summary, its diagnostics, and its link libraries, so a later process does not re-check that unit. Its identity is frontend-only: the unit's exact source bytes, the transitive interface closure it was checked against, the compiler and interface-format identity, and the resolved target triple — which on an Apple target carries the deployment target, and never the kernel version. Profile, `--target-cpu`, runtime LTO, and PGO mode are deliberately absent, because none of them changes what the frontend produces — one entry serves every build configuration.
 
 The **codegen cache** stores object bytes, so its identity does include those backend knobs: profile, target CPU, exports, runtime bitcode, LLVM identity, and PGO mode. Rebuilding the same source under a different `--profile` or `--target-cpu` therefore hits the frontend and misses codegen, and `--cache-stats` names the reason:
 
@@ -103,6 +103,8 @@ alignc size file.align --profile tiny
 
 `emit-mir` is the semantic lens. Raw LLVM IR shows lowering before optimization; optimized IR shows the code LLVM actually shaped. `explain-opt` reports the compiler's current storage and explicit-parallel execution choices, then translates vectorization and other LLVM optimization remarks back to source lines. `size` builds the same artifact as `build` under the selected profile and reports where its bytes went. For standalone objects or IR, repeat `--export name` to keep selected entry-unit functions externally visible.
 
+Roots for linking an executable and roots for inspecting a unit are different questions. A build keeps `main` plus whatever `--export` names, and `emit-obj` keeps the same set because its output is linked, not read. The inspection verbs report the unit you pointed them at: when that file defines no `main` and you pass no `--export`, every `pub` function it defines is a root, so `emit-llvm --stage optimized` emits the unit's own bodies and `explain-opt` reports its own optimizer decisions instead of an empty module. The seeded set is noted on stderr, so a redirected IR or report stream is unchanged. `--export` is accepted by `emit-obj`, `emit-llvm` and `explain-opt`, and narrows that set exactly as before. `emit-mir` needs no rule: it prints every lowered function.
+
 Explicit CPU selectors reject missing, empty, unknown, embedded-NUL and
 wrong-architecture names before artifact work. LLVM validates names for the
 selected architecture. `emit-llvm` and `explain-opt` use the selected profile's
@@ -115,9 +117,12 @@ runtime LTO off; it does not describe a linked ThinLTO executable.
 ```text
 --profile dev|release|fast|small|tiny   # O0, O2, O3, Os, Oz
 --target-cpu baseline|native|<LLVM CPU>
+--deployment-target VERSION            # Apple targets only: the OS version the artifacts target
 --rt-lto / --no-rt-lto                 # force runtime-bitcode LTO on/off (default: on at release/fast)
 --thin-lto                             # cross-unit ThinLTO
 ```
+
+On an Apple target the deployment target is part of the resolved target identity, exactly as the CPU is: one resolution point, one stated precedence, and one string that the objects, the module IR, the link and the cache key all derive from. It resolves to the first of `--deployment-target`, the platform's `MACOSX_DEPLOYMENT_TARGET` (or `IPHONEOS_`/`WATCHOS_`/`TVOS_`/`XROS_`) environment variable, the host's `sw_vers -productVersion`, and a documented per-platform floor. Every layer is read at `major.minor` precision, a malformed value at any layer is an error naming that layer rather than a fall-through to the next, and `--deployment-target` on a non-Apple host is an error rather than a silently ignored flag. Because the version is part of the identity and the OS patch level is not, a patch-level OS update does not invalidate the build cache, and changing the deployment target does.
 
 The default is portable `baseline` plus `release`. `native` is for the current machine; a named LLVM CPU such as `x86-64-v3` is useful for a known deployment fleet. Runtime LTO is **on by default** under the optimizing `release`/`fast` profiles (measured 2-3× on string-predicate pipelines, non-regressing elsewhere, +1-2ms compile) and off under `dev`/`small`/`tiny`; `--no-rt-lto` / `--rt-lto` force either direction. `--thin-lto` stays explicit because it changes compile cost and optimization scope; it requires `release` or `fast`, applies to linked `build`/`run`/`size` operations, is parallel and cached, and composes with runtime LTO.
 

@@ -485,3 +485,96 @@ Correctness owners separately check initialized contents and capacity behavior.
 The local evidence packet retains all nine samples, source and artifact hashes:
 probe `751d60b8e04a795b8a7e2c8300f6e3b37607117f29b146f2e9b8fe2813c4d7a8`,
 runtime `4d4755e37eb6f63b092cc6457b618f685c3adae7502dfa80ca3a8f60f4ad5598`.
+
+## Target identity and inspection roots (issues 1086, 1087)
+
+Two tooling contracts, one capability: what a compiler *is* building for, and what
+an inspection verb is reporting. Both were previously implicit — decided by
+LLVM's Darwin renumbering table, the `cc` driver's injected flag, and the link
+roots model respectively — and both are now stated once and derived everywhere.
+
+### Deployment-target precedence
+
+For any `*-apple-*` triple the compiler constructs, the OS component is the
+platform's canonical LLVM spelling plus an explicit version
+(`arm64-apple-macosx26.0`). `darwin<kernel>` never appears in a triple the
+compiler constructs, on any path. The version is resolved once per process, by
+exactly this precedence, and the first layer that supplies a value wins:
+
+1. `--deployment-target <version>` — the explicit CLI input, the only way to get
+   a non-host value, and the same visible opt-in shape as `--target-cpu`.
+2. the platform's `*_DEPLOYMENT_TARGET` environment variable
+   (`MACOSX_DEPLOYMENT_TARGET`, `IPHONEOS_DEPLOYMENT_TARGET`,
+   `WATCHOS_DEPLOYMENT_TARGET`, `TVOS_DEPLOYMENT_TARGET`,
+   `XROS_DEPLOYMENT_TARGET`) — the one ambient input this contract names, and
+   the Apple toolchain convention `alignc` previously ignored outright.
+3. the host product version (`kern.osproductversion`, the value `sw_vers
+   -productVersion` prints), and only for the platform the host actually is: an
+   iOS triple on a macOS host does not inherit the macOS version.
+4. the documented per-platform floor — macOS 11.0, iOS 13.0, watchOS 7.0,
+   tvOS 13.0, visionOS 1.0 — for a cross-compilation host with no product
+   version to read.
+
+Every layer is canonicalized to `major.minor`: a malformed value at any layer is
+a hard error naming that layer, never a silent fall-through to the next one, and
+an OS *patch* level never reaches the triple. `--deployment-target` on a
+non-Apple host is a hard error rather than a silently ignored flag. Non-Apple
+triples, and any `*-apple-*` triple whose OS component is outside the table
+above, are left byte-identical.
+
+`resolve_target_identity` and `create_target_machine` read the one resolved
+string, so the cache key and the machine are byte-identical by construction
+rather than by two matching code paths; the module triples copied from the
+machine and the merged rt-lto module follow automatically. The link states the
+same value (`-mmacosx-version-min=<v>` and its per-platform siblings) instead of
+inheriting the `cc` driver's own guess, so a direct `ld` or an `ALIGNC_LINKER`
+override cannot stamp an image differently from the objects that went into it.
+
+### Cache-key change
+
+The frontend (`UnitKey` K5), codegen, prelink, and backend keys already hash the
+target triple. They now hash the *resolved* triple, which means the resolved
+deployment target is part of every codegen identity and the Darwin kernel patch
+level is part of none — a kernel patch bump alone no longer invalidates the
+build cache. No key format version changes: the triple component simply carries
+a different, correct string, so a stale entry misses rather than falsely hits.
+
+**Deliberately not closed:** `LC_BUILD_VERSION`'s `sdk` field stays `n/a` in
+`alignc`-produced objects. A truthful SDK version needs an SDK provenance source
+(`xcrun --show-sdk-version`), which is ambient toolchain configuration this
+contract does not name and would add a subprocess to every compile. The linked
+image still carries the linker's SDK version. Resume this when the compiler
+gains an explicit SDK selector.
+
+### Inspection roots
+
+Roots for *linking* an executable and roots for *inspecting* a unit are
+different questions. A build keeps `{main}` plus `--export`; that is unchanged,
+and `emit-obj` — whose output is linked, not read — keeps it too.
+
+An inspection verb (`emit-llvm`, `explain-opt`) was pointed at one unit and must
+report that unit's code. The rule: when the unit named on the command line
+defines no `main` and no `--export` is given, every `pub` function it defines is
+an inspection root. Only a function that is both `pub` in the unit's interface
+and has a body in its MIR becomes a root, so a generic `pub` template never
+produces a root that names nothing; the set is sorted and deduplicated, so the
+roots — which fold into the codegen cache key — do not depend on interface
+iteration order. An explicit `--export` always wins and narrows the set exactly
+as before, and it is now accepted by `explain-opt` as well, so one rejection
+contract covers every verb that has roots. The seeded set is stated on stderr,
+naming the unit and the count, so a redirected IR or report stream is unchanged
+while the difference from a build stays visible. `emit-mir` needs no rule: it
+prints every lowered function and performs no dead-code elimination.
+
+### Closure matrix
+
+| Invariant | Implementation | Discriminating owner |
+| --- | --- | --- |
+| Apple OS normalization, environment preservation, non-Apple byte-identity | `target_identity::normalize_apple_triple` over the platform table | `apple_triples_normalize_and_non_apple_triples_stay_byte_identical` |
+| Exact precedence, per-layer rejection, host-platform restriction | `target_identity::resolve_deployment_version` | `deployment_precedence_is_explicit_then_env_then_host_then_floor`, `versions_canonicalize_to_major_minor` |
+| One resolved triple for the machine, the modules, and the key | One `OnceLock` read by `resolve_target_identity`/`create_target_machine` | `build_target::the_resolved_triple_is_single_sourced_and_never_names_the_kernel`, `cache_codegen::gate14_codegen_key_triple_is_the_resolved_identity` |
+| Host resolution is the product version, never the kernel | `kern.osproductversion` query | `build_target::the_macos_deployment_target_is_the_host_product_version` |
+| Objects and image stamped from one value | `LinkPlan::apple_min_version` | `macho_link::objects_and_the_linked_image_carry_the_resolved_deployment_target`, `link_command_args_are_pinned_per_format` |
+| Deployment target separates cached artifacts | Resolved triple in every key | `cache_codegen::gate14b_deployment_target_separates_cached_objects` |
+| Malformed flag/environment values are clean pre-work errors | `set_deployment_target` plus the eager freeze in `main` | `target_identity` rejection cases; CLI argument-shape owner |
+| A `main`-less unit reports its own code, `--export` narrows, a `main` unit is unchanged | `inspection_export_roots` seeded in `emit-llvm`/`explain-opt` | `emit_llvm_stage::a_main_less_unit_is_reported_through_its_own_pub_functions`, `an_explicit_export_narrows_the_inspection_roots`, `a_unit_with_main_is_unchanged_and_says_nothing`, `explain_opt::a_main_less_unit_reports_its_own_optimizer_decisions`, `explain_opt_takes_explicit_export_roots_and_rejects_unknown_ones`, `a_unit_with_main_seeds_no_inspection_roots` |

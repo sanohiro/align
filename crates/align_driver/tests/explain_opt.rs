@@ -225,3 +225,84 @@ fn missing_file_exits_one() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("cannot read"), "want a read diagnostic:\n{err}");
 }
+
+// ---- Inspection roots: `explain-opt` reports the unit it was pointed at (issue 1086) ------------
+
+/// A library unit with a vectorizable pipeline and an inlinable helper — and no `main`. Under the
+/// link-roots model nothing here is a root, so the lens used to report "no opportunities" for code
+/// it had never compiled.
+const LIB_PIPELINE: &str = "pub fn k1(x: i64) -> i64 = helper(x) + 1\n\
+     pub fn k2(xs: slice<i64>) -> i64 = xs.map(dbl).sum()\n\
+     fn dbl(x: i64) -> i64 = x * 2\n\
+     fn helper(x: i64) -> i64 = x + 10\n";
+
+/// No verb may report "no opportunities" for code it did not compile. A `main`-less unit is rooted
+/// at its own `pub` functions, so the remarks describe that unit — and the seeded set is stated on
+/// stderr rather than applied silently.
+#[test]
+fn a_main_less_unit_reports_its_own_optimizer_decisions() {
+    if !align_driver::backend_available() {
+        return;
+    }
+    let src = write_src("library_unit", LIB_PIPELINE);
+    let out = alignc().arg("explain-opt").arg(src.path()).output().expect("run alignc");
+    assert!(out.status.success(), "exit: {:?}", out.status.code());
+    let report = String::from_utf8_lossy(&out.stdout);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !report.contains("no vectorization or inlining opportunities were reported"),
+        "the unit's own code was compiled, so it must not be reported as opportunity-free:\n{report}"
+    );
+    assert!(
+        report.contains("inlined"),
+        "the intra-unit helper call inlines and must be reported:\n{report}"
+    );
+    assert!(err.contains("defines no `main`"), "the seeded roots must be stated:\n{err}");
+    assert!(err.contains("explain-opt"), "the note names the verb:\n{err}");
+}
+
+/// `--export` is valid on every verb that has roots, and narrows `explain-opt`'s the same way it
+/// narrows `emit-llvm`'s. An unknown name stays a hard, listed error — never a silent no-op.
+#[test]
+fn explain_opt_takes_explicit_export_roots_and_rejects_unknown_ones() {
+    if !align_driver::backend_available() {
+        return;
+    }
+    let src = write_src("library_unit_narrowed", LIB_PIPELINE);
+    let narrowed = alignc()
+        .arg("explain-opt")
+        .arg(src.path())
+        .args(["--export", "k2"])
+        .output()
+        .expect("run alignc");
+    assert!(narrowed.status.success(), "exit: {:?}", narrowed.status.code());
+    let err = String::from_utf8_lossy(&narrowed.stderr);
+    assert!(
+        !err.contains("defines no `main`"),
+        "an explicit --export seeds nothing, so there is nothing to state:\n{err}"
+    );
+
+    let unknown = alignc()
+        .arg("explain-opt")
+        .arg(src.path())
+        .args(["--export", "nosuch"])
+        .output()
+        .expect("run alignc");
+    assert_eq!(unknown.status.code(), Some(1), "a typo'd export must fail cleanly");
+    let unknown_err = String::from_utf8_lossy(&unknown.stderr);
+    assert!(unknown_err.contains("unknown export(s): nosuch"), "{unknown_err}");
+    assert!(!unknown_err.contains("panicked"), "must not panic:\n{unknown_err}");
+}
+
+/// A unit that defines `main` is reported exactly as it builds: no seeded roots, no note.
+#[test]
+fn a_unit_with_main_seeds_no_inspection_roots() {
+    if !align_driver::backend_available() {
+        return;
+    }
+    let src = write_src("entry_unit_unchanged", MAP_SUM);
+    let out = alignc().arg("explain-opt").arg(src.path()).output().expect("run alignc");
+    assert!(out.status.success(), "exit: {:?}", out.status.code());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("defines no `main`"), "a unit with `main` seeds nothing:\n{err}");
+}
