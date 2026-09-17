@@ -439,6 +439,287 @@ fn shared_codegen_table_change_invalidates_every_function_partition() {
         "one shared-table change must invalidate every function partition"
     );
 }
+
+/// Every owned-leaf arm of the call-provenance predicate, carried by the *second* edge of a
+/// depth-2 same-unit chain. `main`'s partition declares only its direct callee, so the peer body
+/// references a function the partition cannot see. Regression for #1070: the whole-program
+/// validators were run unchanged over that truncated partition and rejected correct programs.
+const DEPTH_TWO_CHAINS: &[(&str, &str, &[u8])] = &[
+    (
+        "str-arg-string-return",
+        "fn leaf(text: str) -> string { return text.clone() }\n\
+         fn middle(text: str) -> i64 = leaf(text).len()\n\
+         fn main() -> i32 { print(middle(\"x\")); return 0 }\n",
+        b"1\n",
+    ),
+    (
+        "str-arg",
+        "fn leaf(text: str) -> i64 { return text.len() }\n\
+         fn middle(text: str) -> i64 = leaf(text) + 1\n\
+         fn main() -> i32 { print(middle(\"x\")); return 0 }\n",
+        b"2\n",
+    ),
+    (
+        "string-return",
+        "fn leaf() -> string { return \"abc\".clone() }\n\
+         fn middle() -> i64 = leaf().len()\n\
+         fn main() -> i32 { print(middle()); return 0 }\n",
+        b"3\n",
+    ),
+    (
+        "fn-value-arg",
+        "fn bump(n: i64) -> i64 = n + 1\n\
+         fn apply(f: fn(i64) -> i64, n: i64) -> i64 = f(n)\n\
+         fn middle(n: i64) -> i64 = apply(bump, n)\n\
+         fn main() -> i32 { print(middle(41)); return 0 }\n",
+        b"42\n",
+    ),
+    (
+        "capturing-closure",
+        "fn middle(factor: i64) -> i64 = [1, 2, 3].map(fn x { x * factor }).sum()\n\
+         fn main() -> i32 { print(middle(3)); return 0 }\n",
+        b"18\n",
+    ),
+    (
+        "i64-control",
+        "fn leaf(n: i64) -> i64 = n + 1\n\
+         fn middle(n: i64) -> i64 = leaf(n) * 2\n\
+         fn main() -> i32 { print(middle(3)); return 0 }\n",
+        b"8\n",
+    ),
+    (
+        "peer-closed-chain",
+        "fn leaf(text: str) -> string { return text.clone() }\n\
+         fn middle(text: str) -> i64 = leaf(text).len()\n\
+         fn main() -> i32 { print(middle(\"x\")); print(leaf(\"y\").len()); return 0 }\n",
+        b"1\n1\n",
+    ),
+];
+
+#[test]
+fn depth_two_owned_leaf_chains_partition_and_run() {
+    if !backend_available() {
+        return;
+    }
+    for (label, source, expected) in DEPTH_TWO_CHAINS {
+        let proj = Proj::new(&format!("depth-two-{label}"), &[("main.align", *source)], "main.align");
+        let input = walk(&proj);
+        let build = build_function_thin_lto(
+            &input.units,
+            &CacheContext::Disabled,
+            &BuildTarget::Baseline,
+            Profile::Release,
+            &[],
+            false,
+            2,
+        )
+        .unwrap_or_else(|error| panic!("{label}: function ThinLTO build failed: {error}"));
+        assert_eq!(
+            build.mode(),
+            FunctionThinLtoMode::Partitioned,
+            "{label} must exercise function partitioning"
+        );
+        let executable = proj
+            .dir
+            .join(format!("depth-two{}", std::env::consts::EXE_SUFFIX));
+        build
+            .link_and_publish(&align_driver::CDriver::default(), &executable)
+            .unwrap_or_else(|error| panic!("{label}: link failed: {error}"));
+        let output = std::process::Command::new(&executable)
+            .output()
+            .unwrap_or_else(|error| panic!("{label}: run failed: {error}"));
+        assert!(output.status.success(), "{label}: {output:?}");
+        assert_eq!(output.stdout, *expected, "{label}");
+    }
+}
+
+/// Validation scope must match emission scope, in both directions. A partition-scoped validator
+/// must accept a reference it *cannot see* from a peer body, and must still reject the same defect
+/// inside the body the partition emits.
+#[test]
+fn partition_scoped_validators_match_emission_scope() {
+    use align_mir::producer::{
+        validate_partition_resource_rvalues, validate_partition_tagged_program,
+        validate_resource_rvalues, validate_tagged_program,
+    };
+
+    // The exact shape `emit_function_prelink_bc` builds: the selected root plus the peers its own
+    // blocks reference, over the unit's complete shared tables. The deeper callee is absent.
+    fn partition(source: &str, keep: &[&str]) -> align_mir::Program {
+        let proj = Proj::new("partition-scope", &[("main.align", source)], "main.align");
+        let unit = walk(&proj)
+            .units
+            .into_iter()
+            .find(|unit| unit.is_entry)
+            .expect("entry unit");
+        let mut program = unit.mir;
+        program
+            .fns
+            .retain(|function| keep.contains(&function.name.as_str()));
+        assert_eq!(program.fns.len(), keep.len(), "partition fixture lost a function");
+        program
+    }
+
+    let emitted = |name: &str| {
+        std::collections::BTreeSet::from([
+            align_mir::ProgramCall::try_from_logical(name).expect("fixture identity"),
+        ])
+    };
+
+    // (a) Owned-leaf call provenance: `middle` calls `leaf`, which the partition cannot see.
+    let owned_leaf = partition(DEPTH_TWO_CHAINS[0].1, &["main", "middle"]);
+    assert!(
+        validate_resource_rvalues(&owned_leaf).is_err(),
+        "the whole-program validator must keep rejecting a truncated program"
+    );
+    assert!(
+        validate_partition_resource_rvalues(&owned_leaf, &emitted("main")).is_ok(),
+        "a peer body's unseen callee must not fail the partition"
+    );
+
+    // (b) The same relaxation must not reach the emitted body: retarget `main`'s own `str`-carrying
+    // call at a function no table declares.
+    let mut dangling = owned_leaf.clone();
+    let absent = align_mir::ProgramCall::try_from_logical("absent").expect("absent identity");
+    let mut retargeted = false;
+    let root = dangling
+        .fns
+        .iter_mut()
+        .find(|function| function.name.as_str() == "main")
+        .expect("emitted root");
+    for block in &mut root.blocks {
+        for statement in &mut block.stmts {
+            match statement {
+                align_mir::Stmt::Let(_, align_mir::Rvalue::Call(target, _)) => {
+                    if let align_mir::DirectCall::Program(name) = target {
+                        *name = absent.clone();
+                        retargeted = true;
+                    }
+                }
+                align_mir::Stmt::Let(_, align_mir::Rvalue::CallWithCleanup(call)) => {
+                    call.target = absent.clone();
+                    retargeted = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(retargeted, "the emitted body must contain a direct program call");
+    assert!(
+        validate_partition_resource_rvalues(&dangling, &emitted("main")).is_err(),
+        "an unresolvable call inside the emitted body must still be rejected"
+    );
+
+    // (c) Callable targets: `middle` takes the address of `bump`, which the partition cannot see.
+    let fn_value = partition(DEPTH_TWO_CHAINS[3].1, &["main", "middle"]);
+    assert!(
+        validate_tagged_program(&fn_value).is_err(),
+        "the whole-program validator must keep rejecting a truncated callable table"
+    );
+    assert!(
+        validate_partition_tagged_program(&fn_value, &emitted("main")).is_ok(),
+        "a peer body's unseen callable target must not fail the partition"
+    );
+
+    // …and only the *unseen* reference is exempt. A peer body whose callable target the partition
+    // can resolve keeps every signature check.
+    let mut resolvable = partition(DEPTH_TWO_CHAINS[3].1, &["main", "middle", "bump"]);
+    let peer = resolvable
+        .fns
+        .iter_mut()
+        .find(|function| function.name.as_str() == "middle")
+        .expect("peer body");
+    let mut corrupted = false;
+    for block in &mut peer.blocks {
+        for statement in &mut block.stmts {
+            if let align_mir::Stmt::Let(_, align_mir::Rvalue::FnAddr { signature, .. }) = statement {
+                signature.param_modes.clear();
+                corrupted = true;
+            }
+        }
+    }
+    assert!(corrupted, "the peer body must take a function address");
+    assert!(
+        validate_partition_tagged_program(&resolvable, &emitted("main")).is_err(),
+        "a resolvable callable target keeps its signature check in every body"
+    );
+
+    // (d) …and the emitted body keeps its callable check: `main` itself takes the address here.
+    let emitted_fn_value = partition(
+        "fn bump(n: i64) -> i64 = n + 1\n\
+         fn apply(f: fn(i64) -> i64, n: i64) -> i64 = f(n)\n\
+         fn main() -> i32 { print(apply(bump, 41)); return 0 }\n",
+        &["main", "apply"],
+    );
+    assert!(
+        validate_partition_tagged_program(&emitted_fn_value, &emitted("main")).is_err(),
+        "an unresolvable callable target inside the emitted body must still be rejected"
+    );
+
+    // (e) A partition validator is only as strong as the emitted set it is given, so a degenerate
+    // one must fail closed rather than vacuously validate nothing.
+    let empty = std::collections::BTreeSet::new();
+    let absent_root = emitted("absent");
+    for (label, scope) in [("empty", &empty), ("unknown", &absent_root)] {
+        assert!(
+            validate_partition_resource_rvalues(&owned_leaf, scope).is_err(),
+            "{label} emitted set must be rejected by the resource-rvalue validator"
+        );
+        assert!(
+            validate_partition_tagged_program(&owned_leaf, scope).is_err(),
+            "{label} emitted set must be rejected by the tagged validator"
+        );
+    }
+}
+
+/// The partition-scoped validators are sound only because every unit is certified *whole* before
+/// any partition is formed: a peer body the partition does not emit is trusted on that basis alone.
+/// Nothing else in the suite pins that gate, so a later "skip revalidation on a warm unit" change
+/// would silently leave peer bodies unvalidated. This test fails the moment formation stops
+/// certifying a complete unit.
+#[test]
+fn unit_validation_precedes_partition_formation() {
+    // The `fn`-value chain: `middle` takes the address of `bump`, and `middle` is a *peer* of
+    // `main`'s partition, so its body statements are exactly what partition scope no longer
+    // re-derives.
+    let proj = Proj::new(
+        "partition-unit-gate",
+        &[("main.align", DEPTH_TWO_CHAINS[3].1)],
+        "main.align",
+    );
+    let mut built = walk(&proj);
+    let unit = built
+        .units
+        .iter_mut()
+        .find(|unit| unit.is_entry)
+        .expect("entry unit");
+    let peer = unit
+        .mir
+        .fns
+        .iter_mut()
+        .find(|function| function.name.as_str() == "middle")
+        .expect("peer body");
+    let mut corrupted = false;
+    for block in &mut peer.blocks {
+        for statement in &mut block.stmts {
+            if let align_mir::Stmt::Let(_, align_mir::Rvalue::FnAddr { signature, .. }) = statement {
+                signature.param_modes.clear();
+                corrupted = true;
+            }
+        }
+    }
+    assert!(corrupted, "the peer body must take a function address");
+
+    let error = match function_partitions(&built.units, &[]) {
+        Ok(_) => panic!("a malformed unit body formed partitions"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("ThinLTO program validation failed"),
+        "formation must certify the complete unit before forming partitions, got: {error}"
+    );
+}
+
 /// The source entry's return ABI must not decide whether partitioned builds
 /// contain the C entry wrapper. The second function is the regression trigger.
 #[test]
