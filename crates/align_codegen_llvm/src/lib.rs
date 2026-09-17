@@ -3105,6 +3105,20 @@ fn lower_prepared_module<'c>(
     // layout so offsets match the emitted object.
     let target_data = tm.get_target_data();
     module.set_data_layout(&target_data.get_data_layout());
+    // The `dereferenceable`/`align` extent claimed on a borrowed header parameter is a constant, so
+    // pin it against the real layout here: a target whose `{ptr,len}` header is not 16/8 must fail
+    // loudly rather than claim a wrong extent on every borrowed view in the program.
+    {
+        let header = slice_struct_type(ctx);
+        let size = target_data.get_store_size(&header);
+        let align = u64::from(target_data.get_abi_alignment(&header));
+        if size != VIEW_HEADER_SIZE || align != VIEW_HEADER_ALIGN {
+            return Err(CodegenError::Lowering(format!(
+                "view header layout is {size}/{align} on this target, not \
+                 {VIEW_HEADER_SIZE}/{VIEW_HEADER_ALIGN}"
+            )));
+        }
+    }
     // Pin the target triple too, so emitted IR (`alignc emit-llvm`) is self-describing: an external
     // `opt`/`llc` reading it then knows the architecture and uses the right cost model / vectorizer
     // instead of falling back to a generic one. The driver's own object emission is unaffected (it
@@ -3897,6 +3911,7 @@ fn lower_prepared_module<'c>(
     for f in program.fns.iter().filter(|function| scope.defines(function)) {
         let builder = ctx.create_builder();
         let stack_headers = stack_header_plan(f);
+        let view_facts = view_facts_plan(f);
         let borrowed_element_validation = BorrowedElementValidationIndex::new(f);
         let func = program_funcs
             .get(&f.name)
@@ -3963,6 +3978,12 @@ fn lower_prepared_module<'c>(
             current_mir_block: None,
             current_mir_statement: None,
             alias_scopes: HashMap::new(),
+            view_header_slots: view_facts.headers,
+            view_facts: view_facts.enabled,
+            view_parts: HashMap::new(),
+            view_headers: HashMap::new(),
+            view_tbaa: view_facts.enabled.then(|| view_tbaa_tags(ctx)),
+            view_len_range: nonnegative_i64_range(ctx),
             dibuilder: debug_ctx.as_ref().map(|dc| &dc.dib),
             subprogram,
             fn_line,
@@ -7158,6 +7179,25 @@ fn declare_fn<'c>(
     let fv = module.add_function(symbol, fn_ty, None);
     mark_nounwind(ctx, fv);
     mark_borrow_param_contracts(ctx, fv, &f.param_modes, &f.return_borrow);
+    // Index-preserving and index-safe: a parameter whose slot is out of range degrades to `Unit`,
+    // which is not a view header, so it simply states no header fact.
+    let param_tys: Vec<Ty> = f
+        .params
+        .iter()
+        .map(|slot| f.slots.get(*slot as usize).copied().unwrap_or(Ty::Unit))
+        .collect();
+    let param_values: Vec<BasicTypeEnum<'c>> = param_tys.iter().copied().map(map).collect();
+    mark_view_header_param_facts(
+        ctx,
+        fv,
+        &f.param_modes,
+        &param_tys,
+        &param_values,
+        program,
+        // The body is right here, so `noalias` is decided by the same whole-body proof the
+        // entry-block materialization uses.
+        view_facts_plan(f).enabled,
+    );
     // Every Align program function is module-private (internal) EXCEPT:
     //  - the C entry: an `-> i32` `main` keeps the symbol name `main` and IS the C entry (`crt0`
     //    resolves it by name), so it must stay external. A `Result`- or `Unit`-returning main body
@@ -7240,6 +7280,18 @@ fn declare_imported_fn<'c>(
     let fv = module.add_function(&encoded_program_symbol(&imp.name), fn_ty, None);
     mark_nounwind(ctx, fv);
     mark_borrow_param_contracts(ctx, fv, &imp.param_modes, &imp.return_borrow);
+    // An imported declaration has no body, so it never carries `noalias` (plan 69 I3); the
+    // structural header facts are unaffected by that.
+    let param_values: Vec<BasicTypeEnum<'c>> = imp.params.iter().copied().map(map).collect();
+    mark_view_header_param_facts(
+        ctx,
+        fv,
+        &imp.param_modes,
+        &imp.params,
+        &param_values,
+        program,
+        false,
+    );
     fv
 }
 
@@ -7274,6 +7326,64 @@ fn mark_borrow_param_contracts_at(
             add_valued_enum_attr(ctx, function, location, "captures", CAPTURES_NONE);
         }
         add_enum_attr(ctx, function, location, "readonly");
+    }
+}
+
+/// State the borrowed **view header** parameter facts (plan 69 §2.2, plan 68 G1).
+///
+/// A `borrow`/`borrow mut` view parameter is a pointer to the function's own `{ptr,len}` header, so
+/// `nonnull dereferenceable(16) align 8` is structural and unconditional. `noalias` is not: it is
+/// emitted only on a read-only `borrow` header, and only when `body_states_noalias` says this
+/// function's body is available and writes no view header at all. A writable header has no
+/// `readonly` companion claim, so `noalias` on it would turn an aliasing pair of arguments into
+/// undefined behaviour rather than into a diagnostic — `borrow mut` therefore gains only the
+/// non-aliasing facts, and an imported declaration (no body) gains no `noalias` either.
+fn mark_view_header_param_facts<'c>(
+    ctx: &'c Context,
+    function: FunctionValue<'c>,
+    modes: &[align_ast::ParamMode],
+    param_tys: &[Ty],
+    param_values: &[BasicTypeEnum<'c>],
+    program: &Program,
+    body_states_noalias: bool,
+) {
+    let header_ty: BasicTypeEnum<'c> = slice_struct_type(ctx).into();
+    for (index, mode) in modes.iter().copied().enumerate() {
+        let Some(ty) = param_tys.get(index).copied() else {
+            continue;
+        };
+        // The claimed extent and alignment are the `{ptr,len}` header's own, so the parameter's
+        // lowered value type must really *be* that header — never a hand-maintained type list on
+        // its own, which would silently claim a wrong extent if `abi_map_ty` gained an arm.
+        if !is_view_header_ty(ty) || param_values.get(index) != Some(&header_ty) {
+            continue;
+        }
+        // The `borrow mut` drop-flag ABI passes `{value_ptr, cleanup_ptr}` *by value*, which is not
+        // a pointer parameter: a pointer attribute on it would be invalid IR.
+        let drop_flag = align_sema::needs_drop_flag(
+            ty,
+            &program.structs,
+            &program.tuples,
+            &program.enums,
+            &program.tagged_types,
+        );
+        let pointer_param = match mode {
+            align_ast::ParamMode::Borrow => true,
+            align_ast::ParamMode::BorrowMut => !drop_flag,
+            align_ast::ParamMode::ByValue | align_ast::ParamMode::Out => false,
+        };
+        if !pointer_param {
+            continue;
+        }
+        let location = inkwell::attributes::AttributeLoc::Param(index as u32);
+        // `nonnull` is already emitted for `Borrow`; adding it again is idempotent, and this is the
+        // only site that emits it for `BorrowMut` (which carried no parameter attribute at all).
+        add_enum_attr(ctx, function, location, "nonnull");
+        add_valued_enum_attr(ctx, function, location, "dereferenceable", VIEW_HEADER_SIZE);
+        add_valued_enum_attr(ctx, function, location, "align", VIEW_HEADER_ALIGN);
+        if body_states_noalias && mode == align_ast::ParamMode::Borrow {
+            add_enum_attr(ctx, function, location, "noalias");
+        }
     }
 }
 
@@ -7982,6 +8092,21 @@ struct FnGen<'c, 'a> {
     /// (`!alias.scope in`, `!noalias out`) and `dst` store (`!alias.scope out`, `!noalias in`) are
     /// proven not to overlap. Globally unique per (function, id) so distinct loops never collide.
     alias_scopes: HashMap<u32, (inkwell::values::MetadataValue<'c>, inkwell::values::MetadataValue<'c>)>,
+    /// Plan 69 PR 1: the borrowed header parameters materialized once in the entry block, and
+    /// whether this body may state the header/element alias facts at all ([`view_facts_plan`]).
+    view_header_slots: Vec<Slot>,
+    view_facts: bool,
+    /// `(slot, field)` → the one entry-block load of that header field. A use replaces its reload
+    /// with this value, which dominates every block by construction.
+    view_parts: HashMap<(Slot, u32), BasicValueEnum<'c>>,
+    /// `slot` → the whole `{ptr,len}` header rebuilt from the two cached field loads, for the uses
+    /// that want the aggregate (`Rvalue::Load`, a borrowed-place operand).
+    view_headers: HashMap<Slot, BasicValueEnum<'c>>,
+    /// The `(header, element)` TBAA access tags, present only while `view_facts` holds.
+    view_tbaa: Option<(inkwell::values::MetadataValue<'c>, inkwell::values::MetadataValue<'c>)>,
+    /// `!range !{i64 0, i64 -9223372036854775808}` for every length load — unconditional, because a
+    /// length is non-negative at every profile (plan 69 I7), so it is *not* gated on `view_facts`.
+    view_len_range: inkwell::values::MetadataValue<'c>,
     /// Opt-in debug info (`explain-opt`): the module's `DebugInfoBuilder` and this function's
     /// `DISubprogram`, plus a fallback line. `None` in a normal build → [`FnGen::set_line`] is a
     /// no-op and no `DILocation`s are emitted.
@@ -8005,6 +8130,253 @@ struct ParMapFunctionSignature {
 
 fn is_builder_header_ty(ty: Ty) -> bool {
     ty == Ty::Builder || ty.is_array_builder()
+}
+
+// ── View-header facts (plan 69 PR 1 / plan 68 G1, G2's `!range` half) ───────────────────────────
+//
+// A borrowed `slice<T>`/`array<T>` parameter arrives as a *pointer to* its `{ptr,len}` header, so
+// every syntactic use used to reload both fields and LLVM had to assume an element store through a
+// second view invalidated them. Three facts fix that, and each one is a property of Align's own
+// representation — never of how the program was spelled:
+//
+//   * the header is materialized once, in the entry block (which dominates every use);
+//   * header memory (`align.view.header`) is stated disjoint from element memory (`align.elem`);
+//   * a length load carries `!range !{i64 0, i64 -9223372036854775808}` — "non-negative".
+//
+// The first two are only sound while nothing in the body can write header memory a parameter
+// pointer may reach, so they are gated on [`view_facts_plan`], a whitelist proof that fails closed.
+
+/// The byte size of the `{ptr,len}` view header (`slice_struct_type`) — the extent claimed by
+/// `dereferenceable` on a borrowed header parameter. Asserted against the real data layout in
+/// [`lower_prepared_module`], so a target whose pointer is not 8 bytes fails loudly instead of
+/// claiming a wrong extent.
+const VIEW_HEADER_SIZE: u64 = 16;
+
+/// The alignment of the `{ptr,len}` view header.
+const VIEW_HEADER_ALIGN: u64 = 8;
+
+/// The Align types whose LLVM representation *is* the `{ptr,len}` view header — exactly the
+/// `abi_map_ty`/`scalar_type` arm that maps to [`slice_struct_type`]. A type outside this list
+/// never receives a header attribute, a header alias fact or an entry-block materialization.
+fn is_view_header_ty(ty: Ty) -> bool {
+    matches!(
+        ty,
+        Ty::Slice(_)
+            | Ty::Soa(_)
+            | Ty::JsonDoc
+            | Ty::JsonScanner(_)
+            | Ty::Str
+            | Ty::String
+            | Ty::DynArray(_)
+            | Ty::DynVecArray(..)
+            | Ty::DynMaskArray(..)
+            | Ty::DynFixedArray(..)
+            | Ty::DynFixedStructArray(..)
+            | Ty::CodecBatch
+            | Ty::CodecI64Column
+            | Ty::CodecF64Column
+            | Ty::CodecBoolColumn
+            | Ty::DynSliceArray(_)
+            | Ty::DynResponseArray
+            | Ty::DynStructArray(_, Layout::Aos)
+    )
+}
+
+/// A plain value type that provably contains no view header transitively (plan 69 I4): the element
+/// classes `align.elem` may be claimed for, and the only stored types that keep a function's view
+/// facts alive. A whitelist, so a type added later fails closed into "no fact".
+fn is_pod_scalar_ty(ty: Ty) -> bool {
+    matches!(
+        ty,
+        Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Unit | Ty::Vec(..) | Ty::Mask(..)
+    )
+}
+
+/// Whether `op` provably produces a [`is_pod_scalar_ty`] value. Index-safe: a malformed operand
+/// answers "no" rather than panicking.
+fn operand_is_pod_scalar(f: &Function, op: &Operand) -> bool {
+    match op {
+        Operand::Const(_) => true,
+        Operand::Value(v) => f
+            .value_tys
+            .get(*v as usize)
+            .copied()
+            .is_some_and(is_pod_scalar_ty),
+        Operand::Arg(i) => f
+            .params
+            .get(*i as usize)
+            .and_then(|slot| f.slots.get(*slot as usize))
+            .copied()
+            .is_some_and(is_pod_scalar_ty),
+        // The incoming `borrow mut` drop-flag bit is an `i1` read, never a header.
+        Operand::BorrowedCleanupArg(_) => true,
+        // A borrowed place is a pointer into caller memory, never a POD scalar.
+        Operand::BorrowedPlace(_)
+        | Operand::BorrowedElementPlace(_)
+        | Operand::BorrowedFixedElementPlace(_) => false,
+    }
+}
+
+/// The view facts a function may state (plan 69 §2.3 I1–I5).
+struct ViewFactsPlan {
+    /// The body provably writes no view-header memory and introduces no foreign pointer, so the
+    /// entry-block materialization, the TBAA pair and `noalias` on a read-only `borrow` header are
+    /// all admissible. `!range` is *not* gated on this: a length is non-negative unconditionally.
+    enabled: bool,
+    /// Borrowed header parameters materialized once in the entry block, in slot order.
+    headers: Vec<Slot>,
+}
+
+/// Whether an rvalue provably neither writes view-header memory nor produces a pointer whose
+/// provenance escapes Align's own lowering. A whitelist: every unlisted rvalue — every call that is
+/// handed a pointer, every allocation, every `raw`/resource/FFI form, every I/O form — fails closed.
+fn rvalue_keeps_view_facts(f: &Function, rv: &Rvalue) -> bool {
+    match rv {
+        Rvalue::Use(_)
+        | Rvalue::Load(_)
+        | Rvalue::Un(..)
+        | Rvalue::Bin(..)
+        | Rvalue::Cast { .. }
+        | Rvalue::IntArith { .. }
+        | Rvalue::MathOp { .. }
+        | Rvalue::Select { .. }
+        | Rvalue::Field(..)
+        | Rvalue::Index(..)
+        | Rvalue::IndexField(..)
+        | Rvalue::IndexFieldPtr { .. }
+        | Rvalue::IndexColumn { .. }
+        | Rvalue::IndexPtr { .. }
+        | Rvalue::SoaColumn { .. }
+        | Rvalue::SoaGather { .. }
+        | Rvalue::SliceLen(_)
+        | Rvalue::SlicePtr(_)
+        | Rvalue::SliceIndex(..)
+        | Rvalue::SliceIndexNoalias { .. }
+        | Rvalue::SubSlice { .. }
+        | Rvalue::MakeSlice(..)
+        | Rvalue::MakeVec { .. }
+        | Rvalue::VecExtract { .. }
+        | Rvalue::VecInsert { .. }
+        | Rvalue::VecLoad { .. }
+        | Rvalue::VecSum { .. }
+        | Rvalue::VecDot { .. }
+        | Rvalue::VecMinMax { .. }
+        | Rvalue::VecSumWhere { .. }
+        | Rvalue::MaskAny { .. }
+        | Rvalue::EnumTagEq { .. }
+        | Rvalue::OptionIsSome(_)
+        | Rvalue::ResultIsOk(_)
+        | Rvalue::StrLit(_)
+        | Rvalue::ConstArray { .. } => true,
+        // A runtime call handed nothing but scalars cannot reach header memory: the bounds/range
+        // trap (`align_rt_bounds_fail(index, len)`) is exactly this shape, so a guarded loop keeps
+        // its facts. A call handed any view, pointer or borrowed place fails closed.
+        Rvalue::Call(DirectCall::Runtime(_), args) => {
+            args.iter().all(|arg| operand_is_pod_scalar(f, arg))
+        }
+        _ => false,
+    }
+}
+
+/// Whether a statement provably writes no view-header memory reachable from a parameter. Every
+/// store is admitted only for a [`is_pod_scalar_ty`] value, which is what makes a store to a slot,
+/// an element or a field provably not a header write (plan 69 I2/I3/I4).
+fn stmt_keeps_view_facts(f: &Function, stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Let(_, rv) => rvalue_keeps_view_facts(f, rv),
+        // `_n <- argN` for a borrowed parameter is the MIR prologue's binding of the incoming
+        // pointer, and codegen emits no store at all for it (`gen_block`'s `incoming_borrow` skip),
+        // so it writes nothing. The predicate is the same one that skip uses.
+        Stmt::Store(_, Operand::Arg(index))
+            if matches!(
+                f.param_modes.get(*index as usize),
+                Some(align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut)
+            ) =>
+        {
+            true
+        }
+        Stmt::Store(_, value)
+        | Stmt::StoreField(_, _, value)
+        | Stmt::StoreIndex(_, _, value)
+        | Stmt::PtrStore(_, _, value)
+        | Stmt::StoreElemField(_, _, _, value)
+        | Stmt::PtrStoreNoalias { value, .. }
+        | Stmt::VecStore { value, .. }
+        | Stmt::StoreElemFieldPtr { value, .. }
+        | Stmt::StoreColumn { value, .. } => operand_is_pod_scalar(f, value),
+        Stmt::StoreConstArray { elem, .. } => is_pod_scalar_ty(*elem),
+        _ => false,
+    }
+}
+
+/// Decide which view facts this function may state. Deliberately small and auditable, exactly like
+/// [`stack_header_plan`]: a false negative costs an optimization, a false positive would be a
+/// miscompile, so every unrecognized statement disables the whole set.
+fn view_facts_plan(f: &Function) -> ViewFactsPlan {
+    let enabled = f
+        .blocks
+        .iter()
+        .all(|block| block.stmts.iter().all(|stmt| stmt_keeps_view_facts(f, stmt)));
+    let mut headers = Vec::new();
+    if enabled {
+        for (index, slot) in f.params.iter().enumerate() {
+            let Some(ty) = f.slots.get(*slot as usize).copied() else {
+                continue;
+            };
+            if !is_view_header_ty(ty) {
+                continue;
+            }
+            // Both borrowed modes pass a bare pointer to the header (the `borrow mut` drop-flag
+            // form passes `{value_ptr, cleanup_ptr}`, and `emit_fn` has already extracted the value
+            // pointer into the slot map), so both are materializable.
+            if matches!(
+                f.param_modes.get(index),
+                Some(align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut)
+            ) {
+                headers.push(*slot);
+            }
+        }
+        headers.sort_unstable(); // deterministic IR/object bytes
+        headers.dedup();
+    }
+    ViewFactsPlan { enabled, headers }
+}
+
+/// The `(header, element)` TBAA access tags for one module context. Old-format (scalar) TBAA,
+/// exactly the shape clang emits: a named root, one scalar type node per class, and a
+/// `{base, access, offset}` access tag. The two classes are siblings under one root, so an
+/// `align.view.header` access and an `align.elem` access are proven not to alias; there is one
+/// element class for every element type, so two element accesses still may alias (plan 69 I6).
+fn view_tbaa_tags(ctx: &Context) -> (inkwell::values::MetadataValue<'_>, inkwell::values::MetadataValue<'_>) {
+    let zero = ctx.i64_type().const_int(0, false);
+    let root = ctx.metadata_node(&[ctx.metadata_string("align.tbaa.root").into()]);
+    let header = ctx.metadata_node(&[
+        ctx.metadata_string("align.view.header").into(),
+        root.into(),
+        zero.into(),
+    ]);
+    let element = ctx.metadata_node(&[
+        ctx.metadata_string("align.elem").into(),
+        root.into(),
+        zero.into(),
+    ]);
+    (
+        ctx.metadata_node(&[header.into(), header.into(), zero.into()]),
+        ctx.metadata_node(&[element.into(), element.into(), zero.into()]),
+    )
+}
+
+/// `!range !{i64 0, i64 -9223372036854775808}` — the half-open wrapped range `[0, 2^63)`, i.e.
+/// exactly "this `i64` is non-negative" and nothing more (issue 1080; plan 69 §2.2). Deliberately
+/// not a tighter per-element bound: non-negativity alone removes every `llvm.smax`/`llvm.umin`
+/// length clamp, and a tighter claim would need auditing every length producer for a fact no
+/// measurement needs.
+fn nonnegative_i64_range(ctx: &Context) -> inkwell::values::MetadataValue<'_> {
+    let i64_ty = ctx.i64_type();
+    ctx.metadata_node(&[
+        i64_ty.const_int(0, false).into(),
+        i64_ty.const_int(1u64 << 63, false).into(),
+    ])
 }
 
 #[derive(Default)]
@@ -8316,6 +8688,131 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let out_list = self.ctx.metadata_node(&[out_scope.into()]);
         self.alias_scopes.insert(scope, (in_list, out_list));
         (in_list, out_list)
+    }
+
+    /// Tag an access to view-**header** memory (`align.view.header`). A no-op in a function whose
+    /// body did not qualify for the alias facts, where an untagged access still may-aliases
+    /// everything.
+    fn tag_view_header_access(
+        &self,
+        instruction: inkwell::values::InstructionValue<'c>,
+    ) -> Result<(), CodegenError> {
+        if let Some((header, _)) = self.view_tbaa {
+            instruction
+                .set_metadata(header, self.ctx.get_kind_id("tbaa"))
+                .map_err(|_| self.err("set view header tbaa"))?;
+        }
+        Ok(())
+    }
+
+    /// Tag an access to view-**element** memory (`align.elem`), but only for an element type that
+    /// provably contains no view header transitively (plan 69 I4). An element whose storage can
+    /// hold a header carries no tag and therefore claims nothing.
+    fn tag_view_element_access(
+        &self,
+        instruction: inkwell::values::InstructionValue<'c>,
+        elem: Ty,
+    ) -> Result<(), CodegenError> {
+        if !is_pod_scalar_ty(elem) {
+            return Ok(());
+        }
+        if let Some((_, element)) = self.view_tbaa {
+            instruction
+                .set_metadata(element, self.ctx.get_kind_id("tbaa"))
+                .map_err(|_| self.err("set view element tbaa"))?;
+        }
+        Ok(())
+    }
+
+    /// Attach `!range !{i64 0, i64 -9223372036854775808}` to a length load (issue 1080).
+    fn tag_length_nonnegative(
+        &self,
+        instruction: inkwell::values::InstructionValue<'c>,
+    ) -> Result<(), CodegenError> {
+        instruction
+            .set_metadata(self.view_len_range, self.ctx.get_kind_id("range"))
+            .map_err(|_| self.err("set length range"))?;
+        Ok(())
+    }
+
+    /// Load one `{ptr,len}` header field through `pointer`, carrying the header alias fact and —
+    /// for the length field — its non-negativity. The single place a header field is read from
+    /// memory, so every length load in the program carries `!range` by construction.
+    fn load_view_part(
+        &self,
+        pointer: inkwell::values::PointerValue<'c>,
+        index: u32,
+        name: &str,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let field = self
+            .builder
+            .build_struct_gep(slice_struct_type(self.ctx), pointer, index, name)
+            .map_err(|e| self.err(e))?;
+        let field_ty: BasicTypeEnum<'c> = if index == 0 {
+            self.ctx.ptr_type(AddressSpace::default()).into()
+        } else {
+            self.ctx.i64_type().into()
+        };
+        let value = self
+            .builder
+            .build_load(field_ty, field, name)
+            .map_err(|e| self.err(e))?;
+        let instruction = value
+            .as_instruction_value()
+            .ok_or_else(|| self.err("view header field load is not an instruction"))?;
+        self.tag_view_header_access(instruction)?;
+        if index == 1 {
+            self.tag_length_nonnegative(instruction)?;
+        }
+        Ok(value)
+    }
+
+    /// Materialize every borrowed header parameter once, in the entry block (plan 69 I1). The
+    /// builder is positioned at the end of the entry block's prologue, which dominates every other
+    /// block, and the body proof in [`view_facts_plan`] guarantees nothing in this function writes
+    /// header memory afterwards — so one load per field is all any use ever needs.
+    fn materialize_view_headers(&mut self) -> Result<(), CodegenError> {
+        if !self.view_facts {
+            return Ok(());
+        }
+        let slots = std::mem::take(&mut self.view_header_slots);
+        let header_ty: BasicTypeEnum<'c> = slice_struct_type(self.ctx).into();
+        for slot in &slots {
+            let Some(pointer) = self.slots.get(slot).copied() else {
+                continue;
+            };
+            // Only a slot whose LLVM representation really is the `{ptr,len}` header, so a cached
+            // value can never be substituted for a differently shaped load.
+            if self
+                .f
+                .slots
+                .get(*slot as usize)
+                .copied()
+                .is_none_or(|ty| self.llvm_type(ty) != header_ty)
+            {
+                continue;
+            }
+            let data = self.load_view_part(pointer, 0, "view.ptr")?;
+            let length = self.load_view_part(pointer, 1, "view.len")?;
+            let header = self
+                .builder
+                .build_insert_value(slice_struct_type(self.ctx).get_poison(), data, 0, "view.hdr.ptr")
+                .map_err(|e| self.err(e))?;
+            let header = self
+                .builder
+                .build_insert_value(header, length, 1, "view.hdr")
+                .map_err(|e| self.err(e))?;
+            self.view_parts.insert((*slot, 0), data);
+            self.view_parts.insert((*slot, 1), length);
+            self.view_headers.insert(*slot, header.into_struct_value().into());
+        }
+        self.view_header_slots = slots;
+        Ok(())
+    }
+
+    /// The entry-block header for a whole-`{ptr,len}` read of `slot`, when there is one.
+    fn cached_view_header(&self, slot: Slot) -> Option<BasicValueEnum<'c>> {
+        self.view_headers.get(&slot).copied()
     }
 
     /// Translate a MIR (logical) field index into the LLVM (physical) index for struct `struct_id`.
@@ -10599,6 +11096,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
             self.stack_template_headers.insert(value, ptr);
         }
 
+        // One `{ptr,len}` materialization per borrowed header parameter, still in the entry block
+        // (plan 69 PR 1). Emitted after the allocas so it dominates every use it replaces.
+        self.materialize_view_headers()?;
+
         // Establish a fallback debug location (a no-op without debug info) so every body
         // instruction — including ones from statements with no recorded line — carries one.
         self.set_line(self.fn_line, 0);
@@ -10727,7 +11228,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .build_in_bounds_gep(val.get_type(), p, &[index], "ptrstore")
                             .map_err(|e| self.err(e))?
                     };
-                    self.builder.build_store(ep, val).map_err(|e| self.err(e))?;
+                    let store = self.builder.build_store(ep, val).map_err(|e| self.err(e))?;
+                    self.tag_view_element_access(store, self.checked_operand_ty(op)?)?;
                 }
                 Stmt::PtrStoreNoalias { ptr, index, value, scope } => {
                     // `dst[i] <- val` for a `map_into` loop: like `PtrStore`, plus the loop's `out`
@@ -11394,10 +11896,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let v: BasicValueEnum<'c> = match rv {
             Rvalue::Use(op) => self.operand_by_value(op)?,
             Rvalue::Load(slot) => {
-                let ty = self.llvm_type(self.f.slots[*slot as usize]);
-                self.builder
-                    .build_load(ty, self.slots[slot], "load")
-                    .map_err(|e| self.err(e))?
+                // A borrowed header parameter reads its one entry-block materialization.
+                if let Some(header) = self.cached_view_header(*slot) {
+                    header
+                } else {
+                    let ty = self.llvm_type(self.f.slots[*slot as usize]);
+                    self.builder
+                        .build_load(ty, self.slots[slot], "load")
+                        .map_err(|e| self.err(e))?
+                }
             }
             Rvalue::Un(op, a) => match op {
                 UnOp::Neg if matches!(self.f.operand_ty(a), Ty::Float(_)) => {
@@ -16247,7 +16754,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .build_in_bounds_gep(ty, ptr, &[index], "slcidx")
                         .map_err(|e| self.err(e))?
                 };
-                self.builder.build_load(ty, ep, "slcload").map_err(|e| self.err(e))?
+                let load = self.builder.build_load(ty, ep, "slcload").map_err(|e| self.err(e))?;
+                if let Some(instruction) = load.as_instruction_value() {
+                    self.tag_view_element_access(instruction, physical_ty)?;
+                }
+                load
             }
             Rvalue::SliceIndexNoalias { slice, index, scope } => {
                 // Like `SliceIndex`, plus the `map_into` loop's `in` alias scope so the vectorizer
@@ -22495,19 +23006,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
         index: u32,
         name: &str,
     ) -> Result<BasicValueEnum<'c>, CodegenError> {
+        // A parameter-derived header was materialized once in the entry block; reuse that value
+        // instead of reloading the field (issue 1079). A projection through a field/payload path is
+        // a different place and is not cached.
+        if place.path.is_empty()
+            && let Some(value) = self.view_parts.get(&(place.slot, index)).copied()
+        {
+            return Ok(value);
+        }
         let ptr = self.borrowed_place_ptr(place)?;
-        let field = self
-            .builder
-            .build_struct_gep(slice_struct_type(self.ctx), ptr, index, name)
-            .map_err(|e| self.err(e))?;
-        let field_ty: BasicTypeEnum<'c> = if index == 0 {
-            self.ctx.ptr_type(AddressSpace::default()).into()
-        } else {
-            self.ctx.i64_type().into()
-        };
-        self.builder
-            .build_load(field_ty, field, name)
-            .map_err(|e| self.err(e))
+        self.load_view_part(ptr, index, name)
     }
 
     fn borrowed_sum_tag(
@@ -22600,10 +23108,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 .get_nth_param(*i)
                 .ok_or_else(|| self.err(format!("parameter index {i} is out of range")))?,
             Operand::BorrowedPlace(place) => {
-                let pointer = self.borrowed_place_ptr(place)?;
-                self.builder
-                    .build_load(self.llvm_type(place.ty), pointer, "borrow.load")
-                    .map_err(|error| self.err(error))?
+                // The whole header of a borrowed view parameter is the entry-block materialization
+                // (issue 1079); every other place still loads at its use.
+                if place.path.is_empty()
+                    && is_view_header_ty(place.ty)
+                    && let Some(header) = self.cached_view_header(place.slot)
+                {
+                    header
+                } else {
+                    let pointer = self.borrowed_place_ptr(place)?;
+                    self.builder
+                        .build_load(self.llvm_type(place.ty), pointer, "borrow.load")
+                        .map_err(|error| self.err(error))?
+                }
             }
             Operand::BorrowedElementPlace(_) => {
                 return Err(self.err(
@@ -34683,6 +35200,56 @@ fn main() -> i32 = 0
     #[should_panic(expected = "does not recognize the enum attribute")]
     fn enum_kind_id_panics_on_unknown_attribute() {
         let _ = enum_kind_id("definitely_not_a_real_llvm_attribute");
+    }
+
+    /// Plan 69 PR 1, the "imported declaration" cell: a declaration has no body, so the shared
+    /// header-facts helper is called with no `noalias` authority and must state only the structural
+    /// facts. The same call shape covers `borrow mut`, which never carries `noalias` even when the
+    /// body *is* available. This is a direct owner for the helper, because an interface-only
+    /// dependency's `declare` is not reachable from whole-program IR.
+    #[test]
+    fn imported_and_mutable_view_headers_state_no_noalias() {
+        let ctx = Context::create();
+        let module = ctx.create_module("imported");
+        let pointer = ctx.ptr_type(AddressSpace::default());
+        let fn_ty = ctx
+            .void_type()
+            .fn_type(&[pointer.into(), pointer.into()], false);
+        let function = module.add_function("imported", fn_ty, None);
+        let element = Scalar::Int(align_sema::IntTy { bits: 64, signed: true });
+        mark_view_header_param_facts(
+            &ctx,
+            function,
+            &[
+                align_ast::ParamMode::Borrow,
+                align_ast::ParamMode::BorrowMut,
+            ],
+            &[Ty::Slice(element), Ty::Slice(element)],
+            &[slice_struct_type(&ctx).into(), slice_struct_type(&ctx).into()],
+            &Program::default(),
+            /* body_states_noalias */ false,
+        );
+        use inkwell::values::AnyValue;
+        let text = function.print_to_string().to_string();
+        assert!(
+            !text.contains("noalias"),
+            "a bodyless declaration states no `noalias`:\n{text}"
+        );
+        assert_eq!(
+            text.matches("dereferenceable(16)").count(),
+            2,
+            "both header parameters state the header's own extent:\n{text}"
+        );
+        assert_eq!(
+            text.matches("align 8").count(),
+            2,
+            "both header parameters state the header's alignment:\n{text}"
+        );
+        assert_eq!(
+            text.matches("nonnull").count(),
+            2,
+            "both header parameters are non-null:\n{text}"
+        );
     }
 
     #[test]

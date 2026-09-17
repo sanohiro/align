@@ -37,7 +37,11 @@ subtyping) is now a refused row in the friction ledger.
 loop-facts issues plan 68 assigns to G1–G3 (1079, 1080, 1081, 1084): three
 ordered PRs for view-header materialization with alias and length facts, the
 fused and preheader-versioned bounds check, and the latch-exit counted loop,
-with one implementation closure matrix each. No implementation has started.
+with one implementation closure matrix each. PR 1 (1079, 1080) has shipped: a
+borrowed view header is materialized once in the entry block, header and
+element memory are separate TBAA classes, a read-only `borrow` header of a
+body that writes no header carries `noalias`, and every length load states its
+non-negativity. PRs 2 and 3 are unstarted.
 
 **Decode representation costs:** [plan 62](docs/impl/62-decode-optimization-plan.md)
 implements bounded nonescaping byte storage and direct synchronous chunks
