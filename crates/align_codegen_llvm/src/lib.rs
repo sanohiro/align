@@ -7458,6 +7458,49 @@ fn normalize_linked_rt_lto_guarded_definitions(
     Ok(())
 }
 
+/// Establish the `--rt-lto` merge invariant on the artifact that is about to be merged: **a
+/// definition linked into the program module carries no attribute that binds it to a target other
+/// than the program's own `TargetMachine`** (#1069).
+///
+/// `link_in_module` merges everything the baked artifact defines, not only the guarded rows, so
+/// the sweep is module-scoped: whether `rustc`'s inliner happened to leave a fifth helper body in
+/// `str_prims.bc` decides nothing. Declarations are exempt — a bodiless declaration emits no code
+/// and is not an inline candidate, so no attribute on one can bind codegen to another target; a
+/// body is also the only thing the inliner can copy `"probe-stack"` out of.
+fn shed_rt_lto_target_bound_attributes(module: &Module<'_>) {
+    for function in module.get_functions() {
+        if function.count_basic_blocks() == 0 {
+            continue; // a declaration (`memcmp`) — nothing to shed, nothing to inline
+        }
+        runtime_abi::shed_string_attributes(function);
+    }
+}
+
+/// Re-derive the invariant [`shed_rt_lto_target_bound_attributes`] just established, returning the
+/// offending definition and key when one still carries a string attribute.
+///
+/// Checking the artifact rather than trusting the sweep is what keeps a future guarded row, a
+/// `rustc` upgrade that bakes one more policy string, or a key the shedder could not name from
+/// silently reintroducing the defect. It runs on the incoming module, before `link_in_module` has
+/// mutated anything, so its caller can still fall back exactly like every other baked-artifact
+/// defect — and so it can never mistake an Align-generated function for a merged one.
+fn verify_rt_lto_target_independence(module: &Module<'_>) -> Result<(), String> {
+    for function in module.get_functions() {
+        if function.count_basic_blocks() == 0 {
+            continue;
+        }
+        for loc in runtime_abi::attribute_locations(function) {
+            if let Some(key) = runtime_abi::string_attribute_keys(function, loc).first() {
+                return Err(format!(
+                    "definition {} still carries the producing compiler's string attribute {key:?}",
+                    function.get_name().to_string_lossy(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Link the parsed `--rt-lto` runtime module into the program `module` in place, then normalize the
 /// merged bodies (M14 Slice 2). Steps: (0) compare the parsed runtime module's datalayout against
 /// the program's — a mismatch means blindly overwriting it (the old unconditional
@@ -7466,11 +7509,15 @@ fn normalize_linked_rt_lto_guarded_definitions(
 /// (loud diagnostic, guarded declares re-curated, no merge — see [`probe_rt_lto`]); (1) match the
 /// incoming module's triple to the program's (cosmetic — `link_in_module` does not check it) and the
 /// datalayout too (now known equal); (2) require every guarded row to have the exact type, a body,
-/// external linkage, and the C calling convention, then rename it to the captured physical name of
-/// its typed declaration and `link_in_module` (the definitions replace those declarations even when
-/// an earlier program claimant forced LLVM uniquification); (3) require every captured typed handle
-/// to remain a body-bearing external C definition, then shed exactly that row's curated attrs and
-/// set it `internal` DIRECTLY (never the
+/// external linkage, and the C calling convention; (2b) shed every string attribute the producing
+/// compiler baked into any incoming definition and re-derive that from the same module, so the
+/// merged bodies inherit the program's own `TargetMachine` instead of `rustc`'s — falling back like
+/// any other artifact defect if one survives ([`shed_rt_lto_target_bound_attributes`],
+/// [`verify_rt_lto_target_independence`]); then rename each guarded row to the captured physical
+/// name of its typed declaration and `link_in_module` (the definitions replace those declarations
+/// even when an earlier program claimant forced LLVM uniquification); (3) require every captured
+/// typed handle to remain a body-bearing external C definition, then shed exactly that row's
+/// curated attrs and set it `internal` DIRECTLY (never the
 /// internalize pass — the `{main} ∪ --export` roots model stays untouched, and no runtime symbol is
 /// externally defined, so there is no duplicate-external vs the `.a` at final link); (4) `verify` the
 /// merged module. Runs on the RAW module, BEFORE the single `run_opt_pipeline` — never a second opt
@@ -7535,6 +7582,20 @@ fn link_in_rt_lto<'c>(
             restore_rt_lto_guarded_attributes(ctx, module, runtime)?;
             return Ok(());
         }
+    }
+
+    // (2b) Make every incoming definition target-independent, then re-derive that from the same
+    // module. Both run here, on the artifact and before `link_in_module`, so the guarantee covers
+    // whatever the artifact defines rather than only the guarded rows, and so a violation is one
+    // more baked-artifact defect that falls back instead of failing a user's build (#1069).
+    shed_rt_lto_target_bound_attributes(&rt);
+    if let Err(defect) = verify_rt_lto_target_independence(&rt) {
+        eprintln!(
+            "alignc: --rt-lto disabled: baked runtime bitcode {defect}; falling back to the \
+             runtime staticlib. This is a compiler build defect, not a problem with your program.",
+        );
+        restore_rt_lto_guarded_attributes(ctx, module, runtime)?;
+        return Ok(());
     }
 
     // Retarget each incoming definition to the physical declaration selected before lowering.
@@ -24825,6 +24886,137 @@ fn main() -> i32 = 0
                     "{malformed}: guarded declaration remained un-curated",
                 );
             }
+        }
+    }
+
+    /// The two owners below build LLVM fixtures directly, so they carry the builder API's
+    /// `unwrap`/`expect` panics. They are the whole of this capability's rise in the
+    /// `align_codegen_llvm panics` ratchet; the implementation-side count is unchanged, and a
+    /// failing fixture here must abort the test, not be diagnosed.
+    ///
+    /// #1069: every definition the baked artifact carries into the program module must shed the
+    /// producing compiler's string attributes, at every attribute location — not only the guarded
+    /// rows, because `link_in_module` merges whatever the artifact defines. The fixture therefore
+    /// carries a non-guarded fifth definition alongside the four, and spreads the attributes over
+    /// the function, the return, and a parameter.
+    #[test]
+    fn runtime_abi_rt_lto_merge_sheds_producer_string_attributes_everywhere() {
+        let program = mir("fn main() -> i32 = 0\n");
+        let ctx = Context::create();
+        let module = ctx.create_module("align");
+        let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).unwrap();
+        let runtime =
+            build_module(&ctx, &module, &program, &tm, None, &[], true, ModuleScope::Whole).unwrap();
+
+        let rt = ctx.create_module("align_rt_target_attrs_fixture");
+        rt.set_data_layout(&module.get_data_layout());
+        let baked = |function: FunctionValue<'_>| {
+            // The exact shapes `rustc` bakes, plus return/parameter placements that a
+            // function-attribute-only sweep would miss.
+            function.add_attribute(
+                inkwell::attributes::AttributeLoc::Function,
+                ctx.create_string_attribute("target-cpu", "apple-m1"),
+            );
+            function.add_attribute(
+                inkwell::attributes::AttributeLoc::Function,
+                ctx.create_string_attribute("probe-stack", "inline-asm"),
+            );
+            function.add_attribute(
+                inkwell::attributes::AttributeLoc::Return,
+                ctx.create_string_attribute("align.fixture.return", ""),
+            );
+            function.add_attribute(
+                inkwell::attributes::AttributeLoc::Param(0),
+                ctx.create_string_attribute("align.fixture.param", ""),
+            );
+        };
+        // The non-guarded fifth definition: a helper `rustc`'s inliner did not fold away. Nothing
+        // renames or normalizes it, so only a module-scoped sweep can reach it. It is `internal`
+        // and called from the guarded bodies, exactly as such a leftover would be — an unreferenced
+        // internal definition is not carried over by `link_in_module` at all.
+        let helper_type = ctx.i32_type().fn_type(&[ctx.i32_type().into()], false);
+        let helper = rt.add_function("align_rt_fixture_unguarded_helper", helper_type, None);
+        helper.set_linkage(Linkage::Internal);
+        {
+            let builder = ctx.create_builder();
+            let entry = ctx.append_basic_block(helper, "entry");
+            builder.position_at_end(entry);
+            builder.build_return(Some(&ctx.i32_type().const_int(1, false))).unwrap();
+        }
+        baked(helper);
+        for abi in runtime_abi::keyed_runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
+            let function = abi.declare(&ctx, &rt);
+            let builder = ctx.create_builder();
+            let entry = ctx.append_basic_block(function, "entry");
+            builder.position_at_end(entry);
+            let call = builder
+                .build_call(helper, &[ctx.i32_type().const_zero().into()], "helper")
+                .unwrap();
+            let value = call.try_as_basic_value().basic().expect("helper returns i32");
+            builder.build_return(Some(&value)).unwrap();
+            baked(function);
+        }
+
+        link_in_rt_lto(&ctx, &module, rt, &runtime).expect("the merge must succeed");
+
+        let mut checked_helper = false;
+        for function in module.get_functions() {
+            if function.count_basic_blocks() == 0 {
+                continue;
+            }
+            if function.get_name().to_string_lossy() == "align_rt_fixture_unguarded_helper" {
+                checked_helper = true;
+            }
+            for loc in runtime_abi::attribute_locations(function) {
+                assert!(
+                    runtime_abi::string_attribute_keys(function, loc).is_empty(),
+                    "merged definition {} kept a producer string attribute",
+                    function.get_name().to_string_lossy(),
+                );
+            }
+        }
+        assert!(checked_helper, "the non-guarded fifth definition must reach the merged module");
+    }
+
+    /// The re-derivation is the tripwire for a shedder that stops covering something, so it must
+    /// actually refuse a module that still carries one — and accept the swept module.
+    #[test]
+    fn runtime_abi_rt_lto_target_independence_check_refuses_a_carried_attribute() {
+        let ctx = Context::create();
+        let rt = ctx.create_module("align_rt_check_fixture");
+        let function = rt.add_function(
+            "align_rt_fixture_definition",
+            ctx.i32_type().fn_type(&[ctx.i32_type().into()], false),
+            None,
+        );
+        let builder = ctx.create_builder();
+        let entry = ctx.append_basic_block(function, "entry");
+        builder.position_at_end(entry);
+        builder.build_return(Some(&ctx.i32_type().const_zero())).unwrap();
+        // A declaration is exempt: it emits no code and is not an inline candidate.
+        let declaration = rt.add_function("align_rt_fixture_declaration", ctx.i32_type().fn_type(&[], false), None);
+        declaration.add_attribute(
+            inkwell::attributes::AttributeLoc::Function,
+            ctx.create_string_attribute("target-cpu", "apple-m1"),
+        );
+        verify_rt_lto_target_independence(&rt).expect("a declaration's attributes are not merged");
+
+        for loc in [
+            inkwell::attributes::AttributeLoc::Function,
+            inkwell::attributes::AttributeLoc::Return,
+            inkwell::attributes::AttributeLoc::Param(0),
+        ] {
+            function.add_attribute(loc, ctx.create_string_attribute("target-cpu", "apple-m1"));
+            let defect = verify_rt_lto_target_independence(&rt)
+                .expect_err("a carried string attribute must be refused");
+            assert!(
+                defect.contains("align_rt_fixture_definition")
+                    && defect.contains("still carries the producing compiler's string attribute")
+                    && defect.contains("target-cpu"),
+                "{defect}",
+            );
+            shed_rt_lto_target_bound_attributes(&rt);
+            verify_rt_lto_target_independence(&rt).expect("the sweep must clear it");
         }
     }
 
