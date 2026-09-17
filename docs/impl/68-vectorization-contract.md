@@ -176,6 +176,12 @@ variables: for a loop exiting on `i >= N` with a positive constant step and an
 index `a*i + b` with loop-invariant `a > 0`, one preheader guard replaces the
 in-loop one.
 
+One guard is excluded from both halves: the guard `lower_borrowed_place` emits
+for a borrowed element argument (`inspect(rs[i])`) is also the predicate
+codegen re-derives literally before forming the element pointer, so it keeps its
+signed form and its loop keeps its checks. Plan 69 §3.1, §3.2 and §3.6 own that
+exclusion and its later lifting; G2's corpus contains no such loop.
+
 The guard is moved, never deleted. The `(index, len)` diagnostic text stays
 byte-identical and the first failing access still fails at the same iteration;
 that is a promise, and it is what separates this from bounds-check removal.

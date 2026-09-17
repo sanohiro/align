@@ -369,9 +369,24 @@ keeps its signed form unchanged — the fusion is per guard, not a global rewrit
 and this is the precondition I7 deliberately does not assert globally.
 
 Codegen lowers the fused predicate to an unsigned `icmp` because the predicate
-follows the operand type. No new `BinOp`, no new `Rvalue`, no validator change:
-the index operand of `Rvalue::SliceIndex` stays exactly `i64`, which is what
-`validate_slice_index_rvalues` checks.
+follows the operand type: the two operands pass through the existing
+`Rvalue::Cast` to `u64` and the compare is the existing `BinOp::Ge`. No new
+`BinOp`, no new `Rvalue`. The index operand of `Rvalue::SliceIndex` stays
+exactly `i64`, which is what `validate_slice_index_rvalues` checks.
+
+One class of guard keeps its signed form. `lower_borrowed_place` emits a guard
+for a borrowed element argument such as `inspect(rs[i])` and publishes it as a
+`BorrowedElementGuard { reservation, len }`; codegen's
+`checked_borrowed_element_guard` then re-derives that guard **literally** —
+`Bin(Or, Bin(Lt, index, 0), Bin(Ge, index, len))`, `len` typed `i64` and
+defined by `Rvalue::SliceLen`, exactly one `BoundsFail(index, len)` in an
+`Unreachable` failure block whose success edge dominates the action — before it
+forms the element pointer. That check is a second MIR-to-codegen safety
+contract, and fusing its guard would fail it with `borrowed element guard
+condition is not the canonical bounds predicate`. So `emit_bounds_check` gains
+a signed-form entry used only by `lower_borrowed_place`; every other emitter
+site fuses. Teaching the codegen validator the fused form is the extension in
+§3.6, not part of PR 2.
 
 Fusion changes no call-site count: the check is fused, not removed.
 
@@ -382,6 +397,35 @@ and is fail-closed and roll-back in exactly the same way: derive, rewrite,
 re-derive from the rewritten function, and discard the rewrite if the re-derived
 facts disagree. `loop_facts` is the module PR 3 extends; there is never a second
 induction derivation.
+
+Its position in the pipeline is an invariant, not an accident, because two
+other passes read statement counts:
+
+```text
+1  annotate_par_map_work        lower_program_unchecked_with_plans; derives the
+                                par_map work weight from block.stmts.len()
+2  byte_ranges::simplify        lower_program_checked_with_catalog
+3  loop_facts                   same loop, immediately after 2
+4  byte_prepare::prepare        codegen lower_prepared_module; splices leaf
+                                bodies into callers and re-runs
+                                byte_ranges::simplify and snapshot_descriptors
+                                on the spliced result
+```
+
+This adds one invariant to §2.3's list:
+
+```text
+I8  loop_facts runs after annotate_par_map_work and before codegen in every
+    lowering entry point; a par_map work weight is derived from the unversioned
+    body, so it is byte-identical with and without versioning
+```
+
+Consequences stated once: par_map work weights are computed on the unversioned
+body and are byte-identical with and without versioning, so the `ParMapReduce`
+partition and therefore float reduction order cannot change (I8, §3.4);
+`byte_prepare` sees versioned bodies, so its statement-count admission counts
+the body it actually splices (§3.2.2). `loop_facts` runs on every lowering entry
+point, located or not, because all four funnel through the same hook.
 
 ### 3.2 The exact shape of the movement
 
@@ -422,46 +466,154 @@ effectful body and not only for a pure one.
 Admission requires all of:
 
 ```text
-one monotone index      a slot assigned i + step in the latch, with step a
-                        positive integer constant, assigned on every path
-                        through the body, and assigned nowhere else in it — a
-                        second assignment anywhere in the body, including from
-                        a nested inner loop, is disqualifying
-known entry value       the index's value on entry to the loop is a
-                        loop-invariant expression the trip count can be formed
-                        from. An entry value that is not available fails closed
-loop-invariant bound    the trip-count comparison's right operand is invariant
-                        across the loop
+IR identity             the body contains no Stmt::BorrowedElementReservation.
+                        That marker is a function-unique token that codegen's
+                        BorrowedElementValidationIndex::unique_reservation
+                        requires to occur exactly once, and its guard is the
+                        one checked_borrowed_element_guard re-derives literally
+                        (§3.1). A cloned body would carry the token twice and
+                        the fast copy would carry no guard at all. A loop that
+                        borrows an element into a call keeps its checks in PR 2;
+                        lifting that is §3.6
+one monotone index      exactly one slot i is written in the body, by exactly
+                        one statement i = i + step with step a positive integer
+                        constant, and that statement post-dominates every
+                        guarded access in the body: on every path from a
+                        guarded access to the back-edge the step executes after
+                        the access, so the value that reaches each guarded
+                        access is the value i holds at the loop header. A step
+                        that precedes an access on any path is disqualifying
+                        (shifted_sum, §3.4), as is a second assignment anywhere
+                        in the body, including from a nested inner loop. The
+                        exit test i >= N reads the header value by construction
+non-negative entry      the value of i on entry is a loop-invariant operand
+                        proved >= 0 at the preheader: a non-negative constant, a
+                        length, or an operand under a dominating
+                        non-negativity guard. A negative or unproved entry fails
+                        closed. §3.2.1 depends on it
+loop-invariant bound    the loop exits on i >= N with N a loop-invariant i64
+                        operand not killed in the body. Any other exit is an
+                        ordinary exit and is preserved in both versions; only
+                        this comparison forms the trip count
 affine access           each guarded index is a*i + b with a and b
-                        loop-invariant and a > 0
-invariant view          each guarded access names a view that is itself
-                        invariant across the loop — not merely a length that
-                        happens to be equal — so a borrowed replacement of the
-                        indexed view inside the loop is disqualifying
-invariant length        each guarded length is invariant across the loop, and
-                        admission is proved per guard against that guard's own
-                        length, never against the trip-count bound
-no induction wrap       bound + step does not overflow i64. With PR 1's !range
-                        this is provable whenever the bound is a length; for a
-                        general i64 bound it is not, and the loop is not admitted
-no index wrap           a*i + b does not overflow i64 for any i the loop
-                        reaches. `a > 0` does not imply it: with a large
-                        loop-invariant `a` the product wraps negative
-                        mid-iteration and can wrap back into [0, len) at the
-                        endpoint, which would admit a loop whose intermediate
-                        indices are out of range. The proof is over the whole
-                        iteration space, not at the endpoint, and the admission
-                        test is itself computed in a width that cannot wrap or
-                        is separately guarded
-both ends proved        b may be negative and loop-invariant, so admission
-                        proves the minimum reached index >= 0 and the maximum
-                        reached index < len, never only the maximum
+                        loop-invariant, not killed in the body, and a proved > 0
+                        at the preheader
+invariant view and      the root slot of each guarded view and the length
+length (kill set)       operand of each guard are killed by no statement in the
+                        body. Killing is decided by an exhaustive match over
+                        every Stmt and Rvalue variant with no wildcard arm,
+                        guarded by a compile-time variant tripwire in the manner
+                        of align_sema::variant_sweep_tripwire, so a new variant
+                        is a build error rather than a silent "does not
+                        mutate". A variant kills the root when it names the
+                        root slot or an operand deriving from it: Store,
+                        StoreField, StoreIndex, StoreConstArray, StoreElemField,
+                        StoreElemFieldPtr, ArrayTruncate, NullTupleField,
+                        NullStructField, NullElemField, Drop, DropElem,
+                        DropElemField, DropValue, DropFlagInit, PtrStore,
+                        PtrStoreNoalias, RawStore, RawFree, ArenaEnd, TgEnd,
+                        ColumnBatchFinish, ColumnBatchDrop, and every
+                        store-like Rvalue. A call — DirectCall, CallIndirect,
+                        RawCall, IndirectCallWithCleanup or a runtime call —
+                        kills the root when any argument derives from it in any
+                        mode other than read-only `borrow`, and kills every
+                        root that is not itself a read-only `borrow` parameter
+                        of the enclosing function when the call has no effect
+                        summary. A borrowed replacement of the indexed binding
+                        is a Store to the root and is covered by the same rule.
+                        A length that "happens to be equal" is never a
+                        substitute for the guard's own length operand
+admission arithmetic    the preheader test is the exact i64 sequence in §3.2.1;
+                        every operation in it is overflow-free by construction
+                        or guarded by an explicit comparison, and any failed
+                        guard selects the slow loop. No wider integer type
+                        exists in MIR and none is introduced
+both ends proved        b may be negative, so the test proves min >= 0 and
+                        max < len for every guard, never only max
 every guard proved      if any guarded access in the body is not proved, the
                         loop is not versioned at all
+budget                  the body is within LOOP_FACTS_VERSION_BUDGET (§3.2.2)
 ```
 
 A loop that fails any condition keeps its fused in-loop guards and is otherwise
 untouched. Fail-closed is the default in every direction.
+
+#### 3.2.1 The admission arithmetic
+
+For entry `e` (proved `e >= 0`), constant step `s > 0`, bound `N`, and one
+guard `(a, b, len)` with `a > 0` proved, the preheader computes, in `i64`:
+
+```text
+zero-trip   e >= N              the body never runs; select the fast loop, which
+                                runs zero iterations and performs no access. No
+                                further test is needed
+induction   N <= i64::MAX - s   otherwise the last step i = imax + s wraps
+                                negative under defined two's-complement wrap and
+                                the fast loop, which has no guard, would index
+                                with it; the original loop wraps identically but
+                                keeps its guard, so the slow loop is selected
+imax        e + s * ((N - 1 - e) / s)
+                                overflow-free: e < N gives 0 <= N - 1 - e < N,
+                                and e <= imax <= N - 1
+amax        a * imax            overflows iff imax > i64::MAX / a; a > 0 is
+                                proved, so the division is defined and is
+                                computed once in the preheader
+max         amax + b            b >= 0: overflows iff amax > i64::MAX - b
+                                b <  0: cannot overflow (amax >= 0)
+min         a * e + b           a * e <= amax, so it cannot overflow once amax
+                                did not; b < 0 cannot underflow because
+                                a * e >= 0; b >= 0 gives min <= max
+admit       no overflow guard fired, and min >= 0, and max < len
+```
+
+The test is conjoined over every guard in the body and selects the fast loop
+only when every conjunct holds. Because `a > 0`, `a*i + b` is monotone in `i`,
+and every `i` the loop reaches lies in `[e, imax]`, so every intermediate index
+lies in `[min, max]` and `a*i <= amax` for all of them: the review's
+mid-iteration wrap is excluded without a wider type. The comparisons are the
+exact `i64` compares MIR already has; the two divisions are by proved-positive
+operands, so they cannot trip the hard error invalid integer division carries.
+
+#### 3.2.2 Traversal order, re-entry and the budget
+
+```text
+order       loops are versioned innermost-first in post-order over the
+            function's loop forest; a versioned inner loop contributes both of
+            its copies to the enclosing body's statement count
+re-entry    a block produced by cloning is marked and is never versioned again;
+            each source loop is considered exactly once
+budget      LOOP_FACTS_VERSION_BUDGET is a pub const in loop_facts, counted in
+            body statements including terminators, pinned by an owner test.
+            Over budget is not admitted and is reported (§3.2.3)
+byte_prepare
+            its statement-count admission (2048 statements in total, 32 sites,
+            source order) counts the body it actually splices, which is the
+            post-loop_facts body. A leaf near that budget can therefore stop
+            being inlined once its loop is versioned. That is deterministic —
+            the same input versions the same way in every unit — and is pinned
+            by an owner whose leaf straddles the budget with and without
+            versioning
+determinism the transform is a pure function of the validated function; there
+            is no profile, unit or entry-point dependence
+```
+
+#### 3.2.3 Observability
+
+One source loop becoming two IR loops must be visible. `loop_facts` records one
+decision per source loop in a per-function report, and `explain-opt` prints it
+beside the LLVM remarks:
+
+```text
+loop versioned            budget used / LOOP_FACTS_VERSION_BUDGET
+loop kept checks: <why>   borrowed-element | multiple-index-writes |
+                          step-precedes-access | entry-unproved | bound-killed |
+                          access-not-affine | root-killed:<Stmt kind> |
+                          arithmetic-unproved | over-budget
+```
+
+The reason codes are the stable surface; the wording around them is not. A
+budget refusal is therefore a regression an owner can assert on, and a user can
+see why a loop was or was not versioned without reading MIR.
 
 Plan 68 G2's exact statement — "at most one bounds check per loop, in the
 preheader, for a monotone index" — reads on the admitted fast version. The slow
@@ -508,7 +660,7 @@ named where it already discriminates the defect; a new owner is named `planned`.
 | | `match` in the body | as `if`; a discriminator-unreachable arm contributes no access | `enum_match`, planned |
 | | `else` unwrap | the unwrap's failure edge is an exit; the fast loop keeps it | `else_result`, planned |
 | | `?` propagation | an early function return from the body is an exit, and is preserved in both loop versions | `loop_expr::a_question_mark_in_a_loop_exits_the_function`, `structured_error` |
-| | `map_err` | no effect on admission; the call is opaque and kills nothing it does not write | `structured_error` |
+| | `map_err` | an opaque call kills every place it may write, and a call reached by the indexed root kills that root (§3.2 kill set); a `map_err` whose arguments do not derive from the indexed view leaves admission unaffected | `structured_error`, planned kill-set owner |
 | | branch joins | facts join by intersection; an index proved on one arm only is not proved at the join | planned |
 | | loop joins | the back-edge join must re-derive; a fact killed on any path is killed at the header | planned |
 | | early `break` with a value | both versions carry the same break value and the same break type; the loop's value is unchanged | `loop_expr::loop_yields_its_break_value`, `a_break_moves_an_owned_value_out_once` |
@@ -520,11 +672,12 @@ named where it already discriminates the defect; a new owner is named `planned`.
 | | `chunks` and byte/str helper loops | `lower_chunks_count`'s consumer and the byte helpers use a computed count, which is admitted only under the fusion precondition in §3.1 | `chunks`, `bytes_ops`, planned |
 | | `par_map` / `ParMapParallel` / `ParMapReduce` kernels | the kernel body is generated and lifted; versioning it must not change its purity, its work partition or its reduction order | `par_map`, `task_group`, planned |
 | Index form | non-monotone index | not admitted: an index assigned on some paths only, reassigned in the body, or stepped by a non-constant | planned negative owner (`skip_zeros`, §4.3) |
-| | wrapping induction | not admitted unless `bound + step` provably does not overflow `i64`; integer overflow is defined wrap, so a wrapping loop must keep its guards | planned negative owner |
-| | wrapping access | not admitted unless `a*i + b` is overflow-free across the whole iteration space; a large loop-invariant `a` that wraps mid-iteration and lands back in range at the endpoint must not be admitted | planned negative owner, distinct from the wrapping-induction one |
+| | step precedes a guarded access | not admitted: `i = i + 1` followed by `xs[i]` in the same body reads `1..n` while the header sees `0..n-1`; admission is stated on the value reaching each access (§3.2), so this shape keeps its checks and traps at `xs[n]` exactly as today | planned negative owner `shifted_sum` (`--emit mir` shows the guard retained; the executable trap-parity owner asserts the abort) |
+| | wrapping induction | the preheader tests `N <= i64::MAX - s` (§3.2.1); integer overflow is defined wrap, so a loop whose last step would wrap keeps its guards by taking the slow version | planned negative owner |
+| | wrapping access | admitted only when §3.2.1's `amax` and `max` guards hold; because `a > 0` and every reached `i` lies in `[e, imax]`, no intermediate `a*i + b` can wrap once `amax` did not, so the endpoint-only admission the review attacked cannot occur | planned negative owner, distinct from the wrapping-induction one |
 | | `i` | the base case | planned |
 | | `i + 1` | `a = 1`, `b = 1`; admission uses the maximum reached index, not `i` | planned |
-| | `i * 2` | `a = 2`, `b = 0`; the admission bound is `a*(N-1) + b` | planned (`stride_sum`) |
+| | `i * 2` | `a = 2`, `b = 0`; the admission bound is `a*imax + b` (§3.2.1) | planned (`stride_sum`) |
 | | `i + off` with `off` a parameter | `b` loop-invariant but unknown and possibly negative; both ends of the range must be proved | planned (`scan_report`) |
 | | `a*i + b` with `a` loop-invariant non-constant | admitted only with `a > 0` proved; otherwise not admitted | planned |
 | Access kind | single index | `emit_bounds_check`'s guard | planned |
@@ -534,19 +687,27 @@ named where it already discriminates the defect; a new owner is named `planned`.
 | View shape | zero-length view | admission fails for any access, so the loop is versioned into a slow loop that traps identically, or runs zero times and traps not at all | `runway_a2_binary_codec::read_past_end_aborts`, planned |
 | | negative index | impossible after fusion only in the sense that it still fails the unsigned compare; the trap text still reports the original signed index | `runway_a2_binary_codec::negative_offset_aborts` |
 | | length-1 view | one-trip admission; the fast loop's single iteration is identical | planned |
-| | length changed in the loop | not invariant, so not admitted | planned negative owner |
+| | length changed in the loop by `truncate` | `Stmt::ArrayTruncate { root, .. }` kills the root (§3.2 kill set); `drain` (four elements, `truncate(2)` in the body) keeps its checks and traps at `i = 2` as today, instead of reading past the published length and returning `6` | planned negative owner `drain`, executable |
+| | length or contents changed by any other statement kind | each of `Store`, `StoreField`, `StoreIndex`, `StoreConstArray`, `StoreElemField`, `StoreElemFieldPtr`, `Null*Field`, `Drop*`, `DropValue`, `DropFlagInit`, `PtrStore`, `PtrStoreNoalias`, `RawStore`, `RawFree`, `ArenaEnd`, `TgEnd`, `ColumnBatch*` naming the root or a derived operand kills it; the match has no wildcard arm and a compile-time tripwire fails the build for a new variant | planned MIR-text negative owner per statement kind, plus the tripwire itself |
+| | root passed to a call | a call receiving the root or a derived operand in any mode other than read-only `borrow` kills it; a call with no effect summary kills every root that is not a read-only `borrow` parameter | planned negative owners: `borrow mut` argument, owned array argument, opaque runtime call |
 | | indexed view replaced in the loop | the view, not only its length, must be invariant; a borrowed replacement of the indexed binding disqualifies the loop even when the two lengths are equal | `borrowed_replacement`, planned negative owner |
 | | guard length differs from the trip-count bound | admitted, and proved per guard against that guard's own length — 1081's matvec is exactly this shape | planned owner over `w[r*d+c]` and `x[c]` |
 | Compilation model | whole-program | `loop_facts` runs inside `lower_program_checked_with_catalog`, so one `Program` is rewritten once | `emit_llvm_stage`, planned |
 | | located MIR (`explain-opt`) | all four lowering entry points funnel through the same hook, so the located namespace (`CodegenKey.located`) is rewritten identically. Two consequences are stated rather than discovered: a duplicated body's source-line attribution is no better than any block-mutating pass leaves it, and one source loop now emits two IR loops, so per-loop remark counts change | `explain_opt`, planned located-shape owner |
+| | `explain-opt` decision report | every source loop prints `loop versioned` with its budget use or `loop kept checks: <reason code>` (§3.2.3); the reason codes are stable and asserted | planned `explain_opt` owner over one admitted and one refused loop per reason code |
 | | `--profile dev` versus `release` | `align_mir` carries no profile plumbing and acquires none, so the CFG is identical at every profile and only the optimizer's treatment of it differs | `build_profiles`, `emit_llvm_stage` |
 | | instrument PGO | instrument and use builds see the same CFG for the same source, so counters attach consistently; a profile collected before this change mismatches and is dropped by LLVM with the existing warning, which the two-phase release flow regenerates | `pgo`, `pgo_cache`, `pgo_sv` |
 | | per-unit | the transform is a pure function of the validated body already fingerprinted by `CodegenKey`'s `impl_hash`, and `compiler_build_id` covers the new code, so no key component is added and no stale object survives | `per_unit`, `cache_codegen`, `unit_cache` |
 | | ThinLTO | a partition body is rewritten by the same pass and re-validated by `validate_thin_partition_program`; import decisions are unchanged because no linkage or signature changes | `thin_lto`, `function_thin_lto`, `partition` |
 | | generic monomorphization | each instantiation is rewritten independently after monomorphization; an instantiation whose element type changes the admission is not forced to agree with its siblings | `generics`, planned |
 | | interface serialization | nothing serialized changes; the interface hash of a unit whose bodies are rewritten is byte-identical | `per_unit_surface`, and `cache_codegen`'s `interface_hash` / `dep_interface_hashes` gates |
-| Composition | `byte_ranges::simplify` | runs first and unchanged; `loop_facts` derives from the simplified function and never consumes `byte_ranges`' facts, so a rolled-back byte-range proof cannot leave `loop_facts` holding a stale one | `runway_a2_binary_codec::byte_range_recurrence_preserves_tails_and_eliminates_only_proved_guards`, `paired_byte_ranges_keep_unproved_guards`, `composed_byte_effects_and_reaching_definitions_fail_closed` |
-| | `byte_prepare::prepare` | the second `byte_ranges` site is guarded by `structurally_valid`; `loop_facts` respects the same gate and is skipped when it fails | `runway_a2_binary_codec::composed_reader_per_unit_and_thin_cache_bind_private_body_edits` |
+| Composition | `byte_ranges::simplify`, first site | runs before `loop_facts` in `lower_program_checked_with_catalog` and is unchanged; `loop_facts` derives from the simplified function and never consumes `byte_ranges`' facts, so a rolled-back byte-range proof cannot leave `loop_facts` holding a stale one | `runway_a2_binary_codec::byte_range_recurrence_preserves_tails_and_eliminates_only_proved_guards`, `paired_byte_ranges_keep_unproved_guards`, `composed_byte_effects_and_reaching_definitions_fail_closed` |
+| | `byte_prepare::prepare`, the second site | runs in codegen **after** `loop_facts`, on versioned bodies: it splices leaf bodies into callers and re-runs `byte_ranges::simplify` and `snapshot_descriptors` on the result. `loop_facts` touches only element/range/vec guards and never a byte-accessor guard, so plan 64's rule that the original failure block is retained for every unproved byte edge is evaluated on guards `loop_facts` did not modify; a spliced fast copy keeps `structurally_valid` true, pinned by an owner | `runway_a2_binary_codec::composed_reader_per_unit_and_thin_cache_bind_private_body_edits`, planned owner splicing a leaf whose loop is versioned |
+| | `byte_prepare`'s statement budget | its 2048/32 admission counts the post-`loop_facts` body; a leaf that straddles the budget is inlined without versioning and not inlined with it, deterministically (§3.2.2) | planned straddle owner; `composed_leaf_exposure_covers_generics_returns_and_has_bounded_growth` |
+| | `annotate_par_map_work` (I8) | runs in `lower_program_unchecked_with_plans`, before `loop_facts`, so the work weight — and with it the `ParMapReduce` partition and float reduction order — is byte-identical with and without versioning; a kernel is versioned only under the same admission as any loop | planned owner asserting equal annotated weights; `par_map`, `vectorize_shapes::k6_float_sum_does_not_vectorize_without_fast_math` |
+| IR identity | `Stmt::BorrowedElementReservation` in the body | not admitted: the token is function-unique and `unique_reservation` requires exactly one occurrence; the `total`/`inspect` witness (a `borrow` record element passed to a call) compiles, runs and keeps its guard | planned owner `total` (builds and runs); `cache_codegen::borrowed_element_graph_edit_invalidates_exact_dependents_and_reverts` |
+| | guard published as a `BorrowedElementGuard` | keeps its signed form (§3.1) so `checked_borrowed_element_guard` still re-derives it literally; every other emitter site fuses | planned MIR-text owner asserting the signed form at the borrowed-element site and the fused form beside it |
+| | other function-unique tokens or descriptors | the cloning step re-mints nothing in PR 2, so admission refuses any body containing a per-function unique marker; the refusal predicate is an exhaustive match over `Stmt` like the kill set, so a future marker variant is a build error | planned tripwire |
 | Ownership | drop flags and cleanup bits across the duplicated body | the flag slots are per-binding and shared by both versions, so each version must initialize, set and clear them exactly as the original did, and the post-loop join must see one consistent flag state whichever version ran. A source-level behavior test cannot discriminate a flag-bookkeeping defect in the version that did not execute, so the discriminating owner is a MIR-text one | planned `loop_facts` owner asserting flag parity in both versions and at the join; `loop_expr::a_per_iteration_owned_string_is_freed_each_pass`, `move_return_cleanup`, `reassign_drop`, `borrow_liveness` as the executable backstop |
 | | construction, move-in, move-out, source nulling, replacement, return | every owned value is constructed and dropped exactly once on the executed path, and a value moved out by `break` is moved out once across both versions | `loop_expr::a_break_moves_an_owned_value_out_once`, `owned_temporaries`, planned |
 | | `arena` region inside the loop | region entry and release are lowered into the body before `loop_facts` runs, so both versions carry them and only one executes; allocation and free counts are unchanged | `fb_region`, `region_flow`, planned |
@@ -561,10 +722,28 @@ named where it already discriminates the defect; a new owner is named `planned`.
 
 Cross-cutting note for the whole matrix: `loop_facts` changes a safety strategy
 (which bounds checks execute where), so per the cross-cutting implementation
-gate this matrix and the proposed capability boundary get one fresh independent
-adversarial review **before** PR 2 is coded, not at review time. That review is
-of this section; the implementation PR then carries the author-side
-matrix-to-diff pass and the one ordinary review.
+gate this matrix and the proposed capability boundary got one fresh independent
+adversarial review **before** PR 2 is coded.
+
+**Independent matrix review, 2026-09-18, against `main` 956f3869: FINDINGS
+(4 P1, 5 P2, 1 P3).** The P1s were two classes: the `BorrowedElementPlace`
+channel is a second MIR-to-codegen safety contract this section did not know
+existed (IR identity axis, §3.1 signed-form exemption), and the admission
+predicate was stated informally where an exact analysis was required (the
+per-access reaching-definition rule, the exhaustive kill set with
+`ArrayTruncate`, and §3.2.1's arithmetic). The P2s fixed the `byte_prepare`
+composition direction, the two interacting budgets, the par_map work-weight
+ordering (I8), the missing arithmetic width, and observability; the P3 reworded
+the `map_err` row. Every finding is folded into §3.1, §3.2 and this matrix in
+one pass. The cells the review confirmed sound stand unchanged and are not to be
+re-litigated: fusion exactness in all four sign quadrants, `emit_vec_bounds_check`'s
+wrapping `idx + n` caught by the unsigned arm, trap arguments unchanged by
+fusion, versioning over relocation, lambda capture never writing back the
+induction slot, drop flags shared consistently by both versions, and `!range`
+non-negativity as exactly the fusion precondition. PR 2's implementation
+carries the author-side matrix-to-diff pass and the one ordinary preflight
+review; no further plan review is commissioned unless the implementation changes
+strategy.
 
 ### 3.5 Acceptance corpus
 
@@ -577,6 +756,35 @@ matvec kernel `w[r*d+c] * x[c]` from 1081 §2, per arch tier.
 Trap parity owners are executable, not IR-shape: zero-length, length-1, and
 first-out-of-range accesses each build and run, and assert both the exit status
 and the exact stderr text.
+
+The review witnesses are owners by name, each with its stated disposition:
+`total`/`inspect` (borrowed element into a call: not versioned, signed guard,
+builds and runs), `shifted_sum` (step before access: not versioned, traps at
+`xs[n]`), `drain` (`truncate` in the body: not versioned, traps at `i = 2`),
+one MIR-text negative per kill-set statement kind, the `byte_prepare` straddle
+leaf, the par_map work-weight parity owner, and the `explain-opt` reason-code
+owner.
+
+### 3.6 Deferred extension: versioning a borrowed-element loop
+
+Lifting the IR-identity refusal is a separate capability with its own cells,
+because it changes codegen's safety channel and so crosses a third layer:
+
+```text
+re-mint        the cloning step assigns a fresh reservation token to each
+               cloned Stmt::BorrowedElementReservation and rewrites the
+               matching BorrowedElementGuard.reservation in the clone
+validator      checked_borrowed_element_guard accepts the fused unsigned form,
+               and accepts a guardless access in a fast copy only when the
+               preheader admission fact for that access is published as a MIR
+               record the validator can re-derive, so the pointer is still
+               formed under a proved predicate rather than under trust
+owners         the same trap-parity and MIR-text owners, plus the
+               borrowed-element cache_codegen owner, run against both copies
+```
+
+Until that lands, G2's fast version excludes such loops and plan 68 records the
+exclusion beside G2.
 
 ## 4. PR 3 — the trip-count exit at the latch (1084)
 
@@ -718,7 +926,12 @@ HANDOFF.md         one sentence in the existing open-issue-batch paragraph,
                    a refused row for issue 1047 Finding 3. Unrelated to the
                    three PRs; recorded here because the same pass reads it
 68-vectorization-contract.md
-                   two stale line citations corrected — the llvm.assume record
+                   G2 records the one guard excluded from both halves: the
+                   borrowed-element guard keeps its signed form and its loop
+                   keeps its checks until §3.6 lands. That narrows G2's fast
+                   version by one named loop class and is the only promise this
+                   plan changes in plan 68.
+                   Earlier: two stale line citations corrected — the llvm.assume record
                    and the three section boundaries of docs/open-questions.md
                    have moved since it was written. No promise changes, and
                    this plan implements G1-G3 without widening any of them
@@ -737,8 +950,15 @@ HANDOFF.md         one sentence in the existing open-issue-batch paragraph,
   emission condition, and each PR states what it deliberately does not emit.
 - Every matrix cell has an owner; reused owners are named only where they would
   fail for the defect in that cell, per the gate's reuse rule.
-- The two soundness gates of PR 1 (I3, I4) and the one of PR 2 (versioning
-  rather than relocation) are each stated with a shape that compiles today.
+- The two soundness gates of PR 1 (I3, I4) and the four of PR 2 (versioning
+  rather than relocation; the IR-identity refusal; the per-access
+  reaching-definition rule; the exhaustive kill set) are each stated with a
+  shape that compiles today: `scan_report`, `total`/`inspect`, `shifted_sum`
+  and `drain`.
+- The admission arithmetic (§3.2.1) uses only `i64` operations MIR has, and
+  each of its overflow cases is argued in place; the independent matrix review
+  of 2026-09-18 is recorded in §3.4 and its confirmed-sound cells are marked
+  not to be re-litigated.
 - Every normative `align` example is syntax-checked against `alignc check`, uses
   one `loop` with newline-terminated statements, and has a repository precedent
   for each construct it uses.
