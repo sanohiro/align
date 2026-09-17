@@ -1,5 +1,16 @@
 # Session handoff
 
+**Vectorization contract:** [Plan 68](docs/impl/68-vectorization-contract.md) is
+the design of record for issue 1088 and owns guarantees G1–G10 — the properties
+ordinary Align loops and pipelines need in order to vectorize by default, with
+one owner issue and one acceptance corpus entry each. It settles the promise/try
+split, the ownership map (planned plan 69 loop facts for G1–G3, planned plan 70
+runtime boundary effects for G5, issues 1082 Part 1 and 1083 in progress, 1082
+Part 2 as a future RFC), the locked-decision compliance record including the
+carve-out issue 1084's `assume` fallback would require, and rewritten acceptance
+criteria for issues 1063 and 1064, whose original criteria were measured false
+because they depended on the loop-facts work. No implementation has started.
+
 **Open issue batch:** [Plan 65](docs/impl/65-open-issue-batch-plan.md)'s first
 capability is merged in PR 1056: scalar float inspection, initialized buffers,
 builder capacity, byte-loop proofs and proved-lossless cast diagnostics.
