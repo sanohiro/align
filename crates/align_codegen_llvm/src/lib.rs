@@ -9733,6 +9733,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// does not grow the stack each iteration), then restore the builder to the current position.
     fn alloca_at_entry(&self, ty: BasicTypeEnum<'c>, name: &str) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
         let saved = self.builder.get_insert_block().ok_or_else(|| self.err("no insertion block"))?;
+        let saved_debug = self.current_debug_location();
         let entry = *self.blocks.get(self.f.entry as usize).ok_or_else(|| self.err("entry block not found"))?;
         match entry.get_first_instruction() {
             Some(inst) => self.builder.position_before(&inst),
@@ -9740,6 +9741,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         }
         let p = self.builder.build_alloca(ty, name).map_err(|e| self.err(e))?;
         self.builder.position_at_end(saved);
+        self.restore_debug_location(saved_debug);
         Ok(p)
     }
 
@@ -10365,6 +10367,28 @@ impl<'c, 'a> FnGen<'c, 'a> {
             let (l, c) = if line == 0 { (self.fn_line.max(1), 0) } else { (line, col) };
             let loc = dib.create_debug_location(self.ctx, l, c, sp.as_debug_info_scope(), None);
             self.builder.set_current_debug_location(loc);
+        }
+    }
+
+    /// Read the builder's active debug location directly via LLVM 22's `LLVMGetCurrentDebugLocation2`.
+    ///
+    /// Inkwell 0.9's `builder.get_current_debug_location()` wraps the deprecated `LLVMGetCurrentDebugLocation`,
+    /// which when debug location is unset/empty returns a non-null `MetadataAsValue` wrapping an empty `!{}`
+    /// tuple instead of null. Passing that back to `set_current_debug_location` attaches `!dbg !{}` to
+    /// subsequent instructions, causing LLVM verifier failures. `LLVMGetCurrentDebugLocation2` correctly
+    /// returns null when unset.
+    fn current_debug_location(&self) -> Option<llvm_sys::prelude::LLVMMetadataRef> {
+        let raw = unsafe { llvm_sys::core::LLVMGetCurrentDebugLocation2(self.builder.as_mut_ptr()) };
+        (!raw.is_null()).then_some(raw)
+    }
+
+    /// Restore or clear the builder's current debug location.
+    fn restore_debug_location(&self, loc: Option<llvm_sys::prelude::LLVMMetadataRef>) {
+        unsafe {
+            llvm_sys::core::LLVMSetCurrentDebugLocation2(
+                self.builder.as_mut_ptr(),
+                loc.unwrap_or(std::ptr::null_mut()),
+            );
         }
     }
 
@@ -17336,7 +17360,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             let saved_debug = self
                 .dibuilder
                 .is_some()
-                .then(|| self.builder.get_current_debug_location())
+                .then(|| self.current_debug_location())
                 .flatten();
             if self.dibuilder.is_some() {
                 // The private helper has no DISubprogram. Retaining the outer function's location
@@ -17361,7 +17385,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 None => self.builder.clear_insertion_position(),
             }
             if let Some(location) = saved_debug {
-                self.builder.set_current_debug_location(location);
+                self.restore_debug_location(Some(location));
             } else if self.dibuilder.is_some() {
                 // A debug-enabled outer function always needs a location on later inlinable calls.
                 // Fall back defensively if helper construction was reached before one was active.
@@ -35299,4 +35323,44 @@ fn main() -> i32 = 0
         Ok(())
     }
 
+    #[test]
+    fn drop_struct_helper_with_debug_info_does_not_emit_empty_dbg_metadata() {
+        let program = mir(r#"
+Entry { name: string, value: string }
+fn process(items: array<Entry>) -> i64 {
+  mut b: array_builder<Entry> := array_builder()
+  if items.len() == 0 {
+    return 0
+  }
+  b.push(Entry { name: "test".clone(), value: "val".clone() })
+  return 1
+}
+fn main() -> i32 = 0
+"#);
+        let ctx = Context::create();
+        let module = ctx.create_module("test_dropdeep_dbg");
+        let target = BuildTarget::Baseline;
+        let tm = match create_target_machine(&target, inkwell::OptimizationLevel::None) {
+            Ok(tm) => tm,
+            Err(err) => panic!("create_target_machine failed: {err:?}"),
+        };
+        let debug = DebugInfo {
+            file: "test.align".into(),
+            directory: ".".into(),
+        };
+        let res = build_module(
+            &ctx,
+            &module,
+            &program,
+            &tm,
+            Some(&debug),
+            &[],
+            false,
+            ModuleScope::Whole,
+        );
+        assert!(res.is_ok(), "build_module failed: {:?}", res.err());
+        let ir = module.print_to_string().to_string();
+        assert!(!ir.contains("!dbg !{}"), "module contains invalid empty !dbg attachment:\n{ir}");
+        assert!(module.verify().is_ok());
+    }
 }
