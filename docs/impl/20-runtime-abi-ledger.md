@@ -1207,12 +1207,19 @@ the typed native handle and never the same-spelled program claimant. After
 linking, every captured typed handle must still be an external C-convention
 definition with a body before attributes are removed and linkage becomes
 internal; a missing body or changed linkage/convention is a compiler error,
-never a silent static-runtime fallback after partial mutation. Removal covers
-that row's curated enum attributes and every string attribute at every
-attribute location. Codegen then re-derives the result from the merged module:
-any definition still carrying a string attribute is a compiler error on the
-same post-merge terms, so a new guarded row or a producing-compiler upgrade
-cannot silently reintroduce a target-bound merged body.
+never a silent static-runtime fallback after partial mutation. That post-link
+removal covers the row's curated enum attributes.
+
+Before linking, codegen additionally sheds every string attribute from every
+definition the artifact carries — not only the guarded rows, because linking
+merges whatever that artifact defines — at the function, return, and every
+parameter location, and then re-derives the result from that same module. A
+definition still carrying one is one more baked-artifact defect: it falls back
+loudly to the runtime staticlib without merging, on the same terms as a missing
+symbol or a wrong type, so a new guarded row or a producing-compiler upgrade
+can neither silently reintroduce a target-bound merged body nor fail a user's
+build. The guarantee is function-scoped; module-level flags remain whatever
+linking reconciles.
 
 ## D14 generated SQLite scalar-callback ABI
 

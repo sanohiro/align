@@ -121,6 +121,12 @@ fn call_sites(ir: &str, symbol: &str) -> usize {
 
 /// The body of every `attributes #N = { … }` group that a `define` line in `ir` references, i.e.
 /// the function attributes of every definition in the module (merged runtime bodies included).
+///
+/// LLVM's AsmWriter prints return and parameter attributes inline on the `define` line instead,
+/// where a quoted mangled symbol name is indistinguishable from a string attribute in text. Those
+/// two locations are owned through the LLVM API by `align_codegen_llvm`'s
+/// `runtime_abi_rt_lto_merge_sheds_producer_string_attributes_everywhere`; this lens covers the
+/// function attributes, which is where the producing compiler's target strings actually live.
 fn definition_attribute_groups(ir: &str) -> Vec<(String, String)> {
     let ids: Vec<String> = ir
         .lines()
