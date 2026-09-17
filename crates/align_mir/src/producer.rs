@@ -4,7 +4,7 @@
 //! initialization proof. Native lowering retains its separate target/ABI checks.
 
 use align_ast::{BinOp, UnOp};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use crate::{Block, QueryMetaTypes, CanonicalTy, Const, ConstElem, DirectCall, Function,
     Operand, Program, ProgramCall, RuntimeKey, Rvalue, Slot, Stmt, Term, ValueId};
 use align_sema::{ArrayBuilderElem, ERROR_VARIANT_CODE, FloatTy,
@@ -7759,11 +7759,56 @@ fn validate_host_mir(program: &Program) -> Result<(), ProducerError> {
     Ok(())
 }
 
+/// Whole-program owned-leaf call provenance: every body is validated, and every local contract is
+/// re-derived from a call table that is complete by construction.
 pub fn validate_resource_rvalues(program: &Program) -> Result<(), ProducerError> {
+    validate_resource_rvalues_inner(program, None)
+}
+
+/// Partition-scoped counterpart of [`validate_resource_rvalues`], mirroring the
+/// [`validate_tagged_program`] / [`validate_partition_tagged_program`] split.
+///
+/// A function-partition `Program` deliberately carries only the emitted function plus the
+/// one-call-deep peer declarations it references, so a peer's own callees are usually absent from
+/// `program.fns`. [`xml_direct_call_facts`] is fail-closed on a target it cannot see, so re-deriving
+/// a peer body's call facts from that truncated table makes a correct program look malformed. Every
+/// function in the partition was already certified over the *complete* unit before partitioning
+/// (`align_codegen_llvm::validate_thin_partition_program`), so this variant:
+///
+/// * validates exactly the bodies the partition emits (`defined`), applying the same component
+///   checks and the same rejection of a genuinely malformed resource rvalue inside them, and
+/// * pre-seeds the certified set with the partition's peers, exactly as a `producer_certified`
+///   imported declaration is trusted, instead of re-deriving their facts from the truncated table.
+///
+/// The only relaxation is a reference the partition cannot see. A call target absent from
+/// `program.fns`, `program.imported_fns`, and `program.externs` remains unresolvable and is still
+/// rejected inside an emitted body.
+pub fn validate_partition_resource_rvalues(
+    program: &Program,
+    defined: &BTreeSet<ProgramCall>,
+) -> Result<(), ProducerError> {
+    validate_resource_rvalues_inner(program, Some(defined))
+}
+
+fn validate_resource_rvalues_inner(
+    program: &Program,
+    defined: Option<&BTreeSet<ProgramCall>>,
+) -> Result<(), ProducerError> {
     validate_host_mir(program)?;
     validate_template_html_mir_signatures(program)?;
     let components = xml_local_call_components(program)?;
-    let mut certified = HashSet::<ProgramCall>::new();
+    // A partition peer carries its real signature in `program.fns`; seeding it grants the same
+    // trust the whole-program run grants once the peer's own component has been certified.
+    let mut certified = match defined {
+        Some(defined) => program
+            .fns
+            .iter()
+            .map(|function| &function.name)
+            .filter(|name| !defined.contains(*name))
+            .cloned()
+            .collect::<HashSet<ProgramCall>>(),
+        None => HashSet::new(),
+    };
     for component in components {
         let mut provisional = certified.clone();
         provisional.extend(
@@ -7771,7 +7816,22 @@ pub fn validate_resource_rvalues(program: &Program) -> Result<(), ProducerError>
                 .iter()
                 .map(|member| program.fns[*member].name.clone()),
         );
-        validate_resource_rvalues_component(program, &component, &provisional)?;
+        // `component` is sorted, so the emitted subset stays sorted for its member binary search.
+        let emitted;
+        let members = match defined {
+            Some(defined) => {
+                emitted = component
+                    .iter()
+                    .copied()
+                    .filter(|member| defined.contains(&program.fns[*member].name))
+                    .collect::<Vec<_>>();
+                emitted.as_slice()
+            }
+            None => component.as_slice(),
+        };
+        if !members.is_empty() {
+            validate_resource_rvalues_component(program, members, &provisional)?;
+        }
         certified = provisional;
     }
     Ok(())
@@ -8886,17 +8946,28 @@ pub fn validate_resource_program(program: &Program) -> Result<(), ProducerError>
 /// malformed cached/interface-derived MIR: an absent id, abstract parameter, or inline cycle is a
 /// `ProducerError`, never an out-of-bounds panic or the scalar `i32` fallback.
 pub fn validate_tagged_program(program: &Program) -> Result<(), ProducerError> {
-    validate_tagged_program_inner(program, true)
+    validate_tagged_program_inner(program, None)
 }
 
-pub fn validate_partition_tagged_program(program: &Program) -> Result<(), ProducerError> {
-    validate_tagged_program_inner(program, false)
+/// Partition-scoped counterpart of [`validate_tagged_program`].
+///
+/// Beyond relaxing the compact-table requirement, this variant tolerates one thing: an
+/// `FnAddr`/`Closure` target that a body the partition does **not** emit names and the truncated
+/// `program.fns` does not contain. Resolving such a name is fail-closed, so a correct peer body
+/// otherwise looks malformed — the same scope mismatch [`validate_partition_resource_rvalues`]
+/// exists to avoid. Every other check, including all of them for an emitted body, is unchanged.
+pub fn validate_partition_tagged_program(
+    program: &Program,
+    defined: &BTreeSet<ProgramCall>,
+) -> Result<(), ProducerError> {
+    validate_tagged_program_inner(program, Some(defined))
 }
 
 fn validate_tagged_program_inner(
     program: &Program,
-    require_compact_tables: bool,
+    defined: Option<&BTreeSet<ProgramCall>>,
 ) -> Result<(), ProducerError> {
+    let require_compact_tables = defined.is_none();
     struct SignatureFacts<'a> {
         owner: &'a str,
         modes: &'a [align_ast::ParamMode],
@@ -9907,6 +9978,11 @@ fn validate_tagged_program_inner(
         for ty in crate::function_embedded_types(f) {
             check_ty(ty, &mut type_graph)?;
         }
+        // A partition carries peer bodies it never emits, and those bodies routinely name a
+        // callable the truncated `program.fns` does not contain. Resolving such a target is
+        // fail-closed, so an unresolvable name is tolerated only outside the emitted bodies —
+        // every other check below still applies to a peer.
+        let emitted = defined.is_none_or(|defined| defined.contains(&f.name));
         for block in &f.blocks {
             for statement in &block.stmts {
                 let Stmt::Let(value, rvalue) = statement else {
@@ -9917,7 +9993,10 @@ fn validate_tagged_program_inner(
                         let Some((param_types, ret, modes, borrow, region, cleanup)) =
                             named_signature(program, target)
                         else {
-                            return Err(callable_target_error(target));
+                            if emitted {
+                                return Err(callable_target_error(target));
+                            }
+                            continue;
                         };
                         check_signature_facts(
                             SignatureFacts {
@@ -9952,7 +10031,10 @@ fn validate_tagged_program_inner(
                         let Some(target) =
                             program.fns.iter().find(|function| function.name == *lifted)
                         else {
-                            return Err(callable_target_error(lifted));
+                            if emitted {
+                                return Err(callable_target_error(lifted));
+                            }
+                            continue;
                         };
                         let explicit = target.params.len().checked_sub(capture_tys.len()).ok_or_else(
                             || callable_target_error(lifted),

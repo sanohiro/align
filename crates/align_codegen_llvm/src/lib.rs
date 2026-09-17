@@ -19,7 +19,8 @@ use align_mir::producer::{
 use align_mir::producer::{
     lowercase_hex, builtin_error_enum_is_exact, db_resource_matches_row, xml_callable_flow_matches,
     xml_closure_borrow_summary, xml_closure_region_summary, fs_tree_output_slots,
-    validate_resource_rvalues, validate_resource_program, validate_tagged_program,
+    validate_resource_rvalues, validate_partition_resource_rvalues, validate_resource_program,
+    validate_tagged_program,
     validate_partition_tagged_program, callable_hex, callable_target_error, canonical_metadata,
     canonical_ty, source_ty_matches, callable_metadata_error, preflight_operand_ty,
     slice_index_physical_element, slice_index_result_matches, validate_slice_index_rvalues,
@@ -3016,6 +3017,59 @@ impl ModuleScope<'_> {
     }
 }
 
+/// The names `scope` actually emits: every function for a whole/test module, the selected root for
+/// a function partition.
+fn scope_defined(
+    program: &Program,
+    scope: ModuleScope<'_>,
+) -> std::collections::BTreeSet<ProgramCall> {
+    program
+        .fns
+        .iter()
+        .filter(|function| scope.defines(function))
+        .map(|function| function.name.clone())
+        .collect()
+}
+
+/// Run the target-independent MIR validators for `scope`.
+///
+/// Validation scope must match emission scope. A `ModuleScope::Function` `Program` is a truncated
+/// view — the selected root plus its one-call-deep peer declarations — so a validator that
+/// re-derives whole-program facts from it rejects correct programs. Each validator below is
+/// therefore either dispatched to a partition-scoped variant or audited as scope-independent:
+///
+/// * `validate_tagged_program` — partition variant relaxes the compact-table requirement, and
+///   tolerates a callable target a non-emitted peer body names but the partition cannot see.
+/// * `validate_resource_rvalues` — partition variant validates only the emitted bodies and seeds
+///   the certified set with the partition's peers (both were certified over the complete unit by
+///   [`validate_thin_partition_program`] before partitioning).
+/// * `validate_resource_program` — scope-independent: it checks `program.resources`, which a
+///   partition carries whole, and tolerates an absent Drop-hook definition (`if let Some`).
+/// * `validate_slice_index_rvalues`, `validate_fixed_element_nulling` — scope-independent: both
+///   resolve no call target and check only intra-function structure against the complete shared
+///   struct/enum tables a partition still carries.
+fn validate_module_program(
+    program: &Program,
+    scope: ModuleScope<'_>,
+) -> Result<(), CodegenError> {
+    match scope {
+        ModuleScope::Whole | ModuleScope::Test { .. } => {
+            validate_tagged_program(program)?;
+            validate_resource_program(program)?;
+            validate_resource_rvalues(program)?;
+        }
+        ModuleScope::Function { .. } => {
+            let defined = scope_defined(program, scope);
+            validate_partition_tagged_program(program, &defined)?;
+            validate_resource_program(program)?;
+            validate_partition_resource_rvalues(program, &defined)?;
+        }
+    }
+    validate_slice_index_rvalues(program)?;
+    validate_fixed_element_nulling(program)?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // The explicit module inputs and partition scope are separate axes.
 fn build_module<'c>(
     ctx: &'c Context,
@@ -3027,16 +3081,8 @@ fn build_module<'c>(
     rt_lto_skip_guarded: bool,
     scope: ModuleScope<'_>,
 ) -> Result<RuntimeDeclarations, CodegenError> {
-    match scope {
-        ModuleScope::Whole | ModuleScope::Test { .. } => validate_tagged_program(program)?,
-        ModuleScope::Function { .. } => validate_partition_tagged_program(program)?,
-    }
-    validate_resource_program(program)?;
-    validate_resource_rvalues(program)?;
-    validate_slice_index_rvalues(program)?;
-    validate_fixed_element_nulling(program)?;
-    let defined = program.fns.iter().filter(|f| scope.defines(f))
-        .map(|f| f.name.clone()).collect();
+    validate_module_program(program, scope)?;
+    let defined = scope_defined(program, scope);
     let prepared = align_mir::byte_prepare::prepare(program, &defined);
     lower_prepared_module(ctx, module, &prepared, tm, debug, exports, rt_lto_skip_guarded, scope)
 }
@@ -3053,14 +3099,7 @@ fn lower_prepared_module<'c>(
     scope: ModuleScope<'_>,
 ) -> Result<RuntimeDeclarations, CodegenError> {
     runtime_abi::validate_registry().map_err(CodegenError::Lowering)?;
-    match scope {
-        ModuleScope::Whole | ModuleScope::Test { .. } => validate_tagged_program(program)?,
-        ModuleScope::Function { .. } => validate_partition_tagged_program(program)?,
-    }
-    validate_resource_program(program)?;
-    validate_resource_rvalues(program)?;
-    validate_slice_index_rvalues(program)?;
-    validate_fixed_element_nulling(program)?;
+    validate_module_program(program, scope)?;
     let callable_declarations = callable_declarations(program)?;
     // Target layout (for struct field offsets in `json.decode`); also pin the module's data
     // layout so offsets match the emitted object.
