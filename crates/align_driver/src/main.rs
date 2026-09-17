@@ -20,7 +20,7 @@
 //! A `--profile dev|release|fast|small|tiny` flag selects the optimization/size trade-off for the
 //! build-producing subcommands (`build`/`run`/`emit-obj`/`size`); default `release` (`test`: `dev`).
 //!
-//! A repeatable `--export <name>` flag (`emit-obj`/`emit-llvm` only) names an entry-file top-level
+//! A repeatable `--export <name>` flag (`emit-obj`/`emit-llvm`/`explain-opt` only) names an entry-file top-level
 //! function that keeps external linkage instead of the default whole-program `internal` (M13 Slice
 //! 1 internalized every program function) — the explicit export-roots mechanism restoring a linkable
 //! C-ABI surface for a no-`main` library/benchmark object (`docs/impl/07-roadmap.md` M13 Codex-audit
@@ -40,8 +40,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use align_driver::{
     build_interface_summaries, build_per_unit, check, emit_llvm_ir, emit_object_cached,
-    format_diagnostics, link_objects, unknown_exports, BuildTarget, CacheContext, PerUnitWalk,
-    Profile, UnitReuse,
+    format_diagnostics, link_objects, mark_inspection_roots_with_note, BuildTarget,
+    CacheContext, PerUnitWalk, Profile, UnitReuse,
 };
 use align_span::SourceMap;
 
@@ -113,6 +113,12 @@ fn main() -> ExitCode {
         eprintln!("alignc: {error}");
         return ExitCode::FAILURE;
     }
+    // Same reasoning for the deployment target: validate the flag's lexical shape on the original
+    // prefix, before any stripper can make a following option look like its value.
+    if let Err(error) = parse_deployment_target(compiler_args) {
+        eprintln!("alignc: {error}");
+        return ExitCode::FAILURE;
+    }
     // Validate PGO on the original prefix without stripping a token that could be a missing
     // --cc value. The compiler never parses flags in the program suffix.
     if let Err(error) = parse_pgo(compiler_args) {
@@ -143,6 +149,15 @@ fn main() -> ExitCode {
     // Pull the `--target-cpu` flag out before positional parsing (so it may sit anywhere up to the
     // program's own args, and `run` does not forward it to the built program).
     let (target, args) = match parse_target(&args) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("alignc: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Pull `--deployment-target <version>` next. It is installed below, before any triple is
+    // resolved, so the machine, every module triple, the cache key and the link all derive from it.
+    let (deployment_target, args) = match parse_deployment_target(&args) {
         Ok(parsed) => parsed,
         Err(error) => {
             eprintln!("alignc: {error}");
@@ -350,15 +365,35 @@ fn main() -> ExitCode {
         }
     }
 
-    // `--export` only means something where codegen produces a standalone object/IR with linker-
-    // visible symbols (`emit-obj`/`emit-llvm`); anywhere else a nonempty export set would either be
-    // silently ignored or silently change linkage no one asked for — neither is acceptable
-    // (Nothing hidden), so reject it outright instead.
-    if !exports.is_empty() && !matches!(cmd, Some("emit-obj") | Some("emit-llvm")) {
+    // `--export` only means something on a verb that has roots at all: the ones that produce a
+    // standalone object/IR with linker-visible symbols (`emit-obj`/`emit-llvm`) and the one that
+    // reports what the optimizer did to them (`explain-opt`). Anywhere else a nonempty export set
+    // would either be silently ignored or silently change linkage no one asked for — neither is
+    // acceptable (Nothing hidden), so reject it outright instead.
+    if !exports.is_empty()
+        && !matches!(cmd, Some("emit-obj") | Some("emit-llvm") | Some("explain-opt"))
+    {
         eprintln!(
-            "alignc: --export is only valid for `emit-obj`/`emit-llvm` (got `{}`)",
+            "alignc: --export is only valid for `emit-obj`/`emit-llvm`/`explain-opt` (got `{}`)",
             cmd.unwrap_or("<none>")
         );
+        return ExitCode::FAILURE;
+    }
+
+    // Install the resolved deployment target before ANY triple is resolved — the CPU validation
+    // just below is the first thing that resolves one. A malformed version, or one on a non-Apple
+    // host, is a clean argument error here rather than a surprise inside codegen.
+    if let Some(version) = deployment_target.as_deref()
+        && let Err(error) = align_codegen_llvm::target_identity::set_deployment_target(version)
+    {
+        eprintln!("alignc: {}", target_message(&error));
+        return ExitCode::FAILURE;
+    }
+    // Freeze the identity here, whatever supplied it. The environment layer is an *input* like any
+    // other, so a malformed `MACOSX_DEPLOYMENT_TARGET` must be the same clean, pre-work argument
+    // error as a malformed flag — not a diagnostic attributed to a source line inside codegen.
+    if let Err(error) = align_codegen_llvm::target_identity::resolved_triple() {
+        eprintln!("alignc: {}", target_message(&error));
         return ExitCode::FAILURE;
     }
 
@@ -406,7 +441,7 @@ fn main() -> ExitCode {
         // (vectorized / not, with the reason), translated into the compiler's diagnostic voice.
         (Some("explain-opt"), Some(p)) => {
             let verbose = args.get(3..).unwrap_or(&[]).iter().any(|a| a == "--verbose" || a == "-v");
-            align_driver::explain::run_explain_opt(p, verbose, target, profile)
+            align_driver::explain::run_explain_opt(p, verbose, target, profile, &exports)
         }
         // `fmt <file> [--write]` — format source; prints to stdout, or rewrites in place with --write.
         (Some("fmt"), Some(p)) => run_fmt(p, &args[3..]),
@@ -607,6 +642,43 @@ mod test_limit_tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    /// `--deployment-target` has the same lexical discipline as `--target-cpu`: a missing value
+    /// never silently consumes the next flag, and an empty or NUL-bearing value is rejected before
+    /// any target work. The version *grammar* is owned by `target_identity::canonical_version`.
+    #[test]
+    fn deployment_target_rejects_missing_values_before_flag_stripping() {
+        for args in [
+            vec!["alignc", "build", "x.align", "--deployment-target"],
+            vec!["alignc", "--deployment-target="],
+            vec!["alignc", "--deployment-target", ""],
+            vec!["alignc", "--deployment-target=15\0.0"],
+            // A following option is a MISSING value, not a value. Prevalidation runs on the
+            // original prefix; if it accepted this, the CPU stripper would remove
+            // `--target-cpu baseline` and the second parse would silently consume `14.0`.
+            vec!["alignc", "--deployment-target", "--target-cpu", "baseline", "14.0"],
+            vec!["alignc", "--deployment-target", "--profile", "fast"],
+            vec!["alignc", "--deployment-target=-14.0"],
+        ] {
+            assert!(parse_deployment_target(&strings(&args)).is_err(), "{args:?}");
+        }
+        let (version, rest) = parse_deployment_target(&strings(&[
+            "alignc",
+            "build",
+            "x.align",
+            "--deployment-target=15.0",
+            "--deployment-target",
+            "14.0",
+        ]))
+        .expect("well-formed explicit deployment target");
+        assert_eq!(version.as_deref(), Some("14.0"));
+        assert_eq!(rest, strings(&["alignc", "build", "x.align"]));
+
+        let (absent, rest) = parse_deployment_target(&strings(&["alignc", "build", "x.align"]))
+            .expect("no flag is not an error");
+        assert_eq!(absent, None);
+        assert_eq!(rest, strings(&["alignc", "build", "x.align"]));
     }
 
     #[test]
@@ -863,62 +935,20 @@ fn resolve_jobs(flag: Option<usize>) -> Result<usize, String> {
     Ok(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
 }
 
-/// Validate the `--export` roots against the **entry unit** (M15 S2b): `--export` is entry-unit-only
-/// — every root must name a function defined in the entry unit's MIR, applied only to the entry
-/// unit's object. Fail-closed, three outcomes per unresolved name:
-///   * defined in the entry unit → OK (kept external in the entry object).
-///   * defined in a *non-entry* unit → hard error naming that unit. `--export` cannot reach it; a
-///     non-entry `pub` function is already external (that is the one way to export it), so the fix is
-///     to mark it `pub`, not to `--export` it.
-///   * defined nowhere → the listed unknown-export error (a typo'd name never silently no-ops).
-///
-/// Returns the failing `ExitCode` on any rejection, `None` when every root resolves in the entry unit.
+/// A target-resolution error's own text, without the `target/output failed:` prefix its `Display`
+/// carries for codegen sites: a rejected `--deployment-target` (or environment) value is an
+/// argument error, and reads as one.
+fn target_message(error: &align_codegen_llvm::CodegenError) -> String {
+    match error {
+        align_codegen_llvm::CodegenError::Target(message) => message.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// [`align_driver::entry_exports_rejected`] as this binary's `ExitCode`: the failing code on any
+/// rejection, `None` when every root resolves in the entry unit.
 fn check_exports_entry(walk: &PerUnitWalk, exports: &[String], path: &str) -> Option<ExitCode> {
-    if exports.is_empty() {
-        return None;
-    }
-    let Some(entry) = walk.units.iter().find(|u| u.is_entry) else {
-        // A clean walk always compiles its entry, so this is unreachable after `walk_or_report`;
-        // fail closed rather than silently drop the exports if it ever is not.
-        eprintln!("alignc: cannot apply --export: no entry unit was compiled");
-        return Some(ExitCode::FAILURE);
-    };
-    let not_in_entry = unknown_exports(&entry.mir, exports);
-    if not_in_entry.is_empty() {
-        return None;
-    }
-    // A non-entry unit `u` mangles its functions `u$name`; match the source name against that suffix
-    // (or the bare name defensively) to tell "defined in another unit" apart from "defined nowhere".
-    let mut unknown: Vec<&str> = Vec::new();
-    let mut rejected = false;
-    for name in not_in_entry {
-        let suffix = format!("${name}");
-        if let Some(u) = walk
-            .units
-            .iter()
-            .find(|u| {
-                !u.is_entry
-                    && u.mir.fns.iter().any(|f| {
-                        f.name.as_str() == name || f.name.as_str().ends_with(&suffix)
-                    })
-            })
-        {
-            rejected = true;
-            eprintln!(
-                "alignc: --export '{name}' names a function defined in unit '{u}', not the entry unit; \
-                 --export applies only to the entry unit. Mark it `pub` in `{u}` to export it \
-                 (a non-entry `pub` function already has external linkage).",
-                u = u.unit
-            );
-        } else {
-            unknown.push(name);
-        }
-    }
-    if !unknown.is_empty() {
-        eprintln!("alignc: unknown export(s): {} (not defined in {path})", unknown.join(", "));
-        rejected = true;
-    }
-    rejected.then_some(ExitCode::FAILURE)
+    align_driver::entry_exports_rejected(walk, exports, path).then_some(ExitCode::FAILURE)
 }
 
 /// Pull `--target-cpu <baseline|native>` (or `--target-cpu=…`) out of `args`, returning the chosen
@@ -955,6 +985,53 @@ fn parse_target(args: &[String]) -> Result<(BuildTarget, Vec<String>), String> {
         i += 1;
     }
     Ok((target, rest))
+}
+
+/// Pull `--deployment-target <version>` (or `--deployment-target=…`) out of `args`, returning the
+/// requested Apple deployment target and the remaining arguments.
+///
+/// The explicit, visible opt-in at the top of the deployment-target precedence chain — the same
+/// shape as `--target-cpu`, and the only way to build for a version other than the host's. The
+/// value's grammar is validated by
+/// [`align_codegen_llvm::target_identity::set_deployment_target`], which also rejects it on a
+/// non-Apple host; here only the flag's own shape is checked, so a missing value can never consume
+/// the next flag. A repeated flag keeps the last value, like every other option here.
+fn parse_deployment_target(args: &[String]) -> Result<(Option<String>, Vec<String>), String> {
+    let mut version: Option<String> = None;
+    let mut rest = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        let value = if let Some(v) = a.strip_prefix("--deployment-target=") {
+            Some(v.to_string())
+        } else if a == "--deployment-target" {
+            // A following option is never this flag's value. Without this the ORIGINAL-prefix
+            // prevalidation would accept `--deployment-target --target-cpu baseline 14.0`, and the
+            // CPU stripper would then remove `--target-cpu baseline` so the second parse silently
+            // consumed `14.0` — a missing argument turned into a successful build.
+            let v = args
+                .get(i + 1)
+                .filter(|v| !v.starts_with('-'))
+                .cloned()
+                .ok_or_else(|| "--deployment-target requires a version".to_owned())?;
+            i += 1;
+            Some(v)
+        } else {
+            rest.push(a.clone());
+            None
+        };
+        if let Some(v) = value {
+            if v.is_empty() || v.as_bytes().contains(&0) || v.starts_with('-') {
+                return Err(
+                    "--deployment-target requires a nonempty version without NUL, not an option"
+                        .into(),
+                );
+            }
+            version = Some(v);
+        }
+        i += 1;
+    }
+    Ok((version, rest))
 }
 
 /// Pull `--profile <name>` (or `--profile=…`) out of `args`, returning the chosen profile and the
@@ -1591,11 +1668,16 @@ fn usage() {
          \n\
          --target-cpu  baseline (default; portable per-arch floor), native (this host's CPU),\n  \
                        or an LLVM CPU name like x86-64-v3 (a portable fast tier for a known fleet)\n  \
+         --deployment-target VERSION (Apple targets only) the macOS/iOS/… deployment target every\n  \
+                       object, module triple, cache key and link is stamped with; defaults to\n  \
+                       $<PLATFORM>_DEPLOYMENT_TARGET, then the host product version\n  \
          --profile     dev (O0; test default), release (O2; other default), fast (O3), small (Os), tiny (Oz)\n  \
          --cc PATH     (build/run/size/test) one absolute executable C-driver path; no PATH fallback\n  \
-         --export      (emit-obj/emit-llvm only; repeatable) keep an entry-file top-level function\n  \
-                       name's linkage external instead of the default internal, so a no-`main`\n  \
-                       library/benchmark object exposes it to the linker\n  \
+         --export      (emit-obj/emit-llvm/explain-opt only; repeatable) keep an entry-file top-level\n  \
+                       function name's linkage external instead of the default internal, so a\n  \
+                       no-`main` library/benchmark object exposes it to the linker. The inspection\n  \
+                       verbs (emit-llvm/explain-opt) already root every `pub` function of a\n  \
+                       `main`-less unit; --export narrows that set\n  \
          --rt-lto      (build/run/test/emit-obj/size/emit-llvm) force runtime-bitcode LTO ON — the\n  \
                        default at release/fast; explicit ON still requires release/fast\n  \
          --no-rt-lto   (same verbs) force runtime-bitcode LTO OFF on any profile\n  \
@@ -1827,7 +1909,7 @@ fn run_emit_llvm(path: &str, rest: &[String], target: BuildTarget, profile: Prof
             return ExitCode::FAILURE;
         }
     };
-    let Some(walk) = walk_or_report(path) else {
+    let Some(mut walk) = walk_or_report(path) else {
         return ExitCode::FAILURE;
     };
     // `--export` is entry-unit-only (validated against the entry unit's MIR; applied only to it).
@@ -1837,6 +1919,15 @@ fn run_emit_llvm(path: &str, rest: &[String], target: BuildTarget, profile: Prof
     // Each unit is optimized in isolation (that is the truth under zero cross-unit optimization): a
     // cross-unit `pub` call stays an opaque call, while an intra-unit call inlines. N=1 = byte-
     // identical to the pre-flip whole-program IR; N>1 banners each unit.
+    // Inspection roots, not link roots: with no explicit `--export`, a `main`-less entry unit is
+    // reported through its own `pub` surface instead of being internalized away (issue 1086). This
+    // marks `exportable` rather than adding `--export` names, so the roots keep their encoded
+    // symbols and an inspection verb can never fail on a program a build accepts.
+    if exports.is_empty()
+        && let Some(entry) = walk.units.iter_mut().find(|unit| unit.is_entry)
+    {
+        mark_inspection_roots_with_note(entry, "emit-llvm");
+    }
     let multi = walk.units.len() > 1;
     let mut out = String::new();
     for unit in &walk.units {

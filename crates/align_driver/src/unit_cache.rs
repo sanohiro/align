@@ -161,9 +161,10 @@ pub struct UnitKey {
     pub frontend_schema: u32,
     /// K4 the four keyed toggles, in [`KEYED_ENV_TOGGLES`] order.
     pub env_toggles: Vec<EnvToggle>,
-    /// K5 target triple. MIR lowering is target-independent today; this is kept for the same reason
-    /// `PrelinkKey` keeps it — a future target-dependent layout decision must not be able to serve
-    /// an x86-64 frontend result to an aarch64 build.
+    /// K5 the resolved target triple. MIR lowering is target-independent today; this is kept for
+    /// the same reason `PrelinkKey` keeps it — a future target-dependent layout decision must not
+    /// be able to serve an x86-64 frontend result to an aarch64 build. On an Apple target it
+    /// carries the resolved deployment target and never the Darwin kernel version.
     pub target_triple: String,
     /// K5 (cont.) object format (`0` = ELF, `1` = Mach-O).
     pub object_format: u8,

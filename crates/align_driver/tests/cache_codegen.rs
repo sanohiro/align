@@ -1468,3 +1468,106 @@ fn main() -> Result<(), Error> {
         assert!(emit().all_hit());
     }
 }
+
+// ---- Gate 14: the resolved deployment target is part of the codegen identity --------------------
+
+/// The codegen key's triple is the SAME resolved string the machine is built from, so a cache hit
+/// implies byte-identical codegen, and it never carries the Darwin kernel patch level — which is not
+/// a compilation input and used to invalidate the whole cache on an OS patch bump (issue 1087).
+#[test]
+fn gate14_codegen_key_triple_is_the_resolved_identity() {
+    if !backend() {
+        return;
+    }
+    let key = build_codegen_key(
+        "main",
+        Hash128::of(b"impl"),
+        &[],
+        &BuildTarget::Baseline,
+        Profile::Release,
+        &no_exports(),
+        false,
+        PgoKey::Off,
+    )
+    .expect("build a codegen key");
+    let resolved = align_codegen_llvm::resolve_target_identity(&BuildTarget::Baseline)
+        .expect("resolve the host identity");
+    assert_eq!(
+        key.target_triple, resolved.triple,
+        "the key must hash the EXACT triple codegen uses"
+    );
+    assert!(
+        !key.target_triple.contains("darwin"),
+        "the kernel version is not a codegen input: {}",
+        key.target_triple
+    );
+}
+
+/// Two `--deployment-target` values are two codegen identities: the second build against the same
+/// cache must not be served the first build's object. Proven on the produced bytes (the object's
+/// `LC_BUILD_VERSION`), so it holds whatever the key's internal shape is. macOS only — the
+/// deployment target is an Apple concept and the flag is refused elsewhere.
+#[test]
+#[cfg(target_os = "macos")]
+fn gate14b_deployment_target_separates_cached_objects() {
+    if !backend() {
+        return;
+    }
+    let proj = Project::new(
+        "deploy",
+        &[("lib.align", "pub fn k(x: i64) -> i64 = x + 1\n")],
+        "lib.align",
+    );
+    let shared = proj.dir.join("deploycache");
+    let alignc = env!("CARGO_BIN_EXE_alignc");
+    let emit = |version: &str| {
+        let out = std::process::Command::new(alignc)
+            .args(["emit-obj", "lib.align", "--deployment-target", version])
+            .current_dir(&proj.dir)
+            .env("ALIGNC_CACHE", &shared)
+            .output()
+            .expect("spawn alignc");
+        assert!(
+            out.status.success(),
+            "emit-obj at {version} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        macho_minos(&proj.dir.join("lib.o")).expect("an LC_BUILD_VERSION in the emitted object")
+    };
+    assert_eq!(emit("14.0"), "14.0");
+    assert_eq!(
+        emit("15.0"),
+        "15.0",
+        "a different deployment target is a different codegen identity, not a cache hit"
+    );
+    // And the same value re-hits its own key rather than churning.
+    assert_eq!(emit("14.0"), "14.0");
+}
+
+/// `LC_BUILD_VERSION`'s `minos` as `"<major>.<minor>"`, parsed from the Mach-O bytes.
+#[cfg(target_os = "macos")]
+fn macho_minos(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let u32_at = |at: usize| -> Option<u32> {
+        let slice: [u8; 4] = bytes.get(at..at + 4)?.try_into().ok()?;
+        Some(u32::from_le_bytes(slice))
+    };
+    if u32_at(0)? != 0xfeed_facf {
+        return None;
+    }
+    let ncmds = u32_at(16)?;
+    let mut at = 32usize;
+    for _ in 0..ncmds {
+        let cmd = u32_at(at)?;
+        let cmdsize = u32_at(at + 4)? as usize;
+        if cmdsize < 8 {
+            return None;
+        }
+        if cmd == 0x32 {
+            let packed = u32_at(at + 12)?;
+            return Some(format!("{}.{}", packed >> 16, (packed >> 8) & 0xff));
+        }
+        at = at.checked_add(cmdsize)?;
+    }
+    None
+}

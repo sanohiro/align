@@ -97,3 +97,165 @@ fn stage_unknown_value_is_a_diagnostic_not_a_panic() {
     // A panic would print a backtrace / "panicked at"; this path must be a plain diagnostic.
     assert!(!err.contains("panicked"), "must not panic:\n{err}");
 }
+
+// ---- Inspection roots: a `main`-less unit reports its OWN code (issue 1086) ---------------------
+
+/// A library unit: `pub fn`s, one private helper, no `main`. Under the link-roots model every one of
+/// these is internal, dead, and eliminated by the optimized lens.
+const LIB: &str = "pub fn k1(x: i64) -> i64 = helper(x) + 1\n\
+     pub fn k2(xs: slice<i64>) -> i64 = xs.map(dbl).sum()\n\
+     fn dbl(x: i64) -> i64 = x * 2\n\
+     fn helper(x: i64) -> i64 = x + 10\n";
+
+fn write_named(test_name: &str, body: &str) -> TempFile {
+    let path = std::env::temp_dir().join(format!("align-stage-{}-{}.align", std::process::id(), test_name));
+    std::fs::write(&path, body).expect("write src");
+    TempFile(path)
+}
+
+/// Roots for *inspecting* a unit are not roots for *linking* an executable. A unit with no `main`
+/// and no `--export` is reported through its own `pub` surface, so `emit-llvm --stage optimized`
+/// emits that unit's bodies instead of an empty module — and says so on stderr.
+#[test]
+fn a_main_less_unit_is_reported_through_its_own_pub_functions() {
+    if !align_driver::backend_available() {
+        return;
+    }
+    let src = write_named("inspection_roots", LIB);
+    let out = alignc()
+        .args(["emit-llvm"])
+        .arg(src.path())
+        .args(["--stage", "optimized"])
+        .output()
+        .expect("run alignc");
+    assert!(out.status.success(), "exit: {:?}", out.status.code());
+    let ir = String::from_utf8_lossy(&out.stdout);
+    let err = String::from_utf8_lossy(&out.stderr);
+    // A `define` line, not merely a mention: a call site or a declaration would satisfy a bare
+    // `contains` while the body was still eliminated, which is exactly the defect.
+    let defined: Vec<&str> = ir
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| l.starts_with("define "))
+        .collect();
+    // The roots keep their ENCODED symbols. Seeding marks `exportable` (external linkage, encoded
+    // symbol), not an `--export` root, which would additionally rename the symbol to the raw source
+    // name — see `a_pub_function_named_like_a_runtime_symbol_still_reports`.
+    for root in [encoded("k1"), encoded("k2")] {
+        assert!(
+            defined.iter().any(|l| l.contains(&format!("@\"{root}\"("))),
+            "the requested unit's own `pub` body {root} must be defined, not eliminated:\n{ir}"
+        );
+    }
+    assert!(
+        !ir.contains("define i64 @k1("),
+        "an inspection root must not be renamed to its raw source symbol:\n{ir}"
+    );
+    // The seeded set is stated, not applied silently, and it goes to stderr so a redirected IR
+    // stream is unchanged.
+    assert!(err.contains("defines no `main`"), "the seeded roots must be stated:\n{err}");
+    assert!(err.contains("2 `pub` function(s)"), "the note names the count:\n{err}");
+    assert!(!ir.contains("defines no `main`"), "the note must not pollute stdout:\n{ir}");
+}
+
+/// An explicit `--export` still narrows the set exactly as before: it wins over the seeded roots,
+/// and every other function keeps the default `internal` linkage.
+#[test]
+fn an_explicit_export_narrows_the_inspection_roots() {
+    if !align_driver::backend_available() {
+        return;
+    }
+    let src = write_named("inspection_roots_narrowed", LIB);
+    let out = alignc()
+        .args(["emit-llvm"])
+        .arg(src.path())
+        .args(["--stage", "optimized", "--export", "k1"])
+        .output()
+        .expect("run alignc");
+    assert!(out.status.success(), "exit: {:?}", out.status.code());
+    let ir = String::from_utf8_lossy(&out.stdout);
+    let err = String::from_utf8_lossy(&out.stderr);
+    let defines = ir.lines().filter(|l| l.trim_start().starts_with("define ")).count();
+    assert_eq!(defines, 1, "only the named root survives:\n{ir}");
+    assert!(ir.contains("@k1("), "the named root is the one emitted:\n{ir}");
+    assert!(
+        !err.contains("defines no `main`"),
+        "an explicit --export seeds nothing, so there is nothing to state:\n{err}"
+    );
+}
+
+/// A unit that defines `main` already has its root: it is reported exactly as it builds, with no
+/// seeded roots and no note. The `{main}` link-roots model is untouched.
+#[test]
+fn a_unit_with_main_is_unchanged_and_says_nothing() {
+    if !align_driver::backend_available() {
+        return;
+    }
+    let src = write_src("main_unit_unchanged");
+    let out = alignc()
+        .args(["emit-llvm"])
+        .arg(src.path())
+        .args(["--stage", "optimized"])
+        .output()
+        .expect("run alignc");
+    assert!(out.status.success(), "exit: {:?}", out.status.code());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("defines no `main`"), "a unit with `main` seeds nothing:\n{err}");
+}
+
+/// The encoded, collision-free LLVM symbol for a program function (mirrors `symbol_name`'s
+/// non-export path). Duplicated from `export_roots.rs`: each integration test file is its own
+/// crate.
+fn encoded(sym: &str) -> String {
+    let hex = sym.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    format!("align_fn${}${hex}", sym.len())
+}
+
+/// An inspection root gets `external` linkage, NOT a renamed symbol.
+///
+/// `--export` deliberately does both: it roots the function AND replaces the encoded symbol with
+/// the raw source name, because a linkable object needs a C-ABI name. Seeding inspection roots
+/// through that same mechanism would rename a `pub fn align_rt_print_i64` onto a reserved runtime
+/// symbol, and `callable_preflight` would reject a unit that compiled fine before — an inspection
+/// verb must never fail on a program a build accepts. Both verbs are pinned, because both seed.
+#[test]
+fn a_pub_function_named_like_a_runtime_symbol_still_reports() {
+    if !align_driver::backend_available() {
+        return;
+    }
+    let src = write_named(
+        "reserved_runtime_name",
+        "pub fn align_rt_print_i64(x: i64) -> i64 = x + 1\npub fn ordinary(x: i64) -> i64 = x * 2\n",
+    );
+    let ir_run = alignc()
+        .args(["emit-llvm"])
+        .arg(src.path())
+        .args(["--stage", "optimized"])
+        .output()
+        .expect("run alignc");
+    let err = String::from_utf8_lossy(&ir_run.stderr);
+    assert!(
+        ir_run.status.success(),
+        "a `pub` name that matches a reserved runtime symbol must still report: {err}"
+    );
+    assert!(
+        !err.contains("external identity collision"),
+        "seeding a root must not rename it onto a reserved runtime symbol:\n{err}"
+    );
+    let ir = String::from_utf8_lossy(&ir_run.stdout);
+    assert!(
+        ir.contains(&format!("@\"{}\"(", encoded("align_rt_print_i64"))),
+        "the root keeps its encoded symbol:\n{ir}"
+    );
+
+    let explain = alignc()
+        .arg("explain-opt")
+        .arg(src.path())
+        .output()
+        .expect("run alignc");
+    assert!(
+        explain.status.success(),
+        "explain-opt seeds the same roots and must not fail either: {}",
+        String::from_utf8_lossy(&explain.stderr)
+    );
+}

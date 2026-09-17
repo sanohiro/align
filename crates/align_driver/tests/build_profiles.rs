@@ -285,7 +285,7 @@ fn inspection_uses_complete_profile_configuration() {
             directory: "/".into(),
         };
         let remarks =
-            align_driver::collect_opt_remarks(&mir, BuildTarget::Baseline, profile, &debug)
+            align_driver::collect_opt_remarks(&mir, BuildTarget::Baseline, profile, &debug, &[])
                 .expect("profile remarks");
         if profile == Profile::Dev {
             assert!(

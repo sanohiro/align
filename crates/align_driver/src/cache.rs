@@ -146,7 +146,10 @@ pub struct CodegenKey {
     pub dep_interface_hashes: Vec<(String, Hash128)>,
     /// #5 the explicit export/root set, sorted + deduped (order-independent, it only toggles linkage).
     pub exports: Vec<String>,
-    /// #6 target triple.
+    /// #6 the resolved target triple. On an Apple target it carries the resolved deployment
+    /// target and never the Darwin kernel version, so an OS *patch* bump — which changes no
+    /// compilation input — no longer invalidates the cache, while a deployment-target change does
+    /// (`docs/impl/65-open-issue-batch-plan.md`, "Target identity and inspection roots").
     pub target_triple: String,
     /// #6 (cont.) object format (`0` = ELF, `1` = Mach-O).
     pub object_format: u8,

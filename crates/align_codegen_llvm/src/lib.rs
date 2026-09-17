@@ -40,6 +40,9 @@ mod llvm_build_id;
 pub mod pgo;
 mod return_transport;
 mod runtime_abi;
+/// The resolved target identity: the one place that decides the exact triple (and, on Apple, the
+/// deployment target) every artifact, link, and cache key derives from.
+pub mod target_identity;
 /// ThinLTO S0 feasibility spike (feature-gated; historical S0 go/no-go probes).
 #[cfg(feature = "thinlto-spike")]
 pub mod thinlto_spike;
@@ -77,6 +80,7 @@ use inkwell::module::{Linkage, Module};
 use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{
     ByteOrdering, CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
+    TargetTriple,
 };
 use inkwell::types::{
     AsTypeRef, BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, FunctionType, IntType,
@@ -123,17 +127,21 @@ pub enum ObjectFormat {
 ///
 /// Cross-compilation seam (M15+): when builds take an explicit target triple, this widens to take
 /// the `BuildTarget` as an argument instead of reading the host default triple.
-/// The host's default LLVM target triple. Cheap: one static libLLVM query, with no target
-/// initialization and no `TargetMachine`. The persistent unit-frontend cache keys on it so a
-/// frontend result can never cross a host boundary, even though MIR lowering is target-independent
-/// today (`docs/impl/10-cache-first-optimization.md` §6.7 K5).
-pub fn default_triple() -> String {
-    TargetMachine::get_default_triple().as_str().to_string_lossy().into_owned()
+/// The host's resolved LLVM target triple — the normalized identity from
+/// [`target_identity::resolved_triple`], not LLVM's raw host default: on Apple the OS component is
+/// the platform's canonical spelling plus the resolved deployment target, never `darwin<kernel>`.
+/// Cheap: resolved once per process, with no target initialization and no `TargetMachine`. The
+/// persistent unit-frontend cache keys on it so a frontend result can never cross a host boundary,
+/// even though MIR lowering is target-independent today
+/// (`docs/impl/10-cache-first-optimization.md` §6.7 K5).
+pub fn default_triple() -> Result<String, CodegenError> {
+    target_identity::resolved_triple()
 }
 
 pub fn target_object_format() -> Result<ObjectFormat, String> {
-    let triple = TargetMachine::get_default_triple();
-    let ts = triple.as_str().to_string_lossy().to_ascii_lowercase();
+    let ts = target_identity::resolved_triple()
+        .map_err(|e| e.to_string())?
+        .to_ascii_lowercase();
     if ts.contains("apple") || ts.contains("darwin") {
         Ok(ObjectFormat::MachO)
     } else if ts.contains("windows") {
@@ -375,8 +383,9 @@ pub fn ensure_target_initialized() -> Result<(), CodegenError> {
 /// the SAME resolution [`create_target_machine`] uses, so a cache hit implies byte-identical codegen.
 pub fn resolve_target_identity(target: &BuildTarget) -> Result<ResolvedTarget, CodegenError> {
     ensure_target_initialized()?;
-    let triple = TargetMachine::get_default_triple();
-    let triple_str = triple.as_str().to_string_lossy().to_string();
+    // The SAME resolved triple `create_target_machine` builds its machine from (one `OnceLock`, not
+    // two matching code paths), so the cache key and the machine are byte-identical by construction.
+    let triple_str = target_identity::resolved_triple()?;
     let (cpu, features) = resolve_cpu_features(target, &triple_str.to_ascii_lowercase())?;
     Ok(ResolvedTarget { triple: triple_str, cpu, features, reloc_model: RELOC_MODEL, code_model: CODE_MODEL })
 }
@@ -401,10 +410,14 @@ pub fn llvm_version() -> String {
 /// same profile's [`Profile::codegen_opt_level`].
 fn create_target_machine(target: &BuildTarget, opt: OptimizationLevel) -> Result<TargetMachine, CodegenError> {
     ensure_target_initialized()?;
-    let triple = TargetMachine::get_default_triple();
+    // The normalized identity, not LLVM's raw host default: the machine's triple is what every
+    // module copies (`module.set_triple(&tm.get_triple())`) and what `LC_BUILD_VERSION` is derived
+    // from, so the deployment target must already be in it here.
+    let triple_str = target_identity::resolved_triple()?;
+    let triple = TargetTriple::create(&triple_str);
     let t = Target::from_triple(&triple)
         .map_err(|e| CodegenError::Target(format!("triple resolution: {e}")))?;
-    let (cpu, features) = resolve_cpu_features(target, &triple.as_str().to_string_lossy().to_ascii_lowercase())?;
+    let (cpu, features) = resolve_cpu_features(target, &triple_str.to_ascii_lowercase())?;
     t.create_target_machine(
         &triple,
         &cpu,
@@ -1356,11 +1369,16 @@ pub struct DebugInfo {
 /// **Process-global side effect**: the first call enables `-pass-remarks*` via
 /// `LLVMParseCommandLineOptions` (behind a `Once`) — it stays on for the process. Keep this strictly
 /// on the `explain-opt` path; a normal build / the IR-shape suite must never call it.
+///
+/// `exports` are the roots that keep `external` linkage, exactly as in [`emit_llvm_ir`]. The
+/// `explain-opt` lens seeds them from the inspected unit's own `pub` functions when it defines no
+/// `main`, so the remarks describe that unit instead of an empty module (issue 1086).
 pub fn collect_opt_remarks(
     program: &Program,
     target: &BuildTarget,
     profile: Profile,
     debug: &DebugInfo,
+    exports: &[String],
 ) -> Result<Vec<String>, CodegenError> {
     ensure_remark_cl_opts();
     let ctx = Context::create();
@@ -1388,7 +1406,7 @@ pub fn collect_opt_remarks(
         program,
         &tm,
         Some(debug),
-        &[],
+        exports,
         false,
         ModuleScope::Whole,
     );
