@@ -654,11 +654,15 @@ mod test_limit_tests {
             vec!["alignc", "--deployment-target="],
             vec!["alignc", "--deployment-target", ""],
             vec!["alignc", "--deployment-target=15\0.0"],
+            // A following option is a MISSING value, not a value. Prevalidation runs on the
+            // original prefix; if it accepted this, the CPU stripper would remove
+            // `--target-cpu baseline` and the second parse would silently consume `14.0`.
+            vec!["alignc", "--deployment-target", "--target-cpu", "baseline", "14.0"],
+            vec!["alignc", "--deployment-target", "--profile", "fast"],
+            vec!["alignc", "--deployment-target=-14.0"],
         ] {
             assert!(parse_deployment_target(&strings(&args)).is_err(), "{args:?}");
         }
-        // A value that looks like a flag is still this flag's value — the same shape as
-        // `--target-cpu`, so a later stripper can never reinterpret it.
         let (version, rest) = parse_deployment_target(&strings(&[
             "alignc",
             "build",
@@ -1001,8 +1005,13 @@ fn parse_deployment_target(args: &[String]) -> Result<(Option<String>, Vec<Strin
         let value = if let Some(v) = a.strip_prefix("--deployment-target=") {
             Some(v.to_string())
         } else if a == "--deployment-target" {
+            // A following option is never this flag's value. Without this the ORIGINAL-prefix
+            // prevalidation would accept `--deployment-target --target-cpu baseline 14.0`, and the
+            // CPU stripper would then remove `--target-cpu baseline` so the second parse silently
+            // consumed `14.0` — a missing argument turned into a successful build.
             let v = args
                 .get(i + 1)
+                .filter(|v| !v.starts_with('-'))
                 .cloned()
                 .ok_or_else(|| "--deployment-target requires a version".to_owned())?;
             i += 1;
@@ -1012,8 +1021,11 @@ fn parse_deployment_target(args: &[String]) -> Result<(Option<String>, Vec<Strin
             None
         };
         if let Some(v) = value {
-            if v.is_empty() || v.as_bytes().contains(&0) {
-                return Err("--deployment-target requires a nonempty version without NUL".into());
+            if v.is_empty() || v.as_bytes().contains(&0) || v.starts_with('-') {
+                return Err(
+                    "--deployment-target requires a nonempty version without NUL, not an option"
+                        .into(),
+                );
             }
             version = Some(v);
         }

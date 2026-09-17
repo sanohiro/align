@@ -238,13 +238,37 @@ pub fn normalize_apple_triple(triple: &str, platform: &ApplePlatform, version: &
     format!("{prefix}{}{version}{suffix}", platform.canonical_os)
 }
 
+/// The value an Apple platform's `*_DEPLOYMENT_TARGET` variable supplies, as
+/// `Ok(None)` for an *absent* variable and `Ok(Some(text))` for a present one.
+///
+/// Absent and invalid are different answers. A present variable is a supplied value even when it is
+/// empty or not UTF-8, so it must reach validation instead of disappearing into the next precedence
+/// layer — a silently ignored `MACOSX_DEPLOYMENT_TARGET=""` would stamp artifacts for the host
+/// version while the build configuration says otherwise. Non-UTF-8 fails here (it can never be a
+/// version); everything else is handed to [`canonical_version`], which rejects it by name.
+fn env_deployment_value(
+    var_name: &str,
+    raw: Option<std::ffi::OsString>,
+) -> Result<Option<String>, CodegenError> {
+    match raw {
+        None => Ok(None),
+        Some(value) => value.into_string().map(Some).map_err(|_| {
+            CodegenError::Target(format!(
+                "{var_name} value is not valid UTF-8 and cannot be a deployment target"
+            ))
+        }),
+    }
+}
+
 /// The host's macOS product version (`sw_vers -productVersion`), read without spawning a process.
 ///
 /// `kern.osproductversion` is the same value `sw_vers` prints and is the *product* version, never
-/// the kernel version the default triple carries. `None` on any other host, and on a macOS host
-/// where the query is unavailable — in which case resolution falls to the documented floor.
+/// the kernel version the default triple carries. `Ok(None)` means the query is *unavailable* —
+/// any other host, or a macOS host where the sysctl fails — and resolution then falls to the
+/// documented floor. A query that succeeds but answers with bytes that cannot be a version is a
+/// present-but-invalid value and fails here, for the same reason the environment layer does.
 #[cfg(target_os = "macos")]
-fn host_product_version() -> Option<String> {
+fn host_product_version() -> Result<Option<String>, CodegenError> {
     let name = c"kern.osproductversion";
     let mut len: usize = 0;
     // SAFETY: the two-call sysctl protocol. The sizing call passes a null output buffer with a live
@@ -261,7 +285,7 @@ fn host_product_version() -> Option<String> {
     // A sane product version is a handful of bytes; anything else is not one, and the cap keeps a
     // hostile/garbage length from requesting an unbounded allocation.
     if sized != 0 || len == 0 || len > 64 {
-        return None;
+        return Ok(None);
     }
     let mut buf = vec![0u8; len];
     // SAFETY: `buf` is `len` writable bytes and `len` is the exact capacity the sizing call
@@ -276,18 +300,25 @@ fn host_product_version() -> Option<String> {
         )
     };
     if read != 0 || len == 0 || len > buf.len() {
-        return None;
+        return Ok(None);
     }
     buf.truncate(len);
     // The value is a NUL-terminated C string inside the buffer.
     let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
-    let text = String::from_utf8(buf[..end].to_vec()).ok()?;
-    (!text.is_empty()).then_some(text)
+    if end == 0 {
+        return Ok(None);
+    }
+    match String::from_utf8(buf[..end].to_vec()) {
+        Ok(text) => Ok(Some(text)),
+        Err(_) => Err(CodegenError::Target(
+            "the host product version (kern.osproductversion) is not valid UTF-8".to_string(),
+        )),
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn host_product_version() -> Option<String> {
-    None
+fn host_product_version() -> Result<Option<String>, CodegenError> {
+    Ok(None)
 }
 
 /// The `--deployment-target` value, installed once before any triple is resolved.
@@ -356,8 +387,18 @@ fn resolve_once() -> &'static Result<String, String> {
             .get()
             .and_then(Option::as_deref)
             .map(str::to_string);
-        let env = std::env::var(platform.env_var).ok().filter(|v| !v.is_empty());
-        let host = host_product_version();
+        // A present variable is a supplied value, even an empty one: it reaches validation instead
+        // of falling through to the host, so broken configuration is diagnosed, not obeyed.
+        let env = match env_deployment_value(platform.env_var, std::env::var_os(platform.env_var)) {
+            Ok(value) => value,
+            Err(CodegenError::Target(message)) => return Err(message),
+            Err(other) => return Err(other.to_string()),
+        };
+        let host = match host_product_version() {
+            Ok(value) => value,
+            Err(CodegenError::Target(message)) => return Err(message),
+            Err(other) => return Err(other.to_string()),
+        };
         match resolve_deployment_version(&platform, explicit.as_deref(), env.as_deref(), host.as_deref()) {
             Ok(version) => {
                 let normalized = normalize_apple_triple(&raw, &platform, &version);
@@ -398,6 +439,22 @@ pub fn apple_min_version_flag() -> Result<Option<String>, CodegenError> {
 mod tests {
     use super::*;
 
+    /// The macOS platform row, resolved through the public entry rather than named directly, so a
+    /// change to the table is visible here.
+    fn macos() -> ApplePlatform {
+        let Some(platform) = apple_platform("arm64-apple-darwin27.0.0") else {
+            panic!("a Darwin host triple must resolve to the macOS platform");
+        };
+        platform
+    }
+
+    fn ios() -> ApplePlatform {
+        let Some(platform) = apple_platform("arm64-apple-ios17.0") else {
+            panic!("an iOS triple must resolve to the iOS platform");
+        };
+        platform
+    }
+
     /// Every Apple spelling normalizes to its canonical OS plus an explicit version, the
     /// environment field survives byte-for-byte, and no output contains `darwin<N>`.
     #[test]
@@ -415,7 +472,9 @@ mod tests {
             ("arm64-apple-visionos1.0", "arm64-apple-xros26.0"),
         ];
         for (input, expected) in cases {
-            let platform = apple_platform(input).unwrap_or_else(|| panic!("{input} is Apple"));
+            let Some(platform) = apple_platform(input) else {
+                panic!("{input} must be recognized as an Apple triple");
+            };
             let out = normalize_apple_triple(input, &platform, "26.0");
             assert_eq!(out, expected, "{input}");
             assert!(!out.contains("darwin"), "no constructed triple may spell darwin: {out}");
@@ -436,19 +495,22 @@ mod tests {
     /// own platform consults the host version.
     #[test]
     fn deployment_precedence_is_explicit_then_env_then_host_then_floor() {
-        let mac = apple_platform("arm64-apple-darwin27.0.0").expect("macOS");
-        let ios = apple_platform("arm64-apple-ios17.0").expect("iOS");
-        let all = resolve_deployment_version(&mac, Some("15.4"), Some("14.0"), Some("27.0"));
-        assert_eq!(all.unwrap(), "15.4");
-        let env = resolve_deployment_version(&mac, None, Some("14.0"), Some("27.0"));
-        assert_eq!(env.unwrap(), "14.0");
-        let host = resolve_deployment_version(&mac, None, None, Some("27.0"));
-        assert_eq!(host.unwrap(), "27.0");
-        let floor = resolve_deployment_version(&mac, None, None, None);
-        assert_eq!(floor.unwrap(), mac.floor);
+        let mac = macos();
+        let resolved = |explicit, env, host| {
+            resolve_deployment_version(&mac, explicit, env, host)
+                .ok()
+                .unwrap_or_default()
+        };
+        assert_eq!(resolved(Some("15.4"), Some("14.0"), Some("27.0")), "15.4");
+        assert_eq!(resolved(None, Some("14.0"), Some("27.0")), "14.0");
+        assert_eq!(resolved(None, None, Some("27.0")), "27.0");
+        assert_eq!(resolved(None, None, None), mac.floor);
         // A non-host platform never inherits the macOS host version.
-        let cross = resolve_deployment_version(&ios, None, None, Some("27.0"));
-        assert_eq!(cross.unwrap(), ios.floor);
+        let cross = ios();
+        assert_eq!(
+            resolve_deployment_version(&cross, None, None, Some("27.0")).ok().unwrap_or_default(),
+            cross.floor
+        );
         // A malformed value is a hard error at its own layer, not a fall-through to the next.
         for bad in ["", "0.1", "1.2.3.4", "14.x", "14..0", "-1", "99999999999"] {
             let error = resolve_deployment_version(&mac, Some(bad), Some("14.0"), Some("27.0"))
@@ -458,6 +520,40 @@ mod tests {
         let error = resolve_deployment_version(&mac, None, Some("nope"), Some("27.0"))
             .expect_err("a malformed environment value must fail closed");
         assert!(error.to_string().contains(mac.env_var), "{error}");
+        // A present-but-empty variable is a supplied value, not an absent one: it must be rejected
+        // rather than falling through to the host version.
+        let empty = resolve_deployment_version(&mac, None, Some(""), Some("27.0"))
+            .expect_err("an empty environment value must not fall through to the host");
+        assert!(empty.to_string().contains(mac.env_var), "{empty}");
+        // Same for the host layer: a malformed product version is an error, not the floor.
+        let bad_host = resolve_deployment_version(&mac, None, None, Some("nope"))
+            .expect_err("a malformed host value must not fall through to the floor");
+        assert!(bad_host.to_string().contains("host product version"), "{bad_host}");
+    }
+
+    /// Absent and invalid are different answers at the environment layer. An unset variable moves to
+    /// the next precedence layer; a present one is a supplied value that must reach validation,
+    /// including when it is empty or not UTF-8.
+    #[test]
+    fn a_present_environment_variable_is_a_value_even_when_it_is_unusable() {
+        let var = "MACOSX_DEPLOYMENT_TARGET";
+        assert_eq!(env_deployment_value(var, None).ok(), Some(None), "absent is not an error");
+        assert_eq!(
+            env_deployment_value(var, Some(std::ffi::OsString::from(""))).ok(),
+            Some(Some(String::new())),
+            "an empty variable must reach validation, not disappear"
+        );
+        assert_eq!(
+            env_deployment_value(var, Some(std::ffi::OsString::from("14.0"))).ok(),
+            Some(Some("14.0".to_string()))
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let error = env_deployment_value(var, Some(std::ffi::OsString::from_vec(vec![0xff])))
+                .expect_err("a non-UTF-8 variable can never be a version");
+            assert!(error.to_string().contains(var), "{error}");
+        }
     }
 
     /// Canonicalization is `major.minor`: an OS *patch* level is not a compilation input and must
@@ -470,7 +566,11 @@ mod tests {
             ("15.3.1", "15.3"),
             ("10.13.6", "10.13"),
         ] {
-            assert_eq!(canonical_version(input, "test").unwrap(), expected, "{input}");
+            assert_eq!(
+                canonical_version(input, "test").ok().as_deref(),
+                Some(expected),
+                "{input}"
+            );
         }
     }
 }

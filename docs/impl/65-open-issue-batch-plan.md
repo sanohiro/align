@@ -517,8 +517,14 @@ exactly this precedence, and the first layer that supplies a value wins:
 
 Every layer is canonicalized to `major.minor`: a malformed value at any layer is
 a hard error naming that layer, never a silent fall-through to the next one, and
-an OS *patch* level never reaches the triple. `--deployment-target` on a
-non-Apple host is a hard error rather than a silently ignored flag. Non-Apple
+an OS *patch* level never reaches the triple. Absent and invalid are different
+answers: an unset environment variable moves to the next layer, while a *present*
+one is a supplied value even when it is empty or not UTF-8 and must reach
+validation; the same rule separates an unavailable host query (which falls to the
+floor) from a host query that answers with bytes that cannot be a version (which
+fails). `--deployment-target` on a non-Apple host is a hard error rather than a
+silently ignored flag, and a following option is a missing argument rather than
+that flag's value. Non-Apple
 triples, and any `*-apple-*` triple whose OS component is outside the table
 above, are left byte-identical.
 
@@ -572,6 +578,7 @@ prints every lowered function and performs no dead-code elimination.
 | --- | --- | --- |
 | Apple OS normalization, environment preservation, non-Apple byte-identity | `target_identity::normalize_apple_triple` over the platform table | `apple_triples_normalize_and_non_apple_triples_stay_byte_identical` |
 | Exact precedence, per-layer rejection, host-platform restriction | `target_identity::resolve_deployment_version` | `deployment_precedence_is_explicit_then_env_then_host_then_floor`, `versions_canonicalize_to_major_minor` |
+| Absent versus present-but-unusable at the environment and host layers | `target_identity::env_deployment_value`, `host_product_version` returning `Result<Option<_>>` | `a_present_environment_variable_is_a_value_even_when_it_is_unusable`, the empty/malformed rows of the precedence owner |
 | One resolved triple for the machine, the modules, and the key | One `OnceLock` read by `resolve_target_identity`/`create_target_machine` | `build_target::the_resolved_triple_is_single_sourced_and_never_names_the_kernel`, `cache_codegen::gate14_codegen_key_triple_is_the_resolved_identity` |
 | Host resolution is the product version, never the kernel | `kern.osproductversion` query | `build_target::the_macos_deployment_target_is_the_host_product_version` |
 | Objects and image stamped from one value | `LinkPlan::apple_min_version` | `macho_link::objects_and_the_linked_image_carry_the_resolved_deployment_target`, `link_command_args_are_pinned_per_format` |
