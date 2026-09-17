@@ -7458,6 +7458,43 @@ fn normalize_linked_rt_lto_guarded_definitions(
     Ok(())
 }
 
+/// Machine-check the `--rt-lto` merge invariant: **a definition in the merged module carries no
+/// attribute that binds it to a target other than the program's own `TargetMachine`.**
+///
+/// [`RuntimeAbi::remove_attributes`] establishes it by shedding every string attribute from each
+/// guarded definition; this re-derives it from the merged module so a future guarded row, a
+/// `rustc` upgrade that bakes one more policy string, or a baked artifact that defines something
+/// beyond the guarded four cannot silently reintroduce the defect (#1069). Every *definition* is
+/// checked, not only the guarded rows: a merged body is the only way such an attribute enters, and
+/// a body is also the only thing the inliner can copy one out of (`"probe-stack"` propagates
+/// callee-to-caller). Declarations are exempt — nothing merges into one and no attribute on a
+/// bodiless declaration can bind codegen to another target.
+///
+/// Runs after the merge has mutated the program module, so a violation is a hard compiler error,
+/// exactly like the other post-merge checks: the pre-merge loud-diagnostic fallback is no longer
+/// available once definitions have been linked in (`docs/impl/20-runtime-abi-ledger.md`).
+fn verify_merged_rt_lto_target_independence(module: &Module<'_>) -> Result<(), CodegenError> {
+    use inkwell::attributes::AttributeLoc;
+    for function in module.get_functions() {
+        if function.count_basic_blocks() == 0 {
+            continue; // a declaration — nothing was merged into it
+        }
+        let mut locations = vec![AttributeLoc::Function, AttributeLoc::Return];
+        locations.extend((0..function.count_params()).map(AttributeLoc::Param));
+        for loc in locations {
+            if let Some(key) = runtime_abi::string_attribute_keys(function, loc).first() {
+                let name = function.get_name().to_string_lossy().into_owned();
+                return Err(CodegenError::Target(format!(
+                    "--rt-lto: merged definition {name} still carries the producing compiler's \
+                     string attribute {key:?}; a merged definition must inherit the program's \
+                     target machine",
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Link the parsed `--rt-lto` runtime module into the program `module` in place, then normalize the
 /// merged bodies (M14 Slice 2). Steps: (0) compare the parsed runtime module's datalayout against
 /// the program's — a mismatch means blindly overwriting it (the old unconditional
@@ -7469,10 +7506,14 @@ fn normalize_linked_rt_lto_guarded_definitions(
 /// external linkage, and the C calling convention, then rename it to the captured physical name of
 /// its typed declaration and `link_in_module` (the definitions replace those declarations even when
 /// an earlier program claimant forced LLVM uniquification); (3) require every captured typed handle
-/// to remain a body-bearing external C definition, then shed exactly that row's curated attrs and
+/// to remain a body-bearing external C definition, then shed exactly that row's curated attrs plus
+/// every string attribute the producing compiler baked into it (so the merged body inherits the
+/// program's own `TargetMachine` instead of `rustc`'s — see [`RuntimeAbi::remove_attributes`]) and
 /// set it `internal` DIRECTLY (never the
 /// internalize pass — the `{main} ∪ --export` roots model stays untouched, and no runtime symbol is
-/// externally defined, so there is no duplicate-external vs the `.a` at final link); (4) `verify` the
+/// externally defined, so there is no duplicate-external vs the `.a` at final link); (3b)
+/// re-derive target independence from the merged module
+/// ([`verify_merged_rt_lto_target_independence`]); (4) `verify` the
 /// merged module. Runs on the RAW module, BEFORE the single `run_opt_pipeline` — never a second opt
 /// run (the probe's double-opt is what regressed `str_cmp`).
 ///
@@ -7564,6 +7605,9 @@ fn link_in_rt_lto<'c>(
     // (3) Normalize exactly the typed guarded runtime definitions. Physical names are captured
     // from their declaration handles, so a same-spelled program claimant can never be selected.
     normalize_linked_rt_lto_guarded_definitions(module, runtime)?;
+    // (3b) Re-derive the target-independence invariant from the merged module itself, so no future
+    // guarded row, baked-artifact change or rustc upgrade can leave a target-bound attribute behind.
+    verify_merged_rt_lto_target_independence(module)?;
     // (4) A merged module that does not verify is a compiler bug (our own baked bitcode), not a user
     // error — surface it loudly rather than emitting a broken object.
     module

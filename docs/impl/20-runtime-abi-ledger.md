@@ -925,7 +925,10 @@ attribute. The four rt-LTO guarded symbols `align_rt_str_eq`,
 `align_rt_str_eq_ignore_case` use the shown declaration attributes when
 rt-LTO is off. When rt-LTO is on, their curated declaration attributes are
 withheld before their visible bodies are linked; LLVM then derives attributes
-from those bodies. `align_rt_str_cmp` is not guarded and always keeps A01.
+from those bodies. A merged body also carries no string attribute at any
+attribute location, so it inherits the program's target machine instead of the
+target selection and codegen policy the producing compiler baked into the
+artifact. `align_rt_str_cmp` is not guarded and always keeps A01.
 
 | ABI | Exact LLVM declaration | Symbols |
 |---|---|---|
@@ -1204,7 +1207,12 @@ the typed native handle and never the same-spelled program claimant. After
 linking, every captured typed handle must still be an external C-convention
 definition with a body before attributes are removed and linkage becomes
 internal; a missing body or changed linkage/convention is a compiler error,
-never a silent static-runtime fallback after partial mutation.
+never a silent static-runtime fallback after partial mutation. Removal covers
+that row's curated enum attributes and every string attribute at every
+attribute location. Codegen then re-derives the result from the merged module:
+any definition still carrying a string attribute is a compiler error on the
+same post-merge terms, so a new guarded row or a producing-compiler upgrade
+cannot silently reintroduce a target-bound merged body.
 
 ## D14 generated SQLite scalar-callback ABI
 

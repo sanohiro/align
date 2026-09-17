@@ -302,8 +302,32 @@ impl RuntimeAbi {
         }
     }
 
+    /// Shed everything a `--rt-lto` merged definition must not keep: this row's curated *enum*
+    /// contract (the declaration's promise, which LLVM now re-derives from the visible body) AND
+    /// every *string* attribute the producing compiler baked into the artifact.
+    ///
+    /// The string half is a closed class, not a name list. `rustc` bakes its own target selection
+    /// and codegen policy into `str_prims.bc` (`"target-cpu"="apple-m1"`, `"probe-stack"`,
+    /// `"frame-pointer"`, and `"target-features"` wherever its default carries features), while a
+    /// definition merged into the program module must inherit the program's own `TargetMachine`.
+    /// A surviving `"target-cpu"` makes AArch64's `areInlineCompatible` refuse the inline into the
+    /// `generic` caller that the settled `--target-cpu baseline` default selects, so the settled
+    /// default-ON merge silently bought nothing on aarch64; `"probe-stack"` additionally
+    /// propagates callee-to-caller through the inliner (`adjustCallerStackProbes`), applying a
+    /// stack-probe requirement to Align code that never asked for one. Naming the baked strings
+    /// would reopen that the next time `rustc` bakes one more, so the rule is the inverse: no
+    /// string attribute survives the merge, at any location. None is semantic for a guarded row —
+    /// a row's semantics live in the curated enum contract above, and LLVM's own semantic
+    /// parameter/return attributes (`readonly`, `noalias`, `align`, …) are enum attributes, which
+    /// this leaves untouched. [`super::verify_merged_rt_lto_target_independence`] machine-checks
+    /// the result over the whole merged module.
     pub(super) fn remove_attributes(self, function: FunctionValue<'_>) {
         use inkwell::attributes::AttributeLoc;
+        remove_string_attributes(function, AttributeLoc::Function);
+        remove_string_attributes(function, AttributeLoc::Return);
+        for param in 0..function.count_params() {
+            remove_string_attributes(function, AttributeLoc::Param(param));
+        }
         let spec = shape_spec(self.shape);
         if spec.return_noalias {
             function.remove_enum_attribute(AttributeLoc::Return, super::enum_kind_id("noalias"));
@@ -343,6 +367,33 @@ impl RuntimeAbi {
             RuntimeAbiId::Keyed(key) => Some(key),
             RuntimeAbiId::Unkeyed(_) => None,
         }
+    }
+}
+
+/// Every string-attribute key `function` carries at `loc`, in LLVM's own order.
+///
+/// One enumeration shared by the `--rt-lto` shedder ([`RuntimeAbi::remove_attributes`]) and the
+/// post-merge verifier ([`super::verify_merged_rt_lto_target_independence`]), so "a string
+/// attribute at this location" means exactly the same thing to both. A key that is not UTF-8 (no
+/// LLVM-emitted key is) spells lossily here, so it would fail to be removed and then be reported
+/// by the verifier as a hard error — the pair fails closed rather than silently keeping it.
+pub(super) fn string_attribute_keys(
+    function: FunctionValue<'_>,
+    loc: inkwell::attributes::AttributeLoc,
+) -> Vec<String> {
+    function
+        .attributes(loc)
+        .into_iter()
+        .filter(|attr| attr.is_string())
+        .map(|attr| attr.get_string_kind_id().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Remove every string attribute at `loc`. The keys are collected before the first removal:
+/// removing mutates the very attribute list `attributes` enumerates.
+fn remove_string_attributes(function: FunctionValue<'_>, loc: inkwell::attributes::AttributeLoc) {
+    for key in string_attribute_keys(function, loc) {
+        function.remove_string_attribute(loc, &key);
     }
 }
 

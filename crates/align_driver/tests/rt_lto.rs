@@ -15,6 +15,12 @@
 //!   7. end-to-end bench + bounds — driven by `bench/rt_lto/` through the real `alignc build`, not
 //!      this suite (it needs `cc` + a link + timing).
 //!
+//! Two later gates close #1069, where the merge composed with only one `--target-cpu`:
+//!   8. every guarded row inlines at every `--target-cpu` in [`cpu_matrix`], counted through
+//!      [`call_sites`] so an internalized `tail call fastcc` site cannot pass as an inline.
+//!   9. no definition in the merged module carries a producing-compiler string attribute, at every
+//!      `--target-cpu` and in both lenses — the property that makes gate 8 target-independent.
+//!
 //! The IR gates go through the driver's `emit_llvm_ir` wrapper with `rt_lto = true`, which links the
 //! baked bitcode into the module: `--stage raw` (`optimized = false`) is the pre-opt merged lens
 //! (bodies present, attrs shed) and `--stage optimized` is the after-`O2` lens (calls inlined away).
@@ -22,9 +28,10 @@
 mod common;
 use common::*;
 
-/// Compile `src` to LLVM IR through the driver, exporting `exports`. `optimized` = the `-O2` lens
-/// (calls inlined) vs raw (pre-opt merged shape); `rt_lto` links the fast-path string bitcode.
-fn ir(name: &str, src: &str, exports: &[&str], optimized: bool, rt_lto: bool) -> String {
+/// Compile `src` to LLVM IR through the driver for `target`, exporting `exports`. `optimized` = the
+/// `-O2` lens (calls inlined) vs raw (pre-opt merged shape); `rt_lto` links the fast-path string
+/// bitcode.
+fn ir_at(target: BuildTarget, name: &str, src: &str, exports: &[&str], optimized: bool, rt_lto: bool) -> String {
     let mut sm = SourceMap::new();
     let checked = check(&mut sm, name, src);
     assert!(
@@ -34,7 +41,12 @@ fn ir(name: &str, src: &str, exports: &[&str], optimized: bool, rt_lto: bool) ->
     );
     let mir = lower_to_mir(&checked.hir);
     let exports: Vec<String> = exports.iter().map(|s| s.to_string()).collect();
-    emit_llvm_ir(&mir, BuildTarget::Baseline, align_driver::Profile::Release, optimized, &exports, rt_lto).expect("emit llvm ir")
+    emit_llvm_ir(&mir, target, align_driver::Profile::Release, optimized, &exports, rt_lto).expect("emit llvm ir")
+}
+
+/// [`ir_at`] at the settled default target (`--target-cpu baseline`).
+fn ir(name: &str, src: &str, exports: &[&str], optimized: bool, rt_lto: bool) -> String {
+    ir_at(BuildTarget::Baseline, name, src, exports, optimized, rt_lto)
 }
 
 /// The idiomatic constant-length equality filter — the probe's `str_eq` 2.1× kernel.
@@ -56,6 +68,77 @@ fn backend() -> bool {
     backend_available()
 }
 
+/// The guarded four, by runtime symbol — `runtime_abi.rs`'s `is_rt_lto_guarded` set.
+const GUARDED_SYMBOLS: [&str; 4] = [
+    "align_rt_str_eq",
+    "align_rt_str_starts_with",
+    "align_rt_str_ends_with",
+    "align_rt_str_eq_ignore_case",
+];
+
+/// One kernel that reaches all four guarded rows from ordinary source: `==`, `.starts_with`,
+/// `.ends_with`, `.eq_ignore_ascii_case` — each in a `where` loop, the shape `--rt-lto` exists for.
+const GUARDED_KERNEL: &str = "\
+fn is_hello(x: str) -> bool = x == \"hello\"
+fn has_pre(x: str) -> bool = x.starts_with(\"pre\")
+fn has_suf(x: str) -> bool = x.ends_with(\"suf\")
+fn same(x: str) -> bool = x.eq_ignore_ascii_case(\"hello\")
+pub fn counts(s: slice<str>) -> i64 =
+  s.where(is_hello).count() + s.where(has_pre).count() + s.where(has_suf).count() + s.where(same).count()
+";
+
+/// Every `--target-cpu` this suite exercises on the host architecture.
+///
+/// The merge must compose with EVERY supported target, not only the one whose `rustc` default
+/// happens to be a subset of Align's (#1069). `Baseline` is the settled default and the case the
+/// defect broke: it resolves to `generic` on arm64, which AArch64's `areInlineCompatible` refuses
+/// to inline an `apple-m1`-baked callee into, so every guarded call survived at BOTH settled
+/// defaults at once. `Native` is the configuration that masked it. On arm64 a third, explicit CPU
+/// that is neither the host nor the baseline is added, so a fix that merely re-baked the artifact
+/// for the host would still fail here; it is executed on the arm64 hosts this suite runs on.
+fn cpu_matrix() -> Vec<BuildTarget> {
+    let mut targets = vec![BuildTarget::Baseline, BuildTarget::Native];
+    if std::env::consts::ARCH == "aarch64" {
+        targets.push(BuildTarget::Cpu("cortex-a72".to_string()));
+    }
+    targets
+}
+
+/// Call sites of `@symbol` in `ir`, independent of calling convention and tail markers.
+///
+/// Matching the literal `call i32 @align_rt_str_eq` is NOT enough and is exactly how #1069 hid:
+/// once the merged body is `internal`, LLVM rewrites its call sites to `tail call fastcc i32 @…`,
+/// so the substring assertion passed on arm64 while all 1275 calls were still there.
+fn call_sites(ir: &str, symbol: &str) -> usize {
+    let needle = format!("@{symbol}(");
+    ir.lines()
+        .filter(|line| {
+            let line = line.trim_start();
+            !line.starts_with("define") && !line.starts_with("declare") && line.contains(&needle)
+        })
+        .count()
+}
+
+/// The body of every `attributes #N = { … }` group that a `define` line in `ir` references, i.e.
+/// the function attributes of every definition in the module (merged runtime bodies included).
+fn definition_attribute_groups(ir: &str) -> Vec<(String, String)> {
+    let ids: Vec<String> = ir
+        .lines()
+        .filter(|line| line.starts_with("define"))
+        .filter_map(|line| line.rfind('{').map(|open| &line[..open]))
+        .flat_map(|head| head.split_whitespace())
+        .filter(|token| token.starts_with('#') && token[1..].chars().all(|c| c.is_ascii_digit()))
+        .map(|token| token.to_string())
+        .collect();
+    ids.into_iter()
+        .filter_map(|id| {
+            let prefix = format!("attributes {id} = ");
+            let line = ir.lines().find(|line| line.starts_with(&prefix))?;
+            Some((id, line.to_string()))
+        })
+        .collect()
+}
+
 // -- Gate 1: positive IR-shape (both directions) ------------------------------------------------
 
 #[test]
@@ -66,13 +149,16 @@ fn gate1_str_eq_call_absent_with_rt_lto_present_without() {
     // OFF: the opaque runtime call is present (today's behavior).
     let off = ir("eq_off", EQ_KERNEL, &["eq_count"], /*opt*/ true, /*rt_lto*/ false);
     assert!(
-        off.contains("call i32 @align_rt_str_eq"),
+        call_sites(&off, "align_rt_str_eq") > 0,
         "flag-off optimized IR should still call align_rt_str_eq:\n{off}"
     );
-    // ON: the body is merged + inlined, so no call to the runtime symbol survives.
+    // ON: the body is merged + inlined, so no call to the runtime symbol survives. Counted through
+    // `call_sites`, not a `call i32 @…` substring: the internalized callee's sites are `tail call
+    // fastcc i32 @…`, which the substring form silently missed on arm64 (#1069).
     let on = ir("eq_on", EQ_KERNEL, &["eq_count"], /*opt*/ true, /*rt_lto*/ true);
-    assert!(
-        !on.contains("call i32 @align_rt_str_eq"),
+    assert_eq!(
+        call_sites(&on, "align_rt_str_eq"),
+        0,
         "under --rt-lto align_rt_str_eq must inline (no call left):\n{on}"
     );
     // The inlined constant-length fast path: `icmp` against the literal length, `bcmp` on a hit.
@@ -315,6 +401,74 @@ fn gate7_unparseable_bitcode_falls_back_and_reannotates() {
         decl.contains("readonly captures(none)"),
         "the fallback declare must be re-annotated with the curated `readonly captures(none)` params: {decl}"
     );
+}
+
+// -- Gate 8: every guarded row inlines at every --target-cpu in the matrix (#1069) --------------
+
+#[test]
+fn gate8_guarded_rows_inline_at_every_target_cpu() {
+    if !backend() {
+        return;
+    }
+    for target in cpu_matrix() {
+        let label = format!("{target:?}");
+        let on = ir_at(target, "guarded_on", GUARDED_KERNEL, &["counts"], /*opt*/ true, /*rt_lto*/ true);
+        for symbol in GUARDED_SYMBOLS {
+            assert_eq!(
+                call_sites(&on, symbol),
+                0,
+                "--target-cpu {label}: {symbol} must inline under --rt-lto, no call may survive:\n{on}"
+            );
+        }
+        // The equality fast path really is in the caller now, not merely deleted as dead.
+        assert!(
+            on.contains("@bcmp") || on.contains("@memcmp"),
+            "--target-cpu {label}: the inlined bodies should lower a compare to bcmp/memcmp:\n{on}"
+        );
+    }
+}
+
+// -- Gate 9: the merged module is target-independent, at every --target-cpu (#1069) -------------
+
+#[test]
+fn gate9_merged_definitions_carry_no_producer_target_attributes() {
+    if !backend() {
+        return;
+    }
+    // The strings `rustc` was observed to bake into `str_prims.bc`, named here only so a failure
+    // reads plainly. The assertion below is the general one: no string attribute at all.
+    let observed = ["target-cpu", "target-features", "tune-cpu", "probe-stack", "frame-pointer"];
+    for target in cpu_matrix() {
+        let label = format!("{target:?}");
+        for optimized in [false, true] {
+            // Raw = the merged pre-opt module (bodies present, attrs shed); optimized = after O2,
+            // where a surviving `probe-stack` would have propagated into the Align callers it was
+            // inlined into (`adjustCallerStackProbes`).
+            let out = ir_at(
+                target.clone(),
+                "guarded_ti",
+                GUARDED_KERNEL,
+                &["counts"],
+                optimized,
+                /*rt_lto*/ true,
+            );
+            for (id, group) in definition_attribute_groups(&out) {
+                for attr in observed {
+                    assert!(
+                        !group.contains(attr),
+                        "--target-cpu {label} (optimized={optimized}): a definition's attribute \
+                         group {id} still carries {attr:?}: {group}"
+                    );
+                }
+                assert!(
+                    !group.contains('"'),
+                    "--target-cpu {label} (optimized={optimized}): a definition's attribute group \
+                     {id} carries a string attribute, so a merged body did not inherit the \
+                     program's target machine: {group}"
+                );
+            }
+        }
+    }
 }
 
 // -- CLI: --rt-lto flag-surface rejections (subprocess, real binary; convention per
