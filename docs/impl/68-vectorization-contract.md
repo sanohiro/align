@@ -390,10 +390,10 @@ closest to are recorded explicitly, together with one standing rejection that is
 not a locked decision and is not treated as one here.
 
 A note on status, because the distinction matters for what a later change must
-do: `docs/open-questions.md` is `## Settled` (lines 14–3679), `## Open (to be
-decided)` (3680–5741) and `## Future (out of v1 scope)` (5742–end). The
-`llvm.assume` rejection at `:4187-4189` and the ordered-reduction rule at
-`:4956` both sit in the **Open** section — the first inside the external
+do: `docs/open-questions.md` is `## Settled` (lines 14–3693), `## Open (to be
+decided)` (3694–5755) and `## Future (out of v1 scope)` (5756–end). The
+`llvm.assume` rejection at `:4198-4204` and the ordered-reduction rule at
+`:4970` both sit in the **Open** section — the first inside the external
 optimization-consultation adoption record, the second inside a deferred SIMD
 audit entry. They are standing "do not re-litigate" records, not Settled
 entries, and this document does not promote either.
@@ -404,7 +404,7 @@ deterministically, which is what the scalar path already chose. G4 Part 2's
 excluded flags are excluded permanently and for this reason, not deferred to a
 later level.
 
-**No `llvm.assume` as a general policy.** `docs/open-questions.md:4187-4189`
+**No `llvm.assume` as a general policy.** `docs/open-questions.md:4198-4204`
 rejects "`llvm.assume` / early intrinsic emission / loop-metadata overrides as a
 general policy", with the guidance "attributes and flags first". Nothing in
 G1–G10 reopens that except G3's documented fallback, immediately below, which
@@ -433,7 +433,7 @@ That fallback is a narrow, recognized-shape use of the rejected intrinsic,
 emitted only for a recognized counted loop over a slice and describing only
 Align's own `{ptr, len}` invariant. It may not be implemented under this
 contract alone. It requires a recorded carve-out written against the
-`:4187-4189` record itself — naming the exact shape, the exact emission
+`:4198-4204` record itself — naming the exact shape, the exact emission
 condition, and the reason the general prohibition still stands — added by the PR
 that needs it. Absent that carve-out, G3's dereferenceability half ships only
 for statically known extents. Treat the carve-out as the expected path, not the
@@ -735,9 +735,9 @@ Recorded per the large-design authoring gate.
   guarantee depend on it.
 - The locked decisions nearest this work are checked explicitly in §5, and so is
   the status of the two `docs/open-questions.md` records this contract leans on:
-  the `llvm.assume` rejection at `:4187-4189` and the ordered-reduction rule at
-  `:4956` are both in the **Open** section, not Settled, and this document
-  neither promotes nor changes either. `:5960` (opt-in fast-math flags) is in
+  the `llvm.assume` rejection at `:4198-4204` and the ordered-reduction rule at
+  `:4970` are both in the **Open** section, not Settled, and this document
+  neither promotes nor changes either. `:5974` (opt-in fast-math flags) is in
   Future, where G4 Part 2 belongs. No Settled entry changes as a result of this
   document, and none is claimed to.
 - `draft.md` and `docs/language-spec.md` need no change: this contract adds no

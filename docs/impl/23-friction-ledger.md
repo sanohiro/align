@@ -239,11 +239,11 @@ by treating this deliberate restriction as an implementation gap.
 | | |
 |---|---|
 | Restriction | There are no traits or interfaces and no structural record subtyping; a parameter names one nominal type |
-| Settled reference | `docs/open-questions.md` Settled, `:3250` ("Align has no traits/comptime, so 'one type, many constructors' is the only way to get polymorphism without a second mechanism"); `docs/non-goals.md` "No trait complexity"; `CLAUDE.md` core invariant "avoid macros, complex generics, multiple paradigms" |
+| Settled reference | `docs/open-questions.md` Settled, `:3250` ("Align has no traits/comptime, so 'one type, many constructors' … is the only way to get polymorphism without a second mechanism"); `docs/non-goals.md:71` "No trait complexity"; `CLAUDE.md` core invariant "avoid macros, complex generics, multiple paradigms" |
 | Workaround shape | One near-identical function per nominal record type, differing only in the parameter's type name and one called helper |
-| Occurrences | `../align-llm/src/runtime_generation.align`, the `qwen_kv_bytes`/`olmoe_kv_bytes`, `admit_qwen_shapes`/`admit_olmoe_shapes` and `prepare_session_qwen`/`prepare_session_olmoe` pairs reported in issue 1047 Finding 3, closed 2026-09-18; the report was read, not independently re-scanned |
-| Count | **3 reported pairs, 1 program**; not a full-corpus count |
-| Status | **refused** as requested. A `trait` declaration is a behavior hook written by the programmer, which is exactly what the admissible widening shape excludes; a structural record parameter is a new type surface that the settled no-traits rule closes, and it would make admission a per-call-site declaration rather than a property of the data. The observed count is also below the five-site/two-program threshold. |
+| Occurrences | `../align-llm/src/runtime_generation.align:202` (`qwen_kv_bytes`) · `:368` (`olmoe_kv_bytes`) · `:216` (`admit_qwen_shapes`) · `:330` (`admit_olmoe_shapes`) · `:1211` (`prepare_session_qwen`) · `:1248` (`prepare_session_olmoe`), the align-llm client corpus. Reported in issue 1047 Finding 3, closed 2026-09-18; line numbers located 2026-09-18, the surrounding corpus not re-scanned |
+| Count | **6 sites, 1 program**; not a full-corpus count |
+| Status | **refused** as requested. A `trait` declaration is a behavior hook written by the programmer, which is exactly what the admissible widening shape excludes; a structural record parameter is a new type surface that the settled no-traits rule closes, and it would make admission a per-call-site declaration rather than a property of the data. The count meets the five-site half of the reopen threshold and not the two-program half (1 of 2), so it is below the threshold regardless. |
 
 ## Maintaining this file
 

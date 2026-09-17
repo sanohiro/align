@@ -2415,16 +2415,19 @@ regression net that validates the upgrade.
   exists; generated and user-wrap arithmetic are the same `Rvalue::Bin` — a sound version is a
   large new pass for a benefit SCEV largely recovers post-inline, at the highest miscompile
   risk in the slice).
-  **RETRACTED IN PART 2026-09-18 — the borrowed view header.** The "all redundant with
-  FunctionAttrs today" premise holds for by-value aggregates and whole-program internal
-  functions, and is measured false for a `borrow` header parameter that a loop stores through:
-  FunctionAttrs infers `noalias` for a return value, never for a parameter, so nothing supplies
-  it, and issue 1079 measures 0 `vector.body` as emitted against 2 with the header facts present
-  (4.7× on the byte→`f32` kernel). [Plan 69](69-loop-facts-plan.md) owns the retracted slice —
-  `noalias`/`dereferenceable`/`align` on borrowed view headers, a TBAA header/element split, and
-  `!range` on length loads — and carries the closure matrix for it. The rest of this deferral
-  stands: internal-ABI signature flattening and the `AddProvenNoOverflow` nsw/nuw distinction are
-  unchanged, and no other per-program-fn attribute is derived.
+  **RETRACTED IN PART 2026-09-18 — `noalias` on the borrowed view header.** The "all redundant
+  with FunctionAttrs today" premise holds for by-value aggregates and whole-program internal
+  functions, and is measured false for a read-only `borrow` header parameter that a loop stores
+  through: FunctionAttrs infers `noalias` for a return value, never for a parameter, so nothing
+  supplies it. The measurement is a **conjunction**, and is recorded that way: on the byte→`f32`
+  kernel issue 1079 measures 0 `vector.body` with `noalias` alone and 0 with the in-loop checks
+  hoisted alone; only both together give 2 vector bodies and 4.7× (plan 68 §2's recorded
+  conjunction — a partial fix is not measurable). [Plan 69](69-loop-facts-plan.md) owns the
+  retracted item and carries the closure matrix for it, alongside two facts this deferral never
+  covered and therefore never deferred: a TBAA header/element split and `!range` on length loads.
+  The rest of this deferral stands: internal-ABI signature flattening and the
+  `AddProvenNoOverflow` nsw/nuw distinction are unchanged, `readonly`/`nocapture`/`memory` stay
+  deferred, and plan 69 does not extend `noalias` to a writable `borrow mut` header.
 - **Slice V — verification bundle — DONE (#424, 2026-07-11; gate SHIP — ISA tests
   mutation-verified both directions, moot premise independently reproduced, harness honesty
   verified at both tiers; gemini's one high qualified-then-hardened: the shipped invocation
