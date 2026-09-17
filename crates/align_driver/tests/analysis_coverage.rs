@@ -964,6 +964,188 @@ fn main() -> i32 {
     );
 }
 
+/// One source type can reach MIR under several nominal ids: sema gives each callable origin its
+/// own function type, so `Holder<fn(i64) -> i64>` monomorphizes once per origin even though every
+/// monomorph shares one `source_name` and one id-free definition. Each case below builds two such
+/// monomorphs and makes them meet — in an inline array, across a slice argument, out of a nested
+/// `fn` value, and across a unit boundary — so a validator that compares a flowed type by nominal
+/// id instead of source identity rejects a correct program. The sibling owned leaves (`string`,
+/// `str`) ride in the same records as the `fn` leaf: the owned-leaf walk certifies every leaf of a
+/// split record, not only the callable that caused the split.
+#[test]
+fn monomorph_split_records_certify_every_owned_leaf() {
+    if !backend_available() {
+        return;
+    }
+    let owned_leaf_slice = "\
+Holder<T> { label: string, callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn count(holders: slice<Holder<fn(i64) -> i64>>) -> i64 = holders.len()
+fn main() -> i32 {
+  holders := [
+    Holder { label: \"a\".clone(), callback: quiet },
+    Holder { label: \"b\".clone(), callback: quiet },
+  ]
+  return (count(holders) + 40) as i32
+}
+";
+    assert_eq!(
+        build_and_run("monomorph-split-owned-string-slice", owned_leaf_slice)
+            .status
+            .code(),
+        Some(42),
+        "an owned `string` leaf beside the callable that split the monomorph must still certify"
+    );
+
+    let view_leaf_slice = "\
+Holder<T> { label: str, callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn count(holders: slice<Holder<fn(i64) -> i64>>) -> i64 = holders.len()
+fn main() -> i32 {
+  holders := [
+    Holder { label: \"a\", callback: quiet },
+    Holder { label: \"b\", callback: quiet },
+  ]
+  return (count(holders) + 40) as i32
+}
+";
+    assert_eq!(
+        build_and_run("monomorph-split-view-str-slice", view_leaf_slice)
+            .status
+            .code(),
+        Some(42),
+        "a borrowed `str` leaf in a split record keeps its own read-only authority"
+    );
+
+    let nested_return = "\
+Holder<T> { label: string, callback: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn main() -> i32 {
+  make: fn() -> Holder<fn(i64) -> i64> := fn {
+    holder := Holder { label: \"a\".clone(), callback: quiet }
+    holder
+  }
+  holder := make()
+  return holder.callback(41) as i32
+}
+";
+    assert_eq!(
+        build_and_run("monomorph-split-nested-return", nested_return)
+            .status
+            .code(),
+        Some(42),
+        "a split record returned from a nested `fn` value must carry its leaves' provenance"
+    );
+
+    let carriers = "\
+Holder<T> { label: string, callback: T }
+Pair<T> { left: T, right: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn peek(borrow h: Holder<fn(i64) -> i64>) -> i64 = h.label.len()
+fn take(h: Holder<fn(i64) -> i64>) -> i64 = h.callback(1)
+fn maybe(m: Option<Holder<fn(i64) -> i64>>) -> i64 {
+  h := m else { return 0 }
+  return h.callback(2)
+}
+fn nested(p: Pair<Holder<fn(i64) -> i64>>) -> i64 = p.left.callback(3) + p.right.callback(4)
+fn main() -> i32 {
+  first := Holder { label: \"a\".clone(), callback: quiet }
+  second := Holder { label: \"bb\".clone(), callback: quiet }
+  third := Holder { label: \"c\".clone(), callback: quiet }
+  fourth := Holder { label: \"d\".clone(), callback: quiet }
+  fifth := Holder { label: \"e\".clone(), callback: quiet }
+  sixth := Holder { label: \"f\".clone(), callback: quiet }
+  n := peek(first) + peek(second)
+  t := take(third)
+  m := maybe(Some(fourth))
+  p := nested(Pair { left: fifth, right: sixth })
+  return (n + t + m + p + 25) as i32
+}
+";
+    assert_eq!(
+        build_and_run("monomorph-split-carriers", carriers).status.code(),
+        Some(42),
+        "every carrier of a split record — borrowed parameter, moved value, Option payload, and \
+         an enclosing generic record — must reach the same source identity"
+    );
+
+    // A split record need not own anything: `fn` is a Copy leaf, so `Holder<fn(i64) -> i64>`
+    // with no owned leaf beside it is a Copy carrier that still reaches MIR under several ids.
+    // This is the Copy half of the Move cases above, and it is the only shape that reaches the
+    // borrowed-Copy-place and empty-owned-leaf branches of the producer validator.
+    let copy_carriers = "\
+Holder<T> { tag: i64, callback: T }
+Pair<T> { left: T, right: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn peek(borrow h: Holder<fn(i64) -> i64>) -> i64 = h.callback(h.tag)
+fn take(h: Holder<fn(i64) -> i64>) -> i64 = h.callback(h.tag)
+fn nested(borrow p: Pair<Holder<fn(i64) -> i64>>) -> i64 = p.left.callback(p.right.tag)
+fn count(holders: slice<Holder<fn(i64) -> i64>>) -> i64 = holders.len()
+fn main() -> i32 {
+  first := Holder { tag: 1, callback: quiet }
+  second := Holder { tag: 2, callback: quiet }
+  pair := Pair {
+    left: Holder { tag: 3, callback: quiet },
+    right: Holder { tag: 4, callback: quiet },
+  }
+  holders := [
+    Holder { tag: 5, callback: quiet },
+    Holder { tag: 6, callback: quiet },
+  ]
+  return (peek(first) + take(second) + nested(pair) + count(holders) + 30) as i32
+}
+";
+    assert_eq!(
+        build_and_run("monomorph-split-copy-carriers", copy_carriers)
+            .status
+            .code(),
+        Some(42),
+        "a Copy split record must certify through a borrowed place, a moved value, an enclosing \
+         generic record and a slice view, not only a record with an owned leaf"
+    );
+
+    let files = &[
+        (
+            "holder.align",
+            "\
+module holder
+pub Holder<T> { label: string, callback: T }
+pub fn quiet(x: i64) -> i64 = x + 1
+pub fn count(holders: slice<Holder<fn(i64) -> i64>>) -> i64 = holders.len()
+",
+        ),
+        (
+            "main.align",
+            "\
+module main
+import holder
+fn main() -> i32 {
+  holders := [
+    holder.Holder { label: \"a\".clone(), callback: holder.quiet },
+    holder.Holder { label: \"b\".clone(), callback: holder.quiet },
+  ]
+  return (holder.count(holders) + 40) as i32
+}
+",
+        ),
+    ];
+    assert_eq!(
+        build_and_run_multi("monomorph-split-whole", files, "main.align")
+            .status
+            .code(),
+        Some(42),
+        "whole-program lowering must accept a split record built across a unit boundary"
+    );
+    assert_eq!(
+        build_per_unit_multi("monomorph-split-per-unit", files, "main.align")
+            .link_and_run()
+            .status
+            .code(),
+        Some(42),
+        "per-unit lowering must reach the same verdict as whole-program lowering"
+    );
+}
+
 #[test]
 fn reassigned_generic_fn_wrapper_joins_effect_origins() {
     let src = "\
