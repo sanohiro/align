@@ -234,6 +234,17 @@ not implement enum-field admission or claim the threshold has been reached.
 code-generation evidence. No parser or pattern-semantics change is authorized
 by treating this deliberate restriction as an implementation gap.
 
+### B6 — traits or structural subtyping for shared architecture shapes
+
+| | |
+|---|---|
+| Restriction | There are no traits or interfaces and no structural record subtyping; a parameter names one nominal type |
+| Settled reference | `docs/open-questions.md` Settled, `:3250` ("Align has no traits/comptime, so 'one type, many constructors' is the only way to get polymorphism without a second mechanism"); `docs/non-goals.md` "No trait complexity"; `CLAUDE.md` core invariant "avoid macros, complex generics, multiple paradigms" |
+| Workaround shape | One near-identical function per nominal record type, differing only in the parameter's type name and one called helper |
+| Occurrences | `../align-llm/src/runtime_generation.align`, the `qwen_kv_bytes`/`olmoe_kv_bytes`, `admit_qwen_shapes`/`admit_olmoe_shapes` and `prepare_session_qwen`/`prepare_session_olmoe` pairs reported in issue 1047 Finding 3, closed 2026-09-18; the report was read, not independently re-scanned |
+| Count | **3 reported pairs, 1 program**; not a full-corpus count |
+| Status | **refused** as requested. A `trait` declaration is a behavior hook written by the programmer, which is exactly what the admissible widening shape excludes; a structural record parameter is a new type surface that the settled no-traits rule closes, and it would make admission a per-call-site declaration rather than a property of the data. The observed count is also below the five-site/two-program threshold. |
+
 ## Maintaining this file
 
 - Add a row the first time a restriction produces a mechanical workaround in real

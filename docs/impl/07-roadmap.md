@@ -2415,6 +2415,16 @@ regression net that validates the upgrade.
   exists; generated and user-wrap arithmetic are the same `Rvalue::Bin` — a sound version is a
   large new pass for a benefit SCEV largely recovers post-inline, at the highest miscompile
   risk in the slice).
+  **RETRACTED IN PART 2026-09-18 — the borrowed view header.** The "all redundant with
+  FunctionAttrs today" premise holds for by-value aggregates and whole-program internal
+  functions, and is measured false for a `borrow` header parameter that a loop stores through:
+  FunctionAttrs infers `noalias` for a return value, never for a parameter, so nothing supplies
+  it, and issue 1079 measures 0 `vector.body` as emitted against 2 with the header facts present
+  (4.7× on the byte→`f32` kernel). [Plan 69](69-loop-facts-plan.md) owns the retracted slice —
+  `noalias`/`dereferenceable`/`align` on borrowed view headers, a TBAA header/element split, and
+  `!range` on length loads — and carries the closure matrix for it. The rest of this deferral
+  stands: internal-ABI signature flattening and the `AddProvenNoOverflow` nsw/nuw distinction are
+  unchanged, and no other per-program-fn attribute is derived.
 - **Slice V — verification bundle — DONE (#424, 2026-07-11; gate SHIP — ISA tests
   mutation-verified both directions, moot premise independently reproduced, harness honesty
   verified at both tiers; gemini's one high qualified-then-hardened: the shipped invocation

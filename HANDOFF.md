@@ -31,7 +31,13 @@ deferred.
 [Plan 67](docs/impl/67-caller-result-placement-plan.md) implements caller result
 placement for already-indirect aggregates, with native ABI cross-link and
 alias-sensitive fallback owners; issue 1047 retains its separate foreign-query
-and client-measurement follow-ups.
+and client-measurement follow-ups, and its Finding 3 (traits or structural
+subtyping) is now a refused row in the friction ledger.
+[Plan 69](docs/impl/69-loop-facts-plan.md) is the planned plan of record for the
+loop-facts issues plan 68 assigns to G1–G3 (1079, 1080, 1081, 1084): three
+ordered PRs for view-header materialization with alias and length facts, the
+fused and preheader-versioned bounds check, and the latch-exit counted loop,
+with one implementation closure matrix each. No implementation has started.
 
 **Decode representation costs:** [plan 62](docs/impl/62-decode-optimization-plan.md)
 implements bounded nonescaping byte storage and direct synchronous chunks
