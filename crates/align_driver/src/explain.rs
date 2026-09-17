@@ -598,7 +598,7 @@ pub fn run_explain_opt(path: &str, verbose: bool, target: BuildTarget, profile: 
         }
     };
     let mut sm = SourceMap::new();
-    let walk = build_per_unit_located(&mut sm, path, &src);
+    let mut walk = build_per_unit_located(&mut sm, path, &src);
     if walk.diags.has_errors() {
         eprint!("{}", format_diagnostics(&sm, &walk.diags));
         return ExitCode::FAILURE;
@@ -613,6 +613,17 @@ pub fn run_explain_opt(path: &str, verbose: bool, target: BuildTarget, profile: 
     // `--export` is entry-unit-only and fail-closed, exactly as for `emit-obj`/`emit-llvm`.
     if crate::entry_exports_rejected(&walk, exports, path) {
         return ExitCode::FAILURE;
+    }
+    // Inspection roots, not link roots (issue 1086): a `main`-less unit is reported through its own
+    // `pub` surface, so the remarks describe the unit that was asked about instead of an empty
+    // module. This marks `exportable` rather than adding `--export` names, so the roots keep their
+    // encoded symbols and the lens can never fail on a program a build accepts. An explicit
+    // `--export` narrows the set instead; a non-entry unit's `pub` functions are already external
+    // under per-unit lowering and need no seeding.
+    if exports.is_empty()
+        && let Some(entry) = walk.units.iter_mut().find(|unit| unit.is_entry)
+    {
+        crate::mark_inspection_roots_with_note(entry, "explain-opt");
     }
     match after_current_plan_validation(walk.units.iter().map(|unit| &unit.mir), &sm, || {
         if !walk.diags.is_empty() {
@@ -633,20 +644,7 @@ pub fn run_explain_opt(path: &str, verbose: bool, target: BuildTarget, profile: 
         );
         for unit in &walk.units {
             let debug = unit_debug(&unit.file);
-            // Inspection roots, not link roots (issue 1086): a `main`-less unit is reported through
-            // its own `pub` surface, so the remarks describe the unit that was asked about instead
-            // of an empty module. An explicit `--export` narrows that set; a non-entry unit's `pub`
-            // functions are already external under per-unit lowering and need no seeding.
-            let seeded = if unit.is_entry && exports.is_empty() {
-                crate::inspection_roots_with_note(unit, "explain-opt")
-            } else {
-                Vec::new()
-            };
-            let roots: &[String] = if unit.is_entry {
-                if exports.is_empty() { &seeded } else { exports }
-            } else {
-                &[]
-            };
+            let roots: &[String] = if unit.is_entry { exports } else { &[] };
             let remarks = match collect_opt_remarks(&unit.mir, target.clone(), profile, &debug, roots) {
                 Ok(r) => r,
                 Err(e) => {

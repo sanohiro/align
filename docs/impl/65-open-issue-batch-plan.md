@@ -634,9 +634,20 @@ report that unit's code. The rule: when the unit named on the command line
 defines no `main` and no `--export` is given, every `pub` function it defines is
 an inspection root. Only a function that is both `pub` in the unit's interface
 and has a body in its MIR becomes a root, so a generic `pub` template never
-produces a root that names nothing; the set is sorted and deduplicated, so the
-roots — which fold into the codegen cache key — do not depend on interface
-iteration order. An explicit `--export` always wins and narrows the set exactly
+produces a root that names nothing, and `main` is never marked because the MIR
+producer rejects an exportable entry function outright.
+
+Seeding sets the shipped per-unit `exportable` bit, **not** an `--export` root,
+and the difference is load-bearing. `--export` does two things: it makes a
+function a DCE root with `external` linkage, and it replaces the collision-free
+encoded symbol with the raw source name, because a linkable object needs a C-ABI
+name a third party can reference. Inspection needs only the first. Applying the
+second would rename a `pub fn align_rt_print_i64` onto a reserved runtime symbol
+and make `callable_preflight` reject a unit that compiled before — an inspection
+verb must never fail on a program a build accepts. `exportable` is exactly the
+"external linkage, encoded symbol" bit a non-entry `pub` function already
+carries under per-unit lowering, so the rule reuses that mechanism rather than
+adding a second one. An explicit `--export` always wins and narrows the set exactly
 as before, and it is now accepted by `explain-opt` as well, so one rejection
 contract covers every verb that has roots. The seeded set is stated on stderr,
 naming the unit and the count, so a redirected IR or report stream is unchanged
@@ -655,4 +666,5 @@ prints every lowered function and performs no dead-code elimination.
 | Objects and image stamped from one value | `LinkPlan::apple_min_version` | `macho_link::objects_and_the_linked_image_carry_the_resolved_deployment_target`, `link_command_args_are_pinned_per_format` |
 | Deployment target separates cached artifacts | Resolved triple in every key | `cache_codegen::gate14b_deployment_target_separates_cached_objects` |
 | Malformed flag/environment values are clean pre-work errors | `set_deployment_target` plus the eager freeze in `main` | `target_identity` rejection cases; CLI argument-shape owner |
-| A `main`-less unit reports its own code, `--export` narrows, a `main` unit is unchanged | `inspection_export_roots` seeded in `emit-llvm`/`explain-opt` | `emit_llvm_stage::a_main_less_unit_is_reported_through_its_own_pub_functions`, `an_explicit_export_narrows_the_inspection_roots`, `a_unit_with_main_is_unchanged_and_says_nothing`, `explain_opt::a_main_less_unit_reports_its_own_optimizer_decisions`, `explain_opt_takes_explicit_export_roots_and_rejects_unknown_ones`, `a_unit_with_main_seeds_no_inspection_roots` |
+| A `main`-less unit reports its own code, `--export` narrows, a `main` unit is unchanged | `mark_inspection_roots` setting `exportable` in `emit-llvm`/`explain-opt` | `emit_llvm_stage::a_main_less_unit_is_reported_through_its_own_pub_functions`, `an_explicit_export_narrows_the_inspection_roots`, `a_unit_with_main_is_unchanged_and_says_nothing`, `explain_opt::a_main_less_unit_reports_its_own_optimizer_decisions`, `explain_opt_takes_explicit_export_roots_and_rejects_unknown_ones`, `a_unit_with_main_seeds_no_inspection_roots` |
+| A seeded root keeps its encoded symbol and never collides with a reserved runtime name | `mark_inspection_roots` marks `exportable`, leaving `symbol_name` untouched | `emit_llvm_stage::a_pub_function_named_like_a_runtime_symbol_still_reports` (both verbs) |

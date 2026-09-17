@@ -8739,8 +8739,8 @@ pub fn entry_exports_rejected(walk: &PerUnitWalk, exports: &[String], path: &str
     rejected
 }
 
-/// The **inspection** roots for one unit: every `pub` function it defines, when it defines no
-/// `main`.
+/// Mark the **inspection** roots on one unit: every `pub` function it defines, when it defines no
+/// `main`. Returns how many were marked (`0` when the unit needs no seeding).
 ///
 /// Roots for *linking* an executable and roots for *inspecting* a unit are different questions.
 /// A build needs `{main}` plus `--export`, because that is what the image must keep reachable. An
@@ -8755,47 +8755,55 @@ pub fn entry_exports_rejected(walk: &PerUnitWalk, exports: &[String], path: &str
 /// as it builds; a unit that defines none is reported through its own `pub` surface. An explicit
 /// `--export` always wins — it narrows the set, and the caller applies it instead of this.
 ///
-/// Only a function that is both `pub` in the unit's interface AND has a body in its MIR becomes a
-/// root, so a generic `pub` template (whose interface entry has no single lowered function, only
-/// per-instantiation monomorphs under mangled names) can never produce a root that names nothing.
-/// The result is sorted and deduplicated, so the roots — which fold into the codegen cache key —
-/// do not depend on interface iteration order.
+/// **This sets [`align_mir::Function::exportable`], not an `--export` root, and the difference is
+/// load-bearing.** `--export` does two things: it makes a function a DCE root with `external`
+/// linkage, AND it replaces the collision-free encoded symbol with the raw source name, because a
+/// linkable object needs a C-ABI name a third party can reference. Inspection needs only the
+/// first. Applying the second would rename, say, a `pub fn align_rt_print_i64` onto a reserved
+/// runtime symbol and make `callable_preflight` reject a source that compiled fine before — an
+/// inspection verb must never fail on a program a build accepts. `exportable` is exactly the
+/// "external linkage, encoded symbol" bit that a non-entry `pub` function already carries under
+/// per-unit lowering, so seeding it reuses the shipped mechanism instead of adding a second one.
+///
+/// Only a function that is both `pub` in the unit's interface AND has a body in this unit's MIR is
+/// marked, so a generic `pub` template (whose interface entry has no single lowered function, only
+/// per-instantiation monomorphs under mangled names) can never name nothing. `main` is never
+/// marked: the MIR producer rejects an exportable entry function outright.
 ///
 /// Producing verbs are deliberately untouched: `emit-obj` and every build keep the link-roots
 /// model, because their output is linked, not read.
-pub fn inspection_export_roots(unit: &PerUnitArtifact) -> Vec<String> {
+pub fn mark_inspection_roots(unit: &mut PerUnitArtifact) -> usize {
     if unit.mir.fns.iter().any(|f| f.name.as_str() == "main") {
-        return Vec::new();
+        return 0;
     }
-    let mut roots: Vec<String> = unit
-        .summary
-        .fns
-        .iter()
-        .filter(|sig| unit.mir.fns.iter().any(|f| f.name.as_str() == sig.name.as_str()))
-        .map(|sig| sig.name.clone())
-        .collect();
-    roots.sort();
-    roots.dedup();
-    roots
+    let exported: std::collections::BTreeSet<&str> =
+        unit.summary.fns.iter().map(|sig| sig.name.as_str()).collect();
+    let mut marked = 0;
+    for f in &mut unit.mir.fns {
+        if f.name.as_str() == "main" || f.exportable || !exported.contains(f.name.as_str()) {
+            continue;
+        }
+        f.exportable = true;
+        marked += 1;
+    }
+    marked
 }
 
-/// [`inspection_export_roots`], plus the one-line stderr note that makes the seeded roots visible.
+/// [`mark_inspection_roots`], plus the one-line stderr note that makes the seeded roots visible.
 ///
 /// The seeded set changes what the verb reports, so it is stated rather than applied silently: the
 /// note names the unit, the count, and the `--export` flag that narrows the set. It goes to stderr
 /// so a redirected IR or report stream stays exactly what it was. A unit with a `main`, or a run
 /// with an explicit `--export`, seeds nothing and says nothing.
-pub fn inspection_roots_with_note(unit: &PerUnitArtifact, verb: &str) -> Vec<String> {
-    let roots = inspection_export_roots(unit);
-    if !roots.is_empty() {
+pub fn mark_inspection_roots_with_note(unit: &mut PerUnitArtifact, verb: &str) {
+    let file = unit.file.clone();
+    let marked = mark_inspection_roots(unit);
+    if marked > 0 {
         eprintln!(
-            "alignc: note: `{}` defines no `main`, so {verb} reports it through its own {} `pub` \
-             function(s) as inspection roots; pass `--export <fn>` to narrow that set",
-            unit.file,
-            roots.len()
+            "alignc: note: `{file}` defines no `main`, so {verb} reports it through its own \
+             {marked} `pub` function(s) as inspection roots; pass `--export <fn>` to narrow that set"
         );
     }
-    roots
 }
 
 /// The names in `exports` that do not match any function in `mir` (by [`align_mir::Function::name`]).

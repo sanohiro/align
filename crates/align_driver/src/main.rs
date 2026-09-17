@@ -40,7 +40,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use align_driver::{
     build_interface_summaries, build_per_unit, check, emit_llvm_ir, emit_object_cached,
-    format_diagnostics, inspection_roots_with_note, link_objects, BuildTarget,
+    format_diagnostics, link_objects, mark_inspection_roots_with_note, BuildTarget,
     CacheContext, PerUnitWalk, Profile, UnitReuse,
 };
 use align_span::SourceMap;
@@ -1909,7 +1909,7 @@ fn run_emit_llvm(path: &str, rest: &[String], target: BuildTarget, profile: Prof
             return ExitCode::FAILURE;
         }
     };
-    let Some(walk) = walk_or_report(path) else {
+    let Some(mut walk) = walk_or_report(path) else {
         return ExitCode::FAILURE;
     };
     // `--export` is entry-unit-only (validated against the entry unit's MIR; applied only to it).
@@ -1919,21 +1919,19 @@ fn run_emit_llvm(path: &str, rest: &[String], target: BuildTarget, profile: Prof
     // Each unit is optimized in isolation (that is the truth under zero cross-unit optimization): a
     // cross-unit `pub` call stays an opaque call, while an intra-unit call inlines. N=1 = byte-
     // identical to the pre-flip whole-program IR; N>1 banners each unit.
+    // Inspection roots, not link roots: with no explicit `--export`, a `main`-less entry unit is
+    // reported through its own `pub` surface instead of being internalized away (issue 1086). This
+    // marks `exportable` rather than adding `--export` names, so the roots keep their encoded
+    // symbols and an inspection verb can never fail on a program a build accepts.
+    if exports.is_empty()
+        && let Some(entry) = walk.units.iter_mut().find(|unit| unit.is_entry)
+    {
+        mark_inspection_roots_with_note(entry, "emit-llvm");
+    }
     let multi = walk.units.len() > 1;
     let mut out = String::new();
     for unit in &walk.units {
-        // Inspection roots, not link roots: with no explicit `--export`, a `main`-less entry unit is
-        // reported through its own `pub` surface instead of being internalized away (issue 1086).
-        let seeded = if unit.is_entry && exports.is_empty() {
-            inspection_roots_with_note(unit, "emit-llvm")
-        } else {
-            Vec::new()
-        };
-        let unit_exports: &[String] = if unit.is_entry {
-            if exports.is_empty() { &seeded } else { exports }
-        } else {
-            &[]
-        };
+        let unit_exports: &[String] = if unit.is_entry { exports } else { &[] };
         let ir = match emit_llvm_ir(&unit.mir, target.clone(), profile,
             optimized, unit_exports, rt_lto) {
             Ok(ir) => ir,

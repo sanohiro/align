@@ -138,12 +138,19 @@ fn a_main_less_unit_is_reported_through_its_own_pub_functions() {
         .map(str::trim_start)
         .filter(|l| l.starts_with("define "))
         .collect();
-    for root in ["@k1(", "@k2("] {
+    // The roots keep their ENCODED symbols. Seeding marks `exportable` (external linkage, encoded
+    // symbol), not an `--export` root, which would additionally rename the symbol to the raw source
+    // name — see `a_pub_function_named_like_a_runtime_symbol_still_reports`.
+    for root in [encoded("k1"), encoded("k2")] {
         assert!(
-            defined.iter().any(|l| l.contains(root)),
+            defined.iter().any(|l| l.contains(&format!("@\"{root}\"("))),
             "the requested unit's own `pub` body {root} must be defined, not eliminated:\n{ir}"
         );
     }
+    assert!(
+        !ir.contains("define i64 @k1("),
+        "an inspection root must not be renamed to its raw source symbol:\n{ir}"
+    );
     // The seeded set is stated, not applied silently, and it goes to stderr so a redirected IR
     // stream is unchanged.
     assert!(err.contains("defines no `main`"), "the seeded roots must be stated:\n{err}");
@@ -194,4 +201,61 @@ fn a_unit_with_main_is_unchanged_and_says_nothing() {
     assert!(out.status.success(), "exit: {:?}", out.status.code());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!err.contains("defines no `main`"), "a unit with `main` seeds nothing:\n{err}");
+}
+
+/// The encoded, collision-free LLVM symbol for a program function (mirrors `symbol_name`'s
+/// non-export path). Duplicated from `export_roots.rs`: each integration test file is its own
+/// crate.
+fn encoded(sym: &str) -> String {
+    let hex = sym.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    format!("align_fn${}${hex}", sym.len())
+}
+
+/// An inspection root gets `external` linkage, NOT a renamed symbol.
+///
+/// `--export` deliberately does both: it roots the function AND replaces the encoded symbol with
+/// the raw source name, because a linkable object needs a C-ABI name. Seeding inspection roots
+/// through that same mechanism would rename a `pub fn align_rt_print_i64` onto a reserved runtime
+/// symbol, and `callable_preflight` would reject a unit that compiled fine before — an inspection
+/// verb must never fail on a program a build accepts. Both verbs are pinned, because both seed.
+#[test]
+fn a_pub_function_named_like_a_runtime_symbol_still_reports() {
+    if !align_driver::backend_available() {
+        return;
+    }
+    let src = write_named(
+        "reserved_runtime_name",
+        "pub fn align_rt_print_i64(x: i64) -> i64 = x + 1\npub fn ordinary(x: i64) -> i64 = x * 2\n",
+    );
+    let ir_run = alignc()
+        .args(["emit-llvm"])
+        .arg(src.path())
+        .args(["--stage", "optimized"])
+        .output()
+        .expect("run alignc");
+    let err = String::from_utf8_lossy(&ir_run.stderr);
+    assert!(
+        ir_run.status.success(),
+        "a `pub` name that matches a reserved runtime symbol must still report: {err}"
+    );
+    assert!(
+        !err.contains("external identity collision"),
+        "seeding a root must not rename it onto a reserved runtime symbol:\n{err}"
+    );
+    let ir = String::from_utf8_lossy(&ir_run.stdout);
+    assert!(
+        ir.contains(&format!("@\"{}\"(", encoded("align_rt_print_i64"))),
+        "the root keeps its encoded symbol:\n{ir}"
+    );
+
+    let explain = alignc()
+        .arg("explain-opt")
+        .arg(src.path())
+        .output()
+        .expect("run alignc");
+    assert!(
+        explain.status.success(),
+        "explain-opt seeds the same roots and must not fail either: {}",
+        String::from_utf8_lossy(&explain.stderr)
+    );
 }
