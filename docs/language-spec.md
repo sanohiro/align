@@ -558,6 +558,15 @@ all
 dot
 ```
 
+`min`/`max` is one operation with one lowering in every spelling — the pipeline terminal `xs.max()`,
+the scalar method `a.max(b)` and the vector lane reduction `v.max()`. On floats it is IEEE 754-2019
+`minimum`/`maximum`: **NaN propagates** and the signed zeros are ordered (`max(-0.0, +0.0)` is
+`+0.0`), identically on every target; on integers it is the element type's signed or unsigned
+minimum/maximum. An empty pipeline yields the fold identity (the type's extreme, `∓inf` for a
+float). A hand-written `if xs[i] > best` loop is a different program — an ordered comparison skips
+NaN and carries no minimum/maximum semantics — so it is not the vectorizable spelling.
+(`draft.md` §8.)
+
 Stages and reducers take a named function or an inline lambda `fn x { ... }` (parameter types
 inferred). A lambda may capture enclosing variables by value — with no hidden closure
 environment (it compiles like a named function, captures passed as arguments). `where(.active)`
@@ -600,7 +609,13 @@ for hand-written register kernels.
 The register layer's surface: a vector is built from an array literal under a `vecN<T>` annotation;
 elementwise `+ - * / %` and the unary float math map one-to-one to lane-wise instructions; a
 comparison yields a `maskN<T>`, which is a **nameable** type (annotation, parameter, return) with the
-same element and width as the compared vectors; `select(m, a, b)` blends. A **scalar broadcasts on
+same element and width as the compared vectors; `select(m, a, b)` blends. A mask **gates
+structurally**: because a mask is one bool lane per lane and has no machine-level element type,
+`select` and `sum_where` accept any mask with the same lane count and the same lane bit width as the
+vectors it gates (`mask4<f32>` gates `vec4<i32>`/`vec4<u32>`/`vec4<f32>`; `mask2<f64>` gates the
+64-bit family), which is what makes masked-index algorithms expressible with exact integer indices.
+A differing lane count or lane width is rejected, and the mask *type* a comparison produces is
+unchanged. A **scalar broadcasts on
 either side** of a vector op (`v + 5`, `5 + v`), preserving operand order for the non-commutative
 ops, and its type must unify with the element. A `slice<T>` bridges memory and registers:
 `s.load(i) -> vecN<T>` reads `N` consecutive elements from runtime index `i` (width/element from the
@@ -739,6 +754,14 @@ length, including zero, with capacity at least length. Nonempty construction
 acquires one payload; initialization is O(length). The handle may allocate.
 Negative/overflowing counts abort before allocation and OOM aborts. The existing
 `buffer(capacity)` remains a best-effort empty read window.
+
+`b.append_filled(length: i64, value: u8) -> ()` is that family's append member:
+it extends a `mut buffer`'s published window by exactly `length` bytes of
+`value` in one growth. Zero length is a no-op; a negative or overflowing length
+fails before any write, as in the constructor. No typed `append_filled_S_E`
+suffix forms exist — `fill_S_E` overwrites an already-published window, while an
+append form would need its own element-count grammar that no recorded program
+requires yet.
 
 Scalar `f32`/`f64` provide Pure allocation-free `to_bits()` returning `u32`/`u64`
 and `is_finite()`, `is_nan()`, `is_infinite()` returning bool. Exact input bits,

@@ -1991,6 +1991,39 @@ fn scalar_name(s: Scalar) -> String {
     ty_name(scalar_to_ty(s))
 }
 
+/// The lane bit width of a `vecN<T>` / `maskN<T>` element. Both are restricted to numeric scalars
+/// (`resolve_type`'s `Scalar::Int | Scalar::Float` arms), so every other scalar answers `None`.
+pub fn lane_bits(s: Scalar) -> Option<u32> {
+    match s {
+        Scalar::Int(it) => Some(u32::from(it.bits)),
+        Scalar::Float(ft) => Some(u32::from(ft.bits)),
+        _ => None,
+    }
+}
+
+/// Whether the type `mask` may gate a `vecN<T>` of `lanes` × `elem` lane-wise.
+///
+/// A mask has no element type at the machine level: every `maskN<T>` is `<N x i1>`, and codegen
+/// never reads the element it records (`Ty::Mask(_, n) => bool_type().vec_type(n)`). What a
+/// lane-wise blend actually requires is that the mask has one lane per vector lane and that the
+/// gated lanes have the target bit-select instruction's width. So the compatibility rule is
+/// structural — **lane count and lane bit width** — rather than nominal element identity, which
+/// rejected the correct spelling of every masked-index algorithm (`select(a > b, xi, yi)` keeping
+/// integer indices for a float comparison).
+///
+/// This is the one rule for every masked operation, and it is shared rather than restated: sema's
+/// `select` / `sum_where` checks, the checked-HIR record validator and the MIR producer validator
+/// all call it, so no layer can admit or reject a blend the others disagree about.
+pub fn mask_gates_vector(mask: Ty, elem: Scalar, lanes: u32) -> bool {
+    let Ty::Mask(mask_elem, mask_lanes) = mask else {
+        return false;
+    };
+    let (Some(mask_width), Some(elem_width)) = (lane_bits(mask_elem), lane_bits(elem)) else {
+        return false;
+    };
+    mask_lanes == lanes && mask_width == elem_width
+}
+
 /// Which direction a JSON schema is being validated for. The field-descriptor table
 /// (`emit_desc_table`) is shared by decode and encode, so [`Checker::json_struct_fields_ok`] is one
 /// walk — but the two domains are not identical (an `Option<enum>` field encodes and does not
@@ -16283,6 +16316,11 @@ impl EffectScan<'_> {
                 walk!(buffer);
                 walk!(data);
             }
+            ExprKind::BufferAppendFilled { buffer, length, value } => {
+                walk!(buffer);
+                walk!(length);
+                walk!(value);
+            }
             // `array_builder` new/push/append/build are pure in-memory growth, but their operands
             // may contain calls whose effects still contribute in source order.
             ExprKind::ArrayBuilderNew { region, capacity, .. } => {
@@ -24356,6 +24394,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::BytesCopyFrom { .. }
             | ExprKind::BufferPut { .. }
             | ExprKind::BufferAppend { .. }
+            | ExprKind::BufferAppendFilled { .. }
             | ExprKind::ArrayBuilderPush { .. }
             | ExprKind::ArrayBuilderAppend { .. }
             | ExprKind::FsWriteFile { .. }
@@ -24810,6 +24849,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::BytesCopyFrom { .. }
             | ExprKind::BufferPut { .. }
             | ExprKind::BufferAppend { .. }
+            | ExprKind::BufferAppendFilled { .. }
             | ExprKind::ArrayBuilderNew { .. }
             | ExprKind::ArrayBuilderPush { .. }
             | ExprKind::ArrayBuilderAppend { .. }
@@ -28650,6 +28690,11 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(buffer, depth);
                 self.walk(data, depth);
             }
+            ExprKind::BufferAppendFilled { buffer, length, value } => {
+                self.walk(buffer, depth);
+                self.walk(length, depth);
+                self.walk(value, depth);
+            }
             ExprKind::BufferNew { capacity, fill } => {
                 self.walk(capacity, depth);
                 if let Some(fill) = fill { self.walk(fill, depth); }
@@ -30779,6 +30824,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::BytesCopyFrom { .. }
         | ExprKind::BufferPut { .. }
         | ExprKind::BufferAppend { .. }
+        | ExprKind::BufferAppendFilled { .. }
         | ExprKind::ArrayBuilderNew { .. }
         | ExprKind::ArrayBuilderPush { .. }
         | ExprKind::ArrayBuilderAppend { .. }
@@ -39001,6 +39047,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::BytesFill { .. }
             | ExprKind::BytesCopyFrom { .. }
             | ExprKind::BufferPut { .. } | ExprKind::BufferAppend { .. }
+            | ExprKind::BufferAppendFilled { .. }
             | ExprKind::ArrayBuilderNew { region: None, .. } | ExprKind::ArrayBuilderPush { .. }
             | ExprKind::ArrayBuilderAppend { .. } | ExprKind::FsWriteFile { .. }
             | ExprKind::FsExists { .. } | ExprKind::FsRemove { .. }
@@ -42761,7 +42808,8 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::UdpRecvFrom { buffer, .. }
             | ExprKind::CryptoRandom { out: buffer }
             | ExprKind::BufferPut { buffer, .. }
-            | ExprKind::BufferAppend { buffer, .. } => {
+            | ExprKind::BufferAppend { buffer, .. }
+            | ExprKind::BufferAppendFilled { buffer, .. } => {
                 Some(SourceVisibleMutationAction::Storage(buffer))
             }
             ExprKind::ArrayBuilderPush { builder, value, .. } => {
@@ -45006,6 +45054,14 @@ impl<'a> MoveCheck<'a> {
             ExprKind::BufferAppend { buffer, data } => {
                 move_expr!(self, buffer, moved, false, false);
                 move_expr!(self, data, moved, false, false);
+                if !self.collecting_move_children {
+                    self.invalidate_storage(buffer);
+                }
+            }
+            ExprKind::BufferAppendFilled { buffer, length, value } => {
+                move_expr!(self, buffer, moved, false, false);
+                move_expr!(self, length, moved, false, false);
+                move_expr!(self, value, moved, false, false);
                 if !self.collecting_move_children {
                     self.invalidate_storage(buffer);
                 }
@@ -52552,6 +52608,9 @@ impl<'a, 't> Checker<'a, 't> {
             }
             return self.check_buffer_append(recv, args, span);
         }
+        if method == "append_filled" {
+            return self.check_buffer_append_filled(recv, args, span);
+        }
         // Binary **decode** on a `bytes` (`slice<u8>`) view: `b.u32_le(off)` / `b.f64_be(off)` /
         // `b.u8(off)` (A2). Bounds-checked scalar reads at an explicit byte offset; the method name
         // is the scalar+endian suffix. Type-guarded on the receiver so the names stay free elsewhere.
@@ -55741,7 +55800,8 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     /// `vec.sum_where(mask)` — masked horizontal sum (M6): the sum of the lanes where the mask is
-    /// set, as the element scalar. The mask's width must match the vector's.
+    /// set, as the element scalar. The mask gates the vector structurally: same lane count, same
+    /// lane bit width (see [`mask_gates_vector`]).
     fn check_vec_sum_where(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let [m] = args else {
@@ -55759,9 +55819,9 @@ impl<'a, 't> Checker<'a, 't> {
         };
         let mc_ty = self.resolve(mc.ty);
         match mc_ty {
-            Ty::Mask(ms, mn) if ms == s && mn == n => {}
+            Ty::Mask(..) if mask_gates_vector(mc_ty, s, n) => {}
             Ty::Mask(..) => {
-                self.diags.error(format!("'sum_where' mask {} does not match the vector {}", ty_name(mc_ty), ty_name(self.resolve(v.ty))), m.span);
+                self.diags.error(format!("'sum_where' mask {} does not match the vector {} (a mask gates a vector with the same lane count and lane width)", ty_name(mc_ty), ty_name(self.resolve(v.ty))), m.span);
                 return err;
             }
             other => {
@@ -55772,8 +55832,10 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::VecSumWhere { vec: Box::new(v), mask: Box::new(mc) }, ty: scalar_to_ty(s), span }
     }
 
-    /// `select(mask, a, b)` — lane-wise blend of two `vecN<T>` by a `mask` (M6 slice 2). The mask's
-    /// width must match the vectors' width; the result is the vectors' type.
+    /// `select(mask, a, b)` — lane-wise blend of two `vecN<T>` by a `mask` (M6 slice 2). The mask
+    /// gates the vectors structurally: same lane count, same lane bit width (see
+    /// [`mask_gates_vector`]), whatever element type the producing comparison had. The result is
+    /// the vectors' type.
     /// `fma(a, b, c)` — fused multiply-add `a*b + c` with a single rounding. A free builtin (like
     /// `dot`/`select`). Float-only (scalar `f32`/`f64` or `vecN<f32>`/`vecN<f64>`); the three
     /// operands share the type. Lowers to one `llvm.fma` (a `vfmadd`/`fmla` instruction).
@@ -55834,9 +55896,9 @@ impl<'a, 't> Checker<'a, 't> {
         }
         let mc_ty = self.resolve(mc.ty);
         match mc_ty {
-            Ty::Mask(ms, mn) if ms == s && mn == n => {}
+            Ty::Mask(..) if mask_gates_vector(mc_ty, s, n) => {}
             Ty::Mask(..) => {
-                self.diags.error(format!("'select' mask {} does not match the vectors {}", ty_name(mc_ty), ty_name(Ty::Vec(s, n))), m.span);
+                self.diags.error(format!("'select' mask {} does not match the vectors {} (a mask gates a vector with the same lane count and lane width)", ty_name(mc_ty), ty_name(Ty::Vec(s, n))), m.span);
                 return err;
             }
             other => {
@@ -65542,6 +65604,78 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::BufferAppend { buffer: Box::new(recv_expr), data: Box::new(data) }, ty: Ty::Unit, span }
     }
 
+    /// `b.append_filled(length, value)` — append exactly `length` bytes of `value` to a growable
+    /// `buffer` (Plan 65 Row B2). The append member of the bulk-write family whose constructor is
+    /// `buffer.filled(length, value)` and whose in-place member is `slice<u8>.fill(value)`: same
+    /// `(i64, u8)` argument grammar, same terminal policy for an invalid count, one growth rather
+    /// than a per-byte sequence. Like `.append()` it needs a `mut buffer` local.
+    fn check_buffer_append_filled(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let recv_expr = self.check_expr(recv, None);
+        if self.resolve(recv_expr.ty) != Ty::Buffer {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    format!("'.append_filled()' appends to a `buffer`, but the receiver is {} (it is a `buffer` method)", ty_name(recv_expr.ty)),
+                    recv.span,
+                );
+            }
+            return err;
+        }
+        let Some((bid, _)) = self.place_local(recv) else {
+            self.diags.error(
+                "'.append_filled()' needs a `mut` buffer local (bind it first: `mut b := buffer(0)`, then `b.append_filled(n, v)`) — it grows the buffer in place".to_string(),
+                recv.span,
+            );
+            return err;
+        };
+        if !self.locals[bid as usize].is_mut {
+            let name = self.locals[bid as usize].name.clone();
+            self.diags.error(
+                format!("cannot grow immutable buffer '{name}' (declare with `mut`) — '.append_filled()' appends in place"),
+                recv.span,
+            );
+            return err;
+        }
+        let [length_arg, value_arg] = args else {
+            self.diags.error(format!("'.append_filled()' takes 2 arguments (a length and a byte value), got {}", args.len()), span);
+            return err;
+        };
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let u8_ty = Ty::Int(IntTy { bits: 8, signed: false });
+        let length = self.check_expr(length_arg, Some(i64_ty));
+        let value = self.check_expr(value_arg, Some(u8_ty));
+        if length.ty == Ty::Error || value.ty == Ty::Error {
+            return err;
+        }
+        // Resolve once, then both match and report from the resolved type — an unresolved inference
+        // variable would otherwise print as `?0`.
+        let length_ty = self.resolve(length.ty);
+        let value_ty = self.resolve(value.ty);
+        if length_ty != i64_ty {
+            self.diags.error(
+                format!("'.append_filled()' takes an i64 length, got {}", ty_name(length_ty)),
+                length_arg.span,
+            );
+            return err;
+        }
+        if value_ty != u8_ty {
+            self.diags.error(
+                format!("'.append_filled()' takes a u8 byte value, got {}", ty_name(value_ty)),
+                value_arg.span,
+            );
+            return err;
+        }
+        Expr {
+            kind: ExprKind::BufferAppendFilled {
+                buffer: Box::new(recv_expr),
+                length: Box::new(length),
+                value: Box::new(value),
+            },
+            ty: Ty::Unit,
+            span,
+        }
+    }
+
     /// `arr[index].field` — field access on a struct-array element (MMv2 slice 8f). Fused into one
     /// bounds-checked element-field load; only the field (a scalar or a `str` view) is read. The
     /// result inherits the array's region (a `str` field views the array's input), so it cannot
@@ -67848,6 +67982,11 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::BufferAppend { buffer, data } => {
                 self.finalize_expr(buffer);
                 self.finalize_expr(data);
+            }
+            ExprKind::BufferAppendFilled { buffer, length, value } => {
+                self.finalize_expr(buffer);
+                self.finalize_expr(length);
+                self.finalize_expr(value);
             }
             ExprKind::BufferNew { capacity, fill } => {
                 self.finalize_expr(capacity);

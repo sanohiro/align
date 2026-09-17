@@ -1424,6 +1424,13 @@ pub enum ExprKind {
     /// the bytes in and growing it. The `ty` is [`crate::Ty::Unit`]. The receiver must be a `mut
     /// buffer` local; `data` is borrowed (copied, not consumed). Pure (in-memory growth).
     BufferAppend { buffer: Box<Expr>, data: Box<Expr> },
+    /// `buf.append_filled(length, value)` — append exactly `length` bytes of `value` to a growable
+    /// `buffer`, the append member of the `buffer.filled` / `slice<u8>.fill` bulk-write family. The
+    /// `ty` is [`crate::Ty::Unit`]. The receiver must be a `mut buffer` local; `length` is an `i64`
+    /// and `value` a `u8`, both Copy. Zero length is a no-op; a negative or overflowing length
+    /// aborts before any write, exactly as the `buffer.filled` constructor does. One growth, never
+    /// a per-byte sequence. Pure (in-memory growth), like [`ExprKind::BufferAppend`].
+    BufferAppendFilled { buffer: Box<Expr>, length: Box<Expr>, value: Box<Expr> },
     /// `array_builder()` / `array_builder(out)` — open an empty growable typed array builder. The
     /// `ty` is [`crate::Ty::ArrayBuilder`] and carries the element type. The anonymous form owns
     /// heap storage and is `Drop`-freed; the explicit-region form owns no independent allocation.

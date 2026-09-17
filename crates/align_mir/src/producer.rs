@@ -4332,7 +4332,12 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 let condition_ty = xml_operand_base_ty(self.graph.function, &cond);
                 let condition_matches = condition_ty == Some(Ty::Bool)
                     || xml_numeric_vector_shape(result_ty).is_some_and(|(element, lanes)| {
-                        path.is_empty() && condition_ty == Some(Ty::Mask(element, lanes))
+                        // Structural mask: lane count and lane width, not element identity
+                        // (`align_sema::mask_gates_vector`, shared with sema and checked HIR).
+                        path.is_empty()
+                            && condition_ty.is_some_and(|ty| {
+                                align_sema::mask_gates_vector(ty, element, lanes)
+                            })
                     });
                 if !condition_matches
                     || !xml_operand_base_ty(self.graph.function, &a)
@@ -6183,6 +6188,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::BytesCopyFrom { .. }
             | Rvalue::BufferPut { .. }
             | Rvalue::BufferAppend { .. }
+            | Rvalue::BufferAppendFilled { .. }
             | Rvalue::ArrayBuilderPush { .. }
             | Rvalue::ArrayBuilderPushStr { .. }
             | Rvalue::ArrayBuilderAppend { .. }

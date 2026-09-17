@@ -24,6 +24,7 @@ v.sqrt()/abs()/floor()/ceil()/round()/trunc()    // per-lane float math
 dot(a, b)                        -> T
 fma(a, b, c)                     -> vecN<T>      // one rounding
 select(m, a, b)                  -> vecN<T>      // lane blend; a and b are BOTH vectors (no broadcast)
+                                                  // m: レーン数とレーン幅が一致する任意の mask
 v.sum_where(m)                   -> T            // masked reduction
 
 s.load(i)                        -> vecN<T>      // N consecutive slice elems; bounds-checked
@@ -60,7 +61,7 @@ align(N) Struct { ... }                           // over-align struct; stride p
 - P1 — **幅ジェネリックな `vec<T>` を追加しないこと**: この二層構成は決定済み（settled）である。幅に依存しない処理はパイプラインに属し、そこでバックエンドが適切なレーン幅を選択する。
 - P2 — **手動で vectorize する前に必ず audit すること**: まずパイプライン版のコードに対して `emit-llvm` を実行して確認する。多くの場合、融合（fuse）されたループはすでに自動的に vectorize されている。手動カーネルはスライス境界の関数の後ろに配置し（例: `fn kernel(src: slice<T>, out dst: slice<T>)`）、スカラーとして残る端数の処理は呼び出し側が `chunks(N)` などを用いて行う。
 - P3 — `align(N)` は常に *over-align*（要求より厳しいアライメント制約）を指定するだけであり、動的な `array<align(N) S>` はアライメントを考慮した heap アロケーションがサポートされるまで拒否される（#319）。この属性は汎用的なアロケータへの指示子ではない。
-- P4 — mask の要素型は比較対象のベクタと一致していなければならない（例: `vec4<i32>` の比較からは `mask4<i32>` が生成される）。ベクタ幅をまたぐ、あるいは型をまたぐ mask の再利用は存在しない。
+- P4 — mask は**構造的に**ゲートする（要素型の一致ではない）: `select` / `sum_where` はレーン数とレーン幅が一致する任意の mask を受け取る（`mask4<f32>` は `vec4<i32>` / `vec4<u32>` / `vec4<f32>` をゲートできる）。これにより argmax / top-k / index compaction を厳密な整数インデックスで記述できる。レーン数またはレーン幅が異なる場合は従来どおり拒否される。比較が生成する mask の *型* は変わらないので、明示的な `maskN<T>` 注釈は比較対象の要素型を書く必要がある（#1083）。
 
 ## Test anchors
 

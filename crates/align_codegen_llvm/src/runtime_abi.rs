@@ -31,6 +31,7 @@ enum NativeReturn {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuntimeAbiShape {
+    BufferAppendFilled,
     BufferFilled,
     ArrayBuilderCapacity,
     ArrayBuilderRegionCapacity,
@@ -469,6 +470,11 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
             key,
             symbol: "align_rt_buffer_append",
             shape: RuntimeAbiShape::A73,
+        },
+        RuntimeKey::BufferAppendFilled => RuntimeAbi {
+            key,
+            symbol: "align_rt_buffer_append_filled",
+            shape: RuntimeAbiShape::BufferAppendFilled,
         },
         RuntimeKey::BufferBytes => RuntimeAbi {
             key,
@@ -2255,15 +2261,15 @@ pub(super) fn runtime_abis() -> impl Iterator<Item = RuntimeAbi> {
 }
 
 pub(super) fn validate_registry() -> Result<(), String> {
-    if RuntimeKey::ALL.len() != 445 || keyed_runtime_abis().len() != 445 {
+    if RuntimeKey::ALL.len() != 446 || keyed_runtime_abis().len() != 446 {
         return Err("runtime ABI registry invariant: key-count".to_string());
     }
-    if runtime_abis().count() != 463 {
+    if runtime_abis().count() != 464 {
         return Err("runtime ABI registry invariant: base-count".to_string());
     }
 
     let mut keys = HashSet::with_capacity(RuntimeKey::ALL.len());
-    let mut symbols = HashSet::with_capacity(463);
+    let mut symbols = HashSet::with_capacity(464);
     for abi in keyed_runtime_abis() {
         let key = abi
             .runtime_key()
@@ -3125,6 +3131,14 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
         RuntimeAbiShape::ArrayBuilderStackCapacity => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,
             params: &[NativeType::Ptr, NativeType::I64, NativeType::I64],
+            return_noalias: false,
+            fn_attrs: &[],
+            memory_argmem_read: false,
+            read_ptr_params: &[],
+        },
+        RuntimeAbiShape::BufferAppendFilled => RuntimeAbiShapeSpec {
+            ret: NativeReturn::Void,
+            params: &[NativeType::Ptr, NativeType::I64, NativeType::I8],
             return_noalias: false,
             fn_attrs: &[],
             memory_argmem_read: false,
@@ -4022,17 +4036,17 @@ mod tests {
         );
         validate_registry().unwrap();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 463);
+        assert_eq!(rows.len(), 464);
         assert_eq!(
             rows.iter().map(|row| row.key).collect::<HashSet<_>>().len(),
-            463
+            464
         );
         assert_eq!(
             rows.iter()
                 .map(|row| row.symbol)
                 .collect::<HashSet<_>>()
                 .len(),
-            463
+            464
         );
         for (key, row) in RuntimeKey::ALL.into_iter().zip(keyed_runtime_abis()) {
             assert_eq!(row.key, RuntimeAbiId::Keyed(key));
@@ -4062,7 +4076,7 @@ mod tests {
     fn runtime_abi_extern_type_matrix_is_exact_for_every_row_and_ordinal() {
         let ctx = inkwell::context::Context::create();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 463);
+        assert_eq!(rows.len(), 464);
 
         for row in rows {
             let symbol = row.symbol;

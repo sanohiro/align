@@ -1315,6 +1315,18 @@ all
 dot
 ```
 
+`min` and `max` are **one operation with one lowering**, wherever they are spelled: the pipeline
+terminal `xs.max()`, the scalar method `a.max(b)` and the vector lane reduction `v.max()` all mean
+the same thing and emit the same instruction. On floats that operation is IEEE 754-2019
+`minimum`/`maximum`: **NaN propagates** (a slice containing a NaN reduces to NaN) and the signed
+zeros are ordered (`max(-0.0, +0.0)` is `+0.0`, `min(-0.0, +0.0)` is `-0.0`), identically on every
+target and in every build. On integers it is the signed or unsigned minimum/maximum of the element
+type. An empty pipeline still yields the fold identity — the element type's extreme value, `∓inf`
+for a float. A hand-written `if xs[i] > best { best = xs[i] }` loop is a *different* program: an
+ordered comparison, which is false for a NaN operand and therefore skips NaN elements, and which
+carries no minimum/maximum semantics for the backend to widen into a reduction. Write the reducer
+when you want the reduction.
+
 ### Chunk Processing
 
 ```align
@@ -1426,7 +1438,25 @@ total := scores.sum_where(m)   // masked reduction
 
 A mask has the type `maskN<T>` — spelled like `vecN<T>`, with the same width and element as the
 vectors it compares (the type is usually inferred; name it to thread a mask through a function). A
-mask is a first-class concept for SIMD / branchless / GPU. The pipeline's `where` is the implicit
+mask is a first-class concept for SIMD / branchless / GPU.
+
+**A mask gates structurally.** A mask is one bool lane per lane; it has no element type at the
+machine level. So `select` and `sum_where` accept any mask with the **same lane count and the same
+lane bit width** as the vectors it gates, whatever element type the producing comparison had —
+`mask4<f32>` gates `vec4<i32>`, `vec4<u32>` and `vec4<f32>` alike, and `mask2<f64>` gates the
+64-bit lane family. This is what makes the masked-index algorithms (argmax/argmin, top-k,
+first/last match, index compaction) expressible with exact integer indices:
+
+```align
+m := scores > best              // mask4<f32>
+best = select(m, scores, best)  // gates vec4<f32>
+index = select(m, current, index)  // … and the vec4<i32> indices, same mask
+```
+
+A different lane count or a different lane width is still rejected: `mask4<f32>` gates neither
+`vec2<f64>` nor `vec8<i32>`, which is exactly what the target's bit-select instruction requires.
+The mask *type* is unchanged — a comparison still produces `maskN<T>` for its own `T`, and a
+written annotation must name that `T`. The pipeline's `where` is the implicit
 form when its suffix is safe on rejected lanes: `xs.where(p).sum()` lowers **branchless** (mask +
 `select`, a masked reduction), not a per-element `if`. A general callable after `where` is guarded
 instead; rejected elements never execute it.
@@ -1766,12 +1796,15 @@ out.put_u32_le(magic)
 out.put_u64_be(count)
 out.put_f32_le(weight)
 out.append(payload)                         // copy a raw bytes/str blob in
+out.append_filled(4096, 0 as u8)            // extend by 4096 repeated bytes, one growth
 data := out.bytes()                         // view the accumulated bytes
 ```
 
 The read/write scalar set is `u8`, `i8`, and — with an explicit `_le` / `_be` — `u16`/`i16`,
 `u32`/`i32`, `u64`/`i64`, `f32`, `f64`. A read is `bytes.<scalar>(off)` and its encode dual is
-`buffer.put_<scalar>(v)`; `buffer.append(data)` writes a raw `bytes` / `str` blob. The value handed
+`buffer.put_<scalar>(v)`; `buffer.append(data)` writes a raw `bytes` / `str` blob and
+`buffer.append_filled(length, value)` extends the published window by `length` repeated bytes in
+one growth. The value handed
 to `put_*` must match the writer's scalar type exactly (no silent coercion). An **out-of-range**
 read (`off < 0`, or `off + width > len`) **aborts** — the same fail-closed policy as `slice[i]`, so
 a parser checks `.len()` before reading, exactly as it checks a slice's length before indexing. A
@@ -2590,6 +2623,17 @@ allocator-exact equality promise. Invalid/overflowing counts fail before
 allocation; allocation failure aborts. This is Pure explicit allocation.
 The existing `buffer(capacity)` retains its best-effort empty read-window
 contract. There is no separate zeroed constructor.
+
+`b.append_filled(length: i64, value: u8) -> ()` is the append member of the same
+bulk-write family: it extends the published window of a `mut buffer` by exactly
+`length` bytes of `value`, in one growth rather than a growth sequence or a call
+per byte. Zero length is a no-op; a negative or overflowing length fails before
+any write, the same terminal policy as the constructor. `buffer(capacity)`
+reserves without publishing, so this is how a window grows by repeated bytes.
+There are no typed `append_filled_S_E` suffix forms: the `fill_S_E` family
+overwrites an already-published window whose length the writer already knows,
+while an append form would have to introduce its own element-count grammar, and
+no recorded program needs it yet.
 
 ### core.array_builder
 

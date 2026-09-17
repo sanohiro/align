@@ -1170,13 +1170,24 @@ Settled here: the spelling is **`maskN<T>`** — N-in-name like `vecN<T>`, with 
 element as the compared vectors (`mask4<i32>` = the result of comparing `vec4<i32>`s). This amends the
 spec's `mask<T>` (draft §13) exactly as `vec<N,T>` → `vecN<T>`: the **width must be in the type**, and
 the spec's lone `<T>` left it ambiguous. `Ty::Mask(u32)` became `Ty::Mask(Scalar, u32)` (element +
-width) so the type is fully meaningful and type-safe — `select`/`sum_where` now require the mask's
-**element and width** to match the vectors (operationally a mask is still `<N x i1>`, element-
-independent; the element is part of the *type*, not the repr). `resolve_type` gained the `maskN<T>`
-arm (`parse_mask_name`). The decision to make the mask element-aware (vs the previous width-only
-`Ty::Mask(u32)`) is the type-safe choice and matches the spec's element-parameterized intent; the
-minor flexibility loss (an `i32`-comparison mask can no longer select `f32` vectors) is acceptable and
-arguably more correct. Still deferred: the generic `vec<N,T>` / numeric-type-arg spelling, an aligned-
+width) so the type is fully meaningful and nameable (operationally a mask is still `<N x i1>`,
+element-independent; the element is part of the *type*, not the repr). `resolve_type` gained the
+`maskN<T>` arm (`parse_mask_name`). The decision to make the mask element-aware (vs the previous
+width-only `Ty::Mask(u32)`) matches the spec's element-parameterized intent for the *type*.
+
+**Amended 2026-09-18 (#1083) — a mask gates structurally.** The original amendment also made
+`select`/`sum_where` require the mask's element to match the gated vectors, and recorded the lost
+flexibility (an `f32`-comparison mask could not select `i32` vectors) as acceptable. It was not:
+that is exactly the masked-index family — argmax/argmin, top-k, first/last match, histogram
+bucketing, index compaction — and the only accepted spelling kept the indices in `f32`, exact only
+below 2^24. The compatibility predicate is now structural: `select` and `sum_where` accept any mask
+with the **same lane count and the same lane bit width** as the vectors it gates, which is precisely
+what the target's bit-select instruction requires and what codegen already assumed (it never read
+the mask's element). One predicate, `align_sema::mask_gates_vector`, is shared by sema, the
+checked-HIR record validator and the MIR producer equation. The `maskN<T>` **type** is unchanged and
+still nominal: a comparison yields `Ty::Mask(elem, n)` for its own element, and a written annotation
+must name it. A differing lane count or lane width is still rejected. This is a pure widening — every
+program that compiled before compiles now, with identical IR. Still deferred: the generic `vec<N,T>` / numeric-type-arg spelling, an aligned-
 load fast path, the SIMD-unit tree reduction. (`examples/vec_mask_annot.align`.)
 
 **Decision: `vec<N,T>` + auto-vectorization as the baseline.** Make mask first-class. The fused

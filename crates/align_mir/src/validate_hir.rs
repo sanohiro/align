@@ -4637,6 +4637,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::BytesCopyFrom { .. }
             | hir::ExprKind::BufferPut { .. }
             | hir::ExprKind::BufferAppend { .. }
+            | hir::ExprKind::BufferAppendFilled { .. }
             | hir::ExprKind::ArrayBuilderNew { .. }
             | hir::ExprKind::ArrayBuilderPush { .. }
             | hir::ExprKind::ArrayBuilderAppend { .. }
@@ -5025,6 +5026,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::StrBytes { .. }
             | hir::ExprKind::BufferLen { .. }
             | hir::ExprKind::BufferAppend { .. }
+            | hir::ExprKind::BufferAppendFilled { .. }
             | hir::ExprKind::ArrayBuilderAppend { .. }
             | hir::ExprKind::ArrayBuilderBuild(..)
             | hir::ExprKind::FsExists { .. }
@@ -7733,7 +7735,11 @@ impl<'a> BodyValidator<'a> {
                 let a = self.expr_flow(a)?;
                 let b = self.expr_flow(b)?;
                 let (scalar, lanes) = vector_numeric(a.ty)?;
-                if mask.ty != Ty::Mask(scalar, lanes) || b.ty != Ty::Vec(scalar, lanes) {
+                // The mask is structural: same lane count and lane bit width, whatever element the
+                // producing comparison recorded (`align_sema::mask_gates_vector`, the one rule).
+                if !align_sema::mask_gates_vector(mask.ty, scalar, lanes)
+                    || b.ty != Ty::Vec(scalar, lanes)
+                {
                     return None;
                 }
                 let (falls, breaks) = strict_flow(&[mask, a, b]);
@@ -7743,7 +7749,7 @@ impl<'a> BodyValidator<'a> {
                 let vector = self.expr_flow(vec)?;
                 let mask = self.expr_flow(mask)?;
                 let (scalar, lanes) = vector_numeric(vector.ty)?;
-                if mask.ty != Ty::Mask(scalar, lanes) {
+                if !align_sema::mask_gates_vector(mask.ty, scalar, lanes) {
                     return None;
                 }
                 let (falls, breaks) = strict_flow(&[vector, mask]);
@@ -9109,6 +9115,20 @@ impl<'a> BodyValidator<'a> {
                     return None;
                 }
                 strict(Ty::Unit, &[buffer, data])
+            }
+            hir::ExprKind::BufferAppendFilled {
+                buffer,
+                length,
+                value,
+            } => {
+                if !mutable_local(buffer, Ty::Buffer)
+                    || buffer.ty != Ty::Buffer
+                    || length.ty != i64
+                    || !self.body_ty_matches(value.ty, align_sema::scalar_to_ty(u8_scalar))
+                {
+                    return None;
+                }
+                strict(Ty::Unit, &[buffer, length, value])
             }
             hir::ExprKind::ArrayBuilderNew { elem, region, capacity } => {
                 let valid_elem = if region.is_some() {

@@ -10,6 +10,13 @@ capability is now implemented: in-place `array<T>.truncate(new_len)` (#1054), ty
 stores `slice<u8>.set_S_E(offset, val)` (#1048), bulk `fill`/`fill_S_E`/`copy_from` (#1051),
 general owned struct field replacement (#1048), and disjoint record field borrows (#1050). Numeric slice copy already optimizes to memcpy.
 Foreign certification, ordered SIMD and native Mac investigations remain open.
+Plan 65's SIMD-surface consistency capability is now implemented: a structural
+vector mask for `select`/`sum_where` (#1083), one `MathFn::Min`/`Max` lowering
+for the pipeline `min`/`max` terminals (#1082 Part 1, a deliberate NaN/±0
+behavior change to match the scalar method), and `buffer.append_filled` (#1073
+part 1). Issue 1082 Part 2 — a scoped opt-in float relaxation surface — remains
+an open design, and the typed `append_filled_S_E` forms are recorded as
+deferred.
 [Plan 67](docs/impl/67-caller-result-placement-plan.md) implements caller result
 placement for already-indirect aggregates, with native ABI cross-link and
 alias-sensitive fallback owners; issue 1047 retains its separate foreign-query

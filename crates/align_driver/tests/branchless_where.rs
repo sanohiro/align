@@ -185,18 +185,22 @@ fn where_any_empty_is_false_all_empty_is_true() {
 }
 
 #[test]
-fn where_float_min_max_skip_nan() {
+fn where_float_min_max_propagate_a_surviving_nan() {
     if !backend_available() {
         return;
     }
-    // A NaN element that passes the filter (NaN != 999.0 is true) must be *ignored* by min/max: the
-    // ordered `<`/`>` compare with a NaN operand is false, so the running best is kept — identical to
-    // the branch form (identity-select keeps the same ordered comparison, so NaN handling is
-    // unchanged). min → 1.0, max → 2.0.
-    let src_min = "fn keep(x: f64) -> bool = x != 999.0\nfn pmin(xs: slice<f64>) -> f64 = xs.where(keep).min()\nfn main() -> i32 {\n  n := (0.0 - 1.0).sqrt()\n  r := pmin([n, 1.0, 2.0])\n  return if r == 1.0 { 1 } else { 0 }\n}\n";
+    // `min`/`max` are IEEE 754-2019 `minimum`/`maximum` in every spelling (#1082 Part 1), so a NaN
+    // element that passes the filter (NaN != 999.0 is true) **propagates**: the reduction is NaN,
+    // exactly as the scalar `a.max(b)` method has always been. The masked-out lanes still select
+    // the fold seed, which can never win against a real value.
+    let src_min = "fn keep(x: f64) -> bool = x != 999.0\nfn pmin(xs: slice<f64>) -> f64 = xs.where(keep).min()\nfn main() -> i32 {\n  n := (0.0 - 1.0).sqrt()\n  r := pmin([n, 1.0, 2.0])\n  return if r.is_nan() { 1 } else { 0 }\n}\n";
     assert_eq!(build_and_run("blw-nan-min", src_min).status.code(), Some(1));
-    let src_max = "fn keep(x: f64) -> bool = x != 999.0\nfn pmax(xs: slice<f64>) -> f64 = xs.where(keep).max()\nfn main() -> i32 {\n  n := (0.0 - 1.0).sqrt()\n  r := pmax([n, 1.0, 2.0])\n  return if r == 2.0 { 1 } else { 0 }\n}\n";
+    let src_max = "fn keep(x: f64) -> bool = x != 999.0\nfn pmax(xs: slice<f64>) -> f64 = xs.where(keep).max()\nfn main() -> i32 {\n  n := (0.0 - 1.0).sqrt()\n  r := pmax([n, 1.0, 2.0])\n  return if r.is_nan() { 1 } else { 0 }\n}\n";
     assert_eq!(build_and_run("blw-nan-max", src_max).status.code(), Some(1));
+    // A NaN the filter REJECTS is still gone — the mask selects the seed for that lane, so the
+    // surviving numbers decide the result (min → 1.0, max → 2.0).
+    let src_filtered = "fn keep(x: f64) -> bool = !x.is_nan()\nfn pmin(xs: slice<f64>) -> f64 = xs.where(keep).min()\nfn pmax(xs: slice<f64>) -> f64 = xs.where(keep).max()\nfn main() -> i32 {\n  n := (0.0 - 1.0).sqrt()\n  lo := pmin([n, 1.0, 2.0])\n  hi := pmax([n, 1.0, 2.0])\n  return if lo == 1.0 && hi == 2.0 { 1 } else { 0 }\n}\n";
+    assert_eq!(build_and_run("blw-nan-filtered", src_filtered).status.code(), Some(1));
 }
 
 #[test]

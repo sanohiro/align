@@ -126,6 +126,16 @@ nonzero length, none for zero; the Move handle may allocate. Initialization is
 O(length). Invalid/overflowing counts abort before allocation; OOM aborts.
 The ordinary `buffer(capacity)` remains a best-effort empty read window.
 
+`b.append_filled(length: i64, value: u8) -> ()` is the family's append member.
+It extends a `mut buffer`'s published window by exactly `length` bytes of
+`value` in one growth, never a growth sequence or a call per byte. Zero length
+is a no-op; a negative or overflowing length aborts before any write, the same
+terminal policy as the constructor. Because `buffer(capacity)` reserves without
+publishing, this is how a window grows by repeated bytes. There are no typed
+`append_filled_S_E` forms: `fill_S_E` overwrites an already-published window of
+known length, while an append form would need its own element-count grammar
+that no recorded program requires yet.
+
 Expected-type `array_builder()` and `array_builder(out)` accept an optional last
 i64 capacity argument: `array_builder(capacity)` and
 `array_builder(out, capacity)`. Omitted capacity is zero. Initial length is zero;

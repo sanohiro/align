@@ -1122,6 +1122,11 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             buffer: boxed!(buffer),
             data: boxed!(data),
         },
+        ExprKind::BufferAppendFilled { buffer, length, value } => ExprKind::BufferAppendFilled {
+            buffer: boxed!(buffer),
+            length: boxed!(length),
+            value: boxed!(value),
+        },
         ExprKind::ArrayBuilderPush {
             builder,
             value,
@@ -2908,6 +2913,11 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         ExprKind::BytesSet { bytes, offset, value, .. } => {
             one!(bytes);
             one!(offset);
+            one!(value);
+        }
+        ExprKind::BufferAppendFilled { buffer, length, value } => {
+            one!(buffer);
+            one!(length);
             one!(value);
         }
         ExprKind::BytesFill { bytes, value, .. } => {

@@ -14107,6 +14107,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
+            // `buf.append_filled(length, value)` — one runtime call that grows the published window
+            // by `length` repeated bytes (the append member of the bulk-write family).
+            Rvalue::BufferAppendFilled { buffer, length, value } => {
+                let bp = self.operand(buffer)?.into();
+                let len = self.operand(length)?.into();
+                let byte = self.operand(value)?.into();
+                self.builder
+                    .build_call(self.runtime(RuntimeKey::BufferAppendFilled), &[bp, len, byte], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
             Rvalue::BytesSet { bytes, offset, value, scalar, be } => {
                 let (ptr, _len) = self.split_str(bytes)?;
                 let ptr = ptr.into_pointer_value();
@@ -22879,7 +22890,10 @@ fn main() -> i32 = 0
             *rvalue = replacement;
             changed
         };
-        for condition in [6, 9] {
+        // Arg 6 is `mask4<i32>`, arg 8 is `mask4<f32>` and arg 9 is `bool`. A mask gates
+        // structurally (`align_sema::mask_gates_vector`), so the `f32` mask is a valid condition
+        // for `vec4<i32>` operands: same lane count, same lane bit width.
+        for condition in [6, 8, 9] {
             let valid = replace(Rvalue::Select {
                 cond: Operand::Arg(condition),
                 a: Operand::Arg(0),
@@ -22911,13 +22925,15 @@ fn main() -> i32 = 0
             let malformed = replace(Rvalue::Un(operation, Operand::Arg(0)));
             assert_xml_producer_rejected(&malformed, "unary vector operator is not a source operation");
         }
-        for (condition, other) in [(0, 1), (7, 1), (8, 1), (6, 2), (6, 3), (6, 4)] {
+        // A non-mask condition, a lane-COUNT mismatch (`mask2<i32>` over four lanes), and every
+        // operand-type mismatch stay rejected — only the mask's element type stopped mattering.
+        for (condition, other) in [(0, 1), (7, 1), (6, 2), (6, 3), (6, 4)] {
             let malformed = replace(Rvalue::Select {
                 cond: Operand::Arg(condition),
                 a: Operand::Arg(0),
                 b: Operand::Arg(other),
             });
-            assert_xml_producer_rejected(&malformed, "select exact mask/vector relation");
+            assert_xml_producer_rejected(&malformed, "select structural mask/vector relation");
         }
     }
 
