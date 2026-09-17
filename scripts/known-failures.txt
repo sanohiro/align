@@ -29,13 +29,49 @@
 #
 # The detector then produced no verdict at all from 2026-08-31 to 2026-09-17:
 # the suite outgrew one runner's 30-minute budget and every night was cancelled
-# (#1098). The two entries below are what rotted in on main meanwhile, found by
-# their owner target rather than by the nightly. Both reproduce off CI and on
-# both host platforms; they are a whole-program resource-MIR provenance defect,
-# not an environment dependence, so they are strict lines and they go away in
-# the same change that fixes #1097.
+# (#1098). The sharded nightly's first complete Linux x86_64 verdict is run
+# 35283248096; every entry below was named by it, was confirmed to be
+# pre-existing on main, and carries a triage issue whose fix deletes its line.
 #
-# #1097: `fn` value in a generic record field fails whole-program resource MIR
-# validation ("XML-capable call argument provenance mismatch").
-align_driver::test::analysis_coverage	generic_fn_wrapper_matches_an_explicit_source_signature
-align_driver::test::analysis_coverage	nested_fn_signatures_compare_by_source_identity
+# EVERY line here is strict. None is "env": each one is a defect or a stale
+# expectation with a named owner, not a dependence on something the runner does
+# not provide. Nine of the twelve reproduce on aarch64 macOS as well; the three
+# marked Linux-only were verified to pass locally and must be fixed and
+# re-verified on Linux or in a container.
+#
+# #1102: #937 (384d7744) widened the function-value signature rule and added the
+# align_rt_http_headers_* entry points; three owners still assert the removed
+# restrictions. Reproduces on both platforms.
+# #1103: #1048/#1051/#1054 (76dcb12b) shipped owned field replacement; two
+# owners still assert it is unsupported. Reproduces on both platforms.
+# #1104: Move-resource formation rejections stopped firing for a branch-join
+# return and a slice view. Suspected soundness regression, suspect not yet
+# isolated. Reproduces on both platforms.
+# #1105: two codegen owners bind their IR text scanners to the first match in
+# the whole module, which is the wrong line/byte range on Linux x86_64.
+# Linux-only.
+# #1106: the CLI per-unit build no longer byte-matches the whole-program
+# reference (different e_entry and e_shoff). Linux-only.
+# #1107: only two of three pkg.ws automatic-reply transport failures beat the
+# ordinary protocol result. Linux-only.
+# #1108: under the PollZero capture failpoint align_rt_command_run returns 4
+# instead of 0. Linux-only.
+#
+# Deliberately NOT listed: align_driver::test::pkg_db_a1, which exceeds the
+# 900s per-binary cap and reports <binary-did-not-report> (#1109). A synthetic
+# line for it would retire all 22 of its tests from the detector, which is
+# exactly what the ratchet above exists to prevent. That shard stays red until
+# its cost is cut, and pkg_db_a1 remains covered in full by the required
+# db-postgres job and scripts/db-verify-local.sh.
+align_driver::test::apps_auth	session_only_use_keeps_module_crypto_and_public_surface_is_closed
+align_driver::test::apps_ws	protocol_ping_and_peer_close_reply_transport_failures_win
+align_driver::test::borrow_liveness	storage_generation_move_replacement_cleanup_control_matrix
+align_driver::test::http_client_composition	formation_and_carrier_matrix
+align_driver::test::http_headers_view	a_struct_carrying_the_view_stays_copy
+align_driver::test::modules	qualified_function_value_keeps_signature_restrictions
+align_driver::test::owned_structs_arrays	unsupported_move_leaf_partial_replacement_is_rejected
+align_driver::test::owned_tagged_payloads	llvm_drop_has_a_tag_guard_and_none_constructs_without_allocation
+align_driver::test::par_map	par_map_over_padded_aos_uses_abi_stride
+align_driver::test::per_unit_surface	cli_build_run_size_match_library_reference
+align_driver::test::pkg_kv_timeout_ownership	formation_and_no_live_producer_edges_stay_closed
+align_runtime::lib::align_runtime	tests::command_timeout_budget_quantization
