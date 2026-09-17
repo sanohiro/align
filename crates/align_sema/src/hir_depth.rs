@@ -1217,6 +1217,11 @@ fn walk_body_records<'a>(
                     work.push((BodyRecord::Expr(bytes), child_depth));
                     work.push((BodyRecord::Expr(value), child_depth));
                 }
+                ExprKind::BufferAppendFilled { buffer, length, value } => {
+                    work.push((BodyRecord::Expr(buffer), child_depth));
+                    work.push((BodyRecord::Expr(length), child_depth));
+                    work.push((BodyRecord::Expr(value), child_depth));
+                }
                 ExprKind::BytesCopyFrom { dst, src } => {
                     work.push((BodyRecord::Expr(dst), child_depth));
                     work.push((BodyRecord::Expr(src), child_depth));

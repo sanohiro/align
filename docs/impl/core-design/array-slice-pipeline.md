@@ -36,7 +36,7 @@ arr[i].f = v             // element-field write, nested paths ok; dynamic arrays
 fn f(out dst: slice<T>)  // writable-slice param; caller passes a mut binding; no-alias enforced
 
 // stages                          // terminals
-xs.map(f)                          xs.sum() / .count() / .min() / .max()
+xs.map(f)                          xs.sum() / .count() / .min() / .max()   // min/max: MathFn::Min/Max
 xs.where(p) / .where(.flag)        xs.any(p) / .all(p)
 xs.field                           xs.reduce(init, f)      // init FIRST
 xs.scan(init, f)                   xs.to_array()           // materialize -> array<T>
@@ -212,6 +212,21 @@ lifetimes, not the lifetime of the copied header. Source invalidation and arena
 escape follow existing rules. Receivers and indices/bounds evaluate once in
 source order; early termination performs no later bounds check or action.
 
+## One min/max lowering
+
+`xs.min()` / `xs.max()` reduce with `MathFn::Min` / `MathFn::Max` — literally the same operation as
+the scalar `a.max(b)` method and the `vecN<T>` lane reduction, so the language has one lowering of
+"the minimum/maximum of these values": `llvm.{s,u}{min,max}` for integers, `llvm.minimum` /
+`llvm.maximum` (IEEE 754-2019) for floats. Floats therefore **propagate NaN** and order ±0
+deterministically in every spelling, and LLVM can widen the reduction because the operation carries
+its own NaN semantics. `where` still selects a rejected element to the fold seed (`extreme_of`)
+before the reduction, so an all-masked selection returns that seed.
+
+A hand-written `if xs[i] > best { best = xs[i] }` loop is deliberately **not** canonicalized into
+this form. It is a different program — an ordered comparison, false for a NaN operand and therefore
+NaN-skipping — and rewriting it would be a hidden special case. It is documented as not the
+vectorizable spelling instead (#1082 Part 1).
+
 ## Explicit constructor capacity
 
 `buffer.filled(length: i64, value: u8) -> buffer` returns exactly initialized
@@ -219,6 +234,16 @@ bytes with allocated capacity at least length. It acquires one payload for
 nonzero length, none for zero; the Move handle may allocate. Initialization is
 O(length). Invalid/overflowing counts abort before allocation; OOM aborts.
 The ordinary `buffer(capacity)` remains a best-effort empty read window.
+
+`b.append_filled(length: i64, value: u8) -> ()` is the family's append member.
+It extends a `mut buffer`'s published window by exactly `length` bytes of
+`value` in one growth, never a growth sequence or a call per byte. Zero length
+is a no-op; a negative or overflowing length aborts before any write, the same
+terminal policy as the constructor. Because `buffer(capacity)` reserves without
+publishing, this is how a window grows by repeated bytes. There are no typed
+`append_filled_S_E` forms: `fill_S_E` overwrites an already-published window of
+known length, while an append form would need its own element-count grammar
+that no recorded program requires yet.
 
 Expected-type `array_builder()` and `array_builder(out)` accept an optional last
 i64 capacity argument: `array_builder(capacity)` and

@@ -11566,6 +11566,43 @@ pub unsafe extern "C" fn align_rt_buffer_append(b: *mut Buffer, ptr: *const u8, 
     b.cap = b.cap.max(b.len);
 }
 
+/// `b.append_filled(length, value)` — append exactly `length` bytes of `value` to the published
+/// window, the append member of the `buffer.filled` / `slice<u8>.fill` bulk-write family. Like
+/// [`align_rt_buffer_append`] the write cursor is `len` (truncate-to-logical-length first). Zero
+/// length is a no-op that still normalizes the window; a negative or unrepresentable length aborts
+/// before any write, exactly as [`align_rt_buffer_filled`] does before allocating. One growth
+/// (`Vec::resize` over one reserve), never a per-byte sequence.
+///
+/// # Safety
+/// `b` must be null or a valid [`Buffer`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_buffer_append_filled(b: *mut Buffer, length: i64, value: u8) {
+    if b.is_null() {
+        return;
+    }
+    let b = unsafe { &mut *b };
+    // Validate the request completely before touching the payload, so an invalid or overflowing
+    // length aborts with the buffer exactly as it was rather than after a partial growth.
+    let n = safe_len(length).unwrap_or_else(|()| align_rt_alloc_size_fail());
+    let Some(total) = b.len.checked_add(n) else {
+        align_rt_alloc_size_fail()
+    };
+    if isize::try_from(total).is_err() {
+        align_rt_alloc_size_fail()
+    }
+    b.data.with_mut(|data| data.truncate(b.len));
+    if n > 0 {
+        b.data.with_mut(|data| {
+            if data.try_reserve(n).is_err() {
+                panic_abort("buffer allocation failed");
+            }
+            data.resize(total, value);
+        });
+    }
+    b.len = b.data.len();
+    b.cap = b.cap.max(b.len);
+}
+
 // ---------------------------------------------------------------------------------------------
 // std.encoding (M10 Slice 1) — Base64 (standard + URL-safe), hex, and UTF-8 validation. Pure
 // functions over `bytes`/`str`: encode returns an owned `string` (a fresh `align_rt_alloc` buffer,
@@ -31876,6 +31913,47 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn append_filled_extends_the_window_in_one_growth_and_matches_the_constructor() {
+        // Row B2: the append member must publish exactly what the `filled` constructor would, on
+        // top of whatever is already published, without a growth sequence or a per-byte call.
+        for length in [0usize, 1, 7, 4096, 65536] {
+            for value in [0x00u8, 0xff] {
+                let constructed = align_rt_buffer_filled(i64::try_from(length).unwrap(), value);
+                let appended = align_rt_buffer_new(0);
+                unsafe {
+                    align_rt_buffer_append_filled(appended, i64::try_from(length).unwrap(), value);
+                    assert_eq!((*appended).len, length, "length {length} value {value:#x}");
+                    assert_eq!((*appended).len, (*constructed).len);
+                    assert!((*appended).cap >= length);
+                    let lhs = (*constructed).data.with_mut(|data| data.clone());
+                    let rhs = (*appended).data.with_mut(|data| data.clone());
+                    assert_eq!(lhs, rhs, "length {length} value {value:#x} contents differ");
+                    align_rt_buffer_free(constructed);
+                    align_rt_buffer_free(appended);
+                }
+            }
+        }
+
+        // It extends: already-published bytes survive, and repeated calls accumulate.
+        let b = align_rt_buffer_new(0);
+        unsafe {
+            align_rt_buffer_put(b, 0x11, 1, 0);
+            align_rt_buffer_append_filled(b, 3, 0xaa);
+            align_rt_buffer_append_filled(b, 0, 0xbb);
+            align_rt_buffer_append_filled(b, 2, 0xcc);
+            assert_eq!((*b).len, 6);
+            assert_eq!(
+                (*b).data.with_mut(|data| data.clone()),
+                vec![0x11, 0xaa, 0xaa, 0xaa, 0xcc, 0xcc]
+            );
+            align_rt_buffer_free(b);
+        }
+
+        // A null handle is the same no-op the rest of the Buffer ABI uses.
+        unsafe { align_rt_buffer_append_filled(core::ptr::null_mut(), 8, 0) };
     }
 
     #[test]

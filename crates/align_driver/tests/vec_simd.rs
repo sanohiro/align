@@ -964,3 +964,159 @@ fn vector_remainder_broadcast_scalar_divisor() {
     let out = build_and_run("vrem-broadcast", src);
     assert_eq!(out.status.code(), Some(3));
 }
+
+// ---------------------------------------------------------------------------------------------
+// Structural masks (#1083). A `maskN<T>` is `<N x i1>` at the machine level, so blend legality is
+// lane count + lane bit width, never the element type the producing comparison happened to have.
+// `align_sema::mask_gates_vector` is that one rule, shared by sema, checked HIR and the MIR
+// producer validator. These owners pin the widened admissions, the unchanged rejections, and that
+// the widened blend is still a plain `select` with no conversion instruction introduced.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a_float_mask_blends_integer_vectors_of_the_same_lane_width() {
+    if !backend_available() {
+        return;
+    }
+    // The masked-index idiom: compare floats, keep the *indices* of the winners.
+    // m = a > b = [F, T, F, T]; select(m, x, y) = [1, 20, 3, 40]; sum = 64.
+    let src = concat!(
+        "fn main() -> i32 {\n",
+        "  a: vec4<f32> := [1.0, 5.0, 3.0, 8.0]\n",
+        "  b: vec4<f32> := [4.0, 2.0, 6.0, 7.0]\n",
+        "  x: vec4<i32> := [10, 20, 30, 40]\n",
+        "  y: vec4<i32> := [1, 2, 3, 4]\n",
+        "  m := a > b\n",
+        "  c := select(m, x, y)\n",
+        "  return c[0] + c[1] + c[2] + c[3]\n",
+        "}\n",
+    );
+    let out = build_and_run("vec-mask-f32-gates-i32", src);
+    assert_eq!(out.status.code(), Some(64));
+}
+
+#[test]
+fn a_float_mask_blends_unsigned_vectors_and_an_integer_mask_blends_floats() {
+    if !backend_available() {
+        return;
+    }
+    // Both directions of the same rule at 32-bit lanes: `mask4<f32>` gating `vec4<u32>`, and
+    // `mask4<i32>` gating `vec4<f32>`. u = [1, 20, 3, 40] → lane 1 = 20; f picks 9.0 at lane 0.
+    let src = concat!(
+        "fn main() -> Result<(), Error> {\n",
+        "  a: vec4<f32> := [1.0, 5.0, 3.0, 8.0]\n",
+        "  b: vec4<f32> := [4.0, 2.0, 6.0, 7.0]\n",
+        "  x: vec4<u32> := [10, 20, 30, 40]\n",
+        "  y: vec4<u32> := [1, 2, 3, 4]\n",
+        "  u := select(a > b, x, y)\n",
+        "  print(u[1] as i64)\n",
+        "  p: vec4<i32> := [9, 1, 1, 1]\n",
+        "  q: vec4<i32> := [0, 2, 2, 2]\n",
+        "  fa: vec4<f32> := [9.0, 1.0, 1.0, 1.0]\n",
+        "  fb: vec4<f32> := [0.0, 2.0, 2.0, 2.0]\n",
+        "  f := select(p > q, fa, fb)\n",
+        "  print(f[0] as f64)\n",
+        "  return Ok(())\n",
+        "}\n",
+    );
+    let out = build_and_run("vec-mask-crosstype", src);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "20\n9.0\n");
+}
+
+#[test]
+fn a_sixty_four_bit_float_mask_blends_sixty_four_bit_integer_vectors() {
+    if !backend_available() {
+        return;
+    }
+    // The 64-bit lane family: `mask2<f64>` gating `vec2<i64>`. m = [T, F] → [100, 4]; sum = 104.
+    let src = concat!(
+        "fn main() -> i32 {\n",
+        "  a: vec2<f64> := [5.0, 1.0]\n",
+        "  b: vec2<f64> := [2.0, 9.0]\n",
+        "  x: vec2<i64> := [100, 200]\n",
+        "  y: vec2<i64> := [3, 4]\n",
+        "  c := select(a > b, x, y)\n",
+        "  return (c[0] + c[1]) as i32\n",
+        "}\n",
+    );
+    let out = build_and_run("vec-mask-f64-gates-i64", src);
+    assert_eq!(out.status.code(), Some(104));
+}
+
+#[test]
+fn a_mask_of_a_different_lane_width_or_lane_count_is_still_rejected() {
+    // Lane WIDTH mismatch: a 4×32 mask cannot gate 2×64 vectors …
+    let width = concat!(
+        "fn blend(m: mask4<f32>, a: vec2<f64>, b: vec2<f64>) -> vec2<f64> = select(m, a, b)\n",
+        "fn main() -> i32 { return 0 }\n",
+    );
+    assert!(check_errs("vec-mask-width-mismatch", width));
+    // … and a 4-lane mask cannot gate 8-lane vectors of the same lane width.
+    let count = concat!(
+        "fn blend(m: mask4<f32>, a: vec8<i32>, b: vec8<i32>) -> vec8<i32> = select(m, a, b)\n",
+        "fn main() -> i32 { return 0 }\n",
+    );
+    assert!(check_errs("vec-mask-count-mismatch", count));
+    // The diagnostic names the structural rule rather than the element type.
+    let rendered = check_diagnostics("vec-mask-width-mismatch-text", width);
+    assert!(
+        rendered.contains("same lane count and lane width"),
+        "want the structural mask rule in the diagnostic:\n{rendered}"
+    );
+}
+
+#[test]
+fn a_cross_typed_mask_also_gates_a_masked_horizontal_sum() {
+    if !backend_available() {
+        return;
+    }
+    // One rule, every masked operation: the same relaxation applies to `sum_where`.
+    // a > b = [F, T, F, T] → 20 + 40 = 60.
+    let src = concat!(
+        "fn main() -> i32 {\n",
+        "  a: vec4<f32> := [1.0, 5.0, 3.0, 8.0]\n",
+        "  b: vec4<f32> := [4.0, 2.0, 6.0, 7.0]\n",
+        "  x: vec4<i32> := [10, 20, 30, 40]\n",
+        "  return x.sum_where(a > b)\n",
+        "}\n",
+    );
+    let out = build_and_run("vec-sumwhere-crosstype", src);
+    assert_eq!(out.status.code(), Some(60));
+}
+
+#[test]
+fn a_widened_blend_emits_a_plain_select_with_no_conversion() {
+    if !backend_available() {
+        return;
+    }
+    // Acceptance: the relaxed case is a plain `select <N x i1>` — no lane conversion is introduced
+    // to make the mask "match" the blended element type.
+    let src = concat!(
+        "pub fn m(a: vec4<f32>, b: vec4<f32>, x: vec4<i32>, y: vec4<i32>) -> vec4<i32> {\n",
+        "  mm := a > b\n",
+        "  return select(mm, x, y)\n",
+        "}\n",
+        "fn main() -> i32 { return 0 }\n",
+    );
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "vec-mask-ir", src);
+    assert!(
+        !checked.diags.has_errors(),
+        "{}",
+        align_driver::format_diagnostics(&sm, &checked.diags)
+    );
+    let mir = lower_to_mir(&checked.hir);
+    let ir = emit_llvm_ir(&mir, BuildTarget::Baseline, Profile::Release, false, &[], false)
+        .expect("emit llvm ir");
+    assert!(
+        ir.contains("select <4 x i1>"),
+        "want a plain lane-wise select:\n{ir}"
+    );
+    for conversion in ["sitofp", "uitofp", "fptosi", "fptoui"] {
+        assert!(
+            !ir.contains(conversion),
+            "a widened blend must introduce no `{conversion}` conversion:\n{ir}"
+        );
+    }
+}

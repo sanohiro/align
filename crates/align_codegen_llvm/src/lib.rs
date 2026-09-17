@@ -19,7 +19,8 @@ use align_mir::producer::{
 use align_mir::producer::{
     lowercase_hex, builtin_error_enum_is_exact, db_resource_matches_row, xml_callable_flow_matches,
     xml_closure_borrow_summary, xml_closure_region_summary, fs_tree_output_slots,
-    validate_resource_rvalues, validate_resource_program, validate_tagged_program,
+    validate_resource_rvalues, validate_partition_resource_rvalues, validate_resource_program,
+    validate_tagged_program,
     validate_partition_tagged_program, callable_hex, callable_target_error, canonical_metadata,
     canonical_ty, source_ty_matches, callable_metadata_error, preflight_operand_ty,
     slice_index_physical_element, slice_index_result_matches, validate_slice_index_rvalues,
@@ -3034,6 +3035,59 @@ impl ModuleScope<'_> {
     }
 }
 
+/// The names `scope` actually emits: every function for a whole/test module, the selected root for
+/// a function partition.
+fn scope_defined(
+    program: &Program,
+    scope: ModuleScope<'_>,
+) -> std::collections::BTreeSet<ProgramCall> {
+    program
+        .fns
+        .iter()
+        .filter(|function| scope.defines(function))
+        .map(|function| function.name.clone())
+        .collect()
+}
+
+/// Run the target-independent MIR validators for `scope`.
+///
+/// Validation scope must match emission scope. A `ModuleScope::Function` `Program` is a truncated
+/// view — the selected root plus its one-call-deep peer declarations — so a validator that
+/// re-derives whole-program facts from it rejects correct programs. Each validator below is
+/// therefore either dispatched to a partition-scoped variant or audited as scope-independent:
+///
+/// * `validate_tagged_program` — partition variant relaxes the compact-table requirement, and
+///   tolerates a callable target a non-emitted peer body names but the partition cannot see.
+/// * `validate_resource_rvalues` — partition variant validates only the emitted bodies and seeds
+///   the certified set with the partition's peers (both were certified over the complete unit by
+///   [`validate_thin_partition_program`] before partitioning).
+/// * `validate_resource_program` — scope-independent: it checks `program.resources`, which a
+///   partition carries whole, and tolerates an absent Drop-hook definition (`if let Some`).
+/// * `validate_slice_index_rvalues`, `validate_fixed_element_nulling` — scope-independent: both
+///   resolve no call target and check only intra-function structure against the complete shared
+///   struct/enum tables a partition still carries.
+fn validate_module_program(
+    program: &Program,
+    scope: ModuleScope<'_>,
+) -> Result<(), CodegenError> {
+    match scope {
+        ModuleScope::Whole | ModuleScope::Test { .. } => {
+            validate_tagged_program(program)?;
+            validate_resource_program(program)?;
+            validate_resource_rvalues(program)?;
+        }
+        ModuleScope::Function { .. } => {
+            let defined = scope_defined(program, scope);
+            validate_partition_tagged_program(program, &defined)?;
+            validate_resource_program(program)?;
+            validate_partition_resource_rvalues(program, &defined)?;
+        }
+    }
+    validate_slice_index_rvalues(program)?;
+    validate_fixed_element_nulling(program)?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // The explicit module inputs and partition scope are separate axes.
 fn build_module<'c>(
     ctx: &'c Context,
@@ -3045,16 +3099,8 @@ fn build_module<'c>(
     rt_lto_skip_guarded: bool,
     scope: ModuleScope<'_>,
 ) -> Result<RuntimeDeclarations, CodegenError> {
-    match scope {
-        ModuleScope::Whole | ModuleScope::Test { .. } => validate_tagged_program(program)?,
-        ModuleScope::Function { .. } => validate_partition_tagged_program(program)?,
-    }
-    validate_resource_program(program)?;
-    validate_resource_rvalues(program)?;
-    validate_slice_index_rvalues(program)?;
-    validate_fixed_element_nulling(program)?;
-    let defined = program.fns.iter().filter(|f| scope.defines(f))
-        .map(|f| f.name.clone()).collect();
+    validate_module_program(program, scope)?;
+    let defined = scope_defined(program, scope);
     let prepared = align_mir::byte_prepare::prepare(program, &defined);
     lower_prepared_module(ctx, module, &prepared, tm, debug, exports, rt_lto_skip_guarded, scope)
 }
@@ -3071,14 +3117,7 @@ fn lower_prepared_module<'c>(
     scope: ModuleScope<'_>,
 ) -> Result<RuntimeDeclarations, CodegenError> {
     runtime_abi::validate_registry().map_err(CodegenError::Lowering)?;
-    match scope {
-        ModuleScope::Whole | ModuleScope::Test { .. } => validate_tagged_program(program)?,
-        ModuleScope::Function { .. } => validate_partition_tagged_program(program)?,
-    }
-    validate_resource_program(program)?;
-    validate_resource_rvalues(program)?;
-    validate_slice_index_rvalues(program)?;
-    validate_fixed_element_nulling(program)?;
+    validate_module_program(program, scope)?;
     let callable_declarations = callable_declarations(program)?;
     // Target layout (for struct field offsets in `json.decode`); also pin the module's data
     // layout so offsets match the emitted object.
@@ -7476,6 +7515,49 @@ fn normalize_linked_rt_lto_guarded_definitions(
     Ok(())
 }
 
+/// Establish the `--rt-lto` merge invariant on the artifact that is about to be merged: **a
+/// definition linked into the program module carries no attribute that binds it to a target other
+/// than the program's own `TargetMachine`** (#1069).
+///
+/// `link_in_module` merges everything the baked artifact defines, not only the guarded rows, so
+/// the sweep is module-scoped: whether `rustc`'s inliner happened to leave a fifth helper body in
+/// `str_prims.bc` decides nothing. Declarations are exempt — a bodiless declaration emits no code
+/// and is not an inline candidate, so no attribute on one can bind codegen to another target; a
+/// body is also the only thing the inliner can copy `"probe-stack"` out of.
+fn shed_rt_lto_target_bound_attributes(module: &Module<'_>) {
+    for function in module.get_functions() {
+        if function.count_basic_blocks() == 0 {
+            continue; // a declaration (`memcmp`) — nothing to shed, nothing to inline
+        }
+        runtime_abi::shed_string_attributes(function);
+    }
+}
+
+/// Re-derive the invariant [`shed_rt_lto_target_bound_attributes`] just established, returning the
+/// offending definition and key when one still carries a string attribute.
+///
+/// Checking the artifact rather than trusting the sweep is what keeps a future guarded row, a
+/// `rustc` upgrade that bakes one more policy string, or a key the shedder could not name from
+/// silently reintroducing the defect. It runs on the incoming module, before `link_in_module` has
+/// mutated anything, so its caller can still fall back exactly like every other baked-artifact
+/// defect — and so it can never mistake an Align-generated function for a merged one.
+fn verify_rt_lto_target_independence(module: &Module<'_>) -> Result<(), String> {
+    for function in module.get_functions() {
+        if function.count_basic_blocks() == 0 {
+            continue;
+        }
+        for loc in runtime_abi::attribute_locations(function) {
+            if let Some(key) = runtime_abi::string_attribute_keys(function, loc).first() {
+                return Err(format!(
+                    "definition {} still carries the producing compiler's string attribute {key:?}",
+                    function.get_name().to_string_lossy(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Link the parsed `--rt-lto` runtime module into the program `module` in place, then normalize the
 /// merged bodies (M14 Slice 2). Steps: (0) compare the parsed runtime module's datalayout against
 /// the program's — a mismatch means blindly overwriting it (the old unconditional
@@ -7484,11 +7566,15 @@ fn normalize_linked_rt_lto_guarded_definitions(
 /// (loud diagnostic, guarded declares re-curated, no merge — see [`probe_rt_lto`]); (1) match the
 /// incoming module's triple to the program's (cosmetic — `link_in_module` does not check it) and the
 /// datalayout too (now known equal); (2) require every guarded row to have the exact type, a body,
-/// external linkage, and the C calling convention, then rename it to the captured physical name of
-/// its typed declaration and `link_in_module` (the definitions replace those declarations even when
-/// an earlier program claimant forced LLVM uniquification); (3) require every captured typed handle
-/// to remain a body-bearing external C definition, then shed exactly that row's curated attrs and
-/// set it `internal` DIRECTLY (never the
+/// external linkage, and the C calling convention; (2b) shed every string attribute the producing
+/// compiler baked into any incoming definition and re-derive that from the same module, so the
+/// merged bodies inherit the program's own `TargetMachine` instead of `rustc`'s — falling back like
+/// any other artifact defect if one survives ([`shed_rt_lto_target_bound_attributes`],
+/// [`verify_rt_lto_target_independence`]); then rename each guarded row to the captured physical
+/// name of its typed declaration and `link_in_module` (the definitions replace those declarations
+/// even when an earlier program claimant forced LLVM uniquification); (3) require every captured
+/// typed handle to remain a body-bearing external C definition, then shed exactly that row's
+/// curated attrs and set it `internal` DIRECTLY (never the
 /// internalize pass — the `{main} ∪ --export` roots model stays untouched, and no runtime symbol is
 /// externally defined, so there is no duplicate-external vs the `.a` at final link); (4) `verify` the
 /// merged module. Runs on the RAW module, BEFORE the single `run_opt_pipeline` — never a second opt
@@ -7553,6 +7639,20 @@ fn link_in_rt_lto<'c>(
             restore_rt_lto_guarded_attributes(ctx, module, runtime)?;
             return Ok(());
         }
+    }
+
+    // (2b) Make every incoming definition target-independent, then re-derive that from the same
+    // module. Both run here, on the artifact and before `link_in_module`, so the guarantee covers
+    // whatever the artifact defines rather than only the guarded rows, and so a violation is one
+    // more baked-artifact defect that falls back instead of failing a user's build (#1069).
+    shed_rt_lto_target_bound_attributes(&rt);
+    if let Err(defect) = verify_rt_lto_target_independence(&rt) {
+        eprintln!(
+            "alignc: --rt-lto disabled: baked runtime bitcode {defect}; falling back to the \
+             runtime staticlib. This is a compiler build defect, not a problem with your program.",
+        );
+        restore_rt_lto_guarded_attributes(ctx, module, runtime)?;
+        return Ok(());
     }
 
     // Retarget each incoming definition to the physical declaration selected before lowering.
@@ -9751,6 +9851,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// does not grow the stack each iteration), then restore the builder to the current position.
     fn alloca_at_entry(&self, ty: BasicTypeEnum<'c>, name: &str) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
         let saved = self.builder.get_insert_block().ok_or_else(|| self.err("no insertion block"))?;
+        let saved_debug = self.current_debug_location();
         let entry = *self.blocks.get(self.f.entry as usize).ok_or_else(|| self.err("entry block not found"))?;
         match entry.get_first_instruction() {
             Some(inst) => self.builder.position_before(&inst),
@@ -9758,6 +9859,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         }
         let p = self.builder.build_alloca(ty, name).map_err(|e| self.err(e))?;
         self.builder.position_at_end(saved);
+        self.restore_debug_location(saved_debug);
         Ok(p)
     }
 
@@ -10383,6 +10485,28 @@ impl<'c, 'a> FnGen<'c, 'a> {
             let (l, c) = if line == 0 { (self.fn_line.max(1), 0) } else { (line, col) };
             let loc = dib.create_debug_location(self.ctx, l, c, sp.as_debug_info_scope(), None);
             self.builder.set_current_debug_location(loc);
+        }
+    }
+
+    /// Read the builder's active debug location directly via LLVM 22's `LLVMGetCurrentDebugLocation2`.
+    ///
+    /// Inkwell 0.9's `builder.get_current_debug_location()` wraps the deprecated `LLVMGetCurrentDebugLocation`,
+    /// which when debug location is unset/empty returns a non-null `MetadataAsValue` wrapping an empty `!{}`
+    /// tuple instead of null. Passing that back to `set_current_debug_location` attaches `!dbg !{}` to
+    /// subsequent instructions, causing LLVM verifier failures. `LLVMGetCurrentDebugLocation2` correctly
+    /// returns null when unset.
+    fn current_debug_location(&self) -> Option<llvm_sys::prelude::LLVMMetadataRef> {
+        let raw = unsafe { llvm_sys::core::LLVMGetCurrentDebugLocation2(self.builder.as_mut_ptr()) };
+        (!raw.is_null()).then_some(raw)
+    }
+
+    /// Restore or clear the builder's current debug location.
+    fn restore_debug_location(&self, loc: Option<llvm_sys::prelude::LLVMMetadataRef>) {
+        unsafe {
+            llvm_sys::core::LLVMSetCurrentDebugLocation2(
+                self.builder.as_mut_ptr(),
+                loc.unwrap_or(std::ptr::null_mut()),
+            );
         }
     }
 
@@ -14125,6 +14249,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
+            // `buf.append_filled(length, value)` — one runtime call that grows the published window
+            // by `length` repeated bytes (the append member of the bulk-write family).
+            Rvalue::BufferAppendFilled { buffer, length, value } => {
+                let bp = self.operand(buffer)?.into();
+                let len = self.operand(length)?.into();
+                let byte = self.operand(value)?.into();
+                self.builder
+                    .build_call(self.runtime(RuntimeKey::BufferAppendFilled), &[bp, len, byte], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
             Rvalue::BytesSet { bytes, offset, value, scalar, be } => {
                 let (ptr, _len) = self.split_str(bytes)?;
                 let ptr = ptr.into_pointer_value();
@@ -17354,7 +17489,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             let saved_debug = self
                 .dibuilder
                 .is_some()
-                .then(|| self.builder.get_current_debug_location())
+                .then(|| self.current_debug_location())
                 .flatten();
             if self.dibuilder.is_some() {
                 // The private helper has no DISubprogram. Retaining the outer function's location
@@ -17379,7 +17514,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 None => self.builder.clear_insertion_position(),
             }
             if let Some(location) = saved_debug {
-                self.builder.set_current_debug_location(location);
+                self.restore_debug_location(Some(location));
             } else if self.dibuilder.is_some() {
                 // A debug-enabled outer function always needs a location on later inlinable calls.
                 // Fall back defensively if helper construction was reached before one was active.
@@ -22897,7 +23032,10 @@ fn main() -> i32 = 0
             *rvalue = replacement;
             changed
         };
-        for condition in [6, 9] {
+        // Arg 6 is `mask4<i32>`, arg 8 is `mask4<f32>` and arg 9 is `bool`. A mask gates
+        // structurally (`align_sema::mask_gates_vector`), so the `f32` mask is a valid condition
+        // for `vec4<i32>` operands: same lane count, same lane bit width.
+        for condition in [6, 8, 9] {
             let valid = replace(Rvalue::Select {
                 cond: Operand::Arg(condition),
                 a: Operand::Arg(0),
@@ -22929,13 +23067,15 @@ fn main() -> i32 = 0
             let malformed = replace(Rvalue::Un(operation, Operand::Arg(0)));
             assert_xml_producer_rejected(&malformed, "unary vector operator is not a source operation");
         }
-        for (condition, other) in [(0, 1), (7, 1), (8, 1), (6, 2), (6, 3), (6, 4)] {
+        // A non-mask condition, a lane-COUNT mismatch (`mask2<i32>` over four lanes), and every
+        // operand-type mismatch stay rejected — only the mask's element type stopped mattering.
+        for (condition, other) in [(0, 1), (7, 1), (6, 2), (6, 3), (6, 4)] {
             let malformed = replace(Rvalue::Select {
                 cond: Operand::Arg(condition),
                 a: Operand::Arg(0),
                 b: Operand::Arg(other),
             });
-            assert_xml_producer_rejected(&malformed, "select exact mask/vector relation");
+            assert_xml_producer_rejected(&malformed, "select structural mask/vector relation");
         }
     }
 
@@ -24819,6 +24959,137 @@ fn main() -> i32 = 0
                     "{malformed}: guarded declaration remained un-curated",
                 );
             }
+        }
+    }
+
+    /// The two owners below build LLVM fixtures directly, so they carry the builder API's
+    /// `unwrap`/`expect` panics. They are the whole of this capability's rise in the
+    /// `align_codegen_llvm panics` ratchet; the implementation-side count is unchanged, and a
+    /// failing fixture here must abort the test, not be diagnosed.
+    ///
+    /// #1069: every definition the baked artifact carries into the program module must shed the
+    /// producing compiler's string attributes, at every attribute location — not only the guarded
+    /// rows, because `link_in_module` merges whatever the artifact defines. The fixture therefore
+    /// carries a non-guarded fifth definition alongside the four, and spreads the attributes over
+    /// the function, the return, and a parameter.
+    #[test]
+    fn runtime_abi_rt_lto_merge_sheds_producer_string_attributes_everywhere() {
+        let program = mir("fn main() -> i32 = 0\n");
+        let ctx = Context::create();
+        let module = ctx.create_module("align");
+        let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).unwrap();
+        let runtime =
+            build_module(&ctx, &module, &program, &tm, None, &[], true, ModuleScope::Whole).unwrap();
+
+        let rt = ctx.create_module("align_rt_target_attrs_fixture");
+        rt.set_data_layout(&module.get_data_layout());
+        let baked = |function: FunctionValue<'_>| {
+            // The exact shapes `rustc` bakes, plus return/parameter placements that a
+            // function-attribute-only sweep would miss.
+            function.add_attribute(
+                inkwell::attributes::AttributeLoc::Function,
+                ctx.create_string_attribute("target-cpu", "apple-m1"),
+            );
+            function.add_attribute(
+                inkwell::attributes::AttributeLoc::Function,
+                ctx.create_string_attribute("probe-stack", "inline-asm"),
+            );
+            function.add_attribute(
+                inkwell::attributes::AttributeLoc::Return,
+                ctx.create_string_attribute("align.fixture.return", ""),
+            );
+            function.add_attribute(
+                inkwell::attributes::AttributeLoc::Param(0),
+                ctx.create_string_attribute("align.fixture.param", ""),
+            );
+        };
+        // The non-guarded fifth definition: a helper `rustc`'s inliner did not fold away. Nothing
+        // renames or normalizes it, so only a module-scoped sweep can reach it. It is `internal`
+        // and called from the guarded bodies, exactly as such a leftover would be — an unreferenced
+        // internal definition is not carried over by `link_in_module` at all.
+        let helper_type = ctx.i32_type().fn_type(&[ctx.i32_type().into()], false);
+        let helper = rt.add_function("align_rt_fixture_unguarded_helper", helper_type, None);
+        helper.set_linkage(Linkage::Internal);
+        {
+            let builder = ctx.create_builder();
+            let entry = ctx.append_basic_block(helper, "entry");
+            builder.position_at_end(entry);
+            builder.build_return(Some(&ctx.i32_type().const_int(1, false))).unwrap();
+        }
+        baked(helper);
+        for abi in runtime_abi::keyed_runtime_abis().filter(|abi| abi.is_rt_lto_guarded()) {
+            let function = abi.declare(&ctx, &rt);
+            let builder = ctx.create_builder();
+            let entry = ctx.append_basic_block(function, "entry");
+            builder.position_at_end(entry);
+            let call = builder
+                .build_call(helper, &[ctx.i32_type().const_zero().into()], "helper")
+                .unwrap();
+            let value = call.try_as_basic_value().basic().expect("helper returns i32");
+            builder.build_return(Some(&value)).unwrap();
+            baked(function);
+        }
+
+        link_in_rt_lto(&ctx, &module, rt, &runtime).expect("the merge must succeed");
+
+        let mut checked_helper = false;
+        for function in module.get_functions() {
+            if function.count_basic_blocks() == 0 {
+                continue;
+            }
+            if function.get_name().to_string_lossy() == "align_rt_fixture_unguarded_helper" {
+                checked_helper = true;
+            }
+            for loc in runtime_abi::attribute_locations(function) {
+                assert!(
+                    runtime_abi::string_attribute_keys(function, loc).is_empty(),
+                    "merged definition {} kept a producer string attribute",
+                    function.get_name().to_string_lossy(),
+                );
+            }
+        }
+        assert!(checked_helper, "the non-guarded fifth definition must reach the merged module");
+    }
+
+    /// The re-derivation is the tripwire for a shedder that stops covering something, so it must
+    /// actually refuse a module that still carries one — and accept the swept module.
+    #[test]
+    fn runtime_abi_rt_lto_target_independence_check_refuses_a_carried_attribute() {
+        let ctx = Context::create();
+        let rt = ctx.create_module("align_rt_check_fixture");
+        let function = rt.add_function(
+            "align_rt_fixture_definition",
+            ctx.i32_type().fn_type(&[ctx.i32_type().into()], false),
+            None,
+        );
+        let builder = ctx.create_builder();
+        let entry = ctx.append_basic_block(function, "entry");
+        builder.position_at_end(entry);
+        builder.build_return(Some(&ctx.i32_type().const_zero())).unwrap();
+        // A declaration is exempt: it emits no code and is not an inline candidate.
+        let declaration = rt.add_function("align_rt_fixture_declaration", ctx.i32_type().fn_type(&[], false), None);
+        declaration.add_attribute(
+            inkwell::attributes::AttributeLoc::Function,
+            ctx.create_string_attribute("target-cpu", "apple-m1"),
+        );
+        verify_rt_lto_target_independence(&rt).expect("a declaration's attributes are not merged");
+
+        for loc in [
+            inkwell::attributes::AttributeLoc::Function,
+            inkwell::attributes::AttributeLoc::Return,
+            inkwell::attributes::AttributeLoc::Param(0),
+        ] {
+            function.add_attribute(loc, ctx.create_string_attribute("target-cpu", "apple-m1"));
+            let defect = verify_rt_lto_target_independence(&rt)
+                .expect_err("a carried string attribute must be refused");
+            assert!(
+                defect.contains("align_rt_fixture_definition")
+                    && defect.contains("still carries the producing compiler's string attribute")
+                    && defect.contains("target-cpu"),
+                "{defect}",
+            );
+            shed_rt_lto_target_bound_attributes(&rt);
+            verify_rt_lto_target_independence(&rt).expect("the sweep must clear it");
         }
     }
 
@@ -35317,4 +35588,44 @@ fn main() -> i32 = 0
         Ok(())
     }
 
+    #[test]
+    fn drop_struct_helper_with_debug_info_does_not_emit_empty_dbg_metadata() {
+        let program = mir(r#"
+Entry { name: string, value: string }
+fn process(items: array<Entry>) -> i64 {
+  mut b: array_builder<Entry> := array_builder()
+  if items.len() == 0 {
+    return 0
+  }
+  b.push(Entry { name: "test".clone(), value: "val".clone() })
+  return 1
+}
+fn main() -> i32 = 0
+"#);
+        let ctx = Context::create();
+        let module = ctx.create_module("test_dropdeep_dbg");
+        let target = BuildTarget::Baseline;
+        let tm = match create_target_machine(&target, inkwell::OptimizationLevel::None) {
+            Ok(tm) => tm,
+            Err(err) => panic!("create_target_machine failed: {err:?}"),
+        };
+        let debug = DebugInfo {
+            file: "test.align".into(),
+            directory: ".".into(),
+        };
+        let res = build_module(
+            &ctx,
+            &module,
+            &program,
+            &tm,
+            Some(&debug),
+            &[],
+            false,
+            ModuleScope::Whole,
+        );
+        assert!(res.is_ok(), "build_module failed: {:?}", res.err());
+        let ir = module.print_to_string().to_string();
+        assert!(!ir.contains("!dbg !{}"), "module contains invalid empty !dbg attachment:\n{ir}");
+        assert!(module.verify().is_ok());
+    }
 }

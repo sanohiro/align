@@ -2,7 +2,12 @@
 // scalar) is an explicit SIMD register value. Build one from an array literal under a `vecN<T>`
 // annotation; elementwise `+` `-` `*` `/` map to one lane-wise hardware instruction each, and
 // `v[i]` reads lane `i` (a constant). This is the explicit form of the data-oriented core's
-// automatic vectorization — the pipeline (`map`/`where`/`sum`) already vectorizes the same way.
+// automatic vectorization: the pipeline (`map`/`where`) never names a width, so the backend picks
+// the lanes. What the pipeline *reduces* with decides whether it widens — `sum`/`min`/`max` over
+// integers and `min`/`max` over floats (one `llvm.minimum`/`maximum`, NaN-propagating) do, while a
+// float `sum` stays ordered because Align never reassociates floating-point silently. A
+// hand-written `if x > best { best = x }` loop is a different program (an ordered comparison,
+// which skips NaN), so it is not the vectorizable spelling of `max` — see `vec_argmax.align`.
 
 fn main() -> i32 {
   a: vec4<i32> := [1, 2, 3, 4]

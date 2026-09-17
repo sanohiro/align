@@ -29,7 +29,8 @@ v.sqrt()/abs()/floor()/ceil()/round()/trunc()    // per-lane float math
 dot(a, b)                        -> T
 fma(a, b, c)                     -> vecN<T>      // one rounding
 select(m, a, b)                  -> vecN<T>      // lane blend; a and b are BOTH vectors (no broadcast)
-v.sum_where(m)                   -> T            // masked reduction
+                                                  // m: any mask of the same lane COUNT and WIDTH
+v.sum_where(m)                   -> T            // masked reduction; same structural mask rule
 
 s.load(i)                        -> vecN<T>      // N consecutive slice elems; bounds-checked
 s.store(i, v)                                     // through an out/mut slice; bounds-checked
@@ -42,8 +43,13 @@ align(N) Struct { ... }                           // over-align struct; stride p
 
 `vecN<T>` and `maskN<T>` are **Copy scalar-class values** (register-sized aggregates): pass,
 return, store freely; never on the move/drop/escape path. `maskN<T>` is nameable (annotation,
-param, return). `align(N)` is an attribute, not a type — it composes with `layout(C)` in either
-order.
+param, return). A mask's element type is a *naming* convenience only: a mask is `<N x i1>` at the
+machine level, so the operations that consume one (`select`, `sum_where`) admit any mask with the
+same lane count and lane bit width as the vectors it gates. That predicate is
+`align_sema::mask_gates_vector`, and it is called by sema, the checked-HIR record validator and the
+MIR producer validator alike, so no layer can disagree about a blend.
+
+`align(N)` is an attribute, not a type — it composes with `layout(C)` in either order.
 
 ## Effects
 
@@ -84,8 +90,11 @@ None — Copy values. `load` borrows the slice momentarily; `store` requires a w
   via `chunks(N)`.
 - P3 — `align(N)` only ever *over*-aligns, and dynamic `array<align(N) S>` stays rejected until
   aligned heap allocation lands (#319) — the attribute is not a general allocator directive.
-- P4 — mask element type must match the compared vectors (`mask4<i32>` from `vec4<i32>`
-  comparisons); there is no cross-width or cross-type mask reuse.
+- P4 — a mask gates **structurally**, not nominally: `select`/`sum_where` take any mask with the
+  same lane count and lane bit width (`mask4<f32>` gates `vec4<i32>`/`vec4<u32>`/`vec4<f32>`), which
+  is what makes argmax/top-k/index-compaction expressible with exact integer indices. A different
+  lane count or lane width is still rejected. The mask *type* a comparison produces is unchanged, so
+  a written `maskN<T>` annotation must still name the compared element (#1083).
 
 ## Test anchors
 

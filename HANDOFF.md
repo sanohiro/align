@@ -1,5 +1,16 @@
 # Session handoff
 
+**Vectorization contract:** [Plan 68](docs/impl/68-vectorization-contract.md) is
+the design of record for issue 1088 and owns guarantees G1–G10 — the properties
+ordinary Align loops and pipelines need in order to vectorize by default, with
+one owner issue and one acceptance corpus entry each. It settles the promise/try
+split, the ownership map (planned plan 69 loop facts for G1–G3, planned plan 70
+runtime boundary effects for G5, issues 1082 Part 1 and 1083 in progress, 1082
+Part 2 as a future RFC), the locked-decision compliance record including the
+carve-out issue 1084's `assume` fallback would require, and rewritten acceptance
+criteria for issues 1063 and 1064, whose original criteria were measured false
+because they depended on the loop-facts work. No implementation has started.
+
 **Open issue batch:** [Plan 65](docs/impl/65-open-issue-batch-plan.md)'s first
 capability is merged in PR 1056: scalar float inspection, initialized buffers,
 builder capacity, byte-loop proofs and proved-lossless cast diagnostics.
@@ -10,6 +21,13 @@ capability is now implemented: in-place `array<T>.truncate(new_len)` (#1054), ty
 stores `slice<u8>.set_S_E(offset, val)` (#1048), bulk `fill`/`fill_S_E`/`copy_from` (#1051),
 general owned struct field replacement (#1048), and disjoint record field borrows (#1050). Numeric slice copy already optimizes to memcpy.
 Foreign certification, ordered SIMD and native Mac investigations remain open.
+Plan 65's SIMD-surface consistency capability is now implemented: a structural
+vector mask for `select`/`sum_where` (#1083), one `MathFn::Min`/`Max` lowering
+for the pipeline `min`/`max` terminals (#1082 Part 1, a deliberate NaN/±0
+behavior change to match the scalar method), and `buffer.append_filled` (#1073
+part 1). Issue 1082 Part 2 — a scoped opt-in float relaxation surface — remains
+an open design, and the typed `append_filled_S_E` forms are recorded as
+deferred.
 [Plan 67](docs/impl/67-caller-result-placement-plan.md) implements caller result
 placement for already-indirect aggregates, with native ABI cross-link and
 alias-sensitive fallback owners; issue 1047 retains its separate foreign-query

@@ -33,7 +33,7 @@ arr[i].f = v             // element-field write, nested paths ok; dynamic arrays
 fn f(out dst: slice<T>)  // writable-slice param; caller passes a mut binding; no-alias enforced
 
 // stages                          // terminals
-xs.map(f)                          xs.sum() / .count() / .min() / .max()
+xs.map(f)                          xs.sum() / .count() / .min() / .max()   // min/max: MathFn::Min/Max
 xs.where(p) / .where(.flag)        xs.any(p) / .all(p)
 xs.field                           xs.reduce(init, f)      // init FIRST
 xs.scan(init, f)                   xs.to_array()           // materialize -> array<T>
@@ -163,6 +163,20 @@ clone は独立した所有文字列になる。
 寿命が伝播する。元データの無効化と arena からの脱出には既存の規則を適用する。
 受け手・添字・範囲はソース順に一度だけ評価し、途中終了後の境界検査や操作は行わない。
 
+## min/max の lowering はひとつ
+
+`xs.min()` / `xs.max()` は `MathFn::Min` / `MathFn::Max` で畳み込む。これはスカラーの
+`a.max(b)` メソッドや `vecN<T>` のレーン reduction とまったく同じ操作であり、「これらの値の
+最小値・最大値」の lowering は言語全体でひとつになる。整数は `llvm.{s,u}{min,max}`、浮動小数点は
+`llvm.minimum` / `llvm.maximum`（IEEE 754-2019）である。したがって浮動小数点はどの書き方でも
+**NaN を伝播**し、±0 を決定的に順序付ける。操作自身が NaN 意味論を持つため LLVM は reduction を
+ベクタ化できる。`where` は従来どおり、拒否された要素を畳み込みの種（`extreme_of`）に select して
+から reduction する。すべてマスクされた場合はその種が返る。
+
+手書きの `if xs[i] > best { best = xs[i] }` ループはこの形に正規化**しない**。これは別のプログラム
+であり（順序付き比較なので NaN オペランドでは false になり、NaN をスキップする）、書き換えは隠れた
+特別扱いになる。代わりに「ベクタ化される書き方ではない」と明記する（#1082 Part 1）。
+
 ## 明示的なコンストラクタ容量
 
 `buffer.filled(length: i64, value: u8) -> buffer` は、指定した長さの初期化済み
@@ -171,6 +185,16 @@ clone は独立した所有文字列になる。
 初期化は O(length)。負数・サイズのオーバーフローは確保前に停止し、OOM も
 停止する。通常の `buffer(capacity)` は従来どおり best-effort の空の読み取り
 ウィンドウを作る。
+
+`b.append_filled(length: i64, value: u8) -> ()` は同じファミリの append メンバー
+である。`mut buffer` の公開ウィンドウを `value` の `length` バイト分ちょうど
+伸ばす。拡張は一度だけで、拡張の連続やバイトごとの呼び出しにはならない。
+長さゼロは no-op。負数やオーバーフローする長さは書き込み前に停止し、
+コンストラクタと同じ終了ポリシーに従う。`buffer(capacity)` は公開せずに予約
+するだけなので、繰り返しバイトでウィンドウを伸ばす手段はこれになる。
+型付きの `append_filled_S_E` 形式は存在しない。`fill_S_E` は長さが既知の
+公開済みウィンドウを上書きするのに対し、append 形式は独自の要素数の文法を
+必要とし、それを要求する実プログラムの記録がまだないためである。
 
 期待型で要素型を指定する `array_builder()` と `array_builder(out)` は、末尾に
 省略可能な i64 容量を取る。呼び出しは `array_builder(capacity)` または

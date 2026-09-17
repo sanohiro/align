@@ -1964,6 +1964,14 @@ pub enum Rvalue {
         buffer: Operand,
         data: Operand,
     },
+    /// `buf.append_filled(length, value)` — append exactly `length` bytes of `value` to the
+    /// growable `buffer` operand, growing it once. `length` is an `i64` and `value` a `u8`; zero
+    /// length is a no-op and a negative/overflowing length aborts before any write.
+    BufferAppendFilled {
+        buffer: Operand,
+        length: Operand,
+        value: Operand,
+    },
     /// Open an empty typed array builder. `region` selects arena-backed chunk storage; `None`
     /// preserves the existing individually-owned heap form. Physical element layout is computed by
     /// the target backend from `elem`.
@@ -8304,6 +8312,11 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 lower_buffer_put(b, buffer, value, *be)
             }
             hir::ExprKind::BufferAppend { buffer, data } => lower_buffer_append(b, buffer, data),
+            hir::ExprKind::BufferAppendFilled {
+                buffer,
+                length,
+                value,
+            } => lower_buffer_append_filled(b, buffer, length, value),
             // `array_builder<T>` (M12 A6) — new/push/append/build go through ONE `#[inline(never)]`
             // dispatcher so they add a single tiny arm to the recursive `lower_expr` frame, not four
             // inline bodies (the #296 expr-depth lesson).
@@ -12235,6 +12248,29 @@ fn lower_buffer_append(b: &mut Builder, buffer: &hir::Expr, data: &hir::Expr) ->
     Operand::Const(Const::Unit)
 }
 
+/// `buf.append_filled(length, value)` — one runtime call that grows the published window by
+/// `length` bytes of `value`. Operands lower in source order (receiver, length, value).
+fn lower_buffer_append_filled(
+    b: &mut Builder,
+    buffer: &hir::Expr,
+    length: &hir::Expr,
+    value: &hir::Expr,
+) -> Operand {
+    let bufop = lower_required!(b, lower_expr(b, buffer), Operand::Const(Const::Unit));
+    let lenop = lower_required!(b, lower_expr(b, length), Operand::Const(Const::Unit));
+    let valop = lower_required!(b, lower_expr(b, value), Operand::Const(Const::Unit));
+    let t = b.fresh_value(Ty::Unit);
+    b.push(Stmt::Let(
+        t,
+        Rvalue::BufferAppendFilled {
+            buffer: bufop,
+            length: lenop,
+            value: valop,
+        },
+    ));
+    Operand::Const(Const::Unit)
+}
+
 /// Lower a `chunks` source to its borrowed `{ptr,len}` view without allocating chunk headers.
 /// Fresh owned sources retain their synthetic owner through the returned operand.
 fn lower_chunks_source(b: &mut Builder, source: &hir::Expr, elem: Ty) -> Operand {
@@ -13070,6 +13106,20 @@ fn extreme_of(ty: Ty, is_max: bool) -> Operand {
         }
         // Unreachable: sema guarantees a numeric element (see the doc comment).
         _ => Operand::Const(Const::Int(0, ty)),
+    }
+}
+
+/// The one math builtin a `min`/`max` pipeline terminal reduces with. Naming it here keeps the two
+/// reducer sites (the array/slice fold and the streaming fold) and the scalar `a.max(b)` method on
+/// literally the same operation, so "the maximum of these values" has exactly one lowering:
+/// `llvm.{s,u}{min,max}` for integers, `llvm.minimum`/`llvm.maximum` (IEEE 754-2019, NaN-propagating,
+/// deterministic ±0 order) for floats. Sema's `check_array_min_max` admits only numeric elements, so
+/// the operand type always classifies as one of those four.
+fn min_max_fn(is_max: bool) -> align_sema::MathFn {
+    if is_max {
+        align_sema::MathFn::Max
+    } else {
+        align_sema::MathFn::Min
     }
 }
 
@@ -14375,14 +14425,17 @@ fn lower_array_reduce(
             ));
             Operand::Value(n)
         }
-        // `min`/`max`: acc = (cur `op` acc) ? cur : acc — the branchless min/max reduction idiom
-        // LLVM recognizes (`llvm.{s,u}{min,max}` / `llvm.{min,max}imum`). The comparison is the same
-        // one the former per-element branch used (`Lt` for min, `Gt` for max, floats → ordered
-        // `OLT`/`OGT`), so NaN handling is unchanged: an ordered compare with a NaN operand is false,
-        // so the running best is kept and NaN elements are skipped, exactly as before. A `where`
-        // first selects each masked-out lane to the type extreme that can never win (`min` → type
-        // max / `+∞`, `max` → type min / `−∞`), which is exactly the fold seed (`extreme_of`) — so an
-        // all-masked selection still returns that seed, unchanged from the branch form.
+        // `min`/`max`: acc = min/max(cur, acc) — the SAME `MathFn::Min`/`MathFn::Max` operation the
+        // scalar method (`a.max(b)`) and the explicit vector lane reduction (`v.max()`) already use,
+        // so the language has exactly one lowering of "the minimum/maximum of these values":
+        // `llvm.{s,u}{min,max}` for integers and `llvm.minimum`/`llvm.maximum` (IEEE 754-2019) for
+        // floats. The previous `fcmp ogt` + `select` spelling was a *different* operation with no
+        // NaN semantics attached, which is why LLVM could not form a float reduction from it — and
+        // why a NaN element was silently skipped here while `a.max(b)` propagated it. Floats now
+        // propagate NaN and order ±0 deterministically in every spelling; the integer lowering is
+        // unchanged in meaning. A `where` still first selects each masked-out lane to the type
+        // extreme that can never win (`min` → type max / `+∞`, `max` → type min / `−∞`), which is
+        // exactly the fold seed (`extreme_of`), so an all-masked selection still returns that seed.
         Reducer::MinMax { is_max } => {
             let cur = cur.expect("min/max needs a scalar element");
             let cur = match &mask {
@@ -14400,19 +14453,13 @@ fn lower_array_reduce(
                 }
                 None => cur,
             };
-            let op = if *is_max { BinOp::Gt } else { BinOp::Lt };
-            let cmp = b.fresh_value(Ty::Bool);
-            b.push(Stmt::Let(
-                cmp,
-                Rvalue::Bin(op, cur.clone(), Operand::Value(a)),
-            ));
             let n = b.fresh_value(acc_ty);
             b.push(Stmt::Let(
                 n,
-                Rvalue::Select {
-                    cond: Operand::Value(cmp),
-                    a: cur,
-                    b: Operand::Value(a),
+                Rvalue::MathOp {
+                    fn_: min_max_fn(*is_max),
+                    ty: acc_ty,
+                    operands: vec![cur, Operand::Value(a)],
                 },
             ));
             Operand::Value(n)
@@ -14672,23 +14719,18 @@ fn lower_json_scan_reduce(
             ));
             Operand::Value(n)
         }
-        // `min`/`max`: `acc = (cur `op` acc) ? cur : acc` — the branchless reduction idiom (the array
-        // path's masked select collapses to this guarded form; NaN handling identical).
+        // `min`/`max`: `acc = min/max(cur, acc)` — the one `MathFn::Min`/`MathFn::Max` lowering the
+        // array path, the scalar method and the vector lane reduction all share (the array path's
+        // masked select collapses to this guarded form).
         Reducer::MinMax { is_max } => {
             let cur = cur.expect("min/max needs a scalar element");
-            let op = if *is_max { BinOp::Gt } else { BinOp::Lt };
-            let cmp = b.fresh_value(Ty::Bool);
-            b.push(Stmt::Let(
-                cmp,
-                Rvalue::Bin(op, cur.clone(), Operand::Value(a)),
-            ));
             let n = b.fresh_value(acc_ty);
             b.push(Stmt::Let(
                 n,
-                Rvalue::Select {
-                    cond: Operand::Value(cmp),
-                    a: cur,
-                    b: Operand::Value(a),
+                Rvalue::MathOp {
+                    fn_: min_max_fn(*is_max),
+                    ty: acc_ty,
+                    operands: vec![cur, Operand::Value(a)],
                 },
             ));
             Operand::Value(n)

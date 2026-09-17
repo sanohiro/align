@@ -486,6 +486,77 @@ The local evidence packet retains all nine samples, source and artifact hashes:
 probe `751d60b8e04a795b8a7e2c8300f6e3b37607117f29b146f2e9b8fe2813c4d7a8`,
 runtime `4d4755e37eb6f63b092cc6457b618f685c3adae7502dfa80ca3a8f60f4ad5598`.
 
+## SIMD-surface consistency capability (issues 1083, 1082 Part 1, 1073 part 1)
+
+Three later issues each remove one inconsistency from an already-shipped surface
+rather than adding a facility. They share one boundary because each is a
+front-end or lowering rule with no new ownership, region or allocation model,
+and because two of them touch the same masked/reduction path. None of them
+reopens a Settled decision: the mask relaxation is a pure widening of what
+type-checks, the min/max unification makes one operation have one lowering, and
+the append member completes the bulk-write family whose constructor row B and
+overwrite rows M/P already shipped. Part 2 of issue 1082 (a scoped float
+relaxation surface) is deliberately **not** in this capability: it is a new
+language surface and needs its own design, not a lowering repair.
+
+### Additional public-contract ledger
+
+| ID / exact surface | Inputs, results and errors | Ownership, lifetime, allocation and effect | Owner, prerequisite and acceptance |
+| --- | --- | --- | --- |
+| S: `select(mask, a, b)` and `vec.sum_where(mask)` admit any mask with the same lane count and lane bit width | `a`/`b` are `vecN<T>`; the mask is any `maskM<E>` with `M == N` and `lane_bits(E) == lane_bits(T)`. `mask4<f32>` gates `vec4<i32>`/`vec4<u32>`/`vec4<f32>`; `mask2<f64>` gates the 64-bit family. A differing lane count or lane width keeps the existing rejection, whose message now names the structural rule. The result type is unchanged (`vecN<T>` / `T`). The `maskN<T>` **type** and the type a comparison produces are unchanged, so a written annotation still names the compared element. | No ownership, region or allocation change: masks and vectors stay Copy scalar-class values, and the operation stays Pure. Emitted IR is identical for every program that already compiled, and a relaxed case is a plain `select <N x i1>` with no conversion introduced. | `align_sema::mask_gates_vector`, called by `check_select`, `check_vec_sum_where`, `validate_hir`'s `Select`/`VecSumWhere` records and `producer.rs`'s `Rvalue::Select` equation. `align_driver --test vec_simd` (S owner). |
+| R: `xs.min()` / `xs.max()` pipeline terminals lower through `MathFn::Min` / `MathFn::Max` | No API, arity or result-type change. Integers reduce with `llvm.smin`/`umin`/`smax`/`umax`; floats with `llvm.minimum`/`llvm.maximum` (IEEE 754-2019). Floats therefore **propagate NaN** and order ±0 deterministically, which is a deliberate behavior change from the previous `fcmp ogt` + `select` spelling that skipped NaN elements and left ±0 order-dependent. The empty-pipeline fold identity (`extreme_of`) is unchanged, as are all NaN-free results. A `where` still selects a rejected element to that identity before the reduction. | No ownership, allocation or effect change. Both reducer sites (array/slice fold and streaming fold) emit the one record; the scalar `a.max(b)` method and the `vecN<T>` lane reduction already did. | `align_mir`'s `min_max_fn` plus both `Reducer::MinMax` arms. `align_driver --test scalar_math` (R owner) pins the emitted intrinsic per element class, the masked form, NaN/±0 conformance against the scalar method, and unchanged ordinary results. `--test vectorize_shapes` k4 remains the x86 reduction-shape control. |
+| B2: `buffer.append_filled(length: i64, value: u8) -> ()` | Appends exactly `length` bytes of `value` to the published window of a `mut buffer` local. `length == 0` is a no-op. A negative or unrepresentable `length`, and a total length that overflows, abort before any write through the same terminal `align_rt_alloc_size_fail`/OOM policy as row B; there is no `Result`. A non-`buffer` receiver, an immutable buffer, the wrong arity and a non-`i64`/non-`u8` argument are static errors. Operands evaluate once in source order (receiver, length, value). | Grows existing owned backing in place; no ownership transfer, no new region, no snapshot. One payload acquisition/growth, never a growth sequence or a call per byte; O(length) initialization. Source effect is the existing in-memory buffer-write effect, so it registers as a storage mutation exactly like `put_*`/`append`. | `hir::ExprKind::BufferAppendFilled` → `Rvalue::BufferAppendFilled` → `RuntimeKey::BufferAppendFilled` → `void @align_rt_buffer_append_filled(ptr, i64 length, i8 value)`. Native ABI inventory becomes 446 keyed / 464 base. `align_driver --test bytes_ops` (B2 owner). |
+
+Row S widens only the *compatibility predicate*. It does not introduce a mask
+conversion, a splat into a `select` operand, or a width-generic mask, and it
+does not make `Ty::Mask` structural for unification: `mask4<f32>` and
+`mask4<i32>` remain distinct types, so an annotation, parameter or return still
+names its element. The single predicate is what keeps sema, the checked-HIR
+record contract and the MIR producer equation from disagreeing; do not restate
+it at a fourth site.
+
+Row R states the choice issue 1082 left open for the hand-written
+`if xs[i] > best { best = xs[i] }` loop: it is **documented as not the
+vectorizable spelling**, not canonicalized in MIR. Canonicalizing an ordered
+comparison into a NaN-propagating minimum/maximum would silently change that
+program's meaning and would be exactly the magic special case the invariants
+forbid. The unified reducer keeps its lowering visible in source instead.
+
+Row B2 defers the typed `append_filled_S_E` suffix forms, with the reason
+recorded once: row P's `fill_S_E` overwrites an already-published window whose
+length the writer already knows and whose divisibility is the only obligation,
+while an append form would have to introduce its own element-count grammar
+(`append_filled_u32_le(count, value)`) and a second overflow domain. No recorded
+program needs it, so the family stays uniform by having exactly one append
+member rather than sixteen speculative ones. Half (2) of issue 1073 — the
+`memory(argmem: readwrite)` classification of `BufferPut` and the other
+argument-only runtime rows — remains owned by issue 1071 and is untouched here;
+the new row carries the same empty `fn_attrs` as its neighbours.
+
+### Additional implementation closure matrix
+
+| Axis | Required cases and exact owning target |
+| --- | --- |
+| S admission (widened) | `mask4<f32>` gating `vec4<i32>`, `vec4<u32>` and `vec4<f32>`; `mask4<i32>` gating `vec4<f32>`; `mask2<f64>` gating `vec2<i64>`; the same relaxation through `sum_where`. `vec_simd::a_float_mask_blends_integer_vectors_of_the_same_lane_width`, `a_float_mask_blends_unsigned_vectors_and_an_integer_mask_blends_floats`, `a_sixty_four_bit_float_mask_blends_sixty_four_bit_integer_vectors`, `a_cross_typed_mask_also_gates_a_masked_horizontal_sum`. |
+| S rejection (unchanged) | Lane-width mismatch (`mask4<f32>` vs `vec2<f64>`), lane-count mismatch (`mask4<f32>` vs `vec8<i32>`), a non-mask first argument, and the unchanged annotation mismatch (`m: mask4<f32> := a > a` over `vec4<i32>`). `vec_simd::a_mask_of_a_different_lane_width_or_lane_count_is_still_rejected` and the existing `a_mask_with_a_mismatched_element_or_width_is_rejected`. |
+| S layer agreement | Sema, checked-HIR record and MIR producer equation must admit the same set: a widened program that passes sema must lower, and the emitted blend is a plain `select <N x i1>` with no `sitofp`/`uitofp`/`fptosi`/`fptoui`. `vec_simd::a_widened_blend_emits_a_plain_select_with_no_conversion` plus every runtime owner above (a disagreement is an internal-error abort at the MIR boundary, not a wrong answer). |
+| R lowering identity | `slice<f32>`/`slice<f64>` → `llvm.maximum`/`llvm.minimum` with no `fcmp ogt` left; `slice<i64>` → `llvm.smax`; `slice<u32>` → `llvm.umin`; the masked (`where`) form; both the array/slice and streaming reducer sites. `scalar_math::the_pipeline_terminal_emits_the_same_intrinsic_as_the_scalar_method`, `a_masked_pipeline_terminal_uses_the_same_intrinsic_after_its_lane_select`. |
+| R observable semantics | A NaN element, an all-NaN slice, a `-0.0`/`+0.0` pair, agreement with the scalar `a.max(b)`, unchanged ordinary integer/float results and unchanged empty-pipeline identities. `scalar_math::pipeline_and_scalar_min_max_agree_on_nan_and_signed_zero`, `pipeline_min_max_values_are_unchanged_for_ordinary_numbers`. |
+| R vectorization shape | The float terminal forms a `<4 x float>` `llvm.maximum` body plus `llvm.vector.reduce.fmaximum`; the integer masked terminal keeps its `llvm.vector.reduce.smin`. `vectorize_shapes` k4 remains the pinned x86 control (that suite is x86-gated by construction; the AArch64 equivalent was inspected locally, not pinned). |
+| B2 domains | `n` ∈ {0, 1, 7, 4096, 65536} × `v` ∈ {0x00, 0xff} byte-identical to `buffer.filled(n, v)`, with the same published length; extension of an already-published window; composition with `put_*` before and after; a 64 KiB fill emitting one `align_rt_buffer_append_filled` and zero `align_rt_buffer_put`; a negative length aborting before any write. `bytes_ops::append_filled_matches_the_filled_constructor_byte_for_byte`, `append_filled_extends_an_existing_window_and_composes_with_the_other_writers`, `a_bulk_zero_fill_emits_one_runtime_call_and_no_per_byte_put`, `a_negative_append_filled_length_aborts_before_any_write`. |
+| B2 static rejection | Non-`buffer` receiver, immutable buffer, wrong arity, non-`i64` length, non-`u8` value. `bytes_ops::append_filled_rejects_a_wrong_receiver_arity_or_argument_type`. |
+| B2 record and ABI identity | The new checked-HIR record validates its exact operand types and mutable-local receiver, so a forged record is rejected before lowering; `RuntimeKey::ALL` and the keyed/base registry counts move together (446/464) and the exported symbol matches its declared shape. `align_codegen_llvm --lib` runtime-ABI owners and `scripts/test-runtime-abi-exports.sh`. |
+| B2 optimizer interaction | `byte_storage`'s bounded nonescaping promotion does **not** recognize the new write. Its documented `_ => false` default therefore declines the plan for any function containing one, selecting the ordinary Buffer ABI — correct, and deliberately left as the conservative answer rather than adding a second constant-extent path in this capability. No owner is required for a decline; the existing `runway_a2_binary_codec` byte-storage owners still pass unchanged. |
+
+Documentation propagated in the same change: `draft.md` §8 (the one min/max
+semantics), §9 (the structural mask rule), §12 and §18.1 (`append_filled`);
+`docs/language-spec.md` (all three); `docs/impl/core-design/vec-mask.md`,
+`array-slice-pipeline.md`, `string.md` and their `ja/` mirrors;
+`examples/vec_simd.align`, whose automatic-vectorization claim was false for
+`max`/`min` and misleading for a float `sum`, and the new
+`examples/vec_argmax.align`, which is the integer-index masked argmax the mask
+relaxation exists for.
+
 ## Target identity and inspection roots (issues 1086, 1087)
 
 Two tooling contracts, one capability: what a compiler *is* building for, and what

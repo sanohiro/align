@@ -31,6 +31,7 @@ enum NativeReturn {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuntimeAbiShape {
+    BufferAppendFilled,
     BufferFilled,
     ArrayBuilderCapacity,
     ArrayBuilderRegionCapacity,
@@ -302,6 +303,13 @@ impl RuntimeAbi {
         }
     }
 
+    /// Shed this row's curated *enum* contract from a merged `--rt-lto` definition: the attributes
+    /// describe the declaration's promise, and LLVM re-derives them from the now-visible body.
+    ///
+    /// The producing compiler's *string* attributes are shed separately, by
+    /// [`shed_string_attributes`] over every definition in the baked artifact — the merge brings in
+    /// whatever that artifact defines, not only the guarded rows, so the owner of that half is the
+    /// module sweep rather than this per-row call.
     pub(super) fn remove_attributes(self, function: FunctionValue<'_>) {
         use inkwell::attributes::AttributeLoc;
         let spec = shape_spec(self.shape);
@@ -342,6 +350,66 @@ impl RuntimeAbi {
         match self.key {
             RuntimeAbiId::Keyed(key) => Some(key),
             RuntimeAbiId::Unkeyed(_) => None,
+        }
+    }
+}
+
+/// Every attribute location a function can carry attributes at: the function itself, its return,
+/// and each parameter. One enumeration shared by [`shed_string_attributes`] and
+/// [`super::verify_rt_lto_target_independence`], so the shedder and its check can never disagree
+/// about where they look.
+pub(super) fn attribute_locations(
+    function: FunctionValue<'_>,
+) -> impl Iterator<Item = inkwell::attributes::AttributeLoc> + use<> {
+    use inkwell::attributes::AttributeLoc;
+    [AttributeLoc::Function, AttributeLoc::Return]
+        .into_iter()
+        .chain((0..function.count_params()).map(AttributeLoc::Param))
+}
+
+/// Every string-attribute key `function` carries at `loc`, in LLVM's own order.
+///
+/// The keys are returned owned because `get_string_kind_id` borrows from the attribute handle it
+/// is read from. A key that is not UTF-8 (no LLVM-emitted key is) spells lossily here, so it would
+/// fail to be removed and then be reported by [`super::verify_rt_lto_target_independence`], which
+/// detects string attributes through `LLVMIsStringAttribute` rather than through the key: the pair
+/// fails closed rather than silently keeping such a key.
+pub(super) fn string_attribute_keys(
+    function: FunctionValue<'_>,
+    loc: inkwell::attributes::AttributeLoc,
+) -> Vec<String> {
+    function
+        .attributes(loc)
+        .into_iter()
+        .filter(|attr| attr.is_string())
+        .map(|attr| attr.get_string_kind_id().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Shed every string attribute `function` carries, at every attribute location.
+///
+/// This is the string half of what a `--rt-lto` merged definition must not keep, and it is stated
+/// as a closed class rather than a name list. `rustc` bakes its own target selection and codegen
+/// policy into `str_prims.bc` (`"target-cpu"="apple-m1"`, `"probe-stack"`, `"frame-pointer"`, and
+/// `"target-features"` wherever its default carries features), while a definition merged into the
+/// program module must inherit the program's own `TargetMachine`. A surviving `"target-cpu"` makes
+/// AArch64's `areInlineCompatible` refuse the inline into the `generic` caller that the settled
+/// `--target-cpu baseline` default selects, so the settled default-ON merge silently bought
+/// nothing on aarch64; `"probe-stack"` additionally propagates callee-to-caller through the
+/// inliner (`adjustCallerStackProbes`), applying a stack-probe requirement to Align code that
+/// never asked for one. Naming the baked strings would reopen that the next time `rustc` bakes one
+/// more, so the rule is the inverse: no string attribute survives the merge, at any location.
+///
+/// None is semantic for the guarded rows — they are integer-only leaf predicates whose semantics
+/// live in their curated enum contract, and LLVM's own semantic parameter/return attributes
+/// (`readonly`, `noalias`, `align`, …) are enum attributes, which this leaves untouched. LLVM does
+/// have semantic string attributes (SME state, `"alloc-family"`, `"no-builtins"`), so admitting a
+/// row that carries one is a question for the deferred rt-LTO admission criterion, not something
+/// this sweep may decide silently.
+pub(super) fn shed_string_attributes(function: FunctionValue<'_>) {
+    for loc in attribute_locations(function) {
+        for key in string_attribute_keys(function, loc) {
+            function.remove_string_attribute(loc, &key);
         }
     }
 }
@@ -469,6 +537,11 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
             key,
             symbol: "align_rt_buffer_append",
             shape: RuntimeAbiShape::A73,
+        },
+        RuntimeKey::BufferAppendFilled => RuntimeAbi {
+            key,
+            symbol: "align_rt_buffer_append_filled",
+            shape: RuntimeAbiShape::BufferAppendFilled,
         },
         RuntimeKey::BufferBytes => RuntimeAbi {
             key,
@@ -2255,15 +2328,15 @@ pub(super) fn runtime_abis() -> impl Iterator<Item = RuntimeAbi> {
 }
 
 pub(super) fn validate_registry() -> Result<(), String> {
-    if RuntimeKey::ALL.len() != 445 || keyed_runtime_abis().len() != 445 {
+    if RuntimeKey::ALL.len() != 446 || keyed_runtime_abis().len() != 446 {
         return Err("runtime ABI registry invariant: key-count".to_string());
     }
-    if runtime_abis().count() != 463 {
+    if runtime_abis().count() != 464 {
         return Err("runtime ABI registry invariant: base-count".to_string());
     }
 
     let mut keys = HashSet::with_capacity(RuntimeKey::ALL.len());
-    let mut symbols = HashSet::with_capacity(463);
+    let mut symbols = HashSet::with_capacity(464);
     for abi in keyed_runtime_abis() {
         let key = abi
             .runtime_key()
@@ -3125,6 +3198,14 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
         RuntimeAbiShape::ArrayBuilderStackCapacity => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,
             params: &[NativeType::Ptr, NativeType::I64, NativeType::I64],
+            return_noalias: false,
+            fn_attrs: &[],
+            memory_argmem_read: false,
+            read_ptr_params: &[],
+        },
+        RuntimeAbiShape::BufferAppendFilled => RuntimeAbiShapeSpec {
+            ret: NativeReturn::Void,
+            params: &[NativeType::Ptr, NativeType::I64, NativeType::I8],
             return_noalias: false,
             fn_attrs: &[],
             memory_argmem_read: false,
@@ -4022,17 +4103,17 @@ mod tests {
         );
         validate_registry().unwrap();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 463);
+        assert_eq!(rows.len(), 464);
         assert_eq!(
             rows.iter().map(|row| row.key).collect::<HashSet<_>>().len(),
-            463
+            464
         );
         assert_eq!(
             rows.iter()
                 .map(|row| row.symbol)
                 .collect::<HashSet<_>>()
                 .len(),
-            463
+            464
         );
         for (key, row) in RuntimeKey::ALL.into_iter().zip(keyed_runtime_abis()) {
             assert_eq!(row.key, RuntimeAbiId::Keyed(key));
@@ -4062,7 +4143,7 @@ mod tests {
     fn runtime_abi_extern_type_matrix_is_exact_for_every_row_and_ordinal() {
         let ctx = inkwell::context::Context::create();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 463);
+        assert_eq!(rows.len(), 464);
 
         for row in rows {
             let symbol = row.symbol;
