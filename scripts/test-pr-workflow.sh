@@ -2192,8 +2192,10 @@ for identity in \
 done
 
 # 8. The nightly admits measured long runners first. Priority changes only
-# launch order: every qualified target still runs once, and unranked targets
-# retain Cargo's artifact order.
+# launch order: every qualified target still runs once, and equal ranks break
+# by the stable package/kind/name identity. That tie-break is load-bearing for
+# sharding, not cosmetic — Cargo emits artifacts in completion order, which
+# varies between builds, and each shard partitions this list on its own runner.
 mkdir -p "$suite_dir/align_driver"
 schedule_stream="$tmp_dir/suite-priority-order.json"
 {
@@ -2215,18 +2217,75 @@ ALIGN_GATE_JOBS=1 ALIGN_TB_VERBOSE=1 ALIGN_SUITE_BINARY_TIMEOUT=2 \
   exit 1
 }
 schedule_starts="$(sed -n 's/^suite: start //p' "$schedule_out")"
+# pkg_db_a1 100, pkg_db_q3 94, deep_type_graphs 92, inprocess_memo 45, then the
+# two unranked targets in identity order — constants before m0, NOT the m0-first
+# order the artifact stream above lists them in.
 expected_schedule="$(printf '%s\n' \
   'align_driver::test::pkg_db_a1' \
   'align_driver::test::pkg_db_q3' \
   'align_driver::test::deep_type_graphs' \
   'align_driver::test::inprocess_memo' \
-  'align_driver::test::m0' \
-  'align_driver::test::constants')"
+  'align_driver::test::constants' \
+  'align_driver::test::m0')"
 [[ "$schedule_starts" == "$expected_schedule" ]] || {
-  echo "the suite did not admit long runners first while retaining the unranked order:" >&2
+  echo "the suite did not admit long runners first, then equal ranks by identity:" >&2
   printf 'expected:\n%s\nactual:\n%s\n' "$expected_schedule" "$schedule_starts" >&2
   exit 1
 }
+
+# The admission order must not depend on the artifact stream's order at all.
+# Cargo emits artifacts as compilation completes, so two runners building the
+# same commit can see different orders; if that leaked into the order, the
+# shard partitions computed on separate runners would disagree and targets
+# would be run twice or not at all with every shard still green.
+reordered_stream="$tmp_dir/suite-priority-reordered.json"
+{
+  printf '{"reason":"build-script-executed","package_id":"x",'
+  printf '"linked_paths":["native=%s/bin"],"cfgs":[],"env":[]}\n' "$suite_dir"
+  suite_artifact "$suite_green" align_driver test inprocess_memo
+  suite_artifact "$suite_green" align_driver test constants
+  suite_artifact "$suite_green" align_driver test deep_type_graphs
+  suite_artifact "$suite_green" align_driver test m0
+  suite_artifact "$suite_green" align_driver test pkg_db_a1
+  suite_artifact "$suite_green" align_driver test pkg_db_q3
+} >"$reordered_stream"
+reordered_out="$tmp_dir/suite-priority-reordered-out"
+ALIGN_GATE_JOBS=1 ALIGN_TB_VERBOSE=1 ALIGN_SUITE_BINARY_TIMEOUT=2 \
+  ALIGN_KNOWN_FAILURES="$empty_manifest" \
+  "$suite_runner" "$reordered_stream" >"$reordered_out" 2>&1 || {
+  echo "the reordered-stream suite fixture failed:" >&2
+  cat "$reordered_out" >&2
+  exit 1
+}
+reordered_starts="$(sed -n 's/^suite: start //p' "$reordered_out")"
+[[ "$reordered_starts" == "$expected_schedule" ]] || {
+  echo "admission order followed the artifact stream instead of the identity:" >&2
+  printf 'expected:\n%s\nactual:\n%s\n' "$expected_schedule" "$reordered_starts" >&2
+  exit 1
+}
+# ... and therefore neither does the partition. Same targets, two stream
+# orders, same shard membership.
+for shard_index in 1 2 3; do
+  a="$tmp_dir/suite-partition-a-$shard_index"
+  b="$tmp_dir/suite-partition-b-$shard_index"
+  for pair in "$schedule_stream:$a" "$reordered_stream:$b"; do
+    ALIGN_GATE_JOBS=1 ALIGN_TB_VERBOSE=1 ALIGN_SUITE_BINARY_TIMEOUT=2 \
+      ALIGN_SUITE_SHARDS=3 ALIGN_SUITE_SHARD="$shard_index" \
+      ALIGN_KNOWN_FAILURES="$empty_manifest" \
+      "$suite_runner" "${pair%%:*}" >"${pair##*:}" 2>&1 || {
+      echo "shard $shard_index of the partition-stability fixture failed:" >&2
+      cat "${pair##*:}" >&2
+      exit 1
+    }
+  done
+  [[ "$(sed -n 's/^suite: start //p' "$a")" == "$(sed -n 's/^suite: start //p' "$b")" ]] || {
+    echo "shard $shard_index membership depends on the artifact stream order:" >&2
+    printf 'from one order:\n%s\nfrom the other:\n%s\n' \
+      "$(sed -n 's/^suite: start //p' "$a")" \
+      "$(sed -n 's/^suite: start //p' "$b")" >&2
+    exit 1
+  }
+done
 
 # 9. The self-build branch (no artifact argument) must build the workspace
 # before the test-binary build — `cargo test --no-run` alone does not produce
@@ -2252,6 +2311,9 @@ cat >"$suite_build_root/scripts/cargo.sh" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >>"$FAKE_CARGO_LOG"
+# Stands in for a cold-cache or stalled compile, so the build phase can be
+# driven past the whole-run budget without compiling anything.
+sleep "${FAKE_CARGO_SLEEP:-0}"
 case "$1" in
   build) exit 0 ;;
   metadata) printf '{"target_directory":"%s"}\n' "$FAKE_TARGET_DIR" ;;
@@ -2331,6 +2393,189 @@ case "$(sed -n '3p' "$suite_build_cargo_log")" in
     ;;
 esac
 
+# The whole-run budget has to bite WHILE a build runs, not only between
+# phases. A cold or stalled build would otherwise consume the entire job
+# timeout, the job-level cap would cancel the job, and the night would end in
+# the silent cancellation the budget exists to replace — with the cache save
+# skipped too, guaranteeing the next night starts just as cold.
+build_deadline_out="$tmp_dir/suite-build-deadline-out"
+build_deadline_status=0
+: >"$suite_build_cargo_log"
+FAKE_CARGO_LOG="$suite_build_cargo_log" \
+  FAKE_SUITE_ARTIFACTS="$suite_build_artifacts" \
+  FAKE_TARGET_DIR="$suite_build_root/target" \
+  FAKE_CARGO_SLEEP=30 \
+  ALIGN_GATE_JOBS=2 ALIGN_SUITE_BINARY_TIMEOUT=2 ALIGN_SUITE_DEADLINE=1 \
+  ALIGN_KNOWN_FAILURES="$empty_manifest" \
+  "$suite_build_root/scripts/run-suite-binaries.sh" \
+  >"$build_deadline_out" 2>&1 || build_deadline_status=$?
+[[ "$build_deadline_status" -eq 1 ]] || {
+  echo "an over-budget build exited $build_deadline_status (expected 1):" >&2
+  cat "$build_deadline_out" >&2
+  exit 1
+}
+grep -Fq 'BUDGET EXCEEDED during the workspace build' "$build_deadline_out" || {
+  echo "the over-budget build did not name the phase that consumed the budget:" >&2
+  cat "$build_deadline_out" >&2
+  exit 1
+}
+# And it must not have gone on to the next phase.
+[[ "$(wc -l <"$suite_build_cargo_log" | tr -d '[:space:]')" -eq 1 ]] || {
+  echo "the over-budget build continued past the phase that blew the budget:" >&2
+  cat "$suite_build_cargo_log" >&2
+  exit 1
+}
+
+# 10. Sharding partitions the RUN set and nothing else. Every workspace binary
+# belongs to exactly one shard, and the union of the shards is the whole
+# suite — a binary silently dropped by the partition is a test that stopped
+# being run at all, which is the one thing a detector may never do.
+shard_stream="$tmp_dir/suite-shard.json"
+{
+  printf '{"reason":"build-script-executed","package_id":"x",'
+  printf '"linked_paths":["native=%s/bin"],"cfgs":[],"env":[]}\n' "$suite_dir"
+  suite_artifact "$suite_green" align_driver test pkg_db_a1
+  suite_artifact "$suite_green" align_driver test pkg_db_q3
+  suite_artifact "$suite_green" align_driver test deep_type_graphs
+  suite_artifact "$suite_green" align_driver test m0
+  suite_artifact "$suite_green" align_driver test constants
+} >"$shard_stream"
+shard_union="$tmp_dir/suite-shard-union"
+: >"$shard_union"
+for shard_index in 1 2; do
+  shard_out="$tmp_dir/suite-shard-$shard_index-out"
+  ALIGN_GATE_JOBS=1 ALIGN_TB_VERBOSE=1 ALIGN_SUITE_BINARY_TIMEOUT=2 \
+    ALIGN_SUITE_SHARDS=2 ALIGN_SUITE_SHARD="$shard_index" \
+    ALIGN_KNOWN_FAILURES="$empty_manifest" \
+    "$suite_runner" "$shard_stream" >"$shard_out" 2>&1 || {
+    echo "suite shard $shard_index of 2 failed:" >&2
+    cat "$shard_out" >&2
+    exit 1
+  }
+  # Every shard reports the whole-workspace denominator, not just its slice.
+  grep -Fq "suite: shard $shard_index of 2 of 5 workspace binaries" "$shard_out" || {
+    echo "suite shard $shard_index did not report the workspace-wide count:" >&2
+    cat "$shard_out" >&2
+    exit 1
+  }
+  sed -n 's/^suite: start //p' "$shard_out" >>"$shard_union"
+done
+shard_union_sorted="$(LC_ALL=C sort "$shard_union")"
+shard_expected="$(printf '%s\n' \
+  'align_driver::test::constants' \
+  'align_driver::test::deep_type_graphs' \
+  'align_driver::test::m0' \
+  'align_driver::test::pkg_db_a1' \
+  'align_driver::test::pkg_db_q3')"
+[[ "$shard_union_sorted" == "$shard_expected" ]] || {
+  echo "the shards are not a partition of the workspace binaries:" >&2
+  printf 'expected:\n%s\nactual:\n%s\n' "$shard_expected" "$shard_union_sorted" >&2
+  exit 1
+}
+[[ "$(LC_ALL=C sort -u "$shard_union" | wc -l | tr -d '[:space:]')" \
+  -eq "$(wc -l <"$shard_union" | tr -d '[:space:]')" ]] || {
+  echo "a binary was run by more than one shard:" >&2
+  cat "$shard_union" >&2
+  exit 1
+}
+# A shard that cannot exist is a configuration error, not a green empty run.
+shard_empty_out="$tmp_dir/suite-shard-empty-out"
+shard_empty_status=0
+ALIGN_GATE_JOBS=1 ALIGN_SUITE_BINARY_TIMEOUT=2 \
+  ALIGN_SUITE_SHARDS=2 ALIGN_SUITE_SHARD=3 \
+  ALIGN_KNOWN_FAILURES="$empty_manifest" \
+  "$suite_runner" "$shard_stream" >"$shard_empty_out" 2>&1 ||
+  shard_empty_status=$?
+[[ "$shard_empty_status" -eq 2 ]] || {
+  echo "an out-of-range shard exited $shard_empty_status (expected 2):" >&2
+  cat "$shard_empty_out" >&2
+  exit 1
+}
+
+# A manifest entry owned by ANOTHER shard must not be reported as repaired.
+# This is the ratchet pointing the wrong way at a test the shard never ran, and
+# it is the failure mode that makes a sharded detector worse than no detector.
+shard_manifest="$(suite_manifest shard \
+  "$(suite_line align_driver::test::suite_red beta)")"
+shard_red_stream="$tmp_dir/suite-shard-red.json"
+{
+  printf '{"reason":"build-script-executed","package_id":"x",'
+  printf '"linked_paths":["native=%s/bin"],"cfgs":[],"env":[]}\n' "$suite_dir"
+  suite_artifact "$suite_red" align_driver test suite_red
+  suite_artifact "$suite_green" align_driver test suite_green
+} >"$shard_red_stream"
+for shard_index in 1 2; do
+  shard_red_out="$tmp_dir/suite-shard-red-$shard_index-out"
+  shard_red_status=0
+  ALIGN_GATE_JOBS=1 ALIGN_SUITE_BINARY_TIMEOUT=2 \
+    ALIGN_SUITE_SHARDS=2 ALIGN_SUITE_SHARD="$shard_index" \
+    ALIGN_KNOWN_FAILURES="$shard_manifest" \
+    "$suite_runner" "$shard_red_stream" >"$shard_red_out" 2>&1 ||
+    shard_red_status=$?
+  [[ "$shard_red_status" -eq 0 ]] || {
+    echo "shard $shard_index judged another shard's manifest entry:" >&2
+    cat "$shard_red_out" >&2
+    exit 1
+  }
+done
+
+# 11. A whole-run budget overrun is a NAMED failure carrying the elapsed timing
+# table, never a silent cancellation. The hanging binary here outlives the
+# budget, so the run is stopped, that binary is timed from its launch rather
+# than reported as a pass, and the exit is 1.
+#
+# It is registered under a target name that sorts first, because admission
+# order is the identity order: naming which binary gets the single job slot is
+# what makes the assertion below deterministic. The budget is a few seconds
+# rather than one so that the first launch always happens before it expires,
+# even on a loaded host.
+deadline_stream="$tmp_dir/suite-deadline.json"
+{
+  printf '{"reason":"build-script-executed","package_id":"x",'
+  printf '"linked_paths":["native=%s/bin"],"cfgs":[],"env":[]}\n' "$suite_dir"
+  suite_artifact "$suite_hang" pkg test aaa_hang
+  suite_artifact "$suite_green" pkg test zzz_green
+} >"$deadline_stream"
+deadline_out="$tmp_dir/suite-deadline-out"
+deadline_status=0
+ALIGN_GATE_JOBS=1 ALIGN_SUITE_BINARY_TIMEOUT=30 ALIGN_SUITE_DEADLINE=3 \
+  ALIGN_KNOWN_FAILURES="$empty_manifest" \
+  "$suite_runner" "$deadline_stream" >"$deadline_out" 2>&1 || deadline_status=$?
+[[ "$deadline_status" -eq 1 ]] || {
+  echo "an over-budget suite exited $deadline_status (expected 1):" >&2
+  cat "$deadline_out" >&2
+  exit 1
+}
+grep -Fq 'BUDGET EXCEEDED' "$deadline_out" || {
+  echo "the over-budget suite did not name the overrun:" >&2
+  cat "$deadline_out" >&2
+  exit 1
+}
+grep -Eq '^suite:  +[0-9]+s  pkg::test::aaa_hang \(exit deadline\)$' "$deadline_out" || {
+  echo "the over-budget suite did not time the abandoned binary:" >&2
+  cat "$deadline_out" >&2
+  exit 1
+}
+# The binary that never got a job slot is not in the table at all: a target
+# that did not run must not be reported as anything, least of all a pass.
+if grep -Fq 'pkg::test::zzz_green' "$deadline_out"; then
+  echo "the over-budget suite reported a binary it never launched:" >&2
+  cat "$deadline_out" >&2
+  exit 1
+fi
+grep -Fq 'the budget is not the number to raise' "$deadline_out" || {
+  echo "the over-budget suite did not point at the shard count:" >&2
+  cat "$deadline_out" >&2
+  exit 1
+}
+# No manifest verdict from an incomplete run: most of it never ran, so a
+# "delete the line" report would be about tests nothing executed.
+if grep -Fq 'did NOT fail' "$deadline_out"; then
+  echo "the over-budget suite still produced a manifest verdict:" >&2
+  cat "$deadline_out" >&2
+  exit 1
+fi
+
 # The shipped manifest has to satisfy the same parser, and stay free of the
 # duplicates and stray whitespace that would make an entry unmatchable.
 shipped_manifest="$repo_root/scripts/known-failures.txt"
@@ -2367,8 +2612,52 @@ grep -Fq 'scripts/run-suite-binaries.sh' "$nightly_workflow" || {
   echo "nightly.yml no longer runs the suite runner" >&2
   exit 1
 }
-grep -Eq '^      ALIGN_GATE_JOBS: 6$' "$nightly_workflow" || {
-  echo "nightly.yml no longer pins the measured six-process suite schedule" >&2
+grep -Eq '^      ALIGN_GATE_JOBS: 2$' "$nightly_workflow" || {
+  echo "nightly.yml no longer pins the measured two-process suite schedule" >&2
+  echo "  two processes x two libtest threads is what keeps the long pkg.db" >&2
+  echo "  owners inside the 15-minute per-binary cap on a four-core runner" >&2
+  exit 1
+}
+# The suite is sharded because one runner cannot execute this workspace inside
+# the 30-minute budget. Three numbers have to agree or the partition silently
+# drops or duplicates work: the matrix length, ALIGN_SUITE_SHARDS, and the job
+# name the aggregate reads.
+nightly_shard_count="$(sed -n 's/^ *suite-shard: \[\(.*\)\]$/\1/p' "$nightly_workflow" |
+  tr ',' '\n' | grep -c '[0-9]')"
+nightly_declared_shards="$(sed -n 's/^ *ALIGN_SUITE_SHARDS: \([0-9]*\)$/\1/p' "$nightly_workflow")"
+[[ -n "$nightly_declared_shards" && "$nightly_shard_count" -eq "$nightly_declared_shards" ]] || {
+  echo "the nightly suite matrix and ALIGN_SUITE_SHARDS disagree" >&2
+  echo "  matrix entries: $nightly_shard_count, ALIGN_SUITE_SHARDS: ${nightly_declared_shards:-unset}" >&2
+  exit 1
+}
+grep -Eq '^ *ALIGN_SUITE_SHARD: \$\{\{ matrix\.suite-shard \}\}$' "$nightly_workflow" || {
+  echo "nightly.yml does not pass the matrix shard to the suite runner" >&2
+  exit 1
+}
+# The inside-out budget guard. Without it an overrun is a job-level
+# cancellation, which reports nothing and skips the cache save — nineteen
+# consecutive nights of exactly that. It must fire before `timeout-minutes: 30`.
+nightly_deadline="$(sed -n 's/^ *ALIGN_SUITE_DEADLINE: \([0-9]*\)$/\1/p' "$nightly_workflow")"
+[[ -n "$nightly_deadline" && "$nightly_deadline" -gt 0 && "$nightly_deadline" -lt 1800 ]] || {
+  echo "nightly.yml lost the whole-run budget that must fire before the job cap" >&2
+  echo "  ALIGN_SUITE_DEADLINE: ${nightly_deadline:-unset} (needs 0 < n < 1800)" >&2
+  exit 1
+}
+grep -Eq '^ *if: always\(\) && matrix\.suite-shard == 1$' "$nightly_workflow" || {
+  echo "the nightly cache is no longer saved by exactly one shard" >&2
+  exit 1
+}
+# Eight shard results are not a signal until something reduces them to one.
+grep -Fq 'needs: full-suite' "$nightly_workflow" || {
+  echo "nightly.yml has no job aggregating the sharded suite result" >&2
+  exit 1
+}
+grep -Fq 'SUITE_RESULT: ${{ needs.full-suite.result }}' "$nightly_workflow" || {
+  echo "the nightly suite aggregate does not read the matrix result" >&2
+  exit 1
+}
+grep -Fq 'ALIGN_SUITE_DEADLINE' "$suite_runner" || {
+  echo "scripts/run-suite-binaries.sh no longer documents the whole-run budget" >&2
   exit 1
 }
 if grep -Eq 'cargo\.sh test --workspace' "$nightly_workflow"; then
