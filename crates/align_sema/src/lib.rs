@@ -31752,6 +31752,9 @@ struct BorrowStateData {
     /// after an actual mutation an empty root set means a proven borrow-free replacement, not a
     /// no-op call. Control joins union this may-unmodified fact.
     unmodified_borrow_mut_params: std::collections::BTreeSet<u32>,
+    /// Path-sensitive origin places (root local and field path) tracked for locals initialized from
+    /// place projections or view-producing operations on places (e.g. `state.slot.bytes()`).
+    local_origin_places: std::collections::HashMap<LocalId, (LocalId, Vec<u32>)>,
 }
 
 impl std::ops::Deref for BorrowState {
@@ -32795,6 +32798,9 @@ impl BorrowState {
                 .or_insert(how);
             *entry = (*entry).min(how);
         }
+        out.local_origin_places.retain(|local, place| {
+            b.local_origin_places.get(local) == Some(place)
+        });
         out
     }
 }
@@ -34392,13 +34398,25 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn refresh_borrow_mut_place(&mut self, argument: &Expr) {
-        let root = match argument.kind {
-            ExprKind::Local(local) => Some(local),
-            ExprKind::Field { root, .. } => Some(root),
-            _ => None,
+        let (root, path) = match &argument.kind {
+            ExprKind::Local(local) => (Some(*local), None),
+            ExprKind::Field { root, path } => (Some(*root), Some(path.as_slice())),
+            _ => (None, None),
         };
         if let Some(root) = root {
             self.borrows.invalid.remove(&root);
+            let path = path.unwrap_or(&[]);
+            self.borrows.local_origin_places.retain(|local, (origin_root, origin_path)| {
+                if *local == root {
+                    return false;
+                }
+                if *origin_root == root
+                    && (path.is_empty() || origin_path.starts_with(path) || path.starts_with(origin_path))
+                {
+                    return false;
+                }
+                true
+            });
         }
     }
 
@@ -35445,6 +35463,119 @@ impl<'a> MoveCheck<'a> {
         self.storage_roots(argument)
     }
 
+    fn expr_origin_place(&self, expression: &Expr) -> Option<(LocalId, Vec<u32>)> {
+        if let Some(inner) = borrow_transparent_value(expression) {
+            return self.expr_origin_place(inner);
+        }
+        match &expression.kind {
+            ExprKind::Local(id) => {
+                if let Some(&(root, ref path)) = self.borrows.local_origin_places.get(id) {
+                    Some((root, path.clone()))
+                } else {
+                    Some((*id, Vec::new()))
+                }
+            }
+            ExprKind::Field { root, path } => {
+                if let Some(&(base_root, ref base_path)) = self.borrows.local_origin_places.get(root) {
+                    let mut p = base_path.clone();
+                    p.extend_from_slice(path);
+                    Some((base_root, p))
+                } else {
+                    Some((*root, path.clone()))
+                }
+            }
+            ExprKind::TupleIndex { recv, index } => {
+                let (root, mut path) = self.expr_origin_place(recv)?;
+                path.push(*index);
+                Some((root, path))
+            }
+            ExprKind::BufferBytes { buffer }
+            | ExprKind::StrBytes { inner: buffer }
+            | ExprKind::StrBorrow(buffer)
+            | ExprKind::ArrayToSlice(buffer)
+            | ExprKind::SliceRange { recv: buffer, .. } => {
+                self.expr_origin_place(buffer)
+            }
+            _ => None,
+        }
+    }
+
+    fn assign_local_origin_place(&mut self, local: LocalId, value: &Expr) {
+        if self.local_may_borrow(local)
+            && let Some(origin) = self.expr_origin_place(value)
+        {
+            self.borrows.local_origin_places.insert(local, origin);
+        } else {
+            self.borrows.local_origin_places.remove(&local);
+        }
+    }
+
+    fn assign_tuple_local_origin_places(&mut self, locals: &[Option<LocalId>], init: &Expr) {
+        if let Some((root, base_path)) = self.expr_origin_place(init) {
+            for (index, local) in locals.iter().enumerate() {
+                if let Some(local) = local {
+                    if self.local_may_borrow(*local) {
+                        let mut path = base_path.clone();
+                        path.push(index as u32);
+                        self.borrows.local_origin_places.insert(*local, (root, path));
+                    } else {
+                        self.borrows.local_origin_places.remove(local);
+                    }
+                }
+            }
+        }
+    }
+
+    fn type_at_path(&self, mut current: Ty, path: &[u32]) -> Option<Ty> {
+        for &field in path {
+            current = expand_tagged_ty(current, self.tagged_types);
+            match current {
+                Ty::Struct(id) => {
+                    current = self.structs.get(id as usize)?.fields.get(field as usize)?.ty;
+                }
+                Ty::Tuple(id) => {
+                    let elem_scalar = self.tuples.get(id as usize)?.elems.get(field as usize)?;
+                    current = scalar_to_ty(*elem_scalar);
+                }
+                _ => return None,
+            }
+        }
+        Some(current)
+    }
+
+    fn is_disjoint_sibling_fields(
+        &self,
+        root: LocalId,
+        path_l: &[u32],
+        path_r: &[u32],
+    ) -> bool {
+        let root_ty = match self.f.locals.get(root as usize) {
+            Some(record) => record.ty,
+            None => return false,
+        };
+        let mut k = 0;
+        while k < path_l.len() && k < path_r.len() && path_l[k] == path_r[k] {
+            k += 1;
+        }
+        if k == path_l.len() || k == path_r.len() {
+            return false;
+        }
+        let common_path = &path_l[..k];
+        let Some(parent_ty) = self.type_at_path(root_ty, common_path) else {
+            return false;
+        };
+        let field_l = path_l[k];
+        let field_r = path_r[k];
+        let Some(ty_l) = self.type_at_path(parent_ty, &[field_l]) else {
+            return false;
+        };
+        let Some(ty_r) = self.type_at_path(parent_ty, &[field_r]) else {
+            return false;
+        };
+        !ty_may_borrow(ty_l, self.structs, self.tuples, self.enums, self.tagged_types)
+            && !ty_may_borrow(ty_r, self.structs, self.tuples, self.enums, self.tagged_types)
+    }
+
     fn check_call_borrow_aliases(
         &mut self,
         display: &str,
@@ -35471,6 +35602,7 @@ impl<'a> MoveCheck<'a> {
                 self.storage_roots(argument)
             };
             let argument_place = place(argument);
+            let argument_origin = self.expr_origin_place(argument);
             for (peer_index, peer) in args.iter().enumerate() {
                 if peer_index == index {
                     continue;
@@ -35498,11 +35630,27 @@ impl<'a> MoveCheck<'a> {
                 };
                 if conflicts {
                     let peer_roots = self.storage_roots(peer);
+                    let peer_place = place(peer);
+                    let peer_origin = self.expr_origin_place(peer);
                     let direct_overlap = argument_place
                         .as_ref()
-                        .zip(place(peer).as_ref())
+                        .zip(peer_place.as_ref())
                         .is_some_and(|(left, right)| overlaps(left, right));
-                    if direct_overlap || roots.iter().any(|root| peer_roots.contains(root)) {
+                    let parent_roots = match (argument_origin.as_ref(), peer_origin.as_ref()) {
+                        (Some(left), Some(right))
+                            if left.0 == right.0
+                                && self.is_disjoint_sibling_fields(left.0, &left.1, &right.1) =>
+                        {
+                            let mut pr = self.local_storage_roots(left.0);
+                            pr.insert(self.stable_owner_root(left.0));
+                            pr
+                        }
+                        _ => BorrowRoots::new(),
+                    };
+                    let has_conflicting_roots = roots.iter().any(|root| {
+                        peer_roots.contains(root) && !parent_roots.contains(root)
+                    });
+                    if direct_overlap || has_conflicting_roots {
                         self.diags.error(
                             format!(
                                 "borrowed argument {} to '{display}' aliases argument {}, whose mode may invalidate the same owner",
@@ -39678,6 +39826,17 @@ impl<'a> MoveCheck<'a> {
     fn invalidate_mutable_place(&mut self, root: LocalId, path: &[u32]) {
         self.borrows
             .invalidate_mutable_places(root, path, BorrowEnd::Consumed);
+        self.borrows.local_origin_places.retain(|local, (origin_root, origin_path)| {
+            if *local == root {
+                return false;
+            }
+            if *origin_root == root
+                && (path.is_empty() || origin_path.starts_with(path) || path.starts_with(origin_path))
+            {
+                return false;
+            }
+            true
+        });
     }
 
     fn invalidate_source_mutation_target(&mut self, target: &Expr) {
@@ -40586,6 +40745,7 @@ impl<'a> MoveCheck<'a> {
                     self.assign_borrow(*local, init);
                     self.assign_active_sum(*local, init);
                     self.assign_mutable_backing(*local, init);
+                    self.assign_local_origin_place(*local, init);
                     clear_moved(moved, *local);
                     self.clear_expression_value_snapshots(init);
                 }
@@ -40608,6 +40768,7 @@ impl<'a> MoveCheck<'a> {
                     self.assign_borrow(*local, value);
                     self.assign_active_sum(*local, value);
                     self.assign_mutable_backing(*local, value);
+                    self.assign_local_origin_place(*local, value);
                     clear_moved(moved, *local);
                     self.clear_expression_value_snapshots(value);
                 }
@@ -40803,6 +40964,7 @@ impl<'a> MoveCheck<'a> {
                 Stmt::LetTuple { locals, init, .. } => {
                     move_expr!(self, init, moved, true, true);
                     self.install_tuple_bindings(locals, init, moved);
+                    self.assign_tuple_local_origin_places(locals, init);
                     self.clear_expression_value_snapshots(init);
                 }
             }
@@ -43720,6 +43882,7 @@ impl<'a> MoveCheck<'a> {
                         self.assign_borrow(local, init);
                         self.assign_active_sum(local, init);
                         self.assign_mutable_backing(local, init);
+                        self.assign_local_origin_place(local, init);
                         clear_moved(moved, local);
                         self.clear_expression_value_snapshots(init);
                     }
@@ -43746,6 +43909,7 @@ impl<'a> MoveCheck<'a> {
                         self.assign_borrow(local, value);
                         self.assign_active_sum(local, value);
                         self.assign_mutable_backing(local, value);
+                        self.assign_local_origin_place(local, value);
                         clear_moved(moved, local);
                         self.clear_expression_value_snapshots(value);
                     }
@@ -43771,6 +43935,7 @@ impl<'a> MoveCheck<'a> {
                 Post::BlockLetTuple { locals, init } => {
                     if falls_through {
                         self.install_tuple_bindings(locals, init, moved);
+                        self.assign_tuple_local_origin_places(locals, init);
                         self.clear_expression_value_snapshots(init);
                     }
                     None
