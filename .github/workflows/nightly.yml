@@ -15,15 +15,48 @@ name: Nightly full suite
 # a FIXED one has to lose its manifest line.
 #
 # Budget: any test run that needs more than 30 minutes is worthless as a
-# detector, so the suite job carries `timeout-minutes: 30` and exceeding it is
-# itself the red signal — not something to raise. If the run approaches the
-# cap, cut test cost or raise concurrency with ALIGN_GATE_JOBS (the shared
-# knob scripts/test-binaries-lib.sh reads); do not extend the budget. The
-# runner additionally caps each individual binary at 15 minutes so one hang
-# cannot eat the report on all the others.
+# detector, so each suite job carries `timeout-minutes: 30` and exceeding it is
+# itself the red signal — not something to raise. If a shard approaches the
+# cap, cut test cost or add shards; do not extend the budget. The runner
+# additionally caps each individual binary at 15 minutes so one hang cannot eat
+# the report on all the others.
 #
-# Local equivalent, byte-for-byte the same judgement:
+# Why the suite is sharded. On 2026-08-29 the duplicate-target-identity error
+# that had been aborting every previous night during the build was fixed, and
+# the run phase became reachable for the first time. It immediately showed that
+# one four-core runner cannot execute this workspace inside the budget: on
+# 2026-09-16 the job spent 5 minutes on setup and the incremental build and
+# then completed 7 of 262 binaries in the 25 minutes it had left, with
+# pkg_db_a1, pkg_db_q4b, pkg_db_q5b2 and pkg_db_q3 each killed by the
+# 15-minute per-binary cap. `timeout-minutes: 30` then CANCELLED the job, and a
+# cancelled job reports nothing at all — 19 consecutive nights (2026-08-31 to
+# 2026-09-17) with no verdict, while #1097 rotted undetected on main.
+#
+# So the suite is spread over twelve runners, each judging the manifest for the
+# binaries it ran, and `full-suite-result` aggregates them into the one signal.
+# ALIGN_GATE_JOBS: 2 gives every binary two libtest threads on the four cores,
+# the measured shape the required `db-postgres` shards already use to finish
+# these same pkg.db owners; the previous six-process/one-thread schedule kept
+# the cores fed but left each long binary strictly serial, which is what pushed
+# four of them past the per-binary cap.
+#
+# Twelve is sized from measurement, not taste. The four required db-postgres
+# shards spend 4,391 seconds on the fourteen pkg.db owners at this same
+# ALIGN_GATE_JOBS: 2 (run 34833186128), and run 33225158075 puts the remaining
+# ~248 binaries near 6,300 seconds at the same concurrency: about 10,700
+# seconds of run phase for one runner. Against a ~1,230-second window per shard
+# that needs ten shards to fit at all, so twelve is the number with margin.
+#
+# ALIGN_SUITE_DEADLINE is the inside-out guard: the runner stops, prints every
+# binary's elapsed time, and exits non-zero at 25 minutes, so a future overrun
+# is a NAMED red result carrying its own timing table instead of another silent
+# cancellation — and the cache-save step below still runs, which a cancellation
+# never allowed.
+#
+# Local equivalent, byte-for-byte the same judgement over the whole workspace:
 #   scripts/run-suite-binaries.sh
+# and one shard of it:
+#   ALIGN_SUITE_SHARDS=12 ALIGN_SUITE_SHARD=3 scripts/run-suite-binaries.sh
 
 on:
   schedule:
@@ -45,10 +78,17 @@ env:
 
 jobs:
   full-suite:
-    name: Full workspace tests
+    name: Full workspace tests (${{ matrix.suite-shard }}/12)
     runs-on: ubuntu-24.04
     # Deliberately the owner's hard budget, not a safety margin. See the header.
     timeout-minutes: 30
+    strategy:
+      # One shard's verdict is not a reason to discard the other eleven. The
+      # nightly is a detector: every shard reports, and full-suite-result below
+      # turns the set into one signal.
+      fail-fast: false
+      matrix:
+        suite-shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     env:
       ALIGN_APT_PACKAGES: >-
         llvm-22-dev clang-22 libclang-rt-22-dev lld-22
@@ -57,10 +97,19 @@ jobs:
       # Fail closed on the linker: a missing lld-22 must be a red build, not a
       # silent fallback to the slow system linker (build-perf item 2).
       ALIGNC_LINKER: lld
-      # Six binary processes keep the four runner cores fed while generated
-      # compilers block in link and subprocess work. Longest-first admission
-      # and shared-MIR deep-graph coverage remove the tail from run 33225158075.
-      ALIGN_GATE_JOBS: 6
+      # Two binary processes with two libtest threads each: four runnable
+      # threads on four cores, and — unlike the six-process schedule this
+      # replaces — enough of the machine per binary for the long generated-
+      # program owners to finish inside the 15-minute per-binary cap. See the
+      # header.
+      ALIGN_GATE_JOBS: 2
+      ALIGN_SUITE_SHARD: ${{ matrix.suite-shard }}
+      ALIGN_SUITE_SHARDS: 12
+      # 25 minutes, measured from the runner script's own start, which setup
+      # reaches about 35 seconds into the job. It covers the incremental build
+      # (~270s measured) as well as the run, and always fires before the
+      # 30-minute job cap can cancel the job and destroy the report.
+      ALIGN_SUITE_DEADLINE: 1500
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -152,11 +201,18 @@ jobs:
       # Saved even when the suite is red: a red night must still leave a warm
       # target directory, or every following night pays a cold build out of the
       # same 30 minutes. `if: always()` covers a failed step but not the
-      # job-level timeout, which cancels the job outright — so a night that
-      # runs out of budget saves nothing, and only the per-run key above keeps
-      # the following night from inheriting that gap permanently.
+      # job-level timeout, which cancels the job outright — which is precisely
+      # what happened on every night from 2026-08-31 to 2026-09-17. The
+      # runner's own ALIGN_SUITE_DEADLINE now fails the step before the job cap
+      # can fire, so an over-budget night reaches this save again.
+      #
+      # One shard saves. All eight build the same target directory from the
+      # same restore prefix, and this cache is measured in gigabytes: eight
+      # writes a night would evict the rest of the repository's caches — and
+      # each other — out of GitHub's per-repository LRU budget for no
+      # additional warmth.
       - name: Save Cargo caches
-        if: always()
+        if: always() && matrix.suite-shard == 1
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -164,6 +220,26 @@ jobs:
             ~/.cargo/git
             target
           key: cargo-nightly-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+
+  # The one signal. A sharded detector that only reported per shard would make
+  # "was the nightly green" a question about eight job results, and `needs` on
+  # a matrix already collapses to a single worst-case result — so read it once,
+  # here, and fail unless every shard succeeded. `always()` is required: the
+  # aggregate must still run, and still fail, when a shard was cancelled.
+  full-suite-result:
+    name: Full workspace tests (required)
+    needs: full-suite
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Enforce the sharded suite result
+        shell: bash
+        env:
+          SUITE_RESULT: ${{ needs.full-suite.result }}
+        run: |
+          echo "suite=$SUITE_RESULT"
+          test "$SUITE_RESULT" = success
 
   # x86 release-profile coverage lives here rather than in the per-PR lint job;
   # the per-PR ARM64/macOS jobs still build and smoke the release compiler.

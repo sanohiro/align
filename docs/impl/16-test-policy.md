@@ -517,11 +517,40 @@ the only thing that would have reported it. Two synthetic test names carry
 binary-level outcomes: `<binary-exit-N>` (exited without libtest naming a failed
 test) and `<binary-did-not-report>` (crash, or the per-binary cap).
 
-The budget is 30 minutes, hard. The job carries `timeout-minutes: 30`, the
-runner caps each individual binary at 15 minutes
+The budget is 30 minutes, hard, and it is per runner. The workspace outgrew
+what one four-core runner can execute inside it: on 2026-09-16 the job built
+for five minutes and then completed 7 of 262 binaries in the 25 minutes it had
+left, with four `pkg_db_*` owners killed by the per-binary cap. `timeout-minutes:
+30` cancelled the job, and a cancelled job publishes nothing — 19 consecutive
+nights with no verdict (#1098). Two things follow, and neither of them is a
+larger budget.
+
+First, the suite is **sharded** across runners. `ALIGN_SUITE_SHARDS` and
+`ALIGN_SUITE_SHARD` partition the run set round-robin over the longest-first
+order, so each shard gets a comparable share of the measured long runners and
+of the unranked bulk. The partition is a pure function of that order: identical
+on every shard and every night, every binary in exactly one shard. Sharding
+narrows the *run* set only. Discovery, the target-identity collision check, and
+the "manifest names a target the workspace does not build" check still see the
+whole workspace in every shard, and the two-way failure diff is restricted to
+the targets the shard actually ran — a shard must never report another shard's
+known failure as repaired. `full-suite-result` reduces the shard results to the
+one signal.
+
+Second, the budget is enforced **from inside**. `ALIGN_SUITE_DEADLINE` stops
+the run, prints every binary's elapsed time (including the ones still running,
+timed from the parent's launch record), and exits non-zero before the job-level
+cap can cancel the job. An overrun is therefore a named red result carrying its
+own timing table, and the cache-save step still runs. No manifest verdict is
+produced from an incomplete run, because most of it never executed. The
+nightly's deadline is 23 minutes against a 30-minute job cap.
+
+The runner also caps each individual binary at 15 minutes
 (`ALIGN_SUITE_BINARY_TIMEOUT`) so one hang cannot cost the report on everything
-else, and `ALIGN_GATE_JOBS` raises concurrency. The four-core nightly pins six
-binary processes so subprocess and linker waits do not leave cores idle, and
+else, and `ALIGN_GATE_JOBS` sets the schedule. The four-core nightly pins two
+binary processes with two libtest threads each: the previous six-process,
+one-thread schedule kept the cores fed but left every long binary strictly
+serial, which is what pushed four `pkg_db_*` owners past the per-binary cap. It
 admits measured long-running generated-program owners in longest-first order;
 unknown targets retain Cargo's artifact order and still run exactly once. The
 4,096-node whole-program type-DAG owner checks and lowers once, then exercises
@@ -537,7 +566,9 @@ is itself the red signal, not a number to raise, and no suite may be added
 whose cost only fits by extending it.
 
 Running `scripts/run-suite-binaries.sh` with no arguments reproduces the
-nightly's judgement locally. The nightly is a detector, not a second PR gate: a
+nightly's judgement over the whole workspace locally, and
+`ALIGN_SUITE_SHARDS=12 ALIGN_SUITE_SHARD=3 scripts/run-suite-binaries.sh`
+reproduces one shard of it. The nightly is a detector, not a second PR gate: a
 red nightly is triaged against the manifest and does not block an unrelated PR.
 
 `align_repl`'s two leaf owner binaries (`tests/session.rs`, `tests/e2e.rs`) are

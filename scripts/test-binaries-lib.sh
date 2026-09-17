@@ -37,6 +37,17 @@ ALIGN_TB_PROGRESS_INTERVAL="${ALIGN_TB_PROGRESS_INTERVAL:-60}"
 # otherwise consumes the whole job budget and reports nothing at all, which is
 # the one failure mode a nightly detector cannot afford.
 ALIGN_TB_TIMEOUT="${ALIGN_TB_TIMEOUT:-0}"
+# Absolute epoch second at which the run loop stops admitting new binaries and
+# abandons whatever is still running; 0 disables it. The per-binary cap above
+# bounds one hang, but nothing bounded the RUN AS A WHOLE, so an external job
+# timeout cancelled the job and the report was lost with it — nineteen
+# consecutive nights of `cancelled` with no verdict. The caller sets this to
+# fire before its own job cap, so a budget overrun is a named red result
+# carrying the elapsed timing table instead of a silent cancellation.
+ALIGN_TB_DEADLINE="${ALIGN_TB_DEADLINE:-0}"
+# Set to 1 by align_tb_run when the deadline above stopped the run. The caller
+# reads it to name the overrun; a run that finishes in budget leaves it 0.
+ALIGN_TB_DEADLINE_HIT=0
 
 # Cargo emits one JSON object per built unit, fresh or not. A test binary is an
 # artifact whose *profile* carries "test":true — the target-level flag of the
@@ -199,6 +210,39 @@ align_tb_count_running() {
   echo $#
 }
 
+# True once the whole-run deadline has passed. `date` is the only cost, and it
+# is paid at most five times a second alongside the existing poll.
+align_tb_deadline_passed() {
+  [ "$ALIGN_TB_DEADLINE" -gt 0 ] || return 1
+  [ "$(date +%s)" -ge "$ALIGN_TB_DEADLINE" ]
+}
+
+# Abandon everything still running because the deadline passed. The parent
+# writes the status record itself: a killed child never records one, and
+# "killed ?" would erase the one number the overrun report exists to publish —
+# how long each unfinished binary had been running. The status word is
+# `deadline`, which no manifest line can match, so an abandoned binary stays
+# red on its own account as well.
+align_tb_abandon_running() {
+  local entry pid slot started now
+  now="$(date +%s)"
+  for entry in $ALIGN_TB_RUNNING; do
+    pid="${entry%%:*}"
+    slot="${entry#*:}"
+    pkill -P "$pid" 2>/dev/null || true
+    kill "$pid" 2>/dev/null || true
+    if [ ! -e "$ALIGN_TB_LOGS/$slot.status" ]; then
+      started="$(cat "$ALIGN_TB_LOGS/$slot.start" 2>/dev/null || true)"
+      case "$started" in
+        '' | *[!0-9]*) started="$now" ;;
+      esac
+      printf 'deadline %s\n' "$((now - started))" >"$ALIGN_TB_LOGS/$slot.status"
+    fi
+    wait "$pid" 2>/dev/null || true
+  done
+  ALIGN_TB_RUNNING=""
+}
+
 # At most one progress line per configured interval. It names only the bounded
 # active set (at most ALIGN_TB_JOBS) and counts completed/launched binaries, so
 # a long clean run remains terse while a timeout transcript identifies the
@@ -253,8 +297,13 @@ align_tb_run() {
   now="$(date +%s)"
   ALIGN_TB_NEXT_PROGRESS=$((now + ALIGN_TB_PROGRESS_INTERVAL))
   ALIGN_TB_LAUNCHED=0
+  ALIGN_TB_DEADLINE_HIT=0
   while IFS="$align_tb_tab" read -r manifest target_kind target_name executable; do
     [ -n "$executable" ] || continue
+    if align_tb_deadline_passed; then
+      ALIGN_TB_DEADLINE_HIT=1
+      break
+    fi
     if [ "${ALIGN_TB_QUALIFIED_NAMES:-0}" = 1 ]; then
       name="$(basename "$(dirname "$manifest")")::$target_kind::$target_name"
     else
@@ -275,16 +324,32 @@ align_tb_run() {
     : >"$ALIGN_TB_LOGS/$slot.log"
     align_tb_reap_completed
     while [ "$(align_tb_count_running)" -ge "$ALIGN_TB_JOBS" ]; do
+      if align_tb_deadline_passed; then
+        ALIGN_TB_DEADLINE_HIT=1
+        break
+      fi
       sleep 0.2
       align_tb_reap_completed
       align_tb_maybe_report_progress "$label"
     done
+    if [ "$ALIGN_TB_DEADLINE_HIT" -eq 1 ]; then
+      # The slot was claimed above but nothing was launched into it, so remove
+      # the empty log: a slot with no status record and no output would be
+      # reported as a binary that never got to libtest's summary, which is not
+      # what happened to a binary that never started.
+      rm -f "$ALIGN_TB_LOGS/$slot.log"
+      break
+    fi
     # Verbose mode announces before launching, so an interactive investigation
     # can identify a hung binary. Routine CI keeps these per-binary lines out
     # of successful logs; failures are replayed with their slot below.
     if [ "$ALIGN_TB_VERBOSE" -eq 1 ]; then
       printf '%s: start %s\n' "$label" "$slot"
     fi
+    # The parent records the launch instant too. Only it survives a child the
+    # deadline path has to kill, and it is what lets the overrun report time an
+    # unfinished binary.
+    date +%s >"$ALIGN_TB_LOGS/$slot.start"
     (
       cd "$(dirname "$manifest")"
       binary_status=0
@@ -320,10 +385,17 @@ align_tb_run() {
     ALIGN_TB_LAUNCHED=$((ALIGN_TB_LAUNCHED + 1))
   done <<<"$ALIGN_TB_BINARIES"
   while [ "$(align_tb_count_running)" -gt 0 ]; do
+    if align_tb_deadline_passed; then
+      ALIGN_TB_DEADLINE_HIT=1
+      break
+    fi
     sleep 0.2
     align_tb_reap_completed
     align_tb_maybe_report_progress "$label"
   done
+  if [ "$ALIGN_TB_DEADLINE_HIT" -eq 1 ]; then
+    align_tb_abandon_running
+  fi
   ALIGN_TB_RUNNING=""
 }
 

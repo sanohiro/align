@@ -2331,6 +2331,138 @@ case "$(sed -n '3p' "$suite_build_cargo_log")" in
     ;;
 esac
 
+# 10. Sharding partitions the RUN set and nothing else. Every workspace binary
+# belongs to exactly one shard, and the union of the shards is the whole
+# suite — a binary silently dropped by the partition is a test that stopped
+# being run at all, which is the one thing a detector may never do.
+shard_stream="$tmp_dir/suite-shard.json"
+{
+  printf '{"reason":"build-script-executed","package_id":"x",'
+  printf '"linked_paths":["native=%s/bin"],"cfgs":[],"env":[]}\n' "$suite_dir"
+  suite_artifact "$suite_green" align_driver test pkg_db_a1
+  suite_artifact "$suite_green" align_driver test pkg_db_q3
+  suite_artifact "$suite_green" align_driver test deep_type_graphs
+  suite_artifact "$suite_green" align_driver test m0
+  suite_artifact "$suite_green" align_driver test constants
+} >"$shard_stream"
+shard_union="$tmp_dir/suite-shard-union"
+: >"$shard_union"
+for shard_index in 1 2; do
+  shard_out="$tmp_dir/suite-shard-$shard_index-out"
+  ALIGN_GATE_JOBS=1 ALIGN_TB_VERBOSE=1 ALIGN_SUITE_BINARY_TIMEOUT=2 \
+    ALIGN_SUITE_SHARDS=2 ALIGN_SUITE_SHARD="$shard_index" \
+    ALIGN_KNOWN_FAILURES="$empty_manifest" \
+    "$suite_runner" "$shard_stream" >"$shard_out" 2>&1 || {
+    echo "suite shard $shard_index of 2 failed:" >&2
+    cat "$shard_out" >&2
+    exit 1
+  }
+  # Every shard reports the whole-workspace denominator, not just its slice.
+  grep -Fq "suite: shard $shard_index of 2 of 5 workspace binaries" "$shard_out" || {
+    echo "suite shard $shard_index did not report the workspace-wide count:" >&2
+    cat "$shard_out" >&2
+    exit 1
+  }
+  sed -n 's/^suite: start //p' "$shard_out" >>"$shard_union"
+done
+shard_union_sorted="$(LC_ALL=C sort "$shard_union")"
+shard_expected="$(printf '%s\n' \
+  'align_driver::test::constants' \
+  'align_driver::test::deep_type_graphs' \
+  'align_driver::test::m0' \
+  'align_driver::test::pkg_db_a1' \
+  'align_driver::test::pkg_db_q3')"
+[[ "$shard_union_sorted" == "$shard_expected" ]] || {
+  echo "the shards are not a partition of the workspace binaries:" >&2
+  printf 'expected:\n%s\nactual:\n%s\n' "$shard_expected" "$shard_union_sorted" >&2
+  exit 1
+}
+[[ "$(LC_ALL=C sort -u "$shard_union" | wc -l | tr -d '[:space:]')" \
+  -eq "$(wc -l <"$shard_union" | tr -d '[:space:]')" ]] || {
+  echo "a binary was run by more than one shard:" >&2
+  cat "$shard_union" >&2
+  exit 1
+}
+# A shard that cannot exist is a configuration error, not a green empty run.
+shard_empty_out="$tmp_dir/suite-shard-empty-out"
+shard_empty_status=0
+ALIGN_GATE_JOBS=1 ALIGN_SUITE_BINARY_TIMEOUT=2 \
+  ALIGN_SUITE_SHARDS=2 ALIGN_SUITE_SHARD=3 \
+  ALIGN_KNOWN_FAILURES="$empty_manifest" \
+  "$suite_runner" "$shard_stream" >"$shard_empty_out" 2>&1 ||
+  shard_empty_status=$?
+[[ "$shard_empty_status" -eq 2 ]] || {
+  echo "an out-of-range shard exited $shard_empty_status (expected 2):" >&2
+  cat "$shard_empty_out" >&2
+  exit 1
+}
+
+# A manifest entry owned by ANOTHER shard must not be reported as repaired.
+# This is the ratchet pointing the wrong way at a test the shard never ran, and
+# it is the failure mode that makes a sharded detector worse than no detector.
+shard_manifest="$(suite_manifest shard \
+  "$(suite_line align_driver::test::suite_red beta)")"
+shard_red_stream="$tmp_dir/suite-shard-red.json"
+{
+  printf '{"reason":"build-script-executed","package_id":"x",'
+  printf '"linked_paths":["native=%s/bin"],"cfgs":[],"env":[]}\n' "$suite_dir"
+  suite_artifact "$suite_red" align_driver test suite_red
+  suite_artifact "$suite_green" align_driver test suite_green
+} >"$shard_red_stream"
+for shard_index in 1 2; do
+  shard_red_out="$tmp_dir/suite-shard-red-$shard_index-out"
+  shard_red_status=0
+  ALIGN_GATE_JOBS=1 ALIGN_SUITE_BINARY_TIMEOUT=2 \
+    ALIGN_SUITE_SHARDS=2 ALIGN_SUITE_SHARD="$shard_index" \
+    ALIGN_KNOWN_FAILURES="$shard_manifest" \
+    "$suite_runner" "$shard_red_stream" >"$shard_red_out" 2>&1 ||
+    shard_red_status=$?
+  [[ "$shard_red_status" -eq 0 ]] || {
+    echo "shard $shard_index judged another shard's manifest entry:" >&2
+    cat "$shard_red_out" >&2
+    exit 1
+  }
+done
+
+# 11. A whole-run budget overrun is a NAMED failure carrying the elapsed timing
+# table, never a silent cancellation. The suite binary here sleeps past a
+# one-second budget, so the run is stopped, the still-running binary is timed
+# from its launch, and the exit is 1.
+deadline_stream="$tmp_dir/suite-deadline.json"
+suite_stream "$deadline_stream" "$suite_hang" "$suite_green"
+deadline_out="$tmp_dir/suite-deadline-out"
+deadline_status=0
+ALIGN_GATE_JOBS=1 ALIGN_SUITE_BINARY_TIMEOUT=30 ALIGN_SUITE_DEADLINE=1 \
+  ALIGN_KNOWN_FAILURES="$empty_manifest" \
+  "$suite_runner" "$deadline_stream" >"$deadline_out" 2>&1 || deadline_status=$?
+[[ "$deadline_status" -eq 1 ]] || {
+  echo "an over-budget suite exited $deadline_status (expected 1):" >&2
+  cat "$deadline_out" >&2
+  exit 1
+}
+grep -Fq 'BUDGET EXCEEDED' "$deadline_out" || {
+  echo "the over-budget suite did not name the overrun:" >&2
+  cat "$deadline_out" >&2
+  exit 1
+}
+grep -Eq '^suite:  +[0-9]+s  pkg::test::suite_hang \(exit deadline\)$' "$deadline_out" || {
+  echo "the over-budget suite did not time the abandoned binary:" >&2
+  cat "$deadline_out" >&2
+  exit 1
+}
+grep -Fq 'the budget is not the number to raise' "$deadline_out" || {
+  echo "the over-budget suite did not point at the shard count:" >&2
+  cat "$deadline_out" >&2
+  exit 1
+}
+# No manifest verdict from an incomplete run: most of it never ran, so a
+# "delete the line" report would be about tests nothing executed.
+if grep -Fq 'did NOT fail' "$deadline_out"; then
+  echo "the over-budget suite still produced a manifest verdict:" >&2
+  cat "$deadline_out" >&2
+  exit 1
+fi
+
 # The shipped manifest has to satisfy the same parser, and stay free of the
 # duplicates and stray whitespace that would make an entry unmatchable.
 shipped_manifest="$repo_root/scripts/known-failures.txt"
@@ -2367,8 +2499,52 @@ grep -Fq 'scripts/run-suite-binaries.sh' "$nightly_workflow" || {
   echo "nightly.yml no longer runs the suite runner" >&2
   exit 1
 }
-grep -Eq '^      ALIGN_GATE_JOBS: 6$' "$nightly_workflow" || {
-  echo "nightly.yml no longer pins the measured six-process suite schedule" >&2
+grep -Eq '^      ALIGN_GATE_JOBS: 2$' "$nightly_workflow" || {
+  echo "nightly.yml no longer pins the measured two-process suite schedule" >&2
+  echo "  two processes x two libtest threads is what keeps the long pkg.db" >&2
+  echo "  owners inside the 15-minute per-binary cap on a four-core runner" >&2
+  exit 1
+}
+# The suite is sharded because one runner cannot execute this workspace inside
+# the 30-minute budget. Three numbers have to agree or the partition silently
+# drops or duplicates work: the matrix length, ALIGN_SUITE_SHARDS, and the job
+# name the aggregate reads.
+nightly_shard_count="$(sed -n 's/^ *suite-shard: \[\(.*\)\]$/\1/p' "$nightly_workflow" |
+  tr ',' '\n' | grep -c '[0-9]')"
+nightly_declared_shards="$(sed -n 's/^ *ALIGN_SUITE_SHARDS: \([0-9]*\)$/\1/p' "$nightly_workflow")"
+[[ -n "$nightly_declared_shards" && "$nightly_shard_count" -eq "$nightly_declared_shards" ]] || {
+  echo "the nightly suite matrix and ALIGN_SUITE_SHARDS disagree" >&2
+  echo "  matrix entries: $nightly_shard_count, ALIGN_SUITE_SHARDS: ${nightly_declared_shards:-unset}" >&2
+  exit 1
+}
+grep -Eq '^ *ALIGN_SUITE_SHARD: \$\{\{ matrix\.suite-shard \}\}$' "$nightly_workflow" || {
+  echo "nightly.yml does not pass the matrix shard to the suite runner" >&2
+  exit 1
+}
+# The inside-out budget guard. Without it an overrun is a job-level
+# cancellation, which reports nothing and skips the cache save — nineteen
+# consecutive nights of exactly that. It must fire before `timeout-minutes: 30`.
+nightly_deadline="$(sed -n 's/^ *ALIGN_SUITE_DEADLINE: \([0-9]*\)$/\1/p' "$nightly_workflow")"
+[[ -n "$nightly_deadline" && "$nightly_deadline" -gt 0 && "$nightly_deadline" -lt 1800 ]] || {
+  echo "nightly.yml lost the whole-run budget that must fire before the job cap" >&2
+  echo "  ALIGN_SUITE_DEADLINE: ${nightly_deadline:-unset} (needs 0 < n < 1800)" >&2
+  exit 1
+}
+grep -Eq '^ *if: always\(\) && matrix\.suite-shard == 1$' "$nightly_workflow" || {
+  echo "the nightly cache is no longer saved by exactly one shard" >&2
+  exit 1
+}
+# Eight shard results are not a signal until something reduces them to one.
+grep -Fq 'needs: full-suite' "$nightly_workflow" || {
+  echo "nightly.yml has no job aggregating the sharded suite result" >&2
+  exit 1
+}
+grep -Fq 'SUITE_RESULT: ${{ needs.full-suite.result }}' "$nightly_workflow" || {
+  echo "the nightly suite aggregate does not read the matrix result" >&2
+  exit 1
+}
+grep -Fq 'ALIGN_SUITE_DEADLINE' "$suite_runner" || {
+  echo "scripts/run-suite-binaries.sh no longer documents the whole-run budget" >&2
   exit 1
 }
 if grep -Eq 'cargo\.sh test --workspace' "$nightly_workflow"; then

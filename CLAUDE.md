@@ -293,23 +293,36 @@ Benchmarks are separate local measurements run only for the changed
 performance path or an explicit performance/resource claim. See
 `docs/impl/16-test-policy.md` for selection and growth rules.
 
-**Thirty minutes is the hard test budget.** A run that needs longer is
-worthless as a detector, so the nightly suite job carries `timeout-minutes: 30`
-and the runner caps each individual binary at 15 minutes. Exceeding the budget
-*is* the red signal, not a number to raise: cut test cost or raise concurrency
-with `ALIGN_GATE_JOBS`, the shared knob `scripts/test-binaries-lib.sh` reads for
-both the bounded gate and the full suite. Do not add a suite whose cost only
-fits by extending the budget.
+**Thirty minutes is the hard test budget, per runner.** A run that needs longer
+is worthless as a detector, so every nightly suite shard carries
+`timeout-minutes: 30` and the runner caps each individual binary at 15 minutes.
+Exceeding the budget *is* the red signal, not a number to raise: cut test cost,
+add shards with `ALIGN_SUITE_SHARDS`, or change the schedule with
+`ALIGN_GATE_JOBS`, the shared knob `scripts/test-binaries-lib.sh` reads for both
+the bounded gate and the full suite. Do not add a suite whose cost only fits by
+extending the budget.
+
+A job-level timeout is not a usable red signal, because a cancelled job
+publishes nothing: the suite exceeded its budget on all 19 nights from
+2026-08-31 to 2026-09-17 and reported neither a verdict nor a timing table, so
+#1097 rotted in undetected. `ALIGN_SUITE_DEADLINE` therefore enforces the same
+budget from inside the runner — it stops the run, prints every binary's elapsed
+time, and exits non-zero before `timeout-minutes` can cancel the job. A budget
+overrun must stay a *named* failure that carries its own evidence.
 
 **The nightly full suite is the out-of-gate detector, not a second gate.**
 `scripts/test-pr.sh` is bounded by design, so every suite outside it can rot on
 `main` unnoticed — four such failures accumulated before 2026-08-10.
-`.github/workflows/nightly.yml` builds once and runs every compiled test binary
-through `scripts/run-suite-binaries.sh`, diffing the observed failures against
+`.github/workflows/nightly.yml` runs every compiled test binary through
+`scripts/run-suite-binaries.sh`, diffing the observed failures against
 `scripts/known-failures.txt` in **both** directions: a new failure is named, and
 a manifest line whose test starts passing stays red until the change that fixed
-it deletes the line. `scripts/run-suite-binaries.sh` reproduces that judgement
-locally. A red nightly is triaged against the manifest; it does not block an
+it deletes the line. The workspace no longer fits one runner's budget, so the
+suite is sharded (`ALIGN_SUITE_SHARDS`/`ALIGN_SUITE_SHARD`) and
+`full-suite-result` reduces the shards to one signal; each shard judges only the
+targets it ran, while the manifest's collision and unknown-target checks still
+see the whole workspace. `scripts/run-suite-binaries.sh` with no arguments
+reproduces the whole judgement locally. A red nightly is triaged against the manifest; it does not block an
 unrelated PR, and it never substitutes for running a change's owner target
 locally before pushing.
 

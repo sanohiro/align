@@ -25,4 +25,17 @@
 # entry reproduced in its owner binary after the detector completed all 216
 # targets. The projected-storage consumer closure removed eleven rows, and the
 # direct-owned JSON parity owner removed the stale bounded-schema row, and the
-# PGO owner restored the stable missing-profile diagnostic. The manifest is empty.
+# PGO owner restored the stable missing-profile diagnostic.
+#
+# The detector then produced no verdict at all from 2026-08-31 to 2026-09-17:
+# the suite outgrew one runner's 30-minute budget and every night was cancelled
+# (#1098). The two entries below are what rotted in on main meanwhile, found by
+# their owner target rather than by the nightly. Both reproduce off CI and on
+# both host platforms; they are a whole-program resource-MIR provenance defect,
+# not an environment dependence, so they are strict lines and they go away in
+# the same change that fixes #1097.
+#
+# #1097: `fn` value in a generic record field fails whole-program resource MIR
+# validation ("XML-capable call argument provenance mismatch").
+align_driver::test::analysis_coverage	generic_fn_wrapper_matches_an_explicit_source_signature
+align_driver::test::analysis_coverage	nested_fn_signatures_compare_by_source_identity
