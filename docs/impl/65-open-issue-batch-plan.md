@@ -1,7 +1,8 @@
 # Open issue batch: storage, byte operations and loop proofs
 
 Status: first capability implemented and merged in PR 1056; safe mutable-storage
-capability (typed slice stores, bulk fill/copy, and owned field replacement) implemented. Initial audit: 2026-09-15, baseline
+capability (typed slice stores, bulk fill/copy, owned field replacement, and
+disjoint record field borrows) implemented. Initial audit: 2026-09-15, baseline
 `da20aefe1e4054cd132fbbf852217d5ee2c240ac` (PRs 1044–1046).
 [Plan 66](66-array-prefix-and-text-boundary-plan.md) adds the later issues 1054,
 1055 and 1057 against `61b2de79`, bringing the current inventory to 11 open issues.
@@ -295,7 +296,7 @@ and implementation site. Reuse coverage that fails on the original defect.
 | B allocation | Zero/nonzero, invalid count/size/OOM failpoint, exact initialized bytes and length, capacity lower bound, no grow/snapshot sequence, ordinary Buffer Drop/rebind/return. `align_runtime --lib` filtered new buffer-filled owner plus codec target (B). |
 | M access | Writable heap/stack/arena origins; readonly literal/string, retained aliases, returned/captured/imported/plain-parameter laundering; same/overlapping/unknown source-destination reject; unequal lengths do not modify bytes; disjoint equal-length copy. `align_driver --test consumer_borrow_boundaries` and codec target (M). |
 | C storage grammar | Heap Copy/string/closed record; RegionPlain and rejected owning region elements; generic inference; capacity 0/1/4/40/128; count×stride overflow; header heap/stack/arena; zero initialized prefix, partial push Drop, full push/build, moved-source nulling, final region materialization. `align_driver --test m12_array_builder`, `--test large_drop_codegen`; `align_runtime --lib` filtered builder owner (C). |
-| A places/backing | Direct/nested sibling owned fields, scalar/slot and resource/slot; same field, ancestor, copied sibling slices sharing backing, dynamic elements, unknown root and branch joins; full Session-shaped after-call case; later-argument invalidation. `align_driver --test consumer_borrow_boundaries`, `--test borrowed_params`, and plan 61's full access owners (A). |
+| A places/backing | Direct/nested sibling owned fields, scalar/slot and resource/slot; same field, ancestor, copied sibling slices sharing backing, dynamic elements, unknown root and branch joins; full Session-shaped after-call case; later-argument invalidation. `crates/align_sema/src/lib.rs` (`MoveCheck::check_call_borrow_aliases`, `is_disjoint_sibling_fields`, `expr_origin_place`); `align_driver --test disjoint_field_borrows`, `--test consumer_borrow_boundaries`, `--test borrowed_params` (A). |
 | O lifecycle | Existing admitted Drop-plan classes; construction, move-in/out, source nulling, replacement, Drop/return; self, sibling and branch-selected transfer; owning record and exclusive borrowed record, readonly reject; no new element/field categories. `align_driver --test borrowed_replacement`, `--test owned_structs_arrays`, `--test struct_handle_fields` (O). |
 | A/O generation preservation | Copy descriptor rebind preserves aliases of live old backing; inline destination aliases observe replacement contents; allocation transfer preserves generation and changes release owner; later source rebind cannot invalidate transferred storage; self/branch-selected transfer survives while actually dropped backing invalidates observers. `align_driver --test return_provenance` existing storage-generation matrix plus A/O targets above. |
 | Control paths | `if`, `match`, `else`, `?`, `map_err`, branch/loop joins, zero iterations, early return/divergence, RHS error after temporary ownership acquisition, stale/overlapping view rejection. O/A owners plus `--test owned_borrowed_composition`. |

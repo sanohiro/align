@@ -8,7 +8,7 @@ new issues (1054/1055/1057): the total text boundary predicate (1057) is merged 
 and integer/char pattern matching (1055) is merged in PR 1060. The safe mutable-storage
 capability is now implemented: in-place `array<T>.truncate(new_len)` (#1054), typed slice
 stores `slice<u8>.set_S_E(offset, val)` (#1048), bulk `fill`/`fill_S_E`/`copy_from` (#1051),
-and general owned struct field replacement (#1048). Numeric slice copy already optimizes to memcpy.
+general owned struct field replacement (#1048), and disjoint record field borrows (#1050). Numeric slice copy already optimizes to memcpy.
 Foreign certification, ordered SIMD and native Mac investigations remain open.
 [Plan 67](docs/impl/67-caller-result-placement-plan.md) implements caller result
 placement for already-indirect aggregates, with native ABI cross-link and
