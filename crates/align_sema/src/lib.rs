@@ -34398,13 +34398,25 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn refresh_borrow_mut_place(&mut self, argument: &Expr) {
-        let root = match argument.kind {
-            ExprKind::Local(local) => Some(local),
-            ExprKind::Field { root, .. } => Some(root),
-            _ => None,
+        let (root, path) = match &argument.kind {
+            ExprKind::Local(local) => (Some(*local), None),
+            ExprKind::Field { root, path } => (Some(*root), Some(path.as_slice())),
+            _ => (None, None),
         };
         if let Some(root) = root {
             self.borrows.invalid.remove(&root);
+            let path = path.unwrap_or(&[]);
+            self.borrows.local_origin_places.retain(|local, (origin_root, origin_path)| {
+                if *local == root {
+                    return false;
+                }
+                if *origin_root == root
+                    && (path.is_empty() || origin_path.starts_with(path) || path.starts_with(origin_path))
+                {
+                    return false;
+                }
+                true
+            });
         }
     }
 
@@ -35570,6 +35582,11 @@ impl<'a> MoveCheck<'a> {
         args: &[Expr],
         modes: &[ast::ParamMode],
     ) {
+        let place = |expression: &Expr| match &expression.kind {
+            ExprKind::Local(local) => Some((*local, Vec::new())),
+            ExprKind::Field { root, path } => Some((*root, path.clone())),
+            _ => None,
+        };
         let overlaps = |left: &(LocalId, Vec<u32>), right: &(LocalId, Vec<u32>)| {
             left.0 == right.0
                 && (left.1.starts_with(&right.1) || right.1.starts_with(&left.1))
@@ -35584,7 +35601,8 @@ impl<'a> MoveCheck<'a> {
             } else {
                 self.storage_roots(argument)
             };
-            let argument_place = self.expr_origin_place(argument);
+            let argument_place = place(argument);
+            let argument_origin = self.expr_origin_place(argument);
             for (peer_index, peer) in args.iter().enumerate() {
                 if peer_index == index {
                     continue;
@@ -35612,12 +35630,13 @@ impl<'a> MoveCheck<'a> {
                 };
                 if conflicts {
                     let peer_roots = self.storage_roots(peer);
-                    let peer_place = self.expr_origin_place(peer);
+                    let peer_place = place(peer);
+                    let peer_origin = self.expr_origin_place(peer);
                     let direct_overlap = argument_place
                         .as_ref()
                         .zip(peer_place.as_ref())
                         .is_some_and(|(left, right)| overlaps(left, right));
-                    let parent_roots = match (argument_place.as_ref(), peer_place.as_ref()) {
+                    let parent_roots = match (argument_origin.as_ref(), peer_origin.as_ref()) {
                         (Some(left), Some(right))
                             if left.0 == right.0
                                 && self.is_disjoint_sibling_fields(left.0, &left.1, &right.1) =>
@@ -39807,6 +39826,17 @@ impl<'a> MoveCheck<'a> {
     fn invalidate_mutable_place(&mut self, root: LocalId, path: &[u32]) {
         self.borrows
             .invalidate_mutable_places(root, path, BorrowEnd::Consumed);
+        self.borrows.local_origin_places.retain(|local, (origin_root, origin_path)| {
+            if *local == root {
+                return false;
+            }
+            if *origin_root == root
+                && (path.is_empty() || origin_path.starts_with(path) || path.starts_with(origin_path))
+            {
+                return false;
+            }
+            true
+        });
     }
 
     fn invalidate_source_mutation_target(&mut self, target: &Expr) {

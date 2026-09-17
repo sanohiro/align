@@ -186,3 +186,58 @@ fn main() {}
         "expected alias error for rebound view alias, got:\n{formatted}"
     );
 }
+
+#[test]
+fn reject_rebound_view_via_call_alias() {
+    let src = "\
+pub State {
+  a: buffer,
+  b: buffer,
+}
+
+fn replace_view(borrow mut v: slice<u8>, borrow new_source: slice<u8>) {
+  v = new_source
+}
+
+fn call_views(borrow mut a: slice<u8>, borrow b: slice<u8>) {}
+
+pub fn run(borrow mut state: State) {
+  mut v := state.a.bytes()
+  mut vb := state.b.bytes()
+  replace_view(v, vb)
+  call_views(vb, v)
+}
+
+fn main() {}
+";
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "rebound-view-via-call-alias", src);
+    assert!(checked.diags.has_errors());
+    let formatted = align_driver::format_diagnostics(&sm, &checked.diags);
+    assert!(
+        formatted.contains("aliases argument"),
+        "expected alias error when mutable call replaced view descriptor, got:\n{formatted}"
+    );
+}
+
+#[test]
+fn independent_str_descriptor_borrow_mut_and_by_value() {
+    let src = "\
+fn replace_str(borrow mut dst: str, src: str) {
+  dst = src
+}
+
+pub fn probe_str(owner: str) {
+  mut x := owner
+  y := owner
+  replace_str(x, y)
+}
+
+fn main() -> i32 {
+  probe_str(\"hello\")
+  return 0
+}
+";
+    let output = build_and_run("independent-str-descriptors", src);
+    assert_eq!(output.status.code(), Some(0));
+}
