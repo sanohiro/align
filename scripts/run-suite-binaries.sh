@@ -201,6 +201,58 @@ conflicting="$(LC_ALL=C comm -12 "$expected" "$env_dependent")"
   exit 2
 }
 
+# Run one build phase under the whole-run deadline.
+#
+# The deadline is useless if it can only be observed between phases: a cold
+# cache or a stalled build would consume the entire job budget, the job-level
+# cap would cancel the job, and the night would end in exactly the silent
+# cancellation this deadline exists to replace — with the cache save skipped
+# too, guaranteeing the next night starts just as cold. So the budget is
+# checked WHILE a build runs, not only after it returns.
+#
+# The child records its own status through a marker file because Bash 3.2 has
+# no `wait -n` and `kill -0` cannot distinguish a live child from a zombie one.
+# `set +e` inside the subshell is required: the whole point is to capture a
+# failing status rather than let `set -e` abort before the marker is written.
+#
+# The kill reaches one level, the same reach and the same deliberate limit as
+# the per-binary watchdog: run-quiet.sh dies and cargo below it may not. On CI
+# the runner is destroyed with the job, and locally the named failure and a
+# stray compiler are still strictly better than a cancelled job that reports
+# nothing.
+suite_run_phase() {
+  local phase="$1" marker="$work/phase.status" child status
+  shift
+  if [ "$ALIGN_TB_DEADLINE" -le 0 ]; then
+    "$@"
+    return
+  fi
+  rm -f "$marker"
+  (
+    set +e
+    "$@"
+    printf '%s\n' "$?" >"$marker"
+  ) &
+  child=$!
+  while [ ! -e "$marker" ]; do
+    if [ "$(date +%s)" -ge "$ALIGN_TB_DEADLINE" ]; then
+      pkill -P "$child" 2>/dev/null || true
+      kill -KILL "$child" 2>/dev/null || true
+      wait "$child" 2>/dev/null || true
+      echo "suite: BUDGET EXCEEDED during $phase" >&2
+      printf 'suite:   %ss elapsed of a %ss whole-run budget; no binary has run\n' \
+        "$(($(date +%s) - suite_started_at))" "$suite_deadline" >&2
+      echo "  cut build cost or raise ALIGN_SUITE_SHARDS; the budget is not the number to raise" >&2
+      exit 1
+    fi
+    sleep 1
+  done
+  wait "$child" 2>/dev/null || true
+  status="$(cat "$marker")"
+  rm -f "$marker"
+  return "$status"
+}
+
 if [ $# -ge 1 ]; then
   artifacts="$1"
 else
@@ -217,7 +269,8 @@ else
   # that way for now: whether merging them into one `--all-targets`-style
   # build is worth it gets decided from the first fixed nightly's wall-clock,
   # not guessed here.
-  "$script_dir/run-quiet.sh" "suite build: workspace" -- \
+  suite_run_phase "the workspace build" \
+    "$script_dir/run-quiet.sh" "suite build: workspace" -- \
     "$script_dir/cargo.sh" build --workspace --locked
   # Where the artifacts landed comes from cargo itself: CARGO_TARGET_DIR alone
   # would miss CARGO_BUILD_TARGET_DIR and any .cargo/config override.
@@ -235,7 +288,8 @@ else
     echo "suite: workspace build did not produce $runtime_lib" >&2
     exit 2
   }
-  "$script_dir/run-quiet.sh" --stdout "$artifacts" \
+  suite_run_phase "the test-binary build" \
+    "$script_dir/run-quiet.sh" --stdout "$artifacts" \
     "suite build: test binaries" -- \
     "$script_dir/cargo.sh" test --no-run --workspace --locked \
     --message-format=json-render-diagnostics
@@ -249,9 +303,18 @@ align_tb_discover "$artifacts" || {
 # The four-core nightly runner has enough aggregate CPU for the full suite but
 # can still miss its 30-minute budget when Cargo's artifact order leaves large
 # generated-program owners at the tail. Give the measured long runners a
-# coarse longest-first rank before admission. This is only a scheduling hint:
-# every discovered binary still runs exactly once, unknown targets retain
-# their Cargo order, and verdict identity remains package/kind/target below.
+# coarse longest-first rank before admission. Every discovered binary still
+# runs exactly once, and verdict identity remains package/kind/target below.
+#
+# Equal ranks break by the stable package/kind/name identity, NOT by Cargo's
+# artifact ordinal. Cargo emits artifacts in completion order, which varies
+# with parallel compilation, so the ordinal is not reproducible between two
+# builds of the same commit. That is only a cosmetic difference for a single
+# host, but each shard builds on its own runner and partitions this list
+# independently: a tie broken differently on two runners moves a binary from
+# one shard to another, so some targets would run twice and others not at all,
+# with every shard still green. The identity is a total order (the collision
+# check below proves it), so every runner computes the same partition.
 #
 # Ranks come from the 2026-08-29 four-core constrained full-suite run, with
 # pkg_db_vc1 and pkg_db_q5a added from the required db-postgres shard timings
@@ -291,20 +354,19 @@ align_suite_priority_score() {
 }
 
 align_suite_order_binaries() {
-  local manifest target_kind target_name executable package identity score ordinal=0
+  local manifest target_kind target_name executable package identity score
   printf '%s\n' "$ALIGN_TB_BINARIES" |
     while IFS="$align_tb_tab" read -r manifest target_kind target_name executable; do
       [ -n "$executable" ] || continue
-      ordinal=$((ordinal + 1))
       package="$(basename "$(dirname "$manifest")")"
       identity="$package::$target_kind::$target_name"
       score="$(align_suite_priority_score "$identity")"
-      printf '%03d%s%06d%s%s%s%s%s%s%s%s\n' \
-        "$score" "$align_tb_tab" "$ordinal" "$align_tb_tab" \
+      printf '%03d%s%s%s%s%s%s%s%s%s%s\n' \
+        "$score" "$align_tb_tab" "$identity" "$align_tb_tab" \
         "$manifest" "$align_tb_tab" "$target_kind" "$align_tb_tab" \
         "$target_name" "$align_tb_tab" "$executable"
     done |
-    LC_ALL=C sort -t "$align_tb_tab" -k1,1nr -k2,2n |
+    LC_ALL=C sort -t "$align_tb_tab" -k1,1nr -k2,2 |
     cut -f3-
 }
 

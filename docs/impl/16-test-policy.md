@@ -540,7 +540,10 @@ one signal.
 Second, the budget is enforced **from inside**. `ALIGN_SUITE_DEADLINE` stops
 the run, prints every binary's elapsed time (including the ones still running,
 timed from the parent's launch record), and exits non-zero before the job-level
-cap can cancel the job. An overrun is therefore a named red result carrying its
+cap can cancel the job. It bounds the build phases as well, naming the phase
+that consumed the budget: a cold or stalled build would otherwise reach the job
+cap unobserved, and a cancelled job also skips the cache save, so the next night
+starts just as cold. An overrun is therefore a named red result carrying its
 own timing table, and the cache-save step still runs. No manifest verdict is
 produced from an incomplete run, because most of it never executed. The
 nightly's deadline is 23 minutes against a 30-minute job cap.
@@ -551,8 +554,11 @@ else, and `ALIGN_GATE_JOBS` sets the schedule. The four-core nightly pins two
 binary processes with two libtest threads each: the previous six-process,
 one-thread schedule kept the cores fed but left every long binary strictly
 serial, which is what pushed four `pkg_db_*` owners past the per-binary cap. It
-admits measured long-running generated-program owners in longest-first order;
-unknown targets retain Cargo's artifact order and still run exactly once. The
+admits measured long-running generated-program owners in longest-first order,
+breaking equal ranks by the stable package/kind/name identity rather than by
+Cargo's artifact ordinal, which is completion order and varies between builds.
+That tie-break is what makes the partition reproducible on every runner; every
+target still runs exactly once. The
 4,096-node whole-program type-DAG owner checks and lowers once, then exercises
 raw LLVM, optimized LLVM, and native execution from the same MIR; the three
 backend consumers remain distinct without repeating an identical frontend
