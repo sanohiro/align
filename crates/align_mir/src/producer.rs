@@ -779,6 +779,27 @@ pub fn xml_fn_type_facts(program: &Program, id: u32) -> Option<XmlCallFacts> {
     })
 }
 
+/// Compare a callee's declared facts with the facts an indirect call site states.
+///
+/// Every field but the parameter and result types is an exact ABI fact and stays compared by
+/// equality. The types are compared up to source identity for the reason `xml_source_ty_matches`
+/// documents: one source type can reach MIR under several nominal ids, so a call site that
+/// spells `Holder<fn(i64) -> i64>` with one monomorph and a callee that spells it with another
+/// still agree on the type.
+fn xml_call_facts_match(program: &Program, actual: &XmlCallFacts, expected: &XmlCallFacts) -> bool {
+    actual.modes == expected.modes
+        && actual.borrow == expected.borrow
+        && actual.region == expected.region
+        && actual.cleanup == expected.cleanup
+        && actual.params.len() == expected.params.len()
+        && actual
+            .params
+            .iter()
+            .zip(&expected.params)
+            .all(|(&actual, &expected)| xml_source_ty_matches(program, actual, expected))
+        && xml_source_ty_matches(program, actual.ret, expected.ret)
+}
+
 fn xml_signature_matches_facts(
     signature: &crate::FnSignatureFacts,
     facts: &XmlCallFacts,
@@ -1069,10 +1090,39 @@ fn xml_ty_matches_tagged_body(program: &Program, actual: Ty, expected: Ty) -> bo
         || matches!(actual, Ty::Tagged(id) if tagged_matches(program, id, expected))
 }
 
+/// Compare a flowed type with its expected type up to source identity.
+///
+/// A nominal id does not name a source type on its own. Sema allocates a distinct function type
+/// per callable origin so effect inference can separate two `fn(i64) -> i64` values, so a generic
+/// record instantiated at them monomorphizes once per origin — `Holder$F0_vi64_i64_bn_rn` and
+/// `Holder$F1_vi64_i64_bn_rn` — although every monomorph carries one `source_name` and one
+/// id-free definition. MIR then canonicalizes exactly the function types those records differed
+/// by, leaving several identical records under distinct ids. Nominal equality therefore rejects
+/// an ordinary value flow between two spellings of one source type. The canonical type graph is
+/// the compiler's own proof that they are the same type, and `nominal_link_metadata_is_valid`
+/// already refused a program whose equal-`source_name` records disagree.
+///
+/// This widens only the identity predicate a provenance proof is stated over; the producer walk,
+/// its founded-initialization proof, and every access requirement stay exactly as they were. A
+/// malformed graph fails closed.
+fn xml_source_ty_matches(program: &Program, actual: Ty, expected: Ty) -> bool {
+    source_ty_matches(actual, expected, program).unwrap_or(false)
+}
+
+/// Does a value of type `actual` flow into a place declared `expected`?
+///
+/// This is the validator's one type-compatibility predicate for an ordinary value flow: a store
+/// into a slot, an element or field of one, a call argument, or a produced result. It accepts a
+/// nominal monomorph split (`xml_source_ty_matches`) and the callable borrow/region widening
+/// (`xml_callable_flow_matches`), and nothing else.
+pub fn xml_flow_matches(program: &Program, actual: Ty, expected: Ty) -> bool {
+    xml_source_ty_matches(program, actual, expected)
+        || xml_callable_flow_matches(program, actual, expected)
+}
+
 fn xml_value_flow_matches(program: &Program, actual: Ty, expected: Ty) -> bool {
     xml_ty_matches_tagged_body(program, actual, expected)
-        || (matches!((actual, expected), (Ty::Fn(_), Ty::Fn(_)))
-            && xml_callable_flow_matches(program, actual, expected))
+        || xml_flow_matches(program, actual, expected)
 }
 
 pub fn xml_ty_is_view_retype(actual: Ty, expected: Ty) -> bool {
@@ -2052,7 +2102,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
             return XmlAccessSource::Invalid;
         };
         if !xml_selected_ty(self.graph.program, base, &path)
-            .is_some_and(|actual| xml_callable_flow_matches(self.graph.program, actual, expected)) {
+            .is_some_and(|actual| xml_flow_matches(self.graph.program, actual, expected))
+        {
             return XmlAccessSource::Invalid;
         }
         match operand {
@@ -2389,7 +2440,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
         if (stored != place.ty && !xml_borrowed_place_ty_is_view_retype(stored, place.ty))
             || xml_selected_ty(self.graph.program, place.ty, &path) != Some(expected)
             || !selected.is_some_and(|actual| {
-                xml_callable_flow_matches(self.graph.program, actual, expected)
+                xml_flow_matches(self.graph.program, actual, expected)
                     || xml_ty_is_view_retype(actual, expected)
             })
             || place.cleanup.is_some_and(|cleanup| {
@@ -2933,8 +2984,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 .iter()
                 .zip(&facts.params)
                 .all(|(operand, expected)| {
-                    xml_operand_base_ty(self.graph.function, operand).is_some_and(|actual|
-                        actual == *expected || xml_callable_flow_matches(self.graph.program, actual, *expected))
+                    xml_operand_base_ty(self.graph.function, operand)
+                        .is_some_and(|actual| xml_flow_matches(self.graph.program, actual, *expected))
                 });
         let cleanup_matches = match (cleanup, facts.cleanup) {
             (None, hir::ReturnCleanupAbi::None) => true,
@@ -2949,7 +3000,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
         let (roots, captures) = Self::call_roots(&facts.borrow, &facts.region);
         if !argument_types_match
             || !modes_match
-            || facts.ret != result_ty
+            || !xml_source_ty_matches(self.graph.program, facts.ret, result_ty)
             || !cleanup_matches
             || roots.iter().any(|root| *root as usize >= args.len())
             || (!captures.is_empty() && callee.is_none())
@@ -3564,7 +3615,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             }
             Rvalue::Load(slot) => {
                 if !self.graph.function.slots.get(slot as usize)
-                    .is_some_and(|actual| xml_callable_flow_matches(self.graph.program, *actual, result_ty)) {
+                    .is_some_and(|actual| xml_flow_matches(self.graph.program, *actual, result_ty)) {
                     equation.invalid = true;
                 } else {
                     Self::add_source(
@@ -3660,10 +3711,18 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 };
                 let view_matches = match (slot_ty, result_ty) {
                     (Ty::Array(element, actual), Ty::Slice(view)) => {
-                        element == view && u32::try_from(length) == Ok(actual)
+                        xml_source_ty_matches(
+                            self.graph.program,
+                            scalar_to_ty(element),
+                            scalar_to_ty(view),
+                        ) && u32::try_from(length) == Ok(actual)
                     }
                     (Ty::StructArray(id, actual), Ty::Slice(Scalar::Struct(view))) => {
-                        id == view && u32::try_from(length) == Ok(actual)
+                        xml_source_ty_matches(
+                            self.graph.program,
+                            Ty::Struct(id),
+                            Ty::Struct(view),
+                        ) && u32::try_from(length) == Ok(actual)
                     }
                     _ => false,
                 };
@@ -3690,8 +3749,14 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 {
                     let mut source_path = vec![XmlAccessPathSegment::Element];
                     source_path.extend_from_slice(remaining);
-                    if xml_selected_ty(self.graph.program, slot_ty, &source_path)
-                        != Some(selected_ty)
+                    if !xml_selected_ty(self.graph.program, slot_ty, &source_path)
+                        .is_some_and(|source_selected| {
+                            xml_source_ty_matches(
+                                self.graph.program,
+                                source_selected,
+                                selected_ty,
+                            )
+                        })
                     {
                         equation.invalid = true;
                         return equation;
@@ -4336,9 +4401,9 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     });
                 if !condition_matches
                     || !xml_operand_base_ty(self.graph.function, &a)
-                        .is_some_and(|actual| xml_callable_flow_matches(self.graph.program, actual, result_ty))
+                        .is_some_and(|actual| xml_flow_matches(self.graph.program, actual, result_ty))
                     || !xml_operand_base_ty(self.graph.function, &b)
-                        .is_some_and(|actual| xml_callable_flow_matches(self.graph.program, actual, result_ty))
+                        .is_some_and(|actual| xml_flow_matches(self.graph.program, actual, result_ty))
                 {
                     equation.invalid = true;
                 } else {
@@ -5219,7 +5284,9 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     region: signature.return_region,
                     cleanup: signature.return_cleanup,
                 };
-                if xml_fn_type_facts(self.graph.program, id).as_ref() != Some(&facts) {
+                if !xml_fn_type_facts(self.graph.program, id)
+                    .is_some_and(|declared| xml_call_facts_match(self.graph.program, &declared, &facts))
+                {
                     equation.invalid = true;
                     return equation;
                 }
@@ -5262,7 +5329,9 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     region: call.signature.return_region,
                     cleanup: call.signature.return_cleanup,
                 };
-                if xml_fn_type_facts(self.graph.program, id).as_ref() != Some(&facts) {
+                if !xml_fn_type_facts(self.graph.program, id)
+                    .is_some_and(|declared| xml_call_facts_match(self.graph.program, &declared, &facts))
+                {
                     equation.invalid = true;
                     return equation;
                 }
@@ -6879,7 +6948,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
         let producers = producers.clone();
         for operand in root_stores {
             if !xml_operand_base_ty(self.graph.function, &operand)
-                .is_some_and(|actual| xml_callable_flow_matches(self.graph.program, actual, slot_ty)) {
+                .is_some_and(|actual| xml_flow_matches(self.graph.program, actual, slot_ty)) {
                 equation.invalid = true;
             } else {
                 if matches!(operand, Operand::BorrowedPlace(_)) {
@@ -6907,7 +6976,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             };
             if fields.is_empty()
                 || !xml_operand_base_ty(self.graph.function, &operand)
-                .is_some_and(|actual| xml_callable_flow_matches(self.graph.program, actual, stored_ty))
+                .is_some_and(|actual| xml_flow_matches(self.graph.program, actual, stored_ty))
             {
                 equation.invalid = true;
                 continue;
@@ -6938,7 +7007,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             };
             if xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
                 || !xml_operand_base_ty(self.graph.function, &operand)
-                .is_some_and(|actual| xml_callable_flow_matches(self.graph.program, actual, element_ty))
+                .is_some_and(|actual| xml_flow_matches(self.graph.program, actual, element_ty))
             {
                 equation.invalid = true;
                 continue;
@@ -6949,7 +7018,11 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 equation.invalid = true;
                 continue;
             };
-            if xml_selected_ty(self.graph.program, element_ty, remaining) != Some(selected_ty) {
+            if !xml_selected_ty(self.graph.program, element_ty, remaining).is_some_and(
+                |stored_selected| {
+                    xml_source_ty_matches(self.graph.program, stored_selected, selected_ty)
+                },
+            ) {
                 equation.invalid = true;
                 continue;
             }
@@ -6981,7 +7054,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 || !matches!(slot_ty, Ty::StructArray(..))
                 || xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
                 || !xml_operand_base_ty(self.graph.function, &operand)
-                .is_some_and(|actual| xml_callable_flow_matches(self.graph.program, actual, stored_ty))
+                .is_some_and(|actual| xml_flow_matches(self.graph.program, actual, stored_ty))
             {
                 equation.invalid = true;
                 continue;
@@ -8117,7 +8190,8 @@ fn validate_resource_rvalues_component(
                 region: signature.return_region.clone(),
                 cleanup: signature.return_cleanup,
             };
-            xml_fn_type_facts(program, id).as_ref() == Some(&copied)
+            xml_fn_type_facts(program, id)
+                .is_some_and(|facts| xml_call_facts_match(program, &facts, &copied))
                 && matches!(
                     xml_access(callee, Ty::Fn(id)),
                     XmlProducerState::Present(

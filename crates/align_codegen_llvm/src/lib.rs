@@ -17,7 +17,7 @@ use align_mir::producer::{
     xml_fn_type_facts, xml_operand_base_ty, xml_shared_string_result, xml_ty_is_view_retype
 };
 use align_mir::producer::{
-    lowercase_hex, builtin_error_enum_is_exact, db_resource_matches_row, xml_callable_flow_matches,
+    lowercase_hex, builtin_error_enum_is_exact, db_resource_matches_row, xml_flow_matches,
     xml_closure_borrow_summary, xml_closure_region_summary, fs_tree_output_slots,
     validate_resource_rvalues, validate_resource_program, validate_tagged_program,
     validate_partition_tagged_program, callable_hex, callable_target_error, canonical_metadata,
@@ -4783,10 +4783,11 @@ fn callable_preflight(
                         let types_match = match argument_types.as_deref() {
                             Some(actual) => {
                                 actual.len() == declaration.signature.params.len()
-                                    && actual.iter().zip(&declaration.signature.params).all(|(actual, expected)| {
-                                        source_ty_matches(*actual, *expected, program).unwrap_or(false)
-                                            || xml_callable_flow_matches(program, *actual, *expected)
-                                    })
+                                    && actual.iter().zip(&declaration.signature.params).all(
+                                        |(actual, expected)| {
+                                            xml_flow_matches(program, *actual, *expected)
+                                        },
+                                    )
                             }
                             None => false,
                         };
@@ -4824,10 +4825,11 @@ fn callable_preflight(
                         let types_match = match argument_types.as_deref() {
                             Some(actual) => {
                                 actual.len() == declaration.signature.params.len()
-                                    && actual.iter().zip(&declaration.signature.params).all(|(actual, expected)| {
-                                        source_ty_matches(*actual, *expected, program).unwrap_or(false)
-                                            || xml_callable_flow_matches(program, *actual, *expected)
-                                    })
+                                    && actual.iter().zip(&declaration.signature.params).all(
+                                        |(actual, expected)| {
+                                            xml_flow_matches(program, *actual, *expected)
+                                        },
+                                    )
                             }
                             None => false,
                         };

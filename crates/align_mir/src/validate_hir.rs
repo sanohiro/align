@@ -7639,9 +7639,17 @@ impl<'a> BodyValidator<'a> {
                                 let Some(tail) = block.value.as_deref() else { return false };
                                 constructor = tail;
                             }
+                            // Compare the constructed record the same way this validator
+                            // compares every other type here. One source type reaches checked
+                            // HIR under several nominal ids — sema gives each callable origin
+                            // its own function type, so `Holder<fn(i64) -> i64>` monomorphizes
+                            // once per origin — and the element flow above already accepted
+                            // those spellings through `body_ty_matches`. Requiring the exact id
+                            // only here would reject an in-place constructor that is in place.
                             matches!(
                                 constructor.kind,
-                                hir::ExprKind::StructLit { struct_id, .. } if struct_id == id
+                                hir::ExprKind::StructLit { struct_id, .. }
+                                    if self.body_ty_matches(Ty::Struct(struct_id), Ty::Struct(id))
                             )
                         }),
                     _ => true,
