@@ -26,14 +26,14 @@ Three corollaries bound that sentence, and every guarantee below is written to
 respect all three.
 
 ```text
-own facts only     a fact Align states to LLVM must be a property of Align's
-                   own lowering or representation, never one minted from
-                   source spelling (63-codegen-performance-audit.md:218,
-                   64-composed-byte-optimization-plan.md:186)
+own facts only      a fact Align states to LLVM must be a property of Align's
+                    own lowering or representation, never one minted from
+                    source spelling (63-codegen-performance-audit.md:218,
+                    64-composed-byte-optimization-plan.md:186)
 no silent relaxing  no guarantee relaxes IEEE 754 semantics without a visible
-                   source scope; floats never abort
-say why            when a loop stays scalar anyway, the compiler names the
-                   blocker (G10); a scalar loop is never a silent outcome
+                    source scope; floats never abort
+say why             when a loop stays scalar anyway, the compiler names the
+                    blocker (G10); a scalar loop is never a silent outcome
 ```
 
 Each guarantee separates two different kinds of statement, and the difference
@@ -59,11 +59,11 @@ Measured, not inferred. The owner column names the guarantee that removes it.
 | B1 | Borrowed view header `{ptr,len}` re-loaded per use; no alias facts on `borrow` header params | codegen | 8–10× on `out[i] = out[i] * k` and AXPY; 12,185 LICM remarks | G1 |
 | B2 | Two-compare bounds check per access; two or more surviving checks switch LoopVectorize off | MIR | 16–30× on matvec; 3,605 trap branches | G2 |
 | B3 | Counted loop puts its trip-count exit in the header; LLVM rejects early-exit vectorization structurally | MIR lowering | 10.5× on a byte scan | G3 |
-| B4 | Pipeline `.max()`/`.min()` and `if x > best` lower to `fcmp`+`select`; scalar `a.max(b)` lowers to `llvm.maximum` | MIR/codegen inconsistency | 16× (191 µs → 11.8 µs on 152k f32), no semantics change | G4 Part 1 |
+| B4 | Pipeline `.max()`/`.min()` and `if x > best` lower to `fcmp`+`select`; scalar `a.max(b)` lowers to `llvm.maximum` | MIR/codegen inconsistency | 16× (190.7 µs → 12.0 µs on 152,064 f32), no semantics change | G4 Part 1 |
 | B5 | No scoped reassociation or contraction, so f32 `sum`/`dot` stay serialized | missing surface | 13–17× against clang `reassociate(on) contract(fast)` | G4 Part 2 |
 | B6 | Runtime primitives in loops are opaque calls with no effect attributes | runtime ABI | memset, LICM and vectorization all blocked | G5 |
 | B7 | Transcendentals lower to libcalls; no vector math implementation is configured | codegen/driver | a `pow` loop "vectorizes" to per-lane `bl _powf` plus shuffles, slower than scalar | G6 |
-| B8 | Byte data cannot become `slice<T>` without a copy | language | 65.7 µs copy per 152k f32; typed SIMD unreachable from bytes | G7 |
+| B8 | Byte data cannot become `slice<T>` without a copy | language | 59.4 µs conversion loop per 152,064 f32 (an earlier run of the same pair measured 65.7 µs); typed SIMD unreachable from bytes | G7 |
 | B9 | `maskN<f32>` cannot `select` a `vecN<i32>` | sema | vectorized argmax with exact indices inexpressible | G8 |
 | B10 | Cross-unit non-generic `pub fn` in a pipeline stage stays a call; generic ones inline | build model | stage loop stays scalar | G9 |
 | B11 | An in-loop early exit prevents vectorizing the whole loop | source shape / MIR | argmax stays scalar | G3 + G10 |
@@ -79,21 +79,60 @@ Two conjunctions are recorded here because a partial fix is not measurable:
 
 ## 3. The ledger
 
-Every row is a public promise. "Layer" is the single owner; a guarantee with two
-owners is a guarantee nobody owns.
+Every row is a public promise. "Layer" names the one accountable owner first;
+where a guarantee necessarily touches a second layer that layer follows in
+parentheses, and the prose says what each does. A guarantee may be implemented
+by more than one issue, but every issue belongs to exactly one guarantee, so no
+promise is left without an owner.
+
+Two columns the authoring gate also requires — prerequisite milestone, and
+artifact and cache identity — are stated once per guarantee in §3.1 rather than
+widened into this table.
 
 | G | Exact statement | Promised | Tried | Layer | Acceptance corpus | Implementing issue |
 | --- | --- | --- | --- | --- | --- | --- |
-| G1 | A borrowed view header is materialized once per function or loop preheader, and header memory is stated distinct from element memory | one header load per loop, dominating the loop; a TBAA node pair separating `align.view.header` from `align.elem.<T>`; `noalias dereferenceable(16) align 8` on `borrow` header parameters | that LICM then hoists everything else | LLVM lowering | `vectorize_shapes` owner `g1_view_header_hoisted`; `bytes_to_f32_out` conjunction pin | 1079 |
-| G2 | At most one bounds check per loop, in the preheader, for a monotone index | the check is fused to one unsigned compare; for a monotone index with loop-invariant bound the guard is *moved* to the preheader, not deleted; trap text and first-failing-access iteration unchanged | which residual checks LLVM then folds | MIR | `vectorize_shapes` owner `g2_monotone_check_hoisted`; trap-parity owners for zero-length, length-1, first-out-of-range | 1081 |
-| G3 | A counted loop lowers with its trip-count exit at the latch; the recognized shape produces one named MIR fact | recognition is total for the canonical shape: zero-trip test peeled into the preheader, only body-derived exits in the header, `i + step REL bound` at the latch; the fact carries trip count, step and monotone index and is the single source G1's and G2's owners read | whether LLVM's early-exit vectorizer then fires | MIR lowering | `vectorize_shapes` owner `g3_counted_latch_exit`; zero-trip, one-trip, first-element exit, last-element exit, no-exit owners | 1084 |
-| G4 | One floating-point semantics model: uniform `minimum`/`maximum` lowering, ordered by default, relaxation only inside an explicit lexical scope | Part 1: all three spellings of a float min/max emit `llvm.minimum`/`llvm.maximum`, with NaN propagation and ±0 ordering unchanged. Part 2 (future): `reassoc` and `contract` are named individually and scoped lexically without inheriting across a function boundary; `nnan` and `ninf` are permanently excluded | the vector width LLVM picks for the resulting reduction | MIR (Part 1); sema + MIR (Part 2) | `vectorize_shapes` owner `g4_minmax_uniform_lowering`; NaN, `-0.0`/`+0.0`, all-NaN conformance owners; `k6_float_sum_does_not_vectorize_without_fast_math` as the standing negative control | 1082 Part 1 (now), 1082 Part 2 (future RFC) |
-| G5 | Every runtime primitive that can appear in a loop has an effects record and either an inline fast path or a vector form | each runtime ABI symbol carries a complete memory-effects attribute; per-element primitives have a visible inline fast path and a visible slow path; `Result`/`?` failure edges are cold with one model | which of the fast paths LLVM then widens | runtime ABI + LLVM lowering | the runtime-ABI owner in `20-runtime-abi-ledger.md`, extended by plan 70 | 1071, 1072, 1073, 1074 |
-| G6 | Every `core.math` function has a vector lowering on every supported target and one accuracy contract that holds for both lowerings | a documented ULP bound per function; scalar and vector results agree within it; the same results on every supported target; no scalar libcall inside a vector body | which loops the vectorizer chooses to widen | LLVM lowering + driver | `vec_math` owner extended to the exp/log family; a ULP conformance owner; `examples/vec_math.align` | 1063 (revised, §6.1) |
-| G7 | Bytes reach typed slices through one checked, order-explicit, zero-copy view | construction allocates nothing and copies nothing; alignment and length are validated and yield `None` rather than trapping; the view carries the source borrow's authority and provenance; the named byte order must be the target's native order or the program is rejected at compile time | that a loop over the result then vectorizes — that is G1–G4 | sema (+ MIR for the lowering) | a view owner asserting no allocation and no copy in emitted IR; `vecN` load reachable from `buffer.bytes()`; a negative owner for a non-native order | 1064 (revised, §6.2) |
-| G8 | A mask is structural: lane count and lane bit width, not element type | `select` accepts any mask whose lane count and lane width match the blended vectors; emitted IR is a plain `select <N x i1>` with no conversion; a lane-count or lane-width mismatch keeps its existing diagnostic | nothing | sema | `examples/vec_argmax.align` (planned) plus its codegen owner; negative owners for `mask4<f32>` gating `vec2<f64>` and `vec8<i32>` | 1083 |
-| G9 | A function called from a pipeline stage or a hot loop is inlinable across units | a non-generic `pub fn` body under a size budget travels in the unit interface exactly as a generic body does today | whether LLVM inlines it at a given call site | driver + `align_interface` | a two-unit owner asserting the stage loop vectorizes across the unit boundary | 1066 (comment); no separate issue yet |
-| G10 | When a pipeline or counted loop stays scalar, the compiler says why | the vectorizer remarks `explain-opt` already collects are promoted to a first-class diagnostic on the loop, naming the blocker | nothing | driver (`09-explain-opt.md` owner) | an `explain-opt` owner asserting a known-scalar loop names its blocker | unfiled; see §4 |
+| G1 | A borrowed view header is materialized once per function or loop preheader, and header memory is stated distinct from element memory | one header load per loop, dominating the loop; a TBAA node pair separating `align.view.header` from `align.elem.<T>`; `noalias dereferenceable(16) align 8` on `borrow` header parameters | that LICM then hoists everything else | LLVM lowering | `vectorize_shapes` owners `g1_view_header_hoisted` and the `bytes_to_f32_out` conjunction pin (both planned) | 1079 |
+| G2 | At most one bounds check per loop, in the preheader, for a monotone index | the check is fused to one unsigned compare; for a monotone index with loop-invariant bound the guard is *moved* to the preheader, not deleted; trap text and first-failing-access iteration unchanged | which residual checks LLVM then folds | MIR | `vectorize_shapes` owner `g2_monotone_check_hoisted` (planned); trap-parity owners for zero-length, length-1, first-out-of-range | 1081, 1080 |
+| G3 | A counted loop lowers with its trip-count exit at the latch; the recognized shape produces one named MIR fact | recognition is total for the canonical shape: zero-trip test peeled into the preheader, only body-derived exits in the header, `i + step REL bound` at the latch; the fact carries trip count, step and monotone index and is the single source G1's and G2's owners read | whether LLVM's early-exit vectorizer then fires | MIR lowering | `vectorize_shapes` owner `g3_counted_latch_exit` and the zero-trip, one-trip, first-element-exit, last-element-exit and no-exit owners (all planned) | 1084 |
+| G4 | One floating-point semantics model: uniform `minimum`/`maximum` lowering, ordered by default, relaxation only inside an explicit lexical scope | Part 1: all three spellings of a float min/max emit `llvm.minimum`/`llvm.maximum`, with NaN propagation and ±0 ordering unchanged. Part 2 (future): `reassoc` and `contract` are named individually and scoped lexically without inheriting across a function boundary; `nnan` and `ninf` are permanently excluded | the vector width LLVM picks for the resulting reduction | MIR (Part 1); MIR with sema (Part 2) | `vectorize_shapes` owner `g4_minmax_uniform_lowering` and the NaN, `-0.0`/`+0.0` and all-NaN conformance owners (planned); the existing `vectorize_shapes.rs:258` negative control `k6_float_sum_does_not_vectorize_without_fast_math` | 1082 Part 1 (now), 1082 Part 2 (future RFC) |
+| G5 | Every runtime primitive that can appear in a loop has an effects record and either an inline fast path or a vector form | each runtime ABI symbol carries a complete memory-effects attribute; per-element primitives have a visible inline fast path and a visible slow path; `Result`/`?` failure edges are cold with one model | which of the fast paths LLVM then widens | runtime ABI, with LLVM lowering | the existing runtime-ABI owner in `20-runtime-abi-ledger.md`, extended by plan 70 | 1071, 1072, 1073, and 1074, which this contract adds to issue 1088's B6 owner set |
+| G6 | Every `core.math` function has a vector lowering on every supported target and one accuracy contract that holds for both lowerings | a documented ULP bound per function against the correctly rounded result; the scalar and vector lowerings produce bit-identical results, and so does every supported target; no scalar libcall inside a vector body | which loops the vectorizer chooses to widen | LLVM lowering, with the driver | the existing `crates/align_driver/tests/vec_simd.rs` and `crates/align_driver/tests/scalar_math.rs` owners extended to the exp/log family; a ULP conformance owner (planned); `examples/vec_math.align` | 1063 (revised, §6.1), with 1069 as a prerequisite |
+| G7 | Bytes reach typed slices through one checked, order-explicit, zero-copy view | construction allocates nothing and copies nothing; alignment and length are validated and yield `None` rather than trapping; the view carries the source borrow's authority and provenance; the named byte order must be the target's native order or the program is rejected at compile time | that a loop over the result then vectorizes — that is §6.3's gate, not this guarantee | sema, with MIR for the lowering | a view owner asserting no allocation and no copy in emitted IR; a `vecN` load reachable from `buffer.bytes()`; a negative owner for a non-native order (all planned) | 1064 (revised, §6.2) |
+| G8 | A mask is structural: lane count and lane bit width, not element type | `select` accepts any mask whose lane count and lane width match the blended vectors; emitted IR is a plain `select <N x i1>` with no conversion; a lane-count or lane-width mismatch keeps its existing diagnostic | nothing | sema | `examples/vec_argmax.align` plus its codegen owner, and negative owners for `mask4<f32>` gating `vec2<f64>` and `vec8<i32>` (all planned) | 1083 |
+| G9 | A function called from a pipeline stage or a hot loop is inlinable across units | a non-generic `pub fn` body under a size budget travels in the unit interface exactly as a generic body does today | whether LLVM inlines it at a given call site | `align_interface`, with the driver | a two-unit owner asserting the stage loop vectorizes across the unit boundary (planned) | none yet; issue 1066's comment carries the proposal and needs its own issue |
+| G10 | When a pipeline or counted loop stays scalar, the compiler says why | the vectorizer remarks `explain-opt` already collects are promoted to a first-class diagnostic on the loop, naming the blocker | nothing | driver (`09-explain-opt.md` owner) | an `explain-opt` owner asserting a known-scalar loop names its blocker (planned) | none yet; see §4 |
+
+### 3.1 Prerequisites and artifact identity
+
+```text
+G1, G2, G3  no prerequisite milestone; each changes emission only. No unit
+            interface, cache key or artifact identity changes: the object
+            content changes, the interface hash does not.
+G4 Part 1   no prerequisite; emission only, no identity change.
+G4 Part 2   prerequisite: its own RFC. A relaxation scope is observable
+            semantics, so the scope must enter the unit interface and the
+            implementation identity; it cannot be a codegen-only flag.
+G5          prerequisite: the runtime ABI inventory in 20-runtime-abi-ledger.md
+            is the record of truth, and every effects record added there is
+            part of the runtime artifact's identity.
+G6          prerequisite: issue 1069, because the portable kernels ship as
+            runtime bitcode and 1069 is why --rt-lto does not inline them at
+            the default target on aarch64. The kernels and the selected
+            accuracy tier are part of the runtime artifact identity; the
+            per-target vector-library opt-in must enter the implementation
+            identity, because it changes results.
+G7          no prerequisite milestone. A view type is a new public type
+            constructor in the interface, so it changes the interface hash of
+            any unit exposing one.
+G8          no prerequisite; a pure widening of a type-check predicate, no
+            identity change for any program that compiles today.
+G9          no prerequisite milestone; issue 1070's prelink defect blocks the
+            rejected whole-program ThinLTO alternative, not this path.
+            Interface-carried bodies change interface serialization, so the
+            body set and the size budget both enter the interface hash and the
+            object cache key; a budget change must invalidate that cache.
+G10         no prerequisite; a diagnostic, with no identity effect.
+```
 
 ### G1 — view header materialized once, alias facts stated
 
@@ -143,8 +182,11 @@ that is a promise, and it is what separates this from bounds-check removal.
 
 `!range` on the length load (issue 1080) is part of G2's proof surface rather
 than a separate guarantee: it is what makes the unsigned fusion provable to LLVM
-as well as to us, and it also widens the two-length kernels from `<2 x float>`
-to `<4 x float>`. §5 records why it is not the rejected `llvm.assume` policy.
+as well as to us. Supplying the length's non-negativity also removes the
+`llvm.smax`/`bic` clamps and widens the two-length kernels from `<2 x float>` to
+`<4 x float>`; 1080's experiment established that by asserting `len >= 0` in the
+emitted IR, and `!range` is the mechanism proposed to supply the same fact. §5
+records why it is not the rejected `llvm.assume` policy.
 
 ### G3 — counted loops exit at the latch
 
@@ -223,7 +265,7 @@ scoped relaxation    an explicit lexical scope naming which guarantee is
                      selected independently, never bundled as one "fast"
 non-inheriting       a callee's semantics never change because of its caller
 excluded forever     nnan and ninf: they make the result poison for a NaN or
-                     infinite input, which is a hidden undefined-behaviour
+                     infinite input, which is a hidden undefined-behavior
                      class inside a language whose settled rules are that
                      floats follow IEEE 754 and never abort
 outside any scope    bit-for-bit unchanged, and that is testable
@@ -277,7 +319,7 @@ whether it happens to have a type parameter. The fix is to carry small
 non-generic bodies in the unit interface exactly as generic bodies already
 travel. Default ThinLTO is not the fix: it is blocked by the prelink defect
 (1070), it is a whole-program hammer for a per-function question, and it does
-not make the behaviour predictable at the default profile.
+not make the behavior predictable at the default profile.
 
 ### G10 — the compiler says why
 
@@ -291,8 +333,8 @@ Without G10 this contract is a list of hopes; with it, it is checkable.
 ## 4. Ownership map
 
 ```text
-plan 69 loop facts (planned)          G1  1079, 1080
-                                      G2  1081
+plan 69 loop facts (planned)          G1  1079
+                                      G2  1081, 1080
                                       G3  1084
 plan 70 runtime boundary effects
   (planned)                           G5  1071, 1072, 1073, 1074
@@ -308,9 +350,28 @@ unfiled                               G9  1066 comment, needs its own issue
 
 Plan 69 and plan 70 do not exist yet; they are cited here as the planned owning
 documents so that the guarantees have a named destination, not as existing
-sources of truth. Issues 1079, 1080, 1081 and 1084 record the conjunction
-evidence that makes them one unit of work rather than four patches: two of the
-three data facts in isolation produce zero vector instructions on a real kernel.
+sources of truth.
+
+The four issues plan 69 would carry are scheduled together for three different
+reasons, and the document states each rather than flattening them:
+
+```text
+1079 + 1081  genuinely conjunctive. Issue 1079 section 5 measures the
+             conversion kernel four ways through the identical default<O2>:
+             as emitted, checks hoisted only, noalias only, both. Only the
+             fourth produces a vector body. A partial fix is unmeasurable.
+1080         purely additive, by its own account: it is the cheapest of the
+             three data facts, it is what makes G2's unsigned fusion provable
+             to LLVM, and it widens the two-length kernels. It is not part of
+             the conjunction experiment.
+1084         independent by its own account: the three data-fact issues decide
+             what a loop knows about its data, and 1084 decides the loop's
+             control-flow shape. Its own two factors are rotation and
+             dereferenceability. It is scheduled alongside because 1079's
+             preheader header materialization is what makes its
+             dereferenceability half cheap, not because it is conjunctive
+             with the others.
+```
 
 G4 Part 1 and G8 are being implemented in a parallel PR at the time of writing.
 Neither changes a public contract stated here: Part 1 unifies a lowering and G8
@@ -322,10 +383,20 @@ must go through the normal design gate on its own evidence. This document
 records its direction and its permanent exclusions (§3, G4) and settles nothing
 about its spelling.
 
-## 5. Compliance with the locked decisions
+## 5. Compliance with the locked decisions and standing rejections
 
-This contract adds no exception to any locked decision. The four that it comes
-closest to are recorded explicitly.
+This contract adds no exception to any locked decision. The four it comes
+closest to are recorded explicitly, together with one standing rejection that is
+not a locked decision and is not treated as one here.
+
+A note on status, because the distinction matters for what a later change must
+do: `docs/open-questions.md` is `## Settled` (lines 14–3679), `## Open (to be
+decided)` (3680–5741) and `## Future (out of v1 scope)` (5742–end). The
+`llvm.assume` rejection at `:4187-4189` and the ordered-reduction rule at
+`:4956` both sit in the **Open** section — the first inside the external
+optimization-consultation adoption record, the second inside a deferred SIMD
+audit entry. They are standing "do not re-litigate" records, not Settled
+entries, and this document does not promote either.
 
 **Floats follow IEEE 754 and never abort.** G4 Part 1 changes no float
 semantics at all: `llvm.minimum`/`llvm.maximum` propagate NaN and order ±0
@@ -336,7 +407,8 @@ later level.
 **No `llvm.assume` as a general policy.** `docs/open-questions.md:4187-4189`
 rejects "`llvm.assume` / early intrinsic emission / loop-metadata overrides as a
 general policy", with the guidance "attributes and flags first". Nothing in
-G1–G10 reopens that.
+G1–G10 reopens that except G3's documented fallback, immediately below, which
+needs an explicit carve-out against that exact record.
 
 - `!range` on a length load (1080, inside G2) **is not** that policy. It is
   per-load metadata, carries no control dependence, costs no instruction, and
@@ -347,18 +419,27 @@ G1–G10 reopens that.
 - G1's TBAA pair and G1/G3's `dereferenceable` attributes are likewise
   attributes describing Align's own data layout.
 
-**1084's dereferenceable fallback needs an explicit carve-out.** The preferred
-form is an attribute on the data pointer once G1 has materialized it in the
-preheader, which needs no carve-out. The documented fallback — one operand-bundle
-`assume` in the preheader, emitted only for a recognized counted loop over a
-slice and describing only Align's own `{ptr, len}` invariant — is a narrow,
-recognized-shape use of the rejected intrinsic. It may not be implemented under
-this contract alone. It requires a recorded carve-out in the Settled section of
-`docs/open-questions.md` naming the exact shape, the exact emission condition,
-and the reason the general prohibition still stands, added by the PR that needs
-it. Absent that carve-out, G3's dereferenceability half ships in its attribute
-form or not at all. Recorded negative result: `dereferenceable(16) align 8` on
-the `borrow` *header* parameter does not reach the data buffer.
+**1084's dereferenceable fallback needs an explicit carve-out, and probably
+cannot be avoided.** The extent G3 needs is `len * sizeof(T)`, a runtime value.
+LLVM's `dereferenceable(<n>)` parameter attribute and `!dereferenceable` load
+metadata both take a constant byte count, so the attribute form can express only
+a statically known minimum extent — a fixed-length array, or a loop whose bound
+is a constant. That covers a real subset and should be taken where it applies,
+but it does not express G3's promise for a runtime-length slice, which is why
+1084's own measured variant uses the dynamic operand bundle
+`call void @llvm.assume(i1 true) ["dereferenceable"(ptr %p, i64 %n)]`.
+
+That fallback is a narrow, recognized-shape use of the rejected intrinsic,
+emitted only for a recognized counted loop over a slice and describing only
+Align's own `{ptr, len}` invariant. It may not be implemented under this
+contract alone. It requires a recorded carve-out written against the
+`:4187-4189` record itself — naming the exact shape, the exact emission
+condition, and the reason the general prohibition still stands — added by the PR
+that needs it. Absent that carve-out, G3's dereferenceability half ships only
+for statically known extents. Treat the carve-out as the expected path, not the
+unlikely one, so it is not a surprise at implementation time. Recorded negative
+result: `dereferenceable(16) align 8` on the `borrow` *header* parameter does
+not reach the data buffer.
 
 **One loop expression; no `for`, `while`, `continue`, labels.** G3 is a lowering
 contract, not a syntax addition. No guarantee in this document proposes new loop
@@ -379,8 +460,8 @@ terminal per relaxation level is rejected in G4.
 
 Both issues were filed with an acceptance criterion that is measured false and
 does not become true through the change the issue proposes, because it depends
-on G1–G4. Both are restated here as criteria the owning change can actually
-satisfy on its own.
+on the gate §6.3 states. Both are restated here as criteria the owning change
+can actually satisfy on its own.
 
 ### 6.1 Issue 1063 — `core.math` exponential and logarithmic family
 
@@ -404,7 +485,12 @@ identical-across-builds results.
 target, from Align-owned portable kernels shipped as runtime bitcode — the
 mechanism `--rt-lto` already uses for four string primitives. This is
 target-independent, bit-identical across targets, inlinable into the caller's
-loop, and adds no link dependency. A per-target vector library
+loop, and adds no link dependency. It has one prerequisite, which 1063's own
+comment names and which this contract adopts as G6's gate: **issue 1069**,
+`--rt-lto` does not inline at the default `--target-cpu baseline` on aarch64.
+Until 1069 is fixed the portable kernel stays an out-of-line call on exactly
+the host all of this evidence came from, so criterion 1 below cannot pass
+without it. A per-target vector library
 (`Darwin_libsystem_m`, libmvec, SLEEF, SVML) is an explicit opt-in for users who
 accept non-identical results, never the default. The portable kernel is the
 contract; the library is the escape hatch.
@@ -420,15 +506,20 @@ Acceptance criteria that replace the issue's current ones:
    per-lane insert/extract** on aarch64 and x86-64 at the default target. This
    is pinned on the explicit SIMD surface, which is reachable today, instead of
    on auto-vectorization of a slice loop, which is G1–G3's promise.
-2. Scalar and vector results agree within the documented ULP bound, and both
-   agree across targets. A conformance owner checks each function against a
-   reference at the bound, including the sub-normal and infinity edges; floats
-   never abort, so every input has a defined result.
+2. The scalar and vector lowerings produce **bit-identical** results, and so
+   does every supported target; the ULP bound is stated against the correctly
+   rounded reference, not against the other lowering. Bit-identity is what the
+   portable kernel buys and what the `llvm.maximum` precedent already commits
+   to; a ULP band between lowerings would reintroduce the "results change when
+   the vectorizer fires" problem this section exists to remove. A conformance
+   owner checks each function against the reference at the bound, including the
+   sub-normal and infinity edges; floats never abort, so every input has a
+   defined result.
 3. `examples/vec_math.align`'s "`pow` is a libcall, so it stays scalar" caveat
    is deleted, because `pow` is covered by the same policy.
 4. The auto-vectorization of an ordinary `slice<f32>` loop over these functions
-   is **not** a criterion of 1063. It moves to the umbrella corpus (§7) and is
-   gated on G1, G2 and G3.
+   is **not** a criterion of 1063. It moves to the umbrella corpus (§7), under
+   the one gating rule in §6.3.
 5. The function set is defined by IEEE 754-2019 §9.2's recommended elementary
    functions, adopted as the closed `core.math` surface and shipped in stated
    tiers, so that the next client need does not reopen the set. exp/log first is
@@ -472,9 +563,15 @@ per-width enumeration the `<ty>_le`/`<ty>_be` accessor family already carries
 across 36 methods, and G7's whole point is to make the view the one primitive
 that those accessors are then defined on top of.
 
+Align has no expression-position type-argument syntax — `docs/language-spec.md`
+states the no-turbofish rule three times (`:313`, `:333`, `:792`) — so the
+element type comes from the binding annotation, exactly as `json.decode` and
+`scan` already take theirs. The declaration is written `view_le<T>`; the call is
+not.
+
 ```align
 fn peak(borrow raw: slice<u8>) -> f32 {
-  view := raw.view_le<f32>() else { return 0.0 }
+  view: slice<f32> := raw.view_le() else { return 0.0 }
   mut best: f32 := 0.0
   mut i := 0
   loop {
@@ -486,11 +583,13 @@ fn peak(borrow raw: slice<u8>) -> f32 {
 }
 ```
 
-Public surface of the recommended shape:
+Public surface of the recommended shape. The declaration is shown separately
+from the call expression above, because the call carries no written type
+argument:
 
-| Operation | Signature | Errors | Ownership | Allocation |
+| Operation | Declaration | Errors | Ownership | Allocation |
 | --- | --- | --- | --- | --- |
-| checked view | `slice<u8>.view_le<T>() -> Option<slice<T>>` for the closed scalar set `u16..u64`, `i16..i64`, `f32`, `f64` | `None` on a misaligned pointer or a length that is not a whole multiple of `sizeof(T)`; compile-time rejection when the named order is not native | borrows the same region as the source, with the source's authority and provenance; a `mut` receiver yields a writable view | none; zero copy |
+| checked view | `slice<u8>.view_le<T>() -> Option<slice<T>>` for the closed scalar set `u16..u64`, `i16..i64`, `f32`, `f64`; `T` is supplied by the expected type at the call site, never written there | `None` on a misaligned pointer or a length that is not a whole multiple of `sizeof(T)`; compile-time rejection when the named order is not native | borrows the same region as the source, with the source's authority and provenance; a `mut` receiver yields a writable view | none; zero copy |
 | inverse | `slice<T>.as_bytes() -> slice<u8>` | total: a typed slice is always aligned and always a whole multiple | same region, same authority | none; zero copy |
 
 Acceptance criteria that replace the issue's current ones:
@@ -509,16 +608,17 @@ Acceptance criteria that replace the issue's current ones:
 6. `slice<T>.as_bytes()` round-trips: viewing the bytes of a typed slice yields
    the original slice.
 7. Auto-vectorization of an ordinary loop over the resulting `slice<f32>` is
-   **not** a criterion of 1064. It belongs to G1, G2 and G4 and moves to the
-   umbrella corpus (§7).
+   **not** a criterion of 1064. It moves to the umbrella corpus (§7), under the
+   one gating rule in §6.3.
 
 **Open on 1064, not settled here.** These are design questions the issue must
 close before implementation; this document records the recommended shape, not
 the final surface.
 
 ```text
-spelling         raw.view_le<f32>() versus an annotation-driven
-                 view: slice<f32> := raw.view_le()
+spelling         view_le, view_native, or a name that does not repeat the
+                 order for the only order a target can have; the call site
+                 itself is fixed by the no-turbofish rule
 _be at all       a _be view on a little-endian target is always a compile
                  error; is the name worth having for the sake of keeping
                  "every multi-byte access names its order" total?
@@ -532,30 +632,62 @@ foreign route    whether the checked view and resource.view_from_raw stay two
                  routes permanently or unify once plan 61 lands
 ```
 
+### 6.3 The one gating rule for auto-vectorization
+
+Both rewritten criteria defer the same promise, so the contract states the gate
+once instead of once per issue:
+
+```text
+any ordinary loop      G1 and G2, which are conjunctive, plus G3 when the loop
+                       has an early exit
+a float min/max        the above, plus G4 Part 1
+a float sum/dot        the above, plus G4 Part 2
+a core.math call       the above, plus G6
+```
+
+No guarantee outside that rule is a precondition for an ordinary loop
+vectorizing. G7 and G8 remove a copy and a type-check restriction; neither is on
+this list, which is exactly why neither may carry an auto-vectorization
+acceptance criterion.
+
 ## 7. Acceptance corpus
 
-The contract is proved as a whole by one corpus, extending
-`crates/align_driver/tests/vectorize_shapes.rs`, run on aarch64 and x86-64 at
-the default target:
+The contract is proved as a whole by one corpus extending
+`crates/align_driver/tests/vectorize_shapes.rs`:
 
 ```text
 one positive owner per guarantee   the named owners in §3
-the two conjunction pins           bytes_to_f32_out vectorizes only with G1
+the conjunction pin                bytes_to_f32_out vectorizes only with G1
                                    and G2 both present; a regression in either
                                    half fails the same test
 the standing negative control      k6_float_sum_does_not_vectorize_without_
-                                   fast_math keeps passing unchanged for plain
-                                   f32 +, outside any G4 Part 2 scope
+                                   fast_math keeps passing unchanged for its
+                                   plain f64 + reduction, outside any G4 Part 2
+                                   scope
 the trap-parity owners             zero-length, length-1 and first-out-of-range
                                    accesses trap at the same iteration with
                                    byte-identical (index, len) text under G2
                                    and G3
 the diagnostic owner               a known-scalar loop names its blocker (G10)
-the corrected example              examples/vec_simd.align's claim that the
-                                   pipeline already vectorizes the same way is
-                                   false for max/min today and is corrected
-                                   when G4 Part 1 lands
+the corrected example              examples/vec_simd.align line 5 claims the
+                                   pipeline map/where/sum "already vectorizes
+                                   the same way". For sum that is true in form
+                                   and false in effect, so it is corrected only
+                                   under G4 Part 2 or by rewording the example;
+                                   G4 Part 1 does not touch sum. The same file
+                                   needs no max/min correction, because it does
+                                   not mention them.
 ```
+
+**The corpus has a platform prerequisite, and it is not optional.** Every shape
+test in `vectorize_shapes.rs` today is gated on `x86_backend()`
+(`cfg!(target_arch = "x86_64") && backend_available()`) and pins `x86-64-v3` or
+`x86-64-v2`, so on aarch64 — including the Apple M1 host that produced every
+measurement in this document — the named negative control does not execute at
+all. Extending the corpus therefore requires parameterizing or removing that
+gate and stating the aarch64 target CPU explicitly, in the same change that adds
+the first guarantee owner. Until that lands, "run on aarch64 and x86-64" is a
+statement about the corpus's intent, not about what the file does.
 
 Benchmarks are separate local measurements for the performance claims each
 owner issue makes. They are not correctness gates, and no guarantee in §3 is
@@ -566,21 +698,48 @@ stated as a wall-clock number.
 Recorded per the large-design authoring gate.
 
 - Every normative promise in §3's prose appears in the ledger table, and every
-  ledger cell has a stated owner, corpus entry and issue.
+  ledger cell has a stated owner and corpus entry. Two guarantees have no
+  implementing issue yet and say so in the cell itself: G9 (issue 1066 carries
+  only a comment) and G10. Filing both is the first action this contract asks
+  for.
 - Every guarantee separates promise from try, and no guarantee is stated as a
   target-specific vector width or a wall-clock number.
+- Every guarantee states its prerequisite milestone and its artifact and cache
+  identity effect in §3.1. Two are load-bearing: G6 is gated on issue 1069, and
+  G9 changes interface serialization, so its body set and size budget both enter
+  the interface hash and the object cache key.
 - Every public surface introduced here (G6's accuracy contract, G7's view and
-  its inverse) has a signature, an error behaviour, an ownership and provenance
-  rule, and an allocation rule, in §6.
-- Every normative example is `loop`-only, expression-oriented, newline-
-  terminated and uses only surfaces that exist today, except `view_le<T>()`,
-  which is marked as the recommended, unsettled shape of G7.
+  its inverse) has a declaration, an error behavior, an ownership and provenance
+  rule, and an allocation rule, in §6. G7's declaration is shown separately from
+  its call expression, because Align has no turbofish and the element type comes
+  from the binding annotation.
+- Every normative example is `loop`-only, expression-oriented and newline-
+  terminated, and each construct has a repository precedent: the unit-return
+  `fn f(...) {` form (`examples/out_param.align`), `mut x: T := v`
+  (`examples/vec_lane_set.align`), postfix `else { ... }` with a `return`
+  (`examples/json.align`), value-carrying `break` (`docs/language-spec.md:276`),
+  and the single-expression `fn f() -> T = expr` form. Two examples use a
+  surface that does not exist yet and are marked as such where they appear:
+  `softmax_weight`'s `v.exp()` on a vector receiver is what G6 adds, and
+  `peak`'s `view_le` is G7's recommended, unsettled name.
+- Existing and planned artifacts are distinguished in every corpus cell.
+  Existing: `crates/align_driver/tests/vectorize_shapes.rs` and its
+  `k6_float_sum_does_not_vectorize_without_fast_math` at `:258`,
+  `crates/align_driver/tests/vec_simd.rs`,
+  `crates/align_driver/tests/scalar_math.rs`, `examples/vec_math.align`,
+  `examples/vec_simd.align`, and the runtime-ABI owner in
+  `20-runtime-abi-ledger.md`. Everything else in §3 is marked planned, including
+  every `g<N>_` owner name and `examples/vec_argmax.align`.
 - No guarantee consumes a decision scheduled for a later milestone: G4 Part 2's
-  surface is explicitly deferred and nothing in G1–G3 or G6–G10 depends on it.
-- The two locked decisions nearest this work — IEEE 754 float semantics and the
-  rejection of `llvm.assume` as a general policy — are checked explicitly in §5,
-  including the one carve-out G3's fallback would require.
-- `docs/open-questions.md:5960` already lists opt-in fast-math flags as a future
-  item and `:4956` already settles that ordered float reduction must not be
-  silently reassociated, so G4 Part 2's direction is pre-approved and only its
-  surface is missing. No Settled entry changes as a result of this document.
+  surface is explicitly deferred, and §6.3's gate never makes an earlier
+  guarantee depend on it.
+- The locked decisions nearest this work are checked explicitly in §5, and so is
+  the status of the two `docs/open-questions.md` records this contract leans on:
+  the `llvm.assume` rejection at `:4187-4189` and the ordered-reduction rule at
+  `:4956` are both in the **Open** section, not Settled, and this document
+  neither promotes nor changes either. `:5960` (opt-in fast-math flags) is in
+  Future, where G4 Part 2 belongs. No Settled entry changes as a result of this
+  document, and none is claimed to.
+- `draft.md` and `docs/language-spec.md` need no change: this contract adds no
+  language surface. The two it would eventually touch — G4 Part 2's scope and
+  G7's view — are both deferred to their own issues, which own those updates.
