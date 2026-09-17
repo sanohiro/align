@@ -655,6 +655,69 @@ fn partition_scoped_validators_match_emission_scope() {
         validate_partition_tagged_program(&emitted_fn_value, &emitted("main")).is_err(),
         "an unresolvable callable target inside the emitted body must still be rejected"
     );
+
+    // (e) A partition validator is only as strong as the emitted set it is given, so a degenerate
+    // one must fail closed rather than vacuously validate nothing.
+    let empty = std::collections::BTreeSet::new();
+    let absent_root = emitted("absent");
+    for (label, scope) in [("empty", &empty), ("unknown", &absent_root)] {
+        assert!(
+            validate_partition_resource_rvalues(&owned_leaf, scope).is_err(),
+            "{label} emitted set must be rejected by the resource-rvalue validator"
+        );
+        assert!(
+            validate_partition_tagged_program(&owned_leaf, scope).is_err(),
+            "{label} emitted set must be rejected by the tagged validator"
+        );
+    }
+}
+
+/// The partition-scoped validators are sound only because every unit is certified *whole* before
+/// any partition is formed: a peer body the partition does not emit is trusted on that basis alone.
+/// Nothing else in the suite pins that gate, so a later "skip revalidation on a warm unit" change
+/// would silently leave peer bodies unvalidated. This test fails the moment formation stops
+/// certifying a complete unit.
+#[test]
+fn unit_validation_precedes_partition_formation() {
+    // The `fn`-value chain: `middle` takes the address of `bump`, and `middle` is a *peer* of
+    // `main`'s partition, so its body statements are exactly what partition scope no longer
+    // re-derives.
+    let proj = Proj::new(
+        "partition-unit-gate",
+        &[("main.align", DEPTH_TWO_CHAINS[3].1)],
+        "main.align",
+    );
+    let mut built = walk(&proj);
+    let unit = built
+        .units
+        .iter_mut()
+        .find(|unit| unit.is_entry)
+        .expect("entry unit");
+    let peer = unit
+        .mir
+        .fns
+        .iter_mut()
+        .find(|function| function.name.as_str() == "middle")
+        .expect("peer body");
+    let mut corrupted = false;
+    for block in &mut peer.blocks {
+        for statement in &mut block.stmts {
+            if let align_mir::Stmt::Let(_, align_mir::Rvalue::FnAddr { signature, .. }) = statement {
+                signature.param_modes.clear();
+                corrupted = true;
+            }
+        }
+    }
+    assert!(corrupted, "the peer body must take a function address");
+
+    let error = match function_partitions(&built.units, &[]) {
+        Ok(_) => panic!("a malformed unit body formed partitions"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("ThinLTO program validation failed"),
+        "formation must certify the complete unit before forming partitions, got: {error}"
+    );
 }
 
 /// The source entry's return ABI must not decide whether partitioned builds

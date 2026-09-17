@@ -7780,14 +7780,53 @@ pub fn validate_resource_rvalues(program: &Program) -> Result<(), ProducerError>
 /// * pre-seeds the certified set with the partition's peers, exactly as a `producer_certified`
 ///   imported declaration is trusted, instead of re-deriving their facts from the truncated table.
 ///
-/// The only relaxation is a reference the partition cannot see. A call target absent from
-/// `program.fns`, `program.imported_fns`, and `program.externs` remains unresolvable and is still
-/// rejected inside an emitted body.
+/// The only relaxation is a reference the partition cannot see, and only in a body it does not
+/// emit. Inside an emitted body an unresolvable call target behaves exactly as it does whole-program:
+/// rejected at an owned-leaf (protected) call boundary, and accepted elsewhere here because
+/// `align_codegen_llvm`'s `callable_preflight` owns the unconditional rejection of an undeclared
+/// target for every body it emits.
 pub fn validate_partition_resource_rvalues(
     program: &Program,
     defined: &BTreeSet<ProgramCall>,
 ) -> Result<(), ProducerError> {
+    validate_partition_scope(program, defined)?;
     validate_resource_rvalues_inner(program, Some(defined))
+}
+
+/// Whether any table in `program` declares `name`. A name no table declares is the only shape a
+/// partition may be missing merely because it is truncated.
+fn declares_call_target(program: &Program, name: &ProgramCall) -> bool {
+    program.fns.iter().any(|function| &function.name == name)
+        || program
+            .imported_fns
+            .iter()
+            .any(|function| &function.name == name)
+        || program
+            .externs
+            .iter()
+            .any(|function| &function.name == name)
+}
+
+/// A partition validator is only as strong as the set of bodies it is told to emit, so an empty or
+/// unrecognized `defined` would silently validate nothing. Fail closed instead: a partition must
+/// emit at least one function, and every emitted name must be a body the partition carries.
+fn validate_partition_scope(
+    program: &Program,
+    defined: &BTreeSet<ProgramCall>,
+) -> Result<(), ProducerError> {
+    if defined.is_empty() {
+        return Err(ProducerError::Lowering(
+            "partition MIR validation has no emitted function".to_owned(),
+        ));
+    }
+    for name in defined {
+        if !program.fns.iter().any(|function| &function.name == name) {
+            return Err(ProducerError::Lowering(format!(
+                "partition MIR validation names emitted function '{name}', which the partition does not carry"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_resource_rvalues_inner(
@@ -8960,6 +8999,7 @@ pub fn validate_partition_tagged_program(
     program: &Program,
     defined: &BTreeSet<ProgramCall>,
 ) -> Result<(), ProducerError> {
+    validate_partition_scope(program, defined)?;
     validate_tagged_program_inner(program, Some(defined))
 }
 
@@ -9993,7 +10033,10 @@ fn validate_tagged_program_inner(
                         let Some((param_types, ret, modes, borrow, region, cleanup)) =
                             named_signature(program, target)
                         else {
-                            if emitted {
+                            // `named_signature` is also None for a *declared* target whose own
+                            // parameter slots are malformed. Only a genuinely undeclared name is
+                            // the cross-partition case, so keep every other shape rejected.
+                            if emitted || declares_call_target(program, target) {
                                 return Err(callable_target_error(target));
                             }
                             continue;
