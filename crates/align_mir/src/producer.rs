@@ -787,17 +787,27 @@ pub fn xml_fn_type_facts(program: &Program, id: u32) -> Option<XmlCallFacts> {
 /// spells `Holder<fn(i64) -> i64>` with one monomorph and a callee that spells it with another
 /// still agree on the type.
 fn xml_call_facts_match(program: &Program, actual: &XmlCallFacts, expected: &XmlCallFacts) -> bool {
-    actual.modes == expected.modes
-        && actual.borrow == expected.borrow
-        && actual.region == expected.region
-        && actual.cleanup == expected.cleanup
-        && actual.params.len() == expected.params.len()
-        && actual
-            .params
+    // Destructured, not field-accessed: a new `XmlCallFacts` field must be named here or the
+    // build fails, so it cannot be silently dropped from this ABI-agreement check.
+    let XmlCallFacts { params, modes, ret, borrow, region, cleanup } = actual;
+    let XmlCallFacts {
+        params: expected_params,
+        modes: expected_modes,
+        ret: expected_ret,
+        borrow: expected_borrow,
+        region: expected_region,
+        cleanup: expected_cleanup,
+    } = expected;
+    modes == expected_modes
+        && borrow == expected_borrow
+        && region == expected_region
+        && cleanup == expected_cleanup
+        && params.len() == expected_params.len()
+        && params
             .iter()
-            .zip(&expected.params)
+            .zip(expected_params)
             .all(|(&actual, &expected)| xml_source_ty_matches(program, actual, expected))
-        && xml_source_ty_matches(program, actual.ret, expected.ret)
+        && xml_source_ty_matches(program, *ret, *expected_ret)
 }
 
 fn xml_signature_matches_facts(
@@ -2438,7 +2448,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
         };
         let selected = xml_selected_ty(self.graph.program, stored, &path);
         if (stored != place.ty && !xml_borrowed_place_ty_is_view_retype(stored, place.ty))
-            || xml_selected_ty(self.graph.program, place.ty, &path) != Some(expected)
+            || !xml_selected_ty(self.graph.program, place.ty, &path)
+                .is_some_and(|declared| xml_source_ty_matches(self.graph.program, declared, expected))
             || !selected.is_some_and(|actual| {
                 xml_flow_matches(self.graph.program, actual, expected)
                     || xml_ty_is_view_retype(actual, expected)
@@ -2928,9 +2939,13 @@ impl<'a> XmlAccessAnalyzer<'a> {
             return Vec::new();
         };
         let view_retype = xml_borrowed_place_ty_is_view_retype(stored, expected);
+        // `expected` is the callee's parameter type while `place.ty`/`stored` come from the
+        // caller's slot, so this is exactly the cross-origin pair a monomorph split produces.
+        // A Copy carrier splits too: `Ty::Fn` is a Copy leaf, so `Holder<fn(i64) -> i64>` with
+        // no owned leaf beside it still reaches MIR under several ids.
         if place.cleanup.is_some()
-            || place.ty != expected
-            || (stored != expected && !view_retype)
+            || !xml_source_ty_matches(self.graph.program, place.ty, expected)
+            || (!xml_source_ty_matches(self.graph.program, stored, expected) && !view_retype)
             || align_sema::ty_is_move(
                 expected,
                 &self.graph.program.structs,
@@ -3639,9 +3654,11 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     bits: 64,
                     signed: true,
                 });
-                if result_ty != element_ty
-                    || xml_selected_ty(self.graph.program, slot_ty, &source_path)
-                        != Some(selected_ty)
+                if !xml_source_ty_matches(self.graph.program, result_ty, element_ty)
+                    || !xml_selected_ty(self.graph.program, slot_ty, &source_path)
+                        .is_some_and(|source| {
+                            xml_source_ty_matches(self.graph.program, source, selected_ty)
+                        })
                     || xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
                 {
                     equation.invalid = true;
@@ -3692,7 +3709,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 if fields.is_empty()
                     || !result_matches
                     || !xml_selected_ty(self.graph.program, slot_ty, &source_path).is_some_and(|source|
-                        source == selected_ty || xml_ty_is_view_retype(source, selected_ty))
+                        xml_source_ty_matches(self.graph.program, source, selected_ty)
+                            || xml_ty_is_view_retype(source, selected_ty))
                     || xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
                 {
                     equation.invalid = true;
@@ -8231,7 +8249,9 @@ fn validate_resource_rvalues_component(
                             };
                             if *mode == align_ast::ParamMode::Out && !leaves.is_empty() {
                                 if !matches!(expected, Ty::Slice(_))
-                                    || xml_operand_base_ty(function, operand) != Some(*expected)
+                                    || !xml_operand_base_ty(function, operand).is_some_and(
+                                        |actual| xml_source_ty_matches(program, actual, *expected),
+                                    )
                                     || !matches!(operand, Operand::Value(_) | Operand::Arg(_))
                                 { return false; }
                                 let mut analysis = XmlAccessAnalyzer::new(&access_graph);
@@ -10670,10 +10690,13 @@ fn operands_match_modes(
                     place.cleanup.is_none()
                 }
                 (Operand::BorrowedElementPlace(place), align_ast::ParamMode::Borrow) => {
-                    place.base.cleanup.is_none() && place.element_ty == *ty
+                    // Caller-side element type versus callee-side parameter type: one source
+                    // type can spell them with different monomorph ids.
+                    place.base.cleanup.is_none()
+                        && xml_source_ty_matches(program, place.element_ty, *ty)
                 }
                 (Operand::BorrowedFixedElementPlace(place), align_ast::ParamMode::Borrow) => {
-                    place.cleanup.is_none() && place.ty == *ty
+                    place.cleanup.is_none() && xml_source_ty_matches(program, place.ty, *ty)
                 }
                 (Operand::BorrowedPlace(place), align_ast::ParamMode::BorrowMut) => {
                     let move_pointee = align_sema::needs_drop_flag(

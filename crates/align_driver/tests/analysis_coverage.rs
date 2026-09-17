@@ -1069,6 +1069,41 @@ fn main() -> i32 {
          an enclosing generic record — must reach the same source identity"
     );
 
+    // A split record need not own anything: `fn` is a Copy leaf, so `Holder<fn(i64) -> i64>`
+    // with no owned leaf beside it is a Copy carrier that still reaches MIR under several ids.
+    // This is the Copy half of the Move cases above, and it is the only shape that reaches the
+    // borrowed-Copy-place and empty-owned-leaf branches of the producer validator.
+    let copy_carriers = "\
+Holder<T> { tag: i64, callback: T }
+Pair<T> { left: T, right: T }
+fn quiet(x: i64) -> i64 = x + 1
+fn peek(borrow h: Holder<fn(i64) -> i64>) -> i64 = h.callback(h.tag)
+fn take(h: Holder<fn(i64) -> i64>) -> i64 = h.callback(h.tag)
+fn nested(borrow p: Pair<Holder<fn(i64) -> i64>>) -> i64 = p.left.callback(p.right.tag)
+fn count(holders: slice<Holder<fn(i64) -> i64>>) -> i64 = holders.len()
+fn main() -> i32 {
+  first := Holder { tag: 1, callback: quiet }
+  second := Holder { tag: 2, callback: quiet }
+  pair := Pair {
+    left: Holder { tag: 3, callback: quiet },
+    right: Holder { tag: 4, callback: quiet },
+  }
+  holders := [
+    Holder { tag: 5, callback: quiet },
+    Holder { tag: 6, callback: quiet },
+  ]
+  return (peek(first) + take(second) + nested(pair) + count(holders) + 30) as i32
+}
+";
+    assert_eq!(
+        build_and_run("monomorph-split-copy-carriers", copy_carriers)
+            .status
+            .code(),
+        Some(42),
+        "a Copy split record must certify through a borrowed place, a moved value, an enclosing \
+         generic record and a slice view, not only a record with an owned leaf"
+    );
+
     let files = &[
         (
             "holder.align",

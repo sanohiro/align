@@ -22579,6 +22579,9 @@ fn write_object(module: &Module, out: &Path, tm: &TargetMachine, pipeline: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The production path uses the combined `xml_flow_matches`; these owners exercise the
+    // callable half on its own, so they import it directly rather than through `super`.
+    use align_mir::producer::xml_callable_flow_matches;
     use align_diag::Diagnostics;
     use align_lexer::tokenize;
     use align_mir::lower_program;
