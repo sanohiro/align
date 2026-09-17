@@ -22,6 +22,7 @@ key|Base64urlDecode|base64url_decode|declare i32 @align_rt_base64url_decode(ptr,
 key|Base64urlEncode|base64url_encode|declare { ptr, i64 } @align_rt_base64url_encode(ptr, i64)
 key|BoundsFail|bounds_fail|declare void @align_rt_bounds_fail(i64, i64) #1
 key|BufferAppend|buffer_append|declare void @align_rt_buffer_append(ptr, ptr, i64)
+key|BufferAppendFilled|buffer_append_filled|declare void @align_rt_buffer_append_filled(ptr, i64, i8)
 key|BufferBytes|buffer_bytes|declare void @align_rt_buffer_bytes(ptr, ptr)
 key|BufferCapacity|buffer_capacity|declare i64 @align_rt_buffer_capacity(ptr)
 key|BufferFilled|buffer_filled|declare ptr @align_rt_buffer_filled(i64, i8)

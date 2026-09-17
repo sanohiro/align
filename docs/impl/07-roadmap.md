@@ -971,8 +971,10 @@ packed-bool columns, and the arena/heap `align(N)` over-alignment gaps.
     mask can be a `let` annotation, a **function parameter**, or a return type — threading a mask
     through code (`fn blend(m: mask4<i32>, a, b) = select(m, a, b)`). `Ty::Mask(u32)` became
     `Ty::Mask(Scalar, u32)` (element + width): a comparison yields `Ty::Mask(elem, n)`, and
-    `select`/`sum_where` now require the mask's element **and** width to match the vectors (the repr
-    stays `<N x i1>`, element-independent). `resolve_type` gained the `maskN<T>` arm (mirroring
+    `select`/`sum_where` take any mask of the same lane **count and bit width** as the vectors —
+    structural, because the repr is `<N x i1>` and element-independent (#1083 widened the original
+    element-identity rule; the `maskN<T>` type itself stays nominal).
+    `resolve_type` gained the `maskN<T>` arm (mirroring
     `vecN<T>`, via `parse_mask_name`). `draft.md` §9/§13 amended (`mask<T>` → `maskN<T>`, as `vec<N,T>`
     → `vecN<T>`). (`examples/vec_mask_annot.align`.)
   - **element-wise float-vector math slice 11 — DONE.** The unary float math ops `abs`/`sqrt`/`floor`/
@@ -1093,11 +1095,14 @@ predication-ready, the forward-compatible shape for scalable-ISA tails (`05 §5`
   and each reducer `select`s each masked-out lane to its identity (`min` → `+∞` / `max` → `−∞` — the
   same `extreme_of` fold seed; `any` → `false` / `all` → `true`), while generic `reduce` uses the
   accumulator-select form `acc = mask ? f(acc,v) : acc`. `min`/`max` additionally moved from a
-  compare-and-branch update to the `select(cur `cmp` acc, cur, acc)` idiom, so **both** the `where`
-  and the plain (no-`where`) paths are now branch-free and vectorize (one lowering, no dual
-  mechanism). Semantics are byte-identical to the branch form they replaced: same ordered
-  comparison (so NaN elements are still skipped by `min`/`max`), same empty-selection result (`min`/
-  `max` → the extreme seed, `reduce` → `init`, `any` → `false`, `all` → `true`). Verified: `emit-mir`
+  compare-and-branch update to a branchless idiom, so **both** the `where` and the plain (no-`where`)
+  paths are branch-free and vectorize (one lowering, no dual mechanism). Empty-selection results are
+  unchanged from the branch form (`min`/`max` → the extreme seed, `reduce` → `init`, `any` → `false`,
+  `all` → `true`). **Amended 2026-09-18 (#1082 Part 1):** that idiom was `select(cur cmp acc, cur,
+  acc)`, an ordered comparison that skipped NaN elements and carried no minimum/maximum semantics for
+  the backend to widen. `min`/`max` now reduce with the one `MathFn::Min`/`MathFn::Max` operation the
+  scalar method and the vector lane reduction already used, so floats propagate NaN and order ±0
+  deterministically in every spelling and the float reduction actually vectorizes. Verified: `emit-mir`
   shows no per-element predicate branch for any reducer; `objdump` shows `xs.where(p).min()` over a
   `slice<i32>` emitting `pminsd`/`pcmpgtd`/`movdqu` on the `x86-64-v2` baseline where the branch form
   emitted purely scalar code with 10 branches. `dot` is out of scope — `a.dot(b)` is a two-array

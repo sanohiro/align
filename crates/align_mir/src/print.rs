@@ -925,6 +925,10 @@ fn rvalue_str(rv: &Rvalue) -> String {
             format!("buffer_put{}({}, {})", if *be { "_be" } else { "_le" }, operand_str(buffer), operand_str(value))
         }
         Rvalue::BufferAppend { buffer, data } => format!("buffer_append({}, {})", operand_str(buffer), operand_str(data)),
+        Rvalue::BufferAppendFilled { buffer, length, value } => format!(
+            "buffer_append_filled({}, {}, {})",
+            operand_str(buffer), operand_str(length), operand_str(value)
+        ),
         Rvalue::ArrayBuilderNew { elem, region, capacity } => format!(
             "array_builder_new(elem={elem:?}, region={}, capacity={})",
             region.as_ref().map_or_else(|| "heap".to_string(), operand_str), operand_str(capacity)

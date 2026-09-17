@@ -96,6 +96,16 @@ Pure（I/O なし）。*アロケーションの可視性* というルールは
 停止する。通常の `buffer(capacity)` は従来どおり best-effort の空の読み取り
 ウィンドウを作る。
 
+`b.append_filled(length: i64, value: u8) -> ()` は同じファミリの append メンバー
+である。`mut buffer` の公開ウィンドウを `value` の `length` バイト分ちょうど
+伸ばす。拡張は一度だけで、拡張の連続やバイトごとの呼び出しにはならない。
+長さゼロは no-op。負数やオーバーフローする長さは書き込み前に停止し、
+コンストラクタと同じ終了ポリシーに従う。`buffer(capacity)` は公開せずに予約
+するだけなので、繰り返しバイトでウィンドウを伸ばす手段はこれになる。
+型付きの `append_filled_S_E` 形式は存在しない。`fill_S_E` は長さが既知の
+公開済みウィンドウを上書きするのに対し、append 形式は独自の要素数の文法を
+必要とし、それを要求する実プログラムの記録がまだないためである。
+
 期待型で要素型を指定する `array_builder()` と `array_builder(out)` は、末尾に
 省略可能な i64 容量を取る。呼び出しは `array_builder(capacity)` または
 `array_builder(out, capacity)`。省略時はゼロ。初期要素数はゼロのままで、
