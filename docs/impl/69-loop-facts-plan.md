@@ -167,7 +167,10 @@ captures(none)            already emitted for Borrow when the borrow is not
 !range !{i64 0, i64 -9223372036854775808}
                           on the load that materializes a length from a borrowed
                           header, and on a fixed-array constant length where it
-                          is a no-op
+                          is a no-op. "A length" is the semantic test, not the
+                          `{ptr,i64}` layout: a header whose second field is an
+                          index or a handle — `json.doc`'s `-1`-for-Missing node
+                          — carries every other header fact and not this one
 ```
 
 `noalias` stays on `Borrow` exactly as plan 68 G1 states it, and this plan does
@@ -377,6 +380,16 @@ entry block, parameters     a parameter-derived header is materialized in the
                             LLVM already promotes, so I1's fail-closed default
                             costs nothing measured. The loop-preheader arm of
                             §2.1 is therefore unimplemented, not deferred work
+length, not layout          `!range` attaches only where the header's second
+                            field really is an element or byte count. Several
+                            types share the `{ptr,i64}` layout and give that
+                            field another meaning — `json.doc` is
+                            `{tape, node}` and its node index is `-1` for
+                            Missing — so a layout predicate would have turned a
+                            valid Missing handle into poison. Layout
+                            compatibility earns `dereferenceable`/`align` and
+                            the header alias class; only a length earns the
+                            range fact
 one whole-body gate         I2, I3 and I5 are decided together by one
                             whitelist proof over the body (`view_facts_plan`):
                             a function qualifies only when every statement in

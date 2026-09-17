@@ -8182,6 +8182,33 @@ fn is_view_header_ty(ty: Ty) -> bool {
     )
 }
 
+/// The header types whose second field is, by Align's own representation, a non-negative element
+/// or byte count — the only loads that may carry the non-negativity claim (issue 1080).
+///
+/// Deliberately **not** [`is_view_header_ty`]. That predicate answers a *layout* question, and
+/// several types share the `{ptr,i64}` layout while giving the second field an entirely different
+/// meaning: `json.doc` is `{tape, node}`, whose node index is `-1` for Missing, and a `json.scanner`
+/// and the codec column views are handles rather than lengths. Claiming non-negativity there would
+/// turn a valid Missing handle into poison. Layout compatibility is what earns
+/// `dereferenceable`/`align` and the header alias class; only a real length earns `!range`.
+fn view_len_field_is_a_length(ty: Ty) -> bool {
+    matches!(
+        ty,
+        Ty::Slice(_)
+            | Ty::Str
+            | Ty::String
+            | Ty::Soa(_)
+            | Ty::DynArray(_)
+            | Ty::DynVecArray(..)
+            | Ty::DynMaskArray(..)
+            | Ty::DynFixedArray(..)
+            | Ty::DynFixedStructArray(..)
+            | Ty::DynSliceArray(_)
+            | Ty::DynResponseArray
+            | Ty::DynStructArray(_, Layout::Aos)
+    )
+}
+
 /// A plain value type that provably contains no view header transitively (plan 69 I4): the element
 /// classes `align.elem` may be claimed for, and the only stored types that keep a function's view
 /// facts alive. A whitelist, so a type added later fails closed into "no fact".
@@ -8742,6 +8769,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         &self,
         pointer: inkwell::values::PointerValue<'c>,
         index: u32,
+        view_ty: Ty,
         name: &str,
     ) -> Result<BasicValueEnum<'c>, CodegenError> {
         let field = self
@@ -8761,7 +8789,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .as_instruction_value()
             .ok_or_else(|| self.err("view header field load is not an instruction"))?;
         self.tag_view_header_access(instruction)?;
-        if index == 1 {
+        // Only a field that really is a length: the claim is semantic, and the `{ptr,i64}` layout
+        // alone does not make the second field a count.
+        if index == 1 && view_len_field_is_a_length(view_ty) {
             self.tag_length_nonnegative(instruction)?;
         }
         Ok(value)
@@ -8783,17 +8813,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
             };
             // Only a slot whose LLVM representation really is the `{ptr,len}` header, so a cached
             // value can never be substituted for a differently shaped load.
-            if self
-                .f
-                .slots
-                .get(*slot as usize)
-                .copied()
-                .is_none_or(|ty| self.llvm_type(ty) != header_ty)
-            {
+            let Some(slot_ty) = self.f.slots.get(*slot as usize).copied() else {
+                continue;
+            };
+            if self.llvm_type(slot_ty) != header_ty {
                 continue;
             }
-            let data = self.load_view_part(pointer, 0, "view.ptr")?;
-            let length = self.load_view_part(pointer, 1, "view.len")?;
+            let data = self.load_view_part(pointer, 0, slot_ty, "view.ptr")?;
+            let length = self.load_view_part(pointer, 1, slot_ty, "view.len")?;
             let header = self
                 .builder
                 .build_insert_value(slice_struct_type(self.ctx).get_poison(), data, 0, "view.hdr.ptr")
@@ -23015,7 +23042,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             return Ok(value);
         }
         let ptr = self.borrowed_place_ptr(place)?;
-        self.load_view_part(ptr, index, name)
+        self.load_view_part(ptr, index, place.ty, name)
     }
 
     fn borrowed_sum_tag(

@@ -349,6 +349,35 @@ fn g1_len_range_on_borrowed_and_fixed_lengths() {
     );
 }
 
+/// The non-negativity claim is about a *length*, not about the `{ptr,i64}` layout. Several types
+/// share that layout and give the second field another meaning entirely: a `json.doc` is
+/// `{tape, node}`, and its node index is `-1` for Missing. Claiming `!range !{i64 0, i64 …}` there
+/// would turn a valid Missing handle into poison, so the header facts a `json.doc` parameter does
+/// get — the materialization, the header alias class, `dereferenceable`/`align` — must arrive
+/// *without* the length fact.
+#[test]
+fn g1_len_range_is_not_stated_for_a_non_length_header_field() {
+    let source = "fn identity(borrow d: json.doc) -> json.doc = d\n";
+    let ir = emit_llvm_with_exports(source, &["identity"]);
+    let body = function_ir(&ir, "identity");
+    // Positive control: the header really is materialized here, so the absence below is the length
+    // predicate refusing rather than the whole fact set being off.
+    assert!(
+        body.contains("load i64, ptr %view.len"),
+        "the fixture must materialize a `{{ptr,i64}}` header:\n{body}"
+    );
+    assert!(
+        !body.contains("!range"),
+        "a node index is not a length — `-1` is a valid Missing handle:\n{body}"
+    );
+    // The layout-only facts are unaffected: the parameter is still a 16-byte, 8-aligned header.
+    let define = signature(&ir, "identity");
+    assert!(
+        define.contains("dereferenceable(16)") && define.contains("align 8"),
+        "the layout facts do not depend on the second field's meaning:\n{define}"
+    );
+}
+
 /// Two views of the same buffer stay correct. `noalias` lands only on read-only headers of bodies
 /// that write no header, so passing one place as two `borrow` arguments — and as a
 /// `borrow`/`borrow mut` pair — cannot be made unsound by it. This owner is executable, not
