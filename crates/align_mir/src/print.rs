@@ -81,6 +81,14 @@ fn fn_to_string(out: &mut String, f: &Function) {
     let _ = writeln!(out, "}}");
 }
 
+/// One block's MIR text. `loop_facts` compares a slow copy against the body it was derived from
+/// with it, so a rewrite that moved or deleted anything inside the original loop fails re-derivation.
+pub(crate) fn block_text(b: &Block) -> String {
+    let mut out = String::new();
+    block_to_string(&mut out, b);
+    out
+}
+
 fn block_to_string(out: &mut String, b: &Block) {
     let _ = writeln!(out, "  bb{}:", b.id);
     for s in &b.stmts {

@@ -5,8 +5,8 @@ Status: plan of record for issues
 [1080](https://github.com/sanohiro/align/issues/1080),
 [1081](https://github.com/sanohiro/align/issues/1081) and
 [1084](https://github.com/sanohiro/align/issues/1084). PR 1 (§2, issues 1079
-and 1080) is implemented, with the corrections §2.6 records; PRs 2 and 3 are
-not.
+and 1080) and PR 2 (§3, issue 1081) are implemented, with the corrections §2.6
+and §3.7 record; PR 3 is not.
 
 [Plan 68](68-vectorization-contract.md) is the public-contract ledger and owns
 guarantees G1–G10. This plan implements G1, G2 and G3 and does not restate,
@@ -569,11 +569,19 @@ one monotone index      exactly one slot i is written in the body, by exactly
                         (shifted_sum, §3.4), as is a second assignment anywhere
                         in the body, including from a nested inner loop. The
                         exit test i >= N reads the header value by construction
-non-negative entry      the value of i on entry is a loop-invariant operand
-                        proved >= 0 at the preheader: a non-negative constant, a
-                        length, or an operand under a dominating
-                        non-negativity guard. A negative or unproved entry fails
-                        closed. §3.2.1 depends on it
+non-negative entry      the arithmetic reads the value the index slot holds at
+                        the preheader — a live load, not the initializer's
+                        value. The static initializer (a non-negative constant,
+                        a length, or an operand under a dominating
+                        non-negativity guard, with dominance over the header)
+                        is evidence only that the slot is initialized and
+                        statically non-negative on its first entry: an
+                        enclosing loop can re-enter the header without
+                        re-executing that initializer, so a later entry's live
+                        value can differ from it. `e >= 0` is therefore a
+                        runtime conjunct of the admission test, exactly as
+                        every other operand's proof is. An unproved static
+                        initializer fails closed. §3.2.1 depends on it
 loop-invariant bound    the loop exits on i >= N with N a loop-invariant i64
                         operand not killed in the body. Any other exit is an
                         ordinary exit and is preserved in both versions; only
@@ -623,10 +631,15 @@ untouched. Fail-closed is the default in every direction.
 
 #### 3.2.1 The admission arithmetic
 
-For entry `e` (proved `e >= 0`), constant step `s > 0`, bound `N`, and one
+For entry `e` — loaded live from the index slot at the preheader, not the
+value its initializer once gave it — constant step `s > 0`, bound `N`, and one
 guard `(a, b, len)` with `a > 0` proved, the preheader computes, in `i64`:
 
 ```text
+entry       e = load i, e >= 0  the value the slot holds at this entry, not the
+                                value its initializer once gave it. The header
+                                re-reads the same slot, so a live load here is
+                                exactly what the header will see
 zero-trip   e >= N              the body never runs; select the fast loop, which
                                 runs zero iterations and performs no access. No
                                 further test is needed
@@ -646,7 +659,7 @@ max         amax + b            b >= 0: overflows iff amax > i64::MAX - b
 min         a * e + b           a * e <= amax, so it cannot overflow once amax
                                 did not; b < 0 cannot underflow because
                                 a * e >= 0; b >= 0 gives min <= max
-admit       no overflow guard fired, and min >= 0, and max < len
+admit       no overflow guard fired, and e >= 0, and min >= 0, and max < len
 ```
 
 The test is conjoined over every guard in the body and selects the fast loop
@@ -656,6 +669,9 @@ lies in `[min, max]` and `a*i <= amax` for all of them: the review's
 mid-iteration wrap is excluded without a wider type. The comparisons are the
 exact `i64` compares MIR already has; the two divisions are by proved-positive
 operands, so they cannot trip the hard error invalid integer division carries.
+The zero-trip disjunct is sound for any `e`, proved or not, because the header
+re-reads the same slot the preheader just loaded: if that live value is
+already `>= N` the body cannot run, independently of the entry conjunct.
 
 #### 3.2.2 Traversal order, re-entry and the budget
 
@@ -663,8 +679,19 @@ operands, so they cannot trip the hard error invalid integer division carries.
 order       loops are versioned innermost-first in post-order over the
             function's loop forest; a versioned inner loop contributes both of
             its copies to the enclosing body's statement count
-re-entry    a block produced by cloning is marked and is never versioned again;
-            each source loop is considered exactly once
+clone re-versioning
+            a block produced by cloning is marked and is never versioned
+            again; each source loop is considered exactly once
+loop re-entry
+            the preheader sits on every external entry edge into the header
+            (`apply`), so the admission test runs once per entry and every
+            operand it reads — N, len, b, and e — is read there, live. An
+            enclosing (unversioned) loop may re-enter this header on a later
+            pass without re-executing the index slot's initializer, and a
+            previous slow-copy run may have left the slot wrapped under
+            defined two's-complement wrap. Only a loaded `e` makes the
+            admission test a statement about the entry it actually decides,
+            rather than about the loop's first entry alone
 budget      LOOP_FACTS_VERSION_BUDGET is a pub const in loop_facts, counted in
             body statements including terminators, pinned by an owner test.
             Over budget is not admitted and is reported (§3.2.3)
@@ -747,7 +774,8 @@ named where it already discriminates the defect; a new owner is named `planned`.
 | | branch joins | facts join by intersection; an index proved on one arm only is not proved at the join | planned |
 | | loop joins | the back-edge join must re-derive; a fact killed on any path is killed at the header | planned |
 | | early `break` with a value | both versions carry the same break value and the same break type; the loop's value is unchanged | `loop_expr::loop_yields_its_break_value`, `a_break_moves_an_owned_value_out_once` |
-| | nested loops | an inner loop's index is not the outer loop's; versioning an inner loop inside an unversioned outer one is allowed | `loop_expr::nested_loops_break_the_innermost`, planned |
+| | nested loops | an inner loop's index is not the outer loop's; versioning an inner loop inside an unversioned outer one is allowed because the admission test reads its entry `e` live at the preheader rather than trusting the initializer that dominated only the loop's first entry | `loop_expr::nested_loops_break_the_innermost`, `loop_facts::g2_a_reentered_loop_still_versions_and_computes` |
+| | loop re-entry with a live induction slot | the index slot may hold any value at a given entry, including one a previous slow-copy run left wrapped under defined two's-complement wrap; admission reads that live value rather than assuming the value its initializer once proved | `loop_facts::g2_a_reentered_loop_admits_on_the_current_index` (negative, executable), `g2_a_reentered_loop_still_versions_and_computes` (positive), `g2_the_preheader_loads_the_live_entry` (shape) |
 | | malformed input | a loop whose MIR fails the existing HIR/MIR validation never reaches `loop_facts`; a malformed index type is already rejected by `validate_slice_index_rvalues` | `analysis_coverage`, `runway_a2_binary_codec::byte_range_malformed_and_invalidated_proofs_fail_closed` |
 | Loop producer | source `loop` expression | the primary case | planned `loop_facts` owner |
 | | pipeline stage loops, including `scan` | generated by fusion; admitted only under the same conditions, and `scan`'s loop-carried shape stays a negative control | `vectorize_shapes::k3_scan_does_not_vectorize`, `deep_pipeline`, planned |
@@ -756,7 +784,7 @@ named where it already discriminates the defect; a new owner is named `planned`.
 | | `par_map` / `ParMapParallel` / `ParMapReduce` kernels | the kernel body is generated and lifted; versioning it must not change its purity, its work partition or its reduction order | `par_map`, `task_group`, planned |
 | Index form | non-monotone index | not admitted: an index assigned on some paths only, reassigned in the body, or stepped by a non-constant | planned negative owner (`skip_zeros`, §4.3) |
 | | step precedes a guarded access | not admitted: `i = i + 1` followed by `xs[i]` in the same body reads `1..n` while the header sees `0..n-1`; admission is stated on the value reaching each access (§3.2), so this shape keeps its checks and traps at `xs[n]` exactly as today | planned negative owner `shifted_sum` (`--emit mir` shows the guard retained; the executable trap-parity owner asserts the abort) |
-| | wrapping induction | the preheader tests `N <= i64::MAX - s` (§3.2.1); integer overflow is defined wrap, so a loop whose last step would wrap keeps its guards by taking the slow version | planned negative owner |
+| | wrapping induction | the preheader tests `N <= i64::MAX - s` (§3.2.1); integer overflow is defined wrap, so a loop whose last step would wrap keeps its guards by taking the slow version. That defined wrap is also why the entry cannot be inferred statically: the slow copy's wrapped index stays live in the slot, so the *next* entry into this header (an outer re-entry, or a rederivation) must read it rather than assume the initializer's value | planned negative owner; `loop_facts::g2_a_reentered_loop_admits_on_the_current_index` exercises the wrap surviving into the next entry |
 | | wrapping access | admitted only when §3.2.1's `amax` and `max` guards hold; because `a > 0` and every reached `i` lies in `[e, imax]`, no intermediate `a*i + b` can wrap once `amax` did not, so the endpoint-only admission the review attacked cannot occur | planned negative owner, distinct from the wrapping-induction one |
 | | `i` | the base case | planned |
 | | `i + 1` | `a = 1`, `b = 1`; admission uses the maximum reached index, not `i` | planned |
@@ -846,7 +874,12 @@ builds and runs), `shifted_sum` (step before access: not versioned, traps at
 `xs[n]`), `drain` (`truncate` in the body: not versioned, traps at `i = 2`),
 one MIR-text negative per kill-set statement kind, the `byte_prepare` straddle
 leaf, the par_map work-weight parity owner, and the `explain-opt` reason-code
-owner.
+owner. `g2_a_reentered_loop_admits_on_the_current_index` (an unversioned outer
+loop re-enters a versioned inner one; not versioned would be wrong, the fast
+copy running on a stale entry is the codex P1) and
+`g2_a_reentered_loop_still_versions_and_computes` (the same nesting with a
+monotone, non-wrapping bound: versioned and correct) are both review witnesses
+for the live-entry read (§3.2.1, §3.7).
 
 ### 3.6 Deferred extension: versioning a borrowed-element loop
 
@@ -868,6 +901,163 @@ owners         the same trap-parity and MIR-text owners, plus the
 
 Until that lands, G2's fast version excludes such loops and plan 68 records the
 exclusion beside G2.
+
+### 3.7 Corrections recorded when PR 2 shipped
+
+Each of these narrows or renames what §3.1–§3.6 wrote; none widens a promise, none
+deletes a check, and none changes an invariant. They are recorded here because
+this plan is the normative source, not the implementation.
+
+```text
+two signed-form classes    §3.1 exempts one guard class from fusion. There are
+                           two, for the same reason: `byte_ranges::simplify`
+                           re-derives `Or(Or(Lt(start, 0), Gt(start, end)),
+                           Gt(end, len))` **literally** before it may prove a
+                           byte recurrence safe, exactly as
+                           `checked_borrowed_element_guard` re-derives the
+                           element guard. So `lower_bytes_read` and
+                           `lower_bytes_set` call the signed range emitter.
+                           Fusing them would not be unsound; it would silently
+                           disable plan 64's proof, and §3.4 already assigns
+                           byte accessors to `byte_ranges`
+one classifier, not a      §3.2's kill set is realized as one exhaustive,
+kill list                  wildcard-free classifier over `Stmt` (28 variants)
+                           and `Rvalue` (339), plus `variant_sweep_tripwire`.
+                           Enumerating only the *killing* variants would leave
+                           the other 300 reading as "does not mutate", so the
+                           modelled set is a whitelist and every other variant
+                           is `Unknown`: it kills every root and refuses the
+                           loop. The two `Rvalue` matches share one
+                           `unmodelled_rvalues!` pattern macro, so their
+                           coverage cannot drift apart
+an element store is an     A `PtrStore`/`PtrStoreNoalias`/`VecStore`/
+element store              `StoreIndex`/`StoreElemField`/`StoreElemFieldPtr`/
+                           `StoreColumn` whose stored value is a header-free
+                           scalar changes buffer bytes and no `{ptr,len}`
+                           header anywhere, so it kills no root: a guard's
+                           length operand is a property of the header. The
+                           element type is the gate, exactly as it is for PR 1's
+                           `align.elem` tag (I4). Without this the in-place
+                           kernels — `scale_only`, `bytes_to_f32_out`, the whole
+                           class 1079 and 1081 measured — would all refuse
+the call rule is narrowed  §3.2 excuses a read-only `borrow`
+                           parameter from an opaque call's kill. A slot whose
+                           *address* never leaves the function is excused too,
+                           on a disjoint proof: MIR hands out a slot address
+                           only through the borrowed-place operand family, so a
+                           callee has no way to reach it. `scan_report`'s `off`
+                           and the matvec's `d`/`r` are by-value scalars, and
+                           without this arm `print(i)` in the body would kill
+                           them and refuse the very witness §3.2 uses to
+                           justify versioning over relocation
+the index must be beyond   §3.2's "exactly one slot i is written in the body, by
+a callee's reach           exactly one statement" is a statement-level property,
+                           and a call taking the index as a `borrow mut`
+                           argument writes it through a pointer no `Stmt`
+                           variant names. The independent review of the
+                           implementation found this: `increment(i)` in the body
+                           left the recurrence proved against a value the callee
+                           had already changed, and the fast copy then indexed
+                           past the end with no guard. Admission therefore also
+                           requires that the index slot's address never leaves
+                           the function — not in the body, and not between its
+                           initialization and the loop header. The same
+                           escaping-address rule already governed every slot the
+                           rematerializer reads, so this makes it one rule for
+                           every slot the proof depends on
+seven more reason codes    §3.2.3 lists nine. The implementation adds
+                           `guard-not-fused` (a signed guard this pass does not
+                           own), `value-escapes-loop`, `nested-loop`,
+                           `loop-shape`, `unmodelled-statement`,
+                           `no-provable-guard` and `rederivation-failed`. Each
+                           names a distinct fail-closed refusal that would
+                           otherwise have to be reported under a code that does
+                           not describe it. All are stable and asserted
+a is a positive constant   §3.4 admits `a*i + b` with `a` loop-invariant
+                           non-constant "only with `a > 0` proved". PR 2 proves
+                           `a > 0` only for an integer constant and refuses the
+                           rest with `access-not-affine`, which is that row's
+                           "otherwise not admitted" branch. `b` stays fully
+                           general: loop-invariant, unknown, possibly negative
+one exit relation          Only `i >= N` is recognized. `>` bounds the index
+                           monotonically too, but it belongs to PR 3's
+                           canonical-shape recognition (§4.1) and consuming it
+                           here would take a later PR's decision
+no value escapes the body  A value defined in the body and read after the loop
+                           would, after cloning, be dominated by neither copy.
+                           Admission refuses such a loop
+                           (`value-escapes-loop`). This is an SSA consequence of
+                           duplicating a body, not a new restriction on source
+drop-flag parity is        §3.4's ownership row asks for a MIR-text owner
+closed by construction     asserting flag parity in both copies. Every rvalue
+                           that *produces* an individually owned value
+                           (`StrClone`, `HeapAlloc`, `ArenaBegin`, the builders,
+                           the region and task-group nodes) is unmodelled, so a
+                           body carrying an owned per-iteration value is never
+                           versioned and its flag bookkeeping is never
+                           duplicated. The owner pins that refusal instead, and
+                           `loop_expr::a_per_iteration_owned_string_is_freed_
+                           each_pass` remains the executable backstop
+the par_map weight cell    I8's ordering is real and implemented, but
+is unobservable by value   `par_map_function_work_weight`'s buckets put every
+                           body large enough to be *versionable* above the top
+                           bucket already, so no program can exhibit a weight
+                           that versioning would have moved. The owner pins the
+                           reachable consequence: a versioned kernel whose
+                           printed weight and whose reduction are unchanged
+re-derivation, exactly     §3.2's "re-derive and discard on disagreement" is:
+                           the rewritten function is structurally valid, its
+                           bounds/range trap **call-site count is unchanged**,
+                           every slow-copy block is byte-identical to the block
+                           it was derived from, and each versioned loop
+                           re-admits from the rewritten function — with its own
+                           fast copy ignored, since that copy legitimately adds
+                           a second write of the index slot outside the slow
+                           loop. Any failure restores the original function and
+                           reports `rederivation-failed`
+drain returns, not traps   §3.4 predicts `drain` traps at `i = 2`. It does not:
+                           the header re-reads the truncated length, so the loop
+                           exits and returns 3. The behaviour is unchanged by
+                           this PR either way, which is what the owner asserts,
+                           together with the `root-killed:ArrayTruncate`
+                           refusal that keeps it that way
+witness spellings          `total`/`inspect` borrows its element out of an owned
+                           `array<Record>` local, the spelling sema accepts for
+                           a stable borrowed element. `stride_sum` is exercised
+                           over a length-1 view: at length 2 its `i*2` reaches
+                           index 2, the admission arithmetic correctly refuses,
+                           and the slow copy traps — a useful fact, but not the
+                           "same values" owner's subject
+the entry value is read,   §3.2's static entry check described the
+not remembered             initializer's own value: a non-negative constant, a
+                           length, or an operand under a dominating
+                           non-negativity guard, dominating the header.
+                           Dominance proves only that the initializer runs
+                           before the loop's *first* entry, not before every
+                           one: an enclosing (unversioned) loop can re-enter
+                           the header without re-executing it, and a previous
+                           slow-copy run may have left the index wrapped under
+                           defined two's-complement wrap. Rematerializing the
+                           initializer's own operand into the preheader — as
+                           PR 2 first shipped — could then make `zero_trip`
+                           assert zero iterations for a loop that then ran
+                           unguarded on the real, live index. Found by the
+                           independent review of the implementation. The entry
+                           is now `load i` in the preheader, exactly like every
+                           other admission operand, with `e >= 0` as its own
+                           runtime conjunct — the same treatment `N`, every
+                           guard length, and the affine offset `b` already had.
+                           A recorded follow-up, not done in this PR: the
+                           static initializer scan could be replaced entirely
+                           by an initialization proof, which would let a
+                           parameter or a value with multiple initializers
+                           admit on its own live value instead of failing
+                           `entry-unproved`. `entry-unproved` itself had no
+                           reason-code owner before this fix;
+                           `g2_index_forms_get_their_stated_decision`'s
+                           `choose_start` case (two writes to the index slot
+                           outside the loop, one per `if` arm) closes it
+```
 
 ## 4. PR 3 — the trip-count exit at the latch (1084)
 

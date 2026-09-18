@@ -22,6 +22,7 @@ use std::rc::Rc;
 pub mod byte_storage;
 pub mod byte_ranges;
 pub mod byte_prepare;
+pub mod loop_facts;
 mod canonical_graph;
 mod generated_id;
 mod json_encode;
@@ -338,6 +339,10 @@ pub struct Program {
     /// Located-only current-plan observations. This field is deliberately absent from canonical
     /// graph walks, hashes, MIR printing, runtime-key inventory, and codegen.
     pub plan_records: Vec<PlanRecord>,
+    /// Plan 69 §3.2.3: one `loop_facts` decision per source loop, per function, in innermost-first
+    /// order. Diagnostic data for `explain-opt` only — absent from MIR text and therefore from
+    /// `codegen_impl_hash`, from the canonical graph, and from every interface and cache key.
+    pub loop_facts: Vec<loop_facts::FunctionDecisions>,
     /// Construction-time certification of the complete record table. Validation compares it with
     /// the publishable copy so deletion, insertion, or source-provenance stripping fails closed.
     /// It is located diagnostic data and is excluded from every artifact identity beside records.
@@ -3423,9 +3428,23 @@ fn lower_program_checked_with_catalog(
     {
         return Err(rejected(ValidationPass::LoweringProducedNothing, None));
     }
+    let mut loop_decisions: Vec<loop_facts::FunctionDecisions> = Vec::new();
     for function in &mut mir.fns {
         byte_ranges::simplify(function);
+        // Plan 69 §3.1(b): registered immediately after the byte-range proof, in the same loop and
+        // the same fail-closed shape. `loop_facts` derives from the simplified function and never
+        // consumes `byte_ranges`' facts, so a rolled-back byte-range proof cannot leave it holding
+        // a stale one. It runs after `annotate_par_map_work` (invariant I8), which
+        // `lower_program_unchecked_with_plans` already completed above.
+        let decisions = loop_facts::version_loops(function);
+        if !decisions.is_empty() {
+            loop_decisions.push(loop_facts::FunctionDecisions {
+                function: function.name.to_string(),
+                loops: decisions,
+            });
+        }
     }
+    mir.loop_facts = loop_decisions;
     Ok(mir)
 }
 
@@ -3706,6 +3725,7 @@ fn lower_program_unchecked_with_plans(
         plan_records,
         plan_certification,
         plan_catalog_malformed,
+        loop_facts: Vec::new(),
         sqlite_callback_effects,
         externs: program
             .externs
@@ -4961,6 +4981,12 @@ struct Builder {
 /// `Builder::dbg`. `lower_expr` is deeply recursive, so growing `Builder` itself by even a few words
 /// multiplies across the accepted expression-depth limit and can overflow the test thread stack.
 struct BuilderCtx {
+    /// Values this function has proved non-negative at their definition: every `Rvalue::SliceLen`
+    /// result, every fixed-array constant length, and `lower_chunks_count`'s guarded count. This is
+    /// the per-guard precondition plan 69 §3.1 states for the fused unsigned bounds predicate — it
+    /// is deliberately *not* the global claim `!range` makes about header loads (plan 69 I7), so a
+    /// guard whose length operand is absent here keeps its signed three-way form.
+    non_negative_lengths: std::collections::HashSet<ValueId>,
     /// Monotone entry reachability for each MIR block. Kept out of `Builder` itself so recursive
     /// expression lowering retains its measured stack headroom.
     reachable_blocks: Vec<bool>,
@@ -5351,7 +5377,45 @@ impl Builder {
         if self.ctx.dbg.is_some() {
             self.record_line();
         }
+        // Plan 69 §3.1: a `SliceLen` result is non-negative by construction, which is exactly the
+        // per-guard precondition the fused unsigned bounds predicate needs. Recording it here
+        // covers every producer site at once instead of auditing the thirty-odd emitters.
+        if let Stmt::Let(value, Rvalue::SliceLen(_)) = &s {
+            let value = *value;
+            self.record_non_negative_length(value);
+        }
         self.blocks[self.cur as usize].stmts.push(s);
+    }
+
+    /// Register `value` as proved non-negative. Out-of-line for the same reason as
+    /// [`Builder::record_line`]: `push` is inlined into the deeply recursive `lower_expr`.
+    #[inline(never)]
+    fn record_non_negative_length(&mut self, value: ValueId) {
+        self.ctx.non_negative_lengths.insert(value);
+    }
+
+    /// Whether a guard's length operand is proved non-negative, which is the precondition plan 69
+    /// §3.1 states per guard. A non-negative `i64` constant (a fixed-array length) and a recorded
+    /// `SliceLen`/chunk count qualify; everything else fails closed to the signed form.
+    fn length_is_non_negative(&self, len: &Operand) -> bool {
+        match len {
+            Operand::Const(Const::Int(value, ty)) => *ty == i64_ty() && *value >= 0,
+            Operand::Value(value) => {
+                self.value_tys.get(*value as usize) == Some(&i64_ty())
+                    && self.ctx.non_negative_lengths.contains(value)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether an operand is a plain `i64` value or constant. The fused predicate casts both
+    /// operands to `u64`, so anything else keeps the signed form rather than being reinterpreted.
+    fn operand_is_i64(&self, op: &Operand) -> bool {
+        match op {
+            Operand::Const(Const::Int(_, ty)) => *ty == i64_ty(),
+            Operand::Value(value) => self.value_tys.get(*value as usize) == Some(&i64_ty()),
+            _ => false,
+        }
     }
 
     /// Record the current statement's source (line, col), parallel to the just/soon-pushed stmt.
@@ -5562,6 +5626,7 @@ fn lower_fn(
         alias_scope: 0,
         loops: Vec::new(),
         ctx: Box::new(BuilderCtx {
+            non_negative_lengths: std::collections::HashSet::new(),
             reachable_blocks: Vec::new(),
             value_temp_drop_flags: Vec::new(),
             synthetic_drop_slots: Vec::new(),
@@ -10718,7 +10783,7 @@ fn lower_borrowed_place(b: &mut Builder, e: &hir::Expr, mode: align_ast::ParamMo
             Rvalue::SliceLen(Operand::BorrowedPlace(Box::new(base_place.clone()))),
         ));
         let checked_len = Operand::Value(len);
-        emit_bounds_check(b, &index, checked_len.clone());
+        emit_signed_bounds_check(b, &index, checked_len.clone());
         return Operand::BorrowedElementPlace(Box::new(BorrowedElementPlace {
             base: base_place,
             index,
@@ -10859,7 +10924,7 @@ fn lower_borrowed_place(b: &mut Builder, e: &hir::Expr, mode: align_ast::ParamMo
                         ))),
                     ));
                     let checked_len = Operand::Value(len);
-                    emit_bounds_check(b, &index, checked_len.clone());
+                    emit_signed_bounds_check(b, &index, checked_len.clone());
                     return Operand::BorrowedElementPlace(Box::new(BorrowedElementPlace {
                         base: base_place,
                         index,
@@ -11882,11 +11947,65 @@ fn lower_vec_div(
     Operand::Value(v)
 }
 
-/// Emit the explicit bounds check for `recv[index]` (semantics live in MIR):
-/// `if index < 0 || index >= len { bounds_fail(index, len); unreachable }`. Leaves `b.cur` at the
-/// in-bounds block so the caller emits the element load. Out-of-bounds is a hard error (the
-/// settled panic model — never a silent OOB read).
+/// The unsigned twin of [`i64_ty`], used only as the fused bounds predicate's compare type.
+fn u64_ty() -> Ty {
+    Ty::Int(IntTy {
+        bits: 64,
+        signed: false,
+    })
+}
+
+/// Emit the explicit bounds check for `recv[index]` (semantics live in MIR).
+///
+/// Plan 69 §3.1(a): when the length operand is proved non-negative the three-way signed test
+/// `index < 0 || index >= len` collapses to the single unsigned compare `(u64)index >= (u64)len`,
+/// which is exact — a negative `index` reinterprets as a `u64` above every non-negative `len`. The
+/// failure edge keeps the original **signed** `index`/`len` operands, so the trap text is
+/// byte-identical (§3.3). A length that is not proved non-negative keeps the signed form.
+///
+/// Leaves `b.cur` at the in-bounds block so the caller emits the element load. Out-of-bounds is a
+/// hard error (the settled panic model — never a silent OOB read).
 fn emit_bounds_check(b: &mut Builder, idx: &Operand, len: Operand) -> BlockId {
+    if !(b.length_is_non_negative(&len) && b.operand_is_i64(idx)) {
+        return emit_signed_bounds_check(b, idx, len);
+    }
+    let unsigned_index = b.fresh_value(u64_ty());
+    b.push(Stmt::Let(
+        unsigned_index,
+        Rvalue::Cast {
+            operand: idx.clone(),
+            from: i64_ty(),
+            to: u64_ty(),
+        },
+    ));
+    let unsigned_len = b.fresh_value(u64_ty());
+    b.push(Stmt::Let(
+        unsigned_len,
+        Rvalue::Cast {
+            operand: len.clone(),
+            from: i64_ty(),
+            to: u64_ty(),
+        },
+    ));
+    let oob = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        oob,
+        Rvalue::Bin(
+            BinOp::Ge,
+            Operand::Value(unsigned_index),
+            Operand::Value(unsigned_len),
+        ),
+    ));
+    emit_bounds_failure_edge(b, idx, len, oob)
+}
+
+/// The original three-way signed element guard: `index < 0 || index >= len`.
+///
+/// Plan 69 §3.1 keeps exactly one class of guard on this form. `lower_borrowed_place` publishes its
+/// guard as a `BorrowedElementGuard`, and codegen's `checked_borrowed_element_guard` re-derives
+/// `Or(Lt(index, 0), Ge(index, len))` **literally** before it forms the element pointer; a fused
+/// guard would fail that second MIR-to-codegen safety contract. Lifting the exemption is §3.6.
+fn emit_signed_bounds_check(b: &mut Builder, idx: &Operand, len: Operand) -> BlockId {
     let lo = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(
         lo,
@@ -11906,7 +12025,17 @@ fn emit_bounds_check(b: &mut Builder, idx: &Operand, len: Operand) -> BlockId {
         oob,
         Rvalue::Bin(BinOp::Or, Operand::Value(lo), Operand::Value(hi)),
     ));
+    emit_bounds_failure_edge(b, idx, len, oob)
+}
 
+/// The shared failure edge of both element-guard forms: `bounds_fail(index, len)` in an
+/// `Unreachable` block, with the original signed operands, and `b.cur` left at the success block.
+fn emit_bounds_failure_edge(
+    b: &mut Builder,
+    idx: &Operand,
+    len: Operand,
+    oob: ValueId,
+) -> BlockId {
     let fail = b.new_block();
     let ok = b.new_block();
     b.terminate(Term::Branch(Operand::Value(oob), fail, ok));
@@ -11962,7 +12091,8 @@ fn lower_bytes_read(
             Operand::Const(Const::Int(width, i64_ty())),
         ),
     ));
-    emit_range_bounds_check(b, &off, &Operand::Value(end), Operand::Value(len));
+    // `byte_ranges` re-derives this predicate literally (plan 69 §3.7), so it keeps the signed form.
+    emit_signed_range_bounds_check(b, &off, &Operand::Value(end), Operand::Value(len));
     let v = b.fresh_value(scalar);
     b.push(Stmt::Let(
         v,
@@ -12000,7 +12130,8 @@ fn lower_bytes_set(
             Operand::Const(Const::Int(width, i64_ty())),
         ),
     ));
-    emit_range_bounds_check(b, &off, &Operand::Value(end), Operand::Value(len));
+    // `byte_ranges` re-derives this predicate literally (plan 69 §3.7), so it keeps the signed form.
+    emit_signed_range_bounds_check(b, &off, &Operand::Value(end), Operand::Value(len));
     let t = b.fresh_value(Ty::Unit);
     b.push(Stmt::Let(
         t,
@@ -12490,6 +12621,9 @@ fn lower_chunks_count(b: &mut Builder, src_len: Operand, n: Operand) -> Operand 
     b.cur = exit;
     let count = b.fresh_value(i64_ty());
     b.push(Stmt::Let(count, Rvalue::Load(result)));
+    // Zero on the guarded-out path and `(src_len - 1) / n + 1 > 0` on the computed one, so the
+    // chunk count is the computed-count case of plan 69 §3.1's non-negativity precondition.
+    b.record_non_negative_length(count);
     Operand::Value(count)
 }
 
@@ -12624,7 +12758,85 @@ fn emit_vec_bounds_check(b: &mut Builder, slice: &Operand, idx: &Operand, n: u32
     emit_range_bounds_check(b, idx, &Operand::Value(end), Operand::Value(len));
 }
 
+/// The range guard, fused per plan 69 §3.1(a) when the length operand is proved non-negative:
+/// `(u64)start > (u64)end || (u64)end > (u64)len`. The form is exact in all four sign quadrants
+/// given `len >= 0` — a negative `start` with a non-negative `end` is caught by the first arm and a
+/// negative `end` by the second — and there is no single unsigned predicate over three operands
+/// that reproduces the three-way test, so two compares and one `Or` is the minimum. The failure
+/// edge keeps the original signed `start`/`end`/`len`, so the trap text is byte-identical.
 fn emit_range_bounds_check(b: &mut Builder, start: &Operand, end: &Operand, len: Operand) {
+    if !(b.length_is_non_negative(&len)
+        && b.operand_is_i64(start)
+        && b.operand_is_i64(end))
+    {
+        return emit_signed_range_bounds_check(b, start, end, len);
+    }
+    let unsigned_start = b.fresh_value(u64_ty());
+    b.push(Stmt::Let(
+        unsigned_start,
+        Rvalue::Cast {
+            operand: start.clone(),
+            from: i64_ty(),
+            to: u64_ty(),
+        },
+    ));
+    let unsigned_end = b.fresh_value(u64_ty());
+    b.push(Stmt::Let(
+        unsigned_end,
+        Rvalue::Cast {
+            operand: end.clone(),
+            from: i64_ty(),
+            to: u64_ty(),
+        },
+    ));
+    let unsigned_len = b.fresh_value(u64_ty());
+    b.push(Stmt::Let(
+        unsigned_len,
+        Rvalue::Cast {
+            operand: len.clone(),
+            from: i64_ty(),
+            to: u64_ty(),
+        },
+    ));
+    let inverted = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        inverted,
+        Rvalue::Bin(
+            BinOp::Gt,
+            Operand::Value(unsigned_start),
+            Operand::Value(unsigned_end),
+        ),
+    ));
+    let over = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        over,
+        Rvalue::Bin(
+            BinOp::Gt,
+            Operand::Value(unsigned_end),
+            Operand::Value(unsigned_len),
+        ),
+    ));
+    let oob = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        oob,
+        Rvalue::Bin(BinOp::Or, Operand::Value(inverted), Operand::Value(over)),
+    ));
+    emit_range_failure_edge(b, start, end, len, oob);
+}
+
+/// The original three-way signed range guard: `start < 0 || start > end || end > len`.
+///
+/// Plan 69 §3.4 leaves the byte accessors to `byte_ranges`, and §3.7 records why that means they
+/// keep this form: `byte_ranges::simplify` re-derives `Or(Or(Lt(start, 0), Gt(start, end)),
+/// Gt(end, len))` literally before it may prove a byte recurrence safe, exactly as codegen's
+/// `checked_borrowed_element_guard` re-derives the element guard. Fusing a byte guard would not be
+/// unsound, but it would silently disable plan 64's proof.
+fn emit_signed_range_bounds_check(
+    b: &mut Builder,
+    start: &Operand,
+    end: &Operand,
+    len: Operand,
+) {
     let neg = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(
         neg,
@@ -12654,7 +12866,18 @@ fn emit_range_bounds_check(b: &mut Builder, start: &Operand, end: &Operand, len:
         oob,
         Rvalue::Bin(BinOp::Or, Operand::Value(e1), Operand::Value(over)),
     ));
+    emit_range_failure_edge(b, start, end, len, oob);
+}
 
+/// The shared failure edge of both range-guard forms: `range_fail(start, end, len)` in an
+/// `Unreachable` block, with the original signed operands, and `b.cur` left at the success block.
+fn emit_range_failure_edge(
+    b: &mut Builder,
+    start: &Operand,
+    end: &Operand,
+    len: Operand,
+    oob: ValueId,
+) {
     let fail = b.new_block();
     let ok = b.new_block();
     b.terminate(Term::Branch(Operand::Value(oob), fail, ok));
@@ -25054,6 +25277,7 @@ fn main() -> i32 {
             alias_scope: 0,
             loops: Vec::new(),
             ctx: Box::new(BuilderCtx {
+                non_negative_lengths: std::collections::HashSet::new(),
                 reachable_blocks: Vec::new(),
                 value_temp_drop_flags: Vec::new(),
                 synthetic_drop_slots: Vec::new(),
@@ -25970,6 +26194,7 @@ fn main() -> i32 = 0
             plan_records: Vec::new(),
             plan_certification: Default::default(),
             plan_catalog_malformed: false,
+            loop_facts: Vec::new(),
             fns: vec![Function {
                 name: ProgramCall::from_validated("main"),
                 params: vec![],
@@ -27953,41 +28178,36 @@ fn main() -> i32 = 0
                 "the exact bounds condition must immediately drive its branch:\n{rendered}"
             );
             let Rvalue::Bin(
-                BinOp::Or,
-                Operand::Value(low_condition),
-                Operand::Value(high_condition),
+                BinOp::Ge,
+                Operand::Value(unsigned_index),
+                Operand::Value(unsigned_len),
             ) = condition_definition
             else {
-                panic!("the bounds condition must combine low and high guards:\n{rendered}")
+                panic!("the fused bounds condition must be one unsigned compare:\n{rendered}")
             };
-            let (_, _, low_definition) = value_definition(function, *low_condition);
-            let (_, _, high_definition) = value_definition(function, *high_condition);
+            let (_, _, index_definition) = value_definition(function, *unsigned_index);
+            let (_, _, len_definition) = value_definition(function, *unsigned_len);
             assert!(
                 matches!(
-                    low_definition,
-                    Rvalue::Bin(
-                        BinOp::Lt,
-                        Operand::Value(index),
-                        Operand::Const(Const::Int(
-                            0,
-                            Ty::Int(IntTy { bits: 64, signed: true })
-                        ))
-                    ) if index == checked_index_value
+                    index_definition,
+                    Rvalue::Cast {
+                        operand: Operand::Value(index),
+                        from: Ty::Int(IntTy { bits: 64, signed: true }),
+                        to: Ty::Int(IntTy { bits: 64, signed: false }),
+                    } if index == checked_index_value
                 ),
-                "the low guard must test the exact index sent to bounds_fail:\n{rendered}"
+                "the fused guard must reinterpret the exact index sent to bounds_fail:\n{rendered}"
             );
             assert!(
                 matches!(
-                    high_definition,
-                    Rvalue::Bin(
-                        BinOp::Ge,
-                        Operand::Value(index),
-                        Operand::Const(Const::Int(len, ty))
-                    ) if index == checked_index_value
-                        && len == checked_len_value
-                        && ty == checked_len_ty
+                    len_definition,
+                    Rvalue::Cast {
+                        operand: Operand::Const(Const::Int(len, ty)),
+                        from: Ty::Int(IntTy { bits: 64, signed: true }),
+                        to: Ty::Int(IntTy { bits: 64, signed: false }),
+                    } if len == checked_len_value && ty == checked_len_ty
                 ),
-                "the high guard must test the exact index/length sent to bounds_fail:\n{rendered}"
+                "the fused guard must reinterpret the exact length sent to bounds_fail:\n{rendered}"
             );
             assert!(
                 location_precedes(function, source_load, (condition_block, condition_index)),

@@ -430,3 +430,1028 @@ fn main() -> i32 {
         "the existing sema gate still rejects an aliasing exclusive pair:\n{diagnostics}"
     );
 }
+
+// ── G2, plan 69 PR 2 (issue 1081) ───────────────────────────────────────────────────────────────
+//
+// Two changes, one capability. **Fusion** (§3.1) collapses each emitted guard to its minimal
+// unsigned form: one `Ge` on `u64` for an element index, two unsigned compares and an `Or` for a
+// range. **Versioning** (§3.2) proves, once in a new preheader, that every guarded access of a
+// monotone-index loop is in range for every iteration it will run, and selects a fast copy whose
+// proved guards are bypassed — or the original slow copy, which keeps every one of them.
+//
+// Nothing is deleted. The slow copy is byte-identical to what lowering emitted, so a failing run
+// traps at the same iteration, with the same `(index, len)`, after the same observable prefix.
+// That is why versioning, not relocation, is the shape: `scan_report` below prints `0` and *then*
+// traps, exactly as it did before this pass existed.
+//
+// These owners are arch-neutral: MIR text, `explain-opt` reason codes, and executables. Vector
+// widths stay in `vectorize_shapes.rs`, which names its target tier.
+
+use align_mir::loop_facts::LOOP_FACTS_VERSION_BUDGET;
+
+/// Whole-program MIR text for `src`.
+fn mir_text(name: &str, src: &str) -> String {
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, name, src);
+    assert!(
+        !checked.diags.has_errors(),
+        "unexpected errors:\n{}",
+        align_driver::format_diagnostics(&sm, &checked.diags)
+    );
+    align_mir::print::program_to_string(&lower_to_mir(&checked.hir))
+}
+
+/// The blocks of one MIR function that hold a **guard**: their terminator branches to a block whose
+/// only statement is a bounds/range trap. Fusion assertions belong here and not on the whole
+/// function, because the preheader's own admission arithmetic legitimately compares against `0`.
+fn guard_blocks(body: &str) -> Vec<String> {
+    let blocks: Vec<&str> = body.split("  bb").skip(1).collect();
+    let trap_labels: Vec<String> = blocks
+        .iter()
+        .filter(|block| block.contains("bounds_fail") || block.contains("range_fail"))
+        .map(|block| block.split(':').next().expect("a block is labelled").to_string())
+        .collect();
+    assert!(!trap_labels.is_empty(), "no trap block in:\n{body}");
+    blocks
+        .iter()
+        .filter(|block| {
+            block.lines().any(|line| {
+                line.trim_start().starts_with("branch")
+                    && trap_labels
+                        .iter()
+                        .any(|label| line.contains(&format!("? bb{label} ")))
+            })
+        })
+        .map(|block| format!("  bb{block}"))
+        .collect()
+}
+
+/// One function's MIR text, from its `fn` line to its closing brace.
+fn mir_fn(mir: &str, name: &str) -> String {
+    let needle = format!("fn {name}(");
+    let start = if mir.starts_with(&needle) {
+        0
+    } else {
+        mir.find(&format!("\n{needle}"))
+            .unwrap_or_else(|| panic!("function `{name}` is not in the MIR:\n{mir}"))
+            + 1
+    };
+    let rest = &mir[start..];
+    let end = rest.find("\n}").expect("a MIR function closes") + 2;
+    rest[..end].to_string()
+}
+
+/// The `explain-opt` decision lines (§3.2.3) for one program, in report order.
+fn loop_facts_report(name: &str, src: &str) -> Vec<String> {
+    let path = std::env::temp_dir().join(format!("align-lf-{}-{name}.align", std::process::id()));
+    std::fs::write(&path, src).expect("write fixture");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_alignc"))
+        .env("ALIGNC_CACHE", "off")
+        .args(["explain-opt", path.to_str().expect("utf-8 path")])
+        .output()
+        .expect("run explain-opt");
+    let _ = std::fs::remove_file(&path);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "explain-opt must succeed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    stdout
+        .lines()
+        .filter(|line| line.starts_with("loop facts "))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The decision one named function's first loop received, with the `loop ` prefix stripped.
+fn decision(report: &[String], function: &str) -> String {
+    let prefix = format!("loop facts `{function}` #1: loop ");
+    report
+        .iter()
+        .find_map(|line| line.strip_prefix(&prefix).map(str::to_string))
+        .unwrap_or_else(|| panic!("no decision for `{function}`:\n{report:#?}"))
+}
+
+const SUM: &str = "\
+fn sum(borrow xs: slice<i64>) -> i64 {
+  mut total := 0
+  mut i := 0
+  loop {
+    if i >= xs.len() { break }
+    total = total + xs[i]
+    i = i + 1
+  }
+  return total
+}
+";
+
+const SCAN_REPORT: &str = "\
+fn scan_report(borrow xs: slice<i64>, off: i64) -> i64 {
+  mut total := 0
+  mut i := 0
+  loop {
+    if i >= xs.len() { break }
+    print(i)
+    total = total + xs[i + off]
+    i = i + 1
+  }
+  return total
+}
+";
+
+const SHIFTED_SUM: &str = "\
+fn shifted_sum(borrow xs: slice<i64>) -> i64 {
+  mut total := 0
+  mut i := 0
+  loop {
+    if i >= xs.len() { break }
+    i = i + 1
+    total = total + xs[i]
+  }
+  return total
+}
+";
+
+const STRIDE_SUM: &str = "\
+fn stride_sum(borrow xs: slice<i64>) -> i64 {
+  mut total := 0
+  mut i := 0
+  loop {
+    if i >= xs.len() { break }
+    total = total + xs[i * 2]
+    i = i + 1
+  }
+  return total
+}
+";
+
+const MATVEC: &str = "\
+fn matvec(borrow w: slice<i64>, borrow x: slice<i64>, d: i64, r: i64) -> i64 {
+  mut acc := 0
+  mut c := 0
+  loop {
+    if c >= d { break }
+    acc = acc + w[r * d + c] * x[c]
+    c = c + 1
+  }
+  return acc
+}
+";
+
+const WINDOW_FIRST: &str = "\
+fn window_first(borrow xs: slice<i64>, k: i64) -> i64 {
+  mut seen := 0
+  mut i := 0
+  loop {
+    if i >= xs.len() { break }
+    w := xs[i..i + k]
+    seen = seen + w.len()
+    i = i + 1
+  }
+  return seen
+}
+";
+
+const SKIP_ZEROS: &str = "\
+fn skip_zeros(borrow xs: slice<i64>) -> i64 {
+  mut i := 0
+  mut seen := 0
+  loop {
+    if i >= xs.len() { break }
+    seen = seen + xs[i]
+    if xs[i] == 0 { i = i + 2 } else { i = i + 1 }
+  }
+  return seen
+}
+";
+
+const DRAIN: &str = "\
+fn drain(borrow mut data: array<i64>) -> i64 {
+  mut sum := 0
+  mut i := 0
+  loop {
+    if i >= data.len() { break }
+    sum = sum + data[i]
+    if i == 1 { data.truncate(2) }
+    i = i + 1
+  }
+  return sum
+}
+";
+
+/// No single dominating initializer: the index slot is written on both arms of an `if` before the
+/// loop, so the entries scan finds more than one write outside the body and never gets far enough
+/// to check dominance or non-negativity.
+const TWO_ENTRY_WRITES: &str = "\
+fn choose_start(borrow xs: slice<i64>, flag: bool) -> i64 {
+  mut acc := 0
+  mut i := 0
+  if flag { i = 1 } else { i = 2 }
+  loop {
+    if i >= xs.len() { break }
+    acc = acc + xs[i]
+    i = i + 1
+  }
+  return acc
+}
+";
+
+const TOTAL_INSPECT: &str = "\
+Record { value: string }
+fn inspect(borrow record: Record) -> i64 = record.value.len()
+fn total() -> i64 {
+  mut b: array_builder<Record> := array_builder()
+  b.push(Record { value: \"align\".clone() })
+  b.push(Record { value: \"lang\".clone() })
+  rows := b.build()
+  mut sum := 0
+  mut i := 0
+  loop {
+    if i >= rows.len() { break }
+    sum = sum + inspect(rows[i])
+    i = i + 1
+  }
+  return sum
+}
+";
+
+const BUILD_ARRAY: &str = "\
+fn build(n: i64) -> array<i64> {
+  mut b: array_builder<i64> := array_builder()
+  mut i := 0
+  loop {
+    if i >= n { break }
+    b.push(i * 10)
+    i = i + 1
+  }
+  return b.build()
+}
+";
+
+// ── Fusion (§3.1) ───────────────────────────────────────────────────────────────────────────────
+
+/// An element guard is one unsigned compare. `(idx < 0) || (idx >= len)` is exact only because the
+/// length is non-negative, and under that precondition `(u64)idx >= (u64)len` decides it alone: a
+/// negative index reinterprets as a `u64` above every non-negative length. The trap keeps the
+/// original **signed** operands, so the reported index is still `-1` and not `2^64 - 1`.
+#[test]
+fn g2_element_guard_is_one_unsigned_compare() {
+    let body = mir_fn(&mir_text("g2-fuse-element", SUM), "sum");
+    let guards = guard_blocks(&body);
+    assert_eq!(guards.len(), 1, "the slow copy holds the one live guard:\n{body}");
+    let guard = &guards[0];
+    assert_eq!(
+        guard.matches("as u64 (from i64)").count(),
+        2,
+        "one index cast and one length cast, and nothing else:\n{guard}"
+    );
+    assert!(
+        !guard.contains("< 0_i64") && !guard.contains("||"),
+        "the signed negative-index arm and its `Or` are both gone:\n{guard}"
+    );
+    assert!(
+        guard.contains(" >= "),
+        "what is left is one unsigned `>=`:\n{guard}"
+    );
+    let traps: Vec<&str> = body
+        .lines()
+        .filter(|line| line.contains("call runtime bounds_fail"))
+        .collect();
+    assert_eq!(traps.len(), 1, "exactly one trap action survives:\n{body}");
+    assert!(
+        !traps[0].contains("u64"),
+        "the trap reports the original signed index and length:\n{body}"
+    );
+}
+
+/// A range guard is two unsigned compares and one `Or`. There is no single unsigned predicate over
+/// three operands that reproduces `start < 0 || start > end || end > len`, and claiming one would
+/// be unsound — so the minimal form is stated as two, not one.
+#[test]
+fn g2_range_guard_is_two_unsigned_compares() {
+    let body = mir_fn(&mir_text("g2-fuse-range", WINDOW_FIRST), "window_first");
+    let guards = guard_blocks(&body);
+    assert_eq!(guards.len(), 1, "the slow copy holds the one live guard:\n{body}");
+    let guard = &guards[0];
+    assert!(
+        !guard.contains("< 0_i64"),
+        "the signed negative-start arm is gone from a range guard:\n{guard}"
+    );
+    assert_eq!(
+        guard.matches("as u64 (from i64)").count(),
+        3,
+        "start, end and len are each cast once:\n{guard}"
+    );
+    assert_eq!(
+        guard.matches(" > ").count(),
+        2,
+        "exactly two unsigned compares — there is no single predicate over three operands:\n{guard}"
+    );
+    assert_eq!(guard.matches("||").count(), 1, "joined by one `Or`:\n{guard}");
+    assert!(
+        body.contains("call runtime range_fail"),
+        "the range trap and its three signed operands are unchanged:\n{body}"
+    );
+}
+
+/// The one element guard that keeps its signed form. `lower_borrowed_place` publishes its guard as
+/// a `BorrowedElementGuard`, and codegen's `checked_borrowed_element_guard` re-derives
+/// `Or(Lt(index, 0), Ge(index, len))` **literally** before it forms the element pointer. Fusing it
+/// would fail that second MIR-to-codegen safety contract, so §3.1 exempts it by name — and §3.6
+/// owns lifting the exemption. The fused form must still appear elsewhere in the same program, or
+/// this test would also pass if fusion had simply been reverted.
+#[test]
+fn g2_borrowed_element_guard_keeps_its_signed_form() {
+    let program = format!("{TOTAL_INSPECT}{SUM}");
+    let mir = mir_text("g2-borrowed-element-signed", &program);
+    let borrowed = guard_blocks(&mir_fn(&mir, "total")).join("\n");
+    assert!(
+        borrowed.contains("< 0_i64") && borrowed.contains("||"),
+        "the borrowed-element guard keeps its three-way signed predicate:\n{borrowed}"
+    );
+    assert!(
+        !borrowed.contains("as u64 (from i64)"),
+        "and is not fused:\n{borrowed}"
+    );
+    let fused = mir_fn(&mir, "sum");
+    assert!(
+        fused.contains("as u64 (from i64)"),
+        "while every other emitter site in the same program fuses:\n{fused}"
+    );
+}
+
+/// The §3.7 deviation, pinned. A byte accessor's range guard also keeps the signed form, for the
+/// same class of reason: `byte_ranges::simplify` re-derives `Or(Or(Lt(start, 0), Gt(start, end)),
+/// Gt(end, len))` literally before it may prove a byte recurrence safe. Fusing it would not be
+/// unsound, but it would silently disable plan 64's proof — which `runway_a2_binary_codec` owns.
+#[test]
+fn g2_byte_accessor_guard_keeps_its_signed_form() {
+    let src = "\
+fn read_at(borrow b: slice<u8>, off: i64) -> u32 = b.u32_le(off)
+";
+    let body = mir_fn(&mir_text("g2-byte-signed", src), "read_at");
+    let guard = guard_blocks(&body).join("\n");
+    assert!(
+        guard.contains("< 0_i64") && body.contains("call runtime range_fail"),
+        "a byte accessor keeps the signed three-way range predicate:\n{body}"
+    );
+    assert!(
+        !guard.contains("as u64 (from i64)"),
+        "a byte accessor guard is not fused:\n{guard}"
+    );
+}
+
+// ── Versioning shape (§3.2) ─────────────────────────────────────────────────────────────────────
+
+/// The shape itself: one source loop becomes a preheader, a fast copy and a slow copy. The fast
+/// copy reaches its element load with no branch on the guard; the slow copy keeps the branch and
+/// the trap. The count of trap actions in the whole function is what proves nothing was deleted.
+#[test]
+fn g2_versioned_loop_has_a_preheader_and_two_copies() {
+    let body = mir_fn(&mir_text("g2-versioned-shape", SUM), "sum");
+    let reported = decision(
+        &loop_facts_report("versioned-shape", &format!("{SUM}fn main() {{ }}\n")),
+        "sum",
+    );
+    let used: usize = reported
+        .strip_prefix("versioned ")
+        .and_then(|rest| rest.split('/').next())
+        .and_then(|used| used.parse().ok())
+        .unwrap_or_else(|| panic!("the report names the budget use: `{reported}`"));
+    assert!(
+        (1..=LOOP_FACTS_VERSION_BUDGET).contains(&used),
+        "the loop is versioned within budget, and the report says how much it spent: `{reported}`"
+    );
+    assert!(
+        reported.ends_with(&format!("/{LOOP_FACTS_VERSION_BUDGET}")),
+        "the report names the budget it was measured against: `{reported}`"
+    );
+    assert_eq!(
+        body.matches("call runtime bounds_fail").count(),
+        1,
+        "versioning moves a guard and never deletes one, so the trap call-site count is unchanged:\n{body}"
+    );
+    // Both copies compute the fused predicate; only the slow one still branches on it, which is
+    // what `guard_blocks` counts.
+    assert_eq!(
+        body.matches("as u64 (from i64)").count(),
+        4,
+        "the fused predicate is cloned into the fast copy and only its branch is bypassed:\n{body}"
+    );
+    assert_eq!(
+        guard_blocks(&body).len(),
+        1,
+        "exactly one copy still branches to a trap:\n{body}"
+    );
+    // The preheader is the one block that computes the admission test: it must hold the
+    // division-free overflow guards §3.2.1 names, and end in a two-way selection.
+    assert!(
+        body.contains("9223372036854775806_i64") && body.contains("9223372036854775807_i64"),
+        "the preheader proves `N <= i64::MAX - s` and the `a*imax` / `amax + b` overflow bounds:\n{body}"
+    );
+}
+
+/// The budget is a named constant, counted in body statements including terminators, and pinned.
+/// Code growth from versioning is real; an owner that can see it is what keeps it bounded.
+#[test]
+fn g2_version_budget_is_pinned() {
+    assert_eq!(
+        LOOP_FACTS_VERSION_BUDGET, 256,
+        "changing the versioning budget changes emitted code size for every program"
+    );
+}
+
+// ── Index forms admitted and refused (§3.4) ─────────────────────────────────────────────────────
+
+/// Every admitted index form, and every refusal, in one table. The reason **codes** are the stable
+/// surface §3.2.3 promises; the prose around them is not, which is why this asserts the code.
+#[test]
+fn g2_index_forms_get_their_stated_decision() {
+    let program = format!(
+        "{SUM}{SCAN_REPORT}{SHIFTED_SUM}{STRIDE_SUM}{MATVEC}{WINDOW_FIRST}{SKIP_ZEROS}{DRAIN}\
+{TWO_ENTRY_WRITES}\
+fn main() {{ }}\n"
+    );
+    let report = loop_facts_report("index-forms", &program);
+    for (function, expected) in [
+        // `i`: the base case.
+        ("sum", "versioned"),
+        // `i + off`, `off` an unknown possibly-negative parameter: both ends of the range proved.
+        ("scan_report", "versioned"),
+        // `i * 2`: `a = 2`, and the bound is `a*imax + b`, not `imax`.
+        ("stride_sum", "versioned"),
+        // The guard length differs from the trip-count bound, and each guard is proved against its
+        // own length — 1081's matvec is exactly this shape.
+        ("matvec", "versioned"),
+        // A range access `xs[i..i+k]`, including the loop-invariant overflow test.
+        ("window_first", "versioned"),
+        // The step precedes the access, so the value reaching it is not the header's.
+        ("shifted_sum", "kept checks: step-precedes-access"),
+        // The step is data-dependent, so there is no single monotone recurrence.
+        ("skip_zeros", "kept checks: multiple-index-writes"),
+        // `truncate` changes the published length inside the body.
+        ("drain", "kept checks: root-killed:ArrayTruncate"),
+        // Two writes to the index slot outside the loop (one per `if` arm): no single dominating
+        // initializer, so the entry cannot even be checked for non-negativity.
+        ("choose_start", "kept checks: entry-unproved"),
+    ] {
+        let found = decision(&report, function);
+        assert!(
+            found.starts_with(expected),
+            "[{function}] expected `{expected}`, got `{found}`"
+        );
+    }
+}
+
+/// The IR-identity refusal. `Stmt::BorrowedElementReservation` is a function-unique token that
+/// codegen's `unique_reservation` requires to occur exactly once; a cloned body would carry it
+/// twice and the fast copy would carry no guard at all. So a loop that borrows an element into a
+/// call is refused outright — and still compiles and runs.
+#[test]
+fn g2_borrowed_element_loop_is_not_versioned_and_still_runs() {
+    let program = format!("{TOTAL_INSPECT}fn main() -> i32 {{ print(total()); return 0 }}\n");
+    assert_eq!(
+        decision(&loop_facts_report("borrowed-element", &program), "total"),
+        "kept checks: borrowed-element"
+    );
+    let out = build_and_run("loop-facts-borrowed-element", &program);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "9\n",
+        "the refused loop still produces its value"
+    );
+}
+
+/// The induction slot must be beyond a callee's reach. A call taking the index as `borrow mut`
+/// writes it through a pointer that no `Stmt` variant names, so a statement scan alone would prove
+/// the recurrence against a value the callee had already changed — and the fast copy would then
+/// index past the end with no guard at all. Admission therefore refuses any loop whose index slot
+/// hands its address out **anywhere in the function**, including between its initialization and the
+/// loop header. The executable half is what discriminates the defect: with a length-one view, the
+/// buggy version returned a value read past the end instead of trapping.
+#[test]
+fn g2_an_index_a_callee_can_write_is_not_versioned() {
+    let src = "\
+fn increment(borrow mut value: i64) {
+  value = value + 1
+}
+fn skip_ahead(borrow xs: slice<i64>) -> i64 {
+  mut total := 0
+  mut i := 0
+  loop {
+    if i >= xs.len() { break }
+    increment(i)
+    total = total + xs[i]
+    i = i + 1
+  }
+  return total
+}
+fn main() -> i32 {
+  data := [5]
+  print(skip_ahead(data))
+  return 0
+}
+";
+    assert_eq!(
+        decision(&loop_facts_report("borrowed-index", src), "skip_ahead"),
+        "kept checks: multiple-index-writes",
+        "an index a callee can write is not a monotone recurrence"
+    );
+    let out = build_and_run("loop-facts-borrowed-index", src);
+    assert!(
+        !out.status.success(),
+        "the loop keeps its guard, so the out-of-range read traps:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("align: panic: index out of bounds: the len is 1 but the index is 1"),
+        "with the same (index, len) it reports today:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The same class, on the other slot the proof reads directly: a bound a callee can write. The
+/// guard lengths and the offset `b` go through the rematerializer, which applies the same
+/// escaping-address rule, so this pins that the rule is one rule and not three.
+#[test]
+fn g2_a_bound_a_callee_can_write_is_not_versioned() {
+    let src = "\
+fn bump(borrow mut value: i64) {
+  value = value + 1
+}
+fn walk(borrow xs: slice<i64>, n: i64) -> i64 {
+  mut total := 0
+  mut limit := n
+  mut i := 0
+  loop {
+    if i >= limit { break }
+    bump(limit)
+    total = total + xs[i]
+    i = i + 1
+  }
+  return total
+}
+fn main() { }
+";
+    assert_eq!(
+        decision(&loop_facts_report("borrowed-bound", src), "walk"),
+        "kept checks: root-killed:Call",
+        "a bound a callee can write is not loop-invariant, and the report names the channel"
+    );
+}
+
+/// A body this pass does not model, and a body whose enclosing loop holds a nested one, are both
+/// fail-closed refusals with their own codes rather than silent non-decisions. Every source loop
+/// gets exactly one line.
+#[test]
+fn g2_unmodelled_and_nested_bodies_are_refused_by_name() {
+    let nested = "\
+fn grid(borrow xs: slice<i64>, rows: i64) -> i64 {
+  mut acc := 0
+  mut r := 0
+  loop {
+    if r >= rows { break }
+    mut c := 0
+    loop {
+      if c >= xs.len() { break }
+      acc = acc + xs[c]
+      c = c + 1
+    }
+    r = r + 1
+  }
+  return acc
+}
+";
+    let program = format!("{nested}{BUILD_ARRAY}fn main() {{ }}\n");
+    let report = loop_facts_report("nested-and-unmodelled", &program);
+    // Innermost-first: the inner loop is decided first and is versioned; the outer one then holds
+    // both of its copies and is refused for containing a nested loop.
+    let grid: Vec<&String> = report
+        .iter()
+        .filter(|line| line.contains("`grid`"))
+        .collect();
+    assert_eq!(grid.len(), 2, "one line per source loop:\n{report:#?}");
+    assert!(grid[0].contains("versioned"), "the inner loop is versioned first:\n{grid:#?}");
+    assert!(
+        grid[1].contains("kept checks: nested-loop"),
+        "the enclosing loop is refused by name:\n{grid:#?}"
+    );
+    assert_eq!(
+        decision(&report, "build"),
+        "kept checks: unmodelled-statement",
+        "an array-builder body is not modelled, and says so"
+    );
+}
+
+// ── Trap parity (§3.3) ──────────────────────────────────────────────────────────────────────────
+
+/// The whole reason versioning is the shape rather than relocation. With a negative `off`,
+/// `scan_report` prints `0` and *then* traps: the failing run takes the unmodified slow loop, so
+/// the observable prefix, the failing iteration, and the byte-identical trap text all survive.
+/// A guard relocated to the preheader would trap before printing anything.
+#[test]
+fn g2_trap_parity_keeps_the_effect_prefix_and_the_exact_text() {
+    let program = format!(
+        "{SCAN_REPORT}fn main() -> i32 {{\n  data := [10, 20, 30]\n  print(scan_report(data, -1))\n  return 0\n}}\n"
+    );
+    let out = build_and_run("loop-facts-trap-prefix", &program);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "0\n",
+        "the iterations before the failure happen, in order"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("align: panic: index out of bounds: the len is 3 but the index is -1"),
+        "byte-identical trap text, with the original signed index:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "an out-of-bounds access is a hard error");
+}
+
+/// The view shapes §3.4 names: a zero-length view runs no iteration and traps not at all, and a
+/// length-1 view's single iteration is identical. Both go through the *fast* copy, so these pin
+/// that the admission arithmetic's zero-trip and one-trip cases are right.
+#[test]
+fn g2_zero_length_and_length_one_views_behave_identically() {
+    let program = format!(
+        "{SUM}fn main() -> i32 {{\n  \
+           mut b: array_builder<i64> := array_builder()\n  \
+           empty := b.build()\n  \
+           print(sum(empty))\n  \
+           one := [7]\n  \
+           print(sum(one))\n  \
+           return 0\n\
+         }}\n"
+    );
+    let out = build_and_run("loop-facts-edge-lengths", &program);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "0\n7\n",
+        "zero-trip and one-trip admitted loops keep their values:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The two refusal witnesses, executable. `shifted_sum` reads `1..n` while the header sees
+/// `0..n-1`, so it traps at `xs[n]` exactly as it does today; `drain` truncates inside the body and
+/// so re-reads the shortened length every iteration, exactly as it does today. Neither is
+/// versioned, and both must behave as they did before this pass existed.
+#[test]
+fn g2_refused_loops_keep_their_exact_behaviour() {
+    let shifted = format!(
+        "{SHIFTED_SUM}fn main() -> i32 {{\n  data := [1, 2, 3]\n  print(shifted_sum(data))\n  return 0\n}}\n"
+    );
+    let out = build_and_run("loop-facts-shifted", &shifted);
+    assert!(!out.status.success(), "`shifted_sum` still traps at `xs[n]`");
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("align: panic: index out of bounds: the len is 3 but the index is 3"),
+        "with the same (index, len):\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let drain = format!(
+        "{DRAIN}fn main() -> i32 {{\n  \
+           mut b: array_builder<i64> := array_builder()\n  \
+           b.push(1)\n  b.push(2)\n  b.push(3)\n  b.push(4)\n  \
+           mut d := b.build()\n  \
+           print(drain(d))\n  \
+           return 0\n\
+         }}\n"
+    );
+    let out = build_and_run("loop-facts-drain", &drain);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "3\n",
+        "`drain` re-reads the truncated length every iteration, as it does today:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Every admitted index form, executed. An IR-shape owner cannot see an off-by-one in the
+/// admission arithmetic; only running the fast copy against the slow copy's answers can.
+#[test]
+fn g2_admitted_loops_compute_the_same_values() {
+    let program = format!(
+        "{SUM}{SCAN_REPORT}{STRIDE_SUM}{MATVEC}{WINDOW_FIRST}fn main() -> i32 {{\n  \
+           data := [1, 2, 3, 4]\n  \
+           print(sum(data))\n  \
+           print(scan_report(data, 0))\n  \
+           head : slice<i64> := data[0..1]\n  \
+           print(stride_sum(head))\n  \
+           print(matvec(data, data, 2, 1))\n  \
+           print(window_first(data, 0))\n  \
+           return 0\n\
+         }}\n"
+    );
+    let out = build_and_run("loop-facts-values", &program);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        // sum = 10; scan_report prints 0..3 then 10; stride_sum over a length-1 view reads index 0
+        // only (a length-2 view would step to `xs[2]` and take the slow copy); matvec row 1 of a
+        // 2-wide matrix = 3*1 + 4*2 = 11; window_first sums four empty windows.
+        "10\n0\n1\n2\n3\n10\n1\n11\n0\n",
+        "every admitted form keeps its value:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// ── Composition (§3.4) ──────────────────────────────────────────────────────────────────────────
+
+/// Invariant I8. `annotate_par_map_work` derives a `par_map` work weight from `block.stmts.len()`
+/// and runs in `lower_program_unchecked_with_plans`, *before* `loop_facts`. Versioning a kernel
+/// must therefore leave the annotated weight byte-identical — otherwise the `ParMapReduce`
+/// partition, and with it float reduction order, would change as a side effect of a bounds-check
+/// transform. The weight is printed in MIR text, so the pin is exact; §3.7 records that the bucket
+/// boundaries already put every *versionable* body above the top bucket, so this owner pins the
+/// ordering's observable consequence — a versioned kernel whose weight and reduction are unchanged
+/// — rather than a value versioning could otherwise move.
+#[test]
+fn g2_par_map_work_weight_is_derived_before_versioning() {
+    let src = "\
+fn scale(x: i64) -> i64 {
+  w := [1, 2]
+  mut acc := x
+  mut i := 0
+  loop {
+    if i >= 2 { break }
+    acc = acc + w[i]
+    i = i + 1
+  }
+  return acc
+}
+fn run(xs: slice<i64>) -> i64 = xs.par_map(scale).sum()
+fn main() -> i32 {
+  data := [1, 2, 3, 4]
+  print(run(data))
+  return 0
+}
+";
+    assert!(
+        decision(&loop_facts_report("par-map-weight", src), "scale").starts_with("versioned"),
+        "the kernel body is the one being versioned, so the ordering is what this owner tests"
+    );
+    let mir = mir_text("g2-par-map-weight", src);
+    let nodes: Vec<&str> = mir
+        .lines()
+        .filter(|line| line.contains("par_map_reduce"))
+        .collect();
+    assert_eq!(nodes.len(), 1, "one parallel reduction node:\n{mir}");
+    assert!(
+        nodes[0].contains("work=4"),
+        "the weight is the unversioned body's, computed before this pass ran:\n{}",
+        nodes[0]
+    );
+    let out = build_and_run("loop-facts-par-map", src);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "22\n",
+        "the partition and the reduction are unchanged:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `byte_prepare` runs in codegen, **after** `loop_facts`, and its leaf-eligibility budget counts
+/// the body it actually splices — the post-versioning one. A leaf that straddles that budget is
+/// therefore inlined without versioning and not inlined with it, deterministically. This owner
+/// pins the determinism, not a particular side of the straddle: the same input must version the
+/// same way and produce the same answer in a whole-program build.
+#[test]
+fn g2_byte_prepare_composes_with_a_versioned_leaf() {
+    let src = "\
+fn leaf(borrow b: slice<u8>, off: i64) -> i64 {
+  mut acc := 0
+  mut i := 0
+  loop {
+    if i >= 2 { break }
+    acc = acc + (b.u32_le(off + i * 4) as i64)
+    i = i + 1
+  }
+  return acc
+}
+fn caller(borrow b: slice<u8>) -> i64 = leaf(b, 0) + leaf(b, 4)
+fn main() -> i32 {
+  mut w: array_builder<u8> := array_builder()
+  mut i := 0
+  loop {
+    if i >= 16 { break }
+    w.push(1)
+    i = i + 1
+  }
+  bytes := w.build()
+  print(caller(bytes))
+  return 0
+}
+";
+    let report = loop_facts_report("byte-prepare-straddle", src);
+    assert_eq!(
+        decision(&report, "leaf"),
+        "kept checks: guard-not-fused",
+        "a leaf holding a byte-accessor guard keeps its checks, and says which channel refused it"
+    );
+    let out = build_and_run("loop-facts-byte-prepare", src);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "67372036\n",
+        "the composed byte reader is unchanged:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Ownership across the duplicated body, closed by construction rather than by bookkeeping. Drop
+/// flags are per-binding slots shared by both copies, and a source-level test cannot discriminate a
+/// flag defect in the copy that did not execute — so instead of duplicating that bookkeeping and
+/// then testing it, admission refuses any body it does not model, and every rvalue that *produces*
+/// an individually owned value (`StrClone`, `HeapAlloc`, `ArenaBegin`, the builders) is unmodelled.
+/// A loop carrying an owned per-iteration value is therefore never versioned, which is what this
+/// owner pins; `loop_expr::a_per_iteration_owned_string_is_freed_each_pass` remains the executable
+/// backstop for the behaviour itself.
+#[test]
+fn g2_a_loop_with_an_owned_per_iteration_value_is_never_versioned() {
+    let src = "\
+fn tag(borrow xs: slice<i64>) -> i64 {
+  mut n := 0
+  mut i := 0
+  loop {
+    if i >= xs.len() { break }
+    label := \"row\".clone()
+    n = n + label.len() + xs[i]
+    i = i + 1
+  }
+  return n
+}
+fn main() -> i32 {
+  data := [1, 2, 3]
+  print(tag(data))
+  return 0
+}
+";
+    assert_eq!(
+        decision(&loop_facts_report("owned-per-iteration", src), "tag"),
+        "kept checks: unmodelled-statement",
+        "an owned per-iteration value is unmodelled, so the body is never duplicated"
+    );
+    let body = mir_fn(&mir_text("g2-owned-iteration", src), "tag");
+    assert_eq!(
+        body.matches("call runtime bounds_fail").count(),
+        1,
+        "one copy, one guard, one trap:\n{body}"
+    );
+    let out = build_and_run("loop-facts-owned-iteration", src);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "15\n",
+        "the per-iteration owned string is still freed each pass:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// ── Loop re-entry with a live induction slot (codex P1, plan 69 PR 2) ──────────────────────────
+//
+// `admit()`'s static entry scan proves only that the initializer *dominates* the header — i.e.
+// that it runs before the FIRST entry. An enclosing (unversioned) loop can re-enter the header
+// without re-executing that initializer, and a previous slow-copy run may have left the index
+// wrapped (defined two's-complement wrap). The rematerialized, statically-proved entry value is
+// then stale on the second and later entries, and `zero_trip = e >= N` can be wrongly true for a
+// live index that is nowhere near `N`, admitting the unchecked fast copy.
+
+/// The codex witness. `probe`'s inner loop is re-entered by its enclosing (unversioned, `rounds`-
+/// counted) outer loop. Round 1 fails the induction conjunct (`N = i64::MAX`) and takes the slow
+/// copy, whose real access wraps `i` to `i64::MIN`. Round 2's `N = i64::MAX - 1` still fails
+/// induction, but the stale rematerialized entry (`i64::MAX - 1`, the initializer's value) makes
+/// `zero_trip` wrongly true — admitting the fast copy to run with a live index of `i64::MIN`.
+#[test]
+fn g2_a_reentered_loop_admits_on_the_current_index() {
+    let src = "\
+fn probe(borrow xs: slice<i64>, rounds: i64) -> i64 {
+  mut acc := 0
+  mut i := 9223372036854775806
+  mut n := 9223372036854775807
+  mut r := 0
+  loop {
+    if r >= rounds { break }
+    mut t := 0
+    loop {
+      if i >= n { break }
+      acc = acc + xs[i - 9223372036854775806]
+      i = i + 2
+      t = t + 1
+      if t >= 1 { break }
+    }
+    n = 9223372036854775806
+    r = r + 1
+  }
+  return acc
+}
+fn main() -> i32 {
+  data := [7]
+  print(probe(data, 2))
+  return 0
+}
+";
+    let report = loop_facts_report("reentered-index", src);
+    let found = decision(&report, "probe");
+    assert!(
+        found.starts_with("versioned"),
+        "the inner loop is decided first (innermost-first) and admits: `{found}`:\n{report:#?}"
+    );
+    let out = build_and_run("loop-facts-reentered-index", src);
+    assert!(
+        !out.status.success(),
+        "the live index has wrapped by round 2, so the guarded slow copy must trap rather than \
+         run the unchecked fast copy on a stale, statically-proved entry:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("align: panic: index out of bounds: the len is 1 but the index is 2"),
+        "i64::MIN - (i64::MAX - 1) wraps to 2, against a length-1 view:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The positive control. Same nesting — an outer, unversioned loop re-entering an inner versioned
+/// one — but with a monotonically growing bound and no wraparound, so the loop is legitimately
+/// safe on every re-entry. Discriminates an over-correction that refuses every re-entered loop
+/// outright instead of reading the live entry.
+#[test]
+fn g2_a_reentered_loop_still_versions_and_computes() {
+    let src = "\
+fn probe_ok(borrow xs: slice<i64>) -> i64 {
+  mut acc := 0
+  mut i := 0
+  mut n := 0
+  mut r := 0
+  loop {
+    if r >= xs.len() { break }
+    n = n + 1
+    loop {
+      if i >= n { break }
+      acc = acc + xs[i]
+      i = i + 1
+    }
+    r = r + 1
+  }
+  return acc
+}
+fn main() -> i32 {
+  data := [1, 2, 3, 4]
+  print(probe_ok(data))
+  return 0
+}
+";
+    let report = loop_facts_report("reentered-ok", src);
+    let found = decision(&report, "probe_ok");
+    assert!(
+        found.starts_with("versioned"),
+        "a legitimately re-entered loop with a growing, non-wrapping bound still admits: \
+         `{found}`:\n{report:#?}"
+    );
+    let out = build_and_run("loop-facts-reentered-ok", src);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "10\n",
+        "each outer round admits exactly one more element, and the total is unchanged:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The MIR-text shape: the preheader loads the index slot live, and checks it against `0` — the
+/// same treatment `N`, every guard length, and the affine offset `b` already had. `SUM`'s header
+/// block (`bb1`) is the whole-suite convention for "load the index slot, compare it": its first
+/// statement's slot is the index slot everywhere in this file.
+#[test]
+fn g2_the_preheader_loads_the_live_entry() {
+    let body = mir_fn(&mir_text("g2-preheader-live-entry", SUM), "sum");
+    let header = body
+        .split("\n  bb1:\n")
+        .nth(1)
+        .expect("bb1 is the loop header");
+    let header_first_stmt = header
+        .lines()
+        .find(|line| line.trim_start().starts_with('%'))
+        .expect("the header's first statement loads the index slot");
+    let index_slot = header_first_stmt
+        .rsplit('_')
+        .next()
+        .expect("`load _<slot>`")
+        .to_string();
+    // The preheader is the last block `apply` appends.
+    let preheader = format!(
+        "  bb{}",
+        body.rsplit("\n  bb").next().expect("a function has at least one block")
+    );
+    assert!(
+        preheader.contains(&format!("load _{index_slot}")),
+        "the preheader loads the index slot live rather than assuming its initializer:\n{preheader}"
+    );
+    assert!(
+        preheader.contains(">= 0_i64"),
+        "the live entry is checked against zero, exactly as every other admission operand is:\n{preheader}"
+    );
+}
