@@ -475,14 +475,18 @@ if [[ "$provider" == codex && "$marker_count" -eq 0 ]]; then
       if (ok && line != "No findings.") {
         ok = (lower ~ /(^no |[^a-z]no |without introducing an |without introducing any |without an |without any )actionable( (soundness or regression|soundness\/regression|soundness|regression))?[[:space:]](issue|issues|risk|risks|defect|defects|finding|findings|regression|regressions)/)
       }
-      # (c) no caveat word and no P0-P3 marker in any form, each matched as a
-      # whole word so it cannot be defeated by rewording alone.
+      # (c) no caveat word, no admission that the inspection did not finish,
+      # and no P0-P3 marker in any form, each matched as a whole word or
+      # phrase so it cannot be defeated by rewording alone. An incomplete
+      # review is never CLEAN (CLAUDE.md review guardrails), so a summary that
+      # says "so far", "incomplete", "partial" or the like fails closed here.
       if (ok) {
-        n = split("but however except although should must recommend recommended todo nit", caveats, " ")
+        n = split("but however except although should must recommend recommended todo nit incomplete partial partially unfinished pending remaining truncated skipped stopped unable unreviewed uninspected", caveats, " ")
         for (i = 1; i <= n && ok; i++) {
           if (lower ~ ("(^|[^a-z])" caveats[i] "([^a-z]|$)")) ok = 0
         }
       }
+      if (ok && lower ~ /(^|[^a-z])(so far|not yet|not reviewed|not inspected|not finished|not complete|ran out of|out of scope)([^a-z]|$)/) ok = 0
       if (ok && lower ~ /(^|[^a-z0-9])p[0-3]([^a-z0-9]|$)/) ok = 0
       if (ok) { accepted = 1 } else { invalid = 1 }
     }

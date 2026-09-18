@@ -344,6 +344,8 @@ fake_codex="$fake_bin/codex"
   printf '  native-clean-covered) echo "Inspection found no actionable soundness or regression defects in the requested diff. Review covered guard fusion, admission arithmetic, loop cloning, mutation tracking, and downstream consumers; no tests or builds were run."; echo "Inspection found no actionable soundness or regression defects in the requested diff. Review covered guard fusion, admission arithmetic, loop cloning, mutation tracking, and downstream consumers; no tests or builds were run." ;;\n'
   printf '  native-clean-caveat) echo "No actionable soundness or regression issues were found, but the P2 below should still be fixed."; echo "- P2: scripts/example.sh:1 leaks the temp file" ;;\n'
   printf '  native-clean-lowercase) echo "no actionable issues." ;;\n'
+  printf '  native-clean-incomplete) echo "No actionable issues found so far; inspection is incomplete." ;;\n'
+  printf '  native-clean-unreviewed) echo "No actionable soundness or regression issues in the files reviewed. The remaining files were not yet inspected." ;;\n'
   printf '  native-findings) echo "- [P1] broken workflow — scripts/example.sh:1" ;;\n'
   printf '  stall) sleep 30 ;;\n'
   printf '  progress) for i in 1 2 3; do echo "phase-$i"; sleep 1; done; echo "ALIGN_REVIEW_VERDICT=CLEAN" ;;\n'
@@ -483,6 +485,14 @@ native_caveat_status=$?
   ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
   "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
 native_lowercase_status=$?
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=native-clean-incomplete ALIGN_REVIEW_STALL_SECONDS=5 \
+  ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
+  "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
+native_incomplete_status=$?
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=native-clean-unreviewed ALIGN_REVIEW_STALL_SECONDS=5 \
+  ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
+  "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
+native_unreviewed_status=$?
 set -e
 [[ $findings_status -eq 2 ]] || {
   echo "findings review returned $findings_status, expected 2" >&2
@@ -532,6 +542,11 @@ set -e
 }
 [[ $native_caveat_status -eq 3 && $native_lowercase_status -eq 3 ]] || {
   echo "a caveated or lowercase native result was accepted as clean" >&2
+  exit 1
+}
+# A summary that admits the inspection did not finish is INCOMPLETE, never CLEAN.
+[[ $native_incomplete_status -eq 3 && $native_unreviewed_status -eq 3 ]] || {
+  echo "a self-declared incomplete native result was accepted as clean" >&2
   exit 1
 }
 
