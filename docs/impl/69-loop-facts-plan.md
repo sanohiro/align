@@ -569,11 +569,19 @@ one monotone index      exactly one slot i is written in the body, by exactly
                         (shifted_sum, §3.4), as is a second assignment anywhere
                         in the body, including from a nested inner loop. The
                         exit test i >= N reads the header value by construction
-non-negative entry      the value of i on entry is a loop-invariant operand
-                        proved >= 0 at the preheader: a non-negative constant, a
-                        length, or an operand under a dominating
-                        non-negativity guard. A negative or unproved entry fails
-                        closed. §3.2.1 depends on it
+non-negative entry      the arithmetic reads the value the index slot holds at
+                        the preheader — a live load, not the initializer's
+                        value. The static initializer (a non-negative constant,
+                        a length, or an operand under a dominating
+                        non-negativity guard, with dominance over the header)
+                        is evidence only that the slot is initialized and
+                        statically non-negative on its first entry: an
+                        enclosing loop can re-enter the header without
+                        re-executing that initializer, so a later entry's live
+                        value can differ from it. `e >= 0` is therefore a
+                        runtime conjunct of the admission test, exactly as
+                        every other operand's proof is. An unproved static
+                        initializer fails closed. §3.2.1 depends on it
 loop-invariant bound    the loop exits on i >= N with N a loop-invariant i64
                         operand not killed in the body. Any other exit is an
                         ordinary exit and is preserved in both versions; only
@@ -623,10 +631,15 @@ untouched. Fail-closed is the default in every direction.
 
 #### 3.2.1 The admission arithmetic
 
-For entry `e` (proved `e >= 0`), constant step `s > 0`, bound `N`, and one
+For entry `e` — loaded live from the index slot at the preheader, not the
+value its initializer once gave it — constant step `s > 0`, bound `N`, and one
 guard `(a, b, len)` with `a > 0` proved, the preheader computes, in `i64`:
 
 ```text
+entry       e = load i, e >= 0  the value the slot holds at this entry, not the
+                                value its initializer once gave it. The header
+                                re-reads the same slot, so a live load here is
+                                exactly what the header will see
 zero-trip   e >= N              the body never runs; select the fast loop, which
                                 runs zero iterations and performs no access. No
                                 further test is needed
@@ -646,7 +659,7 @@ max         amax + b            b >= 0: overflows iff amax > i64::MAX - b
 min         a * e + b           a * e <= amax, so it cannot overflow once amax
                                 did not; b < 0 cannot underflow because
                                 a * e >= 0; b >= 0 gives min <= max
-admit       no overflow guard fired, and min >= 0, and max < len
+admit       no overflow guard fired, and e >= 0, and min >= 0, and max < len
 ```
 
 The test is conjoined over every guard in the body and selects the fast loop
@@ -656,6 +669,9 @@ lies in `[min, max]` and `a*i <= amax` for all of them: the review's
 mid-iteration wrap is excluded without a wider type. The comparisons are the
 exact `i64` compares MIR already has; the two divisions are by proved-positive
 operands, so they cannot trip the hard error invalid integer division carries.
+The zero-trip disjunct is sound for any `e`, proved or not, because the header
+re-reads the same slot the preheader just loaded: if that live value is
+already `>= N` the body cannot run, independently of the entry conjunct.
 
 #### 3.2.2 Traversal order, re-entry and the budget
 
@@ -663,8 +679,19 @@ operands, so they cannot trip the hard error invalid integer division carries.
 order       loops are versioned innermost-first in post-order over the
             function's loop forest; a versioned inner loop contributes both of
             its copies to the enclosing body's statement count
-re-entry    a block produced by cloning is marked and is never versioned again;
-            each source loop is considered exactly once
+clone re-versioning
+            a block produced by cloning is marked and is never versioned
+            again; each source loop is considered exactly once
+loop re-entry
+            the preheader sits on every external entry edge into the header
+            (`apply`), so the admission test runs once per entry and every
+            operand it reads — N, len, b, and e — is read there, live. An
+            enclosing (unversioned) loop may re-enter this header on a later
+            pass without re-executing the index slot's initializer, and a
+            previous slow-copy run may have left the slot wrapped under
+            defined two's-complement wrap. Only a loaded `e` makes the
+            admission test a statement about the entry it actually decides,
+            rather than about the loop's first entry alone
 budget      LOOP_FACTS_VERSION_BUDGET is a pub const in loop_facts, counted in
             body statements including terminators, pinned by an owner test.
             Over budget is not admitted and is reported (§3.2.3)
@@ -747,7 +774,8 @@ named where it already discriminates the defect; a new owner is named `planned`.
 | | branch joins | facts join by intersection; an index proved on one arm only is not proved at the join | planned |
 | | loop joins | the back-edge join must re-derive; a fact killed on any path is killed at the header | planned |
 | | early `break` with a value | both versions carry the same break value and the same break type; the loop's value is unchanged | `loop_expr::loop_yields_its_break_value`, `a_break_moves_an_owned_value_out_once` |
-| | nested loops | an inner loop's index is not the outer loop's; versioning an inner loop inside an unversioned outer one is allowed | `loop_expr::nested_loops_break_the_innermost`, planned |
+| | nested loops | an inner loop's index is not the outer loop's; versioning an inner loop inside an unversioned outer one is allowed because the admission test reads its entry `e` live at the preheader rather than trusting the initializer that dominated only the loop's first entry | `loop_expr::nested_loops_break_the_innermost`, `loop_facts::g2_a_reentered_loop_still_versions_and_computes` |
+| | loop re-entry with a live induction slot | the index slot may hold any value at a given entry, including one a previous slow-copy run left wrapped under defined two's-complement wrap; admission reads that live value rather than assuming the value its initializer once proved | `loop_facts::g2_a_reentered_loop_admits_on_the_current_index` (negative, executable), `g2_a_reentered_loop_still_versions_and_computes` (positive), `g2_the_preheader_loads_the_live_entry` (shape) |
 | | malformed input | a loop whose MIR fails the existing HIR/MIR validation never reaches `loop_facts`; a malformed index type is already rejected by `validate_slice_index_rvalues` | `analysis_coverage`, `runway_a2_binary_codec::byte_range_malformed_and_invalidated_proofs_fail_closed` |
 | Loop producer | source `loop` expression | the primary case | planned `loop_facts` owner |
 | | pipeline stage loops, including `scan` | generated by fusion; admitted only under the same conditions, and `scan`'s loop-carried shape stays a negative control | `vectorize_shapes::k3_scan_does_not_vectorize`, `deep_pipeline`, planned |
@@ -756,7 +784,7 @@ named where it already discriminates the defect; a new owner is named `planned`.
 | | `par_map` / `ParMapParallel` / `ParMapReduce` kernels | the kernel body is generated and lifted; versioning it must not change its purity, its work partition or its reduction order | `par_map`, `task_group`, planned |
 | Index form | non-monotone index | not admitted: an index assigned on some paths only, reassigned in the body, or stepped by a non-constant | planned negative owner (`skip_zeros`, §4.3) |
 | | step precedes a guarded access | not admitted: `i = i + 1` followed by `xs[i]` in the same body reads `1..n` while the header sees `0..n-1`; admission is stated on the value reaching each access (§3.2), so this shape keeps its checks and traps at `xs[n]` exactly as today | planned negative owner `shifted_sum` (`--emit mir` shows the guard retained; the executable trap-parity owner asserts the abort) |
-| | wrapping induction | the preheader tests `N <= i64::MAX - s` (§3.2.1); integer overflow is defined wrap, so a loop whose last step would wrap keeps its guards by taking the slow version | planned negative owner |
+| | wrapping induction | the preheader tests `N <= i64::MAX - s` (§3.2.1); integer overflow is defined wrap, so a loop whose last step would wrap keeps its guards by taking the slow version. That defined wrap is also why the entry cannot be inferred statically: the slow copy's wrapped index stays live in the slot, so the *next* entry into this header (an outer re-entry, or a rederivation) must read it rather than assume the initializer's value | planned negative owner; `loop_facts::g2_a_reentered_loop_admits_on_the_current_index` exercises the wrap surviving into the next entry |
 | | wrapping access | admitted only when §3.2.1's `amax` and `max` guards hold; because `a > 0` and every reached `i` lies in `[e, imax]`, no intermediate `a*i + b` can wrap once `amax` did not, so the endpoint-only admission the review attacked cannot occur | planned negative owner, distinct from the wrapping-induction one |
 | | `i` | the base case | planned |
 | | `i + 1` | `a = 1`, `b = 1`; admission uses the maximum reached index, not `i` | planned |
@@ -846,7 +874,12 @@ builds and runs), `shifted_sum` (step before access: not versioned, traps at
 `xs[n]`), `drain` (`truncate` in the body: not versioned, traps at `i = 2`),
 one MIR-text negative per kill-set statement kind, the `byte_prepare` straddle
 leaf, the par_map work-weight parity owner, and the `explain-opt` reason-code
-owner.
+owner. `g2_a_reentered_loop_admits_on_the_current_index` (an unversioned outer
+loop re-enters a versioned inner one; not versioned would be wrong, the fast
+copy running on a stale entry is the codex P1) and
+`g2_a_reentered_loop_still_versions_and_computes` (the same nesting with a
+monotone, non-wrapping bound: versioned and correct) are both review witnesses
+for the live-entry read (§3.2.1, §3.7).
 
 ### 3.6 Deferred extension: versioning a borrowed-element loop
 
@@ -995,6 +1028,35 @@ witness spellings          `total`/`inspect` borrows its element out of an owned
                            index 2, the admission arithmetic correctly refuses,
                            and the slow copy traps — a useful fact, but not the
                            "same values" owner's subject
+the entry value is read,   §3.2's static entry check described the
+not remembered             initializer's own value: a non-negative constant, a
+                           length, or an operand under a dominating
+                           non-negativity guard, dominating the header.
+                           Dominance proves only that the initializer runs
+                           before the loop's *first* entry, not before every
+                           one: an enclosing (unversioned) loop can re-enter
+                           the header without re-executing it, and a previous
+                           slow-copy run may have left the index wrapped under
+                           defined two's-complement wrap. Rematerializing the
+                           initializer's own operand into the preheader — as
+                           PR 2 first shipped — could then make `zero_trip`
+                           assert zero iterations for a loop that then ran
+                           unguarded on the real, live index. Found by the
+                           independent review of the implementation. The entry
+                           is now `load i` in the preheader, exactly like every
+                           other admission operand, with `e >= 0` as its own
+                           runtime conjunct — the same treatment `N`, every
+                           guard length, and the affine offset `b` already had.
+                           A recorded follow-up, not done in this PR: the
+                           static initializer scan could be replaced entirely
+                           by an initialization proof, which would let a
+                           parameter or a value with multiple initializers
+                           admit on its own live value instead of failing
+                           `entry-unproved`. `entry-unproved` itself had no
+                           reason-code owner before this fix;
+                           `g2_index_forms_get_their_stated_decision`'s
+                           `choose_start` case (two writes to the index slot
+                           outside the loop, one per `if` arm) closes it
 ```
 
 ## 4. PR 3 — the trip-count exit at the latch (1084)

@@ -640,6 +640,23 @@ fn drain(borrow mut data: array<i64>) -> i64 {
 }
 ";
 
+/// No single dominating initializer: the index slot is written on both arms of an `if` before the
+/// loop, so the entries scan finds more than one write outside the body and never gets far enough
+/// to check dominance or non-negativity.
+const TWO_ENTRY_WRITES: &str = "\
+fn choose_start(borrow xs: slice<i64>, flag: bool) -> i64 {
+  mut acc := 0
+  mut i := 0
+  if flag { i = 1 } else { i = 2 }
+  loop {
+    if i >= xs.len() { break }
+    acc = acc + xs[i]
+    i = i + 1
+  }
+  return acc
+}
+";
+
 const TOTAL_INSPECT: &str = "\
 Record { value: string }
 fn inspect(borrow record: Record) -> i64 = record.value.len()
@@ -853,6 +870,7 @@ fn g2_version_budget_is_pinned() {
 fn g2_index_forms_get_their_stated_decision() {
     let program = format!(
         "{SUM}{SCAN_REPORT}{SHIFTED_SUM}{STRIDE_SUM}{MATVEC}{WINDOW_FIRST}{SKIP_ZEROS}{DRAIN}\
+{TWO_ENTRY_WRITES}\
 fn main() {{ }}\n"
     );
     let report = loop_facts_report("index-forms", &program);
@@ -874,6 +892,9 @@ fn main() {{ }}\n"
         ("skip_zeros", "kept checks: multiple-index-writes"),
         // `truncate` changes the published length inside the body.
         ("drain", "kept checks: root-killed:ArrayTruncate"),
+        // Two writes to the index slot outside the loop (one per `if` arm): no single dominating
+        // initializer, so the entry cannot even be checked for non-negativity.
+        ("choose_start", "kept checks: entry-unproved"),
     ] {
         let found = decision(&report, function);
         assert!(
@@ -1285,5 +1306,152 @@ fn main() -> i32 {
         "15\n",
         "the per-iteration owned string is still freed each pass:\n{}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// ── Loop re-entry with a live induction slot (codex P1, plan 69 PR 2) ──────────────────────────
+//
+// `admit()`'s static entry scan proves only that the initializer *dominates* the header — i.e.
+// that it runs before the FIRST entry. An enclosing (unversioned) loop can re-enter the header
+// without re-executing that initializer, and a previous slow-copy run may have left the index
+// wrapped (defined two's-complement wrap). The rematerialized, statically-proved entry value is
+// then stale on the second and later entries, and `zero_trip = e >= N` can be wrongly true for a
+// live index that is nowhere near `N`, admitting the unchecked fast copy.
+
+/// The codex witness. `probe`'s inner loop is re-entered by its enclosing (unversioned, `rounds`-
+/// counted) outer loop. Round 1 fails the induction conjunct (`N = i64::MAX`) and takes the slow
+/// copy, whose real access wraps `i` to `i64::MIN`. Round 2's `N = i64::MAX - 1` still fails
+/// induction, but the stale rematerialized entry (`i64::MAX - 1`, the initializer's value) makes
+/// `zero_trip` wrongly true — admitting the fast copy to run with a live index of `i64::MIN`.
+#[test]
+fn g2_a_reentered_loop_admits_on_the_current_index() {
+    let src = "\
+fn probe(borrow xs: slice<i64>, rounds: i64) -> i64 {
+  mut acc := 0
+  mut i := 9223372036854775806
+  mut n := 9223372036854775807
+  mut r := 0
+  loop {
+    if r >= rounds { break }
+    mut t := 0
+    loop {
+      if i >= n { break }
+      acc = acc + xs[i - 9223372036854775806]
+      i = i + 2
+      t = t + 1
+      if t >= 1 { break }
+    }
+    n = 9223372036854775806
+    r = r + 1
+  }
+  return acc
+}
+fn main() -> i32 {
+  data := [7]
+  print(probe(data, 2))
+  return 0
+}
+";
+    let report = loop_facts_report("reentered-index", src);
+    let found = decision(&report, "probe");
+    assert!(
+        found.starts_with("versioned"),
+        "the inner loop is decided first (innermost-first) and admits: `{found}`:\n{report:#?}"
+    );
+    let out = build_and_run("loop-facts-reentered-index", src);
+    assert!(
+        !out.status.success(),
+        "the live index has wrapped by round 2, so the guarded slow copy must trap rather than \
+         run the unchecked fast copy on a stale, statically-proved entry:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("align: panic: index out of bounds: the len is 1 but the index is 2"),
+        "i64::MIN - (i64::MAX - 1) wraps to 2, against a length-1 view:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The positive control. Same nesting — an outer, unversioned loop re-entering an inner versioned
+/// one — but with a monotonically growing bound and no wraparound, so the loop is legitimately
+/// safe on every re-entry. Discriminates an over-correction that refuses every re-entered loop
+/// outright instead of reading the live entry.
+#[test]
+fn g2_a_reentered_loop_still_versions_and_computes() {
+    let src = "\
+fn probe_ok(borrow xs: slice<i64>) -> i64 {
+  mut acc := 0
+  mut i := 0
+  mut n := 0
+  mut r := 0
+  loop {
+    if r >= xs.len() { break }
+    n = n + 1
+    loop {
+      if i >= n { break }
+      acc = acc + xs[i]
+      i = i + 1
+    }
+    r = r + 1
+  }
+  return acc
+}
+fn main() -> i32 {
+  data := [1, 2, 3, 4]
+  print(probe_ok(data))
+  return 0
+}
+";
+    let report = loop_facts_report("reentered-ok", src);
+    let found = decision(&report, "probe_ok");
+    assert!(
+        found.starts_with("versioned"),
+        "a legitimately re-entered loop with a growing, non-wrapping bound still admits: \
+         `{found}`:\n{report:#?}"
+    );
+    let out = build_and_run("loop-facts-reentered-ok", src);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "10\n",
+        "each outer round admits exactly one more element, and the total is unchanged:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The MIR-text shape: the preheader loads the index slot live, and checks it against `0` — the
+/// same treatment `N`, every guard length, and the affine offset `b` already had. `SUM`'s header
+/// block (`bb1`) is the whole-suite convention for "load the index slot, compare it": its first
+/// statement's slot is the index slot everywhere in this file.
+#[test]
+fn g2_the_preheader_loads_the_live_entry() {
+    let body = mir_fn(&mir_text("g2-preheader-live-entry", SUM), "sum");
+    let header = body
+        .split("\n  bb1:\n")
+        .nth(1)
+        .expect("bb1 is the loop header");
+    let header_first_stmt = header
+        .lines()
+        .find(|line| line.trim_start().starts_with('%'))
+        .expect("the header's first statement loads the index slot");
+    let index_slot = header_first_stmt
+        .rsplit('_')
+        .next()
+        .expect("`load _<slot>`")
+        .to_string();
+    // The preheader is the last block `apply` appends.
+    let preheader = format!(
+        "  bb{}",
+        body.rsplit("\n  bb").next().expect("a function has at least one block")
+    );
+    assert!(
+        preheader.contains(&format!("load _{index_slot}")),
+        "the preheader loads the index slot live rather than assuming its initializer:\n{preheader}"
+    );
+    assert!(
+        preheader.contains(">= 0_i64"),
+        "the live entry is checked against zero, exactly as every other admission operand is:\n{preheader}"
     );
 }

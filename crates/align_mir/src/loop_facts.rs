@@ -1584,6 +1584,11 @@ fn admit(
     }
 
     // The entry value: exactly one write to the index slot outside the loop, dominating the header.
+    // Dominance proves only that this initializer runs before the *first* entry, not before every
+    // one: an enclosing (unversioned) loop can re-enter this header without re-executing it, and a
+    // previous slow-copy run may have left the slot wrapped (defined two's-complement wrap). So the
+    // initializer is evidence only that the slot is initialized and statically non-negative here;
+    // the admission arithmetic itself reads the slot's *live* value at the preheader (§3.2.1).
     let mut entries = Vec::new();
     for block in &function.blocks {
         if body.contains(&block.id) || ignore.contains(&block.id) {
@@ -1665,9 +1670,12 @@ fn admit(
     let root_killed = |remat: &Remat<'_>| {
         KeptReason::RootKilled(remat.blocked_by.unwrap_or("Call"))
     };
-    let Some(entry) = remat.get(entry_value, &mut pre) else {
-        return Err(KeptReason::EntryUnproved);
-    };
+    // The initializer proves the slot's first value. An enclosing loop can re-enter this header
+    // without re-executing it, and a slow-copy run may have wrapped the index, so the admission
+    // must read the value the header will actually see. The preheader sits on every edge into the
+    // header (`apply`) and the slot's address never leaves the function (checked above), so this
+    // load is that value.
+    let entry = pre.emit(i64_ty(), Rvalue::Load(index_slot));
     let Some(bound) = remat.get(bound, &mut pre) else {
         return Err(if remat.blocked_by.is_some() {
             root_killed(&remat)
@@ -1689,7 +1697,10 @@ fn admit(
     let scaled = pre.bin(BinOp::Mul, i64_ty(), int(step), quotient);
     let imax = pre.bin(BinOp::Add, i64_ty(), entry.clone(), scaled);
 
-    let mut conjuncts = vec![induction];
+    // The initializer only proved non-negativity of the *first* entry (§3.2); the live entry read
+    // above needs its own runtime check, exactly as every other admission operand does.
+    let entry_ok = pre.bin(BinOp::Ge, Ty::Bool, entry.clone(), int(0));
+    let mut conjuncts = vec![entry_ok, induction];
     let mut proved = Vec::new();
     for guard in &guards {
         let Some(len) = remat.get(&guard.len, &mut pre) else {
