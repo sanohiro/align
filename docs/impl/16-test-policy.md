@@ -574,7 +574,11 @@ whose cost only fits by extending it.
 Running `scripts/run-suite-binaries.sh` with no arguments reproduces the
 nightly's judgement over the whole workspace locally, and
 `ALIGN_SUITE_SHARDS=12 ALIGN_SUITE_SHARD=3 scripts/run-suite-binaries.sh`
-reproduces one shard of it. The nightly is a detector, not a second PR gate: a
+reproduces one shard of it. The manifest is judged on the nightly's platform,
+Linux x86_64: an entry `scripts/known-failures.txt` tags `Linux-only` passes on
+another host, so a local run there reports it under "manifest entries that did
+NOT fail". That is the host disagreeing with the manifest's platform, not a
+repaired test. The nightly is a detector, not a second PR gate: a
 red nightly is triaged against the manifest and does not block an unrelated PR.
 
 `align_repl`'s two leaf owner binaries (`tests/session.rs`, `tests/e2e.rs`) are
