@@ -42,6 +42,15 @@ borrowed view header is materialized once in the entry block, header and
 element memory are separate TBAA classes, a read-only `borrow` header of a
 body that writes no header carries `noalias`, and every length load states its
 non-negativity. PRs 2 and 3 are unstarted.
+[Plan 70](docs/impl/70-runtime-boundary-effects-plan.md) is the planned plan of
+record for G5 (1071, 1072, 1074, folding 1073 part 2 and 1069 part 4): three
+ordered PRs for a per-symbol runtime effects record derived from a closed
+eleven-class classification with an admission predicate for the `--rt-lto`
+guarded set, one cold-path model for `Result`/`?`, and an inline fast path for
+the per-element `array_builder` primitives. It carries the large-design
+public-contract ledger, because the effects record is a new contract on every
+runtime ABI row and `docs/impl/20-runtime-abi-ledger.md` is its source of truth.
+No implementation has started.
 
 **Decode representation costs:** [plan 62](docs/impl/62-decode-optimization-plan.md)
 implements bounded nonescaping byte storage and direct synchronous chunks
