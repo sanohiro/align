@@ -53,9 +53,6 @@
 #          against a substring that is now a prefix of four new symbols.
 #   #1103  #1048/#1051/#1054 (76dcb12b) shipped owned field replacement; two
 #          owners still assert it is unsupported.
-#   #1104  Move-resource formation rejections stopped firing for a branch-join
-#          return and for a slice view. Suspected soundness regression; the
-#          cause is not yet isolated.
 #   #1105  Two codegen owners bind their IR text scanners to the first match in
 #          the whole module, which is the wrong line or byte range on x86_64.
 #   #1106  The CLI per-unit build no longer byte-matches the whole-program
@@ -83,8 +80,6 @@ align_driver::test::apps_auth	session_only_use_keeps_module_crypto_and_public_su
 align_driver::test::apps_ws	protocol_ping_and_peer_close_reply_transport_failures_win
 # #1103
 align_driver::test::borrow_liveness	storage_generation_move_replacement_cleanup_control_matrix
-# #1104
-align_driver::test::http_client_composition	formation_and_carrier_matrix
 # #1102
 align_driver::test::http_headers_view	a_struct_carrying_the_view_stays_copy
 # #1102
@@ -97,7 +92,5 @@ align_driver::test::owned_tagged_payloads	llvm_drop_has_a_tag_guard_and_none_con
 align_driver::test::par_map	par_map_over_padded_aos_uses_abi_stride
 # #1106, Linux-only
 align_driver::test::per_unit_surface	cli_build_run_size_match_library_reference
-# #1104
-align_driver::test::pkg_kv_timeout_ownership	formation_and_no_live_producer_edges_stay_closed
 # #1108, Linux-only
 align_runtime::lib::align_runtime	tests::command_timeout_budget_quantization

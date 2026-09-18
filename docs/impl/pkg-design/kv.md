@@ -387,9 +387,13 @@ slice shapes for retaining sums. A direct `DynStructArray` may additionally occu
 slice element, tuple element, or builtin `Option`/`Result` payload. Every admitted shape in this
 paragraph except the tuple wrapper may occupy a user-struct field and then recurse through the
 ordinary acyclic struct/tagged/sum carrier grammar. Current `.to_array`,
-heap/region builder, JSON decode, and Move-element slice producers
+heap/region builder, and JSON decode producers
 cannot create any such live handle-retaining value, so these are producer-negative rather than
-positive lifecycle cases. `None`, an inactive `Result` or user-sum arm, a moved/null leaf, and
+positive lifecycle cases. A Move-element slice producer (`rows[..]` over an in-place fixed array of
+retaining structs, admitted by [plan 44](../44-move-record-slice-plan.md)) forms the ordinary
+borrowed Copy `{ptr,len}` view: it has no recursive Drop graph, so it is not itself a retainer and
+adds no target leaf. The viewed fixed array remains the counted owner, and the existing
+whole-element-read, escape and invalidated-borrow rules keep the view from becoming a second one. `None`, an inactive `Result` or user-sum arm, a moved/null leaf, and
 the same carrier shape containing only shells from another connection contribute zero target
 leaves; fd-number reuse does not change provenance. A carrier may reach multiple or mixed-provenance
 leaves, and the call is compatible exactly when its active target count is zero.

@@ -357,9 +357,13 @@ type を form できる。direct `DynStructArray` はさらに dynamic-array/sli
 builtin `Option`/`Result` payload にも置ける。この段落で admitted な shape は tuple wrapper を除きすべて
 user-struct field に置け、その後 ordinary acyclic struct/tagged/sum carrier grammar を再帰できる。現行
 `.to_array`、heap/region builder、
-JSON decode、Move-element slice producer は live handle-
+JSON decode producer は live handle-
 retaining value を作れないため producer-negative で
-あり positive lifecycle case ではない。`None`、inactive `Result`/user-sum arm、moved/null leaf、別 connection
+あり positive lifecycle case ではない。Move-element slice producer（retaining struct の in-place fixed
+array に対する `rows[..]`。[plan 44](../../44-move-record-slice-plan.md) で admitted）は ordinary な
+borrowed Copy `{ptr,len}` view を form するだけで、recursive Drop graph を持たないため retainer では
+なく target leaf を足さない。counted owner は viewed fixed array のままであり、既存の whole-element
+read / escape / invalidated-borrow 規則が view を second owner にさせない。`None`、inactive `Result`/user-sum arm、moved/null leaf、別 connection
 由来 shell だけの同じ carrier shape は target leaf zero。fd number 再利用は provenance を変えない。carrier
 は multiple/mixed-provenance leaf を reach でき、active target count が exact zero の場合だけ compatible。
 

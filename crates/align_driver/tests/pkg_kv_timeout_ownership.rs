@@ -1089,10 +1089,6 @@ TaggedChoiceArrayField { values: array<TaggedChoice> }
                 ),
             ),
             (
-                "move-slice",
-                format!("fn bad({params}) {{ rows := [{value}]; view := rows[..] }}"),
-            ),
-            (
                 "struct-field-wrapper-materializer",
                 format!(
                     "fn bad({params}) {{ rows := [{value}].to_array(); wrapped := {field} {{ values: rows }} }}"
@@ -1105,6 +1101,14 @@ TaggedChoiceArrayField { values: array<TaggedChoice> }
                 ),
             ),
         ];
+        if !struct_array_wrappers {
+            // A Move **sum** still has no per-element drop path, so the fixed array under the
+            // view never forms. The struct shapes below take the opposite, admitted direction.
+            bodies.push((
+                "move-slice",
+                format!("fn bad({params}) {{ rows := [{value}]; view := rows[..] }}"),
+            ));
+        }
         if struct_array_wrappers {
             bodies.extend([
                 (
@@ -1145,6 +1149,52 @@ TaggedChoiceArrayField { values: array<TaggedChoice> }
                     &source,
                 ),
                 "{label}/{producer} must not produce a live handle-retaining dynamic value",
+            );
+        }
+        if !struct_array_wrappers {
+            continue;
+        }
+        // `44-move-record-slice-plan.md` (#1013) admits borrowing an in-place fixed array of Move
+        // records as `slice<RetainingStruct>`. That is a *view*, not a producer: the slice is the
+        // ordinary Copy `{ptr,len}` header with no Drop plan of its own, so it retains no handle
+        // and contributes no target leaf. The viewed fixed array remains the single owner the
+        // provenance classifier counts, which is why the producer-negative promise above is
+        // unchanged by it. The three guards that keep the view from becoming a second owner are
+        // asserted here, so widening any of them fails this owner.
+        let view = format!("fn ok({params}) {{ rows := [{value}]; view := rows[..] }}");
+        assert!(
+            !check_errs(
+                &format!("pkg-kv-timeout-view-{label}"),
+                &format!("{prelude}{view}\nfn main() -> i32 = 0\n"),
+            ),
+            "{label}/move-slice must borrow the fixed array of retaining structs",
+        );
+        for (guard, body) in [
+            (
+                "whole-element-read",
+                format!(
+                    "fn bad({params}) -> i32 {{ rows := [{value}]; view := rows[..]; row := view[0]; return 0 }}"
+                ),
+            ),
+            (
+                "escaping-view",
+                format!(
+                    "fn bad({params}) -> slice<{ty}> {{ rows := [{value}]; return rows[..] }}"
+                ),
+            ),
+            (
+                "moved-source",
+                format!(
+                    "fn bad({params}) -> i64 {{ rows := [{value}]\n  view := rows[..]\n  moved := rows\n  return view.len() }}"
+                ),
+            ),
+        ] {
+            assert!(
+                check_errs(
+                    &format!("pkg-kv-timeout-view-guard-{label}-{guard}"),
+                    &format!("{prelude}{body}\nfn main() -> i32 = 0\n"),
+                ),
+                "{label}/{guard} must not give the borrowed view a second owner",
             );
         }
     }
