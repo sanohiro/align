@@ -24177,7 +24177,7 @@ fn main() -> i32 = 0
         assert_lowering(
             emit_llvm_ir(&invalid_base, &BuildTarget::Baseline, Profile::Release, false, &[], None)
                 .expect_err("a descriptor with an invalid array path must fail"),
-            "resource MIR in function 'use' is malformed: XML-capable call argument provenance mismatch",
+            "resource MIR in function 'use' is malformed: owned-leaf argument provenance mismatch at call to 'inspect'",
         );
 
         let mut stale_root = mir(source);
@@ -24419,7 +24419,7 @@ fn main() -> i32 = 0
         assert_lowering(
             emit_llvm_ir(&overlapping_action, &BuildTarget::Baseline, Profile::Release, false, &[], None)
                 .expect_err("an indexed borrow and same-action borrow-mut peer must conflict"),
-            "resource MIR in function 'use' is malformed: XML-capable call argument provenance mismatch",
+            "resource MIR in function 'use' is malformed: owned-leaf argument provenance mismatch at call to 'inspect'",
         );
 
         let by_value_source = r#"Record { value: string }
@@ -24467,7 +24467,7 @@ fn main() -> i32 = 0
         assert_lowering(
             emit_llvm_ir(&by_value_action, &BuildTarget::Baseline, Profile::Release, false, &[], None)
                 .expect_err("a same-action by-value peer must not consume the indexed root"),
-            "resource MIR in function 'use' is malformed: XML-capable call argument provenance mismatch",
+            "resource MIR in function 'use' is malformed: owned-leaf argument provenance mismatch at call to 'inspect'",
         );
     }
 
@@ -24952,7 +24952,7 @@ fn main() -> i32 = 0
             .expect_err("a borrowed place with a forged type must fail closed");
         assert_lowering(
             error,
-            "resource MIR in function 'main' is malformed: XML-capable call argument provenance mismatch",
+            "resource MIR in function 'main' is malformed: owned-leaf argument provenance mismatch at call to 'inspect'",
         );
     }
 
@@ -25001,7 +25001,7 @@ fn main() -> i32 = 0
         if let Err(error) = malformed {
             assert_lowering(
                 error,
-                "resource MIR in function 'inspect' is malformed: XML-capable call argument provenance mismatch",
+                "resource MIR in function 'inspect' is malformed: owned-leaf argument provenance mismatch at call to 'argc'",
             );
         }
     }
