@@ -902,6 +902,85 @@ fn g2_borrowed_element_loop_is_not_versioned_and_still_runs() {
     );
 }
 
+/// The induction slot must be beyond a callee's reach. A call taking the index as `borrow mut`
+/// writes it through a pointer that no `Stmt` variant names, so a statement scan alone would prove
+/// the recurrence against a value the callee had already changed — and the fast copy would then
+/// index past the end with no guard at all. Admission therefore refuses any loop whose index slot
+/// hands its address out **anywhere in the function**, including between its initialization and the
+/// loop header. The executable half is what discriminates the defect: with a length-one view, the
+/// buggy version returned a value read past the end instead of trapping.
+#[test]
+fn g2_an_index_a_callee_can_write_is_not_versioned() {
+    let src = "\
+fn increment(borrow mut value: i64) {
+  value = value + 1
+}
+fn skip_ahead(borrow xs: slice<i64>) -> i64 {
+  mut total := 0
+  mut i := 0
+  loop {
+    if i >= xs.len() { break }
+    increment(i)
+    total = total + xs[i]
+    i = i + 1
+  }
+  return total
+}
+fn main() -> i32 {
+  data := [5]
+  print(skip_ahead(data))
+  return 0
+}
+";
+    assert_eq!(
+        decision(&loop_facts_report("borrowed-index", src), "skip_ahead"),
+        "kept checks: multiple-index-writes",
+        "an index a callee can write is not a monotone recurrence"
+    );
+    let out = build_and_run("loop-facts-borrowed-index", src);
+    assert!(
+        !out.status.success(),
+        "the loop keeps its guard, so the out-of-range read traps:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("align: panic: index out of bounds: the len is 1 but the index is 1"),
+        "with the same (index, len) it reports today:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The same class, on the other slot the proof reads directly: a bound a callee can write. The
+/// guard lengths and the offset `b` go through the rematerializer, which applies the same
+/// escaping-address rule, so this pins that the rule is one rule and not three.
+#[test]
+fn g2_a_bound_a_callee_can_write_is_not_versioned() {
+    let src = "\
+fn bump(borrow mut value: i64) {
+  value = value + 1
+}
+fn walk(borrow xs: slice<i64>, n: i64) -> i64 {
+  mut total := 0
+  mut limit := n
+  mut i := 0
+  loop {
+    if i >= limit { break }
+    bump(limit)
+    total = total + xs[i]
+    i = i + 1
+  }
+  return total
+}
+fn main() { }
+";
+    assert_eq!(
+        decision(&loop_facts_report("borrowed-bound", src), "walk"),
+        "kept checks: root-killed:Call",
+        "a bound a callee can write is not loop-invariant, and the report names the channel"
+    );
+}
+
 /// A body this pass does not model, and a body whose enclosing loop holds a nested one, are both
 /// fail-closed refusals with their own codes rather than silent non-decisions. Every source loop
 /// gets exactly one line.

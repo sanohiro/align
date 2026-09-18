@@ -70,7 +70,10 @@ pub enum KeptReason {
     /// The body contains a `Stmt::BorrowedElementReservation`, whose token is function-unique and
     /// whose guard codegen re-derives literally. Lifting this is plan 69 §3.6.
     BorrowedElement,
-    /// More than one statement writes the candidate index slot (including from a nested loop).
+    /// The candidate index slot is not a single monotone recurrence: more than one statement writes
+    /// it (including from a nested loop), the step is not `i = i + <positive constant>`, or the
+    /// slot's address is handed to a callee anywhere in the function, which could write it through
+    /// a pointer no statement kind names.
     MultipleIndexWrites,
     /// The step can execute before a guarded access on some path, so the value reaching that access
     /// is not the value the header saw (the `shifted_sum` witness).
@@ -1445,6 +1448,10 @@ fn admit(
     let header = shape.header;
     let body = &shape.body;
     let facts = body_facts(function, body);
+    // Every slot whose value this proof depends on must be provably beyond a callee's reach. This
+    // is computed once, over the whole function, because a mutation between the index's
+    // initialization and the loop header is as fatal as one inside the body.
+    let escaping = slots_with_escaping_address(function);
     if facts.borrowed_element {
         return Err(KeptReason::BorrowedElement);
     }
@@ -1507,6 +1514,17 @@ fn admit(
         || analysis.value_ty(bound) != Some(i64_ty())
     {
         return Err(KeptReason::LoopShape);
+    }
+    // The statement scan below sees only writes this function performs itself. A call that takes
+    // the index as a `borrow mut` argument writes it through a pointer, which no statement kind
+    // names — so the recurrence would be proved against a value the callee had already changed.
+    // The index slot must therefore never hand its address out, anywhere in the function: not in
+    // the body, and not between its initialization and the loop header either.
+    if escaping
+        .as_ref()
+        .is_none_or(|escaping| escaping.contains(&index_slot))
+    {
+        return Err(KeptReason::MultipleIndexWrites);
     }
 
     // Exactly one statement writes the index slot in the body, and it is `i = i + step`.
@@ -1632,7 +1650,6 @@ fn admit(
     }
 
     // The admission arithmetic (§3.2.1), all in `i64`, all in the preheader.
-    let escaping = slots_with_escaping_address(function);
     let Some(mut pre) = Preheader::new(function) else {
         return Err(KeptReason::ArithmeticUnproved);
     };
@@ -2029,7 +2046,9 @@ mod tests {
     /// statement shape the kill-set owner classifies.
     fn scratch() -> Function {
         Function {
-            name: ProgramCall::try_from_logical("scratch").expect("valid program call"),
+            // `from_validated` is the crate-internal infallible constructor, so this owner adds no
+            // panic source: the compiler must diagnose, never panic, and a test is no exception.
+            name: ProgramCall::from_validated("scratch"),
             params: Vec::new(),
             param_modes: Vec::new(),
             borrow_mut_cleanup_slots: Vec::new(),

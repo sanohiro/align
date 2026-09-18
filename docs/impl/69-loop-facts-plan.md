@@ -917,6 +917,21 @@ the call rule is narrowed  §3.2 excuses a read-only `borrow`
                            without this arm `print(i)` in the body would kill
                            them and refuse the very witness §3.2 uses to
                            justify versioning over relocation
+the index must be beyond   §3.2's "exactly one slot i is written in the body, by
+a callee's reach           exactly one statement" is a statement-level property,
+                           and a call taking the index as a `borrow mut`
+                           argument writes it through a pointer no `Stmt`
+                           variant names. The independent review of the
+                           implementation found this: `increment(i)` in the body
+                           left the recurrence proved against a value the callee
+                           had already changed, and the fast copy then indexed
+                           past the end with no guard. Admission therefore also
+                           requires that the index slot's address never leaves
+                           the function — not in the body, and not between its
+                           initialization and the loop header. The same
+                           escaping-address rule already governed every slot the
+                           rematerializer reads, so this makes it one rule for
+                           every slot the proof depends on
 seven more reason codes    §3.2.3 lists nine. The implementation adds
                            `guard-not-fused` (a signed guard this pass does not
                            own), `value-escapes-loop`, `nested-loop`,
