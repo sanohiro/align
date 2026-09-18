@@ -563,7 +563,11 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
             symbol: "align_rt_buffer_len",
             shape: RuntimeAbiShape::A29,
         },
-        RuntimeKey::BufferFilled => RuntimeAbi { key, symbol: "align_rt_buffer_filled", shape: RuntimeAbiShape::BufferFilled },
+        RuntimeKey::BufferFilled => RuntimeAbi {
+            key,
+            symbol: "align_rt_buffer_filled",
+            shape: RuntimeAbiShape::BufferFilled,
+        },
         RuntimeKey::BufferNew => RuntimeAbi {
             key,
             symbol: "align_rt_buffer_new",
@@ -604,8 +608,16 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
             symbol: "align_rt_builder_init_stack",
             shape: RuntimeAbiShape::A53,
         },
-        RuntimeKey::JsonBuilderWriteF32 => RuntimeAbi { key, symbol: "align_rt_json_builder_write_f32", shape: RuntimeAbiShape::A129 },
-        RuntimeKey::JsonBuilderWriteF64 => RuntimeAbi { key, symbol: "align_rt_json_builder_write_f64", shape: RuntimeAbiShape::A130 },
+        RuntimeKey::JsonBuilderWriteF32 => RuntimeAbi {
+            key,
+            symbol: "align_rt_json_builder_write_f32",
+            shape: RuntimeAbiShape::A129,
+        },
+        RuntimeKey::JsonBuilderWriteF64 => RuntimeAbi {
+            key,
+            symbol: "align_rt_json_builder_write_f64",
+            shape: RuntimeAbiShape::A130,
+        },
         RuntimeKey::JsonBuilderInit => RuntimeAbi {
             key,
             symbol: "align_rt_json_builder_init",

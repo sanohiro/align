@@ -19,23 +19,85 @@
 #   <binary-exit-N>            exited N without libtest naming a failed test
 #   <binary-did-not-report>    never reached libtest's summary (crash or cap)
 #
-# Comments and blank lines are ignored. Keep entries sorted by target.
+# Comments and blank lines are ignored. Keep entries sorted by target, and give
+# each one a preceding comment naming the issue whose fix deletes it.
 #
-# baseline refreshed by the 2026-08-29 four-core run at 9c0cf23f; each original
-# entry reproduced in its owner binary after the detector completed all 216
-# targets. The projected-storage consumer closure removed eleven rows, and the
-# direct-owned JSON parity owner removed the stale bounded-schema row, and the
-# PGO owner restored the stable missing-profile diagnostic.
+# HISTORY. A 2026-08-29 four-core run at 9c0cf23f refreshed a baseline whose
+# every entry has since been deleted by the change that fixed it: the
+# projected-storage consumer closure removed eleven rows, the direct-owned JSON
+# parity owner removed the stale bounded-schema row, the PGO owner restored the
+# stable missing-profile diagnostic, and #1101 removed the last two — the
+# #1097 `analysis_coverage` pair. None of the entries below descends from it.
 #
 # The detector then produced no verdict at all from 2026-08-31 to 2026-09-17:
 # the suite outgrew one runner's 30-minute budget and every night was cancelled
-# (#1098). The two entries below are what rotted in on main meanwhile, found by
-# their owner target rather than by the nightly. Both reproduce off CI and on
-# both host platforms; they are a whole-program resource-MIR provenance defect,
-# not an environment dependence, so they are strict lines and they go away in
-# the same change that fixes #1097.
+# (#1098). The sharded nightly's first complete verdict is run 35283248096;
+# every entry below was named by it, was confirmed to be pre-existing on main,
+# and carries a triage issue whose fix deletes its line.
 #
-# #1097: `fn` value in a generic record field fails whole-program resource MIR
-# validation ("XML-capable call argument provenance mismatch").
-align_driver::test::analysis_coverage	generic_fn_wrapper_matches_an_explicit_source_signature
-align_driver::test::analysis_coverage	nested_fn_signatures_compare_by_source_identity
+# EVERY line here is strict. None is "env": each one is a defect or a stale
+# expectation with a named owner, not a dependence on something the runner does
+# not provide.
+#
+# THE MANIFEST IS JUDGED ON THE NIGHTLY'S PLATFORM, Linux x86_64. Seven of the
+# twelve entries below also reproduce on aarch64 macOS. The five tagged
+# "Linux-only" pass there, so a bare local `scripts/run-suite-binaries.sh` on an
+# Apple Silicon host reports them under "manifest entries that did NOT fail".
+# That is the host disagreeing with the manifest's platform, not five repaired
+# tests: fix and re-verify them on Linux or in a container.
+#
+# Issues:
+#   #1102  #937 (384d7744) both widened the function-value signature rule and
+#          added the align_rt_http_headers_* entry points. Two owners still
+#          assert the removed restriction; a third guards the whole module
+#          against a substring that is now a prefix of four new symbols.
+#   #1103  #1048/#1051/#1054 (76dcb12b) shipped owned field replacement; two
+#          owners still assert it is unsupported.
+#   #1104  Move-resource formation rejections stopped firing for a branch-join
+#          return and for a slice view. Suspected soundness regression; the
+#          cause is not yet isolated.
+#   #1105  Two codegen owners bind their IR text scanners to the first match in
+#          the whole module, which is the wrong line or byte range on x86_64.
+#   #1106  The CLI per-unit build no longer byte-matches the whole-program
+#          reference: different e_entry and e_shoff.
+#   #1107  Only two of three pkg.ws automatic-reply transport failures beat the
+#          ordinary protocol result.
+#   #1108  Under the PollZero capture failpoint align_rt_command_run returns 4
+#          instead of 0.
+#
+# Deliberately NOT listed: align_driver::test::pkg_db_a1, which exceeds the
+# 900s per-binary cap and reports <binary-did-not-report> (#1109). A synthetic
+# line for it would excuse a target that never produced a trustworthy outcome
+# at all, retiring all 22 of its tests from the detector — the opposite of what
+# every line here is for. The nightly signal therefore stays red, since
+# full-suite-result aggregates the shards, until #1109 cuts that cost.
+# pkg_db_a1 stays covered in full meanwhile by the required db-postgres job and
+# by scripts/db-verify-local.sh, both of which run it against a live service.
+#
+# One line's absence is not a clean bill of health for its owner: the scanner
+# behind the align_runtime entry below covers 384 of the registry's 464 rows
+# and breaks on formatting (#1112).
+# #1102
+align_driver::test::apps_auth	session_only_use_keeps_module_crypto_and_public_surface_is_closed
+# #1107, Linux-only
+align_driver::test::apps_ws	protocol_ping_and_peer_close_reply_transport_failures_win
+# #1103
+align_driver::test::borrow_liveness	storage_generation_move_replacement_cleanup_control_matrix
+# #1104
+align_driver::test::http_client_composition	formation_and_carrier_matrix
+# #1102
+align_driver::test::http_headers_view	a_struct_carrying_the_view_stays_copy
+# #1102
+align_driver::test::modules	qualified_function_value_keeps_signature_restrictions
+# #1103
+align_driver::test::owned_structs_arrays	unsupported_move_leaf_partial_replacement_is_rejected
+# #1105, Linux-only
+align_driver::test::owned_tagged_payloads	llvm_drop_has_a_tag_guard_and_none_constructs_without_allocation
+# #1105, Linux-only
+align_driver::test::par_map	par_map_over_padded_aos_uses_abi_stride
+# #1106, Linux-only
+align_driver::test::per_unit_surface	cli_build_run_size_match_library_reference
+# #1104
+align_driver::test::pkg_kv_timeout_ownership	formation_and_no_live_producer_edges_stay_closed
+# #1108, Linux-only
+align_runtime::lib::align_runtime	tests::command_timeout_budget_quantization

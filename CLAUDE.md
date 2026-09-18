@@ -322,7 +322,11 @@ suite is sharded (`ALIGN_SUITE_SHARDS`/`ALIGN_SUITE_SHARD`) and
 `full-suite-result` reduces the shards to one signal; each shard judges only the
 targets it ran, while the manifest's collision and unknown-target checks still
 see the whole workspace. `scripts/run-suite-binaries.sh` with no arguments
-reproduces the whole judgement locally. A red nightly is triaged against the manifest; it does not block an
+reproduces the whole judgement locally, on the nightly's platform: the manifest
+is judged on Linux x86_64, so an entry `scripts/known-failures.txt` tags
+`Linux-only` passes on another host and is reported there as a manifest entry
+that did not fail — the host disagreeing with the manifest's platform, not a
+repaired test. A red nightly is triaged against the manifest; it does not block an
 unrelated PR, and it never substitutes for running a change's owner target
 locally before pushing.
 

@@ -27330,8 +27330,8 @@ mod tests {
                 None
             })
             .collect();
-        assert_eq!(runtime.len(), 379);
-        assert_eq!(registry.len(), 379);
+        assert_eq!(runtime.len(), 384);
+        assert_eq!(registry.len(), 384);
         assert_eq!(runtime, registry);
     }
 
