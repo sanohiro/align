@@ -86,16 +86,16 @@ def restore_from_history(tracked):
     return restored
 
 
-def touch_changed(base, head):
-    """Set mtime = now for every path the change touched, so a file whose
-    commit predates the cached build (an old author date, a rebase) is never
-    mistaken for unchanged."""
-    proc = run(["git", "diff", "--no-renames", "--name-only", f"{base}...{head}"])
+def touch_changed(cache_rev, head):
+    """Set mtime = now for every path whose content differs between the tree
+    the restored cache was built from and the checked-out tree. A commit's
+    timestamp says nothing about the cache: an old commit merged after the
+    cache was saved is still newer than the artifacts, so only a tree diff
+    against the producing revision can bound staleness."""
+    proc = run(["git", "diff", "--no-renames", "--name-only", cache_rev, head])
     if proc.returncode != 0:
-        proc = run(["git", "diff", "--no-renames", "--name-only", f"{base}..{head}"])
-        if proc.returncode != 0:
-            sys.stderr.write(proc.stderr.decode("utf-8", "replace"))
-            sys.exit(1)
+        sys.stderr.write(proc.stderr.decode("utf-8", "replace"))
+        sys.exit(1)
     now = time.time()
     touched = 0
     for path in proc.stdout.decode("utf-8", "surrogateescape").splitlines():
@@ -106,7 +106,7 @@ def touch_changed(base, head):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--changed", nargs=2, metavar=("BASE", "HEAD"))
+    parser.add_argument("--changed", nargs=2, metavar=("CACHE_REV", "HEAD"))
     args = parser.parse_args()
 
     inside = run(["git", "rev-parse", "--is-inside-work-tree"])

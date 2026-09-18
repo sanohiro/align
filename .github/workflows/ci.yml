@@ -492,30 +492,30 @@ jobs:
       # even though the restored target/ above is unpacked with its original
       # mtimes intact (actions/cache preserves the tar's timestamps). Restore
       # each source file's mtime from the commit that last touched it so the
-      # fingerprint cache actually hits. Soundness: every path this change
-      # itself touches is always reset to `now` afterward, regardless of its
-      # commit's timestamp (an author's commit can predate the cache save),
-      # so a stale artifact can never be mistaken for current.
+      # fingerprint cache actually hits. Soundness: the cache carries the SHA
+      # it was built from (target/.align-cache-rev, written before "Save Cargo
+      # caches"), and every path whose content differs between that tree and
+      # the checked-out tree is reset to `now` afterward. A commit timestamp
+      # cannot bound staleness: an old commit merged after the cache was saved
+      # is still newer than the artifacts. Without the marker (an older cache,
+      # a cache miss) restoration is skipped and checkout mtimes stand.
       - name: Restore source mtimes from Git
         shell: bash
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          PUSH_BEFORE: ${{ github.event.before }}
           HEAD_SHA: ${{ github.sha }}
         run: |
-          case "$EVENT_NAME" in
-            pull_request) base="$(git merge-base "$PR_BASE_SHA" "$HEAD_SHA")" ;;
-            push) base="$PUSH_BEFORE" ;;
-            *) echo "restore-mtime: skipped for $EVENT_NAME"; exit 0 ;;
-          esac
-          case "$base" in
-            "" | 0000000000000000000000000000000000000000)
-              echo "restore-mtime: skipped, no usable base (first push or force push)"
-              exit 0
-              ;;
-          esac
-          python3 scripts/restore-mtime.py --changed "$base" "$HEAD_SHA"
+          marker=target/.align-cache-rev
+          if [ ! -s "$marker" ]; then
+            echo "restore-mtime: skipped, the restored cache carries no source revision"
+            exit 0
+          fi
+          rev="$(tr -d '[:space:]' < "$marker")"
+          if ! git cat-file -e "$rev^{commit}" 2>/dev/null; then
+            echo "restore-mtime: skipped, cache revision $rev is not in this history"
+            exit 0
+          fi
+          echo "restore-mtime: cache built from $rev"
+          python3 scripts/restore-mtime.py --changed "$rev" "$HEAD_SHA"
 
       # Clippy keeps its own target dir exactly as scripts/pre-pr.sh does: clippy
       # and build/test record incompatible fingerprints, and sharing one dir
@@ -608,6 +608,12 @@ jobs:
           # break from being discovered at release time.
           ./target/release/align-repl --version
           printf '40 + 2\n:quit\n' | ./target/release/align-repl | grep -x 42
+
+      # The saved cache names the tree it was built from so the next run's
+      # "Restore source mtimes from Git" can invalidate exactly what changed.
+      - name: Record the cache's source revision
+        if: github.ref == 'refs/heads/main'
+        run: git rev-parse HEAD > target/.align-cache-rev
 
       - name: Save Cargo caches
         if: github.ref == 'refs/heads/main'

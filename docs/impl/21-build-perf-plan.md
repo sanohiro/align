@@ -2595,22 +2595,27 @@ leaf owner test.
 **Mechanism 1: mtime restoration.** `scripts/restore-mtime.py` (stdlib-only)
 sets each tracked file's mtime to the commit time of the most recent commit
 that touched it, walking `git log --pretty=format:%x00%ct --name-only` once
-and stopping as soon as every tracked path is assigned. `--changed BASE HEAD`
-then resets every path in `git diff --no-renames --name-only BASE...HEAD`
-(falling back to `BASE..HEAD` when the three-dot form fails, e.g. a push
-range whose `before` predates a shallow-fetched history) to `now`. This is
-the soundness rule: a file the change itself touched must never be considered
-older than an artifact built before it, regardless of its commit's own
-timestamp — an author's commit can predate the point the cache was saved from,
-and only the changed-set touch, not the restored history mtime, protects
-against that. `.github/workflows/ci.yml`'s `build-and-test` job runs the
-script as the "Restore source mtimes from Git" step, immediately after
-"Restore Cargo caches" and before "Lint", computing `BASE` as the merge base
-for a `pull_request` event or `github.event.before` for a `push`; a first
-push or a force push (an empty or all-zero `before`) skips restoration
-entirely rather than risk touching nothing it should have. Cached artifacts
-under `target` keep the mtimes `actions/cache`'s tar preserved, so this step
-only ever moves source files forward, never the cache itself.
+and stopping as soon as every tracked path is assigned. `--changed CACHE_REV
+HEAD` then resets every path in `git diff --no-renames --name-only CACHE_REV
+HEAD` — the tree difference between the revision the restored cache was built
+from and the checked-out tree — to `now`. This is the soundness rule, and the
+revision must be the cache's own: the first draft touched the pull request's
+merge-base diff instead, and the independent review showed that a file
+changed on `main` between the cache's revision and the merge base can carry a
+commit timestamp older than the cached compilation (an old branch commit
+merged later), so Cargo would have reused a stale artifact for it. A commit
+timestamp bounds nothing about the cache; only a tree diff against the
+producing revision does. The main-branch run therefore writes
+`target/.align-cache-rev` (`git rev-parse HEAD`) immediately before "Save
+Cargo caches", and the "Restore source mtimes from Git" step — right after
+"Restore Cargo caches", before "Lint" — skips restoration entirely when the
+restored cache carries no marker or names a revision outside the fetched
+history (`fetch-depth: 0`), leaving checkout mtimes in place so nothing can be
+judged fresh by accident. Cached artifacts under `target` keep the mtimes
+`actions/cache`'s tar preserved, so this step only ever moves source files
+forward, never the cache itself. The first pull request after this lands
+still sees no marker; the benefit starts with the first `main` cache saved
+afterwards.
 
 **Mechanism 2: platform scope.** `scripts/pr-tier.sh` gained
 `pr_tier_platform_scope`, reusing the existing `pr_tier_docs_only` and
