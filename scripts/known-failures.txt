@@ -39,8 +39,8 @@
 # expectation with a named owner, not a dependence on something the runner does
 # not provide.
 #
-# THE MANIFEST IS JUDGED ON THE NIGHTLY'S PLATFORM, Linux x86_64. Seven of the
-# twelve entries below also reproduce on aarch64 macOS. The five tagged
+# THE MANIFEST IS JUDGED ON THE NIGHTLY'S PLATFORM, Linux x86_64. Five of the
+# ten entries below also reproduce on aarch64 macOS. The five tagged
 # "Linux-only" pass there, so a bare local `scripts/run-suite-binaries.sh` on an
 # Apple Silicon host reports them under "manifest entries that did NOT fail".
 # That is the host disagreeing with the manifest's platform, not five repaired

@@ -246,15 +246,29 @@ fn formation_and_carrier_matrix() {
         for declaration in [
             format!("extern \"C\" fn invalid(value: {name})"),
             format!(
-                "Holder {{ value: {name} }}\nfn invalid(value: Holder) {{ items := [value].map(fn(item: Holder) -> Holder {{ item }}).to_array() }}"
+                "Holder {{ value: {name} }}\nfn invalid(value: Holder) {{ items := [value].map(fn item: Holder {{ item }}).to_array() }}"
             ),
-            format!("fn invalid(value: {name}) -> fn() -> {name} = fn() -> {name} {{ value }}"),
+            format!("fn invalid(value: {name}) {{ captured := fn {{ value }} }}"),
             format!("fn invalid(a: {name}, b: {name}) {{ values := [a, b] }}"),
         ] {
             check_both(
                 &format!("http-forbidden-carrier {declaration}"),
                 &format!("module main\nimport helpers\n{declaration}\nfn main() {{}}\n"),
                 false,
+            );
+        }
+        // Copy twins of the two carrier declarations whose shape (a pipeline element, a lambda
+        // capture) could reject for a reason other than ownership. Each must be ACCEPTED, so the
+        // negatives above are pinned to the Move rule and cannot be satisfied by a syntax or
+        // arity error in the surrounding form.
+        for declaration in [
+            "Copyable { value: i64 }\nfn control(value: Copyable) { items := [value].map(fn item: Copyable { item }).to_array() }",
+            "fn control(value: i64) { captured := fn { value } }",
+        ] {
+            check_both(
+                &format!("http-carrier-copy-control {declaration}"),
+                &format!("module main\nimport helpers\n{declaration}\nfn main() {{}}\n"),
+                true,
             );
         }
         // A conditional result is NOT a forbidden carrier. `38-bound-if-result-plan.md` (#1003)

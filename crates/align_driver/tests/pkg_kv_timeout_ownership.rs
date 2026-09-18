@@ -1159,8 +1159,12 @@ TaggedChoiceArrayField { values: array<TaggedChoice> }
         // ordinary Copy `{ptr,len}` header with no Drop plan of its own, so it retains no handle
         // and contributes no target leaf. The viewed fixed array remains the single owner the
         // provenance classifier counts, which is why the producer-negative promise above is
-        // unchanged by it. The three guards that keep the view from becoming a second owner are
-        // asserted here, so widening any of them fails this owner.
+        // unchanged by it. Three separate rules keep that true, and each is asserted below:
+        // `whole-element-read` is the Move-element rule that stops the view handing out a second
+        // owner, `escaping-view` is the ordinary local-array escape rule (not retainer-specific,
+        // but it is what keeps the view inside the lifetime of the array the classifier counts),
+        // and `moved-source` is the invalidated-borrow rule that stops the view outliving its
+        // owner's move. Widening any of the three fails this owner.
         let view = format!("fn ok({params}) {{ rows := [{value}]; view := rows[..] }}");
         assert!(
             !check_errs(
@@ -1194,7 +1198,7 @@ TaggedChoiceArrayField { values: array<TaggedChoice> }
                     &format!("pkg-kv-timeout-view-guard-{label}-{guard}"),
                     &format!("{prelude}{body}\nfn main() -> i32 = 0\n"),
                 ),
-                "{label}/{guard} must not give the borrowed view a second owner",
+                "{label}/{guard} must keep the borrowed view inside its counted owner",
             );
         }
     }

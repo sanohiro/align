@@ -289,9 +289,12 @@ slice element, tuple element, or builtin `Option`/`Result` payload. Every admitt
 paragraph except the tuple wrapper may occupy a user-struct field and then recurse through the
 ordinary acyclic struct/tagged/sum carrier grammar. Every current
 materializer, builder, and decode producer rejects a live handle-retaining
-value. A Move-element slice producer forms only the borrowed Copy
-`{ptr,len}` header admitted by plan 44: it has no Drop plan, retains nothing,
-and adds no target leaf, so the viewed fixed array stays the counted owner. Inactive arms,
+value. Over an in-place fixed array of retaining structs, the Move-element
+slice producer forms the borrowed Copy `{ptr,len}` header admitted by
+[plan 44](44-move-record-slice-plan.md): it has no Drop plan, retains nothing,
+and adds no target leaf, so the viewed fixed array stays the counted owner.
+Over retaining sums that array itself never forms, so the producer stays a
+formation negative there. Inactive arms,
 moved/null leaves, and carriers containing only other-
 connection shells have target count zero; a compatible call requires zero even when a carrier can
 otherwise reach multiple or mixed-provenance leaves.
