@@ -23,6 +23,12 @@
 # recomputes the two sets from the repository and fails when a list goes stale.
 # Adding a gate target or embedding a new document therefore forces this file
 # to be updated in the same change.
+#
+# `pr_tier_platform_scope <base_sha> <head_sha>` reuses the same two verdicts
+# to pick how much of CI's platform matrix a PR needs: `none` (docs-only) runs
+# no platform job at all, `light` (tooling tier) runs one Linux x86_64
+# compile-only leg, and `full` (library tier, or an uncomputable/empty diff)
+# runs the complete three-platform matrix. See its own comment below.
 
 # Test targets named in scripts/test-pr.sh (bounded-gate content).
 PR_TIER_GATE_TESTS="m0 examples summary effect_fail_closed"
@@ -77,6 +83,31 @@ pr_tier_library_changed() {
     fi
   done < <(git diff --no-renames --name-only "$base_sha...$head_sha")
   return "$status"
+}
+
+# `pr_tier_platform_scope <base_sha> <head_sha>` prints exactly one of:
+#   none  - the diff is docs-only (pr_tier_docs_only); the platform matrix
+#           does not run at all.
+#   light - pr_tier_library_changed fails (the diff is tooling tier) and the
+#           diff is non-empty and computable; CI runs one compile-only leg.
+#   full  - everything else, including an uncomputable diff or an empty one.
+# This drives CI's platform-matrix scope; it never changes whether the
+# platform job runs, only how much of the matrix it runs.
+pr_tier_platform_scope() {
+  local base_sha="$1" head_sha="$2" diff
+  if pr_tier_docs_only "$base_sha" "$head_sha"; then
+    echo none
+    return 0
+  fi
+  diff="$(git diff --no-renames --name-only "$base_sha...$head_sha" 2>/dev/null)" || {
+    echo full
+    return 0
+  }
+  if [[ -n "$diff" ]] && ! pr_tier_library_changed "$base_sha" "$head_sha"; then
+    echo light
+  else
+    echo full
+  fi
 }
 
 # Succeeds only for a non-empty diff made exclusively of ordinary Markdown

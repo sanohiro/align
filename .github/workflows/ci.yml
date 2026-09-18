@@ -31,6 +31,8 @@ jobs:
       reason: ${{ steps.scope.outputs.reason }}
       platform_required: ${{ steps.platform-scope.outputs.required }}
       platform_reason: ${{ steps.platform-scope.outputs.reason }}
+      platform_scope: ${{ steps.platform-scope.outputs.scope }}
+      platform_matrix: ${{ steps.platform-scope.outputs.matrix }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -87,13 +89,19 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
+          full_matrix='[{"name":"Linux x86_64","os":"ubuntu-24.04","lint":true,"scope":"full"},{"name":"Linux ARM64","os":"ubuntu-24.04-arm","lint":false,"scope":"full"},{"name":"macOS Apple Silicon","os":"macos-15","lint":false,"scope":"full"}]'
+          light_matrix='[{"name":"Linux x86_64","os":"ubuntu-24.04","lint":true,"scope":"light"}]'
           if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
             printf 'required=true\nreason=non-pull-request\n' >> "$GITHUB_OUTPUT"
+            printf 'scope=full\n' >> "$GITHUB_OUTPUT"
+            echo "matrix=$full_matrix" >> "$GITHUB_OUTPUT"
           elif [ "$BASE_REF" != main ]; then
             # A stacked PR's base branch is author-controlled. Never source
             # classifier code from it or let its child diff skip protected
             # platform checks; only pull requests targeting main may be light.
             printf 'required=true\nreason=non-main-base\n' >> "$GITHUB_OUTPUT"
+            printf 'scope=full\n' >> "$GITHUB_OUTPUT"
+            echo "matrix=$full_matrix" >> "$GITHUB_OUTPUT"
           else
             BASE_SHA="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
             TRUSTED_TIP="$(git rev-parse refs/remotes/origin/main)"
@@ -104,13 +112,31 @@ jobs:
               if declare -F pr_tier_docs_only >/dev/null && \
                  pr_tier_docs_only "$BASE_SHA" "$HEAD_SHA"; then
                 printf 'required=false\nreason=docs-only\n' >> "$GITHUB_OUTPUT"
-              else
+                printf 'scope=none\n' >> "$GITHUB_OUTPUT"
+                echo "matrix=$full_matrix" >> "$GITHUB_OUTPUT"
+              elif declare -F pr_tier_platform_scope >/dev/null; then
                 printf 'required=true\nreason=non-docs-only\n' >> "$GITHUB_OUTPUT"
+                scope="$(pr_tier_platform_scope "$BASE_SHA" "$HEAD_SHA")"
+                printf 'scope=%s\n' "$scope" >> "$GITHUB_OUTPUT"
+                if [ "$scope" = light ]; then
+                  echo "matrix=$light_matrix" >> "$GITHUB_OUTPUT"
+                else
+                  echo "matrix=$full_matrix" >> "$GITHUB_OUTPUT"
+                fi
+              else
+                # One-PR bootstrap: origin/main's pr-tier.sh predates
+                # pr_tier_platform_scope. Run the complete matrix until the
+                # trusted base owns the function this PR is adding.
+                printf 'required=true\nreason=classifier-bootstrap\n' >> "$GITHUB_OUTPUT"
+                printf 'scope=full\n' >> "$GITHUB_OUTPUT"
+                echo "matrix=$full_matrix" >> "$GITHUB_OUTPUT"
               fi
             else
               # The trusted base cannot prove this diff docs-only. Run the
               # complete matrix; the first PR adding machinery takes this arm.
               printf 'required=true\nreason=classifier-bootstrap\n' >> "$GITHUB_OUTPUT"
+              printf 'scope=full\n' >> "$GITHUB_OUTPUT"
+              echo "matrix=$full_matrix" >> "$GITHUB_OUTPUT"
             fi
           fi
 
@@ -319,16 +345,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: Linux x86_64
-            os: ubuntu-24.04
-            lint: true
-          - name: Linux ARM64
-            os: ubuntu-24.04-arm
-            lint: false
-          - name: macOS Apple Silicon
-            os: macos-15
-            lint: false
+        include: ${{ fromJSON(needs.db-scope.outputs.platform_matrix) }}
     runs-on: ${{ matrix.os }}
     env:
       ALIGN_APT_PACKAGES: >-
@@ -343,6 +360,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
 
       # Fast (no cargo) and needs nothing beyond the checkout, so it runs here
       # rather than after the toolchain install: keeps the pr-tier.sh
@@ -468,6 +487,36 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-${{ runner.arch }}-lint${{ matrix.lint }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-
 
+      # actions/checkout stamps every tracked file's mtime with the checkout
+      # time, so Cargo's fingerprint sees every workspace crate as changed
+      # even though the restored target/ above is unpacked with its original
+      # mtimes intact (actions/cache preserves the tar's timestamps). Restore
+      # each source file's mtime from the commit that last touched it so the
+      # fingerprint cache actually hits. Soundness: every path this change
+      # itself touches is always reset to `now` afterward, regardless of its
+      # commit's timestamp (an author's commit can predate the cache save),
+      # so a stale artifact can never be mistaken for current.
+      - name: Restore source mtimes from Git
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          case "$EVENT_NAME" in
+            pull_request) base="$(git merge-base "$PR_BASE_SHA" "$HEAD_SHA")" ;;
+            push) base="$PUSH_BEFORE" ;;
+            *) echo "restore-mtime: skipped for $EVENT_NAME"; exit 0 ;;
+          esac
+          case "$base" in
+            "" | 0000000000000000000000000000000000000000)
+              echo "restore-mtime: skipped, no usable base (first push or force push)"
+              exit 0
+              ;;
+          esac
+          python3 scripts/restore-mtime.py --changed "$base" "$HEAD_SHA"
+
       # Clippy keeps its own target dir exactly as scripts/pre-pr.sh does: clippy
       # and build/test record incompatible fingerprints, and sharing one dir
       # would invalidate the restored cache in both directions every run.
@@ -490,19 +539,20 @@ jobs:
           scripts/cargo.sh build --workspace --locked
 
       - name: TCP writer SIGPIPE regressions (macOS)
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && matrix.scope != 'light'
         timeout-minutes: 15
         run: >
           scripts/run-quiet.sh "CI test: TCP writer SIGPIPE" --
           scripts/cargo.sh test -p align_runtime --lib --locked tcp_writer_
 
       - name: Owned-JSON boundary regressions (macOS)
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && matrix.scope != 'light'
         run: >
           scripts/run-quiet.sh "CI test: owned JSON" --
           scripts/cargo.sh test -p align_driver --test m5_owned_json --locked
 
       - name: CPU configuration and byte-execution regressions
+        if: matrix.scope != 'light'
         timeout-minutes: 15
         shell: bash
         run: >
@@ -510,19 +560,21 @@ jobs:
           scripts/test-codegen-performance.sh
 
       - name: Native process and signal regressions
+        if: matrix.scope != 'light'
         timeout-minutes: 15
         run: >
           scripts/run-quiet.sh "CI test: native process and signals" --
           scripts/test-process-native.sh
 
       - name: Retained filesystem and identity regressions (macOS)
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && matrix.scope != 'light'
         timeout-minutes: 15
         run: >
           scripts/run-quiet.sh "CI test: retained filesystem and identity" --
           scripts/test-fs-observations.sh
 
       - name: Client composition and regular-file admission regressions
+        if: matrix.scope != 'light'
         timeout-minutes: 15
         run: >
           scripts/run-quiet.sh "CI test: client admission" --
@@ -530,20 +582,22 @@ jobs:
 
       - name: Bounded PR test gate
         if: matrix.lint
+        env:
+          ALIGN_GATE_BUILD_ONLY: ${{ matrix.scope == 'light' && '1' || '' }}
         run: scripts/test-pr.sh
 
       # The lint job is the critical path; its release-profile check moved to
       # the nightly workflow, while the shorter ARM64/macOS jobs keep covering
       # the release build and packaged smoke test on every PR.
       - name: Build release compiler
-        if: ${{ !matrix.lint }}
+        if: ${{ !matrix.lint && matrix.scope != 'light' }}
         run: >
           scripts/run-quiet.sh "CI build: release compiler" --
           scripts/cargo.sh build --locked --release
           -p align_runtime -p align_driver -p align_repl
 
       - name: Smoke test packaged command
-        if: ${{ !matrix.lint }}
+        if: ${{ !matrix.lint && matrix.scope != 'light' }}
         shell: bash
         run: |
           ./target/release/alignc --version

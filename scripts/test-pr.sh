@@ -42,6 +42,14 @@ scripts/run-quiet.sh --stdout "$artifacts" "gate build: test binaries" -- \
   --test m0 \
   --test summary
 
+# The light platform tier mirrors the local tooling tier (compile check, no
+# bounded gate run): CI still gets the compile check and its attestation, but
+# a diff proven not to touch library code does not need the gate binaries run.
+if [[ -n "${ALIGN_GATE_BUILD_ONLY:-}" ]]; then
+  echo "gate: build-only (light platform scope); binaries not run"
+  exit 0
+fi
+
 # Every binary that selection must produce: one per selected library plus each
 # named integration target. The runner fails when the compiled set differs in
 # either direction, and scripts/test-pr-workflow.sh checks this list against
