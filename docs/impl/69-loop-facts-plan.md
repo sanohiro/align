@@ -4,8 +4,9 @@ Status: plan of record for issues
 [1079](https://github.com/sanohiro/align/issues/1079),
 [1080](https://github.com/sanohiro/align/issues/1080),
 [1081](https://github.com/sanohiro/align/issues/1081) and
-[1084](https://github.com/sanohiro/align/issues/1084). Nothing here is
-implemented.
+[1084](https://github.com/sanohiro/align/issues/1084). PR 1 (§2, issues 1079
+and 1080) is implemented, with the corrections §2.6 records; PRs 2 and 3 are
+not.
 
 [Plan 68](68-vectorization-contract.md) is the public-contract ledger and owns
 guarantees G1–G10. This plan implements G1, G2 and G3 and does not restate,
@@ -145,9 +146,14 @@ alias scopes are independent metadata; neither weakens the other.
 
 ```text
 !tbaa                     one align TBAA root with two children,
-                          align.view.header and align.elem.<T>. Attached to
+                          align.view.header and align.elem. Attached to
                           header field loads and to element loads/stores whose
-                          base is an Align-lowered view
+                          base is an Align-lowered view. There is one element
+                          node for every element type, not one per T: sibling
+                          per-T nodes would claim that two element accesses
+                          cannot alias, which I6 forbids (corrected at
+                          implementation; T survives as the I4 predicate that
+                          decides whether an access is tagged at all)
 noalias                   on a Borrow header pointer parameter only, gated by
                           §2.3 I3, and only at a definition site
 dereferenceable(16)       on a Borrow or BorrowMut header pointer parameter —
@@ -161,7 +167,10 @@ captures(none)            already emitted for Borrow when the borrow is not
 !range !{i64 0, i64 -9223372036854775808}
                           on the load that materializes a length from a borrowed
                           header, and on a fixed-array constant length where it
-                          is a no-op
+                          is a no-op. "A length" is the semantic test, not the
+                          `{ptr,i64}` layout: a header whose second field is an
+                          index or a handle — `json.doc`'s `-1`-for-Missing node
+                          — carries every other header fact and not this one
 ```
 
 `noalias` stays on `Borrow` exactly as plan 68 G1 states it, and this plan does
@@ -214,9 +223,11 @@ I3  noalias is emitted on a Borrow header parameter of a function only when
     carries the attribute. `noalias` cannot be violated by a caller when no
     access through any pointer in the callee writes header memory, which is
     what makes a body-derived predicate the right gate for it
-I4  align.elem.<T> is stated disjoint from align.view.header only when T
-    contains no view header transitively. Otherwise the access carries the TBAA
-    root and claims nothing
+I4  an element access of type T is tagged align.elem — and so stated disjoint
+    from align.view.header — only when T contains no view header transitively.
+    Otherwise the access carries no tag and claims nothing (corrected at
+    implementation: an untagged access and a root-tagged one are the same
+    claim, and only the former needs the root to be a valid access type)
 I5  no TBAA node is attached to an access whose pointer did not come from an
     Align-lowered view: a raw FFI pointer, a `resource` handle payload, and
     anything reached through `unsafe raw` are untagged
@@ -260,8 +271,8 @@ restriction later cannot silently invalidate it.
 
 | Cell | Required behavior | Owner |
 | --- | --- | --- |
-| Header load versus element store that can alias | `align.elem.<T>` disjoint from `align.view.header` only for a `T` with no reachable header (I4); otherwise root-tagged | new `loop_facts` owner asserting the tagged and untagged forms for `slice<i64>` and `slice<Row>`; `struct_slice_fields` |
-| Mutable view | `BorrowMut` header gets `nonnull dereferenceable(16) align 8`, never `readonly` and never `noalias`; element stores tagged `align.elem.<T>` | new `loop_facts` owner asserting `noalias`'s absence on a `borrow mut` header; `out_params`, `borrowed_params` |
+| Header load versus element store that can alias | `align.elem` disjoint from `align.view.header` only for a `T` with no reachable header (I4); otherwise untagged | new `loop_facts` owner asserting the tagged and untagged forms for `slice<f32>` and `slice<str>`; `struct_slice_fields` |
+| Mutable view | `BorrowMut` header gets `nonnull dereferenceable(16) align 8`, never `readonly` and never `noalias`; element stores tagged `align.elem` | new `loop_facts` owner asserting `noalias`'s absence on a `borrow mut` header; `out_params`, `borrowed_params` |
 | Header written anywhere in the body | no `noalias` on any header parameter of that function (I3) | `borrowed_replacement`, `owned_field_replacement`, plus a new negative owner pinning the attribute's absence |
 | Imported declaration | no body, so no `noalias`; the other header attributes are unaffected | new negative owner over `declare_imported_fn`'s output; `imports`, `interface_param_modes` |
 | Two views of the same buffer | unchanged: the existing sema gate rejects the aliasing `out` shapes, and `noalias` is never the thing that makes them sound. Because `noalias` lands only on read-only headers of bodies that write no header, an aliasing pair of arguments cannot be made unsound by it | `out_params::out_arg_aliasing_another_arg_rejected`, `out_arg_two_slices_of_same_array_rejected`, `map_into::map_into_dst_aliasing_source_rejected`, plus a new owner passing one place as two `borrow` arguments and as a `borrow`/`borrow mut` pair |
@@ -335,6 +346,78 @@ PR: `map_into`, `out_params`, `borrowed_params`, `borrowed_replacement`,
 Benchmarks: 1079's `scale_only` and AXPY timings and 1080's `dot` guard count
 are local measurements for the issues' own performance claims. They are not
 correctness gates.
+
+### 2.6 Corrections recorded when PR 1 shipped
+
+Each of these narrows or renames what §2.1–§2.5 wrote; none widens a promise,
+and none changes an invariant. They are recorded here because this plan is the
+normative source, not the implementation.
+
+```text
+one element class           `align.elem.<T>` is one node, `align.elem`, not one
+                            per T (§2.2, I4). Sibling per-T nodes would claim
+                            that two element accesses cannot alias, which I6
+                            forbids; T remains the predicate that decides
+                            whether an access is tagged at all. Plan 68 G1's
+                            row is corrected to match
+untagged, not root-tagged   an element whose type can hold a header carries no
+                            tag rather than the TBAA root. The two claim
+                            exactly the same thing — nothing — and only the
+                            former avoids using a root node as an access type
+reuse lands in lowering     §2.1's MIR half is realized in LLVM lowering, not
+                            in MIR text: every `emit_bounds_check` site still
+                            takes its length from its own `Rvalue::SliceLen`,
+                            and codegen's cache makes every one of them read
+                            the single entry-block materialization. The result
+                            is the promised IR — one header load per view,
+                            carrying `!range` — with no MIR pass, no MIR
+                            dominance analysis, and no change to the operand
+                            contract `validate_slice_index_rvalues` checks
+entry block, parameters     a parameter-derived header is materialized in the
+                            entry block, which dominates every use and so
+                            subsumes any preheader. No non-parameter place is
+                            cached: a local view's header is an `alloca` that
+                            LLVM already promotes, so I1's fail-closed default
+                            costs nothing measured. The loop-preheader arm of
+                            §2.1 is therefore unimplemented, not deferred work
+length, not layout          `!range` attaches only where the header's second
+                            field really is an element or byte count. Several
+                            types share the `{ptr,i64}` layout and give that
+                            field another meaning — `json.doc` is
+                            `{tape, node}` and its node index is `-1` for
+                            Missing — so a layout predicate would have turned a
+                            valid Missing handle into poison. Layout
+                            compatibility earns `dereferenceable`/`align` and
+                            the header alias class; only a length earns the
+                            range fact
+one whole-body gate         I2, I3 and I5 are decided together by one
+                            whitelist proof over the body (`view_facts_plan`):
+                            a function qualifies only when every statement in
+                            it provably writes no header memory and forms no
+                            foreign pointer. A per-place kill set would be
+                            strictly more precise; the whole-body proof is what
+                            makes "the fail-closed default is no caching" true
+                            by construction, and it is one predicate for the
+                            cache, the TBAA pair and `noalias` alike
+owner names                 `g1_noalias_absent_on_mutable_and_imported_headers`
+                            ships as two owners: the mutable half is
+                            `g1_noalias_absent_on_mutable_headers` in
+                            `loop_facts.rs`, and the imported half is a codegen
+                            unit owner over the shared attribute helper, since
+                            an interface-only dependency's `declare` is not
+                            reachable from whole-program IR. Two owners are
+                            added beyond the planned list for the
+                            two-views-of-one-buffer cell: one executable, one
+                            pinning the existing sema rejection
+aarch64 arm, narrow         `vectorize_shapes.rs` gains one aarch64 arm —
+                            G1's measured `scale_only` vector body at the
+                            portable baseline — rather than a second arm for
+                            each of the fifteen x86 kernels. The suite now runs
+                            a guarantee owner on the host every measurement was
+                            taken on, and no width is pinned that was not
+                            measured there; the remaining kernels gain their
+                            per-arch arms in the PRs that own them
+```
 
 ## 3. PR 2 — one bounds check, moved and never deleted (1081)
 

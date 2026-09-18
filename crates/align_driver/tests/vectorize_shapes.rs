@@ -491,3 +491,46 @@ fn a8_hash64_loop_invariant_hoist_enables_vectorization() {
     // The invariant call is hoisted (and CSE'd) to a single site, not re-run per iteration.
     assert_eq!(ir.matches("call i64 @align_rt_hash64").count(), 1, "hash64 must be hoisted to one call:\n{ir}");
 }
+
+// ── G1, per-arch (plan 69 PR 1) ─────────────────────────────────────────────────────────────────
+//
+// Every test above pins an x86 CPU tier, so on aarch64 — the host that produced every measurement
+// behind issues 1079/1080/1081/1084 — this suite executed nothing at all. Plan 69 §2.5 requires the
+// architecture gate to be addressed in the same change that adds the first guarantee owner, and it
+// separates the two jobs: an IR **fact** is arch-independent and belongs in `loop_facts.rs`, which
+// runs everywhere; a vector **width** is a target property and belongs here, named per target.
+//
+// This is the aarch64 arm, at the portable per-arch baseline (`BuildTarget::Baseline`, armv8-a) —
+// what the default build emits and what 1079 measured. It pins the *effect* of G1 that the issue
+// records as absent today: with the header materialized once and its alias facts stated, the
+// smallest in-place kernel reaches a 128-bit vector body. The per-arch extension of the fifteen
+// kernels above is left to the PRs that add their own guarantee owners (G2 in PR 2, G3 in PR 3),
+// so no width is pinned here that has not been measured on this host.
+
+/// The aarch64 half of the architecture gate, and the only arm of this suite that runs there.
+fn aarch64_backend() -> bool {
+    cfg!(target_arch = "aarch64") && backend_available()
+}
+
+/// G1's measured effect at the aarch64 baseline: `out[i] = out[i] * k` reaches a `<4 x float>`
+/// (128-bit) vector body, with no surviving length clamp. 1079 §2 records the same kernel as an
+/// 18-instruction scalar loop with zero vector instructions at every profile and every
+/// `--target-cpu`, so a regression in the header materialization or in its alias facts turns this
+/// straight back into a scalar loop.
+#[test]
+fn g1_view_header_hoisted_vectorizes_scale_only() {
+    if !aarch64_backend() {
+        return;
+    }
+    let src = "fn scale_only(borrow mut out: array<f32>, k: f32) {\n  \
+                 mut i := 0\n  \
+                 loop {\n    if i >= out.len() { break }\n    out[i] = out[i] * k\n    i = i + 1\n  }\n\
+               }\n";
+    let ir = emit_llvm_optimized(src, &["scale_only"]);
+    assert!(ir.contains("vector.body"), "want a vector main loop for the in-place kernel:\n{ir}");
+    assert!(ir.contains("<4 x float>"), "want 128-bit f32 lanes at the aarch64 baseline:\n{ir}");
+    assert!(
+        !ir.contains("llvm.smax.i64"),
+        "a length is known non-negative, so no clamp survives:\n{ir}"
+    );
+}
