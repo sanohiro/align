@@ -2406,6 +2406,15 @@ regression net that validates the upgrade.
     probe: **below-gate confirmed** — hacking `nsw` onto the synthesized index add changes only the
     raw spelling (`add nsw i64`); the whole optimized shape suite (widths, `vector.body`,
     reductions, guards) is byte-for-byte unchanged (kernels already vectorize). Reverted.
+    **SUPERSEDED IN PART 2026-09-18 — the curated table becomes a complete per-symbol model.**
+    5A's "fail-safe default = no attribute" left 104 of 141 declaration shapes with no effect fact
+    at all, and keyed effects by C signature, so a pure argument writer and an I/O call share one
+    row by construction. [Plan 70](70-runtime-boundary-effects-plan.md) replaces the shape-keyed
+    fields with a per-symbol effects record derived from a closed twelve-class classification,
+    makes an unclassified row impossible rather than silently conservative, states the `--rt-lto`
+    guarded-set admission criterion over those classes, and carries the closure matrix for issues
+    1071, 1072 and 1074. The withholding rules 5A established for `utf8_valid` and the memchr-backed
+    rows survive as a named class; the abort family gains `cold` and an explicit memory effect.
   **DEFERRED with reasons (revisit post-M14 ThinLTO/runtime-bitcode — the wave that creates
   real non-inlined boundaries where argument attributes stop evaporating):** internal-ABI
   signature flattening (SROA already achieves it; FFI boundary correctly kept aggregate in the
