@@ -1675,6 +1675,16 @@ fn storage_generation_move_replacement_cleanup_control_matrix() {
         }
     }
 
+    // Each of these is a syntactically self-assignment-shaped place write that the exact
+    // self-assignment fast path (above) must NOT swallow as a no-op: `transparent-wrapper` and
+    // `different-place` still hold ordinary generation-killing semantics, and `projected-owned-
+    // rejected` must still surface its unsupported-replacement diagnostic instead of silently
+    // no-opping. #1048/#1051/#1054 (`76dcb12b`) shipped general owned *direct* field replacement, so
+    // `holder.values = holder.values` (the previous fixture here) no longer errors; the still-
+    // rejected shape is element-field replacement of a non-`string` Move leaf through a fixed
+    // struct array index (`values[0].inner = values[0].inner`), which has no per-element drop-old
+    // lowering yet (see `owned_structs_arrays::move_leaf_field_replacement_is_supported_but_array_
+    // element_field_replacement_is_rejected`).
     for (name, src, expected) in [
         (
             "transparent-wrapper",
@@ -1688,8 +1698,8 @@ fn storage_generation_move_replacement_cleanup_control_matrix() {
         ),
         (
             "projected-owned-rejected",
-            "Holder { values: array<i64> }\nfn main() -> i32 {\n  mut holder := Holder { values: [1, 2].to_array() }\n  holder.values = holder.values\n  return 0\n}\n",
-            "field replacement of array<i64> is not supported yet",
+            "Inner { name: string }\nOuter { inner: Inner }\nfn main() -> i32 {\n  mut values := [Outer{inner: Inner{name: \"old\".clone()}}]\n  values[0].inner = values[0].inner\n  return 0\n}\n",
+            "element-field assignment of Inner into a fixed struct array is not supported yet",
         ),
     ] {
         let diagnostics = check_diagnostics(&format!("storage-generation-self-{name}"), src);

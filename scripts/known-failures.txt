@@ -39,20 +39,14 @@
 # expectation with a named owner, not a dependence on something the runner does
 # not provide.
 #
-# THE MANIFEST IS JUDGED ON THE NIGHTLY'S PLATFORM, Linux x86_64. Five of the
-# ten entries below also reproduce on aarch64 macOS. The five tagged
-# "Linux-only" pass there, so a bare local `scripts/run-suite-binaries.sh` on an
-# Apple Silicon host reports them under "manifest entries that did NOT fail".
-# That is the host disagreeing with the manifest's platform, not five repaired
-# tests: fix and re-verify them on Linux or in a container.
+# THE MANIFEST IS JUDGED ON THE NIGHTLY'S PLATFORM, Linux x86_64. Every entry
+# below is tagged "Linux-only": none reproduces on aarch64 macOS, so a bare
+# local `scripts/run-suite-binaries.sh` on an Apple Silicon host reports all
+# five under "manifest entries that did NOT fail". That is the host
+# disagreeing with the manifest's platform, not five repaired tests: fix and
+# re-verify them on Linux or in a container.
 #
 # Issues:
-#   #1102  #937 (384d7744) both widened the function-value signature rule and
-#          added the align_rt_http_headers_* entry points. Two owners still
-#          assert the removed restriction; a third guards the whole module
-#          against a substring that is now a prefix of four new symbols.
-#   #1103  #1048/#1051/#1054 (76dcb12b) shipped owned field replacement; two
-#          owners still assert it is unsupported.
 #   #1105  Two codegen owners bind their IR text scanners to the first match in
 #          the whole module, which is the wrong line or byte range on x86_64.
 #   #1106  The CLI per-unit build no longer byte-matches the whole-program
@@ -74,18 +68,8 @@
 # One line's absence is not a clean bill of health for its owner: the scanner
 # behind the align_runtime entry below covers 384 of the registry's 464 rows
 # and breaks on formatting (#1112).
-# #1102
-align_driver::test::apps_auth	session_only_use_keeps_module_crypto_and_public_surface_is_closed
 # #1107, Linux-only
 align_driver::test::apps_ws	protocol_ping_and_peer_close_reply_transport_failures_win
-# #1103
-align_driver::test::borrow_liveness	storage_generation_move_replacement_cleanup_control_matrix
-# #1102
-align_driver::test::http_headers_view	a_struct_carrying_the_view_stays_copy
-# #1102
-align_driver::test::modules	qualified_function_value_keeps_signature_restrictions
-# #1103
-align_driver::test::owned_structs_arrays	unsupported_move_leaf_partial_replacement_is_rejected
 # #1105, Linux-only
 align_driver::test::owned_tagged_payloads	llvm_drop_has_a_tag_guard_and_none_constructs_without_allocation
 # #1105, Linux-only
