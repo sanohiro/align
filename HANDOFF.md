@@ -16,20 +16,20 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    radius: on 2026-09-18 a one-line diagnostic rename (#1120) and a
    test-only owner fix (#1119) each waited ~20 minutes for the Linux x86_64
    leg, whose steps were 105 s of Cargo cache restore, ~15 min of build and
-   gate, and under 4 minutes of everything else. Owner: a new item in
-   `docs/impl/21-build-perf-plan.md`. Two changes, in this order:
-   a. **Tier-scoped platform matrix.** `scripts/pr-tier.sh` already
-      classifies docs-only, tooling and code; make `.github/workflows` use it
-      so tooling, leaf-test-only and diagnostic-text-only PRs run one Linux
-      x86_64 leg plus the Pre-PR attestation, while compiler-semantics changes
-      keep the full matrix. Target ≤5 minutes for the light tiers. Keep the
-      fail-closed rule: unknown shapes and deletions stay full matrix.
-   b. **Make the Cargo cache actually hit.** Restore takes 105 s and the
-      build still takes ~15 minutes, so the key or the cached paths are
-      wrong; measure with the per-step timings of one run before and after.
-      `sccache` or a pinned target snapshot are the candidates.
-   Until (a) lands, batch small follow-ups into one PR instead of one PR each;
-   the fixed cost is per PR, not per line.
+   gate, and under 4 minutes of everything else. Owner: `docs/impl/21-build-perf-plan.md`
+   Item 7. Both changes shipped in this PR: source-mtime restoration from Git
+   (so the restored Cargo cache actually hits instead of every crate
+   fingerprinting as changed after checkout) and a trusted-classifier
+   platform scope (`pr_tier_platform_scope`: none/light/full) that bounds a
+   tooling-tier PR to one Linux x86_64 compile-only leg. The first PR merged
+   after this one is the measurement: read its "Restore Cargo caches" and
+   "Bounded PR test gate" step timings, and confirm a tooling-tier PR actually
+   ran only the light leg. Until that measurement confirms the win, batch
+   small follow-ups into one PR instead of one PR each; the fixed cost is per
+   PR, not per line. Follow-up not done here: sharding the bounded-gate
+   binaries' own compile across parallel jobs (today one sequential build
+   produces them all, even though `scripts/run-gate-binaries.sh` already runs
+   them concurrently once built).
 
 1. **plan 70 PR 1** (#1071, effects table) — `docs/impl/70-runtime-boundary-effects-plan.md`
    §3. Precondition: run the §3.6 `argmem` experiment first; its result decides

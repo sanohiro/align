@@ -154,7 +154,11 @@ internal checkpoint landed.
   docs-only pull request skips the Linux/macOS compiler matrix and satisfies
   the stable platform aggregate, while compiled prose, deletions, unknown
   paths, non-PR events, nightly, and release flows retain their full checks. A
-  broad normative design change still follows the design review gate below.
+  tooling-tier PR (leaf owner tests only) runs one Linux x86_64 compile-only
+  leg instead, and every leg restores source mtimes from Git so the Cargo
+  cache hits; `scripts/`, `.github/`, shared test infrastructure, and every
+  deletion keep the full matrix. A broad normative design change still
+  follows the design review gate below.
 - A code PR may omit documentation changes when it implements the existing
   contract without changing user-visible behavior. Finish any required
   normative prose before the final-SHA attestation; do not mutate status prose

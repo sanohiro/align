@@ -26,6 +26,7 @@ Order is priority.
 | 4 | Prebuilt optimized cache distribution | Shipped as #893 — exact native releases carry an adjacent immutable cache warmed from 22 first-party `pkg` modules plus one generated entry unit (23 total); compiler-provided `core`/`std` imports have no cacheable source unit |
 | 5 | Foreground watch builds | Implemented — `alignc build FILE --watch` keeps one foreground compiler resident, observes the exact files consumed by ordinary and ThinLTO builds, revalidates their semantic/topology state, captures child output, and atomically preserves the last-good executable without a daemon or socket |
 | 6 | Function-level incremental compilation | Implemented — explicit `--thin-lto` builds form sealed support/function partitions, retain a fresh global thin-link, and cache exact partition-qualified prelink/backend artifacts |
+| 7 | PR CI wall time | Implemented — source-mtime restoration makes the restored Cargo cache actually hit, and a trusted-classifier platform scope bounds a tooling-tier PR to one compile-only leg; see below |
 
 ## Background
 
@@ -2577,3 +2578,98 @@ in this investigation. The v0.7.0 compiler defect and v0.7.1 corpus correction
 changed inputs and versions; they do not demonstrate a failure to reuse
 unchanged artifacts after a publish-only transient error. Actual source/compiler
 defects continue to require a new version and its appropriate qualification.
+
+## Item 7: PR CI wall time
+
+Measured 2026-09-18 on PR #1120's Linux x86_64 leg of
+`.github/workflows/ci.yml` job `build-and-test`: wall time ~20 min, of which
+"Restore Cargo caches" was 105 s and Lint/regressions/"Bounded PR test gate"
+were ~15 min; everything else was under 4 min. The cache restore itself
+already hit (a multi-GB `target` unpacked), but the workspace still rebuilt:
+`actions/checkout` stamps every file's mtime with the checkout time, so
+Cargo's fingerprint saw every workspace crate as changed even though the
+registry dependencies stayed cached. Separately, every PR ran the full
+three-platform matrix even when its diff never touched anything beyond one
+leaf owner test.
+
+**Mechanism 1: mtime restoration.** `scripts/restore-mtime.py` (stdlib-only)
+sets each tracked file's mtime to the commit time of the most recent commit
+that touched it, walking `git log --pretty=format:%x00%ct --name-only` once
+and stopping as soon as every tracked path is assigned. `--changed CACHE_REV
+HEAD` then resets every path in `git diff --no-renames --name-only CACHE_REV
+HEAD` — the tree difference between the revision the restored cache was built
+from and the checked-out tree — to `now`. This is the soundness rule, and the
+revision must be the cache's own: the first draft touched the pull request's
+merge-base diff instead, and the independent review showed that a file
+changed on `main` between the cache's revision and the merge base can carry a
+commit timestamp older than the cached compilation (an old branch commit
+merged later), so Cargo would have reused a stale artifact for it. A commit
+timestamp bounds nothing about the cache; only a tree diff against the
+producing revision does. The main-branch run therefore writes
+`target/.align-cache-rev` (`git rev-parse HEAD`) immediately before "Save
+Cargo caches", and the "Restore source mtimes from Git" step — right after
+"Restore Cargo caches", before "Lint" — skips restoration entirely when the
+restored cache carries no marker or names a revision outside the fetched
+history (`fetch-depth: 0`), leaving checkout mtimes in place so nothing can be
+judged fresh by accident. Cached artifacts under `target` keep the mtimes
+`actions/cache`'s tar preserved, so this step only ever moves source files
+forward, never the cache itself. The first pull request after this lands
+still sees no marker; the benefit starts with the first `main` cache saved
+afterwards.
+
+**Mechanism 2: platform scope.** `scripts/pr-tier.sh` gained
+`pr_tier_platform_scope`, reusing the existing `pr_tier_docs_only` and
+`pr_tier_library_changed` verdicts to print `none` (docs-only; the platform
+job does not run — unchanged), `light` (the diff is tooling tier: not
+library-changed, non-empty, and computable), or `full` (everything else,
+including an uncomputable or empty diff). `build-and-test`'s `strategy.matrix`
+now comes from `needs.db-scope.outputs.platform_matrix`, a JSON array the
+trusted `db-scope` job's "Classify platform build scope" step computes from
+the *trusted* copy of `pr-tier.sh` (`origin/main`'s, never the PR's own) via a
+`declare -F pr_tier_platform_scope` guard — a trusted base that predates this
+function falls back to `full`, reason `classifier-bootstrap`, exactly like the
+existing docs-only bootstrap arm. `light` keeps only the Linux x86_64 leg,
+with `scope: light` in its matrix entry; the per-platform regression steps
+("CPU configuration and byte-execution regressions", "Native process and
+signal regressions", "Client composition and regular-file admission
+regressions", every macOS-only regression step, "Build release compiler", and
+"Smoke test packaged command") gate on `matrix.scope != 'light'`. "Lint",
+"Lint ratchet", "Build compiler and runtime", and "Bounded PR test gate" still
+run; the gate step passes `ALIGN_GATE_BUILD_ONLY=1` in `light` scope, and
+`scripts/test-pr.sh` responds by running both build phases ("gate build:
+workspace" and "gate build: test binaries") and then printing `gate:
+build-only (light platform scope); binaries not run` instead of invoking
+`scripts/run-gate-binaries.sh` — the same compile-check-only shape the local
+tooling tier already uses, so CI keeps the compile check and its attestation
+without running the bounded gate's binaries.
+
+**What stays full, and why.** `scripts/`, `.github/workflows/`, shared test
+infrastructure under `tests/` (`common*`, `helpers/`, `fixtures/`,
+`golden/`, any nested module), compiled prose
+(`docs/impl/pkg-design/web.md`), and every deletion all classify as library
+tier in `pr_tier_library_changed`, so `pr_tier_platform_scope` returns `full`
+for them — none of `light`'s three exemptions apply to a diff that can widen
+the gate itself, remove shared harness coverage, or touch a document compiled
+into a test binary.
+
+**Owners.** `scripts/test-pr-workflow.sh` gained a dedicated `mtime-repo`
+fixture asserting both restore-from-history (two commits at distinct
+`GIT_COMMITTER_DATE`s, each file lands on its own commit's timestamp) and
+`--changed` (the changed path is reset to within 5 s of `now`, the untouched
+path keeps its historical mtime, and `git status` stays clean throughout —
+mtime is invisible to Git). It also extends the existing `tier-repo`
+classifier fixture with four `pr_tier_platform_scope` assertions: a docs-only
+diff (`none`), a leaf-owner-test diff (`light`), a `scripts/` diff (`full`),
+and an invalid sha pair (`full`).
+
+**Measurement to take on the first PR after merge.** Read the per-step
+timings of "Restore Cargo caches" and "Bounded PR test gate" (and, for a
+tooling-tier PR, confirm the platform job ran only the Linux x86_64 leg) to
+confirm the fingerprint cache is actually hitting post-merge, not only in this
+branch's own local reproduction.
+
+**Follow-ups not done.** Sharding the bounded-gate binaries across parallel
+jobs (the gate build itself, not just the binaries' concurrent execution
+within one job, still runs as a single sequential compile), and revisiting
+the `Save Cargo caches` key now that mtime restoration changes what counts as
+a cache hit.

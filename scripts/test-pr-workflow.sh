@@ -861,6 +861,24 @@ library_case script scripts/new-gate.sh
 library_case workflow .github/workflows/new.yml
 library_case unknown-tree newcrate/src/lib.rs
 
+# pr_tier_platform_scope drives CI's platform-matrix scope (none/light/full);
+# it must agree with the tooling/code split above rather than reimplement it.
+platform_scope_case() {
+  local label="$1" expected="$2" repo="$3" base="$4" head="$5" got
+  got="$(cd "$repo" && . "$repo_root/scripts/pr-tier.sh" && pr_tier_platform_scope "$base" "$head")"
+  [[ "$got" == "$expected" ]] || {
+    echo "pr_tier_platform_scope($label) expected $expected, got $got" >&2
+    exit 1
+  }
+}
+platform_scope_case docs-only none "$docs_repo" "$docs_base" "$docs_candidate"
+platform_scope_case leaf-owner-test light "$tier_repo" \
+  "$(git -C "$tier_repo" rev-parse 'main^{commit}')" "$tooling_head"
+platform_scope_case scripts-change full "$tier_repo" \
+  "$(git -C "$tier_repo" rev-parse 'main^{commit}')" "$(git -C "$tier_repo" rev-parse lib-script)"
+platform_scope_case invalid-sha-pair full "$tier_repo" \
+  deadbeefdeadbeefdeadbeefdeadbeefdeadbeef cafebabecafebabecafebabecafebabecafebabe
+
 # Deleting a leaf owner test removes coverage: never the light tier.
 tier_branch delete-change
 git -C "$tier_repo" rm -q crates/thing/tests/baseline_owner.rs
@@ -2969,6 +2987,79 @@ mkdir -p "$relative_cache_case/package/share/align/cache/1"
       "$relative_cache_case/alignc" package/share/align/cache/1
 )
 
+# scripts/restore-mtime.py undoes actions/checkout's uniform "now" mtime stamp
+# so Cargo's fingerprint cache still hits after a fresh CI checkout. Assert
+# both halves: history restoration assigns each tracked path the commit time
+# of the most recent commit that touched it, and --changed always resets a
+# changed path to "now" regardless of its commit's own timestamp (the
+# soundness rule: a file this change touched must never look older than an
+# artifact built before it).
+mtime_repo="$tmp_dir/mtime-repo"
+mkdir -p "$mtime_repo"
+git -C "$mtime_repo" init -q -b main
+git -C "$mtime_repo" config user.name workflow-test
+git -C "$mtime_repo" config user.email workflow-test@example.invalid
+git -C "$mtime_repo" config commit.gpgsign false
+mtime_t1=1700000000
+mtime_t2=1700086400 # T1 + 1 day
+printf 'a\n' >"$mtime_repo/a.txt"
+git -C "$mtime_repo" add a.txt
+GIT_COMMITTER_DATE="@$mtime_t1" GIT_AUTHOR_DATE="@$mtime_t1" \
+  git -C "$mtime_repo" commit -qm 'add a'
+mtime_commit1="$(git -C "$mtime_repo" rev-parse HEAD)"
+printf 'b\n' >"$mtime_repo/b.txt"
+git -C "$mtime_repo" add b.txt
+GIT_COMMITTER_DATE="@$mtime_t2" GIT_AUTHOR_DATE="@$mtime_t2" \
+  git -C "$mtime_repo" commit -qm 'add b'
+mtime_commit2="$(git -C "$mtime_repo" rev-parse HEAD)"
+
+file_mtime() {
+  if [[ "$(uname -s)" == Darwin ]]; then
+    stat -f %m "$1"
+  else
+    stat -c %Y "$1"
+  fi
+}
+
+( cd "$mtime_repo" && python3 "$repo_root/scripts/restore-mtime.py" ) >"$tmp_dir/mtime-out"
+grep -Eq '^restore-mtime: 2 files restored, 0 changed files touched$' "$tmp_dir/mtime-out" || {
+  echo "restore-mtime printed an unexpected summary for a plain restore:" >&2
+  cat "$tmp_dir/mtime-out" >&2
+  exit 1
+}
+[[ "$(file_mtime "$mtime_repo/a.txt")" -eq "$mtime_t1" ]] || {
+  echo "restore-mtime did not set a.txt to its own commit time" >&2
+  exit 1
+}
+[[ "$(file_mtime "$mtime_repo/b.txt")" -eq "$mtime_t2" ]] || {
+  echo "restore-mtime did not set b.txt to its own commit time" >&2
+  exit 1
+}
+
+mtime_now_before="$(date +%s)"
+( cd "$mtime_repo" && python3 "$repo_root/scripts/restore-mtime.py" \
+    --changed "$mtime_commit1" "$mtime_commit2" ) >"$tmp_dir/mtime-changed-out"
+grep -Eq '^restore-mtime: 2 files restored, 1 changed files touched$' "$tmp_dir/mtime-changed-out" || {
+  echo "restore-mtime --changed printed an unexpected summary:" >&2
+  cat "$tmp_dir/mtime-changed-out" >&2
+  exit 1
+}
+mtime_b_after="$(file_mtime "$mtime_repo/b.txt")"
+[[ "$mtime_b_after" -ge $((mtime_now_before - 5)) ]] || {
+  echo "restore-mtime --changed did not touch b.txt to roughly now (got $mtime_b_after)" >&2
+  exit 1
+}
+[[ "$(file_mtime "$mtime_repo/a.txt")" -eq "$mtime_t1" ]] || {
+  echo "restore-mtime --changed touched a.txt, which the change did not modify" >&2
+  exit 1
+}
+mtime_git_status="$(git -C "$mtime_repo" status --porcelain)"
+[[ -z "$mtime_git_status" ]] || {
+  echo "restore-mtime left the worktree dirty (mtime changes must be invisible to git):" >&2
+  echo "$mtime_git_status" >&2
+  exit 1
+}
+
 for script in \
   bench/prebuilt_cache/run.sh \
   scripts/build-prebuilt-cache.sh \
@@ -2994,6 +3085,10 @@ for script in \
 do
   bash -n "$repo_root/$script"
 done
+# A syntax check that writes nothing: py_compile would leave scripts/__pycache__
+# behind and fail preflight's clean-worktree gate.
+python3 -c 'import ast, sys; ast.parse(open(sys.argv[1], "rb").read(), sys.argv[1])' \
+  "$repo_root/scripts/restore-mtime.py"
 
 # scripts/ci-apt-llvm.sh gates every Linux job's toolchain and broke CI twice in
 # one day; its branches are executed here, root-free and offline, so the same
