@@ -1,5 +1,54 @@
 # Session handoff
 
+## Next work (handoff written 2026-09-18)
+
+The align-llm audit issue batch is partly shipped. Merged: #1089 (plan 68),
+#1090, #1091, #1092, #1096, #1099, #1100 (plan 69), #1101, #1110, #1111
+(plan 69 PR 1), #1113, #1114 (plan 70 ledger), #1115, #1116 (plan 69 PR 2,
+closes #1081). Nothing is in flight; every remaining item below starts from
+`main` with a fresh branch and follows the CLAUDE.md review flow.
+
+Suggested order, each its own PR set (implement, one review, one fix, preflight,
+`scripts/open-pr.sh`, CI, merge):
+
+1. **plan 70 PR 1** (#1071, effects table) — `docs/impl/70-runtime-boundary-effects-plan.md`
+   §3. Precondition: run the §3.6 `argmem` experiment first; its result decides
+   whether invariant D widens. Ledger is already reviewed; no new plan review.
+2. **plan 69 PR 3** (#1084, trip-count exit at the latch) — plan 69 §4. Read
+   §3.7 "the entry value is read, not remembered" first: PR 3's `>` exit relation
+   must keep reading `e` at the preheader.
+3. **plan 70 PR 2** (#1074 cold-path model) and **PR 3** (#1072 inline fast path),
+   in that order — plan 70 §4, §5.
+4. **plan 71 ledger** for #1076/#1077/#1078 (sum-type layout, aggregate transport,
+   drop-state model): one ledger, serialized, one fresh independent adversarial
+   review before any code (CLAUDE.md large-design gate).
+5. Language items after the codegen track: #1085 `str` patterns in `match`,
+   #1065 fixed arrays in structs, #1066 proposal 2, #1064 → depends on #1063,
+   #1075 scalar ABI facts, #1082 P2 RFC.
+6. Follow-ups, independent and small: #1093, #1094, #1102, #1103,
+   #1105–#1109, #1112 (nightly triage findings; each has a manifest line in
+   `scripts/known-failures.txt` that the fix must delete).
+7. **#1095 first if reviews keep stalling.** On 2026-09-18 three codex
+   full-diff reviews of PR #1116 each concluded "no actionable soundness or
+   regression defects" but the phrase whitelist in `scripts/review-bounded.sh`
+   (the `awk` block before "unrecognized native result") matched none of the
+   three wordings, so every run ended INCOMPLETE and the PR had to attest with
+   `--findings-fixed` against the earlier FINDINGS log. The fix is in the
+   wrapper, not the prompt: accept a CLEAN result structurally (no `- [P0-3]`
+   line and a closing no-defects sentence), or make the codex prompt's final
+   marker line mandatory in the parser. Retained evidence: the three
+   `align-review-run-f4e431d3*` directories, copied to the owner's local
+   `.git/paused-1081/` (not part of the repository).
+
+Recorded follow-up from PR #1116's review (plan 69 §3.7): the static
+initializer scan in `align_mir::loop_facts::admit` can be replaced by an
+initialization proof, admitting parameters and multiple initializers on their
+runtime value. It widens §3.2 and needs its own owners; not scheduled.
+
+External register: `../align-llm/docs/align-requests.md` holds uncommitted
+status lines for every merge above (Requests 64, 95, 97–102, 107, 108, 110,
+111, 114–116). Leave it uncommitted unless the owner asks.
+
 **Vectorization contract:** [Plan 68](docs/impl/68-vectorization-contract.md) is
 the design of record for issue 1088 and owns guarantees G1–G10 — the properties
 ordinary Align loops and pipelines need in order to vectorize by default, with
@@ -48,7 +97,11 @@ byte-accessor guards another stage re-derives literally; and a new MIR module
 monotone-index loop into a fast copy whose proved guards are bypassed and the
 original slow copy, which keeps every one of them. No check is deleted, trap
 text and failing iteration are unchanged, and `explain-opt` reports one stable
-decision per source loop. PR 3 is unstarted.
+decision per source loop. The admission reads every operand — including the
+induction entry, loaded live from its slot — at the preheader on every entry
+(plan 69 §3.7, "the entry value is read, not remembered"), and records one
+follow-up: replace the static initializer scan by an initialization proof. PR
+3 (1084) is unstarted.
 [Plan 70](docs/impl/70-runtime-boundary-effects-plan.md) is the planned plan of
 record for G5 (1071, 1072, 1074, folding 1073 part 2 and 1069 part 4): three
 ordered PRs for a per-symbol runtime effects record derived from a closed
