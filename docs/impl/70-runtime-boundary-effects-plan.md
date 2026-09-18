@@ -83,7 +83,7 @@ Four claims are restated by the issues and are re-verified here, because three
 of them have moved since the issues were written.
 
 ```text
-VERIFIED   RuntimeAbiShapeSpec holds one effect bit (runtime_abi.rs:177-184).
+VERIFIED   RuntimeAbiShapeSpec holds one effect bit (runtime_abi.rs:178-185).
            At 956f3869 there are 141 shapes, 104 with fn_attrs: &[], 3 with
            memory_argmem_read: true (A01, A26, A82), 131 with no read_ptr_params
 VERIFIED   the registry is 446 keyed + 18 unkeyed = 464 base rows over those
@@ -98,7 +98,7 @@ CORRECTED  1069 proposal 2 asked for remove_attributes to cover string
            became a separate module-scoped sweep, shed_rt_lto_target_bound_
            attributes + verify_rt_lto_target_independence (lib.rs:7529, :7546),
            which runs PRE-merge on the incoming artifact. The two halves have
-           different scopes, different times and different owners; §3.6 R4 is
+           different scopes, different times and different owners; §3.7 R4 is
            the matrix cell that keeps them consistent under PR 1
 CORRECTED  1072 proposal 4, "stop shipping an untuned runtime archive", is
            already satisfied for the shipped artifact: release.yml builds
@@ -107,6 +107,20 @@ CORRECTED  1072 proposal 4, "stop shipping an untuned runtime archive", is
 CORRECTED  1072 proposal 3, "extend the --rt-lto set to the per-element class",
            FAILS the admission predicate this plan states (§2.4). The per-element
            rows are allocator-reaching. §5.3 records the refusal and its reason
+NARROWED   1071 proposal 2 asks for memory(argmem: readwrite) on
+           align_rt_array_builder_push and align_rt_buffer_put, and
+           memory(argmem: readwrite, inaccessiblemem: readwrite) on the free
+           family. Both are UNSOUND as stated. LLVM's argmem location is
+           "accesses to memory via pointer values BASED ON the function's
+           arguments" (LangRef), and AAResults::getModRefInfo implements it by
+           alias-querying the location against each pointer ARGUMENT, with no
+           reachability step. A container mutator writes through a payload
+           pointer LOADED OUT OF argument memory, which is not based on the
+           argument, so the claim lets LLVM conclude NoModRef for that payload.
+           Every argmem claim shipped today (A01, A26, A82) is a DIRECT reader,
+           which is consistent with this rule and is why the existing curation
+           never hit it. §2.2's invariant D and §3.3 record what the rows get
+           instead, and §3.6 records the one experiment that could widen it
 ```
 
 ### 1.4 Which guarantee each PR closes
@@ -116,13 +130,21 @@ effects record and either an inline fast path or a vector form"*, promising
 *"each runtime ABI symbol carries a complete memory-effects attribute;
 per-element primitives have a visible inline fast path and a visible slow path;
 `Result`/`?` failure edges are cold with one model"*. PR 1 closes the first
-clause, PR 3 the second, PR 2 the third. No clause is widened and none is
-reinterpreted.
+clause, PR 3 the second, PR 2 the third.
+
+No clause is widened. One is **narrowed**, and §7 records the edit that makes
+plan 68 say so: "each runtime ABI symbol carries a complete memory-effects
+*attribute*" is not achievable, because invariant D (§2.2) establishes that the
+correct record for every indirect-storage row is to carry no memory attribute at
+all. "A complete memory-effects *record*" — one per symbol, with no silent
+default — is what PR 1 delivers, and it is what G5's exact statement already
+says. The promised column is corrected to match the exact statement rather than
+the plan quietly under-delivering against it.
 
 ## 2. Public-contract ledger
 
 Every public surface this plan introduces, one row each. This ledger is
-authoritative while drafting; §6 is the author-side consistency pass over it.
+authoritative while drafting; §8 is the author-side consistency pass over it.
 
 ### 2.1 The effects record
 
@@ -131,17 +153,42 @@ Surface           RuntimeEffects, one per RuntimeAbiId, in
                   crates/align_codegen_llvm/src/runtime_abi.rs
 
 Exact type        struct RuntimeEffects {
-                      class:   EffectClass,
-                      argmem:  ArgMem,
-                      params:  &'static [ParamEffect],
-                      retains: &'static [u32],
+                      class:    EffectClass,
+                      argmem:   ArgMem,
+                      params:   &'static [ParamEffect],
+                      escapes:  &'static [u32],
                       releases: Release,
+                      returns_fresh: bool,
+                      diverges: bool,
                   }
-                  enum ArgMem { Unstated, None, Read, Write, ReadWrite }
+                  enum ArgMem { Unstated, None, Read }
                   struct ParamEffect { ordinal: u32, mode: ParamMode }
                   enum ParamMode { Read, Write, ReadWrite, Opaque }
-                  enum Release { NotAFree, HandleOnly, Region }
-                  EffectClass is the closed eleven-variant set of §2.2
+                  enum Release { None, HandleOnly, Indirect, Region }
+                  EffectClass is the closed twelve-variant set of §2.2
+
+                  `escapes` lists every pointer ordinal that may leave the call
+                  by ANY route: retained in a handle, stored into another
+                  argument, or RETURNED. `captures(none)` is emitted for a
+                  pointer ordinal exactly when it is absent from `escapes`,
+                  for every class. This is not a naming detail: with a
+                  `retains`-only field, align_rt_realloc (which may return its
+                  own argument), align_rt_array_builder_init_stack and
+                  align_rt_builder_init_stack (which return `out`), and
+                  align_rt_builder_new / align_rt_array_builder_new_in (which
+                  store their arena argument into the constructed header) would
+                  each receive an unsound `captures(none)`. None of those five
+                  rows carries a parameter attribute today, so the record must
+                  not introduce one.
+
+                  `returns_fresh` and `diverges` are ROW bits, not class
+                  consequences: `noalias` on the return and `noreturn` are
+                  facts about a row, and deriving them from the class token
+                  loses two the tree asserts today (§2.3 V7, V8).
+
+                  `ArgMem` deliberately has no Write or ReadWrite variant. See
+                  invariant D in §2.2: no row in this registry may soundly
+                  claim to WRITE only argument-based memory
 
 Inputs, defaults  none and none. The record is produced by a total match over
                   RuntimeAbiId with no `_` arm, so a new RuntimeKey does not
@@ -157,7 +204,11 @@ Owner             compiler (align_codegen_llvm). The *facts* are properties of
                   machine controls of §3.5
 Artifact/cache    compiler_build_id (cache.rs:135, the hash of the alignc
                   binary bytes) changes, so every codegen-family entry misses
-                  exactly once and then hits. No key COMPONENT is added.
+                  exactly once and then hits. No cache key COMPONENT is added.
+                  The versioned test-control ABI fingerprint
+                  (test_control_runtime_abi_fingerprint) serializes
+                  memory_argmem_read today, must serialize the replacement, and
+                  has its v1 tag bumped in the same change.
                   rt_lto_digest (cache.rs:177) is unchanged: it hashes
                   build.rs's baked bitcode, and PR 1 admits no new guarded row.
                   No unit interface field changes, so no importer is
@@ -182,18 +233,25 @@ Mirrors           20-runtime-abi-ledger.md gains the classification column and
 Surface           one token per row in plan 20's declaration tables, and the
                   fourth |-separated field of each golden line
 
-Exact schema      EffectClass, a closed set of exactly eleven tokens:
+Exact schema      EffectClass, a closed set of exactly twelve tokens. "Direct"
+                  below always means the LangRef sense of invariant D: memory
+                  reached through a pointer BASED ON a parameter, never through
+                  a pointer loaded out of one.
 
   PureScalar      no pointer parameter; touches no memory; terminates
-  PureArgRead     reads only through pointer parameters; no allocator, no
-                  process state; terminates
-  ArgWrite        reads and writes only through pointer parameters; never
-                  reaches the allocator; terminates
-  ArgWriteAlloc   reads and writes through pointer parameters and may reach the
-                  allocator; every object it can free is argument-derived
-  AllocNew        allocator-class constructor returning a fresh owned handle
-  FreeLocal       null-safe deallocator; every object it releases is
-                  argument-derived and its Drop touches no process state
+  PureArgRead     reads only direct parameter memory; no allocator, no process
+                  state; terminates
+  ArgRead         reads only direct parameter memory but may allocate or free
+                  through the allocator; terminates or aborts on OOM
+  AllocNew        allocator-class constructor returning a fresh allocation that
+                  aliases nothing the caller holds
+  FreeLocal       null-safe deallocator whose released object IS the argument's
+                  own allocation, exactly as libc `free` (align_rt_free is the
+                  one shipped row that qualifies)
+  IndirectStorage reads or writes storage reached by loading a pointer out of
+                  parameter memory: every container mutator, every handle whose
+                  payload is a separate allocation, and every deallocator that
+                  releases one
   DispatchCache   otherwise PureArgRead, but reads a process-global CPU-feature
                   or dispatch cache
   HostState       reads or writes process/OS state: files, sockets, env, clock,
@@ -201,6 +259,7 @@ Exact schema      EffectClass, a closed set of exactly eleven tokens:
   Callback        calls an Align function pointer the caller supplied
   Foreign         crosses into a third-party native library
   FailNoReturn    diverges through the runtime abort family
+  ProcessExit     diverges by terminating the process
 
 Inputs, defaults  none and none; see §2.1
 Errors            §2.3's structural rejections
@@ -225,42 +284,111 @@ conventions.
 
 **Exact derivation.** `apply_attributes` emits exactly this and nothing else:
 
-| class | `memory(...)` | function attributes | return | pointer parameters |
-|---|---|---|---|---|
-| `PureScalar` | `memory(none)` | `nounwind nofree nosync willreturn` | — | none exist |
-| `PureArgRead` | `memory(argmem: read)` | `nounwind nofree nosync willreturn` | — | `readonly captures(none)` per `params` |
-| `ArgWrite` | `memory(argmem: <argmem>)` | `nounwind nofree nosync willreturn` | — | `readonly`/`writeonly` per `params`, `captures(none)` unless in `retains` |
-| `ArgWriteAlloc` | `memory(argmem: <argmem>, inaccessiblemem: readwrite)` | `nounwind` | — | `readonly`/`writeonly` per `params`, `captures(none)` unless in `retains` |
-| `AllocNew` | `memory(argmem: <argmem>, inaccessiblemem: readwrite)`, and `memory(inaccessiblemem: readwrite)` when `argmem == None` | `nounwind nofree` | `noalias` | `readonly captures(none)` per `params` |
-| `FreeLocal` | `memory(argmem: readwrite, inaccessiblemem: readwrite)` | `nounwind` | — | none |
-| `DispatchCache` | withheld | `nounwind nofree nosync willreturn` | — | `readonly captures(none)` per `params` |
-| `HostState` | withheld | `nounwind` | — | `readonly captures(none)` only for a `params` ordinal explicitly recorded `Read` |
-| `Callback` | withheld | `nounwind` | — | none |
-| `Foreign` | withheld | `nounwind` | — | none |
-| `FailNoReturn` | `memory(inaccessiblemem: readwrite)` | `nounwind noreturn cold` | — | none |
+The `memory` and flag columns are fixed by the class. The `return` and
+parameter columns are the row's own bits, applied uniformly: `noalias` on the
+return exactly when `returns_fresh`, `noreturn` exactly when `diverges`,
+`readonly`/`writeonly` per `params`, and `captures(none)` on every pointer
+ordinal absent from `escapes`. The parameter columns below therefore say only
+which rows may record `params` at all.
+
+| class | `memory(...)` | function attributes | may record `params` |
+|---|---|---|---|
+| `PureScalar` | `memory(none)` | `nounwind nofree nosync willreturn` | no pointer exists |
+| `PureArgRead` | `memory(argmem: read)` | `nounwind nofree nosync willreturn` | `Read` only |
+| `ArgRead` | `memory(argmem: read, inaccessiblemem: readwrite)` | `nounwind` | `Read` only |
+| `AllocNew` | `memory(argmem: read, inaccessiblemem: readwrite)`, or `memory(inaccessiblemem: readwrite)` when `argmem == None` | `nounwind nofree` | `Read` only |
+| `FreeLocal` | `memory(argmem: readwrite, inaccessiblemem: readwrite)` | `nounwind` | none |
+| `IndirectStorage` | withheld | `nounwind` | `Read` only, and only for a directly-read ordinal |
+| `DispatchCache` | withheld | `nounwind nofree nosync willreturn` | `Read` only |
+| `HostState` | withheld | `nounwind` | `Read` only, and only for a directly-read ordinal |
+| `Callback` | withheld | `nounwind` | none |
+| `Foreign` | withheld | `nounwind` | none |
+| `FailNoReturn` | `memory(inaccessiblemem: readwrite)` | `nounwind cold` | none |
+| `ProcessExit` | `memory(inaccessiblemem: readwrite)` | `nounwind` | none |
 
 *Withheld* means no `memory` attribute is emitted, which is LLVM's most
 conservative state: the call may read and write all memory. Withholding is the
 fail-open-into-correctness direction, and it is what makes an over-conservative
 classification cost optimization rather than soundness.
 
-Five facts in that table need their reason on the record.
+**Precedence among the withheld classes is total and ordered**, because they
+overlap on real rows and do not emit identical declarations: a row that is more
+than one of them takes the FIRST that applies, in the order `FailNoReturn`,
+`ProcessExit`, `Foreign`, `Callback`, `HostState`, `IndirectStorage`,
+`DispatchCache`. A generated-SQLite-callback registration is `Foreign` and a
+`par_map` row is `Callback`; neither may record `params`, so the class token is
+determined by the row's properties and the golden cannot drift.
+
+Seven facts in that table need their reason on the record.
+
+**Invariant D — `argmem` is direct-access only, and nothing in this registry
+writes only direct-access memory.** LLVM's `argmem` location means *"accesses to
+memory via pointer values based on the function's arguments"*, and `based on`
+excludes a pointer obtained by loading through another. `AAResults::getModRefInfo`
+implements exactly that: for an `onlyAccessesArgPointees` call it alias-queries
+the queried location against each pointer argument with
+`MemoryLocation::getForArgument`, with no reachability step. A container mutator
+writes through the payload pointer it loads out of its handle, which `BasicAA`
+will report `NoAlias` against the handle, so `memory(argmem: readwrite)` on such
+a row entitles LLVM to conclude `NoModRef` for that payload — and to sink a store
+to it past the call. This is not hypothetical for this wave: PR 3's fast path
+emits exactly `%data = load ptr, %b` followed by a store through `%data`, around
+slow-path calls to the same handle.
+
+Consequently `ArgMem` has no `Write` variant, no class emits `argmem: readwrite`
+except `FreeLocal`, and every mutator, every payload-owning deallocator, and
+every builder writer is `IndirectStorage` with memory withheld. Every `argmem`
+claim shipped today — A01, A26, A82 — is a direct reader of a `{ptr, len}`
+argument, which is why the 2026-07-11 curation never met this and why the
+existing rows are preserved unchanged.
+
+`FreeLocal` is therefore not a family and not a shape. `align_rt_free(ptr)`
+releases exactly the argument's own allocation, precisely as libc `free`, whose
+LLVM declaration is `memory(argmem: readwrite, inaccessiblemem: readwrite)`.
+Every other deallocator releases a payload reached by a load and is
+`IndirectStorage`, and a region teardown is `HostState`. In particular
+`align_rt_free_string_array` and the `array_builder_free_strings` pair walk an
+array and free each element pointer loaded from argument memory, and those
+element buffers came from `align_rt_alloc`, which is declared `noalias ptr`: a
+`FreeLocal` claim on them is the same store-after-free hazard as the arena one.
+
+**A62 is a shape, not a class.** The `void @SYM(ptr)` shape carries 43 registry
+rows and spans at least four classes: `align_rt_free` is `FreeLocal`,
+`align_rt_buffer_free` and `align_rt_array_builder_free` are `IndirectStorage`,
+`align_rt_arena_end`, `align_rt_tg_end`, `align_rt_io_file_free`,
+`align_rt_tcp_conn_free`, `align_rt_child_free`, `align_rt_crypto_random` and
+`align_rt_rng_seed_os` are `HostState`, and `align_rt_builder_pop_comma` frees
+nothing. Naming an A-shape as a class family would be exactly the
+signature-keyed effects that invariant I1 forbids and that 1071 identifies as
+the root cause.
 
 **`nounwind` is universal.** Every base row is a Rust `extern "C"` function, and
-in edition 2024 an unwind out of `extern "C"` aborts. No runtime export declares
-`extern "C-unwind"`. The class table therefore emits `nounwind` for all eleven
-classes, and an owner asserts that no `align_rt_*` export uses `C-unwind`, so
-adding one fails the gate rather than silently invalidating 464 declarations.
+since Rust 1.81 an unwind out of `extern "C"` aborts. That is an ABI property of
+the toolchain, not of the edition, so the invariant's stated basis is the
+workspace's rustc floor, which is the thing a version bump could move. No
+runtime export declares `extern "C-unwind"`. The class table therefore emits
+`nounwind` for all twelve classes, and an owner asserts that no `align_rt_*`
+export uses `C-unwind`, so adding one fails the gate rather than silently
+invalidating 464 declarations.
 
 **`nosync` is never emitted with the allocator.** `malloc`/`free` synchronize,
-so `ArgWriteAlloc`, `AllocNew` and `FreeLocal` carry neither `nosync` nor
-`willreturn` — OOM aborts, which is divergence.
+so `ArgRead`, `AllocNew`, `FreeLocal` and `IndirectStorage` carry neither
+`nosync` nor `willreturn` — OOM aborts, which is divergence.
 
-**A reallocating row is `ArgWriteAlloc`, never `AllocNew`.** `AllocNew` fixes
-`nofree` and a `noalias` return, and both are false for
-`align_rt_realloc(ptr, i64)`: it frees its argument and its result may be that
-same pointer. V7 enforces the `noalias` half structurally, and the class
-definition — *constructor returning a fresh owned handle* — excludes it.
+**A reallocating row is `IndirectStorage`, never `AllocNew`.** `AllocNew` fixes
+`nofree`, and the class definition requires a fresh allocation aliasing nothing
+the caller holds. Both are false for `align_rt_realloc(ptr, i64)`: it frees its
+argument and may return that same pointer. It therefore records
+`escapes: [0]`, so it never receives `captures(none)`, and `releases: HandleOnly`.
+
+**A constructor that returns an argument-derived pointer is not `AllocNew`.**
+`align_rt_array_builder_init_stack(out, …)` and `align_rt_builder_init_stack(out, …)`
+return `out`; `align_rt_builder_init_bounded_stack` writes into caller storage.
+All three are `IndirectStorage` with `returns_fresh: false` and `escapes: [0]`.
+`align_rt_builder_new(arena, …)` and `align_rt_array_builder_new_in(arena, …)`
+are `AllocNew` for their return but store the arena argument into the header
+they construct, so both record `escapes: [0]`, and `new_in` records no `Read`
+mode for that ordinal because it bump-allocates out of it.
 
 **`FailNoReturn` gets `memory(inaccessiblemem: readwrite)`.** The fail family
 takes no pointer argument and writes a message through Rust's global stderr
@@ -268,6 +396,15 @@ machinery, which is exactly what LLVM's own `inaccessiblemem` models for
 `abort`/`exit`/stdio. This is the half of 1074 whose loss is measured: a kernel
 with a surviving bounds check collapses to `{ nounwind }` today because the
 declaration states nothing.
+
+**`ProcessExit` is a separate class from `FailNoReturn`.** The `noreturn`
+attribute group `#1` has eight members today, not seven:
+`align_rt_process_exit(i64)` is a deliberate program termination, not an abort.
+It keeps `noreturn` through the row's `diverges` bit and gets the same
+`inaccessiblemem` model, but it must not be `cold` — `process.exit` on a
+success path is ordinary control flow, and marking it cold would misweight a
+normal program's exit. Folding it into the abort family would have silently
+dropped a `noreturn` the tree asserts today.
 
 **`HostState` keeps memory withheld in this wave.** An I/O row could in
 principle carry LLVM's `memory(argmem: ..., inaccessiblemem: readwrite)` stdio
@@ -278,18 +415,22 @@ row (`env_set`/`env_get` is the clearest pair), and no measured evidence in
 1071, 1072, 1073 or 1074 comes from an I/O row. Narrowing `HostState` per symbol
 later is a follow-up under this same machinery, not a reopening of the schema.
 
-**A region teardown is `HostState`, not `FreeLocal`.** `align_rt_arena_alloc`
-and `align_rt_tg_alloc` are declared `noalias ptr` (A45), so an arena-allocated
-object is, by declaration, *not* derived from the arena argument. If
-`align_rt_arena_end(arena)` claimed `memory(argmem: readwrite,
-inaccessiblemem: readwrite)`, LLVM would be entitled to sink a store to that
-`noalias` object past the teardown: a store after free. `align_rt_arena_end`,
+**A region teardown is `HostState`, not a deallocator class.**
+`align_rt_arena_alloc` and `align_rt_tg_alloc` are declared `noalias ptr` (A45),
+so an arena-allocated object is, by declaration, *not* derived from the arena
+argument. If `align_rt_arena_end(arena)` claimed any `argmem`-limited
+deallocation, LLVM would be entitled to sink a store to that `noalias` object
+past the teardown: a store after free. `align_rt_arena_end`,
 `align_rt_arena_reset` and `align_rt_tg_end` are therefore `HostState` with
-`releases: Region`, and §2.3 rejects `FreeLocal` combined with `Region`
-structurally. `align_rt_buffer_free` and the rest of the A62 family are
-`FreeLocal` with `releases: HandleOnly`, because every view they invalidate
-(`align_rt_buffer_bytes`, A72) was produced from the same handle through a
-non-`noalias` return.
+`releases: Region` — `tg_end` additionally joins threads — and §2.3 rejects
+`Region` and `Indirect` on any class but `HostState` and `IndirectStorage`.
+
+The shape of that hazard is worth stating once, because it is the same one
+invariant D states for writes: whenever LLVM can prove `NoAlias` between a
+pointer the caller holds and the pointer the row receives, an `argmem`-limited
+claim removes that row from the caller's mod/ref picture for that pointer. That
+is correct only when the released or written object genuinely is the argument's
+own allocation.
 
 ### 2.3 Structural validity
 
@@ -304,21 +445,41 @@ Errors            one Err(String) per violated rule, in this deterministic
                   must already have proved present:
 
   V1  every RuntimeAbiId has a RuntimeEffects record       (totality)
-  V2  a params ordinal names a NativeType::Ptr of that row's shape
-  V3  a retains ordinal names a NativeType::Ptr of that row's shape
-  V4  a params mode of Write or ReadWrite requires argmem in {Write, ReadWrite}
-  V5  a params mode of Read requires argmem in {Read, ReadWrite}
-  V6  a withheld class (DispatchCache, HostState, Callback, Foreign) requires
-      argmem == Unstated; a memory-claiming class forbids Unstated
-  V7  return_noalias is set for AllocNew rows and for no other class
-  V8  FailNoReturn forbids willreturn; it is the only class that emits noreturn
-  V9  releases == NotAFree for every class but FreeLocal and HostState;
-      FreeLocal forbids releases == Region
-  V10 a row with no pointer parameter forbids a nonempty params or retains,
+  V2  a params ordinal names a NativeType::Ptr of that row's shape, and no
+      ordinal appears twice
+  V3  an escapes ordinal names a NativeType::Ptr of that row's shape
+  V4  a params mode of Write or ReadWrite is rejected outright. Invariant D
+      leaves no sound way to state a direct-only write, so the mode exists in
+      the type only so that a future widening (§3.6) has somewhere to land,
+      and until then it fails closed
+  V5  a memory-claiming class (PureScalar, PureArgRead, ArgRead, AllocNew,
+      FreeLocal, FailNoReturn, ProcessExit) requires argmem to match its row
+      in the §2.2 table exactly: None for PureScalar, FreeLocal, FailNoReturn
+      and ProcessExit; Read or None for ArgRead and AllocNew; Read for
+      PureArgRead
+  V6  a withheld class (IndirectStorage, DispatchCache, HostState, Callback,
+      Foreign) requires argmem == Unstated. Parameter attributes are NOT
+      coupled to argmem: a withheld row may still record a Read ordinal and
+      receive readonly captures(none), which is what align_rt_utf8_valid,
+      str_find, str_rfind and str_finder_find carry today with no memory
+      attribute (golden attribute group #4)
+  V7  returns_fresh requires the row's NativeReturn to be Ptr, and is rejected
+      for FreeLocal, FailNoReturn and ProcessExit. It is a ROW bit, not an
+      AllocNew consequence: align_rt_par_map is declared `noalias ptr` today
+      and is a Callback row
+  V8  diverges is set exactly for FailNoReturn and ProcessExit, and a row with
+      diverges set forbids willreturn
+  V9  releases == None for every class but FreeLocal, IndirectStorage and
+      HostState; FreeLocal requires HandleOnly; Indirect and Region are
+      permitted only on IndirectStorage and HostState respectively. "Releases"
+      names what the row does to a CALLER-VISIBLE object, so a row that only
+      recycles its own internal storage through the allocator records None
+  V10 a row with no pointer parameter forbids a nonempty params or escapes,
       and PureScalar requires exactly that shape
   V11 the existing key-count, base-count, bijection and key-symbol rules
-  V12 every row listed in the --rt-lto guarded set satisfies P1-P5 of §2.4,
-      and no row satisfying none of them is listed
+  V12 every row listed in the --rt-lto guarded set satisfies P1 and P2 of §2.4.
+      P3, P4 and P5 are properties of the baked artifact, which does not exist
+      at this point; §2.4 gives them their own check and error path
 
 Ownership         none; no value escapes
 Allocation        the existing error String only, on failure
@@ -341,8 +502,8 @@ Surface           RuntimeAbi::is_rt_lto_guarded (runtime_abi.rs:337), restated
 Exact predicate   a row is admissible to the --rt-lto guarded set exactly when
                   ALL of:
 
-  P1  class in {PureScalar, PureArgRead, ArgWrite}
-  P2  retains is empty
+  P1  class in {PureScalar, PureArgRead}
+  P2  escapes is empty and releases == None
   P3  its Rust body's call graph is closed inside the baked artifact:
       no cross-crate call, no allocator, no panic/abort machinery
   P4  the baked definition carries no semantic string attribute
@@ -353,12 +514,22 @@ Exact predicate   a row is admissible to the --rt-lto guarded set exactly when
   P6  a recorded paired measurement on both supported architectures shows no
       regression at the default --target-cpu
 
-Inputs, defaults  none. P1-P5 are static and machine-checked; P6 is a recorded
-                  measurement, and a row without one is not admitted
-Errors            a row failing P1-P5 while listed as guarded fails
-                  validate_registry (rule V12). P6 has no compile-time form:
-                  it gates the PR that adds the row, and its measurement is
-                  recorded in plan 20 beside the row
+Inputs, defaults  none. P1-P2 are registry properties; P3-P5 are properties of
+                  the baked artifact; P6 is a recorded measurement, and a row
+                  without one is not admitted
+Errors            THREE checks with three error paths, because the three groups
+                  are knowable at three different times:
+                  - P1-P2 are checked by validate_registry (V12), before any
+                    LLVM value exists, and fail the compiler build
+                  - P3-P5 are checked by an artifact-time owner over the parsed
+                    str_prims.bc, per guarded row, and fail that owner. They
+                    deliberately do NOT run inside link_in_rt_lto: the existing
+                    verify_rt_lto_target_independence sweeps every definition
+                    with a body and falls back for the whole artifact, so it
+                    can never exclude one row, and a per-row admission question
+                    must not be able to disable rt-LTO on a user's build
+                  - P6 gates the PR that admits the row; its measurement is
+                    recorded in plan 20 beside the row
 Ownership         none
 Allocation        none
 Owner             compiler for P1-P5, the admitting PR for P6
@@ -371,8 +542,9 @@ Artifact/cache    rt_lto_digest changes exactly when the guarded set or the
 Prerequisite      1069 parts 1-3, shipped in PR #1091. Without target
                   independence a merged body does not inline at the default
                   --target-cpu on aarch64, so P6 could not be measured honestly
-Acceptance        rt_lto_admission_predicate_matches_the_guarded_set, plus one
-                  negative per P1-P5
+Acceptance        rt_lto_admission_predicate_matches_the_guarded_set (P1-P2,
+                  one negative each) and rt_lto_guarded_bodies_meet_the_artifact
+                  _budget (P3-P5, one negative each, over the baked bitcode)
 Benchmark         P6 is the benchmark, and it is an admission gate for a row,
                   never a correctness gate
 Mirrors           20-runtime-abi-ledger.md, whose rt-LTO paragraph currently
@@ -380,10 +552,10 @@ Mirrors           20-runtime-abi-ledger.md, whose rt-LTO paragraph currently
 ```
 
 One line: **a runtime row may join the `--rt-lto` guarded set exactly when its
-effect class is `PureScalar`, `PureArgRead` or `ArgWrite`, it retains no pointer
-argument, its baked body is crate-closed, carries no string attribute and stays
-within the instruction budget, and a recorded paired measurement shows no
-regression at the default `--target-cpu` on both architectures.**
+effect class is `PureScalar` or `PureArgRead`, no pointer argument escapes and
+it releases nothing, its baked body is crate-closed, carries no string attribute
+and stays within the instruction budget, and a recorded paired measurement shows
+no regression at the default `--target-cpu` on both architectures.**
 
 Applied to the current set: `StrEq`, `StrStartsWith`, `StrEndsWith` and
 `StrEqIgnoreCase` are `PureArgRead` and pass every clause. `StrCmp` is also
@@ -391,15 +563,15 @@ Applied to the current set: `StrEq`, `StrStartsWith`, `StrEndsWith` and
 regression, which is exactly the outcome 1069 asks for — a row that failed the
 criterion, not evidence against having one.
 
-Why the allocator classes are excluded, stated once. A merged definition is set
-`internal` and has its curated attributes shed, on the theory that LLVM
-re-derives them from the now-visible body. That holds for a leaf predicate. It
-is false for an allocator-reaching body: the growth path calls
-`align_rt_realloc` and the runtime's abort machinery, neither of which is in the
-baked artifact, so the merged body keeps an opaque external call and LLVM
+Why the allocator and indirect-storage classes are excluded, stated once. A
+merged definition is set `internal` and has its curated attributes shed, on the
+theory that LLVM re-derives them from the now-visible body. That holds for a
+leaf predicate. It is false for an allocator-reaching body: the growth path
+calls `align_rt_realloc` and the runtime's abort machinery, neither of which is
+in the baked artifact, so the merged body keeps an opaque external call and LLVM
 re-derives *less* than the declaration promised. Merging such a row therefore
 trades a precise declaration for an imprecise definition. `array_builder_push`
-is `ArgWriteAlloc` and is excluded for exactly this reason; §5.3 records the
+is `IndirectStorage` and is excluded for exactly this reason; §5.3 records the
 resulting refusal of 1072 proposal 3 and what replaces it.
 
 ### 2.5 The `ExceptionalEdge` record (PR 2)
@@ -418,13 +590,17 @@ Exact type        struct ExceptionalEdge {
                   }
                   MirFn gains `exceptional_edges: Vec<ExceptionalEdge>`
 
-Inputs, defaults  recorded by the lowering that CREATES the edge, at the six
-                  sites that exist today: the `?` desugaring
-                  (align_mir/src/lib.rs:22022, whose NOTE this replaces),
-                  emit_bounds_check (:11889), emit_range_bounds_check (:12627)
-                  and the A-range arm (:12055, :12105), emit_vec_bounds_check
-                  (:12612), the UTF-8 boundary arm (:12745), the runtime
-                  divide-guard arm, and the length-mismatch arm (:15215).
+Inputs, defaults  recorded by the lowering that CREATES the edge. Six KINDS
+                  over nine recording SITES, which are not the same count:
+                    ResultPropagate  the `?` desugaring (align_mir/src/lib.rs
+                                     :22022, whose NOTE this replaces)
+                    BoundsCheck      emit_bounds_check (:11889),
+                                     emit_vec_bounds_check (:12612)
+                    RangeCheck       emit_range_bounds_check (:12627) and the
+                                     two A-range arms (:12055, :12105)
+                    Utf8Boundary     the boundary arm (:12745)
+                    DivByZero        the runtime divide guards (:11673, :11836)
+                    LenMismatch      the length-mismatch arm (:15215)
                   It is never inferred from a terminator's shape afterwards.
                   The default is an empty vector: an edge nobody recorded is
                   an ordinary branch
@@ -459,6 +635,18 @@ unlikely weight on the successor the record names. The printed form is pinned
 the way the `memory(...)` bitmask is pinned, so an LLVM change to those
 constants fails an owner rather than silently producing a different layout.
 
+**Deliberately not recorded, with the reason.** MIR synthesizes further branches
+whose unlikely successor calls a diverging runtime row and which none of the six
+kinds names: the raw-call guard (`align_mir/src/lib.rs:11119`), the `impossible`
+arm (`:15730`), the exceeded arm (`:19556`), and the capacity guards (`:21475`,
+`:21593`). They are left unweighted in this wave because each reaches
+`align_rt_process_abort`, whose `noreturn` already makes LLVM's own
+`unreachable` heuristic sink the block — the one mechanism 1074 measures as
+working. Adding a seventh `Guard` kind for them would duplicate that heuristic.
+`ExceptionalKind` is closed, so a later capability that needs one adds the
+variant and its recording site together; the omission is a decision here, not a
+gap the closed enum hides.
+
 ### 2.6 `cold` inference (PR 2 Tier 2)
 
 ```text
@@ -485,9 +673,11 @@ Artifact/cache    object content changes; compiler_build_id covers it. Not an
                   another unit can call, so per-unit fails closed and emits
                   nothing for it. cold is a hint with no semantic content, so
                   the two builds differ in object bytes and in nothing else.
-                  This is stated because plan 20's machine gates otherwise
-                  require whole-program and per-unit agreement on attributes,
-                  and this is the one deliberate exception
+                  Plan 20's agreement gate covers "identical alphabetical
+                  runtime DECLARATIONS"; cold lands on Align-generated
+                  DEFINITIONS, which that gate does not reach, so no exception
+                  to it is needed or claimed and it stays absolute for runtime
+                  declarations
 Prerequisite      §2.5
 Acceptance        a positive owner on a fixture whose error-only helper is
                   reached solely from an Err arm; a negative owner on a helper
@@ -536,14 +726,20 @@ Allocation        the fast path allocates nothing; that is its definition. The
 Owner             align_codegen_llvm emits, align_runtime owns the layout
 Layout pins       ArrayBuilder is already #[repr(C)] with raw fields
                   (align_runtime/src/lib.rs:17582). Its existing assertion is a
-                  BOUND (size <= 64, align <= 16, :17594), which does not pin an
-                  offset. PR 3 replaces it with exact pins:
+                  BOUND (size <= 64, align <= 16, :17593), which does not pin an
+                  offset. PR 3 ADDS exact pins beside it, keeping the existing
+                  alignment bound, which is load-bearing for
+                  align_rt_array_builder_init_stack's documented "at least 64
+                  writable bytes aligned to 16" precondition and for the
+                  companion size_of::<ArrayBuilder>() + size_of::<Buffer>()
+                  <= 128 assertion:
                     offset_of!(ArrayBuilder, data)      == 0
                     offset_of!(ArrayBuilder, len)       == 8
                     offset_of!(ArrayBuilder, cap)       == 16
                     offset_of!(ArrayBuilder, elem_size) == 24
                     offset_of!(ArrayBuilder, arena)     == 32
                     size_of::<ArrayBuilder>()           == 64
+                    align_of::<ArrayBuilder>()          <= 16   (retained)
                   as const assertions, plus a compiler-side constant table
                   carrying the same five offsets and one owner asserting the
                   two agree. A field reorder then fails the runtime build, and
@@ -608,9 +804,15 @@ Artifact/cache    libalign_runtime.a bytes change. The archive is NOT a cache
                   rustc invocation). [profile.dist] is unchanged and already
                   carries lto = "thin" and codegen-units = 1
 Prerequisite      none
-Acceptance        an owner asserting the shipped `_align_rt_array_builder_push`
-                  contains no `bl <ArrayBuilder::reserve>`, run against the
-                  archive the driver actually links
+Acceptance        a SYMBOL-level owner over the release archive: `llvm-nm
+                  --defined-only` on libalign_runtime.a must report no
+                  `ArrayBuilder::reserve` symbol reachable as an external
+                  relocation target from align_rt_array_builder_push's section.
+                  Deliberately not a disassembly grep for `bl <reserve>`: `bl`
+                  is AArch64 only, the leading underscore is Mach-O only, and
+                  the memory note "aarch64 shape gates are x86-only" records
+                  exactly this trap. The owner skips, loudly, when no `--release`
+                  archive is present, because no test target builds one
 Benchmark         the §2.7 benchmark covers it; the build-time delta is
                   recorded in 21-build-perf-plan.md's item ledger
 Mirrors           21-build-perf-plan.md (a new item recording the decision and
@@ -631,8 +833,8 @@ align_codegen_llvm/src/runtime_abi.rs
   ABI digest serializes the record in place of memory_argmem_read
 
 align_codegen_llvm/src/lib.rs
-  the MEM_ARGMEM_READ constant is joined by the three further MemoryEffects
-  bitmasks the classes need, each with its own textual pin in
+  the MEM_ARGMEM_READ constant is joined by the four further MemoryEffects
+  bitmasks §3.2 enumerates, each with its own textual pin in
   rt_contract_attrs_pin_encoding_and_curation
 
 align_runtime
@@ -650,16 +852,31 @@ removing the fields is what makes the old keying unrepresentable rather than
 merely discouraged. Align is pre-release; there is no transitional shape spec
 carrying both.
 
-### 3.2 The four new bitmask pins
+### 3.2 The complete bitmask set
+
+The class × `ArgMem` product is small and closed, because `ArgMem` has three
+variants and only seven classes claim memory at all. This is the exhaustive
+list; nothing else is reachable, and each line gets its own textual pin:
 
 ```text
-memory(none)                                       MemoryEffects::none()
-memory(argmem: read)                               existing MEM_ARGMEM_READ
-memory(argmem: readwrite)
-memory(argmem: readwrite, inaccessiblemem: readwrite)
+memory(none)                                  PureScalar             (existing:
+                                                                  none emitted)
+memory(argmem: read)                          PureArgRead      MEM_ARGMEM_READ,
+                                                                       existing
+memory(inaccessiblemem: readwrite)            ArgRead / AllocNew with
+                                              argmem == None; FailNoReturn;
+                                              ProcessExit                   NEW
 memory(argmem: read, inaccessiblemem: readwrite)
-memory(inaccessiblemem: readwrite)
+                                              ArgRead / AllocNew with
+                                              argmem == Read                NEW
+memory(argmem: readwrite, inaccessiblemem: readwrite)
+                                              FreeLocal                     NEW
 ```
+
+Four new masks, one existing, one (`memory(none)`) new in emission though
+trivially encoded. `memory(argmem: readwrite)` alone and every
+`argmem: write` form are unreachable by construction: invariant D removes the
+`Write` variant from `ArgMem`, and V4 rejects a write-claiming parameter mode.
 
 Each is emitted through `add_valued_enum_attr(..., "memory", <mask>)` and each
 gets an assertion on its exact printed form, for the reason the existing
@@ -671,29 +888,55 @@ module continues to round-trip through `llvm-as-22`
 
 ### 3.3 What each measured symptom becomes
 
+Invariant D narrows this substantially against what 1071 proposal 2 asks for,
+and the narrowing is stated rather than quietly absorbed.
+
 ```text
-1071 (a)  align_rt_buffer_free becomes FreeLocal:
-          memory(argmem: readwrite, inaccessiblemem: readwrite) nounwind.
-          A non-escaping entry alloca never passed to the call is then provably
-          untouched, and DSE removes its dead memset
-1071 (b)  align_rt_buffer_put becomes ArgWriteAlloc:
-          memory(argmem: readwrite, inaccessiblemem: readwrite) nounwind.
-          The borrowed view header is loop-invariant across the call
-1071 (c)  align_rt_array_builder_push becomes ArgWriteAlloc, so the builder
-          handle is no longer reloaded from the frame before each push
+1071 (a)  align_rt_buffer_free becomes IndirectStorage, NOT a FreeLocal claim:
+          it releases the inner payload through a loaded pointer. Memory stays
+          withheld; the row gains nounwind and, through `escapes`, an honest
+          capture record. 1071's criterion 3 (zero memsets for a dead local) is
+          therefore NOT promised by effects alone in this wave; BasicAA's
+          existing non-escaping-allocation reasoning is what can reach it, and
+          §3.6 records the experiment that would tell us whether anything more
+          is available
+1071 (b)  align_rt_buffer_put becomes IndirectStorage for the same reason
+1071 (c)  align_rt_array_builder_push becomes IndirectStorage for the same
+          reason. Criterion 4's LICM claim is likewise not promised by effects
+          alone
 1073 (2)  align_rt_buffer_put and align_rt_buffer_append_filled are classified
-          by the same rule; this issue's half (2) is closed by that, not by a
-          second shape variant
+          by the same rule, which is what this issue's half (2) asks for: one
+          model, not a second shape variant. The classification is
+          IndirectStorage, not the argmem claim the issue proposes
 1074 T3   align_rt_bounds_fail, range_fail, utf8_boundary_fail,
           len_mismatch_fail, div_fail, alloc_size_fail and process_abort become
           FailNoReturn: noreturn cold nounwind
-          memory(inaccessiblemem: readwrite). A caller with a surviving check
-          keeps its inferred memory(read, ...) instead of collapsing to
-          { nounwind }
+          memory(inaccessiblemem: readwrite). align_rt_process_exit becomes
+          ProcessExit: noreturn nounwind memory(inaccessiblemem: readwrite),
+          keeping the noreturn it carries today and deliberately not cold.
+          A caller with a surviving check keeps its inferred memory(read, ...)
+          instead of collapsing to { nounwind }: THIS is the measured effect
+          this wave does deliver
+align_rt_alloc   AllocNew with argmem == None: noalias return,
+          memory(inaccessiblemem: readwrite) nounwind nofree. align_rt_free is
+          the one FreeLocal row, releasing exactly its argument's allocation
+align_rt_par_map Callback, memory withheld, returns_fresh: true — it keeps the
+          noalias return the golden asserts today
 withheld  align_rt_utf8_valid, str_find, str_rfind and str_finder_find become
-          DispatchCache and keep claiming no memory effect. The withholding is
-          now a named class with a stated reason rather than an empty cell
+          DispatchCache and keep claiming no memory effect and their existing
+          readonly captures(none) parameters. The withholding is now a named
+          class with a stated reason rather than an empty cell
 ```
+
+What PR 1 therefore delivers, stated honestly: complete classification with no
+silent default, universal `nounwind` across 464 rows, `noreturn` preserved on
+all eight rows that carry it, `cold` and an explicit memory effect on the abort
+family (1074 Tier 3, the one measured effect-attribute win in the four issues),
+`memory(none)` and `memory(argmem: read)` on the genuinely direct rows,
+honest `captures(none)` coverage including the five rows §2.2 names as needing
+an `escapes` record, and the admission predicate. It does **not** deliver
+1071's criteria 3 and 4 by attribute alone. PR 3's fast path, which removes the
+call rather than describing it, is what reaches the per-element measurements.
 
 ### 3.4 Invariants
 
@@ -708,10 +951,12 @@ I3  a memory-claiming class is emitted only when the claim is true for EVERY
     input, including a null handle, an invalid width, and an error return. A
     row whose fast path is argmem-only but whose error path touches process
     state is HostState
-I4  argmem-limited deallocation requires that every object the row frees is
-    argument-derived AT THE LLVM LEVEL. A row that frees memory handed out
-    through a noalias return is excluded; releases: Region records that, and
-    V9 enforces it
+I4  an argmem claim of ANY kind — read, write or deallocation — requires that
+    every object the row touches is based on a pointer argument AT THE LLVM
+    LEVEL, in the LangRef sense that excludes a pointer obtained by loading
+    through another. This covers writes, not only frees: §2.2's invariant D is
+    the statement, ArgMem's missing Write variant and V4/V5 are the
+    enforcement, and releases: Indirect / Region record the deallocation half
 I5  the withheld direction is always safe. A row classified more conservatively
     than its body warrants costs optimization; a row classified less
     conservatively is a miscompile. Every ambiguity resolves toward HostState
@@ -724,7 +969,12 @@ I7  an indirect call never carries a row's attributes. Attributes live on the
     and must stay asserted
 ```
 
-I4 and I6 carry the soundness of this PR. I4's hazard is reachable today:
+I4 and I6 carry the soundness of this PR. I4's hazard is reachable today, in
+both of its halves. The write half is reachable from PR 3's own codegen: the
+fast path loads `data` out of the builder and stores through it, around
+slow-path calls to the same handle, so an `argmem` write claim on
+`align_rt_array_builder_push` would let LLVM reorder those. The deallocation
+half is reachable from ordinary source:
 
 ```align
 fn double(x: i32) -> i32 = x * 2
@@ -758,40 +1008,101 @@ machinery this repository's "recurred classes are closed by machinery, not
 prose" rule requires, and they are what make the design fail-closed.
 
 ```text
-C1  totality        a new RuntimeKey does not compile until it is classified
-                    (total match, no `_` arm). runtime_export_source_inventory_
-                    matches_registry independently forces a new
-                    #[unsafe(no_mangle)] export into the registry at all
+C1  totality        a new RuntimeKey does not compile until it is classified:
+                    the record is a total match over RuntimeAbiId with no `_`
+                    arm. That is the whole of C1, and the plan does not lean on
+                    more. runtime_export_source_inventory_matches_registry is
+                    NOT a general backstop: it include_str!s six of
+                    align_runtime/src's twenty files and asserts 379 symbols
+                    against 464 registry rows, so a new export added in
+                    process_live.rs, crypto_digest.rs, fs_*.rs, os_host.rs,
+                    json_number.rs or buffer_storage.rs is outside its reach
+                    (align_rt_child_poll is a shipped example). PR 1 therefore
+                    also makes that test's file list DERIVED from a directory
+                    read rather than hand-maintained, so the backstop the plan
+                    wants actually exists
 C2  structure       V1-V12 reject every internally inconsistent record, one
                     negative owner per rule
 C3  golden          every declaration line carries its class token, so a class
                     change is a one-line diff a reviewer must approve, and a
                     mutation owner proves the golden is sensitive to it. The
                     emitted module still round-trips through llvm-as-22
-C4  allocation      THE PRIMARY MACHINE CONTROL. align_runtime already exports
-    parity          align_rt_alloc_count / align_rt_free_count under the
-                    alloc-count feature. A parameterized owner calls every row
-                    classified PureScalar, PureArgRead or ArgWrite with a valid
-                    minimal input and asserts a zero allocation delta. A row
-                    that actually reaches the allocator while claiming a
-                    non-allocator class fails immediately, by test, for the
-                    single most dangerous misclassification in the table
-C5  behavioural     for every row in a memory-claiming class, a driver fixture
-    control         writes a local aggregate, calls the row without passing the
-                    local, reads the local back and checks its bytes at -O2. A
-                    false argmem-only claim that lets DSE delete a live store
-                    is caught as a value mismatch, not by inspection. The same
-                    fixture shape, run under an fd-count and environment
-                    observation, catches a row classified as anything but
-                    HostState, Foreign or Callback that touches process state
+C4  allocation      THE PRIMARY MACHINE CONTROL, and it needs new machinery to
+    parity          be one. align_rt_alloc_count / align_rt_free_count exist
+                    under the alloc-count feature, but ALLOC_CALLS is
+                    incremented at exactly one site — inside align_rt_alloc —
+                    and align_runtime has no #[global_allocator]. Almost every
+                    row allocates through Rust's global allocator (Box, Vec,
+                    String, format!, extend_from_slice), which those counters
+                    never see, so a row that allocates while claiming a
+                    non-allocator class would show a ZERO delta and pass.
+                    PR 1 therefore adds a counting #[global_allocator] behind
+                    the existing alloc-count feature, leaving the two existing
+                    counters and their consumers untouched, and only then is
+                    the parameterized owner meaningful: call every row
+                    classified PureScalar, PureArgRead or DispatchCache with a
+                    valid minimal input and assert a zero global-allocation
+                    delta. Without that shim C4 detects nothing, and the plan
+                    must not claim it does
+C5  behavioural     the discriminating fixture is INDIRECT REACHABILITY, not
+    control         absence. A caller that never passes the local to the row
+                    cannot be affected under any classification, and reading
+                    the local back keeps its store live, so that shape passes
+                    identically for a correct and an incorrect claim. Instead,
+                    for every row in a memory-claiming class, the fixture holds
+                    a pointer the row DOES reach indirectly — a buffer.bytes()
+                    view, an arena object, a pushed element buffer — writes
+                    through it, calls the row, and checks the bytes at -O2. A
+                    false argmem-limited claim that lets LLVM reorder or delete
+                    that write is caught as a value mismatch. A second fixture
+                    shape, under fd-count and environment observation, catches
+                    a row classified as anything but HostState, Foreign or
+                    Callback that touches process state
 ```
 
-C4 and C5 together close the two failure modes that inspection cannot: "this
-body allocates and I did not notice" and "this claim is false in a way that
-changes the caller's observable values". Neither is a benchmark and neither is
-a client measurement; both are ordinary owner tests over the whole table.
+C4 and C5 together close the two failure modes inspection cannot: "this body
+allocates and I did not notice" and "this claim is false in a way that changes
+the caller's observable values". Both require machinery this PR adds — the
+allocator shim and the indirect-reachability fixtures — and neither is a
+benchmark or a client measurement.
 
-### 3.6 Implementation closure matrix (PR 1)
+### 3.6 The one experiment that could widen invariant D
+
+Invariant D is what removes 1071's headline `argmem` claims, so the plan states
+the single question that could restore them and refuses to guess the answer.
+
+**Question.** Does LLVM treat memory reached by loading a pointer out of
+argument memory as part of the `argmem` location, or only memory based on the
+argument itself?
+
+**What the plan currently assumes, and why.** Only the latter. The LangRef
+defines `argmem` as *"accesses to memory via pointer values based on the
+function's arguments"*, `based on` in the pointer-aliasing rules excludes a
+pointer obtained by a load, and `AAResults::getModRefInfo` alias-queries the
+argument locations with no reachability step.
+
+**The experiment.** A standalone module declaring a helper
+`memory(argmem: readwrite)` that a definition calls between a store to and a
+load from a pointer obtained by loading through the helper's argument, run
+through the same `default<O2>` pipeline the driver uses. If the load is
+forwarded across the call, the strict reading is confirmed and invariant D
+stands. It is a one-module experiment, not a benchmark and not a client build.
+
+**If the strict reading is confirmed**, `IndirectStorage` is permanent, and the
+route to 1071's criteria 3 and 4 is not an attribute at all: it is making the
+caller's objects provably non-escaping so BasicAA can answer, which is plan 69's
+territory, plus PR 3's removal of the call. That would be recorded here and in
+plan 68 as a narrowing of G5's promised column.
+
+**If it is refuted**, `ArgMem` regains its `Write` variant, V4 stops rejecting
+write modes, `IndirectStorage` splits back into direct and indirect halves, and
+the rows §3.3 lists gain the claims 1071 proposes. The record's shape does not
+change, which is why the type carries the unreachable `ParamMode::Write` today.
+
+This experiment is a PR 1 precondition, not a follow-up: the classification of
+roughly a third of the table depends on its outcome.
+
+### 3.7 Implementation closure matrix (PR 1)
 
 Every class × every build mode × every declaration site. A cell whose behaviour
 is identical across an axis is stated once for that axis rather than repeated.
@@ -800,17 +1111,18 @@ is identical across an axis is stated once for that axis rather than repeated.
 
 | Class | Required declaration | Failure mode if wrong | Detector |
 | --- | --- | --- | --- |
-| `PureScalar` | `memory(none) nounwind nofree nosync willreturn` | a hidden global read is optimized away | C4 zero-allocation; C5 value control; V10 |
-| `PureArgRead` | `memory(argmem: read)` + pure-finite flags + `readonly captures(none)` | a hidden write is dropped | C4; C5; the existing `rt_contract_attrs_pin_encoding_and_curation` rows |
-| `ArgWrite` | `memory(argmem: <argmem>)` + pure-finite flags | an allocator call is hidden, so a caller's freed object survives | **C4** — the discriminating control for this class |
-| `ArgWriteAlloc` | `memory(argmem: rw, inaccessiblemem: rw) nounwind` | a store to a non-argument object is sunk past the call | C5 value control; I4 review; V4/V5 |
-| `AllocNew` | `noalias` return + `memory(..., inaccessiblemem: rw) nounwind nofree` | a caller assumes non-aliasing that the body does not provide | the existing `align_rt_array_builder_new`/`str_finder_new` allocator-attribute pins; V7 |
-| `FreeLocal` | `memory(argmem: rw, inaccessiblemem: rw) nounwind` | store-after-free when a released object is not argument-derived | **I4 + V9** (`releases: Region` forced to `HostState`); C5 |
-| `DispatchCache` | flags only, memory withheld | none: strictly conservative | the existing `utf8_valid` / `str_find` / `str_finder_find` negatives, extended to the class |
-| `HostState` | `nounwind` only | none: strictly conservative | C4 is not applicable; the class is the fail-closed sink |
-| `Callback` | `nounwind` only | a callback's effects are assumed away | a par-thunk owner asserting the declaration carries no `memory` |
+| `PureScalar` | `memory(none) nounwind nofree nosync willreturn` | a hidden global read or allocation is optimized away | **C4** (needs the §3.5 allocator shim); V10 |
+| `PureArgRead` | `memory(argmem: read)` + pure-finite flags + `readonly captures(none)` | a hidden write or allocation is dropped | **C4**; C5 indirect-reachability control; the existing `rt_contract_attrs_pin_encoding_and_curation` rows |
+| `ArgRead` | `memory(argmem: read, inaccessiblemem: rw) nounwind` | a write through argument-reachable storage is reordered | C5; V5 |
+| `AllocNew` | `memory(…, inaccessiblemem: rw) nounwind nofree`, `noalias` return via `returns_fresh` | a caller assumes non-aliasing the body does not provide, or a captured argument gets `captures(none)` | the existing `align_rt_array_builder_new`/`str_finder_new` allocator pins; V7; the `escapes` records §2.2 names for `builder_new` and `array_builder_new_in` |
+| `FreeLocal` | `memory(argmem: rw, inaccessiblemem: rw) nounwind` | store-after-free when the released object is not the argument's own allocation | **I4 + V9**; C5. Only `align_rt_free` qualifies, so the cell is one row |
+| `IndirectStorage` | `nounwind` only, memory withheld, `escapes`/`releases` recorded | a row is mistakenly promoted out of this class and gains an unsound `argmem` claim | **C5** indirect-reachability control; V4 rejecting a write mode; §3.6's experiment |
+| `DispatchCache` | flags only, memory withheld, `readonly captures(none)` retained | a dispatch-cache row silently gains `memory(...)` | the existing `utf8_valid` / `str_find` / `str_finder_find` negatives, extended to the class; V6 |
+| `HostState` | `nounwind` only | none: strictly conservative. It is the fail-closed sink | the fd/environment half of C5, which catches a row misclassified *out* of it |
+| `Callback` | `nounwind` only, `returns_fresh` where the row has it | a callback's effects are assumed away, or `par_map` loses its `noalias` return | a par-thunk owner asserting no `memory` on the declaration; the golden's `declare noalias ptr @align_rt_par_map` line; V7 |
 | `Foreign` | `nounwind` only | none: strictly conservative | — |
 | `FailNoReturn` | `noreturn cold nounwind memory(inaccessiblemem: rw)` | `willreturn` on a diverging row | V8; the existing abort-family negative that forbids `willreturn` |
+| `ProcessExit` | `noreturn nounwind memory(inaccessiblemem: rw)`, never `cold` | `noreturn` silently dropped, or a success-path exit marked cold | V8; the golden's eight-member `noreturn` group; a negative asserting `cold`'s absence |
 
 **Build-mode axis.**
 
@@ -819,7 +1131,7 @@ is identical across an axis is stated once for that axis rather than repeated.
 | whole-program | every declared row carries its class's exact attributes | the extended declaration golden |
 | per-unit | every unit declares the same rows with byte-identical attributes | the existing "trivial whole-program and per-unit-shaped emitted IR with identical alphabetical runtime declarations" owner, extended to the attribute groups |
 | ThinLTO | the same declaration appears in every partition with identical attributes; no partition disagrees | `thin_lto_sv`, plus a new cross-partition attribute-identity assertion |
-| rt-LTO merged (R4) | a guarded row's declaration attributes are withheld before the merge, and the merged definition carries none of them afterwards. `remove_attributes` is rewritten against the record, not against the deleted shape fields | the existing rt-LTO off/on XOR owner extended to every new attribute, plus a new assertion that a merged definition carries no enum attribute at any location |
+| rt-LTO merged (R4) | a guarded row's declaration attributes are withheld before the merge, and the merged definition carries none of **that row's curated** attributes afterwards. `remove_attributes` is rewritten against the record, not against the deleted shape fields | the existing rt-LTO off/on XOR owner extended to every new attribute. The assertion is scoped to the row's own curated set, **not** "no enum attribute at any location": a `rustc`-compiled body legitimately carries its own `nounwind`, `noundef`, `nonnull`, `readonly`, `captures` and `uwtable`, and keeping them is the whole premise that LLVM re-derives the contract from the visible body |
 | rt-LTO merged, string half | unchanged from PR #1091: `shed_rt_lto_target_bound_attributes` + `verify_rt_lto_target_independence` run pre-merge, module-scoped | `test-review-bounded`-independent existing rt-LTO owners; no change |
 | `--no-rt-lto` | guarded rows keep their full class attributes | the existing off/on XOR owner |
 | rt-LTO artifact defect | every existing fallback path re-applies the *class* attributes through `restore_rt_lto_guarded_attributes` | the existing missing/declaration-only/wrong-type/internal/private/available-externally/non-C negatives |
@@ -834,34 +1146,41 @@ is identical across an axis is stated once for that axis rather than repeated.
 | compatible source extern | a source extern reusing a row's handle receives the row's class attributes and mints none of its own | the existing "compatible reuse representatives for each checked-in attribute class" owner, re-expressed over the class set |
 | probe-feature rows | the eleven probe exports gain no class and no compiler handle | the existing probe-presence owners |
 
-### 3.7 Acceptance corpus
+### 3.8 Acceptance corpus
 
 ```text
 language-level, new
-  dead store across a runtime call: a function writes a local aggregate, never
-  passes it to a runtime call, frees an unrelated handle, and returns. Zero
-  llvm.memset and zero dead stores for that local (1071 criterion 3)
-  LICM across a runtime call: a loop loads a loop-invariant local that is not
-  passed to an in-loop runtime call; the load is hoisted to the preheader
-  (1071 criterion 4)
-  no regression in the withheld set: utf8_valid and str_find still claim no
-  memory effect, and the guarded rows still have theirs withheld before body
-  linking (1071 criterion 5)
+  caller effect recovery: a kernel with a surviving bounds check keeps an
+  inferred memory(read, ...) rather than collapsing to { nounwind }. This is
+  the one language-level effect win PR 1 promises (1074 Tier 3)
+  no regression in the withheld set: utf8_valid, str_find, str_rfind and
+  str_finder_find still claim no memory effect and keep their readonly
+  captures(none) parameters; the guarded rows still have theirs withheld
+  before body linking (1071 criterion 5)
+
+  NOT owners of this PR: 1071 criteria 3 (zero memsets for a dead local) and
+  4 (LICM across a runtime call). Invariant D removes the attribute that would
+  have delivered them; §3.3 records the narrowing and §3.6 the one experiment
+  that could restore them
 
 table-level, new
   runtime_effects_registry_is_total_and_structurally_valid, with one negative
   per V1-V12
-  rt_lto_admission_predicate_matches_the_guarded_set, with one negative per
-  P1-P5
+  rt_lto_admission_predicate_matches_the_guarded_set (P1-P2) and
+  rt_lto_guarded_bodies_meet_the_artifact_budget (P3-P5), one negative each
   runtime_effects_class_mutation_changes_the_golden
   no_runtime_export_uses_extern_c_unwind
+  the derived-file-list form of runtime_export_source_inventory_matches_registry
 
 machine controls, new
-  C4 allocation parity over every non-allocator-class row
-  C5 value and process-state controls over every memory-claiming row
+  the counting #[global_allocator] behind the alloc-count feature, plus C4
+  allocation parity over every PureScalar / PureArgRead / DispatchCache row
+  C5 indirect-reachability value controls over every memory-claiming row, and
+  the fd/environment control over every row not classified HostState, Foreign
+  or Callback
 
 extended, existing
-  rt_contract_attrs_pin_encoding_and_curation: one textual pin per bitmask
+  rt_contract_attrs_pin_encoding_and_curation: one textual pin per §3.2 mask
   emitted_ir_round_trips_through_llvm_as: unchanged, now exercising the new
     attribute payloads
   the declaration golden: 464 lines each gaining a class token, plus a
@@ -870,11 +1189,22 @@ extended, existing
     signatures, not attributes, so the classification does not reach it
 ```
 
+**Gate cost.** These owners are not leaf tests. `scripts/test-pr.sh` builds
+`-p align_codegen_llvm -p align_mir -p align_driver … --lib`, so every
+registry, golden, mutation and codegen owner above lands in a bounded-gate
+binary under the hard 30-minute budget; only C4, which lives in
+`align_runtime`, sits outside it. The parameterized controls are therefore
+written as **one** table-driven owner each rather than one test per row, and
+C5's fixtures reuse the existing driver IR-assertion harness instead of
+compiling a new program per class. PR 1 records the measured gate delta and
+ejects to the nightly suite if it does not fit.
+
 ## 4. PR 2 — one cold-path model for `Result`/`?`
 
 ### 4.1 The three tiers
 
-Tier 1 records §2.5's edge at each of the six MIR sites that create one and
+Tier 1 records §2.5's edge at each of the nine recording sites that create one,
+under the six kinds §2.5 names, and
 attaches `!prof` from one place in codegen. The `?` desugaring's standing NOTE
 (`align_mir/src/lib.rs:22022`) is deleted by the change that closes it.
 
@@ -977,7 +1307,7 @@ K5  no new runtime symbol, no alwaysinline, no inlinehint, no source
 
 1072 proposal 3 asks to extend the `--rt-lto` guarded set from the four string
 predicates to the per-element class and its growth helpers. The admission
-predicate of §2.4 refuses it: `array_builder_push` is `ArgWriteAlloc`, failing
+predicate of §2.4 refuses it: `array_builder_push` is `IndirectStorage`, failing
 P1, and its growth path calls `align_rt_realloc` and the abort machinery,
 failing P3. Merging it would hand LLVM an `internal` body containing an opaque
 external call in place of a precise declaration.
@@ -1047,7 +1377,7 @@ manifest edit.
 
 ```text
 different owner     1075 attributes ALIGN PROGRAM functions at declare_fn
-                    (lib.rs:7077) and declare_imported_fn (:7164). This plan
+                    (lib.rs:7136) and declare_imported_fn (:7223). This plan
                     attributes RUNTIME ABI ROWS through the registry. Different
                     table, different producer, different reviewers
 no shared mechanism it needs no effects record, no class, no ledger row, no
@@ -1103,52 +1433,101 @@ second mechanism. That is guidance, not a dependency in either direction.
                            the measured matrix rerun recorded beside it
 HANDOFF.md                 one paragraph, recording this plan as planned
 68-vectorization-contract.md
-                           UNCHANGED. It already names "plan 70" as G5's
-                           implementing plan and needs no edit
+                           TWO edits, both in PR 1. §3.1's G5 line reads "every
+                           effects record added there is part of the runtime
+                           artifact's identity"; §2.1 here finds that no cache
+                           key component is added, because the record lives in
+                           the compiler rather than in the runtime artifact and
+                           compiler_build_id already covers it. That clause is
+                           clarified to name the two identities that do apply,
+                           compiler_build_id and rt_lto_digest. G5's promised
+                           column is narrowed to match §3.3: "each runtime ABI
+                           symbol carries a complete memory-effects record"
+                           stands, "a complete memory-effects ATTRIBUTE" does
+                           not, because invariant D makes withholding the
+                           correct record for every indirect-storage row. It
+                           already names "plan 70" as G5's implementing plan,
+                           and that needs no edit
 draft.md, docs/language-spec.md, docs/open-questions.md
                            UNCHANGED. No language surface, no settled decision
                            reopened, no new syntax, no new diagnostic
 05-backend-llvm.md         UNCHANGED. Every attribute is emitted through the
                            existing add_enum_attr / add_valued_enum_attr path
-16-test-policy.md          UNCHANGED. Every owner named here is a leaf owner of
-                           an existing target; none enters the bounded gate
+16-test-policy.md          UNCHANGED as policy, but §3.8's gate-cost paragraph
+                           is written against it: most of PR 1's and PR 2's
+                           owners land in align_codegen_llvm / align_mir /
+                           align_driver `--lib` binaries, which scripts/test-pr.sh
+                           builds, so they ARE bounded-gate content under the
+                           hard 30-minute budget. Only C4 sits outside it. Each
+                           PR records its measured gate delta
+crates/align_runtime       PR 1 adds a counting #[global_allocator] behind the
+                           existing alloc-count feature (§3.5 C4) and derives
+                           runtime_export_source_inventory_matches_registry's
+                           file list from a directory read (§3.5 C1). Both are
+                           test-only machinery, not ABI
 ```
 
 ## 8. Author-side ledger-to-prose consistency pass
 
 - Every normative promise in §§3–5 appears in the §2 ledger, and every §2 public
-  field has specified semantics: `class`, `argmem`, `params`, `retains` and
-  `releases` each have a stated meaning, a validity rule (V1–V12) and an effect
-  on the emitted declaration.
+  field has specified semantics: `class`, `argmem`, `params`, `escapes`,
+  `releases`, `returns_fresh` and `diverges` each have a stated meaning, a
+  validity rule (V1–V12) and an effect on the emitted declaration.
 - The Cartesian product is exhaustive where it is externally meaningful. §2.2's
-  derivation table has one row per class with no gap; §3.6 crosses all eleven
-  classes with five build modes and five declaration sites and states, for each
-  axis, the cells where behaviour is uniform rather than repeating them.
+  derivation table has one row per class with no gap, §3.2 enumerates the
+  complete class × `ArgMem` mask product and names the two forms that are
+  unreachable by construction, and §3.7 crosses all twelve classes with five
+  build modes and five declaration sites, stating for each axis the cells where
+  behaviour is uniform rather than repeating them.
+- The withheld classes have a total precedence order (§2.2), so a row that is
+  more than one of them has exactly one class token and the golden cannot drift.
 - Every argument and result has a concrete type, ownership, lifetime and
   allocation rule: the effects record is `'static` `Copy` and allocates nothing;
   `ExceptionalEdge` is owned by its `MirFn`; the fast path copies its scalar by
   value and retains nothing.
-- No text or view crosses a native or wire boundary in this plan. No canonical
-  persisted or exchanged format is added, so no golden vectors are required
-  beyond the declaration golden, which is a textual IR pin and already has a
-  mutation owner in both directions.
+- No text or view crosses a native or wire boundary in this plan. One existing
+  persisted identity is touched and is named rather than elided: the
+  test-control ABI fingerprint `b"align-test-control-runtime-abi-v1\0"`
+  (`runtime_abi.rs`, exported as `test_control_runtime_abi_fingerprint`)
+  serializes `memory_argmem_read` today and must serialize the replacement
+  record. PR 1 bumps its version tag to `v2` in the same change, because a
+  fingerprint whose inputs change without its tag is the failure that tag
+  exists to prevent. No new format is added, and the declaration golden — a
+  textual IR pin with a mutation owner in both directions — remains the only
+  other checked-in artifact.
 - Multi-invalid input has a deterministic order: V1–V12 are stated in evaluation
   order and report the first violation with its symbol, matching
   `validate_registry`'s existing single-`Err(String)` contract.
 - Every CLI and build input is explicit. The fast path has no flag; the effects
   record has no environment input; `--rt-lto` and `--no-rt-lto` keep their exact
   current meaning; §2.8 is a manifest constant, not an ambient setting.
-- Every fingerprint is stated: `compiler_build_id` is the only cache identity
-  that changes for PR 1 and PR 2; `rt_lto_digest` is unchanged and its
-  independence from §2.8 is proved from `build.rs`'s own `rustc` invocation; the
-  runtime archive is stated to be outside every cache key with the reason.
+- Every fingerprint is stated: `compiler_build_id` is the only *cache* identity
+  that changes for PR 1 and PR 2; the test-control ABI fingerprint is a
+  versioned identity that changes and is bumped with it; `rt_lto_digest` is
+  unchanged and its independence from §2.8 is proved from `build.rs`'s own
+  `rustc` invocation; the runtime archive is stated to be outside every cache
+  key with the reason. §7 records the one plan 68 clause this reconciles.
 - Every runtime inspection field is producer-owned: the classification is a
   `'static` table in the compiler and the layout pins are `const` assertions in
   the runtime. Nothing is read from an artifact or from source at run time.
 - Every operation changing process-global native state is classified `HostState`
   and claims no memory effect, so no overlap-exclusion or restoration-order
-  question arises from an effects claim. §2.2 records the one region-teardown
-  exclusion (I4) and V9 enforces it.
+  question arises from an effects claim. §2.2 records the region-teardown and
+  indirect-release exclusions, and V9 enforces both.
+- The one open technical question is named rather than assumed away. §3.6 states
+  the LLVM `argmem` semantics question invariant D depends on, what the plan
+  assumes, the one-module experiment that settles it, and what changes in each
+  direction. It is a PR 1 precondition, not a follow-up, because roughly a third
+  of the table's classification turns on it.
+- Where the plan cannot keep an issue's promise it says so instead of restating
+  it. §3.3 lists 1071 criteria 3 and 4 as not delivered by PR 1, §3.8 repeats
+  that in the corpus, and §7 narrows plan 68's G5 promised column to match.
+- Where a named control does not yet detect what it is assigned, the machinery
+  is added rather than the claim softened: §3.5 C4 requires a counting
+  `#[global_allocator]` (the existing counters see only `align_rt_alloc`), C1
+  requires a derived file list (the existing inventory test reaches 379 of 464
+  rows), and C5 requires indirect-reachability fixtures (an absent-pointer
+  fixture passes for a correct and an incorrect claim alike).
 - Every normative `align` example is one fenced block (§3.4) using constructs
   with repository precedent; declarations are shown separately from the
   positional call expressions in the fenced `text` and `llvm` blocks.
@@ -1162,10 +1541,11 @@ draft.md, docs/language-spec.md, docs/open-questions.md
   and only plan 20 gains one. There is no `ja/` mirror for an `docs/impl` plan,
   so no language mirror is affected.
 - Acceptance tests cover each ledger invariant: I1–I7 map to §3.5's C1–C5 and
-  §3.6's detector column, J1–J5 to §4.3, K1–K5 to §5.2. The only benchmark is
+  §3.7's detector column, J1–J5 to §4.3, K1–K5 to §5.2. The only benchmark is
   §2.7's, attached to the only explicit performance promise in the plan, and it
   is stated as a measurement rather than a correctness gate.
-- Three issue claims were found stale against the tree and are corrected in
-  §1.3 rather than repeated: `remove_attributes`' post-#1091 scope, the shipped
-  archive's profile, and the admissibility of the per-element rows to the
-  rt-LTO set.
+- Four issue claims were found wrong against the tree and are corrected in §1.3
+  rather than repeated: `remove_attributes`' post-#1091 scope, the shipped
+  archive's profile, the admissibility of the per-element rows to the rt-LTO
+  set, and the `memory(argmem: ...)` claims 1071 proposes for the container and
+  free rows.

@@ -2410,7 +2410,7 @@ regression net that validates the upgrade.
     5A's "fail-safe default = no attribute" left 104 of 141 declaration shapes with no effect fact
     at all, and keyed effects by C signature, so a pure argument writer and an I/O call share one
     row by construction. [Plan 70](70-runtime-boundary-effects-plan.md) replaces the shape-keyed
-    fields with a per-symbol effects record derived from a closed eleven-class classification,
+    fields with a per-symbol effects record derived from a closed twelve-class classification,
     makes an unclassified row impossible rather than silently conservative, states the `--rt-lto`
     guarded-set admission criterion over those classes, and carries the closure matrix for issues
     1071, 1072 and 1074. The withholding rules 5A established for `utf8_valid` and the memchr-backed
