@@ -3085,7 +3085,10 @@ for script in \
 do
   bash -n "$repo_root/$script"
 done
-python3 -m py_compile "$repo_root/scripts/restore-mtime.py"
+# A syntax check that writes nothing: py_compile would leave scripts/__pycache__
+# behind and fail preflight's clean-worktree gate.
+python3 -c 'import ast, sys; ast.parse(open(sys.argv[1], "rb").read(), sys.argv[1])' \
+  "$repo_root/scripts/restore-mtime.py"
 
 # scripts/ci-apt-llvm.sh gates every Linux job's toolchain and broke CI twice in
 # one day; its branches are executed here, root-free and offline, so the same
