@@ -176,11 +176,16 @@ variables: for a loop exiting on `i >= N` with a positive constant step and an
 index `a*i + b` with loop-invariant `a > 0`, one preheader guard replaces the
 in-loop one.
 
-One guard is excluded from both halves: the guard `lower_borrowed_place` emits
-for a borrowed element argument (`inspect(rs[i])`) is also the predicate
-codegen re-derives literally before forming the element pointer, so it keeps its
-signed form and its loop keeps its checks. Plan 69 §3.1, §3.2 and §3.6 own that
-exclusion and its later lifting; G2's corpus contains no such loop.
+Two guard classes are excluded from both halves, for one reason: each is a
+predicate some other stage re-derives *literally*, so fusing it would silently
+fail that stage's own contract. The guard `lower_borrowed_place` emits for a
+borrowed element argument (`inspect(rs[i])`) is the predicate codegen re-derives
+before forming the element pointer; the range guard `lower_bytes_read` /
+`lower_bytes_set` emit for `b.u32_le(off)` is the predicate
+`byte_ranges::simplify` re-derives before it may prove a byte recurrence safe
+(plan 64). Both keep their signed three-way form and both keep their loops'
+checks. Plan 69 §3.1, §3.2, §3.6 and §3.7 own the exclusions and the later
+lifting of the first; G2's corpus contains no such loop.
 
 The guard is moved, never deleted. The `(index, len)` diagnostic text stays
 byte-identical and the first failing access still fails at the same iteration;

@@ -534,3 +534,116 @@ fn g1_view_header_hoisted_vectorizes_scale_only() {
         "a length is known non-negative, so no clamp survives:\n{ir}"
     );
 }
+
+// ── G2, per-arch (plan 69 PR 2) ─────────────────────────────────────────────────────────────────
+//
+// G2 promises one unsigned compare for an element index, two for a range, and the monotone-index
+// check out of the loop body — by versioning, so nothing is deleted and trap behaviour is
+// unchanged. The *facts* are pinned arch-neutrally in `loop_facts.rs`; what belongs here is the
+// target-named effect: a monotone-index loop whose body no longer branches to a trap reaches a
+// vector body, which it cannot do while a bounds check sits between its loads.
+
+const MONOTONE_SUM: &str = "\
+fn monotone_sum(borrow xs: slice<i64>) -> i64 {
+  mut total := 0
+  mut i := 0
+  loop {
+    if i >= xs.len() { break }
+    total = total + xs[i]
+    i = i + 1
+  }
+  return total
+}
+";
+
+/// The G2 kernel from 1081 §2: a `bytes_to_f32_out`-shaped in-place conversion, which reaches a
+/// vector body **only** with PR 1 and PR 2 both present. PR 1 gives it one header materialization
+/// with `!range` and the TBAA split; PR 2 takes the per-element bounds branch out of the body. A
+/// regression in either half turns this back into a scalar loop, which is exactly what plan 68 §7
+/// asks the conjunction pin to detect.
+const BYTES_TO_F32_OUT: &str = "\
+fn bytes_to_f32_out(borrow src: slice<u8>, borrow mut out: array<f32>) {
+  mut i := 0
+  loop {
+    if i >= out.len() { break }
+    out[i] = src[i] as f32
+    i = i + 1
+  }
+}
+";
+
+/// G2 on x86, at the v3 tier the rest of this suite pins. The monotone-index check is out of the
+/// loop body, so the reduction widens to 256-bit lanes; the trap block still exists in the slow
+/// version, which is why the guard was *moved* and not deleted.
+#[test]
+fn g2_monotone_check_hoisted() {
+    if !x86_backend() {
+        return;
+    }
+    let ir = opt_ir("g2-monotone", MONOTONE_SUM, V3);
+    assert!(ir.contains("vector.body"), "want a vector main loop:\n{ir}");
+    assert!(ir.contains("<4 x i64>"), "want 256-bit i64 lanes at v3:\n{ir}");
+    // That the guard was *moved* and not deleted is a property of emitted MIR, not of what `-O2`
+    // then does with the slow copy, so `loop_facts::g2_element_guard_is_one_unsigned_compare` and
+    // `g2_versioned_loop_has_a_preheader_and_two_copies` own it — they count trap call sites
+    // exactly. This owner pins only the widening that removing the in-body branch enables.
+}
+
+/// The same promise at the 128-bit tier, so a width regression is distinguishable from a shape
+/// regression.
+#[test]
+fn g2_monotone_check_hoisted_width_tracks_target_v2() {
+    if !x86_backend() {
+        return;
+    }
+    let ir = opt_ir("g2-monotone-v2", MONOTONE_SUM, V2);
+    assert!(ir.contains("vector.body"), "want a vector main loop at v2:\n{ir}");
+    assert!(ir.contains("<2 x i64>"), "want 128-bit i64 lanes at v2:\n{ir}");
+}
+
+/// Plan 68 §7's conjunction pin, on x86 at v2.
+#[test]
+fn g1_g2_bytes_to_f32_out_conjunction_v2() {
+    if !x86_backend() {
+        return;
+    }
+    let ir = opt_ir("g1g2-bytes-f32", BYTES_TO_F32_OUT, V2);
+    assert!(
+        ir.contains("vector.body"),
+        "the in-place conversion reaches a vector body only with G1 and G2 both present:\n{ir}"
+    );
+    assert!(
+        ir.contains("uitofp <"),
+        "and the conversion itself is the widened operation:\n{ir}"
+    );
+}
+
+/// The same conjunction at the aarch64 baseline — the host every measurement behind 1079/1080/1081
+/// was taken on, where 1081 §2 records the kernel as a scalar loop today.
+#[test]
+fn g1_g2_bytes_to_f32_out_conjunction_aarch64() {
+    if !aarch64_backend() {
+        return;
+    }
+    let ir = emit_llvm_optimized(BYTES_TO_F32_OUT, &["bytes_to_f32_out"]);
+    assert!(
+        ir.contains("vector.body"),
+        "the in-place conversion reaches a vector body only with G1 and G2 both present:\n{ir}"
+    );
+    assert!(
+        ir.contains("uitofp <16 x i8>"),
+        "want the byte load widened at the portable aarch64 baseline:\n{ir}"
+    );
+}
+
+/// G2's own effect at the aarch64 baseline: the monotone reduction widens to 128-bit lanes, and
+/// the trap it did not delete is still there.
+#[test]
+fn g2_monotone_check_hoisted_aarch64() {
+    if !aarch64_backend() {
+        return;
+    }
+    let ir = emit_llvm_optimized(MONOTONE_SUM, &["monotone_sum"]);
+    assert!(ir.contains("vector.body"), "want a vector main loop:\n{ir}");
+    assert!(ir.contains("<2 x i64>"), "want 128-bit i64 lanes at the aarch64 baseline:\n{ir}");
+}

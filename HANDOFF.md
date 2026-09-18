@@ -41,7 +41,14 @@ with one implementation closure matrix each. PR 1 (1079, 1080) has shipped: a
 borrowed view header is materialized once in the entry block, header and
 element memory are separate TBAA classes, a read-only `borrow` header of a
 body that writes no header carries `noalias`, and every length load states its
-non-negativity. PRs 2 and 3 are unstarted.
+non-negativity. PR 2 (1081) has shipped: every emitted element guard is one
+unsigned compare and every range guard two, except the borrowed-element and
+byte-accessor guards another stage re-derives literally; and a new MIR module
+`loop_facts`, registered after `byte_ranges::simplify`, versions an admissible
+monotone-index loop into a fast copy whose proved guards are bypassed and the
+original slow copy, which keeps every one of them. No check is deleted, trap
+text and failing iteration are unchanged, and `explain-opt` reports one stable
+decision per source loop. PR 3 is unstarted.
 
 **Decode representation costs:** [plan 62](docs/impl/62-decode-optimization-plan.md)
 implements bounded nonescaping byte storage and direct synchronous chunks

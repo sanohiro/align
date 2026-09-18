@@ -5,8 +5,8 @@ Status: plan of record for issues
 [1080](https://github.com/sanohiro/align/issues/1080),
 [1081](https://github.com/sanohiro/align/issues/1081) and
 [1084](https://github.com/sanohiro/align/issues/1084). PR 1 (§2, issues 1079
-and 1080) is implemented, with the corrections §2.6 records; PRs 2 and 3 are
-not.
+and 1080) and PR 2 (§3, issue 1081) are implemented, with the corrections §2.6
+and §3.7 record; PR 3 is not.
 
 [Plan 68](68-vectorization-contract.md) is the public-contract ledger and owns
 guarantees G1–G10. This plan implements G1, G2 and G3 and does not restate,
@@ -868,6 +868,119 @@ owners         the same trap-parity and MIR-text owners, plus the
 
 Until that lands, G2's fast version excludes such loops and plan 68 records the
 exclusion beside G2.
+
+### 3.7 Corrections recorded when PR 2 shipped
+
+Each of these narrows or renames what §3.1–§3.6 wrote; none widens a promise, none
+deletes a check, and none changes an invariant. They are recorded here because
+this plan is the normative source, not the implementation.
+
+```text
+two signed-form classes    §3.1 exempts one guard class from fusion. There are
+                           two, for the same reason: `byte_ranges::simplify`
+                           re-derives `Or(Or(Lt(start, 0), Gt(start, end)),
+                           Gt(end, len))` **literally** before it may prove a
+                           byte recurrence safe, exactly as
+                           `checked_borrowed_element_guard` re-derives the
+                           element guard. So `lower_bytes_read` and
+                           `lower_bytes_set` call the signed range emitter.
+                           Fusing them would not be unsound; it would silently
+                           disable plan 64's proof, and §3.4 already assigns
+                           byte accessors to `byte_ranges`
+one classifier, not a      §3.2's kill set is realized as one exhaustive,
+kill list                  wildcard-free classifier over `Stmt` (28 variants)
+                           and `Rvalue` (339), plus `variant_sweep_tripwire`.
+                           Enumerating only the *killing* variants would leave
+                           the other 300 reading as "does not mutate", so the
+                           modelled set is a whitelist and every other variant
+                           is `Unknown`: it kills every root and refuses the
+                           loop. The two `Rvalue` matches share one
+                           `unmodelled_rvalues!` pattern macro, so their
+                           coverage cannot drift apart
+an element store is an     A `PtrStore`/`PtrStoreNoalias`/`VecStore`/
+element store              `StoreIndex`/`StoreElemField`/`StoreElemFieldPtr`/
+                           `StoreColumn` whose stored value is a header-free
+                           scalar changes buffer bytes and no `{ptr,len}`
+                           header anywhere, so it kills no root: a guard's
+                           length operand is a property of the header. The
+                           element type is the gate, exactly as it is for PR 1's
+                           `align.elem` tag (I4). Without this the in-place
+                           kernels — `scale_only`, `bytes_to_f32_out`, the whole
+                           class 1079 and 1081 measured — would all refuse
+the call rule is narrowed  §3.2 excuses a read-only `borrow`
+                           parameter from an opaque call's kill. A slot whose
+                           *address* never leaves the function is excused too,
+                           on a disjoint proof: MIR hands out a slot address
+                           only through the borrowed-place operand family, so a
+                           callee has no way to reach it. `scan_report`'s `off`
+                           and the matvec's `d`/`r` are by-value scalars, and
+                           without this arm `print(i)` in the body would kill
+                           them and refuse the very witness §3.2 uses to
+                           justify versioning over relocation
+seven more reason codes    §3.2.3 lists nine. The implementation adds
+                           `guard-not-fused` (a signed guard this pass does not
+                           own), `value-escapes-loop`, `nested-loop`,
+                           `loop-shape`, `unmodelled-statement`,
+                           `no-provable-guard` and `rederivation-failed`. Each
+                           names a distinct fail-closed refusal that would
+                           otherwise have to be reported under a code that does
+                           not describe it. All are stable and asserted
+a is a positive constant   §3.4 admits `a*i + b` with `a` loop-invariant
+                           non-constant "only with `a > 0` proved". PR 2 proves
+                           `a > 0` only for an integer constant and refuses the
+                           rest with `access-not-affine`, which is that row's
+                           "otherwise not admitted" branch. `b` stays fully
+                           general: loop-invariant, unknown, possibly negative
+one exit relation          Only `i >= N` is recognized. `>` bounds the index
+                           monotonically too, but it belongs to PR 3's
+                           canonical-shape recognition (§4.1) and consuming it
+                           here would take a later PR's decision
+no value escapes the body  A value defined in the body and read after the loop
+                           would, after cloning, be dominated by neither copy.
+                           Admission refuses such a loop
+                           (`value-escapes-loop`). This is an SSA consequence of
+                           duplicating a body, not a new restriction on source
+drop-flag parity is        §3.4's ownership row asks for a MIR-text owner
+closed by construction     asserting flag parity in both copies. Every rvalue
+                           that *produces* an individually owned value
+                           (`StrClone`, `HeapAlloc`, `ArenaBegin`, the builders,
+                           the region and task-group nodes) is unmodelled, so a
+                           body carrying an owned per-iteration value is never
+                           versioned and its flag bookkeeping is never
+                           duplicated. The owner pins that refusal instead, and
+                           `loop_expr::a_per_iteration_owned_string_is_freed_
+                           each_pass` remains the executable backstop
+the par_map weight cell    I8's ordering is real and implemented, but
+is unobservable by value   `par_map_function_work_weight`'s buckets put every
+                           body large enough to be *versionable* above the top
+                           bucket already, so no program can exhibit a weight
+                           that versioning would have moved. The owner pins the
+                           reachable consequence: a versioned kernel whose
+                           printed weight and whose reduction are unchanged
+re-derivation, exactly     §3.2's "re-derive and discard on disagreement" is:
+                           the rewritten function is structurally valid, its
+                           bounds/range trap **call-site count is unchanged**,
+                           every slow-copy block is byte-identical to the block
+                           it was derived from, and each versioned loop
+                           re-admits from the rewritten function — with its own
+                           fast copy ignored, since that copy legitimately adds
+                           a second write of the index slot outside the slow
+                           loop. Any failure restores the original function and
+                           reports `rederivation-failed`
+drain returns, not traps   §3.4 predicts `drain` traps at `i = 2`. It does not:
+                           the header re-reads the truncated length, so the loop
+                           exits and returns 3. The behaviour is unchanged by
+                           this PR either way, which is what the owner asserts,
+                           together with the `root-killed:ArrayTruncate`
+                           refusal that keeps it that way
+witness spellings          `total`/`inspect` borrows its element out of an owned
+                           `array<Record>` local, the spelling sema accepts for
+                           a stable borrowed element. `stride_sum` is exercised
+                           over a length-1 view: at length 2 its `i*2` reaches
+                           index 2, the admission arithmetic correctly refuses,
+                           and the slow copy traps — a useful fact, but not the
+                           "same values" owner's subject
+```
 
 ## 4. PR 3 — the trip-count exit at the latch (1084)
 

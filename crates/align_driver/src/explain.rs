@@ -587,6 +587,18 @@ fn after_current_plan_validation<'a, T>(
     }
 }
 
+/// Plan 69 §3.2.3: one line per source loop, naming the function, the loop's ordinal in
+/// innermost-first order, and either the budget the versioning spent or the stable reason code for
+/// keeping the checks. One source loop becoming two IR loops must be visible, and a budget refusal
+/// must be something an owner test can assert on. This is unconditional, not `--verbose`: it
+/// describes what the compiler itself did, not what LLVM reported about it.
+fn render_loop_facts(mir: &align_mir::Program) -> String {
+    mir.loop_facts
+        .iter()
+        .map(align_mir::loop_facts::FunctionDecisions::render)
+        .collect()
+}
+
 pub fn run_explain_opt(path: &str, verbose: bool, target: BuildTarget, profile: crate::Profile,
     exports: &[String],
 ) -> ExitCode {
@@ -657,6 +669,7 @@ pub fn run_explain_opt(path: &str, verbose: bool, target: BuildTarget, profile: 
                 let _ = writeln!(out, "==== unit: {} ({}) ====", unit.unit, debug.file);
             }
             out.push_str(&render_current_plan(&unit.mir.plan_records, verbose, &debug.file));
+            out.push_str(&render_loop_facts(&unit.mir));
             out.push_str(&report.render(verbose));
         }
         print!("{out}");
