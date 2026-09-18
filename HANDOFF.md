@@ -28,17 +28,6 @@ Suggested order, each its own PR set (implement, one review, one fix, preflight,
 6. Follow-ups, independent and small: #1093, #1094, #1102, #1103,
    #1105–#1109, #1112 (nightly triage findings; each has a manifest line in
    `scripts/known-failures.txt` that the fix must delete).
-7. **#1095 first if reviews keep stalling.** On 2026-09-18 three codex
-   full-diff reviews of PR #1116 each concluded "no actionable soundness or
-   regression defects" but the phrase whitelist in `scripts/review-bounded.sh`
-   (the `awk` block before "unrecognized native result") matched none of the
-   three wordings, so every run ended INCOMPLETE and the PR had to attest with
-   `--findings-fixed` against the earlier FINDINGS log. The fix is in the
-   wrapper, not the prompt: accept a CLEAN result structurally (no `- [P0-3]`
-   line and a closing no-defects sentence), or make the codex prompt's final
-   marker line mandatory in the parser. Retained evidence: the three
-   `align-review-run-f4e431d3*` directories, copied to the owner's local
-   `.git/paused-1081/` (not part of the repository).
 
 Recorded follow-up from PR #1116's review (plan 69 §3.7): the static
 initializer scan in `align_mir::loop_facts::admit` can be replaced by an
