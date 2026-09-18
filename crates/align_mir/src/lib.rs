@@ -28178,41 +28178,36 @@ fn main() -> i32 = 0
                 "the exact bounds condition must immediately drive its branch:\n{rendered}"
             );
             let Rvalue::Bin(
-                BinOp::Or,
-                Operand::Value(low_condition),
-                Operand::Value(high_condition),
+                BinOp::Ge,
+                Operand::Value(unsigned_index),
+                Operand::Value(unsigned_len),
             ) = condition_definition
             else {
-                panic!("the bounds condition must combine low and high guards:\n{rendered}")
+                panic!("the fused bounds condition must be one unsigned compare:\n{rendered}")
             };
-            let (_, _, low_definition) = value_definition(function, *low_condition);
-            let (_, _, high_definition) = value_definition(function, *high_condition);
+            let (_, _, index_definition) = value_definition(function, *unsigned_index);
+            let (_, _, len_definition) = value_definition(function, *unsigned_len);
             assert!(
                 matches!(
-                    low_definition,
-                    Rvalue::Bin(
-                        BinOp::Lt,
-                        Operand::Value(index),
-                        Operand::Const(Const::Int(
-                            0,
-                            Ty::Int(IntTy { bits: 64, signed: true })
-                        ))
-                    ) if index == checked_index_value
+                    index_definition,
+                    Rvalue::Cast {
+                        operand: Operand::Value(index),
+                        from: Ty::Int(IntTy { bits: 64, signed: true }),
+                        to: Ty::Int(IntTy { bits: 64, signed: false }),
+                    } if index == checked_index_value
                 ),
-                "the low guard must test the exact index sent to bounds_fail:\n{rendered}"
+                "the fused guard must reinterpret the exact index sent to bounds_fail:\n{rendered}"
             );
             assert!(
                 matches!(
-                    high_definition,
-                    Rvalue::Bin(
-                        BinOp::Ge,
-                        Operand::Value(index),
-                        Operand::Const(Const::Int(len, ty))
-                    ) if index == checked_index_value
-                        && len == checked_len_value
-                        && ty == checked_len_ty
+                    len_definition,
+                    Rvalue::Cast {
+                        operand: Operand::Const(Const::Int(len, ty)),
+                        from: Ty::Int(IntTy { bits: 64, signed: true }),
+                        to: Ty::Int(IntTy { bits: 64, signed: false }),
+                    } if len == checked_len_value && ty == checked_len_ty
                 ),
-                "the high guard must test the exact index/length sent to bounds_fail:\n{rendered}"
+                "the fused guard must reinterpret the exact length sent to bounds_fail:\n{rendered}"
             );
             assert!(
                 location_precedes(function, source_load, (condition_block, condition_index)),
