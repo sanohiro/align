@@ -217,33 +217,60 @@ fn element_owned_field_reassign_consumes_the_source() {
     ));
 }
 
+/// #1048/#1051/#1054 (`76dcb12b`) shipped general owned field replacement, so a *direct* field
+/// replacement of a Move-leaf-containing struct (`value.inner = replacement`) no longer fails
+/// closed: it drops the old `Inner` and moves in the new one like any other owned-field store.
+/// Element-field replacement through a **fixed struct array** index is a different lowering
+/// (`StoreElemFieldPtr`, no per-element drop-old) and still has no typed drop-old operation for a
+/// non-`string` Move leaf, so `values[0].inner = replacement` keeps its original rejection.
 #[test]
-fn unsupported_move_leaf_partial_replacement_is_rejected() {
-    let cases = [
-        (
-            "move-leaf-direct-field-replace.align",
-            "Inner { name: string }\nOuter { inner: Inner }\nfn main() -> i32 {\n  mut value := Outer{inner: Inner{name: \"old\".clone()}}\n  replacement := Inner{name: \"new\".clone()}\n  value.inner = replacement\n  return 0\n}\n",
-            "field replacement of Inner is not supported yet",
-        ),
-        (
-            "move-leaf-element-field-replace.align",
-            "Inner { name: string }\nOuter { inner: Inner }\nfn main() -> i32 {\n  mut values := [Outer{inner: Inner{name: \"old\".clone()}}]\n  replacement := Inner{name: \"new\".clone()}\n  values[0].inner = replacement\n  return 0\n}\n",
-            "element-field assignment of Inner into a fixed struct array is not supported yet",
-        ),
-    ];
-    for (name, src, expected) in cases {
-        let mut sm = SourceMap::new();
-        let checked = check(&mut sm, name, src);
-        let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
-        assert!(
-            checked.diags.has_errors(),
-            "unsupported Move-leaf replacement must fail closed: {name}"
-        );
-        assert!(
-            rendered.contains(expected),
-            "diagnostic must name the unsupported partial replacement in {name}:\n{rendered}"
-        );
+fn move_leaf_field_replacement_is_supported_but_array_element_field_replacement_is_rejected() {
+    let element_src = "Inner { name: string }\nOuter { inner: Inner }\nfn main() -> i32 {\n  mut values := [Outer{inner: Inner{name: \"old\".clone()}}]\n  replacement := Inner{name: \"new\".clone()}\n  values[0].inner = replacement\n  return 0\n}\n";
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "move-leaf-element-field-replace.align", element_src);
+    let rendered = align_driver::format_diagnostics(&sm, &checked.diags);
+    assert!(
+        checked.diags.has_errors(),
+        "element-field replacement of a Move leaf through a fixed struct array must fail closed"
+    );
+    assert!(
+        rendered.contains("element-field assignment of Inner into a fixed struct array is not supported yet"),
+        "diagnostic must name the still-unsupported array element-field replacement:\n{rendered}"
+    );
+
+    if !backend_available() {
+        return;
     }
+    let src = "\
+extern \"C\" {
+  fn align_rt_requested_live_reset()
+  fn align_rt_requested_live_bytes() -> i64
+}
+
+Inner { name: string }
+Outer { inner: Inner }
+
+fn exercise() -> i32 {
+  mut value := Outer{inner: Inner{name: \"old\".clone()}}
+  base_live := unsafe { align_rt_requested_live_bytes() }
+  if base_live <= 0 { return 1 }
+  replacement := Inner{name: \"new\".clone()}
+  value.inner = replacement
+  if value.inner.name.len() != 3 { return 2 }
+  // The old `Inner` (and its `name` string) must be dropped, not leaked, by the replacement.
+  if unsafe { align_rt_requested_live_bytes() } != base_live { return 3 }
+  return 0
+}
+
+fn main() -> i32 {
+  unsafe { align_rt_requested_live_reset() }
+  res := exercise()
+  if res != 0 { return res }
+  if unsafe { align_rt_requested_live_bytes() } != 0 { return 4 }
+  return 0
+}
+";
+    assert_eq!(build_and_run("move-leaf-direct-field-replace", src).status.code(), Some(0));
 }
 
 #[test]

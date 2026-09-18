@@ -397,27 +397,38 @@ fn main() -> Result<(), Error> {
     let kdf = verify_source.find("crypto.argon2id").expect("Argon2 call");
     assert!(maximum_validation < phc_read && phc_read < kdf);
 
-    let function_value = r#"module main
+    // `encode_hs256(claims_json: str, key: slice<u8>) -> Result<string, Error>` used to be rejected
+    // as a function value (its `slice<u8>` parameter was not a scalar). #937 (`384d7744`) widened
+    // `fn_sig_scalar` to admit borrowed slices as function-value parameters, so this signature is
+    // now legal: bind it and call it indirectly, and check it produces the same vector as calling
+    // `pkg.auth.encode_hs256` directly (`jwt_vector_and_whole_per_unit_execution_are_exact`).
+    let claims = format!("{CLAIMS:?}");
+    let function_value = format!(
+        r#"module main
 import pkg.auth
+import std.encoding
 
-fn main() -> i32 {
+fn main() -> Result<(), Error> {{
+  key := encoding.hex_decode("{KEY_HEX}")?
   signer := pkg.auth.encode_hs256
-  return 0
-}
-"#;
-    let diagnostics = check_multi_diagnostics(
+  token := signer({claims}, key.bytes())?
+  print(token)
+  return Ok(())
+}}
+"#
+    );
+    let output = build_and_run_multi(
         "pkg-auth-function-value",
-        &[
-            ("pkg/auth.align", auth_source()),
-            ("main.align", function_value),
-        ],
+        &auth_files(&function_value),
         "main.align",
     );
-    assert!(
-        diagnostics.contains("cannot be used as a function value yet")
-            && diagnostics.contains("only scalar parameters/return"),
-        "{diagnostics}",
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr),
     );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), format!("{TOKEN}\n"));
 }
 
 #[test]

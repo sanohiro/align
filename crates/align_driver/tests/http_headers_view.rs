@@ -458,8 +458,13 @@ pub fn main() -> Result<(), Error> { return Ok(()) }
     // The view really is a bare pointer: `ctx.headers()` is a pointer copy, and the lookup is the
     // SAME runtime call the removed `ctx.header(name)` made — no new runtime entry point exists.
     assert!(ir.contains("align_rt_http_ctx_header("), "the lookup reuses the existing runtime call:\n{ir}");
+    // Scoped to the two emitted bodies, not the whole module: pkg.ws (#937) unconditionally declares
+    // the whole runtime ABI table (including the unrelated `align_rt_http_headers_count` /
+    // `_tokens_valid` / `_contains_token*` token-matching entries it added), so a module-wide
+    // substring check now trips on those declares even though neither `probe` nor `build` calls them.
     for added in ["align_rt_http_headers", "align_rt_http_ctx_headers"] {
-        assert!(!ir.contains(added), "item 10 adds no runtime code at all, but found {added}:\n{ir}");
+        assert!(!body.contains(added), "item 10 adds no runtime code to `probe`, but found {added}:\n{body}");
+        assert!(!build.contains(added), "item 10 adds no runtime code to `build`, but found {added}:\n{build}");
     }
 }
 

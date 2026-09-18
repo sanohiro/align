@@ -779,16 +779,33 @@ fn qualified_callable_enforces_visibility_and_imports() {
 
 #[test]
 fn qualified_function_value_keeps_signature_restrictions() {
-    let util = "module util\npub fn total(xs: slice<i64>) -> i64 = xs.sum()\n";
-    let main = "module main\nimport util\nfn main() -> i32 {\n  f := util.total\n  return 0\n}\n";
+    // #937 (`384d7744`) widened `fn_sig_scalar` to admit borrowed slices as function-value
+    // *parameters* ("Borrowed slices are admitted as parameters only"), so a qualified path to a
+    // slice-parameter signature is no longer rejected — it must now bind and call successfully.
+    if backend_available() {
+        let util = "module util\npub fn total(xs: slice<i64>) -> i64 = xs.sum()\n";
+        let main = "module main\nimport util\nfn main() -> i32 {\n  f := util.total\n  xs := [1, 2, 3]\n  return f(xs) as i32\n}\n";
+        let out = build_and_run_multi(
+            "mod-qualified-fnval-slice-param",
+            &[("util.align", util), ("main.align", main)],
+            "main.align",
+        );
+        assert_eq!(out.status.code(), Some(6));
+    }
+
+    // The other half of the restriction still holds: returning a borrowed slice from a function
+    // value still lacks a region contract (`fn_value_ret_ok` stays `false` for `Scalar::Slice`), so
+    // a qualified path to THIS signature stays rejected.
+    let util_ret = "module util\npub fn first(xs: slice<i64>) -> slice<i64> = xs\n";
+    let main_ret = "module main\nimport util\nfn main() -> i32 {\n  f := util.first\n  return 0\n}\n";
     let diags = check_multi_diagnostics(
-        "mod-qualified-fnval-signature",
-        &[("util.align", util), ("main.align", main)],
+        "mod-qualified-fnval-slice-return",
+        &[("util.align", util_ret), ("main.align", main_ret)],
         "main.align",
     );
     assert!(
-        diags.contains("'util.total' cannot be used as a function value yet"),
-        "qualified values must retain the scalar-signature restriction, got:\n{diags}"
+        diags.contains("'util.first' cannot be used as a function value yet"),
+        "qualified values must retain the slice-return restriction, got:\n{diags}"
     );
 }
 
