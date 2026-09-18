@@ -339,6 +339,13 @@ fake_codex="$fake_bin/codex"
   printf '  native-clean-inline) echo "No actionable soundness or regression risks were found. ALIGN_REVIEW_VERDICT=CLEAN"; echo "No actionable soundness or regression risks were found. ALIGN_REVIEW_VERDICT=CLEAN" ;;\n'
   printf '  native-clean-introducing) echo "The host qualification layer validates canonical shape, fixed identities, resource limits, and quota constraints without introducing an actionable regression." ;;\n'
   printf '  native-clean-mixed) echo "Actionable issue: the review is not clean."; echo "The host qualification layer validates canonical shape, fixed identities, resource limits, and quota constraints without introducing an actionable regression." ;;\n'
+  printf '  native-clean-two-sentences) echo "Read-only inspection found no actionable soundness or regression issues. No tests, builds, benchmarks, or network commands were run."; echo "Read-only inspection found no actionable soundness or regression issues. No tests, builds, benchmarks, or network commands were run." ;;\n'
+  printf '  native-clean-defects) echo "No actionable soundness or regression defects found in the inspected diff. Review was inspection-only; no tests, builds, benchmarks, or network commands were run."; echo "No actionable soundness or regression defects found in the inspected diff. Review was inspection-only; no tests, builds, benchmarks, or network commands were run." ;;\n'
+  printf '  native-clean-covered) echo "Inspection found no actionable soundness or regression defects in the requested diff. Review covered guard fusion, admission arithmetic, loop cloning, mutation tracking, and downstream consumers; no tests or builds were run."; echo "Inspection found no actionable soundness or regression defects in the requested diff. Review covered guard fusion, admission arithmetic, loop cloning, mutation tracking, and downstream consumers; no tests or builds were run." ;;\n'
+  printf '  native-clean-caveat) echo "No actionable soundness or regression issues were found, but the P2 below should still be fixed."; echo "- P2: scripts/example.sh:1 leaks the temp file" ;;\n'
+  printf '  native-clean-lowercase) echo "no actionable issues." ;;\n'
+  printf '  native-clean-incomplete) echo "No actionable issues found so far; inspection is incomplete." ;;\n'
+  printf '  native-clean-unreviewed) echo "No actionable soundness or regression issues in the files reviewed. The remaining files were not yet inspected." ;;\n'
   printf '  native-findings) echo "- [P1] broken workflow — scripts/example.sh:1" ;;\n'
   printf '  stall) sleep 30 ;;\n'
   printf '  progress) for i in 1 2 3; do echo "phase-$i"; sleep 1; done; echo "ALIGN_REVIEW_VERDICT=CLEAN" ;;\n'
@@ -458,6 +465,34 @@ native_introducing_status=$?
   ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
   "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
 native_mixed_status=$?
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=native-clean-two-sentences ALIGN_REVIEW_STALL_SECONDS=5 \
+  ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
+  "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
+native_two_sentences_status=$?
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=native-clean-defects ALIGN_REVIEW_STALL_SECONDS=5 \
+  ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
+  "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
+native_defects_status=$?
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=native-clean-covered ALIGN_REVIEW_STALL_SECONDS=5 \
+  ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
+  "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
+native_covered_status=$?
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=native-clean-caveat ALIGN_REVIEW_STALL_SECONDS=5 \
+  ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
+  "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
+native_caveat_status=$?
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=native-clean-lowercase ALIGN_REVIEW_STALL_SECONDS=5 \
+  ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
+  "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
+native_lowercase_status=$?
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=native-clean-incomplete ALIGN_REVIEW_STALL_SECONDS=5 \
+  ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
+  "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
+native_incomplete_status=$?
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=native-clean-unreviewed ALIGN_REVIEW_STALL_SECONDS=5 \
+  ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
+  "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
+native_unreviewed_status=$?
 set -e
 [[ $findings_status -eq 2 ]] || {
   echo "findings review returned $findings_status, expected 2" >&2
@@ -488,9 +523,30 @@ set -e
 }
 [[ $native_clean_status -eq 0 && $native_readonly_status -eq 0 &&
   $native_inspected_status -eq 0 && $native_risks_status -eq 0 &&
-  $native_inline_status -eq 0 && $native_introducing_status -eq 0 && $native_mixed_status -eq 3 &&
+  $native_inline_status -eq 0 && $native_mixed_status -eq 3 &&
   $native_findings_status -eq 2 ]] || {
   echo "native review output was classified incorrectly" >&2
+  exit 1
+}
+# A clean sentence may contain "fixed" in a benign sense ("fixed identities"),
+# so it is deliberately not a caveat token; "should", "but" and a P-level catch
+# the "should be fixed" caveats instead.
+[[ $native_introducing_status -eq 0 ]] || {
+  echo "native-clean-introducing was classified incorrectly (expected 0, got $native_introducing_status)" >&2
+  exit 1
+}
+[[ $native_two_sentences_status -eq 0 && $native_defects_status -eq 0 &&
+  $native_covered_status -eq 0 ]] || {
+  echo "reworded native-clean summaries were rejected" >&2
+  exit 1
+}
+[[ $native_caveat_status -eq 3 && $native_lowercase_status -eq 3 ]] || {
+  echo "a caveated or lowercase native result was accepted as clean" >&2
+  exit 1
+}
+# A summary that admits the inspection did not finish is INCOMPLETE, never CLEAN.
+[[ $native_incomplete_status -eq 3 && $native_unreviewed_status -eq 3 ]] || {
+  echo "a self-declared incomplete native result was accepted as clean" >&2
   exit 1
 }
 
