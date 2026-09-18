@@ -53,10 +53,14 @@ name: Nightly full suite
 # cancellation — and the cache-save step below still runs, which a cancellation
 # never allowed.
 #
-# Local equivalent, byte-for-byte the same judgement over the whole workspace:
+# Local equivalent, the same judgement over the whole workspace:
 #   scripts/run-suite-binaries.sh
 # and one shard of it:
 #   ALIGN_SUITE_SHARDS=12 ALIGN_SUITE_SHARD=3 scripts/run-suite-binaries.sh
+# It is byte-for-byte the same judgement on this runner's platform. The
+# manifest is judged on Linux x86_64, so an entry tagged Linux-only in
+# scripts/known-failures.txt passes on another host and is reported there as a
+# manifest entry that did not fail.
 
 on:
   schedule:
