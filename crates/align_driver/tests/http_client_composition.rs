@@ -246,12 +246,9 @@ fn formation_and_carrier_matrix() {
         for declaration in [
             format!("extern \"C\" fn invalid(value: {name})"),
             format!(
-                "Holder {{ value: {name} }}\nfn invalid(value: Holder) {{ items := [value].map(fn(item: Holder) -> Holder {{ item }}).to_array() }}"
+                "Holder {{ value: {name} }}\nfn invalid(value: Holder) {{ items := [value].map(fn item: Holder {{ item }}).to_array() }}"
             ),
-            format!("fn invalid(value: {name}) -> fn() -> {name} = fn() -> {name} {{ value }}"),
-            format!(
-                "fn invalid(a: {name}, b: {name}, flag: bool) -> {name} = if flag {{ a }} else {{ b }}"
-            ),
+            format!("fn invalid(value: {name}) {{ captured := fn {{ value }} }}"),
             format!("fn invalid(a: {name}, b: {name}) {{ values := [a, b] }}"),
         ] {
             check_both(
@@ -260,6 +257,50 @@ fn formation_and_carrier_matrix() {
                 false,
             );
         }
+        // Copy twins of the two carrier declarations whose shape (a pipeline element, a lambda
+        // capture) could reject for a reason other than ownership. Each must be ACCEPTED, so the
+        // negatives above are pinned to the Move rule and cannot be satisfied by a syntax or
+        // arity error in the surrounding form.
+        for declaration in [
+            "Copyable { value: i64 }\nfn control(value: Copyable) { items := [value].map(fn item: Copyable { item }).to_array() }",
+            "fn control(value: i64) { captured := fn { value } }",
+        ] {
+            check_both(
+                &format!("http-carrier-copy-control {declaration}"),
+                &format!("module main\nimport helpers\n{declaration}\nfn main() {{}}\n"),
+                true,
+            );
+        }
+        // A conditional result is NOT a forbidden carrier. `38-bound-if-result-plan.md` (#1003)
+        // admits selecting an already-bound Move source through an `if`/`else` result in binding,
+        // argument and return position, for every Move type — a native handle included. The
+        // selected arm clears only its own cleanup bit; the unselected source keeps its ordinary
+        // scope-end Drop. Nothing is collected, aliased or duplicated, so there is no second owner
+        // of either handle. These cells pin the admitted direction: a regression that re-rejected
+        // them would fail here instead of silently narrowing the Move model.
+        for declaration in [
+            format!(
+                "fn valid(a: {name}, b: {name}, flag: bool) -> {name} = if flag {{ a }} else {{ b }}"
+            ),
+            format!(
+                "fn valid(a: {name}, b: {name}, flag: bool) {{ chosen := if flag {{ a }} else {{ b }} }}"
+            ),
+            format!("fn valid(a: Option<{name}>, b: {name}) -> {name} = a else b"),
+        ] {
+            check_both(
+                &format!("http-conditional-carrier {declaration}"),
+                &format!("module main\nimport helpers\n{declaration}\nfn main() {{}}\n"),
+                true,
+            );
+        }
+        // The conditional result transfers one owner; it does not license reusing the source.
+        check_both(
+            &format!("http-conditional-carrier-reuse {name}"),
+            &format!(
+                "module main\nimport helpers\nfn invalid(a: {name}, b: {name}, flag: bool) -> {name} {{\n  chosen := if flag {{ a }} else {{ b }}\n  return a\n}}\nfn main() {{}}\n"
+            ),
+            false,
+        );
         for other in ["http_client", "http_request", "http_response"] {
             if name != other {
                 check_both(
@@ -272,12 +313,16 @@ fn formation_and_carrier_matrix() {
             }
         }
     }
-    for operation in [
-        "owner.value = helpers.prepare(\"new\")?",
-        "moved := values[0].value",
+    // General admitted owning-field replacement shipped with #1048 (`65-open-issue-batch-plan.md`):
+    // `owner.value = <new handle>` drops the displaced handle before installing the replacement, so
+    // an owned handle field is a replaceable place, not a frozen one. Reading a Move field out of an
+    // array element stays closed — that one would copy a handle without transferring it.
+    for (operation, accepted) in [
+        ("owner.value = helpers.prepare(\"new\")?", true),
+        ("moved := values[0].value", false),
     ] {
         check_both(
-            "http-existing-place-restriction",
+            &format!("http-existing-place-restriction {operation}"),
             &format!(
                 r#"module main
 import helpers
@@ -289,7 +334,7 @@ fn main() -> Result<(), Error> {{
 }}
 "#
             ),
-            false,
+            accepted,
         );
     }
 }
