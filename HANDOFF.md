@@ -25,9 +25,9 @@ Suggested order, each its own PR set (implement, one review, one fix, preflight,
 5. Language items after the codegen track: #1085 `str` patterns in `match`,
    #1065 fixed arrays in structs, #1066 proposal 2, #1064 → depends on #1063,
    #1075 scalar ABI facts, #1082 P2 RFC.
-6. Follow-ups, independent and small: #1093, #1094, #1105–#1109, #1112
-   (nightly triage findings; each has a manifest line in
-   `scripts/known-failures.txt` that the fix must delete).
+6. Follow-ups, independent and small: #1093, #1105–#1109, #1112 (nightly
+   triage findings; each has a manifest line in `scripts/known-failures.txt`
+   that the fix must delete).
 
 Recorded follow-up from PR #1116's review (plan 69 §3.7): the static
 initializer scan in `align_mir::loop_facts::admit` can be replaced by an

@@ -8606,10 +8606,17 @@ fn validate_resource_rvalues_component(
                     _ => true,
                 };
                 if !call_arguments_valid {
-                    return Err(fail(
-                        function,
-                        "XML-capable call argument provenance mismatch",
-                    ));
+                    let detail = match rvalue {
+                        Rvalue::Call(DirectCall::Program(target), _) => {
+                            format!("owned-leaf argument provenance mismatch at call to '{target}'")
+                        }
+                        Rvalue::CallWithCleanup(call) => format!(
+                            "owned-leaf argument provenance mismatch at call to '{}'",
+                            call.target
+                        ),
+                        _ => "owned-leaf argument provenance mismatch at an indirect call".to_string(),
+                    };
+                    return Err(fail(function, &detail));
                 }
                 if matches!(
                     rvalue,
