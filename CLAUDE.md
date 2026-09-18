@@ -290,6 +290,14 @@ a missing `ld.lld` is a red build rather than a silent fallback to the slow
 system linker; locally an unset value fails open to `ld.lld` when the matched
 LLVM install has one (`docs/impl/21-build-perf-plan.md` item 2).
 
+When an agent harness caps a tool call below a gate's duration, launch
+`scripts/pre-pr.sh` or `scripts/test-pr-workflow.sh` in its own session with
+default signal dispositions (for example Python `os.setsid()` plus
+`signal.signal(SIG*, SIG_DFL)` in `preexec_fn`), never under `nohup` or as a
+shell background job: those ignore SIGHUP or SIGINT, and the review-wrapper
+signal owners then fail without any defect in the tree. Poll the log file for
+progress instead of holding the call open.
+
 Run the narrow regression target that owns the changed behavior. There is no
 mandatory full-workspace test command: deep driver, fuzz, resource, stress,
 and integration targets run only when they own the changed boundary.
