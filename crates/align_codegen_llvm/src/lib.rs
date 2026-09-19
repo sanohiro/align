@@ -91,9 +91,27 @@ use inkwell::types::{
     StructType,
 };
 use inkwell::values::{
-    ArrayValue, BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, IntValue,
-    OperandBundle, PointerValue, StructValue,
+    ArrayValue, AsValueRef, BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue,
+    IntValue, OperandBundle, PointerValue, StructValue,
 };
+
+fn freeze_struct_value<'c>(
+    builder: &Builder<'c>,
+    value: StructValue<'c>,
+    name: &str,
+) -> Result<StructValue<'c>, CodegenError> {
+    let name = std::ffi::CString::new(name)
+        .map_err(|_| CodegenError::Lowering("LLVM value name contains NUL".into()))?;
+    // Inkwell 0.9 does not wrap LLVMBuildFreeze. `value` is a live struct value owned by the
+    // builder's context, and LLVMBuildFreeze returns a value of that same type and lifetime.
+    Ok(unsafe {
+        StructValue::new(llvm_sys::core::LLVMBuildFreeze(
+            builder.as_mut_ptr(),
+            value.as_value_ref(),
+            name.as_ptr(),
+        ))
+    })
+}
 
 type ColumnBatchLayout<'c> = (
     Vec<IntValue<'c>>,
@@ -2578,21 +2596,31 @@ fn emit_sqlite_scalar_callback_trampoline<'c>(
                 .into_struct_value();
             builder.build_store(value_union_scratch, tagged).map_err(lower)?;
             let storage = builder.build_struct_gep(value_llvm_ty, value_union_scratch, 1, "value.storage").map_err(lower)?;
+            let storage_type = value_llvm_ty.get_field_types()[1].into_struct_type();
+            let bytes = builder.build_struct_gep(storage_type, storage, 1, "value.bytes").map_err(lower)?;
             let offset = match mapping {
                 PhysicalPayload::Stored { offset, .. } => offset,
                 _ => return Err(CodegenError::Lowering("pkg.db.value callback payload is omitted".into())),
             };
-            let pointer = unsafe { builder.build_gep(i8_ty, storage, &[i64_ty.const_int(offset, false)], "value.payload").map_err(lower)? };
+            let pointer = unsafe { builder.build_gep(i8_ty, bytes, &[i64_ty.const_int(offset, false)], "value.payload").map_err(lower)? };
             builder.build_store(pointer, $payload).map_err(lower)?;
-            builder.build_load(value_llvm_ty, value_union_scratch, "value.union.load").map_err(lower)?.into_struct_value()
+            freeze_struct_value(
+                &builder,
+                builder.build_load(value_llvm_ty, value_union_scratch, "value.union.load").map_err(lower)?.into_struct_value(),
+                "value.union.frozen",
+            )?
         }};
     }
 
     builder.position_at_end(null_case);
-    let null_value = builder
+    let null_value = freeze_struct_value(
+        &builder,
+        builder
         .build_insert_value(value_llvm_ty.get_poison(), i32_ty.const_zero(), 0, "value.null")
         .map_err(lower)?
-        .into_struct_value();
+        .into_struct_value(),
+        "value.null.frozen",
+    )?;
     finish_input_value!(null_value);
 
     builder.position_at_end(integer_case);
@@ -6589,9 +6617,13 @@ fn extract_union_payload<'c>(
             let storage = builder
                 .build_struct_gep(aggregate_type, scratch, 1, "union.storage")
                 .map_err(|e| CodegenError::Lowering(e.to_string()))?;
+            let storage_type = aggregate_type.get_field_types()[1].into_struct_type();
+            let bytes = builder
+                .build_struct_gep(storage_type, storage, 1, "union.bytes")
+                .map_err(|e| CodegenError::Lowering(e.to_string()))?;
             let pointer = unsafe {
                 builder
-                    .build_gep(ctx.i8_type(), storage, &[ctx.i64_type().const_int(offset, false)], "union.payload")
+                    .build_gep(ctx.i8_type(), bytes, &[ctx.i64_type().const_int(offset, false)], "union.payload")
                     .map_err(|e| CodegenError::Lowering(e.to_string()))?
             };
             builder
@@ -9263,13 +9295,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .builder
             .build_struct_gep(aggregate, base, 1, "union.storage")
             .map_err(|error| self.err(error))?;
+        let storage_type = aggregate.get_field_types()[1].into_struct_type();
+        let bytes = self
+            .builder
+            .build_struct_gep(storage_type, storage, 1, "union.bytes")
+            .map_err(|error| self.err(error))?;
         let offset = self.ctx.i64_type().const_int(offset, false);
         // This is a raw byte displacement inside union storage. It is deliberately not `inbounds`:
         // provenance comes from the containing tagged object, while the active payload type is a
         // target-computed view over those bytes.
         let pointer = unsafe {
             self.builder
-                .build_gep(self.ctx.i8_type(), storage, &[offset], name)
+                .build_gep(self.ctx.i8_type(), bytes, &[offset], name)
                 .map_err(|error| self.err(error))?
         };
         Ok(Some(pointer))
@@ -9325,11 +9362,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder.build_store(pointer, value).map_err(|e| self.err(e))?;
             }
         }
-        Ok(self
+        freeze_struct_value(
+            self.builder,
+            self
             .builder
             .build_load(aggregate_type, scratch, "union.value")
             .map_err(|e| self.err(e))?
-            .into_struct_value())
+            .into_struct_value(),
+            "union.frozen",
+        )
     }
 
     fn build_union_from_values(
@@ -9357,16 +9398,24 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder.build_store(pointer, value).map_err(|e| self.err(e))?;
             }
         }
-        Ok(self.builder.build_load(aggregate_type, scratch, "union.value").map_err(|e| self.err(e))?.into_struct_value())
+        freeze_struct_value(
+            self.builder,
+            self.builder.build_load(aggregate_type, scratch, "union.value").map_err(|e| self.err(e))?.into_struct_value(),
+            "union.frozen",
+        )
     }
 
     fn option_none_value(&self, payload: Scalar) -> Result<StructValue<'c>, CodegenError> {
         let ty = option_struct_type(self.ctx, payload, self.struct_types, self.enum_types, self.tagged_types);
-        Ok(self
+        freeze_struct_value(
+            self.builder,
+            self
             .builder
             .build_insert_value(ty.get_poison(), self.ctx.i8_type().const_zero(), 0, "option.none")
             .map_err(|e| self.err(e))?
-            .into_struct_value())
+            .into_struct_value(),
+            "option.none.frozen",
+        )
     }
 
     fn option_some_value(&self, payload: Scalar, value: BasicValueEnum<'c>) -> Result<StructValue<'c>, CodegenError> {
@@ -13055,18 +13104,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 else {
                     return Err(self.err("None result is not an Option"));
                 };
-                let option = option_struct_type(
-                    self.ctx,
-                    s,
-                    self.struct_types,
-                    self.enum_types,
-                    self.tagged_types,
-                );
-                self.builder
-                    .build_insert_value(option.get_poison(), self.ctx.i8_type().const_zero(), 0, "tag")
-                    .map_err(|e| self.err(e))?
-                    .into_struct_value()
-                    .into()
+                self.option_none_value(s)?.into()
             }
             Rvalue::OptionIsSome(op) => {
                 let tag = if let Operand::BorrowedPlace(place) = op {
@@ -17558,7 +17596,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder.build_unconditional_branch(join).map_err(|e| self.err(e))?;
                 let code_end = self.builder.get_insert_block().ok_or_else(|| self.err("Error::Code construction block is absent"))?;
                 self.builder.position_at_end(category_block);
-                let category = self.builder.build_insert_value(sty.get_poison(), t, 0, "etag").map_err(|e| self.err(e))?.into_struct_value();
+                let category = freeze_struct_value(
+                    self.builder,
+                    self.builder.build_insert_value(sty.get_poison(), t, 0, "etag").map_err(|e| self.err(e))?.into_struct_value(),
+                    "error.category.frozen",
+                )?;
                 self.builder.build_unconditional_branch(join).map_err(|e| self.err(e))?;
                 let category_end = self.builder.get_insert_block().ok_or_else(|| self.err("Error category construction block is absent"))?;
                 self.builder.position_at_end(join);
@@ -35644,6 +35686,12 @@ fn main() -> i32 = 0
         assert!(matches!(shape.variants[2][0], PhysicalPayload::Stored { offset: 0, size: 1, align: 1, .. }));
         assert!(matches!(shape.variants[2][1], PhysicalPayload::Stored { offset: 8, size: 8, align: 8, .. }));
         assert_eq!(shape.body.count_fields(), 2);
+        let storage = shape.body.get_field_types()[1].into_struct_type();
+        assert_eq!(
+            storage.print_to_string().to_string(),
+            "{ [0 x { i8, i64 }], [16 x i8] }",
+            "the leading zero-length anchor must align the following byte array without occupying storage"
+        );
         assert_eq!((data.get_abi_size(&shape.body), data.get_abi_alignment(&shape.body)), (24, 8));
 
         let all_zero = union_shape(
@@ -35678,12 +35726,12 @@ fn main() -> i32 = 0
             for (name, active_payloads, raw_i64_stores) in [("make", 1, 2), ("make_large", 2, 4)] {
                 let body = function_body(&llvm, name);
                 assert_eq!(
-                    body.matches("getelementptr i8, ptr %union.storage").count(),
+                    body.matches("getelementptr i8, ptr %union.bytes").count(),
                     if optimized { 0 } else { active_payloads },
                     "only raw code may retain one address per active payload:\n{body}"
                 );
                 if name == "make" {
-                    assert!(!body.contains("getelementptr i8, ptr %union.storage, i64 8"), "the inactive second payload must not be addressed:\n{body}");
+                    assert!(!body.contains("getelementptr i8, ptr %union.bytes, i64 8"), "the inactive second payload must not be addressed:\n{body}");
                 }
                 if optimized {
                     assert_eq!(
@@ -35700,6 +35748,28 @@ fn main() -> i32 = 0
                 }
             }
         }
+    }
+
+    #[test]
+    fn option_none_uses_the_frozen_union_constructor_before_a_join() {
+        let source = "fn selected(flag: bool) -> string {\n\
+            value: Option<string> := if flag { Some(\"present\".clone()) } else { None }\n\
+            return value else \"fallback\".clone()\n\
+            }\n\
+            fn main() -> i32 = 0\n";
+        let program = mir(source);
+        let llvm = emit_llvm_ir(
+            &program,
+            &BuildTarget::Baseline,
+            Profile::Release,
+            false,
+            &["selected".to_string()],
+            None,
+        )
+        .unwrap_or_else(|error| panic!("joined Option<string> must lower: {error}"));
+        let body = function_body(&llvm, "selected");
+        assert!(body.contains("union.frozen = freeze"), "Some must freeze inactive payload bytes before the join:\n{body}");
+        assert!(body.contains("option.none.frozen = freeze"), "None must use the same frozen construction boundary:\n{body}");
     }
 
     #[test]

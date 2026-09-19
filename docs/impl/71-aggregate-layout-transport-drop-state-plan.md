@@ -474,12 +474,12 @@ cases.
 | Cell | Required closure and owner |
 | --- | --- |
 | Formation/validation | user sums, Option, Result, tag-only, Unit-only, non-Unit zero-sized, mixed/all-zero variants, mixed alignment, nested tagged payload, generic instantiation, overflow and malformed graphs; exact logical-to-physical map cardinality and semantic type-layout plus LLVM layout twins; zero-sized Drop/alignment rejection |
-| Construction/move-in | every variant writes one tag and only active Stored fields; OmittedUnit and OmittedZero values are evaluated once and synthesized without storage; Copy and Move payloads, nested records/arrays/strings; enum/option/result construction owners and optimized IR store-count owner |
+| Construction/move-in | every variant writes one tag and only active Stored fields; every completed stored-payload value and payload-bearing None is frozen before it can cross an SSA join, store, call, or return; OmittedUnit and OmittedZero values are evaluated once and synthesized without storage; Copy and Move payloads, nested records/arrays/strings; enum/option/result construction owners, optimized IR store-count owner, and optimized nested tagged aggregate owner preserving offset-zero pointer bytes through local assignment and return |
 | Move-out/source nulling | active payload moves clear only its source ownership state; union bytes need no deterministic zero; existing move and owned-match owners |
 | Drop/replacement/return | tag-directed exactly-once Drop for every ordinal, old-value replacement after RHS, direct/indirect returns and cleanup payloads; large-drop, enum-drop, reassign, move-return owners |
 | Control flow | if/match/else/?/map_err, wildcard/or-pattern, branch/loop joins, early return and divergence; value-control and tagged-match owners |
 | Serialization/native | JSON encodes/decodes only active fields; callbacks and task/error slots agree; every runtime-owned scratch mirror that embeds a tagged value uses the same union body, including `process.termination` and the nested `wait_result`/`reaped` records; foreign layout(C) rejection remains; JSON, task-group, callback, exact native size/offset, process lifecycle, and FFI negative owners |
-| Whole/per-unit/cache | imported and generic definitions produce equal layout; compiler/LLVM/target/type edits miss the right cache; per-unit/interface/inprocess owners |
+| Whole/per-unit/cache | imported and generic definitions produce equal layout; compiler/LLVM/target/type edits miss the right cache; freezing construction results keeps LLVM aggregate promotion/SROA from propagating inactive poison or discarding active bytes through local assignment and return; per-unit/interface/inprocess and optimized nested-tagged owners |
 | Allocation/provenance | no new runtime allocation; nested owned payload keeps heap/arena owner and active-tag lifetime; return-provenance and allocation parity owners |
 | Performance | exact sizes equal formula; small-variant construction has O(active payload) stores; local size/store measurement and direct-layout reverse controls |
 
@@ -615,3 +615,10 @@ boundary omissions:
 | --- | --- | --- |
 | A non-Unit empty struct is also zero-sized, so Stored had no U field in an all-zero sum. | OmittedZero covers every zero-sized non-Unit payload with no Drop plan, synthesizing its exact empty LLVM aggregate without storage. Unsupported alignment or a nonempty Drop plan rejects. | Mixed and all-zero user-sum/Option/Result layout twins plus construction/projection and rejected zero-size-Drop/alignment controls. |
 | A body-specialized Invariant function could expose its plain pointer through `--export`. | Every explicit export gets a named external wrapper with the conservative cleanup pair and a private specialized core. Body effect changes cannot alter the wrapper type; PR 3 target transport is derived over that canonical signature. | Export-root IR signature matrix and compiled C harness for Invariant/MayChange, mixed modes and cleanup results. |
+
+The optimized database owner for candidate `19387551` exposed another value
+formation axis. This preserves the exact layout and its active-byte contract:
+
+| Finding | Ledger correction | Closing owner |
+| --- | --- | --- |
+| `Rvalue::OptionNone` bypassed the common constructor and sent an aggregate with poison inactive bytes into an SSA join. LLVM aggregate promotion could then discard the corresponding active pointer bytes from the Some arm, and a later tag-directed Drop reconstructed an invalid owner. | Every completed stored-payload union value is frozen, `OptionNone` uses the same frozen constructor, and payload GEPs explicitly enter the byte-array field. Freeze chooses unspecified defined inactive bytes without requiring deterministic zeroing or changing the physical type. | Active-store IR owner plus the optimized `pkg_db_q5b2` nested `Result<rows<Row>, Error>` return-and-Drop owner that failed when None bypassed the common constructor. |
