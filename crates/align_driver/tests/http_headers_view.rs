@@ -448,16 +448,22 @@ pub fn main() -> Result<(), Error> { return Ok(()) }
     let ir = emit_llvm_with_exports(src, &["probe", "build"]);
     // `probe` neither owns nor borrows any Move handle — it only builds and reads the Copy struct —
     // so if `Req` were Move (or the view were classified as owning anything) a drop would appear here.
-    let body = ir.split("define").find(|f| f.contains(" @probe(")).unwrap_or_else(|| panic!("no `probe` in the IR:\n{ir}"));
+    let body = function_body(&ir, "probe");
     for freed in ["_free", "align_rt_drop"] {
         assert!(!body.contains(freed), "a Copy context struct must emit no drop ({freed}):\n{body}");
     }
     // The view is a bare pointer: minting it is a plain load/store of the ctx pointer, with no call.
-    let build = ir.split("define").find(|f| f.contains(" @build(")).unwrap_or_else(|| panic!("no `build` in the IR:\n{ir}"));
+    let build = function_body(&ir, "build");
     assert!(!build.contains("align_rt_http_ctx_headers"), "`ctx.headers()` is a pointer copy, not a call:\n{build}");
     // The view really is a bare pointer: `ctx.headers()` is a pointer copy, and the lookup is the
     // SAME runtime call the removed `ctx.header(name)` made — no new runtime entry point exists.
-    assert!(ir.contains("align_rt_http_ctx_header("), "the lookup reuses the existing runtime call:\n{ir}");
+    // Asserted on a `call` instruction, not on the bare symbol: the runtime ABI table is declared
+    // unconditionally (#937), so every module already contains the `declare` line and a plain
+    // substring check would hold even if nothing called it.
+    assert!(
+        ir.lines().any(|l| l.contains("call ") && l.contains("@align_rt_http_ctx_header(")),
+        "the lookup reuses the existing runtime call:\n{ir}"
+    );
     // Scoped to the two emitted bodies, not the whole module: pkg.ws (#937) unconditionally declares
     // the whole runtime ABI table (including the unrelated `align_rt_http_headers_count` /
     // `_tokens_valid` / `_contains_token*` token-matching entries it added), so a module-wide
@@ -466,6 +472,34 @@ pub fn main() -> Result<(), Error> { return Ok(()) }
         assert!(!body.contains(added), "item 10 adds no runtime code to `probe`, but found {added}:\n{body}");
         assert!(!build.contains(added), "item 10 adds no runtime code to `build`, but found {added}:\n{build}");
     }
+}
+
+/// One emitted function's own text: its `define` line through its closing brace, and nothing else.
+///
+/// **Bounding the end is the load-bearing half.** Splitting the module on `"define"` bounds every
+/// definition by the *next* one, so the last definition's chunk runs to the end of the module and
+/// swallows the trailing `declare` table. Which function is last is a module-layout detail that
+/// differs by target — on Linux x86_64 nothing follows `@build` before the C entry, while on
+/// aarch64 macOS the Align `main` body does — and the invariant these scans state (this function
+/// calls no new runtime entry point) must not depend on it. The 2026-09-18 nightly failed exactly
+/// that way: the unconditional `align_rt_http_headers_count` declaration #937 added sat inside
+/// `@build`'s unterminated chunk, while `@build`'s instructions were byte-identical on both hosts.
+fn function_body<'a>(ir: &'a str, name: &str) -> &'a str {
+    let head = format!(" @{name}(");
+    let start = ir
+        .match_indices("\ndefine ")
+        .map(|(at, _)| at + 1)
+        .find(|&at| ir[at..].lines().next().is_some_and(|line| line.contains(&head)))
+        .unwrap_or_else(|| panic!("no `{name}` in the IR:\n{ir}"));
+    let rest = &ir[start..];
+    // A basic block is not braced, so the first line-initial `}` is the function's terminator. Its
+    // absence means the scan would run on into whatever the module prints next, so fail here rather
+    // than silently hand back a chunk wider than one body.
+    let end = rest
+        .find("\n}")
+        .unwrap_or_else(|| panic!("`{name}`'s definition is not terminated in the IR:\n{rest}"))
+        + 2;
+    &rest[..end]
 }
 
 /// `ctx.headers()` keeps the receiver **place-gate** (a temporary owned handle is nothing anyone

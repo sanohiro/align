@@ -1981,12 +1981,18 @@ fn postgres_parameter_type_must_match_the_params_field_shape() {
     );
 }
 
-#[test]
-fn streamed_views_cannot_cross_generation_or_escape() {
-    let cases = [
-        (
-            "use-after-next",
-            r#"fn bad(borrow connection: pkg.db.conn) -> i32 {
+/// The five stream-view misuse shapes, in ONE program.
+///
+/// `check`/`check_per_unit` have no cross-program reuse, so each distinct program re-checks the
+/// whole `pkg.db` package from scratch (28 s per whole-program check, measured). Five programs
+/// cost about 220 s and one costs 98 s; sema keeps checking after an error, so the one program
+/// still carries all five shapes. Each shape is now asserted by its OWN diagnostic under BOTH
+/// front ends, which is strictly stronger than the five `has_errors()` checks it replaces.
+const STREAM_VIEW_REJECTIONS: &str = r#"module main
+import pkg.db
+import app.q4b_query
+
+fn bad_use_after_next(borrow connection: pkg.db.conn) -> i32 {
   bytes := [1 as u8]
   mut stream := pkg.db.rows(
     pkg.db.exec_conn(connection), app.q4b_query.viewed(),
@@ -1996,11 +2002,9 @@ fn streamed_views_cannot_cross_generation_or_escape() {
   row := first else { return 0 }
   ignored := pkg.db.next(stream)
   return if row.label == "first" { 1 } else { 0 }
-}"#,
-        ),
-        (
-            "return",
-            r#"fn bad(borrow connection: pkg.db.conn) -> str {
+}
+
+fn bad_return(borrow connection: pkg.db.conn) -> str {
   bytes := [1 as u8]
   mut stream := pkg.db.rows(
     pkg.db.exec_conn(connection), app.q4b_query.viewed(),
@@ -2009,11 +2013,9 @@ fn streamed_views_cannot_cross_generation_or_escape() {
   first := pkg.db.next(stream) else { return "" }
   row := first else { return "" }
   return row.label
-}"#,
-        ),
-        (
-            "builder-storage",
-            r#"fn bad(borrow connection: pkg.db.conn, out: region) -> i32 {
+}
+
+fn bad_builder_storage(borrow connection: pkg.db.conn, out: region) -> i32 {
   bytes := [1 as u8]
   mut stream := pkg.db.rows(
     pkg.db.exec_conn(connection), app.q4b_query.viewed(),
@@ -2021,15 +2023,14 @@ fn streamed_views_cannot_cross_generation_or_escape() {
   ) else { return 0 }
   first := pkg.db.next(stream) else { return 0 }
   row := first else { return 0 }
-  mut values := array_builder<str>(out)
+  mut values: array_builder<str> := array_builder(out)
   values.push(row.label)
   ignored := pkg.db.next(stream)
-  return values.len() as i32
-}"#,
-        ),
-        (
-            "branch-generation",
-            r#"fn bad(borrow connection: pkg.db.conn, advance: bool) -> i32 {
+  built := values.build()
+  return built.len() as i32
+}
+
+fn bad_branch_generation(borrow connection: pkg.db.conn, advance: bool) -> i32 {
   bytes := [1 as u8]
   mut stream := pkg.db.rows(
     pkg.db.exec_conn(connection), app.q4b_query.viewed(),
@@ -2039,11 +2040,9 @@ fn streamed_views_cannot_cross_generation_or_escape() {
   row := first else { return 0 }
   if advance { ignored := pkg.db.next(stream) }
   return row.label.len() as i32
-}"#,
-        ),
-        (
-            "loop-generation",
-            r#"fn bad(borrow connection: pkg.db.conn) -> i32 {
+}
+
+fn bad_loop_generation(borrow connection: pkg.db.conn) -> i32 {
   bytes := [1 as u8]
   mut stream := pkg.db.rows(
     pkg.db.exec_conn(connection), app.q4b_query.viewed(),
@@ -2053,14 +2052,63 @@ fn streamed_views_cannot_cross_generation_or_escape() {
   row := first else { return 0 }
   loop { ignored := pkg.db.next(stream); break }
   return row.payload.len() as i32
-}"#,
+}
+
+fn main() -> i32 = 0
+"#;
+
+#[test]
+fn streamed_views_cannot_cross_generation_or_escape() {
+    let checked = diff_check_multi(
+        "pkg-db-q4b-stream-view-rejections",
+        &q4b(STREAM_VIEW_REJECTIONS).files(),
+        "main.align",
+    );
+    assert!(
+        checked.whole_errors && checked.per_unit_errors,
+        "the stream-view rejection program was accepted (whole_errors={}, per_unit_errors={}):\nwhole:\n{}\nper-unit:\n{}",
+        checked.whole_errors,
+        checked.per_unit_errors,
+        checked.whole_diags,
+        checked.per_unit_diags,
+    );
+    // `use-after-next`, `branch-generation`, and `loop-generation` all end the row's generation
+    // before the view is read, so all three land on the invalidated-borrow diagnostic; counting
+    // them keeps each one proven rather than letting one cover the others.
+    let expected: &[(&str, &str, usize)] = &[
+        (
+            "use-after-next / branch-generation / loop-generation",
+            "use of invalidated borrow 'row': its source 'stream' was moved",
+            3,
+        ),
+        (
+            "return",
+            "cannot return a view that borrows local storage",
+            1,
+        ),
+        // `builder-storage` is the `clone_in` half of the promise: a row view may not be retained
+        // in longer-lived storage. Until this owner pinned its diagnostic, the shape was written
+        // `array_builder<str>(out)` — not the surface's constructor — so BOTH front ends stopped at
+        // `undefined name: 'array_builder'` and the shape proved nothing about view storage. The
+        // `has_errors()`-only assertion it used to carry could not tell the two apart.
+        (
+            "builder-storage",
+            "cannot retain a shorter-lived view in this region builder",
+            1,
         ),
     ];
-    for (name, body) in cases {
-        let main = format!(
-            "module main\nimport pkg.db\nimport app.q4b_query\n{body}\nfn main() -> i32 = 0\n"
-        );
-        expect_checks_rejected(&format!("pkg-db-q4b-stream-view-{name}"), &q4b(&main));
+    for (shape, needle, times) in expected {
+        for (front_end, diags) in [
+            ("whole-program", &checked.whole_diags),
+            ("per-unit", &checked.per_unit_diags),
+        ] {
+            let found = diags.matches(needle).count();
+            assert!(
+                found >= *times,
+                "`{shape}` must be rejected by the {front_end} front end: expected at least \
+                 {times} diagnostic(s) containing `{needle}`, found {found}\n{diags}",
+            );
+        }
     }
 }
 

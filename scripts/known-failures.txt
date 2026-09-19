@@ -33,48 +33,33 @@
 # the suite outgrew one runner's 30-minute budget and every night was cancelled
 # (#1098). The sharded nightly's first complete verdict is run 35283248096;
 # every entry below was named by it, was confirmed to be pre-existing on main,
-# and carries a triage issue whose fix deletes its line.
+# and carries a triage issue whose fix deletes its line. A 2026-09-19 change
+# deleted the #1105/#1107/#1108 lines and repaired two untracked first-night
+# failures (vectorize_shapes's x86 owners and http_headers_view) that were
+# test-harness defects, not product regressions.
 #
 # EVERY line here is strict. None is "env": each one is a defect or a stale
 # expectation with a named owner, not a dependence on something the runner does
 # not provide.
 #
-# THE MANIFEST IS JUDGED ON THE NIGHTLY'S PLATFORM, Linux x86_64. Every entry
-# below is tagged "Linux-only": none reproduces on aarch64 macOS, so a bare
-# local `scripts/run-suite-binaries.sh` on an Apple Silicon host reports all
-# five under "manifest entries that did NOT fail". That is the host
-# disagreeing with the manifest's platform, not five repaired tests: fix and
-# re-verify them on Linux or in a container.
+# THE MANIFEST IS JUDGED ON THE NIGHTLY'S PLATFORM, Linux x86_64. The entry
+# below is tagged "Linux-only": it does not reproduce on aarch64 macOS, so a
+# bare local `scripts/run-suite-binaries.sh` on an Apple Silicon host reports
+# it under "manifest entries that did NOT fail". That is the host disagreeing
+# with the manifest's platform, not a repaired test: fix and re-verify it on
+# Linux or in a container.
 #
 # Issues:
-#   #1105  Two codegen owners bind their IR text scanners to the first match in
-#          the whole module, which is the wrong line or byte range on x86_64.
 #   #1106  The CLI per-unit build no longer byte-matches the whole-program
 #          reference: different e_entry and e_shoff.
-#   #1107  Only two of three pkg.ws automatic-reply transport failures beat the
-#          ordinary protocol result.
-#   #1108  Under the PollZero capture failpoint align_rt_command_run returns 4
-#          instead of 0.
 #
-# Deliberately NOT listed: align_driver::test::pkg_db_a1, which exceeds the
-# 900s per-binary cap and reports <binary-did-not-report> (#1109). A synthetic
-# line for it would excuse a target that never produced a trustworthy outcome
-# at all, retiring all 22 of its tests from the detector — the opposite of what
-# every line here is for. The nightly signal therefore stays red, since
-# full-suite-result aggregates the shards, until #1109 cuts that cost.
-# pkg_db_a1 stays covered in full meanwhile by the required db-postgres job and
-# by scripts/db-verify-local.sh, both of which run it against a live service.
-#
-# One line's absence is not a clean bill of health for its owner: the scanner
-# behind the align_runtime entry below covers 384 of the registry's 464 rows
-# and breaks on formatting (#1112).
-# #1107, Linux-only
-align_driver::test::apps_ws	protocol_ping_and_peer_close_reply_transport_failures_win
-# #1105, Linux-only
-align_driver::test::owned_tagged_payloads	llvm_drop_has_a_tag_guard_and_none_constructs_without_allocation
-# #1105, Linux-only
-align_driver::test::par_map	par_map_over_padded_aos_uses_abi_stride
+# align_driver::test::pkg_db_a1 and align_driver::test::pkg_db_q4b exceeded
+# the 900s per-binary cap on 2026-09-18 (#1109) because every owner test drove
+# an opt-level 0 compiler. `[profile.dev] opt-level = 1`
+# (docs/impl/21-build-perf-plan.md item 8) cut both binaries roughly 4x. A
+# binary that still exceeds the cap is never listed here, for the same reason
+# as before: a synthetic line would excuse a target that never produced a
+# trustworthy outcome at all, retiring all of its tests from the detector —
+# the opposite of what every line here is for.
 # #1106, Linux-only
 align_driver::test::per_unit_surface	cli_build_run_size_match_library_reference
-# #1108, Linux-only
-align_runtime::lib::align_runtime	tests::command_timeout_budget_quantization

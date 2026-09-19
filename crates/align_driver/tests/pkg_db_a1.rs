@@ -2919,26 +2919,108 @@ fn prepared_delivery_surface_typechecks_whole_and_per_unit() {
     );
 }
 
-#[test]
-fn nested_abstract_batch_row_application_is_rejected() {
-    let main = r#"module main
+/// Every A1 rejection shape, in ONE program, checked ONCE.
+///
+/// `check` and `check_per_unit` have no cross-program reuse: each distinct program re-checks the
+/// whole 570 KB `pkg.db` package from scratch, measured at 28 s per whole-program check on an
+/// M-series host. The four shapes below used to be four programs and cost 112 s; sema keeps
+/// checking after an error, so one program carries all four and costs 31 s. Each owner below still
+/// asserts its OWN diagnostic under BOTH front ends, which is stronger than the
+/// `has_errors()`-only assertion four separate programs made: a shape that stopped being rejected
+/// can no longer hide behind a sibling's error.
+const REJECTION_SHAPES: &str = r#"module main
 import pkg.db
+import app.batch_query
 
 Wrap<T> { value: T }
 
 fn keep<T>(value: Option<pkg.db.batch<Wrap<T>>>) -> Option<pkg.db.batch<Wrap<T>>> = value
+
+fn return_row_view(borrow connection: pkg.db.conn) -> str {
+  mut stream := pkg.db.rows(
+    pkg.db.exec_conn(connection), app.batch_query.plain(),
+    app.batch_query.Params { base: 1 }, [],
+  ) else { return "" }
+  values := pkg.db.next_batch(stream, 2) else { return "" }
+  batch := values else { return "" }
+  selected := pkg.db.batch_row(batch, 0) else { return "" }
+  row := selected else { return "" }
+  return row.label
+}
+
+fn consume_batch(values: pkg.db.batch<app.batch_query.PlainRow>) -> i32 = 0
+
+fn post_move_row_view(borrow connection: pkg.db.conn) -> i32 {
+  mut stream := pkg.db.rows(
+    pkg.db.exec_conn(connection), app.batch_query.plain(),
+    app.batch_query.Params { base: 1 }, [],
+  ) else { return 0 }
+  values := pkg.db.next_batch(stream, 2) else { return 0 }
+  batch := values else { return 0 }
+  selected := pkg.db.batch_row(batch, 0) else { return 0 }
+  row := selected else { return 0 }
+  ignored := consume_batch(batch)
+  return row.label.len() as i32
+}
+
+fn return_soa_column_view(borrow connection: pkg.db.conn) -> str {
+  mut stream := pkg.db.rows(
+    pkg.db.exec_conn(connection), app.batch_query.plain(),
+    app.batch_query.Params { base: 1 }, [],
+  ) else { return "" }
+  values := pkg.db.next_batch(stream, 2) else { return "" }
+  batch := values else { return "" }
+  columns := pkg.db.batch_soa(batch) else { return "" }
+  return columns.label[0]
+}
+
 fn main() -> i32 = 0
 "#;
-    let checked = diff_check_multi(
-        "pkg-db-a1-nested-abstract-batch-row",
-        &package_files(main).files(),
-        "main.align",
-    );
-    assert!(
-        checked.whole_errors && checked.per_unit_errors,
-        "nested abstract batch Row unexpectedly accepted:\nwhole diagnostics:\n{}\nper-unit diagnostics:\n{}",
-        checked.whole_diags,
-        checked.per_unit_diags,
+
+/// The rendered diagnostics of [`REJECTION_SHAPES`] under both front ends, computed once.
+///
+/// `OnceLock<(String, String)>` rather than a retained `DiffCheck`: only the rendered text and the
+/// two verdicts are needed, and `String` is `Sync`, so the owners below can share one check across
+/// libtest threads without holding a non-`Sync` checker result.
+fn rejection_diagnostics() -> &'static (String, String) {
+    static CHECKED: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+    CHECKED.get_or_init(|| {
+        let checked = diff_check_multi(
+            "pkg-db-a1-rejection-shapes",
+            &package_files(REJECTION_SHAPES).files(),
+            "main.align",
+        );
+        assert!(
+            checked.whole_errors && checked.per_unit_errors,
+            "the rejection program was accepted by a front end (whole_errors={}, per_unit_errors={}):\nwhole diagnostics:\n{}\nper-unit diagnostics:\n{}",
+            checked.whole_errors,
+            checked.per_unit_errors,
+            checked.whole_diags,
+            checked.per_unit_diags,
+        );
+        (checked.whole_diags, checked.per_unit_diags)
+    })
+}
+
+/// Assert `needle` appears at least `times` times in BOTH front ends' diagnostics.
+fn assert_rejected_by_both(shape: &str, needle: &str, times: usize) {
+    let (whole, per_unit) = rejection_diagnostics();
+    for (front_end, diags) in [("whole-program", whole), ("per-unit", per_unit)] {
+        let found = diags.matches(needle).count();
+        assert!(
+            found >= times,
+            "`{shape}` must be rejected by the {front_end} front end: expected at least {times} \
+             diagnostic(s) containing `{needle}`, found {found}\n{diags}",
+        );
+    }
+}
+
+#[test]
+fn nested_abstract_batch_row_application_is_rejected() {
+    assert_rejected_by_both(
+        "nested abstract batch Row",
+        "cannot be nested inside generic resource 'pkg.db$batch'",
+        1,
     );
 }
 
@@ -2949,70 +3031,19 @@ fn zero_column_query_keeps_a_valid_non_soa_batch_plan() {
 
 #[test]
 fn batch_rows_and_soa_views_cannot_escape_or_survive_move() {
-    let cases = [
-        (
-            "return-row-view",
-            r#"fn bad(borrow connection: pkg.db.conn) -> str {
-  mut stream := pkg.db.rows(
-    pkg.db.exec_conn(connection), app.batch_query.plain(),
-    app.batch_query.Params { base: 1 }, [],
-  ) else { return "" }
-  values := pkg.db.next_batch(stream, 2) else { return "" }
-  batch := values else { return "" }
-  selected := pkg.db.batch_row(batch, 0) else { return "" }
-  row := selected else { return "" }
-  return row.label
-}"#,
-        ),
-        (
-            "post-move-row-view",
-            r#"fn consume(values: pkg.db.batch<app.batch_query.PlainRow>) -> i32 = 0
-
-fn bad(borrow connection: pkg.db.conn) -> i32 {
-  mut stream := pkg.db.rows(
-    pkg.db.exec_conn(connection), app.batch_query.plain(),
-    app.batch_query.Params { base: 1 }, [],
-  ) else { return 0 }
-  values := pkg.db.next_batch(stream, 2) else { return 0 }
-  batch := values else { return 0 }
-  selected := pkg.db.batch_row(batch, 0) else { return 0 }
-  row := selected else { return 0 }
-  ignored := consume(batch)
-  return row.label.len() as i32
-}"#,
-        ),
-        (
-            "return-soa-column-view",
-            r#"fn bad(borrow connection: pkg.db.conn) -> str {
-  mut stream := pkg.db.rows(
-    pkg.db.exec_conn(connection), app.batch_query.plain(),
-    app.batch_query.Params { base: 1 }, [],
-  ) else { return "" }
-  values := pkg.db.next_batch(stream, 2) else { return "" }
-  batch := values else { return "" }
-  columns := pkg.db.batch_soa(batch) else { return "" }
-  return columns.label[0]
-}"#,
-        ),
-    ];
-    for (name, body) in cases {
-        let main = format!(
-            "module main\nimport pkg.db\nimport app.batch_query\n{body}\nfn main() -> i32 = 0\n"
-        );
-        let checked = diff_check_multi(
-            &format!("pkg-db-a1-batch-view-{name}"),
-            &package_files(&main).files(),
-            "main.align",
-        );
-        assert!(
-            checked.whole_errors && checked.per_unit_errors,
-            "{name} unexpectedly accepted (whole_errors={}, per_unit_errors={}):\nwhole diagnostics:\n{}\nper-unit diagnostics:\n{}",
-            checked.whole_errors,
-            checked.per_unit_errors,
-            checked.whole_diags,
-            checked.per_unit_diags,
-        );
-    }
+    // `return-row-view` and `return-soa-column-view` are the two escaping returns; the move case
+    // has its own diagnostic. Counting the returns keeps both of them proven, so dropping one
+    // still fails.
+    assert_rejected_by_both(
+        "returning a batch row or SoA column view",
+        "cannot return a view that borrows local storage",
+        2,
+    );
+    assert_rejected_by_both(
+        "using a row view after its batch moved",
+        "use of invalidated borrow 'row'",
+        1,
+    );
 }
 
 #[test]

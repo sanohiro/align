@@ -2767,6 +2767,49 @@ grep -Eq '^ *cargo-nightly-.*-\$\{\{ hashFiles\('"'"'Cargo.lock'"'"'\) \}\}-$' \
   echo "nightly.yml lost the Cargo.lock-prefixed restore key" >&2
   exit 1
 }
+# Every Cargo restore-keys stage in both workflows must be gated on the root
+# manifest, and must stay a genuine prefix of a key it can match.
+#
+# `[profile.dev]` lives in Cargo.toml, and changing it invalidates every Cargo
+# fingerprint in a restored `target` without deleting one byte of it: cargo
+# writes a second full generation of artifacts under new `-C metadata` hashes
+# beside the dead ones. Nightly run 35418220792 restored the previous night's
+# 10.5 GB opt-level 0 target through an ungated fallback stage and every one of
+# the twelve shards died with "rustc-LLVM ERROR: IO failure on output stream:
+# No space left on device". Gating only the first stage is not enough, because
+# the hash-free fallback below it restores exactly the same stale target.
+#
+# The prefix half of the check is the trap the fix itself can fall into:
+# restore-keys match by prefix, so putting the manifest hash *after* the lock
+# hash would gate the stage and simultaneously stop it matching any saved key,
+# turning a cache into a silent permanent miss.
+for cache_workflow in "$ci_workflow" "$nightly_workflow"; do
+  cache_workflow_name="$(basename "$cache_workflow")"
+  while IFS= read -r restore_key; do
+    case "$restore_key" in
+      *"hashFiles('Cargo.toml')"*) ;;
+      *)
+        echo "$cache_workflow_name: Cargo restore key not gated on the root manifest hash" >&2
+        echo "  $restore_key" >&2
+        exit 1
+        ;;
+    esac
+    restore_key_matches=0
+    while IFS= read -r cache_key; do
+      case "$cache_key" in
+        "$restore_key"*)
+          restore_key_matches=1
+          break
+          ;;
+      esac
+    done < <(grep -E '^ *key: cargo-' "$cache_workflow" | sed 's/^ *key: //')
+    [[ "$restore_key_matches" -eq 1 ]] || {
+      echo "$cache_workflow_name: Cargo restore key is a prefix of no save key, so it can never hit" >&2
+      echo "  $restore_key" >&2
+      exit 1
+    }
+  done < <(grep -E '^ *cargo-[a-z-]*\$\{\{ runner\.os \}\}' "$cache_workflow" | sed 's/^ *//')
+done
 
 # Release PGO profiles alignc, not the runtime archive that alignc links into
 # its training outputs.

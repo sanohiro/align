@@ -27,6 +27,7 @@ Order is priority.
 | 5 | Foreground watch builds | Implemented — `alignc build FILE --watch` keeps one foreground compiler resident, observes the exact files consumed by ordinary and ThinLTO builds, revalidates their semantic/topology state, captures child output, and atomically preserves the last-good executable without a daemon or socket |
 | 6 | Function-level incremental compilation | Implemented — explicit `--thin-lto` builds form sealed support/function partitions, retain a fresh global thin-link, and cache exact partition-qualified prelink/backend artifacts |
 | 7 | PR CI wall time | Implemented — source-mtime restoration makes the restored Cargo cache actually hit, and a trusted-classifier platform scope bounds a tooling-tier PR to one compile-only leg; see below |
+| 8 | Owner tests run an unoptimized compiler | Implemented (this PR) — `[profile.dev] opt-level = 1` cut `pkg_db_a1` 3.96x (486.6s -> 122.8s wall) because every owner test drives the in-process `alignc` frontend/codegen at Rust `opt-level = 0`; see below |
 
 ## Background
 
@@ -2673,3 +2674,78 @@ jobs (the gate build itself, not just the binaries' concurrent execution
 within one job, still runs as a single sequential compile), and revisiting
 the `Save Cargo caches` key now that mtime restoration changes what counts as
 a cache hit.
+
+## Item 8: Owner tests run an unoptimized compiler
+
+**Diagnosis.** Nightly 2026-09-18 run 35387532975: `pkg_db_a1` and
+`pkg_db_q4b` exceeded the 900s per-binary cap (#1109). Per-test profiling
+showed 100% of the cost is `alignc` frontend+codegen of each test's unique
+Align program, at roughly 0.25-0.35s/line under the default `opt-level = 0`
+dev profile; link time was 0.1-0.2s and total child-process execution summed
+to 5.6s across the whole binary. `pkg.db` itself compiles once per binary
+through the existing in-process memo (item 1), so the dominant cost is the
+Rust implementation of `alignc`, not the generated Align program's LLVM IR.
+Lowering the *generated program's* LLVM codegen to `-O0` cut only 12% of the
+remaining cost, confirming the Rust side dominates, not LLVM.
+
+**Measurement.**
+
+| Configuration | Clean build wall | `pkg_db_a1` wall / CPU | Speedup |
+|---|---|---|---|
+| opt-level 0 (previous default) | 31.3s | 486.6s / 926.7s | baseline |
+| opt-level 1 (`[profile.dev]`, workspace-wide) | 76.2s | 122.8s / 217.6s | 3.96x |
+| opt-level 1, per-package override (frontend/sema/codegen crates only) | ~10 lines of config | — | 3.3x |
+
+Incremental rebuild of a one-line comment change showed no measurable
+difference between opt0 and opt1: 1.51s vs 1.54s for a leaf crate, 4.75s vs
+4.61s for a deep crate.
+
+**Decision.** Add `[profile.dev] opt-level = 1` at the workspace root.
+Cargo keeps debug-assertions and overflow checks on at `opt-level < 2`, so
+both stay enabled. The generated-program codegen profile — the LLVM
+optimization level `alignc` applies to the Align source under test — is
+unchanged; this changes only how Cargo compiles the Rust code that
+implements `alignc` itself. All 22 `pkg_db_a1` tests produced identical
+results before and after.
+
+**Rejected alternatives.**
+- Splitting the two binaries or adding more shards: forbidden by this
+  document's and `CLAUDE.md`'s 30-minute-budget rule (a budget overrun is
+  the signal to fix, not a number to raise) and hides the real cost instead
+  of removing it.
+- Per-package `opt-level` override on the frontend/sema/codegen crates only:
+  measured 3.3x, worse than the workspace-wide 3.96x, for comparable
+  configuration size.
+- Test consolidation alone, without the profile change: measured -9% to
+  -11%, far short of clearing the cap.
+
+**CI consequence.** Every leg pays one cold Cargo cache rebuild on the first
+run after this merges; the sharded nightly per-binary and per-shard budget
+rules are otherwise unchanged. `ci.yml`'s Cargo cache keys now hash
+`Cargo.toml` alongside `Cargo.lock`: a cache entry is immutable, so a key
+fixed on the lock file alone could never be replaced and would keep
+restoring the stale opt-level 0 artifacts forever, so "one cold rebuild" is
+true only with that key change. `nightly.yml` needs the same hash for a
+different reason, and the run id does not supply it: the run id makes each
+night's *save* key unique, but the *restore* tiers are prefixes, so run
+35418220792 matched the previous night's entry and restored a 10.5 GB
+opt-level 0 `target`. Changing the profile invalidates every fingerprint in it
+without deleting anything, and cargo then writes a second complete generation
+of artifacts under new `-C metadata` hashes beside the dead ones, so all twelve
+shards filled the runner's disk mid-build (`rustc-LLVM ERROR: IO failure on
+output stream: No space left on device`). Both nightly restore tiers — the
+lock-exact one and the hash-free fallback — are therefore gated on
+`hashFiles('Cargo.toml')`, which makes a profile change a genuinely cold start
+instead of a doubled `target`. `ci.yml`'s two Cargo restore stages were
+hash-free fallbacks with the same hole, so both workflows now spell the key the
+same way, with the manifest hash *ahead* of the lock hash — restore-keys match
+by prefix, so a manifest hash placed after it would gate the stage and
+simultaneously stop it matching any saved key, turning the cache into a silent
+permanent miss. `scripts/test-pr-workflow.sh` asserts both halves for every
+Cargo restore key in both workflows: that it carries the manifest hash, and
+that it remains a prefix of some save key.
+
+**Test-side companion change (same PR).** `pkg_db_a1` and `pkg_db_q4b`
+consolidated their rejection-shape fixtures: each rejection program is
+type-checked once via `OnceLock`, with per-shape diagnostics asserted against
+that pinned shared result instead of re-invoking `alignc` per assertion.
