@@ -6418,6 +6418,8 @@ fn option_struct_type<'c>(
     ex: &[StructType<'c>],
     tx: TaggedTypes<'c, '_>,
 ) -> StructType<'c> {
+    // Checked HIR has already closed this exact Option layout, including every reachable payload
+    // size and alignment. Failure here would mean codegen disagrees with its own validated table.
     let body = union_shape(
         ctx,
         ctx.i8_type().into(),
@@ -6441,6 +6443,8 @@ fn result_struct_type<'c>(
     ex: &[StructType<'c>],
     tx: TaggedTypes<'c, '_>,
 ) -> StructType<'c> {
+    // Checked HIR has already closed this exact Result layout, including both reachable payload
+    // sizes and alignments. Failure here would mean codegen disagrees with its validated table.
     let body = union_shape(
         ctx,
         ctx.i8_type().into(),
@@ -33767,7 +33771,8 @@ fn main() -> i32 = 0
     #[test]
     fn tagged_tables_with_a_missing_entry_are_codegen_errors() {
         let ctx = Context::create();
-        let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).expect("target machine");
+        let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default)
+            .unwrap_or_else(|error| panic!("target machine: {error}"));
         let td = tm.get_target_data();
         let defs = vec![hir::TaggedType::Option(Scalar::Tagged(7))];
         let err = build_tagged_types(&ctx, &defs, &[], &[], &td)
@@ -33789,7 +33794,8 @@ fn main() -> i32 = 0
     #[test]
     fn self_referential_tagged_entries_are_codegen_errors() {
         let ctx = Context::create();
-        let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).expect("target machine");
+        let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default)
+            .unwrap_or_else(|error| panic!("target machine: {error}"));
         let td = tm.get_target_data();
         for defs in [
             vec![hir::TaggedType::Option(Scalar::Tagged(0))],
@@ -33814,7 +33820,8 @@ fn main() -> i32 = 0
     #[test]
     fn shared_tagged_bodies_are_named_for_their_lowest_id() {
         let ctx = Context::create();
-        let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).expect("target machine");
+        let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default)
+            .unwrap_or_else(|error| panic!("target machine: {error}"));
         let td = tm.get_target_data();
         // Entry 0 is reached only through its child 2, so a traversal-ordered name would be
         // `align.tagged.2`; entry 1 shares that body and is the lowest id in the class.
@@ -35597,7 +35604,7 @@ fn main() -> i32 = 0
     fn tagged_union_physical_map_omits_zero_values_and_overlays_variants() {
         let ctx = Context::create();
         let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default)
-            .expect("target machine");
+            .unwrap_or_else(|error| panic!("target machine: {error}"));
         let data = tm.get_target_data();
         let empty = ctx.struct_type(&[], false);
         let i8_scalar = Scalar::Int(IntTy { bits: 8, signed: false });
@@ -35612,7 +35619,7 @@ fn main() -> i32 = 0
             ],
             &data,
         )
-        .expect("union shape");
+        .unwrap_or_else(|error| panic!("union shape: {error}"));
         assert!(matches!(shape.variants[0][0], PhysicalPayload::OmittedUnit));
         assert!(matches!(shape.variants[0][1], PhysicalPayload::OmittedZero { .. }));
         assert!(matches!(shape.variants[1][0], PhysicalPayload::Stored { offset: 0, size: 1, align: 1, .. }));
@@ -35627,7 +35634,7 @@ fn main() -> i32 = 0
             &[vec![(Scalar::Unit, ctx.i32_type().into())], vec![(Scalar::Struct(0), empty.into())]],
             &data,
         )
-        .expect("all-zero union shape");
+        .unwrap_or_else(|error| panic!("all-zero union shape: {error}"));
         assert_eq!(all_zero.body.count_fields(), 1);
         assert_eq!((data.get_abi_size(&all_zero.body), data.get_abi_alignment(&all_zero.body)), (1, 1));
     }
@@ -35649,7 +35656,7 @@ fn main() -> i32 = 0
                 &exports,
                 None,
             )
-            .expect("tagged constructor must lower");
+            .unwrap_or_else(|error| panic!("tagged constructor must lower: {error}"));
             for (name, active_payloads, raw_i64_stores) in [("make", 1, 2), ("make_large", 2, 4)] {
                 let body = function_body(&llvm, name);
                 assert_eq!(
@@ -35925,7 +35932,8 @@ fn main() -> i32 = 0
             let variants = e.variants.iter().map(|variant| variant.payload.iter().copied().map(|s| {
                 (s, scalar_type(&ctx, scalar_to_ty(s), &struct_types, &enum_types, no_tagged))
             }).collect::<Vec<_>>()).collect::<Vec<_>>();
-            let shape = union_shape(&ctx, ctx.i32_type().into(), &variants, &td).expect("enum shape");
+            let shape = union_shape(&ctx, ctx.i32_type().into(), &variants, &td)
+                .unwrap_or_else(|error| panic!("enum shape: {error}"));
             enum_type.set_body(&shape.body.get_field_types(), false);
         }
         // The nested tagged types come from the production builder itself, so this parity gate
