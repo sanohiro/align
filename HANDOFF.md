@@ -53,10 +53,12 @@ preflight, `scripts/open-pr.sh`, CI, merge):
 1. **plan 71 ledger** for #1076/#1077/#1078 (sum-type layout, aggregate transport,
    drop-state model): the unified ledger is drafted on its design branch and
    awaits one fresh independent adversarial review before any code. It fixes
-   three ordered capabilities: explicit-tag/max-variant union storage; a
+   four ordered capabilities: explicit-tag/max-variant union storage with an
+   exact Unit-omission payload map; a
    serialized per-parameter drop-state effect with conservative indirect
-   adapters; then target-selected byval and split cleanup-result transport with
-   fresh-whole-value destination construction. Field replacement and indexed
+   adapters; target-selected byval and split cleanup-result transport; then
+   fresh-whole-value destination construction with reached-exit partial cleanup.
+   Field replacement and indexed
    destinations deliberately retain temporaries to preserve RHS, Drop and
    bounds-error order.
 3. Language items after the codegen track: #1085 `str` patterns in `match`,

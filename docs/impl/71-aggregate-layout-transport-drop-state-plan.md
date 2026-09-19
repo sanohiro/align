@@ -12,7 +12,7 @@ argument and result transport; that transport carries the value's cleanup
 state; and a mutable borrow need only transport cleanup state when the callee
 can change it. Solving the three independently would create incompatible
 signatures or leave one optimization blind to another. This document fixes the
-complete contract and divides it into three ordered, independently useful
+complete contract and divides it into four ordered, independently useful
 capabilities.
 
 ## 1. Scope and sequence
@@ -23,14 +23,18 @@ PR 1  #1076  one union-storage representation for user sums, Option, and Result;
 PR 2  #1078  one per-parameter drop-state effect; conservative indirect-call
                adapters; one MIR drop-state simplifier and proved move-out nulling
 PR 3  #1077  target-selected parameter and cleanup-result transport; tag-only
-               result inspection; destination construction for fresh whole values
+               result inspection
+PR 4  #1077  destination construction for fresh whole values, with explicit
+               partial-initialization control-transfer cleanup
 ```
 
 The order is strict. PR 1 establishes the sizes PR 3 classifies. PR 2 fixes the
-cleanup and mutable-borrow signatures PR 3 normalizes. Each PR is mergeable:
+cleanup and mutable-borrow signatures PR 3 normalizes. PR 4 consumes the final
+result transport without changing its signatures. Each PR is mergeable:
 PR 1 reduces every tagged value without changing call transport, PR 2 removes
 unnecessary cleanup traffic with the existing transport, and PR 3 consumes both
-final forms.
+final ABI forms. PR 4 removes fresh-value staging as a separate MIR ownership
+capability.
 
 PR 1 and PR 3 may each exceed roughly 1,000 changed hand-written lines. PR 1
 must change the representation producer and every projection, construction,
@@ -58,18 +62,28 @@ units and therefore receive the full public-contract treatment.
 Surface           physical layout of every non-recursive user sum, Option<T>,
                   and Result<T,E>
 
-Exact type        Tag is i32 for a user sum and i8 for Option/Result. For each
-                  variant v, P_v is the unpacked LLVM struct of its positional
-                  payload fields in source order. Let S_v and A_v be P_v's ABI
+Exact type        Tag is i32 for a user sum and i8 for Option/Result. Each
+                  variant has a logical-to-physical vector of exactly its
+                  source payload arity:
+                    OmittedUnit
+                    Stored { llvm_type, offset:u64, size:u64, align:u64 }
+                  A source Unit payload always maps to OmittedUnit. It has no
+                  LLVM field, SSA value, storage, load, store, move, or Drop;
+                  construction validates/evaluates its Unit operand and writes
+                  nothing, while projection synthesizes the ordinary valueless
+                  Unit result. Every other payload maps to Stored. P_v is the
+                  unpacked LLVM struct of only those Stored fields in source
+                  order. Let S_v and A_v be P_v's ABI
                   allocation size and alignment. Let S=max(S_v), A_p=max(A_v),
                   A=max(tag ABI alignment,A_p), and P=align_up(tag size,A_p).
-                  A payload-bearing sum is { Tag, U }, where U is
+                  When S>0 the sum is { Tag, U }, where U is
                   { [0 x Anchor], [S x i8] }; Anchor is the first P_v in
                   declaration order whose ABI alignment is A_p. The zero-sized
                   anchor gives U alignment A_p without occupying storage. The
-                  outer ABI size is align_up(P+S,A). A payload-free sum is
-                  { Tag } and has no U field. Empty payload structs have
-                  S_v=0, A_v=1 and do not by themselves create storage.
+                  outer ABI size is align_up(P+S,A). When every P_v has S_v=0,
+                  the sum is { Tag } and has no U field. Unit-only variants and
+                  empty payload structs have S_v=0, A_v=1 and do not by
+                  themselves create storage.
 
                   Variant ordinals and tag meanings do not change: user sums
                   use declaration order; Option is None=0, Some=1; Result is
@@ -81,7 +95,7 @@ Inputs/defaults   complete reachable type graph plus the selected target data
 Errors            reject before module publication on an incomplete/recursive
                   layout, arithmetic overflow, unsupported address space,
                   unavailable target layout, or inconsistent semantic and LLVM
-                  layouts. Existing rejection of unsupported explicitly
+                  layouts or logical-to-physical payload maps. Existing rejection of unsupported explicitly
                   over-aligned payloads remains. When several inputs are
                   invalid, graph/type validity precedes target layout, which
                   precedes size arithmetic, which precedes LLVM-body agreement.
@@ -112,10 +126,11 @@ Mirrors           docs/impl/05-backend-llvm.md, docs/impl/07-roadmap.md,
                   docs/language-spec.md do not change.
 ```
 
-Construction writes the tag and only the selected payload fields. Padding and
+Construction writes the tag and only the selected Stored payload fields. Padding and
 inactive bytes are unspecified and may remain uninitialized. Projection first
 selects the storage field, then uses byte GEPs at the target-computed offsets
-of P_v; it never indexes the former flattened aggregate. Drop switches on the
+of P_v; OmittedUnit synthesizes Unit without touching storage. It never indexes
+the former flattened aggregate. Drop switches on the
 tag before forming or reading a payload place. JSON, diagnostics, matching,
 callbacks, copies, and returns likewise observe only the tag and active fields.
 No equality, hashing, serialization, cache identity, or foreign boundary may
@@ -336,17 +351,19 @@ The eligible final destinations are deliberately narrow:
 | --- | --- |
 | Fresh whole local | eligible when it is the sole adjacent materialization and its address has not escaped |
 | Caller sret result | eligible after all source return evaluation and cleanup required before publication |
-| Fresh Move struct literal | eligible only in a fresh whole local or sret result; fields are evaluated once in source order into final storage, with a bitset/plan of initialized Move fields for exceptional cleanup |
+| Fresh Move struct literal | eligible in PR 4 only in a fresh whole local or sret result; fields are evaluated once in source order into final storage, with a plan of initialized Move fields for reached control-transfer cleanup |
 | Existing whole local replacement | ineligible; RHS must finish before the old value is dropped or overwritten |
 | Record field replacement | ineligible for the same ordering and alias reason, including Copy fields unless an independent future proof establishes an already-formed, non-observable destination |
 | Indexed/element destination | ineligible; current semantics evaluate index and RHS before the bounds action, so destination formation before the call would reorder a hard error and effects |
 | Join, multiple use, exposed alias, volatile/atomic, native call | ineligible; retain the correctly aligned temporary and complete transfer |
 
-Move literal destination construction uses one MIR-owned initialization record,
+PR 4's Move literal destination construction uses one MIR-owned initialization record,
 not inferred LLVM stores. Each field becomes live only after its expression
-falls through and its store completes. On `?`, early return, trap-capable child,
-or divergence, cleanup drops exactly the already initialized Move fields in
-reverse source order. Copy fields need no cleanup. The destination's whole
+falls through and its store completes. On `?` or another early return that
+actually transfers control out of the expression, cleanup drops exactly the
+already initialized Move fields in reverse source order. A hard trap, abort, or
+divergent child has no successor cleanup edge and retains the language's
+existing no-cleanup-after-termination semantics. Copy fields need no cleanup. The destination's whole
 drop flag becomes true only after every field completes. A partial destination
 is never published to a callee or source expression.
 
@@ -358,8 +375,9 @@ existing temporary path.
 ## 3. Cross-stage invariants
 
 1. Semantic layout and LLVM layout agree on size, alignment, tag ordinal,
-   payload offset, and every nested field offset. Both are independently
-   checked; one is not trusted as a certificate for the other.
+   every OmittedUnit/Stored mapping, payload offset, and nested field offset.
+   Both are independently checked; one is not trusted as a certificate for the
+   other.
 2. Every byte-oriented consumer observes canonical memory. In particular an
    LLVM `i1` cleanup value is zero-extended and stored as a full `i8` 0 or 1
    before JSON, native, memcpy, or byte loads can observe it. An sret function
@@ -412,11 +430,12 @@ callable graph in one module pass. Revalidate tail/musttail and parameter
 attributes after hidden parameter insertion. Verify before and after runtime
 module merge as today.
 
-Add a MIR destination-construction form only for §2.4's fresh destinations.
-The general call result, replacement, field, element, join, and alias paths
-retain temporary materialization. LLVM's ordinary optimizer may coalesce a
-fallback when it independently proves safety; Align promises only the explicit
-eligible cases.
+PR 3 retains plan 67's whole-local result placement and otherwise keeps the
+general call result, replacement, field, element, join, and alias temporary
+paths. PR 4 separately adds a MIR destination-construction form only for
+§2.4's fresh destinations. LLVM's ordinary optimizer may coalesce a fallback
+when it independently proves safety; Align promises only the explicit eligible
+cases.
 
 ## 5. Implementation closure matrices
 
@@ -424,8 +443,8 @@ eligible cases.
 
 | Cell | Required closure and owner |
 | --- | --- |
-| Formation/validation | user sums, Option, Result, tag-only, empty payload, mixed alignment, nested tagged payload, generic instantiation, zero-sized fields, overflow and malformed graphs; semantic type-layout owner plus LLVM layout twins |
-| Construction/move-in | every variant writes one tag and only active fields; Copy and Move payloads, nested records/arrays/strings; enum/option/result construction owners and optimized IR store-count owner |
+| Formation/validation | user sums, Option, Result, tag-only, Unit-only, empty payload, mixed alignment, nested tagged payload, generic instantiation, zero-sized fields, overflow and malformed graphs; exact logical-to-physical map cardinality and semantic type-layout plus LLVM layout twins |
+| Construction/move-in | every variant writes one tag and only active Stored fields; OmittedUnit is evaluated then synthesizes valueless Unit without storage; Copy and Move payloads, nested records/arrays/strings; enum/option/result construction owners and optimized IR store-count owner |
 | Move-out/source nulling | active payload moves clear only its source ownership state; union bytes need no deterministic zero; existing move and owned-match owners |
 | Drop/replacement/return | tag-directed exactly-once Drop for every ordinal, old-value replacement after RHS, direct/indirect returns and cleanup payloads; large-drop, enum-drop, reassign, move-return owners |
 | Control flow | if/match/else/?/map_err, wildcard/or-pattern, branch/loop joins, early return and divergence; value-control and tagged-match owners |
@@ -438,7 +457,7 @@ eligible cases.
 
 | Cell | Required closure and owner |
 | --- | --- |
-| Formation/validation | exact params.len vector; all four v13 u8 tags; arity/mode/type/tag/order, generic/concrete and resolved-droppability checks; malformed and unavailable MayChange fallback; independent encode/decode byte goldens and interface schema owners |
+| Formation/validation | exact params.len vector; all four v13 u8 tags; arity/mode/type/tag/order, generic/concrete and resolved-droppability checks; malformed authenticated records always reject, while only unavailable internal analysis and unknown callable edges become MayChange; independent encode/decode byte goldens and interface schema owners |
 | Fixed point | direct chains, mutually recursive SCCs, imported facts, local/imported generic templates instantiated with Copy/non-droppable and Move/droppable arguments, invariant recursion, one changing edge, unknown indirect edge; parameterized MIR analysis owner |
 | Move-in/out | move, replacement, conditional release, and delegation mark MayChange; plain mutation without ownership change remains Invariant; ownership-operation sweep tripwire |
 | Call edges | direct/imported/generic use specialized ABI; function values, mixed target joins, closures and raw/native edges use conservative ABI; adapter identity/dedup owner |
@@ -449,7 +468,7 @@ eligible cases.
 | Allocation/provenance | flag ownership remains caller-side; no heap change; arena, builder-freeze and exactly-once Drop owners |
 | Performance | invariant witness has zero cleanup pair/proxy/load/writeback; caller flags become promotable; local IR and assembly counts with mutating reverse control |
 
-### 5.3 PR 3: transport and destination construction
+### 5.3 PR 3: transport
 
 | Cell | Required closure and owner |
 | --- | --- |
@@ -457,13 +476,24 @@ eligible cases.
 | Definition/call agreement | direct/imported/generic/recursive, function values, captures, entry/export wrappers, whole/per-unit and partitioned emission; signature assertions and native cross-link matrix |
 | By-value parameters | direct small controls; target-selected byval large forms; caller isolation, exact attributes and no callee entry rebuild; parameter transport owner on x86-64 and aarch64 |
 | Cleanup results | direct pair, void sret value+cleanup_out, direct value+cleanup_out; canonical byte, normal-return initialization and terminating-call absence; return-transport owner |
-| Destination placement | fresh whole local and sret result direct placement; replacement, field, element, joins, multiple uses and aliases retain fallback; parameterized materialization owner |
-| Move literal | source-order once-only evaluation, initialized-field cleanup, nested Move fields, early return/?/trap/divergence, whole completion flag; MIR structural plus executable allocation/drop owners |
+| Destination placement | plan 67 fresh whole-local result placement composes with split cleanup; replacement, field, element, joins, multiple uses and aliases retain fallback; parameterized materialization owner |
 | Tagged consumption | tag-only load, payload load only in selected arm, inactive storage unread; optimized IR owner for Result/Option/user sum |
 | Move/Drop/replacement | source nulling after committed transfer, old destination intact through RHS, exactly-once cleanup on every transport; existing replacement and ownership owners |
 | Native boundaries | runtime/extern/callback/raw descriptors retain their ledgers; no accidental marker selection; FFI, DB, task and callback owners; local DB verification if classified |
 | Artifact/cache | no physical LLVM handle serialized; target/LLVM/CPU/type/effect changes select the right plan and cache entry; ThinLTO, per-unit and inprocess owners |
 | Performance | whole-local cleanup result has no `{T,i1}` scratch; large byval has no field rebuild; fixed witness region/copy counts fall with small/direct and fallback reverse controls |
+
+### 5.4 PR 4: fresh-value destination construction
+
+| Cell | Required closure and owner |
+| --- | --- |
+| Formation/validation | destination is an unescaped fresh whole local or caller sret result with exact type, size, alignment and ownership plan; replacement, fields, elements, joins and aliases reject optimization and retain fallback |
+| Construction | source-order once-only field evaluation and store; Copy/Move, nested owned fields, Unit and empty fields; whole completion flag only after the final field |
+| Reached exits | `?`, explicit early return and other reached control transfers drop exactly initialized Move fields in reverse source order before leaving |
+| Terminal paths | bounds/division and other hard traps, abort, and divergence have no successor cleanup and preserve the settled no-cleanup-after-termination rule |
+| Move/Drop/allocation | no partial value is published; successful construction transfers each owner once; allocation/free parity and arena exit remain exact |
+| Whole/per-unit | generic literals and caller sret destinations use the same MIR construction record and ownership plan in whole and per-unit compilation |
+| Performance | eligible fresh Move literals have no full aggregate scratch or second field-store sequence; fallback and Copy reverse controls remain |
 
 One invariant-level owner may close several cells when it would fail for the
 same defect. New fixtures are required only where existing tests would not
@@ -488,6 +518,8 @@ PR 2  invariant mutable borrows expose no cleanup pointer or round-trip, and
       proved-dead MoveOut storage receives no zero-fill
 PR 3  eligible cleanup-bearing returns write T directly to the final slot,
       target-indirect parameters use byval, and tag tests avoid whole loads
+PR 4  eligible fresh Move values construct once in final storage, with reached
+      early exits dropping only initialized fields and terminal paths unchanged
 ```
 
 Client counts in the issues are external qualification. They are remeasured
@@ -514,7 +546,7 @@ The ledger-to-prose pass is complete:
 - no operation changes process-global or connection-global state;
 - there is no text/view wire input, encoding rule, embedded-NUL case, ambient
   configuration, runtime inspection surface, or new source example in scope;
-- the three-PR order consumes no later capability, and each capability leaves
+- the four-PR order consumes no later capability, and each capability leaves
   one usable stable consumer; and
 - the matrices name every formation, move, nulling, Drop, replacement, return,
   control-flow, generic, interface, allocation, and ABI cell required by the
@@ -534,3 +566,13 @@ before implementation.
 | --- | --- | --- |
 | A generic BorrowMut parameter may become droppable only after substitution, so a template vector could not select one physical ABI. | The four-state vector now gives every template BorrowMut a Deferred cell and no callable ABI. Each local or imported template is instantiated in the consumer, then its concrete vector is derived from substituted types and checked MIR before the complete concrete call-graph fixed point. | Copy/non-droppable and Move/droppable substitutions of local and imported templates, with whole/per-unit physical-signature equality and rejected Deferred concrete records. |
 | The persisted IFnSig addition lacked exact bytes. | Interface format v13 fixes the field immediately after return_cleanup, an exact params.len u32 count, u8 tags 0 through 3, validation order, hash/cache participation, and independent encode/decode goldens. | Extended parameter/certificate semantic-to-byte golden, independently assembled byte-to-semantic vector, and mutated length/tag/mode/body/droppability rejection matrix. |
+
+The reopened-axis review of candidate `4e4f74fa` found that the first revision
+still mixed two implementation failure domains and omitted one physical type
+class. This is a boundary redesign rather than another local patch:
+
+| Finding | Redesigned boundary | Closing owner |
+| --- | --- | --- |
+| Unit payloads had semantic size zero but no exact LLVM representation. | PR 1 now owns an exact logical-to-physical payload map. Unit is OmittedUnit with no LLVM field or storage; every other payload is Stored with fixed offset/size/alignment. | Option/Result/user-sum Unit-only and mixed Unit/non-Unit layout twins, construction, projection, match, Drop and malformed-map owners. |
+| The PR 2 matrix still described malformed interface records as a fallback. | Authenticated v13 shape/tag/mode/droppability errors reject everywhere. MayChange is limited to unavailable internal analysis and unknown callable edges. | Mutated artifact rejection matrix plus unknown-edge conservative control. |
+| Destination construction promised cleanup after trap/divergence. | ABI transport remains PR 3. Partial destination initialization becomes PR 4, whose cleanup edges exist only for reached control transfers; terminal paths preserve no-cleanup semantics. | Separate early-return/`?` Drop owners and hard-trap/abort/divergence no-successor-cleanup owners. |
