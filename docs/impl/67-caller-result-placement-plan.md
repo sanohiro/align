@@ -54,6 +54,15 @@ A compiler-created result slot remains the correct fallback. No source syntax,
 public destination argument, foreign purity annotation or size heuristic is
 introduced. Do not implement a 216-byte, NodeTable, or Apple-only special case.
 
+[Plan 71](71-aggregate-layout-transport-drop-state-plan.md) extends this
+implemented result-only capability after tagged layout and drop-state effects
+stabilize. Its transport contract splits cleanup-bearing results, classifies
+program-owned parameters with the same target authority, and permits explicit
+placement only for fresh whole locals and caller result slots. Existing-value
+replacement, record fields, indexed elements, joins and observable aliases
+retain this plan's temporary fallback so RHS, bounds-error and Drop order do
+not change.
+
 ## 2. Contract and ownership ledger
 
 These are compiler-internal records, not new language or runtime APIs. The

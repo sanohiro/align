@@ -35,9 +35,9 @@ Str               { i8* ptr, i64 len }           (+ meta is separate, §6)
 String/Buffer     { i8* ptr, i64 len }            owned headers
 Builder           pointer to runtime builder state
 Named(struct)     %struct.S = type { each field }   (layout is §2)
-Named(sum)        { i32 tag, payload fields... } tagged aggregate
-Option(T)         { i8 tag, T payload }          tag 0=None, 1=Some
-Result(T,E)       { i8 tag, T ok, E err }        tag 0=Ok, 1=Err; inactive owned payloads are zero
+Named(sum)        { i32 tag, union storage }      tag = declaration ordinal
+Option(T)         { i8 tag, union storage }       tag 0=None, 1=Some
+Result(T,E)       { i8 tag, union storage }       tag 0=Ok, 1=Err
 Fn(..)            function pointer (+ environment pointer if there is a capture)
 ```
 
@@ -52,6 +52,14 @@ keys nominal identity on what the type *lowers to* — structs and sum types by 
 structurally equal but distinct LLVM types for one Align type makes `insertvalue`, `ret`, and call
 arguments ill-formed; #670 did exactly that for nested tagged values and it went unnoticed until
 #730 made `--rt-lto`, whose merged-module verifier was the pipeline's only one, the default.
+
+Plan 71 PR 1 replaces the current flattened tagged bodies with one explicit tag
+and max-variant union storage. The storage has the maximum payload size and
+alignment; construction writes only the active payload, and projection and Drop
+switch on the tag before accessing it. Inactive bytes and padding are
+unspecified and unobservable. There is no niche representation. Until that PR
+lands, the implementation still uses the older flattened bodies; plan 71 is the
+authoritative replacement contract and owns the transition matrix.
 
 ### Target-selected indirect results
 
@@ -72,6 +80,16 @@ local's address into the call. Observable old-destination reads retain the
 separate temporary. Source ownership and effect inference are unchanged.
 [Plan 67](67-caller-result-placement-plan.md) owns classification, lifetime,
 native ABI equivalence and the acceptance matrix.
+
+Plan 71 extends the same target-owned classification to program parameters and
+cleanup-bearing returns. An indirect T uses a void function with `sret(T)` and
+a one-byte cleanup output; a direct T may return directly with that cleanup
+output. This obeys LLVM's void-return requirement for sret and prevents the
+cleanup bit from forcing a second aggregate result slot. Large program-owned by-value
+parameters use target-selected `byval(T)`. Only fresh whole locals and caller
+result slots are explicit destination-placement candidates; replacement,
+fields, indexed destinations, joins, and observable aliases keep a temporary
+to preserve evaluation, bounds-error, and Drop order.
 
 ### Module verification (every profile, on every emit path)
 

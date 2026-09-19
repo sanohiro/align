@@ -115,10 +115,19 @@ is sound.
 Owner-generation invalidation is complete in HIR before MIR construction and is retained in debug
 provenance; LLVM does not decide borrow legality.
 
+Plan 71 PR 2 specializes the cleanup companion without changing these source
+rules. A droppable `BorrowMut` whose body and direct callees cannot change
+ownership state receives only the data pointer; a possibly changing or unknown
+edge retains the pointer pair. The effect is serialized per parameter. The
+canonical function-value ABI remains the conservative pair, with a local
+adapter when an invariant named target is converted to that function type.
+
 `Fn`/`FnTy` stores `[(ParamMode, Ty)]`, not only `[Ty]`, plus the target's
 `ReturnBorrowSummary`/`ReturnRegionSummary` and `ReturnCleanupAbi`. A named function converted to a function value retains
 `Out`, `Borrow`, and `BorrowMut`; `CallFnValue` lowers each operand with the identical direct-call
-ABI and applies the stored result provenance. Concrete closure targets resolve target-relative
+logical ABI and applies the stored result provenance. Plan 71's invariant-target
+adapter is the only physical cleanup-state shim; it neither copies nor drops the
+borrowed owner. Concrete closure targets resolve target-relative
 capture-slot summaries through the selected environment; those roots travel when the function
 value moves and constrain the result. Function-value joins require exact mode equality, union
 parameter sets, and preserve the selected target's capture metadata. An unresolved higher-order parameter uses every compatible view/region
@@ -347,7 +356,10 @@ The region checked in `03 §7` is converted into actual allocation/release here.
 
 > **Implemented (Memory Model v2).** Free-standing owned values use a per-binding `Drop` (a
 > `DropFlagInit` null-inits the slot; a moved-out source is nulled at the move site so the exit
-> `Drop` is a no-op `free(null)`). An owned payload inside an `Option`/`Result` is dropped by
+> `Drop` is a no-op `free(null)`). Plan 71 PR 2 splits this statement's origin into
+> `InitializeEmpty` and `MoveOut`: initialization nulling remains mandatory, while the existing
+> drop-state pass may remove MoveOut nulling only when the paired dead flag dominates every path
+> and storage is unread until complete reinitialization or exit. An owned payload inside an `Option`/`Result` is dropped by
 > freeing each owned field's buffer. Inside an `arena {}` the same values are bump-allocated and
 > bulk-freed (no per-binding `Drop`). See `08-memory-model-v2.md`.
 

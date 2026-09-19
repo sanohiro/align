@@ -51,8 +51,14 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    `deep_type_graphs` remains covered by the nightly full-suite detector.
 
 1. **plan 71 ledger** for #1076/#1077/#1078 (sum-type layout, aggregate transport,
-   drop-state model): one ledger, serialized, one fresh independent adversarial
-   review before any code (CLAUDE.md large-design gate).
+   drop-state model): the unified ledger is drafted on its design branch and
+   awaits one fresh independent adversarial review before any code. It fixes
+   three ordered capabilities: explicit-tag/max-variant union storage; a
+   serialized per-parameter drop-state effect with conservative indirect
+   adapters; then target-selected byval and split cleanup-result transport with
+   fresh-whole-value destination construction. Field replacement and indexed
+   destinations deliberately retain temporaries to preserve RHS, Drop and
+   bounds-error order.
 3. Language items after the codegen track: #1085 `str` patterns in `match`,
    #1065 fixed arrays in structs, #1066 proposal 2, #1064 → depends on #1063,
    #1075 scalar ABI facts, #1082 P2 RFC.

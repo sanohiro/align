@@ -289,6 +289,14 @@ place; Copy preserves ownership by value but explicit borrow avoids the structur
 retaining the same checked-place and pointer ABI. `BorrowMut` also accepts a writable Copy place so field mutation
 updates the caller instead of a discarded copy.
 
+The source mode does not expose cleanup transport. Plan 71 derives a
+per-function effect for droppable `BorrowMut`: a body that cannot change
+ownership state uses a plain data pointer, while a changing or unknown target
+also receives the caller-owned cleanup pointer. Function values keep one
+conservative physical form through compiler-generated adapters. This is an
+implementation detail; exclusivity, generation invalidation, and replacement
+semantics above are unchanged.
+
 Checked HIR infers `ReturnBorrowSummary::Roots { params, captures }` by recursively walking every
 possible view in the return value. Named exported functions have an empty capture set and serialize
 the parameter roots. A concrete closure target records sorted capture-slot roots and resolves them

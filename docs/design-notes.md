@@ -367,7 +367,7 @@ borrowed text leaves remain cheap reads, while an owned text leaf can use the ex
 borrowed arm binding is not a stable place for a nested borrowed `match`; that use is rejected
 without an owning fallback. Returning or retaining the whole non-Copy/Move payload is still an ownership error, while existing
 Copy/view matching keeps its current result behavior. Keeping this as a
-compiler projection over the existing flattened tagged layout preserves **Nothing hidden**, avoids
+compiler projection over the tagged value's active-payload access path preserves **Nothing hidden**, avoids
 a shallow Move aggregate copy, and leaves owning-place match, `else`, and `?` semantics unchanged.
 A package-specific wrapper or alternate error/result API would create a second ownership model, so
 the language capability is the correct boundary.
