@@ -4754,6 +4754,11 @@ fn simplify_known_drop_flags(f: &mut Function) {
             None => continue,
         };
     }
+    f.exceptional_edges.retain(|edge| {
+        f.blocks
+            .get(edge.block as usize)
+            .is_some_and(|block| matches!(block.term, Term::Branch(..)))
+    });
 
     // Do not leave the discarded destructor blocks in MIR: codegen intentionally lowers every
     // block, and relying on a later LLVM unreachable-block cleanup is exactly what allowed
@@ -4799,6 +4804,16 @@ fn simplify_known_drop_flags(f: &mut Function) {
         }
     }
     f.entry = remap[f.entry as usize];
+    f.exceptional_edges.retain_mut(|edge| {
+        let Some(mapped) = remap.get(edge.block as usize).copied() else {
+            return false;
+        };
+        if mapped == u32::MAX {
+            return false;
+        }
+        edge.block = mapped;
+        true
+    });
     f.blocks = blocks;
 }
 
@@ -23734,7 +23749,7 @@ mod tests {
                 "{name} gained an exceptional edge"
             );
         }
-        validate_exceptional_edges(&program).unwrap();
+        assert!(validate_exceptional_edges(&program).is_ok());
     }
 
     #[test]
@@ -23747,18 +23762,96 @@ mod tests {
         assert!(validate_exceptional_edges(&stale).is_err());
 
         let mut non_branch = program.clone();
-        non_branch.fns[0].exceptional_edges[0].block = non_branch.fns[0]
+        let Some(non_branch_block) = non_branch.fns[0]
             .blocks
             .iter()
             .find(|block| !matches!(block.term, Term::Branch(..)))
-            .unwrap()
-            .id;
+        else {
+            panic!("valid fixture has no non-branch block");
+        };
+        non_branch.fns[0].exceptional_edges[0].block = non_branch_block.id;
         assert!(validate_exceptional_edges(&non_branch).is_err());
 
         let mut duplicate = program;
         let edge = duplicate.fns[0].exceptional_edges[0];
         duplicate.fns[0].exceptional_edges.push(edge);
         assert!(validate_exceptional_edges(&duplicate).is_err());
+    }
+
+    #[test]
+    fn known_drop_flag_simplification_remaps_exceptional_edges() {
+        let i64_ty = Ty::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        let mut function = Function {
+            name: ProgramCall::from_validated("checked_cleanup"),
+            params: vec![],
+            param_modes: vec![],
+            borrow_mut_cleanup_slots: vec![],
+            ret: i64_ty,
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
+            slots: vec![Ty::Bool, Ty::String],
+            slot_align: vec![None, None],
+            value_tys: vec![Ty::Bool],
+            blocks: vec![
+                Block {
+                    id: 0,
+                    stmts: vec![
+                        Stmt::Store(0, Operand::Const(Const::Bool(false))),
+                        Stmt::Let(0, Rvalue::Load(0)),
+                    ],
+                    stmt_lines: vec![(0, 0), (0, 0)],
+                    term: Term::Branch(Operand::Value(0), 1, 2),
+                },
+                Block {
+                    id: 1,
+                    stmts: vec![Stmt::Drop(1)],
+                    stmt_lines: vec![(0, 0)],
+                    term: Term::Goto(3),
+                },
+                Block {
+                    id: 2,
+                    stmts: vec![],
+                    stmt_lines: vec![],
+                    term: Term::Goto(3),
+                },
+                Block {
+                    id: 3,
+                    stmts: vec![],
+                    stmt_lines: vec![],
+                    term: Term::Branch(Operand::Const(Const::Bool(false)), 4, 5),
+                },
+                Block {
+                    id: 4,
+                    stmts: vec![],
+                    stmt_lines: vec![],
+                    term: Term::Return(Some(Operand::Const(Const::Int(0, i64_ty)))),
+                },
+                Block {
+                    id: 5,
+                    stmts: vec![],
+                    stmt_lines: vec![],
+                    term: Term::Unreachable,
+                },
+            ],
+            entry: 0,
+            exceptional_edges: vec![ExceptionalEdge {
+                block: 3,
+                unlikely: Successor::Then,
+                kind: ExceptionalKind::BoundsCheck,
+            }],
+            cold: false,
+            exportable: false,
+        };
+
+        simplify_known_drop_flags(&mut function);
+
+        assert_eq!(function.blocks.len(), 5);
+        assert_eq!(function.exceptional_edges[0].block, 2);
+        assert!(matches!(function.blocks[2].term, Term::Branch(..)));
     }
 
     #[test]

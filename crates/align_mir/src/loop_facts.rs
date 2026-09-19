@@ -2157,6 +2157,23 @@ fn apply(function: &mut Function, header: BlockId, plan: Plan) -> Option<Applied
         clones[fail_index].term = Term::Unreachable;
     }
 
+    // Exceptional edges are producer-owned CFG facts. Clone every still-live exceptional branch
+    // with the loop body, but do not retain a record for a proved guard that the fast copy just
+    // replaced with `Goto`.
+    let cloned_exceptional_edges = function
+        .exceptional_edges
+        .iter()
+        .filter_map(|edge| {
+            let cloned_block = *block_map.get(&edge.block)?;
+            let clone = clones.get(index_of(edge.block)?)?;
+            matches!(clone.term, Term::Branch(..)).then_some(crate::ExceptionalEdge {
+                block: cloned_block,
+                unlikely: edge.unlikely,
+                kind: edge.kind,
+            })
+        })
+        .collect::<Vec<_>>();
+
     // Every edge that entered the header from outside the loop now enters the preheader instead.
     let body_set: BTreeSet<BlockId> = plan.body.iter().copied().collect();
     for block in &mut function.blocks {
@@ -2179,6 +2196,7 @@ fn apply(function: &mut Function, header: BlockId, plan: Plan) -> Option<Applied
     function.value_tys.extend(plan.preheader.new_tys);
     function.value_tys.extend(cloned_tys);
     function.blocks.extend(clones);
+    function.exceptional_edges.extend(cloned_exceptional_edges);
     function.blocks.push(preheader);
     if let (Some(rotate_entry_id), Some(expected_body)) = (rotate_entry_id, rotated_body) {
         function.blocks.push(crate::Block {

@@ -24755,15 +24755,16 @@ fn main() -> i32 = 0
             .iter()
             .map(|function| function.exceptional_edges.len())
             .sum::<usize>();
-        let llvm = emit_llvm_ir(
+        let Ok(llvm) = emit_llvm_ir(
             &program,
             &BuildTarget::Baseline,
             Profile::Release,
             false,
             &[],
             None,
-        )
-        .unwrap();
+        ) else {
+            panic!("valid exceptional-edge fixture failed codegen");
+        };
         assert_eq!(
             llvm.lines()
                 .filter(|line| line.trim_start().starts_with("br i1 ") && line.contains("!prof"))
@@ -24792,15 +24793,16 @@ fn main() -> i32 = 0
                 "fn checked(xs: slice<i64>, i: i64) -> i64 = xs[i]\nfn main() -> i32 = 0\n",
             );
             single.fns[0].exceptional_edges[0].kind = kind;
-            let llvm = emit_llvm_ir(
+            let Ok(llvm) = emit_llvm_ir(
                 &single,
                 &BuildTarget::Baseline,
                 Profile::Release,
                 false,
                 &[],
                 None,
-            )
-            .unwrap();
+            ) else {
+                panic!("valid {kind:?} fixture failed codegen");
+            };
             assert_eq!(
                 llvm.lines()
                     .filter(|line| line.trim_start().starts_with("br i1 ")
@@ -24818,55 +24820,68 @@ fn main() -> i32 = 0
         let layout_program = mir(
             "E { Bad }\nfn tried(value: Result<i64, E>) -> Result<i64, E> { x := value?\n return Ok(x) }\nfn main() -> i32 = 0\n",
         );
-        let optimized = emit_llvm_ir(
+        let Ok(optimized) = emit_llvm_ir(
             &layout_program,
             &BuildTarget::Baseline,
             Profile::Release,
             true,
             &["tried".to_owned()],
             None,
-        )
-        .unwrap();
-        let definition = optimized
+        ) else {
+            panic!("valid layout fixture failed codegen");
+        };
+        let Some(definition) = optimized
             .split("define ")
             .find(|definition| definition.contains("@tried("))
-            .unwrap();
-        assert!(
-            definition.find("  ret ").unwrap() < definition.find("\n  %err =").unwrap(),
-            "Err continuation must be laid out after the return:\n{definition}"
-        );
+        else {
+            panic!("tried definition missing from optimized IR:\n{optimized}");
+        };
+        let Some(return_offset) = definition.find("  ret ") else {
+            panic!("return missing from tried definition:\n{definition}");
+        };
+        let Some(error_offset) = definition.find("\n  %err =") else {
+            panic!("Err continuation missing from tried definition:\n{definition}");
+        };
+        assert!(return_offset < error_offset, "Err continuation must be laid out after the return:\n{definition}");
     }
 
     #[test]
     fn mir_cold_classification_emits_the_function_attribute() {
         let mut program = mir("fn helper() -> Result<i64, Error> = Err(Error.Code(1))\nfn main() -> i32 = 0\n");
-        let helper = program
+        let Some(helper) = program
             .fns
             .iter_mut()
             .find(|function| function.name.as_str() == "helper")
-            .unwrap();
+        else {
+            panic!("helper missing from valid fixture");
+        };
         helper.cold = true;
         let symbol = encoded_program_symbol(&helper.name);
-        let llvm = emit_llvm_ir(
+        let Ok(llvm) = emit_llvm_ir(
             &program,
             &BuildTarget::Baseline,
             Profile::Release,
             false,
             &[],
             None,
-        )
-        .unwrap();
-        let definition = llvm
+        ) else {
+            panic!("valid cold-function fixture failed codegen");
+        };
+        let Some(definition) = llvm
             .lines()
             .find(|line| line.starts_with("define") && line.contains(&symbol))
-            .unwrap();
-        let attributes = definition
+        else {
+            panic!("cold helper definition missing:\n{llvm}");
+        };
+        let Some(attributes) = definition
             .split('#')
             .nth(1)
             .and_then(|suffix| suffix.split_whitespace().next())
             .map(|group| format!("attributes #{group} ="))
             .and_then(|prefix| llvm.lines().find(|line| line.starts_with(&prefix)))
-            .unwrap();
+        else {
+            panic!("attribute group missing for cold helper:\n{llvm}");
+        };
         assert!(attributes.contains(" cold "), "{definition}\n{attributes}");
     }
 

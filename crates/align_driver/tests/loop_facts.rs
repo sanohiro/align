@@ -703,7 +703,7 @@ fn g2_element_guard_is_one_unsigned_compare() {
     let guard = &guards[0];
     assert_eq!(
         guard.matches("as u64 (from i64)").count(),
-        3,
+        2,
         "one index cast and one length cast, and nothing else:\n{guard}"
     );
     assert!(
@@ -740,7 +740,7 @@ fn g2_range_guard_is_two_unsigned_compares() {
     );
     assert_eq!(
         guard.matches("as u64 (from i64)").count(),
-        2,
+        3,
         "start, end and len are each cast once:\n{guard}"
     );
     assert_eq!(
@@ -1659,6 +1659,34 @@ fn first_marker(borrow xs: slice<u8>, borrow encoded: slice<u8>) -> i64 {
         body.matches("!prof").count(),
         2,
         "byte preparation must remap the exposed reader and loop bounds edges:\n{body}"
+    );
+}
+
+/// Versioning clones exceptional branches that remain live in the fast body. The proved bounds
+/// guard disappears there, while the unproved division guard keeps cold-edge metadata in both the
+/// fast and slow copies.
+#[test]
+fn g3_versioning_clones_unproved_exceptional_edges() {
+    let source = "\
+fn divide_sum(borrow xs: slice<i64>, divisor: i64) -> i64 {
+  mut i := 0
+  mut total := 0
+  loop {
+    if i >= xs.len() { break }
+    total = total + xs[i] / divisor
+    i = i + 1
+  }
+  return total
+}
+";
+    let report = loop_facts_report("g3-exceptional-clone-report", source);
+    assert!(decision(&report, "divide_sum").starts_with("versioned "));
+    let ir = emit_llvm_with_exports(source, &["divide_sum"]);
+    let body = function_ir(&ir, "divide_sum");
+    assert_eq!(
+        body.matches("!prof").count(),
+        3,
+        "one slow bounds edge and both copies of the division edge keep metadata:\n{body}"
     );
 }
 
