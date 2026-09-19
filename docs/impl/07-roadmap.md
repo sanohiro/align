@@ -2438,6 +2438,11 @@ regression net that validates the upgrade.
   conjunction — a partial fix is not measurable). [Plan 69](69-loop-facts-plan.md) owns the
   retracted item and carries the closure matrix for it, alongside two facts this deferral never
   covered and therefore never deferred: a TBAA header/element split and `!range` on length loads.
+  **PLAN 69 IMPLEMENTED 2026-09-20:** borrowed headers are materialized once with the closed alias
+  and length facts; monotone guards are fused and versioned without deleting the original trap
+  path; and a canonical counted loop with a body-derived exit peels its zero-trip test, tests the
+  stepped index at the fast-copy latch, and supplies the exact owned-view data extent. The G3 byte
+  scan produces a 128-bit `<16 x i8>` early-exit vector body on both pinned architecture tiers.
   The rest of this deferral stands: internal-ABI signature flattening and the
   `AddProvenNoOverflow` nsw/nuw distinction are unchanged, `readonly`/`nocapture`/`memory` stay
   deferred, and plan 69 does not extend `noalias` to a writable `borrow mut` header.

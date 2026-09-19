@@ -674,3 +674,89 @@ fn g2_monotone_check_hoisted_aarch64() {
     assert!(ir.contains("vector.body"), "want a vector main loop:\n{ir}");
     assert!(ir.contains("<2 x i64>"), "want 128-bit i64 lanes at the aarch64 baseline:\n{ir}");
 }
+
+// ── G3, per-arch (plan 69 PR 3) ────────────────────────────────────────────────────────────────
+
+const COUNTED_FIRST_NONZERO: &str = "\
+fn first_nonzero(borrow xs: slice<u8>) -> i64 {
+  mut i := 0
+  loop {
+    if i >= xs.len() { break -1 }
+    if xs[i] != 0 { break i }
+    i = i + 1
+  }
+}
+";
+
+fn counted_remarks(name: &str, target: BuildTarget) -> Vec<String> {
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, name, COUNTED_FIRST_NONZERO);
+    assert!(
+        !checked.diags.has_errors(),
+        "unexpected errors:\n{}",
+        align_driver::format_diagnostics(&sm, &checked.diags)
+    );
+    let mir = lower_to_mir(&checked.hir);
+    align_driver::collect_opt_remarks(
+        &mir,
+        target,
+        align_driver::Profile::Release,
+        &align_driver::DebugInfo { file: format!("{name}.align"), directory: "/".into() },
+        &["first_nonzero".to_string()],
+    )
+    .expect("collect G3 optimization remarks")
+}
+
+/// G3 at the x86-64-v2 baseline: the canonical early-exit scan widens to one 128-bit byte vector.
+#[test]
+fn g3_counted_latch_exit_x86_v2() {
+    if !x86_backend() {
+        return;
+    }
+    let ir = opt_ir_rooted(
+        "g3-counted-v2",
+        COUNTED_FIRST_NONZERO,
+        V2,
+        &["first_nonzero"],
+    );
+    assert!(ir.contains("vector.body"), "want an early-exit vector body:\n{ir}");
+    assert!(ir.contains("<16 x i8>"), "want one 128-bit byte vector at v2:\n{ir}");
+    let remarks = counted_remarks("g3-counted-v2", BuildTarget::Cpu(V2.to_string()));
+    assert!(
+        remarks.iter().any(|remark| remark.contains("vectorized loop")),
+        "LLVM must report the widened loop: {remarks:#?}"
+    );
+    assert!(
+        !remarks.iter().any(|remark| {
+            remark.contains("Cannot vectorize early exit loop")
+                || remark.contains("potentially faulting load")
+        }),
+        "rotation and the extent close both measured blockers: {remarks:#?}"
+    );
+}
+
+/// The same G3 promise on the portable aarch64 baseline used by issue 1084's measurement.
+#[test]
+fn g3_counted_latch_exit_aarch64() {
+    if !aarch64_backend() {
+        return;
+    }
+    let ir = emit_llvm_optimized(COUNTED_FIRST_NONZERO, &["first_nonzero"]);
+    assert!(ir.contains("vector.body"), "want an early-exit vector body:\n{ir}");
+    assert!(
+        ir.contains("<16 x i8>"),
+        "want one 128-bit byte vector at the aarch64 baseline:\n{ir}"
+    );
+    let remarks = counted_remarks("g3-counted-aarch64", BuildTarget::Baseline);
+    assert!(
+        remarks.iter().any(|remark| remark.contains("vectorized loop")),
+        "LLVM must report the widened loop: {remarks:#?}"
+    );
+    assert!(
+        !remarks.iter().any(|remark| {
+            remark.contains("Cannot vectorize early exit loop")
+                || remark.contains("potentially faulting load")
+        }),
+        "rotation and the extent close both measured blockers: {remarks:#?}"
+    );
+}

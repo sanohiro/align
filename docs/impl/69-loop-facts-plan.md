@@ -6,7 +6,7 @@ Status: plan of record for issues
 [1081](https://github.com/sanohiro/align/issues/1081) and
 [1084](https://github.com/sanohiro/align/issues/1084). PR 1 (§2, issues 1079
 and 1080) and PR 2 (§3, issue 1081) are implemented, with the corrections §2.6
-and §3.7 record; PR 3 is not.
+and §3.7 record; PR 3 (§4, issue 1084) is implemented.
 
 [Plan 68](68-vectorization-contract.md) is the public-contract ledger and owns
 guarantees G1–G10. This plan implements G1, G2 and G3 and does not restate,
@@ -1143,18 +1143,18 @@ already records that outcome.
 
 | Shape | Why | Owner |
 | --- | --- | --- |
-| Step is not a positive integer constant | `skip_zeros` below steps by 1 or 2 depending on data | planned negative owner |
-| Exit relation other than `>=` or `>` | `if i != n { … } else { break }` with a step that skips `n` runs to defined `i64` wrap today; a peeled and latched form need not reproduce that, so it is not recognized | planned negative owner per relation |
-| Index assigned on some paths only | no monotone recurrence | planned |
-| Index reassigned in the body after the guard | the recurrence is not the latch's | planned |
-| Bound written in the body | not loop-invariant | planned |
-| Bound near `i64::MAX` | `i + step` wraps, and wrap is defined behavior that rotation must not change | planned |
-| Trip-count test not first in the body | the header's first exit is data-dependent; there is nothing to rotate | planned |
-| Two trip-count-shaped exits | ambiguous canonical form; not admitted | planned |
-| Index escapes to a lambda or a call | the recurrence is not local | `lambda`, planned |
-| Index used after the loop | admitted, but the post-loop value must be identical | `loop_expr`, planned |
+| Step is not a positive integer constant | `skip_zeros` below steps by 1 or 2 depending on data | `g2_index_forms_get_their_stated_decision` |
+| Exit relation other than `>=` or `>` | `if i != n { … } else { break }` with a step that skips `n` runs to defined `i64` wrap today; a peeled and latched form need not reproduce that, so it is not recognized | `g3_noncanonical_exit_relations_are_refused` |
+| Index assigned on some paths only | no monotone recurrence | G2 index-form matrix |
+| Index reassigned in the body after the guard | the recurrence is not the latch's | `g2_index_forms_get_their_stated_decision` |
+| Bound written in the body | not loop-invariant | `g2_a_bound_a_callee_can_write_is_not_versioned` |
+| Final body index above `i64::MAX - step` | the following `i + step` wraps, and wrap is defined behavior that rotation must not change | `g2_a_reentered_loop_admits_on_the_current_index`, boundary owner |
+| Trip-count test not first in the body | the header's first exit is data-dependent; there is nothing to rotate | `g3_noncanonical_exit_relations_are_refused` |
+| Two trip-count-shaped exits | ambiguous canonical form; not admitted | `g3_noncanonical_exit_relations_are_refused` |
+| Index escapes to a lambda or a call | the recurrence is not local | `g2_an_index_a_callee_can_write_is_not_versioned`, `lambda` |
+| Index used after the loop | admitted, but the post-loop value must be identical | `loop_expr` |
 | Loop with no exit at all | a diverging loop is unchanged | `loop_expr::a_diverging_loop_body_is_a_function_result` |
-| Zero-trip, one-trip, first-element exit, last-element exit, no early exit | all five behave exactly as today | planned executable owners (1084's own list) |
+| Zero-trip, one-trip, first-element exit, last-element exit, no early exit | all five behave exactly as today | `g3_counted_exit_value_matrix_is_unchanged`, G3 absence owner |
 
 ```align
 fn skip_zeros(borrow xs: slice<u8>) -> i64 {
@@ -1167,25 +1167,58 @@ fn skip_zeros(borrow xs: slice<u8>) -> i64 {
 }
 ```
 
-### 4.4 Acceptance corpus
+### 4.4 Implementation closure matrix (PR 3)
 
-New in `vectorize_shapes.rs`: `g3_counted_latch_exit` plus the zero-trip,
-one-trip, first-element-exit, last-element-exit and no-exit owners (plan 68's
-names), per arch tier; the `all`-style `slice<u8>` scan asserting a 128-bit
-integer vector body on aarch64 baseline and x86-64-v2.
+Rotation and the data-buffer extent are one capability boundary. Both consume the same counted-loop
+record, and neither leaves a useful stable consumer alone: rotation without the extent retains LLVM's
+potentially-faulting-load refusal, while the extent without rotation retains the early-exit refusal.
+Keeping them together also makes one re-derivation gate prove the zero-trip peel, latch relation and
+extent placement against the same CFG. Splitting it would duplicate that proof and leave an
+intentionally dormant half.
 
-New in `loop_facts.rs` (arch-neutral): the rotated MIR shape, the named fact's
-contents, the `dereferenceable` attribute form, the assume bundle's presence for
-a recognized loop and its absence for a raw FFI pointer, a zero-length view and
-an unrecognized loop.
+| Axis | Cell | Required behavior | Owner |
+| --- | --- | --- | --- |
+| Formation | canonical `>=` / `>` header exit | form one counted-loop record containing the live entry, trip count, index slot, positive constant step, relation, loop-invariant bound, exit arm and body arm | `g3_counted_fact_names_the_complete_recurrence` |
+| | every other relation, non-constant/non-positive step, partial or second index write | form no record and leave the CFG byte-identical | `g3_noncanonical_exit_relations_are_refused`, G2 index-form matrix |
+| | bound write, index address escape, two trip-count exits, trip-count test not first | fail closed before mutation | G2 bound/address owners, `g3_noncanonical_exit_relations_are_refused` |
+| Construction | zero-trip peel | every outside edge enters one peel that reads the live index value and current bound; `>` keeps reading the live entry and does not remember its initializer | `g3_greater_than_relation_keeps_the_bound_iteration`, §3.7 re-entry owners |
+| | latch exit | every fast-copy back edge computes `i + step` once and tests the same relation against the same bound; body-derived exits stay in the body | `g3_counted_loop_moves_the_fast_trip_exit_to_the_latch` |
+| | fast and slow G2 copies | rotate the proved fast copy; the original slow copy stays byte-identical with every guard, preserving defined wrap behavior whenever admission fails | G2 shape/trap owners plus the G3 latch owner |
+| Move-in/out and joins | value-carrying `break`, `if`, `match` and branch joins | preserve each exit target, carried value, discriminator order and join value | `g3_counted_exit_value_matrix_is_unchanged`, `loop_expr`, `enum_match` |
+| | `else`, `?`, `map_err`, early return | preserve the exact early exit and cleanup edge; none becomes a latch edge | `else_result`, `structured_error`, `loop_expr` |
+| | nested and re-entered loops | rotate independently innermost-first; every peel reads the value at that entry, including a value left by a preceding execution | `g2_a_reentered_loop_admits_on_the_current_index`, `g2_a_reentered_loop_still_versions_and_computes` |
+| Ownership / cleanup | Copy loop state | duplicate no owner and change no Drop action | G2 slow-copy identity owner, G3 MIR-shape owner |
+| | Move values, Drop flags, replacement and return | refuse a body the existing G2 model cannot clone; otherwise every original cleanup remains on its original exit | `g2_a_loop_with_an_owned_per_iteration_value_is_never_versioned`, `loop_expr` |
+| Arithmetic | near-`i64::MAX` bound or wrapping `i + step` | do not rotate unless the peel proves the next latch step cannot wrap; preserve defined wrap behavior in the original loop | `g2_a_reentered_loop_admits_on_the_current_index`, admission MIR owner |
+| | zero, one, first-exit, last-exit and no-early-exit | preserve result, final index and effect prefix exactly | `g3_counted_exit_value_matrix_is_unchanged` |
+| Data extent | owned slice/array view with runtime length | after the non-empty peel, emit exactly one `dereferenceable(ptr, len * sizeof(T))` operand bundle per distinct view per recognized loop | `g3_dynamic_view_extent_is_exact_and_deduplicated` |
+| | constant extent | rely on the ordinary constant allocation/attribute fact; emit no dynamic operand bundle for the same view | fixed-array and absence owners |
+| | empty, FFI, `unsafe raw`, resource payload, unrecognized loop | the empty path never reaches the bundle; non-view and unrecognized shapes emit none | `g3_extent_is_absent_without_an_early_exit_or_owned_view`, executable zero-trip owner |
+| | byte calculation | concrete element size and runtime multiplication describe that exact safe view allocation | `g3_dynamic_view_extent_is_exact_and_deduplicated` |
+| Compilation modes | whole-program, per-unit and function partition | preserve the same counted record, rotation and extent placement in each path, including emission-scoped byte preparation | whole-program G3 owners, `g3_counted_fact_reaches_per_unit_and_function_partition_codegen`, `g3_extent_survives_byte_preparation` |
+| | generic monomorphization | derive each concrete element width and view identity after monomorphization; no structural fact crosses an incompatible instantiation | post-monomorph `loop_facts` registration, u8/i64 width owners |
+| Artifact / cache | interface and cache identity | public interface hash is unchanged; selected-partition identity includes its counted facts and MIR/object bytes change deterministically | canonical graph exclusion, partition codegen owner |
+| Validation | malformed MIR / unsupported CFG / id exhaustion | diagnose earlier validation faults; otherwise roll back the entire function with no partial rotation or extent record; reject malformed public extent metadata before LLVM value conversion | `analysis_coverage`, `loop_facts::structurally_valid`, `malformed_counted_extent_types_are_errors_not_panics`, existing id-limit rollback owner |
+| Re-derivation | transformed CFG | re-discover the rotated natural loop, latch relation, exact slow body, trap count, producer operands and extent sites from the rewritten function; disagreement restores the original | `loop_facts::rederives`, existing rollback owners |
+| Vector result | aarch64 baseline and x86-64-v2 `slice<u8>` all-scan | one 128-bit integer vector body and neither measured rejection remark for the canonical form | `g3_counted_latch_exit_aarch64`, `g3_counted_latch_exit_x86_v2` |
+
+### 4.5 Acceptance corpus
+
+`vectorize_shapes.rs` owns `g3_counted_latch_exit_aarch64` and
+`g3_counted_latch_exit_x86_v2`: the `slice<u8>` scan produces a 128-bit integer
+vector body and neither measured rejection remark on both architecture tiers.
+
+`loop_facts.rs` owns the rotated MIR shape, the named fact's contents, the
+dynamic extent bundle and deduplication, absence for a raw pointer or a loop
+without a body-derived exit, both admitted relations, and the zero/one/first/
+last/no-match executable matrix.
 
 Reused: `loop_expr` in full — it is the semantics owner for `loop` and would
 fail for any rotation defect — plus `bytes_ops`, `text_boundary`,
 `runway_a2_binary_codec`, and `explain_opt`, whose existing assertions are on
 the `loop(s) vectorized` / `not vectorized` report text and pin no remark count.
-1084's own criterion is a drop in the `Cannot vectorize early exit loop` remark
-count; that string appears nowhere in the tree today, so the remark-count owner
-is planned, not reused.
+1084's two measured rejection strings are pinned absent by the per-architecture
+G3 owners, alongside LLVM's positive `vectorized loop` remark.
 
 ## 5. Documents this plan edits
 
@@ -1193,8 +1226,7 @@ is planned, not reused.
 07-roadmap.md      the Slice 5 deferral of type-derived per-program-fn param
                    attributes is retracted for the borrowed view header only,
                    with a pointer here. The rest of that deferral stands
-HANDOFF.md         one sentence in the existing open-issue-batch paragraph,
-                   recording plan 69 as planned
+HANDOFF.md         the completed G1-G3 capability and the next plan-70 work
 23-friction-ledger.md
                    a refused row for issue 1047 Finding 3. Unrelated to the
                    three PRs; recorded here because the same pass reads it

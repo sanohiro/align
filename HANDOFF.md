@@ -49,18 +49,15 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    against LLVM 22's nested `captures(address, read_provenance)` spelling;
    `deep_type_graphs` remains covered by the nightly full-suite detector.
 
-1. **plan 69 PR 3** (#1084, trip-count exit at the latch) — plan 69 §4. Read
-   §3.7 "the entry value is read, not remembered" first: PR 3's `>` exit relation
-   must keep reading `e` at the preheader.
-2. **plan 70 PR 2** (#1074 cold-path model) and **PR 3** (#1072 inline fast path),
+1. **plan 70 PR 2** (#1074 cold-path model) and **PR 3** (#1072 inline fast path),
    in that order — plan 70 §4, §5.
-3. **plan 71 ledger** for #1076/#1077/#1078 (sum-type layout, aggregate transport,
+2. **plan 71 ledger** for #1076/#1077/#1078 (sum-type layout, aggregate transport,
    drop-state model): one ledger, serialized, one fresh independent adversarial
    review before any code (CLAUDE.md large-design gate).
-4. Language items after the codegen track: #1085 `str` patterns in `match`,
+3. Language items after the codegen track: #1085 `str` patterns in `match`,
    #1065 fixed arrays in structs, #1066 proposal 2, #1064 → depends on #1063,
    #1075 scalar ABI facts, #1082 P2 RFC.
-5. Follow-ups, independent and small (updated 2026-09-19):
+4. Follow-ups, independent and small (updated 2026-09-19):
    `fix/nightly-detector-restore` closed #1105, #1107, #1108, #1109, and
    #1112, and separately repaired two untracked first-night nightly failures
    that never got a manifest line — the vectorize_shapes x86 G1/G2 owners
@@ -133,7 +130,12 @@ decision per source loop. The admission reads every operand — including the
 induction entry, loaded live from its slot — at the preheader on every entry
 (plan 69 §3.7, "the entry value is read, not remembered"), and records one
 follow-up: replace the static initializer scan by an initialization proof. PR
-3 (1084) is unstarted.
+3 (1084) is implemented: canonical counted loops with a body-derived exit peel
+the zero-trip test and test the stepped index at the fast-copy latch; one named
+MIR fact carries the recurrence and exact owned-view extents, and codegen emits
+the narrow post-peel dynamic `dereferenceable` bundle. The byte scan widens to
+`<16 x i8>` on aarch64 baseline and x86-64-v2, while the original slow copy
+preserves wrap and trap behavior whenever admission fails.
 [Plan 70](docs/impl/70-runtime-boundary-effects-plan.md) is the planned plan of
 record for G5 (1071, 1072, 1074, folding 1073 part 2 and 1069 part 4): three
 ordered PRs for a per-symbol runtime effects record derived from a closed

@@ -93,7 +93,7 @@ widened into this table.
 | --- | --- | --- | --- | --- | --- | --- |
 | G1 | A borrowed view header is materialized once per function or loop preheader, and header memory is stated distinct from element memory | one header load per loop, dominating the loop; a TBAA node pair separating `align.view.header` from `align.elem`; `noalias dereferenceable(16) align 8` on `borrow` header parameters | that LICM then hoists everything else | LLVM lowering | `vectorize_shapes` owners `g1_view_header_hoisted` and the `bytes_to_f32_out` conjunction pin (both planned) | 1079 |
 | G2 | At most one bounds check per loop, in the preheader, for a monotone index | the check is fused to one unsigned compare; for a monotone index with loop-invariant bound the guard is *moved* to the preheader, not deleted; trap text and first-failing-access iteration unchanged | which residual checks LLVM then folds | MIR | `vectorize_shapes` owner `g2_monotone_check_hoisted` (planned); trap-parity owners for zero-length, length-1, first-out-of-range | 1081, 1080 |
-| G3 | A counted loop lowers with its trip-count exit at the latch; the recognized shape produces one named MIR fact | recognition is total for the canonical shape: zero-trip test peeled into the preheader, only body-derived exits in the header, `i + step REL bound` at the latch; the fact carries trip count, step and monotone index and is the single source G1's and G2's owners read | whether LLVM's early-exit vectorizer then fires | MIR lowering | `vectorize_shapes` owner `g3_counted_latch_exit` and the zero-trip, one-trip, first-element-exit, last-element-exit and no-exit owners (all planned) | 1084 |
+| G3 | A counted loop lowers with its trip-count exit at the latch; the recognized shape produces one named MIR fact | recognition is total for the canonical early-exit shape: zero-trip test peeled into the fast-copy preheader, only body-derived exits in its header, `i + step REL bound` at the latch; the fact carries trip count, step and monotone index and is the single source rotation and extent emission read | whether LLVM's early-exit vectorizer then fires | MIR lowering | `g3_counted_latch_exit_aarch64`, `g3_counted_latch_exit_x86_v2`, `g3_counted_exit_value_matrix_is_unchanged` | 1084 |
 | G4 | One floating-point semantics model: uniform `minimum`/`maximum` lowering, ordered by default, relaxation only inside an explicit lexical scope | Part 1: all three spellings of a float min/max emit `llvm.minimum`/`llvm.maximum`, with NaN propagation and ±0 ordering unchanged. Part 2 (future): `reassoc` and `contract` are named individually and scoped lexically without inheriting across a function boundary; `nnan` and `ninf` are permanently excluded | the vector width LLVM picks for the resulting reduction | MIR (Part 1); MIR with sema (Part 2) | `vectorize_shapes` owner `g4_minmax_uniform_lowering` and the NaN, `-0.0`/`+0.0` and all-NaN conformance owners (planned); the existing `vectorize_shapes.rs:258` negative control `k6_float_sum_does_not_vectorize_without_fast_math` | 1082 Part 1 (now), 1082 Part 2 (future RFC) |
 | G5 | Every runtime primitive that can appear in a loop has an effects record and either an inline fast path or a vector form | each runtime ABI symbol carries a complete memory-effects record and every sound subset is emitted as an attribute; per-element primitives have a visible inline fast path and a visible slow path; `Result`/`?` failure edges are cold with one model | which of the fast paths LLVM then widens | runtime ABI, with LLVM lowering | the existing runtime-ABI owner in `20-runtime-abi-ledger.md`, extended by plan 70 | 1071, 1072, 1073, and 1074, which this contract adds to issue 1088's B6 owner set |
 | G6 | Every `core.math` function has a vector lowering on every supported target and one accuracy contract that holds for both lowerings | a documented ULP bound per function against the correctly rounded result; the scalar and vector lowerings produce bit-identical results, and so does every supported target; no scalar libcall inside a vector body | which loops the vectorizer chooses to widen | LLVM lowering, with the driver | the existing `crates/align_driver/tests/vec_simd.rs` and `crates/align_driver/tests/scalar_math.rs` owners extended to the exp/log family; a ULP conformance owner (planned); `examples/vec_math.align` | 1063 (revised, §6.1), with 1069 as a prerequisite |
@@ -346,7 +346,7 @@ Without G10 this contract is a list of hopes; with it, it is checkable.
 ## 4. Ownership map
 
 ```text
-plan 69 loop facts (planned)          G1  1079
+plan 69 loop facts (implemented)      G1  1079
                                       G2  1081, 1080
                                       G3  1084
 plan 70 runtime boundary effects
@@ -361,9 +361,8 @@ unfiled                               G9  1066 comment, needs its own issue
                                           09-explain-opt.md's owner
 ```
 
-Plan 69 and plan 70 do not exist yet; they are cited here as the planned owning
-documents so that the guarantees have a named destination, not as existing
-sources of truth.
+Plan 69 is implemented through G3. Plan 70 exists and its first capability is
+implemented; its remaining guarantees retain the status recorded in that plan.
 
 The four issues plan 69 would carry are scheduled together for three different
 reasons, and the document states each rather than flattening them:

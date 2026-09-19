@@ -1441,11 +1441,14 @@ fn g2_the_preheader_loads_the_live_entry() {
         .next()
         .expect("`load _<slot>`")
         .to_string();
-    // The preheader is the last block `apply` appends.
-    let preheader = format!(
-        "  bb{}",
-        body.rsplit("\n  bb").next().expect("a function has at least one block")
-    );
+    // PR 3 appends the one-shot rotated entry after the admission preheader, so identify the
+    // latter by the live-entry proof it owns rather than by its ordinal.
+    let preheader = body
+        .split("\n  bb")
+        .find(|block| {
+            block.contains(&format!("load _{index_slot}")) && block.contains(">= 0_i64")
+        })
+        .unwrap_or_else(|| panic!("no admission preheader in:\n{body}"));
     assert!(
         preheader.contains(&format!("load _{index_slot}")),
         "the preheader loads the index slot live rather than assuming its initializer:\n{preheader}"
@@ -1454,4 +1457,395 @@ fn g2_the_preheader_loads_the_live_entry() {
         preheader.contains(">= 0_i64"),
         "the live entry is checked against zero, exactly as every other admission operand is:\n{preheader}"
     );
+}
+
+// ── G3, plan 69 PR 3 (issue 1084) ─────────────────────────────────────────────────────────────
+
+const FIRST_NONZERO: &str = "\
+fn first_nonzero(borrow xs: slice<u8>) -> i64 {
+  mut i := 0
+  loop {
+    if i >= xs.len() { break -1 }
+    if xs[i] != 0 { break i }
+    i = i + 1
+  }
+}
+";
+
+/// The producer-owned record is the single source for rotation and codegen. Pin the fields that
+/// distinguish it from a codegen pattern match: live entry, trip count, induction slot, step,
+/// relation, bound and the exact view extent all exist before LLVM lowering.
+#[test]
+fn g3_counted_fact_names_the_complete_recurrence() {
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "g3-counted-record", FIRST_NONZERO);
+    assert!(
+        !checked.diags.has_errors(),
+        "unexpected errors:\n{}",
+        align_driver::format_diagnostics(&sm, &checked.diags)
+    );
+    let program = lower_to_mir(&checked.hir);
+    let function = program
+        .loop_facts
+        .iter()
+        .find(|facts| facts.function == "first_nonzero")
+        .expect("the function has a loop-facts record");
+    assert_eq!(function.counted.len(), 1, "one source loop produces one counted fact");
+    let fact = &function.counted[0];
+    assert_eq!(fact.step, 1);
+    assert_eq!(fact.relation, align_ast::BinOp::Ge);
+    assert_eq!(fact.extents.len(), 1, "the one indexed view supplies one extent");
+    assert!(matches!(fact.entry, align_mir::Operand::Value(_)));
+    assert!(matches!(fact.trip_count, align_mir::Operand::Value(_)));
+    assert!(matches!(fact.bound, align_mir::Operand::Value(_)));
+    assert!(
+        program.fns.iter().any(|mir| {
+            mir.name.as_str() == "first_nonzero"
+                && mir.slots.get(fact.index as usize)
+                    == Some(&align_sema::Ty::Int(align_sema::IntTy { bits: 64, signed: true }))
+        }),
+        "the named induction slot is an i64 slot in the owning function"
+    );
+}
+
+/// The fast copy has one peeled zero-trip block and a latch branch on the stepped value. The
+/// original slow copy remains byte-for-byte available for a failed G2 admission, while the
+/// data-dependent exit remains in the fast body.
+#[test]
+fn g3_counted_loop_moves_the_fast_trip_exit_to_the_latch() {
+    let body = mir_fn(&mir_text("g3-latch", FIRST_NONZERO), "first_nonzero");
+    let fast_latches: Vec<_> = body
+        .split("\n  bb")
+        .filter(|block| {
+            block.contains("_1 <-")
+                && block.contains("+ 1_i64")
+                && block.contains(" >= ")
+                && block.contains("branch")
+        })
+        .collect();
+    assert_eq!(
+        fast_latches.len(),
+        1,
+        "exactly the rotated fast copy tests its stepped value at the latch:\n{body}"
+    );
+    assert!(
+        body.split("\n  bb").any(|block| block.contains("!= 0_u8") && block.contains("branch")),
+        "the body-derived early exit remains a branch in the fast body:\n{body}"
+    );
+}
+
+/// The dynamic extent is emitted exactly once, after the non-empty peel. Its byte count is the
+/// exact view length times the concrete element width. Repeated accesses through the same view do
+/// not mint repeated assumptions.
+#[test]
+fn g3_dynamic_view_extent_is_exact_and_deduplicated() {
+    let source = "\
+fn first_pair(borrow xs: slice<i64>) -> i64 {
+  mut i := 0
+  loop {
+    if i >= xs.len() { break -1 }
+    if xs[i] + xs[i] != 0 { break i }
+    i = i + 1
+  }
+}
+";
+    let ir = emit_llvm_with_exports(source, &["first_pair"]);
+    let body = function_ir(&ir, "first_pair");
+    assert_eq!(
+        body.matches("\"dereferenceable\"").count(),
+        1,
+        "one distinct view earns one operand bundle even when accessed twice:\n{body}"
+    );
+    assert!(
+        body.lines().any(|line| line.contains("counted.bytes = mul i64") && line.ends_with(", 8")),
+        "the i64 extent is len * 8 bytes:\n{body}"
+    );
+    let assume_block = body
+        .split("\n\n")
+        .find(|block| block.contains("\"dereferenceable\""))
+        .expect("the extent block exists");
+    assert!(
+        !assume_block.contains("branch i1") && assume_block.contains("br label"),
+        "the bundle is in the one-shot block reached after the zero-trip branch:\n{assume_block}"
+    );
+}
+
+/// G3 is narrow: a counted loop without a body-derived exit keeps PR 2's shape and emits no
+/// assumption, and a raw pointer never acquires a view extent from source spelling.
+#[test]
+fn g3_extent_is_absent_without_an_early_exit_or_owned_view() {
+    let sum = emit_llvm_with_exports(SUM, &["sum"]);
+    assert!(
+        !function_ir(&sum, "sum").contains("\"dereferenceable\""),
+        "a loop with only its trip exit is unchanged by G3:\n{sum}"
+    );
+
+    let scalar = "\
+fn stop_at_three(n: i64) -> i64 {
+  mut i := 0
+  loop {
+    if i >= n { break -1 }
+    if i == 3 { break i }
+    i = i + 1
+  }
+}
+";
+    let ir = emit_llvm_with_exports(scalar, &["stop_at_three"]);
+    assert!(
+        !function_ir(&ir, "stop_at_three").contains("\"dereferenceable\""),
+        "a recognized scalar counted loop has no data extent to state:\n{ir}"
+    );
+
+    let raw = "\
+fn raw_scan(p: raw, n: i64) -> i64 {
+  mut i := 0
+  loop {
+    if i >= n { break -1 }
+    unsafe {
+      value: u8 := raw.load(p, i)
+      if value != 0 { break i }
+    }
+    i = i + 1
+  }
+}
+";
+    let ir = emit_llvm_with_exports(raw, &["raw_scan"]);
+    assert!(
+        !function_ir(&ir, "raw_scan").contains("\"dereferenceable\""),
+        "a raw pointer has no Align-owned view extent:\n{ir}"
+    );
+
+    let guardless = "\
+fn count_to(n: i64) -> i64 {
+  mut i := 0
+  loop {
+    if i >= n { break }
+    i = i + 1
+  }
+  return i
+}
+fn main() { }
+";
+    let report = loop_facts_report("g3-guardless", guardless);
+    assert_eq!(decision(&report, "count_to"), "kept checks: no-provable-guard");
+}
+
+/// Emission-scoped byte preparation may reorder every block in the function. Its block map must
+/// carry the producer-owned extent site with it instead of dropping or misplacing the assumption.
+#[test]
+fn g3_extent_survives_byte_preparation() {
+    let source = "\
+fn read_marker(borrow encoded: slice<u8>) -> u8 = encoded.u8(0)
+fn first_marker(borrow xs: slice<u8>, borrow encoded: slice<u8>) -> i64 {
+  marker := read_marker(encoded)
+  mut i := 0
+  loop {
+    if i >= xs.len() { break -1 }
+    if xs[i] == marker { break i }
+    i = i + 1
+  }
+}
+";
+    let report = loop_facts_report("g3-byte-prepare-report", source);
+    assert!(decision(&report, "first_marker").starts_with("versioned "));
+    let ir = emit_llvm_with_exports(source, &["first_marker"]);
+    let body = function_ir(&ir, "first_marker");
+    assert_eq!(
+        body.matches("\"dereferenceable\"").count(),
+        1,
+        "byte preparation keeps the one-shot extent attached to the rotated entry:\n{body}"
+    );
+}
+
+/// Zero-trip, one-trip, first/last match and no match preserve both the carried value and the first
+/// matching index. The empty case also executes no extent assumption because it leaves at the peel.
+#[test]
+fn g3_counted_exit_value_matrix_is_unchanged() {
+    if !cc_available() {
+        return;
+    }
+    let source = format!(
+        "{FIRST_NONZERO}\nfn trace_first(borrow xs: slice<u8>) -> i64 {{\n  mut i := 0\n  loop {{\n    if i >= xs.len() {{ break -1 }}\n    print(i)\n    if xs[i] != 0 {{ break i }}\n    i = i + 1\n  }}\n}}\nfn main() -> i32 {{\n  empty := [0 as u8]\n  one := [0 as u8]\n  first := [7 as u8, 0, 0, 0]\n  last := [0 as u8, 0, 0, 7]\n  none := [0 as u8, 0, 0, 0]\n  e: slice<u8> := empty[0..0]\n  print(first_nonzero(e))\n  print(first_nonzero(one))\n  print(first_nonzero(first))\n  print(first_nonzero(last))\n  print(first_nonzero(none))\n  print(trace_first(last))\n  return 0\n}}\n"
+    );
+    let trace = mir_fn(&mir_text("g3-counted-effects", &source), "trace_first");
+    assert!(
+        trace.split("\n  bb").any(|block| {
+            block.contains("_1 <-")
+                && block.contains("+ 1_i64")
+                && block.contains(" >= ")
+                && block.contains("branch")
+        }),
+        "the observable-prefix witness must exercise the rotated path:\n{trace}"
+    );
+    let out = build_and_run("g3-counted-values", &source);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "-1\n-1\n0\n3\n-1\n0\n1\n2\n3\n3\n",
+        "the rotated loop preserves the first exit and every boundary case:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `>` is the second and final admitted relation. Equality at the bound is a real iteration, so
+/// the zero-trip peel and trip-count calculation must use `>` too rather than silently treating it
+/// as `>=`.
+#[test]
+fn g3_greater_than_relation_keeps_the_bound_iteration() {
+    if !cc_available() {
+        return;
+    }
+    let source = "\
+fn find_through(borrow xs: slice<u8>, last: i64) -> i64 {
+  mut i := 0
+  loop {
+    if i > last { break -1 }
+    if xs[i] != 0 { break i }
+    i = i + 1
+  }
+}
+fn main() -> i32 {
+  data := [0 as u8, 9]
+  print(find_through(data, 1))
+  return 0
+}
+";
+    let body = mir_fn(&mir_text("g3-gt", source), "find_through");
+    assert!(
+        body.split("\n  bb").any(|block| {
+            block.contains("_2 <-")
+                && block.contains("+ 1_i64")
+                && block.contains(" > ")
+                && block.contains("branch")
+        }),
+        "the latch keeps the source relation:\n{body}"
+    );
+    let out = build_and_run("g3-greater-than", source);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n");
+}
+
+/// Recognition is closed over exactly `>=` and `>`, with one trip-count exit. Other relations and
+/// a second induction-shaped exit retain their original CFG under the stable `loop-shape` refusal.
+#[test]
+fn g3_noncanonical_exit_relations_are_refused() {
+    let source = "\
+fn equal_exit(borrow xs: slice<u8>, n: i64) -> i64 {
+  mut i := 0
+  loop {
+    if i == n { break -1 }
+    if xs[i] != 0 { break i }
+    i = i + 1
+  }
+}
+
+fn two_trip_exits(borrow xs: slice<u8>, cap: i64) -> i64 {
+  mut i := 0
+  loop {
+    if i >= xs.len() { break -1 }
+    if i >= cap { break -2 }
+    if xs[i] != 0 { break i }
+    i = i + 1
+  }
+}
+fn trip_test_after_effect(borrow xs: slice<u8>) -> i64 {
+  mut i := 0
+  loop {
+    print(i)
+    if i >= xs.len() { break -1 }
+    if xs[i] != 0 { break i }
+    i = i + 1
+  }
+}
+fn main() { }
+";
+    let report = loop_facts_report("g3-refused-relations", source);
+    for function in ["equal_exit", "two_trip_exits", "trip_test_after_effect"] {
+        assert_eq!(
+            decision(&report, function),
+            "kept checks: loop-shape",
+            "{function} must not produce a counted fact: {report:#?}"
+        );
+    }
+}
+
+/// Per-unit lowering keeps the same producer record, and a function ThinLTO partition carries that
+/// selected function's record into its sealed codegen view and prelink bitcode. This directly owns
+/// the path where a whole-program-only implementation would silently lose the extent.
+#[test]
+fn g3_counted_fact_reaches_per_unit_and_function_partition_codegen() {
+    if !backend_available() {
+        return;
+    }
+    let library = format!("module scan\npub {FIRST_NONZERO}");
+    let main = "\
+module main
+import scan
+fn main() -> i32 {
+  data := [0 as u8, 4]
+  print(scan.first_nonzero(data))
+  return 0
+}
+";
+    let built = build_per_unit_multi(
+        "g3-partitions",
+        &[("scan.align", &library), ("main.align", main)],
+        "main.align",
+    );
+    let unit = built.unit("scan");
+    let facts = unit
+        .mir
+        .loop_facts
+        .iter()
+        .find(|facts| facts.function.ends_with("$first_nonzero"))
+        .unwrap_or_else(|| panic!("per-unit loop facts: {:#?}", unit.mir.loop_facts));
+    assert_eq!(facts.counted.len(), 1);
+
+    let partitions = function_partitions(&built.walk.units, &[]).expect("form function partitions");
+    let partition = partitions
+        .iter()
+        .find(|partition| {
+            matches!(
+                &partition.view,
+                PartitionCodegenView::Function { selected, .. }
+                    if selected.name.as_str().ends_with("$first_nonzero")
+            )
+        })
+        .expect("first_nonzero function partition");
+    match &partition.view {
+        PartitionCodegenView::Function { counted_loops, .. } => assert!(
+            counted_loops.len() == 1,
+            "the sealed view carries the selected function's counted record"
+        ),
+        PartitionCodegenView::Support { .. } => unreachable!("selected a function partition"),
+    }
+
+    let bitcode = built.dir.join("g3-first-nonzero.bc");
+    align_codegen_llvm::emit_function_prelink_bc(
+        &partition.view,
+        &bitcode,
+        &BuildTarget::Baseline,
+        Profile::Release,
+        None,
+        "g3-first-nonzero",
+    )
+    .expect("emit the function prelink partition");
+    let llvm_dis = align_driver::llvm_tool("llvm-dis").expect("LLVM backend provides llvm-dis");
+    let output = std::process::Command::new(llvm_dis)
+        .args([bitcode.as_os_str(), std::ffi::OsStr::new("-o"), std::ffi::OsStr::new("-")])
+        .output()
+        .expect("run llvm-dis");
+    assert!(
+        output.status.success(),
+        "llvm-dis failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let ir = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        ir.contains("\"dereferenceable\"")
+            && ir.contains("%exitcond.not = icmp eq i64")
+            && ir.contains("br i1 %exitcond.not"),
+        "the prelink partition retains both G3 inputs for its ThinLTO optimization:\n{ir}"
+    );
+
+    let run = built.link_and_run();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "1\n");
 }

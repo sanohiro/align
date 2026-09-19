@@ -4219,7 +4219,13 @@ driver links `-lpthread -ldl -lm -lz -lzstd -lcrypto -lssl` unconditionally. Dis
   conversion (hidden bulk data movement); deterministic map iteration as a default contract
   (map/ordered_map split instead); `llvm.assume` / early intrinsic emission / loop-metadata
   overrides as a general policy (the consultation itself counsels restraint — attributes and
-  flags first); custom pass pipelines from day one (measure `default<O*>` first); linked lists as
+  flags first). **Narrow lowering carve-out, 2026-09-20:** a recognized counted loop with a
+  body-derived exit may emit one `dereferenceable(ptr, len * sizeof(T))` operand bundle per
+  distinct Align-owned slice/array view, in the one-shot block after its non-empty peel. This is a
+  representation fact needed by LLVM's early-exit vectorizer; it admits no other assumption,
+  pointer provenance, loop metadata, or source-derived promise. Constant extents continue to use
+  ordinary attributes/metadata or allocation facts first. Outside this closed case the general
+  rejection stands. Custom pass pipelines from day one (measure `default<O*>` first); linked lists as
   std-central collections.
 - **Standing context reaffirmed by the owner (2026-07-11):** pre-release breaking changes stay OK
   for the foreseeable future — public repo but sole user; interface/spec changes need no compat
