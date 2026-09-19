@@ -9353,6 +9353,39 @@ impl<'c, 'a> FnGen<'c, 'a> {
         self.build_union_from_values(ty, self.ctx.i8_type().const_int(1, false), shape.variant(1)?, &[value])
     }
 
+    fn conditional_option_value(
+        &self,
+        is_some: IntValue<'c>,
+        payload: Scalar,
+        value: BasicValueEnum<'c>,
+        name: &str,
+    ) -> Result<StructValue<'c>, CodegenError> {
+        let some_block = self.ctx.append_basic_block(self.func, &format!("{name}.some"));
+        let none_block = self.ctx.append_basic_block(self.func, &format!("{name}.none"));
+        let join = self.ctx.append_basic_block(self.func, &format!("{name}.join"));
+        self.builder
+            .build_conditional_branch(is_some, some_block, none_block)
+            .map_err(|error| self.err(error))?;
+
+        self.builder.position_at_end(some_block);
+        let some = self.option_some_value(payload, value)?;
+        self.builder.build_unconditional_branch(join).map_err(|error| self.err(error))?;
+        let some_end = self.builder.get_insert_block().ok_or_else(|| self.err("Option Some block is absent"))?;
+
+        self.builder.position_at_end(none_block);
+        let none = self.option_none_value(payload)?;
+        self.builder.build_unconditional_branch(join).map_err(|error| self.err(error))?;
+        let none_end = self.builder.get_insert_block().ok_or_else(|| self.err("Option None block is absent"))?;
+
+        self.builder.position_at_end(join);
+        let phi = self
+            .builder
+            .build_phi(some.get_type(), name)
+            .map_err(|error| self.err(error))?;
+        phi.add_incoming(&[(&some, some_end), (&none, none_end)]);
+        Ok(phi.as_basic_value().into_struct_value())
+    }
+
     fn schedule_clone_in_union(
         &mut self,
         work: &mut Vec<CloneInWork<'c>>,
@@ -12813,30 +12846,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .build_extract_value(agg, 1, "of")
                             .map_err(|e| self.err(e))?
                             .into_int_value();
-                        let oty = option_struct_type(
-                            self.ctx,
-                            s,
-                            self.struct_types,
-                            self.enum_types,
-                            self.tagged_types,
-                        );
-                        let some_tag = self.ctx.i8_type().const_int(1, false);
-                        let none_tag = self.ctx.i8_type().const_int(0, false);
-                        let tag = self
+                        let is_some = self
                             .builder
-                            .build_select(ovf, none_tag, some_tag, "tag")
-                            .map_err(|e| self.err(e))?
-                            .into_int_value();
-                        let a0 = self
-                            .builder
-                            .build_insert_value(oty.const_zero(), tag, 0, "tag")
-                            .map_err(|e| self.err(e))?
-                            .into_struct_value();
-                        self.builder
-                            .build_insert_value(a0, res, 1, "val")
-                            .map_err(|e| self.err(e))?
-                            .into_struct_value()
-                            .into()
+                            .build_not(ovf, "checked.some")
+                            .map_err(|e| self.err(e))?;
+                        self.conditional_option_value(is_some, s, res, "checked.result")?.into()
                     }
                 }
             }
@@ -14988,28 +15002,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .builder
                             .build_int_compare(IntPredicate::SGE, idx, i64t.const_zero(), "found")
                             .map_err(|e| self.err(e))?;
-                        let tag = self.builder.build_int_z_extend(found, self.ctx.i8_type(), "tag").map_err(|e| self.err(e))?;
-                        let payload = self
-                            .builder
-                            .build_select(found, idx, i64t.const_zero(), "fpayload")
-                            .map_err(|e| self.err(e))?;
-                        let oty = option_struct_type(
-                            self.ctx,
-                            s,
-                            self.struct_types,
-                            self.enum_types,
-                            self.tagged_types,
-                        );
-                        let agg = self
-                            .builder
-                            .build_insert_value(oty.const_zero(), tag, 0, "ftag")
-                            .map_err(|e| self.err(e))?
-                            .into_struct_value();
-                        self.builder
-                            .build_insert_value(agg, payload, 1, "fsome")
-                            .map_err(|e| self.err(e))?
-                            .into_struct_value()
-                            .into()
+                        self.conditional_option_value(found, s, idx.into(), "str.find.result")?.into()
                     }
                 }
             }
@@ -19444,9 +19437,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
         })
     }
 
-    /// The byte offset of an `Option<s>`'s payload within its `{ i8 tag, payload }` LLVM layout
-    /// (`option_struct_type` element 1) — where the decoder writes the `Some` value.
-    fn option_payload_offset(&self, s: Scalar) -> u64 {
+    /// The byte offset of an `Option<s>`'s Stored payload within its tagged-union layout. An omitted
+    /// zero-sized payload uses offset zero because the decoder has no payload byte to write.
+    fn option_payload_offset(&self, s: Scalar) -> Result<u64, CodegenError> {
         let opt_ty = option_struct_type(
             self.ctx,
             s,
@@ -19454,9 +19447,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
             self.enum_types,
             self.tagged_types,
         );
-        self.target_data
-            .offset_of_element(&opt_ty, 1)
-            .expect("Option payload is element 1")
+        match self.option_union_shape(s)?.payload(1, 0)? {
+            PhysicalPayload::Stored { offset, .. } => self
+                .target_data
+                .offset_of_element(&opt_ty, 1)
+                .and_then(|storage| storage.checked_add(offset))
+                .ok_or_else(|| self.err("Option payload byte offset is unavailable or overflows")),
+            PhysicalPayload::OmittedUnit | PhysicalPayload::OmittedZero { .. } => Ok(0),
+        }
     }
 
     /// The LLVM type of a nested-struct field's sub-schema, matching the runtime `JsonSubTable`
@@ -19557,7 +19555,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // logical→physical.
                 let field_off = self.field_byte_offset(struct_id, i as u32);
                 // An `Option<T>` field describes its **payload** (tag/sub), with `offset` pointing at
-                // the payload slot inside the `Option` (`{ i8 tag, payload }`) and `opt_tag` = the
+                // active payload bytes inside the Option union storage and `opt_tag` = the
                 // field's own byte offset (the tag byte). A required field is `opt_tag = -1` with
                 // `offset` = the field itself.
                 let (tag, sub_ptr, offset, opt_tag): (
@@ -19576,7 +19574,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             (
                                 tag,
                                 sub,
-                                field_off + self.option_payload_offset(payload),
+                                field_off
+                                    .checked_add(self.option_payload_offset(payload)?)
+                                    .ok_or_else(|| self.err("owned JSON Option payload offset overflows"))?,
                                 field_off as i64,
                             )
                         }
@@ -19594,7 +19594,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             (
                                 tag,
                                 sub_ptr,
-                                field_off + self.option_payload_offset(s),
+                                field_off
+                                    .checked_add(self.option_payload_offset(s)?)
+                                    .ok_or_else(|| self.err("JSON Option payload offset overflows"))?,
                                 field_off as i64,
                             )
                         }
@@ -22215,7 +22217,6 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     };
                     let agg = self.operand(opt)?.into_struct_value();
                     let tag = self.builder.build_extract_value(agg, 0, "otag").map_err(|e| self.err(e))?.into_int_value();
-                    let payload = self.builder.build_extract_value(agg, 1, "opay").map_err(|e| self.err(e))?;
                     let is_some = self
                         .builder
                         .build_int_compare(IntPredicate::NE, tag, tag.get_type().const_zero(), "issome")
@@ -22229,6 +22230,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let cont_bb = self.ctx.append_basic_block(func, "opt.cont");
                     self.builder.build_conditional_branch(is_some, some_bb, cont_bb).map_err(|e| self.err(e))?;
                     self.builder.position_at_end(some_bb);
+                    let shape = self.option_union_shape(s)?;
+                    let payload = self
+                        .union_payload_value(agg, agg.get_type(), shape.payload(1, 0)?, "opay")?
+                        .ok_or_else(|| self.err("json.encode Option payload produced no value"))?;
                     // `"name":` prefix.
                     let (pptr, plen) = self.str_global(&format!("\"{name}\":"));
                     self.builder
@@ -22316,9 +22321,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // uses), then a trailing comma; when `None`, emit nothing. The payload struct is stored
                 // to an entry alloca so the encoder can read it by field offset.
                 align_mir::TemplatePiece::OptionStructField { opt, name, struct_id } => {
+                    let Ty::Option(payload_scalar) = self.f.operand_ty(opt) else {
+                        return Err(self.err("json.encode OptionStructField piece is not an Option"));
+                    };
+                    if payload_scalar != Scalar::Struct(*struct_id) {
+                        return Err(self.err("json.encode OptionStructField payload does not match its struct"));
+                    }
                     let agg = self.operand(opt)?.into_struct_value();
                     let tag = self.builder.build_extract_value(agg, 0, "ostag").map_err(|e| self.err(e))?.into_int_value();
-                    let payload = self.builder.build_extract_value(agg, 1, "ospay").map_err(|e| self.err(e))?;
                     let is_some = self
                         .builder
                         .build_int_compare(IntPredicate::NE, tag, tag.get_type().const_zero(), "osissome")
@@ -22332,6 +22342,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let cont_bb = self.ctx.append_basic_block(func, "optstruct.cont");
                     self.builder.build_conditional_branch(is_some, some_bb, cont_bb).map_err(|e| self.err(e))?;
                     self.builder.position_at_end(some_bb);
+                    let shape = self.option_union_shape(payload_scalar)?;
+                    let payload = self
+                        .union_payload_value(agg, agg.get_type(), shape.payload(1, 0)?, "ospay")?
+                        .ok_or_else(|| self.err("json.encode Option struct payload produced no value"))?;
                     let (pptr, plen) = self.str_global(&format!("\"{name}\":"));
                     self.builder
                         .build_call(self.runtime(RuntimeKey::BuilderWrite), &[bptr.into(), pptr.into(), plen.into()], "")
@@ -35677,6 +35691,24 @@ fn main() -> i32 = 0
             assert!(body.contains("clonein.union.variant"), "{name} omitted its tagged clone branches:\n{body}");
             assert!(body.contains("@align_rt_arena_alloc"), "{name} did not clone its active view into the region:\n{body}");
         }
+    }
+
+    #[test]
+    fn checked_find_and_json_option_paths_use_union_storage() {
+        let source = "import core.json\n\
+            Leaf { value: i64 }\n\
+            Data { number: Option<i64>, leaf: Option<Leaf> }\n\
+            fn checked(left: i64, right: i64) -> Option<i64> = left.checked_add(right)\n\
+            fn found(text: str, needle: str) -> Option<i64> = text.find(needle)\n\
+            fn encoded(value: Data) -> Result<string, Error> = json.encode(value)\n\
+            fn main() -> i32 = 0\n";
+        let llvm = ir(source);
+        let checked = function_body(&llvm, "checked");
+        assert!(checked.contains("checked.result.some") && checked.contains("union.payload"), "checked arithmetic bypassed conditional union construction:\n{checked}");
+        let found = function_body(&llvm, "found");
+        assert!(found.contains("str.find.result.some") && found.contains("union.payload"), "str.find bypassed conditional union construction:\n{found}");
+        let encoded = function_body(&llvm, "encoded");
+        assert!(encoded.contains("%opay = load i64") && encoded.contains("%ospay = load %Leaf"), "JSON Option fields bypassed mapped union projection:\n{encoded}");
     }
 
     /// Layout parity: the sema `(size, align)` computation (the shared iterative type-layout engine,
