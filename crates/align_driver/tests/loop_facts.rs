@@ -1655,6 +1655,39 @@ fn first_marker(borrow xs: slice<u8>, borrow encoded: slice<u8>) -> i64 {
         1,
         "byte preparation keeps the one-shot extent attached to the rotated entry:\n{body}"
     );
+    assert_eq!(
+        body.matches("!prof").count(),
+        2,
+        "byte preparation must remap the exposed reader and loop bounds edges:\n{body}"
+    );
+}
+
+/// Versioning clones exceptional branches that remain live in the fast body. The proved bounds
+/// guard disappears there, while the unproved division guard keeps cold-edge metadata in both the
+/// fast and slow copies.
+#[test]
+fn g3_versioning_clones_unproved_exceptional_edges() {
+    let source = "\
+fn divide_sum(borrow xs: slice<i64>, divisor: i64) -> i64 {
+  mut i := 0
+  mut total := 0
+  loop {
+    if i >= xs.len() { break }
+    total = total + xs[i] / divisor
+    i = i + 1
+  }
+  return total
+}
+";
+    let report = loop_facts_report("g3-exceptional-clone-report", source);
+    assert!(decision(&report, "divide_sum").starts_with("versioned "));
+    let ir = emit_llvm_with_exports(source, &["divide_sum"]);
+    let body = function_ir(&ir, "divide_sum");
+    assert_eq!(
+        body.matches("!prof").count(),
+        3,
+        "one slow bounds edge and both copies of the division edge keep metadata:\n{body}"
+    );
 }
 
 /// Zero-trip, one-trip, first/last match and no match preserve both the carried value and the first

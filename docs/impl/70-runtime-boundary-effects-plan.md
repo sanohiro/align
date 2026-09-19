@@ -7,8 +7,9 @@ Status: plan of record for issues
 [1073](https://github.com/sanohiro/align/issues/1073) part 2 (the `BufferPut`
 effects row) and [1069](https://github.com/sanohiro/align/issues/1069) part 4
 (the rt-LTO guarded-set admission criterion), per those issues' 2026-09-18
-triage comments. PR 1's per-symbol effect model and fail-closed owners are
-implemented; PR 2 and PR 3 remain unimplemented.
+triage comments. PR 1's per-symbol effect model and fail-closed owners and PR
+2's exceptional-edge/cold-path model are implemented; PR 3 remains
+unimplemented.
 
 [Plan 68](68-vectorization-contract.md) is the public-contract ledger and names
 this document as the implementing plan for guarantee G5. Unlike
@@ -1227,6 +1228,14 @@ Tier 2 computes §2.6's fixed point and emits `cold`.
 
 Tier 3 is a consumer of PR 1: the fail family's class is `FailNoReturn`, which
 already carries `cold`. Tier 3 adds no pass and no attribute of its own.
+
+PR 2 may exceed roughly 1,000 changed hand-written lines once the mandatory
+owners and `MirFn` constructor updates are counted. The larger boundary keeps
+the lowering-owned edge record, every block-remapping/deletion consumer, MIR
+validation, LLVM metadata emission, and cold fixed point in one reviewable
+capability. Splitting it would either publish an unconsumed fact or let codegen
+act on a fact before its rewrite and validation closure existed, duplicating
+the same proof across a dormant producer/consumer chain.
 
 ### 4.2 Invariants
 

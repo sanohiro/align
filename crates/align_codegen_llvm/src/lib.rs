@@ -55,7 +55,7 @@ use align_mir::{
     Block, CanonicalFnAbi, CanonicalTy, ColumnBatchInput, Const, ConstElem, DirectCall, Function, GeneratedId,
     Operand, ParMapStage, ParMapStageKind, ParallelGeneratedId, ParallelKernelMode, ParallelSource,
     ParallelStageId, Program, ProgramCall, RuntimeKey, Rvalue, Slot, StaticData, StaticDataTarget,
-    Stmt, Term, ValueId,
+    Stmt, Successor, Term, ValueId,
 };
 use align_sema::{
     ArrayBuilderElem, DropPlan, ERROR_VARIANT_CODE, EnumDef, FloatTy, IntTy, Layout, Scalar, StructDef, TupleDef, Ty,
@@ -995,6 +995,7 @@ pub fn validate_thin_partition_program(
     exports: &[String],
 ) -> Result<(), CodegenError> {
     runtime_abi::validate_registry().map_err(CodegenError::Lowering)?;
+    align_mir::validate_exceptional_edges(program).map_err(CodegenError::Lowering)?;
     validate_tagged_program(program)?;
     validate_resource_program(program)?;
     validate_resource_rvalues(program)?;
@@ -3082,6 +3083,7 @@ fn validate_module_program(
     program: &Program,
     scope: ModuleScope<'_>,
 ) -> Result<(), CodegenError> {
+    align_mir::validate_exceptional_edges(program).map_err(CodegenError::Lowering)?;
     match scope {
         ModuleScope::Whole | ModuleScope::Test { .. } => {
             validate_tagged_program(program)?;
@@ -7216,6 +7218,14 @@ fn declare_fn<'c>(
     };
     let fv = module.add_function(symbol, fn_ty, None);
     mark_nounwind(ctx, fv);
+    if f.cold {
+        add_enum_attr(
+            ctx,
+            fv,
+            inkwell::attributes::AttributeLoc::Function,
+            "cold",
+        );
+    }
     mark_borrow_param_contracts(ctx, fv, &f.param_modes, &f.return_borrow);
     // Index-preserving and index-safe: a parameter whose slot is out of range degrades to `Unit`,
     // which is not a view header, so it simply states no header fact.
@@ -11790,7 +11800,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         }
         self.current_mir_statement = None;
         self.emit_counted_extents(b.id)?;
-        self.gen_term(&b.term)
+        self.gen_term(b.id, &b.term)
     }
 
     fn emit_counted_extents(
@@ -11851,7 +11861,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         Ok(())
     }
 
-    fn gen_term(&mut self, t: &Term) -> Result<(), CodegenError> {
+    fn gen_term(&mut self, block: align_mir::BlockId, t: &Term) -> Result<(), CodegenError> {
         match t {
             Term::Goto(target) => {
                 self.builder
@@ -11860,13 +11870,34 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Term::Branch(cond, then_bb, else_bb) => {
                 let c = self.operand(cond)?.into_int_value();
-                self.builder
+                let branch = self.builder
                     .build_conditional_branch(
                         c,
                         self.blocks[*then_bb as usize],
                         self.blocks[*else_bb as usize],
                     )
                     .map_err(|e| self.err(e))?;
+                if let Some(edge) = self
+                    .f
+                    .exceptional_edges
+                    .iter()
+                    .find(|edge| edge.block == block)
+                {
+                    let likely = self.ctx.i32_type().const_int(2000, false);
+                    let unlikely = self.ctx.i32_type().const_int(1, false);
+                    let (then_weight, else_weight) = match edge.unlikely {
+                        Successor::Then => (unlikely, likely),
+                        Successor::Else => (likely, unlikely),
+                    };
+                    let weights = self.ctx.metadata_node(&[
+                        self.ctx.metadata_string("branch_weights").into(),
+                        then_weight.into(),
+                        else_weight.into(),
+                    ]);
+                    branch
+                        .set_metadata(weights, self.ctx.get_kind_id("prof"))
+                        .map_err(|_| self.err("set exceptional branch weights"))?;
+                }
             }
             Term::Return(Some(op)) => {
                 if self.f.return_cleanup != hir::ReturnCleanupAbi::None {
@@ -24705,6 +24736,155 @@ fn main() -> i32 = 0
         emit_llvm_ir(&mir(src), &BuildTarget::Baseline, Profile::Release, false, &[], None).unwrap()
     }
 
+    #[test]
+    fn exceptional_edge_inventory_emits_exact_branch_weights() {
+        let source = "E { Bad }\n\
+            fn tried(value: Result<i64, E>) -> Result<i64, E> { x := value?\n return Ok(x) }\n\
+            fn indexed(xs: slice<i64>, i: i64) -> i64 = xs[i]\n\
+            fn ranged(xs: slice<i64>, a: i64, b: i64) -> slice<i64> = xs[a..b]\n\
+            fn loaded(xs: slice<i64>, i: i64) -> vec4<i64> = xs.load(i)\n\
+            fn text(s: str, a: i64, b: i64) -> str = s[a..b]\n\
+            fn divided(a: i64, b: i64) -> i64 = a / b\n\
+            fn dbl(x: i64) -> i64 = x * 2\n\
+            fn mapped(src: slice<i64>, out dst: slice<i64>) { src.map(dbl).map_into(dst) }\n\
+            fn ordinary(flag: bool) -> i64 = if flag { 1 } else { 2 }\n\
+            fn main() -> i32 = 0\n";
+        let program = mir(source);
+        let expected = program
+            .fns
+            .iter()
+            .map(|function| function.exceptional_edges.len())
+            .sum::<usize>();
+        let Ok(llvm) = emit_llvm_ir(
+            &program,
+            &BuildTarget::Baseline,
+            Profile::Release,
+            false,
+            &[],
+            None,
+        ) else {
+            panic!("valid exceptional-edge fixture failed codegen");
+        };
+        assert_eq!(
+            llvm.lines()
+                .filter(|line| line.trim_start().starts_with("br i1 ") && line.contains("!prof"))
+                .count(),
+            expected,
+            "{llvm}"
+        );
+        assert!(
+            llvm.contains("!{!\"branch_weights\", i32 2000, i32 1}"),
+            "missing else-unlikely weights:\n{llvm}"
+        );
+        assert!(
+            llvm.contains("!{!\"branch_weights\", i32 1, i32 2000}"),
+            "missing then-unlikely weights:\n{llvm}"
+        );
+
+        for kind in [
+            align_mir::ExceptionalKind::ResultPropagate,
+            align_mir::ExceptionalKind::BoundsCheck,
+            align_mir::ExceptionalKind::RangeCheck,
+            align_mir::ExceptionalKind::Utf8Boundary,
+            align_mir::ExceptionalKind::DivByZero,
+            align_mir::ExceptionalKind::LenMismatch,
+        ] {
+            let mut single = mir(
+                "fn checked(xs: slice<i64>, i: i64) -> i64 = xs[i]\nfn main() -> i32 = 0\n",
+            );
+            single.fns[0].exceptional_edges[0].kind = kind;
+            let Ok(llvm) = emit_llvm_ir(
+                &single,
+                &BuildTarget::Baseline,
+                Profile::Release,
+                false,
+                &[],
+                None,
+            ) else {
+                panic!("valid {kind:?} fixture failed codegen");
+            };
+            assert_eq!(
+                llvm.lines()
+                    .filter(|line| line.trim_start().starts_with("br i1 ")
+                        && line.contains("!prof"))
+                    .count(),
+                1,
+                "{kind:?}: {llvm}"
+            );
+            assert!(
+                llvm.contains("!{!\"branch_weights\", i32 1, i32 2000}"),
+                "{kind:?}: {llvm}"
+            );
+        }
+
+        let layout_program = mir(
+            "E { Bad }\nfn tried(value: Result<i64, E>) -> Result<i64, E> { x := value?\n return Ok(x) }\nfn main() -> i32 = 0\n",
+        );
+        let Ok(optimized) = emit_llvm_ir(
+            &layout_program,
+            &BuildTarget::Baseline,
+            Profile::Release,
+            true,
+            &["tried".to_owned()],
+            None,
+        ) else {
+            panic!("valid layout fixture failed codegen");
+        };
+        let Some(definition) = optimized
+            .split("define ")
+            .find(|definition| definition.contains("@tried("))
+        else {
+            panic!("tried definition missing from optimized IR:\n{optimized}");
+        };
+        let Some(return_offset) = definition.find("  ret ") else {
+            panic!("return missing from tried definition:\n{definition}");
+        };
+        let Some(error_offset) = definition.find("\n  %err =") else {
+            panic!("Err continuation missing from tried definition:\n{definition}");
+        };
+        assert!(return_offset < error_offset, "Err continuation must be laid out after the return:\n{definition}");
+    }
+
+    #[test]
+    fn mir_cold_classification_emits_the_function_attribute() {
+        let mut program = mir("fn helper() -> Result<i64, Error> = Err(Error.Code(1))\nfn main() -> i32 = 0\n");
+        let Some(helper) = program
+            .fns
+            .iter_mut()
+            .find(|function| function.name.as_str() == "helper")
+        else {
+            panic!("helper missing from valid fixture");
+        };
+        helper.cold = true;
+        let symbol = encoded_program_symbol(&helper.name);
+        let Ok(llvm) = emit_llvm_ir(
+            &program,
+            &BuildTarget::Baseline,
+            Profile::Release,
+            false,
+            &[],
+            None,
+        ) else {
+            panic!("valid cold-function fixture failed codegen");
+        };
+        let Some(definition) = llvm
+            .lines()
+            .find(|line| line.starts_with("define") && line.contains(&symbol))
+        else {
+            panic!("cold helper definition missing:\n{llvm}");
+        };
+        let Some(attributes) = definition
+            .split('#')
+            .nth(1)
+            .and_then(|suffix| suffix.split_whitespace().next())
+            .map(|group| format!("attributes #{group} ="))
+            .and_then(|prefix| llvm.lines().find(|line| line.starts_with(&prefix)))
+        else {
+            panic!("attribute group missing for cold helper:\n{llvm}");
+        };
+        assert!(attributes.contains(" cold "), "{definition}\n{attributes}");
+    }
+
     fn test_resource() -> hir::ResourceDef {
         hir::ResourceDef {
             name: "pkg$db$conn".into(),
@@ -26292,6 +26472,8 @@ fn main() -> i32 = 0
                 term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
             }],
             entry: 0,
+            exceptional_edges: Vec::new(),
+            cold: false,
             exportable: false,
         }];
         fns.extend(extra_fns);
@@ -26322,6 +26504,8 @@ fn main() -> i32 = 0
                 term: Term::Return(Some(Operand::Const(Const::Unit))),
             }],
             entry: 0,
+            exceptional_edges: Vec::new(),
+            cold: false,
             exportable: true,
         }
     }
@@ -27321,6 +27505,8 @@ fn main() -> i32 = 0
                 term: Term::Return(Some(Operand::Value(2))),
             }],
             entry: 0,
+            exceptional_edges: Vec::new(),
+            cold: false,
             exportable: false,
         };
         assert!(validate_mir_producers(&static_array).is_ok());
@@ -27367,6 +27553,8 @@ fn main() -> i32 = 0
                 term: Term::Return(Some(Operand::Value(1))),
             }],
             entry: 0,
+            exceptional_edges: Vec::new(),
+            cold: false,
             exportable: false,
         };
         assert!(validate_mir_producers(&pooled_array).is_ok());
@@ -29293,6 +29481,8 @@ fn main() -> i32 = 0
                     term,
                 }],
                 entry: 0,
+                exceptional_edges: Vec::new(),
+                cold: false,
                 exportable: false,
             }];
         program
@@ -30611,6 +30801,8 @@ fn main() -> i32 = 0
                 term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
             }],
             entry: 0,
+            exceptional_edges: Vec::new(),
+            cold: false,
             exportable: false,
         };
         let result = codegen_program(
@@ -30963,6 +31155,8 @@ fn main() -> i32 = 0
                     term,
                 }],
                 entry: 0,
+                exceptional_edges: Vec::new(),
+                cold: false,
                 exportable: false,
             }
         };
@@ -31225,6 +31419,8 @@ fn main() -> i32 = 0
                 term: Term::Return(Some(Operand::Const(Const::Int(1, u32_ty)))),
             }],
             entry: 0,
+            exceptional_edges: Vec::new(),
+            cold: false,
             exportable: false,
         });
         let emit_descriptor = |version: u32,
@@ -31280,6 +31476,8 @@ fn main() -> i32 = 0
                     term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
                 }],
                 entry: 0,
+                exceptional_edges: Vec::new(),
+                cold: false,
                 exportable: false,
             };
             let mut program = Program::default();
@@ -31581,6 +31779,8 @@ fn main() -> i32 = 0
                     term: Term::Return(Some(Operand::Value(0))),
                 }],
                 entry: 0,
+                exceptional_edges: Vec::new(),
+                cold: false,
                 exportable: false,
             };
             let mut program = Program::default();
@@ -32486,6 +32686,8 @@ fn main() -> i32 = 0
                     term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
                 }],
                 entry: 0,
+                exceptional_edges: Vec::new(),
+                cold: false,
                 exportable: false,
             }];
         let err = emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
@@ -32532,6 +32734,8 @@ fn main() -> i32 = 0
                     term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
                 }],
                 entry: 0,
+                exceptional_edges: Vec::new(),
+                cold: false,
                 exportable: false,
             }];
         let err = emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
@@ -32573,6 +32777,8 @@ fn main() -> i32 = 0
                     term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
                 }],
                 entry: 0,
+                exceptional_edges: Vec::new(),
+                cold: false,
                 exportable: false,
             }];
         let err = emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
@@ -32607,6 +32813,8 @@ fn main() -> i32 = 0
                     term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
                 }],
                 entry: 0,
+                exceptional_edges: Vec::new(),
+                cold: false,
                 exportable: false,
             }];
             program.tagged_types = vec![hir::TaggedType::Option(payload)];
@@ -32655,6 +32863,8 @@ fn main() -> i32 = 0
                     term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
                 }],
                 entry: 0,
+                exceptional_edges: Vec::new(),
+                cold: false,
                 exportable: false,
             }];
             program.structs = structs;
@@ -32802,6 +33012,8 @@ fn main() -> i32 = 0
                     term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
                 }],
                 entry: 0,
+                exceptional_edges: Vec::new(),
+                cold: false,
                 exportable: false,
             }];
             program
@@ -33051,6 +33263,8 @@ fn main() -> i32 = 0
                     term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
                 }],
                 entry: 0,
+                exceptional_edges: Vec::new(),
+                cold: false,
                 exportable: false,
             }];
         program.tagged_types = vec![hir::TaggedType::Option(Scalar::String)];
@@ -33085,6 +33299,8 @@ fn main() -> i32 = 0
                     term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
                 }],
                 entry: 0,
+                exceptional_edges: Vec::new(),
+                cold: false,
                 exportable: false,
             }];
         program.tuples = vec![TupleDef {
@@ -33117,6 +33333,8 @@ fn main() -> i32 = 0
                     term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
                 }],
                 entry: 0,
+                exceptional_edges: Vec::new(),
+                cold: false,
                 exportable: false,
             }];
         program.structs = vec![StructDef {
@@ -33169,6 +33387,8 @@ fn main() -> i32 = 0
                     term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
                 }],
                 entry: 0,
+                exceptional_edges: Vec::new(),
+                cold: false,
                 exportable: false,
             }];
             program.tagged_types = tagged_types;
@@ -33280,6 +33500,8 @@ fn main() -> i32 = 0
             value_tys: vec![],
             blocks: vec![Block { id: 0, stmts: vec![], stmt_lines: vec![], term: Term::Return(None) }],
             entry: 0,
+            exceptional_edges: Vec::new(),
+            cold: false,
             exportable: false,
         };
         let err = codegen_program(
@@ -33383,6 +33605,8 @@ fn main() -> i32 = 0
                 term: Term::Return(Some(Operand::Const(Const::Int(0, i64_ty)))),
             }],
             entry: 0,
+            exceptional_edges: Vec::new(),
+            cold: false,
             exportable: false,
         };
         let valid_source = ParallelSource::VirtualChunks {
@@ -33536,6 +33760,8 @@ fn main() -> i32 = 0
                 term: Term::Return(Some(Operand::Value(0))),
             }],
             entry: 0,
+            exceptional_edges: Vec::new(),
+            cold: false,
             exportable: false,
         };
         let err = codegen_program(
@@ -33587,6 +33813,8 @@ fn main() -> i32 = 0
                 term: Term::Return(Some(Operand::Value(0))),
             }],
             entry: 0,
+            exceptional_edges: Vec::new(),
+            cold: false,
             exportable: false,
         };
         let source_ty = Ty::Slice(Scalar::Int(IntTy { bits: 64, signed: true }));
@@ -33643,6 +33871,8 @@ fn main() -> i32 = 0
                 term: Term::Return(Some(Operand::Const(Const::Int(0, i64_ty)))),
             }],
             entry: 0,
+            exceptional_edges: Vec::new(),
+            cold: false,
             exportable: false,
         };
         let source_ty = Ty::Slice(Scalar::String);
@@ -33691,6 +33921,8 @@ fn main() -> i32 = 0
             value_tys: vec![],
             blocks: vec![Block { id: 0, stmts: vec![], stmt_lines: vec![], term: Term::Return(Some(Operand::Const(Const::Int(0, i64_ty)))) }],
             entry: 0,
+            exceptional_edges: Vec::new(),
+            cold: false,
             exportable: false,
         };
         let err = codegen_program(
@@ -33738,6 +33970,8 @@ fn main() -> i32 = 0
             value_tys: vec![],
             blocks: vec![Block { id: 0, stmts: vec![], stmt_lines: vec![], term: Term::Return(Some(Operand::Const(Const::Int(0, i64_ty)))) }],
             entry: 0,
+            exceptional_edges: Vec::new(),
+            cold: false,
             exportable: false,
         };
         let err = codegen_program(
@@ -33786,6 +34020,8 @@ fn main() -> i32 = 0
             value_tys: vec![],
             blocks: vec![Block { id: 0, stmts: vec![], stmt_lines: vec![], term: Term::Return(Some(Operand::Const(Const::Bool(true)))) }],
             entry: 0,
+            exceptional_edges: Vec::new(),
+            cold: false,
             exportable: false,
         };
         let finish = Function {
@@ -33802,6 +34038,8 @@ fn main() -> i32 = 0
             value_tys: vec![],
             blocks: vec![Block { id: 0, stmts: vec![], stmt_lines: vec![], term: Term::Return(Some(Operand::Const(Const::Int(0, i64_ty)))) }],
             entry: 0,
+            exceptional_edges: Vec::new(),
+            cold: false,
             exportable: false,
         };
         let err = codegen_program(
@@ -33862,6 +34100,8 @@ fn main() -> i32 = 0
                 term: Term::Return(Some(Operand::Const(Const::Int(0, i64_ty)))),
             }],
             entry: 0,
+            exceptional_edges: Vec::new(),
+            cold: false,
             exportable: false,
         };
         let err = codegen_program(
@@ -33916,6 +34156,8 @@ fn main() -> i32 = 0
             value_tys: vec![],
             blocks: vec![Block { id: 0, stmts: vec![], stmt_lines: vec![], term: Term::Return(Some(Operand::Const(Const::Int(0, i64_ty)))) }],
             entry: 0,
+            exceptional_edges: Vec::new(),
+            cold: false,
             exportable: false,
         };
         let err = codegen_program(
@@ -34014,6 +34256,8 @@ fn main() -> i32 = 0
             value_tys: vec![],
             blocks: vec![Block { id: 0, stmts: vec![], stmt_lines: vec![], term: Term::Return(Some(Operand::Const(Const::Int(0, i64_ty)))) }],
             entry: 0,
+            exceptional_edges: Vec::new(),
+            cold: false,
             exportable: false,
         };
         let source_ty = Ty::Slice(Scalar::Int(IntTy { bits: 64, signed: true }));
@@ -34061,6 +34305,8 @@ fn main() -> i32 = 0
             value_tys: vec![],
             blocks: vec![Block { id: 0, stmts: vec![], stmt_lines: vec![], term: Term::Return(Some(Operand::Const(Const::Int(0, i64_ty)))) }],
             entry: 0,
+            exceptional_edges: Vec::new(),
+            cold: false,
             exportable: false,
         };
         let source_ty = Ty::Slice(Scalar::Int(IntTy { bits: 64, signed: true }));
@@ -34303,6 +34549,8 @@ fn main() -> i32 = 0
                     )))),
                 }],
                 entry: 0,
+                exceptional_edges: Vec::new(),
+                cold: false,
                 exportable: false,
             }];
         program.structs = structs;
@@ -34361,6 +34609,8 @@ fn main() -> i32 = 0
                     )))),
                 }],
                 entry: 0,
+                exceptional_edges: Vec::new(),
+                cold: false,
                 exportable: false,
             }];
         emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None).unwrap()
@@ -34402,6 +34652,8 @@ fn main() -> i32 = 0
                     )))),
                 }],
                 entry: 0,
+                exceptional_edges: Vec::new(),
+                cold: false,
                 exportable: false,
             }];
         program.structs = vec![row];
@@ -35191,6 +35443,8 @@ fn main() -> i32 = 0
                 term: Term::Return(None),
             }],
             entry: 0,
+            exceptional_edges: Vec::new(),
+            cold: false,
             exportable: false,
         };
         assert!(stack_header_plan(&f).slots.is_empty(), "an unaudited wrapper must retain the boxed ABI");
@@ -35827,6 +36081,8 @@ fn main() -> i32 = 0
                     term: Term::Return(Some(Operand::Value(0))),
                 }],
                 entry: 0,
+                exceptional_edges: Vec::new(),
+                cold: false,
                 exportable: false,
             }
         }

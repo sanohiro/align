@@ -2,7 +2,10 @@
 //!
 //! Prepared bodies never enter the scope-independent MIR cache. A partition may
 //! consume only definitions included in its own implementation identity.
-use crate::{Block, DirectCall, Function, Operand, Program, ProgramCall, Rvalue, Stmt, Term};
+use crate::{
+    Block, DirectCall, ExceptionalEdge, Function, Operand, Program, ProgramCall, Rvalue, Stmt,
+    Term,
+};
 use align_ast::ParamMode;
 use align_sema::Ty;
 use std::borrow::Cow;
@@ -207,6 +210,17 @@ fn expose(caller: &mut Function, block: usize, position: usize, leaf: &Function)
         })
     };
     let mut cloned = Vec::new();
+    let cloned_exceptional_edges = leaf
+        .exceptional_edges
+        .iter()
+        .map(|edge| {
+            Some(ExceptionalEdge {
+                block: edge.block.checked_add(block_base)?,
+                unlikely: edge.unlikely,
+                kind: edge.kind,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
     for b in &leaf.blocks {
         let mut stmts = Vec::new();
         for s in &b.stmts {
@@ -271,6 +285,7 @@ fn expose(caller: &mut Function, block: usize, position: usize, leaf: &Function)
     caller.value_tys.extend_from_slice(&leaf.value_tys);
     caller.value_tys.extend(materialized_tys);
     caller.blocks.extend(cloned);
+    caller.exceptional_edges.extend(cloned_exceptional_edges);
     Some(())
 }
 
@@ -325,6 +340,9 @@ fn order_blocks(f: &mut Function) -> Vec<u32> {
         blocks.push(b);
     }
     f.entry = remap[f.entry as usize];
+    for edge in &mut f.exceptional_edges {
+        edge.block = remap[edge.block as usize];
+    }
     f.blocks = blocks;
     remap
 }

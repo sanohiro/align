@@ -89,6 +89,8 @@ fn deep_drop_program(depth: usize) -> Program {
                 term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
             }],
             entry: 0,
+            exceptional_edges: Vec::new(),
+            cold: false,
             exportable: false,
         }];
     program.structs = structs;

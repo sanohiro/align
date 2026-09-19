@@ -2418,7 +2418,11 @@ regression net that validates the upgrade.
     **PR 1 IMPLEMENTED 2026-09-19:** all 464 base rows now have a total
     `RuntimeEffects` record; declaration and rt-LTO attribute removal derive from that one record;
     allocation, indirect-reachability, host-state, source-inventory, C-unwind, golden, and
-    whole/per-unit owners close the model. Plan 70 PR 2 and PR 3 remain.
+    whole/per-unit owners close the model. **PR 2 IMPLEMENTED 2026-09-20:** the
+    six-kind `ExceptionalEdge` inventory covers all nine lowering-owned sites,
+    validates and follows MIR rewrites, emits exact `2000:1` branch weights,
+    and drives fail-closed whole-program cold inference over direct call sites.
+    Plan 70 PR 3 remains.
   **DEFERRED with reasons (revisit post-M14 ThinLTO/runtime-bitcode — the wave that creates
   real non-inlined boundaries where argument attributes stop evaporating):** internal-ABI
   signature flattening (SROA already achieves it; FFI boundary correctly kept aggregate in the

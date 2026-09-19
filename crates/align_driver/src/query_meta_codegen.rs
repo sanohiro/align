@@ -369,6 +369,8 @@ pub(crate) fn generate_query_meta_thunk(
             value_tys: values,
             blocks,
             entry: 0,
+            exceptional_edges: Vec::new(),
+            cold: false,
             exportable: false,
         },
     ))

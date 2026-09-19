@@ -160,7 +160,20 @@ ok:  data = t0.ok_value
 err: r = make Err(convert(t0.err))  // E -> the function's E'
      Return(r)
 ```
-codegen can place the cold edge in a separate/low-priority section.
+The lowering that creates this branch also records
+`ExceptionalEdge { block, unlikely: Else, kind: ResultPropagate }`. Bounds,
+range, UTF-8-boundary, divide-by-zero, and length-mismatch lowerings use the
+same closed record with their own kind. Ordinary `if`, `match`, and `else`
+branches carry no record. MIR validation rejects a stale, non-branch, or
+duplicate record; codegen lowers a valid record to the exact `2000:1` LLVM
+branch weights with `1` on its named successor.
+
+After MIR rewrites, the cold-function pass marks an Align definition only when
+every reachable return constructs `Err` (or diverges) and every direct call
+site lies in an exceptional region or an already-cold caller. The least fixed
+point covers helper chains and self-recursive error helpers. Exportable
+per-unit definitions, address-taken functions, mixed hot/cold callers, and
+unprovable call graphs remain unmarked.
 
 ### 2.2 `else` unwrap
 Turn `lhs else rhs` into an Option/Result branch. If `rhs` diverges (`return`), keep it as is; if it supplies a value, merge with the then side.

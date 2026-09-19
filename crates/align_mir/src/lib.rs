@@ -22,6 +22,7 @@ use std::rc::Rc;
 pub mod byte_storage;
 pub mod byte_ranges;
 pub mod byte_prepare;
+mod cold;
 pub mod loop_facts;
 mod canonical_graph;
 mod generated_id;
@@ -419,11 +420,41 @@ pub struct Function {
     pub value_tys: Vec<Ty>,
     pub blocks: Vec<Block>,
     pub entry: BlockId,
+    /// Synthesized exceptional branches whose unlikely successor may carry LLVM branch weights.
+    /// Records name the branch block rather than an instruction so MIR rewrites can validate and
+    /// remap them before codegen.
+    pub exceptional_edges: Vec<ExceptionalEdge>,
+    /// Whole-program proof that this definition only returns `Err` (or diverges) and is reached
+    /// exclusively from exceptional regions. Per-unit exportable definitions fail closed.
+    pub cold: bool,
     /// M15 S2: whether this function gets `external` linkage under separate compilation (a non-entry
     /// `pub` user function; see [`hir::FnOrigin::is_exportable`]). **Always `false` from whole-program
     /// lowering** ([`lower_program`]) so the default object is byte-identical to today; set from HIR
     /// only by per-unit lowering ([`lower_program_per_unit`]).
     pub exportable: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Successor {
+    Then,
+    Else,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExceptionalKind {
+    ResultPropagate,
+    BoundsCheck,
+    RangeCheck,
+    Utf8Boundary,
+    DivByZero,
+    LenMismatch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExceptionalEdge {
+    pub block: BlockId,
+    pub unlikely: Successor,
+    pub kind: ExceptionalKind,
 }
 
 /// Static work hint attached to an explicit parallel map. The value is deliberately a small
@@ -557,6 +588,34 @@ impl Function {
             Operand::BorrowedCleanupArg(_) => Ty::Bool,
         }
     }
+}
+
+/// Validate the lowering-owned exceptional-edge inventory before any backend side effect.
+pub fn validate_exceptional_edges(program: &Program) -> Result<(), String> {
+    for function in &program.fns {
+        let mut seen = std::collections::BTreeSet::new();
+        for edge in &function.exceptional_edges {
+            let Some(block) = function.blocks.get(edge.block as usize) else {
+                return Err(format!(
+                    "function {} has an exceptional edge for out-of-range block {}",
+                    function.name, edge.block
+                ));
+            };
+            if block.id != edge.block || !matches!(block.term, Term::Branch(..)) {
+                return Err(format!(
+                    "function {} exceptional edge block {} is not a live branch",
+                    function.name, edge.block
+                ));
+            }
+            if !seen.insert(edge.block) {
+                return Err(format!(
+                    "function {} has duplicate exceptional edge block {}",
+                    function.name, edge.block
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -3446,6 +3505,7 @@ fn lower_program_checked_with_catalog(
         }
     }
     mir.loop_facts = loop_decisions;
+    cold::infer(&mut mir);
     Ok(mir)
 }
 
@@ -4694,6 +4754,11 @@ fn simplify_known_drop_flags(f: &mut Function) {
             None => continue,
         };
     }
+    f.exceptional_edges.retain(|edge| {
+        f.blocks
+            .get(edge.block as usize)
+            .is_some_and(|block| matches!(block.term, Term::Branch(..)))
+    });
 
     // Do not leave the discarded destructor blocks in MIR: codegen intentionally lowers every
     // block, and relying on a later LLVM unreachable-block cleanup is exactly what allowed
@@ -4739,6 +4804,16 @@ fn simplify_known_drop_flags(f: &mut Function) {
         }
     }
     f.entry = remap[f.entry as usize];
+    f.exceptional_edges.retain_mut(|edge| {
+        let Some(mapped) = remap.get(edge.block as usize).copied() else {
+            return false;
+        };
+        if mapped == u32::MAX {
+            return false;
+        }
+        edge.block = mapped;
+        true
+    });
     f.blocks = blocks;
 }
 
@@ -4932,6 +5007,7 @@ struct Builder {
     /// assignment forwards the exact selected path instead of recomputing from a joined Region.
     value_drop_flags: Vec<Option<Operand>>,
     blocks: Vec<BBuild>,
+    exceptional_edges: Vec<ExceptionalEdge>,
     cur: BlockId,
     /// The enclosing function's return type (so `?` can build the propagated Result).
     ret: Ty,
@@ -5457,6 +5533,26 @@ impl Builder {
         self.blocks[current].term = Some(t);
     }
 
+    fn terminate_exceptional_branch(
+        &mut self,
+        condition: Operand,
+        then_block: BlockId,
+        else_block: BlockId,
+        unlikely: Successor,
+        kind: ExceptionalKind,
+    ) {
+        let block = self.cur;
+        let was_open = self.blocks[block as usize].term.is_none();
+        self.terminate(Term::Branch(condition, then_block, else_block));
+        if was_open {
+            self.exceptional_edges.push(ExceptionalEdge {
+                block,
+                unlikely,
+                kind,
+            });
+        }
+    }
+
     /// Terminate the current block with this function's return edge, honoring its return-cleanup
     /// ABI. The single authority over every return edge — the `?` `Err` propagation, the body's
     /// fall-through tail, and `Stmt::Return` — because `04 §1`'s rule is one rule: a `DynamicBit`
@@ -5611,6 +5707,7 @@ fn lower_fn(
         value_tys: Vec::new(),
         value_drop_flags: Vec::new(),
         blocks: Vec::new(),
+        exceptional_edges: Vec::new(),
         cur: 0,
         ret: f.ret,
         arenas: Vec::new(),
@@ -5772,6 +5869,8 @@ fn lower_fn(
         value_tys: b.value_tys,
         blocks,
         entry,
+        exceptional_edges: b.exceptional_edges,
+        cold: false,
         // Set by `lower_program_impl` after this returns (needs the whole-program vs per-unit mode).
         exportable: false,
     };
@@ -11731,7 +11830,13 @@ fn lower_int_div(b: &mut Builder, op: BinOp, l: Operand, r: Operand, ty: Ty) -> 
     ));
     let fail = b.new_block();
     let ok = b.new_block();
-    b.terminate(Term::Branch(Operand::Value(is_zero), fail, ok));
+    b.terminate_exceptional_branch(
+        Operand::Value(is_zero),
+        fail,
+        ok,
+        Successor::Then,
+        ExceptionalKind::DivByZero,
+    );
     b.cur = fail;
     let t = b.fresh_value(Ty::Unit);
     b.push(Stmt::Let(
@@ -11894,7 +11999,13 @@ fn lower_vec_div(
     ));
     let fail = b.new_block();
     let ok = b.new_block();
-    b.terminate(Term::Branch(Operand::Value(any_zero), fail, ok));
+    b.terminate_exceptional_branch(
+        Operand::Value(any_zero),
+        fail,
+        ok,
+        Successor::Then,
+        ExceptionalKind::DivByZero,
+    );
     b.cur = fail;
     let t = b.fresh_value(Ty::Unit);
     b.push(Stmt::Let(
@@ -12039,7 +12150,13 @@ fn emit_bounds_failure_edge(
 ) -> BlockId {
     let fail = b.new_block();
     let ok = b.new_block();
-    b.terminate(Term::Branch(Operand::Value(oob), fail, ok));
+    b.terminate_exceptional_branch(
+        Operand::Value(oob),
+        fail,
+        ok,
+        Successor::Then,
+        ExceptionalKind::BoundsCheck,
+    );
 
     // fail: report (index, len) and abort. `bounds_fail` is `-> !`, so the block is `Unreachable`.
     b.cur = fail;
@@ -12178,7 +12295,13 @@ fn lower_bytes_fill(
         ));
         let fail = b.new_block();
         let ok = b.new_block();
-        b.terminate(Term::Branch(Operand::Value(bad), fail, ok));
+        b.terminate_exceptional_branch(
+            Operand::Value(bad),
+            fail,
+            ok,
+            Successor::Then,
+            ExceptionalKind::RangeCheck,
+        );
         b.cur = fail;
         let t = b.fresh_value(Ty::Unit);
         b.push(Stmt::Let(
@@ -12227,7 +12350,13 @@ fn lower_bytes_copy_from(
     ));
     let fail = b.new_block();
     let ok = b.new_block();
-    b.terminate(Term::Branch(Operand::Value(mismatch), fail, ok));
+    b.terminate_exceptional_branch(
+        Operand::Value(mismatch),
+        fail,
+        ok,
+        Successor::Then,
+        ExceptionalKind::RangeCheck,
+    );
     b.cur = fail;
     let zero = Operand::Const(Const::Int(0, i64_ty()));
     let t = b.fresh_value(Ty::Unit);
@@ -12756,7 +12885,13 @@ fn emit_vec_bounds_check(b: &mut Builder, slice: &Operand, idx: &Operand, n: u32
             Operand::Const(Const::Int(n as i128, i64_ty())),
         ),
     ));
-    emit_range_bounds_check(b, idx, &Operand::Value(end), Operand::Value(len));
+    emit_range_bounds_check_kind(
+        b,
+        idx,
+        &Operand::Value(end),
+        Operand::Value(len),
+        ExceptionalKind::BoundsCheck,
+    );
 }
 
 /// The range guard, fused per plan 69 §3.1(a) when the length operand is proved non-negative:
@@ -12766,11 +12901,21 @@ fn emit_vec_bounds_check(b: &mut Builder, slice: &Operand, idx: &Operand, n: u32
 /// that reproduces the three-way test, so two compares and one `Or` is the minimum. The failure
 /// edge keeps the original signed `start`/`end`/`len`, so the trap text is byte-identical.
 fn emit_range_bounds_check(b: &mut Builder, start: &Operand, end: &Operand, len: Operand) {
+    emit_range_bounds_check_kind(b, start, end, len, ExceptionalKind::RangeCheck);
+}
+
+fn emit_range_bounds_check_kind(
+    b: &mut Builder,
+    start: &Operand,
+    end: &Operand,
+    len: Operand,
+    kind: ExceptionalKind,
+) {
     if !(b.length_is_non_negative(&len)
         && b.operand_is_i64(start)
         && b.operand_is_i64(end))
     {
-        return emit_signed_range_bounds_check(b, start, end, len);
+        return emit_signed_range_bounds_check_kind(b, start, end, len, kind);
     }
     let unsigned_start = b.fresh_value(u64_ty());
     b.push(Stmt::Let(
@@ -12822,7 +12967,7 @@ fn emit_range_bounds_check(b: &mut Builder, start: &Operand, end: &Operand, len:
         oob,
         Rvalue::Bin(BinOp::Or, Operand::Value(inverted), Operand::Value(over)),
     ));
-    emit_range_failure_edge(b, start, end, len, oob);
+    emit_range_failure_edge(b, start, end, len, oob, kind);
 }
 
 /// The original three-way signed range guard: `start < 0 || start > end || end > len`.
@@ -12837,6 +12982,16 @@ fn emit_signed_range_bounds_check(
     start: &Operand,
     end: &Operand,
     len: Operand,
+) {
+    emit_signed_range_bounds_check_kind(b, start, end, len, ExceptionalKind::RangeCheck);
+}
+
+fn emit_signed_range_bounds_check_kind(
+    b: &mut Builder,
+    start: &Operand,
+    end: &Operand,
+    len: Operand,
+    kind: ExceptionalKind,
 ) {
     let neg = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(
@@ -12867,7 +13022,7 @@ fn emit_signed_range_bounds_check(
         oob,
         Rvalue::Bin(BinOp::Or, Operand::Value(e1), Operand::Value(over)),
     ));
-    emit_range_failure_edge(b, start, end, len, oob);
+    emit_range_failure_edge(b, start, end, len, oob, kind);
 }
 
 /// The shared failure edge of both range-guard forms: `range_fail(start, end, len)` in an
@@ -12878,10 +13033,17 @@ fn emit_range_failure_edge(
     end: &Operand,
     len: Operand,
     oob: ValueId,
+    kind: ExceptionalKind,
 ) {
     let fail = b.new_block();
     let ok = b.new_block();
-    b.terminate(Term::Branch(Operand::Value(oob), fail, ok));
+    b.terminate_exceptional_branch(
+        Operand::Value(oob),
+        fail,
+        ok,
+        Successor::Then,
+        kind,
+    );
 
     b.cur = fail;
     let t = b.fresh_value(Ty::Unit);
@@ -12963,7 +13125,13 @@ fn emit_utf8_boundary_check(b: &mut Builder, base: &Operand, index: &Operand, le
     let boundary = emit_utf8_boundary_predicate(b, base, index, len);
     let fail = b.new_block();
     let ok = b.new_block();
-    b.terminate(Term::Branch(boundary, ok, fail));
+    b.terminate_exceptional_branch(
+        boundary,
+        ok,
+        fail,
+        Successor::Else,
+        ExceptionalKind::Utf8Boundary,
+    );
     b.cur = fail;
     let value = b.fresh_value(Ty::Unit);
     b.push(Stmt::Let(value, Rvalue::Call(DirectCall::Runtime(RuntimeKey::Utf8BoundaryFail), vec![index.clone(), len.clone()])));
@@ -15430,7 +15598,13 @@ fn emit_len_eq_check(b: &mut Builder, have: Operand, want: Operand) {
     ));
     let fail = b.new_block();
     let ok = b.new_block();
-    b.terminate(Term::Branch(Operand::Value(ne), fail, ok));
+    b.terminate_exceptional_branch(
+        Operand::Value(ne),
+        fail,
+        ok,
+        Successor::Then,
+        ExceptionalKind::LenMismatch,
+    );
     b.cur = fail;
     let t = b.fresh_value(Ty::Unit);
     b.push(Stmt::Let(
@@ -22243,9 +22417,13 @@ fn lower_try(b: &mut Builder, inner: &hir::Expr, ok_ty: Ty) -> Operand {
     b.push(Stmt::Let(is_ok, Rvalue::ResultIsOk(r.clone())));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
-    // NOTE: the Err edge is the designed "cold" path, but this is a plain branch — LLVM
-    // branch-weight / cold metadata is not emitted yet (a later codegen optimization).
-    b.terminate(Term::Branch(Operand::Value(is_ok), ok_bb, err_bb));
+    b.terminate_exceptional_branch(
+        Operand::Value(is_ok),
+        ok_bb,
+        err_bb,
+        Successor::Else,
+        ExceptionalKind::ResultPropagate,
+    );
 
     // Err: extract the error and early-return Err(err) of the function's return type.
     b.cur = err_bb;
@@ -23526,6 +23704,154 @@ mod tests {
             d.iter().map(|diag| &diag.message).collect::<Vec<_>>()
         );
         lower_program(&hir)
+    }
+
+    #[test]
+    fn exceptional_edges_are_recorded_only_at_lowering_owned_sites() {
+        let program = lower(
+            "E { Bad }\n\
+             fn tried(value: Result<i64, E>) -> Result<i64, E> { x := value?\n return Ok(x) }\n\
+             fn indexed(xs: slice<i64>, i: i64) -> i64 = xs[i]\n\
+             fn ranged(xs: slice<i64>, a: i64, b: i64) -> slice<i64> = xs[a..b]\n\
+             fn loaded(xs: slice<i64>, i: i64) -> vec4<i64> = xs.load(i)\n\
+             fn text(s: str, a: i64, b: i64) -> str = s[a..b]\n\
+             fn filled(borrow mut dst: slice<u8>) { dst.fill_u32_le(0) }\n\
+             fn copied(borrow mut dst: slice<u8>, borrow src: slice<u8>) { dst.copy_from(src) }\n\
+             fn divided(a: i64, b: i64) -> i64 = a / b\n\
+             fn dbl(x: i64) -> i64 = x * 2\n\
+             fn mapped(src: slice<i64>, out dst: slice<i64>) { src.map(dbl).map_into(dst) }\n\
+             fn ordinary(flag: bool) -> i64 = if flag { 1 } else { 2 }\n\
+             fn matched(value: E) -> i64 = match value { Bad => 1 }\n\
+             fn unwrapped(value: Option<i64>) -> i64 { x := value else { return 0 }\n return x }\n\
+             fn main() -> i32 = 0\n",
+        );
+        let count = |kind| {
+            program
+                .fns
+                .iter()
+                .flat_map(|function| &function.exceptional_edges)
+                .filter(|edge| edge.kind == kind)
+                .count()
+        };
+        assert_eq!(count(ExceptionalKind::ResultPropagate), 1);
+        assert_eq!(count(ExceptionalKind::BoundsCheck), 2);
+        assert_eq!(count(ExceptionalKind::RangeCheck), 4);
+        assert_eq!(count(ExceptionalKind::Utf8Boundary), 2);
+        assert_eq!(count(ExceptionalKind::DivByZero), 1);
+        assert_eq!(count(ExceptionalKind::LenMismatch), 1);
+        for name in ["ordinary", "matched", "unwrapped"] {
+            assert!(
+                program
+                    .fns
+                    .iter()
+                    .find(|function| function.name.as_str() == name)
+                    .is_some_and(|function| function.exceptional_edges.is_empty()),
+                "{name} gained an exceptional edge"
+            );
+        }
+        assert!(validate_exceptional_edges(&program).is_ok());
+    }
+
+    #[test]
+    fn exceptional_edge_validation_rejects_stale_and_duplicate_records() {
+        let program = lower(
+            "fn checked(xs: slice<i64>, i: i64) -> i64 = xs[i]\nfn main() -> i32 = 0\n",
+        );
+        let mut stale = program.clone();
+        stale.fns[0].exceptional_edges[0].block = u32::MAX;
+        assert!(validate_exceptional_edges(&stale).is_err());
+
+        let mut non_branch = program.clone();
+        let Some(non_branch_block) = non_branch.fns[0]
+            .blocks
+            .iter()
+            .find(|block| !matches!(block.term, Term::Branch(..)))
+        else {
+            panic!("valid fixture has no non-branch block");
+        };
+        non_branch.fns[0].exceptional_edges[0].block = non_branch_block.id;
+        assert!(validate_exceptional_edges(&non_branch).is_err());
+
+        let mut duplicate = program;
+        let edge = duplicate.fns[0].exceptional_edges[0];
+        duplicate.fns[0].exceptional_edges.push(edge);
+        assert!(validate_exceptional_edges(&duplicate).is_err());
+    }
+
+    #[test]
+    fn known_drop_flag_simplification_remaps_exceptional_edges() {
+        let i64_ty = Ty::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        let mut function = Function {
+            name: ProgramCall::from_validated("checked_cleanup"),
+            params: vec![],
+            param_modes: vec![],
+            borrow_mut_cleanup_slots: vec![],
+            ret: i64_ty,
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
+            slots: vec![Ty::Bool, Ty::String],
+            slot_align: vec![None, None],
+            value_tys: vec![Ty::Bool],
+            blocks: vec![
+                Block {
+                    id: 0,
+                    stmts: vec![
+                        Stmt::Store(0, Operand::Const(Const::Bool(false))),
+                        Stmt::Let(0, Rvalue::Load(0)),
+                    ],
+                    stmt_lines: vec![(0, 0), (0, 0)],
+                    term: Term::Branch(Operand::Value(0), 1, 2),
+                },
+                Block {
+                    id: 1,
+                    stmts: vec![Stmt::Drop(1)],
+                    stmt_lines: vec![(0, 0)],
+                    term: Term::Goto(3),
+                },
+                Block {
+                    id: 2,
+                    stmts: vec![],
+                    stmt_lines: vec![],
+                    term: Term::Goto(3),
+                },
+                Block {
+                    id: 3,
+                    stmts: vec![],
+                    stmt_lines: vec![],
+                    term: Term::Branch(Operand::Const(Const::Bool(false)), 4, 5),
+                },
+                Block {
+                    id: 4,
+                    stmts: vec![],
+                    stmt_lines: vec![],
+                    term: Term::Return(Some(Operand::Const(Const::Int(0, i64_ty)))),
+                },
+                Block {
+                    id: 5,
+                    stmts: vec![],
+                    stmt_lines: vec![],
+                    term: Term::Unreachable,
+                },
+            ],
+            entry: 0,
+            exceptional_edges: vec![ExceptionalEdge {
+                block: 3,
+                unlikely: Successor::Then,
+                kind: ExceptionalKind::BoundsCheck,
+            }],
+            cold: false,
+            exportable: false,
+        };
+
+        simplify_known_drop_flags(&mut function);
+
+        assert_eq!(function.blocks.len(), 5);
+        assert_eq!(function.exceptional_edges[0].block, 2);
+        assert!(matches!(function.blocks[2].term, Term::Branch(..)));
     }
 
     #[test]
@@ -25262,6 +25588,7 @@ fn main() -> i32 {
             value_tys: Vec::new(),
             value_drop_flags: Vec::new(),
             blocks: Vec::new(),
+            exceptional_edges: Vec::new(),
             cur: 0,
             ret: Ty::Unit,
             arenas: Vec::new(),
@@ -26230,6 +26557,8 @@ fn main() -> i32 = 0
                     term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
                 }],
                 entry: 0,
+                exceptional_edges: Vec::new(),
+                cold: false,
                 exportable: false,
             }],
             externs: vec![],
