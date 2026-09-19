@@ -39006,12 +39006,12 @@ mod tests {
     unsafe fn captured_output_exit_code(owner: *const RunOutput) -> i64 {
         let mut status=process_live::WaitResult::default();
         unsafe { process_live::align_rt_run_output_status(owner,&mut status); }
-        if status.termination.tag==0 { status.termination.exited } else { 128+status.termination.signaled }
+        if status.termination.tag==0 { status.termination.value } else { 128+status.termination.value }
     }
     unsafe fn captured_bytes_exit_code(owner: *const RunBytes) -> i64 {
         let mut status=process_live::WaitResult::default();
         unsafe { process_live::align_rt_run_bytes_status(owner,&mut status); }
-        if status.termination.tag==0 { status.termination.exited } else { 128+status.termination.signaled }
+        if status.termination.tag==0 { status.termination.value } else { 128+status.termination.value }
     }
     unsafe fn wait_termination(child: *mut Child) -> Result<process_live::Termination, i32> {
         let mut result = process_live::WaitResult::default();
@@ -39019,7 +39019,7 @@ mod tests {
         if status == 0 { Ok(result.termination) } else { Err(status) }
     }
     fn exited(code: i64) -> Result<process_live::Termination, i32> {
-        Ok(process_live::Termination { exited: code, ..process_live::Termination::default() })
+        Ok(process_live::Termination { value: code, ..process_live::Termination::default() })
     }
     fn process_coreutil(name: &str) -> Option<String> {
         ["/bin", "/usr/bin"].iter().map(|directory| format!("{directory}/{name}"))
@@ -39151,7 +39151,7 @@ mod tests {
         let Some(ch) = spawn_sleeper() else { return };
         // SIGTERM (15) terminates the sleeper; `wait` then reports 128 + 15 = 143 (shell convention).
         assert_eq!(unsafe { align_rt_child_kill(ch, 15) }, 0, "kill(SIGTERM) on a live child succeeds");
-        assert_eq!(unsafe { wait_termination(ch) }, Ok(process_live::Termination { tag: 1, signaled: 15, ..process_live::Termination::default() }), "signal termination remains distinct from exit 143");
+        assert_eq!(unsafe { wait_termination(ch) }, Ok(process_live::Termination { tag: 1, value: 15, ..process_live::Termination::default() }), "signal termination remains distinct from exit 143");
         unsafe { align_rt_child_free(ch) };
     }
 
@@ -39212,11 +39212,11 @@ mod tests {
     fn wait_status_preserves_exit_and_signal_domains() {
         for code in [0,3,143,255] {
             let value=process_live::Termination::from_wait(code<<8).unwrap();
-            assert_eq!((value.tag,value.exited),(0,i64::from(code)));
+            assert_eq!((value.tag,value.value),(0,i64::from(code)));
         }
         for signal in [9,15] {
             let value=process_live::Termination::from_wait(signal).unwrap();
-            assert_eq!((value.tag,value.signaled),(1,i64::from(signal)));
+            assert_eq!((value.tag,value.value),(1,i64::from(signal)));
         }
         assert!(process_live::Termination::from_wait(0x7f).is_err());
     }

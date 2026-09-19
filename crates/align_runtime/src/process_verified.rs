@@ -871,7 +871,7 @@ mod tests {
             crate::process_launch::FORCE_FD_SCAN
                 .store(fallback, std::sync::atomic::Ordering::Relaxed);
             let mut child = super::super::process_launch::launch(&command, false, false).unwrap();
-            assert_eq!(child.wait().unwrap().termination.exited, 0);
+            assert_eq!(child.wait().unwrap().termination.value, 0);
         }
     }
     #[cfg(target_os = "linux")]
@@ -1015,7 +1015,7 @@ mod tests {
             let mut child = crate::process_launch::launch(&command, true, false).unwrap();
             child.stdout.fd.take();
             child.stderr.fd.take();
-            assert_eq!(child.wait().unwrap().termination.exited, 0);
+            assert_eq!(child.wait().unwrap().termination.value, 0);
         }
         drop(sentinel);
     }

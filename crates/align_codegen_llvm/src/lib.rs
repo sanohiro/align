@@ -91,9 +91,41 @@ use inkwell::types::{
     StructType,
 };
 use inkwell::values::{
-    ArrayValue, BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, IntValue,
-    OperandBundle, PointerValue, StructValue,
+    ArrayValue, AsValueRef, BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue,
+    IntValue, OperandBundle, PointerValue, StructValue,
 };
+
+fn freeze_struct_value<'c>(
+    builder: &Builder<'c>,
+    value: StructValue<'c>,
+    name: &str,
+) -> Result<StructValue<'c>, CodegenError> {
+    let name = std::ffi::CString::new(name)
+        .map_err(|_| CodegenError::Lowering("LLVM value name contains NUL".into()))?;
+    // Inkwell 0.9 does not wrap LLVMBuildFreeze. `value` is a live struct value owned by the
+    // builder's context, and LLVMBuildFreeze returns a value of that same type and lifetime.
+    Ok(unsafe {
+        StructValue::new(llvm_sys::core::LLVMBuildFreeze(
+            builder.as_mut_ptr(),
+            value.as_value_ref(),
+            name.as_ptr(),
+        ))
+    })
+}
+
+/// Complete one tagged-union value. Any aggregate with inactive storage must become fully defined
+/// before LLVM can promote it through an SSA join; a tag-only aggregate has no inactive bytes.
+fn finish_union_value<'c>(
+    builder: &Builder<'c>,
+    value: StructValue<'c>,
+    name: &str,
+) -> Result<StructValue<'c>, CodegenError> {
+    if value.get_type().count_fields() > 1 {
+        freeze_struct_value(builder, value, name)
+    } else {
+        Ok(value)
+    }
+}
 
 type ColumnBatchLayout<'c> = (
     Vec<IntValue<'c>>,
@@ -620,13 +652,26 @@ pub fn emit_test_harness_object(
     let ctx = Context::create();
     let module = ctx.create_module("align.test.harness");
     let tm = create_target_machine(target, profile.codegen_opt_level())?;
-    module.set_data_layout(&tm.get_target_data().get_data_layout());
+    let target_data = tm.get_target_data();
+    module.set_data_layout(&target_data.get_data_layout());
     module.set_triple(&tm.get_triple());
     let lower = |error: inkwell::builder::BuilderError| CodegenError::Lowering(error.to_string());
     let i8_ty = ctx.i8_type();
     let i32_ty = ctx.i32_type();
-    let error_ty = ctx.struct_type(&[i32_ty.into(), i32_ty.into()], false);
-    let result_ty = ctx.struct_type(&[i8_ty.into(), i32_ty.into(), error_ty.into()], false);
+    let mut error_variants = vec![Vec::new(); ERROR_VARIANT_CODE as usize + 1];
+    error_variants[ERROR_VARIANT_CODE as usize] = vec![(Scalar::Int(IntTy { bits: 32, signed: true }), i32_ty.into())];
+    let error_shape = union_shape(&ctx, i32_ty.into(), &error_variants, &target_data)?;
+    let error_ty = error_shape.body;
+    let result_shape = union_shape(
+        &ctx,
+        i8_ty.into(),
+        &[
+            vec![(Scalar::Unit, i32_ty.into())],
+            vec![(Scalar::Enum(0), error_ty.into())],
+        ],
+        &target_data,
+    )?;
+    let result_ty = result_shape.body;
     let test_ty = result_ty.fn_type(&[], false);
     let tests = root_symbols
         .iter()
@@ -811,9 +856,15 @@ pub fn emit_test_harness_object(
             "result.is_error",
         )
         .map_err(lower)?;
-    let error = builder
-        .build_extract_value(result, 2, "result.error")
-        .map_err(lower)?
+    let result_error = ctx.append_basic_block(main, "result.error");
+    let result_ok = ctx.append_basic_block(main, "result.ok");
+    let error_code_block = ctx.append_basic_block(main, "result.error.code");
+    let error_category_block = ctx.append_basic_block(main, "result.error.category");
+    let report_join = ctx.append_basic_block(main, "result.report");
+    builder.build_conditional_branch(is_error, result_error, result_ok).map_err(lower)?;
+
+    builder.position_at_end(result_error);
+    let error = extract_union_payload(&ctx, &builder, result, result_shape.payload(1, 0)?, "result.error")?
         .into_struct_value();
     let error_tag = builder
         .build_extract_value(error, 0, "error.tag")
@@ -822,45 +873,60 @@ pub fn emit_test_harness_object(
     let error_tag = builder
         .build_int_truncate(error_tag, i8_ty, "error.tag8")
         .map_err(lower)?;
-    let error_code = builder
-        .build_extract_value(error, 1, "error.code")
-        .map_err(lower)?
-        .into_int_value();
-    let outcome = builder
-        .build_select(
-            is_error,
-            i8_ty.const_int(1, false),
-            i8_ty.const_zero(),
-            "report.outcome",
-        )
-        .map_err(lower)?
-        .into_int_value();
-    let report_tag = builder
-        .build_select(
-            is_error,
-            error_tag,
-            i8_ty.const_int(255, false),
-            "report.error_tag",
-        )
-        .map_err(lower)?
-        .into_int_value();
-    let report_code = builder
-        .build_select(
-            is_error,
-            error_code,
-            i32_ty.const_zero(),
-            "report.error_code",
-        )
-        .map_err(lower)?
-        .into_int_value();
+    let is_code = builder.build_int_compare(
+        IntPredicate::EQ,
+        error_tag,
+        i8_ty.const_int(ERROR_VARIANT_CODE as u64, false),
+        "error.is_code",
+    ).map_err(lower)?;
+    builder.build_conditional_branch(is_code, error_code_block, error_category_block).map_err(lower)?;
+
+    builder.position_at_end(error_code_block);
+    let error_code = extract_union_payload(
+        &ctx,
+        &builder,
+        error,
+        error_shape.payload(ERROR_VARIANT_CODE as usize, 0)?,
+        "error.code",
+    )?.into_int_value();
+    builder.build_unconditional_branch(report_join).map_err(lower)?;
+    let error_code_end = builder.get_insert_block().ok_or_else(|| CodegenError::Lowering("test Error::Code block is absent".into()))?;
+
+    builder.position_at_end(error_category_block);
+    builder.build_unconditional_branch(report_join).map_err(lower)?;
+    let error_category_end = builder.get_insert_block().ok_or_else(|| CodegenError::Lowering("test Error category block is absent".into()))?;
+
+    builder.position_at_end(result_ok);
+    builder.build_unconditional_branch(report_join).map_err(lower)?;
+    let result_ok_end = builder.get_insert_block().ok_or_else(|| CodegenError::Lowering("test Ok block is absent".into()))?;
+
+    builder.position_at_end(report_join);
+    let outcome = builder.build_phi(i8_ty, "report.outcome").map_err(lower)?;
+    outcome.add_incoming(&[
+        (&i8_ty.const_int(1, false), error_code_end),
+        (&i8_ty.const_int(1, false), error_category_end),
+        (&i8_ty.const_zero(), result_ok_end),
+    ]);
+    let report_tag = builder.build_phi(i8_ty, "report.error_tag").map_err(lower)?;
+    report_tag.add_incoming(&[
+        (&error_tag, error_code_end),
+        (&error_tag, error_category_end),
+        (&i8_ty.const_int(255, false), result_ok_end),
+    ]);
+    let report_code = builder.build_phi(i32_ty, "report.error_code").map_err(lower)?;
+    report_code.add_incoming(&[
+        (&error_code, error_code_end),
+        (&i32_ty.const_zero(), error_category_end),
+        (&i32_ty.const_zero(), result_ok_end),
+    ]);
     let report_status = builder
         .build_call(
             report,
             &[
                 fd.into(),
-                outcome.into(),
-                report_tag.into(),
-                report_code.into(),
+                outcome.as_basic_value().into(),
+                report_tag.as_basic_value().into(),
+                report_code.as_basic_value().into(),
                 ordinal.into(),
             ],
             "report.status",
@@ -2106,6 +2172,8 @@ fn emit_sqlite_scalar_callback_trampoline<'c>(
     runtime_funcs: &HashMap<RuntimeKey, FunctionValue<'c>>,
     struct_types: &[StructType<'c>],
     enum_types: &[StructType<'c>],
+    tagged_types: TaggedTypes<'c, '_>,
+    target_data: &inkwell::targets::TargetData,
 ) -> Result<(), CodegenError> {
     let lower = |error: inkwell::builder::BuilderError| CodegenError::Lowering(error.to_string());
     let GeneratedId::SqliteScalarCallback { target, .. } = id else {
@@ -2186,6 +2254,31 @@ fn emit_sqlite_scalar_callback_trampoline<'c>(
     let value_llvm_ty = enum_types.get(value_id as usize).copied().ok_or_else(|| {
         CodegenError::Lowering("pkg.db.value LLVM layout is absent".into())
     })?;
+    let value_variants = value_definition
+        .variants
+        .iter()
+        .map(|variant| {
+            variant
+                .payload
+                .iter()
+                .copied()
+                .map(|scalar| (scalar, scalar_type(ctx, scalar_to_ty(scalar), struct_types, enum_types, tagged_types)))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let value_shape = union_shape(ctx, i32_ty.into(), &value_variants, target_data)?;
+    let Ty::Result(callback_ok, callback_err) = declaration.signature.ret else {
+        return Err(CodegenError::Lowering("pkg.db callback result is not Result".into()));
+    };
+    let callback_result_shape = union_shape(
+        ctx,
+        i8_ty.into(),
+        &[
+            vec![(callback_ok, scalar_type(ctx, scalar_to_ty(callback_ok), struct_types, enum_types, tagged_types))],
+            vec![(callback_err, scalar_type(ctx, scalar_to_ty(callback_err), struct_types, enum_types, tagged_types))],
+        ],
+        target_data,
+    )?;
     let args_llvm_ty = struct_types.get(args_id as usize).copied().ok_or_else(|| {
         CodegenError::Lowering("pkg.db.sqlite.function_args LLVM layout is absent".into())
     })?;
@@ -2325,6 +2418,7 @@ fn emit_sqlite_scalar_callback_trampoline<'c>(
     let alias_ordinal_slot = builder
         .build_alloca(i32_ty, "alias.ordinal")
         .map_err(lower)?;
+    let value_union_scratch = builder.build_alloca(value_llvm_ty, "value.union").map_err(lower)?;
     builder.build_store(ordinal_slot, i32_ty.const_zero()).map_err(lower)?;
     builder.build_unconditional_branch(args_head).map_err(lower)?;
 
@@ -2504,25 +2598,44 @@ fn emit_sqlite_scalar_callback_trampoline<'c>(
     }
     macro_rules! enum_value {
         ($variant:expr, $payload:expr) => {{
-            let variant = value_definition.variants.get($variant).ok_or_else(|| {
+            let _variant = value_definition.variants.get($variant).ok_or_else(|| {
                 CodegenError::Lowering("pkg.db.value callback variant is absent".into())
             })?;
+            let mapping = value_shape.variants.get($variant).and_then(|mapping| mapping.first()).copied().ok_or_else(|| {
+                CodegenError::Lowering("pkg.db.value callback payload map is absent".into())
+            })?;
             let tagged = builder
-                .build_insert_value(value_llvm_ty.const_zero(), i32_ty.const_int($variant as u64, false), 0, "value.tag")
+                .build_insert_value(value_llvm_ty.get_poison(), i32_ty.const_int($variant as u64, false), 0, "value.tag")
                 .map_err(lower)?
                 .into_struct_value();
-            builder
-                .build_insert_value(tagged, $payload, variant.field_base, "value.payload")
-                .map_err(lower)?
-                .into_struct_value()
+            let tagged = finish_union_value(&builder, tagged, "value.union.base.frozen")?;
+            builder.build_store(value_union_scratch, tagged).map_err(lower)?;
+            let storage = builder.build_struct_gep(value_llvm_ty, value_union_scratch, 1, "value.storage").map_err(lower)?;
+            let storage_type = value_llvm_ty.get_field_types()[1].into_struct_type();
+            let bytes = builder.build_struct_gep(storage_type, storage, 1, "value.bytes").map_err(lower)?;
+            let offset = match mapping {
+                PhysicalPayload::Stored { offset, .. } => offset,
+                _ => return Err(CodegenError::Lowering("pkg.db.value callback payload is omitted".into())),
+            };
+            let pointer = unsafe { builder.build_gep(i8_ty, bytes, &[i64_ty.const_int(offset, false)], "value.payload").map_err(lower)? };
+            builder.build_store(pointer, $payload).map_err(lower)?;
+            finish_union_value(
+                &builder,
+                builder.build_load(value_llvm_ty, value_union_scratch, "value.union.load").map_err(lower)?.into_struct_value(),
+                "value.union.frozen",
+            )?
         }};
     }
 
     builder.position_at_end(null_case);
-    let null_value = builder
-        .build_insert_value(value_llvm_ty.const_zero(), i32_ty.const_zero(), 0, "value.null")
+    let null_value = finish_union_value(
+        &builder,
+        builder
+        .build_insert_value(value_llvm_ty.get_poison(), i32_ty.const_zero(), 0, "value.null")
         .map_err(lower)?
-        .into_struct_value();
+        .into_struct_value(),
+        "value.null.frozen",
+    )?;
     finish_input_value!(null_value);
 
     builder.position_at_end(integer_case);
@@ -2698,7 +2811,7 @@ fn emit_sqlite_scalar_callback_trampoline<'c>(
         .map_err(lower)?;
 
     builder.position_at_end(err_case);
-    let error_view = builder.build_extract_value(callback_result, 2, "error.message").map_err(lower)?.into_struct_value();
+    let error_view = extract_union_payload(ctx, &builder, callback_result, callback_result_shape.payload(1, 0)?, "error.message")?.into_struct_value();
     let error_pointer = builder.build_extract_value(error_view, 0, "error.pointer").map_err(lower)?.into_pointer_value();
     let error_len = builder.build_extract_value(error_view, 1, "error.len").map_err(lower)?.into_int_value();
     let error_positive = builder.build_int_compare(IntPredicate::SGT, error_len, i64_ty.const_zero(), "error.positive").map_err(lower)?;
@@ -2725,7 +2838,7 @@ fn emit_sqlite_scalar_callback_trampoline<'c>(
     builder.build_return(None).map_err(lower)?;
 
     builder.position_at_end(ok_case);
-    let output_value = builder.build_extract_value(callback_result, 1, "output.value").map_err(lower)?.into_struct_value();
+    let output_value = extract_union_payload(ctx, &builder, callback_result, callback_result_shape.payload(0, 0)?, "output.value")?.into_struct_value();
     let output_tag = builder.build_extract_value(output_value, 0, "output.tag").map_err(lower)?.into_int_value();
     let output_cases: Vec<_> = (0..9)
         .map(|_| ctx.append_basic_block(callback, "output.case"))
@@ -2748,12 +2861,19 @@ fn emit_sqlite_scalar_callback_trampoline<'c>(
         let output_case = output_cases.get(variant_index).copied().ok_or_else(|| {
             CodegenError::Lowering("pkg.db.value integer output block is absent".into())
         })?;
-        let variant = value_definition.variants.get(variant_index).ok_or_else(|| {
+        let _variant = value_definition.variants.get(variant_index).ok_or_else(|| {
             CodegenError::Lowering("pkg.db.value integer callback variant is absent".into())
         })?;
         builder.position_at_end(output_case);
+        let mapping = value_shape.payload(variant_index, 0)?;
+        builder.build_store(value_union_scratch, output_value).map_err(lower)?;
+        let storage = builder.build_struct_gep(value_llvm_ty, value_union_scratch, 1, "output.storage").map_err(lower)?;
+        let PhysicalPayload::Stored { llvm_type, offset, .. } = mapping else {
+            return Err(CodegenError::Lowering("pkg.db.value integer payload is omitted".into()));
+        };
+        let pointer = unsafe { builder.build_gep(i8_ty, storage, &[i64_ty.const_int(offset, false)], "output.payload").map_err(lower)? };
         let integer = builder
-            .build_extract_value(output_value, variant.field_base, "output.integer")
+            .build_load(llvm_type, pointer, "output.integer")
             .map_err(lower)?
             .into_int_value();
         let widened = if integer.get_type() == i64_ty {
@@ -2771,12 +2891,18 @@ fn emit_sqlite_scalar_callback_trampoline<'c>(
         let output_case = output_cases.get(variant_index).copied().ok_or_else(|| {
             CodegenError::Lowering("pkg.db.value float output block is absent".into())
         })?;
-        let variant = value_definition.variants.get(variant_index).ok_or_else(|| {
+        let _variant = value_definition.variants.get(variant_index).ok_or_else(|| {
             CodegenError::Lowering("pkg.db.value float callback variant is absent".into())
         })?;
         builder.position_at_end(output_case);
+        let PhysicalPayload::Stored { llvm_type, offset, .. } = value_shape.payload(variant_index, 0)? else {
+            return Err(CodegenError::Lowering("pkg.db.value float payload is omitted".into()));
+        };
+        builder.build_store(value_union_scratch, output_value).map_err(lower)?;
+        let storage = builder.build_struct_gep(value_llvm_ty, value_union_scratch, 1, "output.storage").map_err(lower)?;
+        let pointer = unsafe { builder.build_gep(i8_ty, storage, &[i64_ty.const_int(offset, false)], "output.payload").map_err(lower)? };
         let float = builder
-            .build_extract_value(output_value, variant.field_base, "output.float")
+            .build_load(llvm_type, pointer, "output.float")
             .map_err(lower)?
             .into_float_value();
         let nan = builder.build_float_compare(FloatPredicate::UNO, float, float, "output.nan").map_err(lower)?;
@@ -2796,11 +2922,17 @@ fn emit_sqlite_scalar_callback_trampoline<'c>(
         let output_case = output_cases.get(variant_index).copied().ok_or_else(|| {
             CodegenError::Lowering("pkg.db.value view output block is absent".into())
         })?;
-        let variant = value_definition.variants.get(variant_index).ok_or_else(|| {
+        let _variant = value_definition.variants.get(variant_index).ok_or_else(|| {
             CodegenError::Lowering("pkg.db.value view callback variant is absent".into())
         })?;
         builder.position_at_end(output_case);
-        let payload = builder.build_extract_value(output_value, variant.field_base, "output.view.payload").map_err(lower)?;
+        let PhysicalPayload::Stored { llvm_type, offset, .. } = value_shape.payload(variant_index, 0)? else {
+            return Err(CodegenError::Lowering("pkg.db.value view payload is omitted".into()));
+        };
+        builder.build_store(value_union_scratch, output_value).map_err(lower)?;
+        let storage = builder.build_struct_gep(value_llvm_ty, value_union_scratch, 1, "output.storage").map_err(lower)?;
+        let pointer = unsafe { builder.build_gep(i8_ty, storage, &[i64_ty.const_int(offset, false)], "output.payload").map_err(lower)? };
+        let payload = builder.build_load(llvm_type, pointer, "output.view.payload").map_err(lower)?;
         let view = if variant_index == 7 {
             payload.into_struct_value()
         } else {
@@ -3208,7 +3340,7 @@ fn lower_prepared_module<'c>(
                 .or_insert_with(|| ctx.opaque_struct_type(&s.source_name))
         })
         .collect();
-    // Sum-type layouts → named tagged structs `{ i32 tag, <every variant's payload flattened> }`.
+    // Sum-type layouts → named tagged unions `{ i32 tag, maximum-payload storage }`.
     // Create every enum opaque first, then set the bodies, mirroring structs. This lets the closed
     // builtin `Error` enum be a payload of pkg.web's middleware verdict without admitting general
     // recursive enum graphs in sema.
@@ -3223,32 +3355,21 @@ fn lower_prepared_module<'c>(
         })
         .collect();
     // Concrete nested `Option` / `Result` values need their own named recursive-capable aggregate
-    // type. Entries that lower to the same LLVM body share one identified struct, and the body
-    // index makes that struct the ONE lowering of its shape — whether MIR spelled it
+    // type. Entries with the same semantic constructor and resolved payload identities share one
+    // identified struct, and the shape index makes that struct the ONE lowering of its shape — whether MIR spelled it
     // `Ty::Tagged(id)` or `Ty::Option`/`Ty::Result`, and whether or not the spelling is itself a
     // table entry. See [`TaggedTypes`].
-    let (tagged_shells, tagged_bodies) =
-        build_tagged_types(ctx, &program.tagged_types, &struct_types, &enum_types)?;
-    let tagged_types = TaggedTypes { shells: &tagged_shells, by_body: &tagged_bodies };
-    let mut completed_enum_types = HashSet::new();
-    for (e, et) in program.enums.iter().zip(&enum_types) {
-        if !completed_enum_types.insert(e.source_name.as_str()) {
-            continue;
-        }
-        let mut fields: Vec<BasicTypeEnum> = vec![ctx.i32_type().into()];
-        for v in &e.variants {
-            for &s in &v.payload {
-                fields.push(scalar_type(
-                    ctx,
-                    scalar_to_ty(s),
-                    &struct_types,
-                    &enum_types,
-                    tagged_types,
-                ));
-            }
-        }
-        et.set_body(&fields, false);
-    }
+    let PredeclaredTaggedTypes {
+        shells: tagged_shells,
+        identities: tagged_identity,
+        representative: tagged_representatives,
+    } = predeclare_tagged_types(
+        ctx,
+        &program.tagged_types,
+        &struct_types,
+        &enum_types,
+        &target_data,
+    )?;
     // Field reordering (see `docs/impl/05-backend-llvm.md` §2): a non-`layout(C)` struct's field
     // order is language-unspecified, so codegen lays fields out in **descending alignment** (ties
     // keep declaration order) to eliminate padding. Source access is by name, so this is invisible.
@@ -3266,21 +3387,148 @@ fn lower_prepared_module<'c>(
         .iter()
         .map(|s| logical_to_physical(s, &mut type_layouts))
         .collect();
-    let mut completed_struct_types = HashSet::new();
-    for ((s, st), perm) in program.structs.iter().zip(&struct_types).zip(&field_perm) {
-        if !completed_struct_types.insert(s.source_name.as_str()) {
-            continue;
+    // Resolve every aggregate body child-first across the combined struct/enum/tagged DAG. LLVM
+    // reports an opaque nominal as size zero, so measuring before this dependency is complete would
+    // silently classify a real payload as OmittedZero.
+    let mut tagged_shapes = HashMap::new();
+    loop {
+        let mut progress = false;
+
+        for (id, definition) in program.tagged_types.iter().copied().enumerate() {
+            let shell = *tagged_shells
+                .get(id)
+                .ok_or_else(|| CodegenError::Lowering("tagged shell is absent".into()))?;
+            if !shell.is_opaque() {
+                continue;
+            }
+            let payloads = tagged_payloads(definition);
+            if !payloads.iter().all(|payload| {
+                llvm_layout_ready(scalar_to_ty(*payload), &struct_types, &enum_types, &tagged_shells)
+            }) {
+                continue;
+            }
+            let tagged_types = TaggedTypes {
+                shells: &tagged_shells,
+                by_shape: &tagged_shapes,
+                target_data: &target_data,
+            };
+            let resolved = payloads
+                .iter()
+                .copied()
+                .map(|payload| {
+                    (payload, scalar_type(ctx, scalar_to_ty(payload), &struct_types, &enum_types, tagged_types))
+                })
+                .collect::<Vec<_>>();
+            let shape = match definition {
+                hir::TaggedType::Option(payload) => {
+                    TaggedShapeKey::Option(tagged_payload_key(payload, resolved[0].1))
+                }
+                hir::TaggedType::Result(..) => TaggedShapeKey::Result(
+                    tagged_payload_key(resolved[0].0, resolved[0].1),
+                    tagged_payload_key(resolved[1].0, resolved[1].1),
+                ),
+            };
+            let variants = match definition {
+                hir::TaggedType::Option(_) => vec![Vec::new(), resolved],
+                hir::TaggedType::Result(..) => {
+                    let [ok, err] = resolved.as_slice() else {
+                        return Err(CodegenError::Lowering("Result tagged payload arity is not two".into()));
+                    };
+                    vec![vec![*ok], vec![*err]]
+                }
+            };
+            let body = union_shape(ctx, ctx.i8_type().into(), &variants, &target_data)?.body;
+            shell.set_body(&body.get_field_types(), false);
+            let representative = *tagged_representatives
+                .get(tagged_identity.get(id).ok_or_else(|| {
+                    CodegenError::Lowering("tagged identity is absent".into())
+                })?)
+                .ok_or_else(|| CodegenError::Lowering("tagged identity representative is absent".into()))?;
+            let representative_shell = tagged_shells
+                .get(representative as usize)
+                .copied()
+                .ok_or_else(|| CodegenError::Lowering("tagged representative shell is absent".into()))?;
+            if let Some(existing) = tagged_shapes.insert(shape, representative_shell)
+                && existing != representative_shell
+            {
+                return Err(CodegenError::Lowering(
+                    "duplicate tagged semantic shape resolved to multiple shells".into(),
+                ));
+            }
+            progress = true;
         }
-        set_struct_body(
-            ctx,
-            *st,
-            s,
-            perm,
-            &struct_types,
-            &enum_types,
-            tagged_types,
-            &target_data,
-        );
+
+        for (definition, enum_type) in program.enums.iter().zip(&enum_types) {
+            if !enum_type.is_opaque()
+                || !definition.variants.iter().flat_map(|variant| &variant.payload).all(|payload| {
+                    llvm_layout_ready(scalar_to_ty(*payload), &struct_types, &enum_types, &tagged_shells)
+                })
+            {
+                continue;
+            }
+            let tagged_types = TaggedTypes { shells: &tagged_shells, by_shape: &tagged_shapes, target_data: &target_data };
+            let variants = definition.variants.iter().map(|variant| {
+                variant.payload.iter().copied().map(|payload| {
+                    (payload, scalar_type(ctx, scalar_to_ty(payload), &struct_types, &enum_types, tagged_types))
+                }).collect::<Vec<_>>()
+            }).collect::<Vec<_>>();
+            let shape = union_shape(ctx, ctx.i32_type().into(), &variants, &target_data)?;
+            enum_type.set_body(&shape.body.get_field_types(), false);
+            progress = true;
+        }
+
+        for ((definition, struct_type), permutation) in program.structs.iter().zip(&struct_types).zip(&field_perm) {
+            if !struct_type.is_opaque()
+                || !definition.fields.iter().all(|field| {
+                    llvm_layout_ready(field.ty, &struct_types, &enum_types, &tagged_shells)
+                })
+            {
+                continue;
+            }
+            let tagged_types = TaggedTypes { shells: &tagged_shells, by_shape: &tagged_shapes, target_data: &target_data };
+            set_struct_body(
+                ctx,
+                *struct_type,
+                definition,
+                permutation,
+                &struct_types,
+                &enum_types,
+                tagged_types,
+                &target_data,
+            );
+            progress = true;
+        }
+
+        let complete = struct_types.iter().all(|ty| !ty.is_opaque())
+            && enum_types.iter().all(|ty| !ty.is_opaque())
+            && tagged_shells.iter().all(|ty| !ty.is_opaque());
+        if complete {
+            break;
+        }
+        if !progress {
+            return Err(CodegenError::Lowering(
+                "aggregate LLVM layout graph is incomplete or recursive".into(),
+            ));
+        }
+    }
+    let tagged_types = TaggedTypes { shells: &tagged_shells, by_shape: &tagged_shapes, target_data: &target_data };
+    for (id, llvm_type) in enum_types.iter().enumerate() {
+        let semantic = type_layouts.layout(Ty::Enum(id as u32));
+        let llvm = (target_data.get_abi_size(llvm_type), u64::from(target_data.get_abi_alignment(llvm_type)));
+        if semantic != llvm {
+            return Err(CodegenError::Lowering(format!(
+                "enum {id} semantic layout {semantic:?} disagrees with LLVM layout {llvm:?}"
+            )));
+        }
+    }
+    for (id, llvm_type) in tagged_shells.iter().enumerate() {
+        let semantic = type_layouts.layout(Ty::Tagged(id as u32));
+        let llvm = (target_data.get_abi_size(llvm_type), u64::from(target_data.get_abi_alignment(llvm_type)));
+        if semantic != llvm {
+            return Err(CodegenError::Lowering(format!(
+                "tagged type {id} semantic layout {semantic:?} disagrees with LLVM layout {llvm:?}"
+            )));
+        }
     }
 
     // Tuple layouts → anonymous LLVM struct types, indexed by tuple id. Elements use the scalar
@@ -3793,12 +4041,20 @@ fn lower_prepared_module<'c>(
             // On `Err`, write the full `Error` value to `err_slot` and return 1; on `Ok`, write R.
             let ok_s = ty_to_scalar(*r)
                 .ok_or_else(|| CodegenError::Lowering("fallible task Ok is not a scalar".into()))?;
-            let err_s = Scalar::Enum(
-                error_id
-                    .ok_or_else(|| CodegenError::Lowering("Error enum not registered".into()))?,
-            );
+            let error_enum_id = error_id
+                .ok_or_else(|| CodegenError::Lowering("Error enum not registered".into()))?;
+            let err_s = Scalar::Enum(error_enum_id);
             let result_ty =
                 result_struct_type(ctx, ok_s, err_s, &struct_types, &enum_types, tagged_types);
+            let result_shape = union_shape(
+                ctx,
+                ctx.i8_type().into(),
+                &[
+                    vec![(ok_s, scalar_type(ctx, *r, &struct_types, &enum_types, tagged_types))],
+                    vec![(err_s, scalar_type(ctx, Ty::Enum(error_enum_id), &struct_types, &enum_types, tagged_types))],
+                ],
+                &target_data,
+            )?;
             let agg = return_transport::build_indirect_call(ctx, &tb, result_ty.fn_type(&[ptr.into()], false), thunk, &[env.into()], "r")
                 .map_err(lower)?
                 .try_as_basic_value()
@@ -3806,8 +4062,6 @@ fn lower_prepared_module<'c>(
                 .ok_or_else(|| CodegenError::Lowering("spawn closure returned no value".into()))?
                 .into_struct_value();
             let tag = tb.build_extract_value(agg, 0, "tag").map_err(lower)?.into_int_value();
-            let ok = tb.build_extract_value(agg, 1, "ok").map_err(lower)?;
-            let err = tb.build_extract_value(agg, 2, "err").map_err(lower)?;
             let is_err = tb
                 .build_int_compare(IntPredicate::EQ, tag, ctx.i8_type().const_int(1, false), "iserr")
                 .map_err(lower)?;
@@ -3815,9 +4069,11 @@ fn lower_prepared_module<'c>(
             let ok_bb = ctx.append_basic_block(tramp, "ok");
             tb.build_conditional_branch(is_err, err_bb, ok_bb).map_err(lower)?;
             tb.position_at_end(err_bb);
+            let err = extract_union_payload(ctx, &tb, agg, result_shape.payload(1, 0)?, "err")?;
             tb.build_store(err_slot, err).map_err(lower)?;
             tb.build_return(Some(&i32t.const_int(1, false))).map_err(lower)?;
             tb.position_at_end(ok_bb);
+            let ok = extract_union_payload(ctx, &tb, agg, result_shape.payload(0, 0)?, "ok")?;
             tb.build_store(slot, ok).map_err(lower)?;
             tb.build_return(Some(&i32t.const_zero())).map_err(lower)?;
         } else if *r == Ty::Unit {
@@ -3895,6 +4151,8 @@ fn lower_prepared_module<'c>(
             &runtime_funcs,
             &struct_types,
             &enum_types,
+            tagged_types,
+            &target_data,
         )?;
         generated_funcs.insert(id.clone(), callback);
     }
@@ -4060,7 +4318,13 @@ fn lower_prepared_module<'c>(
                 .ok_or_else(|| callable_target_error(&f.name))?,
             f.ret,
             !f.params.is_empty(),
-            &extern_fn_types,
+            MainWrapperTypes {
+                extern_fn_types: &extern_fn_types,
+                struct_types: &struct_types,
+                enum_types: &enum_types,
+                enums: &program.enums,
+                tagged: tagged_types,
+            },
         )?;
     }
     // Every emit path — object, PGO, ThinLTO prelink, `emit-llvm`, and the remark lens — funnels
@@ -5962,14 +6226,25 @@ fn validate_static_data_record(
 /// for that case is to turn the void call into `ret i32 0` (never leave the ABI return register
 /// undefined — the bug this function exists to close for the `Unit` case, `has_args` always
 /// `false` there since sema restricts the `args: array<str>` form to a `Result`-returning `main`).
+struct MainWrapperTypes<'c, 'a> {
+    extern_fn_types: &'a HashMap<String, FunctionType<'c>>,
+    struct_types: &'a [StructType<'c>],
+    enum_types: &'a [StructType<'c>],
+    enums: &'a [EnumDef],
+    tagged: TaggedTypes<'c, 'a>,
+}
+
 fn emit_main_wrapper<'c>(
     ctx: &'c Context,
     module: &Module<'c>,
     align_body: FunctionValue<'c>,
     ret: Ty,
     has_args: bool,
-    extern_fn_types: &HashMap<String, FunctionType<'c>>,
+    types: MainWrapperTypes<'c, '_>,
 ) -> Result<(), CodegenError> {
+    let MainWrapperTypes { extern_fn_types, struct_types, enum_types, enums, tagged: tagged_types } =
+        types;
+    let target_data = tagged_types.target_data;
     if !matches!(ret, Ty::Result(_, _)) && ret != Ty::Unit {
         return Err(CodegenError::Lowering("main wrapper on a non-Result, non-Unit return".into()));
     }
@@ -6028,7 +6303,18 @@ fn emit_main_wrapper<'c>(
         .basic()
         .ok_or_else(|| CodegenError::Lowering("main returned void".into()))?
         .into_struct_value();
-    // `res` already has the Result aggregate type (main's payloads are () / Error).
+    let Ty::Result(ok_scalar, err_scalar @ Scalar::Enum(error_id)) = ret else {
+        return Err(CodegenError::Lowering("main Result must carry the builtin Error enum".into()));
+    };
+    let result_shape = union_shape(
+        ctx,
+        ctx.i8_type().into(),
+        &[
+            vec![(ok_scalar, scalar_type(ctx, scalar_to_ty(ok_scalar), struct_types, enum_types, tagged_types))],
+            vec![(err_scalar, scalar_type(ctx, Ty::Enum(error_id), struct_types, enum_types, tagged_types))],
+        ],
+        target_data,
+    )?;
     let tag = builder.build_extract_value(res, 0, "tag").map_err(lower)?.into_int_value();
     let is_err = builder
         .build_int_compare(IntPredicate::NE, tag, ctx.i8_type().const_int(0, false), "iserr")
@@ -6040,16 +6326,45 @@ fn emit_main_wrapper<'c>(
     builder.position_at_end(err_bb);
     // The err payload is the `Error` enum `{ i32 tag, i32 code }`. Its exit code: `Code(c)` → `c`
     // (the payload), a category → `tag + 1` (a small distinct nonzero code). `report_error` clamps.
-    let err_enum = builder.build_extract_value(res, 2, "err").map_err(lower)?.into_struct_value();
+    let err_enum = extract_union_payload(ctx, &builder, res, result_shape.payload(1, 0)?, "err")?.into_struct_value();
     let etag = builder.build_extract_value(err_enum, 0, "etag").map_err(lower)?.into_int_value();
-    let ecode = builder.build_extract_value(err_enum, 1, "ecode").map_err(lower)?.into_int_value();
+    let error = enums
+        .get(error_id as usize)
+        .ok_or_else(|| CodegenError::Lowering("main Error enum definition is absent".into()))?;
+    let error_variants = error
+        .variants
+        .iter()
+        .map(|variant| variant.payload.iter().copied().map(|scalar| {
+            (scalar, scalar_type(ctx, scalar_to_ty(scalar), struct_types, enum_types, tagged_types))
+        }).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let error_shape = union_shape(ctx, i32t.into(), &error_variants, target_data)?;
     let is_code = builder
         .build_int_compare(IntPredicate::EQ, etag, i32t.const_int(ERROR_VARIANT_CODE as u64, false), "iscode")
         .map_err(lower)?;
+    let code_bb = ctx.append_basic_block(main, "error.code");
+    let category_bb = ctx.append_basic_block(main, "error.category");
+    let report_bb = ctx.append_basic_block(main, "error.report");
+    builder.build_conditional_branch(is_code, code_bb, category_bb).map_err(lower)?;
+    let code_payload = error_shape
+        .variants
+        .get(ERROR_VARIANT_CODE as usize)
+        .and_then(|variant| variant.first())
+        .copied()
+        .ok_or_else(|| CodegenError::Lowering("main Error::Code payload map is absent".into()))?;
+    builder.position_at_end(code_bb);
+    let ecode = extract_union_payload(ctx, &builder, err_enum, code_payload, "ecode")?.into_int_value();
+    builder.build_unconditional_branch(report_bb).map_err(lower)?;
+    let code_end = builder.get_insert_block().ok_or_else(|| CodegenError::Lowering("Error::Code block is absent".into()))?;
+    builder.position_at_end(category_bb);
     let cat_code = builder.build_int_add(etag, i32t.const_int(1, false), "catcode").map_err(lower)?;
-    let code = builder.build_select(is_code, ecode, cat_code, "exitcode").map_err(lower)?.into_int_value();
+    builder.build_unconditional_branch(report_bb).map_err(lower)?;
+    let category_end = builder.get_insert_block().ok_or_else(|| CodegenError::Lowering("Error category block is absent".into()))?;
+    builder.position_at_end(report_bb);
+    let code = builder.build_phi(i32t, "exitcode").map_err(lower)?;
+    code.add_incoming(&[(&ecode, code_end), (&cat_code, category_end)]);
     let exit = builder
-        .build_call(report, &[code.into()], "exit")
+        .build_call(report, &[code.as_basic_value().into()], "exit")
         .map_err(lower)?
         .try_as_basic_value()
         .basic()
@@ -6098,7 +6413,7 @@ fn scalar_type<'c>(
         Ty::Float(_) => float_type(ctx, ty).into(),
         Ty::Struct(id) => sx[id as usize].into(),
         Ty::StructArray(id, n) => sx[id as usize].array_type(n).into(),
-        // A sum type lowers to its non-union tagged struct `{ i32 tag, … }`.
+        // A sum type lowers to its explicit-tag union-storage struct.
         Ty::Enum(id) => ex[id as usize].into(),
         Ty::Tagged(id) => tx.shell(id).into(),
         // A `{ptr,len}` payload (an owned `string` in an Option/Result, slice 8a; also str/slice/
@@ -6159,7 +6474,8 @@ fn vec_llvm_ty<'c>(ctx: &'c Context, elem: Ty, n: u32) -> BasicTypeEnum<'c> {
     }
 }
 
-/// `Option<T>` lowers to `{ i8 tag, T value }` (tag 1 = Some, 0 = None) — as the identified
+/// `Option<T>` lowers to an explicit `i8` tag plus maximum-variant union storage (tag 1 = Some,
+/// 0 = None) — as the identified
 /// `%align.tagged.{id}` struct when a tagged table entry has that exact body, and as the
 /// structurally-uniqued literal struct otherwise (see [`TaggedTypes`]).
 fn option_struct_type<'c>(
@@ -6169,17 +6485,23 @@ fn option_struct_type<'c>(
     ex: &[StructType<'c>],
     tx: TaggedTypes<'c, '_>,
 ) -> StructType<'c> {
-    let body = ctx.struct_type(
-        &[
-            ctx.i8_type().into(),
-            scalar_type(ctx, scalar_to_ty(s), sx, ex, tx),
-        ],
-        false,
-    );
-    tx.shell_for_body(body).unwrap_or(body)
+    // Checked HIR has already closed this exact Option layout, including every reachable payload
+    // size and alignment. Failure here would mean codegen disagrees with its own validated table.
+    let payload_type = scalar_type(ctx, scalar_to_ty(s), sx, ex, tx);
+    let body = union_shape(
+        ctx,
+        ctx.i8_type().into(),
+        &[Vec::new(), vec![(s, payload_type)]],
+        tx.target_data,
+    )
+    .expect("validated Option layout")
+    .body;
+    tx.shell_for_shape(TaggedShapeKey::Option(tagged_payload_key(s, payload_type)))
+        .unwrap_or(body)
 }
 
-/// `Result<T, E>` lowers to `{ i8 tag, T ok, E err }` (tag 0 = Ok, 1 = Err) — as the identified
+/// `Result<T, E>` lowers to an explicit `i8` tag plus maximum-variant union storage (tag 0 = Ok,
+/// 1 = Err) — as the identified
 /// `%align.tagged.{id}` struct when a tagged table entry has that exact body, and as the
 /// structurally-uniqued literal struct otherwise (see [`TaggedTypes`]).
 fn result_struct_type<'c>(
@@ -6190,15 +6512,161 @@ fn result_struct_type<'c>(
     ex: &[StructType<'c>],
     tx: TaggedTypes<'c, '_>,
 ) -> StructType<'c> {
-    let body = ctx.struct_type(
-        &[
-            ctx.i8_type().into(),
-            scalar_type(ctx, scalar_to_ty(ok), sx, ex, tx),
-            scalar_type(ctx, scalar_to_ty(err), sx, ex, tx),
-        ],
-        false,
-    );
-    tx.shell_for_body(body).unwrap_or(body)
+    // Checked HIR has already closed this exact Result layout, including both reachable payload
+    // sizes and alignments. Failure here would mean codegen disagrees with its validated table.
+    let ok_type = scalar_type(ctx, scalar_to_ty(ok), sx, ex, tx);
+    let err_type = scalar_type(ctx, scalar_to_ty(err), sx, ex, tx);
+    let body = union_shape(
+        ctx,
+        ctx.i8_type().into(),
+        &[vec![(ok, ok_type)], vec![(err, err_type)]],
+        tx.target_data,
+    )
+    .expect("validated Result layout")
+    .body;
+    tx.shell_for_shape(TaggedShapeKey::Result(
+        tagged_payload_key(ok, ok_type),
+        tagged_payload_key(err, err_type),
+    ))
+    .unwrap_or(body)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PhysicalPayload<'c> {
+    OmittedUnit,
+    OmittedZero { llvm_type: BasicTypeEnum<'c> },
+    Stored { llvm_type: BasicTypeEnum<'c>, offset: u64, size: u64, align: u64 },
+}
+
+#[derive(Clone)]
+struct UnionShape<'c> {
+    body: StructType<'c>,
+    variants: Vec<Vec<PhysicalPayload<'c>>>,
+}
+
+impl<'c> UnionShape<'c> {
+    fn variant(&self, variant: usize) -> Result<&[PhysicalPayload<'c>], CodegenError> {
+        self.variants
+            .get(variant)
+            .map(Vec::as_slice)
+            .ok_or_else(|| CodegenError::Lowering("tagged variant is out of bounds".into()))
+    }
+
+    fn payload(&self, variant: usize, payload: usize) -> Result<PhysicalPayload<'c>, CodegenError> {
+        self.variant(variant)?
+            .get(payload)
+            .copied()
+            .ok_or_else(|| CodegenError::Lowering("tagged payload is out of bounds".into()))
+    }
+}
+
+/// Build the one physical tagged-union body and its exact logical-to-physical payload map.
+fn union_shape<'c>(
+    ctx: &'c Context,
+    tag: BasicTypeEnum<'c>,
+    variants: &[Vec<(Scalar, BasicTypeEnum<'c>)>],
+    target_data: &inkwell::targets::TargetData,
+) -> Result<UnionShape<'c>, CodegenError> {
+    let mut physical = Vec::with_capacity(variants.len());
+    let mut payload_structs = Vec::with_capacity(variants.len());
+    let mut maximum_size = 0;
+    let mut maximum_align = 1u32;
+    let mut anchor = None;
+
+    for variant in variants {
+        let stored = variant
+            .iter()
+            .filter(|(scalar, ty)| *scalar != Scalar::Unit && target_data.get_abi_size(ty) != 0)
+            .map(|(_, ty)| *ty)
+            .collect::<Vec<_>>();
+        let payload_struct = ctx.struct_type(&stored, false);
+        let size = target_data.get_abi_size(&payload_struct);
+        let align = target_data.get_abi_alignment(&payload_struct);
+        if align > maximum_align {
+            maximum_align = align;
+            anchor = Some(payload_struct);
+        }
+        maximum_size = maximum_size.max(size);
+
+        let mut stored_index = 0u32;
+        let mut mapping = Vec::with_capacity(variant.len());
+        for &(scalar, llvm_type) in variant {
+            if scalar == Scalar::Unit {
+                mapping.push(PhysicalPayload::OmittedUnit);
+            } else {
+                let field_size = target_data.get_abi_size(&llvm_type);
+                if field_size == 0 {
+                    mapping.push(PhysicalPayload::OmittedZero { llvm_type });
+                } else {
+                    let offset = target_data
+                        .offset_of_element(&payload_struct, stored_index)
+                        .ok_or_else(|| CodegenError::Lowering("tagged payload offset is unavailable".into()))?;
+                    mapping.push(PhysicalPayload::Stored {
+                        llvm_type,
+                        offset,
+                        size: field_size,
+                        align: u64::from(target_data.get_abi_alignment(&llvm_type)),
+                    });
+                    stored_index += 1;
+                }
+            }
+        }
+        physical.push(mapping);
+        payload_structs.push(payload_struct);
+    }
+
+    let mut fields = vec![tag];
+    if maximum_size != 0 {
+        let anchor = anchor.unwrap_or_else(|| payload_structs[0]);
+        let bytes = u32::try_from(maximum_size)
+            .map_err(|_| CodegenError::Lowering("tagged payload storage exceeds LLVM array limits".into()))?;
+        let storage = ctx.struct_type(
+            &[anchor.array_type(0).into(), ctx.i8_type().array_type(bytes).into()],
+            false,
+        );
+        if target_data.get_abi_alignment(&storage) != maximum_align {
+            return Err(CodegenError::Lowering("tagged payload storage alignment disagrees with its anchor".into()));
+        }
+        fields.push(storage.into());
+    }
+    Ok(UnionShape { body: ctx.struct_type(&fields, false), variants: physical })
+}
+
+fn extract_union_payload<'c>(
+    ctx: &'c Context,
+    builder: &Builder<'c>,
+    aggregate: StructValue<'c>,
+    payload: PhysicalPayload<'c>,
+    name: &str,
+) -> Result<BasicValueEnum<'c>, CodegenError> {
+    match payload {
+        PhysicalPayload::OmittedUnit => Ok(ctx.i32_type().const_zero().into()),
+        PhysicalPayload::OmittedZero { llvm_type } => Ok(llvm_type.const_zero()),
+        PhysicalPayload::Stored { llvm_type, offset, .. } => {
+            let aggregate_type = aggregate.get_type();
+            let scratch = builder
+                .build_alloca(aggregate_type, "union.read")
+                .map_err(|e| CodegenError::Lowering(e.to_string()))?;
+            builder
+                .build_store(scratch, aggregate)
+                .map_err(|e| CodegenError::Lowering(e.to_string()))?;
+            let storage = builder
+                .build_struct_gep(aggregate_type, scratch, 1, "union.storage")
+                .map_err(|e| CodegenError::Lowering(e.to_string()))?;
+            let storage_type = aggregate_type.get_field_types()[1].into_struct_type();
+            let bytes = builder
+                .build_struct_gep(storage_type, storage, 1, "union.bytes")
+                .map_err(|e| CodegenError::Lowering(e.to_string()))?;
+            let pointer = unsafe {
+                builder
+                    .build_gep(ctx.i8_type(), bytes, &[ctx.i64_type().const_int(offset, false)], "union.payload")
+                    .map_err(|e| CodegenError::Lowering(e.to_string()))?
+            };
+            builder
+                .build_load(llvm_type, pointer, name)
+                .map_err(|e| CodegenError::Lowering(e.to_string()))
+        }
+    }
 }
 
 /// The LLVM view of MIR's nested-tagged table (`Program::tagged_types`).
@@ -6216,9 +6684,10 @@ fn result_struct_type<'c>(
 ///   borrowed payload are one `{ ptr, len }` LLVM type and only one of the two shapes is in the
 ///   table at all.
 ///
-/// So identity here is the **LLVM body**, not the table entry: a tagged shape whose body matches a
-/// predeclared entry's lowers to that entry's identified `%align.tagged.{id}` struct, and every
-/// other shape keeps the literal struct LLVM already uniques structurally. Lowering the
+/// So identity here is the semantic constructor plus its resolved LLVM payload identities, not the
+/// physical union body: equivalent payload spellings share a shell, while an `Option<T>` and a
+/// `Result<T, T>` remain distinct even when their union bodies happen to match. Every other shape
+/// keeps the literal struct LLVM already uniques structurally. Lowering the
 /// source-shaped spelling to a literal unconditionally is what made `insertvalue` mix
 /// `{ i8, i64 }` into `{ i8, %align.tagged.0, %Error }` — invalid IR, latent since #670 and
 /// surfaced when #730 turned `--rt-lto` (which verifies the merged module) on by default.
@@ -6227,10 +6696,11 @@ struct TaggedTypes<'c, 'a> {
     /// The identified struct per table entry, indexed by [`Ty::Tagged`]'s id. Many-to-one: entries
     /// that lower to one body share one struct.
     shells: &'a [StructType<'c>],
-    /// Every predeclared body → its identified struct, keyed by the uniqued literal struct's LLVM
-    /// handle. `LLVMTypeRef` is a stable, context-owned pointer and LLVM uniques literal structs
-    /// structurally, so equal bodies are one key.
-    by_body: &'a HashMap<usize, StructType<'c>>,
+    /// Every predeclared semantic shape → its identified struct. LLVM type handles are stable,
+    /// context-owned payload identities; the constructor discriminator prevents equal physical
+    /// union bodies from collapsing Option and Result.
+    by_shape: &'a HashMap<TaggedShapeKey, StructType<'c>>,
+    target_data: &'a inkwell::targets::TargetData,
 }
 
 impl<'c> TaggedTypes<'c, '_> {
@@ -6239,10 +6709,30 @@ impl<'c> TaggedTypes<'c, '_> {
         self.shells[id as usize]
     }
 
-    /// The identified struct predeclared for this body, or `None` when no table entry lowers to
+    /// The identified struct predeclared for this shape, or `None` when no table entry lowers to
     /// it — in which case the caller's own literal struct is already the one lowering of the shape.
-    fn shell_for_body(self, body: StructType<'c>) -> Option<StructType<'c>> {
-        self.by_body.get(&(body.as_type_ref() as usize)).copied()
+    fn shell_for_shape(self, shape: TaggedShapeKey) -> Option<StructType<'c>> {
+        self.by_shape.get(&shape).copied()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum TaggedShapeKey {
+    Option(TaggedPayloadKey),
+    Result(TaggedPayloadKey, TaggedPayloadKey),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum TaggedPayloadKey {
+    Unit,
+    Value(usize),
+}
+
+fn tagged_payload_key(payload: Scalar, llvm_type: BasicTypeEnum<'_>) -> TaggedPayloadKey {
+    if payload == Scalar::Unit {
+        TaggedPayloadKey::Unit
+    } else {
+        TaggedPayloadKey::Value(llvm_type.as_type_ref() as usize)
     }
 }
 
@@ -6322,49 +6812,72 @@ fn tagged_payloads(tagged: hir::TaggedType) -> Vec<Scalar> {
     }
 }
 
-/// Predeclare one identified struct per distinct tagged body and assign it, returning the
-/// per-entry table and the body index that [`TaggedTypes`] resolves every other spelling through.
+struct PredeclaredTaggedTypes<'c> {
+    shells: Vec<StructType<'c>>,
+    identities: Vec<TaggedLogicalKey>,
+    representative: HashMap<TaggedLogicalKey, u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum TaggedLogicalPayloadKey {
+    Unit,
+    Leaf(usize),
+    Tagged(u32),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum TaggedLogicalKey {
+    Option(TaggedLogicalPayloadKey),
+    Result(TaggedLogicalPayloadKey, TaggedLogicalPayloadKey),
+}
+
+/// Predeclare one identified struct per distinct tagged shape and assign it, returning the
+/// per-entry table and the shape index that [`TaggedTypes`] resolves every other spelling through.
 ///
 /// Three passes, because the name of a shared struct must not depend on traversal order:
 ///
-/// 1. give every entry the fully literal form of its body, children first, so equal bodies are one
-///    uniqued LLVM type and the whole equivalence is decided before anything is named;
-/// 2. walk ids in ascending order, so the **lowest** id in a body class is the one that names its
+/// 1. give every entry a logical key, children first, so Unit stays distinct from value-bearing
+///    payloads even when both use the same LLVM value type;
+/// 2. walk ids in ascending order, so the **lowest** id in a shape class is the one that names its
 ///    `%align.tagged.{id}` struct — a golden IR assertion then depends on the table, not on which
 ///    entry a depth-first walk happened to reach first;
-/// 3. assign each class representative its body over the now-final child structs, and index that
-///    body so `option_struct_type`/`result_struct_type` can resolve a query built the same way.
+/// 3. assign each class representative its physical body over the now-final child structs, and
+///    index its semantic shape so `option_struct_type`/`result_struct_type` can resolve a query
+///    built the same way.
 ///
 /// The walk is iterative because an Align program may nest thousands of tagged types deep
 /// (`deep_type_consumer_closure_matrix`), and it fails closed: a missing or self-referential entry
 /// is a `CodegenError`, never a guessed representation. `validate_tagged_program` has already
 /// rejected both by the time this runs, so this is the second line of defense.
-fn build_tagged_types<'c>(
+fn predeclare_tagged_types<'c>(
     ctx: &'c Context,
     defs: &[hir::TaggedType],
     sx: &[StructType<'c>],
     ex: &[StructType<'c>],
-) -> Result<(Vec<StructType<'c>>, HashMap<usize, StructType<'c>>), CodegenError> {
+    target_data: &inkwell::targets::TargetData,
+) -> Result<PredeclaredTaggedTypes<'c>, CodegenError> {
     let malformed = || {
         CodegenError::Lowering(
             "nested tagged type table is missing an entry or is recursive".to_string(),
         )
     };
     // A tagged payload is resolved from the tables built here, so this bundle is never indexed.
-    let no_tagged_bodies = HashMap::new();
-    let no_tagged = TaggedTypes { shells: &[], by_body: &no_tagged_bodies };
+    let no_tagged_shapes = HashMap::new();
+    let no_tagged = TaggedTypes { shells: &[], by_shape: &no_tagged_shapes, target_data };
 
-    // (1) The literal body of every entry, children first. Two entries are the same LLVM type
-    // exactly when these agree, because LLVM uniques literal structs structurally.
-    let mut literals: Vec<Option<StructType<'c>>> = vec![None; defs.len()];
+    // (1) The logical identity of every entry, children first. Leaf LLVM identities preserve the
+    // existing Str/String and origin-specific nominal equivalences; Unit has its own storage class.
+    let mut identities: Vec<Option<TaggedLogicalKey>> = vec![None; defs.len()];
+    let mut classes: Vec<Option<u32>> = vec![None; defs.len()];
+    let mut class_ids: HashMap<TaggedLogicalKey, u32> = HashMap::new();
     for root in 0..defs.len() {
-        if literals[root].is_some() {
+        if identities[root].is_some() {
             continue;
         }
         let mut active = HashSet::new();
         let mut work = vec![(root, false)];
         while let Some((id, children_done)) = work.pop() {
-            if literals.get(id).ok_or_else(malformed)?.is_some() {
+            if identities.get(id).ok_or_else(malformed)?.is_some() {
                 active.remove(&id);
                 continue;
             }
@@ -6377,7 +6890,7 @@ fn build_tagged_types<'c>(
                 }
                 if pending
                     .iter()
-                    .any(|child| literals.get(*child as usize).is_none_or(Option::is_none))
+                    .any(|child| identities.get(*child as usize).is_none_or(Option::is_none))
                 {
                     active.insert(id);
                     work.push((id, true));
@@ -6388,33 +6901,49 @@ fn build_tagged_types<'c>(
                 }
             }
             active.remove(&id);
-            let mut fields: Vec<BasicTypeEnum<'c>> = Vec::with_capacity(payloads.len() + 1);
-            fields.push(ctx.i8_type().into());
+            let mut payload_keys = Vec::with_capacity(payloads.len());
             for payload in payloads {
-                fields.push(match tagged_child(payload) {
-                    Some(child) => literals
+                payload_keys.push(if payload == Scalar::Unit {
+                    TaggedLogicalPayloadKey::Unit
+                } else if let Some(child) = tagged_child(payload) {
+                    TaggedLogicalPayloadKey::Tagged(
+                        classes
                         .get(child as usize)
                         .copied()
                         .flatten()
-                        .ok_or_else(malformed)?
-                        .into(),
-                    None => scalar_type(ctx, scalar_to_ty(payload), sx, ex, no_tagged),
+                        .ok_or_else(malformed)?,
+                    )
+                } else {
+                    TaggedLogicalPayloadKey::Leaf(
+                        scalar_type(ctx, scalar_to_ty(payload), sx, ex, no_tagged).as_type_ref()
+                            as usize,
+                    )
                 });
             }
-            literals[id] = Some(ctx.struct_type(&fields, false));
+            let identity = match tagged {
+                hir::TaggedType::Option(_) => TaggedLogicalKey::Option(payload_keys[0]),
+                hir::TaggedType::Result(..) => {
+                    TaggedLogicalKey::Result(payload_keys[0], payload_keys[1])
+                }
+            };
+            let next_class = u32::try_from(class_ids.len())
+                .map_err(|_| CodegenError::Lowering("too many tagged identity classes".into()))?;
+            let class = *class_ids.entry(identity).or_insert(next_class);
+            identities[id] = Some(identity);
+            classes[id] = Some(class);
         }
     }
-    let literals = literals
+    let identities = identities
         .into_iter()
-        .map(|literal| literal.ok_or_else(malformed))
+        .map(|identity| identity.ok_or_else(malformed))
         .collect::<Result<Vec<_>, _>>()?;
 
-    // (2) One identified struct per body class, named for the lowest id in that class.
-    let mut representative: HashMap<usize, u32> = HashMap::new();
+    // (2) One identified struct per logical-shape class, named for the lowest id in that class.
+    let mut representative: HashMap<TaggedLogicalKey, u32> = HashMap::new();
     let mut shells: Vec<StructType<'c>> = Vec::with_capacity(defs.len());
-    for (id, literal) in literals.iter().enumerate() {
+    for (id, identity) in identities.iter().enumerate() {
         let owner = *representative
-            .entry(literal.as_type_ref() as usize)
+            .entry(*identity)
             .or_insert(id as u32);
         shells.push(if owner as usize == id {
             ctx.opaque_struct_type(&format!("align.tagged.{id}"))
@@ -6423,29 +6952,101 @@ fn build_tagged_types<'c>(
         });
     }
 
-    // (3) Assign each representative its body over the final child structs, and index that body.
-    let mut by_body: HashMap<usize, StructType<'c>> = HashMap::new();
-    for (id, literal) in literals.iter().enumerate() {
+    Ok(PredeclaredTaggedTypes { shells, identities, representative })
+}
+
+#[cfg(test)]
+fn build_tagged_types<'c>(
+    ctx: &'c Context,
+    defs: &[hir::TaggedType],
+    sx: &[StructType<'c>],
+    ex: &[StructType<'c>],
+    target_data: &inkwell::targets::TargetData,
+) -> Result<(Vec<StructType<'c>>, HashMap<TaggedShapeKey, StructType<'c>>), CodegenError> {
+    let malformed = || CodegenError::Lowering("nested tagged type table is missing an entry or is recursive".to_string());
+    let PredeclaredTaggedTypes { shells, identities, representative } =
+        predeclare_tagged_types(ctx, defs, sx, ex, target_data)?;
+    let no_tagged_shapes = HashMap::new();
+    let no_tagged = TaggedTypes { shells: &shells, by_shape: &no_tagged_shapes, target_data };
+    // Assign each representative its physical union body over the final child structs, and index
+    // its semantic shape independently of that body's layout.
+    let mut by_shape: HashMap<TaggedShapeKey, StructType<'c>> = HashMap::new();
+    for (id, identity) in identities.iter().enumerate() {
         if *representative
-            .get(&(literal.as_type_ref() as usize))
+            .get(identity)
             .ok_or_else(malformed)? as usize
             != id
         {
             continue;
         }
         let payloads = tagged_payloads(*defs.get(id).ok_or_else(malformed)?);
-        let mut fields: Vec<BasicTypeEnum<'c>> = Vec::with_capacity(payloads.len() + 1);
-        fields.push(ctx.i8_type().into());
+        let mut resolved = Vec::with_capacity(payloads.len());
         for payload in payloads {
-            fields.push(match tagged_child(payload) {
+            resolved.push((payload, match tagged_child(payload) {
                 Some(child) => shells.get(child as usize).copied().ok_or_else(malformed)?.into(),
                 None => scalar_type(ctx, scalar_to_ty(payload), sx, ex, no_tagged),
-            });
+            }));
         }
+        let shape = match defs[id] {
+            hir::TaggedType::Option(payload) => {
+                TaggedShapeKey::Option(tagged_payload_key(payload, resolved[0].1))
+            }
+            hir::TaggedType::Result(..) => TaggedShapeKey::Result(
+                tagged_payload_key(resolved[0].0, resolved[0].1),
+                tagged_payload_key(resolved[1].0, resolved[1].1),
+            ),
+        };
+        let variants = match defs[id] {
+            hir::TaggedType::Option(_) => vec![Vec::new(), resolved],
+            hir::TaggedType::Result(..) => vec![vec![resolved[0]], vec![resolved[1]]],
+        };
+        let body = union_shape(ctx, ctx.i8_type().into(), &variants, target_data)?.body;
+        let fields = body.get_field_types();
         shells[id].set_body(&fields, false);
-        by_body.insert(ctx.struct_type(&fields, false).as_type_ref() as usize, shells[id]);
+        if let Some(existing) = by_shape.insert(shape, shells[id])
+            && existing != shells[id]
+        {
+            return Err(CodegenError::Lowering(
+                "duplicate tagged semantic shape resolved to multiple shells".into(),
+            ));
+        }
     }
-    Ok((shells, by_body))
+    Ok((shells, by_shape))
+}
+
+fn llvm_layout_ready(
+    ty: Ty,
+    struct_types: &[StructType<'_>],
+    enum_types: &[StructType<'_>],
+    tagged_types: &[StructType<'_>],
+) -> bool {
+    let mut work = vec![ty];
+    while let Some(ty) = work.pop() {
+        match ty {
+            Ty::Struct(id) => {
+                if struct_types.get(id as usize).is_none_or(|ty| ty.is_opaque()) {
+                    return false;
+                }
+            }
+            Ty::Enum(id) => {
+                if enum_types.get(id as usize).is_none_or(|ty| ty.is_opaque()) {
+                    return false;
+                }
+            }
+            Ty::Tagged(id) => {
+                if tagged_types.get(id as usize).is_none_or(|ty| ty.is_opaque()) {
+                    return false;
+                }
+            }
+            Ty::Option(payload) => work.push(scalar_to_ty(payload)),
+            Ty::Result(ok, err) => {
+                work.push(scalar_to_ty(err));
+                work.push(scalar_to_ty(ok));
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 /// `slice<T>` lowers to `{ T* ptr, i64 len }`.
@@ -7865,6 +8466,17 @@ enum CloneInWork<'c> {
     Visit(BasicValueEnum<'c>, Ty),
     RebuildStruct { base: StructValue<'c>, fields: Vec<u32> },
     RebuildArray { base: ArrayValue<'c>, elements: u32 },
+    Position(BasicBlock<'c>),
+    Branch(BasicBlock<'c>),
+    CloneUnionField {
+        aggregate: StructType<'c>,
+        input: PointerValue<'c>,
+        output: PointerValue<'c>,
+        physical: PhysicalPayload<'c>,
+        ty: Ty,
+    },
+    Store(PointerValue<'c>),
+    FinishUnion { aggregate: StructType<'c>, output: PointerValue<'c> },
 }
 
 #[derive(Clone, Copy)]
@@ -8727,6 +9339,278 @@ impl<'c, 'a> FnGen<'c, 'a> {
 
     fn runtime(&self, key: RuntimeKey) -> FunctionValue<'c> {
         self.runtime_funcs[&key]
+    }
+
+    fn enum_union_shape(&self, enum_id: u32) -> Result<UnionShape<'c>, CodegenError> {
+        let definition = self
+            .enums
+            .get(enum_id as usize)
+            .ok_or_else(|| self.err(format!("enum definition id {enum_id} is missing")))?;
+        let variants = definition
+            .variants
+            .iter()
+            .map(|variant| {
+                variant
+                    .payload
+                    .iter()
+                    .copied()
+                    .map(|scalar| {
+                        (scalar, scalar_type(self.ctx, scalar_to_ty(scalar), self.struct_types, self.enum_types, self.tagged_types))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        union_shape(self.ctx, self.ctx.i32_type().into(), &variants, self.target_data)
+    }
+
+    fn option_union_shape(&self, payload: Scalar) -> Result<UnionShape<'c>, CodegenError> {
+        let llvm = scalar_type(self.ctx, scalar_to_ty(payload), self.struct_types, self.enum_types, self.tagged_types);
+        union_shape(self.ctx, self.ctx.i8_type().into(), &[Vec::new(), vec![(payload, llvm)]], self.target_data)
+    }
+
+    fn result_union_shape(&self, ok: Scalar, err: Scalar) -> Result<UnionShape<'c>, CodegenError> {
+        let ok_llvm = scalar_type(self.ctx, scalar_to_ty(ok), self.struct_types, self.enum_types, self.tagged_types);
+        let err_llvm = scalar_type(self.ctx, scalar_to_ty(err), self.struct_types, self.enum_types, self.tagged_types);
+        union_shape(self.ctx, self.ctx.i8_type().into(), &[vec![(ok, ok_llvm)], vec![(err, err_llvm)]], self.target_data)
+    }
+
+    fn union_payload_ptr(
+        &self,
+        aggregate: StructType<'c>,
+        base: PointerValue<'c>,
+        payload: PhysicalPayload<'c>,
+        name: &str,
+    ) -> Result<Option<PointerValue<'c>>, CodegenError> {
+        let PhysicalPayload::Stored { llvm_type, offset, size, align } = payload else {
+            return Ok(None);
+        };
+        if size != self.target_data.get_abi_size(&llvm_type)
+            || align != u64::from(self.target_data.get_abi_alignment(&llvm_type))
+        {
+            return Err(self.err("tagged payload map disagrees with the target layout"));
+        }
+        if aggregate.count_fields() < 2 {
+            return Err(self.err("stored tagged payload has no union storage field"));
+        }
+        let storage = self
+            .builder
+            .build_struct_gep(aggregate, base, 1, "union.storage")
+            .map_err(|error| self.err(error))?;
+        let storage_type = aggregate.get_field_types()[1].into_struct_type();
+        let bytes = self
+            .builder
+            .build_struct_gep(storage_type, storage, 1, "union.bytes")
+            .map_err(|error| self.err(error))?;
+        let offset = self.ctx.i64_type().const_int(offset, false);
+        // This is a raw byte displacement inside union storage. It is deliberately not `inbounds`:
+        // provenance comes from the containing tagged object, while the active payload type is a
+        // target-computed view over those bytes.
+        let pointer = unsafe {
+            self.builder
+                .build_gep(self.ctx.i8_type(), bytes, &[offset], name)
+                .map_err(|error| self.err(error))?
+        };
+        Ok(Some(pointer))
+    }
+
+    fn union_payload_value(
+        &self,
+        aggregate: StructValue<'c>,
+        aggregate_type: StructType<'c>,
+        payload: PhysicalPayload<'c>,
+        name: &str,
+    ) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
+        match payload {
+            PhysicalPayload::OmittedUnit => Ok(Some(self.ctx.i32_type().const_zero().into())),
+            PhysicalPayload::OmittedZero { llvm_type } => Ok(Some(llvm_type.const_zero())),
+            PhysicalPayload::Stored { llvm_type, .. } => {
+                let scratch = self.alloca_at_entry(aggregate_type.into(), "union.read")?;
+                self.builder.build_store(scratch, aggregate).map_err(|e| self.err(e))?;
+                let pointer = self
+                    .union_payload_ptr(aggregate_type, scratch, payload, "union.payload")?
+                    .ok_or_else(|| self.err("stored tagged payload has no pointer"))?;
+                Ok(Some(self.builder.build_load(llvm_type, pointer, name).map_err(|e| self.err(e))?))
+            }
+        }
+    }
+
+    fn build_union_value(
+        &self,
+        aggregate_type: StructType<'c>,
+        tag: IntValue<'c>,
+        mapping: &[PhysicalPayload<'c>],
+        operands: &[Operand],
+    ) -> Result<StructValue<'c>, CodegenError> {
+        if mapping.len() != operands.len() {
+            return Err(self.err("tagged payload map arity mismatch"));
+        }
+        let base = self
+            .builder
+            .build_insert_value(aggregate_type.get_poison(), tag, 0, "union.tag")
+            .map_err(|e| self.err(e))?
+            .into_struct_value();
+        let base = finish_union_value(self.builder, base, "union.base.frozen")?;
+        if !mapping.iter().any(|entry| matches!(entry, PhysicalPayload::Stored { .. })) {
+            for operand in operands {
+                let _ = self.operand(operand)?;
+            }
+            return Ok(base);
+        }
+        let scratch = self.alloca_at_entry(aggregate_type.into(), "union.write")?;
+        self.builder.build_store(scratch, base).map_err(|e| self.err(e))?;
+        for (&entry, operand) in mapping.iter().zip(operands) {
+            let value = self.operand(operand)?;
+            if let Some(pointer) = self.union_payload_ptr(aggregate_type, scratch, entry, "union.payload")? {
+                self.builder.build_store(pointer, value).map_err(|e| self.err(e))?;
+            }
+        }
+        finish_union_value(
+            self.builder,
+            self
+            .builder
+            .build_load(aggregate_type, scratch, "union.value")
+            .map_err(|e| self.err(e))?
+            .into_struct_value(),
+            "union.frozen",
+        )
+    }
+
+    fn build_union_from_values(
+        &self,
+        aggregate_type: StructType<'c>,
+        tag: IntValue<'c>,
+        mapping: &[PhysicalPayload<'c>],
+        values: &[BasicValueEnum<'c>],
+    ) -> Result<StructValue<'c>, CodegenError> {
+        if mapping.len() != values.len() {
+            return Err(self.err("tagged payload map/value arity mismatch"));
+        }
+        let base = self
+            .builder
+            .build_insert_value(aggregate_type.get_poison(), tag, 0, "union.tag")
+            .map_err(|e| self.err(e))?
+            .into_struct_value();
+        let base = finish_union_value(self.builder, base, "union.base.frozen")?;
+        if !mapping.iter().any(|entry| matches!(entry, PhysicalPayload::Stored { .. })) {
+            return Ok(base);
+        }
+        let scratch = self.alloca_at_entry(aggregate_type.into(), "union.write")?;
+        self.builder.build_store(scratch, base).map_err(|e| self.err(e))?;
+        for (&entry, &value) in mapping.iter().zip(values) {
+            if let Some(pointer) = self.union_payload_ptr(aggregate_type, scratch, entry, "union.payload")? {
+                self.builder.build_store(pointer, value).map_err(|e| self.err(e))?;
+            }
+        }
+        finish_union_value(
+            self.builder,
+            self.builder.build_load(aggregate_type, scratch, "union.value").map_err(|e| self.err(e))?.into_struct_value(),
+            "union.frozen",
+        )
+    }
+
+    fn option_none_value(&self, payload: Scalar) -> Result<StructValue<'c>, CodegenError> {
+        let ty = option_struct_type(self.ctx, payload, self.struct_types, self.enum_types, self.tagged_types);
+        finish_union_value(
+            self.builder,
+            self
+            .builder
+            .build_insert_value(ty.get_poison(), self.ctx.i8_type().const_zero(), 0, "option.none")
+            .map_err(|e| self.err(e))?
+            .into_struct_value(),
+            "option.none.frozen",
+        )
+    }
+
+    fn option_some_value(&self, payload: Scalar, value: BasicValueEnum<'c>) -> Result<StructValue<'c>, CodegenError> {
+        let ty = option_struct_type(self.ctx, payload, self.struct_types, self.enum_types, self.tagged_types);
+        let shape = self.option_union_shape(payload)?;
+        self.build_union_from_values(ty, self.ctx.i8_type().const_int(1, false), shape.variant(1)?, &[value])
+    }
+
+    fn conditional_option_value(
+        &self,
+        is_some: IntValue<'c>,
+        payload: Scalar,
+        value: BasicValueEnum<'c>,
+        name: &str,
+    ) -> Result<StructValue<'c>, CodegenError> {
+        let some_block = self.ctx.append_basic_block(self.func, &format!("{name}.some"));
+        let none_block = self.ctx.append_basic_block(self.func, &format!("{name}.none"));
+        let join = self.ctx.append_basic_block(self.func, &format!("{name}.join"));
+        self.builder
+            .build_conditional_branch(is_some, some_block, none_block)
+            .map_err(|error| self.err(error))?;
+
+        self.builder.position_at_end(some_block);
+        let some = self.option_some_value(payload, value)?;
+        self.builder.build_unconditional_branch(join).map_err(|error| self.err(error))?;
+        let some_end = self.builder.get_insert_block().ok_or_else(|| self.err("Option Some block is absent"))?;
+
+        self.builder.position_at_end(none_block);
+        let none = self.option_none_value(payload)?;
+        self.builder.build_unconditional_branch(join).map_err(|error| self.err(error))?;
+        let none_end = self.builder.get_insert_block().ok_or_else(|| self.err("Option None block is absent"))?;
+
+        self.builder.position_at_end(join);
+        let phi = self
+            .builder
+            .build_phi(some.get_type(), name)
+            .map_err(|error| self.err(error))?;
+        phi.add_incoming(&[(&some, some_end), (&none, none_end)]);
+        Ok(phi.as_basic_value().into_struct_value())
+    }
+
+    fn schedule_clone_in_union(
+        &mut self,
+        work: &mut Vec<CloneInWork<'c>>,
+        value: StructValue<'c>,
+        aggregate_type: StructType<'c>,
+        tag_type: IntType<'c>,
+        variants: &[Vec<PhysicalPayload<'c>>],
+        payload_tys: &[Vec<Ty>],
+    ) -> Result<(), CodegenError> {
+        if variants.len() != payload_tys.len()
+            || variants.iter().zip(payload_tys).any(|(mapping, tys)| mapping.len() != tys.len())
+        {
+            return Err(self.err("clone_in tagged payload map arity mismatch"));
+        }
+        let input = self.alloca_at_entry(aggregate_type.into(), "clonein.union.input")?;
+        let output = self.alloca_at_entry(aggregate_type.into(), "clonein.union.output")?;
+        self.builder.build_store(input, value).map_err(|e| self.err(e))?;
+        self.builder.build_store(output, value).map_err(|e| self.err(e))?;
+        let tag = self
+            .builder
+            .build_extract_value(value, 0, "clonein.union.tag")
+            .map_err(|e| self.err(e))?
+            .into_int_value();
+        let cont = self.ctx.append_basic_block(self.func, "clonein.union.cont");
+        let blocks = (0..variants.len())
+            .map(|_| self.ctx.append_basic_block(self.func, "clonein.union.variant"))
+            .collect::<Vec<_>>();
+        let cases = blocks
+            .iter()
+            .enumerate()
+            .map(|(index, block)| (tag_type.const_int(index as u64, false), *block))
+            .collect::<Vec<_>>();
+        self.builder.build_switch(tag, cont, &cases).map_err(|e| self.err(e))?;
+        work.push(CloneInWork::FinishUnion { aggregate: aggregate_type, output });
+        work.push(CloneInWork::Position(cont));
+        for ((mapping, tys), block) in variants.iter().zip(payload_tys).zip(blocks).rev() {
+            work.push(CloneInWork::Branch(cont));
+            for (&physical, &ty) in mapping.iter().zip(tys).rev() {
+                if matches!(physical, PhysicalPayload::Stored { .. }) {
+                    work.push(CloneInWork::CloneUnionField {
+                        aggregate: aggregate_type,
+                        input,
+                        output,
+                        physical,
+                        ty,
+                    });
+                }
+            }
+            work.push(CloneInWork::Position(block));
+        }
+        Ok(())
     }
 
     /// LLVM's store size omits an aggregate's tail padding, while typed GEP and the runtime's
@@ -9850,21 +10734,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .builder
                     .build_load(llvm_ty, element, "batch.row.value")
                     .map_err(|error| self.err(error))?;
-                let some = self
-                    .builder
-                    .build_insert_value(
-                        option_ty.const_zero(),
-                        self.ctx.i8_type().const_int(1, false),
-                        0,
-                        "batch.row.some.tag",
-                    )
-                    .map_err(|error| self.err(error))?
-                    .into_struct_value();
-                let some = self
-                    .builder
-                    .build_insert_value(some, loaded, 1, "batch.row.some.value")
-                    .map_err(|error| self.err(error))?
-                    .into_struct_value();
+                let some = self.option_some_value(payload_scalar, loaded)?;
                 self.builder
                     .build_unconditional_branch(join)
                     .map_err(|error| self.err(error))?;
@@ -9873,7 +10743,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .get_insert_block()
                     .ok_or_else(|| self.err("column batch row some block is absent"))?;
                 self.builder.position_at_end(none_block);
-                let none = option_ty.const_zero();
+                let none = self.option_none_value(payload_scalar)?;
                 self.builder
                     .build_unconditional_branch(join)
                     .map_err(|error| self.err(error))?;
@@ -10311,10 +11181,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_conditional_branch(present, store, skip)
                     .map_err(|error| self.err(error))?;
                 self.builder.position_at_end(store);
+                let payload_scalar = ty_to_scalar(base)
+                    .ok_or_else(|| self.err("nullable scalar batch payload is not scalar"))?;
+                let shape = self.option_union_shape(payload_scalar)?;
                 let value = self
-                    .builder
-                    .build_extract_value(option, 1, "batch.scalar.value")
-                    .map_err(|error| self.err(error))?;
+                    .union_payload_value(option, option.get_type(), shape.payload(1, 0)?, "batch.scalar.value")?
+                    .ok_or_else(|| self.err("nullable scalar batch payload did not produce a value"))?;
                 self.builder
                     .build_store(element, value)
                     .map_err(|error| self.err(error))?;
@@ -12148,30 +13020,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .build_extract_value(agg, 1, "of")
                             .map_err(|e| self.err(e))?
                             .into_int_value();
-                        let oty = option_struct_type(
-                            self.ctx,
-                            s,
-                            self.struct_types,
-                            self.enum_types,
-                            self.tagged_types,
-                        );
-                        let some_tag = self.ctx.i8_type().const_int(1, false);
-                        let none_tag = self.ctx.i8_type().const_int(0, false);
-                        let tag = self
+                        let is_some = self
                             .builder
-                            .build_select(ovf, none_tag, some_tag, "tag")
-                            .map_err(|e| self.err(e))?
-                            .into_int_value();
-                        let a0 = self
-                            .builder
-                            .build_insert_value(oty.const_zero(), tag, 0, "tag")
-                            .map_err(|e| self.err(e))?
-                            .into_struct_value();
-                        self.builder
-                            .build_insert_value(a0, res, 1, "val")
-                            .map_err(|e| self.err(e))?
-                            .into_struct_value()
-                            .into()
+                            .build_not(ovf, "checked.some")
+                            .map_err(|e| self.err(e))?;
+                        self.conditional_option_value(is_some, s, res, "checked.result")?.into()
                     }
                 }
             }
@@ -12345,36 +13198,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     self.enum_types,
                     self.tagged_types,
                 );
-                let payload = self.operand(op)?;
                 let tag = self.ctx.i8_type().const_int(1, false);
-                // Start zeroed (not poison): an owned (Move) payload's drop frees the payload field
-                // null-safely, so the inactive arm must read as {null,0}, not garbage (slice 8a).
-                let agg = self
-                    .builder
-                    .build_insert_value(oty.const_zero(), tag, 0, "tag")
-                    .map_err(|e| self.err(e))?
-                    .into_struct_value();
-                self.builder
-                    .build_insert_value(agg, payload, 1, "some")
-                    .map_err(|e| self.err(e))?
-                    .into_struct_value()
-                    .into()
+                let shape = self.option_union_shape(s)?;
+                self.build_union_value(oty, tag, shape.variant(1)?, std::slice::from_ref(op))?.into()
             }
             Rvalue::OptionNone => {
                 let Ty::Option(s) = align_sema::expand_tagged_ty(result_ty, self.tagged_defs)
                 else {
                     return Err(self.err("None result is not an Option"));
                 };
-                // All-zero aggregate → tag 0 (None).
-                option_struct_type(
-                    self.ctx,
-                    s,
-                    self.struct_types,
-                    self.enum_types,
-                    self.tagged_types,
-                )
-                .const_zero()
-                .into()
+                self.option_none_value(s)?.into()
             }
             Rvalue::OptionIsSome(op) => {
                 let tag = if let Operand::BorrowedPlace(place) = op {
@@ -12405,9 +13238,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     self.operand_by_value(&Operand::BorrowedPlace(Box::new(payload)))?
                 } else {
                     let agg = self.operand(op)?.into_struct_value();
-                    self.builder
-                        .build_extract_value(agg, 1, "some")
-                        .map_err(|e| self.err(e))?
+                    let Ty::Option(s) = align_sema::expand_tagged_ty(self.f.operand_ty(op), self.tagged_defs) else {
+                        return Err(self.err("Option unwrap has the wrong input type"));
+                    };
+                    let shape = self.option_union_shape(s)?;
+                    self.union_payload_value(agg, agg.get_type(), shape.payload(1, 0)?, "some")?
+                        .ok_or_else(|| self.err("Option payload did not produce a value"))?
                 }
             }
             Rvalue::ResultOk(op) => {
@@ -12422,19 +13258,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     self.enum_types,
                     self.tagged_types,
                 );
-                let tag = self.ctx.i8_type().const_int(0, false);
-                // Zeroed base (see OptionSome): the inactive `err` arm reads {null,0}, so an owned
-                // (Move) payload there drops null-safely (slice 8a).
-                let agg = self
-                    .builder
-                    .build_insert_value(rty.const_zero(), tag, 0, "tag")
-                    .map_err(|e| self.err(e))?
-                    .into_struct_value();
-                self.builder
-                    .build_insert_value(agg, self.operand(op)?, 1, "ok")
-                    .map_err(|e| self.err(e))?
-                    .into_struct_value()
-                    .into()
+                let shape = self.result_union_shape(o, e)?;
+                self.build_union_value(rty, self.ctx.i8_type().const_zero(), shape.variant(0)?, std::slice::from_ref(op))?.into()
             }
             Rvalue::ResultErr(op) => {
                 let Ty::Result(o, e) = result_ty else {
@@ -12448,19 +13273,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     self.enum_types,
                     self.tagged_types,
                 );
-                let tag = self.ctx.i8_type().const_int(1, false);
-                // Zeroed base (see OptionSome): the inactive `ok` arm reads {null,0}, so an owned
-                // (Move) payload there drops null-safely (slice 8a).
-                let agg = self
-                    .builder
-                    .build_insert_value(rty.const_zero(), tag, 0, "tag")
-                    .map_err(|e| self.err(e))?
-                    .into_struct_value();
-                self.builder
-                    .build_insert_value(agg, self.operand(op)?, 2, "err")
-                    .map_err(|e| self.err(e))?
-                    .into_struct_value()
-                    .into()
+                let shape = self.result_union_shape(o, e)?;
+                self.build_union_value(rty, self.ctx.i8_type().const_int(1, false), shape.variant(1)?, std::slice::from_ref(op))?.into()
             }
             Rvalue::ResultIsOk(op) => {
                 let tag = if let Operand::BorrowedPlace(place) = op {
@@ -12491,9 +13305,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     self.operand_by_value(&Operand::BorrowedPlace(Box::new(payload)))?
                 } else {
                     let agg = self.operand(op)?.into_struct_value();
-                    self.builder
-                        .build_extract_value(agg, 1, "ok")
-                        .map_err(|e| self.err(e))?
+                    let Ty::Result(ok, err) = align_sema::expand_tagged_ty(self.f.operand_ty(op), self.tagged_defs) else {
+                        return Err(self.err("Result unwrap has the wrong input type"));
+                    };
+                    let shape = self.result_union_shape(ok, err)?;
+                    self.union_payload_value(agg, agg.get_type(), shape.payload(0, 0)?, "ok")?
+                        .ok_or_else(|| self.err("Result Ok payload did not produce a value"))?
                 }
             }
             Rvalue::ResultUnwrapErr(op) => {
@@ -12507,29 +13324,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     self.operand_by_value(&Operand::BorrowedPlace(Box::new(payload)))?
                 } else {
                     let agg = self.operand(op)?.into_struct_value();
-                    self.builder
-                        .build_extract_value(agg, 2, "err")
-                        .map_err(|e| self.err(e))?
+                    let Ty::Result(ok, err) = align_sema::expand_tagged_ty(self.f.operand_ty(op), self.tagged_defs) else {
+                        return Err(self.err("Result unwrap has the wrong input type"));
+                    };
+                    let shape = self.result_union_shape(ok, err)?;
+                    self.union_payload_value(agg, agg.get_type(), shape.payload(1, 0)?, "err")?
+                        .ok_or_else(|| self.err("Result Err payload did not produce a value"))?
                 }
             }
             Rvalue::MakeEnum { enum_id, variant, payload } => {
-                // `{ i32 tag, … }`: store the variant tag, then this variant's payload fields.
                 let sty = self.enum_types[*enum_id as usize];
                 let tag = self.ctx.i32_type().const_int(*variant as u64, false);
-                let mut agg = self
-                    .builder
-                    .build_insert_value(sty.const_zero(), tag, 0, "tag")
-                    .map_err(|e| self.err(e))?
-                    .into_struct_value();
-                let base = self.enums[*enum_id as usize].variants[*variant as usize].field_base;
-                for (j, op) in payload.iter().enumerate() {
-                    agg = self
-                        .builder
-                        .build_insert_value(agg, self.operand(op)?, base + j as u32, "pl")
-                        .map_err(|e| self.err(e))?
-                        .into_struct_value();
-                }
-                agg.into()
+                let shape = self.enum_union_shape(*enum_id)?;
+                let mapping = shape.variants.get(*variant as usize).ok_or_else(|| self.err("enum variant is out of bounds"))?;
+                self.build_union_value(sty, tag, mapping, payload)?.into()
             }
             Rvalue::EnumTagEq {
                 enum_id,
@@ -12573,10 +13381,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     return Ok(Some(self.operand_by_value(&Operand::BorrowedPlace(Box::new(payload)))?));
                 }
                 let agg = self.operand(operand)?.into_struct_value();
-                let base = self.enums[*enum_id as usize].variants[*variant as usize].field_base;
-                self.builder
-                    .build_extract_value(agg, base + *slot, "pl")
-                    .map_err(|e| self.err(e))?
+                let shape = self.enum_union_shape(*enum_id)?;
+                let payload = shape
+                    .variants
+                    .get(*variant as usize)
+                    .and_then(|mapping| mapping.get(*slot as usize))
+                    .copied()
+                    .ok_or_else(|| self.err("enum payload is out of bounds"))?;
+                self.union_payload_value(agg, agg.get_type(), payload, "pl")?
+                    .ok_or_else(|| self.err("enum payload did not produce a value"))?
             }
             Rvalue::ArenaBegin => {
                 let cs = self
@@ -12725,6 +13538,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         self.tagged_types,
                     );
                     let rslot = self.alloca_at_entry(rty.into(), "waitr")?;
+                    let shape = self.result_union_shape(o, e)?;
                     let is_err = self
                         .builder
                         .build_is_not_null(errp, "iserr")
@@ -12736,17 +13550,23 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // Err: tag 1, err = *errp.
                     self.builder.position_at_end(err_bb);
                     let errv = self.builder.build_load(ety, errp, "errv").map_err(|e| self.err(e))?;
-                    let e0 = self
-                        .builder
-                        .build_insert_value(rty.const_zero(), self.ctx.i8_type().const_int(1, false), 0, "etag")
-                        .map_err(|e| self.err(e))?
-                        .into_struct_value();
-                    let ev = self.builder.build_insert_value(e0, errv, 2, "eerr").map_err(|e| self.err(e))?.into_struct_value();
+                    let ev = self.build_union_from_values(
+                        rty,
+                        self.ctx.i8_type().const_int(1, false),
+                        shape.variant(1)?,
+                        &[errv],
+                    )?;
                     self.builder.build_store(rslot, ev).map_err(|e| self.err(e))?;
                     self.builder.build_unconditional_branch(join_bb).map_err(|e| self.err(e))?;
-                    // Ok: a zeroed Result (tag 0).
+                    // Ok: tag 0 with the omitted Unit payload.
                     self.builder.position_at_end(ok_bb);
-                    self.builder.build_store(rslot, rty.const_zero()).map_err(|e| self.err(e))?;
+                    let okv = self.build_union_from_values(
+                        rty,
+                        self.ctx.i8_type().const_zero(),
+                        shape.variant(0)?,
+                        &[self.ctx.i32_type().const_zero().into()],
+                    )?;
+                    self.builder.build_store(rslot, okv).map_err(|e| self.err(e))?;
                     self.builder.build_unconditional_branch(join_bb).map_err(|e| self.err(e))?;
                     self.builder.position_at_end(join_bb);
                     self.builder.build_load(rty, rslot, "waitres").map_err(|e| self.err(e))?
@@ -13124,27 +13944,36 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_insert_value(slice, length, 1, "resource.view.len")
                     .map_err(|e| self.err(e))?
                     .into_struct_value();
-                let option_ty = option_struct_type(
-                    self.ctx,
-                    payload,
-                    self.struct_types,
-                    self.enum_types,
-                    self.tagged_types,
-                );
-                let tag = self
-                    .builder
-                    .build_int_z_extend(valid, self.ctx.i8_type(), "resource.view.tag")
+                let some_block = self.ctx.append_basic_block(self.func, "resource.view.some");
+                let none_block = self.ctx.append_basic_block(self.func, "resource.view.none");
+                let join = self.ctx.append_basic_block(self.func, "resource.view.join");
+                self.builder
+                    .build_conditional_branch(valid, some_block, none_block)
                     .map_err(|e| self.err(e))?;
+
+                self.builder.position_at_end(some_block);
+                let some = self.option_some_value(payload, slice.into())?;
+                self.builder.build_unconditional_branch(join).map_err(|e| self.err(e))?;
+                let some_end = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or_else(|| self.err("resource view some block is absent"))?;
+
+                self.builder.position_at_end(none_block);
+                let none = self.option_none_value(payload)?;
+                self.builder.build_unconditional_branch(join).map_err(|e| self.err(e))?;
+                let none_end = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or_else(|| self.err("resource view none block is absent"))?;
+
+                self.builder.position_at_end(join);
                 let option = self
                     .builder
-                    .build_insert_value(option_ty.const_zero(), tag, 0, "resource.view.tag")
-                    .map_err(|e| self.err(e))?
-                    .into_struct_value();
-                self.builder
-                    .build_insert_value(option, slice, 1, "resource.view")
-                    .map_err(|e| self.err(e))?
-                    .into_struct_value()
-                    .into()
+                    .build_phi(self.llvm_type(result_ty), "resource.view")
+                    .map_err(|e| self.err(e))?;
+                option.add_incoming(&[(&some, some_end), (&none, none_end)]);
+                option.as_basic_value()
             }
             Rvalue::BoxGet(op) => {
                 let ty = scalar_type(
@@ -14336,28 +15165,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .builder
                             .build_int_compare(IntPredicate::SGE, idx, i64t.const_zero(), "found")
                             .map_err(|e| self.err(e))?;
-                        let tag = self.builder.build_int_z_extend(found, self.ctx.i8_type(), "tag").map_err(|e| self.err(e))?;
-                        let payload = self
-                            .builder
-                            .build_select(found, idx, i64t.const_zero(), "fpayload")
-                            .map_err(|e| self.err(e))?;
-                        let oty = option_struct_type(
-                            self.ctx,
-                            s,
-                            self.struct_types,
-                            self.enum_types,
-                            self.tagged_types,
-                        );
-                        let agg = self
-                            .builder
-                            .build_insert_value(oty.const_zero(), tag, 0, "ftag")
-                            .map_err(|e| self.err(e))?
-                            .into_struct_value();
-                        self.builder
-                            .build_insert_value(agg, payload, 1, "fsome")
-                            .map_err(|e| self.err(e))?
-                            .into_struct_value()
-                            .into()
+                        self.conditional_option_value(found, s, idx.into(), "str.find.result")?.into()
                     }
                 }
             }
@@ -16868,19 +17676,40 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 return Ok(None);
             }
             Rvalue::MakeError { enum_id, tag, code } => {
-                // Build the builtin `Error` aggregate `{ i32 tag, i32 code }` from runtime operands.
                 let sty = self.enum_types[*enum_id as usize];
-                let t = self.operand(tag)?;
+                let t = self.operand(tag)?.into_int_value();
                 let c = self.operand(code)?;
-                let agg = self
-                    .builder
-                    .build_insert_value(sty.const_zero(), t, 0, "etag")
-                    .map_err(|e| self.err(e))?;
-                self.builder
-                    .build_insert_value(agg, c, 1, "ecode")
-                    .map_err(|e| self.err(e))?
-                    .into_struct_value()
-                    .into()
+                let shape = self.enum_union_shape(*enum_id)?;
+                let code_variant = shape
+                    .variants
+                    .get(ERROR_VARIANT_CODE as usize)
+                    .ok_or_else(|| self.err("Error::Code payload map is absent"))?;
+                let code_block = self.ctx.append_basic_block(self.func, "error.make.code");
+                let category_block = self.ctx.append_basic_block(self.func, "error.make.category");
+                let join = self.ctx.append_basic_block(self.func, "error.make.join");
+                let is_code = self.builder.build_int_compare(
+                    IntPredicate::EQ,
+                    t,
+                    self.ctx.i32_type().const_int(ERROR_VARIANT_CODE as u64, false),
+                    "error.make.is_code",
+                ).map_err(|e| self.err(e))?;
+                self.builder.build_conditional_branch(is_code, code_block, category_block).map_err(|e| self.err(e))?;
+                self.builder.position_at_end(code_block);
+                let with_code = self.build_union_from_values(sty, t, code_variant, &[c])?;
+                self.builder.build_unconditional_branch(join).map_err(|e| self.err(e))?;
+                let code_end = self.builder.get_insert_block().ok_or_else(|| self.err("Error::Code construction block is absent"))?;
+                self.builder.position_at_end(category_block);
+                let category = finish_union_value(
+                    self.builder,
+                    self.builder.build_insert_value(sty.get_poison(), t, 0, "etag").map_err(|e| self.err(e))?.into_struct_value(),
+                    "error.category.frozen",
+                )?;
+                self.builder.build_unconditional_branch(join).map_err(|e| self.err(e))?;
+                let category_end = self.builder.get_insert_block().ok_or_else(|| self.err("Error category construction block is absent"))?;
+                self.builder.position_at_end(join);
+                let result = self.builder.build_phi(sty, "error.make").map_err(|e| self.err(e))?;
+                result.add_incoming(&[(&with_code, code_end), (&category, category_end)]);
+                result.as_basic_value()
             }
             Rvalue::SliceLen(op) => {
                 if let Operand::BorrowedPlace(place) = op {
@@ -17568,8 +18397,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// Clone every view-bearing leaf of a checked `RegionPlain` value into `handle`. The explicit
     /// worklist is deliberate: nominal graphs and nested tagged values can be deep, and backend
     /// construction must not recurse on the host stack. Aggregate tags and non-view fields are
-    /// preserved byte-for-value; inactive tagged payloads start zeroed and remain semantically
-    /// unavailable.
+    /// preserved byte-for-value; inactive tagged payload bytes remain semantically unavailable.
     fn clone_in_value(
         &mut self,
         value: BasicValueEnum<'c>,
@@ -17630,12 +18458,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         let BasicValueEnum::StructValue(base) = value else {
                             return Err(self.err("clone_in RegionPlain Option has a non-struct LLVM value"));
                         };
-                        let child = self
-                            .builder
-                            .build_extract_value(base, 1, "clonein.option")
-                            .map_err(|e| self.err(e))?;
-                        work.push(CloneInWork::RebuildStruct { base, fields: vec![1] });
-                        work.push(CloneInWork::Visit(child, scalar_to_ty(payload)));
+                        let shape = self.option_union_shape(payload)?;
+                        self.schedule_clone_in_union(
+                            &mut work,
+                            base,
+                            base.get_type(),
+                            self.ctx.i8_type(),
+                            &shape.variants,
+                            &[Vec::new(), vec![scalar_to_ty(payload)]],
+                        )?;
                     }
                     Ty::Array(payload, elements) => {
                         let BasicValueEnum::ArrayValue(base) = value else {
@@ -17685,70 +18516,48 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .enums
                             .get(id as usize)
                             .ok_or_else(|| self.err(format!("clone_in has unknown sum id {id}")))?;
-                        let fields: Vec<(u32, Ty)> = definition
+                        let payload_tys = definition
                             .variants
                             .iter()
-                            .flat_map(|variant| {
-                                variant.payload.iter().enumerate().map(move |(index, payload)| {
-                                    (variant.field_base + index as u32, scalar_to_ty(*payload))
-                                })
+                            .map(|variant| {
+                                variant.payload.iter().map(|payload| scalar_to_ty(*payload)).collect::<Vec<_>>()
                             })
-                            .collect();
-                        let mut children = Vec::with_capacity(fields.len());
-                        for (field, field_ty) in &fields {
-                            children.push((
-                                self.builder
-                                    .build_extract_value(base, *field, "clonein.sum.payload")
-                                    .map_err(|e| self.err(e))?,
-                                *field_ty,
-                            ));
-                        }
-                        work.push(CloneInWork::RebuildStruct {
+                            .collect::<Vec<_>>();
+                        let shape = self.enum_union_shape(id)?;
+                        self.schedule_clone_in_union(
+                            &mut work,
                             base,
-                            fields: fields.iter().map(|(field, _)| *field).collect(),
-                        });
-                        work.extend(
-                            children
-                                .into_iter()
-                                .rev()
-                                .map(|(child, child_ty)| CloneInWork::Visit(child, child_ty)),
-                        );
+                            base.get_type(),
+                            self.ctx.i32_type(),
+                            &shape.variants,
+                            &payload_tys,
+                        )?;
                     }
                     Ty::Tagged(id) => {
                         let BasicValueEnum::StructValue(base) = value else {
                             return Err(self.err("clone_in RegionPlain tagged value has a non-struct LLVM value"));
                         };
-                        let payloads: Vec<(u32, Ty)> = match self.tagged_defs.get(id as usize) {
-                            Some(hir::TaggedType::Option(payload)) => {
-                                vec![(1, scalar_to_ty(*payload))]
-                            }
-                            Some(hir::TaggedType::Result(ok, err)) => vec![
-                                (1, scalar_to_ty(*ok)),
-                                (2, scalar_to_ty(*err)),
-                            ],
+                        let (shape, payloads) = match self.tagged_defs.get(id as usize) {
+                            Some(hir::TaggedType::Option(payload)) => (
+                                self.option_union_shape(*payload)?,
+                                vec![Vec::new(), vec![scalar_to_ty(*payload)]],
+                            ),
+                            Some(hir::TaggedType::Result(ok, err)) => (
+                                self.result_union_shape(*ok, *err)?,
+                                vec![vec![scalar_to_ty(*ok)], vec![scalar_to_ty(*err)]],
+                            ),
                             None => {
                                 return Err(self.err(format!("clone_in has unknown tagged id {id}")));
                             }
                         };
-                        let mut children = Vec::with_capacity(payloads.len());
-                        for (field, field_ty) in &payloads {
-                            children.push((
-                                self.builder
-                                    .build_extract_value(base, *field, "clonein.tagged.payload")
-                                    .map_err(|e| self.err(e))?,
-                                *field_ty,
-                            ));
-                        }
-                        work.push(CloneInWork::RebuildStruct {
+                        self.schedule_clone_in_union(
+                            &mut work,
                             base,
-                            fields: payloads.iter().map(|(field, _)| *field).collect(),
-                        });
-                        work.extend(
-                            children
-                                .into_iter()
-                                .rev()
-                                .map(|(child, child_ty)| CloneInWork::Visit(child, child_ty)),
-                        );
+                            base.get_type(),
+                            self.ctx.i8_type(),
+                            &shape.variants,
+                            &payloads,
+                        )?;
                     }
                     _ => values.push(value),
                 },
@@ -17783,6 +18592,38 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     }
                     values.push(base.into());
                 }
+                CloneInWork::Position(block) => self.builder.position_at_end(block),
+                CloneInWork::Branch(block) => {
+                    self.builder.build_unconditional_branch(block).map_err(|e| self.err(e))?;
+                }
+                CloneInWork::CloneUnionField { aggregate, input, output, physical, ty } => {
+                    let PhysicalPayload::Stored { llvm_type, .. } = physical else {
+                        return Err(self.err("clone_in scheduled an omitted union payload"));
+                    };
+                    let source = self
+                        .union_payload_ptr(aggregate, input, physical, "clonein.union.source")?
+                        .ok_or_else(|| self.err("stored clone_in payload has no source pointer"))?;
+                    let destination = self
+                        .union_payload_ptr(aggregate, output, physical, "clonein.union.destination")?
+                        .ok_or_else(|| self.err("stored clone_in payload has no destination pointer"))?;
+                    let child = self
+                        .builder
+                        .build_load(llvm_type, source, "clonein.union.payload")
+                        .map_err(|e| self.err(e))?;
+                    work.push(CloneInWork::Store(destination));
+                    work.push(CloneInWork::Visit(child, ty));
+                }
+                CloneInWork::Store(destination) => {
+                    let value = values
+                        .pop()
+                        .ok_or_else(|| self.err("clone_in union field produced no value"))?;
+                    self.builder.build_store(destination, value).map_err(|e| self.err(e))?;
+                }
+                CloneInWork::FinishUnion { aggregate, output } => values.push(
+                    self.builder
+                        .build_load(aggregate, output, "clonein.union.value")
+                        .map_err(|e| self.err(e))?,
+                ),
             }
         }
         if values.len() != 1 {
@@ -18251,62 +19092,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// and recursively non-Move structs require no case. Owned strings, arrays, handles, structs,
     /// and nested sums all use the canonical pointer-based dispatcher. Null-safe: an unconstructed / moved-out enum
     /// was zeroed by `DropFlagInit`, so the tag reads 0 and a variant-0 owned payload frees `null`.
-    /// `base` is the pointer to the in-memory enum aggregate (`{ i32 tag, payloads… }`).
+    /// `base` is the pointer to the in-memory enum aggregate (`{ i32 tag, union storage }`).
     fn drop_enum(&self, base: inkwell::values::PointerValue<'c>, enum_id: u32) -> Result<(), CodegenError> {
-        let ety = self.enum_types[enum_id as usize];
-        // (variant tag, LLVM field indices + scalar kinds of its owned payloads) for every variant
-        // that owns storage. Each selected payload is recursively dropped through `drop_ty_at`.
-        // A variant's payload `k` lives at flat field index `field_base + k` (`field_base` includes the
-        // tag slot — see `MakeEnum`). Snapshot into owned `Vec`s so no borrow of `self.enums` is held
-        // across the builder calls below.
-        let owned: Vec<(u64, Vec<(u32, Scalar)>)> = self.enums[enum_id as usize]
-            .variants
-            .iter()
-            .enumerate()
-            .filter_map(|(vi, v)| {
-                let fields: Vec<(u32, Scalar)> = v
-                    .payload
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, s)| {
-                        drop_plan(
-                            scalar_to_ty(**s),
-                            self.structs,
-                            self.enums,
-                            self.tagged_defs,
-                        )
-                        .needs_drop()
-                    })
-                    .map(|(k, s)| (v.field_base + k as u32, *s))
-                    .collect();
-                (!fields.is_empty()).then_some((vi as u64, fields))
-            })
-            .collect();
-        if owned.is_empty() {
-            return Ok(()); // a non-Move enum reached here only defensively — nothing to free.
-        }
-        let tag_ptr = self.builder.build_struct_gep(ety, base, 0, "droptag").map_err(|e| self.err(e))?;
-        let tag = self
-            .builder
-            .build_load(self.ctx.i32_type(), tag_ptr, "droptagv")
-            .map_err(|e| self.err(e))?
-            .into_int_value();
-        let cont = self.ctx.append_basic_block(self.func, "drop.enum.cont");
-        let cases: Vec<_> = owned
-            .iter()
-            .map(|(vi, _)| (self.ctx.i32_type().const_int(*vi, false), self.ctx.append_basic_block(self.func, "drop.enum.v")))
-            .collect();
-        self.builder.build_switch(tag, cont, &cases).map_err(|e| self.err(e))?;
-        for ((_, fields), (_, bb)) in owned.iter().zip(cases.iter()) {
-            self.builder.position_at_end(*bb);
-            for &(fi, scalar) in fields {
-                let fp = self.builder.build_struct_gep(ety, base, fi, "dropev").map_err(|e| self.err(e))?;
-                self.drop_ty_at(fp, scalar_to_ty(scalar))?;
-            }
-            self.builder.build_unconditional_branch(cont).map_err(|e| self.err(e))?;
-        }
-        self.builder.position_at_end(cont);
-        Ok(())
+        self.emit_drop_at_iterative(base, Ty::Enum(enum_id))
     }
 
     /// The type of the innermost field reached by `path` from `slot`'s struct.
@@ -18816,9 +19604,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
         })
     }
 
-    /// The byte offset of an `Option<s>`'s payload within its `{ i8 tag, payload }` LLVM layout
-    /// (`option_struct_type` element 1) — where the decoder writes the `Some` value.
-    fn option_payload_offset(&self, s: Scalar) -> u64 {
+    /// The byte offset of an `Option<s>`'s Stored payload within its tagged-union layout. An omitted
+    /// zero-sized payload uses offset zero because the decoder has no payload byte to write.
+    fn option_payload_offset(&self, s: Scalar) -> Result<u64, CodegenError> {
         let opt_ty = option_struct_type(
             self.ctx,
             s,
@@ -18826,9 +19614,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
             self.enum_types,
             self.tagged_types,
         );
-        self.target_data
-            .offset_of_element(&opt_ty, 1)
-            .expect("Option payload is element 1")
+        match self.option_union_shape(s)?.payload(1, 0)? {
+            PhysicalPayload::Stored { offset, .. } => self
+                .target_data
+                .offset_of_element(&opt_ty, 1)
+                .and_then(|storage| storage.checked_add(offset))
+                .ok_or_else(|| self.err("Option payload byte offset is unavailable or overflows")),
+            PhysicalPayload::OmittedUnit | PhysicalPayload::OmittedZero { .. } => Ok(0),
+        }
     }
 
     /// The LLVM type of a nested-struct field's sub-schema, matching the runtime `JsonSubTable`
@@ -18929,7 +19722,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // logical→physical.
                 let field_off = self.field_byte_offset(struct_id, i as u32);
                 // An `Option<T>` field describes its **payload** (tag/sub), with `offset` pointing at
-                // the payload slot inside the `Option` (`{ i8 tag, payload }`) and `opt_tag` = the
+                // active payload bytes inside the Option union storage and `opt_tag` = the
                 // field's own byte offset (the tag byte). A required field is `opt_tag = -1` with
                 // `offset` = the field itself.
                 let (tag, sub_ptr, offset, opt_tag): (
@@ -18948,7 +19741,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             (
                                 tag,
                                 sub,
-                                field_off + self.option_payload_offset(payload),
+                                field_off
+                                    .checked_add(self.option_payload_offset(payload)?)
+                                    .ok_or_else(|| self.err("owned JSON Option payload offset overflows"))?,
                                 field_off as i64,
                             )
                         }
@@ -18966,7 +19761,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             (
                                 tag,
                                 sub_ptr,
-                                field_off + self.option_payload_offset(s),
+                                field_off
+                                    .checked_add(self.option_payload_offset(s)?)
+                                    .ok_or_else(|| self.err("JSON Option payload offset overflows"))?,
                                 field_off as i64,
                             )
                         }
@@ -19143,9 +19940,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// Emit the constant [`JsonUnion`] descriptor for shape-directed decode/encode of sum type
     /// `enum_id` (JSON completeness J1b): one payload arm ([`JsonField`]) per variant, a `class_to_arm`
     /// table (shape class → arm index, `-1` if absent), and an `enum_tags` table (arm → variant index
-    /// / enum tag). The payload's byte offset within the enum `{ i32 tag, payloads… }` comes from the
-    /// LLVM layout (`offset_of_element(ety, 1 + field_base)`), so it stays the exact dual of the
-    /// enum's codegen layout. Returns a pointer to the union global (a private constant → safe in a
+    /// / enum tag). The payload's byte offset comes from the shared tagged-union physical map and
+    /// the target layout of its storage field, so it stays the exact dual of enum construction and
+    /// projection. Returns a pointer to the union global (a private constant → safe in a
     /// loop). Sema (`check_union_decodable`) guarantees each variant has one payload and the shape
     /// classes are pairwise distinct.
     fn emit_json_union(&mut self, enum_id: u32) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
@@ -19156,6 +19953,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let null = ptr_ty.const_null();
         let ety = self.enum_types[enum_id as usize];
         let variants = self.enums[enum_id as usize].variants.clone();
+        let shape = self.enum_union_shape(enum_id)?;
+        let storage_offset = self
+            .target_data
+            .offset_of_element(&ety, 1)
+            .ok_or_else(|| self.err("json union storage offset is unavailable"))?;
 
         // One arm per variant + the shape-class → arm and arm → enum-tag tables.
         let mut arms: Vec<inkwell::values::StructValue> = Vec::with_capacity(variants.len());
@@ -19171,10 +19973,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
             };
             let pty = scalar_to_ty(payload);
             let (tag, sub_ptr) = self.json_payload_tag_sub(pty, null)?;
-            // The payload sits at enum LLVM element `field_base` (`field_base` is 1-based — it already
-            // accounts for the i32 tag at element 0; `MakeEnum` stores the payload at `field_base + j`,
-            // and a union variant has a single payload, j = 0).
-            let off = self.target_data.offset_of_element(&ety, v.field_base).expect("valid enum payload offset");
+            let PhysicalPayload::Stored { offset, .. } = shape.payload(tag_idx, 0)? else {
+                return Err(self.err("json union payload has no physical storage"));
+            };
+            let off = storage_offset
+                .checked_add(offset)
+                .ok_or_else(|| self.err("json union payload offset overflows"))?;
             let arm_idx = arms.len() as i32;
             arms.push(desc_ty.const_named_struct(&[
                 null.into(),                                    // name_ptr (unused for a union arm)
@@ -20002,11 +20806,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .builder
                     .build_load(self.llvm_type(Ty::XmlReader), out, "xml.parse.reader")
                     .map_err(|error| self.err(error))?;
-                let ok_result = self
-                    .builder
-                    .build_insert_value(result_type.const_zero(), reader, 1, "xml.parse.ok.value")
-                    .map_err(|error| self.err(error))?
-                    .into_struct_value();
+                let result_shape = self.result_union_shape(ok_scalar, error_scalar)?;
+                let ok_result = self.build_union_from_values(
+                    result_type,
+                    self.ctx.i8_type().const_zero(),
+                    result_shape.variant(0)?,
+                    &[reader],
+                )?;
                 self.builder
                     .build_unconditional_branch(join)
                     .map_err(|error| self.err(error))?;
@@ -20030,21 +20836,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     )
                     .map_err(|error| self.err(error))?
                     .into_struct_value();
-                let tagged = self
-                    .builder
-                    .build_insert_value(
-                        result_type.const_zero(),
-                        self.ctx.i8_type().const_int(1, false),
-                        0,
-                        "xml.parse.err.tag",
-                    )
-                    .map_err(|error| self.err(error))?
-                    .into_struct_value();
-                let invalid_result = self
-                    .builder
-                    .build_insert_value(tagged, error, 2, "xml.parse.err.value")
-                    .map_err(|error| self.err(error))?
-                    .into_struct_value();
+                let invalid_result = self.build_union_from_values(
+                    result_type,
+                    self.ctx.i8_type().const_int(1, false),
+                    result_shape.variant(1)?,
+                    &[error.into()],
+                )?;
                 self.builder
                     .build_unconditional_branch(join)
                     .map_err(|error| self.err(error))?;
@@ -20133,7 +20930,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 for (status, &block) in cases.iter().enumerate() {
                     self.builder.position_at_end(block);
                     let option = if status == 0 {
-                        option_type.const_zero()
+                        self.option_none_value(payload)?
                     } else {
                         let event = self
                             .builder
@@ -20145,20 +20942,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             )
                             .map_err(|error| self.err(error))?
                             .into_struct_value();
-                        let tagged = self
-                            .builder
-                            .build_insert_value(
-                                option_type.const_zero(),
-                                self.ctx.i8_type().const_int(1, false),
-                                0,
-                                "xml.next.some.tag",
-                            )
-                            .map_err(|error| self.err(error))?
-                            .into_struct_value();
-                        self.builder
-                            .build_insert_value(tagged, event, 1, "xml.next.some.value")
-                            .map_err(|error| self.err(error))?
-                            .into_struct_value()
+                        self.option_some_value(payload, event.into())?
                     };
                     self.builder
                         .build_unconditional_branch(join)
@@ -20410,21 +21194,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
 
         self.builder.position_at_end(some_block);
         let payload = payload(self)?;
-        let some = self
-            .builder
-            .build_insert_value(
-                option_type.const_zero(),
-                self.ctx.i8_type().const_int(1, false),
-                0,
-                &format!("{name}.tag"),
-            )
-            .map_err(|error| self.err(error))?
-            .into_struct_value();
-        let some = self
-            .builder
-            .build_insert_value(some, payload, 1, name)
-            .map_err(|error| self.err(error))?
-            .into_struct_value();
+        let some = self.option_some_value(payload_scalar, payload)?;
         self.builder
             .build_unconditional_branch(join_block)
             .map_err(|error| self.err(error))?;
@@ -20434,7 +21204,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .ok_or_else(|| self.err("codec option some block is absent"))?;
 
         self.builder.position_at_end(none_block);
-        let none = option_type.const_zero();
+        let none = self.option_none_value(payload_scalar)?;
         self.builder
             .build_unconditional_branch(join_block)
             .map_err(|error| self.err(error))?;
@@ -20935,21 +21705,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 .into_struct_value()
                 .into()
         };
-        let some = self
-            .builder
-            .build_insert_value(
-                option_type.const_zero(),
-                self.ctx.i8_type().const_int(1, false),
-                0,
-                "codec.column.some.tag",
-            )
-            .map_err(|error| self.err(error))?
-            .into_struct_value();
-        let some = self
-            .builder
-            .build_insert_value(some, payload, 1, "codec.column.some")
-            .map_err(|error| self.err(error))?
-            .into_struct_value();
+        let some = self.option_some_value(payload_scalar, payload)?;
         self.builder
             .build_unconditional_branch(join_block)
             .map_err(|error| self.err(error))?;
@@ -20959,7 +21715,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .ok_or_else(|| self.err("codec column some block is absent"))?;
 
         self.builder.position_at_end(none_block);
-        let none = option_type.const_zero();
+        let none = self.option_none_value(payload_scalar)?;
         self.builder
             .build_unconditional_branch(join_block)
             .map_err(|error| self.err(error))?;
@@ -21205,7 +21961,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .build_store(index_slot, self.ctx.i64_type().const_zero())
             .map_err(|error| self.err(error))?;
         self.builder
-            .build_store(result_slot, option_type.const_zero())
+            .build_store(result_slot, self.option_none_value(payload_scalar)?)
             .map_err(|error| self.err(error))?;
 
         let header = self.ctx.append_basic_block(self.func, "codec.find.header");
@@ -21302,21 +22058,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .map_err(|error| self.err(error))?;
 
         self.builder.position_at_end(found);
-        let some = self
-            .builder
-            .build_insert_value(
-                option_type.const_zero(),
-                self.ctx.i8_type().const_int(1, false),
-                0,
-                "codec.find.some.tag",
-            )
-            .map_err(|error| self.err(error))?
-            .into_struct_value();
-        let some = self
-            .builder
-            .build_insert_value(some, index, 1, "codec.find.some.index")
-            .map_err(|error| self.err(error))?
-            .into_struct_value();
+        let some = self.option_some_value(payload_scalar, index.into())?;
         self.builder
             .build_store(result_slot, some)
             .map_err(|error| self.err(error))?;
@@ -21642,7 +22384,6 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     };
                     let agg = self.operand(opt)?.into_struct_value();
                     let tag = self.builder.build_extract_value(agg, 0, "otag").map_err(|e| self.err(e))?.into_int_value();
-                    let payload = self.builder.build_extract_value(agg, 1, "opay").map_err(|e| self.err(e))?;
                     let is_some = self
                         .builder
                         .build_int_compare(IntPredicate::NE, tag, tag.get_type().const_zero(), "issome")
@@ -21656,6 +22397,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let cont_bb = self.ctx.append_basic_block(func, "opt.cont");
                     self.builder.build_conditional_branch(is_some, some_bb, cont_bb).map_err(|e| self.err(e))?;
                     self.builder.position_at_end(some_bb);
+                    let shape = self.option_union_shape(s)?;
+                    let payload = self
+                        .union_payload_value(agg, agg.get_type(), shape.payload(1, 0)?, "opay")?
+                        .ok_or_else(|| self.err("json.encode Option payload produced no value"))?;
                     // `"name":` prefix.
                     let (pptr, plen) = self.str_global(&format!("\"{name}\":"));
                     self.builder
@@ -21743,9 +22488,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // uses), then a trailing comma; when `None`, emit nothing. The payload struct is stored
                 // to an entry alloca so the encoder can read it by field offset.
                 align_mir::TemplatePiece::OptionStructField { opt, name, struct_id } => {
+                    let Ty::Option(payload_scalar) = self.f.operand_ty(opt) else {
+                        return Err(self.err("json.encode OptionStructField piece is not an Option"));
+                    };
+                    if payload_scalar != Scalar::Struct(*struct_id) {
+                        return Err(self.err("json.encode OptionStructField payload does not match its struct"));
+                    }
                     let agg = self.operand(opt)?.into_struct_value();
                     let tag = self.builder.build_extract_value(agg, 0, "ostag").map_err(|e| self.err(e))?.into_int_value();
-                    let payload = self.builder.build_extract_value(agg, 1, "ospay").map_err(|e| self.err(e))?;
                     let is_some = self
                         .builder
                         .build_int_compare(IntPredicate::NE, tag, tag.get_type().const_zero(), "osissome")
@@ -21759,6 +22509,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let cont_bb = self.ctx.append_basic_block(func, "optstruct.cont");
                     self.builder.build_conditional_branch(is_some, some_bb, cont_bb).map_err(|e| self.err(e))?;
                     self.builder.position_at_end(some_bb);
+                    let shape = self.option_union_shape(payload_scalar)?;
+                    let payload = self
+                        .union_payload_value(agg, agg.get_type(), shape.payload(1, 0)?, "ospay")?
+                        .ok_or_else(|| self.err("json.encode Option struct payload produced no value"))?;
                     let (pptr, plen) = self.str_global(&format!("\"{name}\":"));
                     self.builder
                         .build_call(self.runtime(RuntimeKey::BuilderWrite), &[bptr.into(), pptr.into(), plen.into()], "")
@@ -23184,15 +23938,22 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .get(id as usize)
                         .copied()
                         .ok_or_else(|| self.err("borrowed place enum id is out of bounds"))?;
-                    ptr = self
-                        .builder
-                        .build_struct_gep(
-                            enum_ty,
-                            ptr,
-                            variant_def.field_base + *payload_ordinal,
-                            "borrow.enum.payload",
-                        )
-                        .map_err(|e| self.err(e))?;
+                    let shape = self.enum_union_shape(id)?;
+                    let physical = shape.payload(*variant as usize, *payload_ordinal as usize)?;
+                    ptr = if let Some(pointer) = self.union_payload_ptr(enum_ty, ptr, physical, "borrow.enum.payload")? {
+                        pointer
+                    } else {
+                        let llvm = match physical {
+                            PhysicalPayload::OmittedUnit => self.ctx.i32_type().into(),
+                            PhysicalPayload::OmittedZero { llvm_type } => llvm_type,
+                            PhysicalPayload::Stored { .. } => {
+                                return Err(self.err("stored enum payload has no physical pointer"));
+                            }
+                        };
+                        let scratch = self.alloca_at_entry(llvm, "borrow.omitted.payload")?;
+                        self.builder.build_store(scratch, llvm.const_zero()).map_err(|e| self.err(e))?;
+                        scratch
+                    };
                     ty = align_sema::scalar_to_ty(payload);
                 }
                 align_sema::hir::BorrowedPathSegment::OptionSome => {
@@ -23205,7 +23966,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         _ => return Err(self.err("borrowed place Option projection crosses a non-Option type",
                             )),
                     };
-                    ptr = self.builder.build_struct_gep(option_ty, ptr, 1, "borrow.option.some").map_err(|e| self.err(e))?;
+                    let physical = self.option_union_shape(payload)?.payload(1, 0)?;
+                    ptr = if let Some(pointer) = self.union_payload_ptr(option_ty, ptr, physical, "borrow.option.some")? {
+                        pointer
+                    } else {
+                        let llvm = match physical {
+                            PhysicalPayload::OmittedUnit => self.ctx.i32_type().into(),
+                            PhysicalPayload::OmittedZero { llvm_type } => llvm_type,
+                            PhysicalPayload::Stored { .. } => {
+                                return Err(self.err("stored Option payload has no physical pointer"));
+                            }
+                        };
+                        let scratch = self.alloca_at_entry(llvm, "borrow.omitted.payload")?;
+                        self.builder.build_store(scratch, llvm.const_zero()).map_err(|e| self.err(e))?;
+                        scratch
+                    };
                     ty = align_sema::scalar_to_ty(payload);
                 }
                 align_sema::hir::BorrowedPathSegment::ResultOk
@@ -23220,10 +23995,22 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             )),
                     };
                     let is_ok = matches!(segment, align_sema::hir::BorrowedPathSegment::ResultOk);
-                    ptr = self
-                        .builder
-                        .build_struct_gep(result_ty, ptr, if is_ok { 1 } else { 2 }, "borrow.result.payload")
-                        .map_err(|e| self.err(e))?;
+                    let shape = self.result_union_shape(ok, err)?;
+                    let physical = shape.payload(if is_ok { 0 } else { 1 }, 0)?;
+                    ptr = if let Some(pointer) = self.union_payload_ptr(result_ty, ptr, physical, "borrow.result.payload")? {
+                        pointer
+                    } else {
+                        let llvm = match physical {
+                            PhysicalPayload::OmittedUnit => self.ctx.i32_type().into(),
+                            PhysicalPayload::OmittedZero { llvm_type } => llvm_type,
+                            PhysicalPayload::Stored { .. } => {
+                                return Err(self.err("stored Result payload has no physical pointer"));
+                            }
+                        };
+                        let scratch = self.alloca_at_entry(llvm, "borrow.omitted.payload")?;
+                        self.builder.build_store(scratch, llvm.const_zero()).map_err(|e| self.err(e))?;
+                        scratch
+                    };
                     ty = align_sema::scalar_to_ty(if is_ok { ok } else { err });
                 }
             }
@@ -25007,7 +25794,16 @@ fn main() -> i32 = 0
         let Some(return_offset) = definition.find("  ret ") else {
             panic!("return missing from tried definition:\n{definition}");
         };
-        let Some(error_offset) = definition.find("\n  %err =") else {
+        let branch = definition
+            .lines()
+            .find(|line| line.contains("br i1 %isok") && line.contains("!prof"))
+            .unwrap_or_else(|| panic!("weighted Result branch missing from tried definition:\n{definition}"));
+        let error_label = branch
+            .split("label %")
+            .nth(2)
+            .and_then(|tail| tail.split(',').next())
+            .unwrap_or_else(|| panic!("Err label missing from tried branch: {branch}"));
+        let Some(error_offset) = definition.find(&format!("\n{error_label}:")) else {
             panic!("Err continuation missing from tried definition:\n{definition}");
         };
         assert!(return_offset < error_offset, "Err continuation must be laid out after the return:\n{definition}");
@@ -25606,7 +26402,8 @@ fn main() -> i32 = 0
                 "fn inspect(borrow value: Option<{payload}>) -> i64 = match value {{ Some(handle) => {observation}, None => 0 }}\nfn main() {{}}\n"
             );
             let program = mir(&source);
-            assert!(emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_ok());
+            let emitted = emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None);
+            assert!(emitted.is_ok(), "valid borrowed handle projection failed: {emitted:?}");
             for mutation in 0..3 {
                 let mut forged = program.clone();
                 let mut changed = false;
@@ -33137,19 +33934,22 @@ fn main() -> i32 = 0
     #[test]
     fn tagged_tables_with_a_missing_entry_are_codegen_errors() {
         let ctx = Context::create();
+        let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default)
+            .unwrap_or_else(|error| panic!("target machine: {error}"));
+        let td = tm.get_target_data();
         let defs = vec![hir::TaggedType::Option(Scalar::Tagged(7))];
-        let err = build_tagged_types(&ctx, &defs, &[], &[])
+        let err = build_tagged_types(&ctx, &defs, &[], &[], &td)
             .expect_err("a payload naming an absent entry must fail closed");
         assert!(
             err.to_string().contains("missing an entry or is recursive"),
             "unexpected diagnostic for a missing tagged entry: {err}"
         );
         // A well-formed neighbour still lowers, so the guard rejects the table, not the shape.
-        let (shells, by_body) =
-            build_tagged_types(&ctx, &[hir::TaggedType::Option(Scalar::Bool)], &[], &[])
+        let (shells, by_shape) =
+            build_tagged_types(&ctx, &[hir::TaggedType::Option(Scalar::Bool)], &[], &[], &td)
                 .expect("a complete table must lower");
         assert_eq!(shells.len(), 1);
-        assert_eq!(by_body.len(), 1);
+        assert_eq!(by_shape.len(), 1);
     }
 
     /// A self-referential entry has no finite body. It must be refused rather than send the
@@ -33157,6 +33957,9 @@ fn main() -> i32 = 0
     #[test]
     fn self_referential_tagged_entries_are_codegen_errors() {
         let ctx = Context::create();
+        let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default)
+            .unwrap_or_else(|error| panic!("target machine: {error}"));
+        let td = tm.get_target_data();
         for defs in [
             vec![hir::TaggedType::Option(Scalar::Tagged(0))],
             vec![hir::TaggedType::Result(Scalar::Bool, Scalar::Tagged(0))],
@@ -33166,7 +33969,7 @@ fn main() -> i32 = 0
                 hir::TaggedType::Option(Scalar::Tagged(0)),
             ],
         ] {
-            let err = build_tagged_types(&ctx, &defs, &[], &[])
+            let err = build_tagged_types(&ctx, &defs, &[], &[], &td)
                 .expect_err("a recursive tagged entry must fail closed");
             assert!(
                 err.to_string().contains("missing an entry or is recursive"),
@@ -33180,6 +33983,9 @@ fn main() -> i32 = 0
     #[test]
     fn shared_tagged_bodies_are_named_for_their_lowest_id() {
         let ctx = Context::create();
+        let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default)
+            .unwrap_or_else(|error| panic!("target machine: {error}"));
+        let td = tm.get_target_data();
         // Entry 0 is reached only through its child 2, so a traversal-ordered name would be
         // `align.tagged.2`; entry 1 shares that body and is the lowest id in the class.
         let defs = vec![
@@ -33187,8 +33993,8 @@ fn main() -> i32 = 0
             hir::TaggedType::Option(Scalar::Str),
             hir::TaggedType::Option(Scalar::String),
         ];
-        let (shells, by_body) =
-            build_tagged_types(&ctx, &defs, &[], &[]).expect("a complete table must lower");
+        let (shells, by_shape) =
+            build_tagged_types(&ctx, &defs, &[], &[], &td).expect("a complete table must lower");
         assert_eq!(
             shells[1], shells[2],
             "`Option<str>` and `Option<string>` are one LLVM body and must share one struct"
@@ -33201,7 +34007,67 @@ fn main() -> i32 = 0
             Some("align.tagged.1".to_string()),
             "the shared struct must be named for the lowest id in its body class"
         );
-        assert_eq!(by_body.len(), 2, "two distinct bodies must index two structs");
+        assert_eq!(by_shape.len(), 2, "two distinct shapes must index two structs");
+    }
+
+    #[test]
+    fn physically_equal_option_and_result_keep_distinct_semantic_shells() {
+        let ctx = Context::create();
+        let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default)
+            .unwrap_or_else(|error| panic!("target machine: {error}"));
+        let td = tm.get_target_data();
+        let i64_scalar = Scalar::Int(IntTy { bits: 64, signed: true });
+        let defs = vec![
+            hir::TaggedType::Option(i64_scalar),
+            hir::TaggedType::Result(i64_scalar, i64_scalar),
+        ];
+        let (shells, by_shape) =
+            build_tagged_types(&ctx, &defs, &[], &[], &td).expect("tagged types must lower");
+        assert_ne!(shells[0], shells[1], "Option and Result are distinct semantic types");
+        assert_eq!(
+            shells[0].get_field_types(),
+            shells[1].get_field_types(),
+            "the regression requires an actual physical-body collision"
+        );
+        assert_eq!(by_shape.len(), 2, "both semantic shapes need independent lookup entries");
+
+        let tagged = TaggedTypes { shells: &shells, by_shape: &by_shape, target_data: &td };
+        assert_eq!(option_struct_type(&ctx, i64_scalar, &[], &[], tagged), shells[0]);
+        assert_eq!(result_struct_type(&ctx, i64_scalar, i64_scalar, &[], &[], tagged), shells[1]);
+    }
+
+    #[test]
+    fn unit_and_i32_payloads_keep_distinct_storage_identities() {
+        let ctx = Context::create();
+        let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default)
+            .unwrap_or_else(|error| panic!("target machine: {error}"));
+        let td = tm.get_target_data();
+        let i32_scalar = Scalar::Int(IntTy { bits: 32, signed: true });
+        let defs = vec![
+            hir::TaggedType::Option(Scalar::Unit),
+            hir::TaggedType::Option(i32_scalar),
+            hir::TaggedType::Result(Scalar::Unit, i32_scalar),
+            hir::TaggedType::Result(i32_scalar, i32_scalar),
+        ];
+        let (shells, by_shape) =
+            build_tagged_types(&ctx, &defs, &[], &[], &td).expect("tagged types must lower");
+        assert_eq!(by_shape.len(), defs.len(), "each storage identity needs its own lookup entry");
+        for left in 0..shells.len() {
+            for right in left + 1..shells.len() {
+                assert_ne!(
+                    shells[left], shells[right],
+                    "Unit/value and Option/Result distinctions must survive LLVM i32 collisions"
+                );
+            }
+        }
+        assert_eq!(shells[0].count_fields(), 1, "Option<Unit> is tag-only");
+        assert_eq!(shells[1].count_fields(), 2, "Option<i32> owns union storage");
+
+        let tagged = TaggedTypes { shells: &shells, by_shape: &by_shape, target_data: &td };
+        assert_eq!(option_struct_type(&ctx, Scalar::Unit, &[], &[], tagged), shells[0]);
+        assert_eq!(option_struct_type(&ctx, i32_scalar, &[], &[], tagged), shells[1]);
+        assert_eq!(result_struct_type(&ctx, Scalar::Unit, i32_scalar, &[], &[], tagged), shells[2]);
+        assert_eq!(result_struct_type(&ctx, i32_scalar, i32_scalar, &[], &[], tagged), shells[3]);
     }
 
     #[test]
@@ -34646,7 +35512,8 @@ fn main() -> i32 = 0
     fn r63_json_sequence_is_checked_by_every_body_emitter() -> Result<(), CodegenError> {
         let source = "import core.json\nRow { value: f64 }\nfn main() -> Result<(), Error> { row := Row { value: 0.3 }; text := json.encode(row)?; print(text); return Ok(()) }\n";
         let base = mir(source);
-        assert!(emit_llvm_ir(&base, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_ok());
+        let emitted = emit_llvm_ir(&base, &BuildTarget::Baseline, Profile::Release, false, &[], None);
+        assert!(emitted.is_ok(), "valid JSON sequence failed: {emitted:?}");
         let output = std::env::temp_dir().join(format!("align-r63-rejected-{}", std::process::id()));
         for mutation in 0..7 {
             let mut bad = base.clone();
@@ -34956,6 +35823,201 @@ fn main() -> i32 = 0
         assert!(function_body(&soa, "main").contains("@align_rt_alloc_size_fail"), "SoA alignment bump overflow must fail:\n{soa}");
     }
 
+    #[test]
+    fn tagged_union_physical_map_omits_zero_values_and_overlays_variants() {
+        let ctx = Context::create();
+        let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default)
+            .unwrap_or_else(|error| panic!("target machine: {error}"));
+        let data = tm.get_target_data();
+        let empty = ctx.struct_type(&[], false);
+        let i8_scalar = Scalar::Int(IntTy { bits: 8, signed: false });
+        let i64_scalar = Scalar::Int(IntTy { bits: 64, signed: true });
+        let shape = union_shape(
+            &ctx,
+            ctx.i32_type().into(),
+            &[
+                vec![(Scalar::Unit, ctx.i32_type().into()), (Scalar::Struct(0), empty.into())],
+                vec![(i8_scalar, ctx.i8_type().into())],
+                vec![(i8_scalar, ctx.i8_type().into()), (i64_scalar, ctx.i64_type().into())],
+            ],
+            &data,
+        )
+        .unwrap_or_else(|error| panic!("union shape: {error}"));
+        assert!(matches!(shape.variants[0][0], PhysicalPayload::OmittedUnit));
+        assert!(matches!(shape.variants[0][1], PhysicalPayload::OmittedZero { .. }));
+        assert!(matches!(shape.variants[1][0], PhysicalPayload::Stored { offset: 0, size: 1, align: 1, .. }));
+        assert!(matches!(shape.variants[2][0], PhysicalPayload::Stored { offset: 0, size: 1, align: 1, .. }));
+        assert!(matches!(shape.variants[2][1], PhysicalPayload::Stored { offset: 8, size: 8, align: 8, .. }));
+        assert_eq!(shape.body.count_fields(), 2);
+        let storage = shape.body.get_field_types()[1].into_struct_type();
+        assert_eq!(
+            storage.print_to_string().to_string(),
+            "{ [0 x { i8, i64 }], [16 x i8] }",
+            "the leading zero-length anchor must align the following byte array without occupying storage"
+        );
+        assert_eq!((data.get_abi_size(&shape.body), data.get_abi_alignment(&shape.body)), (24, 8));
+
+        let all_zero = union_shape(
+            &ctx,
+            ctx.i8_type().into(),
+            &[vec![(Scalar::Unit, ctx.i32_type().into())], vec![(Scalar::Struct(0), empty.into())]],
+            &data,
+        )
+        .unwrap_or_else(|error| panic!("all-zero union shape: {error}"));
+        assert_eq!(all_zero.body.count_fields(), 1);
+        assert_eq!((data.get_abi_size(&all_zero.body), data.get_abi_alignment(&all_zero.body)), (1, 1));
+    }
+
+    #[test]
+    fn tagged_union_constructor_writes_only_the_active_payload() {
+        let source = "Choice { Small(i64), Large(i64, i64) }\n\
+            fn make(value: i64) -> Choice = Choice.Small(value)\n\
+            fn make_large(first: i64, second: i64) -> Choice = Choice.Large(first, second)\n\
+            fn main() -> i32 = 0\n";
+        let program = mir(source);
+        let exports = ["make".to_string(), "make_large".to_string()];
+        for optimized in [false, true] {
+            let llvm = emit_llvm_ir(
+                &program,
+                &BuildTarget::Baseline,
+                Profile::Release,
+                optimized,
+                &exports,
+                None,
+            )
+            .unwrap_or_else(|error| panic!("tagged constructor must lower: {error}"));
+            for (name, active_payloads, raw_i64_stores) in [("make", 1, 2), ("make_large", 2, 4)] {
+                let body = function_body(&llvm, name);
+                assert_eq!(
+                    body.matches("getelementptr i8, ptr %union.bytes").count(),
+                    if optimized { 0 } else { active_payloads },
+                    "only raw code may retain one address per active payload:\n{body}"
+                );
+                if name == "make" {
+                    assert!(!body.contains("getelementptr i8, ptr %union.bytes, i64 8"), "the inactive second payload must not be addressed:\n{body}");
+                }
+                if optimized {
+                    assert_eq!(
+                        body.lines().filter(|line| line.trim_start().starts_with("store %Choice ")).count(),
+                        1,
+                        "optimized code may write the returned aggregate once:\n{body}"
+                    );
+                } else {
+                    assert_eq!(
+                        body.lines().filter(|line| line.trim_start().starts_with("store i64 ")).count(),
+                        raw_i64_stores,
+                        "raw code must store argument slots and active payloads only:\n{body}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn option_none_uses_the_frozen_union_constructor_before_a_join() {
+        let source = "fn selected(flag: bool) -> string {\n\
+            value: Option<string> := if flag { Some(\"present\".clone()) } else { None }\n\
+            return value else \"fallback\".clone()\n\
+            }\n\
+            fn main() -> i32 = 0\n";
+        let program = mir(source);
+        let llvm = emit_llvm_ir(
+            &program,
+            &BuildTarget::Baseline,
+            Profile::Release,
+            false,
+            &["selected".to_string()],
+            None,
+        )
+        .unwrap_or_else(|error| panic!("joined Option<string> must lower: {error}"));
+        let body = function_body(&llvm, "selected");
+        assert!(body.contains("union.frozen = freeze"), "Some must freeze inactive payload bytes before the join:\n{body}");
+        assert!(body.contains("option.none.frozen = freeze"), "None must use the same frozen construction boundary:\n{body}");
+    }
+
+    #[test]
+    fn variants_with_omitted_active_payloads_freeze_sibling_storage() {
+        let source = "Choice { Empty, Text(string) }\n\
+            Flag { Off, On }\n\
+            fn selected_result(flag: bool) -> Result<(), string> = if flag { Ok(()) } else { Err(\"bad\".clone()) }\n\
+            fn selected_choice(flag: bool) -> Choice = if flag { Choice.Empty } else { Choice.Text(\"text\".clone()) }\n\
+            fn selected_flag(flag: bool) -> Flag = if flag { Flag.Off } else { Flag.On }\n\
+            fn main() -> i32 = 0\n";
+        let program = mir(source);
+        let exports = [
+            "selected_result".to_string(),
+            "selected_choice".to_string(),
+            "selected_flag".to_string(),
+        ];
+        let llvm = emit_llvm_ir(
+            &program,
+            &BuildTarget::Baseline,
+            Profile::Release,
+            false,
+            &exports,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("omitted-payload variants must lower: {error}"));
+        for name in ["selected_result", "selected_choice"] {
+            let body = function_body(&llvm, name);
+            assert_eq!(
+                body.matches(" = freeze ").count(),
+                3,
+                "both arms must define union storage and the stored arm must finalize it in {name}:\n{body}"
+            );
+            let base_freeze = body.find("union.base.frozen = freeze").unwrap_or_else(|| {
+                panic!("{name} must define inactive bytes before scratch initialization:\n{body}")
+            });
+            let aggregate_store = body.find(", ptr %union.write").unwrap_or_else(|| {
+                panic!("{name} must retain the aggregate scratch store in raw IR:\n{body}")
+            });
+            assert!(
+                base_freeze < aggregate_store,
+                "{name} must freeze the base before its first aggregate store:\n{body}"
+            );
+        }
+        let tag_only = function_body(&llvm, "selected_flag");
+        assert_eq!(
+            tag_only.matches(" = freeze ").count(),
+            0,
+            "tag-only unions have no inactive storage to freeze:\n{tag_only}"
+        );
+    }
+
+    #[test]
+    fn clone_in_walks_nested_tagged_payloads_without_host_recursion() {
+        let source = "Choice { Text(str), Empty }\n\
+            Holder { choice: Choice }\n\
+            Nested { option: Option<Option<str>> }\n\
+            fn clone_choice(value: Holder, out: region) -> Holder = value.clone_in(out)\n\
+            fn clone_nested(value: Nested, out: region) -> Nested = value.clone_in(out)\n\
+            fn main() -> i32 = 0\n";
+        let llvm = ir(source);
+        for name in ["clone_choice", "clone_nested"] {
+            let body = function_body(&llvm, name);
+            assert!(body.contains("clonein.union.variant"), "{name} omitted its tagged clone branches:\n{body}");
+            assert!(body.contains("@align_rt_arena_alloc"), "{name} did not clone its active view into the region:\n{body}");
+        }
+    }
+
+    #[test]
+    fn checked_find_and_json_option_paths_use_union_storage() {
+        let source = "import core.json\n\
+            Leaf { value: i64 }\n\
+            Data { number: Option<i64>, leaf: Option<Leaf> }\n\
+            fn checked(left: i64, right: i64) -> Option<i64> = left.checked_add(right)\n\
+            fn found(text: str, needle: str) -> Option<i64> = text.find(needle)\n\
+            fn encoded(value: Data) -> Result<string, Error> = json.encode(value)\n\
+            fn main() -> i32 = 0\n";
+        let llvm = ir(source);
+        let checked = function_body(&llvm, "checked");
+        assert!(checked.contains("checked.result.some") && checked.contains("union.payload"), "checked arithmetic bypassed conditional union construction:\n{checked}");
+        let found = function_body(&llvm, "found");
+        assert!(found.contains("str.find.result.some") && found.contains("union.payload"), "str.find bypassed conditional union construction:\n{found}");
+        let encoded = function_body(&llvm, "encoded");
+        assert!(encoded.contains("%opay = load i64") && encoded.contains("%ospay = load %Leaf"), "JSON Option fields bypassed mapped union projection:\n{encoded}");
+    }
+
     /// Layout parity: the sema `(size, align)` computation (the shared iterative type-layout engine,
     /// which the huge-struct-copy lint trusts) must equal the **real** LLVM ABI
     /// size/alignment of the struct as codegen lays it out (descending-alignment field order via
@@ -34976,7 +36038,7 @@ fn main() -> i32 = 0
         fn f(bits: u8) -> Ty {
             Ty::Float(FloatTy { bits })
         }
-        // `Option<T>` field: `{ i8 tag, T }`. Pins the option-field layout dual (sema layout ↔
+        // `Option<T>` field: explicit tag plus union storage. Pins the option-field layout dual (sema layout ↔
         // option_struct_type) across scalar / str / nested-struct payloads and reorder cases.
         fn opt(ty: Ty) -> Ty {
             Ty::Option(align_sema::ty_to_scalar(ty).expect("option payload is a scalar"))
@@ -35047,8 +36109,8 @@ fn main() -> i32 = 0
             // array-field layout dual (a `array<Struct>` / `array<scalar>` field is a heap handle).
             sdef("ArrStruct", false, &[i(64, true), Ty::DynStructArray(2, Layout::Aos)]), // { i64, {ptr,len} }
             sdef("ArrScalar", false, &[Ty::Bool, Ty::DynArray(align_sema::Scalar::Int(IntTy { bits: 64, signed: true }))]),
-            // Sum-type (`enum`) fields (JSON completeness J1b): an enum lowers to `{ i32 tag, payloads
-            // flattened }`, so its field alignment/size must agree between sema's layout engine and
+            // Sum-type (`enum`) fields (JSON completeness J1b): an enum lowers to an explicit tag
+            // plus maximum-variant storage, so its field alignment/size must agree between sema and
             // LLVM. `EScalar`/`EStr`/`EObj` (enum ids 0/1/2 below) cover scalar-only (align 4),
             // `str`-view (align 8), and object (struct payload) shapes, plus a reorder (`SEnum1`).
             sdef("SEnumScalar", false, &[Ty::Enum(0)]),                  // { i32, i32, i8 } → (12, 4)
@@ -35105,7 +36167,7 @@ fn main() -> i32 = 0
         ];
 
         // Sum-type layouts referenced by the `SEnum*` fields above. Built exactly as codegen builds
-        // `enum_types`: a literal `{ i32 tag, <every variant's payload flattened in variant order> }`.
+        // `enum_types`: an explicit tag plus maximum-variant storage.
         fn sc_int(bits: u8, signed: bool) -> align_sema::Scalar {
             align_sema::Scalar::Int(IntTy { bits, signed })
         }
@@ -35148,40 +36210,49 @@ fn main() -> i32 = 0
         // Build the LLVM struct types exactly as `codegen` does (opaque, then body via the shared
         // `set_struct_body` — the same size-padding path production uses). Enum types are built first
         // (as literal `{ i32, payloads }` structs) so a struct field of enum type resolves.
-        let no_tagged_bodies = HashMap::new();
-        let no_tagged = TaggedTypes { shells: &[], by_body: &no_tagged_bodies };
+        let no_tagged_shapes = HashMap::new();
+        let no_tagged = TaggedTypes { shells: &[], by_shape: &no_tagged_shapes, target_data: &td };
         let struct_types: Vec<StructType> = structs.iter().map(|s| ctx.opaque_struct_type(&s.name)).collect();
-        let enum_types: Vec<StructType> = enums
-            .iter()
-            .map(|e| {
-                let mut fields: Vec<BasicTypeEnum> = vec![ctx.i32_type().into()];
-                for v in &e.variants {
-                    for &s in &v.payload {
-                        fields.push(scalar_type(&ctx, scalar_to_ty(s), &struct_types, &[], no_tagged));
-                    }
+        let enum_types: Vec<StructType> = enums.iter().map(|e| ctx.opaque_struct_type(&e.name)).collect();
+        let mut layouts = align_sema::TypeLayoutCache::new(&structs, &enums, &tagged_defs);
+        let permutations = structs.iter().map(|s| logical_to_physical(s, &mut layouts)).collect::<Vec<_>>();
+        loop {
+            let mut progress = false;
+            for ((definition, llvm_ty), permutation) in structs.iter().zip(&struct_types).zip(&permutations) {
+                if llvm_ty.is_opaque()
+                    && definition.fields.iter().all(|field| llvm_layout_ready(field.ty, &struct_types, &enum_types, &[]))
+                {
+                    set_struct_body(&ctx, *llvm_ty, definition, permutation, &struct_types, &enum_types, no_tagged, &td);
+                    progress = true;
                 }
-                ctx.struct_type(&fields, false)
-            })
-            .collect();
+            }
+            if !progress { break; }
+        }
+        for (e, enum_type) in enums.iter().zip(&enum_types) {
+            let variants = e.variants.iter().map(|variant| variant.payload.iter().copied().map(|s| {
+                (s, scalar_type(&ctx, scalar_to_ty(s), &struct_types, &enum_types, no_tagged))
+            }).collect::<Vec<_>>()).collect::<Vec<_>>();
+            let shape = union_shape(&ctx, ctx.i32_type().into(), &variants, &td)
+                .unwrap_or_else(|error| panic!("enum shape: {error}"));
+            enum_type.set_body(&shape.body.get_field_types(), false);
+        }
         // The nested tagged types come from the production builder itself, so this parity gate
         // cannot drift from the shells and bodies `build_module` actually emits.
-        let (tagged_shells, tagged_bodies) =
-            build_tagged_types(&ctx, &tagged_defs, &struct_types, &enum_types)
+        let (tagged_shells, tagged_shapes) =
+            build_tagged_types(&ctx, &tagged_defs, &struct_types, &enum_types, &td)
                 .expect("tagged type tables");
-        let tagged_types = TaggedTypes { shells: &tagged_shells, by_body: &tagged_bodies };
-        let mut layouts = align_sema::TypeLayoutCache::new(&structs, &enums, &tagged_defs);
-        for (s, st) in structs.iter().zip(&struct_types) {
-            let perm = logical_to_physical(s, &mut layouts);
-            set_struct_body(
-                &ctx,
-                *st,
-                s,
-                &perm,
-                &struct_types,
-                &enum_types,
-                tagged_types,
-                &td,
-            );
+        let tagged_types = TaggedTypes { shells: &tagged_shells, by_shape: &tagged_shapes, target_data: &td };
+        loop {
+            let mut progress = false;
+            for ((s, st), perm) in structs.iter().zip(&struct_types).zip(&permutations) {
+                if st.is_opaque()
+                    && s.fields.iter().all(|field| llvm_layout_ready(field.ty, &struct_types, &enum_types, &tagged_shells))
+                {
+                    set_struct_body(&ctx, *st, s, perm, &struct_types, &enum_types, tagged_types, &td);
+                    progress = true;
+                }
+            }
+            if !progress { break; }
         }
 
         for (id, s) in structs.iter().enumerate() {
@@ -35237,8 +36308,8 @@ fn main() -> i32 = 0
                     .map(|structure| ctx.opaque_struct_type(&structure.name))
                     .collect::<Vec<_>>();
                 let mut layouts = align_sema::TypeLayoutCache::new(&structs, &[], &[]);
-                let no_tagged_bodies = HashMap::new();
-                let no_tagged = TaggedTypes { shells: &[], by_body: &no_tagged_bodies };
+                let no_tagged_shapes = HashMap::new();
+                let no_tagged = TaggedTypes { shells: &[], by_shape: &no_tagged_shapes, target_data: &target_data };
                 for (structure, llvm_ty) in structs.iter().zip(&struct_types) {
                     let permutation = logical_to_physical(structure, &mut layouts);
                     set_struct_body(
@@ -36204,7 +37275,7 @@ fn main() -> i32 = 0
             "Result must carry an i8 tag:\n{res_ir}"
         );
 
-        // A user sum type lowers to a non-union tagged struct with an i32 tag.
+        // A user sum type lowers to an explicit i32 tag plus union storage.
         let sum_ir = ir("Shape { Circle(i64), Square(i64) }\n\
              fn area(s: Shape) -> i64 = match s {\n    Circle(r) => r,\n    Square(w) => w,\n  }\n\
              fn main() -> i32 = area(Shape.Circle(3)) as i32\n");
@@ -36906,7 +37977,7 @@ fn main() -> i32 = 0
         let permutation = logical_to_physical(&definitions[0], &mut layouts);
         let structure = context.opaque_struct_type("host_info");
         let bodies = HashMap::new();
-        let tagged = TaggedTypes { shells: &[], by_body: &bodies };
+        let tagged = TaggedTypes { shells: &[], by_shape: &bodies, target_data: &data };
         set_struct_body(&context, structure, &definitions[0], &permutation, &[structure], &[], tagged, &data);
         assert_eq!((data.get_abi_size(&structure), data.get_abi_alignment(&structure)), (88,8));
         for (index,expected) in [0,16,32,48,72].into_iter().enumerate() {

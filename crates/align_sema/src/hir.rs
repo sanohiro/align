@@ -418,9 +418,9 @@ pub struct EnumVariant {
     pub name: String,
     /// Positional scalar payload (S1b); empty for a tag-only variant.
     pub payload: Vec<crate::Scalar>,
-    /// The first struct field index holding this variant's payload. The enum lowers to a
-    /// non-union struct `{ i32 tag, <every variant's payload flattened> }`, so field 0 is the tag
-    /// and this variant's payload occupies fields `field_base .. field_base + payload.len()`.
+    /// The canonical flattened logical ordinal of this variant's first payload (one-based after
+    /// the tag). Interface validation retains this source-order identity; LLVM codegen derives the
+    /// target-specific union-storage map independently and never treats this as a physical field.
     pub field_base: u32,
 }
 

@@ -108,17 +108,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 len: u32,
                 next: u32,
             },
-            AggregateFields {
+            UnionFields {
                 base: inkwell::values::PointerValue<'c>,
                 aggregate: StructType<'c>,
-                fields: Vec<(u32, Ty)>,
+                fields: Vec<(PhysicalPayload<'c>, Ty)>,
                 next: usize,
             },
-            BranchFields {
+            BranchUnion {
                 block: BasicBlock<'c>,
                 base: inkwell::values::PointerValue<'c>,
                 aggregate: StructType<'c>,
-                fields: Vec<(u32, Ty)>,
+                fields: Vec<(PhysicalPayload<'c>, Ty)>,
                 cont: BasicBlock<'c>,
             },
             EndBranch(BasicBlock<'c>),
@@ -176,11 +176,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .build_conditional_branch(is_some, some, cont)
                             .map_err(|error| self.err(error))?;
                         work.push(Work::Position(cont));
-                        work.push(Work::BranchFields {
+                        let shape = self.option_union_shape(payload)?;
+                        work.push(Work::BranchUnion {
                             block: some,
                             base,
                             aggregate: option_ty,
-                            fields: vec![(1, scalar_to_ty(payload))],
+                            fields: vec![(shape.payload(1, 0)?, scalar_to_ty(payload))],
                             cont,
                         });
                     }
@@ -203,9 +204,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .map_err(|error| self.err(error))?
                             .into_int_value();
                         let cont = self.ctx.append_basic_block(function, "drop.result.cont");
+                        let shape = self.result_union_shape(ok, err)?;
                         let candidates = [
-                            (0u64, 1u32, scalar_to_ty(ok), "drop.result.ok"),
-                            (1u64, 2u32, scalar_to_ty(err), "drop.result.err"),
+                            (0u64, shape.payload(0, 0)?, scalar_to_ty(ok), "drop.result.ok"),
+                            (1u64, shape.payload(1, 0)?, scalar_to_ty(err), "drop.result.err"),
                         ];
                         let branches = candidates
                             .into_iter()
@@ -233,7 +235,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .map_err(|error| self.err(error))?;
                         work.push(Work::Position(cont));
                         for (_, field, ty, block) in branches.into_iter().rev() {
-                            work.push(Work::BranchFields {
+                            work.push(Work::BranchUnion {
                                 block,
                                 base,
                                 aggregate: result_ty,
@@ -261,16 +263,27 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         let definition = self.enums.get(id as usize).ok_or_else(|| {
                             self.err(format!("enum definition id {id} is missing"))
                         })?;
+                        let shape = self.enum_union_shape(id)?;
+                        if definition.variants.len() != shape.variants.len()
+                            || definition
+                                .variants
+                                .iter()
+                                .zip(&shape.variants)
+                                .any(|(variant, physical)| variant.payload.len() != physical.len())
+                        {
+                            return Err(self.err("enum Drop payload map arity mismatch"));
+                        }
                         let owned = definition
                             .variants
                             .iter()
+                            .zip(&shape.variants)
                             .enumerate()
-                            .filter_map(|(variant_index, variant)| {
+                            .filter_map(|(variant_index, (variant, physical))| {
                                 let fields = variant
                                     .payload
                                     .iter()
-                                    .enumerate()
-                                    .filter_map(|(payload_index, scalar)| {
+                                    .zip(physical)
+                                    .filter_map(|(scalar, physical)| {
                                         let ty = scalar_to_ty(*scalar);
                                         cached_plan_needs_drop(
                                             &mut drop_plans,
@@ -279,10 +292,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                             self.enums,
                                             self.tagged_defs,
                                         )
-                                            .then_some((
-                                                variant.field_base + payload_index as u32,
-                                                ty,
-                                            ))
+                                            .then_some((*physical, ty))
                                     })
                                     .collect::<Vec<_>>();
                                 (!fields.is_empty()).then_some((variant_index as u64, fields))
@@ -322,7 +332,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .map_err(|error| self.err(error))?;
                         work.push(Work::Position(cont));
                         for (_, fields, block) in branches.into_iter().rev() {
-                            work.push(Work::BranchFields {
+                            work.push(Work::BranchUnion {
                                 block,
                                 base,
                                 aggregate: enum_ty,
@@ -586,7 +596,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         ty: Ty::Struct(id),
                     });
                 }
-                Work::AggregateFields {
+                Work::UnionFields {
                     base,
                     aggregate,
                     fields,
@@ -596,21 +606,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         continue;
                     };
                     let field_ptr = self
-                        .builder
-                        .build_struct_gep(aggregate, base, field, "droppayload")
-                        .map_err(|error| self.err(error))?;
-                    work.push(Work::AggregateFields {
+                        .union_payload_ptr(aggregate, base, field, "droppayload")?
+                        .ok_or_else(|| self.err("droppable zero-sized tagged payload has no storage"))?;
+                    work.push(Work::UnionFields {
                         base,
                         aggregate,
                         fields,
                         next: next + 1,
                     });
-                    work.push(Work::Drop {
-                        base: field_ptr,
-                        ty,
-                    });
+                    work.push(Work::Drop { base: field_ptr, ty });
                 }
-                Work::BranchFields {
+                Work::BranchUnion {
                     block,
                     base,
                     aggregate,
@@ -619,7 +625,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 } => {
                     self.builder.position_at_end(block);
                     work.push(Work::EndBranch(cont));
-                    work.push(Work::AggregateFields {
+                    work.push(Work::UnionFields {
                         base,
                         aggregate,
                         fields,

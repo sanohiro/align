@@ -30,7 +30,7 @@ struct Reaped {
 }
 const _: () = assert!(core::mem::offset_of!(Scope, root) == 0);
 const _: () = assert!(core::mem::size_of::<MemberInfo>() == 16);
-const _: () = assert!(core::mem::size_of::<Reaped>() == 48);
+const _: () = assert!(core::mem::size_of::<Reaped>() == 40);
 fn status(errno: i32) -> i32 {
     io_error_to_status(&std::io::Error::from_raw_os_error(errno))
 }
@@ -675,7 +675,7 @@ mod tests {
                 core::mem::size_of::<Reaped>(),
                 core::mem::offset_of!(Reaped, status)
             ),
-            (48, 8)
+            (40, 8)
         );
         for count in [0, -1, i64::MAX] {
             assert!(capacity::<Reaped>(count).is_err());
@@ -913,7 +913,7 @@ mod tests {
         scope.root.stdout.fd.take();
         scope.root.stderr.fd.take();
         let root = scope.root.wait().unwrap();
-        assert_eq!(root.termination.exited, 0);
+        assert_eq!(root.termination.value, 0);
         assert_eq!(scope.release(), Ok(false));
         let members = scope.children(4096).unwrap();
         assert!(!members.is_empty());
@@ -963,7 +963,7 @@ mod tests {
         );
         assert!(output.ptr.is_null());
         assert_eq!(output.len, 0);
-        assert_eq!(scope.root.wait().unwrap().termination.exited, 7);
+        assert_eq!(scope.root.wait().unwrap().termination.value, 7);
         FAIL_SUBREAPER.with(|fail| fail.set(0));
         assert_eq!(scope.release(), Err(status(libc::EIO)));
         assert_eq!(subreaper(), Ok(1));
@@ -1045,7 +1045,7 @@ mod tests {
         let mut scope = start(&command).unwrap();
         scope.root.stdout.fd.take();
         scope.root.stderr.fd.take();
-        assert_eq!(scope.root.wait().unwrap().termination.exited, 0);
+        assert_eq!(scope.root.wait().unwrap().termination.value, 0);
         // Deliberate test-only foreign injection: a direct non-SIGCHLD child.
         // CLONE_PARENT inherits the creator's exit signal and cannot supply this.
         let pid = unsafe { libc::syscall(libc::SYS_clone, 0, 0usize, 0usize, 0usize, 0usize) };
@@ -1091,7 +1091,7 @@ mod tests {
         };
         assert_eq!(rows[0].pid, i64::from(pid));
         assert_eq!(
-            rows[0].status.termination.signaled,
+            rows[0].status.termination.value,
             i64::from(libc::SIGKILL)
         );
         assert!(scope.reap(1).unwrap().is_empty());

@@ -43,7 +43,7 @@ impl<'a> TypeLayoutCache<'a> {
     /// nominal/tagged id, cycle-safe, and bounds-safe. Definition validation owns diagnostics for
     /// malformed graphs; this consumer only terminates deterministically before layout use.
     pub fn layout(&mut self, ty: Ty) -> (u64, u64) {
-        #[derive(Clone, Copy)]
+        #[derive(Clone)]
         enum Work {
             Enter(Ty),
             ExitStruct {
@@ -54,7 +54,7 @@ impl<'a> TypeLayoutCache<'a> {
             },
             ExitEnum {
                 id: u32,
-                payloads: usize,
+                variants: Vec<usize>,
             },
             ExitOption,
             ExitResult,
@@ -127,12 +127,12 @@ impl<'a> TypeLayoutCache<'a> {
                         } else if !active_enums.insert(id) {
                             built.push((4, 4));
                         } else if let Some(definition) = self.enums.get(id as usize) {
-                            let payloads = definition
+                            let variants = definition
                                 .variants
                                 .iter()
                                 .map(|variant| variant.payload.len())
-                                .sum();
-                            work.push(Work::ExitEnum { id, payloads });
+                                .collect();
+                            work.push(Work::ExitEnum { id, variants });
                             work.extend(
                                 definition
                                     .variants
@@ -187,39 +187,38 @@ impl<'a> TypeLayoutCache<'a> {
                     self.struct_cache.insert(id, layout);
                     built.push(layout);
                 }
-                Work::ExitEnum { id, payloads } => {
+                Work::ExitEnum { id, variants } => {
+                    let payloads = variants.iter().sum();
                     let start = built.len().saturating_sub(payloads);
                     let layouts = built.drain(start..).collect::<Vec<_>>();
-                    let mut size = 4u64;
-                    let mut align = 4u64;
-                    for (payload_size, payload_align) in layouts {
-                        let payload_align = payload_align.max(1);
-                        size = align_up(size, payload_align) + payload_size;
-                        align = align.max(payload_align);
+                    let mut cursor = 0;
+                    let mut maximum = (0, 1);
+                    for fields in variants {
+                        let layout = aggregate_layout(&layouts[cursor..cursor + fields]);
+                        cursor += fields;
+                        if layout.0 > maximum.0 {
+                            maximum.0 = layout.0;
+                        }
+                        if layout.1 > maximum.1 {
+                            maximum.1 = layout.1;
+                        }
                     }
-                    let layout = (align_up(size, align), align);
+                    let layout = tagged_union_layout((4, 4), maximum);
                     active_enums.remove(&id);
                     self.enum_cache.insert(id, layout);
                     built.push(layout);
                 }
                 Work::ExitOption => {
-                    let (payload_size, payload_align) = built.pop().unwrap_or((0, 1));
-                    let payload_align = payload_align.max(1);
-                    let payload_offset = align_up(1, payload_align);
-                    built.push((
-                        align_up(payload_offset + payload_size, payload_align),
-                        payload_align,
-                    ));
+                    let payload = built.pop().unwrap_or((0, 1));
+                    built.push(tagged_union_layout((1, 1), payload));
                 }
                 Work::ExitResult => {
                     let (err_size, err_align) = built.pop().unwrap_or((0, 1));
                     let (ok_size, ok_align) = built.pop().unwrap_or((0, 1));
-                    let ok_align = ok_align.max(1);
-                    let err_align = err_align.max(1);
-                    let align = ok_align.max(err_align);
-                    let ok_offset = align_up(1, ok_align);
-                    let err_offset = align_up(ok_offset + ok_size, err_align);
-                    built.push((align_up(err_offset + err_size, align), align));
+                    built.push(tagged_union_layout(
+                        (1, 1),
+                        (ok_size.max(err_size), ok_align.max(err_align)),
+                    ));
                 }
                 Work::ExitTagged(id) => {
                     let layout = built.pop().unwrap_or((0, 1));
@@ -233,6 +232,32 @@ impl<'a> TypeLayoutCache<'a> {
     }
 }
 
+/// Natural layout of an unpacked payload struct after zero-sized fields are omitted.
+fn aggregate_layout(fields: &[(u64, u64)]) -> (u64, u64) {
+    let mut size = 0;
+    let mut align = 1;
+    for &(field_size, field_align) in fields {
+        if field_size == 0 {
+            continue;
+        }
+        let field_align = field_align.max(1);
+        size = align_up(size, field_align) + field_size;
+        align = align.max(field_align);
+    }
+    (align_up(size, align), align)
+}
+
+/// Layout of `{ Tag, U }`, where `U` is maximum-sized storage aligned for every payload.
+fn tagged_union_layout(tag: (u64, u64), payload: (u64, u64)) -> (u64, u64) {
+    if payload.0 == 0 {
+        return tag;
+    }
+    let payload_align = payload.1.max(1);
+    let align = tag.1.max(payload_align);
+    let payload_offset = align_up(tag.0, payload_align);
+    (align_up(payload_offset + payload.0, align), align)
+}
+
 pub fn ty_abi_layout(
     ty: Ty,
     structs: &[StructDef],
@@ -240,4 +265,52 @@ pub fn ty_abi_layout(
     tagged_types: &[hir::TaggedType],
 ) -> (u64, u64) {
     TypeLayoutCache::new(structs, enums, tagged_types).layout(ty)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{IntTy, Scalar};
+
+    fn variant(name: &str, payload: Vec<Scalar>, field_base: u32) -> hir::EnumVariant {
+        hir::EnumVariant { name: name.into(), payload, field_base }
+    }
+
+    #[test]
+    fn tagged_layout_uses_only_the_largest_variant_payload() {
+        let i8 = Scalar::Int(IntTy { bits: 8, signed: false });
+        let i64 = Scalar::Int(IntTy { bits: 64, signed: true });
+        let enums = [hir::EnumDef {
+            name: "Mixed".into(),
+            source_name: "Mixed".into(),
+            variants: vec![
+                variant("Small", vec![i8], 1),
+                variant("Large", vec![i8, i64], 2),
+                variant("Empty", vec![Scalar::Unit], 4),
+            ],
+        }];
+        let mut layouts = TypeLayoutCache::new(&[], &enums, &[]);
+        assert_eq!(layouts.layout(Ty::Enum(0)), (24, 8));
+        assert_eq!(layouts.layout(Ty::Option(Scalar::Unit)), (1, 1));
+        assert_eq!(layouts.layout(Ty::Result(i64, i8)), (16, 8));
+    }
+
+    #[test]
+    fn non_unit_zero_sized_payload_is_omitted_from_union_storage() {
+        let structs = [StructDef {
+            name: "Empty".into(),
+            source_name: "Empty".into(),
+            fields: Vec::new(),
+            align: None,
+            c_repr: false,
+        }];
+        let enums = [hir::EnumDef {
+            name: "OnlyEmpty".into(),
+            source_name: "OnlyEmpty".into(),
+            variants: vec![variant("Value", vec![Scalar::Struct(0)], 1)],
+        }];
+        let mut layouts = TypeLayoutCache::new(&structs, &enums, &[]);
+        assert_eq!(layouts.layout(Ty::Enum(0)), (4, 4));
+        assert_eq!(layouts.layout(Ty::Option(Scalar::Struct(0))), (1, 1));
+    }
 }

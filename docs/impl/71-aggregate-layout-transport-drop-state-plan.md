@@ -473,13 +473,13 @@ cases.
 
 | Cell | Required closure and owner |
 | --- | --- |
-| Formation/validation | user sums, Option, Result, tag-only, Unit-only, non-Unit zero-sized, mixed/all-zero variants, mixed alignment, nested tagged payload, generic instantiation, overflow and malformed graphs; exact logical-to-physical map cardinality and semantic type-layout plus LLVM layout twins; zero-sized Drop/alignment rejection |
-| Construction/move-in | every variant writes one tag and only active Stored fields; OmittedUnit and OmittedZero values are evaluated once and synthesized without storage; Copy and Move payloads, nested records/arrays/strings; enum/option/result construction owners and optimized IR store-count owner |
+| Formation/validation | user sums, Option, Result, tag-only, Unit-only, non-Unit zero-sized, mixed/all-zero variants, mixed alignment, nested tagged payload, generic instantiation, overflow and malformed graphs; semantic identity includes the constructor and each payload's Unit-versus-value storage class as well as its resolved LLVM identity; exact logical-to-physical map cardinality and semantic type-layout plus LLVM layout twins; zero-sized Drop/alignment rejection across user sums and direct or nested builtin Option/Result formation |
+| Construction/move-in | every variant writes one tag and only active Stored fields; one completion authority freezes every value whose aggregate type owns union storage before the first store and again at publication, including a variant whose own active payloads are all omitted and payload-bearing None; tag-only values have no inactive storage to freeze; OmittedUnit and OmittedZero values are evaluated once and synthesized without storage; Copy and Move payloads, nested records/arrays/strings; enum/option/result construction owners, defined-before-store IR owner, optimized IR store-count owner, omitted-active-payload reverse control, and optimized nested tagged aggregate owner preserving offset-zero pointer bytes through local assignment and return |
 | Move-out/source nulling | active payload moves clear only its source ownership state; union bytes need no deterministic zero; existing move and owned-match owners |
 | Drop/replacement/return | tag-directed exactly-once Drop for every ordinal, old-value replacement after RHS, direct/indirect returns and cleanup payloads; large-drop, enum-drop, reassign, move-return owners |
 | Control flow | if/match/else/?/map_err, wildcard/or-pattern, branch/loop joins, early return and divergence; value-control and tagged-match owners |
-| Serialization/native | JSON encodes/decodes only active fields; callbacks and task/error slots agree; foreign layout(C) rejection remains; JSON, task-group, callback, FFI negative owners |
-| Whole/per-unit/cache | imported and generic definitions produce equal layout; compiler/LLVM/target/type edits miss the right cache; per-unit/interface/inprocess owners |
+| Serialization/native | JSON encodes/decodes only active fields; callbacks and task/error slots agree; every runtime-owned scratch mirror that embeds a tagged value uses the same union body, including `process.termination` and the nested `wait_result`/`reaped` records; foreign layout(C) rejection remains; JSON, task-group, callback, exact native size/offset, process lifecycle, and FFI negative owners |
+| Whole/per-unit/cache | imported and generic definitions produce equal layout; tagged lookup keys the semantic constructor and resolved payload LLVM identities so physically equal Option/Result bodies remain distinct while equivalent source spellings share one shell; compiler/LLVM/target/type edits miss the right cache; freezing construction results keeps LLVM aggregate promotion/SROA from propagating inactive poison or discarding active bytes through local assignment and return; semantic-identity collision, per-unit/interface/inprocess and optimized nested-tagged owners |
 | Allocation/provenance | no new runtime allocation; nested owned payload keeps heap/arena owner and active-tag lifetime; return-provenance and allocation parity owners |
 | Performance | exact sizes equal formula; small-variant construction has O(active payload) stores; local size/store measurement and direct-layout reverse controls |
 
@@ -615,3 +615,29 @@ boundary omissions:
 | --- | --- | --- |
 | A non-Unit empty struct is also zero-sized, so Stored had no U field in an all-zero sum. | OmittedZero covers every zero-sized non-Unit payload with no Drop plan, synthesizing its exact empty LLVM aggregate without storage. Unsupported alignment or a nonempty Drop plan rejects. | Mixed and all-zero user-sum/Option/Result layout twins plus construction/projection and rejected zero-size-Drop/alignment controls. |
 | A body-specialized Invariant function could expose its plain pointer through `--export`. | Every explicit export gets a named external wrapper with the conservative cleanup pair and a private specialized core. Body effect changes cannot alter the wrapper type; PR 3 target transport is derived over that canonical signature. | Export-root IR signature matrix and compiled C harness for Invariant/MayChange, mixed modes and cleanup results. |
+
+The optimized database owner for candidate `19387551` exposed another value
+formation axis. This preserves the exact layout and its active-byte contract:
+
+| Finding | Ledger correction | Closing owner |
+| --- | --- | --- |
+| `Rvalue::OptionNone` bypassed the common constructor and sent an aggregate with poison inactive bytes into an SSA join. LLVM aggregate promotion could then discard the corresponding active pointer bytes from the Some arm, and a later tag-directed Drop reconstructed an invalid owner. | Every completed stored-payload union value is frozen, `OptionNone` uses the same frozen constructor, and payload GEPs explicitly enter the byte-array field. Freeze chooses unspecified defined inactive bytes without requiring deterministic zeroing or changing the physical type. | Active-store IR owner plus the optimized `pkg_db_q5b2` nested `Result<rows<Row>, Error>` return-and-Drop owner that failed when None bypassed the common constructor. |
+
+The revised-diff review of candidate `7c826572` found two P1s in those same
+formation boundaries. The matrix is reopened again; both fixes replace the
+incomplete selection rule rather than adding another call-site exception:
+
+| Finding | Redesigned boundary | Closing owner |
+| --- | --- | --- |
+| The physical-body index could overwrite an `Option<T>` shell with a physically identical `Result<T, T>` shell even though their logical tagged identities differ. | Tagged lookup is keyed by the semantic constructor plus the resolved payload LLVM identities. Equivalent source spellings still share a shell, while Option and Result remain distinct even when union lowering produces the same physical body; conflicting entries reject instead of overwriting. | Direct Option/Result physical-collision owner plus the existing source-spelling and nested-tagged identity owners. |
+| The constructor froze only when the active variant contained a Stored payload, so `Result<(), E>::Ok(())` and payload-less user-sum variants could return poison inactive storage. | One union completion authority inspects the aggregate type, not the active mapping, and freezes every completed value with union storage. Operand evaluation and active stores remain unchanged; tag-only aggregates skip the unnecessary freeze. | Omitted-active-payload branch/join IR owner for Result and user sums, with a tag-only reverse control and the optimized database owner. |
+
+The next reopened-axis review of candidate `0087259d` found three P1 closure
+gaps. They extend the same formation authority rather than adding independent
+representations:
+
+| Finding | Redesigned boundary | Closing owner |
+| --- | --- | --- |
+| Unit and i32 both use an LLVM `i32` value type, but Unit is omitted while i32 owns storage, so an LLVM-type-only semantic key could still merge their shells. | Both predeclaration and resolved lookup key every payload as Unit or Value(LLVM identity); nested tagged children use their canonical logical class during predeclaration. Physical storage never decides semantic identity. | Option/Result Unit-versus-i32 collision owner plus nested and source-spelling identity owners. |
+| Stored-payload constructors wrote a poison-bearing base into scratch before freezing the reloaded result. | The shared completion authority runs before every scratch initialization store and again after active fields are written. Callback construction uses the same ordering. | Raw IR order owner requiring freeze before the first aggregate store for enum, Option/Result and callback paths. |
+| Explicitly aligned zero-sized structs were rejected through user-sum payloads but remained admissible in direct or nested builtin Option/Result formation. | One recursive aligned-payload predicate is consumed by user-sum closure and by Option/Result type resolution, including generic substitution; inference constructors retain the same checked type boundary. | Direct parameter/local/return Option/Result rejection, nested builtin rejection and existing user-sum/generic controls. |
