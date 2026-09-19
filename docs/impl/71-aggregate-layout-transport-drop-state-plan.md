@@ -131,20 +131,30 @@ representation.
 ### 2.2 Drop-state effect and indirect-call adapter
 
 ```text
-Surface           one effect per droppable BorrowMut parameter of every program
-                  function
+Surface           one effect-state cell per parameter of every program function
 
-Exact type        enum DropStateEffect { Invariant, MayChange }
-                  IFnSig stores a vector indexed by parameter ordinal. Entries
-                  exist only for droppable BorrowMut parameters; every other
-                  ordinal is absent. Invariant means the body performs no
+Exact type        enum DropStateEffect {
+                      NotApplicable, Invariant, MayChange, Deferred
+                  }
+                  IFnSig stores a vector whose length is exactly params.len(),
+                  indexed by parameter ordinal. A concrete droppable BorrowMut
+                  is Invariant or MayChange. Every concrete non-droppable
+                  BorrowMut and every non-BorrowMut parameter is NotApplicable.
+                  A generic template records Deferred at every BorrowMut
+                  ordinal and NotApplicable elsewhere; a template has no
+                  physical callable ABI. Invariant means the concrete body performs no
                   operation that can change ownership state: no move-out,
                   replacement, conditional release, or call through an edge
                   whose corresponding effect is MayChange or unknown.
                   MayChange is the conservative state.
 
-Derivation        least fixed point over the complete direct program call graph.
-                  A function starts Invariant for a parameter and becomes
+Derivation        after generic substitution and ordinary monomorph body
+                  checking, derive a fresh concrete vector from that
+                  monomorph's resolved parameter types and checked MIR; never
+                  copy or specialize the template's Deferred cells. Complete
+                  all reachable monomorphization first, then compute the least
+                  fixed point over the complete concrete direct program call
+                  graph. A function starts Invariant for a parameter and becomes
                   MayChange when its body performs a listed operation or
                   delegates that parameter to a MayChange/unknown direct,
                   imported, closure, function-value, raw, native, or malformed
@@ -152,14 +162,21 @@ Derivation        least fixed point over the complete direct program call graph.
                   Invariant. The result is deterministic by function and
                   parameter ordinal, independent of traversal order.
 
-Inputs/defaults   checked MIR bodies and imported IFnSig records. Missing,
-                  malformed, duplicate, wrong-arity, wrong-mode, and unknown
-                  facts become MayChange before any ABI is formed.
+Inputs/defaults   checked concrete MIR bodies and imported non-generic IFnSig
+                  records. Imported generic bodies are instantiated and
+                  analyzed in the consumer exactly like local templates. An
+                  unresolved callable or unavailable internal analysis fact
+                  becomes MayChange before any ABI is formed. A malformed,
+                  incomplete, duplicate, wrong-arity, or wrong-mode
+                  authenticated interface record is rejected as specified next.
 Errors            an authenticated interface record that disagrees with the
                   declared signature is rejected before body/codegen mutation.
                   Multi-invalid validation order is signature graph, parameter
-                  arity/modes/types, vector shape, enum tag, then call-graph
-                  substitution.
+                  arity/modes/types, vector length, enum tag, per-ordinal mode
+                  and generic/concrete admissibility, resolved droppability,
+                  then call-graph substitution. Deferred in a concrete function,
+                  Invariant/MayChange in a template, or a changing tag on a
+                  non-droppable/non-BorrowMut parameter rejects.
 Ownership         Invariant passes only the non-null data pointer. The caller
                   retains and does not expose its drop flag; the callee creates
                   no proxy, entry load, or writeback. MayChange retains the
@@ -171,13 +188,28 @@ Allocation        none for the effect. Adapter thunks are compiler-generated
 Owner             align_mir derives the effect and owns drop-state
                   simplification; align_interface serializes it;
                   align_codegen_llvm consumes it.
-Artifact/cache    IFnSig encoding adds an explicit versioned field and the
-                  interface hash includes every entry. Whole-program and
-                  per-unit compilation serialize the same semantic record.
+Artifact/cache    bump interface FORMAT_VERSION from 12 to 13. In write_fn and
+                  read_fn, immediately after return_cleanup and before
+                  producer_certification, encode one u32 little-endian length
+                  followed by one u8 per parameter: 0=NotApplicable,
+                  1=Invariant, 2=MayChange, 3=Deferred. No other tag is valid.
+                  The length must equal the preceding parameter count. The same
+                  bytes occur in write_surface, so interface_hash covers them;
+                  complete artifact serialization reuses that surface. The
+                  existing parameter-mode/certificate byte golden becomes a v13
+                  semantic-to-byte golden containing all four tags, and an
+                  independently assembled v13 byte vector must decode to the
+                  expected semantic record. Mutated length, tags, modes,
+                  generic-body presence, and droppability each reject. Unit
+                  cache frontend_schema consumes FORMAT_VERSION and therefore
+                  misses v12 artifacts. Whole-program and per-unit compilation
+                  serialize the same semantic record.
 Prerequisite      checked MIR ownership operations and complete imported
                   interfaces.
-Acceptance        §5 PR 2 matrix, including whole/per-unit equality, recursive
-                  SCCs, malformed fallback, and conservative indirect calls.
+Acceptance        §5 PR 2 matrix, including generic Copy/Move substitutions,
+                  local/imported template instantiation, whole/per-unit equality,
+                  recursive SCCs, v13 byte goldens, malformed fallback, and
+                  conservative indirect calls.
 Benchmark         required local code-shape/count measurement because the plan
                   promises fewer flag allocas, loads, stores, and branches. No
                   fixed client count becomes a gate.
@@ -406,8 +438,8 @@ eligible cases.
 
 | Cell | Required closure and owner |
 | --- | --- |
-| Formation/validation | exact interface vector, arity/mode/type/tag/order checks, malformed and unavailable MayChange fallback; interface schema owners |
-| Fixed point | direct chains, mutually recursive SCCs, imported facts, generic instances, invariant recursion, one changing edge, unknown indirect edge; parameterized MIR analysis owner |
+| Formation/validation | exact params.len vector; all four v13 u8 tags; arity/mode/type/tag/order, generic/concrete and resolved-droppability checks; malformed and unavailable MayChange fallback; independent encode/decode byte goldens and interface schema owners |
+| Fixed point | direct chains, mutually recursive SCCs, imported facts, local/imported generic templates instantiated with Copy/non-droppable and Move/droppable arguments, invariant recursion, one changing edge, unknown indirect edge; parameterized MIR analysis owner |
 | Move-in/out | move, replacement, conditional release, and delegation mark MayChange; plain mutation without ownership change remains Invariant; ownership-operation sweep tripwire |
 | Call edges | direct/imported/generic use specialized ABI; function values, mixed target joins, closures and raw/native edges use conservative ABI; adapter identity/dedup owner |
 | Entry/return | Invariant has plain ptr and no proxy/load/writeback; MayChange retains pair and exact writeback on normal/early/?/map_err exits; codegen ABI owner |
@@ -472,10 +504,12 @@ The ledger-to-prose pass is complete:
   ownership, allocation, owner, identity, prerequisite, acceptance owner,
   benchmark rule, and mirror set;
 - the complete discriminator product is covered: three tag families,
-  payload/no-payload and every variant; Invariant/MayChange and direct/indirect
-  calls; direct/indirect T, cleanup/no-cleanup, and every destination class;
-- native and interface boundaries fix scalar widths, enum tags, sequence order,
-  malformed rejection, and whole/per-unit equality;
+  payload/no-payload and every variant; all four drop-state cells across
+  generic/concrete and direct/indirect calls; direct/indirect T,
+  cleanup/no-cleanup, and every destination class;
+- the v13 interface format fixes the drop-state field position, u32 sequence
+  width, all four u8 tags, exact cardinality and validation order, with
+  independent semantic-to-byte and byte-to-semantic golden vectors;
 - structural identities include the reachable type graph and effect vector;
 - no operation changes process-global or connection-global state;
 - there is no text/view wire input, encoding rule, embedded-NUL case, ambient
@@ -489,3 +523,14 @@ The ledger-to-prose pass is complete:
 If review changes a type, validation order, representation, effect meaning,
 transport form, or destination boundary, update this ledger first and repeat
 this pass before implementation.
+
+## 8. Design review ledger
+
+The fresh independent review of candidate `09685d55` found two P1 omissions.
+Both changed the public record, so this revised ledger requires a fresh review
+before implementation.
+
+| Finding | Ledger correction | Closing owner |
+| --- | --- | --- |
+| A generic BorrowMut parameter may become droppable only after substitution, so a template vector could not select one physical ABI. | The four-state vector now gives every template BorrowMut a Deferred cell and no callable ABI. Each local or imported template is instantiated in the consumer, then its concrete vector is derived from substituted types and checked MIR before the complete concrete call-graph fixed point. | Copy/non-droppable and Move/droppable substitutions of local and imported templates, with whole/per-unit physical-signature equality and rejected Deferred concrete records. |
+| The persisted IFnSig addition lacked exact bytes. | Interface format v13 fixes the field immediately after return_cleanup, an exact params.len u32 count, u8 tags 0 through 3, validation order, hash/cache participation, and independent encode/decode goldens. | Extended parameter/certificate semantic-to-byte golden, independently assembled byte-to-semantic vector, and mutated length/tag/mode/body/droppability rejection matrix. |

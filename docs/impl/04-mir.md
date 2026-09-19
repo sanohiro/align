@@ -121,6 +121,9 @@ ownership state receives only the data pointer; a possibly changing or unknown
 edge retains the pointer pair. The effect is serialized per parameter. The
 canonical function-value ABI remains the conservative pair, with a local
 adapter when an invariant named target is converted to that function type.
+Generic templates carry only Deferred effect cells and no callable ABI; each
+concrete monomorph derives its own effect from substituted types and checked
+MIR before the concrete call-graph fixed point.
 
 `Fn`/`FnTy` stores `[(ParamMode, Ty)]`, not only `[Ty]`, plus the target's
 `ReturnBorrowSummary`/`ReturnRegionSummary` and `ReturnCleanupAbi`. A named function converted to a function value retains
