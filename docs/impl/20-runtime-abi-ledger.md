@@ -1848,7 +1848,7 @@ owners independently verify every symbol and argument ordinal.
 
 Plan 49 owns the exact common operations and scratch layouts. Sixteen new keyed
 rows replace the two numeric capture-code accessors (net fourteen); ChildWait
-now writes a 40-byte typed wait result. A131 is void(ptr,i8), A132 is
+now writes a 32-byte typed wait result. A131 is void(ptr,i8), A132 is
 i32(ptr,i32,i64,ptr), and A133 is i64(i32). Every other row reuses an existing
 shape. Current inventory: 409 keyed, 427 base, 434 alloc-count, 431 par-map-probe,
 and 438 maximum exports. No probe category is added. The declaration golden and
@@ -1892,7 +1892,7 @@ ProcessMemberFinished and ScopeRelease use A19; both owner frees use A62.
 The shared Child operations accept the validated NativeChild prefix at offset
 zero only through scope-specific checked operations; ScopeFree retains the
 exclusive lease until cleanup and restoration complete. MemberInfo is a natural
-16-byte owned record; Reaped is a 48-byte Copy record with status at offset 8.
+16-byte owned record; Reaped is a 40-byte Copy record with status at offset 8.
 The two canonical leaves are Ty 81/82 and Scalar 59/60. No attributes or optional
 exports are added.
 
