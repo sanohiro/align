@@ -3316,7 +3316,11 @@ fn lower_prepared_module<'c>(
     // index makes that struct the ONE lowering of its shape — whether MIR spelled it
     // `Ty::Tagged(id)` or `Ty::Option`/`Ty::Result`, and whether or not the spelling is itself a
     // table entry. See [`TaggedTypes`].
-    let (tagged_shells, tagged_identity, tagged_representatives) = predeclare_tagged_types(
+    let PredeclaredTaggedTypes {
+        shells: tagged_shells,
+        literals: tagged_identity,
+        representative: tagged_representatives,
+    } = predeclare_tagged_types(
         ctx,
         &program.tagged_types,
         &struct_types,
@@ -4258,12 +4262,13 @@ fn lower_prepared_module<'c>(
                 .ok_or_else(|| callable_target_error(&f.name))?,
             f.ret,
             !f.params.is_empty(),
-            &extern_fn_types,
-            &struct_types,
-            &enum_types,
-            &program.enums,
-            tagged_types,
-            &target_data,
+            MainWrapperTypes {
+                extern_fn_types: &extern_fn_types,
+                struct_types: &struct_types,
+                enum_types: &enum_types,
+                enums: &program.enums,
+                tagged: tagged_types,
+            },
         )?;
     }
     // Every emit path — object, PGO, ThinLTO prelink, `emit-llvm`, and the remark lens — funnels
@@ -6165,19 +6170,25 @@ fn validate_static_data_record(
 /// for that case is to turn the void call into `ret i32 0` (never leave the ABI return register
 /// undefined — the bug this function exists to close for the `Unit` case, `has_args` always
 /// `false` there since sema restricts the `args: array<str>` form to a `Result`-returning `main`).
+struct MainWrapperTypes<'c, 'a> {
+    extern_fn_types: &'a HashMap<String, FunctionType<'c>>,
+    struct_types: &'a [StructType<'c>],
+    enum_types: &'a [StructType<'c>],
+    enums: &'a [EnumDef],
+    tagged: TaggedTypes<'c, 'a>,
+}
+
 fn emit_main_wrapper<'c>(
     ctx: &'c Context,
     module: &Module<'c>,
     align_body: FunctionValue<'c>,
     ret: Ty,
     has_args: bool,
-    extern_fn_types: &HashMap<String, FunctionType<'c>>,
-    struct_types: &[StructType<'c>],
-    enum_types: &[StructType<'c>],
-    enums: &[EnumDef],
-    tagged_types: TaggedTypes<'c, '_>,
-    target_data: &inkwell::targets::TargetData,
+    types: MainWrapperTypes<'c, '_>,
 ) -> Result<(), CodegenError> {
+    let MainWrapperTypes { extern_fn_types, struct_types, enum_types, enums, tagged: tagged_types } =
+        types;
+    let target_data = tagged_types.target_data;
     if !matches!(ret, Ty::Result(_, _)) && ret != Ty::Unit {
         return Err(CodegenError::Lowering("main wrapper on a non-Result, non-Unit return".into()));
     }
@@ -6712,6 +6723,12 @@ fn tagged_payloads(tagged: hir::TaggedType) -> Vec<Scalar> {
     }
 }
 
+struct PredeclaredTaggedTypes<'c> {
+    shells: Vec<StructType<'c>>,
+    literals: Vec<StructType<'c>>,
+    representative: HashMap<usize, u32>,
+}
+
 /// Predeclare one identified struct per distinct tagged body and assign it, returning the
 /// per-entry table and the body index that [`TaggedTypes`] resolves every other spelling through.
 ///
@@ -6735,7 +6752,7 @@ fn predeclare_tagged_types<'c>(
     sx: &[StructType<'c>],
     ex: &[StructType<'c>],
     target_data: &inkwell::targets::TargetData,
-) -> Result<(Vec<StructType<'c>>, Vec<StructType<'c>>, HashMap<usize, u32>), CodegenError> {
+) -> Result<PredeclaredTaggedTypes<'c>, CodegenError> {
     let malformed = || {
         CodegenError::Lowering(
             "nested tagged type table is missing an entry or is recursive".to_string(),
@@ -6818,7 +6835,7 @@ fn predeclare_tagged_types<'c>(
         });
     }
 
-    Ok((shells, literals, representative))
+    Ok(PredeclaredTaggedTypes { shells, literals, representative })
 }
 
 #[cfg(test)]
@@ -6830,7 +6847,8 @@ fn build_tagged_types<'c>(
     target_data: &inkwell::targets::TargetData,
 ) -> Result<(Vec<StructType<'c>>, HashMap<usize, StructType<'c>>), CodegenError> {
     let malformed = || CodegenError::Lowering("nested tagged type table is missing an entry or is recursive".to_string());
-    let (shells, literals, representative) = predeclare_tagged_types(ctx, defs, sx, ex, target_data)?;
+    let PredeclaredTaggedTypes { shells, literals, representative } =
+        predeclare_tagged_types(ctx, defs, sx, ex, target_data)?;
     let no_tagged_bodies = HashMap::new();
     let no_tagged = TaggedTypes { shells: &shells, by_body: &no_tagged_bodies, target_data };
     // Assign each representative its physical union body over the final child structs, and index it.
