@@ -14,6 +14,176 @@ fn code(out: &std::process::Output) -> Option<i32> {
     out.status.code()
 }
 
+fn function_ir(ir: &str, name: &str) -> String {
+    let needle = format!(" @{name}(");
+    let start = ir
+        .lines()
+        .position(|line| line.starts_with("define") && line.contains(&needle))
+        .unwrap_or_else(|| panic!("function `{name}` missing from IR:\n{ir}"));
+    ir.lines()
+        .skip(start)
+        .take_while(|line| *line != "}")
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn scalar_push_fast_path_layout_matches_the_runtime() {
+    assert_eq!(
+        align_codegen_llvm::ARRAY_BUILDER_LAYOUT,
+        align_runtime::ARRAY_BUILDER_LAYOUT.map(|value| value as u64),
+    );
+}
+
+#[test]
+fn scalar_pushes_have_one_typed_fast_store_and_one_slow_call() {
+    let source = "\
+fn push_i64(value: i64) -> i64 { mut b: array_builder<i64> := array_builder(1)\n b.push(value)\n return b.build()[0] }
+fn push_f32(value: f32) -> f32 { mut b: array_builder<f32> := array_builder(1)\n b.push(value)\n return b.build()[0] }
+fn push_f64(value: f64) -> f64 { mut b: array_builder<f64> := array_builder(1)\n b.push(value)\n return b.build()[0] }
+fn push_bool(value: bool) -> bool { mut b: array_builder<bool> := array_builder(1)\n b.push(value)\n return b.build()[0] }
+fn push_char(value: char) -> char { mut b: array_builder<char> := array_builder(1)\n b.push(value)\n return b.build()[0] }
+fn main() -> i32 = 0
+";
+    let names = ["push_i64", "push_f32", "push_f64", "push_bool", "push_char"];
+    let ir = emit_llvm_with_exports(source, &names);
+    for (name, store, width) in [
+        ("push_i64", "store i64", 8),
+        ("push_f32", "store float", 4),
+        ("push_f64", "store double", 8),
+        ("push_bool", "store i8", 1),
+        ("push_char", "store i32", 4),
+    ] {
+        let body = function_ir(&ir, name);
+        let fast = body
+            .split("ab.push.fast:")
+            .nth(1)
+            .and_then(|tail| tail.split("ab.push.slow:").next())
+            .unwrap_or_else(|| panic!("{name} fast block missing:\n{body}"));
+        assert_eq!(
+            fast.lines()
+                .filter(|line| line.contains(store) && line.contains("ptr %ab.destination"))
+                .count(),
+            1,
+            "{name}:\n{fast}",
+        );
+        assert_eq!(fast.matches(" add i64 ").count(), 1, "{name}:\n{fast}");
+        assert!(!fast.contains(" call ") && !fast.contains("memcpy"), "{name}:\n{fast}");
+        assert_eq!(
+            body.matches("call void @align_rt_array_builder_push(").count(),
+            1,
+            "{name} must retain exactly one slow growth call:\n{body}",
+        );
+        assert!(
+            body.contains(&format!("icmp eq i64 %ab.elem_size, {width}")),
+            "{name} must guard the exact runtime stride, including zero-stride forged headers:\n{body}",
+        );
+        assert!(!body.contains("alwaysinline") && !body.contains("inlinehint"));
+        if name == "push_bool" {
+            assert!(body.contains("zext i1") && body.contains("%ab.bool.byte"), "{body}");
+        }
+    }
+}
+
+#[test]
+fn string_and_record_pushes_keep_their_existing_runtime_paths() {
+    let source = "\
+Row { value: i64 }
+fn record(value: i64) -> i64 { mut b: array_builder<Row> := array_builder(1)\n b.push(Row { value: value })\n return b.build()[0].value }
+fn text(value: string) -> i64 { mut b: array_builder<string> := array_builder(1)\n b.push(value)\n return b.build().len() }
+fn main() -> i32 = 0
+";
+    let ir = emit_llvm_with_exports(source, &["record", "text"]);
+    let record = function_ir(&ir, "record");
+    assert!(record.contains("@align_rt_array_builder_push_bytes"), "{record}");
+    assert!(!record.contains("ab.push.fast:"), "{record}");
+    let text = function_ir(&ir, "text");
+    assert!(text.contains("@align_rt_array_builder_push_str"), "{text}");
+    assert!(!text.contains("ab.push.fast:"), "{text}");
+}
+
+#[test]
+fn stack_header_and_arena_builders_share_the_guarded_shape() {
+    let source = "\
+fn arena_value(out: region, value: i64) -> i64 { mut b: array_builder<i64> := array_builder(out, 1)\n b.push(value)\n return b.build()[0] }
+fn main() -> i32 { mut b: array_builder<i64> := array_builder(1)\n b.push(7)\n return b.build().len() as i32 }
+";
+    let ir = emit_llvm_with_exports(source, &["arena_value"]);
+    let stack = function_ir(&ir, "main");
+    assert!(stack.contains("@align_rt_array_builder_init_stack"), "{stack}");
+    assert!(stack.contains("ab.push.fast:"), "{stack}");
+    let arena = function_ir(&ir, "arena_value");
+    assert!(arena.contains("@align_rt_array_builder_new_in"), "{arena}");
+    assert!(arena.contains("ab.arena") && arena.contains("ab.push.slow:"), "{arena}");
+    assert_eq!(arena.matches("call void @align_rt_array_builder_push(").count(), 1, "{arena}");
+}
+
+#[test]
+fn reserved_loop_keeps_the_handle_in_ssa_and_the_call_off_the_fast_edge() {
+    let source = "\
+pub fn fill(n: i64) -> array<i64> {
+  mut b: array_builder<i64> := array_builder(n)
+  mut i := 0
+  loop {
+    if i >= n { break }
+    b.push(i)
+    i = i + 1
+  }
+  return b.build()
+}
+";
+    let ir = emit_llvm_optimized(source, &["fill"]);
+    let body = function_ir(&ir, "fill");
+    let fast = body
+        .split("ab.push.fast:")
+        .nth(1)
+        .and_then(|tail| tail.split("ab.push.slow:").next())
+        .unwrap_or_else(|| panic!("optimized fast block missing:\n{body}"));
+    assert!(!fast.contains(" call ") && !fast.contains("memcpy"), "{fast}");
+    assert_eq!(body.matches("call void @align_rt_array_builder_push(").count(), 1, "{body}");
+    assert!(
+        body.lines()
+            .any(|line| line.contains("@align_rt_array_builder_push(ptr nonnull %ab.stack")),
+        "the loop must carry the proven local header directly instead of reloading a handle:\n{body}",
+    );
+}
+
+#[test]
+fn scalar_push_fast_path_is_identical_at_the_per_unit_codegen_boundary() {
+    let files = [
+        (
+            "values.align",
+            "module values\npub fn one(value: i64) -> i64 { mut b: array_builder<i64> := array_builder(1)\n b.push(value)\n return b.build()[0] }\n",
+        ),
+        (
+            "main.align",
+            "import values\nfn main() -> i32 = values.one(7) as i32\n",
+        ),
+    ];
+    let whole = emit_llvm_multi("ab-fast-whole", &files, "main.align");
+    let per_unit = build_per_unit_multi("ab-fast-per-unit", &files, "main.align");
+    let unit = per_unit.unit("values");
+    let split = emit_llvm_ir(
+        &unit.mir,
+        BuildTarget::Baseline,
+        Profile::Release,
+        false,
+        &[],
+        false,
+    )
+    .expect("per-unit array-builder LLVM emission");
+
+    for (mode, ir) in [("whole", whole), ("per-unit", split)] {
+        assert_eq!(ir.matches("ab.push.fast:").count(), 1, "{mode}:\n{ir}");
+        assert_eq!(
+            ir.matches("call void @align_rt_array_builder_push(").count(),
+            1,
+            "{mode}:\n{ir}",
+        );
+        assert!(ir.contains("store i64") && ir.contains("%ab.destination"), "{mode}:\n{ir}");
+    }
+}
+
 // --- scalar round-trips + freeze-to-array<T> feeds the pipeline -----------------------------------
 
 /// The headline: push i64 elements, freeze into an owned `array<i64>`, and consume it with the
@@ -59,6 +229,27 @@ fn f64_push_build_then_sum() {
     let src = "fn main() -> i32 {\n  mut b: array_builder<f64> := array_builder()\n  b.push(1.5)\n  b.push(2.25)\n  b.push(0.25)\n  xs := b.build()\n  return (xs.sum() * 4.0) as i32\n}\n";
     let out = build_and_run("ab-f64", src);
     assert_eq!(code(&out), Some(16), "stderr: {}", String::from_utf8_lossy(&out.stderr)); // 4.0 * 4
+}
+
+#[test]
+fn f32_push_build_then_sum() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn main() -> i32 {\n  mut b: array_builder<f32> := array_builder(4)\n  b.push(1.5 as f32)\n  b.push(2.5 as f32)\n  xs := b.build()\n  return xs.sum() as i32\n}\n";
+    let out = build_and_run("ab-f32", src);
+    assert_eq!(code(&out), Some(4), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn bool_fast_push_keeps_canonical_bytes_for_json() {
+    if !backend_available() {
+        return;
+    }
+    let src = "import core.json\nfn main() -> Result<(), Error> {\n  mut b: array_builder<bool> := array_builder(2)\n  b.push(false)\n  b.push(true)\n  values := b.build()\n  print(json.encode(values)?)\n  return Ok(())\n}\n";
+    let out = build_and_run("ab-bool-canonical-byte", src);
+    assert_eq!(code(&out), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "[false,true]\n");
 }
 
 /// bool round-trip: push then index each element back out of the frozen array.

@@ -1957,3 +1957,12 @@ Only initialized prefixes participate in Drop or freeze; the heap payload still
 transfers and the region output still compacts. `explicit_constructor_capacity_preserves_payload_and_initialized_prefix`
 owns header-mode, no-growth, initialization and heap transfer parity.
 Float inspection adds no native export.
+
+Plan 70 PR 3 adds no export and does not change these declarations. Its compiler-side scalar-push
+fast path consumes an exact `ArrayBuilder` layout contract: `data = 0`, `len = 8`, `cap = 16`,
+`elem_size = 24`, `arena = 32`, total size 64, and alignment at most 16. Const assertions in
+`align_runtime` pin the native definition; `align_codegen_llvm::ARRAY_BUILDER_LAYOUT` carries the
+same table, and the driver owner compares them. Heap mode with matching stride and spare capacity
+uses one typed store and increments `len`; `bool` is zero-extended from LLVM `i1` to the runtime's
+canonical `i8` byte before that store. Every other state calls the existing
+`align_rt_array_builder_push` exactly once.

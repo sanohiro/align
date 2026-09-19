@@ -2749,3 +2749,16 @@ that it remains a prefix of some save key.
 consolidated their rejection-shape fixtures: each rejection program is
 type-checked once via `OnceLock`, with per-shape diagnostics asserted against
 that pinned shared result instead of re-invoking `alignc` per assertion.
+
+## Item 9: Runtime archive one-codegen-unit investigation
+
+Plan 70 proposed `[profile.release.package.align_runtime] codegen-units = 1` to remove the
+`ArrayBuilder::reserve` and `memcpy` relocations from `align_rt_array_builder_push`. Implementation
+measurement on Apple M1 with Rust 1.96 and LLVM 22.1.8 rejected that premise: the proposed release
+build completed in 6.37 s and retained both relocations. The existing dist profile, which already
+combines one codegen unit with thin LTO, completed in 12.38 s and retained both as well.
+
+**Decision.** Do not add a no-op package override or charge local builds for serialized runtime
+codegen. Plan 70's compiler-emitted fast path removes the runtime call from capacity-available
+scalar iterations. Any future archive-only change needs a new measured Rust-source strategy; inline
+attributes remain outside this capability's contract.

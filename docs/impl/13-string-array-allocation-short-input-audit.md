@@ -582,7 +582,7 @@ test-only) pending native hardware.
 
 ## 8. Array allocation, copying, and IR opportunities
 
-### 8.1 CONFIRMED P1 — make `array_builder` cheap when it is tiny
+### 8.1 SHIPPED 2026-09-20 — make scalar `array_builder.push` cheap
 
 The boxed `array_builder_new` ABI still allocates a header for escaping values; proven local values
 now use aligned caller storage instead ([runtime](../../crates/align_runtime/src/lib.rs#L7652)). The
@@ -645,12 +645,35 @@ the 1K/1M controls stayed within 0.3%.
 At 100K, bulk append and exact direct fill are at parity: payload copying is already the right
 shape, while the opaque call per pushed element is the large gap. Removing the header helps tiny
 builders (append/direct was 2.3-2.6x at 1-16 elements) but saves only about 13 ns in absolute terms.
-The shipped header cleanup addresses that fixed tiny-builder cost; next prioritize compiler-selected
-bulk/direct fill from cardinality for the much larger loop gap.
+The shipped header cleanup addresses that fixed tiny-builder cost. Compiler-selected bulk/direct
+fill from cardinality remains the next opportunity for the larger loop gap.
 
-The shipped gate required 0–4 elements to lose one allocation and improve by at least 15%, with no
-more than 3% regression in the 1K/1M append and push controls. Pin optimized IR for no per-element
-call only in the future direct-fill/bulk case — header placement alone cannot remove it.
+The shipped header gate required 0–4 elements to lose one allocation and improve by at least 15%, with no
+more than 3% regression in the 1K/1M append and push controls. Header placement alone did not remove
+the per-element call; the scalar fast path below now removes it from the capacity-available edge.
+
+Plan 70 PR 3 adds the missing scalar fast path. Codegen loads the pinned native header fields and,
+when the builder is heap-backed, its runtime stride matches the static scalar width, and `len < cap`,
+emits one typed store plus `len += 1`. Growth, arena mode, strings, and records retain exactly one
+existing runtime call. The runtime header is pinned at data/len/cap/stride/arena offsets
+0/8/16/24/32 and size 64 on both sides.
+
+**Measured (2026-09-20, Apple M1, release/baseline, `--no-rt-lto`, median of nine alternating
+runs):** the same source was compiled by merge base `bdf29a48` and by the PR 3 compiler. Each timing
+includes allocation and freeze; direct fill is an exact `map(...).to_array()` ceiling. Values are
+nanoseconds per completed array.
+
+| elements | push before | push after | append after | direct fill after | before/after |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 33 ns | 29 ns | 34 ns | 13 ns | 1.14x |
+| 4 | 55 ns | 33 ns | 35 ns | 14 ns | 1.67x |
+| 16 | 122 ns | 52 ns | 37 ns | 15 ns | 2.35x |
+| 1,024 | 5.622 us | 2.223 us | 165 ns | 144 ns | 2.53x |
+| 100,000 | 544.924 us | 214.295 us | 10.900 us | 11.278 us | 2.54x |
+
+The push/append ratio falls from 34.07x to 13.47x at 1,024 elements and from 50.43x to 19.66x at
+100,000. The remaining gap is repeated guard/store work versus one bulk copy; the PR does not claim
+to replace explicit `append` when a source slice already exists.
 
 ### 8.2 SHIPPED 2026-07-16 — virtual `chunks` for direct `.len()` and index
 

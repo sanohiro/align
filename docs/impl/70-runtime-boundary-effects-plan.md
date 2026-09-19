@@ -7,9 +7,9 @@ Status: plan of record for issues
 [1073](https://github.com/sanohiro/align/issues/1073) part 2 (the `BufferPut`
 effects row) and [1069](https://github.com/sanohiro/align/issues/1069) part 4
 (the rt-LTO guarded-set admission criterion), per those issues' 2026-09-18
-triage comments. PR 1's per-symbol effect model and fail-closed owners and PR
-2's exceptional-edge/cold-path model are implemented; PR 3 remains
-unimplemented.
+triage comments. All three PRs are implemented: the per-symbol effect model,
+the exceptional-edge/cold-path model, and the scalar `array_builder.push`
+fast path with its measured archive-profile refusal.
 
 [Plan 68](68-vectorization-contract.md) is the public-contract ledger and names
 this document as the implementing plan for guarantee G5. Unlike
@@ -80,8 +80,8 @@ no allocator change      libc stays (12-pipeline-...-audit.md:912)
 no diagnostic change     PR 2 changes no Err value and no trap text, byte for
                          byte. PR 3 changes no observable container behaviour
 no reduced optimization  21-build-perf-plan.md's principle is preserved: PR 3
-                         raises the local runtime artifact to the shipped
-                         artifact's level and lowers nothing
+                         leaves the runtime archive profile unchanged after
+                         measuring the proposed override as ineffective
 no PGO dependency        PR 2's model works with no profile data
 no new ABI symbol        PR 1 and PR 2 add none. PR 3 adds none: the fast path
                          is codegen, the slow path is the existing symbol
@@ -712,26 +712,27 @@ Exact contract    for an element of statically known width W in the scalar set,
                   codegen emits
 
                     if arena == null && elem_size == W && len < cap {
-                        store v, data + len * W
+                        store repr(v), data + len * W
                         len = len + 1
                     } else {
                         call align_rt_array_builder_push(b, bits)
                     }
 
-                  The slow path is exactly one call to the existing symbol and
-                  is the only path that can grow, use arena chunks, or handle a
-                  string element. No new runtime symbol, no alwaysinline, no
-                  source annotation
+                  `repr(v)` is the scalar's typed value, except `bool`, whose
+                  `i1` is zero-extended to the canonical `i8` byte the runtime
+                  path writes. The slow path is exactly one call to the
+                  existing symbol and is the only path that can grow, use arena
+                  chunks, or handle a string element. No new runtime symbol,
+                  no alwaysinline, no source annotation
 
 Inputs, defaults  the builder handle and the value, as today. There is no
                   option, flag or environment input; the fast path is emitted
                   whenever the element is a statically sized scalar
-Errors            none at compile time. Behaviour is identical to the call on
-                  every input, including a null handle, which fails the
-                  `arena == null && elem_size == W` guard only if the load
-                  itself is legal — so the fast path is emitted only where the
-                  handle is already known non-null by the existing lowering,
-                  and otherwise the call is emitted unchanged
+Errors            no new source-level error. Behaviour is identical to the call
+                  for every valid builder state. Existing lowering supplies a
+                  non-null live handle at every `ArrayBuilderPush`; malformed
+                  MIR whose receiver or value type disagrees with `scalar` is
+                  rejected before LLVM construction
 Ownership         unchanged. The builder is borrowed; the element is copied by
                   value; no element is retained by the fast path that the slow
                   path would not retain
@@ -765,8 +766,9 @@ Prerequisite      PR 1. Without the effects row on the slow-path call, the
                   LLVM and the fast path measures as little as the call it
                   replaces
 Acceptance        the scalar set owner (i64, f32, f64, bool, char); a
-                  bounded-capacity loop emitting zero calls; an unbounded loop
-                  emitting exactly one call on the growth edge; an arena-mode
+                  bounded-capacity loop whose fast iteration emits zero calls
+                  and carries its header in SSA; exactly one static slow-path
+                  call site on the growth edge; an arena-mode
                   builder taking the slow path; a zero-stride builder taking
                   the slow path; runtime equivalence of both paths over the
                   plan 13 §4.2 length matrix
@@ -794,44 +796,26 @@ and `BufferAppendFilled` therefore receive their effects rows from PR 1 and
 nothing else; a `Buffer` layout restructure is recorded here as deliberately
 deferred, not forgotten.
 
-### 2.8 The runtime archive profile (PR 3)
+### 2.8 The runtime archive profile investigation (PR 3)
 
 ```text
-Surface           [profile.release.package.align_runtime] in the root
-                  Cargo.toml
-
-Exact schema      [profile.release.package.align_runtime]
-                  codegen-units = 1
-
-Inputs, defaults  none. It applies to every `cargo build --release` of the
-                  workspace, including the align-llm batch build
-                  (`cargo build --release --workspace`) CLAUDE.md fixes
-Errors            none; it is a cargo profile override
+Surface           no manifest or runtime-code change
+Exact result      `codegen-units = 1` is refused: it does not remove either
+                  relocation the proposal attributed to codegen-unit splitting
+Inputs, defaults  unchanged
+Errors            unchanged
 Ownership         n/a
 Allocation        n/a
-Owner             the workspace manifest; 21-build-perf-plan.md records the
-                  decision
-Artifact/cache    libalign_runtime.a bytes change. The archive is NOT a cache
-                  key input: it participates only at final link, and no cached
-                  artifact is derived from it, so no entry can go stale.
-                  rt_lto_digest is unaffected (build.rs bakes with its own
-                  rustc invocation). [profile.dist] is unchanged and already
-                  carries lto = "thin" and codegen-units = 1
+Owner             the implementation-time release/dist archive disassembly
+Artifact/cache    unchanged
 Prerequisite      none
-Acceptance        a SYMBOL-level owner over the release archive: `llvm-nm
-                  --defined-only` on libalign_runtime.a must report no
-                  `ArrayBuilder::reserve` symbol reachable as an external
-                  relocation target from align_rt_array_builder_push's section.
-                  Deliberately not a disassembly grep for `bl <reserve>`: `bl`
-                  is AArch64 only, the leading underscore is Mach-O only, and
-                  the memory note "aarch64 shape gates are x86-only" records
-                  exactly this trap. The owner skips, loudly, when no `--release`
-                  archive is present, because no test target builds one
-Benchmark         the §2.7 benchmark covers it; the build-time delta is
-                  recorded in 21-build-perf-plan.md's item ledger
-Mirrors           21-build-perf-plan.md (a new item recording the decision and
-                  its compliance with that document's Principle); Cargo.toml's
-                  existing [profile.dist] comment, which gains one sentence
+Acceptance        both `--release` plus the proposed package override and the
+                  existing `--profile dist` were built on Apple M1 with Rust
+                  1.96 / LLVM 22.1.8 and inspected with relocation-aware
+                  `llvm-objdump`; both retain calls to `ArrayBuilder::reserve`
+                  and `memcpy` from `align_rt_array_builder_push`
+Benchmark         none: the candidate does not change the artifact
+Mirrors           §5.4 and issue 1072's corrected disposition
 ```
 
 ## 3. PR 1 — the per-symbol effects model
@@ -1294,9 +1278,9 @@ metadata and layout, so it carries no benchmark.
 ### 5.1 Invariants
 
 ```text
-K1  the fast path and the slow path are observationally identical on every
-    input: same published length, same bytes, same growth behaviour, same Drop
-    eligibility, same initialized prefix
+K1  the fast path and the slow path are observationally identical for every
+    valid builder state: same published length, same bytes, same growth
+    behaviour, same Drop eligibility, same initialized prefix
 K2  the fast path never grows, never touches an arena chunk, and never handles
     a string element. Every one of those is a guard failure, and a guard
     failure is one call to the existing symbol
@@ -1313,8 +1297,8 @@ K5  no new runtime symbol, no alwaysinline, no inlinehint, no source
 
 | Cell | Required behaviour | Owner |
 | --- | --- | --- |
-| scalar set | `i64`, `f32`, `f64`, `bool`, `char`: one typed store and one `add`, zero calls, zero `memcpy` | one owner per element type |
-| reserved capacity | a bounded-capacity push loop emits zero calls | new owner (1072 criterion 1) |
+| scalar set | `i64`, `f32`, `f64`, `bool`, `char`: the fast block has one typed store and one `add`, with zero calls and zero `memcpy`; `bool` zero-extends `i1` to a canonical `i8` slot | one parameterized IR owner over every element type plus a byte-reading JSON owner for `bool` |
+| reserved capacity | a bounded-capacity push loop carries the header in SSA and its fast iteration emits zero calls; the guarded growth edge remains one static slow call site | new owner (1072 criterion 1, with the literal whole-function zero-call wording corrected by §2.7's exact contract) |
 | growth edge | an unbounded loop emits exactly one call, on the growth edge | new owner (1072 criterion 3) |
 | arena mode | an `array_builder` created with `new_in` takes the slow path every time | new owner |
 | zero stride | a zero-`elem_size` builder takes the slow path | new owner |
@@ -1322,9 +1306,9 @@ K5  no new runtime symbol, no alwaysinline, no inlinehint, no source
 | record element | `push_bytes` is untouched by this PR; 1072 criterion 2's record half is deferred with its reason recorded here | existing owners |
 | stack-header builder | `init_stack` builders use the same fast path, because the header layout is the same | new owner |
 | freeze and Drop | `build()` still transfers the payload without copying; the unfinished-Drop element sweep still sees the same initialized prefix | existing `array_builder` freeze and Drop owners, which fail for a fast path that mis-updates `len` |
-| whole-program / per-unit / ThinLTO | identical emitted fast path in all three | the existing per-unit and `thin_lto_sv` comparison owners |
+| whole-program / per-unit / ThinLTO | whole-program and per-unit compilation emit the same guarded fast path; ThinLTO consumes that per-unit prelink generation path | direct whole/per-unit IR owner; the existing ThinLTO prelink-path owners |
 | runtime equivalence | both paths produce identical arrays over the plan 13 §4.2 length matrix | new differential owner |
-| shipped archive | `_align_rt_array_builder_push` contains no `bl <reserve>` | new owner over the linked archive (§2.8) |
+| shipped archive | no change: both proposed release tuning and the existing dist profile retain the measured `reserve` and `memcpy` relocations | implementation-time relocation-aware inspection (§2.8) |
 | no new attribute | no `alwaysinline` or `inlinehint` anywhere in the emitted module | a grep-shaped IR negative (K5) |
 
 ### 5.3 What this plan refuses from 1072, and why
@@ -1348,52 +1332,30 @@ does not depend on 1069 at all.
 
 ### 5.4 The archive-profile decision, as recorded
 
-**Decision.** The shipped artifact is already tuned, and the defect is local.
-`release.yml` builds `align_runtime` with `--profile dist` in every phase —
-`lto = "thin"`, `codegen-units = 1` — and deliberately keeps that archive
-outside PGO instrumentation, so the `libalign_runtime.a` a user links from a
-release archive already has `reserve` inlined into `push`. 1072's disassembly
-was taken from `target/release/libalign_runtime.a`, the untuned local artifact.
+**Decision.** Do not change the release profile. Implementation-time evidence
+disproved the premise behind the proposed override. On Apple M1 with Rust 1.96
+and LLVM 22.1.8, a fresh `align_runtime` build with
+`[profile.release.package.align_runtime] codegen-units = 1` completed in 6.37 s,
+but relocation-aware disassembly of `align_rt_array_builder_push` still named
+both `ArrayBuilder::reserve` and `memcpy`. A fresh `--profile dist` build (thin
+LTO, one codegen unit) completed in 12.38 s and retained the same two
+relocations. The shipped artifact therefore was not already in the claimed
+shape, and one codegen unit is not sufficient to produce it.
 
-The real gap is that the local archive differs from the shipped one, so local
-iteration and local evidence do not represent what users link. PR 3 closes it
-with a per-package profile override:
-
-```toml
-[profile.release.package.align_runtime]
-codegen-units = 1
-```
-
-Rationale, recorded so it is not re-litigated:
+Disposition:
 
 ```text
-sufficient      intra-crate inlining is what reserve-into-push needs, and
-                codegen-units = 1 supplies it. lto is not expressible in a
-                cargo per-package override and is not required for one crate
-cheap           align_runtime is 1 of 15 crates and rarely changes, so the
-                serialized codegen cost is paid on a runtime edit only. The
-                fourteen compiler crates keep parallel codegen
-compliant       21-build-perf-plan.md's Principle — "Output is always fully
-                optimized. Build speed comes from reuse and parallelism, never
-                from lowering optimization" — is preserved: this RAISES the
-                local artifact and lowers nothing
-bounded         [profile.dist] is unchanged. `--release` for the compiler
-                crates stays untuned, which is what Cargo.toml's existing
-                comment settled
-rejected        making --release inherit dist: pays thin-LTO link time on every
-                compiler iteration, the exact cost that comment rejects
-rejected        building the runtime with LTO under release: cargo does not
-                accept lto in a per-package profile override
-identity        libalign_runtime.a bytes change. It is not a cache-key input —
-                it participates only at final link and no cached artifact
-                derives from it — so no entry can go stale. rt_lto_digest is
-                unaffected: build.rs bakes str_prims.bc with its own
-                `rustc -O -Ccodegen-units=1`, independent of any cargo profile
+refused         a no-op profile override that serializes runtime codegen
+deferred        changing Rust source shape or adding inline attributes; either
+                is a separate runtime implementation strategy and K5 forbids
+                solving this PR with `alwaysinline` or `inlinehint`
+shipped fix     the compiler-emitted guarded fast path removes the call,
+                reserve, and memcpy from every capacity-available scalar
+                iteration; the unchanged generic runtime symbol remains the
+                single growth/arena fallback
+identity        no manifest or archive-policy change, so no cache or artifact
+                identity changes
 ```
-
-`21-build-perf-plan.md` gains one item recording this decision and its measured
-build-time delta. It is a release-profile decision on the record, not a silent
-manifest edit.
 
 ## 6. Scalar ABI facts at call boundaries (issue 1075)
 
