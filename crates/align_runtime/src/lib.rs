@@ -27265,6 +27265,60 @@ const _: extern "C" fn(i32, u8, u8, i32, u32) -> i32 = align_rt_test_report_v1;
 mod tests {
     use super::*;
 
+    // The complete runtime source list (crates/align_runtime/src/**/*.rs), not just the six files
+    // that historically happened to define every symbol the old line-start registry scanner could
+    // see (#1112). Kept as one array so the inventory test below can both scan these contents AND
+    // assert, via `read_dir`, that this list still names every `.rs` file under `src/` — a new file
+    // dropped in without a matching entry here used to fail open (its exports never joined
+    // `runtime`, so a missing registry row went undetected).
+    const RUNTIME_SOURCE_FILES: &[(&str, &str)] = &[
+        ("buffer_storage.rs", include_str!("buffer_storage.rs")),
+        ("crypto_asymmetric.rs", include_str!("crypto_asymmetric.rs")),
+        ("crypto_digest.rs", include_str!("crypto_digest.rs")),
+        ("csv.rs", include_str!("csv.rs")),
+        ("fs_directory.rs", include_str!("fs_directory.rs")),
+        ("fs_regular.rs", include_str!("fs_regular.rs")),
+        ("fs_retained_tree.rs", include_str!("fs_retained_tree.rs")),
+        ("json_number.rs", include_str!("json_number.rs")),
+        ("lib.rs", include_str!("lib.rs")),
+        ("os_host.rs", include_str!("os_host.rs")),
+        ("process_launch.rs", include_str!("process_launch.rs")),
+        ("process_launch/darwin.rs", include_str!("process_launch/darwin.rs")),
+        ("process_live.rs", include_str!("process_live.rs")),
+        ("process_scope.rs", include_str!("process_scope.rs")),
+        ("process_signal.rs", include_str!("process_signal.rs")),
+        ("process_table.rs", include_str!("process_table.rs")),
+        ("process_verified.rs", include_str!("process_verified.rs")),
+        ("str_prims.rs", include_str!("str_prims.rs")),
+        ("time_formats.rs", include_str!("time_formats.rs")),
+        ("xml.rs", include_str!("xml.rs")),
+    ];
+
+    /// Every `.rs` path under `root`, relative to `root`, with `/`-separated components regardless
+    /// of host path separator.
+    fn discover_rust_sources(root: &std::path::Path) -> std::collections::BTreeSet<String> {
+        fn walk(dir: &std::path::Path, base: &std::path::Path, out: &mut std::collections::BTreeSet<String>) {
+            for entry in std::fs::read_dir(dir).expect("read_dir(src)") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, base, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let rel = path
+                        .strip_prefix(base)
+                        .expect("path under base")
+                        .components()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    out.insert(rel);
+                }
+            }
+        }
+        let mut out = std::collections::BTreeSet::new();
+        walk(root, root, &mut out);
+        out
+    }
+
     #[test]
     fn runtime_export_source_inventory_matches_registry() {
         fn function_symbols(source: &str) -> std::collections::BTreeSet<String> {
@@ -27280,29 +27334,22 @@ mod tests {
                 .collect()
         }
 
-        // The complete runtime source list (crates/align_runtime/src/**/*.rs), not just the six
-        // files that historically happened to define every symbol the old line-start registry
-        // scanner could see (#1112).
-        let mut runtime = function_symbols(include_str!("lib.rs"));
-        runtime.extend(function_symbols(include_str!("buffer_storage.rs")));
-        runtime.extend(function_symbols(include_str!("crypto_asymmetric.rs")));
-        runtime.extend(function_symbols(include_str!("crypto_digest.rs")));
-        runtime.extend(function_symbols(include_str!("csv.rs")));
-        runtime.extend(function_symbols(include_str!("fs_directory.rs")));
-        runtime.extend(function_symbols(include_str!("fs_regular.rs")));
-        runtime.extend(function_symbols(include_str!("fs_retained_tree.rs")));
-        runtime.extend(function_symbols(include_str!("json_number.rs")));
-        runtime.extend(function_symbols(include_str!("os_host.rs")));
-        runtime.extend(function_symbols(include_str!("process_launch.rs")));
-        runtime.extend(function_symbols(include_str!("process_launch/darwin.rs")));
-        runtime.extend(function_symbols(include_str!("process_live.rs")));
-        runtime.extend(function_symbols(include_str!("process_scope.rs")));
-        runtime.extend(function_symbols(include_str!("process_signal.rs")));
-        runtime.extend(function_symbols(include_str!("process_table.rs")));
-        runtime.extend(function_symbols(include_str!("process_verified.rs")));
-        runtime.extend(function_symbols(include_str!("str_prims.rs")));
-        runtime.extend(function_symbols(include_str!("time_formats.rs")));
-        runtime.extend(function_symbols(include_str!("xml.rs")));
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let discovered = discover_rust_sources(&src_dir);
+        let covered: std::collections::BTreeSet<String> =
+            RUNTIME_SOURCE_FILES.iter().map(|(path, _)| path.to_string()).collect();
+        assert_eq!(
+            discovered, covered,
+            "crates/align_runtime/src/**/*.rs no longer matches RUNTIME_SOURCE_FILES in this test \
+             (missing from the list: {:?}; listed but absent on disk: {:?})",
+            discovered.difference(&covered).collect::<Vec<_>>(),
+            covered.difference(&discovered).collect::<Vec<_>>(),
+        );
+
+        let mut runtime = std::collections::BTreeSet::new();
+        for (_, source) in RUNTIME_SOURCE_FILES {
+            runtime.extend(function_symbols(source));
+        }
         for non_base in [
             "align_rt_alloc_count",
             "align_rt_free_count",

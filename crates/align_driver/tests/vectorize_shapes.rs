@@ -66,6 +66,13 @@ fn compile_ir(name: &str, src: &str, cpu: &str, optimized: bool, exports: &[&str
         "kernel `{name}` left no function in the emitted module: it defines no `main` and named no \
          export root, so every function is internal and dead:\n{ir}"
     );
+    for root in exports {
+        let head = format!("@{root}(");
+        assert!(
+            ir.lines().any(|line| line.trim_start().starts_with("define") && line.contains(&head)),
+            "kernel `{name}` named export root `{root}` but the emitted module has no `define` for it:\n{ir}"
+        );
+    }
     ir
 }
 

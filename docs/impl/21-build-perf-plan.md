@@ -2721,7 +2721,12 @@ results before and after.
 
 **CI consequence.** Every leg pays one cold Cargo cache rebuild on the first
 run after this merges; the sharded nightly per-binary and per-shard budget
-rules are otherwise unchanged.
+rules are otherwise unchanged. `ci.yml`'s Cargo cache keys now hash
+`Cargo.toml` alongside `Cargo.lock`: a cache entry is immutable, so a key
+fixed on the lock file alone could never be replaced and would keep
+restoring the stale opt-level 0 artifacts forever, so "one cold rebuild" is
+true only with that key change. `nightly.yml`'s keys already include the run
+id and self-heal, so they needed no equivalent change.
 
 **Test-side companion change (same PR).** `pkg_db_a1` and `pkg_db_q4b`
 consolidated their rejection-shape fixtures: each rejection program is

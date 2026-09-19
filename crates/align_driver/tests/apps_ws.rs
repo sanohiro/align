@@ -729,7 +729,7 @@ fn protocol_ping_and_peer_close_reply_transport_failures_win() {
     assert_ne!(timed_ws, ws_root(), "std.http import seam must remain recognizable");
     let reset_ws = timed_ws.replace(
         "  return connection.write(header[0..count])",
-        "  mut sync := buffer(1)\n  match connection.read_exact(sync, 1) {\n    Ok(_) => {}\n    Err(_) => { return Err(Error.Denied) }\n  }\n  time.sleep(500000000)\n  return connection.write(header[0..count])",
+        "  mut sync := buffer(1)\n  match connection.read_exact(sync, 1) {\n    Ok(_) => {}\n    Err(_) => { return Err(Error.Denied) }\n  }\n  time.sleep(500000000)\n  match connection.write(header[0..count]) {\n    Ok(_) => { return Err(Error.Timeout) }\n    Err(error) => { return Err(error) }\n  }",
     );
     assert_ne!(reset_ws, timed_ws, "frame-head write seam must remain recognizable");
 
@@ -773,6 +773,10 @@ fn protocol_ping_and_peer_close_reply_transport_failures_win() {
     assert!(
         !stderr.contains("Denied"),
         "a failed synchronization read must take the distinct sentinel path:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains("Timeout"),
+        "a successful header write must take the distinct sentinel path:\n{stderr}",
     );
 }
 

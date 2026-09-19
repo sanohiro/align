@@ -218,7 +218,12 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-db-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          # The key hashes the root manifest as well as the lock file: `[profile.dev]`
+          # lives there and changing it invalidates every Cargo fingerprint in the
+          # restored `target`. A cache entry is immutable, so without the manifest in
+          # the key the save below cannot replace the stale entry and every later run
+          # would restore artifacts it must rebuild from scratch.
+          key: cargo-db-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
           restore-keys: |
             cargo-db-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-
 
@@ -312,7 +317,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-db-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-db-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
 
   db-required:
     name: PostgreSQL integration (required)
@@ -483,7 +488,12 @@ jobs:
             ~/.cargo/git
             target
             target/clippy
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-lint${{ matrix.lint }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          # The key hashes the root manifest as well as the lock file: `[profile.dev]`
+          # lives there and changing it invalidates every Cargo fingerprint in the
+          # restored `target`. A cache entry is immutable, so without the manifest in
+          # the key the save below cannot replace the stale entry and every later run
+          # would restore artifacts it must rebuild from scratch.
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-lint${{ matrix.lint }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
           restore-keys: |
             cargo-${{ runner.os }}-${{ runner.arch }}-lint${{ matrix.lint }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-
 
@@ -624,7 +634,7 @@ jobs:
             ~/.cargo/git
             target
             target/clippy
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-lint${{ matrix.lint }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-lint${{ matrix.lint }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
 
   platform-required:
     name: Platform CI (required)

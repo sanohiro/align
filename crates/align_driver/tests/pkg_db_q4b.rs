@@ -2111,6 +2111,7 @@ fn streamed_views_cannot_cross_generation_or_escape() {
         }
     }
 }
+
 #[test]
 fn sqlite_direct_stream_retains_binds_and_releases_each_native_phase_once() {
     CASE_SQLITE_DIRECT_STREAM.run();

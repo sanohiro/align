@@ -31,6 +31,24 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    produces them all, even though `scripts/run-gate-binaries.sh` already runs
    them concurrently once built).
 
+   **Item 8 shipped (updated 2026-09-19).** `fix/nightly-detector-restore`
+   fixed a second, independent CI/nightly cost: owner tests were compiling
+   generated programs through an opt-level 0 `alignc`. Adding
+   `[profile.dev] opt-level = 1` at the workspace root cuts `pkg_db_a1` 3.96x
+   (486.6s -> 122.8s) for a one-time +45s clean-build cost, with
+   debug-assertions and overflow checks unaffected below opt-level 2.
+   `ci.yml`'s four Cargo cache keys now hash `Cargo.toml` alongside
+   `Cargo.lock` so the immutable cache entry can actually be replaced once
+   `[profile.dev]` changes what a cached `target` means. After merge, the
+   next agent must confirm: (a) the first `main` CI run logs "Cache saved"
+   under the new key and the second run restores and hits it — this also
+   closes item 7's still-pending post-merge measurement, since both land in
+   the same cache; (b) the first nightly after merge is green, or triage its
+   diff against `scripts/known-failures.txt` (#1106 is the only expected
+   failure); (c) one Linux observation each for two owners self-review
+   flagged as profile-sensitive: `crates/align_driver/tests/deep_type_graphs.rs`'s
+   fixed 2 MiB worker-thread stacks, and `scripts/test-runtime-abi-exports.sh`.
+
 1. **plan 70 PR 1** (#1071, effects table) — `docs/impl/70-runtime-boundary-effects-plan.md`
    §3. Precondition: run the §3.6 `argmem` experiment first; its result decides
    whether invariant D widens. Ledger is already reviewed; no new plan review.
@@ -45,9 +63,27 @@ preflight, `scripts/open-pr.sh`, CI, merge):
 5. Language items after the codegen track: #1085 `str` patterns in `match`,
    #1065 fixed arrays in structs, #1066 proposal 2, #1064 → depends on #1063,
    #1075 scalar ABI facts, #1082 P2 RFC.
-6. Follow-ups, independent and small: #1093, #1105–#1109, #1112 (nightly
-   triage findings; each has a manifest line in `scripts/known-failures.txt`
-   that the fix must delete).
+6. Follow-ups, independent and small (updated 2026-09-19):
+   `fix/nightly-detector-restore` closed #1105, #1107, #1108, #1109, and
+   #1112, and separately repaired two untracked first-night nightly failures
+   that never got a manifest line — the vectorize_shapes x86 G1/G2 owners
+   added by #1116 compiled main-less kernels with no export root, so -O2
+   removed every function and the assertions inspected an empty module; and
+   http_headers_view's `split("define")` left the last definition's chunk
+   unbounded, swallowing the trailing declare table. `scripts/known-failures.txt`
+   now carries only #1106 (per-unit ELF byte mismatch, `e_entry`/`e_shoff`,
+   Linux-only). #1093 is untouched and still open.
+7. **New, found during this PR's self-review (2026-09-19):**
+   `docs/impl/20-runtime-abi-ledger.md` states two inconsistent counts for
+   the same registry: the R88 summary near line 9 gives 446 keyed / 464 base
+   / 471 alloc-count / 468 par-map-probe / 475 maximum, while the test
+   description near line 1171 gives 426 keyed / 464 base / 451 alloc-count /
+   448 par-map-probe / 455 maximum. Base (464) agrees; the other four don't.
+   This is pre-existing drift, not caused by this PR. Reconcile against the
+   actual registry, `crates/align_codegen_llvm/src/runtime_abi.rs` (464
+   `=> RuntimeAbi {` arms, confirmed 2026-09-19) — the base-record source of
+   truth lives in `align_codegen_llvm`; `align_runtime` has no
+   `runtime_abi.rs` of its own.
 
 Recorded follow-up from PR #1116's review (plan 69 §3.7): the static
 initializer scan in `align_mir::loop_facts::admit` can be replaced by an
@@ -952,6 +988,17 @@ Operational rules:
   stops at the hard 30-minute budget.
 - Network, TLS, filesystem, and fd tests may need an unrestricted local
   environment rather than a sandbox.
+- Process fact (2026-09-19): when a suite blows its time budget (30 min /
+  900s per binary), profile per-test cost and cut what the tests don't need
+  to prove; splitting binaries or adding shards is not the first move. The
+  pkg_db overrun analysis found 100% of the cost was `alignc` compiling each
+  test's unique program, not test count or the generated program's LLVM
+  level, and the fix was the Cargo dev profile (`docs/impl/21-build-perf-plan.md`
+  item 8), not more shards.
+- Run `scripts/db-verify-local.sh` before pushing any `pkg_db_*` change. On
+  macOS it needs libpq/openssl in `LIBRARY_PATH` and
+  `DYLD_FALLBACK_LIBRARY_PATH` (keg-only Homebrew paths); without them every
+  linked test fails with `ld: library 'ssl' not found`.
 
 ## Durable records
 

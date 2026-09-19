@@ -1942,15 +1942,38 @@ fn llvm_drop_has_a_tag_guard_and_none_constructs_without_allocation() {
         ir.contains("dropoptissome"),
         "Drop must test the Option tag:\n{ir}"
     );
-    let none_start = ir
-        .find("define internal")
-        .expect("missing function definition");
-    let from_none = &ir[none_start..];
-    let none_body = &from_none[..from_none.find("\n}").map_or(from_none.len(), |end| end + 2)];
+    let none_body = function_body(&ir, &encoded_symbol("none"));
     assert!(
         !none_body.contains("@align_rt_alloc") && !none_body.contains("@malloc"),
         "the None constructor must not allocate:\n{none_body}"
     );
+}
+
+/// The encoded, collision-free LLVM symbol for a program function (mirrors `symbol_name`'s
+/// non-export path). Duplicated from `export_roots.rs`: each integration test file is its own
+/// crate.
+fn encoded_symbol(name: &str) -> String {
+    let hex = name.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    format!("align_fn${}${hex}", name.len())
+}
+
+/// The IR text of the `define` for `sym`, from its `define` line through its closing brace.
+/// Anchoring on the actual symbol (rather than e.g. the first `internal` function) matters because
+/// a module can have more than one `internal` definition. Panics if `sym` has no definition.
+fn function_body<'a>(ir: &'a str, sym: &str) -> &'a str {
+    let bare = format!("@{sym}(");
+    let quoted = format!("@\"{sym}\"(");
+    let start = ir
+        .match_indices("\ndefine ")
+        .map(|(at, _)| at + 1)
+        .find(|&at| ir[at..].lines().next().is_some_and(|line| line.contains(&bare) || line.contains(&quoted)))
+        .unwrap_or_else(|| panic!("no `{sym}` define in the IR:\n{ir}"));
+    let rest = &ir[start..];
+    let end = rest
+        .find("\n}")
+        .unwrap_or_else(|| panic!("`{sym}`'s definition is not terminated in the IR:\n{rest}"))
+        + 2;
+    &rest[..end]
 }
 
 /// One Align tagged type must reach exactly one LLVM type, whichever MIR spelling names it.

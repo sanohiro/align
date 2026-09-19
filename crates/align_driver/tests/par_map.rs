@@ -203,7 +203,7 @@ fn par_map_over_padded_aos_uses_abi_stride() {
     let ir = emit_llvm(src);
     let call = ir
         .lines()
-        .find(|line| line.contains("@align_rt_par_map(") && !line.trim_start().starts_with("declare"))
+        .find(|line| line.contains("call ") && line.contains("@align_rt_par_map("))
         .unwrap_or_else(|| panic!("no par_map runtime call in IR:\n{ir}"));
     assert!(call.contains(", i64 16, i64 8,"), "the padded AoS input must use its ABI stride:\n{call}");
     assert!(
