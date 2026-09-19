@@ -51,7 +51,7 @@ fn main() -> i32 = 0
         ("push_i64", "store i64", 8),
         ("push_f32", "store float", 4),
         ("push_f64", "store double", 8),
-        ("push_bool", "store i1", 1),
+        ("push_bool", "store i8", 1),
         ("push_char", "store i32", 4),
     ] {
         let body = function_ir(&ir, name);
@@ -79,6 +79,9 @@ fn main() -> i32 = 0
             "{name} must guard the exact runtime stride, including zero-stride forged headers:\n{body}",
         );
         assert!(!body.contains("alwaysinline") && !body.contains("inlinehint"));
+        if name == "push_bool" {
+            assert!(body.contains("zext i1") && body.contains("%ab.bool.byte"), "{body}");
+        }
     }
 }
 
@@ -236,6 +239,17 @@ fn f32_push_build_then_sum() {
     let src = "fn main() -> i32 {\n  mut b: array_builder<f32> := array_builder(4)\n  b.push(1.5 as f32)\n  b.push(2.5 as f32)\n  xs := b.build()\n  return xs.sum() as i32\n}\n";
     let out = build_and_run("ab-f32", src);
     assert_eq!(code(&out), Some(4), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn bool_fast_push_keeps_canonical_bytes_for_json() {
+    if !backend_available() {
+        return;
+    }
+    let src = "import core.json\nfn main() -> Result<(), Error> {\n  mut b: array_builder<bool> := array_builder(2)\n  b.push(false)\n  b.push(true)\n  values := b.build()\n  print(json.encode(values)?)\n  return Ok(())\n}\n";
+    let out = build_and_run("ab-bool-canonical-byte", src);
+    assert_eq!(code(&out), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "[false,true]\n");
 }
 
 /// bool round-trip: push then index each element back out of the frozen array.

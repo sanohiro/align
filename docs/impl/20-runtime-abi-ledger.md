@@ -1963,5 +1963,6 @@ fast path consumes an exact `ArrayBuilder` layout contract: `data = 0`, `len = 8
 `elem_size = 24`, `arena = 32`, total size 64, and alignment at most 16. Const assertions in
 `align_runtime` pin the native definition; `align_codegen_llvm::ARRAY_BUILDER_LAYOUT` carries the
 same table, and the driver owner compares them. Heap mode with matching stride and spare capacity
-uses one typed store and increments `len`; every other state calls the existing
+uses one typed store and increments `len`; `bool` is zero-extended from LLVM `i1` to the runtime's
+canonical `i8` byte before that store. Every other state calls the existing
 `align_rt_array_builder_push` exactly once.

@@ -22003,8 +22003,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 .build_gep(self.ctx.i8_type(), data, &[byte_offset], "ab.destination")
                 .map_err(|error| self.err(error))?
         };
+        // LLVM `store i1` leaves the high seven bits of its one-byte memory slot unspecified.
+        // The runtime fallback writes a canonical 0/1 byte, and byte-oriented consumers read the
+        // full slot, so preserve that representation on the fast edge as well.
+        let stored_value = if scalar == Ty::Bool {
+            self.builder
+                .build_int_z_extend(value.into_int_value(), self.ctx.i8_type(), "ab.bool.byte")
+                .map_err(|error| self.err(error))?
+                .into()
+        } else {
+            value
+        };
         self.builder
-            .build_store(destination, value)
+            .build_store(destination, stored_value)
             .map_err(|error| self.err(error))?;
         let next_len = self
             .builder
@@ -25064,13 +25075,12 @@ fn main() -> i32 = 0
                             },
                         ) = statement
                         {
-                            match axis {
-                                "receiver" => {
-                                    *builder = Operand::Const(Const::Int(0, *scalar));
-                                }
-                                "value" => *value = Operand::Const(Const::Bool(false)),
-                                "scalar" => *scalar = Ty::Bool,
-                                _ => unreachable!(),
+                            if axis == "receiver" {
+                                *builder = Operand::Const(Const::Int(0, *scalar));
+                            } else if axis == "value" {
+                                *value = Operand::Const(Const::Bool(false));
+                            } else {
+                                *scalar = Ty::Bool;
                             }
                             changed = true;
                         }

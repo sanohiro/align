@@ -712,16 +712,18 @@ Exact contract    for an element of statically known width W in the scalar set,
                   codegen emits
 
                     if arena == null && elem_size == W && len < cap {
-                        store v, data + len * W
+                        store repr(v), data + len * W
                         len = len + 1
                     } else {
                         call align_rt_array_builder_push(b, bits)
                     }
 
-                  The slow path is exactly one call to the existing symbol and
-                  is the only path that can grow, use arena chunks, or handle a
-                  string element. No new runtime symbol, no alwaysinline, no
-                  source annotation
+                  `repr(v)` is the scalar's typed value, except `bool`, whose
+                  `i1` is zero-extended to the canonical `i8` byte the runtime
+                  path writes. The slow path is exactly one call to the
+                  existing symbol and is the only path that can grow, use arena
+                  chunks, or handle a string element. No new runtime symbol,
+                  no alwaysinline, no source annotation
 
 Inputs, defaults  the builder handle and the value, as today. There is no
                   option, flag or environment input; the fast path is emitted
@@ -1295,7 +1297,7 @@ K5  no new runtime symbol, no alwaysinline, no inlinehint, no source
 
 | Cell | Required behaviour | Owner |
 | --- | --- | --- |
-| scalar set | `i64`, `f32`, `f64`, `bool`, `char`: the fast block has one typed store and one `add`, with zero calls and zero `memcpy` | one parameterized owner over every element type |
+| scalar set | `i64`, `f32`, `f64`, `bool`, `char`: the fast block has one typed store and one `add`, with zero calls and zero `memcpy`; `bool` zero-extends `i1` to a canonical `i8` slot | one parameterized IR owner over every element type plus a byte-reading JSON owner for `bool` |
 | reserved capacity | a bounded-capacity push loop carries the header in SSA and its fast iteration emits zero calls; the guarded growth edge remains one static slow call site | new owner (1072 criterion 1, with the literal whole-function zero-call wording corrected by §2.7's exact contract) |
 | growth edge | an unbounded loop emits exactly one call, on the growth edge | new owner (1072 criterion 3) |
 | arena mode | an `array_builder` created with `new_in` takes the slow path every time | new owner |
