@@ -478,7 +478,7 @@ cases.
 | Move-out/source nulling | active payload moves clear only its source ownership state; union bytes need no deterministic zero; existing move and owned-match owners |
 | Drop/replacement/return | tag-directed exactly-once Drop for every ordinal, old-value replacement after RHS, direct/indirect returns and cleanup payloads; large-drop, enum-drop, reassign, move-return owners |
 | Control flow | if/match/else/?/map_err, wildcard/or-pattern, branch/loop joins, early return and divergence; value-control and tagged-match owners |
-| Serialization/native | JSON encodes/decodes only active fields; callbacks and task/error slots agree; foreign layout(C) rejection remains; JSON, task-group, callback, FFI negative owners |
+| Serialization/native | JSON encodes/decodes only active fields; callbacks and task/error slots agree; every runtime-owned scratch mirror that embeds a tagged value uses the same union body, including `process.termination` and the nested `wait_result`/`reaped` records; foreign layout(C) rejection remains; JSON, task-group, callback, exact native size/offset, process lifecycle, and FFI negative owners |
 | Whole/per-unit/cache | imported and generic definitions produce equal layout; compiler/LLVM/target/type edits miss the right cache; per-unit/interface/inprocess owners |
 | Allocation/provenance | no new runtime allocation; nested owned payload keeps heap/arena owner and active-tag lifetime; return-provenance and allocation parity owners |
 | Performance | exact sizes equal formula; small-variant construction has O(active payload) stores; local size/store measurement and direct-layout reverse controls |

@@ -932,7 +932,7 @@ pub(crate) mod tests {
                 let mut child = launch(&configuration, capture, false).unwrap();
                 child.stdout.fd.take();
                 child.stderr.fd.take();
-                assert_eq!(child.wait().unwrap().termination.exited, 7);
+                assert_eq!(child.wait().unwrap().termination.value, 7);
             }
             std::process::exit(0);
         }
@@ -967,7 +967,7 @@ pub(crate) mod tests {
                     Ok(mut child) => {
                         child.stdout.fd.take();
                         child.stderr.fd.take();
-                        assert_eq!(child.wait().unwrap().termination.exited, 0);
+                        assert_eq!(child.wait().unwrap().termination.value, 0);
                         completed = true;
                     }
                     Err(error) => assert_eq!(
@@ -1061,7 +1061,7 @@ pub(crate) mod tests {
         );
         assert_eq!(observed[2], 1);
         assert_eq!(
-            child.wait().unwrap().termination.signaled,
+            child.wait().unwrap().termination.value,
             i64::from(libc::SIGKILL)
         );
         // This fixture has one process: exec preserves the writer PID. Observe
@@ -1078,7 +1078,7 @@ pub(crate) mod tests {
     fn native_launch_error_and_final_environment() {
         let mut command = command("exit 127");
         let mut child = launch(&command, false, false).unwrap();
-        assert_eq!(child.wait().unwrap().termination.exited, 127);
+        assert_eq!(child.wait().unwrap().termination.value, 127);
         command.target = super::super::CommandTarget::Path(CString::new("/nonexistent/align-r65-executable").unwrap());
         assert!(matches!(
             launch(&command, false, false),
@@ -1104,7 +1104,7 @@ pub(crate) mod tests {
                 .wait()
                 .unwrap()
                 .termination
-                .exited,
+                .value,
             127
         );
     }
@@ -1141,7 +1141,7 @@ pub(crate) mod tests {
         assert_eq!(child.stderr.read(&mut byte).unwrap(), Some(1));
         assert_eq!(byte, [b'x']);
         let result = child.wait().unwrap();
-        assert_eq!(result.termination.exited, 0);
+        assert_eq!(result.termination.value, 0);
         assert_eq!(unsafe { super::super::process_live::align_rt_child_poll(
             &mut *child, 2, 5_000_000_000, readiness.as_mut_ptr().cast(),
         ) }, 0);
@@ -1182,7 +1182,7 @@ pub(crate) mod tests {
         for signal in [-1, super::super::MAX_SIGNAL + 1, i64::MAX] {
             assert_eq!(child.signal(signal, true), Err(AL_INVALID));
         }
-        assert_eq!(child.wait().unwrap().termination.exited, 143);
+        assert_eq!(child.wait().unwrap().termination.value, 143);
         assert_eq!(child.signal(0, true), Err(AL_INVALID));
         assert_eq!(child.signal(0, false), Err(AL_INVALID));
     }
@@ -1200,7 +1200,7 @@ pub(crate) mod tests {
             let mut child = launch(&command, capture, false).unwrap();
             child.stdout.fd.take();
             child.stderr.fd.take();
-            assert_eq!(child.wait().unwrap().termination.exited, 0);
+            assert_eq!(child.wait().unwrap().termination.value, 0);
         }
         assert_eq!(
             unsafe { libc::fcntl(foreign.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,

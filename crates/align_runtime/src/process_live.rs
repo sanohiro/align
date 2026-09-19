@@ -22,26 +22,25 @@ impl OptionalCount {
     }
 }
 
-/// Align natural sums retain all variant payload fields, not a C union.
+/// Native mirror of `process.termination`: an i32 tag followed by the one active i64 payload.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Termination {
     pub tag: i32,
     pub padding: [u8; 4],
-    pub exited: i64,
-    pub signaled: i64,
+    pub value: i64,
 }
 impl Termination {
     pub(crate) fn from_wait(status: i32) -> Result<Self, i32> {
         if libc::WIFEXITED(status) {
             Ok(Self {
-                exited: i64::from(libc::WEXITSTATUS(status)),
+                value: i64::from(libc::WEXITSTATUS(status)),
                 ..Self::default()
             })
         } else if libc::WIFSIGNALED(status) {
             Ok(Self {
                 tag: 1,
-                signaled: i64::from(libc::WTERMSIG(status)),
+                value: i64::from(libc::WTERMSIG(status)),
                 ..Self::default()
             })
         } else {
@@ -164,12 +163,12 @@ impl NativeChild {
         let value = i64::from(unsafe { info.si_status() });
         let result = match info.si_code {
             libc::CLD_EXITED if (0..=255).contains(&value) => Termination {
-                exited: value,
+                value,
                 ..Termination::default()
             },
             libc::CLD_KILLED | libc::CLD_DUMPED if value > 0 => Termination {
                 tag: 1,
-                signaled: value,
+                value,
                 ..Termination::default()
             },
             _ => {
@@ -376,7 +375,7 @@ mod tests {
         assert_eq!(child.poll(4, 1).unwrap().status, 1);
         assert!(!FINISH_DURING_FALLBACK.with(core::cell::Cell::get));
         assert_eq!(
-            child.wait().unwrap().termination.signaled,
+            child.wait().unwrap().termination.value,
             i64::from(libc::SIGKILL)
         );
     }
@@ -403,7 +402,7 @@ mod tests {
         child.signal(i64::from(libc::SIGKILL), false).unwrap();
         assert_eq!(child.poll(4, 1_000_000_000).unwrap().status, 1);
         assert_eq!(
-            child.wait().unwrap().termination.signaled,
+            child.wait().unwrap().termination.value,
             i64::from(libc::SIGKILL)
         );
         assert_eq!(child.poll(4, 0).unwrap().status, 1);
@@ -412,29 +411,25 @@ mod tests {
     fn native_status_layout_and_domains() {
         assert_eq!(
             (size_of::<Termination>(), align_of::<Termination>()),
-            (24, 8)
+            (16, 8)
         );
         assert_eq!(
-            [
-                offset_of!(Termination, tag),
-                offset_of!(Termination, exited),
-                offset_of!(Termination, signaled)
-            ],
-            [0, 8, 16]
+            [offset_of!(Termination, tag), offset_of!(Termination, value)],
+            [0, 8]
         );
         assert_eq!(
             (
                 size_of::<WaitResult>(),
                 offset_of!(WaitResult, max_rss_bytes)
             ),
-            (40, 24)
+            (32, 16)
         );
         assert_eq!(offset_of!(OptionalCount, value), 8);
         let exit = Termination::from_wait(143 << 8).unwrap();
         let signal = Termination::from_wait(15).unwrap();
         assert_ne!(exit, signal);
-        assert_eq!((exit.tag, exit.exited, exit.signaled), (0, 143, 0));
-        assert_eq!((signal.tag, signal.exited, signal.signaled), (1, 0, 15));
+        assert_eq!((exit.tag, exit.value), (0, 143));
+        assert_eq!((signal.tag, signal.value), (1, 15));
         assert_eq!(Termination::from_wait(0x7f), Err(AL_INVALID));
         assert_eq!(
             OptionalCount::from_nonnegative(-1),
@@ -525,7 +520,7 @@ mod tests {
             std::thread::yield_now();
         }
         let observed = child.status().unwrap().unwrap();
-        assert_eq!(observed.exited, 143);
+        assert_eq!(observed.value, 143);
         assert!(child.reaped.is_none());
         let result = child.wait().unwrap();
         assert_eq!(result.termination, observed);
