@@ -340,8 +340,8 @@ pub struct Program {
     /// graph walks, hashes, MIR printing, runtime-key inventory, and codegen.
     pub plan_records: Vec<PlanRecord>,
     /// Plan 69 §3.2.3: one `loop_facts` decision per source loop, per function, in innermost-first
-    /// order. Diagnostic data for `explain-opt` only — absent from MIR text and therefore from
-    /// `codegen_impl_hash`, from the canonical graph, and from every interface and cache key.
+    /// order. The decisions are diagnostic data for `explain-opt`; each record's counted-loop
+    /// facts are producer-owned codegen input. Both remain absent from MIR text and interfaces.
     pub loop_facts: Vec<loop_facts::FunctionDecisions>,
     /// Construction-time certification of the complete record table. Validation compares it with
     /// the publishable copy so deletion, insertion, or source-provenance stripping fails closed.
@@ -3436,11 +3436,12 @@ fn lower_program_checked_with_catalog(
         // consumes `byte_ranges`' facts, so a rolled-back byte-range proof cannot leave it holding
         // a stale one. It runs after `annotate_par_map_work` (invariant I8), which
         // `lower_program_unchecked_with_plans` already completed above.
-        let decisions = loop_facts::version_loops(function);
+        let (decisions, counted) = loop_facts::version_loops(function);
         if !decisions.is_empty() {
             loop_decisions.push(loop_facts::FunctionDecisions {
                 function: function.name.to_string(),
                 loops: decisions,
+                counted,
             });
         }
     }

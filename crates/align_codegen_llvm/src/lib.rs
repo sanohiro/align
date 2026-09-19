@@ -88,7 +88,7 @@ use inkwell::types::{
 };
 use inkwell::values::{
     ArrayValue, BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, IntValue,
-    PointerValue, StructValue,
+    OperandBundle, PointerValue, StructValue,
 };
 
 type ColumnBatchLayout<'c> = (
@@ -1127,6 +1127,7 @@ pub fn emit_function_prelink_bc(
         definition,
         peers,
         peer_functions,
+        counted_loops,
         shared,
     } = view
     else {
@@ -1179,6 +1180,13 @@ pub fn emit_function_prelink_bc(
     program.tagged_types = shared.tagged_types.to_vec();
     program.fn_types = shared.fn_types.to_vec();
     program.tuples = shared.tuples.to_vec();
+    if !counted_loops.is_empty() {
+        program.loop_facts.push(align_mir::loop_facts::FunctionDecisions {
+            function: selected.name.to_string(),
+            loops: Vec::new(),
+            counted: counted_loops.to_vec(),
+        });
+    }
     if partition_function_abi(selected, &program)? != definition.abi
         || peers
             .iter()
@@ -2921,8 +2929,9 @@ impl<'a> PartitionSharedCodegenView<'a> {
 }
 
 /// The complete borrowed module input for one function/support partition. `peer_functions` is the
-/// physical source needed by the existing LLVM ABI lowering, paired one-for-one with `peers`; the
-/// manual `Debug` implementation deliberately fingerprints only the canonical peer records.
+/// physical source needed by the existing LLVM ABI lowering, paired one-for-one with `peers`;
+/// `counted_loops` is the selected body's producer-owned codegen input. The manual `Debug`
+/// implementation fingerprints both alongside the canonical peer records.
 #[allow(clippy::large_enum_variant)] // Keep the sealed borrowed shared view allocation-free.
 pub enum PartitionCodegenView<'a> {
     Function {
@@ -2930,6 +2939,7 @@ pub enum PartitionCodegenView<'a> {
         definition: ThinPeerDeclaration,
         peers: Vec<ThinPeerDeclaration>,
         peer_functions: Vec<&'a Function>,
+        counted_loops: &'a [align_mir::loop_facts::CountedLoopFact],
         shared: PartitionSharedCodegenView<'a>,
     },
     Support {
@@ -2944,6 +2954,7 @@ impl std::fmt::Debug for PartitionCodegenView<'_> {
                 selected,
                 definition,
                 peers,
+                counted_loops,
                 shared,
                 ..
             } => formatter
@@ -2951,6 +2962,7 @@ impl std::fmt::Debug for PartitionCodegenView<'_> {
                 .field("selected", selected)
                 .field("definition", definition)
                 .field("peers", peers)
+                .field("counted_loops", counted_loops)
                 .field("shared_fingerprint", &shared.fingerprint)
                 .finish(),
             Self::Support { thunks } => formatter.debug_struct("Support").field("thunks", thunks).finish(),
@@ -3931,6 +3943,11 @@ fn lower_prepared_module<'c>(
         let stack_headers = stack_header_plan(f);
         let view_facts = view_facts_plan(f);
         let borrowed_element_validation = BorrowedElementValidationIndex::new(f);
+        let counted_loops = program
+            .loop_facts
+            .iter()
+            .find(|facts| facts.function == f.name.as_str())
+            .map_or(&[][..], |facts| facts.counted.as_slice());
         let func = program_funcs
             .get(&f.name)
             .copied()
@@ -3979,6 +3996,7 @@ fn lower_prepared_module<'c>(
             tuples: &program.tuples,
             target_data: &target_data,
             f,
+            counted_loops,
             borrowed_element_validation: &borrowed_element_validation,
             func,
             slots: HashMap::new(),
@@ -8084,6 +8102,7 @@ struct FnGen<'c, 'a> {
     /// Target layout — used to compute struct field byte offsets for `json.decode`.
     target_data: &'a inkwell::targets::TargetData,
     f: &'a Function,
+    counted_loops: &'a [align_mir::loop_facts::CountedLoopFact],
     borrowed_element_validation: &'a BorrowedElementValidationIndex,
     func: FunctionValue<'c>,
     slots: HashMap<Slot, inkwell::values::PointerValue<'c>>,
@@ -11770,7 +11789,55 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
         }
         self.current_mir_statement = None;
+        self.emit_counted_extents(b.id)?;
         self.gen_term(&b.term)
+    }
+
+    fn emit_counted_extents(
+        &mut self,
+        block: align_mir::BlockId,
+    ) -> Result<(), CodegenError> {
+        let Some(fact) = self.counted_loops.iter().find(|fact| fact.preheader == block) else {
+            return Ok(());
+        };
+        if fact.extents.is_empty() {
+            return Ok(());
+        }
+        let assume = Intrinsic::find("llvm.assume")
+            .and_then(|intrinsic| intrinsic.get_declaration(self.module, &[]))
+            .ok_or_else(|| self.err("llvm.assume is unavailable"))?;
+        for extent in &fact.extents {
+            let view = self.operand(&extent.view)?.into_struct_value();
+            let pointer = self
+                .builder
+                .build_extract_value(view, 0, "counted.data")
+                .map_err(|error| self.err(error))?
+                .into_pointer_value();
+            let len = self.operand(&extent.len)?.into_int_value();
+            let elem_ty = self.llvm_type(scalar_to_ty(extent.elem));
+            let elem_size = self.target_data.get_store_size(&elem_ty);
+            let bytes = self
+                .builder
+                .build_int_mul(
+                    len,
+                    self.ctx.i64_type().const_int(elem_size, false),
+                    "counted.bytes",
+                )
+                .map_err(|error| self.err(error))?;
+            let bundle = OperandBundle::create(
+                "dereferenceable",
+                &[pointer.into(), bytes.into()],
+            );
+            self.builder
+                .build_direct_call_with_operand_bundles(
+                    assume,
+                    &[self.ctx.bool_type().const_int(1, false).into()],
+                    &[bundle],
+                    "",
+                )
+                .map_err(|error| self.err(error))?;
+        }
+        Ok(())
     }
 
     fn gen_term(&mut self, t: &Term) -> Result<(), CodegenError> {
@@ -23907,6 +23974,7 @@ fn main() -> i32 = 0
                 definition,
                 peers,
                 peer_functions,
+                counted_loops: &[],
                 shared: shared.clone(),
             };
             let error = match emit_function_prelink_bc(
@@ -34090,6 +34158,7 @@ fn main() -> i32 = 0
                 },
                 peers: vec![],
                 peer_functions: vec![],
+                counted_loops: &[],
                 shared: PartitionSharedCodegenView::from_program(&bad),
             };
             let result = emit_function_prelink_bc(&view, &output, &BuildTarget::Baseline, Profile::Release, None, "r63-reject");

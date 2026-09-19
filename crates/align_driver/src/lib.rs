@@ -7671,6 +7671,12 @@ pub fn function_partitions<'a>(
                 definition,
                 peers,
                 peer_functions,
+                counted_loops: unit
+                    .mir
+                    .loop_facts
+                    .iter()
+                    .find(|facts| facts.function == selected.name.as_str())
+                    .map_or(&[], |facts| facts.counted.as_slice()),
                 shared: shared.clone(),
             };
             let impl_hash = thin_view_hash(&view);

@@ -1,6 +1,7 @@
 //! Loop facts: the induction structure of a loop, and the bounds checks that follow from it.
 //!
-//! Plan 69 §3.2 (`docs/impl/69-loop-facts-plan.md`), implementing plan 68's G2 movement half. The
+//! Plan 69 §§3.2 and 4 (`docs/impl/69-loop-facts-plan.md`), implementing plan 68's G2 movement and
+//! G3 counted-loop shape. The
 //! guard *fusion* half lives in lowering (`emit_bounds_check` / `emit_range_bounds_check`); this
 //! module never deletes a check. It **versions** a loop: an admission test in a new preheader
 //! selects between a fast copy whose proved guards are bypassed and the original slow copy, which
@@ -10,7 +11,10 @@
 //! The pass is registered immediately after [`crate::byte_ranges::simplify`] in
 //! `lower_program_checked_with_catalog` and is fail-closed in the same way: derive, rewrite,
 //! re-derive from the rewritten function, and discard the whole rewrite when the re-derived facts
-//! disagree. It runs after `annotate_par_map_work` in every lowering entry point (invariant I8), so
+//! disagree. A versioned fast copy with a body-derived exit is also rotated: its zero-trip test is
+//! peeled, its stepped trip test is placed at the latch, and a named record carries its recurrence
+//! and owned-view extents to codegen. It runs after `annotate_par_map_work` in every lowering entry
+//! point (invariant I8), so
 //! a `par_map` work weight is derived from the unversioned body and is byte-identical with and
 //! without versioning.
 //!
@@ -141,6 +145,36 @@ impl KeptReason {
 pub struct FunctionDecisions {
     pub function: String,
     pub loops: Vec<LoopDecision>,
+    /// Recognized counted loops after rewriting. Codegen consumes only these producer-owned
+    /// records when placing the narrow data-buffer extent assumption from plan 69 §4.2.
+    pub counted: Vec<CountedLoopFact>,
+}
+
+/// The codegen-facing part of one recognized counted loop. `preheader` is reached only after the
+/// peeled zero-trip test and exactly once on the rotated path.
+#[derive(Clone, Debug)]
+pub struct CountedLoopFact {
+    pub preheader: BlockId,
+    pub header: BlockId,
+    pub latch: BlockId,
+    pub exit: BlockId,
+    pub entry: Operand,
+    pub trip_count: Operand,
+    pub index: Slot,
+    pub step: i64,
+    pub relation: BinOp,
+    pub bound: Operand,
+    pub extents: Vec<DataExtent>,
+    stepped: Operand,
+    latch_bound: Operand,
+}
+
+/// One Align-owned view whose data buffer is accessible for `len * sizeof(elem)` bytes.
+#[derive(Clone, Debug)]
+pub struct DataExtent {
+    pub view: Operand,
+    pub len: Operand,
+    pub elem: align_sema::Scalar,
 }
 
 impl FunctionDecisions {
@@ -824,6 +858,7 @@ impl Cfg {
 struct LoopShape {
     header: BlockId,
     body: BTreeSet<BlockId>,
+    latch: BlockId,
 }
 
 /// Every natural loop of the function, innermost-first (smallest body first, then by header id, so
@@ -844,6 +879,7 @@ fn discover_loops(function: &Function, cfg: &Cfg) -> Option<Vec<LoopShape>> {
             loops.push(LoopShape {
                 header,
                 body: BTreeSet::new(),
+                latch: header,
             });
             continue;
         };
@@ -883,7 +919,11 @@ fn discover_loops(function: &Function, cfg: &Cfg) -> Option<Vec<LoopShape>> {
                 break;
             }
         }
-        loops.push(LoopShape { header, body });
+        loops.push(LoopShape {
+            header,
+            body,
+            latch: *latch,
+        });
     }
     loops.sort_by_key(|shape| (shape.body.len(), shape.header));
     let _ = cfg.blocks;
@@ -1133,6 +1173,22 @@ struct Plan {
     /// `(guard block, failure block, success block)` for each proved guard.
     proved: Vec<(BlockId, BlockId, BlockId)>,
     budget_used: usize,
+    counted: Option<CountedPlan>,
+    extents: Vec<DataExtent>,
+}
+
+struct CountedPlan {
+    entry: Operand,
+    trip_count: Operand,
+    index: Slot,
+    step: i64,
+    relation: BinOp,
+    body_arm: BlockId,
+    exit_arm: BlockId,
+    latch: BlockId,
+    stepped: Operand,
+    fact_bound: Operand,
+    bound: Operand,
 }
 
 /// A loop's body facts: what it writes, and whether it calls out.
@@ -1431,6 +1487,28 @@ fn affine(
     }
 }
 
+fn view_extent_source<'a>(
+    analysis: &'a Analysis<'a>,
+    len: &'a Operand,
+) -> Option<(Slot, &'a Operand, align_sema::Scalar)> {
+    let (_, _, Rvalue::SliceLen(view)) = analysis.def(len)? else {
+        return None;
+    };
+    let elem = match analysis.value_ty(view)? {
+        Ty::Slice(elem) | Ty::DynArray(elem) => elem,
+        _ => return None,
+    };
+    fn root_slot(analysis: &Analysis<'_>, operand: &Operand) -> Option<Slot> {
+        let (_, _, value) = analysis.def(operand)?;
+        match value {
+            Rvalue::Load(slot) => Some(*slot),
+            Rvalue::Use(inner) => root_slot(analysis, inner),
+            _ => None,
+        }
+    }
+    Some((root_slot(analysis, view)?, view, elem))
+}
+
 /// Decide whether one loop may be versioned, and build the rewrite it would receive.
 ///
 /// `ignore` names blocks that are not part of this decision — the fast copy produced for this same
@@ -1486,24 +1564,68 @@ fn admit(
     if budget_used > LOOP_FACTS_VERSION_BUDGET {
         return Err(KeptReason::OverBudget);
     }
-    if guards.is_empty() {
-        return Err(KeptReason::NoProvableGuard);
-    }
-
-    // The header's trip-count exit: `i >= N`, leaving the loop on the true arm.
+    // The header's trip-count exit: `i >= N` or `i > N`, leaving the loop on the true arm.
     let Term::Branch(condition, exit_arm, body_arm) = &function.blocks[header as usize].term else {
         return Err(KeptReason::LoopShape);
     };
     if body.contains(exit_arm) || !body.contains(body_arm) {
         return Err(KeptReason::LoopShape);
     }
-    let Some((index_operand, bound)) = analysis.binary(condition, BinOp::Ge) else {
+    let (relation, index_operand, bound) = if let Some((index, bound)) =
+        analysis.binary(condition, BinOp::Ge)
+    {
+        (BinOp::Ge, index, bound)
+    } else if let Some((index, bound)) = analysis.binary(condition, BinOp::Gt) {
+        (BinOp::Gt, index, bound)
+    } else {
         return Err(KeptReason::LoopShape);
     };
+    let latch_bound = bound.clone();
+    let guard_exits: BTreeSet<BlockId> = guards.iter().map(|guard| guard.fail).collect();
+    let mut has_early_exit = false;
+    for block in body {
+        let Some(loop_block) = function.blocks.get(*block as usize) else {
+            return Err(KeptReason::LoopShape);
+        };
+        has_early_exit |= matches!(loop_block.term, Term::Return(_) | Term::ReturnWithCleanup(_))
+            || successors(&loop_block.term).into_iter().any(|target| {
+                !body.contains(&target)
+                    && target != *exit_arm
+                    && !guard_exits.contains(&target)
+            });
+    }
     let Some((condition_block, _, _)) = analysis.def(condition) else {
         return Err(KeptReason::LoopShape);
     };
     if condition_block != header {
+        return Err(KeptReason::LoopShape);
+    }
+    // Rotation bypasses the source header after the first iteration, so that block may contain
+    // only the pure dependency cone that forms the trip test. An observable call, a potentially
+    // failing unrelated expression, or even an unrelated load before the `if` belongs to every
+    // source iteration and must not be skipped by the rotated back edge.
+    let Some(header_block) = function.blocks.get(header as usize) else {
+        return Err(KeptReason::LoopShape);
+    };
+    let mut pending = Vec::new();
+    operand_values(condition, &mut pending);
+    let mut condition_stmts = BTreeSet::new();
+    while let Some(value) = pending.pop() {
+        let operand = Operand::Value(value);
+        let Some((block, position, rvalue)) = analysis.def(&operand) else {
+            return Err(KeptReason::LoopShape);
+        };
+        if block != header || !condition_stmts.insert(position) {
+            continue;
+        }
+        let RvalueFacts::Pure(operands) = rvalue_facts(rvalue) else {
+            return Err(KeptReason::LoopShape);
+        };
+        for operand in operands {
+            operand_values(operand, &mut pending);
+        }
+    }
+    if condition_stmts.len() != header_block.stmts.len() {
         return Err(KeptReason::LoopShape);
     }
     let Some((_, _, Rvalue::Load(index_slot))) = analysis.def(index_operand) else {
@@ -1514,6 +1636,62 @@ fn admit(
         || analysis.value_ty(bound) != Some(i64_ty())
     {
         return Err(KeptReason::LoopShape);
+    }
+    let header_index_values: BTreeSet<ValueId> = header_block
+        .stmts
+        .iter()
+        .filter_map(|statement| match statement {
+            Stmt::Let(value, Rvalue::Load(slot)) if *slot == index_slot => Some(*value),
+            _ => None,
+        })
+        .collect();
+    for block in body.iter().filter(|block| **block != header) {
+        let Some(loop_block) = function.blocks.get(*block as usize) else {
+            return Err(KeptReason::LoopShape);
+        };
+        let mut uses = Vec::new();
+        for statement in &loop_block.stmts {
+            for operand in match statement_facts(function, statement) {
+                StmtFacts::Pure(uses)
+                | StmtFacts::Call(uses)
+                | StmtFacts::WritesElements(uses)
+                | StmtFacts::WritesSlot(_, _, uses)
+                | StmtFacts::WritesThrough(_, uses) => uses,
+                StmtFacts::KillsEverything => return Err(KeptReason::UnmodelledStatement),
+            } {
+                operand_values(operand, &mut uses);
+            }
+        }
+        for operand in term_operands(&loop_block.term) {
+            operand_values(operand, &mut uses);
+        }
+        if uses.iter().any(|value| header_index_values.contains(value)) {
+            return Err(KeptReason::LoopShape);
+        }
+    }
+    // A second exit shaped like another trip-count test is ambiguous: neither comparison is the
+    // unique recurrence boundary G3 promises to rotate. A data-derived branch remains admissible.
+    for block in body {
+        if *block == header {
+            continue;
+        }
+        let Some(loop_block) = function.blocks.get(*block as usize) else {
+            return Err(KeptReason::LoopShape);
+        };
+        let Term::Branch(condition, left, right) = &loop_block.term else {
+            continue;
+        };
+        if body.contains(left) && body.contains(right) {
+            continue;
+        }
+        let trip_operand = analysis
+            .binary(condition, BinOp::Ge)
+            .or_else(|| analysis.binary(condition, BinOp::Gt))
+            .map(|(index, _)| index);
+        if matches!(trip_operand.and_then(|index| analysis.def(index)), Some((_, _, Rvalue::Load(slot))) if *slot == index_slot)
+        {
+            return Err(KeptReason::LoopShape);
+        }
     }
     // The statement scan below sees only writes this function performs itself. A call that takes
     // the index as a `borrow mut` argument writes it through a pointer, which no statement kind
@@ -1540,6 +1718,11 @@ fn admit(
     let [(step_block, step_position, step_stmt)] = writes.as_slice() else {
         return Err(KeptReason::MultipleIndexWrites);
     };
+    if !cfg.dominates(*step_block, shape.latch)
+        || !matches!(function.blocks.get(shape.latch as usize).map(|block| &block.term), Some(Term::Goto(target)) if *target == header)
+    {
+        return Err(KeptReason::LoopShape);
+    }
     let Stmt::Store(_, stepped) = step_stmt else {
         return Err(KeptReason::MultipleIndexWrites);
     };
@@ -1684,24 +1867,37 @@ fn admit(
         });
     };
 
-    let zero_trip = pre.bin(BinOp::Ge, Ty::Bool, entry.clone(), bound.clone());
+    let zero_trip = pre.bin(relation, Ty::Bool, entry.clone(), bound.clone());
+    let fact_bound = bound.clone();
+    let last_bound = if relation == BinOp::Ge {
+        pre.bin(BinOp::Sub, i64_ty(), bound.clone(), int(1))
+    } else {
+        bound.clone()
+    };
+    let span = pre.bin(BinOp::Sub, i64_ty(), last_bound, entry.clone());
+    let quotient = pre.bin(BinOp::Div, i64_ty(), span, int(step));
+    let trip_count = pre.bin(BinOp::Add, i64_ty(), quotient.clone(), int(1));
+    let scaled = pre.bin(BinOp::Mul, i64_ty(), int(step), quotient);
+    let imax = pre.bin(BinOp::Add, i64_ty(), entry.clone(), scaled);
+    // The loop performs one final step after the last body iteration. Constrain that exact last
+    // body index rather than `bound`: for `0 .. i64::MAX` with step 1, `imax` is
+    // `i64::MAX - 1` and the final step to the bound is valid. Constraining the bound itself would
+    // needlessly retain a slow copy which then prevents LLVM's early-exit vectorizer from using
+    // the otherwise canonical fast loop.
     let induction = pre.bin(
         BinOp::Le,
         Ty::Bool,
-        bound.clone(),
+        imax.clone(),
         int(i128::from(i64::MAX) - step),
     );
-    let minus_one = pre.bin(BinOp::Sub, i64_ty(), bound, int(1));
-    let span = pre.bin(BinOp::Sub, i64_ty(), minus_one, entry.clone());
-    let quotient = pre.bin(BinOp::Div, i64_ty(), span, int(step));
-    let scaled = pre.bin(BinOp::Mul, i64_ty(), int(step), quotient);
-    let imax = pre.bin(BinOp::Add, i64_ty(), entry.clone(), scaled);
 
     // The initializer only proved non-negativity of the *first* entry (§3.2); the live entry read
     // above needs its own runtime check, exactly as every other admission operand does.
     let entry_ok = pre.bin(BinOp::Ge, Ty::Bool, entry.clone(), int(0));
     let mut conjuncts = vec![entry_ok, induction];
     let mut proved = Vec::new();
+    let mut extent_slots = BTreeSet::new();
+    let mut extents = Vec::new();
     for guard in &guards {
         let Some(len) = remat.get(&guard.len, &mut pre) else {
             return Err(if remat.blocked_by.is_some() {
@@ -1710,6 +1906,17 @@ fn admit(
                 KeptReason::ArithmeticUnproved
             });
         };
+        if has_early_exit
+            && let Some((slot, view, elem)) = view_extent_source(analysis, &guard.len)
+            && extent_slots.insert(slot)
+            && let Some(view) = remat.get(view, &mut pre)
+        {
+            extents.push(DataExtent {
+                view,
+                len: len.clone(),
+                elem,
+            });
+        }
         let Some(low) = affine(&mut remat, &mut pre, index_slot, &guard.start) else {
             return Err(KeptReason::AccessNotAffine);
         };
@@ -1782,6 +1989,20 @@ fn admit(
         admit,
         proved,
         budget_used,
+        counted: has_early_exit.then_some(CountedPlan {
+            entry,
+            trip_count,
+            index: index_slot,
+            step: i64::try_from(step).ok().ok_or(KeptReason::ArithmeticUnproved)?,
+            relation,
+            body_arm: *body_arm,
+            exit_arm: *exit_arm,
+            latch: shape.latch,
+            stepped: stepped.clone(),
+            fact_bound,
+            bound: latch_bound,
+        }),
+        extents,
     })
 }
 
@@ -1791,7 +2012,12 @@ fn admit(
 
 /// Apply one admitted plan: append the fast copy, insert the preheader, and redirect every edge
 /// that entered the loop from outside. Returns the blocks the clone created.
-fn apply(function: &mut Function, header: BlockId, plan: Plan) -> Option<BTreeSet<BlockId>> {
+struct AppliedPlan {
+    blocks: BTreeSet<BlockId>,
+    counted: Option<CountedLoopFact>,
+}
+
+fn apply(function: &mut Function, header: BlockId, plan: Plan) -> Option<AppliedPlan> {
     // Every id minted here is a `u32`. A function large enough to wrap one is refused rather than
     // rewritten with a colliding block or value id.
     let block_base = BlockId::try_from(function.blocks.len()).ok()?;
@@ -1800,6 +2026,11 @@ fn apply(function: &mut Function, header: BlockId, plan: Plan) -> Option<BTreeSe
         block_map.insert(*block, block_base.checked_add(BlockId::try_from(offset).ok()?)?);
     }
     let preheader_id = block_base.checked_add(BlockId::try_from(plan.body.len()).ok()?)?;
+    let rotate_entry_id = if plan.counted.is_some() {
+        Some(preheader_id.checked_add(1)?)
+    } else {
+        None
+    };
 
     // Fresh SSA values for every definition in the clone, allocated after the preheader's own.
     let mut value_map: BTreeMap<ValueId, ValueId> = BTreeMap::new();
@@ -1841,6 +2072,56 @@ fn apply(function: &mut Function, header: BlockId, plan: Plan) -> Option<BTreeSe
         clones.push(cloned);
     }
 
+    // A counted loop with a body-derived exit receives the G3 rotation. A loop with only its trip
+    // exit keeps PR 2's existing versioned shape: rotation buys it nothing and the G3 contract
+    // explicitly leaves that shape unchanged.
+    let mut rotated_body = None;
+    let mut rotated_operands = None;
+    if let Some(counted) = &plan.counted {
+        let rotate_entry_id = rotate_entry_id?;
+        let header_index = plan.body.iter().position(|block| *block == header)?;
+        let latch_index = plan.body.iter().position(|block| *block == counted.latch)?;
+        let expected_exit = counted.exit_arm;
+        let expected_body = *block_map.get(&counted.body_arm)?;
+        let Some(header_clone) = clones.get_mut(header_index) else {
+            return None;
+        };
+        let Term::Branch(zero_trip, found_exit, found_body) = header_clone.term.clone()
+        else {
+            return None;
+        };
+        if found_exit != expected_exit || found_body != expected_body {
+            return None;
+        }
+        header_clone.term = Term::Branch(zero_trip, found_exit, rotate_entry_id);
+
+        let mut stepped = counted.stepped.clone();
+        remap_operand(&mut stepped, &value_map);
+        let mut latch_bound = counted.bound.clone();
+        remap_operand(&mut latch_bound, &value_map);
+        let Some(latch_clone) = clones.get_mut(latch_index) else {
+            return None;
+        };
+        if !matches!(latch_clone.term, Term::Goto(target) if target == *block_map.get(&header)?)
+        {
+            return None;
+        }
+        let compare = value_base.checked_add(ValueId::try_from(cloned_tys.len()).ok()?)?;
+        cloned_tys.push(Ty::Bool);
+        latch_clone.stmts.push(Stmt::Let(
+            compare,
+            Rvalue::Bin(counted.relation, stepped.clone(), latch_bound.clone()),
+        ));
+        latch_clone.stmt_lines.push((0, 0));
+        latch_clone.term = Term::Branch(
+            Operand::Value(compare),
+            counted.exit_arm,
+            expected_body,
+        );
+        rotated_body = Some(expected_body);
+        rotated_operands = Some((stepped, latch_bound));
+    }
+
     // Bypass each proved guard in the fast copy, and empty its failure block so the function's trap
     // call-site count is exactly what it was (§3.3).
     let index_of = |block: BlockId| plan.body.iter().position(|found| *found == block);
@@ -1876,7 +2157,45 @@ fn apply(function: &mut Function, header: BlockId, plan: Plan) -> Option<BTreeSe
     function.value_tys.extend(cloned_tys);
     function.blocks.extend(clones);
     function.blocks.push(preheader);
-    Some(block_map.values().copied().chain([preheader_id]).collect())
+    if let (Some(rotate_entry_id), Some(expected_body)) = (rotate_entry_id, rotated_body) {
+        function.blocks.push(crate::Block {
+            id: rotate_entry_id,
+            stmt_lines: Vec::new(),
+            stmts: Vec::new(),
+            term: Term::Goto(expected_body),
+        });
+    }
+    let counted = match plan.counted {
+        Some(counted) => {
+            let (stepped, latch_bound) = rotated_operands?;
+            Some(CountedLoopFact {
+                preheader: rotate_entry_id?,
+                header: rotated_body?,
+                latch: *block_map.get(&counted.latch)?,
+                exit: counted.exit_arm,
+                entry: counted.entry,
+                trip_count: counted.trip_count,
+                index: counted.index,
+                step: counted.step,
+                relation: counted.relation,
+                bound: counted.fact_bound,
+                extents: plan.extents,
+                stepped,
+                latch_bound,
+            })
+        }
+        None => None,
+    };
+    let mut blocks: BTreeSet<_> = block_map
+        .values()
+        .copied()
+        .chain([preheader_id])
+        .collect();
+    blocks.extend(rotate_entry_id);
+    Some(AppliedPlan {
+        blocks,
+        counted,
+    })
 }
 
 fn remap_operand(operand: &mut Operand, value_map: &BTreeMap<ValueId, ValueId>) {
@@ -1933,13 +2252,14 @@ fn structurally_valid(function: &Function) -> bool {
 /// Version every admissible loop of one function, innermost-first, and report one decision per
 /// source loop. Fail-closed throughout: any disagreement between the facts the rewrite was built
 /// from and the facts the rewritten function re-derives discards the whole rewrite.
-pub fn version_loops(function: &mut Function) -> Vec<LoopDecision> {
+pub fn version_loops(function: &mut Function) -> (Vec<LoopDecision>, Vec<CountedLoopFact>) {
     let original = function.clone();
     let original_traps = trap_call_count(&original);
     let mut decided: BTreeSet<BlockId> = BTreeSet::new();
     let mut cloned: BTreeSet<BlockId> = BTreeSet::new();
     let mut versioned: Vec<VersionedLoop> = Vec::new();
     let mut decisions: Vec<LoopDecision> = Vec::new();
+    let mut counted: Vec<CountedLoopFact> = Vec::new();
 
     while let Some(cfg) = Cfg::build(function) {
         let Some(loops) = discover_loops(function, &cfg) else {
@@ -1964,8 +2284,9 @@ pub fn version_loops(function: &mut Function) -> Vec<LoopDecision> {
                 let body = shape.body.clone();
                 drop(analysis);
                 match apply(function, shape.header, plan) {
-                    Some(new_blocks) => {
-                        cloned.extend(new_blocks);
+                    Some(applied) => {
+                        cloned.extend(applied.blocks);
+                        counted.extend(applied.counted);
                         versioned.push((shape.header, body, proved));
                         decisions.push(LoopDecision::Versioned { budget_used });
                     }
@@ -1978,11 +2299,19 @@ pub fn version_loops(function: &mut Function) -> Vec<LoopDecision> {
     }
 
     if versioned.is_empty() {
-        return decisions;
+        return (decisions, counted);
     }
-    if !rederives(function, &original, original_traps, &versioned, &cloned) {
+    if !rederives(
+        function,
+        &original,
+        original_traps,
+        &versioned,
+        &cloned,
+        &counted,
+    ) {
         *function = original;
-        return decisions
+        return (
+            decisions
             .into_iter()
             .map(|decision| match decision {
                 LoopDecision::Versioned { .. } => {
@@ -1990,9 +2319,11 @@ pub fn version_loops(function: &mut Function) -> Vec<LoopDecision> {
                 }
                 other => other,
             })
-            .collect();
+            .collect(),
+            Vec::new(),
+        );
     }
-    decisions
+    (decisions, counted)
 }
 
 /// Re-derive the facts the rewrite was built from, **from the rewritten function**, and check them.
@@ -2002,6 +2333,7 @@ fn rederives(
     original_traps: usize,
     versioned: &[VersionedLoop],
     cloned: &BTreeSet<BlockId>,
+    counted: &[CountedLoopFact],
 ) -> bool {
     if !structurally_valid(function) || trap_call_count(function) != original_traps {
         return false;
@@ -2030,6 +2362,110 @@ fn rederives(
     let Some(analysis) = Analysis::new(function, &cfg) else {
         return false;
     };
+    for fact in counted {
+        if fact.step <= 0
+            || function.slots.get(fact.index as usize) != Some(&i64_ty())
+            || !matches!(function.blocks.get(fact.preheader as usize).map(|block| &block.term), Some(Term::Goto(target)) if *target == fact.header)
+        {
+            return false;
+        }
+        let Some(shape) = loops.iter().find(|shape| shape.header == fact.header) else {
+            return false;
+        };
+        if shape.latch != fact.latch {
+            return false;
+        }
+        let Some(latch) = function.blocks.get(fact.latch as usize) else {
+            return false;
+        };
+        let Term::Branch(condition, exit, body) = &latch.term else {
+            return false;
+        };
+        if *exit != fact.exit || *body != fact.header {
+            return false;
+        }
+        let Some((stepped, bound)) = analysis.binary(condition, fact.relation) else {
+            return false;
+        };
+        if !same_operand(stepped, &fact.stepped) || !same_operand(bound, &fact.latch_bound) {
+            return false;
+        }
+        let Some((step_block, _, Rvalue::Bin(BinOp::Add, previous, delta))) =
+            analysis.def(stepped)
+        else {
+            return false;
+        };
+        if !cfg.dominates(step_block, fact.latch)
+            || !matches!(delta, Operand::Const(Const::Int(step, ty)) if *ty == i64_ty() && *step == i128::from(fact.step))
+            || !matches!(analysis.def(previous), Some((_, _, Rvalue::Load(slot))) if *slot == fact.index)
+            || !function
+                .blocks
+                .get(step_block as usize)
+                .is_some_and(|block| {
+                    block.stmts.iter().any(|statement| {
+                        matches!(statement, Stmt::Store(slot, value) if *slot == fact.index && same_operand(value, stepped))
+                    })
+                })
+        {
+            return false;
+        }
+        let Some((quotient, one)) = analysis.binary(&fact.trip_count, BinOp::Add) else {
+            return false;
+        };
+        let Some((span, divisor)) = analysis.binary(quotient, BinOp::Div) else {
+            return false;
+        };
+        let Some((last, entry)) = analysis.binary(span, BinOp::Sub) else {
+            return false;
+        };
+        if !same_operand(one, &int(1))
+            || !same_operand(divisor, &int(i128::from(fact.step)))
+            || !same_operand(entry, &fact.entry)
+        {
+            return false;
+        }
+        match fact.relation {
+            BinOp::Ge => {
+                let Some((bound, one)) = analysis.binary(last, BinOp::Sub) else {
+                    return false;
+                };
+                if !same_operand(bound, &fact.bound) || !same_operand(one, &int(1)) {
+                    return false;
+                }
+            }
+            BinOp::Gt if same_operand(last, &fact.bound) => {}
+            _ => return false,
+        }
+        let mut extent_slots = BTreeSet::new();
+        for extent in &fact.extents {
+            let Some((slot, view, elem)) = view_extent_source(&analysis, &extent.len) else {
+                return false;
+            };
+            if !same_operand(view, &extent.view)
+                || elem != extent.elem
+                || !extent_slots.insert(slot)
+            {
+                return false;
+            }
+        }
+        for operand in [
+            &fact.entry,
+            &fact.trip_count,
+            &fact.bound,
+        ]
+        .into_iter()
+        .chain(fact.extents.iter().flat_map(|extent| [&extent.view, &extent.len]))
+        {
+            if matches!(operand, Operand::Value(_)) {
+                let Some((block, _, _)) = analysis.def(operand) else {
+                    return false;
+                };
+                if !cfg.dominates(block, fact.preheader) {
+                    return false;
+                }
+            }
+        }
+    }
     // Each versioned loop still re-admits from the rewritten function, with the fast copy ignored:
     // the induction structure the fast copy was built on must still be the one the slow copy has.
     for (header, _, proved) in versioned {
