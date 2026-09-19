@@ -10587,17 +10587,11 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         }
         for variant in &def.variants {
             for payload in &variant.payload {
-                let mut inline_structs = Vec::new();
-                collect_inline_struct_ids(
+                if contains_explicitly_aligned_inline_struct(
                     scalar_to_ty(*payload),
+                    &structs,
                     &tagged_types,
-                    &mut inline_structs,
-                );
-                if inline_structs.iter().any(|id| {
-                    structs
-                        .get(*id as usize)
-                        .is_some_and(|definition| definition.align.is_some())
-                }) {
+                ) {
                     let source_span = *span.get_or_insert_with(|| {
                         if eid < enum_decls.len() {
                             enum_decls[eid].2.span
@@ -51723,14 +51717,28 @@ impl<'a, 't> Checker<'a, 't> {
                 .error(format!("'Some' takes 1 argument, got {}", args.len()), span);
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         }
-        let inner_expected = match expected.map(|ty| {
+        let resolved_expected = expected.map(|ty| {
             expand_tagged_ty(self.resolve(ty), self.tagged_types)
-        }) {
+        });
+        let inner_expected = match resolved_expected {
             Some(Ty::Option(s)) => Some(scalar_to_ty(s)),
             _ => None,
         };
         let arg = self.check_expr(&args[0], inner_expected);
         let scalar = self.payload_scalar(arg.ty, "Option payload", true, args[0].span);
+        if !matches!(resolved_expected, Some(Ty::Error))
+            && contains_explicitly_aligned_inline_struct(
+                scalar_to_ty(scalar),
+                self.structs,
+                self.tagged_types,
+            )
+        {
+            self.diags.error(
+                "an `align(N)` struct cannot be a sum-type payload yet (union storage does not preserve explicit payload alignment)".to_string(),
+                span,
+            );
+            return Expr { kind: ExprKind::OptionSome(Box::new(arg)), ty: Ty::Error, span };
+        }
         let ty = Ty::Option(scalar);
         self.constrain(ty, expected, span);
         Expr { kind: ExprKind::OptionSome(Box::new(arg)), ty, span }
@@ -65844,9 +65852,10 @@ impl<'a, 't> Checker<'a, 't> {
                 .error(format!("'{name}' takes 1 argument, got {}", args.len()), span);
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         }
-        let (ok_exp, err_exp) = match expected.map(|ty| {
+        let resolved_expected = expected.map(|ty| {
             expand_tagged_ty(self.resolve(ty), self.tagged_types)
-        }) {
+        });
+        let (ok_exp, err_exp) = match resolved_expected {
             Some(Ty::Result(o, e)) => (Some(scalar_to_ty(o)), Some(scalar_to_ty(e))),
             _ => (None, None),
         };
@@ -65862,6 +65871,24 @@ impl<'a, 't> Checker<'a, 't> {
             true,
             args[0].span,
         );
+        if !matches!(resolved_expected, Some(Ty::Error))
+            && contains_explicitly_aligned_inline_struct(
+                scalar_to_ty(arg_scalar),
+                self.structs,
+                self.tagged_types,
+            )
+        {
+            self.diags.error(
+                "an `align(N)` struct cannot be a sum-type payload yet (union storage does not preserve explicit payload alignment)".to_string(),
+                span,
+            );
+            let kind = if is_ok {
+                ExprKind::ResultOk(Box::new(arg))
+            } else {
+                ExprKind::ResultErr(Box::new(arg))
+            };
+            return Expr { kind, ty: Ty::Error, span };
+        }
 
         // The other arm's scalar must be known from context; otherwise we cannot form
         // a complete Result type (M2 limitation).
@@ -71730,6 +71757,13 @@ fn resolve_type(
             {
                 return Ty::Error;
             }
+            if contains_explicitly_aligned_inline_struct(inner, cx.structs, cx.tagged_types) {
+                diags.error(
+                    "an `align(N)` struct cannot be a sum-type payload yet (union storage does not preserve explicit payload alignment)".to_string(),
+                    span,
+                );
+                return Ty::Error;
+            }
             if type_contains_run_bytes(inner, cx.tagged_types) {
                 diags.error(
                     "Option cannot contain `run_bytes`; use `Result<run_bytes, E>` and bind its Ok value to a local"
@@ -71931,6 +71965,15 @@ fn resolve_type(
                 diags.error(
                     "only an abstract generic resource application may be nested inside `Result` yet"
                         .to_string(),
+                    span,
+                );
+                return Ty::Error;
+            }
+            if contains_explicitly_aligned_inline_struct(ok, cx.structs, cx.tagged_types)
+                || contains_explicitly_aligned_inline_struct(err, cx.structs, cx.tagged_types)
+            {
+                diags.error(
+                    "an `align(N)` struct cannot be a sum-type payload yet (union storage does not preserve explicit payload alignment)".to_string(),
                     span,
                 );
                 return Ty::Error;
@@ -72361,6 +72404,20 @@ fn collect_inline_struct_ids(
             _ => {}
         }
     }
+}
+
+fn contains_explicitly_aligned_inline_struct(
+    ty: Ty,
+    structs: &[StructDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    let mut inline_structs = Vec::new();
+    collect_inline_struct_ids(ty, tagged_types, &mut inline_structs);
+    inline_structs.iter().any(|id| {
+        structs
+            .get(*id as usize)
+            .is_some_and(|definition| definition.align.is_some())
+    })
 }
 
 fn ty_contains_inline_enum(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
@@ -80921,6 +80978,10 @@ fn exit_branch(flag: bool) -> i64 {
             "align(16) Empty {}\nBad { Value(Empty) }\nfn take(value: Bad) -> i64 = 0\n",
             "align(16) Empty {}\nBad { Value(Option<Empty>) }\nfn take(value: Bad) -> i64 = 0\n",
             "align(16) Empty {}\nBox<T> { Value(T) }\nfn take(value: Box<Empty>) -> i64 = 0\n",
+            "align(16) Empty {}\nfn take(value: Option<Empty>) -> i64 = 0\n",
+            "align(16) Empty {}\nfn take(value: Result<Empty, i32>) -> i64 = 0\n",
+            "align(16) Empty {}\nfn take() -> Option<Empty> = None\n",
+            "align(16) Empty {}\nfn take() -> i64 { value: Option<Option<Empty>> := None; return 0 }\n",
         ] {
             let (_program, diagnostics) = check(&format!("{source}fn main() -> i32 = 0\n"));
             let errors = diagnostics

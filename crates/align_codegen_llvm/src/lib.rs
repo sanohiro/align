@@ -2608,6 +2608,7 @@ fn emit_sqlite_scalar_callback_trampoline<'c>(
                 .build_insert_value(value_llvm_ty.get_poison(), i32_ty.const_int($variant as u64, false), 0, "value.tag")
                 .map_err(lower)?
                 .into_struct_value();
+            let tagged = finish_union_value(&builder, tagged, "value.union.base.frozen")?;
             builder.build_store(value_union_scratch, tagged).map_err(lower)?;
             let storage = builder.build_struct_gep(value_llvm_ty, value_union_scratch, 1, "value.storage").map_err(lower)?;
             let storage_type = value_llvm_ty.get_field_types()[1].into_struct_type();
@@ -3360,7 +3361,7 @@ fn lower_prepared_module<'c>(
     // table entry. See [`TaggedTypes`].
     let PredeclaredTaggedTypes {
         shells: tagged_shells,
-        literals: tagged_identity,
+        identities: tagged_identity,
         representative: tagged_representatives,
     } = predeclare_tagged_types(
         ctx,
@@ -3419,10 +3420,12 @@ fn lower_prepared_module<'c>(
                 })
                 .collect::<Vec<_>>();
             let shape = match definition {
-                hir::TaggedType::Option(_) => TaggedShapeKey::Option(resolved[0].1.as_type_ref() as usize),
+                hir::TaggedType::Option(payload) => {
+                    TaggedShapeKey::Option(tagged_payload_key(payload, resolved[0].1))
+                }
                 hir::TaggedType::Result(..) => TaggedShapeKey::Result(
-                    resolved[0].1.as_type_ref() as usize,
-                    resolved[1].1.as_type_ref() as usize,
+                    tagged_payload_key(resolved[0].0, resolved[0].1),
+                    tagged_payload_key(resolved[1].0, resolved[1].1),
                 ),
             };
             let variants = match definition {
@@ -3436,12 +3439,10 @@ fn lower_prepared_module<'c>(
             };
             let body = union_shape(ctx, ctx.i8_type().into(), &variants, &target_data)?.body;
             shell.set_body(&body.get_field_types(), false);
-            let identity = tagged_identity
-                .get(id)
-                .ok_or_else(|| CodegenError::Lowering("tagged identity is absent".into()))?
-                .as_type_ref() as usize;
             let representative = *tagged_representatives
-                .get(&identity)
+                .get(tagged_identity.get(id).ok_or_else(|| {
+                    CodegenError::Lowering("tagged identity is absent".into())
+                })?)
                 .ok_or_else(|| CodegenError::Lowering("tagged identity representative is absent".into()))?;
             let representative_shell = tagged_shells
                 .get(representative as usize)
@@ -6495,7 +6496,7 @@ fn option_struct_type<'c>(
     )
     .expect("validated Option layout")
     .body;
-    tx.shell_for_shape(TaggedShapeKey::Option(payload_type.as_type_ref() as usize))
+    tx.shell_for_shape(TaggedShapeKey::Option(tagged_payload_key(s, payload_type)))
         .unwrap_or(body)
 }
 
@@ -6524,8 +6525,8 @@ fn result_struct_type<'c>(
     .expect("validated Result layout")
     .body;
     tx.shell_for_shape(TaggedShapeKey::Result(
-        ok_type.as_type_ref() as usize,
-        err_type.as_type_ref() as usize,
+        tagged_payload_key(ok, ok_type),
+        tagged_payload_key(err, err_type),
     ))
     .unwrap_or(body)
 }
@@ -6717,8 +6718,22 @@ impl<'c> TaggedTypes<'c, '_> {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum TaggedShapeKey {
-    Option(usize),
-    Result(usize, usize),
+    Option(TaggedPayloadKey),
+    Result(TaggedPayloadKey, TaggedPayloadKey),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum TaggedPayloadKey {
+    Unit,
+    Value(usize),
+}
+
+fn tagged_payload_key(payload: Scalar, llvm_type: BasicTypeEnum<'_>) -> TaggedPayloadKey {
+    if payload == Scalar::Unit {
+        TaggedPayloadKey::Unit
+    } else {
+        TaggedPayloadKey::Value(llvm_type.as_type_ref() as usize)
+    }
 }
 
 /// The nested tagged entry a payload scalar names, if any.
@@ -6799,8 +6814,21 @@ fn tagged_payloads(tagged: hir::TaggedType) -> Vec<Scalar> {
 
 struct PredeclaredTaggedTypes<'c> {
     shells: Vec<StructType<'c>>,
-    literals: Vec<StructType<'c>>,
-    representative: HashMap<usize, u32>,
+    identities: Vec<TaggedLogicalKey>,
+    representative: HashMap<TaggedLogicalKey, u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum TaggedLogicalPayloadKey {
+    Unit,
+    Leaf(usize),
+    Tagged(u32),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum TaggedLogicalKey {
+    Option(TaggedLogicalPayloadKey),
+    Result(TaggedLogicalPayloadKey, TaggedLogicalPayloadKey),
 }
 
 /// Predeclare one identified struct per distinct tagged shape and assign it, returning the
@@ -6808,8 +6836,8 @@ struct PredeclaredTaggedTypes<'c> {
 ///
 /// Three passes, because the name of a shared struct must not depend on traversal order:
 ///
-/// 1. give every entry the fully literal form of its logical shape, children first, so equal shapes are one
-///    uniqued LLVM type and the whole equivalence is decided before anything is named;
+/// 1. give every entry a logical key, children first, so Unit stays distinct from value-bearing
+///    payloads even when both use the same LLVM value type;
 /// 2. walk ids in ascending order, so the **lowest** id in a shape class is the one that names its
 ///    `%align.tagged.{id}` struct — a golden IR assertion then depends on the table, not on which
 ///    entry a depth-first walk happened to reach first;
@@ -6837,17 +6865,19 @@ fn predeclare_tagged_types<'c>(
     let no_tagged_shapes = HashMap::new();
     let no_tagged = TaggedTypes { shells: &[], by_shape: &no_tagged_shapes, target_data };
 
-    // (1) The literal body of every entry, children first. Two entries are the same LLVM type
-    // exactly when these agree, because LLVM uniques literal structs structurally.
-    let mut literals: Vec<Option<StructType<'c>>> = vec![None; defs.len()];
+    // (1) The logical identity of every entry, children first. Leaf LLVM identities preserve the
+    // existing Str/String and origin-specific nominal equivalences; Unit has its own storage class.
+    let mut identities: Vec<Option<TaggedLogicalKey>> = vec![None; defs.len()];
+    let mut classes: Vec<Option<u32>> = vec![None; defs.len()];
+    let mut class_ids: HashMap<TaggedLogicalKey, u32> = HashMap::new();
     for root in 0..defs.len() {
-        if literals[root].is_some() {
+        if identities[root].is_some() {
             continue;
         }
         let mut active = HashSet::new();
         let mut work = vec![(root, false)];
         while let Some((id, children_done)) = work.pop() {
-            if literals.get(id).ok_or_else(malformed)?.is_some() {
+            if identities.get(id).ok_or_else(malformed)?.is_some() {
                 active.remove(&id);
                 continue;
             }
@@ -6860,7 +6890,7 @@ fn predeclare_tagged_types<'c>(
                 }
                 if pending
                     .iter()
-                    .any(|child| literals.get(*child as usize).is_none_or(Option::is_none))
+                    .any(|child| identities.get(*child as usize).is_none_or(Option::is_none))
                 {
                     active.insert(id);
                     work.push((id, true));
@@ -6871,37 +6901,49 @@ fn predeclare_tagged_types<'c>(
                 }
             }
             active.remove(&id);
-            let mut fields = Vec::with_capacity(payloads.len() + 1);
-            fields.push(ctx.i8_type().into());
+            let mut payload_keys = Vec::with_capacity(payloads.len());
             for payload in payloads {
-                fields.push(match tagged_child(payload) {
-                    Some(child) => literals
+                payload_keys.push(if payload == Scalar::Unit {
+                    TaggedLogicalPayloadKey::Unit
+                } else if let Some(child) = tagged_child(payload) {
+                    TaggedLogicalPayloadKey::Tagged(
+                        classes
                         .get(child as usize)
                         .copied()
                         .flatten()
-                        .ok_or_else(malformed)?
-                        .into(),
-                    None => scalar_type(ctx, scalar_to_ty(payload), sx, ex, no_tagged),
+                        .ok_or_else(malformed)?,
+                    )
+                } else {
+                    TaggedLogicalPayloadKey::Leaf(
+                        scalar_type(ctx, scalar_to_ty(payload), sx, ex, no_tagged).as_type_ref()
+                            as usize,
+                    )
                 });
             }
-            // This is an identity key only. Physical union bodies are assigned after every nominal
-            // payload dependency has a target layout; using the flattened logical fields here lets
-            // equivalent Str/String and nested tagged spellings share one shell without measuring
-            // an opaque nominal type as zero-sized.
-            literals[id] = Some(ctx.struct_type(&fields, false));
+            let identity = match tagged {
+                hir::TaggedType::Option(_) => TaggedLogicalKey::Option(payload_keys[0]),
+                hir::TaggedType::Result(..) => {
+                    TaggedLogicalKey::Result(payload_keys[0], payload_keys[1])
+                }
+            };
+            let next_class = u32::try_from(class_ids.len())
+                .map_err(|_| CodegenError::Lowering("too many tagged identity classes".into()))?;
+            let class = *class_ids.entry(identity).or_insert(next_class);
+            identities[id] = Some(identity);
+            classes[id] = Some(class);
         }
     }
-    let literals = literals
+    let identities = identities
         .into_iter()
-        .map(|literal| literal.ok_or_else(malformed))
+        .map(|identity| identity.ok_or_else(malformed))
         .collect::<Result<Vec<_>, _>>()?;
 
     // (2) One identified struct per logical-shape class, named for the lowest id in that class.
-    let mut representative: HashMap<usize, u32> = HashMap::new();
+    let mut representative: HashMap<TaggedLogicalKey, u32> = HashMap::new();
     let mut shells: Vec<StructType<'c>> = Vec::with_capacity(defs.len());
-    for (id, literal) in literals.iter().enumerate() {
+    for (id, identity) in identities.iter().enumerate() {
         let owner = *representative
-            .entry(literal.as_type_ref() as usize)
+            .entry(*identity)
             .or_insert(id as u32);
         shells.push(if owner as usize == id {
             ctx.opaque_struct_type(&format!("align.tagged.{id}"))
@@ -6910,7 +6952,7 @@ fn predeclare_tagged_types<'c>(
         });
     }
 
-    Ok(PredeclaredTaggedTypes { shells, literals, representative })
+    Ok(PredeclaredTaggedTypes { shells, identities, representative })
 }
 
 #[cfg(test)]
@@ -6922,16 +6964,16 @@ fn build_tagged_types<'c>(
     target_data: &inkwell::targets::TargetData,
 ) -> Result<(Vec<StructType<'c>>, HashMap<TaggedShapeKey, StructType<'c>>), CodegenError> {
     let malformed = || CodegenError::Lowering("nested tagged type table is missing an entry or is recursive".to_string());
-    let PredeclaredTaggedTypes { shells, literals, representative } =
+    let PredeclaredTaggedTypes { shells, identities, representative } =
         predeclare_tagged_types(ctx, defs, sx, ex, target_data)?;
     let no_tagged_shapes = HashMap::new();
     let no_tagged = TaggedTypes { shells: &shells, by_shape: &no_tagged_shapes, target_data };
     // Assign each representative its physical union body over the final child structs, and index
     // its semantic shape independently of that body's layout.
     let mut by_shape: HashMap<TaggedShapeKey, StructType<'c>> = HashMap::new();
-    for (id, literal) in literals.iter().enumerate() {
+    for (id, identity) in identities.iter().enumerate() {
         if *representative
-            .get(&(literal.as_type_ref() as usize))
+            .get(identity)
             .ok_or_else(malformed)? as usize
             != id
         {
@@ -6946,10 +6988,12 @@ fn build_tagged_types<'c>(
             }));
         }
         let shape = match defs[id] {
-            hir::TaggedType::Option(_) => TaggedShapeKey::Option(resolved[0].1.as_type_ref() as usize),
+            hir::TaggedType::Option(payload) => {
+                TaggedShapeKey::Option(tagged_payload_key(payload, resolved[0].1))
+            }
             hir::TaggedType::Result(..) => TaggedShapeKey::Result(
-                resolved[0].1.as_type_ref() as usize,
-                resolved[1].1.as_type_ref() as usize,
+                tagged_payload_key(resolved[0].0, resolved[0].1),
+                tagged_payload_key(resolved[1].0, resolved[1].1),
             ),
         };
         let variants = match defs[id] {
@@ -9405,11 +9449,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .build_insert_value(aggregate_type.get_poison(), tag, 0, "union.tag")
             .map_err(|e| self.err(e))?
             .into_struct_value();
+        let base = finish_union_value(self.builder, base, "union.base.frozen")?;
         if !mapping.iter().any(|entry| matches!(entry, PhysicalPayload::Stored { .. })) {
             for operand in operands {
                 let _ = self.operand(operand)?;
             }
-            return finish_union_value(self.builder, base, "union.frozen");
+            return Ok(base);
         }
         let scratch = self.alloca_at_entry(aggregate_type.into(), "union.write")?;
         self.builder.build_store(scratch, base).map_err(|e| self.err(e))?;
@@ -9445,8 +9490,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .build_insert_value(aggregate_type.get_poison(), tag, 0, "union.tag")
             .map_err(|e| self.err(e))?
             .into_struct_value();
+        let base = finish_union_value(self.builder, base, "union.base.frozen")?;
         if !mapping.iter().any(|entry| matches!(entry, PhysicalPayload::Stored { .. })) {
-            return finish_union_value(self.builder, base, "union.frozen");
+            return Ok(base);
         }
         let scratch = self.alloca_at_entry(aggregate_type.into(), "union.write")?;
         self.builder.build_store(scratch, base).map_err(|e| self.err(e))?;
@@ -33991,6 +34037,40 @@ fn main() -> i32 = 0
     }
 
     #[test]
+    fn unit_and_i32_payloads_keep_distinct_storage_identities() {
+        let ctx = Context::create();
+        let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default)
+            .unwrap_or_else(|error| panic!("target machine: {error}"));
+        let td = tm.get_target_data();
+        let i32_scalar = Scalar::Int(IntTy { bits: 32, signed: true });
+        let defs = vec![
+            hir::TaggedType::Option(Scalar::Unit),
+            hir::TaggedType::Option(i32_scalar),
+            hir::TaggedType::Result(Scalar::Unit, i32_scalar),
+            hir::TaggedType::Result(i32_scalar, i32_scalar),
+        ];
+        let (shells, by_shape) =
+            build_tagged_types(&ctx, &defs, &[], &[], &td).expect("tagged types must lower");
+        assert_eq!(by_shape.len(), defs.len(), "each storage identity needs its own lookup entry");
+        for left in 0..shells.len() {
+            for right in left + 1..shells.len() {
+                assert_ne!(
+                    shells[left], shells[right],
+                    "Unit/value and Option/Result distinctions must survive LLVM i32 collisions"
+                );
+            }
+        }
+        assert_eq!(shells[0].count_fields(), 1, "Option<Unit> is tag-only");
+        assert_eq!(shells[1].count_fields(), 2, "Option<i32> owns union storage");
+
+        let tagged = TaggedTypes { shells: &shells, by_shape: &by_shape, target_data: &td };
+        assert_eq!(option_struct_type(&ctx, Scalar::Unit, &[], &[], tagged), shells[0]);
+        assert_eq!(option_struct_type(&ctx, i32_scalar, &[], &[], tagged), shells[1]);
+        assert_eq!(result_struct_type(&ctx, Scalar::Unit, i32_scalar, &[], &[], tagged), shells[2]);
+        assert_eq!(result_struct_type(&ctx, i32_scalar, i32_scalar, &[], &[], tagged), shells[3]);
+    }
+
+    #[test]
     fn malformed_mir_type_graphs_fail_before_llvm_construction() {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let base = || {
@@ -35882,8 +35962,18 @@ fn main() -> i32 = 0
             let body = function_body(&llvm, name);
             assert_eq!(
                 body.matches(" = freeze ").count(),
-                2,
-                "both the stored and omitted-payload arms must finalize union storage in {name}:\n{body}"
+                3,
+                "both arms must define union storage and the stored arm must finalize it in {name}:\n{body}"
+            );
+            let base_freeze = body.find("union.base.frozen = freeze").unwrap_or_else(|| {
+                panic!("{name} must define inactive bytes before scratch initialization:\n{body}")
+            });
+            let aggregate_store = body.find(", ptr %union.write").unwrap_or_else(|| {
+                panic!("{name} must retain the aggregate scratch store in raw IR:\n{body}")
+            });
+            assert!(
+                base_freeze < aggregate_store,
+                "{name} must freeze the base before its first aggregate store:\n{body}"
             );
         }
         let tag_only = function_body(&llvm, "selected_flag");
