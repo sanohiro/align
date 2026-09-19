@@ -45,7 +45,7 @@ use common::*;
 /// over a compile-time-constant array (see the module header, finding 1), so the loop never
 /// vectorizes. Seeding the values from `n` keeps the reduction genuinely data-dependent. `main(args)`
 /// must return `Result<(), Error>`, and the pipeline result is kept live with `print`.
-fn compile_ir(name: &str, src: &str, cpu: &str, optimized: bool) -> String {
+fn compile_ir(name: &str, src: &str, cpu: &str, optimized: bool, exports: &[&str]) -> String {
     let mut sm = SourceMap::new();
     let checked = check(&mut sm, name, src);
     assert!(
@@ -54,17 +54,37 @@ fn compile_ir(name: &str, src: &str, cpu: &str, optimized: bool) -> String {
         align_driver::format_diagnostics(&sm, &checked.diags)
     );
     let mir = lower_to_mir(&checked.hir);
-    emit_llvm_ir(&mir, BuildTarget::Cpu(cpu.to_string()), align_driver::Profile::Release, optimized, &[], false).expect("emit llvm ir")
+    let exports: Vec<String> = exports.iter().map(|name| (*name).to_string()).collect();
+    let ir = emit_llvm_ir(&mir, BuildTarget::Cpu(cpu.to_string()), align_driver::Profile::Release, optimized, &exports, false)
+        .expect("emit llvm ir");
+    // A unit keeps only what a DCE root reaches: `main`, or an explicit export root. A kernel with
+    // neither leaves the `-O2` lens an empty module, and every shape assertion below then fails for
+    // the wrong reason — reporting "no vector body" about IR that contains no code at all. Name that
+    // mistake once, here, instead of once per owner.
+    assert!(
+        ir.contains("\ndefine "),
+        "kernel `{name}` left no function in the emitted module: it defines no `main` and named no \
+         export root, so every function is internal and dead:\n{ir}"
+    );
+    ir
 }
 
-/// Optimized IR (the `-O2` lens — "what LLVM did").
+/// Optimized IR (the `-O2` lens — "what LLVM did") for a kernel rooted by its own `main`.
 fn opt_ir(name: &str, src: &str, cpu: &str) -> String {
-    compile_ir(name, src, cpu, true)
+    compile_ir(name, src, cpu, true, &[])
+}
+
+/// Optimized IR for a **library-shaped** kernel — one that defines no `main`, so it carries no DCE
+/// root of its own and must name one. This is the x86-tier twin of `common::emit_llvm_optimized`,
+/// which the aarch64 arms below call with exactly the same root; the difference is only that a tier
+/// owner names its CPU (`BuildTarget::Cpu`) instead of the per-arch baseline.
+fn opt_ir_rooted(name: &str, src: &str, cpu: &str, exports: &[&str]) -> String {
+    compile_ir(name, src, cpu, true, exports)
 }
 
 /// Raw IR (what codegen emitted, pre-optimization) — used only by the mutation checks.
 fn raw_ir(name: &str, src: &str, cpu: &str) -> String {
-    compile_ir(name, src, cpu, false)
+    compile_ir(name, src, cpu, false, &[])
 }
 
 /// The suite pins x86 CPU tiers, so it only runs on an x86-64 host with the LLVM backend present.
@@ -580,7 +600,7 @@ fn g2_monotone_check_hoisted() {
     if !x86_backend() {
         return;
     }
-    let ir = opt_ir("g2-monotone", MONOTONE_SUM, V3);
+    let ir = opt_ir_rooted("g2-monotone", MONOTONE_SUM, V3, &["monotone_sum"]);
     assert!(ir.contains("vector.body"), "want a vector main loop:\n{ir}");
     assert!(ir.contains("<4 x i64>"), "want 256-bit i64 lanes at v3:\n{ir}");
     // That the guard was *moved* and not deleted is a property of emitted MIR, not of what `-O2`
@@ -596,7 +616,7 @@ fn g2_monotone_check_hoisted_width_tracks_target_v2() {
     if !x86_backend() {
         return;
     }
-    let ir = opt_ir("g2-monotone-v2", MONOTONE_SUM, V2);
+    let ir = opt_ir_rooted("g2-monotone-v2", MONOTONE_SUM, V2, &["monotone_sum"]);
     assert!(ir.contains("vector.body"), "want a vector main loop at v2:\n{ir}");
     assert!(ir.contains("<2 x i64>"), "want 128-bit i64 lanes at v2:\n{ir}");
 }
@@ -607,7 +627,7 @@ fn g1_g2_bytes_to_f32_out_conjunction_v2() {
     if !x86_backend() {
         return;
     }
-    let ir = opt_ir("g1g2-bytes-f32", BYTES_TO_F32_OUT, V2);
+    let ir = opt_ir_rooted("g1g2-bytes-f32", BYTES_TO_F32_OUT, V2, &["bytes_to_f32_out"]);
     assert!(
         ir.contains("vector.body"),
         "the in-place conversion reaches a vector body only with G1 and G2 both present:\n{ir}"

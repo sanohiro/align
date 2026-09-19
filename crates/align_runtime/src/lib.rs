@@ -27280,12 +27280,29 @@ mod tests {
                 .collect()
         }
 
+        // The complete runtime source list (crates/align_runtime/src/**/*.rs), not just the six
+        // files that historically happened to define every symbol the old line-start registry
+        // scanner could see (#1112).
         let mut runtime = function_symbols(include_str!("lib.rs"));
-        runtime.extend(function_symbols(include_str!("str_prims.rs")));
+        runtime.extend(function_symbols(include_str!("buffer_storage.rs")));
         runtime.extend(function_symbols(include_str!("crypto_asymmetric.rs")));
+        runtime.extend(function_symbols(include_str!("crypto_digest.rs")));
         runtime.extend(function_symbols(include_str!("csv.rs")));
-        runtime.extend(function_symbols(include_str!("xml.rs")));
+        runtime.extend(function_symbols(include_str!("fs_directory.rs")));
+        runtime.extend(function_symbols(include_str!("fs_regular.rs")));
+        runtime.extend(function_symbols(include_str!("fs_retained_tree.rs")));
+        runtime.extend(function_symbols(include_str!("json_number.rs")));
+        runtime.extend(function_symbols(include_str!("os_host.rs")));
+        runtime.extend(function_symbols(include_str!("process_launch.rs")));
+        runtime.extend(function_symbols(include_str!("process_launch/darwin.rs")));
+        runtime.extend(function_symbols(include_str!("process_live.rs")));
+        runtime.extend(function_symbols(include_str!("process_scope.rs")));
+        runtime.extend(function_symbols(include_str!("process_signal.rs")));
+        runtime.extend(function_symbols(include_str!("process_table.rs")));
+        runtime.extend(function_symbols(include_str!("process_verified.rs")));
+        runtime.extend(function_symbols(include_str!("str_prims.rs")));
         runtime.extend(function_symbols(include_str!("time_formats.rs")));
+        runtime.extend(function_symbols(include_str!("xml.rs")));
         for non_base in [
             "align_rt_alloc_count",
             "align_rt_free_count",
@@ -27311,28 +27328,75 @@ mod tests {
             assert!(runtime.remove(non_base), "missing feature/test-only runtime function {non_base}");
         }
 
+        // Registry rows that are genuinely macro-/generic-generated: no literal `fn
+        // align_rt_...` spelling exists anywhere in the runtime sources above for
+        // `function_symbols` to find, so they can never join `runtime`. Recorded here as a
+        // named decision instead of silently widening the comparison (#1112); removing an
+        // entry from this list without also removing its registry row, or vice versa, fails
+        // the assertion below.
+        let macro_generated_registry_only: std::collections::BTreeSet<String> = [
+            "align_rt_fs_directory_create_new",
+            "align_rt_fs_directory_metadata",
+            "align_rt_fs_directory_metadata_at",
+            "align_rt_fs_directory_open_dir",
+            "align_rt_fs_directory_open_read",
+            "align_rt_fs_directory_open_read_single_link",
+            "align_rt_fs_directory_set_mode",
+            "align_rt_fs_file_metadata",
+            "align_rt_fs_file_set_mode",
+            "align_rt_fs_reader_metadata",
+            "align_rt_fs_reader_set_mode",
+            "align_rt_fs_writer_metadata",
+            "align_rt_fs_writer_set_mode",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
         let registry_source = include_str!("../../align_codegen_llvm/src/runtime_abi.rs");
+
+        // Ground truth for the row count, independent of how a row's `symbol:` field happens to
+        // be line-wrapped: every registry row is exactly one `RuntimeKey`/`UnkeyedRuntimeKey`
+        // match arm that constructs a `RuntimeAbi`.
+        let row_count = registry_source.matches("=> RuntimeAbi {").count();
+
+        // Parse the `symbol: "align_rt_..."` value out of every arm, tolerating any amount of
+        // whitespace (including none) between `symbol:` and the opening quote and any line
+        // layout the arm is written in, so reformatting alone cannot hide a row (the class that
+        // broke this test twice: `b747af9f`, `4cb14895`).
         let registry: std::collections::BTreeSet<String> = registry_source
-            .lines()
-            .filter_map(|line| {
-                let line = line.trim();
-                if let Some(rest) = line.strip_prefix("symbol: \"align_rt_") {
-                    return rest
-                        .split_once('"')
-                        .map(|(tail, _)| format!("align_rt_{tail}"));
-                }
-                if line.starts_with("UnkeyedRuntimeKey::") {
-                    return line
-                        .split_once("=> \"")
-                        .and_then(|(_, rest)| rest.split_once('"'))
-                        .map(|(symbol, _)| symbol.to_string());
-                }
-                None
+            .split("=> RuntimeAbi {")
+            .skip(1)
+            .filter_map(|arm| {
+                let after_key = arm.split_once("symbol:")?.1.trim_start();
+                let literal = after_key.strip_prefix('"')?;
+                let (symbol, _) = literal.split_once('"')?;
+                symbol.starts_with("align_rt_").then(|| symbol.to_string())
             })
             .collect();
-        assert_eq!(runtime.len(), 384);
-        assert_eq!(registry.len(), 384);
-        assert_eq!(runtime, registry);
+        assert_eq!(
+            registry.len(),
+            row_count,
+            "parsed only {} of {row_count} registry rows in runtime_abi.rs; a row's `symbol:` \
+             field is written in a layout this scanner no longer recognizes",
+            registry.len(),
+        );
+
+        let registry_only: std::collections::BTreeSet<String> =
+            registry.difference(&runtime).cloned().collect();
+        assert_eq!(
+            registry_only, macro_generated_registry_only,
+            "registry rows with no literal `fn align_rt_...` export in crates/align_runtime/src \
+             changed; update the macro_generated_registry_only allow-list above to match, or add \
+             the missing runtime export",
+        );
+
+        let runtime_only: std::collections::BTreeSet<String> =
+            runtime.difference(&registry).cloned().collect();
+        assert!(
+            runtime_only.is_empty(),
+            "runtime exports with no codegen ABI registry row in runtime_abi.rs: {runtime_only:?}",
+        );
     }
 
     fn test_datagram_pair() -> [i32; 2] {
@@ -39359,6 +39423,28 @@ mod tests {
             unsafe { align_rt_run_output_free(out) };
             unsafe { align_rt_command_free(command) };
         }
+
+        // One clock covers the whole run, spawn included. A budget below any real fork/exec cost
+        // makes that deterministic on every host: while the spawn handshake kept its own real-clock
+        // copy of the budget it charged fork/exec against it and returned AL_TIMEOUT here, which is
+        // exactly how the 3 ms case above failed whenever a loaded runner spawned slower than its
+        // budget.
+        set_capture_failpoint(CaptureFailpoint::None);
+        set_capture_timeout_elapsed(Duration::ZERO);
+        let command = capture_test_command("printf x", true, 1);
+        let mut out: *mut RunOutput = core::ptr::null_mut();
+        assert_eq!(
+            unsafe { align_rt_command_run(command, &mut out) },
+            0,
+            "real spawn latency must not consume a virtualized budget"
+        );
+        assert!(!out.is_null());
+        let calls = capture_poll_calls();
+        assert!(!calls.is_empty());
+        assert_eq!(calls[0].1, 1, "a 1 ns budget rounds up to one whole millisecond");
+        assert!(calls.iter().all(|(_, timeout)| *timeout > 0));
+        unsafe { align_rt_run_output_free(out) };
+        unsafe { align_rt_command_free(command) };
 
         // Command arbitration remains timeout-wins after a syscall. The next loop observes
         // exhaustion before issuing another native wait.

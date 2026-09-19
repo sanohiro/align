@@ -13,6 +13,15 @@ license = "MIT OR Apache-2.0"
 #           -> align_codegen_llvm -> (linked with align_runtime)
 # Cross-cutting: align_span / align_diag
 
+# Every owner test drives the in-process alignc, so the dev profile's
+# opt-level is the test suite's compile speed, not runtime speed. opt-level 1
+# keeps debug-assertions and overflow checks and made pkg_db_a1 (22 tests, 2
+# threads) 3.96x faster (486.6s -> 122.8s wall, 926.7s -> 217.6s CPU) for +45s
+# clean build (31.3s -> 76.2s); per-package overrides measured 3.3x and were
+# rejected. See docs/impl/21-build-perf-plan.md item 8.
+[profile.dev]
+opt-level = 1
+
 # Versioned-release artifacts only (release.yml / the tagged release flow).
 # Ordinary `--release` builds (align-llm batches, local artifacts) stay on the
 # untuned default profile so iteration never pays the LTO link time.

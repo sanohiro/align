@@ -719,7 +719,21 @@ fn protocol_ping_and_peer_close_reply_transport_failures_win() {
     }
     use std::os::fd::AsRawFd;
 
-    let mut server = start_server_with(APP, "apps-ws-reply-failures");
+    // Every automatic reply -- the 1002 protocol Close, the Pong, and the peer-Close echo --
+    // reaches the wire through `write_frame_head`. Synchronize there and give the abortive reset
+    // time to become observable before the header write, exactly as the outbound-close owner does:
+    // the peer's RST is then a processed socket error rather than a packet that may still be in
+    // flight. Without that ordering the reply can reach the wire first and succeed, so the count
+    // depended on scheduling instead of on the promised precedence.
+    let timed_ws = ws_root().replace("import std.http\n", "import std.http\nimport std.time\n");
+    assert_ne!(timed_ws, ws_root(), "std.http import seam must remain recognizable");
+    let reset_ws = timed_ws.replace(
+        "  return connection.write(header[0..count])",
+        "  mut sync := buffer(1)\n  match connection.read_exact(sync, 1) {\n    Ok(_) => {}\n    Err(_) => { return Err(Error.Denied) }\n  }\n  time.sleep(500000000)\n  return connection.write(header[0..count])",
+    );
+    assert_ne!(reset_ws, timed_ws, "frame-head write seam must remain recognizable");
+
+    let mut server = start_server_with_ws(APP, &reset_ws, "apps-ws-reply-failures");
     for (label, frame) in [
         ("protocol Close", vec![0x81, 0]),
         ("Ping Pong", masked_frame(true, 9, b"ping", [1, 2, 3, 4])),
@@ -741,14 +755,24 @@ fn protocol_ping_and_peer_close_reply_transport_failures_win() {
             "{label}",
         );
         reset.write_all(&frame).unwrap();
+        reset.write_all(&[0]).unwrap();
+        // The synchronization byte must be consumed before the reset: a peer reset can discard
+        // data still queued behind it, which macOS does, and that would take the sentinel path
+        // instead. Once the reply path has the byte it is inside its own longer sleep, so the
+        // reset lands while it waits and the header write owns the failure on every platform.
+        std::thread::sleep(Duration::from_millis(200));
         drop(reset);
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(600));
     }
     let stderr = server.stop_and_stderr();
     assert_eq!(
         stderr.matches("Code(").count(),
         3,
         "every automatic reply failure must beat the ordinary protocol result:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains("Denied"),
+        "a failed synchronization read must take the distinct sentinel path:\n{stderr}",
     );
 }
 

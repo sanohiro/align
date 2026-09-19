@@ -1945,7 +1945,8 @@ fn llvm_drop_has_a_tag_guard_and_none_constructs_without_allocation() {
     let none_start = ir
         .find("define internal")
         .expect("missing function definition");
-    let none_body = &ir[none_start..ir.find("\n}").map_or(ir.len(), |end| end + 2)];
+    let from_none = &ir[none_start..];
+    let none_body = &from_none[..from_none.find("\n}").map_or(from_none.len(), |end| end + 2)];
     assert!(
         !none_body.contains("@align_rt_alloc") && !none_body.contains("@malloc"),
         "the None constructor must not allocate:\n{none_body}"

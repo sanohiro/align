@@ -395,27 +395,36 @@ fn cleanup_failed(child: &mut NativeChild, group: bool) {
     let _ = child.wait();
 }
 fn handshake(child: &mut NativeChild, fd: i32, timeout_ns: i64) -> Result<(), i32> {
+    // The spawn handshake and the capture loop share one monotonic start-plus-budget clock
+    // (`MonotonicTimeoutBudget` + `poll_timeout_ms`): the run's `timeout_ns` is charged from
+    // `child.started`, every positive remainder rounds up to whole milliseconds, and the
+    // post-syscall timeout-wins recheck keeps its order. Reusing the shared type rather than a
+    // second local copy also means the test-only elapsed override governs the whole run, so a
+    // virtualized-clock owner cannot be defeated by real fork/exec latency.
+    let budget = super::MonotonicTimeoutBudget::from_positive_ns(timeout_ns).map(|mut budget| {
+        budget.start = child.started;
+        budget
+    });
     let mut frame = [0u8; 9];
     let mut length = 0usize;
     loop {
-        let budget = (timeout_ns > 0)
-            .then(|| std::time::Duration::from_nanos(u64::try_from(timeout_ns).unwrap_or(0)));
-        let remaining = budget.map(|budget| budget.saturating_sub(child.started.elapsed()));
-        if remaining.is_some_and(|duration| duration.is_zero()) {
-            return Err(AL_TIMEOUT);
-        }
-        let timeout = remaining
-            .map(|duration| {
-                i32::try_from(duration.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX)
-            })
-            .unwrap_or(-1);
+        let timeout = match budget.as_ref() {
+            Some(budget) => match budget.remaining().and_then(super::poll_timeout_ms) {
+                Some(milliseconds) => milliseconds,
+                None => return Err(AL_TIMEOUT),
+            },
+            None => -1,
+        };
         let mut poll = libc::pollfd {
             fd,
             events: libc::POLLIN,
             revents: 0,
         };
         let ready = unsafe { libc::poll(&mut poll, 1, timeout) };
-        if budget.is_some_and(|budget| child.started.elapsed() >= budget) {
+        if budget
+            .as_ref()
+            .is_some_and(super::MonotonicTimeoutBudget::is_exhausted)
+        {
             return Err(AL_TIMEOUT);
         }
         if ready < 0 {
