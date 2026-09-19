@@ -11803,6 +11803,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
         if fact.extents.is_empty() {
             return Ok(());
         }
+        for extent in &fact.extents {
+            if !matches!(self.checked_operand_ty(&extent.view)?, Ty::Slice(elem) | Ty::DynArray(elem) if elem == extent.elem)
+                || self.checked_operand_ty(&extent.len)?
+                    != Ty::Int(align_sema::IntTy {
+                        bits: 64,
+                        signed: true,
+                    })
+            {
+                return Err(self.err("counted-loop extent has invalid operand types"));
+            }
+        }
         let assume = Intrinsic::find("llvm.assume")
             .and_then(|intrinsic| intrinsic.get_declaration(self.module, &[]))
             .ok_or_else(|| self.err("llvm.assume is unavailable"))?;
@@ -33928,6 +33939,61 @@ fn main() -> i32 = 0
         )
         .expect_err("a reduction source that is not a slice must fail before aggregate extraction");
         assert_lowering(err, "callable metadata invalid:InvalidGraph");
+    }
+
+    #[test]
+    fn malformed_counted_extent_types_are_errors_not_panics() {
+        let source = r#"
+fn first_nonzero(borrow xs: slice<u8>) -> i64 {
+  mut i := 0
+  loop {
+    if i >= xs.len() { break -1 }
+    if xs[i] != 0 { break i }
+    i = i + 1
+  }
+}
+fn main() -> i32 = 0
+"#;
+        for axis in ["view", "len"] {
+            let mut program = mir(source);
+            let Some(extent) = program
+                .loop_facts
+                .iter_mut()
+                .find(|facts| facts.function == "first_nonzero")
+                .and_then(|facts| facts.counted.first_mut())
+                .and_then(|fact| fact.extents.first_mut())
+            else {
+                assert!(false, "counted extent fixture: {axis}");
+                continue;
+            };
+            if axis == "view" {
+                extent.view = Operand::Const(Const::Int(
+                    0,
+                    Ty::Int(IntTy {
+                        bits: 64,
+                        signed: true,
+                    }),
+                ));
+            } else {
+                extent.len = Operand::Const(Const::Bool(false));
+            }
+            let result = emit_llvm_ir(
+                &program,
+                &BuildTarget::Baseline,
+                Profile::Release,
+                false,
+                &["first_nonzero".to_owned()],
+                None,
+            );
+            let message = match result {
+                Err(CodegenError::Lowering(message)) => message,
+                _ => String::new(),
+            };
+            assert!(
+                message.contains("counted-loop extent has invalid operand types"),
+                "unexpected {axis} result: {message}"
+            );
+        }
     }
 
     #[test]

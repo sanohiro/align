@@ -1614,6 +1614,47 @@ fn raw_scan(p: raw, n: i64) -> i64 {
         !function_ir(&ir, "raw_scan").contains("\"dereferenceable\""),
         "a raw pointer has no Align-owned view extent:\n{ir}"
     );
+
+    let guardless = "\
+fn count_to(n: i64) -> i64 {
+  mut i := 0
+  loop {
+    if i >= n { break }
+    i = i + 1
+  }
+  return i
+}
+fn main() { }
+";
+    let report = loop_facts_report("g3-guardless", guardless);
+    assert_eq!(decision(&report, "count_to"), "kept checks: no-provable-guard");
+}
+
+/// Emission-scoped byte preparation may reorder every block in the function. Its block map must
+/// carry the producer-owned extent site with it instead of dropping or misplacing the assumption.
+#[test]
+fn g3_extent_survives_byte_preparation() {
+    let source = "\
+fn read_marker(borrow encoded: slice<u8>) -> u8 = encoded.u8(0)
+fn first_marker(borrow xs: slice<u8>, borrow encoded: slice<u8>) -> i64 {
+  marker := read_marker(encoded)
+  mut i := 0
+  loop {
+    if i >= xs.len() { break -1 }
+    if xs[i] == marker { break i }
+    i = i + 1
+  }
+}
+";
+    let report = loop_facts_report("g3-byte-prepare-report", source);
+    assert!(decision(&report, "first_marker").starts_with("versioned "));
+    let ir = emit_llvm_with_exports(source, &["first_marker"]);
+    let body = function_ir(&ir, "first_marker");
+    assert_eq!(
+        body.matches("\"dereferenceable\"").count(),
+        1,
+        "byte preparation keeps the one-shot extent attached to the rotated entry:\n{body}"
+    );
 }
 
 /// Zero-trip, one-trip, first/last match and no match preserve both the carried value and the first

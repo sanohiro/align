@@ -276,7 +276,7 @@ fn expose(caller: &mut Function, block: usize, position: usize, leaf: &Function)
 
 // LLVM lowering consumes defining SSA values before their uses. Splicing must
 // restore that ordering; numeric append order is not control-flow order.
-fn order_blocks(f: &mut Function) {
+fn order_blocks(f: &mut Function) -> Vec<u32> {
     let mut seen = BTreeSet::new();
     let mut postorder = Vec::new();
     let mut pending = vec![(f.entry, false)];
@@ -306,7 +306,7 @@ fn order_blocks(f: &mut Function) {
     for (index, old) in postorder.iter().enumerate() {
         // Existing IDs already bound this inventory to u32.
         let Ok(index) = u32::try_from(index) else {
-            return;
+            return Vec::new();
         };
         remap[*old as usize] = index;
     }
@@ -326,6 +326,7 @@ fn order_blocks(f: &mut Function) {
     }
     f.entry = remap[f.entry as usize];
     f.blocks = blocks;
+    remap
 }
 
 /// Prepare an owned view using exactly the bodies covered by this emission's
@@ -368,14 +369,28 @@ pub fn prepare<'a>(program: &'a Program, defined: &BTreeSet<ProgramCall>) -> Cow
         {
             continue;
         }
-        let function = &mut prepared.to_mut().fns[index];
+        let prepared = prepared.to_mut();
+        let function_name = prepared.fns[index].name.clone();
+        let function = &mut prepared.fns[index];
         // Select in source order, splice in reverse so original coordinates stay valid.
         for (bi, si, leaf) in sites.into_iter().rev() {
             let _ = expose(function, bi, si, leaf);
         }
-        order_blocks(function);
+        let block_remap = order_blocks(function);
         super::byte_ranges::simplify(function);
         super::byte_ranges::snapshot_descriptors(function);
+        if let Some(facts) = prepared
+            .loop_facts
+            .iter_mut()
+            .find(|facts| facts.function == function_name.as_str())
+            && (block_remap.is_empty()
+                || facts
+                    .counted
+                    .iter_mut()
+                    .any(|fact| !fact.remap_blocks(&block_remap)))
+        {
+            facts.counted.clear();
+        }
     }
     prepared
 }

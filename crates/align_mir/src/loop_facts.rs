@@ -169,6 +169,30 @@ pub struct CountedLoopFact {
     latch_bound: Operand,
 }
 
+impl CountedLoopFact {
+    /// Keep emission-scoped facts aligned when a preparation pass renumbers the owning function's
+    /// blocks. A missing source id invalidates the whole record instead of guessing a placement.
+    pub(crate) fn remap_blocks(&mut self, remap: &[BlockId]) -> bool {
+        let Some(preheader) = remap.get(self.preheader as usize).copied() else {
+            return false;
+        };
+        let Some(header) = remap.get(self.header as usize).copied() else {
+            return false;
+        };
+        let Some(latch) = remap.get(self.latch as usize).copied() else {
+            return false;
+        };
+        let Some(exit) = remap.get(self.exit as usize).copied() else {
+            return false;
+        };
+        self.preheader = preheader;
+        self.header = header;
+        self.latch = latch;
+        self.exit = exit;
+        true
+    }
+}
+
 /// One Align-owned view whose data buffer is accessible for `len * sizeof(elem)` bytes.
 #[derive(Clone, Debug)]
 pub struct DataExtent {
@@ -1594,6 +1618,9 @@ fn admit(
                     && !guard_exits.contains(&target)
             });
     }
+    if guards.is_empty() && !has_early_exit {
+        return Err(KeptReason::NoProvableGuard);
+    }
     let Some((condition_block, _, _)) = analysis.def(condition) else {
         return Err(KeptReason::LoopShape);
     };
@@ -2083,9 +2110,7 @@ fn apply(function: &mut Function, header: BlockId, plan: Plan) -> Option<Applied
         let latch_index = plan.body.iter().position(|block| *block == counted.latch)?;
         let expected_exit = counted.exit_arm;
         let expected_body = *block_map.get(&counted.body_arm)?;
-        let Some(header_clone) = clones.get_mut(header_index) else {
-            return None;
-        };
+        let header_clone = clones.get_mut(header_index)?;
         let Term::Branch(zero_trip, found_exit, found_body) = header_clone.term.clone()
         else {
             return None;
@@ -2099,9 +2124,7 @@ fn apply(function: &mut Function, header: BlockId, plan: Plan) -> Option<Applied
         remap_operand(&mut stepped, &value_map);
         let mut latch_bound = counted.bound.clone();
         remap_operand(&mut latch_bound, &value_map);
-        let Some(latch_clone) = clones.get_mut(latch_index) else {
-            return None;
-        };
+        let latch_clone = clones.get_mut(latch_index)?;
         if !matches!(latch_clone.term, Term::Goto(target) if target == *block_map.get(&header)?)
         {
             return None;
