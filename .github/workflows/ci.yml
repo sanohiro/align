@@ -218,14 +218,20 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          # The key hashes the root manifest as well as the lock file: `[profile.dev]`
-          # lives there and changing it invalidates every Cargo fingerprint in the
-          # restored `target`. A cache entry is immutable, so without the manifest in
-          # the key the save below cannot replace the stale entry and every later run
-          # would restore artifacts it must rebuild from scratch.
-          key: cargo-db-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          # The key and every restore-keys stage carry the root manifest hash.
+          # `[profile.dev]` lives there, and changing it invalidates every Cargo
+          # fingerprint in a restored `target` without deleting one byte of it:
+          # cargo writes a second full generation of artifacts under new
+          # `-C metadata` hashes beside the dead ones. Nightly run 35418220792
+          # restored a 10.5 GB opt-level 0 target that way and filled the runner's
+          # disk mid-build. A cache entry is also immutable, so a key fixed on the
+          # lock file alone could never be replaced and every later run would keep
+          # restoring artifacts it must rebuild from scratch. restore-keys match by
+          # prefix, so the manifest hash sits ahead of the lock hash: that is what
+          # gates the hash-free fallback stage on the profile as well.
+          key: cargo-db-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-profile${{ hashFiles('Cargo.toml') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-db-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-
+            cargo-db-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-profile${{ hashFiles('Cargo.toml') }}-
 
       # The apt install costs ~23 s a run and only ~3 s of that is the 160 MB
       # download: `apt-get update` and two package-list resolutions dominate.
@@ -317,7 +323,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-db-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          key: cargo-db-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-profile${{ hashFiles('Cargo.toml') }}-${{ hashFiles('Cargo.lock') }}
 
   db-required:
     name: PostgreSQL integration (required)
@@ -488,14 +494,20 @@ jobs:
             ~/.cargo/git
             target
             target/clippy
-          # The key hashes the root manifest as well as the lock file: `[profile.dev]`
-          # lives there and changing it invalidates every Cargo fingerprint in the
-          # restored `target`. A cache entry is immutable, so without the manifest in
-          # the key the save below cannot replace the stale entry and every later run
-          # would restore artifacts it must rebuild from scratch.
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-lint${{ matrix.lint }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          # The key and every restore-keys stage carry the root manifest hash.
+          # `[profile.dev]` lives there, and changing it invalidates every Cargo
+          # fingerprint in a restored `target` without deleting one byte of it:
+          # cargo writes a second full generation of artifacts under new
+          # `-C metadata` hashes beside the dead ones. Nightly run 35418220792
+          # restored a 10.5 GB opt-level 0 target that way and filled the runner's
+          # disk mid-build. A cache entry is also immutable, so a key fixed on the
+          # lock file alone could never be replaced and every later run would keep
+          # restoring artifacts it must rebuild from scratch. restore-keys match by
+          # prefix, so the manifest hash sits ahead of the lock hash: that is what
+          # gates the hash-free fallback stage on the profile as well.
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-lint${{ matrix.lint }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-profile${{ hashFiles('Cargo.toml') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-${{ runner.arch }}-lint${{ matrix.lint }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-
+            cargo-${{ runner.os }}-${{ runner.arch }}-lint${{ matrix.lint }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-profile${{ hashFiles('Cargo.toml') }}-
 
       # actions/checkout stamps every tracked file's mtime with the checkout
       # time, so Cargo's fingerprint sees every workspace crate as changed
@@ -634,7 +646,7 @@ jobs:
             ~/.cargo/git
             target
             target/clippy
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-lint${{ matrix.lint }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-lint${{ matrix.lint }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-profile${{ hashFiles('Cargo.toml') }}-${{ hashFiles('Cargo.lock') }}
 
   platform-required:
     name: Platform CI (required)

@@ -144,10 +144,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-nightly-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+          key: cargo-nightly-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-profile${{ hashFiles('Cargo.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
           restore-keys: |
-            cargo-nightly-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}-
-            cargo-nightly-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-
+            cargo-nightly-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-profile${{ hashFiles('Cargo.toml') }}-${{ hashFiles('Cargo.lock') }}-
+            cargo-nightly-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-profile${{ hashFiles('Cargo.toml') }}-
 
       - name: Restore OpenSSL cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -223,7 +223,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-nightly-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+          key: cargo-nightly-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-profile${{ hashFiles('Cargo.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
 
   # The one signal. A sharded detector that only reported per shard would make
   # "was the nightly green" a question about eight job results, and `needs` on
@@ -278,10 +278,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-nightly-release-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+          key: cargo-nightly-release-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-profile${{ hashFiles('Cargo.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
           restore-keys: |
-            cargo-nightly-release-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}-
-            cargo-nightly-release-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-
+            cargo-nightly-release-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-profile${{ hashFiles('Cargo.toml') }}-${{ hashFiles('Cargo.lock') }}-
+            cargo-nightly-release-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-profile${{ hashFiles('Cargo.toml') }}-
 
       - name: Restore OpenSSL cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -355,4 +355,4 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-nightly-release-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+          key: cargo-nightly-release-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-profile${{ hashFiles('Cargo.toml') }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}

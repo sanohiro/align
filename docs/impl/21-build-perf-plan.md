@@ -2725,8 +2725,25 @@ rules are otherwise unchanged. `ci.yml`'s Cargo cache keys now hash
 `Cargo.toml` alongside `Cargo.lock`: a cache entry is immutable, so a key
 fixed on the lock file alone could never be replaced and would keep
 restoring the stale opt-level 0 artifacts forever, so "one cold rebuild" is
-true only with that key change. `nightly.yml`'s keys already include the run
-id and self-heal, so they needed no equivalent change.
+true only with that key change. `nightly.yml` needs the same hash for a
+different reason, and the run id does not supply it: the run id makes each
+night's *save* key unique, but the *restore* tiers are prefixes, so run
+35418220792 matched the previous night's entry and restored a 10.5 GB
+opt-level 0 `target`. Changing the profile invalidates every fingerprint in it
+without deleting anything, and cargo then writes a second complete generation
+of artifacts under new `-C metadata` hashes beside the dead ones, so all twelve
+shards filled the runner's disk mid-build (`rustc-LLVM ERROR: IO failure on
+output stream: No space left on device`). Both nightly restore tiers — the
+lock-exact one and the hash-free fallback — are therefore gated on
+`hashFiles('Cargo.toml')`, which makes a profile change a genuinely cold start
+instead of a doubled `target`. `ci.yml`'s two Cargo restore stages were
+hash-free fallbacks with the same hole, so both workflows now spell the key the
+same way, with the manifest hash *ahead* of the lock hash — restore-keys match
+by prefix, so a manifest hash placed after it would gate the stage and
+simultaneously stop it matching any saved key, turning the cache into a silent
+permanent miss. `scripts/test-pr-workflow.sh` asserts both halves for every
+Cargo restore key in both workflows: that it carries the manifest hash, and
+that it remains a prefix of some save key.
 
 **Test-side companion change (same PR).** `pkg_db_a1` and `pkg_db_q4b`
 consolidated their rejection-shape fixtures: each rejection program is
