@@ -6,8 +6,9 @@ The align-llm audit issue batch is partly shipped. Merged: #1089 (plan 68),
 #1090, #1091, #1092, #1096, #1099, #1100 (plan 69), #1101, #1110, #1111
 (plan 69 PR 1), #1113, #1114 (plan 70 ledger), #1115, #1116 (plan 69 PR 2,
 closes #1081), #1124 (build-performance items 7 and 8), #1125 (the first
-post-#1124 nightly repair), and #1128 (plan 70 PR 2). Plan 70 PR 3 is implemented
-locally as the current candidate. Every remaining item
+post-#1124 nightly repair), #1128 (plan 70 PR 2), #1129 (plan 70 PR 3), and
+#1130 (plan 71 ledger). Plan 71 PR 1 is implemented locally as the current
+candidate. Every remaining item
 below starts from `main` with a fresh branch and follows the CLAUDE.md review
 flow.
 
@@ -50,11 +51,13 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    against LLVM 22's nested `captures(address, read_provenance)` spelling;
    `deep_type_graphs` remains covered by the nightly full-suite detector.
 
-1. **plan 71 ledger** for #1076/#1077/#1078 (sum-type layout, aggregate transport,
-   drop-state model): the unified ledger is drafted on its design branch and
-   awaits one fresh independent adversarial review before any code. It fixes
-   four ordered capabilities: explicit-tag/max-variant union storage with an
-   exact Unit-omission payload map; a
+1. **plan 71 implementation** for #1076/#1077/#1078 (sum-type layout, aggregate
+   transport, drop-state model): the unified ledger shipped in #1130. PR 1 is
+   the current candidate: user sums, `Option`, and `Result` use explicit-tag,
+   max-variant union storage with an exact Unit/zero-size omission payload map;
+   construction, projection, Drop, clone, JSON, callbacks, tasks, errors, and
+   whole/per-unit LLVM layout validation consume that one representation. The
+   remaining ordered capabilities are a
    serialized per-parameter drop-state effect with conservative indirect
    adapters; target-selected byval and split cleanup-result transport; then
    fresh-whole-value destination construction with reached-exit partial cleanup.

@@ -9292,7 +9292,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
     }
 
     // Pass 0c: resolve concrete enum variant payloads (structs are now known) into the reserved
-    // slots. The enum lowers to a non-union struct `{ i32 tag, <flattened payloads> }`; payloads may
+    // slots. The enum lowers to an explicit tag plus maximum-variant union storage; payloads may
     // include direct recursively Move strings, structs, sums, and supported owned arrays. Monomorph
     // instances of generic sum types append after the reserved slots, so a concrete enum's id stays
     // valid.
@@ -10587,6 +10587,29 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         }
         for variant in &def.variants {
             for payload in &variant.payload {
+                let mut inline_structs = Vec::new();
+                collect_inline_struct_ids(
+                    scalar_to_ty(*payload),
+                    &tagged_types,
+                    &mut inline_structs,
+                );
+                if inline_structs.iter().any(|id| {
+                    structs
+                        .get(*id as usize)
+                        .is_some_and(|definition| definition.align.is_some())
+                }) {
+                    let source_span = *span.get_or_insert_with(|| {
+                        if eid < enum_decls.len() {
+                            enum_decls[eid].2.span
+                        } else {
+                            resolved_enum_span(&def.name)
+                        }
+                    });
+                    diags.error(
+                        "an `align(N)` struct cannot be a sum-type payload yet (union storage does not preserve explicit payload alignment)".to_string(),
+                        source_span,
+                    );
+                }
                 let struct_id = match payload {
                     Scalar::DynStructArray(id) => *id,
                     _ => continue,
@@ -80890,6 +80913,22 @@ fn exit_branch(flag: bool) -> i64 {
             !checked_hir_body_facts_are_valid(&forged),
             "a different function return type must remain a checked-HIR rejection"
         );
+    }
+
+    #[test]
+    fn sum_payloads_reject_explicitly_aligned_zero_sized_structs() {
+        for source in [
+            "align(16) Empty {}\nBad { Value(Empty) }\nfn take(value: Bad) -> i64 = 0\n",
+            "align(16) Empty {}\nBad { Value(Option<Empty>) }\nfn take(value: Bad) -> i64 = 0\n",
+            "align(16) Empty {}\nBox<T> { Value(T) }\nfn take(value: Box<Empty>) -> i64 = 0\n",
+        ] {
+            let (_program, diagnostics) = check(&format!("{source}fn main() -> i32 = 0\n"));
+            let errors = diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.message.contains("cannot be a sum-type payload"))
+                .count();
+            assert_eq!(errors, 1, "aligned payload must reject exactly once: {:?}", diagnostics.iter().collect::<Vec<_>>());
+        }
     }
 
     #[test]
