@@ -298,10 +298,12 @@ every item below has since completed as recorded in the per-milestone sections, 
      with a result slot (like `if`); enums are Copy values usable as locals / params / returns.
      **S1b DONE** — scalar variant payloads: `Shape { Circle(f64), Rect(f64, f64) }`,
      `Type.Variant(args)` construction (arity/type checked), and `match` arms binding the payload
-     positionally (`Circle(r) => …`, scoped to the arm). The enum now lowers to a non-union tagged
-     struct `{ i32 tag, <every variant's payload flattened> }` (the `Result` `{tag, ok, err}` shape
-     generalized), built/read via SSA insert/extract-value (MIR `MakeEnum` / `EnumTagEq` /
-     `EnumPayload`); later slices admit recursively Move payloads on the same layout. **S3 DONE** — `match` on the builtin
+     positionally (`Circle(r) => …`, scoped to the arm). The shipped first implementation lowers to
+     a non-union tagged struct `{ i32 tag, <every variant's payload flattened> }` (the `Result`
+     `{tag, ok, err}` shape generalized), built/read via SSA insert/extract-value (MIR `MakeEnum` /
+     `EnumTagEq` / `EnumPayload`). [Plan 71](71-aggregate-layout-transport-drop-state-plan.md)
+     settles its replacement with one explicit tag plus max-variant union storage; PR 1 changes all
+     construction, projection, Drop and serialization consumers together. **S3 DONE** — `match` on the builtin
      `Option`/`Result` (`match o { Some(x) => …, None => … }`, `match r { Ok(v) => …, Err(e) => … }`):
      `check_match` derives the variant list from the scrutinee type (a `match_variants` helper
      covering enum + Option + Result uniformly), and MIR lowers these two-variant types as a single
@@ -314,8 +316,8 @@ every item below has since completed as recorded in the per-milestone sections, 
      guards cross the settled "`match` = variants, `if` = conditions" One-Way line; recursive enums
      run against the data-oriented core and need a larger box-rework track — both deferred (rationale
      in `open-questions.md`). So **4a (sum types + exhaustive `match`) is complete** for the planned
-     surface. (A space-optimal union layout instead of flattened fields is a deferred codegen
-     optimization — no surface change.)
+     surface. The union layout is now scheduled as plan 71 PR 1; it remains a codegen change with no
+     source-surface change.
    - **4b. Error type** *(DONE)* — built **on** sum types: `Error` as a sum type of
      categories + structured payloads, an explicit value (no unwinding / no stack-trace alloc),
      static/predictable `?` conversion, structured (position-bearing) errors. Replaces the M2 i32
