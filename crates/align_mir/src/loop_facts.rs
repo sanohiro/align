@@ -2536,6 +2536,8 @@ mod tests {
                 term: Term::Unreachable,
             }],
             entry: 0,
+            exceptional_edges: Vec::new(),
+            cold: false,
             exportable: false,
         }
     }

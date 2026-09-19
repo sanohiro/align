@@ -703,7 +703,7 @@ fn g2_element_guard_is_one_unsigned_compare() {
     let guard = &guards[0];
     assert_eq!(
         guard.matches("as u64 (from i64)").count(),
-        2,
+        3,
         "one index cast and one length cast, and nothing else:\n{guard}"
     );
     assert!(
@@ -740,7 +740,7 @@ fn g2_range_guard_is_two_unsigned_compares() {
     );
     assert_eq!(
         guard.matches("as u64 (from i64)").count(),
-        3,
+        2,
         "start, end and len are each cast once:\n{guard}"
     );
     assert_eq!(
@@ -1654,6 +1654,11 @@ fn first_marker(borrow xs: slice<u8>, borrow encoded: slice<u8>) -> i64 {
         body.matches("\"dereferenceable\"").count(),
         1,
         "byte preparation keeps the one-shot extent attached to the rotated entry:\n{body}"
+    );
+    assert_eq!(
+        body.matches("!prof").count(),
+        2,
+        "byte preparation must remap the exposed reader and loop bounds edges:\n{body}"
     );
 }
 

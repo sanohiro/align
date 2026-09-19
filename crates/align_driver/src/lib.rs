@@ -864,6 +864,8 @@ fn install_static_descriptor_data(
             value_tys: binder_value_tys,
             blocks: binder_blocks,
             entry: 0,
+            exceptional_edges: Vec::new(),
+            cold: false,
             exportable: false,
         });
         generated_functions.push(Function {
@@ -888,6 +890,8 @@ fn install_static_descriptor_data(
                 )))),
             }],
             entry: 0,
+            exceptional_edges: Vec::new(),
+            cold: false,
             exportable: false,
         });
 
@@ -991,6 +995,8 @@ fn install_static_descriptor_data(
             value_tys: ordinal_value_tys,
             blocks: ordinal_blocks,
             entry: 0,
+            exceptional_edges: Vec::new(),
+            cold: false,
             exportable: false,
         });
 
@@ -1140,6 +1146,8 @@ fn install_static_descriptor_data(
             value_tys: static_value_tys,
             blocks: static_blocks,
             entry: 0,
+            exceptional_edges: Vec::new(),
+            cold: false,
             exportable: false,
         });
 
@@ -1442,6 +1450,8 @@ fn install_static_descriptor_data(
                 value_tys: values,
                 blocks,
                 entry: 0,
+                exceptional_edges: Vec::new(),
+                cold: false,
                 exportable: false,
             });
 
@@ -1707,6 +1717,8 @@ fn install_static_descriptor_data(
                     },
                 }],
                 entry: 0,
+                exceptional_edges: Vec::new(),
+                cold: false,
                 exportable: false,
             });
             generated_functions.push(Function {
@@ -1732,6 +1744,8 @@ fn install_static_descriptor_data(
                     },
                 }],
                 entry: 0,
+                exceptional_edges: Vec::new(),
+                cold: false,
                 exportable: false,
             });
 
@@ -1804,6 +1818,8 @@ fn install_static_descriptor_data(
                     term: Term::Return(Some(Operand::Value(0))),
                 }],
                 entry: 0,
+                exceptional_edges: Vec::new(),
+                cold: false,
                 exportable: false,
             });
             let mut batch_append_stmts = Vec::new();
@@ -1897,6 +1913,8 @@ fn install_static_descriptor_data(
                     term: Term::Return(Some(Operand::Value(batch_append_result))),
                 }],
                 entry: 0,
+                exceptional_edges: Vec::new(),
+                cold: false,
                 exportable: false,
             });
             generated_functions.push(Function {
@@ -1921,6 +1939,8 @@ fn install_static_descriptor_data(
                     term: Term::Return(None),
                 }],
                 entry: 0,
+                exceptional_edges: Vec::new(),
+                cold: false,
                 exportable: false,
             });
             generated_functions.push(Function {
@@ -1951,6 +1971,8 @@ fn install_static_descriptor_data(
                     term: Term::Return(Some(Operand::Value(0))),
                 }],
                 entry: 0,
+                exceptional_edges: Vec::new(),
+                cold: false,
                 exportable: false,
             });
             if soa_plain {
@@ -1987,6 +2009,8 @@ fn install_static_descriptor_data(
                         term: Term::Return(Some(Operand::Value(0))),
                     }],
                     entry: 0,
+                    exceptional_edges: Vec::new(),
+                    cold: false,
                     exportable: false,
                 });
             }
@@ -2012,6 +2036,8 @@ fn install_static_descriptor_data(
                     term: Term::Return(None),
                 }],
                 entry: 0,
+                exceptional_edges: Vec::new(),
+                cold: false,
                 exportable: false,
             });
             let mut batch_plan_bytes = vec![0u8; 72];

@@ -724,5 +724,12 @@ pub fn simplify(function: &mut Function) {
         for (block, term) in original {
             function.blocks[block as usize].term = term;
         }
+    } else {
+        function.exceptional_edges.retain(|edge| {
+            matches!(
+                function.blocks.get(edge.block as usize).map(|block| &block.term),
+                Some(Term::Branch(..))
+            )
+        });
     }
 }

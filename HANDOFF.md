@@ -6,7 +6,7 @@ The align-llm audit issue batch is partly shipped. Merged: #1089 (plan 68),
 #1090, #1091, #1092, #1096, #1099, #1100 (plan 69), #1101, #1110, #1111
 (plan 69 PR 1), #1113, #1114 (plan 70 ledger), #1115, #1116 (plan 69 PR 2,
 closes #1081), #1124 (build-performance items 7 and 8), and #1125 (the first
-post-#1124 nightly repair). Plan 70 PR 1 is implemented. Every remaining item
+post-#1124 nightly repair). Plan 70 PR 1 and PR 2 are implemented. Every remaining item
 below starts from `main` with a fresh branch and follows the CLAUDE.md review
 flow.
 
@@ -49,8 +49,7 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    against LLVM 22's nested `captures(address, read_provenance)` spelling;
    `deep_type_graphs` remains covered by the nightly full-suite detector.
 
-1. **plan 70 PR 2** (#1074 cold-path model) and **PR 3** (#1072 inline fast path),
-   in that order — plan 70 §4, §5.
+1. **plan 70 PR 3** (#1072 inline fast path) — plan 70 §5.
 2. **plan 71 ledger** for #1076/#1077/#1078 (sum-type layout, aggregate transport,
    drop-state model): one ledger, serialized, one fresh independent adversarial
    review before any code (CLAUDE.md large-design gate).
@@ -148,8 +147,10 @@ PR 1 is implemented: all 464 base rows have one total `RuntimeEffects` record;
 declaration and rt-LTO removal attributes derive from it; the `argmem`
 experiment confirmed that indirect loaded-pointer storage must stay withheld;
 and allocation, host-state, source-inventory, C-unwind, whole/per-unit,
-function-partition, admission and artifact-budget owners close the matrix.
-PR 2 and PR 3 remain.
+function-partition, admission and artifact-budget owners close the matrix. PR 2
+implements the six-kind, nine-site MIR exceptional-edge inventory, exact
+`2000:1` LLVM branch weights, stale-record validation through MIR rewrites, and
+fail-closed cold inference over the direct call graph. PR 3 remains.
 
 **Decode representation costs:** [plan 62](docs/impl/62-decode-optimization-plan.md)
 implements bounded nonescaping byte storage and direct synchronous chunks
