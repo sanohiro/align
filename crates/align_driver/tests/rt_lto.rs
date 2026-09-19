@@ -28,6 +28,118 @@
 mod common;
 use common::*;
 
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Output, Stdio};
+use std::time::{Duration, Instant};
+
+/// One exclusively acquired directory for artifact-inspection subprocesses. Every artifact and
+/// redirected output remains below it, and cleanup stays armed across assertion panics.
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    fn new(tag: &str) -> Self {
+        loop {
+            let path = std::env::temp_dir().join(format!(
+                "align-rtlto-{}-{tag}-{}",
+                std::process::id(),
+                thin_nonce()
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Self(path),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                Err(error) => panic!("acquire private temporary directory: {error}"),
+            }
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        loop {
+            match std::fs::remove_dir_all(&self.0) {
+                Ok(()) => break,
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => break,
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+struct ChildOwner {
+    child: Option<std::process::Child>,
+    deadline: Instant,
+}
+
+impl ChildOwner {
+    fn child(&mut self) -> &mut std::process::Child {
+        self.child.as_mut().expect("child owner holds its process")
+    }
+
+    fn disarm(&mut self) {
+        self.child.take();
+    }
+}
+
+impl Drop for ChildOwner {
+    fn drop(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        let _ = child.kill();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < self.deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    eprintln!("LLVM inspection tool could not be reaped before its deadline");
+                    break;
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+/// Run an artifact-inspection tool with one deadline covering execution, kill, and reap. Redirecting
+/// to owned files avoids pipe backpressure while the parent polls the child.
+fn bounded_tool_output(mut command: Command, scratch: &ScratchDir, tag: &str) -> Output {
+    let stdout_path = scratch.path().join(format!("{tag}.stdout"));
+    let stderr_path = scratch.path().join(format!("{tag}.stderr"));
+    let stdout = std::fs::File::create(&stdout_path).expect("create tool stdout");
+    let stderr = std::fs::File::create(&stderr_path).expect("create tool stderr");
+    command.stdout(Stdio::from(stdout)).stderr(Stdio::from(stderr));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let execution_deadline = deadline - Duration::from_secs(5);
+    let child = command.spawn().expect("spawn LLVM inspection tool");
+    let mut owner = ChildOwner { child: Some(child), deadline };
+    let status: ExitStatus = loop {
+        match owner.child().try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < execution_deadline => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+            Ok(None) => panic!("LLVM inspection tool exceeded its 30-second deadline"),
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => panic!("poll LLVM inspection tool: {error}"),
+        }
+    };
+    owner.disarm();
+    Output {
+        status,
+        stdout: std::fs::read(stdout_path).expect("read tool stdout"),
+        stderr: std::fs::read(stderr_path).expect("read tool stderr"),
+    }
+}
+
 /// Compile `src` to LLVM IR through the driver for `target`, exporting `exports`. `optimized` = the
 /// `-O2` lens (calls inlined) vs raw (pre-opt merged shape); `rt_lto` links the fast-path string
 /// bitcode.
@@ -204,30 +316,28 @@ fn gate3_baked_bitcode_symbol_set() {
     let Some(nm) = align_driver::llvm_tool("llvm-nm") else {
         return; // no version-matched llvm-nm — skip the artifact inspection
     };
-    let dir = std::env::temp_dir().join(format!("align-rtlto-nm-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("tmp dir");
-    let bc = dir.join("str_prims.bc");
+    let scratch = ScratchDir::new("nm");
+    let bc = scratch.path().join("str_prims.bc");
     std::fs::write(&bc, align_driver::rt_lto_bitcode()).expect("write bc");
 
-    let defined = String::from_utf8(
-        std::process::Command::new(&nm)
-            .args(["--defined-only"])
-            .arg(&bc)
-            .output()
-            .expect("run llvm-nm --defined-only")
-            .stdout,
-    )
-    .expect("utf8");
-    let undefined = String::from_utf8(
-        std::process::Command::new(&nm)
-            .args(["--undefined-only"])
-            .arg(&bc)
-            .output()
-            .expect("run llvm-nm --undefined-only")
-            .stdout,
-    )
-    .expect("utf8");
-    let _ = std::fs::remove_dir_all(&dir);
+    let mut defined_command = Command::new(&nm);
+    defined_command.args(["--defined-only"]).arg(&bc);
+    let defined_output = bounded_tool_output(defined_command, &scratch, "defined");
+    assert!(
+        defined_output.status.success(),
+        "llvm-nm --defined-only failed: {}",
+        String::from_utf8_lossy(&defined_output.stderr)
+    );
+    let defined = String::from_utf8(defined_output.stdout).expect("utf8");
+    let mut undefined_command = Command::new(&nm);
+    undefined_command.args(["--undefined-only"]).arg(&bc);
+    let undefined_output = bounded_tool_output(undefined_command, &scratch, "undefined");
+    assert!(
+        undefined_output.status.success(),
+        "llvm-nm --undefined-only failed: {}",
+        String::from_utf8_lossy(&undefined_output.stderr)
+    );
+    let undefined = String::from_utf8(undefined_output.stdout).expect("utf8");
 
     // Defined `align_rt_*` symbols == exactly the guarded four.
     //
@@ -276,6 +386,91 @@ fn gate3_baked_bitcode_symbol_set() {
             allow.contains(&unprefixed),
             "unexpected undefined symbol {sym} — extend the allowlist only after auditing it"
         );
+    }
+}
+
+fn validate_guarded_artifact_ir(ir: &str) -> Result<(), String> {
+    let defined: std::collections::BTreeSet<_> = ir
+        .lines()
+        .filter(|line| line.starts_with("define "))
+        .filter_map(|line| line.split_once('@')?.1.split_once('(').map(|(name, _)| name))
+        .collect();
+    let allowed_external = ["bcmp", "memcmp", "memcpy", "memmove", "memset"];
+    for line in ir.lines().filter(|line| line.starts_with("declare ")) {
+        let Some(name) = line.split_once('@').and_then(|(_, rest)| rest.split_once('(')).map(|x| x.0)
+        else {
+            continue;
+        };
+        if !name.starts_with("llvm.") && !allowed_external.contains(&name) && !defined.contains(name)
+        {
+            return Err(format!("guarded artifact has an open call graph through {name}"));
+        }
+    }
+
+    for symbol in GUARDED_SYMBOLS {
+        let needle = format!("@{symbol}(");
+        let mut body = ir
+            .lines()
+            .skip_while(|line| !(line.starts_with("define ") && line.contains(&needle)))
+            .skip(1);
+        let mut instructions = 0usize;
+        let mut found_end = false;
+        for line in body.by_ref() {
+            let line = line.trim();
+            if line == "}" {
+                found_end = true;
+                break;
+            }
+            if !line.is_empty() && !line.starts_with(';') && !line.ends_with(':') {
+                instructions += 1;
+            }
+        }
+        if !found_end {
+            return Err(format!("guarded artifact is missing a body for {symbol}"));
+        }
+        if instructions > 200 {
+            return Err(format!(
+                "guarded artifact body {symbol} has {instructions} LLVM instructions (limit 200)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn rt_lto_guarded_bodies_meet_the_artifact_budget() {
+    let Some(dis) = align_driver::llvm_tool("llvm-dis") else {
+        return;
+    };
+    let scratch = ScratchDir::new("budget");
+    let bc = scratch.path().join("str_prims.bc");
+    std::fs::write(&bc, align_driver::rt_lto_bitcode()).expect("write bc");
+    let mut command = Command::new(dis);
+    command.arg(&bc).args(["-o", "-"]);
+    let output = bounded_tool_output(command, &scratch, "disassembly");
+    assert!(output.status.success(), "llvm-dis failed: {}", String::from_utf8_lossy(&output.stderr));
+    let artifact = String::from_utf8(output.stdout).expect("LLVM IR is UTF-8");
+    validate_guarded_artifact_ir(&artifact).unwrap();
+
+    let open_graph = artifact.replacen(
+        "declare i32 @memcmp",
+        "declare ptr @__rust_alloc(i64, i64)\ndeclare i32 @memcmp",
+        1,
+    );
+    assert!(validate_guarded_artifact_ir(&open_graph).unwrap_err().contains("__rust_alloc"));
+
+    let oversized = artifact.replacen(
+        "start:\n",
+        &format!("start:\n{}", "  %budget = freeze i1 false\n".repeat(201)),
+        1,
+    );
+    assert!(validate_guarded_artifact_ir(&oversized).unwrap_err().contains("limit 200"));
+
+    // P4 is checked after the production string-attribute shedder, the same stage consumed by
+    // users. Keep one real merged-artifact observation beside the P3/P5 checks.
+    let merged = ir("artifact_budget", GUARDED_KERNEL, &["counts"], false, true);
+    for (_, group) in definition_attribute_groups(&merged) {
+        assert!(!group.contains('"'), "merged guarded body kept a producer string attribute: {group}");
     }
 }
 
@@ -527,4 +722,3 @@ fn cli_rt_lto_rejects_non_build_verb() {
         "diagnostic must name the valid verb set:\n{err}"
     );
 }
-

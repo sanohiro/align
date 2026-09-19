@@ -7545,6 +7545,10 @@ const CAPTURES_NONE: u64 = 0;
 /// `rt_contract_attrs_pin_encoding_and_curation` pins the emitted attribute's textual form —
 /// an LLVM upgrade that shifts the bits fails that test loudly instead of silently miscompiling.
 const MEM_ARGMEM_READ: u64 = 1;
+const MEM_NONE: u64 = 0;
+const MEM_INACCESSIBLE_READWRITE: u64 = 12;
+const MEM_ARGMEM_READ_INACCESSIBLE_READWRITE: u64 = 13;
+const MEM_ARGMEM_READWRITE_INACCESSIBLE_READWRITE: u64 = 15;
 
 /// Parse the baked `--rt-lto` bitcode (`build.rs` → `str_prims.bc`, `include_bytes!`) into a module
 /// in `ctx`. The probe half of "probe-then-annotate": the caller decides whether to skip curating
@@ -24696,6 +24700,112 @@ fn main() -> i32 = 0
         });
         let per_unit = emit_llvm_ir(&per_unit, &BuildTarget::Baseline, Profile::Release, false, &[], None).unwrap();
         assert_eq!(declarations(&per_unit), expected);
+
+        let contracts = |text: &str| -> Vec<_> {
+            expected
+                .iter()
+                .map(|symbol| {
+                    let declaration = text
+                        .lines()
+                        .find(|line| {
+                            line.starts_with("declare ")
+                                && line.contains(&format!("@{symbol}("))
+                        })
+                        .unwrap_or_else(|| panic!("missing runtime declaration {symbol}"));
+                    let signature = declaration
+                        .rsplit_once(" #")
+                        .map_or(declaration, |(signature, _)| signature);
+                    (
+                        symbol.clone(),
+                        signature.to_string(),
+                        attr_group_of(text, symbol),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            contracts(&per_unit),
+            contracts(&whole),
+            "whole-program and per-unit lowering must derive identical runtime effects",
+        );
+    }
+
+    #[test]
+    fn function_thin_lto_partitions_derive_identical_runtime_effects() {
+        let program = mir(
+            "fn leaf(value: i64) -> i64 = value + 1\n\
+             fn main() -> i32 = leaf(1) as i32\n",
+        );
+        let records: Vec<_> = program
+            .fns
+            .iter()
+            .map(|function| {
+                let (symbol, linkage) =
+                    partition_function_symbol("runtime-effects", function, &[]).unwrap();
+                ThinPeerDeclaration {
+                    logical: function.name.clone(),
+                    abi: partition_function_abi(function, &program).unwrap(),
+                    symbol,
+                    linkage,
+                }
+            })
+            .collect();
+        let expected: Vec<_> = runtime_abi::keyed_runtime_abis()
+            .map(|abi| abi.symbol.to_owned())
+            .collect();
+        let mut partition_contracts = Vec::new();
+        for (index, selected) in program.fns.iter().enumerate() {
+            let definition = &records[index];
+            let peers: Vec<_> = records
+                .iter()
+                .enumerate()
+                .filter(|(peer, _)| *peer != index)
+                .map(|(_, record)| record.clone())
+                .collect();
+            let ctx = Context::create();
+            let (module, _tm) = build_program_module(
+                &ctx,
+                &program,
+                &BuildTarget::Baseline,
+                Profile::Release,
+                &[],
+                None,
+                ModuleScope::Function {
+                    selected: &selected.name,
+                    definition,
+                    peers: &peers,
+                },
+            )
+            .unwrap();
+            let text = module.print_to_string().to_string();
+            let contracts: Vec<_> = expected
+                .iter()
+                .map(|symbol| {
+                    let declaration = text
+                        .lines()
+                        .find(|line| {
+                            line.starts_with("declare ")
+                                && line.contains(&format!("@{symbol}("))
+                        })
+                        .unwrap_or_else(|| {
+                            panic!("partition {} omitted {symbol}", selected.name.as_str())
+                        });
+                    let signature = declaration
+                        .rsplit_once(" #")
+                        .map_or(declaration, |(signature, _)| signature);
+                    (
+                        symbol.clone(),
+                        signature.to_owned(),
+                        attr_group_of(&text, symbol),
+                    )
+                })
+                .collect();
+            partition_contracts.push(contracts);
+        }
+        assert_eq!(
+            partition_contracts[0], partition_contracts[1],
+            "every function ThinLTO partition must derive identical runtime declarations",
+        );
     }
 
     #[test]
@@ -25297,6 +25407,76 @@ fn main() -> i32 = 0
         assert!(!has(utf8_valid, function_loc, "memory"));
         assert!(has(utf8_valid, param0, "readonly"));
         assert!(has(utf8_valid, param0, "captures"));
+    }
+
+    #[test]
+    fn runtime_effects_indirect_reachability_control_discriminates_false_argmem() {
+        fn optimized(source: &str) -> String {
+            let ctx = Context::create();
+            let bytes = std::ffi::CString::new(source).unwrap();
+            let module = ctx
+                .create_module_from_ir(MemoryBuffer::create_from_memory_range_copy(
+                    bytes.as_bytes_with_nul(),
+                    "runtime-effects-indirect-reachability",
+                ))
+                .unwrap();
+            let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default)
+                .unwrap();
+            run_opt_pipeline(&module, &tm, "default<O2>").unwrap();
+            module.print_to_string().to_string()
+        }
+
+        let fixture = |effect: &str| {
+            format!(
+                "declare void @helper(ptr) nounwind {effect}\n\
+                 define i32 @probe(ptr noalias %handle, ptr noalias %payload) {{\n\
+                 entry:\n\
+                   store ptr %payload, ptr %handle\n\
+                   store i32 7, ptr %payload\n\
+                   call void @helper(ptr %handle)\n\
+                   %value = load i32, ptr %payload\n\
+                   ret i32 %value\n\
+                 }}\n"
+            )
+        };
+        let withheld = optimized(&fixture(""));
+        assert!(
+            withheld.contains("load i32, ptr %payload"),
+            "the conservative declaration must keep the indirectly reachable read:\n{withheld}",
+        );
+
+        let false_argmem = optimized(&fixture("memory(argmem: readwrite)"));
+        assert!(
+            false_argmem.contains("ret i32 7"),
+            "the negative control must expose LLVM's loaded-pointer exclusion:\n{false_argmem}",
+        );
+        assert!(!false_argmem.contains("load i32, ptr %payload"));
+    }
+
+    #[test]
+    fn runtime_fail_effect_preserves_caller_memory_summary() {
+        let program = mir(
+            "pub fn checked_load(values: slice<i64>, index: i64) -> i64 = values[index]\n\
+             fn main() -> i32 = 0\n",
+        );
+        let out = emit_llvm_ir(
+            &program,
+            &BuildTarget::Baseline,
+            Profile::Release,
+            true,
+            &["checked_load".to_string()],
+            None,
+        )
+        .unwrap();
+        let attrs = definition_attr_group_of(&out, "checked_load");
+        assert!(
+            attrs.contains("memory("),
+            "a surviving bounds-fail edge must not erase the caller's memory summary:\n{out}",
+        );
+        assert!(
+            attrs.contains("memory(read, inaccessiblemem: readwrite"),
+            "the successful load path must remain visible in the caller summary:\n{attrs}",
+        );
     }
 
     #[test]
@@ -34720,9 +34900,14 @@ fn main() -> i32 = 0
         assert!(out.contains(&format!("define internal i64 @\"{sq}\"(i64 %0) #0")));
         assert!(out.contains("define i32 @main() #0"));
         assert!(out.contains("attributes #0 = { nounwind }"));
-        // ...but the external runtime declarations (ordinary Rust fns) are NOT promised nounwind.
+        // The runtime boundary is also nounwind: every Rust export aborts rather than unwinding
+        // across its C ABI, and the per-symbol effects record now owns that universal promise.
         let out2 = ir("fn main() -> i32 {\n  print(1)\n  return 0\n}\n");
-        assert!(out2.contains("declare void @align_rt_print_i64(i64)\n"));
+        let print_attrs = attr_group_of(&out2, "align_rt_print_i64");
+        assert!(
+            print_attrs.contains("nounwind"),
+            "runtime declaration must carry nounwind:\n{print_attrs}"
+        );
     }
 
     #[test]
@@ -34766,6 +34951,13 @@ fn main() -> i32 = 0
             }
         };
         assert!(!group_has("align_rt_par_map_filter", "noalias"), "aggregate filter result must not carry pointer-only noalias:\n{out}");
+        for sym in ["align_rt_par_map", "align_rt_par_map_filter", "align_rt_tg_register"] {
+            assert!(group_has(sym, "nounwind"), "callback boundary must be nounwind: {sym}\n{out}");
+            assert!(
+                !group_has(sym, "memory("),
+                "callback boundary must withhold a memory claim: {sym}\n{out}"
+            );
+        }
         // Single-shot allocators get `nofree` + `nounwind` — but deliberately NOT `willreturn` (they
         // `abort` on OOM, so asserting they always return would be a miscompile).
         for sym in [
@@ -35119,6 +35311,35 @@ fn main() -> i32 = 0
         // hash128 shares the treatment.
         assert!(attr_group_of(&out, "align_rt_hash128").contains("memory(argmem: read)"));
 
+        // Pin every other LLVM 22 MemoryEffects mask the row model can emit.
+        let alloc_attrs = attr_group_of(&out, "align_rt_alloc");
+        assert!(
+            alloc_attrs.contains("memory(inaccessiblemem: readwrite)"),
+            "allocator memory encoding drifted:\n{alloc_attrs}"
+        );
+        let clone_attrs = attr_group_of(&out, "align_rt_str_clone");
+        assert!(
+            clone_attrs.contains("memory(argmem: read, inaccessiblemem: readwrite)"),
+            "allocating reader memory encoding drifted:\n{clone_attrs}"
+        );
+        let free_attrs = attr_group_of(&out, "align_rt_free");
+        assert!(
+            free_attrs.contains("memory(argmem: readwrite, inaccessiblemem: readwrite)"),
+            "free memory encoding drifted:\n{free_attrs}"
+        );
+        let scalar_ctx = Context::create();
+        let scalar_module = scalar_ctx.create_module("runtime_effect_scalar_pin");
+        let scalar = runtime_abi::unkeyed_runtime_abi(
+            runtime_abi::UnkeyedRuntimeKey::F32ToBits,
+        );
+        let scalar_function = scalar.declare(&scalar_ctx, &scalar_module);
+        scalar.apply_attributes(&scalar_ctx, scalar_function);
+        let scalar_ir = scalar_module.print_to_string().to_string();
+        assert!(
+            attr_group_of(&scalar_ir, "align_rt_f32_to_bits").contains("memory(none)"),
+            "pure-scalar memory encoding drifted:\n{scalar_ir}"
+        );
+
         // (2) The str compare/order family: same `memory(argmem: read)` + `readonly captures(none)` on
         // BOTH pointer operands (params 0 and 2).
         assert!(
@@ -35171,17 +35392,19 @@ fn main() -> i32 = 0
         let fnew = attr_group_of(&out, "align_rt_str_finder_new");
         assert!(fnew.contains("nofree") && fnew.contains("nounwind"), "finder_new must be nofree+nounwind:\n{fnew}");
         assert!(!fnew.contains("willreturn"), "finder_new must NOT be willreturn (OOM aborts):\n{fnew}");
-        // `finder_free` is a bare null-safe deallocator declare (free fns take no curated attrs).
-        assert!(
-            out.contains("declare void @align_rt_str_finder_free(ptr)\n"),
-            "finder_free must be an attribute-free declare:\n{out}"
-        );
+        // `finder_free` is an indirect-storage deallocator: memory is withheld, while the universal
+        // C-ABI `nounwind` fact remains.
+        let ffree = attr_group_of(&out, "align_rt_str_finder_free");
+        assert!(ffree.contains("nounwind"), "finder_free must be nounwind:\n{ffree}");
+        assert!(!ffree.contains("memory("), "finder_free memory must stay withheld:\n{ffree}");
 
-        // (4) The abort family: `noreturn`, nothing else. Never `willreturn` (they diverge).
+        // (4) The abort family: one cold model with an inaccessible-memory effect. Process exit
+        // deliberately shares noreturn and the memory model but remains non-cold.
         for sym in [
             "align_rt_bounds_fail",
             "align_rt_range_fail",
             "align_rt_utf8_boundary_fail",
+            "align_rt_len_mismatch_fail",
             "align_rt_div_fail",
             "align_rt_alloc_size_fail",
             "align_rt_process_exit",
@@ -35190,14 +35413,21 @@ fn main() -> i32 = 0
             let g = attr_group_of(&out, sym);
             assert!(g.contains("noreturn"), "{sym} must be noreturn:\n{g}");
             assert!(!g.contains("willreturn"), "{sym} diverges — must NOT be willreturn:\n{g}");
+            assert!(
+                g.contains("memory(inaccessiblemem: readwrite)"),
+                "{sym} must state its process-global failure effect:\n{g}"
+            );
+            if sym == "align_rt_process_exit" {
+                assert!(!g.contains("cold"), "ordinary process exit must not be cold:\n{g}");
+            } else {
+                assert!(g.contains("cold"), "abort-family member must be cold:\n{g}");
+            }
         }
 
-        // (5) Fail-safe default: a runtime symbol with no contract entry gets NO added attribute.
-        // `align_rt_print_i64` is impure (writes stdout) and unlisted → a bare declare.
-        assert!(
-            out.contains("declare void @align_rt_print_i64(i64)\n"),
-            "an unlisted runtime declare must stay attribute-free:\n{out}"
-        );
+        // (5) Withheld memory remains the fail-safe state, while every extern-C row is nounwind.
+        let print = attr_group_of(&out, "align_rt_print_i64");
+        assert!(print.contains("nounwind"), "print must carry the universal C-ABI fact:\n{print}");
+        assert!(!print.contains("memory("), "host-state memory must stay withheld:\n{print}");
     }
 
     /// Semantic pin (Codex audit item 9): assert the no-capture contract as an *attribute-kind
@@ -35372,8 +35602,24 @@ fn main() -> i32 = 0
     /// The textual attribute group `{ ... }` attached to the declaration of `@sym`, resolved through
     /// its `#N` reference. Empty string if the declare carries no attribute group.
     fn attr_group_of(ir: &str, sym: &str) -> String {
-        let decl = ir.lines().find(|l| l.contains(&format!("@{sym}("))).unwrap_or_else(|| panic!("declare for {sym} not found:\n{ir}"));
-        let Some(n) = decl.rsplit('#').next().and_then(|s| s.trim().parse::<u32>().ok()) else {
+        attr_group_of_header(ir, sym, "declare ")
+    }
+
+    fn definition_attr_group_of(ir: &str, sym: &str) -> String {
+        attr_group_of_header(ir, sym, "define ")
+    }
+
+    fn attr_group_of_header(ir: &str, sym: &str, prefix: &str) -> String {
+        let header = ir
+            .lines()
+            .find(|line| line.starts_with(prefix) && line.contains(&format!("@{sym}(")))
+            .unwrap_or_else(|| panic!("{prefix}header for {sym} not found:\n{ir}"));
+        let Some(n) = header
+            .rsplit('#')
+            .next()
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
             return String::new();
         };
         ir.lines()
@@ -35691,6 +35937,17 @@ fn main() -> i32 = 0
         assert!(
             !text.contains("call i32 %cf(ptr %ce)"),
             "Unit fn value must not be called through an i32 signature:\n{text}"
+        );
+        let indirect = text
+            .lines()
+            .find(|line| line.contains("call void %cf(ptr %ce)"))
+            .expect("indirect call");
+        assert!(
+            !indirect.contains('#')
+                && !indirect.contains("memory(")
+                && !indirect.contains("readonly")
+                && !indirect.contains("captures("),
+            "an indirect call must not inherit any runtime row contract: {indirect}"
         );
     }
 

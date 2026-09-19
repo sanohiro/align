@@ -17341,6 +17341,65 @@ static ALLOC_CALLS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI6
 #[cfg(feature = "alloc-count")]
 static FREE_CALLS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
 
+// Test-only whole-Rust-allocation counter for the runtime effects registry's allocation-parity
+// owner. This is deliberately separate from `ALLOC_CALLS`: the shipped probe continues to count
+// only `align_rt_alloc`, while this allocator sees `Box`, `Vec`, `String`, and formatting too.
+// `cfg(test)` avoids exporting an allocator from the library into `alignc`, which owns its own
+// measured mimalloc selection. A thread-local count keeps the snapshot deterministic while the
+// ordinary runtime test suite executes on other libtest workers.
+#[cfg(all(feature = "alloc-count", test))]
+std::thread_local! {
+    static GLOBAL_ALLOC_CALLS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(all(feature = "alloc-count", test))]
+struct CountingGlobalAllocator;
+
+#[cfg(all(feature = "alloc-count", test))]
+unsafe impl std::alloc::GlobalAlloc for CountingGlobalAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let ptr = unsafe { std::alloc::System.alloc(layout) };
+        if !ptr.is_null() {
+            let _ = GLOBAL_ALLOC_CALLS.try_with(|count| count.set(count.get().wrapping_add(1)));
+        }
+        ptr
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let ptr = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        if !ptr.is_null() {
+            let _ = GLOBAL_ALLOC_CALLS.try_with(|count| count.set(count.get().wrapping_add(1)));
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(
+        &self,
+        ptr: *mut u8,
+        layout: std::alloc::Layout,
+        new_size: usize,
+    ) -> *mut u8 {
+        let new_ptr = unsafe { std::alloc::System.realloc(ptr, layout, new_size) };
+        if !new_ptr.is_null() {
+            let _ = GLOBAL_ALLOC_CALLS.try_with(|count| count.set(count.get().wrapping_add(1)));
+        }
+        new_ptr
+    }
+}
+
+#[cfg(all(feature = "alloc-count", test))]
+#[global_allocator]
+static COUNTING_GLOBAL_ALLOCATOR: CountingGlobalAllocator = CountingGlobalAllocator;
+
+#[cfg(all(feature = "alloc-count", test))]
+fn global_alloc_count() -> u64 {
+    GLOBAL_ALLOC_CALLS.with(core::cell::Cell::get)
+}
+
 /// Opt-in requested-live-byte probe used by the `pkg.ws` resource owner. It tracks only allocation
 /// families explicitly attributed to the measured operation; the map itself is probe machinery and
 /// therefore outside the measurement. Kind 0 is C-owned payload, 1 a `buffer` shell+payload, and 2
@@ -27265,35 +27324,6 @@ const _: extern "C" fn(i32, u8, u8, i32, u32) -> i32 = align_rt_test_report_v1;
 mod tests {
     use super::*;
 
-    // The complete runtime source list (crates/align_runtime/src/**/*.rs), not just the six files
-    // that historically happened to define every symbol the old line-start registry scanner could
-    // see (#1112). Kept as one array so the inventory test below can both scan these contents AND
-    // assert, via `read_dir`, that this list still names every `.rs` file under `src/` — a new file
-    // dropped in without a matching entry here used to fail open (its exports never joined
-    // `runtime`, so a missing registry row went undetected).
-    const RUNTIME_SOURCE_FILES: &[(&str, &str)] = &[
-        ("buffer_storage.rs", include_str!("buffer_storage.rs")),
-        ("crypto_asymmetric.rs", include_str!("crypto_asymmetric.rs")),
-        ("crypto_digest.rs", include_str!("crypto_digest.rs")),
-        ("csv.rs", include_str!("csv.rs")),
-        ("fs_directory.rs", include_str!("fs_directory.rs")),
-        ("fs_regular.rs", include_str!("fs_regular.rs")),
-        ("fs_retained_tree.rs", include_str!("fs_retained_tree.rs")),
-        ("json_number.rs", include_str!("json_number.rs")),
-        ("lib.rs", include_str!("lib.rs")),
-        ("os_host.rs", include_str!("os_host.rs")),
-        ("process_launch.rs", include_str!("process_launch.rs")),
-        ("process_launch/darwin.rs", include_str!("process_launch/darwin.rs")),
-        ("process_live.rs", include_str!("process_live.rs")),
-        ("process_scope.rs", include_str!("process_scope.rs")),
-        ("process_signal.rs", include_str!("process_signal.rs")),
-        ("process_table.rs", include_str!("process_table.rs")),
-        ("process_verified.rs", include_str!("process_verified.rs")),
-        ("str_prims.rs", include_str!("str_prims.rs")),
-        ("time_formats.rs", include_str!("time_formats.rs")),
-        ("xml.rs", include_str!("xml.rs")),
-    ];
-
     /// Every `.rs` path under `root`, relative to `root`, with `/`-separated components regardless
     /// of host path separator.
     fn discover_rust_sources(root: &std::path::Path) -> std::collections::BTreeSet<String> {
@@ -27336,19 +27366,16 @@ mod tests {
 
         let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let discovered = discover_rust_sources(&src_dir);
-        let covered: std::collections::BTreeSet<String> =
-            RUNTIME_SOURCE_FILES.iter().map(|(path, _)| path.to_string()).collect();
-        assert_eq!(
-            discovered, covered,
-            "crates/align_runtime/src/**/*.rs no longer matches RUNTIME_SOURCE_FILES in this test \
-             (missing from the list: {:?}; listed but absent on disk: {:?})",
-            discovered.difference(&covered).collect::<Vec<_>>(),
-            covered.difference(&discovered).collect::<Vec<_>>(),
-        );
-
         let mut runtime = std::collections::BTreeSet::new();
-        for (_, source) in RUNTIME_SOURCE_FILES {
-            runtime.extend(function_symbols(source));
+        for relative in &discovered {
+            let source = std::fs::read_to_string(src_dir.join(relative))
+                .unwrap_or_else(|error| panic!("failed to read {relative}: {error}"));
+            assert!(
+                !source.contains("extern \"C-unwind\""),
+                "runtime source {relative} uses C-unwind; the ABI registry's universal \
+                 nounwind contract must be redesigned first",
+            );
+            runtime.extend(function_symbols(&source));
         }
         for non_base in [
             "align_rt_alloc_count",
@@ -27443,6 +27470,166 @@ mod tests {
         assert!(
             runtime_only.is_empty(),
             "runtime exports with no codegen ABI registry row in runtime_abi.rs: {runtime_only:?}",
+        );
+    }
+
+    #[cfg(feature = "alloc-count")]
+    #[test]
+    fn runtime_effect_memory_claims_have_zero_global_allocation_delta() {
+        const CLAIMING_ROWS: &[&str] = &[
+            "F32ToBits", "F32FromBits", "F64ToBits", "F64FromBits", "F32TextLen",
+            "F64TextLen", "Hash128", "Hash64", "PathBase", "PathDir", "PathExt", "StrCmp",
+            "StrEndsWith", "StrEq", "StrEqIgnoreCase", "StrStartsWith", "StrTrim", "StrTrimEnd",
+            "StrTrimStart", "StrContains", "StrFind", "StrFinderFind", "StrRfind", "Utf8Valid",
+        ];
+
+        let registry = include_str!("../../align_codegen_llvm/src/runtime_abi.rs");
+        let effects_table = registry
+            .split_once("fn runtime_effects")
+            .and_then(|(_, rest)| rest.split_once("\nimpl RuntimeAbi"))
+            .map(|(table, _)| table)
+            .expect("runtime_effects table");
+        let claiming_count = ["PureScalar", "PureArgRead", "DispatchCache"]
+            .into_iter()
+            .map(|class| effects_table.matches(&format!("class: EffectClass::{class}")).count())
+            .sum::<usize>();
+        assert_eq!(claiming_count, CLAIMING_ROWS.len());
+        for key in CLAIMING_ROWS {
+            assert!(
+                effects_table.contains(&format!("::{key}) => RuntimeEffects {{ class: EffectClass::")),
+                "allocation-parity owner is missing the registry row {key}",
+            );
+        }
+
+        let assert_no_alloc = |name: &str, call: &mut dyn FnMut()| {
+            let before = global_alloc_count();
+            call();
+            assert_eq!(
+                global_alloc_count(),
+                before,
+                "{name} allocated through Rust's global allocator despite its effect class",
+            );
+        };
+        let haystack = b"  Alpha/file.txt  ";
+        let needle = b"file";
+        let finder = unsafe { align_rt_str_finder_new(needle.as_ptr(), needle.len() as i64) };
+        assert!(!finder.is_null());
+
+        let mut rows: [(&str, Box<dyn FnMut()>); 24] = [
+            ("F32ToBits", Box::new(|| { std::hint::black_box(align_rt_f32_to_bits(1.25)); })),
+            ("F32FromBits", Box::new(|| { std::hint::black_box(align_rt_f32_from_bits(1)); })),
+            ("F64ToBits", Box::new(|| { std::hint::black_box(align_rt_f64_to_bits(1.25)); })),
+            ("F64FromBits", Box::new(|| { std::hint::black_box(align_rt_f64_from_bits(1)); })),
+            ("F32TextLen", Box::new(|| { std::hint::black_box(align_rt_f32_text_len(1.25)); })),
+            ("F64TextLen", Box::new(|| { std::hint::black_box(align_rt_f64_text_len(1.25)); })),
+            ("Hash128", Box::new(|| unsafe { std::hint::black_box(align_rt_hash128(haystack.as_ptr(), haystack.len() as i64)); })),
+            ("Hash64", Box::new(|| unsafe { std::hint::black_box(align_rt_hash64(haystack.as_ptr(), haystack.len() as i64)); })),
+            ("PathBase", Box::new(|| unsafe { std::hint::black_box(align_rt_path_base(haystack.as_ptr(), haystack.len() as i64)); })),
+            ("PathDir", Box::new(|| unsafe { std::hint::black_box(align_rt_path_dir(haystack.as_ptr(), haystack.len() as i64)); })),
+            ("PathExt", Box::new(|| unsafe { std::hint::black_box(align_rt_path_ext(haystack.as_ptr(), haystack.len() as i64)); })),
+            ("StrCmp", Box::new(|| unsafe { std::hint::black_box(align_rt_str_cmp(haystack.as_ptr(), haystack.len() as i64, needle.as_ptr(), needle.len() as i64)); })),
+            ("StrEndsWith", Box::new(|| unsafe { std::hint::black_box(align_rt_str_ends_with(haystack.as_ptr(), haystack.len() as i64, needle.as_ptr(), needle.len() as i64)); })),
+            ("StrEq", Box::new(|| unsafe { std::hint::black_box(align_rt_str_eq(haystack.as_ptr(), haystack.len() as i64, needle.as_ptr(), needle.len() as i64)); })),
+            ("StrEqIgnoreCase", Box::new(|| unsafe { std::hint::black_box(align_rt_str_eq_ignore_case(haystack.as_ptr(), haystack.len() as i64, needle.as_ptr(), needle.len() as i64)); })),
+            ("StrStartsWith", Box::new(|| unsafe { std::hint::black_box(align_rt_str_starts_with(haystack.as_ptr(), haystack.len() as i64, needle.as_ptr(), needle.len() as i64)); })),
+            ("StrTrim", Box::new(|| unsafe { std::hint::black_box(align_rt_str_trim(haystack.as_ptr(), haystack.len() as i64)); })),
+            ("StrTrimEnd", Box::new(|| unsafe { std::hint::black_box(align_rt_str_trim_end(haystack.as_ptr(), haystack.len() as i64)); })),
+            ("StrTrimStart", Box::new(|| unsafe { std::hint::black_box(align_rt_str_trim_start(haystack.as_ptr(), haystack.len() as i64)); })),
+            ("StrContains", Box::new(|| unsafe { std::hint::black_box(align_rt_str_contains(haystack.as_ptr(), haystack.len() as i64, needle.as_ptr(), needle.len() as i64)); })),
+            ("StrFind", Box::new(|| unsafe { std::hint::black_box(align_rt_str_find(haystack.as_ptr(), haystack.len() as i64, needle.as_ptr(), needle.len() as i64)); })),
+            ("StrFinderFind", Box::new(|| unsafe { std::hint::black_box(align_rt_str_finder_find(finder, haystack.as_ptr(), haystack.len() as i64)); })),
+            ("StrRfind", Box::new(|| unsafe { std::hint::black_box(align_rt_str_rfind(haystack.as_ptr(), haystack.len() as i64, needle.as_ptr(), needle.len() as i64)); })),
+            ("Utf8Valid", Box::new(|| unsafe { std::hint::black_box(align_rt_utf8_valid(haystack.as_ptr(), haystack.len() as i64)); })),
+        ];
+        for (name, call) in &mut rows {
+            assert_no_alloc(name, call.as_mut());
+        }
+        unsafe { align_rt_str_finder_free(finder) };
+    }
+
+    #[cfg(all(feature = "alloc-count", unix))]
+    #[test]
+    fn runtime_effect_memory_claims_do_not_touch_host_state_child() {
+        if std::env::var_os("ALIGN_RUNTIME_EFFECT_HOST_CONTROL").is_none() {
+            return;
+        }
+        let environment = || {
+            let mut values: Vec<_> = std::env::vars_os().collect();
+            values.sort();
+            values
+        };
+        let fd_count = || {
+            let root = if cfg!(target_os = "linux") { "/proc/self/fd" } else { "/dev/fd" };
+            std::fs::read_dir(root).expect("fd directory").count()
+        };
+        let before_environment = environment();
+        let before_fds = fd_count();
+        runtime_effect_memory_claims_have_zero_global_allocation_delta();
+        assert_eq!(environment(), before_environment);
+        assert_eq!(fd_count(), before_fds);
+    }
+
+    #[cfg(all(feature = "alloc-count", unix))]
+    #[test]
+    fn runtime_effect_memory_claims_have_no_host_state_delta() {
+        struct ChildOwner {
+            child: Option<std::process::Child>,
+            deadline: std::time::Instant,
+        }
+        impl Drop for ChildOwner {
+            fn drop(&mut self) {
+                let Some(child) = self.child.as_mut() else {
+                    return;
+                };
+                let _ = child.kill();
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => break,
+                        Ok(None) if std::time::Instant::now() < self.deadline => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Ok(None) => {
+                            eprintln!(
+                                "isolated host-state control could not be reaped before its deadline"
+                            );
+                            break;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let execution_deadline = deadline - std::time::Duration::from_secs(5);
+        let child = std::process::Command::new(std::env::current_exe().expect("current test exe"))
+            .args([
+                "--exact",
+                "tests::runtime_effect_memory_claims_do_not_touch_host_state_child",
+                "--nocapture",
+            ])
+            .env("ALIGN_RUNTIME_EFFECT_HOST_CONTROL", "1")
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("spawn isolated host-state control");
+        let mut child = ChildOwner { child: Some(child), deadline };
+        let status = loop {
+            match child.child.as_mut().expect("child owner holds its process").try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if std::time::Instant::now() < execution_deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Ok(None) => panic!("isolated host-state control exceeded its 30-second deadline"),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("poll isolated host-state control: {error}"),
+            }
+        };
+        child.child.take();
+        assert!(
+            status.success(),
+            "isolated host-state control failed with {status}",
         );
     }
 
