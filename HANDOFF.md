@@ -1,12 +1,13 @@
 # Session handoff
 
-## Next work (handoff updated 2026-09-19)
+## Next work (handoff updated 2026-09-20)
 
 The align-llm audit issue batch is partly shipped. Merged: #1089 (plan 68),
 #1090, #1091, #1092, #1096, #1099, #1100 (plan 69), #1101, #1110, #1111
 (plan 69 PR 1), #1113, #1114 (plan 70 ledger), #1115, #1116 (plan 69 PR 2,
-closes #1081), #1124 (build-performance items 7 and 8), and #1125 (the first
-post-#1124 nightly repair). Plan 70 PR 1 and PR 2 are implemented. Every remaining item
+closes #1081), #1124 (build-performance items 7 and 8), #1125 (the first
+post-#1124 nightly repair), and #1128 (plan 70 PR 2). Plan 70 PR 3 is implemented
+locally as the current candidate. Every remaining item
 below starts from `main` with a fresh branch and follows the CLAUDE.md review
 flow.
 
@@ -49,8 +50,7 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    against LLVM 22's nested `captures(address, read_provenance)` spelling;
    `deep_type_graphs` remains covered by the nightly full-suite detector.
 
-1. **plan 70 PR 3** (#1072 inline fast path) — plan 70 §5.
-2. **plan 71 ledger** for #1076/#1077/#1078 (sum-type layout, aggregate transport,
+1. **plan 71 ledger** for #1076/#1077/#1078 (sum-type layout, aggregate transport,
    drop-state model): one ledger, serialized, one fresh independent adversarial
    review before any code (CLAUDE.md large-design gate).
 3. Language items after the codegen track: #1085 `str` patterns in `match`,
@@ -150,7 +150,11 @@ and allocation, host-state, source-inventory, C-unwind, whole/per-unit,
 function-partition, admission and artifact-budget owners close the matrix. PR 2
 implements the six-kind, nine-site MIR exceptional-edge inventory, exact
 `2000:1` LLVM branch weights, stale-record validation through MIR rewrites, and
-fail-closed cold inference over the direct call graph. PR 3 remains.
+fail-closed cold inference over the direct call graph. PR 3 implements the
+guarded heap scalar-push store with exact native-header layout pins and one
+unchanged growth/arena fallback call. The proposed one-codegen-unit runtime
+override was measured in release and dist builds and refused because both
+artifacts retained the `reserve` and `memcpy` relocations.
 
 **Decode representation costs:** [plan 62](docs/impl/62-decode-optimization-plan.md)
 implements bounded nonescaping byte storage and direct synchronous chunks

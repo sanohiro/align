@@ -2422,7 +2422,12 @@ regression net that validates the upgrade.
     six-kind `ExceptionalEdge` inventory covers all nine lowering-owned sites,
     validates and follows MIR rewrites, emits exact `2000:1` branch weights,
     and drives fail-closed whole-program cold inference over direct call sites.
-    Plan 70 PR 3 remains.
+    **PR 3 IMPLEMENTED 2026-09-20:** scalar `array_builder.push` emits a guarded
+    typed store for heap builders with matching stride and spare capacity,
+    with exact native-header layout pins and the existing runtime call as the
+    single growth/arena fallback. Release and dist archive inspection retained
+    both `reserve` and `memcpy`, so the proposed one-codegen-unit override was
+    refused rather than shipping an ineffective profile change.
   **DEFERRED with reasons (revisit post-M14 ThinLTO/runtime-bitcode — the wave that creates
   real non-inlined boundaries where argument attributes stop evaporating):** internal-ABI
   signature flattening (SROA already achieves it; FFI boundary correctly kept aggregate in the

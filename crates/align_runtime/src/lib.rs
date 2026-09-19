@@ -17652,8 +17652,23 @@ pub struct ArrayBuilder {
     elem_align: usize,
 }
 
+/// Stable native layout consumed by the compiler's scalar-push fast path: data, len, cap,
+/// elem_size, arena, and total size.
+pub const ARRAY_BUILDER_LAYOUT: [usize; 6] = [
+    core::mem::offset_of!(ArrayBuilder, data),
+    core::mem::offset_of!(ArrayBuilder, len),
+    core::mem::offset_of!(ArrayBuilder, cap),
+    core::mem::offset_of!(ArrayBuilder, elem_size),
+    core::mem::offset_of!(ArrayBuilder, arena),
+    core::mem::size_of::<ArrayBuilder>(),
+];
+const _: () = assert!(core::mem::offset_of!(ArrayBuilder, data) == 0);
+const _: () = assert!(core::mem::offset_of!(ArrayBuilder, len) == 8);
+const _: () = assert!(core::mem::offset_of!(ArrayBuilder, cap) == 16);
+const _: () = assert!(core::mem::offset_of!(ArrayBuilder, elem_size) == 24);
+const _: () = assert!(core::mem::offset_of!(ArrayBuilder, arena) == 32);
 const _: () = assert!(
-    core::mem::size_of::<ArrayBuilder>() <= 64
+    core::mem::size_of::<ArrayBuilder>() == 64
         && core::mem::align_of::<ArrayBuilder>() <= 16
 );
 const _: () = assert!(core::mem::size_of::<ArrayBuilder>() + core::mem::size_of::<Buffer>() <= 128);

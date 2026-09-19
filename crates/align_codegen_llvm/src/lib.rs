@@ -49,6 +49,10 @@ pub mod thinlto_spike;
 
 pub use llvm_build_id::loaded_llvm_build_id;
 
+/// Native `ArrayBuilder` offsets consumed by the scalar-push fast path: data, len, cap,
+/// elem_size, arena, and total size. `align_runtime::ARRAY_BUILDER_LAYOUT` is the other exact pin.
+pub const ARRAY_BUILDER_LAYOUT: [u64; 6] = [0, 8, 16, 24, 32, 64];
+
 use align_ast::{BinOp, UnOp};
 use align_interface::Hash128;
 use align_mir::{
@@ -21881,6 +21885,153 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .expect("builder finish returns a string descriptor"))
     }
 
+    fn array_builder_field_ptr(
+        &self,
+        builder: PointerValue<'c>,
+        offset: u64,
+        name: &str,
+    ) -> Result<PointerValue<'c>, CodegenError> {
+        let offset = self.ctx.i64_type().const_int(offset, false);
+        // This is a byte offset into a live native header, so use a plain GEP: the pointer is opaque
+        // and the exact offset is pinned against `align_runtime::ArrayBuilder` on both sides.
+        unsafe {
+            self.builder
+                .build_gep(self.ctx.i8_type(), builder, &[offset], name)
+                .map_err(|error| self.err(error))
+        }
+    }
+
+    fn gen_array_builder_scalar_push(
+        &mut self,
+        builder: PointerValue<'c>,
+        value: BasicValueEnum<'c>,
+        bits: IntValue<'c>,
+        scalar: Ty,
+    ) -> Result<(), CodegenError> {
+        let i64_type = self.ctx.i64_type();
+        let pointer_type = self.ctx.ptr_type(AddressSpace::default());
+        let width = self.element_allocation_size(self.llvm_type(scalar));
+        let len_pointer = self.array_builder_field_ptr(
+            builder,
+            ARRAY_BUILDER_LAYOUT[1],
+            "ab.len.ptr",
+        )?;
+        let cap_pointer = self.array_builder_field_ptr(
+            builder,
+            ARRAY_BUILDER_LAYOUT[2],
+            "ab.cap.ptr",
+        )?;
+        let elem_size_pointer = self.array_builder_field_ptr(
+            builder,
+            ARRAY_BUILDER_LAYOUT[3],
+            "ab.elem_size.ptr",
+        )?;
+        let arena_pointer = self.array_builder_field_ptr(
+            builder,
+            ARRAY_BUILDER_LAYOUT[4],
+            "ab.arena.ptr",
+        )?;
+        let len = self
+            .builder
+            .build_load(i64_type, len_pointer, "ab.len")
+            .map_err(|error| self.err(error))?
+            .into_int_value();
+        let cap = self
+            .builder
+            .build_load(i64_type, cap_pointer, "ab.cap")
+            .map_err(|error| self.err(error))?
+            .into_int_value();
+        let elem_size = self
+            .builder
+            .build_load(i64_type, elem_size_pointer, "ab.elem_size")
+            .map_err(|error| self.err(error))?
+            .into_int_value();
+        let arena = self
+            .builder
+            .build_load(pointer_type, arena_pointer, "ab.arena")
+            .map_err(|error| self.err(error))?
+            .into_pointer_value();
+        let heap_mode = self
+            .builder
+            .build_is_null(arena, "ab.heap")
+            .map_err(|error| self.err(error))?;
+        let width_matches = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                elem_size,
+                i64_type.const_int(width, false),
+                "ab.width.matches",
+            )
+            .map_err(|error| self.err(error))?;
+        let has_capacity = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, len, cap, "ab.has.capacity")
+            .map_err(|error| self.err(error))?;
+        let fast = self
+            .builder
+            .build_and(heap_mode, width_matches, "ab.fast.layout")
+            .map_err(|error| self.err(error))?;
+        let fast = self
+            .builder
+            .build_and(fast, has_capacity, "ab.fast.eligible")
+            .map_err(|error| self.err(error))?;
+        let fast_block = self.ctx.append_basic_block(self.func, "ab.push.fast");
+        let slow_block = self.ctx.append_basic_block(self.func, "ab.push.slow");
+        let done_block = self.ctx.append_basic_block(self.func, "ab.push.done");
+        self.builder
+            .build_conditional_branch(fast, fast_block, slow_block)
+            .map_err(|error| self.err(error))?;
+
+        self.builder.position_at_end(fast_block);
+        let data_pointer = self.array_builder_field_ptr(
+            builder,
+            ARRAY_BUILDER_LAYOUT[0],
+            "ab.data.ptr",
+        )?;
+        let data = self
+            .builder
+            .build_load(pointer_type, data_pointer, "ab.data")
+            .map_err(|error| self.err(error))?
+            .into_pointer_value();
+        let byte_offset = self
+            .builder
+            .build_int_mul(len, i64_type.const_int(width, false), "ab.byte.offset")
+            .map_err(|error| self.err(error))?;
+        let destination = unsafe {
+            self.builder
+                .build_gep(self.ctx.i8_type(), data, &[byte_offset], "ab.destination")
+                .map_err(|error| self.err(error))?
+        };
+        self.builder
+            .build_store(destination, value)
+            .map_err(|error| self.err(error))?;
+        let next_len = self
+            .builder
+            .build_int_add(len, i64_type.const_int(1, false), "ab.next.len")
+            .map_err(|error| self.err(error))?;
+        self.builder
+            .build_store(len_pointer, next_len)
+            .map_err(|error| self.err(error))?;
+        self.builder
+            .build_unconditional_branch(done_block)
+            .map_err(|error| self.err(error))?;
+
+        self.builder.position_at_end(slow_block);
+        self.builder
+            .build_call(
+                self.runtime(RuntimeKey::ArrayBuilderPush),
+                &[builder.into(), bits.into()],
+                "",
+            )
+            .map_err(|error| self.err(error))?;
+        self.builder
+            .build_unconditional_branch(done_block)
+            .map_err(|error| self.err(error))?;
+        self.builder.position_at_end(done_block);
+        Ok(())
+    }
+
     /// All `array_builder<T>` (M12 A6) rvalues (new/push/push_str/append/build). `#[inline(never)]`
     /// so `gen_rvalue` stays flat (the #296 expr-depth lesson, mirroring `gen_file_rvalue`). Returns
     /// `Some` for the value-producing ops (new/build) and `None` for the void growth ops.
@@ -21941,7 +22092,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // materialized in a temporary and copied through the byte entry point. Move-record
             // source nulling already happened in MIR after this operand was evaluated.
             Rvalue::ArrayBuilderPush { builder, value, scalar } => {
-                let bp = self.operand(builder)?.into();
+                let builder_ty = self.checked_operand_ty(builder)?;
+                let Some(element) = builder_ty.array_builder_element() else {
+                    return Err(self.err("array_builder push receiver is not an array_builder"));
+                };
+                if element.ty() != *scalar || self.checked_operand_ty(value)? != *scalar {
+                    return Err(self.err("array_builder push element type mismatch"));
+                }
+                let bp = self.operand(builder)?.into_pointer_value();
                 let i64t = self.ctx.i64_type();
                 if !matches!(scalar, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char) {
                     let value = self.operand(value)?;
@@ -21950,24 +22108,23 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     self.builder
                         .build_call(
                             self.runtime(RuntimeKey::ArrayBuilderPushBytes),
-                            &[bp, slot.into()],
+                            &[bp.into(), slot.into()],
                             "",
                         )
                         .map_err(|e| self.err(e))?;
                     return Ok(None);
                 }
+                let scalar_value = self.operand(value)?;
                 let bits = if matches!(scalar, Ty::Float(_)) {
-                    let fv = self.operand(value)?.into_float_value();
+                    let fv = scalar_value.into_float_value();
                     let int_bits = match scalar { Ty::Float(FloatTy { bits: 32 }) => self.ctx.i32_type(), _ => i64t };
                     let as_int = self.builder.build_bit_cast(fv, int_bits, "fbits").map_err(|e| self.err(e))?.into_int_value();
                     self.builder.build_int_z_extend_or_bit_cast(as_int, i64t, "bits64").map_err(|e| self.err(e))?
                 } else {
-                    let iv = self.operand(value)?.into_int_value();
+                    let iv = scalar_value.into_int_value();
                     self.builder.build_int_z_extend_or_bit_cast(iv, i64t, "bits64").map_err(|e| self.err(e))?
                 };
-                self.builder
-                    .build_call(self.runtime(RuntimeKey::ArrayBuilderPush), &[bp, bits.into()], "")
-                    .map_err(|e| self.err(e))?;
+                self.gen_array_builder_scalar_push(bp, scalar_value, bits, *scalar)?;
                 Ok(None)
             }
             // `b.push(s)` (string element) — split the moved-in `string` `{ptr,len}` and hand it to the
@@ -24883,6 +25040,55 @@ fn main() -> i32 = 0
             panic!("attribute group missing for cold helper:\n{llvm}");
         };
         assert!(attributes.contains(" cold "), "{definition}\n{attributes}");
+    }
+
+    #[test]
+    fn malformed_array_builder_push_types_are_rejected_before_llvm() {
+        let source = "fn fill(value: i64) -> i64 { mut b: array_builder<i64> := array_builder(1)\n b.push(value)\n return b.build()[0] }\nfn main() -> i32 = 0\n";
+        for (axis, expected) in [
+            ("receiver", "array_builder push receiver is not an array_builder"),
+            ("value", "array_builder push element type mismatch"),
+            ("scalar", "array_builder push element type mismatch"),
+        ] {
+            let mut program = mir(source);
+            let mut changed = false;
+            for function in &mut program.fns {
+                for block in &mut function.blocks {
+                    for statement in &mut block.stmts {
+                        if let Stmt::Let(
+                            _,
+                            Rvalue::ArrayBuilderPush {
+                                builder,
+                                value,
+                                scalar,
+                            },
+                        ) = statement
+                        {
+                            match axis {
+                                "receiver" => {
+                                    *builder = Operand::Const(Const::Int(0, *scalar));
+                                }
+                                "value" => *value = Operand::Const(Const::Bool(false)),
+                                "scalar" => *scalar = Ty::Bool,
+                                _ => unreachable!(),
+                            }
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            assert!(changed, "fixture did not contain an array_builder push: {axis}");
+            let error = emit_llvm_ir(
+                &program,
+                &BuildTarget::Baseline,
+                Profile::Release,
+                false,
+                &["fill".to_owned()],
+                None,
+            )
+            .expect_err("forged array_builder metadata must be rejected");
+            assert!(error.to_string().contains(expected), "{axis}: {error}");
+        }
     }
 
     fn test_resource() -> hir::ResourceDef {
