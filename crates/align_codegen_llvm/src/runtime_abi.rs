@@ -4354,7 +4354,7 @@ mod tests {
             UNKEYED_RUNTIME_KEYS.map(|key| key as u8),
             [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
         );
-        validate_registry().unwrap();
+        validate_registry().unwrap_or_else(|error| panic!("valid runtime registry: {error}"));
         let rows: Vec<_> = runtime_abis().collect();
         assert_eq!(rows.len(), 464);
         assert_eq!(

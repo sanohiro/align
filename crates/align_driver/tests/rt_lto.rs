@@ -452,16 +452,17 @@ fn rt_lto_guarded_bodies_meet_the_artifact_budget() {
     let artifact = String::from_utf8(output.stdout).expect("LLVM IR is UTF-8");
     validate_guarded_artifact_ir(&artifact).unwrap();
 
-    let open_graph = artifact.replacen(
-        "declare i32 @memcmp",
-        "declare ptr @__rust_alloc(i64, i64)\ndeclare i32 @memcmp",
-        1,
-    );
+    let open_graph = format!("declare ptr @__rust_alloc(i64, i64)\n{artifact}");
     assert!(validate_guarded_artifact_ir(&open_graph).unwrap_err().contains("__rust_alloc"));
 
+    let first_guarded = format!("@{}(", GUARDED_SYMBOLS[0]);
+    let definition = artifact
+        .lines()
+        .find(|line| line.starts_with("define ") && line.contains(&first_guarded))
+        .unwrap_or_else(|| panic!("guarded artifact is missing {}", GUARDED_SYMBOLS[0]));
     let oversized = artifact.replacen(
-        "start:\n",
-        &format!("start:\n{}", "  %budget = freeze i1 false\n".repeat(201)),
+        definition,
+        &format!("{definition}\n{}", "  %budget = freeze i1 false\n".repeat(201)),
         1,
     );
     assert!(validate_guarded_artifact_ir(&oversized).unwrap_err().contains("limit 200"));

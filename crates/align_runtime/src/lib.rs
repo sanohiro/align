@@ -17358,7 +17358,7 @@ struct CountingGlobalAllocator;
 #[cfg(all(feature = "alloc-count", test))]
 unsafe impl std::alloc::GlobalAlloc for CountingGlobalAllocator {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        let ptr = unsafe { std::alloc::System.alloc(layout) };
+        let ptr = unsafe { std::alloc::GlobalAlloc::alloc(&std::alloc::System, layout) };
         if !ptr.is_null() {
             let _ = GLOBAL_ALLOC_CALLS.try_with(|count| count.set(count.get().wrapping_add(1)));
         }
@@ -17366,7 +17366,7 @@ unsafe impl std::alloc::GlobalAlloc for CountingGlobalAllocator {
     }
 
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
-        let ptr = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        let ptr = unsafe { std::alloc::GlobalAlloc::alloc_zeroed(&std::alloc::System, layout) };
         if !ptr.is_null() {
             let _ = GLOBAL_ALLOC_CALLS.try_with(|count| count.set(count.get().wrapping_add(1)));
         }
@@ -17374,7 +17374,7 @@ unsafe impl std::alloc::GlobalAlloc for CountingGlobalAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
-        unsafe { std::alloc::System.dealloc(ptr, layout) }
+        unsafe { std::alloc::GlobalAlloc::dealloc(&std::alloc::System, ptr, layout) }
     }
 
     unsafe fn realloc(
@@ -17383,7 +17383,9 @@ unsafe impl std::alloc::GlobalAlloc for CountingGlobalAllocator {
         layout: std::alloc::Layout,
         new_size: usize,
     ) -> *mut u8 {
-        let new_ptr = unsafe { std::alloc::System.realloc(ptr, layout, new_size) };
+        let new_ptr = unsafe {
+            std::alloc::GlobalAlloc::realloc(&std::alloc::System, ptr, layout, new_size)
+        };
         if !new_ptr.is_null() {
             let _ = GLOBAL_ALLOC_CALLS.try_with(|count| count.set(count.get().wrapping_add(1)));
         }
@@ -27515,7 +27517,7 @@ mod tests {
         let finder = unsafe { align_rt_str_finder_new(needle.as_ptr(), needle.len() as i64) };
         assert!(!finder.is_null());
 
-        let mut rows: [(&str, Box<dyn FnMut()>); 24] = [
+        let mut rows: [(&str, Box<dyn FnMut() + '_>); 24] = [
             ("F32ToBits", Box::new(|| { std::hint::black_box(align_rt_f32_to_bits(1.25)); })),
             ("F32FromBits", Box::new(|| { std::hint::black_box(align_rt_f32_from_bits(1)); })),
             ("F64ToBits", Box::new(|| { std::hint::black_box(align_rt_f64_to_bits(1.25)); })),

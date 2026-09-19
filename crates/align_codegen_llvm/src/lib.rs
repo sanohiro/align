@@ -24740,11 +24740,16 @@ fn main() -> i32 = 0
             .fns
             .iter()
             .map(|function| {
-                let (symbol, linkage) =
-                    partition_function_symbol("runtime-effects", function, &[]).unwrap();
+                let (symbol, linkage) = partition_function_symbol(
+                    "runtime-effects",
+                    function,
+                    &[],
+                )
+                .unwrap_or_else(|error| panic!("valid test partition symbol: {error}"));
                 ThinPeerDeclaration {
                     logical: function.name.clone(),
-                    abi: partition_function_abi(function, &program).unwrap(),
+                    abi: partition_function_abi(function, &program)
+                        .unwrap_or_else(|error| panic!("valid test partition ABI: {error}")),
                     symbol,
                     linkage,
                 }
@@ -24776,7 +24781,7 @@ fn main() -> i32 = 0
                     peers: &peers,
                 },
             )
-            .unwrap();
+            .unwrap_or_else(|error| panic!("valid test partition module: {error}"));
             let text = module.print_to_string().to_string();
             let contracts: Vec<_> = expected
                 .iter()
@@ -25413,16 +25418,18 @@ fn main() -> i32 = 0
     fn runtime_effects_indirect_reachability_control_discriminates_false_argmem() {
         fn optimized(source: &str) -> String {
             let ctx = Context::create();
-            let bytes = std::ffi::CString::new(source).unwrap();
+            let bytes = std::ffi::CString::new(source)
+                .unwrap_or_else(|error| panic!("constant LLVM fixture contains NUL: {error}"));
             let module = ctx
                 .create_module_from_ir(MemoryBuffer::create_from_memory_range_copy(
                     bytes.as_bytes_with_nul(),
                     "runtime-effects-indirect-reachability",
                 ))
-                .unwrap();
+                .unwrap_or_else(|error| panic!("valid LLVM fixture: {error}"));
             let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default)
-                .unwrap();
-            run_opt_pipeline(&module, &tm, "default<O2>").unwrap();
+                .unwrap_or_else(|error| panic!("host target machine: {error}"));
+            run_opt_pipeline(&module, &tm, "default<O2>")
+                .unwrap_or_else(|error| panic!("optimize LLVM fixture: {error}"));
             module.print_to_string().to_string()
         }
 
@@ -25467,7 +25474,7 @@ fn main() -> i32 = 0
             &["checked_load".to_string()],
             None,
         )
-        .unwrap();
+        .unwrap_or_else(|error| panic!("valid bounds-check fixture: {error}"));
         let attrs = definition_attr_group_of(&out, "checked_load");
         assert!(
             attrs.contains("memory("),
@@ -35941,7 +35948,7 @@ fn main() -> i32 = 0
         let indirect = text
             .lines()
             .find(|line| line.contains("call void %cf(ptr %ce)"))
-            .expect("indirect call");
+            .unwrap_or_else(|| panic!("indirect call missing from valid function-value fixture"));
         assert!(
             !indirect.contains('#')
                 && !indirect.contains("memory(")
