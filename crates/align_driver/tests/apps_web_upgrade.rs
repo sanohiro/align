@@ -36,6 +36,7 @@ fn query() -> &'static str {
 const APP: &str = r#"module main
 import std.cli
 import std.http
+import std.time
 import pkg.web
 import pkg.web.types
 
@@ -48,6 +49,7 @@ fn decision(c: pkg.web.types.Ctx, values: slice<str>) -> pkg.web.types.UpgradeDe
     }
   }
   if value == "failed" { return pkg.web.types.UpgradeDecision.Failed(Error.Denied) }
+  if value == "write-fail" { time.sleep(500000000) }
   status := if value == "invalid" { 200 } else { 101 }
   response := http.response(status)
   response.header("Upgrade", "owner")
@@ -311,8 +313,12 @@ fn upgrade_dispatch_group_middleware_prepare_transfer_and_pump_matrix() {
         .expect("Upgrade owner deadline exhausted before reset request");
     reset.set_write_timeout(Some(remaining)).unwrap();
     reset.write_all(&get("/write-fail")).unwrap();
+    // Let the server parse the request and enter the route's delay before closing. The delay then
+    // gives the abortive reset time to become a processed socket error before the 101 write. If the
+    // client closes immediately, Linux can enqueue the short response before observing the RST.
+    std::thread::sleep(Duration::from_millis(200));
     drop(reset);
-    std::thread::sleep(Duration::from_millis(100));
+    std::thread::sleep(Duration::from_millis(600));
 
     let stderr = server.stop_and_stderr();
     for expected in [
