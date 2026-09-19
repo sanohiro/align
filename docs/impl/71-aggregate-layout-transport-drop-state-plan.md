@@ -46,9 +46,12 @@ producer-to-consumer chain in one capability avoids duplicate proof and lowers
 integration risk.
 
 No language syntax, source annotation, runtime export, allocation mode, error
-value, evaluation order, or foreign ABI changes. Native extern and runtime
-signatures remain owned by their existing ledgers. The work applies only to
-compiler-owned program callables and compiler-internal representation.
+value, or evaluation order changes. Native extern, callback, raw-descriptor and
+runtime signatures remain owned by their existing ledgers. Explicit program
+`--export` roots adopt the signature-derived wrapper contract in §2.2; Align is
+pre-release, so this replaces the body-exposure ABI outright without a legacy
+alias or compatibility path. All other work applies only to compiler-owned
+program callables and compiler-internal representation.
 
 ## 2. Public-contract ledger
 
@@ -66,14 +69,21 @@ Exact type        Tag is i32 for a user sum and i8 for Option/Result. Each
                   variant has a logical-to-physical vector of exactly its
                   source payload arity:
                     OmittedUnit
+                    OmittedZero { llvm_type }
                     Stored { llvm_type, offset:u64, size:u64, align:u64 }
                   A source Unit payload always maps to OmittedUnit. It has no
                   LLVM field, SSA value, storage, load, store, move, or Drop;
                   construction validates/evaluates its Unit operand and writes
                   nothing, while projection synthesizes the ordinary valueless
-                  Unit result. Every other payload maps to Stored. P_v is the
-                  unpacked LLVM struct of only those Stored fields in source
-                  order. Let S_v and A_v be P_v's ABI
+                  Unit result. Every non-Unit payload whose ABI allocation size
+                  is zero and whose semantic Drop plan is None maps to
+                  OmittedZero. It has no field or storage; construction
+                  evaluates and discards the value, and projection synthesizes
+                  the exact zero-sized LLVM aggregate constant of llvm_type.
+                  A zero-sized payload with a nonempty Drop plan or unsupported
+                  alignment rejects before layout. Every remaining payload maps
+                  to Stored. P_v is the unpacked LLVM struct of only those
+                  Stored fields in source order. Let S_v and A_v be P_v's ABI
                   allocation size and alignment. Let S=max(S_v), A_p=max(A_v),
                   A=max(tag ABI alignment,A_p), and P=align_up(tag size,A_p).
                   When S>0 the sum is { Tag, U }, where U is
@@ -81,9 +91,10 @@ Exact type        Tag is i32 for a user sum and i8 for Option/Result. Each
                   declaration order whose ABI alignment is A_p. The zero-sized
                   anchor gives U alignment A_p without occupying storage. The
                   outer ABI size is align_up(P+S,A). When every P_v has S_v=0,
-                  the sum is { Tag } and has no U field. Unit-only variants and
-                  empty payload structs have S_v=0, A_v=1 and do not by
-                  themselves create storage.
+                  the sum is { Tag } and has no U field. OmittedUnit and
+                  OmittedZero entries have S_v=0, A_v=1 and do not by
+                  themselves create storage, including mixed and all-zero
+                  variant sets.
 
                   Variant ordinals and tag meanings do not change: user sums
                   use declaration order; Option is None=0, Some=1; Result is
@@ -129,8 +140,8 @@ Mirrors           docs/impl/05-backend-llvm.md, docs/impl/07-roadmap.md,
 Construction writes the tag and only the selected Stored payload fields. Padding and
 inactive bytes are unspecified and may remain uninitialized. Projection first
 selects the storage field, then uses byte GEPs at the target-computed offsets
-of P_v; OmittedUnit synthesizes Unit without touching storage. It never indexes
-the former flattened aggregate. Drop switches on the
+of P_v; OmittedUnit synthesizes Unit and OmittedZero synthesizes its exact empty
+aggregate without touching storage. It never indexes the former flattened aggregate. Drop switches on the
 tag before forming or reading a payload place. JSON, diagnostics, matching,
 callbacks, copies, and returns likewise observe only the tag and active fields.
 No equality, hashing, serialization, cache identity, or foreign boundary may
@@ -223,8 +234,8 @@ Prerequisite      checked MIR ownership operations and complete imported
                   interfaces.
 Acceptance        §5 PR 2 matrix, including generic Copy/Move substitutions,
                   local/imported template instantiation, whole/per-unit equality,
-                  recursive SCCs, v13 byte goldens, malformed fallback, and
-                  conservative indirect calls.
+                  recursive SCCs, v13 byte goldens, malformed rejection, and
+                  conservative unknown/indirect-call fallback.
 Benchmark         required local code-shape/count measurement because the plan
                   promises fewer flag allocas, loads, stores, and branches. No
                   fixed client count becomes a gate.
@@ -242,6 +253,25 @@ targets therefore has one function type. Closures and unresolved targets keep
 MayChange. Adapter identity is structural over target symbol, instantiated
 signature, effect vector, codegen target, and compiler build; it is emitted
 once per module and never serialized as a new source symbol.
+
+An explicit `emit-obj`/`emit-llvm --export name` is an object-level external ABI
+and never exposes the body-specialized core directly. Codegen emits one external
+wrapper under the requested canonical symbol and a private/internal core. The
+wrapper derives its signature from the semantic source signature and selected
+target: every concrete droppable BorrowMut parameter uses the conservative
+`{data pointer, cleanup pointer}` form, regardless of Invariant/MayChange; every
+other mode keeps its canonical form; tagged values use §2.1; and PR 3 applies
+the same target-selected parameter/result transport to wrapper and harness.
+For an Invariant core the wrapper extracts and passes only the data pointer and
+does not read or write the cleanup pointer. For a MayChange core it forwards the
+pair. Results and all other arguments forward mechanically. The wrapper adds no
+allocation, Drop, effect inference, or cleanup state. Its identity is the
+requested export symbol, semantic signature, target transport plan, tagged
+layout and compiler/LLVM identity; changing only the body effect changes the
+private call inside the wrapper, never its external function type. Function-
+value adapters may reuse the same bridge logic but never replace the named
+external wrapper. The generated C `main` wrapper retains its separate existing
+contract.
 
 The existing `simplify_known_drop_flags` becomes the single
 `simplify_drop_state` authority. `DropFlagInit` gains an explicit origin:
@@ -375,7 +405,7 @@ existing temporary path.
 ## 3. Cross-stage invariants
 
 1. Semantic layout and LLVM layout agree on size, alignment, tag ordinal,
-   every OmittedUnit/Stored mapping, payload offset, and nested field offset.
+   every OmittedUnit/OmittedZero/Stored mapping, payload offset, and nested field offset.
    Both are independently checked; one is not trusted as a certificate for the
    other.
 2. Every byte-oriented consumer observes canonical memory. In particular an
@@ -443,8 +473,8 @@ cases.
 
 | Cell | Required closure and owner |
 | --- | --- |
-| Formation/validation | user sums, Option, Result, tag-only, Unit-only, empty payload, mixed alignment, nested tagged payload, generic instantiation, zero-sized fields, overflow and malformed graphs; exact logical-to-physical map cardinality and semantic type-layout plus LLVM layout twins |
-| Construction/move-in | every variant writes one tag and only active Stored fields; OmittedUnit is evaluated then synthesizes valueless Unit without storage; Copy and Move payloads, nested records/arrays/strings; enum/option/result construction owners and optimized IR store-count owner |
+| Formation/validation | user sums, Option, Result, tag-only, Unit-only, non-Unit zero-sized, mixed/all-zero variants, mixed alignment, nested tagged payload, generic instantiation, overflow and malformed graphs; exact logical-to-physical map cardinality and semantic type-layout plus LLVM layout twins; zero-sized Drop/alignment rejection |
+| Construction/move-in | every variant writes one tag and only active Stored fields; OmittedUnit and OmittedZero values are evaluated once and synthesized without storage; Copy and Move payloads, nested records/arrays/strings; enum/option/result construction owners and optimized IR store-count owner |
 | Move-out/source nulling | active payload moves clear only its source ownership state; union bytes need no deterministic zero; existing move and owned-match owners |
 | Drop/replacement/return | tag-directed exactly-once Drop for every ordinal, old-value replacement after RHS, direct/indirect returns and cleanup payloads; large-drop, enum-drop, reassign, move-return owners |
 | Control flow | if/match/else/?/map_err, wildcard/or-pattern, branch/loop joins, early return and divergence; value-control and tagged-match owners |
@@ -461,6 +491,7 @@ cases.
 | Fixed point | direct chains, mutually recursive SCCs, imported facts, local/imported generic templates instantiated with Copy/non-droppable and Move/droppable arguments, invariant recursion, one changing edge, unknown indirect edge; parameterized MIR analysis owner |
 | Move-in/out | move, replacement, conditional release, and delegation mark MayChange; plain mutation without ownership change remains Invariant; ownership-operation sweep tripwire |
 | Call edges | direct/imported/generic use specialized ABI; function values, mixed target joins, closures and raw/native edges use conservative ABI; adapter identity/dedup owner |
+| Explicit exports | every droppable BorrowMut stays a conservative pair in the named external wrapper; Invariant and MayChange private cores differ only behind that signature; non-droppable, mixed-mode, result and target-transport forms remain canonical; export-roots IR plus compiled C harness owners |
 | Entry/return | Invariant has plain ptr and no proxy/load/writeback; MayChange retains pair and exact writeback on normal/early/?/map_err exits; codegen ABI owner |
 | Sweep folding | known live/dead states fold at branches and agreeing joins without losing exceptional-edge records; MIR structural owner plus executable Drop count |
 | Nulling | only proved dead MoveOut nulling disappears; InitializeEmpty, runtime-selected, read-after, partial reinit, loop/join and malformed cases retain it; zeroing IR owner |
@@ -473,7 +504,7 @@ cases.
 | Cell | Required closure and owner |
 | --- | --- |
 | Formation/validation | full target context, sizes/alignments/address spaces, parameter register pressure, split cleanup forms, malformed/multi-invalid refusal before mutation; classifier unit owners |
-| Definition/call agreement | direct/imported/generic/recursive, function values, captures, entry/export wrappers, whole/per-unit and partitioned emission; signature assertions and native cross-link matrix |
+| Definition/call agreement | direct/imported/generic/recursive, function values, captures, entry/export wrappers, whole/per-unit and partitioned emission; signature assertions and native cross-link matrix; explicit export wrapper uses the canonical conservative drop-state signature before this target transport is applied |
 | By-value parameters | direct small controls; target-selected byval large forms; caller isolation, exact attributes and no callee entry rebuild; parameter transport owner on x86-64 and aarch64 |
 | Cleanup results | direct pair, void sret value+cleanup_out, direct value+cleanup_out; canonical byte, normal-return initialization and terminating-call absence; return-transport owner |
 | Destination placement | plan 67 fresh whole-local result placement composes with split cleanup; replacement, field, element, joins, multiple uses and aliases retain fallback; parameterized materialization owner |
@@ -536,7 +567,7 @@ The ledger-to-prose pass is complete:
   ownership, allocation, owner, identity, prerequisite, acceptance owner,
   benchmark rule, and mirror set;
 - the complete discriminator product is covered: three tag families,
-  payload/no-payload and every variant; all four drop-state cells across
+  Stored/OmittedUnit/OmittedZero and every variant; all four drop-state cells across
   generic/concrete and direct/indirect calls; direct/indirect T,
   cleanup/no-cleanup, and every destination class;
 - the v13 interface format fixes the drop-state field position, u32 sequence
@@ -573,6 +604,14 @@ class. This is a boundary redesign rather than another local patch:
 
 | Finding | Redesigned boundary | Closing owner |
 | --- | --- | --- |
-| Unit payloads had semantic size zero but no exact LLVM representation. | PR 1 now owns an exact logical-to-physical payload map. Unit is OmittedUnit with no LLVM field or storage; every other payload is Stored with fixed offset/size/alignment. | Option/Result/user-sum Unit-only and mixed Unit/non-Unit layout twins, construction, projection, match, Drop and malformed-map owners. |
+| Unit payloads had semantic size zero but no exact LLVM representation. | PR 1 now owns an exact logical-to-physical payload map. Unit is OmittedUnit with no LLVM field or storage; the later reopened-axis correction below generalizes omission to every zero-sized Drop-free payload. | Option/Result/user-sum Unit-only and mixed Unit/non-Unit layout twins, construction, projection, match, Drop and malformed-map owners. |
 | The PR 2 matrix still described malformed interface records as a fallback. | Authenticated v13 shape/tag/mode/droppability errors reject everywhere. MayChange is limited to unavailable internal analysis and unknown callable edges. | Mutated artifact rejection matrix plus unknown-edge conservative control. |
 | Destination construction promised cleanup after trap/divergence. | ABI transport remains PR 3. Partial destination initialization becomes PR 4, whose cleanup edges exist only for reached control transfers; terminal paths preserve no-cleanup semantics. | Separate early-return/`?` Drop owners and hard-trap/abort/divergence no-successor-cleanup owners. |
+
+The reopened-axis review of candidate `bf3b7d64` found two remaining physical
+boundary omissions:
+
+| Finding | Ledger correction | Closing owner |
+| --- | --- | --- |
+| A non-Unit empty struct is also zero-sized, so Stored had no U field in an all-zero sum. | OmittedZero covers every zero-sized non-Unit payload with no Drop plan, synthesizing its exact empty LLVM aggregate without storage. Unsupported alignment or a nonempty Drop plan rejects. | Mixed and all-zero user-sum/Option/Result layout twins plus construction/projection and rejected zero-size-Drop/alignment controls. |
+| A body-specialized Invariant function could expose its plain pointer through `--export`. | Every explicit export gets a named external wrapper with the conservative cleanup pair and a private specialized core. Body effect changes cannot alter the wrapper type; PR 3 target transport is derived over that canonical signature. | Export-root IR signature matrix and compiled C harness for Invariant/MayChange, mixed modes and cleanup results. |

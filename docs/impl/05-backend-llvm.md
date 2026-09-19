@@ -57,7 +57,9 @@ Plan 71 PR 1 replaces the current flattened tagged bodies with one explicit tag
 and max-variant union storage. The storage has the maximum payload size and
 alignment; construction writes only the active payload, and projection and Drop
 switch on the tag before accessing it. Inactive bytes and padding are
-unspecified and unobservable. There is no niche representation. Until that PR
+unspecified and unobservable. Unit and other zero-sized, Drop-free payloads
+have explicit omitted mappings and synthesize their valueless/empty result
+without storage. There is no niche representation. Until that PR
 lands, the implementation still uses the older flattened bodies; plan 71 is the
 authoritative replacement contract and owns the transition matrix.
 
@@ -90,6 +92,12 @@ parameters use target-selected `byval(T)`. Only fresh whole locals and caller
 result slots are explicit destination-placement candidates; replacement,
 fields, indexed destinations, joins, and observable aliases keep a temporary
 to preserve evaluation, bounds-error, and Drop order.
+
+Plan 71 also separates body-specialized program cores from explicit `--export`
+symbols. A named external wrapper always uses the semantic signature's
+conservative cleanup-state form, then calls the Invariant or MayChange private
+core. Body effect changes therefore cannot change an external function type;
+the target transport above applies consistently to wrapper and harness.
 
 ### Module verification (every profile, on every emit path)
 

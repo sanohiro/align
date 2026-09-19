@@ -124,6 +124,10 @@ adapter when an invariant named target is converted to that function type.
 Generic templates carry only Deferred effect cells and no callable ABI; each
 concrete monomorph derives its own effect from substituted types and checked
 MIR before the concrete call-graph fixed point.
+An explicit `--export` root retains the conservative cleanup-state signature
+through a named external wrapper; the inferred effect specializes only its
+private core. Function-value adapters and export wrappers share the bridge rule
+but have distinct identities and linkage.
 
 `Fn`/`FnTy` stores `[(ParamMode, Ty)]`, not only `[Ty]`, plus the target's
 `ReturnBorrowSummary`/`ReturnRegionSummary` and `ReturnCleanupAbi`. A named function converted to a function value retains
