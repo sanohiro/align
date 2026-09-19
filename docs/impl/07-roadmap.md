@@ -2415,6 +2415,10 @@ regression net that validates the upgrade.
     guarded-set admission criterion over those classes, and carries the closure matrix for issues
     1071, 1072 and 1074. The withholding rules 5A established for `utf8_valid` and the memchr-backed
     rows survive as a named class; the abort family gains `cold` and an explicit memory effect.
+    **PR 1 IMPLEMENTED 2026-09-19:** all 464 base rows now have a total
+    `RuntimeEffects` record; declaration and rt-LTO attribute removal derive from that one record;
+    allocation, indirect-reachability, host-state, source-inventory, C-unwind, golden, and
+    whole/per-unit owners close the model. Plan 70 PR 2 and PR 3 remain.
   **DEFERRED with reasons (revisit post-M14 ThinLTO/runtime-bitcode — the wave that creates
   real non-inlined boundaries where argument attributes stop evaporating):** internal-ABI
   signature flattening (SROA already achieves it; FFI boundary correctly kept aggregate in the

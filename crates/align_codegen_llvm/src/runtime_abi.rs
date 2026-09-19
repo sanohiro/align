@@ -178,10 +178,102 @@ enum RuntimeAbiShape {
 struct RuntimeAbiShapeSpec {
     ret: NativeReturn,
     params: &'static [NativeType],
-    return_noalias: bool,
-    fn_attrs: &'static [&'static str],
-    memory_argmem_read: bool,
-    read_ptr_params: &'static [u32],
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EffectClass {
+    PureScalar,
+    PureArgRead,
+    ArgRead,
+    AllocNew,
+    FreeLocal,
+    IndirectStorage,
+    DispatchCache,
+    HostState,
+    Callback,
+    Foreign,
+    FailNoReturn,
+    ProcessExit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArgMem {
+    Unstated,
+    None,
+    Read,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParamMode {
+    Read,
+    Write,
+    ReadWrite,
+    Opaque,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ParamEffect {
+    ordinal: u32,
+    mode: ParamMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Release {
+    None,
+    HandleOnly,
+    Indirect,
+    Region,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimeEffects {
+    class: EffectClass,
+    argmem: ArgMem,
+    params: &'static [ParamEffect],
+    escapes: &'static [u32],
+    releases: Release,
+    returns_fresh: bool,
+    diverges: bool,
+}
+
+impl RuntimeEffects {
+    fn function_attributes(self) -> &'static [&'static str] {
+        use EffectClass::{
+            AllocNew, DispatchCache, FailNoReturn, PureArgRead, PureScalar,
+        };
+        match (self.class, self.diverges) {
+            (FailNoReturn, true) => &["nounwind", "cold", "noreturn"],
+            (_, true) => &["nounwind", "noreturn"],
+            (PureScalar | PureArgRead | DispatchCache, false) => {
+                &["nounwind", "nofree", "nosync", "willreturn"]
+            }
+            (AllocNew, false) => &["nounwind", "nofree"],
+            _ => &["nounwind"],
+        }
+    }
+
+    fn memory_attribute(self) -> Option<u64> {
+        use EffectClass::{
+            AllocNew, ArgRead, FailNoReturn, FreeLocal, ProcessExit, PureArgRead, PureScalar,
+        };
+        match (self.class, self.argmem) {
+            (PureScalar, ArgMem::None) => Some(super::MEM_NONE),
+            (PureArgRead, ArgMem::Read) => Some(super::MEM_ARGMEM_READ),
+            (ArgRead | AllocNew, ArgMem::None) => Some(super::MEM_INACCESSIBLE_READWRITE),
+            (ArgRead | AllocNew, ArgMem::Read) => {
+                Some(super::MEM_ARGMEM_READ_INACCESSIBLE_READWRITE)
+            }
+            (FreeLocal, ArgMem::None) => {
+                Some(super::MEM_ARGMEM_READWRITE_INACCESSIBLE_READWRITE)
+            }
+            (FailNoReturn | ProcessExit, ArgMem::None) => {
+                Some(super::MEM_INACCESSIBLE_READWRITE)
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -241,6 +333,475 @@ pub(super) enum RuntimeAbiId {
     Unkeyed(UnkeyedRuntimeKey),
 }
 
+fn runtime_effects(id: RuntimeAbiId) -> RuntimeEffects {
+    match id {
+        RuntimeAbiId::Keyed(RuntimeKey::Alloc) => RuntimeEffects { class: EffectClass::AllocNew, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: true, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::AllocSizeFail) => RuntimeEffects { class: EffectClass::FailNoReturn, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: true },
+        RuntimeAbiId::Keyed(RuntimeKey::ArenaAlloc) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: true, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ArenaBegin) => RuntimeEffects { class: EffectClass::AllocNew, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: true, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ArenaEnd) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::Region, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ArrayBuilderAppend) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ArrayBuilderBuild) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ArrayBuilderBuildStack) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ArrayBuilderFree) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::Indirect, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ArrayBuilderFreeStack) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::Indirect, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ArrayBuilderFreeStrings) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::Indirect, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ArrayBuilderFreeStringsStack) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::Indirect, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ArrayBuilderInitStack) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ArrayBuilderNew) => RuntimeEffects { class: EffectClass::AllocNew, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: true, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ArrayBuilderNewIn) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: true, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ArrayBuilderPush) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ArrayBuilderPushBytes) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ArrayBuilderPushStr) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::Base64Decode) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::Base64Encode) => RuntimeEffects { class: EffectClass::ArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::Base64urlDecode) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::Base64urlEncode) => RuntimeEffects { class: EffectClass::ArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BoundsFail) => RuntimeEffects { class: EffectClass::FailNoReturn, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: true },
+        RuntimeAbiId::Keyed(RuntimeKey::BufferAppend) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BufferAppendFilled) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BufferBytes) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BufferCapacity) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BufferFilled) => RuntimeEffects { class: EffectClass::AllocNew, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: true, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BufferFree) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::Indirect, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BufferLen) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BufferNew) => RuntimeEffects { class: EffectClass::AllocNew, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: true, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BufferPut) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BuilderFinish) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BuilderFinishStack) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BuilderFree) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::Indirect, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BuilderFreeStack) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::Indirect, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BuilderInitStack) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BuilderIntoString) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BuilderIntoStringStack) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BuilderNew) => RuntimeEffects { class: EffectClass::AllocNew, argmem: ArgMem::None, params: &[], escapes: &[0], releases: Release::None, returns_fresh: true, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BuilderPopComma) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BuilderWrite) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BuilderWriteBool) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BuilderWriteChar) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BuilderWriteF32) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BuilderWriteF64) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BuilderWriteInt) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BuilderWriteJsonStr) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BuilderWriteStrIntStr) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 4], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BuilderWriteUint) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BytesAsStr) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ChildFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ChildGroupMembers) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ChildId) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ChildKill) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ChildKillGroup) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ChildPoll) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ChildReadStderr) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ChildReadStdout) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ChildStatus) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ChildTryWait) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ChildWait) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::Chunks) => RuntimeEffects { class: EffectClass::ArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CliCommand) => RuntimeEffects { class: EffectClass::AllocNew, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: true, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CliCommandFree) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::Indirect, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CliFlagBool) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CliFlagI64) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CliFlagStr) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CliGetBool) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CliGetI64) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CliGetStr) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CliParse) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CliParsedFree) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::Indirect, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CliUsage) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CodecEncoderFinishV1) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CodecEncoderFreeV1) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::Indirect, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CodecEncoderNewV1) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CodecEncoderPutBoolV1) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CodecEncoderPutF64V1) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CodecEncoderPutI64V1) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CodecEncoderPutStrV1) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CodecOpenV1) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CommandCwd) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CommandEnv) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CommandEnvClear) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CommandFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CommandImage) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CommandInheritFile) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CommandInheritNamespace) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CommandMaxCapture) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CommandNew) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: true, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CommandNewSession) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CommandRun) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CommandRunBytes) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CommandStart) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CommandStartScope) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CommandStderrTo) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CommandStdoutTo) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CommandTimeout) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CompressGzipCompress) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CompressGzipDecompress) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CompressZstdCompress) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CompressZstdDecompress) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CryptoAesGcmOpen) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 4, 6, 8], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CryptoAesGcmSeal) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 4, 6, 8], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CryptoArgon2id) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 8], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CryptoChacha20Poly1305Open) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 4, 6, 8], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CryptoChacha20Poly1305Seal) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 4, 6, 8], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CryptoCtEqual) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CryptoDigestFinish) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CryptoDigestFree) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CryptoDigestNew) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CryptoDigestUpdate) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CryptoHkdfSha256) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 4, 7], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CryptoHmacSha256) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CryptoKeyFree) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CryptoPrivateKeyFromPem) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CryptoPublicKeyFromJwk) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[1, 3, 5], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CryptoPublicKeyFromPem) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CryptoRandom) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CryptoSha1) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CryptoSha256) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CryptoSha512) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CryptoSign) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[1, 2, 4], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CryptoVerify) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[1, 2, 4, 6], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CsvDecodeSoaV1) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 4, 8], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::DictEncodeStr) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 4, 5], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::DictLookup) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 4], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::DivFail) => RuntimeEffects { class: EffectClass::FailNoReturn, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: true },
+        RuntimeAbiId::Keyed(RuntimeKey::DnsResolve) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::EnvGet) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::EnvSet) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FormDecode) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FormEncode) => RuntimeEffects { class: EffectClass::ArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FrameInnerJoinI64V1) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 5], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FrameInnerJoinStrV1) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3, 4, 7], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::Free) => RuntimeEffects { class: EffectClass::FreeLocal, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FreeResponseArray) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::Indirect, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FreeStringArray) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::Indirect, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsCreateDir) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsCreatePrivateTempDir) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsCursorFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsCursorNext) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsDirectoryAccess) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 4], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsDirectoryAccessAt) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 6], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsDirectoryCreateDir) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsDirectoryCreateNew) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsDirectoryCreateSymlink) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsDirectoryCursor) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsDirectoryFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsDirectoryMetadata) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsDirectoryMetadataAt) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsDirectoryMetadataFollow) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsDirectoryOpen) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsDirectoryOpenDir) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsDirectoryOpenRead) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsDirectoryOpenReadSingleLink) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsDirectoryReadLink) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 4], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsDirectoryRemoveDir) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsDirectoryRemoveFile) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsDirectorySetMode) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsExists) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsFileMetadata) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsFileSetMode) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsIsDir) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsMemoryFile) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsMemoryFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsMemorySeal) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsMemoryWrite) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsReadBytesView) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsReadDir) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsReadFile) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsReadFileView) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsReaderMetadata) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsReaderSetMode) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsRemove) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsRemoveEmptyDir) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsRenameNoReplace) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsSealedFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsSealedLen) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsSealedReadAt) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 4], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsWriteFile) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsWriteFileBuilder) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsWriterMetadata) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsWriterSetMode) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::GatherI64) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 4], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::GroupCountI64) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::GroupCountStr) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 5, 6], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::GroupCountStrCols) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3, 4], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::GroupMaxI64) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3, 4], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::GroupMaxStr) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 5, 6], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::GroupMaxStrCols) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3, 4], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::GroupMinI64) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3, 4], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::GroupMinStr) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 5, 6], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::GroupMinStrCols) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3, 4], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::GroupMultiStr) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 4, 6], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::GroupSumI64) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3, 4], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::GroupSumStr) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 5, 6], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::GroupSumStrCols) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3, 4], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::Hash128) => RuntimeEffects { class: EffectClass::PureArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::Hash64) => RuntimeEffects { class: EffectClass::PureArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HexDecode) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HexEncode) => RuntimeEffects { class: EffectClass::ArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HtmlEscape) => RuntimeEffects { class: EffectClass::ArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpAccept) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpBody) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpClientFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpClientGet) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpClientMaxResponseBodyBytes) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpClientNew) => RuntimeEffects { class: EffectClass::AllocNew, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: true, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpClientPost) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3, 5], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpClientRequest) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpClientRequestStream) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpClientTimeout) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpCtxBody) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpCtxFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpCtxHeader) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpCtxMethod) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpCtxPath) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpCtxUpgradeReady) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpGetMany) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 4], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpHeader) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpHeadersContainsToken) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpHeadersContainsTokenExact) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpHeadersCount) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpHeadersTokensValid) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpMaxResponseBodyBytes) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpParse) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpRbBody) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpRbHeader) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpReadStreamFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpReadStreamHeader) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpReadStreamRead) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpReadStreamSse) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpReadStreamStatus) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpRequest) => RuntimeEffects { class: EffectClass::AllocNew, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }, ParamEffect { ordinal: 2, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: true, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpRequestFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpRespBody) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpRespFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpRespHeader) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpRespStatus) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpRespond) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpRespondStream) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpRespondUpgrade) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpResponseFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpResponseNew) => RuntimeEffects { class: EffectClass::AllocNew, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: true, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpServe) => RuntimeEffects { class: EffectClass::Callback, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpServeShared) => RuntimeEffects { class: EffectClass::Callback, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpServerFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpSseStreamLastEventId) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpSseStreamNext) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpSseStreamRetryMs) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpStreamFinish) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpStreamFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpStreamReject) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpStreamSend) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpStreamSendEvent) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpTimeout) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpUpgradeDeadline) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpUpgradeFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpUpgradeReadExact) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpUpgradeShutdown) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpUpgradeWrite) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::IoCopy) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::IoFileCreate) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::IoFileFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::IoFileLen) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::IoFileOpen) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::IoFilePread) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::IoFilePwrite) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::IoReaderBuffered) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::IoReaderFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::IoReaderOpen) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::IoReaderOpenBeneath) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 4], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::IoReaderOpenBeneathSingleLink) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 4], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::IoReaderOpenRegular) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::IoReaderRead) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::IoReaderReadLine) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::IoReaderStdin) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::IoWriterCreate) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::IoWriterCreateExclusive) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::IoWriterCreateExclusiveBeneath) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 4], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::IoWriterFlush) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::IoWriterFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::IoWriterStd) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::IoWriterWrite) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::IoWriterWriteBuilder) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::JsonBuilderFinish) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::JsonBuilderInit) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::JsonBuilderWriteF32) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::JsonBuilderWriteF64) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::JsonDecode) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 4, 6, 9], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::JsonDecodeArray) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::JsonDecodeScalar) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::JsonDecodeSoa) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 4, 5, 6], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::JsonDecodeStructArray) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 5, 6, 9], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::JsonDecodeUnion) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 3, 4], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::JsonDocAsBool) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::JsonDocAsF64) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::JsonDocAsI64) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::JsonDocAsStr) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::JsonDocAt) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::JsonDocElems) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::JsonDocGet) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 4], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::JsonDocKey) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::JsonDocKind) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::JsonDocLen) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::JsonDocParse) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::JsonEncodeObject) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::JsonEncodeScalarArray) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::JsonEncodeStructArray) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::JsonEncodeUnion) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::JsonScanNext) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 3, 5, 7], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::LenMismatchFail) => RuntimeEffects { class: EffectClass::FailNoReturn, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: true },
+        RuntimeAbiId::Keyed(RuntimeKey::LogEnabled) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::LogFlush) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::LogFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::LogLine) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::LogLineBuilder) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::LogNew) => RuntimeEffects { class: EffectClass::AllocNew, argmem: ArgMem::None, params: &[], escapes: &[0], releases: Release::None, returns_fresh: true, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::OsHost) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::OsIdentity) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ParMap) => RuntimeEffects { class: EffectClass::Callback, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 6], releases: Release::None, returns_fresh: true, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ParMapFilter) => RuntimeEffects { class: EffectClass::Callback, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 6, 7], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ParMapReduce) => RuntimeEffects { class: EffectClass::Callback, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 6], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::PathBase) => RuntimeEffects { class: EffectClass::PureArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::PathDir) => RuntimeEffects { class: EffectClass::PureArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::PathExt) => RuntimeEffects { class: EffectClass::PureArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::PathJoin) => RuntimeEffects { class: EffectClass::ArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }, ParamEffect { ordinal: 2, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::PathNormalize) => RuntimeEffects { class: EffectClass::ArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::PercentDecode) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::PercentEncode) => RuntimeEffects { class: EffectClass::ArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::PercentEncodePath) => RuntimeEffects { class: EffectClass::ArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::Print) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::PrintBool) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::PrintChar) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::PrintF32) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::PrintF64) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::PrintStr) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ProcessAbort) => RuntimeEffects { class: EffectClass::FailNoReturn, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: true },
+        RuntimeAbiId::Keyed(RuntimeKey::ProcessCpuCount) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ProcessCurrentImage) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ProcessExec) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ProcessExecutable) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ProcessExit) => RuntimeEffects { class: EffectClass::ProcessExit, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: true },
+        RuntimeAbiId::Keyed(RuntimeKey::ProcessImageFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ProcessImageLen) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ProcessImageReadAt) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 4], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ProcessMemberFinished) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ProcessMemberFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ProcessMemberKill) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ProcessSignalClose) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ProcessSignalFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ProcessSignalNext) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ProcessSignalNumber) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ProcessSignals) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ProcessSpawn) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 4], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ProcessTable) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ProcessUserNamespace) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ProcessUserNamespaceFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::RangeFail) => RuntimeEffects { class: EffectClass::FailNoReturn, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: true },
+        RuntimeAbiId::Keyed(RuntimeKey::RegexCaptures) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::RegexCapturesFree) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::Indirect, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::RegexCapturesGroup) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::RegexCompile) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::RegexFind) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 4], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::RegexFindAll) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::RegexFree) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::Indirect, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::RegexGroupCount) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::RegexGroupIndex) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::RegexIsMatch) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::RegexReplace) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::RegexSplit) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::RngNext) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::RngRange) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::RngSample) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::RngSeedOs) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::RngSeedWith) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::RngShuffle) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::RunBytesFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::RunBytesStatus) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::RunBytesStderr) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::RunBytesStdout) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::RunOutputFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::RunOutputStatus) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::RunOutputStderr) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::RunOutputStdout) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ScopeChildren) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ScopeFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ScopeOwnerId) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ScopeReap) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ScopeRelease) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::StrClone) => RuntimeEffects { class: EffectClass::ArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::StrCmp) => RuntimeEffects { class: EffectClass::PureArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }, ParamEffect { ordinal: 2, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::StrContains) => RuntimeEffects { class: EffectClass::DispatchCache, argmem: ArgMem::Unstated, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }, ParamEffect { ordinal: 2, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::StrEndsWith) => RuntimeEffects { class: EffectClass::PureArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }, ParamEffect { ordinal: 2, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::StrEq) => RuntimeEffects { class: EffectClass::PureArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }, ParamEffect { ordinal: 2, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::StrEqIgnoreCase) => RuntimeEffects { class: EffectClass::PureArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }, ParamEffect { ordinal: 2, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::StrFind) => RuntimeEffects { class: EffectClass::DispatchCache, argmem: ArgMem::Unstated, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }, ParamEffect { ordinal: 2, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::StrFinderFind) => RuntimeEffects { class: EffectClass::DispatchCache, argmem: ArgMem::Unstated, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }, ParamEffect { ordinal: 1, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::StrFinderFree) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::Indirect, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::StrFinderNew) => RuntimeEffects { class: EffectClass::AllocNew, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: true, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::StrRfind) => RuntimeEffects { class: EffectClass::DispatchCache, argmem: ArgMem::Unstated, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }, ParamEffect { ordinal: 2, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::StrStartsWith) => RuntimeEffects { class: EffectClass::PureArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }, ParamEffect { ordinal: 2, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::StrTrim) => RuntimeEffects { class: EffectClass::PureArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::StrTrimEnd) => RuntimeEffects { class: EffectClass::PureArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::StrTrimStart) => RuntimeEffects { class: EffectClass::PureArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::TcpAccept) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::TcpConnFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::TcpConnReader) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::TcpConnWriter) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::TcpConnect) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 4], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::TcpListen) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::TcpListenerFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::TcpReadTimeout) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::TcpWriteTimeout) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::TemplateHtmlFree) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::Indirect, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::TemplateHtmlNew) => RuntimeEffects { class: EffectClass::AllocNew, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: true, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::TemplateHtmlRaw) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::TemplateHtmlToString) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::TemplateHtmlWrite) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::TgAlloc) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: true, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::TgBegin) => RuntimeEffects { class: EffectClass::AllocNew, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: true, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::TgEnd) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::Region, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::TgRegister) => RuntimeEffects { class: EffectClass::Callback, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 2, 3, 4, 5], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::TgWait) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::TimeFormat) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::TimeInstant) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::TimeNow) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::TimeParse) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::TimeSleep) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::UdpBind) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::UdpRecvFrom) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::UdpSendTo) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::UdpSocketFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::Utf8BoundaryFail) => RuntimeEffects { class: EffectClass::FailNoReturn, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: true },
+        RuntimeAbiId::Keyed(RuntimeKey::Utf8DecodeLossy) => RuntimeEffects { class: EffectClass::ArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::Utf8Valid) => RuntimeEffects { class: EffectClass::DispatchCache, argmem: ArgMem::Unstated, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::XmlAttributeCount) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::XmlAttributeName) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::XmlAttributeValue) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::XmlFree) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::Indirect, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::XmlName) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::XmlNext) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::XmlParse) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::XmlText) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Unkeyed(UnkeyedRuntimeKey::ReportError) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Unkeyed(UnkeyedRuntimeKey::ArgsBuild) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Unkeyed(UnkeyedRuntimeKey::ArenaReset) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::Region, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Unkeyed(UnkeyedRuntimeKey::Realloc) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Unkeyed(UnkeyedRuntimeKey::HttpSerialize) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Unkeyed(UnkeyedRuntimeKey::F32ToBits) => RuntimeEffects { class: EffectClass::PureScalar, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Unkeyed(UnkeyedRuntimeKey::F32FromBits) => RuntimeEffects { class: EffectClass::PureScalar, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Unkeyed(UnkeyedRuntimeKey::F64ToBits) => RuntimeEffects { class: EffectClass::PureScalar, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Unkeyed(UnkeyedRuntimeKey::F64FromBits) => RuntimeEffects { class: EffectClass::PureScalar, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Unkeyed(UnkeyedRuntimeKey::F32TextLen) => RuntimeEffects { class: EffectClass::PureScalar, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Unkeyed(UnkeyedRuntimeKey::F64TextLen) => RuntimeEffects { class: EffectClass::PureScalar, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Unkeyed(UnkeyedRuntimeKey::F32TextWrite) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Unkeyed(UnkeyedRuntimeKey::F64TextWrite) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Unkeyed(UnkeyedRuntimeKey::TestLaunchRecvV1) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Unkeyed(UnkeyedRuntimeKey::TestFdCloexecV1) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Unkeyed(UnkeyedRuntimeKey::TestAckV1) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Unkeyed(UnkeyedRuntimeKey::TestReportV1) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Unkeyed(UnkeyedRuntimeKey::TcpConnSetIoTimeout) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+    }
+}
+
 impl RuntimeAbi {
     pub(super) fn function_type<'c>(self, ctx: &'c Context) -> FunctionType<'c> {
         let spec = shape_spec(self.shape);
@@ -260,8 +821,8 @@ impl RuntimeAbi {
     }
 
     pub(super) fn apply_attributes<'c>(self, ctx: &'c Context, function: FunctionValue<'c>) {
-        let spec = shape_spec(self.shape);
-        if spec.return_noalias {
+        let effects = runtime_effects(self.key);
+        if effects.returns_fresh {
             super::add_enum_attr(
                 ctx,
                 function,
@@ -269,7 +830,7 @@ impl RuntimeAbi {
                 "noalias",
             );
         }
-        for attr in spec.fn_attrs {
+        for attr in effects.function_attributes() {
             super::add_enum_attr(
                 ctx,
                 function,
@@ -277,29 +838,33 @@ impl RuntimeAbi {
                 attr,
             );
         }
-        if spec.memory_argmem_read {
+        if let Some(memory) = effects.memory_attribute() {
             super::add_valued_enum_attr(
                 ctx,
                 function,
                 inkwell::attributes::AttributeLoc::Function,
                 "memory",
-                super::MEM_ARGMEM_READ,
+                memory,
             );
         }
-        for param in spec.read_ptr_params {
-            super::add_enum_attr(
-                ctx,
-                function,
-                inkwell::attributes::AttributeLoc::Param(*param),
-                "readonly",
-            );
-            super::add_valued_enum_attr(
-                ctx,
-                function,
-                inkwell::attributes::AttributeLoc::Param(*param),
-                "captures",
-                super::CAPTURES_NONE,
-            );
+        for param in effects.params {
+            let location = inkwell::attributes::AttributeLoc::Param(param.ordinal);
+            match param.mode {
+                ParamMode::Read => super::add_enum_attr(ctx, function, location, "readonly"),
+                ParamMode::Write => super::add_enum_attr(ctx, function, location, "writeonly"),
+                ParamMode::ReadWrite | ParamMode::Opaque => {}
+            }
+        }
+        for (ordinal, ty) in shape_spec(self.shape).params.iter().enumerate() {
+            if *ty == NativeType::Ptr && !effects.escapes.contains(&(ordinal as u32)) {
+                super::add_valued_enum_attr(
+                    ctx,
+                    function,
+                    inkwell::attributes::AttributeLoc::Param(ordinal as u32),
+                    "captures",
+                    super::CAPTURES_NONE,
+                );
+            }
         }
     }
 
@@ -312,38 +877,38 @@ impl RuntimeAbi {
     /// module sweep rather than this per-row call.
     pub(super) fn remove_attributes(self, function: FunctionValue<'_>) {
         use inkwell::attributes::AttributeLoc;
-        let spec = shape_spec(self.shape);
-        if spec.return_noalias {
+        let effects = runtime_effects(self.key);
+        if effects.returns_fresh {
             function.remove_enum_attribute(AttributeLoc::Return, super::enum_kind_id("noalias"));
         }
-        for attr in spec.fn_attrs {
+        for attr in effects.function_attributes() {
             function.remove_enum_attribute(AttributeLoc::Function, super::enum_kind_id(attr));
         }
-        if spec.memory_argmem_read {
+        if effects.memory_attribute().is_some() {
             function.remove_enum_attribute(AttributeLoc::Function, super::enum_kind_id("memory"));
         }
-        for param in spec.read_ptr_params {
+        for (ordinal, ty) in shape_spec(self.shape).params.iter().enumerate() {
+            if *ty != NativeType::Ptr {
+                continue;
+            }
+            let location = AttributeLoc::Param(ordinal as u32);
             function.remove_enum_attribute(
-                AttributeLoc::Param(*param),
+                location,
                 super::enum_kind_id("readonly"),
             );
             function.remove_enum_attribute(
-                AttributeLoc::Param(*param),
+                location,
+                super::enum_kind_id("writeonly"),
+            );
+            function.remove_enum_attribute(
+                location,
                 super::enum_kind_id("captures"),
             );
         }
     }
 
     pub(super) fn is_rt_lto_guarded(self) -> bool {
-        matches!(
-            self.key,
-            RuntimeAbiId::Keyed(
-                RuntimeKey::StrEq
-                    | RuntimeKey::StrStartsWith
-                    | RuntimeKey::StrEndsWith
-                    | RuntimeKey::StrEqIgnoreCase
-            )
-        )
+        has_rt_lto_measurement(self.key) && effects_admit_rt_lto(runtime_effects(self.key))
     }
 
     pub(super) fn runtime_key(self) -> Option<RuntimeKey> {
@@ -352,6 +917,24 @@ impl RuntimeAbi {
             RuntimeAbiId::Unkeyed(_) => None,
         }
     }
+}
+
+fn has_rt_lto_measurement(id: RuntimeAbiId) -> bool {
+    matches!(
+        id,
+        RuntimeAbiId::Keyed(
+            RuntimeKey::StrEq
+                | RuntimeKey::StrStartsWith
+                | RuntimeKey::StrEndsWith
+                | RuntimeKey::StrEqIgnoreCase
+        )
+    )
+}
+
+fn effects_admit_rt_lto(effects: RuntimeEffects) -> bool {
+    matches!(effects.class, EffectClass::PureScalar | EffectClass::PureArgRead)
+        && effects.escapes.is_empty()
+        && effects.releases == Release::None
 }
 
 /// Every attribute location a function can carry attributes at: the function itself, its return,
@@ -2339,6 +2922,116 @@ pub(super) fn runtime_abis() -> impl Iterator<Item = RuntimeAbi> {
     keyed_runtime_abis().chain(UNKEYED_RUNTIME_KEYS.into_iter().map(unkeyed_runtime_abi))
 }
 
+fn validate_effects(abi: RuntimeAbi, effects: RuntimeEffects) -> Result<(), String> {
+    let spec = shape_spec(abi.shape);
+    let fail = |rule: &str| {
+        Err(format!(
+            "runtime ABI effects {rule}:{}",
+            super::lowercase_hex(abi.symbol.as_bytes()),
+        ))
+    };
+
+    let mut params = HashSet::with_capacity(effects.params.len());
+    for param in effects.params {
+        if !matches!(spec.params.get(param.ordinal as usize), Some(NativeType::Ptr))
+            || !params.insert(param.ordinal)
+        {
+            return fail("V2");
+        }
+    }
+    let mut escapes = HashSet::with_capacity(effects.escapes.len());
+    for ordinal in effects.escapes {
+        if !matches!(spec.params.get(*ordinal as usize), Some(NativeType::Ptr))
+            || !escapes.insert(*ordinal)
+        {
+            return fail("V3");
+        }
+    }
+    let params_valid = effects.params.iter().all(|param| param.mode == ParamMode::Read)
+        && (effects.params.is_empty()
+            || matches!(
+                effects.class,
+                EffectClass::PureArgRead
+                    | EffectClass::ArgRead
+                    | EffectClass::AllocNew
+                    | EffectClass::IndirectStorage
+                    | EffectClass::DispatchCache
+                    | EffectClass::HostState
+            ));
+    if !params_valid {
+        return fail("V4");
+    }
+
+    let argmem_valid = match effects.class {
+        EffectClass::PureScalar
+        | EffectClass::FreeLocal
+        | EffectClass::FailNoReturn
+        | EffectClass::ProcessExit => effects.argmem == ArgMem::None,
+        EffectClass::PureArgRead => effects.argmem == ArgMem::Read,
+        EffectClass::ArgRead | EffectClass::AllocNew => {
+            matches!(effects.argmem, ArgMem::None | ArgMem::Read)
+        }
+        EffectClass::IndirectStorage
+        | EffectClass::DispatchCache
+        | EffectClass::HostState
+        | EffectClass::Callback
+        | EffectClass::Foreign => effects.argmem == ArgMem::Unstated,
+    };
+    if !argmem_valid {
+        return fail(if matches!(
+            effects.class,
+            EffectClass::IndirectStorage
+                | EffectClass::DispatchCache
+                | EffectClass::HostState
+                | EffectClass::Callback
+                | EffectClass::Foreign
+        ) {
+            "V6"
+        } else {
+            "V5"
+        });
+    }
+
+    if effects.returns_fresh
+        && (spec.ret != NativeReturn::Ptr
+            || matches!(
+                effects.class,
+                EffectClass::FreeLocal | EffectClass::FailNoReturn | EffectClass::ProcessExit
+            ))
+    {
+        return fail("V7");
+    }
+    if effects.diverges
+        != matches!(
+            effects.class,
+            EffectClass::FailNoReturn | EffectClass::ProcessExit
+        )
+    {
+        return fail("V8");
+    }
+
+    let release_valid = match effects.releases {
+        Release::None => !matches!(effects.class, EffectClass::FreeLocal),
+        Release::HandleOnly => matches!(
+            effects.class,
+            EffectClass::FreeLocal | EffectClass::IndirectStorage | EffectClass::HostState
+        ),
+        Release::Indirect => effects.class == EffectClass::IndirectStorage,
+        Release::Region => effects.class == EffectClass::HostState,
+    };
+    if !release_valid {
+        return fail("V9");
+    }
+
+    let has_pointer = spec.params.contains(&NativeType::Ptr);
+    if (!has_pointer && (!effects.params.is_empty() || !effects.escapes.is_empty()))
+        || (effects.class == EffectClass::PureScalar && has_pointer)
+    {
+        return fail("V10");
+    }
+    Ok(())
+}
+
 pub(super) fn validate_registry() -> Result<(), String> {
     if RuntimeKey::ALL.len() != 446 || keyed_runtime_abis().len() != 446 {
         return Err("runtime ABI registry invariant: key-count".to_string());
@@ -2350,6 +3043,7 @@ pub(super) fn validate_registry() -> Result<(), String> {
     let mut keys = HashSet::with_capacity(RuntimeKey::ALL.len());
     let mut symbols = HashSet::with_capacity(464);
     for abi in keyed_runtime_abis() {
+        validate_effects(abi, runtime_effects(abi.key))?;
         let key = abi
             .runtime_key()
             .expect("keyed runtime iterator yielded an unkeyed row");
@@ -2367,6 +3061,7 @@ pub(super) fn validate_registry() -> Result<(), String> {
         }
     }
     for abi in UNKEYED_RUNTIME_KEYS.into_iter().map(unkeyed_runtime_abi) {
+        validate_effects(abi, runtime_effects(abi.key))?;
         if !symbols.insert(abi.symbol) {
             return Err(format!(
                 "runtime ABI registry invariant: duplicate-symbol:{}",
@@ -2383,6 +3078,15 @@ pub(super) fn validate_registry() -> Result<(), String> {
             return Err(format!(
                 "runtime ABI registry invariant: key-symbol:{}",
                 super::lowercase_hex(key.logical_name().as_bytes()),
+            ));
+        }
+    }
+    for abi in runtime_abis().filter(|abi| has_rt_lto_measurement(abi.key)) {
+        let effects = runtime_effects(abi.key);
+        if !effects_admit_rt_lto(effects) {
+            return Err(format!(
+                "runtime ABI effects V12:{}",
+                super::lowercase_hex(abi.symbol.as_bytes()),
             ));
         }
     }
@@ -2520,7 +3224,50 @@ pub(super) fn test_control_fingerprint() -> Vec<u8> {
         }
     }
 
-    let mut bytes = b"align-test-control-runtime-abi-v1\0".to_vec();
+    fn effect_class_tag(value: EffectClass) -> u8 {
+        match value {
+            EffectClass::PureScalar => 0,
+            EffectClass::PureArgRead => 1,
+            EffectClass::ArgRead => 2,
+            EffectClass::AllocNew => 3,
+            EffectClass::FreeLocal => 4,
+            EffectClass::IndirectStorage => 5,
+            EffectClass::DispatchCache => 6,
+            EffectClass::HostState => 7,
+            EffectClass::Callback => 8,
+            EffectClass::Foreign => 9,
+            EffectClass::FailNoReturn => 10,
+            EffectClass::ProcessExit => 11,
+        }
+    }
+
+    fn argmem_tag(value: ArgMem) -> u8 {
+        match value {
+            ArgMem::Unstated => 0,
+            ArgMem::None => 1,
+            ArgMem::Read => 2,
+        }
+    }
+
+    fn param_mode_tag(value: ParamMode) -> u8 {
+        match value {
+            ParamMode::Read => 0,
+            ParamMode::Write => 1,
+            ParamMode::ReadWrite => 2,
+            ParamMode::Opaque => 3,
+        }
+    }
+
+    fn release_tag(value: Release) -> u8 {
+        match value {
+            Release::None => 0,
+            Release::HandleOnly => 1,
+            Release::Indirect => 2,
+            Release::Region => 3,
+        }
+    }
+
+    let mut bytes = b"align-test-control-runtime-abi-v2\0".to_vec();
     for key in [
         UnkeyedRuntimeKey::TestLaunchRecvV1,
         UnkeyedRuntimeKey::TestFdCloexecV1,
@@ -2529,23 +3276,27 @@ pub(super) fn test_control_fingerprint() -> Vec<u8> {
     ] {
         let abi = unkeyed_runtime_abi(key);
         let spec = shape_spec(abi.shape);
+        let effects = runtime_effects(abi.key);
         bytes.push(key as u8);
         bytes.extend_from_slice(&(abi.symbol.len() as u32).to_le_bytes());
         bytes.extend_from_slice(abi.symbol.as_bytes());
         bytes.push(native_return_tag(spec.ret));
         bytes.extend_from_slice(&(spec.params.len() as u32).to_le_bytes());
         bytes.extend(spec.params.iter().copied().map(native_type_tag));
-        bytes.push(u8::from(spec.return_noalias));
-        bytes.push(u8::from(spec.memory_argmem_read));
-        bytes.extend_from_slice(&(spec.fn_attrs.len() as u32).to_le_bytes());
-        for attribute in spec.fn_attrs {
-            bytes.extend_from_slice(&(attribute.len() as u32).to_le_bytes());
-            bytes.extend_from_slice(attribute.as_bytes());
+        bytes.push(effect_class_tag(effects.class));
+        bytes.push(argmem_tag(effects.argmem));
+        bytes.extend_from_slice(&(effects.params.len() as u32).to_le_bytes());
+        for param in effects.params {
+            bytes.extend_from_slice(&param.ordinal.to_le_bytes());
+            bytes.push(param_mode_tag(param.mode));
         }
-        bytes.extend_from_slice(&(spec.read_ptr_params.len() as u32).to_le_bytes());
-        for ordinal in spec.read_ptr_params {
+        bytes.extend_from_slice(&(effects.escapes.len() as u32).to_le_bytes());
+        for ordinal in effects.escapes {
             bytes.extend_from_slice(&ordinal.to_le_bytes());
         }
+        bytes.push(release_tag(effects.releases));
+        bytes.push(u8::from(effects.returns_fresh));
+        bytes.push(u8::from(effects.diverges));
     }
     bytes
 }
@@ -2636,10 +3387,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
         RuntimeAbiShape::A00 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
             params: &[NativeType::Ptr, NativeType::I64],
-            return_noalias: false,
-            fn_attrs: &["nofree", "nosync", "willreturn"],
-            memory_argmem_read: false,
-            read_ptr_params: &[0],
         },
         RuntimeAbiShape::A01 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
@@ -2649,10 +3396,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::Ptr,
                 NativeType::I64,
             ],
-            return_noalias: false,
-            fn_attrs: &["nofree", "nosync", "willreturn"],
-            memory_argmem_read: true,
-            read_ptr_params: &[0, 2],
         },
         RuntimeAbiShape::A02 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
@@ -2662,26 +3405,14 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::Ptr,
                 NativeType::I64,
             ],
-            return_noalias: false,
-            fn_attrs: &["nofree", "nosync", "willreturn"],
-            memory_argmem_read: false,
-            read_ptr_params: &[0, 2],
         },
         RuntimeAbiShape::A03 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
             params: &[NativeType::Ptr],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A04 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
             params: &[NativeType::Ptr, NativeType::I64],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A05 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
@@ -2691,10 +3422,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I32,
                 NativeType::Ptr,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A06 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
@@ -2705,10 +3432,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::Ptr,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A07 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
@@ -2718,18 +3441,10 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::Ptr,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A08 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
             params: &[NativeType::Ptr, NativeType::I64, NativeType::Ptr],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A09 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
@@ -2739,10 +3454,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::Ptr,
                 NativeType::I64,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A10 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
@@ -2757,10 +3468,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::Ptr,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A12 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
@@ -2771,10 +3478,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::Ptr,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A13 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
@@ -2788,10 +3491,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::Ptr,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A15 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
@@ -2806,10 +3505,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::Ptr,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A16 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
@@ -2824,10 +3519,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::I64,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A17 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
@@ -2837,10 +3528,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::Ptr,
                 NativeType::Ptr,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A18 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
@@ -2856,26 +3543,14 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::I64,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A19 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
             params: &[NativeType::Ptr, NativeType::Ptr],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A20 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
             params: &[NativeType::Ptr, NativeType::Ptr, NativeType::I64],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A21 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
@@ -2886,10 +3561,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::Ptr,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A22 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
@@ -2899,10 +3570,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::Ptr,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A23 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
@@ -2914,34 +3581,18 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::Ptr,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A24 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
             params: &[NativeType::Ptr, NativeType::Ptr, NativeType::Ptr],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A25 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I64,
             params: &[],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A26 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I64,
             params: &[NativeType::Ptr, NativeType::I64],
-            return_noalias: false,
-            fn_attrs: &["nofree", "nosync", "willreturn"],
-            memory_argmem_read: true,
-            read_ptr_params: &[0],
         },
         RuntimeAbiShape::A27 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I64,
@@ -2951,42 +3602,22 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::Ptr,
                 NativeType::I64,
             ],
-            return_noalias: false,
-            fn_attrs: &["nofree", "nosync", "willreturn"],
-            memory_argmem_read: false,
-            read_ptr_params: &[0, 2],
         },
         RuntimeAbiShape::A28 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I64,
             params: &[NativeType::Ptr, NativeType::Ptr, NativeType::I64],
-            return_noalias: false,
-            fn_attrs: &["nofree", "nosync", "willreturn"],
-            memory_argmem_read: false,
-            read_ptr_params: &[0, 1],
         },
         RuntimeAbiShape::A29 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I64,
             params: &[NativeType::Ptr],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A30 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I64,
             params: &[NativeType::Ptr, NativeType::I64],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A31 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I64,
             params: &[NativeType::Ptr, NativeType::I64, NativeType::I64],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A32 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I64,
@@ -3000,10 +3631,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::Ptr,
                 NativeType::I64,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A33 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I64,
@@ -3017,10 +3644,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::Ptr,
                 NativeType::I64,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A34 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I64,
@@ -3033,10 +3656,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::Ptr,
                 NativeType::I64,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A35 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I64,
@@ -3047,26 +3666,14 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::Ptr,
                 NativeType::I64,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A36 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I64,
             params: &[NativeType::Ptr, NativeType::Ptr],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A37 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I64,
             params: &[NativeType::Ptr, NativeType::Ptr, NativeType::I64],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A38 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I64,
@@ -3076,10 +3683,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::I64,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A39 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I64,
@@ -3092,10 +3695,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::Ptr,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A40 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I64,
@@ -3107,10 +3706,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::I64,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A41 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I64,
@@ -3122,42 +3717,22 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::Ptr,
                 NativeType::I64,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A42 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,
             params: &[],
-            return_noalias: true,
-            fn_attrs: &["nofree", "nounwind"],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A43 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,
             params: &[NativeType::I64],
-            return_noalias: true,
-            fn_attrs: &["nofree", "nounwind"],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A44 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,
             params: &[NativeType::Ptr, NativeType::I64],
-            return_noalias: true,
-            fn_attrs: &["nofree", "nounwind"],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A45 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,
             params: &[NativeType::Ptr, NativeType::I64, NativeType::I64],
-            return_noalias: true,
-            fn_attrs: &["nounwind"],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A46 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,
@@ -3170,90 +3745,46 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::Ptr,
             ],
-            return_noalias: true,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A47 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,
             params: &[],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A48 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,
             params: &[NativeType::I32, NativeType::I32],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::ArrayBuilderCapacity => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,
             params: &[NativeType::I64, NativeType::I64],
-            return_noalias: true,
-            fn_attrs: &["nofree", "nounwind"],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::ArrayBuilderRegionCapacity => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,
             params: &[NativeType::Ptr, NativeType::I64, NativeType::I64, NativeType::I64],
-            return_noalias: true,
-            fn_attrs: &["nounwind"],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::ArrayBuilderStackCapacity => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,
             params: &[NativeType::Ptr, NativeType::I64, NativeType::I64],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::BufferAppendFilled => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
             params: &[NativeType::Ptr, NativeType::I64, NativeType::I8],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::BufferFilled => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,
             params: &[NativeType::I64, NativeType::I8],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A49 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,
             params: &[NativeType::I64],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A50 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,
             params: &[NativeType::Ptr],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A51 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,
             params: &[NativeType::Ptr, NativeType::I64],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A52 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,
@@ -3263,122 +3794,62 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::Ptr,
                 NativeType::I64,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A53 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,
             params: &[NativeType::Ptr, NativeType::Ptr, NativeType::I64],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A54 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
             params: &[],
-            return_noalias: false,
-            fn_attrs: &["noreturn"],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A55 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
             params: &[NativeType::F64],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A56 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
             params: &[NativeType::F32],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A57 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
             params: &[NativeType::I32],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A58 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
             params: &[NativeType::I64],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A59 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
             params: &[NativeType::I64],
-            return_noalias: false,
-            fn_attrs: &["noreturn"],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A60 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
             params: &[NativeType::I64, NativeType::I64],
-            return_noalias: false,
-            fn_attrs: &["noreturn"],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A61 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
             params: &[NativeType::I64, NativeType::I64, NativeType::I64],
-            return_noalias: false,
-            fn_attrs: &["noreturn"],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A62 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
             params: &[NativeType::Ptr],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A63 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
             params: &[NativeType::Ptr, NativeType::F64],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A64 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
             params: &[NativeType::Ptr, NativeType::F32],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A65 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
             params: &[NativeType::Ptr, NativeType::I32],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A66 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
             params: &[NativeType::Ptr, NativeType::I64],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A67 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
@@ -3388,10 +3859,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::I32,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A68 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
@@ -3402,10 +3869,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::Ptr,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A69 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
@@ -3415,10 +3878,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::Ptr,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A70 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
@@ -3429,10 +3888,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::Ptr,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A71 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
@@ -3442,26 +3897,14 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::Ptr,
                 NativeType::Ptr,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A72 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
             params: &[NativeType::Ptr, NativeType::Ptr],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A73 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
             params: &[NativeType::Ptr, NativeType::Ptr, NativeType::I64],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A74 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
@@ -3471,10 +3914,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::I32,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A75 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
@@ -3484,10 +3923,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::I64,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A76 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
@@ -3499,10 +3934,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::Ptr,
                 NativeType::I64,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A77 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
@@ -3513,10 +3944,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::Ptr,
                 NativeType::I64,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A78 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
@@ -3528,18 +3955,10 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::I64,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A79 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
             params: &[NativeType::Ptr, NativeType::Ptr, NativeType::Ptr],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A80 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
@@ -3549,10 +3968,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::Ptr,
                 NativeType::I64,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A81 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
@@ -3564,34 +3979,18 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::Ptr,
                 NativeType::Ptr,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A82 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I64Pair,
             params: &[NativeType::Ptr, NativeType::I64],
-            return_noalias: false,
-            fn_attrs: &["nofree", "nosync", "willreturn"],
-            memory_argmem_read: true,
-            read_ptr_params: &[0],
         },
         RuntimeAbiShape::A83 => RuntimeAbiShapeSpec {
             ret: NativeReturn::PtrLen,
             params: &[NativeType::Ptr],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A84 => RuntimeAbiShapeSpec {
             ret: NativeReturn::PtrLen,
             params: &[NativeType::Ptr, NativeType::I64],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A85 => RuntimeAbiShapeSpec {
             ret: NativeReturn::PtrLen,
@@ -3601,10 +4000,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::I64,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A86 => RuntimeAbiShapeSpec {
             ret: NativeReturn::PtrLen,
@@ -3614,18 +4009,10 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::Ptr,
                 NativeType::I64,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A87 => RuntimeAbiShapeSpec {
             ret: NativeReturn::PtrLen,
             params: &[NativeType::Ptr, NativeType::Ptr, NativeType::I64],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A88 => RuntimeAbiShapeSpec {
             ret: NativeReturn::PtrLen,
@@ -3636,10 +4023,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::I64,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A89 => RuntimeAbiShapeSpec {
             ret: NativeReturn::PtrLen,
@@ -3653,10 +4036,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::Ptr,
                 NativeType::Ptr,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A90 => RuntimeAbiShapeSpec {
             ret: NativeReturn::PtrLen,
@@ -3668,106 +4047,54 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::I32,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A91 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
             params: &[NativeType::I32],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A92 => RuntimeAbiShapeSpec {
             ret: NativeReturn::PtrLen,
             params: &[NativeType::I32, NativeType::Ptr],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A93 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
             params: &[NativeType::Ptr],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A94 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,
             params: &[NativeType::Ptr, NativeType::I64],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A95 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
             params: &[NativeType::Ptr, NativeType::Ptr],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A96 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
             params: &[NativeType::F32],
-            return_noalias: false,
-            fn_attrs: &["nofree", "nosync", "willreturn"],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A97 => RuntimeAbiShapeSpec {
             ret: NativeReturn::F32,
             params: &[NativeType::I32],
-            return_noalias: false,
-            fn_attrs: &["nofree", "nosync", "willreturn"],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A98 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I64,
             params: &[NativeType::F64],
-            return_noalias: false,
-            fn_attrs: &["nofree", "nosync", "willreturn"],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A99 => RuntimeAbiShapeSpec {
             ret: NativeReturn::F64,
             params: &[NativeType::I64],
-            return_noalias: false,
-            fn_attrs: &["nofree", "nosync", "willreturn"],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A100 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I64,
             params: &[NativeType::F32],
-            return_noalias: false,
-            fn_attrs: &["nofree", "nosync", "willreturn"],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A101 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I64,
             params: &[NativeType::F32, NativeType::Ptr, NativeType::I64],
-            return_noalias: false,
-            fn_attrs: &["nofree", "nosync", "willreturn"],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A102 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I64,
             params: &[NativeType::F64, NativeType::Ptr, NativeType::I64],
-            return_noalias: false,
-            fn_attrs: &["nofree", "nosync", "willreturn"],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A103 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
@@ -3783,10 +4110,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::Ptr,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A104 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
@@ -3802,26 +4125,14 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::Ptr,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A105 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
             params: &[NativeType::Ptr, NativeType::I64, NativeType::Ptr, NativeType::Ptr, NativeType::Ptr],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A106 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
             params: &[NativeType::I32, NativeType::Ptr, NativeType::I64, NativeType::Ptr],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A107 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
@@ -3833,10 +4144,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::Ptr,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A108 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
@@ -3847,10 +4154,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::Ptr,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A109 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
@@ -3863,34 +4166,18 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::Ptr,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A110 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
             params: &[NativeType::I32, NativeType::Ptr],
-            return_noalias: false,
-            fn_attrs: &["nounwind"],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A111 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
             params: &[NativeType::I32],
-            return_noalias: false,
-            fn_attrs: &["nounwind"],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A112 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
             params: &[NativeType::I32, NativeType::I32],
-            return_noalias: false,
-            fn_attrs: &["nounwind"],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A113 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
@@ -3901,26 +4188,14 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I32,
                 NativeType::I32,
             ],
-            return_noalias: false,
-            fn_attrs: &["nounwind"],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A114 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,
             params: &[NativeType::Ptr, NativeType::I32],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A115 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
             params: &[NativeType::Ptr, NativeType::I32],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A116 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
@@ -3930,34 +4205,18 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::Ptr,
                 NativeType::I64,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A117 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
             params: &[NativeType::Ptr, NativeType::I32, NativeType::Ptr],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A118 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
             params: &[NativeType::Ptr, NativeType::I64],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A119 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
             params: &[NativeType::I64, NativeType::Ptr],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A120 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
@@ -3968,10 +4227,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::Ptr,
                 NativeType::I64,
             ],
-            return_noalias: false,
-            fn_attrs: &[],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A121 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
@@ -3983,10 +4238,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::Ptr,
             ],
-            return_noalias: false,
-            fn_attrs: &["nounwind"],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A122 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
@@ -4000,47 +4251,34 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::Ptr,
             ],
-            return_noalias: false,
-            fn_attrs: &["nounwind"],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
         RuntimeAbiShape::A124 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
             params: &[NativeType::Ptr, NativeType::I64, NativeType::I32],
-            return_noalias: false, fn_attrs: &["nounwind"], memory_argmem_read: false, read_ptr_params: &[],
         },
         RuntimeAbiShape::A127 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr, params: &[NativeType::Ptr, NativeType::I32, NativeType::I64],
-            return_noalias: false, fn_attrs: &["nounwind"], memory_argmem_read: false, read_ptr_params: &[],
         },
         RuntimeAbiShape::A131 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void, params: &[NativeType::Ptr, NativeType::I8],
-            return_noalias: false, fn_attrs: &[], memory_argmem_read: false, read_ptr_params: &[],
         },
         RuntimeAbiShape::A132 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32, params: &[NativeType::Ptr, NativeType::I32, NativeType::I64, NativeType::Ptr],
-            return_noalias: false, fn_attrs: &[], memory_argmem_read: false, read_ptr_params: &[],
         },
         RuntimeAbiShape::A136 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32, params: &[NativeType::Ptr, NativeType::I8, NativeType::I8, NativeType::I8, NativeType::Ptr],
-            return_noalias: false, fn_attrs: &[], memory_argmem_read: false, read_ptr_params: &[],
         },
         RuntimeAbiShape::A137 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32, params: &[NativeType::Ptr, NativeType::Ptr, NativeType::I64, NativeType::I8, NativeType::I8, NativeType::I8, NativeType::Ptr],
-            return_noalias: false, fn_attrs: &[], memory_argmem_read: false, read_ptr_params: &[],
         },
         RuntimeAbiShape::A135 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32, params: &[NativeType::I32,NativeType::I64,NativeType::Ptr],
-            return_noalias: false, fn_attrs: &[], memory_argmem_read: false, read_ptr_params: &[],
         },
         RuntimeAbiShape::A134 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32, params: &[NativeType::I32, NativeType::Ptr],
-            return_noalias: false, fn_attrs: &[], memory_argmem_read: false, read_ptr_params: &[],
         },
         RuntimeAbiShape::A133 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I64, params: &[NativeType::I32],
-            return_noalias: false, fn_attrs: &[], memory_argmem_read: false, read_ptr_params: &[],
         },
         RuntimeAbiShape::A128 | RuntimeAbiShape::A129 | RuntimeAbiShape::A130 => {
             let base = match shape {
@@ -4048,17 +4286,15 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 RuntimeAbiShape::A129 => RuntimeAbiShape::A64,
                 _ => RuntimeAbiShape::A63,
             };
-            RuntimeAbiShapeSpec { fn_attrs: &["nounwind"], ..shape_spec(base) }
+            RuntimeAbiShapeSpec { ..shape_spec(base) }
         },
         RuntimeAbiShape::A126 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
             params: &[NativeType::Ptr, NativeType::Ptr, NativeType::I64, NativeType::I32],
-            return_noalias: false, fn_attrs: &[], memory_argmem_read: false, read_ptr_params: &[],
         },
         RuntimeAbiShape::A125 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
             params: &[NativeType::Ptr, NativeType::Ptr, NativeType::I64, NativeType::I32],
-            return_noalias: false, fn_attrs: &["nounwind"], memory_argmem_read: false, read_ptr_params: &[],
         },
         RuntimeAbiShape::A123 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
@@ -4073,10 +4309,6 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
                 NativeType::I64,
                 NativeType::Ptr,
             ],
-            return_noalias: false,
-            fn_attrs: &["nounwind"],
-            memory_argmem_read: false,
-            read_ptr_params: &[],
         },
     }
 }
@@ -4084,14 +4316,23 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
 #[cfg(test)]
 mod tests {
     use super::{
-        RuntimeAbiId, UNKEYED_RUNTIME_KEYS, is_test_control_key, keyed_runtime_abis, native_extern_abi_matches,
-        runtime_abi, runtime_abi_by_id, runtime_abi_for_symbol, runtime_abis, unkeyed_symbol,
-        validate_registry,
+        ArgMem, EffectClass, ParamEffect, ParamMode, Release, RuntimeAbiId, UNKEYED_RUNTIME_KEYS,
+        effects_admit_rt_lto, has_rt_lto_measurement, is_test_control_key, keyed_runtime_abis,
+        native_extern_abi_matches, runtime_abi,
+        runtime_abi_by_id, runtime_abi_for_symbol, runtime_abis, runtime_effects, unkeyed_symbol,
+        validate_effects, validate_registry,
     };
     use align_mir::RuntimeKey;
     use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FunctionType};
     use std::collections::HashSet;
     use std::fmt::Write;
+
+    fn golden_prefix(kind: &str, id: &str, logical: Option<&str>, class: EffectClass) -> String {
+        match logical {
+            Some(logical) => format!("{kind}|{id}|{logical}|{class:?}"),
+            None => format!("{kind}|{id}|{class:?}"),
+        }
+    }
 
     fn rebuilt_function_type<'c>(
         ctx: &'c inkwell::context::Context,
@@ -4113,7 +4354,7 @@ mod tests {
             UNKEYED_RUNTIME_KEYS.map(|key| key as u8),
             [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
         );
-        validate_registry().unwrap();
+        validate_registry().unwrap_or_else(|error| panic!("valid runtime registry: {error}"));
         let rows: Vec<_> = runtime_abis().collect();
         assert_eq!(rows.len(), 464);
         assert_eq!(
@@ -4149,6 +4390,132 @@ mod tests {
             assert_eq!(runtime_abi_for_symbol(symbol), Some(id));
         }
         assert!(runtime_abi_for_symbol("align_rt_not_a_fixed_row").is_none());
+    }
+
+    #[test]
+    fn runtime_effects_registry_is_total_and_structurally_valid() {
+        validate_registry().unwrap();
+        assert_eq!(runtime_abis().map(|abi| runtime_effects(abi.key)).count(), 464);
+
+        let expect_rule = |abi, effects, rule: &str| {
+            let error = validate_effects(abi, effects).unwrap_err();
+            assert!(error.contains(rule), "expected {rule}, got {error}");
+        };
+        let hash = runtime_abi(RuntimeKey::Hash64);
+        let base = runtime_effects(hash.key);
+
+        expect_rule(
+            hash,
+            super::RuntimeEffects {
+                params: &[ParamEffect { ordinal: 1, mode: ParamMode::Read }],
+                ..base
+            },
+            "V2",
+        );
+        expect_rule(hash, super::RuntimeEffects { escapes: &[1], ..base }, "V3");
+        expect_rule(
+            hash,
+            super::RuntimeEffects {
+                params: &[ParamEffect { ordinal: 0, mode: ParamMode::Write }],
+                ..base
+            },
+            "V4",
+        );
+        expect_rule(
+            hash,
+            super::RuntimeEffects {
+                params: &[ParamEffect { ordinal: 0, mode: ParamMode::Opaque }],
+                ..base
+            },
+            "V4",
+        );
+        expect_rule(
+            hash,
+            super::RuntimeEffects {
+                class: EffectClass::Callback,
+                argmem: ArgMem::Unstated,
+                ..base
+            },
+            "V4",
+        );
+        expect_rule(hash, super::RuntimeEffects { argmem: ArgMem::None, ..base }, "V5");
+
+        let dispatch = runtime_abi(RuntimeKey::Utf8Valid);
+        expect_rule(
+            dispatch,
+            super::RuntimeEffects {
+                argmem: ArgMem::Read,
+                ..runtime_effects(dispatch.key)
+            },
+            "V6",
+        );
+        expect_rule(hash, super::RuntimeEffects { returns_fresh: true, ..base }, "V7");
+        expect_rule(hash, super::RuntimeEffects { diverges: true, ..base }, "V8");
+        expect_rule(
+            hash,
+            super::RuntimeEffects {
+                releases: Release::HandleOnly,
+                ..base
+            },
+            "V9",
+        );
+        expect_rule(
+            hash,
+            super::RuntimeEffects {
+                class: EffectClass::PureScalar,
+                argmem: ArgMem::None,
+                params: &[],
+                ..base
+            },
+            "V10",
+        );
+    }
+
+    #[test]
+    fn runtime_effects_class_mutation_changes_the_golden() {
+        let effects = runtime_effects(RuntimeAbiId::Keyed(RuntimeKey::Hash64));
+        let actual = golden_prefix("key", "Hash64", Some("hash64"), effects.class);
+        let mutated = golden_prefix("key", "Hash64", Some("hash64"), EffectClass::HostState);
+        assert_ne!(actual, mutated);
+        assert_eq!(actual, "key|Hash64|hash64|PureArgRead");
+    }
+
+    #[test]
+    fn rt_lto_admission_predicate_matches_the_guarded_set() {
+        let measured: Vec<_> = runtime_abis()
+            .filter(|abi| has_rt_lto_measurement(abi.key))
+            .map(|abi| abi.symbol)
+            .collect();
+        assert_eq!(
+            measured,
+            [
+                "align_rt_str_ends_with",
+                "align_rt_str_eq",
+                "align_rt_str_eq_ignore_case",
+                "align_rt_str_starts_with",
+            ],
+        );
+        for abi in runtime_abis() {
+            assert_eq!(
+                abi.is_rt_lto_guarded(),
+                has_rt_lto_measurement(abi.key) && effects_admit_rt_lto(runtime_effects(abi.key)),
+            );
+        }
+
+        let base = runtime_effects(RuntimeAbiId::Keyed(RuntimeKey::StrEq));
+        assert!(!effects_admit_rt_lto(super::RuntimeEffects {
+            class: EffectClass::HostState,
+            argmem: ArgMem::Unstated,
+            ..base
+        }));
+        assert!(!effects_admit_rt_lto(super::RuntimeEffects {
+            escapes: &[0],
+            ..base
+        }));
+        assert!(!effects_admit_rt_lto(super::RuntimeEffects {
+            releases: Release::HandleOnly,
+            ..base
+        }));
     }
 
     #[test]
@@ -4223,8 +4590,13 @@ mod tests {
             let abi = runtime_abi(key);
             writeln!(
                 actual,
-                "key|{key:?}|{}|{}",
-                key.logical_name(),
+                "{}|{}",
+                golden_prefix(
+                    "key",
+                    &format!("{key:?}"),
+                    Some(key.logical_name()),
+                    runtime_effects(abi.key).class,
+                ),
                 declaration(abi.symbol),
             )
             .unwrap();
@@ -4232,7 +4604,13 @@ mod tests {
         for key in UNKEYED_RUNTIME_KEYS {
             writeln!(
                 actual,
-                "unkeyed|{key:?}|{}",
+                "{}|{}",
+                golden_prefix(
+                    "unkeyed",
+                    &format!("{key:?}"),
+                    None,
+                    runtime_effects(RuntimeAbiId::Unkeyed(key)).class,
+                ),
                 declaration(unkeyed_symbol(key)),
             )
             .unwrap();

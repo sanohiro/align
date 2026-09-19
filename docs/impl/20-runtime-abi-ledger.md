@@ -92,6 +92,508 @@ No new probe category was introduced. The implemented `pkg.kv` row reuses an exi
 independently useful prerequisites first hardened the shared TCP timeout substrate and existing
 TCP-derived writers without changing a symbol, key, shape, attribute, or count.
 
+## Runtime effect classification
+
+Every one of the 464 base rows has one `RuntimeEffects` record in
+`align_codegen_llvm::runtime_abi`. The record is a total match over
+`RuntimeAbiId`; there is no unclassified/default arm. Its exact fields are
+`class`, `argmem`, per-pointer `params`, `escapes`, `releases`,
+`returns_fresh`, and `diverges`. `escapes` is conservative: a pointer absent
+from it receives `captures(none)`, so an unaudited withheld row lists every
+pointer ordinal rather than making an optimistic capture claim. The checked-in
+declaration golden owns the emitted declaration and the class token together.
+
+| Registry row | Physical symbol | `EffectClass` |
+|---|---|---|
+| `Alloc` | `align_rt_alloc` | `AllocNew` |
+| `AllocSizeFail` | `align_rt_alloc_size_fail` | `FailNoReturn` |
+| `ArenaAlloc` | `align_rt_arena_alloc` | `IndirectStorage` |
+| `ArenaBegin` | `align_rt_arena_begin` | `AllocNew` |
+| `ArenaEnd` | `align_rt_arena_end` | `HostState` |
+| `ArrayBuilderAppend` | `align_rt_array_builder_append` | `IndirectStorage` |
+| `ArrayBuilderBuild` | `align_rt_array_builder_build` | `IndirectStorage` |
+| `ArrayBuilderBuildStack` | `align_rt_array_builder_build_stack` | `IndirectStorage` |
+| `ArrayBuilderFree` | `align_rt_array_builder_free` | `IndirectStorage` |
+| `ArrayBuilderFreeStack` | `align_rt_array_builder_free_stack` | `IndirectStorage` |
+| `ArrayBuilderFreeStrings` | `align_rt_array_builder_free_strings` | `IndirectStorage` |
+| `ArrayBuilderFreeStringsStack` | `align_rt_array_builder_free_strings_stack` | `IndirectStorage` |
+| `ArrayBuilderInitStack` | `align_rt_array_builder_init_stack` | `IndirectStorage` |
+| `ArrayBuilderNew` | `align_rt_array_builder_new` | `AllocNew` |
+| `ArrayBuilderNewIn` | `align_rt_array_builder_new_in` | `IndirectStorage` |
+| `ArrayBuilderPush` | `align_rt_array_builder_push` | `IndirectStorage` |
+| `ArrayBuilderPushBytes` | `align_rt_array_builder_push_bytes` | `IndirectStorage` |
+| `ArrayBuilderPushStr` | `align_rt_array_builder_push_str` | `IndirectStorage` |
+| `Base64Decode` | `align_rt_base64_decode` | `IndirectStorage` |
+| `Base64Encode` | `align_rt_base64_encode` | `ArgRead` |
+| `Base64urlDecode` | `align_rt_base64url_decode` | `IndirectStorage` |
+| `Base64urlEncode` | `align_rt_base64url_encode` | `ArgRead` |
+| `BoundsFail` | `align_rt_bounds_fail` | `FailNoReturn` |
+| `BufferAppend` | `align_rt_buffer_append` | `IndirectStorage` |
+| `BufferAppendFilled` | `align_rt_buffer_append_filled` | `IndirectStorage` |
+| `BufferBytes` | `align_rt_buffer_bytes` | `IndirectStorage` |
+| `BufferCapacity` | `align_rt_buffer_capacity` | `IndirectStorage` |
+| `BufferFilled` | `align_rt_buffer_filled` | `AllocNew` |
+| `BufferFree` | `align_rt_buffer_free` | `IndirectStorage` |
+| `BufferLen` | `align_rt_buffer_len` | `IndirectStorage` |
+| `BufferNew` | `align_rt_buffer_new` | `AllocNew` |
+| `BufferPut` | `align_rt_buffer_put` | `IndirectStorage` |
+| `BuilderFinish` | `align_rt_builder_finish` | `IndirectStorage` |
+| `BuilderFinishStack` | `align_rt_builder_finish_stack` | `IndirectStorage` |
+| `BuilderFree` | `align_rt_builder_free` | `IndirectStorage` |
+| `BuilderFreeStack` | `align_rt_builder_free_stack` | `IndirectStorage` |
+| `BuilderInitStack` | `align_rt_builder_init_stack` | `IndirectStorage` |
+| `BuilderIntoString` | `align_rt_builder_into_string` | `IndirectStorage` |
+| `BuilderIntoStringStack` | `align_rt_builder_into_string_stack` | `IndirectStorage` |
+| `BuilderNew` | `align_rt_builder_new` | `AllocNew` |
+| `BuilderPopComma` | `align_rt_builder_pop_comma` | `IndirectStorage` |
+| `BuilderWrite` | `align_rt_builder_write` | `IndirectStorage` |
+| `BuilderWriteBool` | `align_rt_builder_write_bool` | `IndirectStorage` |
+| `BuilderWriteChar` | `align_rt_builder_write_char` | `IndirectStorage` |
+| `BuilderWriteF32` | `align_rt_builder_write_f32` | `IndirectStorage` |
+| `BuilderWriteF64` | `align_rt_builder_write_f64` | `IndirectStorage` |
+| `BuilderWriteInt` | `align_rt_builder_write_int` | `IndirectStorage` |
+| `BuilderWriteJsonStr` | `align_rt_builder_write_json_str` | `IndirectStorage` |
+| `BuilderWriteStrIntStr` | `align_rt_builder_write_str_int_str` | `IndirectStorage` |
+| `BuilderWriteUint` | `align_rt_builder_write_uint` | `IndirectStorage` |
+| `BytesAsStr` | `align_rt_bytes_as_str` | `IndirectStorage` |
+| `ChildFree` | `align_rt_child_free` | `HostState` |
+| `ChildGroupMembers` | `align_rt_child_group_members` | `HostState` |
+| `ChildId` | `align_rt_child_id` | `HostState` |
+| `ChildKill` | `align_rt_child_kill` | `HostState` |
+| `ChildKillGroup` | `align_rt_child_kill_group` | `HostState` |
+| `ChildPoll` | `align_rt_child_poll` | `HostState` |
+| `ChildReadStderr` | `align_rt_child_read_stderr` | `HostState` |
+| `ChildReadStdout` | `align_rt_child_read_stdout` | `HostState` |
+| `ChildStatus` | `align_rt_child_status` | `HostState` |
+| `ChildTryWait` | `align_rt_child_try_wait` | `HostState` |
+| `ChildWait` | `align_rt_child_wait` | `HostState` |
+| `Chunks` | `align_rt_chunks` | `ArgRead` |
+| `CliCommand` | `align_rt_cli_command_new` | `AllocNew` |
+| `CliCommandFree` | `align_rt_cli_command_free` | `IndirectStorage` |
+| `CliFlagBool` | `align_rt_cli_flag_bool` | `IndirectStorage` |
+| `CliFlagI64` | `align_rt_cli_flag_i64` | `IndirectStorage` |
+| `CliFlagStr` | `align_rt_cli_flag_str` | `IndirectStorage` |
+| `CliGetBool` | `align_rt_cli_get_bool` | `IndirectStorage` |
+| `CliGetI64` | `align_rt_cli_get_i64` | `IndirectStorage` |
+| `CliGetStr` | `align_rt_cli_get_str` | `IndirectStorage` |
+| `CliParse` | `align_rt_cli_parse` | `IndirectStorage` |
+| `CliParsedFree` | `align_rt_cli_parsed_free` | `IndirectStorage` |
+| `CliUsage` | `align_rt_cli_usage` | `IndirectStorage` |
+| `CodecEncoderFinishV1` | `align_rt_codec_encoder_finish_v1` | `IndirectStorage` |
+| `CodecEncoderFreeV1` | `align_rt_codec_encoder_free_v1` | `IndirectStorage` |
+| `CodecEncoderNewV1` | `align_rt_codec_encoder_new_v1` | `IndirectStorage` |
+| `CodecEncoderPutBoolV1` | `align_rt_codec_encoder_put_bool_v1` | `IndirectStorage` |
+| `CodecEncoderPutF64V1` | `align_rt_codec_encoder_put_f64_v1` | `IndirectStorage` |
+| `CodecEncoderPutI64V1` | `align_rt_codec_encoder_put_i64_v1` | `IndirectStorage` |
+| `CodecEncoderPutStrV1` | `align_rt_codec_encoder_put_str_v1` | `IndirectStorage` |
+| `CodecOpenV1` | `align_rt_codec_open_v1` | `IndirectStorage` |
+| `CommandCwd` | `align_rt_command_cwd` | `HostState` |
+| `CommandEnv` | `align_rt_command_env` | `HostState` |
+| `CommandEnvClear` | `align_rt_command_env_clear` | `HostState` |
+| `CommandFree` | `align_rt_command_free` | `HostState` |
+| `CommandImage` | `align_rt_command_image` | `HostState` |
+| `CommandInheritFile` | `align_rt_command_inherit_file` | `HostState` |
+| `CommandInheritNamespace` | `align_rt_command_inherit_namespace` | `HostState` |
+| `CommandMaxCapture` | `align_rt_command_max_capture` | `HostState` |
+| `CommandNew` | `align_rt_command_new` | `IndirectStorage` |
+| `CommandNewSession` | `align_rt_command_new_session` | `HostState` |
+| `CommandRun` | `align_rt_command_run` | `HostState` |
+| `CommandRunBytes` | `align_rt_command_run_bytes` | `HostState` |
+| `CommandStart` | `align_rt_command_start` | `HostState` |
+| `CommandStartScope` | `align_rt_command_start_scope` | `HostState` |
+| `CommandStderrTo` | `align_rt_command_stderr_to` | `HostState` |
+| `CommandStdoutTo` | `align_rt_command_stdout_to` | `HostState` |
+| `CommandTimeout` | `align_rt_command_timeout` | `HostState` |
+| `CompressGzipCompress` | `align_rt_compress_gzip_compress` | `Foreign` |
+| `CompressGzipDecompress` | `align_rt_compress_gzip_decompress` | `Foreign` |
+| `CompressZstdCompress` | `align_rt_compress_zstd_compress` | `Foreign` |
+| `CompressZstdDecompress` | `align_rt_compress_zstd_decompress` | `Foreign` |
+| `CryptoAesGcmOpen` | `align_rt_crypto_aes_gcm_open` | `Foreign` |
+| `CryptoAesGcmSeal` | `align_rt_crypto_aes_gcm_seal` | `Foreign` |
+| `CryptoArgon2id` | `align_rt_crypto_argon2id` | `Foreign` |
+| `CryptoChacha20Poly1305Open` | `align_rt_crypto_chacha20_poly1305_open` | `Foreign` |
+| `CryptoChacha20Poly1305Seal` | `align_rt_crypto_chacha20_poly1305_seal` | `Foreign` |
+| `CryptoCtEqual` | `align_rt_crypto_ct_equal` | `Foreign` |
+| `CryptoDigestFinish` | `align_rt_crypto_digest_finish` | `Foreign` |
+| `CryptoDigestFree` | `align_rt_crypto_digest_free` | `Foreign` |
+| `CryptoDigestNew` | `align_rt_crypto_digest_new` | `Foreign` |
+| `CryptoDigestUpdate` | `align_rt_crypto_digest_update` | `Foreign` |
+| `CryptoHkdfSha256` | `align_rt_crypto_hkdf_sha256` | `Foreign` |
+| `CryptoHmacSha256` | `align_rt_crypto_hmac_sha256` | `Foreign` |
+| `CryptoKeyFree` | `align_rt_crypto_key_free` | `Foreign` |
+| `CryptoPrivateKeyFromPem` | `align_rt_crypto_private_key_from_pem` | `Foreign` |
+| `CryptoPublicKeyFromJwk` | `align_rt_crypto_public_key_from_jwk` | `Foreign` |
+| `CryptoPublicKeyFromPem` | `align_rt_crypto_public_key_from_pem` | `Foreign` |
+| `CryptoRandom` | `align_rt_crypto_random` | `HostState` |
+| `CryptoSha1` | `align_rt_crypto_sha1` | `Foreign` |
+| `CryptoSha256` | `align_rt_crypto_sha256` | `Foreign` |
+| `CryptoSha512` | `align_rt_crypto_sha512` | `Foreign` |
+| `CryptoSign` | `align_rt_crypto_sign` | `Foreign` |
+| `CryptoVerify` | `align_rt_crypto_verify` | `Foreign` |
+| `CsvDecodeSoaV1` | `align_rt_csv_decode_soa_v1` | `IndirectStorage` |
+| `DictEncodeStr` | `align_rt_dict_encode_str` | `IndirectStorage` |
+| `DictLookup` | `align_rt_dict_lookup` | `IndirectStorage` |
+| `DivFail` | `align_rt_div_fail` | `FailNoReturn` |
+| `DnsResolve` | `align_rt_dns_resolve` | `HostState` |
+| `EnvGet` | `align_rt_env_get` | `HostState` |
+| `EnvSet` | `align_rt_env_set` | `HostState` |
+| `FormDecode` | `align_rt_form_decode` | `IndirectStorage` |
+| `FormEncode` | `align_rt_form_encode` | `ArgRead` |
+| `FrameInnerJoinI64V1` | `align_rt_frame_inner_join_i64_v1` | `IndirectStorage` |
+| `FrameInnerJoinStrV1` | `align_rt_frame_inner_join_str_v1` | `IndirectStorage` |
+| `Free` | `align_rt_free` | `FreeLocal` |
+| `FreeResponseArray` | `align_rt_free_response_array` | `IndirectStorage` |
+| `FreeStringArray` | `align_rt_free_string_array` | `IndirectStorage` |
+| `FsCreateDir` | `align_rt_fs_create_dir` | `HostState` |
+| `FsCreatePrivateTempDir` | `align_rt_fs_create_private_temp_dir` | `HostState` |
+| `FsCursorFree` | `align_rt_fs_cursor_free` | `HostState` |
+| `FsCursorNext` | `align_rt_fs_cursor_next` | `HostState` |
+| `FsDirectoryAccess` | `align_rt_fs_directory_access` | `HostState` |
+| `FsDirectoryAccessAt` | `align_rt_fs_directory_access_at` | `HostState` |
+| `FsDirectoryCreateDir` | `align_rt_fs_directory_create_dir` | `HostState` |
+| `FsDirectoryCreateNew` | `align_rt_fs_directory_create_new` | `HostState` |
+| `FsDirectoryCreateSymlink` | `align_rt_fs_directory_create_symlink` | `HostState` |
+| `FsDirectoryCursor` | `align_rt_fs_directory_cursor` | `HostState` |
+| `FsDirectoryFree` | `align_rt_fs_directory_free` | `HostState` |
+| `FsDirectoryMetadata` | `align_rt_fs_directory_metadata` | `HostState` |
+| `FsDirectoryMetadataAt` | `align_rt_fs_directory_metadata_at` | `HostState` |
+| `FsDirectoryMetadataFollow` | `align_rt_fs_directory_metadata_follow` | `HostState` |
+| `FsDirectoryOpen` | `align_rt_fs_directory_open` | `HostState` |
+| `FsDirectoryOpenDir` | `align_rt_fs_directory_open_dir` | `HostState` |
+| `FsDirectoryOpenRead` | `align_rt_fs_directory_open_read` | `HostState` |
+| `FsDirectoryOpenReadSingleLink` | `align_rt_fs_directory_open_read_single_link` | `HostState` |
+| `FsDirectoryReadLink` | `align_rt_fs_directory_read_link` | `HostState` |
+| `FsDirectoryRemoveDir` | `align_rt_fs_directory_remove_dir` | `HostState` |
+| `FsDirectoryRemoveFile` | `align_rt_fs_directory_remove_file` | `HostState` |
+| `FsDirectorySetMode` | `align_rt_fs_directory_set_mode` | `HostState` |
+| `FsExists` | `align_rt_fs_exists` | `HostState` |
+| `FsFileMetadata` | `align_rt_fs_file_metadata` | `HostState` |
+| `FsFileSetMode` | `align_rt_fs_file_set_mode` | `HostState` |
+| `FsIsDir` | `align_rt_fs_is_dir` | `HostState` |
+| `FsMemoryFile` | `align_rt_fs_memory_file` | `HostState` |
+| `FsMemoryFree` | `align_rt_fs_memory_free` | `HostState` |
+| `FsMemorySeal` | `align_rt_fs_memory_seal` | `HostState` |
+| `FsMemoryWrite` | `align_rt_fs_memory_write` | `HostState` |
+| `FsReadBytesView` | `align_rt_fs_read_bytes_view` | `HostState` |
+| `FsReadDir` | `align_rt_fs_read_dir` | `HostState` |
+| `FsReadFile` | `align_rt_fs_read_file` | `HostState` |
+| `FsReadFileView` | `align_rt_fs_read_file_view` | `HostState` |
+| `FsReaderMetadata` | `align_rt_fs_reader_metadata` | `HostState` |
+| `FsReaderSetMode` | `align_rt_fs_reader_set_mode` | `HostState` |
+| `FsRemove` | `align_rt_fs_remove` | `HostState` |
+| `FsRemoveEmptyDir` | `align_rt_fs_remove_empty_dir` | `HostState` |
+| `FsRenameNoReplace` | `align_rt_fs_rename_no_replace` | `HostState` |
+| `FsSealedFree` | `align_rt_fs_sealed_free` | `HostState` |
+| `FsSealedLen` | `align_rt_fs_sealed_len` | `HostState` |
+| `FsSealedReadAt` | `align_rt_fs_sealed_read_at` | `HostState` |
+| `FsWriteFile` | `align_rt_fs_write_file` | `HostState` |
+| `FsWriteFileBuilder` | `align_rt_fs_write_file_builder` | `HostState` |
+| `FsWriterMetadata` | `align_rt_fs_writer_metadata` | `HostState` |
+| `FsWriterSetMode` | `align_rt_fs_writer_set_mode` | `HostState` |
+| `GatherI64` | `align_rt_gather_i64` | `IndirectStorage` |
+| `GroupCountI64` | `align_rt_group_count_i64` | `IndirectStorage` |
+| `GroupCountStr` | `align_rt_group_count_str` | `IndirectStorage` |
+| `GroupCountStrCols` | `align_rt_group_count_str_cols` | `IndirectStorage` |
+| `GroupMaxI64` | `align_rt_group_max_i64` | `IndirectStorage` |
+| `GroupMaxStr` | `align_rt_group_max_str` | `IndirectStorage` |
+| `GroupMaxStrCols` | `align_rt_group_max_str_cols` | `IndirectStorage` |
+| `GroupMinI64` | `align_rt_group_min_i64` | `IndirectStorage` |
+| `GroupMinStr` | `align_rt_group_min_str` | `IndirectStorage` |
+| `GroupMinStrCols` | `align_rt_group_min_str_cols` | `IndirectStorage` |
+| `GroupMultiStr` | `align_rt_group_multi_str` | `IndirectStorage` |
+| `GroupSumI64` | `align_rt_group_sum_i64` | `IndirectStorage` |
+| `GroupSumStr` | `align_rt_group_sum_str` | `IndirectStorage` |
+| `GroupSumStrCols` | `align_rt_group_sum_str_cols` | `IndirectStorage` |
+| `Hash128` | `align_rt_hash128` | `PureArgRead` |
+| `Hash64` | `align_rt_hash64` | `PureArgRead` |
+| `HexDecode` | `align_rt_hex_decode` | `IndirectStorage` |
+| `HexEncode` | `align_rt_hex_encode` | `ArgRead` |
+| `HtmlEscape` | `align_rt_html_escape` | `ArgRead` |
+| `HttpAccept` | `align_rt_http_accept` | `HostState` |
+| `HttpBody` | `align_rt_http_body` | `HostState` |
+| `HttpClientFree` | `align_rt_http_client_free` | `HostState` |
+| `HttpClientGet` | `align_rt_http_client_get` | `HostState` |
+| `HttpClientMaxResponseBodyBytes` | `align_rt_http_client_max_response_body_bytes` | `HostState` |
+| `HttpClientNew` | `align_rt_http_client_new` | `AllocNew` |
+| `HttpClientPost` | `align_rt_http_client_post` | `HostState` |
+| `HttpClientRequest` | `align_rt_http_client_request` | `HostState` |
+| `HttpClientRequestStream` | `align_rt_http_client_request_stream` | `HostState` |
+| `HttpClientTimeout` | `align_rt_http_client_timeout` | `HostState` |
+| `HttpCtxBody` | `align_rt_http_ctx_body` | `HostState` |
+| `HttpCtxFree` | `align_rt_http_ctx_free` | `HostState` |
+| `HttpCtxHeader` | `align_rt_http_ctx_header` | `HostState` |
+| `HttpCtxMethod` | `align_rt_http_ctx_method` | `HostState` |
+| `HttpCtxPath` | `align_rt_http_ctx_path` | `HostState` |
+| `HttpCtxUpgradeReady` | `align_rt_http_ctx_upgrade_ready` | `HostState` |
+| `HttpGetMany` | `align_rt_http_get_many` | `HostState` |
+| `HttpHeader` | `align_rt_http_header` | `HostState` |
+| `HttpHeadersContainsToken` | `align_rt_http_headers_contains_token` | `HostState` |
+| `HttpHeadersContainsTokenExact` | `align_rt_http_headers_contains_token_exact` | `HostState` |
+| `HttpHeadersCount` | `align_rt_http_headers_count` | `HostState` |
+| `HttpHeadersTokensValid` | `align_rt_http_headers_tokens_valid` | `HostState` |
+| `HttpMaxResponseBodyBytes` | `align_rt_http_max_response_body_bytes` | `HostState` |
+| `HttpParse` | `align_rt_http_parse` | `HostState` |
+| `HttpRbBody` | `align_rt_http_rb_body` | `HostState` |
+| `HttpRbHeader` | `align_rt_http_rb_header` | `HostState` |
+| `HttpReadStreamFree` | `align_rt_http_read_stream_free` | `HostState` |
+| `HttpReadStreamHeader` | `align_rt_http_read_stream_header` | `HostState` |
+| `HttpReadStreamRead` | `align_rt_http_read_stream_read` | `HostState` |
+| `HttpReadStreamSse` | `align_rt_http_read_stream_sse` | `HostState` |
+| `HttpReadStreamStatus` | `align_rt_http_read_stream_status` | `HostState` |
+| `HttpRequest` | `align_rt_http_request_new` | `AllocNew` |
+| `HttpRequestFree` | `align_rt_http_request_free` | `HostState` |
+| `HttpRespBody` | `align_rt_http_resp_body` | `HostState` |
+| `HttpRespFree` | `align_rt_http_resp_free` | `HostState` |
+| `HttpRespHeader` | `align_rt_http_resp_header` | `HostState` |
+| `HttpRespStatus` | `align_rt_http_resp_status` | `HostState` |
+| `HttpRespond` | `align_rt_http_respond` | `HostState` |
+| `HttpRespondStream` | `align_rt_http_respond_stream` | `HostState` |
+| `HttpRespondUpgrade` | `align_rt_http_respond_upgrade` | `HostState` |
+| `HttpResponseFree` | `align_rt_http_response_free` | `HostState` |
+| `HttpResponseNew` | `align_rt_http_response_new` | `AllocNew` |
+| `HttpServe` | `align_rt_http_serve` | `Callback` |
+| `HttpServeShared` | `align_rt_http_serve_shared` | `Callback` |
+| `HttpServerFree` | `align_rt_http_server_free` | `HostState` |
+| `HttpSseStreamLastEventId` | `align_rt_http_sse_stream_last_event_id` | `HostState` |
+| `HttpSseStreamNext` | `align_rt_http_sse_stream_next` | `HostState` |
+| `HttpSseStreamRetryMs` | `align_rt_http_sse_stream_retry_ms` | `HostState` |
+| `HttpStreamFinish` | `align_rt_http_stream_finish` | `HostState` |
+| `HttpStreamFree` | `align_rt_http_stream_free` | `HostState` |
+| `HttpStreamReject` | `align_rt_http_stream_reject` | `HostState` |
+| `HttpStreamSend` | `align_rt_http_stream_send` | `HostState` |
+| `HttpStreamSendEvent` | `align_rt_http_stream_send_event` | `HostState` |
+| `HttpTimeout` | `align_rt_http_timeout` | `HostState` |
+| `HttpUpgradeDeadline` | `align_rt_http_upgrade_deadline` | `HostState` |
+| `HttpUpgradeFree` | `align_rt_http_upgrade_free` | `HostState` |
+| `HttpUpgradeReadExact` | `align_rt_http_upgrade_read_exact` | `HostState` |
+| `HttpUpgradeShutdown` | `align_rt_http_upgrade_shutdown` | `HostState` |
+| `HttpUpgradeWrite` | `align_rt_http_upgrade_write` | `HostState` |
+| `IoCopy` | `align_rt_io_copy` | `HostState` |
+| `IoFileCreate` | `align_rt_io_file_create` | `HostState` |
+| `IoFileFree` | `align_rt_io_file_free` | `HostState` |
+| `IoFileLen` | `align_rt_io_file_len` | `HostState` |
+| `IoFileOpen` | `align_rt_io_file_open` | `HostState` |
+| `IoFilePread` | `align_rt_io_file_pread` | `HostState` |
+| `IoFilePwrite` | `align_rt_io_file_pwrite` | `HostState` |
+| `IoReaderBuffered` | `align_rt_io_reader_buffered` | `HostState` |
+| `IoReaderFree` | `align_rt_io_reader_free` | `HostState` |
+| `IoReaderOpen` | `align_rt_io_reader_open` | `HostState` |
+| `IoReaderOpenBeneath` | `align_rt_io_reader_open_beneath` | `HostState` |
+| `IoReaderOpenBeneathSingleLink` | `align_rt_io_reader_open_beneath_single_link` | `HostState` |
+| `IoReaderOpenRegular` | `align_rt_io_reader_open_regular` | `HostState` |
+| `IoReaderRead` | `align_rt_io_reader_read` | `HostState` |
+| `IoReaderReadLine` | `align_rt_io_reader_read_line` | `HostState` |
+| `IoReaderStdin` | `align_rt_io_reader_stdin` | `HostState` |
+| `IoWriterCreate` | `align_rt_io_writer_create` | `HostState` |
+| `IoWriterCreateExclusive` | `align_rt_io_writer_create_exclusive` | `HostState` |
+| `IoWriterCreateExclusiveBeneath` | `align_rt_io_writer_create_exclusive_beneath` | `HostState` |
+| `IoWriterFlush` | `align_rt_io_writer_flush` | `HostState` |
+| `IoWriterFree` | `align_rt_io_writer_free` | `HostState` |
+| `IoWriterStd` | `align_rt_io_writer_std` | `HostState` |
+| `IoWriterWrite` | `align_rt_io_writer_write` | `HostState` |
+| `IoWriterWriteBuilder` | `align_rt_io_writer_write_builder` | `HostState` |
+| `JsonBuilderFinish` | `align_rt_json_builder_finish` | `IndirectStorage` |
+| `JsonBuilderInit` | `align_rt_json_builder_init` | `IndirectStorage` |
+| `JsonBuilderWriteF32` | `align_rt_json_builder_write_f32` | `IndirectStorage` |
+| `JsonBuilderWriteF64` | `align_rt_json_builder_write_f64` | `IndirectStorage` |
+| `JsonDecode` | `align_rt_json_decode` | `IndirectStorage` |
+| `JsonDecodeArray` | `align_rt_json_decode_array` | `IndirectStorage` |
+| `JsonDecodeScalar` | `align_rt_json_decode_scalar` | `IndirectStorage` |
+| `JsonDecodeSoa` | `align_rt_json_decode_soa` | `IndirectStorage` |
+| `JsonDecodeStructArray` | `align_rt_json_decode_struct_array` | `IndirectStorage` |
+| `JsonDecodeUnion` | `align_rt_json_decode_union` | `IndirectStorage` |
+| `JsonDocAsBool` | `align_rt_json_doc_as_bool` | `IndirectStorage` |
+| `JsonDocAsF64` | `align_rt_json_doc_as_f64` | `IndirectStorage` |
+| `JsonDocAsI64` | `align_rt_json_doc_as_i64` | `IndirectStorage` |
+| `JsonDocAsStr` | `align_rt_json_doc_as_str` | `IndirectStorage` |
+| `JsonDocAt` | `align_rt_json_doc_at` | `IndirectStorage` |
+| `JsonDocElems` | `align_rt_json_doc_elems` | `IndirectStorage` |
+| `JsonDocGet` | `align_rt_json_doc_get` | `IndirectStorage` |
+| `JsonDocKey` | `align_rt_json_doc_key` | `IndirectStorage` |
+| `JsonDocKind` | `align_rt_json_doc_kind` | `IndirectStorage` |
+| `JsonDocLen` | `align_rt_json_doc_len` | `IndirectStorage` |
+| `JsonDocParse` | `align_rt_json_doc_parse` | `IndirectStorage` |
+| `JsonEncodeObject` | `align_rt_json_encode_object` | `IndirectStorage` |
+| `JsonEncodeScalarArray` | `align_rt_json_encode_scalar_array` | `IndirectStorage` |
+| `JsonEncodeStructArray` | `align_rt_json_encode_struct_array` | `IndirectStorage` |
+| `JsonEncodeUnion` | `align_rt_json_encode_union` | `IndirectStorage` |
+| `JsonScanNext` | `align_rt_json_scan_next` | `IndirectStorage` |
+| `LenMismatchFail` | `align_rt_len_mismatch_fail` | `FailNoReturn` |
+| `LogEnabled` | `align_rt_log_enabled` | `HostState` |
+| `LogFlush` | `align_rt_log_flush` | `HostState` |
+| `LogFree` | `align_rt_log_free` | `HostState` |
+| `LogLine` | `align_rt_log_line` | `HostState` |
+| `LogLineBuilder` | `align_rt_log_line_builder` | `HostState` |
+| `LogNew` | `align_rt_log_new` | `AllocNew` |
+| `OsHost` | `align_rt_os_host` | `HostState` |
+| `OsIdentity` | `align_rt_os_identity` | `HostState` |
+| `ParMap` | `align_rt_par_map` | `Callback` |
+| `ParMapFilter` | `align_rt_par_map_filter` | `Callback` |
+| `ParMapReduce` | `align_rt_par_map_reduce` | `Callback` |
+| `PathBase` | `align_rt_path_base` | `PureArgRead` |
+| `PathDir` | `align_rt_path_dir` | `PureArgRead` |
+| `PathExt` | `align_rt_path_ext` | `PureArgRead` |
+| `PathJoin` | `align_rt_path_join` | `ArgRead` |
+| `PathNormalize` | `align_rt_path_normalize` | `ArgRead` |
+| `PercentDecode` | `align_rt_percent_decode` | `IndirectStorage` |
+| `PercentEncode` | `align_rt_percent_encode` | `ArgRead` |
+| `PercentEncodePath` | `align_rt_percent_encode_path` | `ArgRead` |
+| `Print` | `align_rt_print_i64` | `HostState` |
+| `PrintBool` | `align_rt_print_bool` | `HostState` |
+| `PrintChar` | `align_rt_print_char` | `HostState` |
+| `PrintF32` | `align_rt_print_f32` | `HostState` |
+| `PrintF64` | `align_rt_print_f64` | `HostState` |
+| `PrintStr` | `align_rt_print_str` | `HostState` |
+| `ProcessAbort` | `align_rt_process_abort` | `FailNoReturn` |
+| `ProcessCpuCount` | `align_rt_process_cpu_count` | `HostState` |
+| `ProcessCurrentImage` | `align_rt_process_current_image` | `HostState` |
+| `ProcessExec` | `align_rt_process_exec` | `HostState` |
+| `ProcessExecutable` | `align_rt_process_executable` | `HostState` |
+| `ProcessExit` | `align_rt_process_exit` | `ProcessExit` |
+| `ProcessImageFree` | `align_rt_process_image_free` | `HostState` |
+| `ProcessImageLen` | `align_rt_process_image_len` | `HostState` |
+| `ProcessImageReadAt` | `align_rt_process_image_read_at` | `HostState` |
+| `ProcessMemberFinished` | `align_rt_process_member_finished` | `HostState` |
+| `ProcessMemberFree` | `align_rt_process_member_free` | `HostState` |
+| `ProcessMemberKill` | `align_rt_process_member_kill` | `HostState` |
+| `ProcessSignalClose` | `align_rt_process_signal_close` | `HostState` |
+| `ProcessSignalFree` | `align_rt_process_signal_free` | `HostState` |
+| `ProcessSignalNext` | `align_rt_process_signal_next` | `HostState` |
+| `ProcessSignalNumber` | `align_rt_process_signal_number` | `HostState` |
+| `ProcessSignals` | `align_rt_process_signals` | `HostState` |
+| `ProcessSpawn` | `align_rt_process_spawn` | `HostState` |
+| `ProcessTable` | `align_rt_process_table` | `HostState` |
+| `ProcessUserNamespace` | `align_rt_process_user_namespace` | `HostState` |
+| `ProcessUserNamespaceFree` | `align_rt_process_user_namespace_free` | `HostState` |
+| `RangeFail` | `align_rt_range_fail` | `FailNoReturn` |
+| `RegexCaptures` | `align_rt_regex_captures` | `IndirectStorage` |
+| `RegexCapturesFree` | `align_rt_regex_captures_free` | `IndirectStorage` |
+| `RegexCapturesGroup` | `align_rt_regex_captures_group` | `IndirectStorage` |
+| `RegexCompile` | `align_rt_regex_compile` | `IndirectStorage` |
+| `RegexFind` | `align_rt_regex_find` | `IndirectStorage` |
+| `RegexFindAll` | `align_rt_regex_find_all` | `IndirectStorage` |
+| `RegexFree` | `align_rt_regex_free` | `IndirectStorage` |
+| `RegexGroupCount` | `align_rt_regex_group_count` | `IndirectStorage` |
+| `RegexGroupIndex` | `align_rt_regex_group_index` | `IndirectStorage` |
+| `RegexIsMatch` | `align_rt_regex_is_match` | `IndirectStorage` |
+| `RegexReplace` | `align_rt_regex_replace` | `IndirectStorage` |
+| `RegexSplit` | `align_rt_regex_split` | `IndirectStorage` |
+| `RngNext` | `align_rt_rng_next` | `IndirectStorage` |
+| `RngRange` | `align_rt_rng_range` | `IndirectStorage` |
+| `RngSample` | `align_rt_rng_sample` | `IndirectStorage` |
+| `RngSeedOs` | `align_rt_rng_seed_os` | `HostState` |
+| `RngSeedWith` | `align_rt_rng_seed_with` | `IndirectStorage` |
+| `RngShuffle` | `align_rt_rng_shuffle` | `IndirectStorage` |
+| `RunBytesFree` | `align_rt_run_bytes_free` | `HostState` |
+| `RunBytesStatus` | `align_rt_run_bytes_status` | `HostState` |
+| `RunBytesStderr` | `align_rt_run_bytes_stderr` | `HostState` |
+| `RunBytesStdout` | `align_rt_run_bytes_stdout` | `HostState` |
+| `RunOutputFree` | `align_rt_run_output_free` | `HostState` |
+| `RunOutputStatus` | `align_rt_run_output_status` | `HostState` |
+| `RunOutputStderr` | `align_rt_run_output_stderr` | `HostState` |
+| `RunOutputStdout` | `align_rt_run_output_stdout` | `HostState` |
+| `ScopeChildren` | `align_rt_scope_children` | `HostState` |
+| `ScopeFree` | `align_rt_scope_free` | `HostState` |
+| `ScopeOwnerId` | `align_rt_scope_owner_id` | `HostState` |
+| `ScopeReap` | `align_rt_scope_reap` | `HostState` |
+| `ScopeRelease` | `align_rt_scope_release` | `HostState` |
+| `StrClone` | `align_rt_str_clone` | `ArgRead` |
+| `StrCmp` | `align_rt_str_cmp` | `PureArgRead` |
+| `StrContains` | `align_rt_str_contains` | `DispatchCache` |
+| `StrEndsWith` | `align_rt_str_ends_with` | `PureArgRead` |
+| `StrEq` | `align_rt_str_eq` | `PureArgRead` |
+| `StrEqIgnoreCase` | `align_rt_str_eq_ignore_case` | `PureArgRead` |
+| `StrFind` | `align_rt_str_find` | `DispatchCache` |
+| `StrFinderFind` | `align_rt_str_finder_find` | `DispatchCache` |
+| `StrFinderFree` | `align_rt_str_finder_free` | `IndirectStorage` |
+| `StrFinderNew` | `align_rt_str_finder_new` | `AllocNew` |
+| `StrRfind` | `align_rt_str_rfind` | `DispatchCache` |
+| `StrStartsWith` | `align_rt_str_starts_with` | `PureArgRead` |
+| `StrTrim` | `align_rt_str_trim` | `PureArgRead` |
+| `StrTrimEnd` | `align_rt_str_trim_end` | `PureArgRead` |
+| `StrTrimStart` | `align_rt_str_trim_start` | `PureArgRead` |
+| `TcpAccept` | `align_rt_tcp_accept` | `HostState` |
+| `TcpConnFree` | `align_rt_tcp_conn_free` | `HostState` |
+| `TcpConnReader` | `align_rt_tcp_conn_reader` | `HostState` |
+| `TcpConnWriter` | `align_rt_tcp_conn_writer` | `HostState` |
+| `TcpConnect` | `align_rt_tcp_connect` | `HostState` |
+| `TcpListen` | `align_rt_tcp_listen` | `HostState` |
+| `TcpListenerFree` | `align_rt_tcp_listener_free` | `HostState` |
+| `TcpReadTimeout` | `align_rt_tcp_read_timeout` | `HostState` |
+| `TcpWriteTimeout` | `align_rt_tcp_write_timeout` | `HostState` |
+| `TemplateHtmlFree` | `align_rt_template_html_free_v1` | `IndirectStorage` |
+| `TemplateHtmlNew` | `align_rt_template_html_new_v1` | `AllocNew` |
+| `TemplateHtmlRaw` | `align_rt_template_html_raw_v1` | `IndirectStorage` |
+| `TemplateHtmlToString` | `align_rt_template_html_into_string_v1` | `IndirectStorage` |
+| `TemplateHtmlWrite` | `align_rt_template_html_write_v1` | `IndirectStorage` |
+| `TgAlloc` | `align_rt_tg_alloc` | `IndirectStorage` |
+| `TgBegin` | `align_rt_tg_begin` | `AllocNew` |
+| `TgEnd` | `align_rt_tg_end` | `HostState` |
+| `TgRegister` | `align_rt_tg_register` | `Callback` |
+| `TgWait` | `align_rt_tg_wait` | `IndirectStorage` |
+| `TimeFormat` | `align_rt_time_format` | `HostState` |
+| `TimeInstant` | `align_rt_time_instant` | `HostState` |
+| `TimeNow` | `align_rt_time_now` | `HostState` |
+| `TimeParse` | `align_rt_time_parse` | `HostState` |
+| `TimeSleep` | `align_rt_time_sleep` | `HostState` |
+| `UdpBind` | `align_rt_udp_bind` | `HostState` |
+| `UdpRecvFrom` | `align_rt_udp_recv_from` | `HostState` |
+| `UdpSendTo` | `align_rt_udp_send_to` | `HostState` |
+| `UdpSocketFree` | `align_rt_udp_socket_free` | `HostState` |
+| `Utf8BoundaryFail` | `align_rt_utf8_boundary_fail` | `FailNoReturn` |
+| `Utf8DecodeLossy` | `align_rt_utf8_decode_lossy` | `ArgRead` |
+| `Utf8Valid` | `align_rt_utf8_valid` | `DispatchCache` |
+| `XmlAttributeCount` | `align_rt_xml_attribute_count` | `IndirectStorage` |
+| `XmlAttributeName` | `align_rt_xml_attribute_name` | `IndirectStorage` |
+| `XmlAttributeValue` | `align_rt_xml_attribute_value` | `IndirectStorage` |
+| `XmlFree` | `align_rt_xml_free` | `IndirectStorage` |
+| `XmlName` | `align_rt_xml_name` | `IndirectStorage` |
+| `XmlNext` | `align_rt_xml_next` | `IndirectStorage` |
+| `XmlParse` | `align_rt_xml_parse` | `IndirectStorage` |
+| `XmlText` | `align_rt_xml_text` | `IndirectStorage` |
+| `Unkeyed::ReportError` | `align_rt_report_error` | `IndirectStorage` |
+| `Unkeyed::ArgsBuild` | `align_rt_args_build` | `IndirectStorage` |
+| `Unkeyed::ArenaReset` | `align_rt_arena_reset` | `HostState` |
+| `Unkeyed::Realloc` | `align_rt_realloc` | `IndirectStorage` |
+| `Unkeyed::HttpSerialize` | `align_rt_http_serialize` | `HostState` |
+| `Unkeyed::F32ToBits` | `align_rt_f32_to_bits` | `PureScalar` |
+| `Unkeyed::F32FromBits` | `align_rt_f32_from_bits` | `PureScalar` |
+| `Unkeyed::F64ToBits` | `align_rt_f64_to_bits` | `PureScalar` |
+| `Unkeyed::F64FromBits` | `align_rt_f64_from_bits` | `PureScalar` |
+| `Unkeyed::F32TextLen` | `align_rt_f32_text_len` | `PureScalar` |
+| `Unkeyed::F64TextLen` | `align_rt_f64_text_len` | `PureScalar` |
+| `Unkeyed::F32TextWrite` | `align_rt_f32_text_write` | `IndirectStorage` |
+| `Unkeyed::F64TextWrite` | `align_rt_f64_text_write` | `IndirectStorage` |
+| `Unkeyed::TestLaunchRecvV1` | `align_rt_test_launch_recv_v1` | `IndirectStorage` |
+| `Unkeyed::TestFdCloexecV1` | `align_rt_test_fd_cloexec_v1` | `IndirectStorage` |
+| `Unkeyed::TestAckV1` | `align_rt_test_ack_v1` | `IndirectStorage` |
+| `Unkeyed::TestReportV1` | `align_rt_test_report_v1` | `IndirectStorage` |
+| `Unkeyed::TcpConnSetIoTimeout` | `align_rt_tcp_conn_set_io_timeout` | `HostState` |
+
+The class-to-attribute derivation is closed:
+
+| Class | LLVM memory effect | Function attributes |
+|---|---|---|
+| `PureScalar` | `memory(none)` | `nounwind nofree nosync willreturn` |
+| `PureArgRead` | `memory(argmem: read)` | `nounwind nofree nosync willreturn` |
+| `ArgRead` | `memory(argmem: read, inaccessiblemem: readwrite)` | `nounwind` |
+| `AllocNew` | `memory(inaccessiblemem: readwrite)` or the `ArgRead` memory set | `nounwind nofree` |
+| `FreeLocal` | `memory(argmem: readwrite, inaccessiblemem: readwrite)` | `nounwind` |
+| `IndirectStorage` | withheld | `nounwind` |
+| `DispatchCache` | withheld | `nounwind nofree nosync willreturn` |
+| `HostState` | withheld | `nounwind` |
+| `Callback` | withheld | `nounwind` |
+| `Foreign` | withheld | `nounwind` |
+| `FailNoReturn` | `memory(inaccessiblemem: readwrite)` | `nounwind cold noreturn` |
+| `ProcessExit` | `memory(inaccessiblemem: readwrite)` | `nounwind noreturn` |
+
+`returns_fresh` adds return `noalias`; `diverges` adds `noreturn`.
+Every admitted `params` entry is `Read` and adds `readonly`; callback, foreign,
+free, diverging, and exit rows forbid `params`. Every pointer ordinal absent
+from `escapes` gets `captures(none)`. The shape inventory below fixes types only. A single shape
+can span several effect classes, so the per-symbol records and declaration
+golden, rather than an A-shape, own attributes.
+
 ## O0 parallel range-source safety contract (design accepted)
 
 O0 changes no symbol, `RuntimeKey`, declaration shape, attribute, count, or
@@ -137,9 +639,7 @@ production `process.command` continues to select its shipped runtime entries unc
 These declarations occupy A110 through A113. The implemented `std.log` design occupies A114 through
 A117, `core.codec` occupies A118 through A120, `pkg.frame` occupies A121/A122 below, and `pkg.csv`
 occupies A123. Named time formatting/parsing occupies A124/A125; A126 is the next unreserved design shape. All
-four declarations carry the existing
-generated `nounwind` function attribute and no curated
-parameter attribute. `TestLaunchRecvV1` requires a non-null four-byte-aligned output, stores zero
+four declarations use their per-symbol effect records above. `TestLaunchRecvV1` requires a non-null four-byte-aligned output, stores zero
 before I/O, performs one blocking datagram receive with a fixed 17-byte capacity and EINTR retry,
 requires the exact 16-byte `ALTESTL` v1 envelope with zero reserved bytes, and stores the decoded
 little-endian ordinal only on success. The generated harness, not the runtime, validates that ordinal
@@ -332,8 +832,8 @@ connection with both entry options clear and before shell construction; its owne
 closes after either option failure and proves that resolution is not reopened, no other address is
 attempted, and no partially configured client is published.
 
-The LLVM and Rust definitions use A04's default C calling convention and have no curated function,
-return, or parameter attributes. The compiler recognizes the fixed physical symbol for exact ABI
+The LLVM and Rust definitions use A04's default C calling convention and the row's `HostState`
+effect record. The compiler recognizes the fixed physical symbol for exact ABI
 compatibility, collision reservation, and source reachability. This adds no language builtin,
 checked-HIR or MIR operation, call-spelling selector, or new ABI shape.
 
@@ -410,8 +910,8 @@ never returns a status.
 Finish receives one live complete shell, allocates and fills the exact canonical final buffer,
 consumes all staging, and returns the existing nonnull Buffer pointer; a null/private-invalid shell
 hard-aborts because no source-valid call can form it. Free is null-safe and releases unfinished
-staging exactly once. Every row is C calling convention and `nounwind`. Open and all encoder rows
-carry no curated memory, parameter, or return attribute.
+staging exactly once. Every row is C calling convention and derives its attributes from the
+per-symbol effect record above.
 
 ## Implemented `pkg.frame` extension (2026-09-01)
 
@@ -617,9 +1117,8 @@ an ordinary zero/false result. All other pointer/length/count/capacity/address p
 before Rust reference or slice formation as specified by their status-returning rows.
 
 All eleven exports use the Rust C calling convention and must not unwind across it. Their generated
-LLVM declarations preserve the reused A03/A04/A20/A24/A37/A62/A120 shapes' current empty curated
-function-attribute sets: this capability adds no `nounwind`, memory, return, or parameter attribute
-and does not mutate shared shape fingerprints. Exact public semantics, status mapping, validation
+LLVM declarations derive attributes from their per-symbol effect records; the reused
+A03/A04/A20/A24/A37/A62/A120 shapes remain type-only. Exact public semantics, status mapping, validation
 order, ownership, allocation, cache identity, and closure matrix: `pkg-design/ws.md`.
 
 ## `pkg.template` extension (implemented 2026-09-04)
@@ -778,7 +1277,7 @@ one keyed base record while reusing an existing LLVM function shape:
 
 | Runtime key | Exact symbol | Existing ABI row and exact declaration |
 |---|---|---|
-| `BuilderWriteUint` | `align_rt_builder_write_uint` | A66: `void @SYM(ptr, i64)`; Rust receives `(*mut Builder, u64)`; no curated attributes |
+| `BuilderWriteUint` | `align_rt_builder_write_uint` | A66: `void @SYM(ptr, i64)`; Rust receives `(*mut Builder, u64)`; effects record above |
 
 The implementation changed the exact counts from 293 to 294 `RuntimeKey`
 variants, 306 to 307 base records, and 314 to 315 maximum optional-probe exports.
@@ -924,23 +1423,20 @@ CryptoChacha20Poly1305Seal    -> align_rt_crypto_chacha20_poly1305_seal
 ```
 
 Every symbol occurs exactly once below. `@SYM` is replaced with that row's
-symbol. Braces after a function type are exact function attributes; return and
-parameter attributes remain inline. An absent brace means no curated
-attribute. The four rt-LTO guarded symbols `align_rt_str_eq`,
-`align_rt_str_starts_with`, `align_rt_str_ends_with`, and
-`align_rt_str_eq_ignore_case` use the shown declaration attributes when
-rt-LTO is off. When rt-LTO is on, their curated declaration attributes are
-withheld before their visible bodies are linked; LLVM then derives attributes
-from those bodies. A merged body also carries no string attribute at any
-attribute location, so it inherits the program's target machine instead of the
-target selection and codegen policy the producing compiler baked into the
-artifact. `align_rt_str_cmp` is not guarded and always keeps A01.
+symbol. This table fixes the LLVM function type only; the per-symbol effect
+record above fixes return, parameter, memory, and function attributes. The four
+rt-LTO guarded symbols `align_rt_str_eq`, `align_rt_str_starts_with`,
+`align_rt_str_ends_with`, and `align_rt_str_eq_ignore_case` use their record's
+declaration attributes when rt-LTO is off. When rt-LTO is on, those attributes
+are withheld before their visible bodies are linked and LLVM derives attributes
+from the bodies. A merged body also carries no producer string attribute.
+`align_rt_str_cmp` is not guarded and always uses its `PureArgRead` record.
 
-| ABI | Exact LLVM declaration | Symbols |
+| ABI | Exact LLVM function type | Symbols |
 |---|---|---|
-| A00 | `i32 @SYM(ptr readonly captures(none), i64) {nofree nosync willreturn}` | `align_rt_utf8_valid` |
-| A01 | `i32 @SYM(ptr readonly captures(none), i64, ptr readonly captures(none), i64) {nofree nosync willreturn memory(argmem: read)}` | `align_rt_str_eq`, `align_rt_str_starts_with`, `align_rt_str_ends_with`, `align_rt_str_cmp`, `align_rt_str_eq_ignore_case` |
-| A02 | `i32 @SYM(ptr readonly captures(none), i64, ptr readonly captures(none), i64) {nofree nosync willreturn}` | `align_rt_str_contains` |
+| A00 | `i32 @SYM(ptr, i64)` | `align_rt_utf8_valid` |
+| A01 | `i32 @SYM(ptr, i64, ptr, i64)` | `align_rt_str_eq`, `align_rt_str_starts_with`, `align_rt_str_ends_with`, `align_rt_str_cmp`, `align_rt_str_eq_ignore_case` |
+| A02 | `i32 @SYM(ptr, i64, ptr, i64)` | `align_rt_str_contains` |
 | A03 | `i32 @SYM(ptr)` | `align_rt_io_writer_flush`, `align_rt_http_stream_finish`, `align_rt_os_host` |
 | A04 | `i32 @SYM(ptr, i64)` | `align_rt_json_doc_kind`, `align_rt_fs_exists`, `align_rt_fs_create_dir`, `align_rt_fs_remove`, `align_rt_fs_remove_empty_dir`, `align_rt_child_kill`, `align_rt_tcp_conn_set_io_timeout` |
 | A05 | `i32 @SYM(ptr, i64, i32, ptr)` | `align_rt_json_decode_array`, `align_rt_json_decode_scalar` |
@@ -963,10 +1459,10 @@ artifact. `align_rt_str_cmp` is not guarded and always keeps A01.
 | A109 | `i32 @SYM(i32, ptr, ptr, i64, ptr, i64, ptr)` | `align_rt_crypto_verify` |
 | A18 | `i32 @SYM(ptr, i64, ptr, ptr, i64, ptr, i64, ptr, i64, i64)` | `align_rt_json_scan_next` |
 | A19 | `i32 @SYM(ptr, ptr)` | `align_rt_tcp_accept`, `align_rt_command_run`, `align_rt_io_writer_write_builder`, `align_rt_http_accept`, `align_rt_http_respond`, `align_rt_http_stream_reject` |
-| A127 | `ptr @SYM(ptr, i32, i64) {nounwind}` | `align_rt_json_builder_init` |
-| A128 | `i32 @SYM(ptr, ptr) {nounwind}` | `align_rt_json_builder_finish` |
-| A129 | `void @SYM(ptr, float) {nounwind}` | `align_rt_json_builder_write_f32` |
-| A130 | `void @SYM(ptr, double) {nounwind}` | `align_rt_json_builder_write_f64` |
+| A127 | `ptr @SYM(ptr, i32, i64)` | `align_rt_json_builder_init` |
+| A128 | `i32 @SYM(ptr, ptr)` | `align_rt_json_builder_finish` |
+| A129 | `void @SYM(ptr, float)` | `align_rt_json_builder_write_f32` |
+| A130 | `void @SYM(ptr, double)` | `align_rt_json_builder_write_f64` |
 | A131 | `void @SYM(ptr, i8)` | `align_rt_command_new_session` |
 | A132 | `i32 @SYM(ptr, i32, i64, ptr)` | `align_rt_child_poll` |
 | A133 | `i64 @SYM(i32)` | `align_rt_process_signal_number` |
@@ -978,9 +1474,9 @@ artifact. `align_rt_str_cmp` is not guarded and always keeps A01.
 | A23 | `i32 @SYM(ptr, ptr, i64, ptr, i64, ptr)` | `align_rt_http_client_post` |
 | A24 | `i32 @SYM(ptr, ptr, ptr)` | `align_rt_http_client_request`, `align_rt_http_client_request_stream`, `align_rt_http_read_stream_read`, `align_rt_http_respond_stream` |
 | A25 | `i64 @SYM()` | `align_rt_time_now`, `align_rt_time_instant`, `align_rt_process_cpu_count` |
-| A26 | `i64 @SYM(ptr readonly captures(none), i64) {nofree nosync willreturn memory(argmem: read)}` | `align_rt_hash64` |
-| A27 | `i64 @SYM(ptr readonly captures(none), i64, ptr readonly captures(none), i64) {nofree nosync willreturn}` | `align_rt_str_find`, `align_rt_str_rfind` |
-| A28 | `i64 @SYM(ptr readonly captures(none), ptr readonly captures(none), i64) {nofree nosync willreturn}` | `align_rt_str_finder_find` |
+| A26 | `i64 @SYM(ptr, i64)` | `align_rt_hash64` |
+| A27 | `i64 @SYM(ptr, i64, ptr, i64)` | `align_rt_str_find`, `align_rt_str_rfind` |
+| A28 | `i64 @SYM(ptr, ptr, i64)` | `align_rt_str_finder_find` |
 | A29 | `i64 @SYM(ptr)` | `align_rt_io_file_len`, `align_rt_buffer_len`, `align_rt_buffer_capacity`, `align_rt_rng_next`, `align_rt_http_resp_status`, `align_rt_http_read_stream_status`, `align_rt_regex_group_count` |
 | A30 | `i64 @SYM(ptr, i64)` | `align_rt_json_doc_len` |
 | A31 | `i64 @SYM(ptr, i64, i64)` | `align_rt_rng_range` |
@@ -994,11 +1490,11 @@ artifact. `align_rt_str_cmp` is not guarded and always keeps A01.
 | A39 | `i64 @SYM(ptr, ptr, i64, i64, i64, i64, ptr)` | `align_rt_par_map_reduce` |
 | A40 | `i64 @SYM(ptr, ptr, i64, ptr, i64, i64)` | `align_rt_udp_send_to` |
 | A41 | `i64 @SYM(ptr, ptr, i64, ptr, ptr, i64)` | `align_rt_group_sum_i64`, `align_rt_group_min_i64`, `align_rt_group_max_i64`, `align_rt_group_sum_str_cols`, `align_rt_group_min_str_cols`, `align_rt_group_max_str_cols`, `align_rt_group_count_str_cols` |
-| A42 | `noalias ptr @SYM() {nofree nounwind}` | `align_rt_arena_begin`, `align_rt_tg_begin` |
-| A43 | `noalias ptr @SYM(i64) {nofree nounwind}` | `align_rt_alloc` |
-| A44 | `noalias ptr @SYM(ptr, i64) {nofree nounwind}` | `align_rt_str_finder_new`, `align_rt_builder_new` |
-| A45 | `noalias ptr @SYM(ptr, i64, i64) {nounwind}` | `align_rt_arena_alloc`, `align_rt_tg_alloc` |
-| A46 | `noalias ptr @SYM(ptr, ptr, i64, i64, i64, i64, ptr)` | `align_rt_par_map` |
+| A42 | `ptr @SYM()` | `align_rt_arena_begin`, `align_rt_tg_begin` |
+| A43 | `ptr @SYM(i64)` | `align_rt_alloc` |
+| A44 | `ptr @SYM(ptr, i64)` | `align_rt_str_finder_new`, `align_rt_builder_new` |
+| A45 | `ptr @SYM(ptr, i64, i64)` | `align_rt_arena_alloc`, `align_rt_tg_alloc` |
+| A46 | `ptr @SYM(ptr, ptr, i64, i64, i64, i64, ptr)` | `align_rt_par_map` |
 | A47 | `ptr @SYM()` | `align_rt_io_reader_stdin`, `align_rt_http_client_new`, `align_rt_crypto_digest_new` |
 | A48 | `ptr @SYM(i32, i32)` | `align_rt_io_writer_std` |
 | A49 | `ptr @SYM(i64)` | `align_rt_buffer_new`, `align_rt_http_response_new` |
@@ -1006,14 +1502,14 @@ artifact. `align_rt_str_cmp` is not guarded and always keeps A01.
 | A51 | `ptr @SYM(ptr, i64)` | `align_rt_builder_init_bounded_stack`, `align_rt_cli_command_new` |
 | A52 | `ptr @SYM(ptr, i64, ptr, i64)` | `align_rt_command_new`, `align_rt_http_request_new` |
 | A53 | `ptr @SYM(ptr, ptr, i64)` | `align_rt_builder_init_stack` |
-| A54 | `void @SYM() {noreturn}` | `align_rt_div_fail`, `align_rt_alloc_size_fail`, `align_rt_process_abort` |
+| A54 | `void @SYM()` | `align_rt_div_fail`, `align_rt_alloc_size_fail`, `align_rt_process_abort` |
 | A55 | `void @SYM(double)` | `align_rt_print_f64` |
 | A56 | `void @SYM(float)` | `align_rt_print_f32` |
 | A57 | `void @SYM(i32)` | `align_rt_print_bool`, `align_rt_print_char` |
 | A58 | `void @SYM(i64)` | `align_rt_print_i64`, `align_rt_time_sleep` |
-| A59 | `void @SYM(i64) {noreturn}` | `align_rt_process_exit` |
-| A60 | `void @SYM(i64, i64) {noreturn}` | `align_rt_bounds_fail`, `align_rt_len_mismatch_fail`, `align_rt_utf8_boundary_fail` |
-| A61 | `void @SYM(i64, i64, i64) {noreturn}` | `align_rt_range_fail` |
+| A59 | `void @SYM(i64)` | `align_rt_process_exit` |
+| A60 | `void @SYM(i64, i64)` | `align_rt_bounds_fail`, `align_rt_len_mismatch_fail`, `align_rt_utf8_boundary_fail` |
+| A61 | `void @SYM(i64, i64, i64)` | `align_rt_range_fail` |
 | A62 | `void @SYM(ptr)` | `align_rt_arena_end`, `align_rt_tg_end`, `align_rt_free`, `align_rt_str_finder_free`, `align_rt_builder_pop_comma`, `align_rt_tcp_conn_free`, `align_rt_tcp_listener_free`, `align_rt_udp_socket_free`, `align_rt_child_free`, `align_rt_command_env_clear`, `align_rt_command_free`, `align_rt_run_output_free`, `align_rt_io_reader_free`, `align_rt_io_writer_free`, `align_rt_io_file_free`, `align_rt_buffer_free`, `align_rt_array_builder_free`, `align_rt_array_builder_free_stack`, `align_rt_array_builder_free_strings`, `align_rt_array_builder_free_strings_stack`, `align_rt_crypto_random`, `align_rt_crypto_key_free`, `align_rt_rng_seed_os`, `align_rt_cli_command_free`, `align_rt_cli_parsed_free`, `align_rt_http_request_free`, `align_rt_http_read_stream_free`, `align_rt_http_resp_free`, `align_rt_http_client_free`, `align_rt_http_server_free`, `align_rt_regex_captures_free`, `align_rt_regex_free`, `align_rt_http_ctx_free`, `align_rt_http_response_free`, `align_rt_http_stream_free`, `align_rt_builder_free`, `align_rt_builder_free_stack`, `align_rt_crypto_digest_free` |
 | A63 | `void @SYM(ptr, double)` | `align_rt_builder_write_f64` |
 | A64 | `void @SYM(ptr, float)` | `align_rt_builder_write_f32` |
@@ -1034,7 +1530,7 @@ artifact. `align_rt_str_cmp` is not guarded and always keeps A01.
 | A79 | `void @SYM(ptr, ptr, ptr)` | `align_rt_json_encode_union` |
 | A80 | `void @SYM(ptr, ptr, ptr, i64)` | `align_rt_json_encode_object` |
 | A81 | `void @SYM(ptr, ptr, ptr, ptr, ptr, ptr)` | `align_rt_tg_register` |
-| A82 | `{ i64, i64 } @SYM(ptr readonly captures(none), i64) {nofree nosync willreturn memory(argmem: read)}` | `align_rt_hash128` |
+| A82 | `{ i64, i64 } @SYM(ptr, i64)` | `align_rt_hash128` |
 | A83 | `{ ptr, i64 } @SYM(ptr)` | `align_rt_run_output_stdout`, `align_rt_run_output_stderr`, `align_rt_array_builder_build`, `align_rt_array_builder_build_stack`, `align_rt_builder_finish`, `align_rt_builder_finish_stack`, `align_rt_cli_usage`, `align_rt_http_resp_body`, `align_rt_http_ctx_method`, `align_rt_http_ctx_path`, `align_rt_http_ctx_body`, `align_rt_builder_into_string`, `align_rt_builder_into_string_stack`, `align_rt_crypto_digest_finish` |
 | A84 | `{ ptr, i64 } @SYM(ptr, i64)` | `align_rt_str_clone`, `align_rt_base64_encode`, `align_rt_base64url_encode`, `align_rt_hex_encode`, `align_rt_percent_encode`, `align_rt_form_encode`, `align_rt_html_escape`, `align_rt_crypto_sha256`, `align_rt_crypto_sha512`, `align_rt_str_trim`, `align_rt_str_trim_start`, `align_rt_str_trim_end`, `align_rt_path_base`, `align_rt_path_dir`, `align_rt_path_ext`, `align_rt_path_normalize` |
 | A85 | `{ ptr, i64 } @SYM(ptr, i64, i64, i64)` | `align_rt_chunks` |
@@ -1048,12 +1544,12 @@ Request 11 keyed delta:
 
 | Runtime key | Exact symbol | Existing ABI row and exact declaration |
 |---|---|---|
-| `CommandMaxCapture` | `align_rt_command_max_capture` | A66: `void @SYM(ptr, i64)`; no curated attributes |
-| `CommandRunBytes` | `align_rt_command_run_bytes` | A19: `i32 @SYM(ptr, ptr)`; no curated attributes |
-| `RunBytesStatus` | `align_rt_run_bytes_status` | A72: `void @SYM(ptr, ptr)`; no curated attributes |
-| `RunBytesStdout` | `align_rt_run_bytes_stdout` | A83: `{ ptr, i64 } @SYM(ptr)`; no curated attributes |
-| `RunBytesStderr` | `align_rt_run_bytes_stderr` | A83: `{ ptr, i64 } @SYM(ptr)`; no curated attributes |
-| `RunBytesFree` | `align_rt_run_bytes_free` | A62: `void @SYM(ptr)`; no curated attributes |
+| `CommandMaxCapture` | `align_rt_command_max_capture` | A66: `void @SYM(ptr, i64)`; effects record above |
+| `CommandRunBytes` | `align_rt_command_run_bytes` | A19: `i32 @SYM(ptr, ptr)`; effects record above |
+| `RunBytesStatus` | `align_rt_run_bytes_status` | A72: `void @SYM(ptr, ptr)`; effects record above |
+| `RunBytesStdout` | `align_rt_run_bytes_stdout` | A83: `{ ptr, i64 } @SYM(ptr)`; effects record above |
+| `RunBytesStderr` | `align_rt_run_bytes_stderr` | A83: `{ ptr, i64 } @SYM(ptr)`; effects record above |
+| `RunBytesFree` | `align_rt_run_bytes_free` | A62: `void @SYM(ptr)`; effects record above |
 
 All six use the regular `align_rt_` plus snake-case key mapping and occupy collision-reserved native
 identities as soon as the capability activates. At that capability boundary,
@@ -1068,8 +1564,8 @@ Request 5 bounded-HTTP shipped delta:
 
 | Runtime key | Exact symbol | Existing ABI row and exact declaration |
 |---|---|---|
-| `HttpMaxResponseBodyBytes` | `align_rt_http_max_response_body_bytes` | A66: `void @SYM(ptr, i64)`; no curated attributes |
-| `HttpClientMaxResponseBodyBytes` | `align_rt_http_client_max_response_body_bytes` | A66: `void @SYM(ptr, i64)`; no curated attributes |
+| `HttpMaxResponseBodyBytes` | `align_rt_http_max_response_body_bytes` | A66: `void @SYM(ptr, i64)`; effects record above |
+| `HttpClientMaxResponseBodyBytes` | `align_rt_http_client_max_response_body_bytes` | A66: `void @SYM(ptr, i64)`; effects record above |
 
 Both use ordinary keyed-native identity and are mandatory base exports. The implementation updated
 registry counts, bijection, declaration golden, and base runtime-export parity in the same change.
@@ -1079,22 +1575,22 @@ decoder, so it cannot collide with a saturating encoded errno.
 
 Unkeyed native records:
 
-| Owner | Exact LLVM declaration | Runtime export presence |
+| Owner | Exact LLVM function type | Runtime export presence |
 |---|---|---|
-| main error wrapper | `i32 @align_rt_report_error(i32)` | every Unit/Result main wrapper; no attributes |
-| argv wrapper | `{ ptr, i64 } @align_rt_args_build(i32, ptr)` | only argv main; no attributes |
-| arena implementation | `void @align_rt_arena_reset(ptr)` | always linked; runtime-internal, no curated declaration attributes |
-| allocator implementation | `ptr @align_rt_realloc(ptr, i64)` | always linked; runtime-internal, no curated declaration attributes |
-| HTTP implementation | `i32 @align_rt_http_serialize(ptr, ptr)` | always linked; runtime-internal, no curated declaration attributes |
-| PostgreSQL codec | `i32 @align_rt_f32_to_bits(float) {nofree nosync willreturn}` | always linked; package-internal compatible extern |
-| PostgreSQL codec | `float @align_rt_f32_from_bits(i32) {nofree nosync willreturn}` | always linked; package-internal compatible extern |
-| PostgreSQL codec | `i64 @align_rt_f64_to_bits(double) {nofree nosync willreturn}` | always linked; package-internal compatible extern |
-| PostgreSQL codec | `double @align_rt_f64_from_bits(i64) {nofree nosync willreturn}` | always linked; package-internal compatible extern |
-| PostgreSQL codec | `i64 @align_rt_f32_text_len(float) {nofree nosync willreturn}` | always linked; package-internal compatible extern |
-| PostgreSQL codec | `i64 @align_rt_f64_text_len(double) {nofree nosync willreturn}` | always linked; package-internal compatible extern |
-| PostgreSQL codec | `i64 @align_rt_f32_text_write(float, ptr, i64) {nofree nosync willreturn}` | always linked; package-internal compatible extern |
-| PostgreSQL codec | `i64 @align_rt_f64_text_write(double, ptr, i64) {nofree nosync willreturn}` | always linked; package-internal compatible extern |
-| pkg.kv TCP configuration | `i32 @align_rt_tcp_conn_set_io_timeout(ptr, i64)` | always linked; package-internal compatible extern; no curated declaration attributes |
+| main error wrapper | `i32 @align_rt_report_error(i32)` | every Unit/Result main wrapper; effects record above |
+| argv wrapper | `{ ptr, i64 } @align_rt_args_build(i32, ptr)` | only argv main; effects record above |
+| arena implementation | `void @align_rt_arena_reset(ptr)` | always linked; runtime-internal; effects record above |
+| allocator implementation | `ptr @align_rt_realloc(ptr, i64)` | always linked; runtime-internal; effects record above |
+| HTTP implementation | `i32 @align_rt_http_serialize(ptr, ptr)` | always linked; runtime-internal; effects record above |
+| PostgreSQL codec | `i32 @align_rt_f32_to_bits(float)` | always linked; package-internal compatible extern; effects record above |
+| PostgreSQL codec | `float @align_rt_f32_from_bits(i32)` | always linked; package-internal compatible extern; effects record above |
+| PostgreSQL codec | `i64 @align_rt_f64_to_bits(double)` | always linked; package-internal compatible extern; effects record above |
+| PostgreSQL codec | `double @align_rt_f64_from_bits(i64)` | always linked; package-internal compatible extern; effects record above |
+| PostgreSQL codec | `i64 @align_rt_f32_text_len(float)` | always linked; package-internal compatible extern; effects record above |
+| PostgreSQL codec | `i64 @align_rt_f64_text_len(double)` | always linked; package-internal compatible extern; effects record above |
+| PostgreSQL codec | `i64 @align_rt_f32_text_write(float, ptr, i64)` | always linked; package-internal compatible extern; effects record above |
+| PostgreSQL codec | `i64 @align_rt_f64_text_write(double, ptr, i64)` | always linked; package-internal compatible extern; effects record above |
+| pkg.kv TCP configuration | `i32 @align_rt_tcp_conn_set_io_timeout(ptr, i64)` | always linked; package-internal compatible extern; effects record above |
 | allocation probe | `i64 @align_rt_alloc_count()` | only with the explicit `align_runtime/alloc-count` feature; no curated declaration attributes |
 | allocation probe | `i64 @align_rt_free_count()` | only with the explicit `align_runtime/alloc-count` feature; no curated declaration attributes |
 | requested-live probe | `void @align_rt_requested_live_reset()` | only with the explicit `align_runtime/alloc-count` feature; no curated declaration attributes |
@@ -1110,10 +1606,11 @@ Unkeyed native records:
 ## Machine gates
 
 Am-c1 replaces the current ABI/declaration, dedicated-consumer, AEAD-selection,
-and attribute authorities with one typed `RuntimeAbi` row per identity:
-`{ key, symbol, return type, ordered parameter types, return attrs, parameter
-attrs, function attrs, rt_lto_policy }`. Declaration and call lookup consume
-that row. `key` is `RuntimeAbiId`, either `Keyed(RuntimeKey)` or
+and attribute authorities with one typed `RuntimeAbi` row per identity.
+`RuntimeAbi` owns `{ key, symbol, return type, ordered parameter types }` and the
+separate total `RuntimeEffects` match owns class, argument memory, per-pointer
+modes and escape, release, fresh-return, divergence, and rt-LTO admission facts.
+Declaration and call lookup consume both records. `key` is `RuntimeAbiId`, either `Keyed(RuntimeKey)` or
 `Unkeyed(UnkeyedRuntimeKey)`. The eighteen base unkeyed records use the same
 typed-row machinery; only `ReportError` and `ArgsBuild` have a dedicated Align main-wrapper
 declaration policy and yield typed wrapper handles when that wrapper requires
@@ -1168,17 +1665,17 @@ LLVM construction and receives no runtime-feature input.
 
 Tests compare:
 
-- all 426 keys, mapped symbols, LLVM declaration types, and default attributes
+- all 446 keys, mapped symbols, LLVM declaration types, and derived effects
   against this table through the checked-in
   `crates/align_codegen_llvm/tests/golden/runtime_abi_declarations.txt`;
 - the 464 base native symbols against default-feature `align_runtime` exports,
   plus every actual Rust definition's normalized native return and ordered
   parameter types against the declaration golden, failing on either direction's
   difference through `scripts/test-runtime-abi-exports.sh`;
-- the 451 `alloc-count` and 448 `par-map-probe` native symbols against
+- the 471 `alloc-count` and 468 `par-map-probe` native symbols against
   `align_runtime` built with each feature separately, including the eleven exact
   probe signatures above;
-- the 455 maximum native symbols against `align_runtime` built with
+- the 475 maximum native symbols against `align_runtime` built with
   `alloc-count,par-map-probe,task-group-probe`, while proving
   `task-group-probe` adds no unmangled export;
 - rt-LTO off/on attributes for every guarded symbol, with missing,
@@ -1190,10 +1687,13 @@ Tests compare:
   ordinal; source-valid compatible reuse for a keyed builtin and the thirteen
   source-reachable unkeyed rows; exact `ArgsBuild` `str` rejection plus the
   source-valid `layout(C) { u64, i64 }` aggregate mismatch; and
-  compatible reuse representatives for each of the five checked-in attribute
-  classes (`#0`–`#4`), with the native row supplying its curated attributes;
-- one mutation of each registry attribute class, symbol, and key through the
-  checked-in golden and uniqueness owners;
+  compatible reuse representatives for the source-expressible emitted
+  attribute forms, with the native row supplying its derived attributes; the
+  checked-in golden covers all twelve effect classes, including rows whose
+  native result has no source-valid extern spelling;
+- one class-token mutation proving the declaration golden is class-sensitive,
+  plus symbol and key coverage through the checked-in golden and uniqueness
+  owners;
 - ordinary extern and program-definition positives for all eleven probe
   spellings while the normal runtime export set excludes them; and
 - trivial whole-program and per-unit-shaped emitted IR with identical

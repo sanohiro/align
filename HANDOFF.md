@@ -1,37 +1,41 @@
 # Session handoff
 
-## Next work (handoff written 2026-09-18)
+## Next work (handoff updated 2026-09-19)
 
 The align-llm audit issue batch is partly shipped. Merged: #1089 (plan 68),
 #1090, #1091, #1092, #1096, #1099, #1100 (plan 69), #1101, #1110, #1111
 (plan 69 PR 1), #1113, #1114 (plan 70 ledger), #1115, #1116 (plan 69 PR 2,
-closes #1081). Nothing is in flight; every remaining item below starts from
-`main` with a fresh branch and follows the CLAUDE.md review flow.
+closes #1081), #1124 (build-performance items 7 and 8), and #1125 (the first
+post-#1124 nightly repair). Plan 70 PR 1 is implemented. Every remaining item
+below starts from `main` with a fresh branch and follows the CLAUDE.md review
+flow.
 
 Suggested order (item 0 first; then each its own PR set: implement, one review, one fix,
 preflight, `scripts/open-pr.sh`, CI, merge):
 
-0. **CI wall time — highest priority (owner, 2026-09-18).** Every PR pays a
+0. **CI wall time measured and nightly repaired (complete 2026-09-19).** Every PR paid a
    fixed ~35 minutes (codex 3, preflight 5–10, CI 20) regardless of blast
    radius: on 2026-09-18 a one-line diagnostic rename (#1120) and a
    test-only owner fix (#1119) each waited ~20 minutes for the Linux x86_64
    leg, whose steps were 105 s of Cargo cache restore, ~15 min of build and
    gate, and under 4 minutes of everything else. Owner: `docs/impl/21-build-perf-plan.md`
-   Item 7. Both changes shipped in this PR: source-mtime restoration from Git
+   Item 7. Both changes shipped in #1124: source-mtime restoration from Git
    (so the restored Cargo cache actually hits instead of every crate
    fingerprinting as changed after checkout) and a trusted-classifier
    platform scope (`pr_tier_platform_scope`: none/light/full) that bounds a
-   tooling-tier PR to one Linux x86_64 compile-only leg. The first PR merged
-   after this one is the measurement: read its "Restore Cargo caches" and
-   "Bounded PR test gate" step timings, and confirm a tooling-tier PR actually
-   ran only the light leg. Until that measurement confirms the win, batch
-   small follow-ups into one PR instead of one PR each; the fixed cost is per
-   PR, not per line. Follow-up not done here: sharding the bounded-gate
+   tooling-tier PR to one Linux x86_64 compile-only leg. PR #1125 supplied the
+   measurement: the exact cache key restored, source mtimes were restored from
+   Git, the tooling tier ran only its Linux x86_64 light leg, and the bounded
+   gate fell from roughly 199 seconds to 127 seconds. Its first nightly exposed
+   a deterministic Linux-only write-error fixture race in `apps_web_upgrade`;
+   #1125 fixed it with a server-side delay and a bounded client abort window,
+   verified on Ubuntu 24.04 x86_64 with LLVM 22 and Rust 1.96. Follow-up not
+   done here: sharding the bounded-gate
    binaries' own compile across parallel jobs (today one sequential build
    produces them all, even though `scripts/run-gate-binaries.sh` already runs
    them concurrently once built).
 
-   **Item 8 shipped (updated 2026-09-19).** `fix/nightly-detector-restore`
+   **Item 8 shipped in #1124 (updated 2026-09-19).** `fix/nightly-detector-restore`
    fixed a second, independent CI/nightly cost: owner tests were compiling
    generated programs through an opt-level 0 `alignc`. Adding
    `[profile.dev] opt-level = 1` at the workspace root cuts `pkg_db_a1` 3.96x
@@ -39,31 +43,24 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    debug-assertions and overflow checks unaffected below opt-level 2.
    `ci.yml`'s four Cargo cache keys now hash `Cargo.toml` alongside
    `Cargo.lock` so the immutable cache entry can actually be replaced once
-   `[profile.dev]` changes what a cached `target` means. After merge, the
-   next agent must confirm: (a) the first `main` CI run logs "Cache saved"
-   under the new key and the second run restores and hits it — this also
-   closes item 7's still-pending post-merge measurement, since both land in
-   the same cache; (b) the first nightly after merge is green, or triage its
-   diff against `scripts/known-failures.txt` (#1106 is the only expected
-   failure); (c) one Linux observation each for two owners self-review
-   flagged as profile-sensitive: `crates/align_driver/tests/deep_type_graphs.rs`'s
-   fixed 2 MiB worker-thread stacks, and `scripts/test-runtime-abi-exports.sh`.
+   `[profile.dev]` changes what a cached `target` means. The required
+   post-merge cache and nightly observations are recorded above. The current
+   capability also repairs and reruns `scripts/test-runtime-abi-exports.sh`
+   against LLVM 22's nested `captures(address, read_provenance)` spelling;
+   `deep_type_graphs` remains covered by the nightly full-suite detector.
 
-1. **plan 70 PR 1** (#1071, effects table) — `docs/impl/70-runtime-boundary-effects-plan.md`
-   §3. Precondition: run the §3.6 `argmem` experiment first; its result decides
-   whether invariant D widens. Ledger is already reviewed; no new plan review.
-2. **plan 69 PR 3** (#1084, trip-count exit at the latch) — plan 69 §4. Read
+1. **plan 69 PR 3** (#1084, trip-count exit at the latch) — plan 69 §4. Read
    §3.7 "the entry value is read, not remembered" first: PR 3's `>` exit relation
    must keep reading `e` at the preheader.
-3. **plan 70 PR 2** (#1074 cold-path model) and **PR 3** (#1072 inline fast path),
+2. **plan 70 PR 2** (#1074 cold-path model) and **PR 3** (#1072 inline fast path),
    in that order — plan 70 §4, §5.
-4. **plan 71 ledger** for #1076/#1077/#1078 (sum-type layout, aggregate transport,
+3. **plan 71 ledger** for #1076/#1077/#1078 (sum-type layout, aggregate transport,
    drop-state model): one ledger, serialized, one fresh independent adversarial
    review before any code (CLAUDE.md large-design gate).
-5. Language items after the codegen track: #1085 `str` patterns in `match`,
+4. Language items after the codegen track: #1085 `str` patterns in `match`,
    #1065 fixed arrays in structs, #1066 proposal 2, #1064 → depends on #1063,
    #1075 scalar ABI facts, #1082 P2 RFC.
-6. Follow-ups, independent and small (updated 2026-09-19):
+5. Follow-ups, independent and small (updated 2026-09-19):
    `fix/nightly-detector-restore` closed #1105, #1107, #1108, #1109, and
    #1112, and separately repaired two untracked first-night nightly failures
    that never got a manifest line — the vectorize_shapes x86 G1/G2 owners
@@ -73,18 +70,6 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    unbounded, swallowing the trailing declare table. `scripts/known-failures.txt`
    now carries only #1106 (per-unit ELF byte mismatch, `e_entry`/`e_shoff`,
    Linux-only). #1093 is untouched and still open.
-7. **New, found during this PR's self-review (2026-09-19):**
-   `docs/impl/20-runtime-abi-ledger.md` states two inconsistent counts for
-   the same registry: the R88 summary near line 9 gives 446 keyed / 464 base
-   / 471 alloc-count / 468 par-map-probe / 475 maximum, while the test
-   description near line 1171 gives 426 keyed / 464 base / 451 alloc-count /
-   448 par-map-probe / 455 maximum. Base (464) agrees; the other four don't.
-   This is pre-existing drift, not caused by this PR. Reconcile against the
-   actual registry, `crates/align_codegen_llvm/src/runtime_abi.rs` (464
-   `=> RuntimeAbi {` arms, confirmed 2026-09-19) — the base-record source of
-   truth lives in `align_codegen_llvm`; `align_runtime` has no
-   `runtime_abi.rs` of its own.
-
 Recorded follow-up from PR #1116's review (plan 69 §3.7): the static
 initializer scan in `align_mir::loop_facts::admit` can be replaced by an
 initialization proof, admitting parameters and multiple initializers on their
@@ -103,7 +88,9 @@ runtime boundary effects for G5, issues 1082 Part 1 and 1083 in progress, 1082
 Part 2 as a future RFC), the locked-decision compliance record including the
 carve-out issue 1084's `assume` fallback would require, and rewritten acceptance
 criteria for issues 1063 and 1064, whose original criteria were measured false
-because they depended on the loop-facts work. No implementation has started.
+because they depended on the loop-facts work. Plan 70 PR 1 now implements
+G5's complete per-symbol record and every sound attribute subset; its cold-path
+and inline-fast-path halves remain.
 
 **Open issue batch:** [Plan 65](docs/impl/65-open-issue-batch-plan.md)'s first
 capability is merged in PR 1056: scalar float inspection, initialized buffers,
@@ -155,7 +142,12 @@ guarded set, one cold-path model for `Result`/`?`, and an inline fast path for
 the per-element `array_builder` primitives. It carries the large-design
 public-contract ledger, because the effects record is a new contract on every
 runtime ABI row and `docs/impl/20-runtime-abi-ledger.md` is its source of truth.
-No implementation has started.
+PR 1 is implemented: all 464 base rows have one total `RuntimeEffects` record;
+declaration and rt-LTO removal attributes derive from it; the `argmem`
+experiment confirmed that indirect loaded-pointer storage must stay withheld;
+and allocation, host-state, source-inventory, C-unwind, whole/per-unit,
+function-partition, admission and artifact-budget owners close the matrix.
+PR 2 and PR 3 remain.
 
 **Decode representation costs:** [plan 62](docs/impl/62-decode-optimization-plan.md)
 implements bounded nonescaping byte storage and direct synchronous chunks

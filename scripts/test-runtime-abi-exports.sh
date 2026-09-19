@@ -51,10 +51,27 @@ perl -ne '
     die "no native type in golden: $text\n" unless @types;
     return $types[-1];
   }
+  sub split_params {
+    my ($text) = @_;
+    my @parts;
+    my $start = 0;
+    my $depth = 0;
+    for (my $i = 0; $i < length($text); $i++) {
+      my $char = substr($text, $i, 1);
+      $depth++ if $char =~ /[\(\[\{]/;
+      $depth-- if $char =~ /[\)\]\}]/;
+      if ($char eq "," && $depth == 0) {
+        push @parts, substr($text, $start, $i - $start);
+        $start = $i + 1;
+      }
+    }
+    push @parts, substr($text, $start);
+    return @parts;
+  }
   chomp;
   next unless /\bdeclare\s+(.+?)\s+\@(align_rt_[A-Za-z0-9_]+)\((.*)\)(?:\s+#\d+)?$/;
   my ($ret, $symbol, $params) = ($1, $2, $3);
-  my @params = length($params) ? map { native_type($_) } split /,/, $params : ();
+  my @params = length($params) ? map { native_type($_) } split_params($params) : ();
   print join("|", $symbol, native_type($ret), @params), "\n";
 ' "$golden" | sort > "$work_dir/golden-abi"
 
@@ -66,10 +83,31 @@ perl -ne '
     die "no native type in runtime IR: $text\n" unless @types;
     return $types[-1];
   }
+  sub split_params {
+    my ($text) = @_;
+    my @parts;
+    my $start = 0;
+    my $depth = 0;
+    for (my $i = 0; $i < length($text); $i++) {
+      my $char = substr($text, $i, 1);
+      $depth++ if $char =~ /[\(\[\{]/;
+      $depth-- if $char =~ /[\)\]\}]/;
+      if ($char eq "," && $depth == 0) {
+        push @parts, substr($text, $start, $i - $start);
+        $start = $i + 1;
+      }
+    }
+    push @parts, substr($text, $start);
+    return @parts;
+  }
   chomp;
-  next unless /^define\s+(.+?)\s+\@(align_rt_[A-Za-z0-9_]+)\((.*?)\)\s/;
+  # Parameter attributes such as LLVM 22 `captures(address, read_provenance)` contain nested
+  # parentheses and commas. Match through the final signature-closing parenthesis on the line;
+  # the previous non-greedy form stopped inside `captures(...)` and parsed `read_provenance` as a
+  # parameter after rustc began emitting that attribute on runtime definitions.
+  next unless /^define\s+(.+?)\s+\@(align_rt_[A-Za-z0-9_]+)\((.*)\)\s/;
   my ($ret, $symbol, $params) = ($1, $2, $3);
-  my @params = length($params) ? map { native_type($_) } split /,/, $params : ();
+  my @params = length($params) ? map { native_type($_) } split_params($params) : ();
   print join("|", $symbol, native_type($ret), @params), "\n";
 ' "$runtime_ir" | sort > "$work_dir/runtime-abi"
 
