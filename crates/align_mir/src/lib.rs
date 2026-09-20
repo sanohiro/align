@@ -966,9 +966,9 @@ pub enum Rvalue {
         a: Operand,
         b: Operand,
     },
-    /// A scalar math builtin (`core.math`): `abs` (1 operand) / `min` / `max` (2). `ty` is the
-    /// numeric operand type; float inspection returns bool or the same-width unsigned integer.
-    /// Other operations return `ty`, using its signedness/float kind for intrinsic selection.
+    /// A scalar or explicit-vector math builtin (`core.math`). `ty` is the numeric operand type;
+    /// float inspection returns bool or the same-width unsigned integer. Other operations return
+    /// `ty`, using its signedness/float kind for intrinsic selection.
     MathOp {
         fn_: align_sema::MathFn,
         ty: Ty,

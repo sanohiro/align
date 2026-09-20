@@ -302,22 +302,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
             format!("{m}({} {} {} : {})", operand_str(a), binop_str(*op), operand_str(b), ty_name(*int_ty))
         }
         Rvalue::MathOp { fn_, ty, operands } => {
-            let f = match fn_ {
-                align_sema::MathFn::Abs => "abs",
-                align_sema::MathFn::Min => "min",
-                align_sema::MathFn::Max => "max",
-                align_sema::MathFn::Sqrt => "sqrt",
-                align_sema::MathFn::Floor => "floor",
-                align_sema::MathFn::Ceil => "ceil",
-                align_sema::MathFn::Round => "round",
-                align_sema::MathFn::Trunc => "trunc",
-                align_sema::MathFn::Pow => "pow",
-                align_sema::MathFn::Fma => "fma",
-                align_sema::MathFn::ToBits => "to_bits",
-                align_sema::MathFn::IsFinite => "is_finite",
-                align_sema::MathFn::IsNan => "is_nan",
-                align_sema::MathFn::IsInfinite => "is_infinite",
-            };
+            let f = fn_.source_name();
             let a: Vec<String> = operands.iter().map(operand_str).collect();
             format!("{f}({}) : {}", a.join(", "), ty_name(*ty))
         }

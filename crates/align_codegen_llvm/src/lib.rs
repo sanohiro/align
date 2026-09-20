@@ -1480,6 +1480,173 @@ pub struct DebugInfo {
     pub directory: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MathVisibilityState {
+    EliminatedOrMerged,
+    RetainedVectorIr,
+    Scalarized,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MathProvider {
+    None,
+    Configured(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MathVisibilityRecord {
+    pub function: ProgramCall,
+    pub operation_ordinal: u32,
+    pub operation: hir::MathFn,
+    pub ty: Ty,
+    pub state: MathVisibilityState,
+    pub provider: MathProvider,
+    pub source: Option<(u32, u32)>,
+    pub llvm_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OptInspection {
+    pub remarks: Vec<String>,
+    pub math: Vec<MathVisibilityRecord>,
+}
+
+fn math_visibility_tag(function: &ProgramCall, ordinal: u32, operation: hir::MathFn, ty: Ty) -> String {
+    let Ty::Vec(Scalar::Float(float), lanes) = ty else {
+        return String::new();
+    };
+    format!(
+        "{}\t{}\t{}\tvec{}<f{}>",
+        function,
+        ordinal,
+        operation.source_name(),
+        lanes,
+        float.bits,
+    )
+}
+
+fn math_visibility_inventory(program: &Program) -> Vec<MathVisibilityRecord> {
+    let mut records = Vec::new();
+    for function in &program.fns {
+        let mut ordinal = 0u32;
+        for block in &function.blocks {
+            for (index, statement) in block.stmts.iter().enumerate() {
+                let Stmt::Let(_, Rvalue::MathOp { fn_, ty, .. }) = statement else {
+                    continue;
+                };
+                if !fn_.is_elementary_e1() || !matches!(ty, Ty::Vec(Scalar::Float(_), 2 | 4 | 8 | 16)) {
+                    continue;
+                }
+                ordinal += 1;
+                let source = block
+                    .stmt_lines
+                    .get(index)
+                    .copied()
+                    .filter(|(line, _)| *line != 0);
+                records.push(MathVisibilityRecord {
+                    function: function.name.clone(),
+                    operation_ordinal: ordinal,
+                    operation: *fn_,
+                    ty: *ty,
+                    state: MathVisibilityState::EliminatedOrMerged,
+                    provider: MathProvider::None,
+                    source,
+                    llvm_reason: None,
+                });
+            }
+        }
+    }
+    records
+}
+
+fn classify_math_visibility(
+    ctx: &Context,
+    module: &Module<'_>,
+    records: Vec<MathVisibilityRecord>,
+) -> Result<Vec<MathVisibilityRecord>, CodegenError> {
+    let kind = ctx.get_kind_id("align.math.visibility");
+    let mut shapes = HashMap::<String, (bool, bool)>::new();
+    for function in module.get_functions() {
+        for block in function.get_basic_blocks() {
+            for instruction in block.get_instructions() {
+                let Some(metadata) = instruction.get_metadata(kind) else {
+                    continue;
+                };
+                let Some(values) = metadata.get_node_values() else {
+                    return Err(CodegenError::Lowering("math visibility metadata is not a node".into()));
+                };
+                let [BasicMetadataValueEnum::MetadataValue(tag)] = values.as_slice() else {
+                    return Err(CodegenError::Lowering("math visibility metadata has the wrong shape".into()));
+                };
+                let tag = std::str::from_utf8(
+                    tag.get_string_value().ok_or_else(|| {
+                        CodegenError::Lowering("math visibility metadata tag is not a string".into())
+                    })?,
+                )
+                .map_err(|_| CodegenError::Lowering("math visibility metadata tag is not UTF-8".into()))?
+                .to_owned();
+                let entry = shapes.entry(tag).or_default();
+                if instruction.get_type().is_vector_type() {
+                    entry.0 = true;
+                } else {
+                    entry.1 = true;
+                }
+            }
+        }
+    }
+    resolve_math_visibility(records, shapes)
+}
+
+fn resolve_math_visibility(
+    mut records: Vec<MathVisibilityRecord>,
+    mut shapes: HashMap<String, (bool, bool)>,
+) -> Result<Vec<MathVisibilityRecord>, CodegenError> {
+    let mut previous_function: Option<ProgramCall> = None;
+    let mut expected_ordinal = 1u32;
+    for record in &mut records {
+        if previous_function.as_ref() != Some(&record.function) {
+            previous_function = Some(record.function.clone());
+            expected_ordinal = 1;
+        }
+        if record.operation_ordinal != expected_ordinal {
+            return Err(CodegenError::Lowering(
+                "math visibility inventory has a non-canonical ordinal".into(),
+            ));
+        }
+        expected_ordinal = expected_ordinal
+            .checked_add(1)
+            .ok_or_else(|| CodegenError::Lowering("too many math visibility records".into()))?;
+        if !record.operation.is_elementary_e1()
+            || !matches!(record.ty, Ty::Vec(Scalar::Float(FloatTy { bits: 32 | 64 }), 2 | 4 | 8 | 16))
+            || record.source.is_some_and(|(line, column)| line == 0 || column == 0)
+        {
+            return Err(CodegenError::Lowering(
+                "math visibility inventory has an invalid operation, type, or source".into(),
+            ));
+        }
+        let tag = math_visibility_tag(
+            &record.function,
+            record.operation_ordinal,
+            record.operation,
+            record.ty,
+        );
+        record.state = match shapes.remove(&tag) {
+            None => MathVisibilityState::EliminatedOrMerged,
+            Some((true, false)) => MathVisibilityState::RetainedVectorIr,
+            Some((_, true)) => MathVisibilityState::Scalarized,
+            Some((false, false)) => {
+                return Err(CodegenError::Lowering("math visibility metadata has no operation".into()));
+            }
+        };
+    }
+    if !shapes.is_empty() {
+        return Err(CodegenError::Lowering(
+            "optimized math visibility metadata has no source inventory record".into(),
+        ));
+    }
+    Ok(records)
+}
+
 /// Compile `program` with opt-in debug locations and the selected profile, and return LLVM's raw
 /// optimization-remark strings (each `"<file>:<line>:<col>: <message>"`) captured via the
 /// diagnostic handler (`docs/impl/09-explain-opt.md`, Slice 3b, Mechanism A). The driver's
@@ -1492,14 +1659,15 @@ pub struct DebugInfo {
 /// `exports` are the roots that keep `external` linkage, exactly as in [`emit_llvm_ir`]. The
 /// `explain-opt` lens seeds them from the inspected unit's own `pub` functions when it defines no
 /// `main`, so the remarks describe that unit instead of an empty module (issue 1086).
-pub fn collect_opt_remarks(
+pub fn collect_opt_inspection(
     program: &Program,
     target: &BuildTarget,
     profile: Profile,
     debug: &DebugInfo,
     exports: &[String],
-) -> Result<Vec<String>, CodegenError> {
+) -> Result<OptInspection, CodegenError> {
     ensure_remark_cl_opts();
+    let inventory = math_visibility_inventory(program);
     let ctx = Context::create();
     let module = ctx.create_module("align");
     let tm = create_target_machine(target, profile.codegen_opt_level())?;
@@ -1536,7 +1704,19 @@ pub fn collect_opt_remarks(
 
     drop(_detach_guard);
     ran?;
-    Ok(*sink)
+    let math = classify_math_visibility(&ctx, &module, inventory)?;
+    Ok(OptInspection { remarks: *sink, math })
+}
+
+pub fn collect_opt_remarks(
+    program: &Program,
+    target: &BuildTarget,
+    profile: Profile,
+    debug: &DebugInfo,
+    exports: &[String],
+) -> Result<Vec<String>, CodegenError> {
+    collect_opt_inspection(program, target, profile, debug, exports)
+        .map(|inspection| inspection.remarks)
 }
 
 /// Detaches the context diagnostic handler on drop. Ensures the handler is cleared before its
@@ -4549,6 +4729,7 @@ fn lower_prepared_module<'c>(
             blocks: Vec::new(),
             current_mir_block: None,
             current_mir_statement: None,
+            math_visibility_ordinal: 0,
             alias_scopes: HashMap::new(),
             view_header_slots: view_facts.headers,
             view_facts: view_facts.enabled,
@@ -9367,6 +9548,9 @@ struct FnGen<'c, 'a> {
     /// their successful guard against this action block before codegen forms any pointer.
     current_mir_block: Option<align_mir::BlockId>,
     current_mir_statement: Option<usize>,
+    /// One-based source/evaluation ordinal across explicit-vector E1 operations in this function.
+    /// Used only by the opt-in `explain-opt` metadata path.
+    math_visibility_ordinal: u32,
     /// Per-`map_into`-loop scoped-`noalias` metadata, keyed by the MIR loop's scope id: the
     /// `(in_list, out_list)` scope lists (each a one-scope MDNode) built lazily on first use. The
     /// `in`/`out` scopes share a fresh disjoint domain per id, so the loop's source load
@@ -11958,6 +12142,48 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .ok_or_else(|| self.err(format!("intrinsic {name} returned no value")))
     }
 
+    fn call_elementary_math_intrinsic(
+        &mut self,
+        name: &str,
+        overload: BasicTypeEnum<'c>,
+        argument: BasicValueEnum<'c>,
+        operation: hir::MathFn,
+        ty: Ty,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let intr = Intrinsic::find(name).ok_or_else(|| self.err(format!("intrinsic {name} not found")))?;
+        let function = intr
+            .get_declaration(self.module, &[overload])
+            .ok_or_else(|| self.err(format!("could not declare intrinsic {name}")))?;
+        let value = self
+            .builder
+            .build_call(function, &[argument.into()], "intr")
+            .map_err(|e| self.err(e))?
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| self.err(format!("intrinsic {name} returned no value")))?;
+        if matches!(ty, Ty::Vec(Scalar::Float(_), 2 | 4 | 8 | 16)) {
+            self.math_visibility_ordinal = self
+                .math_visibility_ordinal
+                .checked_add(1)
+                .ok_or_else(|| self.err("too many elementary vector-math operations"))?;
+            if self.dibuilder.is_some() {
+                let tag = math_visibility_tag(
+                    &self.f.name,
+                    self.math_visibility_ordinal,
+                    operation,
+                    ty,
+                );
+                let node = self.ctx.metadata_node(&[self.ctx.metadata_string(&tag).into()]);
+                value
+                    .as_instruction_value()
+                    .ok_or_else(|| self.err("elementary math call has no instruction"))?
+                    .set_metadata(node, self.ctx.get_kind_id("align.math.visibility"))
+                    .map_err(|_| self.err("cannot attach elementary math visibility metadata"))?;
+            }
+        }
+        Ok(value)
+    }
+
     /// Find + declare + call an overloaded binary integer intrinsic (`llvm.sadd.sat`,
     /// `llvm.umul.with.overflow`, …) on `int_ty`, returning its result value (`iN` for `.sat`,
     /// `{ iN, i1 }` for `.with.overflow`).
@@ -13851,6 +14077,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     align_sema::MathFn::Ceil => self.call_intrinsic("llvm.ceil", &[overload], &[ops[0].into()])?,
                     align_sema::MathFn::Round => self.call_intrinsic("llvm.round", &[overload], &[ops[0].into()])?,
                     align_sema::MathFn::Trunc => self.call_intrinsic("llvm.trunc", &[overload], &[ops[0].into()])?,
+                    align_sema::MathFn::Exp => self.call_elementary_math_intrinsic("llvm.exp", overload, ops[0], *fn_, *ty)?,
+                    align_sema::MathFn::Exp2 => self.call_elementary_math_intrinsic("llvm.exp2", overload, ops[0], *fn_, *ty)?,
+                    align_sema::MathFn::Log => self.call_elementary_math_intrinsic("llvm.log", overload, ops[0], *fn_, *ty)?,
+                    align_sema::MathFn::Log2 => self.call_elementary_math_intrinsic("llvm.log2", overload, ops[0], *fn_, *ty)?,
+                    align_sema::MathFn::Log10 => self.call_elementary_math_intrinsic("llvm.log10", overload, ops[0], *fn_, *ty)?,
                     // `pow(base, exp)`.
                     align_sema::MathFn::Pow => self.call_intrinsic("llvm.pow", &[overload], &[ops[0].into(), ops[1].into()])?,
                     // `fma(a, b, c)` = a*b + c, one rounding (scalar or vector overload).
@@ -25512,6 +25743,94 @@ mod tests {
 
     fn program_call(name: &str) -> ProgramCall {
         ProgramCall::try_from_logical(name).expect("valid test program call")
+    }
+
+    fn math_visibility_record(
+        ordinal: u32,
+        operation: hir::MathFn,
+    ) -> MathVisibilityRecord {
+        MathVisibilityRecord {
+            function: program_call("main$visibility"),
+            operation_ordinal: ordinal,
+            operation,
+            ty: Ty::Vec(Scalar::Float(FloatTy { bits: 32 }), 4),
+            state: MathVisibilityState::EliminatedOrMerged,
+            provider: MathProvider::None,
+            source: Some((ordinal, 1)),
+            llvm_reason: None,
+        }
+    }
+
+    #[test]
+    fn math_visibility_resolution_is_total_and_rejects_malformed_inventory() {
+        let records = vec![
+            math_visibility_record(1, hir::MathFn::Exp),
+            math_visibility_record(2, hir::MathFn::Exp2),
+            math_visibility_record(3, hir::MathFn::Log),
+            math_visibility_record(4, hir::MathFn::Log2),
+        ];
+        let mut shapes = HashMap::new();
+        shapes.insert(
+            math_visibility_tag(&records[1].function, 2, records[1].operation, records[1].ty),
+            (true, false),
+        );
+        shapes.insert(
+            math_visibility_tag(&records[2].function, 3, records[2].operation, records[2].ty),
+            (false, true),
+        );
+        shapes.insert(
+            math_visibility_tag(&records[3].function, 4, records[3].operation, records[3].ty),
+            (true, true),
+        );
+        let resolved = resolve_math_visibility(records.clone(), shapes).expect("valid inventory");
+        assert_eq!(
+            resolved.iter().map(|record| record.state).collect::<Vec<_>>(),
+            vec![
+                MathVisibilityState::EliminatedOrMerged,
+                MathVisibilityState::RetainedVectorIr,
+                MathVisibilityState::Scalarized,
+                MathVisibilityState::Scalarized,
+            ],
+        );
+
+        let mut malformed = records.clone();
+        malformed[1].operation_ordinal = 3;
+        assert!(resolve_math_visibility(malformed, HashMap::new()).is_err());
+        let mut malformed = records.clone();
+        malformed[0].operation = hir::MathFn::Sqrt;
+        assert!(resolve_math_visibility(malformed, HashMap::new()).is_err());
+        let mut malformed = records.clone();
+        malformed[0].ty = Ty::Vec(Scalar::Float(FloatTy { bits: 16 }), 4);
+        assert!(resolve_math_visibility(malformed, HashMap::new()).is_err());
+        let mut malformed = records;
+        malformed[0].source = Some((0, 1));
+        assert!(resolve_math_visibility(malformed, HashMap::new()).is_err());
+    }
+
+    #[test]
+    fn math_visibility_inspection_does_not_change_normal_optimized_ir() {
+        let program = mir(
+            "pub fn first(v: vec4<f32>) -> f32 {\n  out := v.exp()\n  return out[0]\n}\nfn main() -> i32 = 0\n",
+        );
+        let target = BuildTarget::Baseline;
+        let before = emit_llvm_ir(&program, &target, Profile::Release, true, &[], None)
+            .expect("normal optimized IR before inspection");
+        let inspection = collect_opt_inspection(
+            &program,
+            &target,
+            Profile::Release,
+            &DebugInfo {
+                file: "visibility.align".into(),
+                directory: ".".into(),
+            },
+            &["first".into()],
+        )
+        .expect("opt inspection");
+        assert_eq!(inspection.math.len(), 1);
+        let after = emit_llvm_ir(&program, &target, Profile::Release, true, &[], None)
+            .expect("normal optimized IR after inspection");
+        assert_eq!(before, after, "the inspection lens must not mutate ordinary output");
+        assert!(!after.contains("align.math.visibility"));
     }
 
 

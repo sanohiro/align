@@ -664,11 +664,115 @@ fn vector_math_lowers_to_the_vector_intrinsic() {
 }
 
 #[test]
+fn elementary_exp_log_family_lowers_to_every_vector_intrinsic() {
+    if !backend_available() {
+        return;
+    }
+    let mut source = String::new();
+    for lanes in [2, 4, 8, 16] {
+        for bits in [32, 64] {
+            for operation in ["exp", "exp2", "log", "log2", "log10"] {
+                source.push_str(&format!(
+                    "pub fn {operation}_{lanes}_{bits}(x: vec{lanes}<f{bits}>) -> vec{lanes}<f{bits}> = x.{operation}()\n"
+                ));
+            }
+        }
+    }
+    source.push_str("fn main() -> i32 = 0\n");
+    let ir = emit_llvm(&source);
+    for lanes in [2, 4, 8, 16] {
+        for bits in [32, 64] {
+            for operation in ["exp", "exp2", "log", "log2", "log10"] {
+                assert!(
+                    ir.contains(&format!("@llvm.{operation}.v{lanes}f{bits}")),
+                    "missing llvm.{operation}.v{lanes}f{bits}:\n{ir}",
+                );
+            }
+        }
+    }
+    assert!(
+        !ir.contains("align.math.visibility"),
+        "ordinary raw IR must not carry explain-only math metadata:\n{ir}",
+    );
+}
+
+#[test]
+fn elementary_exp_log_special_values_are_lane_wise_at_every_width() {
+    if !backend_available() {
+        return;
+    }
+    let mut source = String::new();
+    let mut checks = Vec::new();
+    for lanes in [2, 4, 8, 16] {
+        for bits in [32, 64] {
+            let name = format!("check_{lanes}_{bits}");
+            checks.push(name.clone());
+            let repeated = |value: &str| std::iter::repeat_n(value, lanes).collect::<Vec<_>>().join(", ");
+            source.push_str(&format!("fn {name}() -> i32 {{\n"));
+            source.push_str(&format!("  zero: f{bits} := 0.0\n  neg_zero: f{bits} := -0.0\n  one: f{bits} := 1.0\n  high: f{bits} := 10000.0\n"));
+            source.push_str("  inf := one / zero\n  neg_inf := zero - inf\n  nan := zero / zero\n  neg_one := zero - one\n  low := zero - high\n");
+            for (vector, value) in [
+                ("zeros", "zero"),
+                ("neg_zeros", "neg_zero"),
+                ("ones", "one"),
+                ("infs", "inf"),
+                ("neg_infs", "neg_inf"),
+                ("nans", "nan"),
+                ("neg_ones", "neg_one"),
+                ("highs", "high"),
+                ("lows", "low"),
+            ] {
+                source.push_str(&format!(
+                    "  {vector}: vec{lanes}<f{bits}> := [{}]\n",
+                    repeated(value),
+                ));
+            }
+            source.push_str("  exp_zero := zeros.exp()\n  exp_neg_zero := neg_zeros.exp()\n  exp_neg_inf := neg_infs.exp()\n  exp_inf := infs.exp()\n  exp_nan := nans.exp()\n  exp_high := highs.exp()\n  exp_low := lows.exp()\n");
+            source.push_str("  exp2_zero := zeros.exp2()\n  exp2_neg_zero := neg_zeros.exp2()\n  exp2_neg_inf := neg_infs.exp2()\n  exp2_inf := infs.exp2()\n  exp2_nan := nans.exp2()\n  exp2_high := highs.exp2()\n  exp2_low := lows.exp2()\n");
+            source.push_str("  log_one := ones.log()\n  log_zero := zeros.log()\n  log_neg_zero := neg_zeros.log()\n  log_inf := infs.log()\n  log_neg := neg_ones.log()\n  log_neg_inf := neg_infs.log()\n  log_nan := nans.log()\n");
+            source.push_str("  log2_one := ones.log2()\n  log2_zero := zeros.log2()\n  log2_neg_zero := neg_zeros.log2()\n  log2_inf := infs.log2()\n  log2_neg := neg_ones.log2()\n  log2_neg_inf := neg_infs.log2()\n  log2_nan := nans.log2()\n");
+            source.push_str("  log10_one := ones.log10()\n  log10_zero := zeros.log10()\n  log10_neg_zero := neg_zeros.log10()\n  log10_inf := infs.log10()\n  log10_neg := neg_ones.log10()\n  log10_neg_inf := neg_infs.log10()\n  log10_nan := nans.log10()\n");
+            for lane in 0..lanes {
+                source.push_str(&format!(
+                    "  if exp_zero[{lane}] != one || exp_neg_zero[{lane}] != one || exp_neg_inf[{lane}].to_bits() != 0 || exp_inf[{lane}] != inf || !exp_nan[{lane}].is_nan() || exp_high[{lane}] != inf || exp_low[{lane}] < zero {{ return 1 }}\n",
+                ));
+                source.push_str(&format!(
+                    "  if exp2_zero[{lane}] != one || exp2_neg_zero[{lane}] != one || exp2_neg_inf[{lane}].to_bits() != 0 || exp2_inf[{lane}] != inf || !exp2_nan[{lane}].is_nan() || exp2_high[{lane}] != inf || exp2_low[{lane}] < zero {{ return 2 }}\n",
+                ));
+                source.push_str(&format!(
+                    "  if log_one[{lane}] != zero || log_zero[{lane}] != neg_inf || log_neg_zero[{lane}] != neg_inf || log_inf[{lane}] != inf || !log_neg[{lane}].is_nan() || !log_neg_inf[{lane}].is_nan() || !log_nan[{lane}].is_nan() {{ return 3 }}\n",
+                ));
+                source.push_str(&format!(
+                    "  if log2_one[{lane}] != zero || log2_zero[{lane}] != neg_inf || log2_neg_zero[{lane}] != neg_inf || log2_inf[{lane}] != inf || !log2_neg[{lane}].is_nan() || !log2_neg_inf[{lane}].is_nan() || !log2_nan[{lane}].is_nan() {{ return 4 }}\n",
+                ));
+                source.push_str(&format!(
+                    "  if log10_one[{lane}] != zero || log10_zero[{lane}] != neg_inf || log10_neg_zero[{lane}] != neg_inf || log10_inf[{lane}] != inf || !log10_neg[{lane}].is_nan() || !log10_neg_inf[{lane}].is_nan() || !log10_nan[{lane}].is_nan() {{ return 5 }}\n",
+                ));
+            }
+            source.push_str("  return 0\n}\n");
+        }
+    }
+    source.push_str("fn main() -> i32 {\n");
+    for check in checks {
+        source.push_str(&format!("  if {check}() != 0 {{ return 1 }}\n"));
+    }
+    source.push_str("  return 0\n}\n");
+    assert_eq!(
+        build_and_run("vec-elementary-special", &source).status.code(),
+        Some(0),
+    );
+}
+
+#[test]
 fn integer_vector_math_is_rejected() {
     // The unary float ops are float-only; an integer vector has no `sqrt`.
     assert!(check_errs(
         "vec-int-sqrt",
         "fn main() -> i32 {\n  v: vec4<i32> := [1, 4, 9, 16]\n  w := v.sqrt()\n  return w[0]\n}\n",
+    ));
+    assert!(check_errs(
+        "vec-int-exp",
+        "fn main() -> i32 {\n  v: vec4<i32> := [1, 2, 3, 4]\n  w := v.exp()\n  return w[0]\n}\n",
     ));
 }
 

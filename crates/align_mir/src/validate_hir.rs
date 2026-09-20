@@ -14052,8 +14052,9 @@ fn math_result(fn_: hir::MathFn, operands: &[BodyFlow]) -> Option<Ty> {
     let exact = |count: usize| tys.len() == count && tys.iter().all(|ty| *ty == first);
     match fn_ {
         hir::MathFn::Abs | hir::MathFn::Sqrt | hir::MathFn::Floor | hir::MathFn::Ceil
-        | hir::MathFn::Round | hir::MathFn::Trunc => {
-            if !exact(1) || !numeric || (matches!(fn_, hir::MathFn::Sqrt | hir::MathFn::Floor | hir::MathFn::Ceil | hir::MathFn::Round | hir::MathFn::Trunc) && !float) {
+        | hir::MathFn::Round | hir::MathFn::Trunc | hir::MathFn::Exp | hir::MathFn::Exp2
+        | hir::MathFn::Log | hir::MathFn::Log2 | hir::MathFn::Log10 => {
+            if !exact(1) || !numeric || (fn_ != hir::MathFn::Abs && !float) {
                 None
             } else {
                 Some(first)

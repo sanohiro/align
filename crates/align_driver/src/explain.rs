@@ -21,7 +21,10 @@ use std::process::ExitCode;
 use align_mir::{PlanKind, PlanReason, PlanRecord, PlanState, PlanStrategy};
 use align_span::SourceMap;
 
-use crate::{build_per_unit_located, collect_opt_remarks, format_diagnostics, BuildTarget, DebugInfo};
+use crate::{
+    build_per_unit_located, collect_opt_inspection, format_diagnostics, BuildTarget, DebugInfo,
+    MathProvider, MathVisibilityRecord, MathVisibilityState,
+};
 
 /// What LLVM did to a construct.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -562,6 +565,100 @@ fn render_current_plan(records: &[PlanRecord], verbose: bool, file: &str) -> Str
     out
 }
 
+fn math_state(state: MathVisibilityState) -> &'static str {
+    match state {
+        MathVisibilityState::EliminatedOrMerged => "eliminated-or-merged",
+        MathVisibilityState::RetainedVectorIr => "retained-vector-ir",
+        MathVisibilityState::Scalarized => "scalarized",
+    }
+}
+
+fn math_type(ty: align_sema::Ty) -> Option<String> {
+    let align_sema::Ty::Vec(align_sema::Scalar::Float(float), lanes @ (2 | 4 | 8 | 16)) = ty else {
+        return None;
+    };
+    Some(format!("vec{lanes}<f{}>", float.bits))
+}
+
+fn math_explanation(record: &MathVisibilityRecord) -> String {
+    let operation = record.operation.source_name();
+    let llvm_reason = escaped_plan_filename(
+        record
+            .llvm_reason
+            .as_deref()
+            .unwrap_or("LLVM supplied no reason"),
+    );
+    match (&record.state, &record.provider) {
+        (MathVisibilityState::EliminatedOrMerged, _) => format!(
+            "vector math `{operation}` has no independent optimized operation; it was eliminated or merged"
+        ),
+        (MathVisibilityState::RetainedVectorIr, MathProvider::None) => format!(
+            "vector math `{operation}` remains vector IR, but no vector math provider is configured; final instruction selection may scalarize it"
+        ),
+        (MathVisibilityState::RetainedVectorIr, MathProvider::Configured(provider)) => format!(
+            "vector math `{operation}` remains vector IR with provider `{}`; final machine shape is owned by that provider's object-disassembly contract",
+            escaped_plan_filename(provider),
+        ),
+        (MathVisibilityState::Scalarized, MathProvider::None) => format!(
+            "vector math `{operation}` was scalarized before instruction selection — {}; no vector math provider is configured",
+            llvm_reason,
+        ),
+        (MathVisibilityState::Scalarized, MathProvider::Configured(provider)) => format!(
+            "vector math `{operation}` was scalarized before instruction selection with provider `{}` — {}",
+            escaped_plan_filename(provider),
+            llvm_reason,
+        ),
+    }
+}
+
+fn math_default_visible(record: &MathVisibilityRecord) -> bool {
+    match (&record.state, &record.provider) {
+        (MathVisibilityState::EliminatedOrMerged, _) => false,
+        (MathVisibilityState::RetainedVectorIr, MathProvider::Configured(_)) => false,
+        (MathVisibilityState::RetainedVectorIr | MathVisibilityState::Scalarized, _) => true,
+    }
+}
+
+fn render_math_visibility(records: &[MathVisibilityRecord], verbose: bool, file: &str) -> Result<String, ()> {
+    let mut out = String::new();
+    let file = escaped_plan_filename(file);
+    if verbose {
+        for record in records {
+            let explanation = math_explanation(record);
+            if let Some((line, column)) = record.source {
+                let _ = writeln!(out, "{file}:{line}:{column}: {explanation}");
+            } else {
+                let ty = math_type(record.ty).ok_or(())?;
+                let function = escaped_plan_filename(&record.function.to_string());
+                let _ = writeln!(
+                    out,
+                    "  [vector math `{function}` #{} `{}` `{ty}`] {} — {explanation}; source location is unavailable",
+                    record.operation_ordinal,
+                    record.operation.source_name(),
+                    math_state(record.state),
+                );
+            }
+        }
+        return Ok(out);
+    }
+
+    for record in records.iter().filter(|record| record.source.is_some() && math_default_visible(record)) {
+        let (line, column) = record.source.ok_or(())?;
+        let _ = writeln!(out, "{file}:{line}:{column}: {}", math_explanation(record));
+    }
+    let unavailable = records
+        .iter()
+        .filter(|record| record.source.is_none() && math_default_visible(record))
+        .count();
+    if unavailable != 0 {
+        let _ = writeln!(
+            out,
+            "+ {unavailable} vector-math visibility record(s) without user source (see --verbose)",
+        );
+    }
+    Ok(out)
+}
+
 /// `alignc explain-opt <file> [--verbose]` — compile, capture remarks, and print the report. Exit
 /// code: `0` = compiled + report produced (missed optimizations are not errors); `1` = compile
 /// error / bad args (`docs/impl/09-explain-opt.md`).
@@ -657,18 +754,26 @@ pub fn run_explain_opt(path: &str, verbose: bool, target: BuildTarget, profile: 
         for unit in &walk.units {
             let debug = unit_debug(&unit.file);
             let roots: &[String] = if unit.is_entry { exports } else { &[] };
-            let remarks = match collect_opt_remarks(&unit.mir, target.clone(), profile, &debug, roots) {
-                Ok(r) => r,
+            let inspection = match collect_opt_inspection(&unit.mir, target.clone(), profile, &debug, roots) {
+                Ok(inspection) => inspection,
                 Err(e) => {
                     eprintln!("alignc: {e}");
                     return ExitCode::FAILURE;
                 }
             };
-            let report = Report::build(&remarks);
+            let report = Report::build(&inspection.remarks);
             if multi {
                 let _ = writeln!(out, "==== unit: {} ({}) ====", unit.unit, debug.file);
             }
             out.push_str(&render_current_plan(&unit.mir.plan_records, verbose, &debug.file));
+            let math = match render_math_visibility(&inspection.math, verbose, &debug.file) {
+                Ok(math) => math,
+                Err(()) => {
+                    eprintln!("alignc: cannot explain vector math: malformed record");
+                    return ExitCode::FAILURE;
+                }
+            };
+            out.push_str(&math);
             out.push_str(&render_loop_facts(&unit.mir));
             out.push_str(&report.render(verbose));
         }
@@ -752,6 +857,85 @@ mod tests {
         assert_eq!(
             render_current_plan(&source_less, true, "ignored.align"),
             "  [current plan `main$f` #1 buffer-donation] rejected `fresh-output` — source and result element layouts are not identical; source location is unavailable\n  [current plan `main$f` #2 par-map] rejected `sequential-collect` — a stage or value shape has no current range-kernel form, so the explicit operation uses the sequential collector; source location is unavailable\n"
+        );
+    }
+
+    fn math_record(
+        ordinal: u32,
+        operation: align_sema::MathFn,
+        state: MathVisibilityState,
+        source: Option<(u32, u32)>,
+    ) -> MathVisibilityRecord {
+        MathVisibilityRecord {
+            function: align_mir::ProgramCall::try_from_logical("main$f").unwrap(),
+            operation_ordinal: ordinal,
+            operation,
+            ty: align_sema::Ty::Vec(
+                align_sema::Scalar::Float(align_sema::FloatTy { bits: 32 }),
+                4,
+            ),
+            state,
+            provider: MathProvider::None,
+            source,
+            llvm_reason: None,
+        }
+    }
+
+    #[test]
+    fn math_visibility_renderer_pins_state_and_source_matrix() {
+        let rows = [
+            math_record(
+                1,
+                align_sema::MathFn::Exp,
+                MathVisibilityState::RetainedVectorIr,
+                Some((2, 3)),
+            ),
+            math_record(
+                2,
+                align_sema::MathFn::Log,
+                MathVisibilityState::EliminatedOrMerged,
+                Some((4, 5)),
+            ),
+            math_record(
+                3,
+                align_sema::MathFn::Log2,
+                MathVisibilityState::Scalarized,
+                None,
+            ),
+        ];
+        assert_eq!(
+            render_math_visibility(&rows, false, "a\\b\nc\r.align").unwrap(),
+            "a\\\\b\\nc\\r.align:2:3: vector math `exp` remains vector IR, but no vector math provider is configured; final instruction selection may scalarize it\n+ 1 vector-math visibility record(s) without user source (see --verbose)\n",
+        );
+        assert_eq!(
+            render_math_visibility(&rows, true, "file.align").unwrap(),
+            "file.align:2:3: vector math `exp` remains vector IR, but no vector math provider is configured; final instruction selection may scalarize it\nfile.align:4:5: vector math `log` has no independent optimized operation; it was eliminated or merged\n  [vector math `main$f` #3 `log2` `vec4<f32>`] scalarized — vector math `log2` was scalarized before instruction selection — LLVM supplied no reason; no vector math provider is configured; source location is unavailable\n",
+        );
+
+        let mut configured_retained = math_record(
+            4,
+            align_sema::MathFn::Log10,
+            MathVisibilityState::RetainedVectorIr,
+            Some((6, 7)),
+        );
+        configured_retained.provider = MathProvider::Configured("sleef\\avx\n2".to_owned());
+        assert_eq!(render_math_visibility(&[configured_retained.clone()], false, "file.align").unwrap(), "");
+        assert_eq!(
+            render_math_visibility(&[configured_retained], true, "file.align").unwrap(),
+            "file.align:6:7: vector math `log10` remains vector IR with provider `sleef\\\\avx\\n2`; final machine shape is owned by that provider's object-disassembly contract\n",
+        );
+
+        let mut configured_scalar = math_record(
+            5,
+            align_sema::MathFn::Exp2,
+            MathVisibilityState::Scalarized,
+            Some((8, 9)),
+        );
+        configured_scalar.provider = MathProvider::Configured("svml".to_owned());
+        configured_scalar.llvm_reason = Some("cost\nmodel\\detail".to_owned());
+        assert_eq!(
+            render_math_visibility(&[configured_scalar], false, "file.align").unwrap(),
+            "file.align:8:9: vector math `exp2` was scalarized before instruction selection with provider `svml` — cost\\nmodel\\\\detail\n",
         );
     }
 

@@ -50660,29 +50660,13 @@ impl<'a, 't> Checker<'a, 't> {
     fn check_scalar_math(&mut self, recv: &ast::Expr, fn_: hir::MathFn, args: &[ast::Expr], span: Span) -> Expr {
         use hir::MathFn::*;
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        let name = match fn_ {
-            Abs => "abs",
-            Min => "min",
-            Max => "max",
-            Sqrt => "sqrt",
-            Floor => "floor",
-            Ceil => "ceil",
-            Round => "round",
-            Trunc => "trunc",
-            Pow => "pow",
-            // `fma` is a free builtin (`check_fma`), never a method — listed only for exhaustiveness.
-            Fma => "fma",
-            ToBits => "to_bits",
-            IsFinite => "is_finite",
-            IsNan => "is_nan",
-            IsInfinite => "is_infinite",
-        };
+        let name = fn_.source_name();
         // `(want_args, float_only)`: `abs`/`min`/`max` accept any numeric; the rest are float-only.
         // `min`/`max`/`pow` take one operand; the others take none.
         let (want_args, float_only) = match fn_ {
             Abs => (0, false),
             Min | Max => (1, false),
-            Sqrt | Floor | Ceil | Round | Trunc => (0, true),
+            Sqrt | Floor | Ceil | Round | Trunc | Exp | Exp2 | Log | Log2 | Log10 => (0, true),
             Pow => (1, true),
             Fma => (2, true), // free builtin; never reached here
             ToBits | IsFinite | IsNan | IsInfinite => (0, true),
@@ -50691,12 +50675,17 @@ impl<'a, 't> Checker<'a, 't> {
         if r.ty == Ty::Error {
             return err;
         }
-        // Element-wise vector math (M6): every op below maps to **one lane-wise hardware
-        // instruction**, so it vectorizes. A float vector takes the unary float ops + min/max; an
-        // integer vector takes abs + min/max (the float-only ops don't apply). `pow` is excluded —
-        // it lowers to a libcall, not a lane-wise instruction, so it stays scalar-only.
+        // Element-wise vector math (M6): the established operations and E1 family lower to LLVM
+        // vector intrinsics. The E1 intrinsics may later scalarize when no provider is available;
+        // that target fact does not remove the source-level vector operation. A float vector takes
+        // the unary float ops + min/max; an integer vector takes abs + min/max. `pow` remains
+        // scalar-only because it has no settled explicit-vector surface.
         let vec_ok = match r.ty {
-            Ty::Vec(Scalar::Float(_), _) => matches!(fn_, Abs | Sqrt | Floor | Ceil | Round | Trunc | Min | Max),
+            Ty::Vec(Scalar::Float(_), _) => matches!(
+                fn_,
+                Abs | Sqrt | Floor | Ceil | Round | Trunc | Exp | Exp2 | Log | Log2 | Log10
+                    | Min | Max
+            ),
             Ty::Vec(Scalar::Int(_), _) => matches!(fn_, Abs | Min | Max),
             _ => false,
         };
@@ -53176,6 +53165,11 @@ impl<'a, 't> Checker<'a, 't> {
             "ceil" => Some(hir::MathFn::Ceil),
             "round" => Some(hir::MathFn::Round),
             "trunc" => Some(hir::MathFn::Trunc),
+            "exp" => Some(hir::MathFn::Exp),
+            "exp2" => Some(hir::MathFn::Exp2),
+            "log" => Some(hir::MathFn::Log),
+            "log2" => Some(hir::MathFn::Log2),
+            "log10" => Some(hir::MathFn::Log10),
             "pow" => Some(hir::MathFn::Pow),
             _ => None,
         };

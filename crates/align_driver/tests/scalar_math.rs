@@ -66,6 +66,93 @@ fn float_transcendentals() {
 }
 
 #[test]
+fn elementary_exp_log_family_lowers_to_exact_scalar_intrinsics() {
+    if !backend_available() {
+        return;
+    }
+    let mut source = String::new();
+    for bits in [32, 64] {
+        for operation in ["exp", "exp2", "log", "log2", "log10"] {
+            source.push_str(&format!(
+                "pub fn {operation}_{bits}(x: f{bits}) -> f{bits} = x.{operation}()\n"
+            ));
+        }
+    }
+    source.push_str("fn main() -> i32 = 0\n");
+    let ir = raw_ir("sm-elementary-ir", &source);
+    for bits in [32, 64] {
+        for operation in ["exp", "exp2", "log", "log2", "log10"] {
+            assert!(
+                ir.contains(&format!("@llvm.{operation}.f{bits}")),
+                "missing llvm.{operation}.f{bits}:\n{ir}",
+            );
+        }
+    }
+    assert!(!ir.contains("@llvm.pow"), "elementary functions must not decompose through pow:\n{ir}");
+}
+
+#[test]
+fn elementary_exp_log_special_value_classes() {
+    if !backend_available() {
+        return;
+    }
+    let source = concat!(
+        "fn main() -> i32 {\n",
+        "  zero: f64 := 0.0\n",
+        "  neg_zero: f64 := -0.0\n",
+        "  one: f64 := 1.0\n",
+        "  inf := one / zero\n",
+        "  neg_inf := zero - inf\n",
+        "  nan := zero / zero\n",
+        "  high: f64 := 10000.0\n",
+        "  low := zero - high\n",
+        "  if zero.exp() != one || neg_zero.exp() != one || neg_inf.exp().to_bits() != 0 || high.exp() != inf || low.exp() < zero { return 1 }\n",
+        "  if zero.exp2() != one || neg_zero.exp2() != one || neg_inf.exp2().to_bits() != 0 || high.exp2() != inf || low.exp2() < zero { return 2 }\n",
+        "  if one.log() != zero || zero.log() != neg_inf || neg_zero.log() != neg_inf || inf.log() != inf || !neg_inf.log().is_nan() { return 3 }\n",
+        "  if one.log2() != zero || zero.log2() != neg_inf || neg_zero.log2() != neg_inf || inf.log2() != inf || !neg_inf.log2().is_nan() { return 4 }\n",
+        "  if one.log10() != zero || zero.log10() != neg_inf || neg_zero.log10() != neg_inf || inf.log10() != inf || !neg_inf.log10().is_nan() { return 5 }\n",
+        "  if !(zero - one).log().is_nan() || !nan.exp().is_nan() || !nan.exp2().is_nan() || !nan.log().is_nan() || !nan.log2().is_nan() || !nan.log10().is_nan() { return 6 }\n",
+        "  return 0\n",
+        "}\n",
+    );
+    assert_eq!(build_and_run("sm-elementary-special", source).status.code(), Some(0));
+}
+
+#[test]
+fn elementary_exp_log_diagnostics_check_receiver_before_arity() {
+    let diagnostic = |name: &str, source: &str| {
+        let mut sm = SourceMap::new();
+        let checked = check(&mut sm, name, source);
+        assert!(checked.diags.has_errors());
+        align_driver::format_diagnostics(&sm, &checked.diags)
+    };
+    let receiver = diagnostic(
+        "sm-elementary-receiver",
+        "fn main() -> i32 {\n  x: i32 := 1\n  return x.exp(2.0) as i32\n}\n",
+    );
+    assert!(receiver.contains("'exp' needs a float"), "{receiver}");
+    assert!(!receiver.contains("takes 0 argument"), "receiver error must win:\n{receiver}");
+
+    let arity = diagnostic(
+        "sm-elementary-arity",
+        "fn main() -> i32 {\n  x: f64 := 1.0\n  return x.log10(2.0) as i32\n}\n",
+    );
+    assert!(arity.contains("'log10' takes 0 argument(s), got 1"), "{arity}");
+
+    let array = diagnostic(
+        "sm-elementary-array",
+        "fn bad(a: array<f64>) -> f64 = a.log()\nfn main() -> i32 = 0\n",
+    );
+    assert!(array.contains("'log' needs a float"), "{array}");
+
+    let mask = diagnostic(
+        "sm-elementary-mask",
+        "fn bad(m: mask4<f32>) -> mask4<f32> = m.exp2()\nfn main() -> i32 = 0\n",
+    );
+    assert!(mask.contains("'exp2' needs a float"), "{mask}");
+}
+
+#[test]
 fn sqrt_on_int_rejected() {
     // The transcendentals are float-only.
     assert!(check_errs("sm-int-sqrt", "fn main() -> i32 {\n  x: i32 := 4\n  return x.sqrt()\n}\n"));
