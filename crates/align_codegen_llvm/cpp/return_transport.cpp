@@ -18,6 +18,7 @@
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/raw_ostream.h"
@@ -364,6 +365,46 @@ StoreInst *materializingStore(CallInst &Call, const ResultLayout &L) {
   return Store;
 }
 
+bool collectCompletedValueReads(Value *Pointer, StoreInst &Commit,
+                                CallInst &Call, DominatorTree &Dominators,
+                                bool Root, SmallPtrSetImpl<Value *> &Seen,
+                                SmallVectorImpl<LoadInst *> &Reads,
+                                SmallVectorImpl<StoreInst *> &LaterWrites) {
+  if (!Seen.insert(Pointer).second) return true;
+  for (User *User : Pointer->users()) {
+    auto *Use = dyn_cast<Instruction>(User);
+    if (!Use) return false;
+    if (Root && Use == &Commit) continue;
+    if (Use->isLifetimeStartOrEnd()) continue;
+    if (auto *Store = dyn_cast<StoreInst>(Use)) {
+      if (!Root || !Store->isSimple() ||
+          !isa<ConstantAggregateZero>(Store->getValueOperand()))
+        return false;
+      if (Store->getParent() == Call.getParent() &&
+          Store->comesBefore(&Call))
+        continue;
+      if (!Dominators.dominates(&Commit, Store)) return false;
+      LaterWrites.push_back(Store);
+      continue;
+    }
+    if (auto *Load = dyn_cast<LoadInst>(Use)) {
+      if (!Load->isSimple() || !Dominators.dominates(&Commit, Load))
+        return false;
+      Reads.push_back(Load);
+      continue;
+    }
+    if ((isa<GetElementPtrInst>(Use) || isa<BitCastInst>(Use) ||
+         isa<AddrSpaceCastInst>(Use)) && Dominators.dominates(&Commit, Use)) {
+      if (!collectCompletedValueReads(Use, Commit, Call, Dominators, false,
+                                      Seen, Reads, LaterWrites))
+        return false;
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
 StoreInst *cleanupMaterializingStore(CallInst &Call,
                                      const ResultLayout &Value) {
   ExtractValueInst *Extract = nullptr;
@@ -394,25 +435,23 @@ StoreInst *cleanupMaterializingStore(CallInst &Call,
   if (Store->getParent() != Call.getParent() || !Call.comesBefore(Store))
     return nullptr;
   DominatorTree Dominators(*Call.getFunction());
-  for (User *User : Slot->users()) {
-    auto *Use = dyn_cast<Instruction>(User);
-    if (!Use) return nullptr;
-    if (Use == Store || Use->isLifetimeStartOrEnd()) continue;
-    if (auto *OtherStore = dyn_cast<StoreInst>(Use)) {
-      if (!OtherStore->isSimple() ||
-          !isa<ConstantAggregateZero>(OtherStore->getValueOperand()))
+  SmallPtrSet<llvm::Value *, 8> Seen;
+  SmallVector<LoadInst *, 8> Reads;
+  SmallVector<StoreInst *, 4> LaterWrites;
+  if (!collectCompletedValueReads(Slot, *Store, Call, Dominators, true, Seen,
+                                  Reads, LaterWrites))
+    return nullptr;
+  for (StoreInst *Write : LaterWrites)
+    for (LoadInst *Read : Reads)
+      if (isPotentiallyReachable(Write, Read, nullptr, &Dominators))
         return nullptr;
-      if ((OtherStore->getParent() == Call.getParent() &&
-           OtherStore->comesBefore(&Call)) ||
-          Dominators.dominates(Store, OtherStore))
-        continue;
-      return nullptr;
+  for (StoreInst *Write : LaterWrites)
+    for (User *User : Extract->users()) {
+      auto *Use = dyn_cast<Instruction>(User);
+      if (Use != Store &&
+          (!Use || isPotentiallyReachable(Write, Use, nullptr, &Dominators)))
+        return nullptr;
     }
-    // The destination must be fresh until this result is committed. Every
-    // ordinary use must observe the completed store, and a later replacement
-    // store keeps the general temporary path.
-    if (!Dominators.dominates(Store, Use)) return nullptr;
-  }
   return Store;
 }
 
@@ -765,6 +804,15 @@ bool splitTaggedResultLoads(Module &M, std::string &Error) {
       Error = "tagged indirect result retained a pre-branch aggregate use";
       return false;
     }
+    SmallVector<Instruction *, 2> LifetimeEnds;
+    for (User *User : Pointer->users())
+      if (auto *Intrinsic = dyn_cast<IntrinsicInst>(User);
+          Intrinsic && Intrinsic->getIntrinsicID() == Intrinsic::lifetime_end)
+        LifetimeEnds.push_back(Intrinsic);
+    // The selected-arm reloads can live in distinct successor blocks, so no
+    // single earlier lifetime.end is valid. Omitting the hint leaves the
+    // entry alloca live to function exit and preserves the original SSA value.
+    for (Instruction *End : LifetimeEnds) End->eraseFromParent();
     Load->eraseFromParent();
   }
   return true;
@@ -999,6 +1047,12 @@ bool normalize(Module &M, TargetMachine &TM, ArrayRef<LLVMValueRef> Owned,
     if (P.Materialize) {
       auto *ValueExtract = cast<ExtractValueInst>(P.Materialize->getValueOperand());
       P.Materialize->eraseFromParent();
+      SmallVector<Instruction *, 2> LifetimeEnds;
+      for (User *User : ValueSlot->users())
+        if (auto *Intrinsic = dyn_cast<IntrinsicInst>(User);
+            Intrinsic && Intrinsic->getIntrinsicID() == Intrinsic::lifetime_end)
+          LifetimeEnds.push_back(Intrinsic);
+      for (Instruction *End : LifetimeEnds) End->eraseFromParent();
       SmallVector<User *, 8> ValueUsers(ValueExtract->user_begin(),
                                         ValueExtract->user_end());
       for (User *User : ValueUsers) {

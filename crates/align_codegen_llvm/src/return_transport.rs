@@ -717,6 +717,123 @@ entry:
     }
 
     #[test]
+    fn tagged_reload_keeps_storage_live_through_selected_users() -> Result<(), String> {
+        let ctx = Context::create();
+        let module = parse(
+            &ctx,
+            r#"
+%Tagged = type { i8, [31 x i64] }
+declare void @llvm.lifetime.start.p0(i64, ptr nocapture)
+declare void @llvm.lifetime.end.p0(i64, ptr nocapture)
+declare void @fill(ptr sret(%Tagged))
+define i8 @probe() {
+entry:
+  %slot = alloca %Tagged, align 8
+  call void @llvm.lifetime.start.p0(i64 256, ptr %slot)
+  call void @fill(ptr sret(%Tagged) %slot)
+  %snapshot = load %Tagged, ptr %slot, align 8
+  call void @llvm.lifetime.end.p0(i64 256, ptr %slot)
+  %tag = extractvalue %Tagged %snapshot, 0
+  ret i8 %tag
+}
+"#,
+        )?;
+        let tm = target()?;
+        module.set_data_layout(&tm.get_target_data().get_data_layout());
+        module.set_triple(&tm.get_triple());
+        let owned: Vec<_> = module.get_functions().collect();
+        normalize(&module, &tm, &owned).map_err(|error| error.to_string())?;
+        let raw = module.print_to_string().to_string();
+        assert!(raw.contains("call.tag = load i8"), "{raw}");
+        assert!(!raw.contains("llvm.lifetime.end.p0(i64 256"), "{raw}");
+        assert!(module.verify().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_forwarding_rejects_transitive_destination_aliases() -> Result<(), String> {
+        let ctx = Context::create();
+        let module = parse(
+            &ctx,
+            r#"
+%Big = type { [27 x i64] }
+define { %Big, i1 } @make(i1 %live) #0 {
+entry:
+  %p0 = insertvalue { %Big, i1 } poison, %Big zeroinitializer, 0
+  %p1 = insertvalue { %Big, i1 } %p0, i1 %live, 1
+  ret { %Big, i1 } %p1
+}
+define i64 @probe(i1 %live, i64 %replacement) {
+entry:
+  %dst = alloca %Big, align 8
+  %pair = call { %Big, i1 } @make(i1 %live)
+  %value = extractvalue { %Big, i1 } %pair, 0
+  store %Big %value, ptr %dst, align 8
+  %alias = getelementptr inbounds %Big, ptr %dst, i32 0, i32 0, i64 26
+  store i64 %replacement, ptr %alias, align 8
+  %original = extractvalue %Big %value, 0, 26
+  ret i64 %original
+}
+attributes #0 = { "align.program.cleanup" }
+"#,
+        )?;
+        let tm = target()?;
+        module.set_data_layout(&tm.get_target_data().get_data_layout());
+        module.set_triple(&tm.get_triple());
+        let owned: Vec<_> = module.get_functions().collect();
+        normalize(&module, &tm, &owned).map_err(|error| error.to_string())?;
+        let raw = module.print_to_string().to_string();
+        assert!(raw.contains("%call.value.storage = alloca %Big"), "{raw}");
+        assert!(
+            raw.contains("call void @make(ptr sret(%Big) align 8 captures(none) %call.value.storage"),
+            "{raw}"
+        );
+        assert!(!raw.contains("ptr sret(%Big) align 8 captures(none) %dst"), "{raw}");
+        assert!(module.verify().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_forwarding_keeps_destination_live_for_ssa_users() -> Result<(), String> {
+        let ctx = Context::create();
+        let module = parse(
+            &ctx,
+            r#"
+%Big = type { [27 x i64] }
+declare void @llvm.lifetime.end.p0(i64, ptr nocapture)
+define { %Big, i1 } @make(i1 %live) #0 {
+entry:
+  %p0 = insertvalue { %Big, i1 } poison, %Big zeroinitializer, 0
+  %p1 = insertvalue { %Big, i1 } %p0, i1 %live, 1
+  ret { %Big, i1 } %p1
+}
+define i64 @probe(i1 %live) {
+entry:
+  %dst = alloca %Big, align 8
+  %pair = call { %Big, i1 } @make(i1 %live)
+  %value = extractvalue { %Big, i1 } %pair, 0
+  store %Big %value, ptr %dst, align 8
+  call void @llvm.lifetime.end.p0(i64 216, ptr %dst)
+  %original = extractvalue %Big %value, 0, 26
+  ret i64 %original
+}
+attributes #0 = { "align.program.cleanup" }
+"#,
+        )?;
+        let tm = target()?;
+        module.set_data_layout(&tm.get_target_data().get_data_layout());
+        module.set_triple(&tm.get_triple());
+        let owned: Vec<_> = module.get_functions().collect();
+        normalize(&module, &tm, &owned).map_err(|error| error.to_string())?;
+        let raw = module.print_to_string().to_string();
+        assert!(raw.contains("ptr sret(%Big) align 8 captures(none) %dst"), "{raw}");
+        assert!(!raw.contains("llvm.lifetime.end.p0(i64 216"), "{raw}");
+        assert!(!raw.contains("call.value.storage"), "{raw}");
+        assert!(module.verify().is_ok());
+        Ok(())
+    }
+
+    #[test]
     fn native_descriptor_edges_match_generated_definitions_without_new_effect_facts()
     -> Result<(), String> {
         let ctx = Context::create();

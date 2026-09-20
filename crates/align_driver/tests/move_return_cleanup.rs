@@ -411,6 +411,10 @@ fn indirect_tagged_result_reads_the_tag_before_selected_payload() {
         !before_branch.contains("call.value = load"),
         "the aggregate payload must not be loaded before its tag branch:\n{inspect}"
     );
+    assert!(
+        !inspect.contains("llvm.lifetime.end.p0(ptr %call.value.storage)"),
+        "a selected-arm reload must remain inside its storage lifetime:\n{inspect}"
+    );
     assert_eq!(
         build_and_run("tag-only-cleanup-result", TAG_ONLY_SOURCE)
             .status

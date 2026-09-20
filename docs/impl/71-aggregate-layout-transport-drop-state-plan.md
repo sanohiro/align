@@ -572,6 +572,19 @@ transport chain:
   execute Move/Drop paths and whole/per-unit large by-value calls, and assert
   definition/call agreement and absence of redundant aggregate staging.
 
+PR 3 review finding-to-fix ledger (candidate `301867e6`):
+
+- Selected-arm tag/payload reloads could move beyond the result slot's
+  `lifetime.end`. The rewrite now removes that end hint when it splits the
+  aggregate load, leaving the entry alloca live through every selected arm;
+  the tagged-result owner asserts the invalid early end is absent.
+- Cleanup-result destination forwarding checked only direct alloca users and
+  could miss writes through a derived GEP or cast. Forwarding now admits only
+  a recursively proved read-only derived-pointer graph plus canonical root
+  zero-state stores; every write or escaping use through a derived pointer
+  retains the separate result slot. A derived-alias reverse owner pins that
+  fallback and the original SSA snapshot.
+
 ### 5.4 PR 4: fresh-value destination construction
 
 | Cell | Required closure and owner |
