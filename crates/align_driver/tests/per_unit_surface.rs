@@ -12,8 +12,8 @@
 //!     produce an OBJECT byte-identical to a library whole-program reference (the portable form of
 //!     this gate: the compiler's own output, nothing linker- or platform-dependent in it), plus an
 //!     identical program output and a size report; the removed `build-per-unit` verb is now an
-//!     unknown command. The linked-executable comparison additionally runs off Mach-O — see the
-//!     note at the assertion for why the archive path makes it meaningless there.
+//!     unknown command. The linked-executable comparison pins the runtime archive to the production
+//!     artifact beside the CLI so every linker input is identical.
 //!  3. **`emit-obj` multi-file** — one object per unit at `<module>.o` (incl. a dotted path), a
 //!     non-entry `pub` fn external in ITS object, `--export` entry-unit-only (applied / wrong-unit /
 //!     unknown), and a rejected `[out.o]` positional.
@@ -198,7 +198,19 @@ fn cli_build_run_size_match_library_reference() {
     emit_object_file(&ref_mir, &obj, BuildTarget::Baseline, Profile::Release, &[], false)
         .expect("reference emit");
     let ref_obj_bytes = std::fs::read(&obj).expect("read reference object");
-    link_objects(&align_driver::CDriver::default(), &[obj.as_path()], &exe, &ref_mir.link_libs, Profile::Release).expect("reference link");
+    let cli_runtime = Path::new(alignc())
+        .parent()
+        .expect("alignc must have a parent directory")
+        .join("libalign_runtime.a");
+    align_driver::link_objects_with_runtime_archive(
+        &align_driver::CDriver::default(),
+        &[obj.as_path()],
+        &exe,
+        &ref_mir.link_libs,
+        Profile::Release,
+        &cli_runtime,
+    )
+    .expect("reference link");
     let ref_exe_bytes = std::fs::read(&exe).expect("read reference exe");
 
     // The OBJECT is the portable form of this gate, and the stronger one: it is the compiler's
@@ -212,27 +224,17 @@ fn cli_build_run_size_match_library_reference() {
         "CLI per-unit codegen must byte-match the whole-program reference"
     );
 
-    // `build`: the produced `<stem>` executable runs and, where the platform permits, is
-    // byte-identical to the reference link.
+    // `build`: the produced `<stem>` executable runs and is byte-identical to the reference link.
+    // Library-side links from an integration-test process deliberately resolve the production
+    // runtime archive beside `alignc`, not a feature-built archive under `deps/`, so the runtime is
+    // held constant along with the object, output path, profile, and linker.
     let built = proj.run(&["build", "--no-rt-lto", "app.align"]);
     assert!(built.status.success(), "build failed: {}", String::from_utf8_lossy(&built.stderr));
     let cli_exe_bytes = std::fs::read(&exe).expect("read cli exe");
-
-    // The executable comparison is NOT run on Mach-O, and the reason is specific rather than a
-    // blanket exemption. `runtime_archive()` resolves `libalign_runtime.a` relative to
-    // `current_exe()`, so the library reference — linked from inside this test binary in
-    // `target/<profile>/deps/` — picks up `deps/libalign_runtime.a`, while `alignc` in
-    // `target/<profile>/` picks up its sibling. Same archive, two paths, and Mach-O records the
-    // path of every linked object in its debug map (`OSO` stabs): 22 entries differing by the five
-    // characters of `deps/` accounted for exactly the 112-byte size difference observed. Nothing
-    // there is downstream of per-unit vs whole-program, which is what this gate is about — and the
-    // object assertion above already pins that, on every platform.
-    if cfg!(not(target_os = "macos")) {
-        assert_eq!(
-            ref_exe_bytes, cli_exe_bytes,
-            "CLI per-unit build must byte-match the whole-program reference"
-        );
-    }
+    assert_eq!(
+        ref_exe_bytes, cli_exe_bytes,
+        "CLI per-unit build must byte-match the whole-program reference"
+    );
 
     // `run`: program output is identical.
     let ran = proj.run(&["run", "--no-rt-lto", "app.align"]);

@@ -42,17 +42,6 @@
 # expectation with a named owner, not a dependence on something the runner does
 # not provide.
 #
-# THE MANIFEST IS JUDGED ON THE NIGHTLY'S PLATFORM, Linux x86_64. The entry
-# below is tagged "Linux-only": it does not reproduce on aarch64 macOS, so a
-# bare local `scripts/run-suite-binaries.sh` on an Apple Silicon host reports
-# it under "manifest entries that did NOT fail". That is the host disagreeing
-# with the manifest's platform, not a repaired test: fix and re-verify it on
-# Linux or in a container.
-#
-# Issues:
-#   #1106  The CLI per-unit build no longer byte-matches the whole-program
-#          reference: different e_entry and e_shoff.
-#
 # align_driver::test::pkg_db_a1 and align_driver::test::pkg_db_q4b exceeded
 # the 900s per-binary cap on 2026-09-18 (#1109) because every owner test drove
 # an opt-level 0 compiler. `[profile.dev] opt-level = 1`
@@ -61,5 +50,3 @@
 # as before: a synthetic line would excuse a target that never produced a
 # trustworthy outcome at all, retiring all of its tests from the detector —
 # the opposite of what every line here is for.
-# #1106, Linux-only
-align_driver::test::per_unit_surface	cli_build_run_size_match_library_reference

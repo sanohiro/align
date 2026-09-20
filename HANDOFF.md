@@ -106,16 +106,18 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    source scope and whole/per-unit behavior. Provider acceptance remains
    benchmark-free; align-llm adoption and performance measurement are consumer
    follow-up work.
-4. Follow-ups, independent and small (updated 2026-09-19):
+4. Follow-ups, independent and small (updated 2026-09-21):
    `fix/nightly-detector-restore` closed #1105, #1107, #1108, #1109, and
    #1112, and separately repaired two untracked first-night nightly failures
    that never got a manifest line — the vectorize_shapes x86 G1/G2 owners
    added by #1116 compiled main-less kernels with no export root, so -O2
    removed every function and the assertions inspected an empty module; and
    http_headers_view's `split("define")` left the last definition's chunk
-   unbounded, swallowing the trailing declare table. `scripts/known-failures.txt`
-   now carries only #1106 (per-unit ELF byte mismatch, `e_entry`/`e_shoff`,
-   Linux-only). #1093 is untouched and still open.
+   unbounded, swallowing the trailing declare table. #1106 was a false
+   production-parity comparison: integration tests linked the feature-built
+   `deps/libalign_runtime.a` while `alignc` linked the production archive beside
+   it. Test-side driver links now select the production archive, and the known
+   failure manifest is empty. #1093 is untouched and still open.
 Recorded follow-up from PR #1116's review (plan 69 §3.7): the static
 initializer scan in `align_mir::loop_facts::admit` can be replaced by an
 initialization proof, admitting parameters and multiple initializers on their
