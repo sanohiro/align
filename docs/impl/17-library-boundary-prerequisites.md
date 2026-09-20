@@ -2398,10 +2398,12 @@ pub enum GeneratedId {
     FnValue {
         target: ProgramCall,
         signature: CanonicalFnAbi,
+        drop_state_effects: Vec<u8>,
     },
     Closure {
         lifted: ProgramCall,
         explicit_signature: CanonicalFnAbi,
+        drop_state_effects: Vec<u8>,
         captures: Vec<CanonicalTy>,
     },
     Task {
@@ -2778,9 +2780,14 @@ hide a second cache or allocation. `decode` owns all nested values in the return
 borrows the input only for the call. Both use only the closed `CanonicalCodecError` enum and the
 same left-to-right field, record-local semantic, and trailing-byte precedence specified above.
 
-`GeneratedId` is `version=1` followed by `0=FnValue`, `1=Closure`, `2=Task`, or `3=Parallel`, then
+`GeneratedId` is `version=2` followed by `0=FnValue`, `1=Closure`, `2=Task`, or `3=Parallel`, then
 the fields in the Rust declaration order above. `ProgramCall` is encoded as its length-prefixed
-UTF-8 bytes. A vector is `u32 count` then elements. `ParallelGeneratedId` encodes its nine fields
+UTF-8 bytes. A vector is `u32 count` then elements. A drop-state byte is
+`0=NotApplicable`, `1=Invariant`, or `2=MayChange`; `Deferred` is an interface-template state and
+never enters a generated callable identity. `FnValue.drop_state_effects` is the target's complete
+concrete vector. `Closure.drop_state_effects` is the lifted core's complete concrete vector,
+including trailing capture parameters, so changing only the lifted physical ABI changes the
+adapter identity even though `explicit_signature` remains conservative. `ParallelGeneratedId` encodes its nine fields
 in declaration order. `ParallelKernelMode` is its explicit `repr(u8)` value.
 `ParallelStageId` is `0=Map`, `1=Filter`, `2=FilterStrContains`, `3=Project`, or
 `4=FilterField`, followed by that variant's fields in declaration order. Decoding repeats the
@@ -2798,11 +2805,11 @@ Semantic-to-byte and independent byte-to-semantic goldens are:
 | `CanonicalTy::Bool` | `010000000002` |
 | signed `CanonicalTy::i64` | `0100000000000140` |
 | `CanonicalFnAbi { params: [], ret: Unit, borrow: None, region: None }` | `01000000000100000000380000` |
-| `GeneratedId::FnValue { target: "f", signature: preceding ABI }` | `0100010000006601000000000100000000380000` |
-| `GeneratedId::Closure { lifted: "l", explicit_signature: preceding empty ABI, captures: [Bool] }` | `0101010000006c0100000000010000000038000001000000010000000002` |
-| `GeneratedId::Task { fallible: false, result: Unit }` | `010200010000000038` |
-| `GeneratedId::Task { fallible: true, result: i64 }` | `0102010100000000000140` |
-| `GeneratedId::Parallel { mode: Materialize, source: slice<i64>, terminal_input: i64, terminal_output: i64, terminal: "f", terminal_abi: fn(ByValue i64) -> i64 with None/None, terminal_captures: [], stages: [], work_weight: 1 }` | `01030001000000000d000140010000000000014001000000000001400100000066010100000000010000000000014001000000000001400000000000000000000001` |
+| `GeneratedId::FnValue { target: "f", signature: fn(ByValue i64) -> i64, drop_state_effects: [NotApplicable] }` | `02000100000066010100000000030000000000014003000000000001400000000100000000` |
+| `GeneratedId::Closure { lifted: "l", explicit_signature: fn() -> Unit, drop_state_effects: [], captures: [Bool] }` | `0201010000006c01000000000300000000380000000000000001000000030000000002` |
+| `GeneratedId::Task { fallible: false, result: Unit }` | `020200030000000038` |
+| `GeneratedId::Task { fallible: true, result: i64 }` | `0202010300000000000140` |
+| `GeneratedId::Parallel { mode: Materialize, source: slice<i64>, terminal_input: i64, terminal_output: i64, terminal: "f", terminal_abi: fn(ByValue i64) -> i64 with None/None, terminal_captures: [], stages: [], work_weight: 1 }` | `02030003000000000d00014003000000000001400300000000000140010000006601010000000003000000000001400300000000000140000000000000000000000001` |
 
 Each golden is encoded from the semantic record and decoded from the literal bytes in separate
 tests. Malformed goldens flip version/tag/bool, truncate each scalar width, add one trailing byte,

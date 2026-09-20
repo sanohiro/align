@@ -245,6 +245,8 @@ pub struct ImportedFn {
     pub return_borrow: ReturnBorrowSummary,
     pub return_region: ReturnRegionSummary,
     pub return_cleanup: ReturnCleanupAbi,
+    /// Per-parameter ownership-state effect authenticated by the producing interface.
+    pub drop_state_effects: Vec<DropStateEffect>,
     /// The dependency interface was emitted only after producer validation of this body.
     pub producer_certified: bool,
     /// The normalized cross-unit effect fact. This is checked-HIR transport only; MIR strips it
@@ -254,6 +256,15 @@ pub struct ImportedFn {
     /// imported body. This validation-only interface fact is stripped before MIR construction.
     pub parallel_transfer_params: Vec<u32>,
     pub mutable_retention: MutableRetentionSummary,
+}
+
+/// Whether a callable can change the cleanup state carried by one parameter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum DropStateEffect {
+    NotApplicable,
+    Invariant,
+    MayChange,
+    Deferred,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]

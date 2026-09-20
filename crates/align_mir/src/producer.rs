@@ -2066,6 +2066,7 @@ fn assert_xml_stmt_variant_classified(statement: &Stmt) {
         | Stmt::TgWait(..)
         | Stmt::TgEnd(..)
         | Stmt::DropFlagInit(..)
+        | Stmt::DropFlagMoveOut { .. }
         | Stmt::NullTupleField(..)
         | Stmt::NullStructField(..)
         | Stmt::NullElemField(..)
@@ -10079,7 +10080,13 @@ fn validate_tagged_program_inner(
             .zip(&param_types)
             .enumerate()
         {
+            let effect = program.drop_state_effects
+                .get(&f.name)
+                .and_then(|effects| effects.get(index))
+                .copied()
+                .unwrap_or(hir::DropStateEffect::MayChange);
             let expected = *mode == align_ast::ParamMode::BorrowMut
+                && effect != hir::DropStateEffect::Invariant
                 && align_sema::needs_drop_flag(
                     *ty,
                     &program.structs,

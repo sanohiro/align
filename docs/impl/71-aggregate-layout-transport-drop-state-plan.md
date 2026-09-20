@@ -7,6 +7,9 @@ Status: plan of record for issues
 implementation starts only after one fresh independent adversarial review of
 this ledger. Evidence baseline: Align `9583d8c8`, LLVM 22.1.8.
 
+Implementation status (2026-09-20): PR 1 merged in #1131. PR 2 is implemented
+as the current candidate; PR 3 and PR 4 remain pending.
+
 These issues expose one boundary. A tagged value's physical size determines its
 argument and result transport; that transport carries the value's cleanup
 state; and a mutable borrow need only transport cleanup state when the callee
@@ -44,6 +47,14 @@ returns, parameters, cleanup channels, and function values together; a partial
 change creates incompatible LLVM signatures. Keeping each closed
 producer-to-consumer chain in one capability avoids duplicate proof and lowers
 integration risk.
+
+PR 2's completed candidate also crosses roughly 1,400 added hand-written
+lines once its malformed-input, adapter-identity, cache, MIR-structure, and
+raw/optimized LLVM owners are counted. Splitting it would leave either a
+serialized effect with no ABI consumer or a body-specialized ABI with no
+cross-unit authority; keeping derivation, interface transport, adapters,
+lowering, and their shared proof in one capability is the smaller integration
+risk.
 
 No language syntax, source annotation, runtime export, allocation mode, error
 value, or evaluation order changes. Native extern, callback, raw-descriptor and
@@ -498,6 +509,29 @@ cases.
 | Whole/per-unit/cache | serialized effects and adapters agree across unit boundaries and invalidate interface/codegen caches; per-unit and inprocess owners |
 | Allocation/provenance | flag ownership remains caller-side; no heap change; arena, builder-freeze and exactly-once Drop owners |
 | Performance | invariant witness has zero cleanup pair/proxy/load/writeback; caller flags become promotable; local IR and assembly counts with mutating reverse control |
+
+PR 2's author-side matrix-to-diff pass maps these cells to one closed chain:
+
+- `align_interface` owns the exact v13 vector, all four byte tags, semantic and
+  independently decoded byte goldens, and malformed arity/tag/mode/template/
+  resolved-droppability rejection.
+- `align_mir::derive_drop_state_effects` owns the deterministic least fixed
+  point. Its parameterized owner covers invariant and changing direct chains,
+  invariant recursion, and conservative indirect edges; the shared exhaustive
+  Rvalue inventory makes a new operation a compile error until classified.
+- `align_mir::simplify_drop_state` owns known-flag CFG folding and the distinct
+  `DropFlagInit`/`DropFlagMoveOut` origins. Existing exceptional-edge and Drop
+  owners remain active; the new owner covers removable terminal nulling and
+  retained read-after/initialization controls.
+- `align_codegen_llvm` owns specialized definitions, declarations and direct
+  calls, conservative function-value/closure adapters and explicit-export
+  wrappers, generated-adapter identity, partition cache identity, malformed
+  internal rejection, concrete cross-unit definition/declaration agreement,
+  and raw/optimized IR counts with a MayChange reverse control. The per-unit
+  owner rederives Copy and Move generic instantiations from a Deferred imported
+  template, and the compiled C harness executes mixed-mode Invariant and
+  MayChange exports. Existing ownership suites remain the executable
+  allocation/Drop controls.
 
 ### 5.3 PR 3: transport
 

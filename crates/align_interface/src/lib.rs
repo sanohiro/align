@@ -155,6 +155,7 @@ pub struct IFnSig {
     pub return_borrow: ReturnBorrowSummary,
     pub return_region: ReturnRegionSummary,
     pub return_cleanup: align_sema::hir::ReturnCleanupAbi,
+    pub drop_state_effects: Vec<align_sema::hir::DropStateEffect>,
     pub producer_certification: ProducerCertification,
     /// The 3-valued effect bit (part of the interface — flipping Pure→Impure is an interface change).
     pub effect: Effect,
@@ -639,6 +640,28 @@ pub fn build_summaries_with_effects(
                                 "function '{canonical}' lacks MIR producer certification"
                             ));
                         }
+                        let drop_state_effects = if is_generic {
+                            fd.params
+                                .iter()
+                                .map(|parameter| {
+                                    if parameter.mode == ParamMode::BorrowMut {
+                                        align_sema::hir::DropStateEffect::Deferred
+                                    } else {
+                                        align_sema::hir::DropStateEffect::NotApplicable
+                                    }
+                                })
+                                .collect()
+                        } else {
+                            mir.drop_state_effects
+                                .iter()
+                                .find(|(name, _)| name.as_str() == canonical)
+                                .map(|(_, effects)| effects.clone())
+                                .ok_or_else(|| {
+                                    format!(
+                                        "function '{canonical}' lacks MIR drop-state certification"
+                                    )
+                                })?
+                        };
                         fns.push(IFnSig {
                             name: fd.name.name.clone(),
                             type_params: convert_type_params(&fd.type_params),
@@ -647,6 +670,7 @@ pub fn build_summaries_with_effects(
                             return_borrow,
                             return_region,
                             return_cleanup,
+                            drop_state_effects,
                             producer_certification: if is_generic {
                                 ProducerCertification::RevalidateGenericBody
                             } else {
@@ -1113,6 +1137,7 @@ pub enum ImportCompatibilityError {
     ParallelTransferRootsNonCanonical,
     InvalidMutableRetention(&'static str),
     ReturnCleanupMismatch,
+    DropStateEffectMismatch,
 }
 
 impl std::fmt::Display for ImportCompatibilityError {
@@ -1224,6 +1249,9 @@ impl std::fmt::Display for ImportCompatibilityError {
             }
             ImportCompatibilityError::ReturnCleanupMismatch => {
                 write!(f, "interface return-cleanup metadata disagrees with its return type")
+            }
+            ImportCompatibilityError::DropStateEffectMismatch => {
+                write!(f, "interface drop-state metadata disagrees with its parameter type or mode")
             }
         }
     }
@@ -2586,6 +2614,26 @@ pub fn validate_for_import(
         {
             return Err(ImportCompatibilityError::ReturnCleanupMismatch);
         }
+        if function.drop_state_effects.len() != function.params.len() {
+            return Err(ImportCompatibilityError::DropStateEffectMismatch);
+        }
+        for (parameter, effect) in function.params.iter().zip(&function.drop_state_effects) {
+            let generic = !function.type_params.is_empty() || function.generic_body.is_some();
+            let expected_move = !generic
+                && parameter.mode == ParamMode::BorrowMut
+                && analysis.return_cleanup(&parameter.ty, &[]) == Some(align_sema::hir::ReturnCleanupAbi::DynamicBit);
+            let valid = if generic {
+                (*effect == align_sema::hir::DropStateEffect::Deferred)
+                    == (parameter.mode == ParamMode::BorrowMut)
+            } else if expected_move {
+                matches!(effect, align_sema::hir::DropStateEffect::Invariant | align_sema::hir::DropStateEffect::MayChange)
+            } else {
+                *effect == align_sema::hir::DropStateEffect::NotApplicable
+            };
+            if !valid {
+                return Err(ImportCompatibilityError::DropStateEffectMismatch);
+            }
+        }
         for parameter in &function.params {
             validate_return_cleanup_metadata(
                 &parameter.ty,
@@ -2860,6 +2908,7 @@ pub fn summary_return_provenance(
                 function.parallel_transfer_params.clone(),
                 function.producer_certification == ProducerCertification::ValidatedBody,
                 function.mutable_retention.clone(),
+                function.drop_state_effects.clone(),
             ),
         );
     }
@@ -3003,6 +3052,7 @@ mod builtin_spelling_tests {
                 return_borrow: ReturnBorrowSummary::None,
                 return_region: ReturnRegionSummary::None,
                 return_cleanup: align_sema::hir::ReturnCleanupAbi::DynamicBit,
+                drop_state_effects: Vec::new(),
                 producer_certification: ProducerCertification::ValidatedBody,
                 effect: Effect::Pure,
                 parallel_transfer_params: Vec::new(),

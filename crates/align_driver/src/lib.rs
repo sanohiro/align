@@ -395,6 +395,7 @@ fn install_static_descriptor_data(
         {
             return;
         }
+        let drop_state_effects = vec![align_sema::hir::DropStateEffect::NotApplicable; params.len()];
         mir.imported_fns.push(ImportedFn {
             name,
             param_modes: vec![ParamMode::ByValue; params.len()],
@@ -403,6 +404,7 @@ fn install_static_descriptor_data(
             return_borrow: none_borrow.clone(),
             return_region: none_region.clone(),
             return_cleanup: no_cleanup,
+            drop_state_effects,
             producer_certified: true,
         });
     };

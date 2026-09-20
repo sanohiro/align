@@ -7500,6 +7500,7 @@ pub type ExternalReturnProvenance = std::collections::HashMap<
         Vec<u32>,
         bool,
         hir::MutableRetentionSummary,
+        Vec<hir::DropStateEffect>,
     ),
 >;
 
@@ -9947,7 +9948,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
     // Synthesized interface source cannot spell compiler-owned provenance facts. Restore those
     // facts after signature collection. The driver supplies the complete transitive fact map, so
     // entries outside the modules visible to this check are intentionally ignored.
-    for (name, (return_borrow, return_region, return_cleanup, _, _, _)) in external_return_provenance {
+    for (name, (return_borrow, return_region, return_cleanup, _, _, _, _)) in external_return_provenance {
         if let Some(sig) = sigs.get_mut(name) {
             sig.return_borrow = return_borrow.clone();
             sig.return_region = return_region.clone();
@@ -10325,14 +10326,14 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                         external_return_provenance.contains_key(&mangled);
                     let producer_certified = external_return_provenance
                         .get(&mangled)
-                        .is_some_and(|(_, _, _, _, certified, _)| *certified);
+                        .is_some_and(|(_, _, _, _, certified, _, _)| *certified);
                     let effect = external_effects
                         .get(&mangled)
                         .copied()
                         .unwrap_or(FnEffect::Impure);
                     let parallel_transfer_params = external_return_provenance
                         .get(&mangled)
-                        .map(|(_, _, _, roots, _, _)| roots.clone())
+                        .map(|(_, _, _, roots, _, _, _)| roots.clone())
                         .unwrap_or_else(|| {
                             sig.params
                                 .iter()
@@ -10354,7 +10355,30 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                                 .collect()
                         });
                     let mutable_retention = external_return_provenance.get(&mangled)
-                        .and_then(|(_, _, _, _, _, summary)| summary.clone());
+                        .and_then(|(_, _, _, _, _, summary, _)| summary.clone());
+                    let drop_state_effects = external_return_provenance.get(&mangled)
+                        .map(|(_, _, _, _, _, _, effects)| effects.clone())
+                        .unwrap_or_else(|| {
+                            sig.params
+                                .iter()
+                                .zip(&sig.param_modes)
+                                .map(|(&ty, mode)| {
+                                    if *mode == ast::ParamMode::BorrowMut
+                                        && needs_drop_flag(
+                                            ty,
+                                            &structs,
+                                            &tuples,
+                                            &enums,
+                                            &tagged_types,
+                                        )
+                                    {
+                                        hir::DropStateEffect::MayChange
+                                    } else {
+                                        hir::DropStateEffect::NotApplicable
+                                    }
+                                })
+                                .collect()
+                        });
                     if mutable_retention.is_some() && !producer_certified {
                         diags.error("mutable-retention summary requires producer certification".to_string(), f.span);
                     }
@@ -10370,6 +10394,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                         return_borrow: sig.return_borrow.clone(),
                         return_region: sig.return_region.clone(),
                         return_cleanup: sig.return_cleanup,
+                        drop_state_effects,
                         producer_certified,
                         effect,
                         parallel_transfer_params,

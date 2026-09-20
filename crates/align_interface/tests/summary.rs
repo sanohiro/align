@@ -1104,8 +1104,10 @@ fn semantic_import_rejects_return_roots_incapable_of_borrowing() {
     non_borrowing_root.fns[0].params[0].mode = ParamMode::Borrow;
     assert_eq!(validate_for_import(&non_borrowing_root), Ok(()));
     non_borrowing_root.fns[0].params[0].mode = ParamMode::BorrowMut;
+    non_borrowing_root.fns[0].drop_state_effects[0] = align_sema::hir::DropStateEffect::Invariant;
     assert_eq!(validate_for_import(&non_borrowing_root), Ok(()));
     non_borrowing_root.fns[0].params[0].mode = ParamMode::ByValue;
+    non_borrowing_root.fns[0].drop_state_effects[0] = align_sema::hir::DropStateEffect::NotApplicable;
 
     non_borrowing_root.fns[0].params[0].ty = IType::Named {
         path: "Option".to_string(),
@@ -1140,6 +1142,11 @@ fn semantic_import_rejects_return_roots_incapable_of_borrowing() {
     }
     for mode in [ParamMode::Borrow, ParamMode::BorrowMut] {
         non_borrowing_root.fns[0].params[0].mode = mode;
+        non_borrowing_root.fns[0].drop_state_effects[0] = if mode == ParamMode::BorrowMut {
+            align_sema::hir::DropStateEffect::Invariant
+        } else {
+            align_sema::hir::DropStateEffect::NotApplicable
+        };
         assert_eq!(
             validate_for_import(&non_borrowing_root),
             Ok(()),
@@ -1156,6 +1163,8 @@ fn semantic_import_rejects_return_roots_incapable_of_borrowing() {
         "regex.regex_match",
     ] {
         let mut builtin_root = non_borrowing_root.clone();
+        builtin_root.fns[0].params[0].mode = ParamMode::ByValue;
+        builtin_root.fns[0].drop_state_effects[0] = align_sema::hir::DropStateEffect::NotApplicable;
         builtin_root.fns[0].params[0].ty = IType::Named {
             path: builtin.to_string(),
             args: vec![],
@@ -1327,6 +1336,11 @@ fn semantic_import_substitutes_local_generic_nominal_arguments() {
             let mut summary = reader_carriers.clone();
             summary.fns[0].params[0].ty = carrier.clone();
             summary.fns[0].params[0].mode = mode;
+            summary.fns[0].drop_state_effects[0] = if mode == ParamMode::BorrowMut {
+                align_sema::hir::DropStateEffect::Invariant
+            } else {
+                align_sema::hir::DropStateEffect::NotApplicable
+            };
             assert_eq!(
                 validate_for_import(&summary),
                 Err(ImportCompatibilityError::ReturnSummaryRootCannotBorrow(0)),
@@ -1337,6 +1351,11 @@ fn semantic_import_substitutes_local_generic_nominal_arguments() {
             let mut summary = reader_carriers.clone();
             summary.fns[0].params[0].ty = carrier.clone();
             summary.fns[0].params[0].mode = mode;
+            summary.fns[0].drop_state_effects[0] = if mode == ParamMode::BorrowMut {
+                align_sema::hir::DropStateEffect::Invariant
+            } else {
+                align_sema::hir::DropStateEffect::NotApplicable
+            };
             assert_eq!(
                 validate_for_import(&summary),
                 Ok(()),
@@ -2590,7 +2609,7 @@ fn parameter_mode_and_producer_certificate_codec_have_a_byte_golden() {
     let hex = surface.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
     assert_eq!(
         hex,
-        "0c000000040000006d61696e0100000007000000696e73706563740000000001000000010005000000736c69636501000000000300000069363400000000000300000069363400000000000000010000000000010100000001000000010000000000000000000000000000000000000000000000000000"
+        "0d000000040000006d61696e0100000007000000696e73706563740000000001000000010005000000736c696365010000000003000000693634000000000003000000693634000000000000000100000000010000000000010100000001000000010000000000000000000000000000000000000000000000000000"
     );
 
     let mut artifact = serialize(&summary);
@@ -2607,29 +2626,35 @@ fn parameter_mode_and_producer_certificate_codec_have_a_byte_golden() {
     );
 
     // This one-function surface ends with the function's borrow tag, region tag, cleanup ABI,
-    // producer certificate, effect, empty parallel-transfer sequence, the 14-byte
+    // one-element drop-state sequence, producer certificate, effect, empty parallel-transfer sequence, the 14-byte
     // Some([[Storage(0)]]) mutable-retention record, resource-hook-body bit,
     // generic body option, then the empty top-level sequences.
     let mut bad_borrow = serialize(&summary);
-    bad_borrow[surface.len() - 45] = 0xff;
+    bad_borrow[surface.len() - 50] = 0xff;
     assert_eq!(
         deserialize(&bad_borrow),
         Err(DecodeError::BadTag { what: "return-borrow summary", tag: 0xff })
     );
     let mut bad_region = serialize(&summary);
-    bad_region[surface.len() - 44] = 0xff;
+    bad_region[surface.len() - 49] = 0xff;
     assert_eq!(
         deserialize(&bad_region),
         Err(DecodeError::BadTag { what: "return-region summary", tag: 0xff })
     );
     let mut bad_cleanup = serialize(&summary);
-    bad_cleanup[surface.len() - 43] = 0xff;
+    bad_cleanup[surface.len() - 48] = 0xff;
     assert_eq!(
         deserialize(&bad_cleanup),
         Err(DecodeError::BadTag {
             what: "return cleanup ABI",
             tag: 0xff,
         })
+    );
+    let mut bad_drop_state = serialize(&summary);
+    bad_drop_state[surface.len() - 43] = 0xff;
+    assert_eq!(
+        deserialize(&bad_drop_state),
+        Err(DecodeError::BadTag { what: "drop-state effect", tag: 0xff })
     );
     let mut bad_certificate = serialize(&summary);
     bad_certificate[surface.len() - 42] = 0xff;
@@ -2647,6 +2672,122 @@ fn parameter_mode_and_producer_certificate_codec_have_a_byte_golden() {
         deserialize(&serialize(&mismatched)),
         Err(DecodeError::InvalidSummary(
             "producer certification disagrees with function body presence"
+        ))
+    );
+}
+
+#[test]
+fn v13_drop_state_surface_has_independent_full_record_goldens() {
+    let summary = one(
+        "pub fn plain(value: i64) -> i64 = value\n\
+         pub fn invariant(borrow mut value: string) -> i64 = value.len()\n\
+         pub fn changing(borrow mut value: string) { value = \"x\".clone() }\n\
+         pub fn deferred<T>(borrow mut value: T) {}\n\
+         fn main() -> i32 = 0\n",
+    )
+    .remove(0);
+    let expected_hex = "0d000000040000006d61696e04000000080000006368616e67696e670000000001000000030006000000737472696e6700000000000200000028290000000000000001000000020100000000000101000000000000000000080000006465666572726564010000000100000054000100000003000100000054000000000002000000282900000000000000010000000300020000000000000126000000666e2064656665727265643c543e28626f72726f77206d75742076616c75653a205429207b7d09000000696e76617269616e740000000001000000030006000000737472696e670000000000030000006936340000000000000001000000010100000000000101000000010000000000000000000005000000706c61696e000000000100000000000300000069363400000000000300000069363400000000000000010000000001000000000001010000000000000000000000000000000000000000000000000000000000";
+    let surface = encode_interface_surface(&summary);
+    assert_eq!(
+        surface.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+        expected_hex,
+        "the semantic-to-byte v13 surface must retain exact function and effect ordering"
+    );
+    let mut artifact = (0..expected_hex.len() / 2)
+        .map(|index| {
+            u8::from_str_radix(&expected_hex[index * 2..index * 2 + 2], 16)
+                .expect("independently transcribed hex")
+        })
+        .collect::<Vec<_>>();
+    let interface_hash = Hash128::of(&artifact);
+    artifact.extend(0_u32.to_le_bytes());
+    artifact.extend(interface_hash.lo.to_le_bytes());
+    artifact.extend(interface_hash.hi.to_le_bytes());
+    artifact.extend(summary.impl_hash.lo.to_le_bytes());
+    artifact.extend(summary.impl_hash.hi.to_le_bytes());
+    let decoded = deserialize(&artifact).expect("independent v13 bytes decode");
+    assert_eq!(decoded, summary);
+    assert_eq!(
+        decoded
+            .fns
+            .iter()
+            .map(|function| function.drop_state_effects[0])
+            .collect::<Vec<_>>(),
+        vec![
+            align_sema::hir::DropStateEffect::MayChange,
+            align_sema::hir::DropStateEffect::Deferred,
+            align_sema::hir::DropStateEffect::Invariant,
+            align_sema::hir::DropStateEffect::NotApplicable,
+        ]
+    );
+}
+
+#[test]
+fn drop_state_effect_codec_rejects_each_shape_and_ownership_mismatch() {
+    use align_sema::hir::DropStateEffect::{Deferred, Invariant, NotApplicable};
+
+    let concrete = one(
+        "pub fn inspect(borrow mut value: string) -> i64 = value.len()\nfn main() -> i32 = 0\n",
+    )
+    .remove(0);
+    let mut wrong_arity = concrete.clone();
+    wrong_arity.fns[0].drop_state_effects.clear();
+    rehash(&mut wrong_arity);
+    assert_eq!(
+        deserialize(&serialize(&wrong_arity)),
+        Err(DecodeError::InvalidSummary(
+            "drop-state effect arity disagrees with parameters"
+        ))
+    );
+
+    let mut deferred_concrete = concrete;
+    deferred_concrete.fns[0].drop_state_effects[0] = Deferred;
+    rehash(&mut deferred_concrete);
+    assert_eq!(
+        deserialize(&serialize(&deferred_concrete)),
+        Err(DecodeError::InvalidSummary(
+            "drop-state effect disagrees with parameter mode or template state"
+        ))
+    );
+
+    let mut non_borrowing = one(
+        "pub fn inspect(value: i64) -> i64 = value\nfn main() -> i32 = 0\n",
+    )
+    .remove(0);
+    non_borrowing.fns[0].drop_state_effects[0] = Invariant;
+    rehash(&mut non_borrowing);
+    assert_eq!(
+        deserialize(&serialize(&non_borrowing)),
+        Err(DecodeError::InvalidSummary(
+            "drop-state effect disagrees with parameter mode or template state"
+        ))
+    );
+
+    let mut non_droppable = one(
+        "pub fn inspect(borrow mut value: i64) -> i64 = value\nfn main() -> i32 = 0\n",
+    )
+    .remove(0);
+    assert_eq!(non_droppable.fns[0].drop_state_effects, vec![NotApplicable]);
+    non_droppable.fns[0].drop_state_effects[0] = Invariant;
+    rehash(&mut non_droppable);
+    assert_eq!(
+        deserialize(&serialize(&non_droppable)),
+        Err(DecodeError::InvalidSummary(
+            "drop-state effect disagrees with resolved parameter ownership"
+        ))
+    );
+
+    let mut generic = one(
+        "pub fn inspect<T>(borrow mut value: T) {}\nfn main() -> i32 = 0\n",
+    )
+    .remove(0);
+    assert_eq!(generic.fns[0].drop_state_effects, vec![Deferred]);
+    generic.fns[0].drop_state_effects[0] = Invariant;
+    rehash(&mut generic);
+    assert_eq!(
+        deserialize(&serialize(&generic)),
+        Err(DecodeError::InvalidSummary(
+            "drop-state effect disagrees with parameter mode or template state"
         ))
     );
 }

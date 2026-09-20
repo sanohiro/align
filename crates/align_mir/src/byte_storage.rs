@@ -138,7 +138,9 @@ fn argument_confined(f: &Function, arg: usize, calls: &CallEscapeSummary) -> boo
                         || (!f.params.contains(slot)
                             && f.slots.get(*slot as usize) == Some(&byte_slice_ty()))
                 }
-                Stmt::Drop(slot) | Stmt::DropFlagInit(slot) => !slots.contains(slot),
+                Stmt::Drop(slot)
+                | Stmt::DropFlagInit(slot)
+                | Stmt::DropFlagMoveOut { slot, .. } => !slots.contains(slot),
                 Stmt::Let(id, rv) => match rv {
                     Rvalue::Load(_) | Rvalue::StrLit(_) | Rvalue::RawNull | Rvalue::OptionNone => {
                         true
@@ -405,7 +407,9 @@ fn nonescaping(
                             || (!f.params.contains(dst)
                                 && matches!(f.slots.get(*dst as usize), Some(Ty::Slice(_)))))
                 }
-                Stmt::Drop(target) | Stmt::DropFlagInit(target) => {
+                Stmt::Drop(target)
+                | Stmt::DropFlagInit(target)
+                | Stmt::DropFlagMoveOut { slot: target, .. } => {
                     *target == slot || !slots.contains(target)
                 }
                 Stmt::Let(id, rv) => match rv {
@@ -543,7 +547,10 @@ fn transfer(
 ) -> Extent {
     match stmt {
         Stmt::Let(id, Rvalue::BufferNew { fill: None, .. }) if *id == constructor => Extent::Bytes(0),
-        Stmt::Drop(target) | Stmt::DropFlagInit(target) if *target == slot => Extent::Dead,
+        Stmt::Drop(target)
+        | Stmt::DropFlagInit(target)
+        | Stmt::DropFlagMoveOut { slot: target, .. }
+            if *target == slot => Extent::Dead,
         Stmt::Let(_, rv) => match write_width(rv, handles, literals) {
             Some(Some(width)) => state.append(width),
             Some(None) => Extent::Mixed,

@@ -134,6 +134,50 @@ fn gate_b_multi_file_run_matches_whole_program() {
 }
 
 #[test]
+fn imported_generic_drop_state_is_rederived_for_copy_and_move_instantiations() {
+    let library = "\
+module generic
+pub fn inspect<T>(borrow mut value: T) -> i64 = 1
+";
+    let main = "\
+import generic
+fn main() {
+  mut number := 1
+  mut text := \"x\".clone()
+  print(generic.inspect(number) + generic.inspect(text))
+}
+";
+    let per_unit = build_per_unit_multi(
+        "drop-state-generic",
+        &[("generic.align", library), ("main.align", main)],
+        "main.align",
+    );
+    let consumer = &per_unit.unit("main").mir;
+    let effects = consumer
+        .fns
+        .iter()
+        .filter(|function| function.name.as_str().starts_with("generic$inspect"))
+        .map(|function| {
+            (
+                function.slots[function.params[0] as usize],
+                consumer.drop_state_effects[&function.name][0],
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(effects.len(), 2, "{effects:?}");
+    assert!(
+        effects.contains(&(
+            align_sema::Ty::Int(align_sema::IntTy { bits: 64, signed: true }),
+            align_sema::hir::DropStateEffect::NotApplicable,
+        )) && effects.contains(&(
+            align_sema::Ty::String,
+            align_sema::hir::DropStateEffect::Invariant,
+        )),
+        "the consumer must rederive concrete effects from the imported template: {effects:?}"
+    );
+}
+
+#[test]
 fn eager_expression_termination() {
     let library = "\
 module continuation
