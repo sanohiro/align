@@ -47,18 +47,21 @@ pub fn format_source(file: FileId, src: &str) -> Option<String> {
     // to format rather than risk changing the program's meaning.
     let mut out_diags = Diagnostics::new();
     let out_tokens = tokenize(file, &out, &mut out_diags);
-    if sig_texts(&tokens, src) != sig_texts(&out_tokens, &out) {
+    let out_ast = align_parser::parse_file(out_tokens.clone(), &mut out_diags);
+    if out_diags.has_errors() {
         return None;
     }
-    align_parser::parse_file(out_tokens, &mut out_diags);
-    if out_diags.has_errors() {
+    let out_ann = Annotations::collect(&out_ast, &out);
+    if sig_texts(&tokens, src, &ann) != sig_texts(&out_tokens, &out, &out_ann) {
         return None;
     }
     Some(out)
 }
 
-fn is_skipped(t: &Token) -> bool {
+fn is_skipped(t: &Token, ann: &Annotations) -> bool {
     matches!(t.kind, align_lexer::TokKind::End | align_lexer::TokKind::Eof)
+        || matches!(t.kind, align_lexer::TokKind::Semicolon)
+            && !ann.fixed_array_semicolons.contains(&t.span.lo)
 }
 
 fn tok_text<'s>(src: &'s str, t: &Token) -> &'s str {
@@ -74,9 +77,13 @@ fn tok_text<'s>(src: &'s str, t: &Token) -> &'s str {
 }
 
 /// The significant tokens' source texts, in order — the meaning-bearing fingerprint of a program
-/// (whitespace, `;`, and comments are all absent here, so they don't affect equality).
-fn sig_texts(tokens: &[Token], src: &str) -> Vec<String> {
-    tokens.iter().filter(|t| !is_skipped(t)).map(|t| tok_text(src, t).to_string()).collect()
+/// (whitespace, statement `;`, and comments are absent here; fixed-array `;` remains structural).
+fn sig_texts(tokens: &[Token], src: &str, ann: &Annotations) -> Vec<String> {
+    tokens
+        .iter()
+        .filter(|t| !is_skipped(t, ann))
+        .map(|t| tok_text(src, t).to_string())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -90,11 +97,17 @@ struct Annotations {
     type_ranges: Vec<(u32, u32)>,
     /// Offsets of unary prefix operators (`-`/`~`/`!`) — a `-` here takes no trailing space.
     unary_ops: HashSet<u32>,
+    /// Written semicolons that are structural `[T; N]` separators, not statement trivia.
+    fixed_array_semicolons: HashSet<u32>,
 }
 
 impl Annotations {
     fn collect(file: &File, src: &str) -> Annotations {
-        let mut a = Annotations { type_ranges: Vec::new(), unary_ops: HashSet::new() };
+        let mut a = Annotations {
+            type_ranges: Vec::new(),
+            unary_ops: HashSet::new(),
+            fixed_array_semicolons: HashSet::new(),
+        };
         for item in &file.items {
             a.visit_item(item, src);
         }
@@ -195,6 +208,12 @@ impl Annotations {
                         self.visit_type(a);
                     }
                 }
+            }
+            Type::FixedArray {
+                element, separator, ..
+            } => {
+                self.fixed_array_semicolons.insert(separator.lo);
+                self.visit_type(element);
             }
             Type::Tuple { elems, .. } => {
                 for e in elems {
@@ -401,7 +420,7 @@ impl<'a> Formatter<'a> {
     }
 
     fn run(mut self, tokens: &[Token]) -> String {
-        let sig: Vec<&Token> = tokens.iter().filter(|t| !is_skipped(t)).collect();
+        let sig: Vec<&Token> = tokens.iter().filter(|t| !is_skipped(t, self.ann)).collect();
         let mut prev_hi = 0u32;
         let mut prev: Option<&Token> = None;
         for t in &sig {
@@ -566,10 +585,16 @@ impl<'a> Formatter<'a> {
         }
 
         // No space before these.
-        if matches!(c, Comma | Colon | Question | Dot | DotDot | DotDotEq) {
+        if matches!(
+            c,
+            Comma | Colon | Semicolon | Question | Dot | DotDot | DotDotEq
+        ) {
             return "";
         }
         // No space after these.
+        if matches!(p, Semicolon) {
+            return " ";
+        }
         if matches!(p, Dot | DotDot | DotDotEq) {
             return "";
         }
@@ -670,6 +695,20 @@ mod tests {
         // immediately before a newline is redundant).
         let out = fmt("fn main() -> i32 {\n  x := 1; y := 2\n  return x + y\n}\n");
         assert!(out.contains("x := 1; y := 2"), "cramming ; dropped (corrupts code):\n{out}");
+    }
+
+    #[test]
+    fn fixed_array_type_semicolon_is_preserved_and_spaced() {
+        let output = fmt("Table{values:[i64;32]}\nfn main(){x:=1; y:=2}\n");
+        assert!(
+            output.contains("values: [i64; 32]"),
+            "fixed-array separator changed:\n{output}"
+        );
+        assert!(
+            output.contains("x := 1; y := 2"),
+            "statement separator changed:\n{output}"
+        );
+        assert_eq!(fmt(&output), output);
     }
 
     #[test]

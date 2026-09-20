@@ -7382,6 +7382,10 @@ fn abi_type<'c>(
         // A function value is a closure `{fn_ptr, env_ptr}` here too — matching `llvm_type`, so an
         // `Ty::Fn` in an ABI position (later: fn-typed parameters/returns) is not silently `i32`.
         Ty::Fn(_) => closure_struct_type(ctx).into(),
+        Ty::Array(element, length) => scalar_type(ctx, scalar_to_ty(element), sx, ex, tx)
+            .array_type(length)
+            .into(),
+        Ty::StructArray(id, length) => sx[id as usize].array_type(length).into(),
         Ty::Slice(_) | Ty::Soa(_) | Ty::JsonDoc | Ty::JsonScanner(_) | Ty::Str | Ty::String | Ty::DynArray(_)
         | Ty::DynVecArray(..) | Ty::DynMaskArray(..) | Ty::DynFixedArray(..)
         | Ty::DynFixedStructArray(..) | Ty::CodecBatch | Ty::CodecI64Column
@@ -9246,6 +9250,7 @@ fn rvalue_keeps_view_facts(f: &Function, rv: &Rvalue) -> bool {
         | Rvalue::SliceIndexNoalias { .. }
         | Rvalue::SubSlice { .. }
         | Rvalue::MakeSlice(..)
+        | Rvalue::MakeFieldSlice(..)
         | Rvalue::MakeVec { .. }
         | Rvalue::VecExtract { .. }
         | Rvalue::VecInsert { .. }
@@ -14550,6 +14555,28 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let len = self.ctx.i64_type().const_int(*n as u64, false);
                 self.builder
                     .build_insert_value(agg, len, 1, "slclen")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value()
+                    .into()
+            }
+            Rvalue::MakeFieldSlice(slot, path, n) => {
+                let array_ty = self.llvm_type(self.field_path_ty(*slot, path));
+                let field_ptr = self.field_path_ptr(*slot, path)?;
+                let zero = self.ctx.i64_type().const_zero();
+                let ptr0 = unsafe {
+                    self.builder
+                        .build_in_bounds_gep(array_ty, field_ptr, &[zero, zero], "slcfldbase")
+                        .map_err(|e| self.err(e))?
+                };
+                let sty = slice_struct_type(self.ctx);
+                let aggregate = self
+                    .builder
+                    .build_insert_value(sty.get_poison(), ptr0, 0, "slcfldptr")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value();
+                let len = self.ctx.i64_type().const_int(*n as u64, false);
+                self.builder
+                    .build_insert_value(aggregate, len, 1, "slcfldlen")
                     .map_err(|e| self.err(e))?
                     .into_struct_value()
                     .into()

@@ -165,7 +165,9 @@ pub enum TokKind {
     Tilde,   // ~ (bitwise complement)
     Bang,    // !
     Question, // ?
-    /// Statement terminator (implicit `;` from a newline, or explicit `;`).
+    /// A written `;`. It terminates statements and is also the fixed-array type separator.
+    Semicolon,
+    /// Statement terminator inserted from a newline.
     End,
     Eof,
 }
@@ -198,6 +200,8 @@ impl TokKind {
 pub struct Token {
     pub kind: TokKind,
     pub span: Span,
+    /// Radix of an integer token. Other tokens carry `None`.
+    pub integer_radix: Option<u32>,
 }
 
 struct Lexer<'a> {
@@ -245,6 +249,7 @@ impl<'a> Lexer<'a> {
         self.tokens.push(Token {
             kind: TokKind::Eof,
             span: self.span(at, at),
+            integer_radix: None,
         });
     }
 
@@ -266,6 +271,7 @@ impl<'a> Lexer<'a> {
         self.tokens.push(Token {
             kind: TokKind::End,
             span: self.span(at, at),
+            integer_radix: None,
         });
     }
 
@@ -730,7 +736,7 @@ impl<'a> Lexer<'a> {
             (b'/', _) => (TokKind::Slash, 1),
             (b'%', _) => (TokKind::Percent, 1),
             (b'?', _) => (TokKind::Question, 1),
-            (b';', _) => (TokKind::End, 1),
+            (b';', _) => (TokKind::Semicolon, 1),
             _ => {
                 // Report the whole (possibly multi-byte) UTF-8 character once and advance past
                 // exactly its bytes — not one byte at a time, which mangles a non-ASCII glyph
@@ -769,7 +775,21 @@ impl<'a> Lexer<'a> {
 
     fn push(&mut self, kind: TokKind, start: usize) {
         let span = self.span(start, self.pos);
-        self.tokens.push(Token { kind, span });
+        let integer_radix = if matches!(kind, TokKind::Int(_)) {
+            Some(match self.src.get(start..start.saturating_add(2)) {
+                Some([b'0', b'x' | b'X']) => 16,
+                Some([b'0', b'o' | b'O']) => 8,
+                Some([b'0', b'b' | b'B']) => 2,
+                _ => 10,
+            })
+        } else {
+            None
+        };
+        self.tokens.push(Token {
+            kind,
+            span,
+            integer_radix,
+        });
     }
 }
 
@@ -822,6 +842,13 @@ mod tests {
         let mut d = Diagnostics::new();
         tokenize(0, src, &mut d);
         d.iter().map(|e| e.message.clone()).collect()
+    }
+
+    #[test]
+    fn written_semicolon_is_distinct_from_newline_termination() {
+        let tokens = kinds("x;\ny");
+        assert!(tokens.iter().any(|token| *token == TokKind::Semicolon));
+        assert!(tokens.iter().any(|token| *token == TokKind::End));
     }
 
     // 2-5: a float literal that overflows to infinity is diagnosed, not silently `inf`.

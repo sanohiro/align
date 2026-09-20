@@ -116,6 +116,8 @@ pub enum IType {
     /// A named type, optionally with generic arguments: `i64`, `Option<i32>`, `other.Point`.
     /// `path` is the dotted source path (`()` for unit); `args` are its generic arguments.
     Named { path: String, args: Vec<IType> },
+    /// A structural fixed inline array `[element; length]`.
+    FixedArray { element: Box<IType>, length: u32 },
     /// An anonymous tuple type `(T, U, ...)`.
     Tuple(Vec<IType>),
     /// A function-value type `fn(params) -> ret`.
@@ -275,6 +277,10 @@ fn convert_type(t: &align_ast::Type) -> IType {
         align_ast::Type::Named { path, args, .. } => {
             IType::Named { path: path_to_string(path), args: args.iter().map(convert_type).collect() }
         }
+        align_ast::Type::FixedArray { element, length, .. } => IType::FixedArray {
+            element: Box::new(convert_type(element)),
+            length: *length,
+        },
         align_ast::Type::Tuple { elems, .. } => IType::Tuple(elems.iter().map(convert_type).collect()),
         align_ast::Type::Fn { params, ret, .. } => IType::Fn {
             params: params
@@ -1006,8 +1012,9 @@ fn partition_impl_hashes(
 // re-parsed regardless), so render-to-source unifies the whole reconstruction into a single
 // `parse_file` call in the driver.
 
-/// Render a UTF-8 type reference back to source. Every summary type is `Named`/`Tuple`/`Fn` (see
-/// [`convert_type`]); a named type with args is `path<a, b>`, the unit type is its sentinel `()`.
+/// Render a UTF-8 type reference back to source. Every summary type is
+/// `Named`/`FixedArray`/`Tuple`/`Fn` (see [`convert_type`]); a named type with args is
+/// `path<a, b>`, and the unit type is its sentinel `()`.
 fn render_itype(t: &IType) -> String {
     match t {
         IType::Named { path, args } => {
@@ -1017,6 +1024,9 @@ fn render_itype(t: &IType) -> String {
                 let a = args.iter().map(render_itype).collect::<Vec<_>>().join(", ");
                 format!("{path}<{a}>")
             }
+        }
+        IType::FixedArray { element, length } => {
+            format!("[{}; {length}]", render_itype(element))
         }
         IType::Tuple(elems) => {
             let e = elems.iter().map(render_itype).collect::<Vec<_>>().join(", ");
@@ -1631,6 +1641,7 @@ impl<'a> CapabilityAnalysis<'a> {
         let mut work = vec![ty];
         while let Some(current) = work.pop() {
             match current {
+                IType::FixedArray { element, .. } => work.push(element),
                 IType::Tuple(elements) => work.extend(elements),
                 IType::Fn { .. } => {}
                 IType::Named { path, args } => {
@@ -1727,6 +1738,7 @@ impl<'a> CapabilityAnalysis<'a> {
         let mut work = vec![ty];
         while let Some(current) = work.pop() {
             match current {
+                IType::FixedArray { element, .. } => work.push(element),
                 IType::Tuple(elements) => work.extend(elements),
                 IType::Fn { .. } => result.intrinsic = true,
                 IType::Named { path, args } => {
@@ -1777,6 +1789,7 @@ impl<'a> CapabilityAnalysis<'a> {
         let mut work = vec![ty];
         while let Some(current) = work.pop() {
             match current {
+                IType::FixedArray { element, .. } => work.push(element),
                 IType::Tuple(elements) => work.extend(elements),
                 IType::Fn { .. } => {}
                 IType::Named { path, args } => {
@@ -1880,6 +1893,7 @@ impl<'a> CapabilityAnalysis<'a> {
         let mut work = vec![(actual, false)];
         while let Some((current, wrapped)) = work.pop() {
             match current {
+                IType::FixedArray { element, .. } => work.push((element, true)),
                 IType::Named { path, args } => {
                     if args.is_empty()
                         && let Some(source_param) = source_params
@@ -1915,6 +1929,7 @@ impl<'a> CapabilityAnalysis<'a> {
         let mut work = vec![root];
         while let Some(current) = work.pop() {
             match current {
+                IType::FixedArray { element, .. } => work.push(element),
                 IType::Tuple(elements) => work.extend(elements),
                 IType::Fn { .. } => {}
                 IType::Named { path, args } => {
@@ -2041,6 +2056,7 @@ impl<'a> CapabilityAnalysis<'a> {
         let mut work = vec![ty];
         while let Some(current) = work.pop() {
             match current {
+                IType::FixedArray { element, .. } => work.push(element),
                 IType::Tuple(elements) => work.extend(elements),
                 IType::Fn { .. } => {}
                 IType::Named { path, args } => {
@@ -2115,6 +2131,7 @@ fn validate_import_type_shape(
     let mut work = vec![ty];
     while let Some(current) = work.pop() {
         match current {
+            IType::FixedArray { element, .. } => work.push(element),
             IType::Tuple(elements) => work.extend(elements.iter().rev()),
             IType::Fn { params, ret, .. } => {
                 work.push(ret);
@@ -2266,6 +2283,7 @@ fn validate_import_type_headers(ty: &IType) -> Result<(), ImportCompatibilityErr
     let mut work = vec![ty];
     while let Some(current) = work.pop() {
         match current {
+            IType::FixedArray { element, .. } => work.push(element),
             IType::Named { args, .. } => work.extend(args.iter().rev()),
             IType::Tuple(elements) => work.extend(elements.iter().rev()),
             IType::Fn {
@@ -2554,6 +2572,7 @@ fn validate_return_cleanup_metadata(
     let mut work = vec![ty];
     while let Some(current) = work.pop() {
         match current {
+            IType::FixedArray { element, .. } => work.push(element),
             IType::Named { args, .. } => work.extend(args.iter().rev()),
             IType::Tuple(elements) => work.extend(elements.iter().rev()),
             IType::Fn {
@@ -2752,6 +2771,7 @@ pub fn summary_to_source(
         let mut work = vec![root];
         while let Some(ty) = work.pop() {
             match ty {
+                IType::FixedArray { element, .. } => work.push(element),
                 IType::Named { path, args } => {
                     match path.as_str() {
                         "crypto.argon2_params" | "crypto.digest"

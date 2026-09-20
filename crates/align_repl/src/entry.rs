@@ -77,7 +77,9 @@ pub(crate) fn shape_of(text: &str) -> Shape {
     let file = sm.add_file("<repl-probe>", text.to_string());
     let mut diags = Diagnostics::new();
     let toks = align_lexer::tokenize(file, text, &mut diags);
-    let first = toks.iter().find(|t| !matches!(t.kind, TokKind::End | TokKind::Eof));
+    let first = toks
+        .iter()
+        .find(|t| !matches!(t.kind, TokKind::Semicolon | TokKind::End | TokKind::Eof));
     match first.map(|t| &t.kind) {
         None => Shape::Empty,
         Some(TokKind::Import | TokKind::Fn | TokKind::Extern) => Shape::KeywordDecl,

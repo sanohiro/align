@@ -1304,6 +1304,8 @@ pub enum Rvalue {
     },
     /// Borrow array `slot` (length `n`) as a slice value `{ &slot[0], n }`.
     MakeSlice(Slot, i128),
+    /// Borrow an inline fixed-array record field as a slice value `{ &slot.field[0], n }`.
+    MakeFieldSlice(Slot, Vec<u32>, i128),
     /// Bump-allocate `count` elements of type `elem` in the arena `handle`; yields the
     /// element pointer (used to build an owned `array<T>` via [`Rvalue::MakeDynArray`]).
     ArenaAlloc {
@@ -6670,12 +6672,12 @@ fn lower_parallel_source(
             lower_chunks_pipeline_source(b, source, ChunksConsumer::Parallel)
         }
         _ => {
-            let (slot, n) = array_source_slot(b, source);
+            let (slot, path, n) = array_source_slot(b, source);
             if !lowering_continues(b) {
                 return None;
             }
             let value = b.fresh_value(Ty::Slice(scalar_of(elem_in)));
-            b.push(Stmt::Let(value, Rvalue::MakeSlice(slot, n)));
+            b.push(Stmt::Let(value, fixed_slice_rvalue(slot, path, n)));
             Operand::Value(value)
         }
     };
@@ -7048,6 +7050,22 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 store_value_at(b, *root, &mut path.clone(), value);
                 return;
             }
+            if matches!(value.kind, hir::ExprKind::ArrayLit { .. }) {
+                // A fixed Move-record array is an aggregate value that cannot travel through the
+                // scalar `lower_expr` path. Build it under a temporary owner before touching the
+                // destination, then drop the old field and publish the complete replacement.
+                let Some((replacement, owner, _)) = materialize_array_literal(b, value) else {
+                    return;
+                };
+                let old = b.fresh_value(leaf_ty);
+                b.push(Stmt::Let(old, Rvalue::Field(*root, path.clone())));
+                b.emit_drop_value_if_owner_live(*root, Operand::Value(old));
+                b.push(Stmt::StoreField(*root, path.clone(), replacement));
+                if let Some(owner) = owner {
+                    b.set_drop_flag(owner, false);
+                }
+                return;
+            }
             // Assignment evaluates the RHS before mutating the destination. Capture it first so
             // borrows of the old field remain valid during evaluation and a consuming RHS can
             // transfer that exact ownership back into the destination.
@@ -7062,15 +7080,24 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             b.emit_drop_value_if_owner_live(*root, Operand::Value(old));
             b.push(Stmt::StoreField(*root, path.clone(), replacement));
         }
-        hir::Stmt::AssignIndex { base, index, value } => {
+        hir::Stmt::AssignIndex {
+            base,
+            path,
+            index,
+            value,
+        } => {
             // `base[index] = value` — bounds-checked element store (abort on out-of-range, like a
             // read). A `{ptr,len}` slice/owned-array writes through its buffer pointer; a fixed
             // stack array writes its slot directly.
             let idx = lower_required!(b, lower_expr(b, index), ());
             let val = lower_required!(b, lower_expr(b, value), ());
-            let base_ty = b.slots[*base as usize];
+            let base_ty = if path.is_empty() {
+                b.slots[*base as usize]
+            } else {
+                field_ty_at(b, *base, path)
+            };
             match base_ty {
-                Ty::Slice(s) | Ty::DynArray(s) => {
+                Ty::Slice(s) | Ty::DynArray(s) if path.is_empty() => {
                     let sv = b.fresh_value(base_ty);
                     b.push(Stmt::Let(sv, Rvalue::Load(*base)));
                     let len = b.fresh_value(i64_ty());
@@ -7080,11 +7107,25 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                     b.push(Stmt::Let(ptr, Rvalue::SlicePtr(Operand::Value(sv))));
                     b.push(Stmt::PtrStore(Operand::Value(ptr), idx, val));
                 }
-                Ty::Array(_, n) => {
+                Ty::Array(element, n) => {
                     emit_bounds_check(b, &idx, Operand::Const(Const::Int(n as i128, i64_ty())));
-                    b.push(Stmt::StoreIndex(*base, idx, val));
+                    if path.is_empty() {
+                        b.push(Stmt::StoreIndex(*base, idx, val));
+                    } else {
+                        let slice_ty = Ty::Slice(element);
+                        let descriptor = b.fresh_value(slice_ty);
+                        b.push(Stmt::Let(
+                            descriptor,
+                            Rvalue::MakeFieldSlice(*base, path.clone(), i128::from(n)),
+                        ));
+                        let ptr = b.fresh_value(Ty::Box(element));
+                        b.push(Stmt::Let(ptr, Rvalue::SlicePtr(Operand::Value(descriptor))));
+                        b.push(Stmt::PtrStore(Operand::Value(ptr), idx, val));
+                    }
                 }
-                other => unreachable!("element assignment into non-array/slice {other:?}"),
+                _ => {
+                    b.terminate(Term::Unreachable);
+                }
             }
         }
         hir::Stmt::AssignElemField {
@@ -10763,12 +10804,12 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                     );
                     return lower_view_retype(b, owned_view, e.ty);
                 }
-                let (slot, n) = array_source_slot(b, inner);
+                let (slot, path, n) = array_source_slot(b, inner);
                 if !lowering_continues(b) {
                     return Operand::Const(Const::Unit);
                 }
                 let v = b.fresh_value(e.ty);
-                b.push(Stmt::Let(v, Rvalue::MakeSlice(slot, n)));
+                b.push(Stmt::Let(v, fixed_slice_rvalue(slot, path, n)));
                 Operand::Value(v)
             }
             hir::ExprKind::Len(inner) => {
@@ -10776,7 +10817,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                     if matches!(inner.kind, hir::ExprKind::ArrayLit { .. }) {
                         // Literals are slot-backed. Reuse guarded element initialization so an
                         // early exit cleans up the completed owned prefix, never generic SSA.
-                        let (slot, _) = array_source_slot(b, inner);
+                        let (slot, _, _) = array_source_slot(b, inner);
                         if !lowering_continues(b) {
                             return Operand::Const(Const::Unit);
                         }
@@ -11107,6 +11148,24 @@ fn store_consumed_struct_fields(
                 }
             }
         }
+        hir::ExprKind::ArrayLit { .. } => {
+            let Some((owner, live)) = store_array_field_literal(b, slot, path, value) else {
+                return false;
+            };
+            if let Some(live) = live {
+                *aggregate_drop_flag = Some(match aggregate_drop_flag.take() {
+                    None => live,
+                    Some(previous) => {
+                        let both = b.fresh_value(Ty::Bool);
+                        b.push(Stmt::Let(both, Rvalue::Bin(BinOp::And, previous, live)));
+                        Operand::Value(both)
+                    }
+                });
+            }
+            if let Some(owner) = owner {
+                owners.push(owner);
+            }
+        }
         _ => {
             let (operand, owner) = lower_consumed_call_arg(b, value);
             if !lowering_continues(b) {
@@ -11152,6 +11211,31 @@ fn store_fresh_struct_fields(b: &mut Builder, slot: Slot, value: &hir::Expr) -> 
                     if !complete {
                         return false;
                     }
+                }
+            }
+            hir::ExprKind::ArrayLit { .. } => {
+                let Some((owner, live)) = store_array_field_literal(b, slot, path, value) else {
+                    return false;
+                };
+                if let Some(live) = live {
+                    let flag = b.new_slot(Ty::Bool);
+                    b.push(Stmt::Store(flag, live.clone()));
+                    *aggregate_drop_flag = Some(match aggregate_drop_flag.take() {
+                        None => live,
+                        Some(previous) => {
+                            let both = b.fresh_value(Ty::Bool);
+                            b.push(Stmt::Let(both, Rvalue::Bin(BinOp::And, previous, live)));
+                            Operand::Value(both)
+                        }
+                    });
+                    b.partial_fields.push(PartialField {
+                        destination: slot,
+                        path: path.clone(),
+                        flag,
+                    });
+                }
+                if let Some(owner) = owner {
+                    b.set_drop_flag(owner, false);
                 }
             }
             _ => {
@@ -11281,18 +11365,23 @@ fn lower_borrowed_place(b: &mut Builder, e: &hir::Expr, mode: align_ast::ParamMo
     if let hir::ExprKind::ArrayToSlice(inner) = &e.kind
         && matches!(inner.ty, Ty::Array(..) | Ty::StructArray(..))
     {
-        if !matches!(inner.kind, hir::ExprKind::ArrayLit { .. } | hir::ExprKind::Local(_)) {
+        if !matches!(
+            inner.kind,
+            hir::ExprKind::ArrayLit { .. }
+                | hir::ExprKind::Local(_)
+                | hir::ExprKind::Field { .. }
+        ) {
             b.terminate(Term::Unreachable);
             return Operand::Const(Const::Unit);
         }
-        let (source_slot, length) = array_source_slot(b, inner);
+        let (source_slot, source_path, length) = array_source_slot(b, inner);
         if !lowering_continues(b) {
             return Operand::Const(Const::Unit);
         }
         let descriptor = b.fresh_value(e.ty);
         b.push(Stmt::Let(
             descriptor,
-            Rvalue::MakeSlice(source_slot, length),
+            fixed_slice_rvalue(source_slot, source_path, length),
         ));
         let descriptor_slot = b.new_slot(e.ty);
         b.push(Stmt::Store(descriptor_slot, Operand::Value(descriptor)));
@@ -11437,7 +11526,12 @@ fn lower_borrowed_place(b: &mut Builder, e: &hir::Expr, mode: align_ast::ParamMo
                 && !matches!(index.kind, hir::ExprKind::Int(_))
                 && !needs_drop_flag(e.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
             {
-                if !matches!(recv.kind, hir::ExprKind::Local(_) | hir::ExprKind::ArrayLit { .. }) {
+                if !matches!(
+                    recv.kind,
+                    hir::ExprKind::Local(_)
+                        | hir::ExprKind::ArrayLit { .. }
+                        | hir::ExprKind::Field { .. }
+                ) {
                     b.terminate(Term::Unreachable);
                     return Operand::Const(Const::Unit);
                 }
@@ -12919,12 +13013,12 @@ fn lower_chunks_source(b: &mut Builder, source: &hir::Expr, elem: Ty) -> Operand
             lower_view_retype(b, source, Ty::Slice(scalar_of(elem)))
         }
         _ => {
-            let (slot, len) = array_source_slot(b, source);
+            let (slot, path, len) = array_source_slot(b, source);
             if !lowering_continues(b) {
                 return Operand::Const(Const::Unit);
             }
             let sv = b.fresh_value(Ty::Slice(scalar_of(elem)));
-            b.push(Stmt::Let(sv, Rvalue::MakeSlice(slot, len)));
+            b.push(Stmt::Let(sv, fixed_slice_rvalue(slot, path, len)));
             Operand::Value(sv)
         }
     }
@@ -13217,11 +13311,20 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
         }
         _ => {
             // A fixed `array<T>` (sema restricted `recv` to a literal / local).
-            let (slot, n) = array_source_slot(b, recv);
+            let (slot, path, n) = array_source_slot(b, recv);
             if !lowering_continues(b) {
                 return Operand::Const(Const::Unit);
             }
-            (Src::Slot(slot), Operand::Const(Const::Int(n, i64_ty())))
+            if path.is_empty() {
+                (Src::Slot(slot), Operand::Const(Const::Int(n, i64_ty())))
+            } else {
+                let slice = b.fresh_value(Ty::Slice(scalar_of(elem_ty)));
+                b.push(Stmt::Let(slice, Rvalue::MakeFieldSlice(slot, path, n)));
+                (
+                    Src::Slice(Operand::Value(slice)),
+                    Operand::Const(Const::Int(n, i64_ty())),
+                )
+            }
         }
     };
     let idx = lower_required!(b, lower_expr(b, index), Operand::Const(Const::Unit));
@@ -13546,12 +13649,12 @@ fn lower_slice_range(
     };
     let base = match slot_element {
         Some(element) => {
-            let (slot, n) = array_source_slot(b, recv);
+            let (slot, path, n) = array_source_slot(b, recv);
             if !lowering_continues(b) {
                 return Operand::Const(Const::Unit);
             }
             let v = b.fresh_value(Ty::Slice(element));
-            b.push(Stmt::Let(v, Rvalue::MakeSlice(slot, n)));
+            b.push(Stmt::Let(v, fixed_slice_rvalue(slot, path, n)));
             Operand::Value(v)
         }
         None => lower_borrowed_owned(b, recv),
@@ -13646,16 +13749,27 @@ fn lower_index_field(
         }
         _ => {
             // A fixed `array<Struct>` slot (sema restricted `recv` to a literal / local).
-            let (slot, n) = array_source_slot(b, recv);
+            let (slot, field_path, n) = array_source_slot(b, recv);
             if !lowering_continues(b) {
                 return Operand::Const(Const::Unit);
             }
-            (
-                None,
-                None,
-                slot,
-                Some(Operand::Const(Const::Int(n, i64_ty()))),
-            )
+            if field_path.is_empty() {
+                (
+                    None,
+                    None,
+                    slot,
+                    Some(Operand::Const(Const::Int(n, i64_ty()))),
+                )
+            } else {
+                let view = b.fresh_value(Ty::Slice(Scalar::Struct(struct_id)));
+                b.push(Stmt::Let(view, Rvalue::MakeFieldSlice(slot, field_path, n)));
+                (
+                    Some((struct_id, Layout::Aos)),
+                    Some(Operand::Value(view)),
+                    0,
+                    None,
+                )
+            }
         }
     };
     let Some(_) = checked_struct_field_path(b, struct_id, path) else {
@@ -13894,9 +14008,24 @@ fn min_max_fn(is_max: bool) -> align_sema::MathFn {
 
 /// Resolve an array-typed source expression to a slot holding it (materializing a
 /// literal), returning `(slot, length)`.
-fn array_source_slot(b: &mut Builder, source: &hir::Expr) -> (Slot, i128) {
+fn array_source_slot(b: &mut Builder, source: &hir::Expr) -> (Slot, Vec<u32>, i128) {
+    let fixed_length = match source.ty {
+        Ty::Array(_, length) | Ty::StructArray(_, length) => Some(length),
+        _ => None,
+    };
     match &source.kind {
         hir::ExprKind::ArrayLit { elems, elem, .. } => {
+            let expected_element = match source.ty {
+                Ty::Array(element, _) => Some(align_sema::scalar_to_ty(element)),
+                Ty::StructArray(id, _) => Some(Ty::Struct(id)),
+                _ => None,
+            };
+            if fixed_length != u32::try_from(elems.len()).ok()
+                || expected_element != Some(*elem)
+            {
+                b.terminate(Term::Unreachable);
+                return (0, Vec::new(), 0);
+            }
             // A pipeline/reduce source literal is a fresh temporary, never a `pooled` binding
             // (sema sets `pooled` only at a `let`), so it always takes the per-element store path.
             // A fixed Move-struct array owns its completed elements, so its anonymous backing slot
@@ -13914,16 +14043,48 @@ fn array_source_slot(b: &mut Builder, source: &hir::Expr) -> (Slot, i128) {
             if owns_elements && lowering_continues(b) {
                 b.set_drop_flag_operand(slot, live.unwrap_or(Operand::Const(Const::Bool(false))));
             }
-            (slot, elems.len() as i128)
+            (slot, Vec::new(), elems.len() as i128)
         }
         hir::ExprKind::Local(id) => {
-            let n = match source.ty {
-                Ty::Array(_, n) | Ty::StructArray(_, n) => n as i128,
-                _ => 0,
+            let Some(length) = fixed_length.filter(|_| {
+                b.slots.get(*id as usize).copied() == Some(source.ty)
+            }) else {
+                b.terminate(Term::Unreachable);
+                return (0, Vec::new(), 0);
             };
-            (*id, n)
+            (*id, Vec::new(), i128::from(length))
         }
-        _ => unreachable!("array source must be a literal or a local in M4"),
+        hir::ExprKind::Field { root, path } => {
+            let mut current = b.slots.get(*root as usize).copied();
+            for field in path {
+                current = current.and_then(|ty| {
+                    let Ty::Struct(id) = ty else { return None };
+                    b.structs
+                        .get(id as usize)
+                        .and_then(|definition| definition.fields.get(*field as usize))
+                        .map(|field| field.ty)
+                });
+            }
+            let Some(length) = fixed_length.filter(|_| {
+                !path.is_empty() && current == Some(source.ty)
+            }) else {
+                b.terminate(Term::Unreachable);
+                return (0, Vec::new(), 0);
+            };
+            (*root, path.clone(), i128::from(length))
+        }
+        _ => {
+            b.terminate(Term::Unreachable);
+            (0, Vec::new(), 0)
+        }
+    }
+}
+
+fn fixed_slice_rvalue(slot: Slot, path: Vec<u32>, length: i128) -> Rvalue {
+    if path.is_empty() {
+        Rvalue::MakeSlice(slot, length)
+    } else {
+        Rvalue::MakeFieldSlice(slot, path, length)
     }
 }
 
@@ -13949,6 +14110,55 @@ fn field_ty_at(b: &Builder, slot: Slot, path: &[u32]) -> Ty {
     ty
 }
 
+/// Materialize one fixed-array literal and store the complete inline aggregate at a record field.
+/// A Move-element array keeps its synthetic source owner live until the caller has published the
+/// surrounding aggregate; Copy arrays return no owner or cleanup fact.
+fn store_array_field_literal(
+    b: &mut Builder,
+    destination: Slot,
+    path: &[u32],
+    value: &hir::Expr,
+) -> Option<(Option<Slot>, Option<Operand>)> {
+    let (aggregate, owner, live) = materialize_array_literal(b, value)?;
+    b.push(Stmt::StoreField(destination, path.to_vec(), aggregate));
+    Some((owner, live))
+}
+
+/// Materialize one fixed-array literal under a temporary owner without publishing it. This is the
+/// common evaluation phase for fresh aggregate construction and field replacement; callers decide
+/// when the destination becomes visible and then retire the temporary owner.
+fn materialize_array_literal(
+    b: &mut Builder,
+    value: &hir::Expr,
+) -> Option<(Operand, Option<Slot>, Option<Operand>)> {
+    let hir::ExprKind::ArrayLit { elems, elem, .. } = &value.kind else {
+        return None;
+    };
+    let owns_elements = needs_drop_flag(value.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types);
+    let source = if owns_elements {
+        b.new_synthetic_owner(value.ty)
+    } else {
+        b.new_slot(value.ty)
+    };
+    let live = store_array_elems(b, source, elems, *elem);
+    if !lowering_continues(b) {
+        return None;
+    }
+    if owns_elements {
+        b.set_drop_flag_operand(
+            source,
+            live.clone().unwrap_or(Operand::Const(Const::Bool(false))),
+        );
+    }
+    let aggregate = b.fresh_value(value.ty);
+    b.push(Stmt::Let(aggregate, Rvalue::Load(source)));
+    Some((
+        Operand::Value(aggregate),
+        owns_elements.then_some(source),
+        owns_elements.then_some(live.unwrap_or(Operand::Const(Const::Bool(false)))),
+    ))
+}
+
 fn store_value_at(b: &mut Builder, slot: Slot, path: &mut Vec<u32>, value: &hir::Expr) {
     match &value.kind {
         hir::ExprKind::StructLit { fields, .. } => {
@@ -13959,6 +14169,11 @@ fn store_value_at(b: &mut Builder, slot: Slot, path: &mut Vec<u32>, value: &hir:
                 if !lowering_continues(b) {
                     return;
                 }
+            }
+        }
+        hir::ExprKind::ArrayLit { .. } => {
+            if let Some((Some(owner), _)) = store_array_field_literal(b, slot, path, value) {
+                b.set_drop_flag(owner, false);
             }
         }
         _ => {
@@ -14425,13 +14640,28 @@ fn setup_source(
             })
         }
         _ => {
-            let (slot, n) = array_source_slot(b, source);
+            let (slot, path, n) = array_source_slot(b, source);
             if !lowering_continues(b) {
                 return None;
             }
+            let slice_val = if path.is_empty() {
+                None
+            } else {
+                let Some(element) = (match source.ty {
+                    Ty::Array(element, _) => Some(element),
+                    Ty::StructArray(id, _) => Some(Scalar::Struct(id)),
+                    _ => None,
+                }) else {
+                    b.terminate(Term::Unreachable);
+                    return None;
+                };
+                let view = b.fresh_value(Ty::Slice(element));
+                b.push(Stmt::Let(view, Rvalue::MakeFieldSlice(slot, path, n)));
+                Some(Operand::Value(view))
+            };
             Some(SrcSetup {
                 slot,
-                slice_val: None,
+                slice_val,
                 bound: Operand::Const(Const::Int(n, i64_ty())),
                 scalar_slot: matches!(source.ty, Ty::Array(..)),
                 struct_view: None,
@@ -18259,15 +18489,30 @@ fn lower_array_sort(
 /// (sema-checked) length, folded in one counted loop. Both sources materialize to a slot
 /// (`array_source_slot`); `mul`/`add` lower per element type (int or float).
 fn lower_array_dot(b: &mut Builder, a: &hir::Expr, bex: &hir::Expr, elem: Ty) -> Operand {
-    let (a_slot, n) = array_source_slot(b, a);
+    let (a_slot, a_path, n) = array_source_slot(b, a);
     if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
     }
-    let (b_slot, _nb) = array_source_slot(b, bex);
+    let (b_slot, b_path, _nb) = array_source_slot(b, bex);
 
     if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
     }
+
+    let a_slice = if a_path.is_empty() {
+        None
+    } else {
+        let value = b.fresh_value(Ty::Slice(scalar_of(elem)));
+        b.push(Stmt::Let(value, Rvalue::MakeFieldSlice(a_slot, a_path, n)));
+        Some(Operand::Value(value))
+    };
+    let b_slice = if b_path.is_empty() {
+        None
+    } else {
+        let value = b.fresh_value(Ty::Slice(scalar_of(elem)));
+        b.push(Stmt::Let(value, Rvalue::MakeFieldSlice(b_slot, b_path, n)));
+        Some(Operand::Value(value))
+    };
 
     let acc = b.new_slot(elem);
     b.push(Stmt::Store(acc, zero_of(elem)));
@@ -18298,9 +18543,21 @@ fn lower_array_dot(b: &mut Builder, a: &hir::Expr, bex: &hir::Expr, elem: Ty) ->
     b.push(Stmt::Let(idx, Rvalue::Load(iv)));
     let index = Operand::Value(idx);
     let xa = b.fresh_value(elem);
-    b.push(Stmt::Let(xa, Rvalue::Index(a_slot, index.clone())));
+    b.push(Stmt::Let(
+        xa,
+        match &a_slice {
+            Some(slice) => Rvalue::SliceIndex(slice.clone(), index.clone()),
+            None => Rvalue::Index(a_slot, index.clone()),
+        },
+    ));
     let xb = b.fresh_value(elem);
-    b.push(Stmt::Let(xb, Rvalue::Index(b_slot, index)));
+    b.push(Stmt::Let(
+        xb,
+        match &b_slice {
+            Some(slice) => Rvalue::SliceIndex(slice.clone(), index),
+            None => Rvalue::Index(b_slot, index),
+        },
+    ));
     let prod = b.fresh_value(elem);
     b.push(Stmt::Let(
         prod,

@@ -2240,6 +2240,7 @@ mod tests {
                 MoveControlShape::BlockAssignIndexValue => ExprKind::Block(Block {
                     stmts: vec![Stmt::AssignIndex {
                         base: 0,
+                        path: Vec::new(),
                         index: leaf(),
                         value: expression,
                     }],
@@ -2248,6 +2249,7 @@ mod tests {
                 MoveControlShape::BlockAssignIndexIndex => ExprKind::Block(Block {
                     stmts: vec![Stmt::AssignIndex {
                         base: 0,
+                        path: Vec::new(),
                         index: expression,
                         value: leaf(),
                     }],

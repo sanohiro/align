@@ -1075,6 +1075,54 @@ fn hir_body_validator_rejects_forged_move_element_assign_index() {
     );
 }
 
+#[test]
+fn hir_body_validator_rejects_nonfixed_field_assign_index() {
+    let mut program = checked_source_program(
+        "Holder { values: slice<str> }\nfn replace(borrow mut holder: Holder, out values: slice<str>, value: str) {\n  values[0] = value\n}\nfn main() -> i32 = 0\n",
+    );
+    assert!(
+        validate_hir::body_only_metadata_is_valid(&program),
+        "the direct slice store fixture must survive the body gate",
+    );
+
+    let function = program
+        .fns
+        .iter_mut()
+        .find(|function| function.name == "replace");
+    assert!(function.is_some(), "indexed-store fixture lost replace");
+    let Some(function) = function else {
+        return;
+    };
+    let holder = function
+        .locals
+        .iter()
+        .find(|local| local.name == "holder")
+        .map(|local| local.id);
+    assert!(holder.is_some(), "indexed-store fixture lost holder");
+    let Some(holder) = holder else {
+        return;
+    };
+    let statement = function
+        .body
+        .stmts
+        .first_mut();
+    assert!(statement.is_some(), "indexed-store fixture lost statement");
+    let Some(statement) = statement else {
+        return;
+    };
+    let hir::Stmt::AssignIndex { base, path, .. } = statement else {
+        assert!(false, "indexed-store fixture lost AssignIndex");
+        return;
+    };
+    *base = holder;
+    *path = vec![0];
+
+    assert!(
+        !validate_hir::body_only_metadata_is_valid(&program),
+        "a forged non-fixed field AssignIndex must fail before MIR lowering",
+    );
+}
+
 /// Producer-delegation matrix owner: every source shape sema accepts must survive the body
 /// validator and lower to a non-empty program.
 ///
@@ -10483,7 +10531,11 @@ fn hir_body_validator_pipeline_array_views() {
             Ty::Unit,
         ));
         assert!(
-            body_core_metadata_is_valid(&reject) == matches!(source_ty, Ty::DynArray(_) | Ty::DynStructArray(..)),
+            body_core_metadata_is_valid(&reject)
+                == matches!(
+                    source_ty,
+                    Ty::StructArray(..) | Ty::DynArray(_) | Ty::DynStructArray(..)
+                ),
             "{name}: view admission must preserve existing owning-array type formation"
         );
     }
@@ -15627,6 +15679,7 @@ fn hir_body_validator_statement_inventory() {
         "stmt_assign_index",
         hir::Stmt::AssignIndex {
             base: 0,
+            path: Vec::new(),
             index: expr(hir::ExprKind::Int(0), integer),
             value: expr(hir::ExprKind::Int(3), integer),
         },

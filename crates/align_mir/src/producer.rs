@@ -2249,6 +2249,9 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     },
                 });
             }
+            Rvalue::MakeFieldSlice(_, _, _) => {
+                equation.invalid = true;
+            }
             Rvalue::Use(operand) | Rvalue::SubSlice { base: operand, .. } => {
                 equation.seed = None;
                 equation.dependencies.clear();
@@ -3788,6 +3791,9 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 } else {
                     equation.invalid = true;
                 }
+            }
+            Rvalue::MakeFieldSlice(_, _, _) => {
+                equation.invalid = true;
             }
             Rvalue::ConstArray { elems, elem } => {
                 let result_matches = align_sema::ty_to_scalar(elem)
@@ -7735,6 +7741,7 @@ pub fn validate_mir_producers(program: &Program) -> Result<HashSet<String>, Prod
     validate_slice_index_rvalues(program)?;
     validate_str_match_terminators(program)?;
     validate_fixed_element_nulling(program)?;
+    validate_fixed_field_slices(program)?;
     // Publication certifies the typed producer graph, not final native codegen.
     // Generated callback/parallel-kernel preflight runs at emission, after the
     // consumer's interface checks and diagnostic precedence have completed.
@@ -7754,6 +7761,60 @@ pub fn validate_mir_producers(program: &Program) -> Result<HashSet<String>, Prod
         ));
     }
     Ok(certified)
+}
+
+fn validate_fixed_field_slices(program: &Program) -> Result<(), ProducerError> {
+    for function in &program.fns {
+        for statement in function.blocks.iter().flat_map(|block| &block.stmts) {
+            let Stmt::Let(value, Rvalue::MakeFieldSlice(slot, path, length)) = statement else {
+                continue;
+            };
+            let Some(mut current) = function.slots.get(*slot as usize).copied() else {
+                return Err(ProducerError::Lowering(
+                    "fixed-field slice references a missing root slot".to_string(),
+                ));
+            };
+            if path.is_empty() {
+                return Err(ProducerError::Lowering(
+                    "fixed-field slice has an empty field path".to_string(),
+                ));
+            }
+            for field in path {
+                let Ty::Struct(id) = current else {
+                    return Err(ProducerError::Lowering(
+                        "fixed-field slice path crosses a non-struct type".to_string(),
+                    ));
+                };
+                current = program
+                    .structs
+                    .get(id as usize)
+                    .and_then(|definition| definition.fields.get(*field as usize))
+                    .map(|field| field.ty)
+                    .ok_or_else(|| {
+                        ProducerError::Lowering(
+                            "fixed-field slice path is outside the record definition".to_string(),
+                        )
+                    })?;
+            }
+            let expected = match current {
+                Ty::Array(element, actual) if i128::from(actual) == *length => Ty::Slice(element),
+                Ty::StructArray(id, actual) if i128::from(actual) == *length => {
+                    Ty::Slice(Scalar::Struct(id))
+                }
+                _ => {
+                    return Err(ProducerError::Lowering(
+                        "fixed-field slice leaf or length is inconsistent".to_string(),
+                    ));
+                }
+            };
+            if function.value_tys.get(*value as usize).copied() != Some(expected) {
+                return Err(ProducerError::Lowering(
+                    "fixed-field slice result type is inconsistent".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_host_mir(program: &Program) -> Result<(), ProducerError> {

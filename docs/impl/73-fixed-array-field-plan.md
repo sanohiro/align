@@ -1,10 +1,11 @@
 # Fixed-array types and inline record fields
 
-Status: plan of record for
+Status: implementation candidate for
 [issue 1065](https://github.com/sanohiro/align/issues/1065). The language
-contract is complete; implementation starts only after one fresh independent
-adversarial review of this ledger. Evidence baseline: Align `e4395337`, LLVM
-22.1.8. The requesting consumer baseline is align-llm Request 94.
+contract and its independent design review shipped in PR #1137. The provider
+implementation closes the matrix below as one capability. Evidence baseline:
+Align `44282ee7`, LLVM 22.1.8. The requesting consumer baseline is align-llm
+Request 94.
 
 This capability makes the already implemented fixed array a nameable type and
 therefore permits it as an inline record field. Syntax, formation, stable-place
@@ -69,7 +70,7 @@ Access            `.len()` is the compile-time N. `place[i]`, `place[a..b]`,
                   a mutable root use the existing fixed-array operations and
                   bounds behavior.
                   A nameable fixed array may be rooted in a named local,
-                  parameter, or recursively selected record/tuple field place;
+                  parameter, or recursively selected record field place;
                   receiver and index/bounds evaluate once in source order. An
                   arbitrary temporary fixed-array expression remains rejected:
                   bind it first, so a slice or indexed place always has stable
@@ -187,6 +188,26 @@ parameterized owner may close several cells when it would fail for each defect.
 | Allocation | construction/access/return/Drop of the 13x32 acceptance record has no builder/runtime allocator call; explicit materialization remains the only allocation | IR symbol scan plus runtime allocation counter |
 | Malformed input | forged type/field/cardinality/place/layout equations fail in checked-HIR or MIR validation, never by panic or backend guess | one mutation owner per producer-owned discriminator/equation |
 
+Candidate owner evidence is concentrated in
+`crates/align_driver/tests/fixed_array_fields.rs`: its parameterized cases own
+cardinality and excluded-element formation; runtime cases own field
+read/index/range/len/pipeline, indexed and whole-field replacement, generic
+substitution, zero/37 lengths, Move-record construction/Drop and whole/per-unit
+transport; the 13x32 case owns the no-allocation IR assertion; and the forged
+field-slice case owns MIR rejection. Lexer, parser and formatter unit owners
+close the semicolon/newline distinction. Interface codec and summary owners
+close format 14, the independent tag-3 golden, malformed input, depth and
+round-trip identity. Existing parameterized ownership, control-flow, layout
+and escape owners remain the invariant-level evidence for their unchanged
+rules; the new negative field-slice return exercises the added storage root.
+
+This capability deliberately exceeds roughly 1,000 changed hand-written lines.
+Splitting syntax/interface publication from field-place lowering would leave a
+dormant type that no stable consumer could use, while splitting MIR from LLVM
+would duplicate the same layout, lifetime and malformed-producer proof. One
+atomic provider PR therefore has less duplicated evidence and lower integration
+risk than partial producer/consumer branches.
+
 ## 3. Acceptance corpus
 
 The provider corpus must include:
@@ -221,7 +242,9 @@ expression, array repetition syntax, nested fixed-array element, dynamic-length
 field, hidden boxing, C flexible-array member, native extern/raw array ABI,
 equality/hash/print behavior, reflection, data serialization widening or new
 runtime ABI. An arbitrary temporary is still not stable fixed-array storage;
-bind it before indexing or slicing.
+bind it before indexing or slicing. Tuple element syntax still reaches the
+existing placement gate, which does not admit inline aggregate tuple elements;
+this capability adds no tuple-projected fixed-array storage.
 
 ## 5. Design-review finding closure
 
@@ -234,3 +257,13 @@ changed.
 | Explicit `;` and newline shared `TokKind::End` | the ledger named a glyph but not its lexer provenance or existing statement role | specify `Semicolon` versus newline `End`, dual statement termination, fixed-type-only separator use, newline negative and compatibility owners |
 | Format 14 named a Rust record but not canonical bytes | artifact identity lacked a complete producer/consumer byte contract | fix tag 3, element/length order, u32 little endian, 128-record depth, malformed rules and independent bidirectional `[i64; 32]` golden |
 | Japanese receiver prose contradicted the English contract | only the newly inserted mirror paragraph was compared | update the later receiver paragraph to stable local/parameter/field places plus arbitrary-temporary exclusion and re-scan both mirrors for the old restriction |
+
+The implementation review of candidate `6e548441` found one P1 and two P2
+closure gaps. The complete root-cause class was audited before the single fix
+commit.
+
+| Finding | Root cause | Closure |
+|---|---|---|
+| A field-path indexed store could admit a slice/dynamic-array leaf but lower the containing record as its header | the new field-place path widened every indexable leaf although MIR added address formation only for inline fixed fields | sema and checked HIR admit a nonempty `AssignIndex.path` only for a fixed-array leaf; MIR also terminates malformed input before a load; negative source and forged-HIR owners pin the boundary |
+| The plan alone named tuple-projected fixed-array storage | the implementation ledger exceeded `draft.md`, the language digest and the settled decision, while tuple formation deliberately stores only scalar elements | restore the authoritative record-field boundary and state the unchanged tuple placement exclusion explicitly |
+| Function-type weak modes did not look through `[` | the type-start lookahead duplicated the pre-fixed-array constructor set | add `LBracket` to `out`, `borrow` and `borrow mut` lookahead plus parser owners for all three modes |
