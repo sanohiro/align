@@ -1,9 +1,11 @@
 # Scoped floating-point relaxation
 
-Status: design candidate for
+Status: accepted and implemented for
 [issue 1082 Part 2](https://github.com/sanohiro/align/issues/1082). This document
-is the public-contract ledger and implementation closure matrix. Evidence
-baseline: Align `1a446e5e4c38e241be7c140f6ee7747e39429110`, LLVM 22.1.8.
+is the public-contract ledger and implementation closure matrix. The design
+merged in PR #1144; the implementation follows that reviewed contract without
+reopening it. Evidence baseline: Align `1a446e5e4c38e241be7c140f6ee7747e39429110`,
+LLVM 22.1.8.
 
 Align keeps floating-point evaluation ordered by default. The missing
 capability is an explicit source scope in which the programmer may separately

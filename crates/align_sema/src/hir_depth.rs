@@ -835,6 +835,7 @@ fn walk_body_records<'a>(
                 }
                 ExprKind::TaskGroup(block)
                 | ExprKind::Block(block)
+                | ExprKind::FloatScope { block, .. }
                 | ExprKind::Arena(block)
                 | ExprKind::NamedArena { block, .. }
                 | ExprKind::Unsafe(block) => {
@@ -1067,22 +1068,22 @@ fn walk_body_records<'a>(
                         work.push((BodyRecord::Expr(end), child_depth));
                     }
                 }
-                ExprKind::VecSumWhere { vec, mask } => {
+                ExprKind::VecSumWhere { vec, mask, .. } => {
                     work.push((BodyRecord::Expr(vec), child_depth));
                     work.push((BodyRecord::Expr(mask), child_depth));
                 }
-                ExprKind::VecDot { a, b } => {
+                ExprKind::VecDot { a, b, .. } => {
                     work.push((BodyRecord::Expr(a), child_depth));
                     work.push((BodyRecord::Expr(b), child_depth));
                 }
-                ExprKind::VecMinMax { vec, .. } | ExprKind::VecSum { vec } => {
+                ExprKind::VecMinMax { vec, .. } | ExprKind::VecSum { vec, .. } => {
                     work.push((BodyRecord::Expr(vec), child_depth));
                 }
                 ExprKind::VecLoad { src, index, .. } => {
                     work.push((BodyRecord::Expr(src), child_depth));
                     work.push((BodyRecord::Expr(index), child_depth));
                 }
-                ExprKind::ArraySum { source, stages }
+                ExprKind::ArraySum { source, stages, .. }
                 | ExprKind::ArrayCount { source, stages }
                 | ExprKind::ArrayMinMax { source, stages, .. }
                 | ExprKind::ArraySort { source, stages, .. }
@@ -1629,6 +1630,7 @@ mod tests {
             ),
             Shape::Stage => (
                 ExprKind::ArraySum {
+                    float_mode: hir::FloatMode::STRICT,
                     source: Box::new(leaf()),
                     stages: vec![Stage {
                         kind: StageKind::Map {
@@ -1978,6 +1980,7 @@ mod tests {
         while expression_depth + delta <= target_expression_depth {
             let kind = match shape {
                 MoveControlShape::ShortCircuit => ExprKind::Binary {
+                    float_mode: hir::FloatMode::STRICT,
                     op: crate::BinOp::And,
                     lhs: Box::new(Expr {
                         kind: ExprKind::Bool(true),
@@ -1987,6 +1990,7 @@ mod tests {
                     rhs: Box::new(expression),
                 },
                 MoveControlShape::ShortCircuitLhs => ExprKind::Binary {
+                    float_mode: hir::FloatMode::STRICT,
                     op: crate::BinOp::And,
                     lhs: Box::new(expression),
                     rhs: Box::new(Expr {

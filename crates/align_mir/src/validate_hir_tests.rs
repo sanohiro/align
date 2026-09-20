@@ -194,6 +194,64 @@ fn checked_source_program(source: &str) -> hir::Program {
     program
 }
 
+fn float_scope_modes(program: &mut hir::Program) -> (&mut hir::FloatMode, &mut hir::FloatMode) {
+    let expression = program.fns[0]
+        .body
+        .value
+        .as_deref_mut()
+        .expect("expression-bodied float fixture");
+    let hir::ExprKind::FloatScope { mode, block } = &mut expression.kind else {
+        panic!("fixture root is a float scope");
+    };
+    let operation = block.value.as_deref_mut().expect("float scope value");
+    let hir::ExprKind::Binary { float_mode, .. } = &mut operation.kind else {
+        panic!("float scope value is binary arithmetic");
+    };
+    (mode, float_mode)
+}
+
+#[test]
+fn float_scope_modes_are_recomputed_from_retained_lexical_hir() {
+    let source = "fn f(a: f64, b: f64) -> f64 = float(reassoc) { a + b }\n";
+    let base = checked_source_program(source);
+    assert!(validate_hir::body_only_metadata_is_valid(&base));
+
+    for mutation in 0..4 {
+        let mut malformed = base.clone();
+        let (scope, operation) = float_scope_modes(&mut malformed);
+        match mutation {
+            0 => scope.bits = 0,
+            1 => scope.bits |= 0x80,
+            2 => *operation = hir::FloatMode::STRICT,
+            3 => *operation = operation.with_contract(),
+            _ => unreachable!(),
+        }
+        assert!(
+            !validate_hir::body_only_metadata_is_valid(&malformed),
+            "malformed float-mode mutation {mutation} was accepted",
+        );
+    }
+
+    let mut ineligible = base;
+    let expression = ineligible.fns[0]
+        .body
+        .value
+        .as_deref_mut()
+        .expect("expression-bodied float fixture");
+    let hir::ExprKind::FloatScope { block, .. } = &mut expression.kind else {
+        panic!("fixture root is a float scope");
+    };
+    let operation = block.value.as_deref_mut().expect("float scope value");
+    let hir::ExprKind::Binary { op, .. } = &mut operation.kind else {
+        panic!("float scope value is binary arithmetic");
+    };
+    *op = align_ast::BinOp::Div;
+    assert!(
+        !validate_hir::body_only_metadata_is_valid(&ineligible),
+        "an ineligible division retained a reassociation mode",
+    );
+}
+
 #[test]
 fn hir_digest_records_reject_malformed_types_and_borrowed_consumption() -> Result<(), &'static str> {
     let source = "import std.crypto\nfn make() -> crypto.digest = crypto.sha256_stream()\nfn add(borrow mut d: crypto.digest) { d.update(\"abc\") }\nfn finish(d: crypto.digest) -> array<u8> = d.finish()\nfn discard(d: Option<crypto.digest>) {}\nfn main() {}\n";
@@ -4317,6 +4375,7 @@ fn hir_owner_evidence(program: &hir::Program) -> HirOwnerEvidence {
                 evidence.binary_matches += 1;
             }
             hir::ExprKind::Binary {
+                float_mode: hir::FloatMode::STRICT,
                 op: align_ast::BinOp::And | align_ast::BinOp::Or,
                 ..
             } => evidence.short_circuits += 1,
@@ -4819,6 +4878,7 @@ fn with_mixed_eager_body_depth(depth: usize) -> hir::Program {
         expr = match expression_depth % 4 {
             0 => hir::Expr {
                 kind: hir::ExprKind::Binary {
+                    float_mode: hir::FloatMode::STRICT,
                     op: align_ast::BinOp::Add,
                     lhs: Box::new(expr),
                     rhs: Box::new(hir::Expr {
@@ -5864,6 +5924,7 @@ fn with_conditional_operand_body_depth(depth: usize) -> hir::Program {
         expr = if expression_depth.is_multiple_of(2) {
             hir::Expr {
                 kind: hir::ExprKind::Binary {
+                    float_mode: hir::FloatMode::STRICT,
                     op: align_ast::BinOp::And,
                     lhs: Box::new(hir::Expr {
                         kind: hir::ExprKind::Bool(true),
@@ -6066,6 +6127,7 @@ fn with_stage_body_depth(depth: usize) -> hir::Program {
     }));
     let mut expr = hir::Expr {
         kind: hir::ExprKind::ArraySum {
+            float_mode: hir::FloatMode::STRICT,
             source: Box::new(hir::Expr {
                 kind: hir::ExprKind::Local(0),
                 ty: array_ty,
@@ -8154,6 +8216,7 @@ fn hir_body_validator_expression_inventory() {
             "binary_add_case",
             body_test_expr(
                 hir::ExprKind::Binary {
+                    float_mode: hir::FloatMode::STRICT,
                     op: align_ast::BinOp::Add,
                     lhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
                     rhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
@@ -8165,6 +8228,7 @@ fn hir_body_validator_expression_inventory() {
             "binary_sub_case",
             body_test_expr(
                 hir::ExprKind::Binary {
+                    float_mode: hir::FloatMode::STRICT,
                     op: align_ast::BinOp::Sub,
                     lhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
                     rhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
@@ -8176,6 +8240,7 @@ fn hir_body_validator_expression_inventory() {
             "binary_mul_case",
             body_test_expr(
                 hir::ExprKind::Binary {
+                    float_mode: hir::FloatMode::STRICT,
                     op: align_ast::BinOp::Mul,
                     lhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
                     rhs: Box::new(body_test_expr(hir::ExprKind::Int(3), integer)),
@@ -8187,6 +8252,7 @@ fn hir_body_validator_expression_inventory() {
             "binary_div_case",
             body_test_expr(
                 hir::ExprKind::Binary {
+                    float_mode: hir::FloatMode::STRICT,
                     op: align_ast::BinOp::Div,
                     lhs: Box::new(body_test_expr(hir::ExprKind::Int(4), integer)),
                     rhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
@@ -8198,6 +8264,7 @@ fn hir_body_validator_expression_inventory() {
             "binary_rem_case",
             body_test_expr(
                 hir::ExprKind::Binary {
+                    float_mode: hir::FloatMode::STRICT,
                     op: align_ast::BinOp::Rem,
                     lhs: Box::new(body_test_expr(hir::ExprKind::Int(5), integer)),
                     rhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
@@ -8209,6 +8276,7 @@ fn hir_body_validator_expression_inventory() {
             "binary_eq_case",
             body_test_expr(
                 hir::ExprKind::Binary {
+                    float_mode: hir::FloatMode::STRICT,
                     op: align_ast::BinOp::Eq,
                     lhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
                     rhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
@@ -8220,6 +8288,7 @@ fn hir_body_validator_expression_inventory() {
             "binary_ne_case",
             body_test_expr(
                 hir::ExprKind::Binary {
+                    float_mode: hir::FloatMode::STRICT,
                     op: align_ast::BinOp::Ne,
                     lhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
                     rhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
@@ -8231,6 +8300,7 @@ fn hir_body_validator_expression_inventory() {
             "binary_lt_case",
             body_test_expr(
                 hir::ExprKind::Binary {
+                    float_mode: hir::FloatMode::STRICT,
                     op: align_ast::BinOp::Lt,
                     lhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
                     rhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
@@ -8242,6 +8312,7 @@ fn hir_body_validator_expression_inventory() {
             "binary_le_case",
             body_test_expr(
                 hir::ExprKind::Binary {
+                    float_mode: hir::FloatMode::STRICT,
                     op: align_ast::BinOp::Le,
                     lhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
                     rhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
@@ -8253,6 +8324,7 @@ fn hir_body_validator_expression_inventory() {
             "binary_gt_case",
             body_test_expr(
                 hir::ExprKind::Binary {
+                    float_mode: hir::FloatMode::STRICT,
                     op: align_ast::BinOp::Gt,
                     lhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
                     rhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
@@ -8264,6 +8336,7 @@ fn hir_body_validator_expression_inventory() {
             "binary_ge_case",
             body_test_expr(
                 hir::ExprKind::Binary {
+                    float_mode: hir::FloatMode::STRICT,
                     op: align_ast::BinOp::Ge,
                     lhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
                     rhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
@@ -8275,6 +8348,7 @@ fn hir_body_validator_expression_inventory() {
             "binary_and_case",
             body_test_expr(
                 hir::ExprKind::Binary {
+                    float_mode: hir::FloatMode::STRICT,
                     op: align_ast::BinOp::And,
                     lhs: Box::new(body_test_expr(hir::ExprKind::Bool(true), Ty::Bool)),
                     rhs: Box::new(body_test_expr(hir::ExprKind::Bool(false), Ty::Bool)),
@@ -8286,6 +8360,7 @@ fn hir_body_validator_expression_inventory() {
             "binary_or_case",
             body_test_expr(
                 hir::ExprKind::Binary {
+                    float_mode: hir::FloatMode::STRICT,
                     op: align_ast::BinOp::Or,
                     lhs: Box::new(body_test_expr(hir::ExprKind::Bool(true), Ty::Bool)),
                     rhs: Box::new(body_test_expr(hir::ExprKind::Bool(false), Ty::Bool)),
@@ -8297,6 +8372,7 @@ fn hir_body_validator_expression_inventory() {
             "binary_bit_and_case",
             body_test_expr(
                 hir::ExprKind::Binary {
+                    float_mode: hir::FloatMode::STRICT,
                     op: align_ast::BinOp::BitAnd,
                     lhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
                     rhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
@@ -8308,6 +8384,7 @@ fn hir_body_validator_expression_inventory() {
             "binary_bit_or_case",
             body_test_expr(
                 hir::ExprKind::Binary {
+                    float_mode: hir::FloatMode::STRICT,
                     op: align_ast::BinOp::BitOr,
                     lhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
                     rhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
@@ -8319,6 +8396,7 @@ fn hir_body_validator_expression_inventory() {
             "binary_bit_xor_case",
             body_test_expr(
                 hir::ExprKind::Binary {
+                    float_mode: hir::FloatMode::STRICT,
                     op: align_ast::BinOp::BitXor,
                     lhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
                     rhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
@@ -8330,6 +8408,7 @@ fn hir_body_validator_expression_inventory() {
             "binary_shl_case",
             body_test_expr(
                 hir::ExprKind::Binary {
+                    float_mode: hir::FloatMode::STRICT,
                     op: align_ast::BinOp::Shl,
                     lhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
                     rhs: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
@@ -8341,6 +8420,7 @@ fn hir_body_validator_expression_inventory() {
             "binary_shr_case",
             body_test_expr(
                 hir::ExprKind::Binary {
+                    float_mode: hir::FloatMode::STRICT,
                     op: align_ast::BinOp::Shr,
                     lhs: Box::new(body_test_expr(hir::ExprKind::Int(4), integer)),
                     rhs: Box::new(body_test_expr(hir::ExprKind::Int(1), integer)),
@@ -9270,6 +9350,7 @@ fn hir_body_validator_storage_vector_array() {
     let mask = || {
         body_test_expr(
             hir::ExprKind::Binary {
+                float_mode: hir::FloatMode::STRICT,
                 op: align_ast::BinOp::Eq,
                 lhs: Box::new(vector(0)),
                 rhs: Box::new(vector(1)),
@@ -9402,6 +9483,7 @@ fn hir_body_validator_storage_vector_array() {
             "vec_sum_where_case",
             body_test_expr(
                 hir::ExprKind::VecSumWhere {
+                    float_mode: hir::FloatMode::STRICT,
                     vec: Box::new(vector(2)),
                     mask: Box::new(mask()),
                 },
@@ -9413,6 +9495,7 @@ fn hir_body_validator_storage_vector_array() {
             "vec_dot_case",
             body_test_expr(
                 hir::ExprKind::VecDot {
+                    float_mode: hir::FloatMode::STRICT,
                     a: Box::new(vector(2)),
                     b: Box::new(vector(3)),
                 },
@@ -9435,6 +9518,7 @@ fn hir_body_validator_storage_vector_array() {
             "vec_sum_case",
             body_test_expr(
                 hir::ExprKind::VecSum {
+                    float_mode: hir::FloatMode::STRICT,
                     vec: Box::new(vector(2)),
                 },
                 integer,
@@ -9802,6 +9886,7 @@ fn hir_body_validator_pipeline_stage_records() {
             stmts: Vec::new(),
             value: Some(Box::new(body_test_expr(
                 hir::ExprKind::ArraySum {
+                    float_mode: hir::FloatMode::STRICT,
                     source: Box::new(source_int),
                     stages: vec![
                         hir::Stage {
@@ -9860,6 +9945,7 @@ fn hir_body_validator_pipeline_stage_records() {
             stmts: Vec::new(),
             value: Some(Box::new(body_test_expr(
                 hir::ExprKind::ArraySum {
+                    float_mode: hir::FloatMode::STRICT,
                     source: Box::new(body_test_expr(hir::ExprKind::Local(0), dyn_flags)),
                     stages: vec![
                         hir::Stage {
@@ -9956,6 +10042,7 @@ fn hir_body_validator_pipeline_terminals() {
         "pipeline_sum",
         body_test_expr(
             hir::ExprKind::ArraySum {
+                float_mode: hir::FloatMode::STRICT,
                 source: Box::new(local_source()),
                 stages: Vec::new(),
             },
@@ -10124,6 +10211,7 @@ fn hir_body_validator_pipeline_terminals() {
         "pipeline_dot",
         body_test_expr(
             hir::ExprKind::ArrayDot {
+                float_mode: hir::FloatMode::STRICT,
                 a: Box::new(array(1)),
                 b: Box::new(array(3)),
                 elem: integer,
@@ -10652,6 +10740,7 @@ fn hir_body_validator_pipeline_control_flow() {
             stmts: Vec::new(),
             value: Some(Box::new(body_test_expr(
                 hir::ExprKind::ArraySum {
+                    float_mode: hir::FloatMode::STRICT,
                     source: Box::new(diverging_source),
                     stages: vec![hir::Stage {
                         kind: hir::StageKind::Map {
@@ -11169,6 +11258,7 @@ fn hir_body_validator_pipeline_template_json_group() {
         vec![scanner_local()],
         body_test_expr(
             hir::ExprKind::ArraySum {
+                float_mode: hir::FloatMode::STRICT,
                 source: Box::new(scanner_source()),
                 stages: vec![project_value()],
             },
@@ -15047,6 +15137,7 @@ fn hir_body_validator_generated_callables() {
             stmts: Vec::new(),
             value: Some(Box::new(body_test_expr(
                 hir::ExprKind::ArraySum {
+                    float_mode: hir::FloatMode::STRICT,
                     source: Box::new(native_local(0, dyn_int)),
                     stages: vec![hir::Stage {
                         kind: hir::StageKind::Map {
@@ -15080,6 +15171,7 @@ fn hir_body_validator_generated_callables() {
                     stmts: Vec::new(),
                     value: Some(Box::new(body_test_expr(
                         hir::ExprKind::ArraySum {
+                            float_mode: hir::FloatMode::STRICT,
                             source: Box::new(native_local(0, dyn_int)),
                             stages: vec![hir::Stage {
                                 kind: hir::StageKind::Map {
@@ -17147,6 +17239,7 @@ fn hir_body_validator_postgres_normalized_plan_provenance_fails_closed() {
         hir::ExprKind::If {
             cond: Box::new(body_test_expr(
                 hir::ExprKind::Binary {
+                    float_mode: hir::FloatMode::STRICT,
                     op: align_ast::BinOp::Eq,
                     lhs: Box::new(local(0, u32_ty)),
                     rhs: Box::new(body_test_expr(hir::ExprKind::Int(0), u32_ty)),
@@ -17162,6 +17255,7 @@ fn hir_body_validator_postgres_normalized_plan_provenance_fails_closed() {
                 value: Some(Box::new(body_test_expr(
                     hir::ExprKind::RawAlloc(Box::new(body_test_expr(
                         hir::ExprKind::Binary {
+                            float_mode: hir::FloatMode::STRICT,
                             op: align_ast::BinOp::Mul,
                             lhs: Box::new(body_test_expr(
                                 hir::ExprKind::Cast(Box::new(local(0, u32_ty))),

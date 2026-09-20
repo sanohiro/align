@@ -467,7 +467,16 @@ pub enum ExprKind {
     Arena(Block),
     /// `arena name { ... }` — the same region with an explicit, scope-limited `region`
     /// capability bound as `name` for allocation in ordinary callees.
-    NamedArena { name: Ident, block: Block },
+    NamedArena {
+        name: Ident,
+        block: Block,
+    },
+    /// `float(reassoc[, contract]) { ... }` — explicit lexical floating-point permissions.
+    /// Options remain in source order so sema can provide deterministic diagnostics.
+    FloatScope {
+        options: Vec<Ident>,
+        block: Block,
+    },
     /// `unsafe { ... }` — a block in which `raw.*` operations (raw allocation, unchecked casts,
     /// manual free) are permitted. A plain marker block otherwise (no runtime effect); a function
     /// containing one is inferred impure (so it can never be a `par_map` callee).

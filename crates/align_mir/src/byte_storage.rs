@@ -189,6 +189,10 @@ fn argument_confined(f: &Function, arg: usize, calls: &CallEscapeSummary) -> boo
                     }
                     Rvalue::Index(slot, index) => !slots.contains(slot) && !related(index),
                     Rvalue::Bin(_, a, b) => !related(a) && !related(b),
+                    Rvalue::FloatBin { a, b, .. } => !related(a) && !related(b),
+                    Rvalue::FloatFma { a, b, c, .. } => {
+                        !related(a) && !related(b) && !related(c)
+                    }
                     Rvalue::Un(_, op)
                     | Rvalue::Cast { operand: op, .. }
                     | Rvalue::OptionSome(op)
@@ -458,6 +462,10 @@ fn nonescaping(
                     | Rvalue::ResultUnwrapOk(op)
                     | Rvalue::ResultUnwrapErr(op) => !is_related(op),
                     Rvalue::Bin(_, a, b) => !is_related(a) && !is_related(b),
+                    Rvalue::FloatBin { a, b, .. } => !is_related(a) && !is_related(b),
+                    Rvalue::FloatFma { a, b, c, .. } => {
+                        !is_related(a) && !is_related(b) && !is_related(c)
+                    }
                     Rvalue::Select { cond, a, b } => {
                         !is_related(cond) && !is_related(a) && !is_related(b)
                     }

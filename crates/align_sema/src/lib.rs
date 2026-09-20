@@ -1658,6 +1658,7 @@ fn materializes_fresh_soa_storage(expression: &Expr) -> bool {
         | ExprKind::ResultErr(inner)
         | ExprKind::Try(inner) => materializes_fresh_soa_storage(inner),
         ExprKind::Block(block)
+        | ExprKind::FloatScope { block, .. }
         | ExprKind::Unsafe(block)
         | ExprKind::Arena(block)
         | ExprKind::NamedArena { block, .. }
@@ -4607,6 +4608,7 @@ pub fn concrete_inline_body_externs(
                     | hir::ExprKind::IntArith { .. }
                     | hir::ExprKind::MathOp { .. }
                     | hir::ExprKind::Block(_)
+                    | hir::ExprKind::FloatScope { .. }
                     | hir::ExprKind::Unsafe(_)
                     | hir::ExprKind::RawNull
                     | hir::ExprKind::RawIsNull(_)
@@ -4826,7 +4828,9 @@ pub fn soa_plain_ok(id: u32, structs: &[StructDef]) -> bool {
 /// which is exactly what `keep = { inner }` did before this was single-sourced.
 pub fn borrow_transparent_value(e: &hir::Expr) -> Option<&hir::Expr> {
     match &e.kind {
-        hir::ExprKind::Block(b) | hir::ExprKind::Unsafe(b) => b.value.as_deref(),
+        hir::ExprKind::Block(b)
+        | hir::ExprKind::FloatScope { block: b, .. }
+        | hir::ExprKind::Unsafe(b) => b.value.as_deref(),
         _ => None,
     }
 }
@@ -4884,7 +4888,9 @@ pub fn may_need_synthetic_owner(e: &hir::Expr) -> bool {
         | hir::ExprKind::Index { .. }
         | hir::ExprKind::ElemField { .. } => false,
         // A block with no value is Unit: nothing to borrow, so nothing to own.
-        hir::ExprKind::Block(_) | hir::ExprKind::Unsafe(_) => false,
+        hir::ExprKind::Block(_) | hir::ExprKind::FloatScope { .. } | hir::ExprKind::Unsafe(_) => {
+            false
+        }
         _ => true,
     }
 }
@@ -6968,7 +6974,9 @@ impl<'a, 'd> GenericBodyWalker<'a, 'd> {
                     self.walk_expr(e2);
                 }
             }
-            ast::ExprKind::Block(b) => self.walk_block(b),
+            ast::ExprKind::Block(b) | ast::ExprKind::FloatScope { block: b, .. } => {
+                self.walk_block(b)
+            }
             ast::ExprKind::StructLit { name, fields } => {
                 if name.segments.len() == 1 {
                     self.check_type_name(&name.segments[0].name, name.segments[0].span);
@@ -8014,9 +8022,11 @@ fn normalize_test_assertion_expr(expression: &mut ast::Expr, is_statement: bool)
                 normalize_test_assertion_expr(els, is_statement);
             }
         }
-        K::Block(block) | K::Arena(block) | K::Unsafe(block) | K::TaskGroup(block) => {
-            normalize_test_assertion_block(block, is_statement)
-        }
+        K::Block(block)
+        | K::FloatScope { block, .. }
+        | K::Arena(block)
+        | K::Unsafe(block)
+        | K::TaskGroup(block) => normalize_test_assertion_block(block, is_statement),
         K::NamedArena { block, .. } => normalize_test_assertion_block(block, is_statement),
         K::StructLit { fields, .. } => {
             for field in fields {
@@ -15698,6 +15708,7 @@ impl EffectScan<'_> {
                         });
                     }
                     ExprKind::Block(block)
+                    | ExprKind::FloatScope { block, .. }
                     | ExprKind::Arena(block)
                     | ExprKind::NamedArena { block, .. }
                     | ExprKind::Unsafe(block)
@@ -16030,6 +16041,7 @@ impl EffectScan<'_> {
                 }
                 (
                     ExprKind::Block(block)
+                    | ExprKind::FloatScope { block, .. }
                     | ExprKind::Arena(block)
                     | ExprKind::NamedArena { block, .. }
                     | ExprKind::Unsafe(block)
@@ -17167,7 +17179,7 @@ impl EffectScan<'_> {
                 self.impure_direct = true;
             }
             // Pipeline nodes carry a `source` (+ a stage/reducer function that is a call).
-            ExprKind::ArraySum { source, stages } | ExprKind::ArrayCount { source, stages } => {
+            ExprKind::ArraySum { source, stages, .. } | ExprKind::ArrayCount { source, stages } => {
                 walk!(source);
                 self.join_stage_actions(source, stages);
             }
@@ -17281,6 +17293,7 @@ impl EffectScan<'_> {
                 op: BinOp::And | BinOp::Or,
                 lhs,
                 rhs,
+                            ..
             } => {
                 walk!(lhs);
                 // The RHS is conditionally reachable, but the short path remains a continuation
@@ -17326,16 +17339,16 @@ impl EffectScan<'_> {
                 walk!(a);
                 walk!(b);
             }
-            ExprKind::VecSumWhere { vec, mask } => {
+            ExprKind::VecSumWhere { vec, mask, .. } => {
                 walk!(vec);
                 walk!(mask);
             }
-            ExprKind::VecDot { a, b } => {
+            ExprKind::VecDot { a, b, .. } => {
                 walk!(a);
                 walk!(b);
             }
             ExprKind::VecMinMax { vec, .. } => walk!(vec),
-            ExprKind::VecSum { vec } => walk!(vec),
+            ExprKind::VecSum { vec, .. } => walk!(vec),
             ExprKind::VecLoad { src, index, .. } => {
                 walk!(src);
                 walk!(index);
@@ -17359,6 +17372,7 @@ impl EffectScan<'_> {
                 walk!(arg);
             }
             ExprKind::Block(b)
+            | ExprKind::FloatScope { block: b, .. }
             | ExprKind::Arena(b)
             | ExprKind::NamedArena { block: b, .. }
             | ExprKind::TaskGroup(b) => {
@@ -19390,6 +19404,7 @@ fn resolve_active_sum_paths(
                     ExprKind::ResultErr(_) => values.push(one(BorrowProjection::ResultErr)),
                     ExprKind::ResultMapErr { result, .. } => work.push(Work::Eval(result)),
                     ExprKind::Block(block)
+                    | ExprKind::FloatScope { block, .. }
                     | ExprKind::Arena(block)
                     | ExprKind::NamedArena { block, .. }
                     | ExprKind::TaskGroup(block)
@@ -20875,6 +20890,7 @@ impl<'a> EscapeCheck<'a> {
                 arms.iter().map(|arm| self.completed_escape_value(&arm.body)),
             ),
             ExprKind::Block(block)
+            | ExprKind::FloatScope { block, .. }
             | ExprKind::Arena(block)
             | ExprKind::NamedArena { block, .. }
             | ExprKind::TaskGroup(block)
@@ -20911,7 +20927,9 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::SliceRange { recv, .. } => {
                 self.escape_place_fallback_roots(recv).into_iter().next()
             }
-            ExprKind::Block(block) | ExprKind::Unsafe(block) => block
+            ExprKind::Block(block)
+            | ExprKind::FloatScope { block, .. }
+            | ExprKind::Unsafe(block) => block
                 .value
                 .as_deref()
                 .and_then(|value| self.escape_place_fallback_roots(value).into_iter().next()),
@@ -22219,7 +22237,9 @@ impl<'a> EscapeCheck<'a> {
                 | ExprKind::ResultErr(inner)
                 | ExprKind::Try(inner)
                 | ExprKind::TaskGet(inner) => work.push((inner, depth)),
-                ExprKind::Block(block) | ExprKind::Unsafe(block) => {
+                ExprKind::Block(block)
+                | ExprKind::FloatScope { block, .. }
+                | ExprKind::Unsafe(block) => {
                     if let Some(value) = block.value.as_deref() {
                         work.push((value, depth));
                     }
@@ -22328,7 +22348,9 @@ impl<'a> EscapeCheck<'a> {
                 ExprKind::ResultErr(error) => {
                     self.check_return_escape(error, depth);
                 }
-                ExprKind::Block(block) | ExprKind::Unsafe(block) => {
+                ExprKind::Block(block)
+                | ExprKind::FloatScope { block, .. }
+                | ExprKind::Unsafe(block) => {
                     if let Some(value) = block.value.as_deref() {
                         work.push((value, depth));
                     }
@@ -22385,7 +22407,9 @@ impl<'a> EscapeCheck<'a> {
                         return true;
                     }
                 }
-                ExprKind::Block(block) | ExprKind::Unsafe(block) => {
+                ExprKind::Block(block)
+                | ExprKind::FloatScope { block, .. }
+                | ExprKind::Unsafe(block) => {
                     if let Some(value) = block.value.as_deref() {
                         work.push((value, depth));
                     }
@@ -22481,7 +22505,9 @@ impl<'a> EscapeCheck<'a> {
                 matches!(inner.kind, ExprKind::Call { .. } | ExprKind::CallFnValue { .. } | ExprKind::RawCall { .. })
                     || Self::slices_an_unnamed_call_result(inner)
             }
-            ExprKind::Block(block) | ExprKind::Unsafe(block) => block
+            ExprKind::Block(block)
+            | ExprKind::FloatScope { block, .. }
+            | ExprKind::Unsafe(block) => block
                 .value
                 .as_deref()
                 .is_some_and(Self::slices_an_unnamed_call_result),
@@ -22895,7 +22921,9 @@ impl<'a> EscapeCheck<'a> {
                         ExprKind::ResultMapErr { result, .. } => {
                             work.push(Work::Eval(result, depth));
                         }
-                        ExprKind::Block(block) | ExprKind::Unsafe(block) => {
+                        ExprKind::Block(block)
+                        | ExprKind::FloatScope { block, .. }
+                        | ExprKind::Unsafe(block) => {
                             push_all(
                                 &mut work,
                                 &mut values,
@@ -23133,7 +23161,9 @@ impl<'a> EscapeCheck<'a> {
                                 work.push(Work::Eval(result, depth));
                             }
                         }
-                        ExprKind::Block(block) | ExprKind::Unsafe(block) => {
+                        ExprKind::Block(block)
+                        | ExprKind::FloatScope { block, .. }
+                        | ExprKind::Unsafe(block) => {
                             if let Some(value) = block.value.as_deref() {
                                 work.push(Work::Eval(value, depth));
                             } else {
@@ -23288,7 +23318,9 @@ impl<'a> EscapeCheck<'a> {
                 | ExprKind::TupleIndex { .. }
                 | ExprKind::Index { .. }
                 | ExprKind::ElemField { .. } => return false,
-                ExprKind::Block(block) | ExprKind::Unsafe(block) => {
+                ExprKind::Block(block)
+                | ExprKind::FloatScope { block, .. }
+                | ExprKind::Unsafe(block) => {
                     let Some(value) = block.value.as_deref() else {
                         return false;
                     };
@@ -23547,6 +23579,7 @@ impl<'a> EscapeCheck<'a> {
                 )
             }
             ExprKind::Block(block)
+            | ExprKind::FloatScope { block, .. }
             | ExprKind::Unsafe(block)
             | ExprKind::Arena(block)
             | ExprKind::NamedArena { block, .. }
@@ -24421,7 +24454,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::SoaColumn { base, .. } => {
                 values.push(self.local_contained_region(*base));
             }
-            ExprKind::Block(block) => {
+            ExprKind::Block(block) | ExprKind::FloatScope { block, .. } => {
                 if let Some(value) = block.value.as_deref() {
                     work.push(Work::Eval(value, depth));
                 } else {
@@ -24963,7 +24996,9 @@ impl<'a> EscapeCheck<'a> {
                 return true;
             }
             ExprKind::Field { .. } => {}
-            ExprKind::Block(b) => work.extend(b.value.as_deref()),
+            ExprKind::Block(b) | ExprKind::FloatScope { block: b, .. } => {
+                work.extend(b.value.as_deref())
+            }
             ExprKind::If { then, els, .. } => {
                 work.extend(els.value.as_deref());
                 work.extend(then.value.as_deref());
@@ -25369,7 +25404,9 @@ impl<'a> EscapeCheck<'a> {
                             });
                             work.push(EscapeWalkItem::Block(block, inner));
                         }
-                        ExprKind::Block(block) | ExprKind::Unsafe(block) => {
+                        ExprKind::Block(block)
+                        | ExprKind::FloatScope { block, .. }
+                        | ExprKind::Unsafe(block) => {
                             work.push(EscapeWalkItem::ExprExit(expression, depth));
                             work.push(EscapeWalkItem::Block(block, depth));
                         }
@@ -25545,6 +25582,7 @@ impl<'a> EscapeCheck<'a> {
                             op: BinOp::And | BinOp::Or,
                             lhs: input,
                             rhs: conditional,
+                            ..
                         }
                         | ExprKind::ElseUnwrap { opt: input, fallback: conditional } => {
                             work.push(EscapeWalkItem::ExprExit(expression, depth));
@@ -26028,7 +26066,9 @@ impl<'a> EscapeCheck<'a> {
                     ExprKind::ArrayToSlice(inner) | ExprKind::SliceRange { recv: inner, .. } => {
                         work.push(Work::Eval(inner, depth));
                     }
-                    ExprKind::Block(block) | ExprKind::Unsafe(block) => {
+                        ExprKind::Block(block)
+                        | ExprKind::FloatScope { block, .. }
+                        | ExprKind::Unsafe(block) => {
                         if let Some(value) = block.value.as_deref() {
                             work.push(Work::Eval(value, depth));
                         } else {
@@ -27073,6 +27113,7 @@ impl<'a> EscapeCheck<'a> {
         match &value.kind {
             ExprKind::Local(local) => Some(*local),
             ExprKind::Block(block)
+            | ExprKind::FloatScope { block, .. }
             | ExprKind::Arena(block)
             | ExprKind::NamedArena { block, .. }
             | ExprKind::TaskGroup(block)
@@ -28276,6 +28317,7 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::Arena(_)
             | ExprKind::NamedArena { .. }
             | ExprKind::Block(_)
+            | ExprKind::FloatScope { .. }
             | ExprKind::Loop { .. }
             | ExprKind::Unsafe(_) => {
                 unreachable!("escape control expressions use explicit walk items");
@@ -28356,7 +28398,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(ptr, depth);
                 self.walk(len, depth);
             }
-            ExprKind::ArraySum { source, stages }
+            ExprKind::ArraySum { source, stages, .. }
             | ExprKind::ArrayCount { source, stages }
             | ExprKind::ArrayAnyAll { source, stages, .. }
             | ExprKind::ArrayMinMax { source, stages, .. }
@@ -28467,16 +28509,16 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(a, depth);
                 self.walk(b, depth);
             }
-            ExprKind::VecSumWhere { vec, mask } => {
+            ExprKind::VecSumWhere { vec, mask, .. } => {
                 self.walk(vec, depth);
                 self.walk(mask, depth);
             }
-            ExprKind::VecDot { a, b } => {
+            ExprKind::VecDot { a, b, .. } => {
                 self.walk(a, depth);
                 self.walk(b, depth);
             }
             ExprKind::VecMinMax { vec, .. } => self.walk(vec, depth),
-            ExprKind::VecSum { vec } => self.walk(vec, depth),
+            ExprKind::VecSum { vec, .. } => self.walk(vec, depth),
             ExprKind::VecLoad { src, index, .. } => {
                 self.walk(src, depth);
                 self.walk(index, depth);
@@ -29325,6 +29367,7 @@ fn hir_diverges(root: HirDivergenceNode<'_>) -> bool {
                         work.push(HirDivergenceWork::Eval(HirDivergenceNode::Expr(cond)));
                     }
                     ExprKind::Block(block)
+                    | ExprKind::FloatScope { block, .. }
                     | ExprKind::Arena(block)
                     | ExprKind::NamedArena { block, .. }
                     | ExprKind::TaskGroup(block)
@@ -30995,6 +31038,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::TupleIndex { .. }
         | ExprKind::IndexField { .. }
         | ExprKind::Block(_)
+        | ExprKind::FloatScope { .. }
         | ExprKind::ElseUnwrap { .. }
         | ExprKind::Try(_)
         | ExprKind::Loop { .. }
@@ -33286,6 +33330,7 @@ fn match_scrutinee_materializes_result(e: &Expr) -> bool {
     match &e.kind {
         ExprKind::If { .. } | ExprKind::Match { .. } | ExprKind::ElseUnwrap { .. } => true,
         ExprKind::Block(block)
+        | ExprKind::FloatScope { block, .. }
         | ExprKind::Arena(block)
         | ExprKind::NamedArena { block, .. }
         | ExprKind::TaskGroup(block)
@@ -34430,6 +34475,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::NamedArena { block, .. }
             | ExprKind::TaskGroup(block)
             | ExprKind::Block(block)
+            | ExprKind::FloatScope { block, .. }
             | ExprKind::Unsafe(block) => block
                 .value
                 .as_deref()
@@ -36432,7 +36478,7 @@ impl<'a> MoveCheck<'a> {
             }
             // A valueless block is Unit: nothing to borrow. (A block WITH a value never reaches
             // this match — `borrow_transparent_value` forwarded it above.)
-            ExprKind::Block(_) | ExprKind::Unsafe(_) => {}
+            ExprKind::Block(_) | ExprKind::FloatScope { .. } | ExprKind::Unsafe(_) => {}
             // A task_group owns only spawned task storage. Its bound ordinary tail place keeps the
             // same borrow root; region escape is checked separately on the wrapper.
             ExprKind::TaskGroup(block) => {
@@ -36796,6 +36842,7 @@ impl<'a> MoveCheck<'a> {
                 .map(|fact| fact.headers.clone())
                 .unwrap_or_default(),
             ExprKind::Block(block)
+            | ExprKind::FloatScope { block, .. }
             | ExprKind::Arena(block)
             | ExprKind::NamedArena { block, .. }
             | ExprKind::TaskGroup(block)
@@ -37896,6 +37943,7 @@ impl<'a> MoveCheck<'a> {
         matches!(
             kind,
             ExprKind::Block(_)
+                | ExprKind::FloatScope { .. }
                 | ExprKind::Arena(_)
                 | ExprKind::NamedArena { .. }
                 | ExprKind::TaskGroup(_)
@@ -38871,6 +38919,7 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::FnValue(_) => BorrowFact::default(),
             ExprKind::Block(block)
+            | ExprKind::FloatScope { block, .. }
             | ExprKind::Arena(block)
             | ExprKind::NamedArena { block, .. }
             | ExprKind::TaskGroup(block)
@@ -39329,6 +39378,7 @@ impl<'a> MoveCheck<'a> {
             // making the query maintain the depth unless it also handles being entered from inside
             // an arena: that direction is the unsound one.
             ExprKind::Block(b)
+            | ExprKind::FloatScope { block: b, .. }
             | ExprKind::Arena(b)
             | ExprKind::NamedArena { block: b, .. }
             | ExprKind::TaskGroup(b)
@@ -39571,6 +39621,7 @@ impl<'a> MoveCheck<'a> {
         match &value.kind {
             ExprKind::Local(local) => Some(*local),
             ExprKind::Block(block)
+            | ExprKind::FloatScope { block, .. }
             | ExprKind::Arena(block)
             | ExprKind::NamedArena { block, .. }
             | ExprKind::TaskGroup(block)
@@ -40903,6 +40954,7 @@ impl<'a> MoveCheck<'a> {
                 }
             }
             ExprKind::Block(block)
+            | ExprKind::FloatScope { block, .. }
             | ExprKind::Arena(block)
             | ExprKind::NamedArena { block, .. }
             | ExprKind::TaskGroup(block)
@@ -41645,6 +41697,7 @@ impl<'a> MoveCheck<'a> {
                     return;
                 }
                 ExprKind::Block(block)
+                | ExprKind::FloatScope { block, .. }
                 | ExprKind::Arena(block)
                 | ExprKind::NamedArena { block, .. }
                 | ExprKind::TaskGroup(block)
@@ -42248,6 +42301,7 @@ impl<'a> MoveCheck<'a> {
                             op: BinOp::And | BinOp::Or,
                             lhs,
                             rhs,
+                            ..
                         } => Some((lhs.as_ref(), rhs.as_ref())),
                         _ => None,
                     };
@@ -42551,6 +42605,7 @@ impl<'a> MoveCheck<'a> {
         !matches!(
             expression.kind,
             ExprKind::Block(_)
+                | ExprKind::FloatScope { .. }
                 | ExprKind::Arena(_)
                 | ExprKind::NamedArena { .. }
                 | ExprKind::TaskGroup(_)
@@ -42789,6 +42844,7 @@ impl<'a> MoveCheck<'a> {
                 | ExprKind::ResultErr(inner) => work.push(inner),
                 ExprKind::EnumValue { payload, .. } => work.extend(payload.iter().rev()),
                 ExprKind::Block(block)
+                | ExprKind::FloatScope { block, .. }
                 | ExprKind::Arena(block)
                 | ExprKind::NamedArena { block, .. }
                 | ExprKind::TaskGroup(block)
@@ -43503,6 +43559,7 @@ impl<'a> MoveCheck<'a> {
                 } else {
                     match &current.kind {
                     ExprKind::Block(block)
+                    | ExprKind::FloatScope { block, .. }
                     | ExprKind::Arena(block)
                     | ExprKind::NamedArena { block, .. }
                     | ExprKind::TaskGroup(block)
@@ -43580,6 +43637,7 @@ impl<'a> MoveCheck<'a> {
                         )
                     }
                     ExprKind::Block(block)
+                    | ExprKind::FloatScope { block, .. }
                     | ExprKind::Arena(block)
                     | ExprKind::NamedArena { block, .. }
                     | ExprKind::TaskGroup(block)
@@ -43650,6 +43708,7 @@ impl<'a> MoveCheck<'a> {
                         }
                     }
                     ExprKind::Block(block)
+                    | ExprKind::FloatScope { block, .. }
                     | ExprKind::Arena(block)
                     | ExprKind::NamedArena { block, .. }
                     | ExprKind::TaskGroup(block)
@@ -43728,6 +43787,7 @@ impl<'a> MoveCheck<'a> {
                         }
                     }
                     ExprKind::Block(block)
+                    | ExprKind::FloatScope { block, .. }
                     | ExprKind::Arena(block)
                     | ExprKind::NamedArena { block, .. }
                     | ExprKind::TaskGroup(block)
@@ -43778,6 +43838,7 @@ impl<'a> MoveCheck<'a> {
                         )
                     }
                     ExprKind::Block(block)
+                    | ExprKind::FloatScope { block, .. }
                     | ExprKind::Arena(block)
                     | ExprKind::NamedArena { block, .. }
                     | ExprKind::TaskGroup(block)
@@ -43805,6 +43866,7 @@ impl<'a> MoveCheck<'a> {
                         )
                     }
                     ExprKind::Block(block)
+                    | ExprKind::FloatScope { block, .. }
                     | ExprKind::Arena(block)
                     | ExprKind::NamedArena { block, .. }
                     | ExprKind::TaskGroup(block)
@@ -43835,6 +43897,7 @@ impl<'a> MoveCheck<'a> {
                         )
                     }
                     ExprKind::Block(block)
+                    | ExprKind::FloatScope { block, .. }
                     | ExprKind::Arena(block)
                     | ExprKind::NamedArena { block, .. }
                     | ExprKind::TaskGroup(block)
@@ -43870,6 +43933,7 @@ impl<'a> MoveCheck<'a> {
                         )
                     }
                     ExprKind::Block(block)
+                    | ExprKind::FloatScope { block, .. }
                     | ExprKind::Arena(block)
                     | ExprKind::NamedArena { block, .. }
                     | ExprKind::TaskGroup(block)
@@ -43900,6 +43964,7 @@ impl<'a> MoveCheck<'a> {
                         )
                     }
                     ExprKind::Block(block)
+                    | ExprKind::FloatScope { block, .. }
                     | ExprKind::Arena(block)
                     | ExprKind::NamedArena { block, .. }
                     | ExprKind::TaskGroup(block)
@@ -43935,6 +44000,7 @@ impl<'a> MoveCheck<'a> {
                         )
                     }
                     ExprKind::Block(block)
+                    | ExprKind::FloatScope { block, .. }
                     | ExprKind::Arena(block)
                     | ExprKind::NamedArena { block, .. }
                     | ExprKind::TaskGroup(block)
@@ -43962,6 +44028,7 @@ impl<'a> MoveCheck<'a> {
                         )
                     }
                     ExprKind::Block(block)
+                    | ExprKind::FloatScope { block, .. }
                     | ExprKind::TaskGroup(block)
                     | ExprKind::Unsafe(block)
                         if block.stmts.is_empty() && block.value.is_some() =>
@@ -43975,6 +44042,7 @@ impl<'a> MoveCheck<'a> {
                         )
                     }
                     ExprKind::Block(block)
+                    | ExprKind::FloatScope { block, .. }
                     | ExprKind::TaskGroup(block)
                     | ExprKind::Unsafe(block)
                         if block.value.is_none()
@@ -44715,7 +44783,7 @@ impl<'a> MoveCheck<'a> {
         expression: &'a Expr,
     ) -> Option<(&'a Expr, &'a Expr, bool)> {
         let (source, child, snapshots_source) = match &expression.kind {
-            ExprKind::ArraySum { source, stages }
+            ExprKind::ArraySum { source, stages, .. }
             | ExprKind::ArrayCount { source, stages }
             | ExprKind::ArrayMinMax { source, stages, .. }
             | ExprKind::ArrayToArray { source, stages, .. }
@@ -44795,6 +44863,7 @@ impl<'a> MoveCheck<'a> {
                 | ExprKind::SoaColumn { .. }
                 | ExprKind::IndexField { .. } => return false,
                 ExprKind::Block(block)
+                | ExprKind::FloatScope { block, .. }
                 | ExprKind::Arena(block)
                 | ExprKind::NamedArena { block, .. }
                 | ExprKind::TaskGroup(block)
@@ -45538,7 +45607,7 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, value, moved, false, false);
                 move_expr!(self, region, moved, false, false);
             }
-            ExprKind::ArraySum { source, stages }
+            ExprKind::ArraySum { source, stages, .. }
             | ExprKind::ArrayCount { source, stages }
             | ExprKind::ArrayAnyAll { source, stages, .. }
             | ExprKind::ArrayMinMax { source, stages, .. }
@@ -45782,16 +45851,16 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, a, moved, true, true);
                 move_expr!(self, b, moved, true, true);
             }
-            ExprKind::VecSumWhere { vec, mask } => {
+            ExprKind::VecSumWhere { vec, mask, .. } => {
                 move_expr!(self, vec, moved, true, true);
                 move_expr!(self, mask, moved, true, true);
             }
-            ExprKind::VecDot { a, b } => {
+            ExprKind::VecDot { a, b, .. } => {
                 move_expr!(self, a, moved, true, true);
                 move_expr!(self, b, moved, true, true);
             }
             ExprKind::VecMinMax { vec, .. } => move_expr!(self, vec, moved, true, true),
-            ExprKind::VecSum { vec } => move_expr!(self, vec, moved, true, true),
+            ExprKind::VecSum { vec, .. } => move_expr!(self, vec, moved, true, true),
             ExprKind::VecLoad { src, index, .. } => {
                 move_expr!(self, src, moved, true, true);
                 move_expr!(self, index, moved, true, true);
@@ -45805,7 +45874,10 @@ impl<'a> MoveCheck<'a> {
                 unreachable!("else-unwrap expressions use the control worklist")
             }
             // A plain block is transparent: its tail inherits this position's consuming/direct.
-            ExprKind::Block(b) | ExprKind::TaskGroup(b) | ExprKind::Unsafe(b) => {
+            ExprKind::Block(b)
+            | ExprKind::FloatScope { block: b, .. }
+            | ExprKind::TaskGroup(b)
+            | ExprKind::Unsafe(b) => {
                 if !self.block(b, moved, consuming, direct) {
                     return false;
                 }
@@ -46704,6 +46776,9 @@ struct Checker<'a, 't> {
     json_scan_local_spellings: HashMap<LocalId, String>,
     /// Nesting depth of `arena {}` blocks (0 = not in an arena).
     arena_depth: u32,
+    /// Effective lexical floating-point permissions in the current function body. Lifted
+    /// callable roots reset this to strict and must contain their own visible FloatScope.
+    float_mode: hir::FloatMode,
     /// True while checking a pipeline terminal that supports a `json.scanner<Row>` streaming source
     /// (`sum`/`count` in J5 slice 1). Set transiently by those terminal builders around
     /// `check_pipeline`; every other terminal leaves it false, so `check_pipeline` rejects a scanner
@@ -46896,6 +46971,7 @@ impl<'a, 't> Checker<'a, 't> {
             json_scan_source_spelling: None,
             json_scan_local_spellings: HashMap::new(),
             arena_depth: 0,
+            float_mode: hir::FloatMode::STRICT,
             scan_terminal: false,
             unsafe_depth: 0,
             extern_boundary_error: false,
@@ -48804,7 +48880,9 @@ impl<'a, 't> Checker<'a, 't> {
         }
         match &e.kind {
             ExprKind::Local(id) => self.json_scan_local_spellings.get(id).cloned(),
-            ExprKind::Block(block) | ExprKind::Unsafe(block) => block
+            ExprKind::Block(block)
+            | ExprKind::FloatScope { block, .. }
+            | ExprKind::Unsafe(block) => block
                 .value
                 .as_deref()
                 .and_then(|value| self.json_scan_source_spelling_of_expr(value)),
@@ -48885,6 +48963,7 @@ impl<'a, 't> Checker<'a, 't> {
             | ExprKind::If { .. }
             | ExprKind::Match { .. } => {}
             ExprKind::Block(block)
+            | ExprKind::FloatScope { block, .. }
             | ExprKind::Arena(block)
             | ExprKind::NamedArena { block, .. }
             | ExprKind::Unsafe(block)
@@ -49071,6 +49150,77 @@ impl<'a, 't> Checker<'a, 't> {
                 self.check_else_unwrap(opt, fallback, expected, e.span)
             }
             ast::ExprKind::Try(inner) => self.check_try(inner, expected, e.span),
+            ast::ExprKind::FloatScope {
+                options,
+                block: source_block,
+            } => {
+                let mut selected = hir::FloatMode::STRICT;
+                let mut seen_reassoc = None;
+                let mut seen_contract = None;
+                let mut first_unknown = None;
+                let mut first_duplicate = None;
+                for option in options {
+                    match option.name.as_str() {
+                        "reassoc" => {
+                            if seen_reassoc.replace(option.span).is_some()
+                                && first_duplicate.is_none()
+                            {
+                                first_duplicate = Some(("reassoc", option.span));
+                            }
+                            selected = selected.with_reassoc();
+                        }
+                        "contract" => {
+                            if seen_contract.replace(option.span).is_some()
+                                && first_duplicate.is_none()
+                            {
+                                first_duplicate = Some(("contract", option.span));
+                            }
+                            selected = selected.with_contract();
+                        }
+                        _ if first_unknown.is_none() => first_unknown = Some(option),
+                        _ => {}
+                    }
+                }
+                if options.is_empty() {
+                    self.diags.error(
+                        "`float(...)` needs at least one option (`reassoc` or `contract`)",
+                        e.span,
+                    );
+                } else if let Some(option) = first_unknown {
+                    self.diags.error(
+                        format!("unknown floating-point relaxation option '{}'", option.name),
+                        option.span,
+                    );
+                } else if let Some((name, duplicate_span)) = first_duplicate {
+                    self.diags.error(
+                        format!("duplicate floating-point relaxation option '{name}'"),
+                        duplicate_span,
+                    );
+                }
+                let saved_mode = self.float_mode;
+                let mode = saved_mode.union(selected);
+                self.float_mode = mode;
+                let syntax_diverges = ast_block_diverges(source_block);
+                let block =
+                    self.check_block(source_block, if syntax_diverges { None } else { expected });
+                self.float_mode = saved_mode;
+                let diverges = hir_block_diverges(&block);
+                let ty = if diverges {
+                    diverging_block_result_ty(&block, expected)
+                } else {
+                    let t = block.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit);
+                    self.constrain(t, expected, e.span);
+                    t
+                };
+                Expr {
+                    kind: ExprKind::FloatScope {
+                        mode: selected,
+                        block,
+                    },
+                    ty,
+                    span: e.span,
+                }
+            }
             ast::ExprKind::Arena(b) => {
                 let syntax_diverges = ast_block_diverges(b);
                 self.arena_depth += 1;
@@ -50416,7 +50566,25 @@ impl<'a, 't> Checker<'a, 't> {
             }
         }
         self.constrain(ty, expected, span);
-        Expr { kind: ExprKind::Binary { op, lhs: Box::new(l), rhs: Box::new(r) }, ty, span }
+        let float_mode = if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+            && matches!(
+                self.resolve(ty),
+                Ty::Float(_) | Ty::FloatVar(_) | Ty::Vec(Scalar::Float(_), _) | Ty::Param(_)
+            ) {
+            self.float_mode
+        } else {
+            hir::FloatMode::STRICT
+        };
+        Expr {
+            kind: ExprKind::Binary {
+                op,
+                lhs: Box::new(l),
+                rhs: Box::new(r),
+                float_mode,
+            },
+            ty,
+            span,
+        }
     }
 
     /// `x.wrapping_add(y)` / `x.saturating_sub(y)` / `x.checked_mul(y)` etc. (`core.math`). The
@@ -50458,8 +50626,26 @@ impl<'a, 't> Checker<'a, 't> {
         let (lhs, rhs) = (Box::new(r), Box::new(a));
         match mode {
             // `wrapping_*` is the default wrapping arithmetic.
-            None => Expr { kind: ExprKind::Binary { op, lhs, rhs }, ty: t, span },
-            Some(m @ hir::ArithMode::Saturating) => Expr { kind: ExprKind::IntArith { op, mode: m, lhs, rhs }, ty: t, span },
+            None => Expr {
+                kind: ExprKind::Binary {
+                    op,
+                    lhs,
+                    rhs,
+                    float_mode: hir::FloatMode::STRICT,
+                },
+                ty: t,
+                span,
+            },
+            Some(m @ hir::ArithMode::Saturating) => Expr {
+                kind: ExprKind::IntArith {
+                    op,
+                    mode: m,
+                    lhs,
+                    rhs,
+                },
+                ty: t,
+                span,
+            },
             // `checked_*` yields `Option<T>`. The payload scalar must be concrete now (no inference
             // var inside a composite), so resolve `t` — an unconstrained literal pair defaults to i64.
             Some(m @ hir::ArithMode::Checked) => {
@@ -52886,8 +53072,21 @@ impl<'a, 't> Checker<'a, 't> {
             // A `vecN<T>` receiver makes this the SIMD horizontal sum (the same surface as the array
             // reduction `arr.sum()`); otherwise the array path runs. (Mirrors `min`/`max`.)
             if args.is_empty()
-                && let Some((rv, s)) = self.try_vec_recv(recv) {
-                return Expr { kind: ExprKind::VecSum { vec: Box::new(rv) }, ty: scalar_to_ty(s), span };
+                && let Some((rv, s)) = self.try_vec_recv(recv)
+            {
+                let float_mode = if matches!(s, Scalar::Float(_)) {
+                    self.float_mode
+                } else {
+                    hir::FloatMode::STRICT
+                };
+                return Expr {
+                    kind: ExprKind::VecSum {
+                        vec: Box::new(rv),
+                        float_mode,
+                    },
+                    ty: scalar_to_ty(s),
+                    span,
+                };
             }
             return self.check_array_sum(recv, args, expected, span);
         }
@@ -53780,7 +53979,20 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         }
-        Expr { kind: ExprKind::VecDot { a: Box::new(ac), b: Box::new(bc) }, ty: scalar_to_ty(s), span }
+        let float_mode = if matches!(s, Scalar::Float(_)) {
+            self.float_mode
+        } else {
+            hir::FloatMode::STRICT
+        };
+        Expr {
+            kind: ExprKind::VecDot {
+                a: Box::new(ac),
+                b: Box::new(bc),
+                float_mode,
+            },
+            ty: scalar_to_ty(s),
+            span,
+        }
     }
 
     /// Closed compiler/package bridge for the canonical `pkg.csv` generic wrapper. The abstract
@@ -54326,6 +54538,7 @@ impl<'a, 't> Checker<'a, 't> {
                                 ty: Ty::Str,
                                 span,
                             }),
+                            float_mode: hir::FloatMode::STRICT,
                         },
                         ty: Ty::Bool,
                         span,
@@ -56371,7 +56584,20 @@ impl<'a, 't> Checker<'a, 't> {
                 return err;
             }
         }
-        Expr { kind: ExprKind::VecSumWhere { vec: Box::new(v), mask: Box::new(mc) }, ty: scalar_to_ty(s), span }
+        let float_mode = if matches!(s, Scalar::Float(_)) {
+            self.float_mode
+        } else {
+            hir::FloatMode::STRICT
+        };
+        Expr {
+            kind: ExprKind::VecSumWhere {
+                vec: Box::new(v),
+                mask: Box::new(mc),
+                float_mode,
+            },
+            ty: scalar_to_ty(s),
+            span,
+        }
     }
 
     /// `select(mask, a, b)` — lane-wise blend of two `vecN<T>` by a `mask` (M6 slice 2). The mask
@@ -56869,6 +57095,7 @@ impl<'a, 't> Checker<'a, 't> {
         let saved_json_scan_source_spelling = self.json_scan_source_spelling.take();
         let saved_json_scan_local_spellings = std::mem::take(&mut self.json_scan_local_spellings);
         let saved_arena = self.arena_depth;
+        let saved_float_mode = self.float_mode;
         // A lambda body is a separate function: an enclosing `unsafe {}` does not lexically
         // contain the lifted function body. Extern permission must be re-established by an unsafe
         // block inside the lambda itself.
@@ -56889,6 +57116,7 @@ impl<'a, 't> Checker<'a, 't> {
         self.ret_hint = expected_ret.unwrap_or(Ty::Unit);
         self.json_scan_source_spelling = None;
         self.arena_depth = 0;
+        self.float_mode = hir::FloatMode::STRICT;
         self.unsafe_depth = 0;
         self.extern_boundary_error = false;
         self.task_group_depth = 0;
@@ -56962,6 +57190,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.json_scan_source_spelling = saved_json_scan_source_spelling;
                 self.json_scan_local_spellings = saved_json_scan_local_spellings;
                 self.arena_depth = saved_arena;
+                self.float_mode = saved_float_mode;
                 self.unsafe_depth = saved_unsafe_depth;
                 self.extern_boundary_error = saved_extern_boundary_error || extern_boundary_error;
                 self.task_group_depth = saved_tg_depth;
@@ -57032,6 +57261,7 @@ impl<'a, 't> Checker<'a, 't> {
         self.json_scan_source_spelling = saved_json_scan_source_spelling;
         self.json_scan_local_spellings = saved_json_scan_local_spellings;
         self.arena_depth = saved_arena;
+        self.float_mode = saved_float_mode;
         self.unsafe_depth = saved_unsafe_depth;
         self.extern_boundary_error = saved_extern_boundary_error || extern_boundary_error;
         self.task_group_depth = saved_tg_depth;
@@ -57688,14 +57918,42 @@ impl<'a, 't> Checker<'a, 't> {
         // summed field is a concrete struct-field scalar, so no inference constraint is needed.
         if matches!(source.ty, Ty::JsonScanner(_)) {
             let sc = ty_to_scalar(elem).expect("a numeric element is a scalar");
+            let float_mode = if matches!(
+                self.resolve(elem),
+                Ty::Float(_) | Ty::FloatVar(_) | Ty::Param(_)
+            ) {
+                self.float_mode
+            } else {
+                hir::FloatMode::STRICT
+            };
             return Expr {
-                kind: ExprKind::ArraySum { source: Box::new(source), stages },
+                kind: ExprKind::ArraySum {
+                    source: Box::new(source),
+                    stages,
+                    float_mode,
+                },
                 ty: Ty::Result(sc, Scalar::Enum(self.error_enum_id)),
                 span,
             };
         }
         self.constrain(elem, expected, span);
-        Expr { kind: ExprKind::ArraySum { source: Box::new(source), stages }, ty: elem, span }
+        let float_mode = if matches!(
+            self.resolve(elem),
+            Ty::Float(_) | Ty::FloatVar(_) | Ty::Param(_)
+        ) {
+            self.float_mode
+        } else {
+            hir::FloatMode::STRICT
+        };
+        Expr {
+            kind: ExprKind::ArraySum {
+                source: Box::new(source),
+                stages,
+                float_mode,
+            },
+            ty: elem,
+            span,
+        }
     }
 
     /// `s.group_by(.key).<agg>(…)` — column-oriented grouped aggregate over a `soa<Struct>` local:
@@ -58900,7 +59158,24 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         self.constrain(elem, expected, span);
-        Expr { kind: ExprKind::ArrayDot { a: Box::new(a_src), b: Box::new(b), elem }, ty: elem, span }
+        let float_mode = if matches!(
+            self.resolve(elem),
+            Ty::Float(_) | Ty::FloatVar(_) | Ty::Param(_)
+        ) {
+            self.float_mode
+        } else {
+            hir::FloatMode::STRICT
+        };
+        Expr {
+            kind: ExprKind::ArrayDot {
+                a: Box::new(a_src),
+                b: Box::new(b),
+                elem,
+                float_mode,
+            },
+            ty: elem,
+            span,
+        }
     }
 
     /// `r.map_err(f)` — convert a `Result<T, E>`'s error with `f: fn(E) -> E'`, yielding
@@ -67891,6 +68166,7 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
             ExprKind::Block(b)
+            | ExprKind::FloatScope { block: b, .. }
             | ExprKind::Arena(b)
             | ExprKind::NamedArena { block: b, .. }
             | ExprKind::TaskGroup(b)
@@ -67991,7 +68267,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(value);
                 self.finalize_expr(region);
             }
-            ExprKind::ArraySum { source, stages }
+            ExprKind::ArraySum { source, stages, .. }
             | ExprKind::ArrayCount { source, stages }
             | ExprKind::ArrayMinMax { source, stages, .. }
             | ExprKind::ArrayToArray { source, stages, .. }
@@ -68070,16 +68346,16 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(a);
                 self.finalize_expr(b);
             }
-            ExprKind::VecSumWhere { vec, mask } => {
+            ExprKind::VecSumWhere { vec, mask, .. } => {
                 self.finalize_expr(vec);
                 self.finalize_expr(mask);
             }
-            ExprKind::VecDot { a, b } => {
+            ExprKind::VecDot { a, b, .. } => {
                 self.finalize_expr(a);
                 self.finalize_expr(b);
             }
             ExprKind::VecMinMax { vec, .. } => self.finalize_expr(vec),
-            ExprKind::VecSum { vec } => self.finalize_expr(vec),
+            ExprKind::VecSum { vec, .. } => self.finalize_expr(vec),
             ExprKind::VecLoad { src, index, .. } => {
                 self.finalize_expr(src);
                 self.finalize_expr(index);
@@ -68899,6 +69175,7 @@ fn ast_loop_expr_flow(
             }
         }
         K::Block(block)
+        | K::FloatScope { block, .. }
         | K::Arena(block)
         | K::NamedArena { block, .. }
         | K::Unsafe(block)
@@ -69203,6 +69480,7 @@ fn walk_expr(e: &ast::Expr, out: &mut std::collections::HashSet<String>) {
             }
         }
         K::Block(b)
+        | K::FloatScope { block: b, .. }
         | K::Arena(b)
         | K::NamedArena { block: b, .. }
         | K::TaskGroup(b)
@@ -69531,6 +69809,7 @@ fn init_is_buffered_reader(e: &hir::Expr) -> bool {
     match &e.kind {
         hir::ExprKind::ReaderBuffered { .. } => true,
         hir::ExprKind::Block(b)
+        | hir::ExprKind::FloatScope { block: b, .. }
         | hir::ExprKind::Arena(b)
         | hir::ExprKind::NamedArena { block: b, .. }
         | hir::ExprKind::Unsafe(b) => {
@@ -74666,9 +74945,10 @@ mod tests {
         // StrCharBoundary has a scalar result and retains no storage.
         // BufferAppendFilled mutates an existing owned buffer and produces Unit, so it shares
         // BufferAppend's fresh-missing policy.
+        // FloatScope is an explicit forwarding wrapper with no storage of its own.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 338,
+            variants, 339,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

@@ -117,6 +117,8 @@ pub enum TokKind {
     True,
     False,
     Arena,
+    /// `float(...) { ... }` — explicit lexical floating-point relaxation scope.
+    FloatScope,
     TaskGroup,
     Match,
     /// `loop` — the one sequential-control construct (`loop { ... break value }`). An expression.
@@ -680,6 +682,7 @@ impl<'a> Lexer<'a> {
             "true" => TokKind::True,
             "false" => TokKind::False,
             "arena" => TokKind::Arena,
+            "float" => TokKind::FloatScope,
             "task_group" => TokKind::TaskGroup,
             "match" => TokKind::Match,
             "loop" => TokKind::Loop,

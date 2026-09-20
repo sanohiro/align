@@ -938,6 +938,23 @@ pub enum Rvalue {
         to: Ty,
     },
     Bin(BinOp, Operand, Operand),
+    /// Source-authenticated floating-point arithmetic. Strict operations use the all-zero mode;
+    /// relaxed operations carry the exact lexical permission record checked at the HIR boundary.
+    FloatBin {
+        op: BinOp,
+        a: Operand,
+        b: Operand,
+        mode: hir::FloatMode,
+    },
+    /// An authenticated contraction selected before LLVM. The backend lowers this to `llvm.fma`
+    /// and never relies on LLVM's raw `contract` flag.
+    FloatFma {
+        ty: Ty,
+        a: Operand,
+        b: Operand,
+        c: Operand,
+        mode: hir::FloatMode,
+    },
     /// Explicit-overflow integer arithmetic (`core.math`): `op` is `Add`/`Sub`/`Mul` on the
     /// integer type `int_ty`. `Saturating` → the clamped result (`int_ty`); `Checked` → an
     /// `Option<int_ty>` (`None` on overflow). Lowers to the LLVM `{s,u}OP.sat` / `{s,u}OP.with.overflow`
@@ -1213,6 +1230,7 @@ pub enum Rvalue {
         mask: Operand,
         elem: Ty,
         n: u32,
+        mode: hir::FloatMode,
     },
     /// `dot(a, b)` — the dot product of two `vecN<T>` (M6): multiply lane-wise then add all `n`
     /// lanes, yielding the element scalar `elem`.
@@ -1221,6 +1239,7 @@ pub enum Rvalue {
         b: Operand,
         elem: Ty,
         n: u32,
+        mode: hir::FloatMode,
     },
     /// `v.min()` / `v.max()` — the horizontal min/max of a `vecN<T>` (M6): fold the `n` lanes with
     /// the scalar min/max intrinsic, yielding the element scalar `elem`. `max` selects max vs min.
@@ -1236,6 +1255,7 @@ pub enum Rvalue {
         vec: Operand,
         elem: Ty,
         n: u32,
+        mode: hir::FloatMode,
     },
     /// Reduce a `mask` (`<N x i1>`) to a scalar `bool` that is true iff **any** lane is set
     /// (an OR-fold of the `n` lanes). Used by the vector `/`/`%` divisor guard:
@@ -4119,8 +4139,10 @@ pub fn function_embedded_types(f: &Function) -> Vec<Ty> {
                         types.push(*from);
                         types.push(*to);
                     }
-                    Rvalue::IntArith { int_ty, .. } | Rvalue::MathOp { ty: int_ty, .. } => {
-                        types.push(*int_ty)
+                    Rvalue::FloatFma { ty: embedded_ty, .. }
+                    | Rvalue::IntArith { int_ty: embedded_ty, .. }
+                    | Rvalue::MathOp { ty: embedded_ty, .. } => {
+                        types.push(*embedded_ty)
                     }
                     Rvalue::Closure { capture_tys, .. } => {
                         types.extend(capture_tys.iter().copied())
@@ -4556,8 +4578,10 @@ fn remap_function_embedded_types(
                         remap_ty(from, remap);
                         remap_ty(to, remap);
                     }
-                    Rvalue::IntArith { int_ty, .. } | Rvalue::MathOp { ty: int_ty, .. } => {
-                        remap_ty(int_ty, remap)
+                    Rvalue::FloatFma { ty: embedded_ty, .. }
+                    | Rvalue::IntArith { int_ty: embedded_ty, .. }
+                    | Rvalue::MathOp { ty: embedded_ty, .. } => {
+                        remap_ty(embedded_ty, remap)
                     }
                     Rvalue::Closure { capture_tys, .. } => remap_vec(capture_tys),
                     Rvalue::CallIndirect {
@@ -6225,6 +6249,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
             }
         }
         hir::ExprKind::Block(blk)
+        | hir::ExprKind::FloatScope { block: blk, .. }
         | hir::ExprKind::Arena(blk)
         | hir::ExprKind::NamedArena { block: blk, .. }
         | hir::ExprKind::Unsafe(blk)
@@ -6396,6 +6421,7 @@ fn temporary_drop_flag(b: &mut Builder, e: &hir::Expr, operand: &Operand) -> Opt
 fn borrow_transparent_scope_block(e: &hir::Expr) -> Option<&hir::Block> {
     match &e.kind {
         hir::ExprKind::Block(block)
+        | hir::ExprKind::FloatScope { block, .. }
         | hir::ExprKind::Unsafe(block)
         | hir::ExprKind::Arena(block)
         | hir::ExprKind::NamedArena { block, .. }
@@ -6454,7 +6480,9 @@ fn lower_expr_for_borrow(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::ElseUnwrap { opt, fallback } => {
             lower_else_unwrap(b, opt, fallback, e.ty, true)
         }
-        hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) => {
+        hir::ExprKind::Block(block)
+        | hir::ExprKind::FloatScope { block, .. }
+        | hir::ExprKind::Unsafe(block) => {
             lower_block_for_borrow(b, block).unwrap_or(Operand::Const(Const::Unit))
         }
         hir::ExprKind::Arena(block) => {
@@ -7856,7 +7884,10 @@ fn lower_plain_block_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
 
     let mut posts = Vec::new();
     let mut current = root;
-    while let hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) = &current.kind {
+    while let hir::ExprKind::Block(block)
+    | hir::ExprKind::FloatScope { block, .. }
+    | hir::ExprKind::Unsafe(block) = &current.kind
+    {
         if block.stmts.is_empty()
             && let Some(value) = block.value.as_deref()
         {
@@ -7879,8 +7910,10 @@ fn lower_plain_block_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
 
     if posts.is_empty() {
         let block = match &root.kind {
-            hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) => block,
-            _ => unreachable!("a plain block spine starts at Block or Unsafe"),
+            hir::ExprKind::Block(block)
+            | hir::ExprKind::FloatScope { block, .. }
+            | hir::ExprKind::Unsafe(block) => block,
+            _ => unreachable!("a plain block spine starts at Block, FloatScope, or Unsafe"),
         };
         return lower_block(b, block).unwrap_or(Operand::Const(Const::Unit));
     }
@@ -8030,6 +8063,7 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
             | hir::ExprKind::ElseUnwrap { .. }
             | hir::ExprKind::Loop { .. }
             | hir::ExprKind::Block(_)
+            | hir::ExprKind::FloatScope { .. }
             | hir::ExprKind::Unsafe(_)
             | hir::ExprKind::Arena(_)
             | hir::ExprKind::NamedArena { .. }
@@ -8183,6 +8217,17 @@ fn eager_worklist_children(parent: &hir::Expr) -> Vec<&hir::Expr> {
     ) {
         children.retain(|child| !borrow_mode_differs(child));
     }
+    if let hir::ExprKind::Binary {
+        op: BinOp::Add | BinOp::Sub,
+        float_mode,
+        ..
+    } = &parent.kind
+        && float_mode.contract()
+    {
+        // The parent consumes an authenticated immediate multiply's operands directly when it
+        // forms FloatFma. Do not first emit the multiply as an unused eager-worklist result.
+        children.retain(|child| contracted_mul_parts(child).is_none());
+    }
     children
 }
 
@@ -8193,7 +8238,7 @@ fn eager_worklist_children(parent: &hir::Expr) -> Vec<&hir::Expr> {
 #[inline(never)]
 fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
     match &e.kind {
-        hir::ExprKind::Binary { op, lhs, rhs } if matches!(op, BinOp::And | BinOp::Or) => {
+        hir::ExprKind::Binary { op, lhs, rhs, .. } if matches!(op, BinOp::And | BinOp::Or) => {
             lower_short_circuit(b, *op, lhs, rhs)
         }
         hir::ExprKind::Unary { .. } => lower_unary_spine(b, e),
@@ -8207,7 +8252,9 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             lower_else_unwrap(b, opt, fallback, e.ty, false)
         }
         hir::ExprKind::Loop { .. } => lower_loop(b, e),
-        hir::ExprKind::Block(_) | hir::ExprKind::Unsafe(_) => lower_plain_block_spine(b, e),
+        hir::ExprKind::Block(_) | hir::ExprKind::FloatScope { .. } | hir::ExprKind::Unsafe(_) => {
+            lower_plain_block_spine(b, e)
+        }
         hir::ExprKind::Arena(block) => lower_arena_block(b, block),
         hir::ExprKind::NamedArena { local, block } => lower_named_arena_block(b, *local, block),
         hir::ExprKind::TaskGroup(block) => lower_task_group_block(b, block),
@@ -8359,6 +8406,91 @@ fn lower_task_group_block(b: &mut Builder, block: &hir::Block) -> Operand {
 /// Structured control remains in its dedicated lowering helpers because its children occupy
 /// distinct MIR blocks. Those helpers re-enter this function for each selected child; eager chains
 /// below those boundaries still use this worklist rather than native recursion.
+fn contracted_mul_parts(expression: &hir::Expr) -> Option<(&hir::Expr, &hir::Expr)> {
+    match &expression.kind {
+        hir::ExprKind::Binary {
+            op: BinOp::Mul,
+            lhs,
+            rhs,
+            float_mode,
+        } if float_mode.contract() => Some((lhs, rhs)),
+        _ => None,
+    }
+}
+
+fn lower_contracted_binary(
+    b: &mut Builder,
+    expression: &hir::Expr,
+    op: BinOp,
+    lhs: &hir::Expr,
+    rhs: &hir::Expr,
+    mode: hir::FloatMode,
+) -> Option<Operand> {
+    if !mode.contract()
+        || !matches!(op, BinOp::Add | BinOp::Sub)
+        || !matches!(expression.ty, Ty::Float(_) | Ty::Vec(Scalar::Float(_), _))
+    {
+        return None;
+    }
+    let emit_neg = |b: &mut Builder, operand: Operand| {
+        let value = b.fresh_value(expression.ty);
+        b.push(Stmt::Let(value, Rvalue::Un(UnOp::Neg, operand)));
+        Operand::Value(value)
+    };
+    let emit_fma = |b: &mut Builder, a: Operand, bb: Operand, c: Operand| {
+        let value = b.fresh_value(expression.ty);
+        b.push(Stmt::Let(
+            value,
+            Rvalue::FloatFma {
+                ty: expression.ty,
+                a,
+                b: bb,
+                c,
+                mode,
+            },
+        ));
+        Operand::Value(value)
+    };
+
+    if let Some((mul_lhs, mul_rhs)) = contracted_mul_parts(lhs) {
+        let a = lower_expr(b, mul_lhs);
+        if !lowering_continues(b) {
+            return Some(terminated_operand());
+        }
+        let bb = lower_expr(b, mul_rhs);
+        if !lowering_continues(b) {
+            return Some(terminated_operand());
+        }
+        let mut c = lower_expr(b, rhs);
+        if !lowering_continues(b) {
+            return Some(terminated_operand());
+        }
+        if op == BinOp::Sub {
+            c = emit_neg(b, c);
+        }
+        return Some(emit_fma(b, a, bb, c));
+    }
+    if let Some((mul_lhs, mul_rhs)) = contracted_mul_parts(rhs) {
+        let c = lower_expr(b, lhs);
+        if !lowering_continues(b) {
+            return Some(terminated_operand());
+        }
+        let mut a = lower_expr(b, mul_lhs);
+        if !lowering_continues(b) {
+            return Some(terminated_operand());
+        }
+        let bb = lower_expr(b, mul_rhs);
+        if !lowering_continues(b) {
+            return Some(terminated_operand());
+        }
+        if op == BinOp::Sub {
+            a = emit_neg(b, a);
+        }
+        return Some(emit_fma(b, a, bb, c));
+    }
+    None
+}
+
 fn lower_expr(b: &mut Builder, root: &hir::Expr) -> Operand {
     if !lowering_continues(b) {
         return terminated_operand();
@@ -9553,12 +9685,21 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 ));
                 Operand::Value(v)
             }
-            hir::ExprKind::Binary { op, lhs, rhs } => {
+            hir::ExprKind::Binary {
+                op,
+                lhs,
+                rhs,
+                float_mode,
+            } => {
                 // `&&` / `||` short-circuit: the right operand is evaluated only when the left doesn't
                 // already decide the result. Lower to a branch (not a strict `Rvalue::Bin`), so a guard
                 // like `i < len && arr[i] > 0` doesn't evaluate `arr[i]` (and trap) when `i >= len`.
                 if matches!(op, BinOp::And | BinOp::Or) {
                     return lower_short_circuit(b, *op, lhs, rhs);
+                }
+                if let Some(contracted) = lower_contracted_binary(b, e, *op, lhs, rhs, *float_mode)
+                {
+                    return contracted;
                 }
                 lower_required_binding!(b, l = lower_expr(b, lhs), Operand::Const(Const::Unit));
                 lower_required_binding!(b, r = lower_expr(b, rhs), Operand::Const(Const::Unit));
@@ -9574,7 +9715,19 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                     return lower_vec_div(b, *op, l, r, s, n, rhs.ty);
                 }
                 let v = b.fresh_value(e.ty);
-                b.push(Stmt::Let(v, Rvalue::Bin(*op, l, r)));
+                let value = if matches!(e.ty, Ty::Float(_) | Ty::Vec(Scalar::Float(_), _))
+                    && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+                {
+                    Rvalue::FloatBin {
+                        op: *op,
+                        a: l,
+                        b: r,
+                        mode: *float_mode,
+                    }
+                } else {
+                    Rvalue::Bin(*op, l, r)
+                };
+                b.push(Stmt::Let(v, value));
                 Operand::Value(v)
             }
             hir::ExprKind::IntArith { op, mode, lhs, rhs } => {
@@ -9753,7 +9906,9 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 ));
                 Operand::Value(v)
             }
-            hir::ExprKind::Block(_) => lower_plain_block_spine(b, e),
+            hir::ExprKind::Block(_) | hir::ExprKind::FloatScope { .. } => {
+                lower_plain_block_spine(b, e)
+            }
             // `unsafe {}` is a plain marker block at MIR level — no handle, no region. It lowers to its
             // inner block; the enforcement + impurity were handled in sema.
             hir::ExprKind::Unsafe(_) => lower_plain_block_spine(b, e),
@@ -10353,7 +10508,11 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 ));
                 Operand::Value(v)
             }
-            hir::ExprKind::ArraySum { source, stages } => {
+            hir::ExprKind::ArraySum {
+                source,
+                stages,
+                float_mode,
+            } => {
                 // An explicitly parallel, directly-consumed integer map can fold its result in the
                 // range kernel. This removes the full transformed array and the serial reread while
                 // preserving the existing `par_map` Pure boundary and wrapping integer semantics.
@@ -10386,7 +10545,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                         stages,
                         sid,
                         e.ty,
-                        ReducerSpec::Sum,
+                        ReducerSpec::Sum(*float_mode),
                         ReduceInit::Identity,
                     )
                 } else {
@@ -10396,7 +10555,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                         stages,
                         e.ty,
                         ReduceInit::Identity,
-                        ReducerSpec::Sum,
+                        ReducerSpec::Sum(*float_mode),
                     )
                 }
             }
@@ -10564,7 +10723,12 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 )
                 .0
             }
-            hir::ExprKind::ArrayDot { a, b: bex, elem } => lower_array_dot(b, a, bex, *elem),
+            hir::ExprKind::ArrayDot {
+                a,
+                b: bex,
+                elem,
+                float_mode,
+            } => lower_array_dot(b, a, bex, *elem, *float_mode),
             hir::ExprKind::ArraySort {
                 source,
                 stages,
@@ -10898,7 +11062,11 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             }
             // `vec.sum_where(mask)` → masked horizontal sum. `e.ty` is the element scalar; the width is
             // recovered from the receiver's vector type.
-            hir::ExprKind::VecSumWhere { vec, mask } => {
+            hir::ExprKind::VecSumWhere {
+                vec,
+                mask,
+                float_mode,
+            } => {
                 let n = match vec.ty {
                     Ty::Vec(_, n) => n,
                     _ => unreachable!("sema types sum_where's receiver as a vector"),
@@ -10913,13 +11081,18 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                         mask: mv,
                         elem: e.ty,
                         n,
+                        mode: *float_mode,
                     },
                 ));
                 Operand::Value(v)
             }
             // `dot(a, b)` → vector multiply then a lane reduction. `e.ty` is the element; the width comes
             // from the operand vector type.
-            hir::ExprKind::VecDot { a, b: bexpr } => {
+            hir::ExprKind::VecDot {
+                a,
+                b: bexpr,
+                float_mode,
+            } => {
                 let n = match a.ty {
                     Ty::Vec(_, n) => n,
                     _ => unreachable!("sema types dot's operands as vectors"),
@@ -10934,6 +11107,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                         b: bv,
                         elem: e.ty,
                         n,
+                        mode: *float_mode,
                     },
                 ));
                 Operand::Value(v)
@@ -10958,7 +11132,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 Operand::Value(v)
             }
             // `v.sum()` → add all lanes (the shared horizontal sum).
-            hir::ExprKind::VecSum { vec } => {
+            hir::ExprKind::VecSum { vec, float_mode } => {
                 let n = match vec.ty {
                     Ty::Vec(_, n) => n,
                     _ => unreachable!("sema types sum's receiver as a vector"),
@@ -10971,6 +11145,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                         vec: vv,
                         elem: e.ty,
                         n,
+                        mode: *float_mode,
                     },
                 ));
                 Operand::Value(v)
@@ -14331,7 +14506,7 @@ fn store_array_elems(
 /// How a fused pipeline's surviving elements combine into the result.
 enum Reducer {
     /// `sum`: `acc + element`.
-    Sum,
+    Sum(hir::FloatMode),
     /// `count`: `acc + 1` (element value ignored).
     Count,
     /// `reduce(init, f)`: `f(acc, element)`. `captures` are a lifted lambda's captured values,
@@ -14351,7 +14526,7 @@ enum Reducer {
 }
 
 enum ReducerSpec<'a> {
-    Sum,
+    Sum(hir::FloatMode),
     Count,
     Fold {
         func: &'a str,
@@ -14384,7 +14559,7 @@ fn prepare_reducer(b: &mut Builder, spec: ReducerSpec<'_>) -> Option<Reducer> {
         Some(captures)
     };
     Some(match spec {
-        ReducerSpec::Sum => Reducer::Sum,
+        ReducerSpec::Sum(mode) => Reducer::Sum(mode),
         ReducerSpec::Count => Reducer::Count,
         ReducerSpec::Fold { func, captures } => Reducer::Fold {
             func: ProgramCall::from_validated(func),
@@ -15375,7 +15550,7 @@ fn lower_array_reduce(
             Operand::Value(n)
         }
         // `sum`: acc + (mask ? cur : 0).
-        Reducer::Sum => {
+        Reducer::Sum(mode) => {
             let cur = cur.expect("sum needs a scalar element");
             let contribution = match &mask {
                 Some(m) => {
@@ -15393,10 +15568,17 @@ fn lower_array_reduce(
                 None => cur,
             };
             let n = b.fresh_value(acc_ty);
-            b.push(Stmt::Let(
-                n,
-                Rvalue::Bin(BinOp::Add, Operand::Value(a), contribution),
-            ));
+            let value = if matches!(acc_ty, Ty::Float(_)) {
+                Rvalue::FloatBin {
+                    op: BinOp::Add,
+                    a: Operand::Value(a),
+                    b: contribution,
+                    mode: *mode,
+                }
+            } else {
+                Rvalue::Bin(BinOp::Add, Operand::Value(a), contribution)
+            };
+            b.push(Stmt::Let(n, value));
             Operand::Value(n)
         }
         // A callable reducer is control-flow guarded after `where`, so only surviving elements call
@@ -15685,13 +15867,20 @@ fn lower_json_scan_reduce(
             ));
             Operand::Value(n)
         }
-        Reducer::Sum => {
+        Reducer::Sum(mode) => {
             let cur = cur.expect("sum needs a scalar element");
             let n = b.fresh_value(acc_ty);
-            b.push(Stmt::Let(
-                n,
-                Rvalue::Bin(BinOp::Add, Operand::Value(a), cur),
-            ));
+            let value = if matches!(acc_ty, Ty::Float(_)) {
+                Rvalue::FloatBin {
+                    op: BinOp::Add,
+                    a: Operand::Value(a),
+                    b: cur,
+                    mode: *mode,
+                }
+            } else {
+                Rvalue::Bin(BinOp::Add, Operand::Value(a), cur)
+            };
+            b.push(Stmt::Let(n, value));
             Operand::Value(n)
         }
         // `reduce(init, f)`: `acc = f(acc, cur)` (+ captures). Rejected rows already branched to `cont`
@@ -18501,7 +18690,13 @@ fn lower_array_sort(
 /// `a.dot(b)` — the inner product `Σ a[i]*b[i]` of two fixed-length scalar arrays of equal
 /// (sema-checked) length, folded in one counted loop. Both sources materialize to a slot
 /// (`array_source_slot`); `mul`/`add` lower per element type (int or float).
-fn lower_array_dot(b: &mut Builder, a: &hir::Expr, bex: &hir::Expr, elem: Ty) -> Operand {
+fn lower_array_dot(
+    b: &mut Builder,
+    a: &hir::Expr,
+    bex: &hir::Expr,
+    elem: Ty,
+    mode: hir::FloatMode,
+) -> Operand {
     let (a_slot, a_path, n) = array_source_slot(b, a);
     if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
@@ -18571,18 +18766,45 @@ fn lower_array_dot(b: &mut Builder, a: &hir::Expr, bex: &hir::Expr, elem: Ty) ->
             None => Rvalue::Index(b_slot, index),
         },
     ));
-    let prod = b.fresh_value(elem);
-    b.push(Stmt::Let(
-        prod,
-        Rvalue::Bin(BinOp::Mul, Operand::Value(xa), Operand::Value(xb)),
-    ));
     let a_acc = b.fresh_value(elem);
     b.push(Stmt::Let(a_acc, Rvalue::Load(acc)));
     let next = b.fresh_value(elem);
+    if matches!(elem, Ty::Float(_)) && mode.contract() {
     b.push(Stmt::Let(
         next,
-        Rvalue::Bin(BinOp::Add, Operand::Value(a_acc), Operand::Value(prod)),
+            Rvalue::FloatFma {
+                ty: elem,
+                a: Operand::Value(xa),
+                b: Operand::Value(xb),
+                c: Operand::Value(a_acc),
+                mode,
+            },
     ));
+    } else {
+        let product = b.fresh_value(elem);
+        let multiply = if matches!(elem, Ty::Float(_)) {
+            Rvalue::FloatBin {
+                op: BinOp::Mul,
+                a: Operand::Value(xa),
+                b: Operand::Value(xb),
+                mode,
+            }
+        } else {
+            Rvalue::Bin(BinOp::Mul, Operand::Value(xa), Operand::Value(xb))
+        };
+        b.push(Stmt::Let(product, multiply));
+        let add = if matches!(elem, Ty::Float(_)) {
+            Rvalue::FloatBin {
+                op: BinOp::Add,
+                a: Operand::Value(a_acc),
+                b: Operand::Value(product),
+                mode,
+            }
+        } else {
+            Rvalue::Bin(BinOp::Add, Operand::Value(a_acc), Operand::Value(product))
+        };
+        b.push(Stmt::Let(next, add));
+    }
     b.push(Stmt::Store(acc, Operand::Value(next)));
     b.terminate(Term::Goto(cont));
 
@@ -23008,6 +23230,7 @@ fn process_exec_failure_spine(mut expression: &hir::Expr) -> bool {
         match &expression.kind {
             hir::ExprKind::ProcessExec { .. } => return true,
             hir::ExprKind::Block(block)
+            | hir::ExprKind::FloatScope { block, .. }
             | hir::ExprKind::Unsafe(block)
             | hir::ExprKind::Arena(block)
             | hir::ExprKind::TaskGroup(block)
@@ -23463,6 +23686,7 @@ fn match_scrutinee_transfers_source_to_owner(e: &hir::Expr) -> bool {
         | hir::ExprKind::TaskGet(_)
         | hir::ExprKind::TaskGroup(_) => true,
         hir::ExprKind::Block(block)
+        | hir::ExprKind::FloatScope { block, .. }
         | hir::ExprKind::Unsafe(block)
         | hir::ExprKind::Arena(block)
         | hir::ExprKind::NamedArena { block, .. } => block

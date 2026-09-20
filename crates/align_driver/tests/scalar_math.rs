@@ -102,6 +102,220 @@ fn raw_ir(name: &str, src: &str) -> String {
 }
 
 #[test]
+fn float_relaxation_scope_emits_only_its_named_permissions() {
+    if !backend_available() {
+        return;
+    }
+    let ir = raw_ir(
+        "sm-float-scope-ir",
+        concat!(
+            "pub fn strict(a: f64, b: f64, c: f64) -> f64 = a * b + c\n",
+            "pub fn reassociated(a: f64, b: f64, c: f64) -> f64 = float(reassoc) { a + b + c }\n",
+            "pub fn contracted(a: f64, b: f64, c: f64) -> f64 = float(contract) { a * b + c }\n",
+            "pub fn plus_right(a: f64, b: f64, c: f64) -> f64 = float(contract) { c + a * b }\n",
+            "pub fn minus_right(a: f64, b: f64, c: f64) -> f64 = float(contract) { a * b - c }\n",
+            "pub fn both(a: f64, b: f64, c: f64) -> f64 = float(contract, reassoc) { c - a * b }\n",
+            "fn main() -> i32 { return 0 }\n",
+        ),
+    );
+    assert!(
+        ir.contains("fadd reassoc double"),
+        "reassoc was not emitted:\n{ir}"
+    );
+    assert_eq!(
+        ir.matches("@llvm.fma.f64").count(),
+        5,
+        "four calls plus one declaration must name the explicit FMA intrinsic:\n{ir}",
+    );
+    assert_eq!(
+        ir.matches("fmul double").count(),
+        1,
+        "only the strict function may retain a multiply; contracted pairs must not emit dead multiplies:\n{ir}",
+    );
+    assert!(
+        ir.lines()
+            .any(|line| line.contains("call double @llvm.fma.f64")),
+        "contract-only FMA unexpectedly gained reassoc:\n{ir}",
+    );
+    assert!(
+        ir.lines()
+            .any(|line| line.contains("call reassoc double @llvm.fma.f64")),
+        "the combined scope did not retain reassoc on its explicit FMA:\n{ir}",
+    );
+    assert!(
+        !ir.lines()
+            .any(|line| line.contains("fmul contract") || line.contains("fadd contract")),
+        "raw LLVM contract must never be emitted:\n{ir}",
+    );
+    for forbidden in [" nnan", " ninf", " nsz", " arcp", " afn", " fast"] {
+        assert!(
+            !ir.contains(forbidden),
+            "float scopes emitted the unnamed fast-math flag {forbidden:?}:\n{ir}",
+        );
+    }
+    assert!(
+        ir.lines()
+            .any(|line| line.contains("fmul double") && !line.contains("reassoc")),
+        "strict multiplication disappeared or gained a relaxed flag:\n{ir}",
+    );
+
+    let callable = raw_ir(
+        "sm-float-scope-callable-root",
+        concat!(
+            "pub fn run(x: f64) -> f64 = float(contract) {\n",
+            "  f := fn y: f64 { y * y + 1.0 }\n",
+            "  f(x)\n",
+            "}\n",
+            "fn main() -> i32 { return 0 }\n",
+        ),
+    );
+    assert!(
+        !callable.contains("@llvm.fma"),
+        "a lifted callable inherited its declaration-site float mode:\n{callable}",
+    );
+
+    let boundaries = raw_ir(
+        "sm-float-scope-contract-boundaries",
+        concat!(
+            "pub fn strict_product(a: f64, b: f64, c: f64) -> f64 {\n",
+            "  product := a * b\n",
+            "  return float(contract) { product + c }\n",
+            "}\n",
+            "pub fn strict_consumer(a: f64, b: f64, c: f64) -> f64 {\n",
+            "  product := float(contract) { a * b }\n",
+            "  return product + c\n",
+            "}\n",
+            "pub fn indirect(a: f64, b: f64, c: f64) -> f64 = float(contract) {\n",
+            "  product := a * b\n",
+            "  product + c\n",
+            "}\n",
+            "fn main() -> i32 { return 0 }\n",
+        ),
+    );
+    assert!(
+        !boundaries.contains("@llvm.fma"),
+        "strict or non-immediate multiplication crossed the contraction boundary:\n{boundaries}",
+    );
+
+    let restored = raw_ir(
+        "sm-float-scope-restoration",
+        concat!(
+            "pub fn run(a: f64, b: f64, c: f64) -> f64 {\n",
+            "  inside := float(reassoc) { a + b }\n",
+            "  return inside + c\n",
+            "}\n",
+            "pub fn nested(a: f64, b: f64, c: f64) -> f64 = float(reassoc) {\n",
+            "  float(contract) { a * b + c }\n",
+            "}\n",
+            "fn main() -> i32 { return 0 }\n",
+        ),
+    );
+    assert!(restored.contains("fadd reassoc double"), "scope entry was lost:\n{restored}");
+    assert!(
+        restored.lines().any(|line| line.contains("fadd double") && !line.contains("reassoc")),
+        "the mode was not restored after leaving the scope:\n{restored}",
+    );
+    assert!(
+        restored
+            .lines()
+            .any(|line| line.contains("call reassoc double @llvm.fma.f64")),
+        "nested scopes did not union their permissions:\n{restored}",
+    );
+}
+
+#[test]
+fn float_relaxation_keeps_strict_bits_and_nan_infinity_defined() {
+    if !backend_available() {
+        return;
+    }
+    let source = concat!(
+        "fn main() -> i32 {\n",
+        "  strict := (10000000000000000.0 + (0.0 - 10000000000000000.0)) + 1.0\n",
+        "  if strict.to_bits() != 4607182418800017408 { return 1 }\n",
+        "  zero := 0.0\n",
+        "  nan := zero / zero\n",
+        "  if !float(reassoc) { nan + 1.0 }.is_nan() { return 2 }\n",
+        "  infinity := 1.0 / zero\n",
+        "  if !float(reassoc, contract) { infinity * 1.0 + zero }.is_infinite() { return 3 }\n",
+        "  return 0\n",
+        "}\n",
+    );
+    let output = build_and_run("sm-float-scope-defined", source);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn float_reduction_scopes_reach_sum_and_dot_owners() {
+    if !backend_available() {
+        return;
+    }
+    let ir = raw_ir(
+        "sm-float-scope-reductions",
+        concat!(
+            "pub fn sum(borrow xs: slice<f64>) -> f64 = float(reassoc) { xs.sum() }\n",
+            "pub fn vector(a: vec4<f64>, b: vec4<f64>) -> f64 = float(contract) { dot(a, b) }\n",
+            "pub fn vector_sum(a: vec4<f64>) -> f64 = float(reassoc) { a.sum() }\n",
+            "pub fn vector_sum_where(a: vec4<f64>, b: vec4<f64>) -> f64 = float(reassoc) { a.sum_where(a > b) }\n",
+            "pub fn fixed() -> f64 = float(contract) { [1.0, 2.0].dot([3.0, 4.0]) }\n",
+            "fn main() -> i32 { return 0 }\n",
+        ),
+    );
+    assert!(
+        ir.contains("fadd reassoc double"),
+        "sum lost reassoc:\n{ir}"
+    );
+    assert!(
+        ir.matches("call double @llvm.fma.f64").count() >= 5,
+        "vector and fixed-array dot must select explicit per-term FMA:\n{ir}",
+    );
+    assert!(
+        !ir.lines()
+            .any(|line| line.contains("fmul contract") || line.contains("fadd contract")),
+        "a reduction emitted raw LLVM contract:\n{ir}",
+    );
+}
+
+#[test]
+fn float_relaxation_diagnostics_have_stable_precedence() {
+    let cases = [
+        (
+            "fn f() -> f64 = float() { missing }\n",
+            "`float(...)` needs at least one option",
+        ),
+        (
+            "fn f() -> f64 = float(reassoc, reassoc, mystery) { 0.0 }\n",
+            "unknown floating-point relaxation option 'mystery'",
+        ),
+        (
+            "fn f() -> f64 = float(mystery, contract, contract) { 0.0 }\n",
+            "unknown floating-point relaxation option 'mystery'",
+        ),
+        (
+            "fn f() -> f64 = float(contract, contract) { 0.0 }\n",
+            "duplicate floating-point relaxation option 'contract'",
+        ),
+    ];
+    for (source, expected_first) in cases {
+        let mut sources = SourceMap::new();
+        let checked = check(&mut sources, "sm-float-scope-error", source);
+        let first = checked
+            .diags
+            .iter()
+            .next()
+            .expect("float scope must be rejected");
+        assert!(
+            first.message.contains(expected_first),
+            "wrong first diagnostic: {:?}",
+            checked
+                .diags
+                .iter()
+                .map(|diagnostic| &diagnostic.message)
+                .collect::<Vec<_>>(),
+        );
+    }
+}
+
+#[test]
 fn the_pipeline_terminal_emits_the_same_intrinsic_as_the_scalar_method() {
     if !backend_available() {
         return;
