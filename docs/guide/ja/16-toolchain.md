@@ -112,11 +112,14 @@ CPU名の欠落、空文字、埋め込みNUL、未知の名前、別アーキ�
 --profile dev|release|fast|small|tiny   # O0, O2, O3, Os, Oz
 --target-cpu baseline|native|<LLVM CPU>
 --deployment-target VERSION            # Apple ターゲット専用: 成果物が対象とする OS バージョン
+--sdk-version VERSION                   # Apple ターゲット専用: オブジェクトに明示する SDK 来歴
 --rt-lto / --no-rt-lto                 # runtime bitcode LTO の強制 on/off（既定: release/fast で on）
 --thin-lto                             # cross-unit ThinLTO
 ```
 
 Apple ターゲットでは、deployment target は CPU と同じくターゲット識別子の一部です。解決箇所は 1 か所、優先順位は 1 つで、オブジェクト、モジュール IR、リンク、キャッシュキーはすべて同じ文字列から導かれます。値は `--deployment-target`、プラットフォームの `MACOSX_DEPLOYMENT_TARGET`（`IPHONEOS_`/`WATCHOS_`/`TVOS_`/`XROS_`）環境変数、ホストの `sw_vers -productVersion`、文書化されたプラットフォームごとの下限値の順に、最初に値を与えた段階が採用されます。各段階の値は `major.minor` の精度で読み取り、不正な値はその段階を明示したエラーになります（次の段階へは進みません）。環境変数が未設定の場合は次の段階に進みますが、空文字などの使用できない値が設定されている場合は「値が与えられた」とみなしてエラーになります。Apple 以外のホストで `--deployment-target` を指定した場合も、黙って無視せずエラーになります。バージョンは識別子に含まれ OS のパッチレベルは含まれないため、OS のパッチ更新だけではビルドキャッシュは無効化されず、deployment target を変更すると無効化されます。
+
+`--sdk-version` はこれとは別に、Apple オブジェクトの `LC_BUILD_VERSION` へ明示的な SDK の来歴を記録します。`major`、`major.minor`、`major.minor.patch` を受け付け、省略時は従来どおりオブジェクトの SDK を未指定（`sdk n/a`）のままにします。SDK や sysroot を選択するオプションではなく、`SDKROOT` や `xcrun` から暗黙に補いません。正規化した値は codegen と ThinLTO のキャッシュ識別子に含めますが、フロントエンドキャッシュには含めません。不正な値と Apple 以外のターゲットでの指定は、ソースや成果物を処理する前にエラーになります。
 
 既定は移植性のある `baseline` ターゲットと `release` プロファイルです。`native` は現在のマシン向け、`x86-64-v3` などの LLVM CPU 名は配布先のハードウェアが決まっている場合に使えます。
 ランタイム LTO は `release` / `fast` で**既定で有効**です。文字列述語のパイプラインで実測2〜3倍の速度改善があり、その他の測定では性能低下はなく、コンパイル時間の増加は1〜2msでした。`dev` / `small` / `tiny` では無効で、`--no-rt-lto` / `--rt-lto` で切り替えられます。`--thin-lto` はコンパイル時間と最適化の範囲を変えるため、明示的に指定します。`release` / `fast` のリンクを伴う `build` / `run` / `size` に適用され、並列化とキャッシュに対応し、ランタイム LTO と組み合わせられます。

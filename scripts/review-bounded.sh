@@ -473,7 +473,7 @@ if [[ "$provider" == codex && "$marker_count" -eq 0 ]]; then
       # in the line (negation + "actionable" + optional soundness/regression
       # qualifier + an issue-like noun).
       if (ok && line != "No findings.") {
-        ok = (lower ~ /(^no |[^a-z]no |without introducing an |without introducing any |without an |without any )actionable( (soundness or regression|soundness\/regression|soundness|regression))?[[:space:]](issue|issues|risk|risks|defect|defects|finding|findings|regression|regressions)/)
+        ok = (lower ~ /(^no |[^a-z]no |without introducing |without introducing an |without introducing any |without an |without any )actionable( (soundness or regression|soundness\/regression|soundness|regression))?[[:space:]](issue|issues|risk|risks|defect|defects|finding|findings|regression|regressions|inconsistency|inconsistencies)/)
       }
       # (c) no caveat word, no admission that the inspection did not finish,
       # and no P0-P3 marker in any form, each matched as a whole word or

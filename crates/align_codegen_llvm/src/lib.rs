@@ -393,6 +393,9 @@ const CODE_MODEL: &str = "Default";
 /// resolve `native` differently get distinct keys (doc-10 §6.2).
 pub struct ResolvedTarget {
     pub triple: String,
+    /// Explicit Apple SDK provenance, canonicalized as `major.minor.patch`; absent preserves the
+    /// previous object metadata and is distinct in every object-producing cache key.
+    pub sdk_version: Option<String>,
     pub cpu: String,
     pub features: String,
     pub reloc_model: &'static str,
@@ -423,8 +426,40 @@ pub fn resolve_target_identity(target: &BuildTarget) -> Result<ResolvedTarget, C
     // The SAME resolved triple `create_target_machine` builds its machine from (one `OnceLock`, not
     // two matching code paths), so the cache key and the machine are byte-identical by construction.
     let triple_str = target_identity::resolved_triple()?;
+    let sdk_version = target_identity::resolved_sdk_version()?.map(|version| version.canonical());
     let (cpu, features) = resolve_cpu_features(target, &triple_str.to_ascii_lowercase())?;
-    Ok(ResolvedTarget { triple: triple_str, cpu, features, reloc_model: RELOC_MODEL, code_model: CODE_MODEL })
+    Ok(ResolvedTarget {
+        triple: triple_str,
+        sdk_version,
+        cpu,
+        features,
+        reloc_model: RELOC_MODEL,
+        code_model: CODE_MODEL,
+    })
+}
+
+/// Stamp the one LLVM module flag the Mach-O writer consumes for `LC_BUILD_VERSION.sdk`.
+/// Omission is meaningful and therefore a no-op rather than an ambient SDK lookup.
+fn stamp_sdk_version<'ctx>(
+    ctx: &'ctx Context,
+    module: &Module<'ctx>,
+) -> Result<(), CodegenError> {
+    let Some(version) = target_identity::resolved_sdk_version()? else {
+        return Ok(());
+    };
+    let (major, minor, patch) = version.components();
+    let i32_type = ctx.i32_type();
+    let fields = [
+        i32_type.const_int(u64::from(major), false),
+        i32_type.const_int(u64::from(minor), false),
+        i32_type.const_int(u64::from(patch), false),
+    ];
+    module.add_basic_value_flag(
+        "SDK Version",
+        inkwell::module::FlagBehavior::Warning,
+        i32_type.const_array(&fields),
+    );
+    Ok(())
 }
 
 /// The exact LLVM version this compiler is dynamically linked against, `"major.minor.patch"`, read at
@@ -656,6 +691,7 @@ pub fn emit_test_harness_object(
     let target_data = tm.get_target_data();
     module.set_data_layout(&target_data.get_data_layout());
     module.set_triple(&tm.get_triple());
+    stamp_sdk_version(&ctx, &module)?;
     let lower = |error: inkwell::builder::BuilderError| CodegenError::Lowering(error.to_string());
     let i8_ty = ctx.i8_type();
     let i32_ty = ctx.i32_type();
@@ -1325,6 +1361,7 @@ pub fn emit_support_prelink_bc(
     let target_data = tm.get_target_data();
     module.set_data_layout(&target_data.get_data_layout());
     module.set_triple(&tm.get_triple());
+    stamp_sdk_version(&ctx, &module)?;
     let thunk_ty = ctx
         .void_type()
         .fn_type(&[ctx.ptr_type(AddressSpace::default()).into()], false);
@@ -3321,6 +3358,7 @@ fn lower_prepared_module<'c>(
     // instead of falling back to a generic one. The driver's own object emission is unaffected (it
     // always drives `write_object` with the same TargetMachine).
     module.set_triple(&tm.get_triple());
+    stamp_sdk_version(ctx, module)?;
 
     // Opt-in debug info (explain-opt / a future `-g`). Emitting DILocations anchors LLVM's
     // optimization remarks to real source lines; off by default so normal builds and the IR-shape

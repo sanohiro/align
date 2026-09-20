@@ -1544,6 +1544,95 @@ fn gate14b_deployment_target_separates_cached_objects() {
     assert_eq!(emit("14.0"), "14.0");
 }
 
+/// Explicit SDK provenance reaches Mach-O and is part of the codegen identity. Reusing one cache
+/// across two values must never serve the first object's load command for the second request;
+/// omission remains the pre-#1093 `sdk n/a` representation (packed zero).
+#[test]
+#[cfg(target_os = "macos")]
+fn gate14c_sdk_version_stamps_objects_and_separates_cached_values() {
+    if !backend() {
+        return;
+    }
+    let proj = Project::new(
+        "sdk-version",
+        &[("lib.align", "pub fn k(x: i64) -> i64 = x + 1\n")],
+        "lib.align",
+    );
+    let shared = proj.dir.join("sdkcache");
+    let alignc = env!("CARGO_BIN_EXE_alignc");
+    let ir = std::process::Command::new(alignc)
+        .args([
+            "emit-llvm",
+            "lib.align",
+            "--sdk-version",
+            "27.1.2",
+            "--stage",
+            "raw",
+        ])
+        .current_dir(&proj.dir)
+        .output()
+        .expect("spawn alignc emit-llvm");
+    assert!(ir.status.success(), "{}", String::from_utf8_lossy(&ir.stderr));
+    assert!(
+        String::from_utf8_lossy(&ir.stdout)
+            .contains("!{i32 2, !\"SDK Version\", [3 x i32] [i32 27, i32 1, i32 2]}"),
+        "selected SDK flag is absent or malformed:\n{}",
+        String::from_utf8_lossy(&ir.stdout)
+    );
+    let emit = |version: Option<&str>| {
+        let mut command = std::process::Command::new(alignc);
+        command
+            .args(["emit-obj", "lib.align", "--no-rt-lto"])
+            .current_dir(&proj.dir)
+            .env("ALIGNC_CACHE", &shared);
+        if let Some(version) = version {
+            command.args(["--sdk-version", version]);
+        }
+        let out = command.output().expect("spawn alignc");
+        assert!(
+            out.status.success(),
+            "emit-obj at {version:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        macho_sdk(&proj.dir.join("lib.o")).expect("an LC_BUILD_VERSION in the emitted object")
+    };
+    assert_eq!(emit(None), "n/a");
+    assert_eq!(emit(Some("27.1.2")), "27.1.2");
+    assert_eq!(emit(Some("28")), "28.0");
+    assert_eq!(emit(Some("27.1.2")), "27.1.2");
+}
+
+#[test]
+fn gate14d_invalid_sdk_version_fails_before_source_or_artifact_work() {
+    let proj = Project::new("sdk-invalid", &[], "missing.align");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_alignc"))
+        .args(["emit-obj", "missing.align", "--sdk-version", "65536"])
+        .current_dir(&proj.dir)
+        .output()
+        .expect("spawn alignc");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--sdk-version"), "{stderr}");
+    assert!(stderr.contains("major must be in 1..=65535"), "{stderr}");
+    assert!(!stderr.contains("missing.align"), "source I/O ran before SDK validation: {stderr}");
+    assert!(!proj.dir.join("missing.o").exists());
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn gate14e_sdk_version_rejects_non_apple_targets_before_source_work() {
+    let proj = Project::new("sdk-platform", &[], "missing.align");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_alignc"))
+        .args(["emit-obj", "missing.align", "--sdk-version", "27.0"])
+        .current_dir(&proj.dir)
+        .output()
+        .expect("spawn alignc");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--sdk-version does not apply"), "{stderr}");
+    assert!(!stderr.contains("missing.align"), "source I/O ran before SDK validation: {stderr}");
+}
+
 /// `LC_BUILD_VERSION`'s `minos` as `"<major>.<minor>"`, parsed from the Mach-O bytes.
 #[cfg(target_os = "macos")]
 fn macho_minos(path: &Path) -> Option<String> {
@@ -1566,6 +1655,42 @@ fn macho_minos(path: &Path) -> Option<String> {
         if cmd == 0x32 {
             let packed = u32_at(at + 12)?;
             return Some(format!("{}.{}", packed >> 16, (packed >> 8) & 0xff));
+        }
+        at = at.checked_add(cmdsize)?;
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn macho_sdk(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let u32_at = |at: usize| -> Option<u32> {
+        let slice: [u8; 4] = bytes.get(at..at + 4)?.try_into().ok()?;
+        Some(u32::from_le_bytes(slice))
+    };
+    if u32_at(0)? != 0xfeed_facf {
+        return None;
+    }
+    let ncmds = u32_at(16)?;
+    let mut at = 32usize;
+    for _ in 0..ncmds {
+        let cmd = u32_at(at)?;
+        let cmdsize = u32_at(at + 4)? as usize;
+        if cmdsize < 8 {
+            return None;
+        }
+        if cmd == 0x32 {
+            let packed = u32_at(at + 16)?;
+            return (packed == 0).then_some("n/a".to_string()).or_else(|| {
+                let major = packed >> 16;
+                let minor = (packed >> 8) & 0xff;
+                let patch = packed & 0xff;
+                Some(if patch == 0 {
+                    format!("{major}.{minor}")
+                } else {
+                    format!("{major}.{minor}.{patch}")
+                })
+            });
         }
         at = at.checked_add(cmdsize)?;
     }
