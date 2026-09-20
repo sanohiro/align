@@ -2445,7 +2445,8 @@ regression net that validates the upgrade.
   and disproved auto-vectorization criterion with
   `slice<u8>.view_le<T>() -> Option<slice<T>>` plus the total
   `slice<T>.as_bytes()` inverse. Natural alignment, whole-element length and
-  native little-endian order are explicit gates; the view preserves source
+  native little-endian order are explicit gates, with the order requirement
+  retained in MIR and admitted by the driver before LLVM; the view preserves source
   provenance and authority and allocates/copies nothing. Scalar binary
   accessors remain the alignment-1 packed-data route. Plan 78 owns the one-PR
   vertical implementation matrix and interface format 16.

@@ -8,7 +8,8 @@ admitted multi-byte element types and the exact `Option<slice<T>>` result.
 `slice<u8>` result. Both retain the source's precise provenance and authority;
 no binding-header mutation may manufacture backing-store write access. The
 validator re-derives all type equations and source roots and rejects every
-field mutation before MIR. The plan-78 closure matrix owns Option unwrap,
+field mutation before MIR. MIR retains the semantic little-endian requirement;
+driver target admission checks it before cache access and LLVM. The plan-78 closure matrix owns Option unwrap,
 branch/loop/call joins, interface format 16, malformed records and the complete
 enum/pass sweep.
 

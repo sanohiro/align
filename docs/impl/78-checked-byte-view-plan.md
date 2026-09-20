@@ -83,8 +83,11 @@ Effects           Pure. No I/O, allocation, global state, locale, errno,
 Owner             align_sema owns method dispatch, expected-type inference,
                   authority and provenance. Checked HIR authenticates receiver,
                   element and result equations. align_mir preserves the exact
-                  view operation and source dependency. align_codegen_llvm owns
-                  target-order admission and descriptor/check lowering.
+                  view operation, source dependency and required little-endian
+                  order. align_driver validates that requirement against the
+                  resolved target after MIR validation and before cache access,
+                  LLVM construction or output. align_codegen_llvm only lowers
+                  the already-admitted descriptor and runtime checks.
 
 Artifact/cache    New HIR/MIR operation identities and concrete public-body
                   serialization enter compiler_build_id. Interface format 16
@@ -122,7 +125,7 @@ Neither is specified as an implementation of the other.
 | receiver and arity | only `slice<u8>` receives `view_le`; only `slice<T>` in the closed set receives `as_bytes`; receiver is checked once before arity/domain; fields, subslices and call results dispatch by type | sema receiver/arity table with nested-invalid receiver controls |
 | runtime validation | exact/misaligned pointer, exact/nonmultiple length, empty null, aligned empty non-null and misaligned empty sub-slice produce the ledger result without reading payload | execution table over every width and both integer/float classes |
 | descriptor shape | success preserves the pointer and divides length exactly; inverse preserves pointer and multiplies length exactly; raw and optimized IR contain no allocation, memcpy or runtime call | LLVM structural owner and round-trip execution owner |
-| byte order | little-endian supported targets admit `view_le`; a synthetic future big-endian target is rejected before object publication; scalar `_le`/`_be` accessors remain unchanged | target-policy unit owner plus existing binary-codec suite |
+| byte order | MIR retains the little-endian requirement; little-endian supported targets admit it and a synthetic future big-endian target is rejected by driver target admission before cache access or LLVM construction; scalar `_le`/`_be` accessors remain unchanged | target-policy unit owner plus existing binary-codec suite |
 | provenance | buffer, array, subslice, parameter, field, returned view and control-flow joins retain the exact source root/generation through view, Option unwrap and inverse | sema/MIR provenance owners across direct and per-unit calls |
 | authority | writable source permits typed store and inverse-byte mutation; immutable/shared/string-derived source rejects mutation even when the copied header binding is mut; aliases conflict through either representation | writable/read-only/alias owner matrix |
 | vector reachability | `buffer.bytes()` -> `view_le` -> `slice<T>.load` and writable `store` type-check and reach vector LLVM loads/stores without a conversion loop | explicit vec2/4/8/16 load/store owner for f32 plus representative i32 |
@@ -145,7 +148,8 @@ Source checking is deterministic:
 3. reject nonzero argument count;
 4. for view_le, resolve the complete expected result and infer T;
 5. reject T outside the closed set;
-6. record the target-order requirement for code-generation admission.
+6. record the little-endian requirement on MIR; driver target admission checks
+   it after MIR validation and before cache access or LLVM construction.
 
 At runtime, view_le computes the nonnegative-length, whole-element and pointer-
 alignment predicates without forming a typed pointer or reading memory. All

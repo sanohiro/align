@@ -548,7 +548,9 @@ Two explicit MIR operations preserve the checked-HIR distinction:
 source dependency through Option projection, assignments, fields, joins and
 calls. Validation rechecks the closed element set, operand/result equations and
 descriptor relationship; it does not reconstruct authority or target order in
-LLVM. They are Pure, allocation-free and do not introduce a runtime ABI call.
+LLVM. `BytesView` retains its required little-endian order for driver target
+admission after MIR validation and before cache access or LLVM construction.
+They are Pure, allocation-free and do not introduce a runtime ABI call.
 
 ## 10. Remaining design refinements
 
