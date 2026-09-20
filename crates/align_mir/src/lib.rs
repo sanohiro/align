@@ -8172,6 +8172,18 @@ fn expression_uses_template_spine(e: &hir::Expr) -> bool {
 /// by [`eager_worklist_children`] before they are entered.
 fn expression_uses_eager_worklist(e: &hir::Expr) -> bool {
     match &e.kind {
+        hir::ExprKind::Binary {
+            op: BinOp::Add | BinOp::Sub,
+            lhs,
+            rhs,
+            float_mode,
+        } if float_mode.contract()
+            && (contracted_mul_parts(lhs).is_some() || contracted_mul_parts(rhs).is_some()) =>
+        {
+            // Contraction consumes the multiply's children directly. Lower the whole parent in
+            // its recursive dispatcher so neither sibling can be pre-lowered out of source order.
+            false
+        }
         hir::ExprKind::Binary { op, .. } => !matches!(op, BinOp::And | BinOp::Or),
         hir::ExprKind::IntArith { .. }
         | hir::ExprKind::MathOp { .. }
@@ -8216,17 +8228,6 @@ fn eager_worklist_children(parent: &hir::Expr) -> Vec<&hir::Expr> {
         hir::ExprKind::StrBorrow(_) | hir::ExprKind::StrClone(_)
     ) {
         children.retain(|child| !borrow_mode_differs(child));
-    }
-    if let hir::ExprKind::Binary {
-        op: BinOp::Add | BinOp::Sub,
-        float_mode,
-        ..
-    } = &parent.kind
-        && float_mode.contract()
-    {
-        // The parent consumes an authenticated immediate multiply's operands directly when it
-        // forms FloatFma. Do not first emit the multiply as an unused eager-worklist result.
-        children.retain(|child| contracted_mul_parts(child).is_none());
     }
     children
 }
@@ -8432,8 +8433,8 @@ fn lower_contracted_binary(
     {
         return None;
     }
-    let emit_neg = |b: &mut Builder, operand: Operand| {
-        let value = b.fresh_value(expression.ty);
+    let emit_neg = |b: &mut Builder, operand: Operand, operand_ty: Ty| {
+        let value = b.fresh_value(operand_ty);
         b.push(Stmt::Let(value, Rvalue::Un(UnOp::Neg, operand)));
         Operand::Value(value)
     };
@@ -8466,7 +8467,7 @@ fn lower_contracted_binary(
             return Some(terminated_operand());
         }
         if op == BinOp::Sub {
-            c = emit_neg(b, c);
+            c = emit_neg(b, c, rhs.ty);
         }
         return Some(emit_fma(b, a, bb, c));
     }
@@ -8484,7 +8485,7 @@ fn lower_contracted_binary(
             return Some(terminated_operand());
         }
         if op == BinOp::Sub {
-            a = emit_neg(b, a);
+            a = emit_neg(b, a, lhs.ty);
         }
         return Some(emit_fma(b, a, bb, c));
     }

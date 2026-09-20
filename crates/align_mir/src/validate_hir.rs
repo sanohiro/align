@@ -4561,7 +4561,10 @@ impl<'a> BodyValidator<'a> {
                 self.pipeline_stages_envelope_ok(stages)
                     && exact_float_mode(
                         *float_mode,
-                        if matches!(expression.ty, Ty::Float(_)) {
+                        if matches!(
+                            expression.ty,
+                            Ty::Float(_) | Ty::Result(Scalar::Float(_), _)
+                        ) {
                             context.float_mode
                         } else {
                             hir::FloatMode::STRICT
@@ -10462,7 +10465,7 @@ impl<'a> BodyValidator<'a> {
     ) -> Option<(Ty, bool, Vec<Ty>)> {
         let kind = &expression.kind;
         match kind {
-                hir::ExprKind::ArraySum { source, stages, .. } => {
+            hir::ExprKind::ArraySum { source, stages, .. } => {
                 let (elem, flows) = self.pipeline_prefix(source, stages, context)?;
                 if !numeric_body_ty(elem) {
                     return None;

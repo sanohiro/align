@@ -115,6 +115,8 @@ fn float_relaxation_scope_emits_only_its_named_permissions() {
             "pub fn plus_right(a: f64, b: f64, c: f64) -> f64 = float(contract) { c + a * b }\n",
             "pub fn minus_right(a: f64, b: f64, c: f64) -> f64 = float(contract) { a * b - c }\n",
             "pub fn both(a: f64, b: f64, c: f64) -> f64 = float(contract, reassoc) { c - a * b }\n",
+            "pub fn vector_minus_right(v: vec4<f64>) -> vec4<f64> = float(contract) { v * 2.0 - 1.0 }\n",
+            "pub fn vector_minus_left(v: vec4<f64>, w: vec4<f64>) -> vec4<f64> = float(contract) { v - w * 2.0 }\n",
             "fn main() -> i32 { return 0 }\n",
         ),
     );
@@ -141,6 +143,10 @@ fn float_relaxation_scope_emits_only_its_named_permissions() {
         ir.lines()
             .any(|line| line.contains("call reassoc double @llvm.fma.f64")),
         "the combined scope did not retain reassoc on its explicit FMA:\n{ir}",
+    );
+    assert!(
+        ir.contains("@llvm.fma.v4f64"),
+        "mixed vector/scalar subtraction did not preserve a valid vector FMA:\n{ir}",
     );
     assert!(
         !ir.lines()
@@ -229,7 +235,12 @@ fn float_relaxation_keeps_strict_bits_and_nan_infinity_defined() {
         return;
     }
     let source = concat!(
+        "fn left() -> f64 {\n  print(1)\n  return 2.0\n}\n",
+        "fn middle() -> f64 {\n  print(2)\n  return 3.0\n}\n",
+        "fn right() -> f64 {\n  print(3)\n  return 4.0\n}\n",
         "fn main() -> i32 {\n",
+        "  ordered := float(contract) { left() * middle() + right() }\n",
+        "  if ordered != 10.0 { return 4 }\n",
         "  strict := (10000000000000000.0 + (0.0 - 10000000000000000.0)) + 1.0\n",
         "  if strict.to_bits() != 4607182418800017408 { return 1 }\n",
         "  zero := 0.0\n",
@@ -242,6 +253,7 @@ fn float_relaxation_keeps_strict_bits_and_nan_infinity_defined() {
     );
     let output = build_and_run("sm-float-scope-defined", source);
     assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "1\n2\n3\n");
 }
 
 #[test]
@@ -252,11 +264,17 @@ fn float_reduction_scopes_reach_sum_and_dot_owners() {
     let ir = raw_ir(
         "sm-float-scope-reductions",
         concat!(
+            "import core.json\n",
+            "FloatRow { score: f64 }\n",
             "pub fn sum(borrow xs: slice<f64>) -> f64 = float(reassoc) { xs.sum() }\n",
             "pub fn vector(a: vec4<f64>, b: vec4<f64>) -> f64 = float(contract) { dot(a, b) }\n",
             "pub fn vector_sum(a: vec4<f64>) -> f64 = float(reassoc) { a.sum() }\n",
             "pub fn vector_sum_where(a: vec4<f64>, b: vec4<f64>) -> f64 = float(reassoc) { a.sum_where(a > b) }\n",
             "pub fn fixed() -> f64 = float(contract) { [1.0, 2.0].dot([3.0, 4.0]) }\n",
+            "pub fn scanner() -> Result<f64, Error> {\n",
+            "  rows: json.scanner<FloatRow> := json.scan(\"[{\\\"score\\\":1.0}]\")\n",
+            "  return float(reassoc) { rows.score.sum() }\n",
+            "}\n",
             "fn main() -> i32 { return 0 }\n",
         ),
     );
