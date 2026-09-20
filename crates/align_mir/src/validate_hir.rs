@@ -726,12 +726,12 @@ impl<'a> DeclarationValidator<'a> {
                             .iter()
                             .map(|candidate| candidate.name.as_str()),
                     )
-                    .filter_map(|name| {
+                    .filter(|name| {
                         same_unit_prefix
                             .as_ref()
                             .is_some_and(|prefix| name.starts_with(prefix))
-                            .then(|| name.to_string())
                     })
+                    .map(|name| name.to_string())
                     .collect();
                 align_sema::concrete_inline_body_externs(
                     function,

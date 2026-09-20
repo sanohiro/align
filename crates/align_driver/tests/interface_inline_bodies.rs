@@ -156,13 +156,17 @@ fn raw_and_c_extern_closures_are_rechecked_and_lowered_in_the_consumer() {
     let library = "\
 module native
 extern \"C\" fn abs(x: i32) -> i32
+extern \"C\" fn labs(x: i64) -> i64
+extern \"C\" link(\"m\") { fn acos(x: f64) -> f64 }
 pub fn cabs(x: i32) -> i64 = unsafe { abs(x) as i64 }
+pub fn mixed_extern_order(x: i64) -> i64 = unsafe { labs(x) + acos(1.0) as i64 }
 pub fn null_is_null() -> bool = unsafe { raw.null().is_null() }
 ";
     let main = "\
 import native
 fn main() {
   print(native.cabs(-42))
+  print(native.mixed_extern_order(-42))
   print(native.null_is_null())
 }
 ";
@@ -183,7 +187,11 @@ fn main() {
     assert!(externs[0].link.is_none());
 
     let consumer = built.unit("main");
-    for name in ["native$cabs", "native$null_is_null"] {
+    for name in [
+        "native$cabs",
+        "native$mixed_extern_order",
+        "native$null_is_null",
+    ] {
         assert!(
             consumer
                 .mir
@@ -197,7 +205,7 @@ fn main() {
         let whole = build_and_run_multi("interface-inline-native-whole", &files, "main.align");
         let per_unit = built.link_and_run();
         assert_eq!(whole.stdout, per_unit.stdout);
-        assert_eq!(String::from_utf8_lossy(&per_unit.stdout), "42\ntrue\n");
+        assert_eq!(String::from_utf8_lossy(&per_unit.stdout), "42\n42\ntrue\n");
     }
 }
 

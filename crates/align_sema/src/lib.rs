@@ -10462,8 +10462,11 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                 && external_return_provenance
                     .get(&mangled)
                     .is_some_and(|(_, _, _, _, _, _, _, externs)| externs.is_some());
-            if !is_generic && !concrete_inline && matches!(f.vis, ast::Vis::Pub) {
-                if let Some(sig) = sigs.get(&mangled) {
+            if !is_generic
+                && !concrete_inline
+                && matches!(f.vis, ast::Vis::Pub)
+                && let Some(sig) = sigs.get(&mangled)
+            {
                     let expected_cleanup = return_cleanup_abi(
                         sig.ret,
                         &structs,
@@ -10557,7 +10560,6 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                         parallel_transfer_params,
                         mutable_retention,
                     });
-                }
             }
             if !concrete_inline {
                 continue;
@@ -10882,12 +10884,12 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                     .iter()
                     .map(|candidate| candidate.name.as_str()),
             )
-            .filter_map(|name| {
+            .filter(|name| {
                 same_unit_prefix
                     .as_ref()
                     .is_some_and(|prefix| name.starts_with(prefix))
-                    .then(|| name.to_string())
             })
+            .map(|name| name.to_string())
             .collect::<std::collections::HashSet<_>>();
         let expected = external_return_provenance.get(&function.name);
         let exact_facts = expected.is_some_and(

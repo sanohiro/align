@@ -309,3 +309,13 @@ selected source-transport/available-externally strategy.
 |---|---|---|
 | Budget-version invalidation had no canonical byte | identity prose named a version but format 15 encoded only body source and extern closure | concrete-inline tag 2 now encodes exact little-endian u32 policy version 1 immediately after the tag; every other version rejects, exact goldens include it, and any eligibility/count change increments it or the interface format |
 | Local bindings were neither admitted nor rejected | statements contributed to the node budget but the domain listed only parameter reads | reject every immutable, mutable, inferred, annotated and tuple-destructuring binding and all dependent local reads; admit only wrapper blocks/unsafe plus a terminal return or tail expression, and add each binding form to the eligibility owner |
+
+## 7. Implementation-review finding closure
+
+The fresh full-diff review of implementation candidate `7a5ae92e` found one
+P2 canonical-order mismatch. The interface record orders externs by `(link,
+symbol)`, while the body walker reports referenced names by symbol. The
+producer-fact bridge now sorts its name-only projection by symbol before the
+consumer comparison. The focused interface owner and the two-unit native
+wrapper owner both cover the previously failing linked-`acos` plus unlinked-
+`labs` combination.

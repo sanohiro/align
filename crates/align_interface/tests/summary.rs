@@ -2454,6 +2454,26 @@ fn concrete_inline_extern_names_are_validated_before_source_reconstruction() {
 }
 
 #[test]
+fn concrete_inline_extern_fact_names_use_symbol_order_independent_of_link_order() {
+    let sums = summaries(&[
+        unit(
+            "lib",
+            false,
+            "module lib\nextern \"C\" link(\"z\") { fn a(x: i64) -> i64 }\nextern \"C\" fn b(x: i64) -> i64\npub fn both(x: i64) -> i64 = unsafe { a(x) + b(x) }\n",
+        ),
+        unit("main", true, "import lib\nfn main() -> i32 = 0\n"),
+    ]);
+    let summary = find(&sums, "lib");
+    let facts = align_interface::summary_return_provenance(summary, false);
+    assert_eq!(
+        facts
+            .get("lib$both")
+            .and_then(|(_, _, _, _, _, _, _, externs)| externs.as_ref()),
+        Some(&vec!["a".to_string(), "b".to_string()])
+    );
+}
+
+#[test]
 fn semantic_import_validates_nested_function_type_summaries() {
     let mut summary = one("pub Holder { value: i64 }\nfn main() -> i32 = 0\n").remove(0);
     summary.structs[0].fields[0].1 = IType::Fn {

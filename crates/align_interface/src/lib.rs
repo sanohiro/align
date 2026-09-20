@@ -3128,12 +3128,12 @@ pub fn summary_to_source(
             continue;
         };
         for external in externs {
-            if let Some(existing) = inline_externs.insert(external.name.clone(), external) {
-                if existing != external {
-                    return Err(ImportCompatibilityError::InlineExternInvalid(
-                        external.name.clone(),
-                    ));
-                }
+            if let Some(existing) = inline_externs.insert(external.name.clone(), external)
+                && existing != external
+            {
+                return Err(ImportCompatibilityError::InlineExternInvalid(
+                    external.name.clone(),
+                ));
             }
         }
     }
@@ -3240,12 +3240,14 @@ pub fn summary_return_provenance(
                 function.mutable_retention.clone(),
                 function.drop_state_effects.clone(),
                 match &function.body {
-                    IFnBody::ConcreteInline { externs, .. } => Some(
-                        externs
+                    IFnBody::ConcreteInline { externs, .. } => {
+                        let mut names = externs
                             .iter()
                             .map(|external| external.name.clone())
-                            .collect(),
-                    ),
+                            .collect::<Vec<_>>();
+                        names.sort();
+                        Some(names)
+                    }
                     IFnBody::Absent | IFnBody::GenericTemplate(_) => None,
                 },
             ),
