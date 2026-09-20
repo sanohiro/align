@@ -403,6 +403,19 @@ Consumers depend on the public-interface hash, not the implementation hash. Fina
 all implementation artifacts and the union of link summaries. Canonical encodings must not contain
 process-local numeric ids or hash-map iteration order.
 
+> **Plan 74 concrete inline bodies:** issue 1066 deliberately moves only an
+> admitted small non-generic `pub fn` body from implementation-only identity
+> into interface identity. Format 15's explicit `ConcreteInline` record carries
+> exact little-endian u32 policy version 1, the checked source and canonical
+> C-extern closure. Its body-kind bytes, extern records and policy version enter
+> `interface_hash`, so an
+> admitted edit or an admission-boundary crossing invalidates consumers; an
+> edit that remains nonadmitted retains the ordinary private-body behavior.
+> Consumers recheck the producer facts and emit the definition as LLVM
+> `available_externally`; the producer object remains the sole external symbol.
+> Exact edit-and-revert restores the previous interface hash and dependent unit
+> key. `docs/impl/74-interface-inline-body-plan.md` owns the full contract.
+
 > **Shipped Request 9 extension:** `docs/impl/24-owned-json-plan.md`
 > adds a sorted descriptor list for each accepted non-generic exported owned-JSON
 > record after the interface struct table. Each target-local `OwnedJsonDescV1` is

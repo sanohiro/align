@@ -99,7 +99,7 @@ widened into this table.
 | G6 | Every `core.math` function has a vector lowering on every supported target and one accuracy contract that holds for both lowerings | a documented ULP bound per function against the correctly rounded result; the scalar and vector lowerings produce bit-identical results, and so does every supported target; no scalar libcall inside a vector body | which loops the vectorizer chooses to widen | LLVM lowering, with the driver | the existing `crates/align_driver/tests/vec_simd.rs` and `crates/align_driver/tests/scalar_math.rs` owners extended to the exp/log family; a ULP conformance owner (planned); `examples/vec_math.align` | 1063 (revised, §6.1), with 1069 as a prerequisite |
 | G7 | Bytes reach typed slices through one checked, order-explicit, zero-copy view | construction allocates nothing and copies nothing; alignment and length are validated and yield `None` rather than trapping; the view carries the source borrow's authority and provenance; the named byte order must be the target's native order or the program is rejected at compile time | that a loop over the result then vectorizes — that is §6.3's gate, not this guarantee | sema, with MIR for the lowering | a view owner asserting no allocation and no copy in emitted IR; a `vecN` load reachable from `buffer.bytes()`; a negative owner for a non-native order (all planned) | 1064 (revised, §6.2) |
 | G8 | A mask is structural: lane count and lane bit width, not element type | `select` accepts any mask whose lane count and lane width match the blended vectors; emitted IR is a plain `select <N x i1>` with no conversion; a lane-count or lane-width mismatch keeps its existing diagnostic | nothing | sema | `examples/vec_argmax.align` plus its codegen owner, and negative owners for `mask4<f32>` gating `vec2<f64>` and `vec8<i32>` (all planned) | 1083 |
-| G9 | A function called from a pipeline stage or a hot loop is inlinable across units | a non-generic `pub fn` body under a size budget travels in the unit interface exactly as a generic body does today | whether LLVM inlines it at a given call site | `align_interface`, with the driver | a two-unit owner asserting the stage loop vectorizes across the unit boundary (planned) | none yet; issue 1066's comment carries the proposal and needs its own issue |
+| G9 | A function called from a pipeline stage or a hot loop is inlinable across units | a non-generic `pub fn` admitted by plan 74's target-independent checked-HIR budget travels in the unit interface with its exact extern closure and is emitted in the consumer as `available_externally`; no admitted call has a definition-unavailable refusal | whether LLVM inlines it at a given call site | `align_interface`, with sema, LLVM and the driver | plan 74's two-unit scalar, pipeline/explain-opt, extern-wrapper, symbol/link and cache corpus | 1066; plan 74 |
 | G10 | When a pipeline or counted loop stays scalar, the compiler says why | the vectorizer remarks `explain-opt` already collects are promoted to a first-class diagnostic on the loop, naming the blocker | nothing | driver (`09-explain-opt.md` owner) | an `explain-opt` owner asserting a known-scalar loop names its blocker (planned) | none yet; see §4 |
 
 ### 3.1 Prerequisites and artifact identity
@@ -328,11 +328,14 @@ rather than being special-cased where `select` is checked.
 
 A `pub fn` called from a pipeline stage stays a call across a unit boundary
 while a generic one inlines, so the same helper vectorizes or not depending on
-whether it happens to have a type parameter. The fix is to carry small
-non-generic bodies in the unit interface exactly as generic bodies already
-travel. Default ThinLTO is not the fix: it is blocked by the prelink defect
-(1070), it is a whole-program hammer for a per-function question, and it does
-not make the behavior predictable at the default profile.
+whether it happens to have a type parameter. Plan 74 carries a separately tagged
+small concrete body and its exact extern closure in the unit interface, then
+emits it in the consumer as `available_externally`. It deliberately does not
+overload the generic-template record: concrete imports retain producer-certified
+facts and never enter monomorphization. Default ThinLTO is not the fix: issue
+1070 repaired its prelink defect, but it remains a whole-program hammer for a
+per-function question and does not make the body available at the default
+per-unit profile.
 
 ### G10 — the compiler says why
 
@@ -356,7 +359,7 @@ in progress, parallel PR              G4 Part 1  1082 Part 1
 future RFC, surface not settled       G4 Part 2  1082 Part 2
 revised by this document              G6  1063 (§6.1)
                                       G7  1064 (§6.2)
-unfiled                               G9  1066 comment, needs its own issue
+design candidate                      G9  1066, plan 74
                                       G10 needs its own issue against
                                           09-explain-opt.md's owner
 ```
@@ -710,10 +713,8 @@ stated as a wall-clock number.
 Recorded per the large-design authoring gate.
 
 - Every normative promise in §3's prose appears in the ledger table, and every
-  ledger cell has a stated owner and corpus entry. Two guarantees have no
-  implementing issue yet and say so in the cell itself: G9 (issue 1066 carries
-  only a comment) and G10. Filing both is the first action this contract asks
-  for.
+  ledger cell has a stated owner and corpus entry. G9 now has issue 1066 and
+  plan 74; G10 remains the one guarantee without an implementing issue.
 - Every guarantee separates promise from try, and no guarantee is stated as a
   target-specific vector width or a wall-clock number.
 - Every guarantee states its prerequisite milestone and its artifact and cache
