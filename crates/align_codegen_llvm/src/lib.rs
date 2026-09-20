@@ -12423,6 +12423,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let ep = self.elem_ptr(*slot, idx)?;
                     self.drop_struct_fields(ep, *sid)?;
                 }
+                Stmt::DropField(slot, path) => {
+                    let (field_ptr, field_ty) = self.checked_field_path_ptr_and_ty(*slot, path)?;
+                    self.drop_ty_at(field_ptr, field_ty)?;
+                }
                 Stmt::DropElemField(slot, idx, path) => {
                     // Free one owned `string` leaf field of element `idx` before it is overwritten
                     // (4b) — `us[i].name` or a nested `us[i].addr.name`. The leaf field pointer is
@@ -19243,6 +19247,60 @@ impl<'c, 'a> FnGen<'c, 'a> {
         Ok(ptr)
     }
 
+    /// Checked counterpart used by cleanup records that may arrive through hand-built MIR.
+    fn checked_field_path_ptr_and_ty(
+        &self,
+        slot: Slot,
+        path: &[u32],
+    ) -> Result<(inkwell::values::PointerValue<'c>, Ty), CodegenError> {
+        if path.is_empty() {
+            return Err(self.err("DropField has an empty field path"));
+        }
+        let mut sid = match self.f.slots.get(slot as usize).copied() {
+            Some(Ty::Struct(id)) => id,
+            Some(_) => return Err(self.err("DropField destination is not a struct slot")),
+            None => return Err(self.err("DropField destination slot is out of bounds")),
+        };
+        let mut pointer = self
+            .slots
+            .get(&slot)
+            .copied()
+            .ok_or_else(|| self.err("DropField destination has no storage"))?;
+        for (depth, &logical) in path.iter().enumerate() {
+            let definition = self
+                .structs
+                .get(sid as usize)
+                .ok_or_else(|| self.err(format!("DropField struct definition id {sid} is missing")))?;
+            let field = definition
+                .fields
+                .get(logical as usize)
+                .ok_or_else(|| self.err("DropField field index is out of bounds"))?;
+            let llvm_ty = self
+                .struct_types
+                .get(sid as usize)
+                .copied()
+                .ok_or_else(|| self.err(format!("DropField LLVM struct id {sid} is missing")))?;
+            let physical = self
+                .field_perm
+                .get(sid as usize)
+                .and_then(|permutation| permutation.get(logical as usize))
+                .copied()
+                .ok_or_else(|| self.err("DropField layout entry is missing"))?;
+            pointer = self
+                .builder
+                .build_struct_gep(llvm_ty, pointer, physical, "drop.field.ptr")
+                .map_err(|error| self.err(error))?;
+            if depth + 1 == path.len() {
+                return Ok((pointer, field.ty));
+            }
+            sid = match field.ty {
+                Ty::Struct(id) => id,
+                _ => return Err(self.err("DropField path crosses a non-struct field")),
+            };
+        }
+        Err(self.err("DropField path is incomplete"))
+    }
+
     /// Call the module's one private iterative destructor for a Move struct at `base`.
     /// Null-safe: an unconstructed / moved-out struct was zeroed (`DropFlagInit`), so each owned
     /// leaf reads `{null,0}` and `free(null)` is a no-op. Copy structs need no helper or call.
@@ -23851,6 +23909,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             | Stmt::NullStructField(slot, _)
             | Stmt::NullElemField(slot, ..)
             | Stmt::Drop(slot)
+            | Stmt::DropField(slot, _)
             | Stmt::DropElem(slot, ..)
             | Stmt::DropElemField(slot, ..)
             | Stmt::ArrayTruncate { root: slot, .. } => *slot == root,
@@ -32494,6 +32553,29 @@ fn main() -> i32 = 0
             error.to_string().contains("struct definition id 1 is missing"),
             "unexpected malformed-id diagnostic: {error}"
         );
+    }
+
+    #[test]
+    fn malformed_partial_field_drop_paths_are_diagnosed() {
+        for (path, expected) in [
+            (vec![], "empty field path"),
+            (vec![1], "field index is out of bounds"),
+            (vec![0, 0], "path crosses a non-struct field"),
+        ] {
+            let error = codegen_program(
+                vec![Stmt::DropField(0, path)],
+                vec![],
+                vec![Ty::Struct(0)],
+                vec![test_struct("Element", &[Ty::String])],
+                vec![],
+                vec![],
+            )
+            .expect_err("a malformed partial-field path must fail closed");
+            assert!(
+                error.to_string().contains(expected),
+                "expected `{expected}`, got `{error}`"
+            );
+        }
     }
 
     #[test]

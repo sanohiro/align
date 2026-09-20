@@ -370,6 +370,7 @@ fn variant_sweep_tripwire(stmt: &Stmt) {
         | Stmt::NullStructField { .. }
         | Stmt::NullElemField { .. }
         | Stmt::Drop { .. }
+        | Stmt::DropField { .. }
         | Stmt::DropElem { .. }
         | Stmt::DropElemField { .. }
         | Stmt::BorrowedElementReservation { .. }
@@ -681,6 +682,7 @@ fn statement_facts<'a>(function: &Function, stmt: &'a Stmt) -> StmtFacts<'a> {
             WritesSlot(*slot, "NullElemField", vec![index])
         }
         Stmt::Drop(slot) => WritesSlot(*slot, "Drop", Vec::new()),
+        Stmt::DropField(slot, _) => WritesSlot(*slot, "DropField", Vec::new()),
         Stmt::DropElem(slot, index, _) => WritesSlot(*slot, "DropElem", vec![index]),
         Stmt::DropElemField(slot, index, _) => {
             WritesSlot(*slot, "DropElemField", vec![index])
@@ -726,6 +728,7 @@ fn stmt_operands_mut(stmt: &mut Stmt) -> Option<Vec<&mut Operand>> {
         Stmt::NullStructField(_, _) => Vec::new(),
         Stmt::NullElemField(_, index, _) => vec![index],
         Stmt::Drop(_) => Vec::new(),
+        Stmt::DropField(_, _) => Vec::new(),
         Stmt::DropElem(_, index, _) => vec![index],
         Stmt::DropElemField(_, index, _) => vec![index],
         Stmt::BorrowedElementReservation { token: _, root: _ } => Vec::new(),
@@ -2702,6 +2705,7 @@ mod tests {
             ("NullStructField", Stmt::NullStructField(1, 0), false),
             ("NullElemField", Stmt::NullElemField(1, scalar.clone(), vec![0]), false),
             ("Drop", Stmt::Drop(1), false),
+            ("DropField", Stmt::DropField(1, vec![0]), false),
             ("DropElem", Stmt::DropElem(1, scalar.clone(), 0), false),
             ("DropElemField", Stmt::DropElemField(1, scalar.clone(), vec![0]), false),
             (

@@ -2071,6 +2071,7 @@ fn assert_xml_stmt_variant_classified(statement: &Stmt) {
         | Stmt::NullStructField(..)
         | Stmt::NullElemField(..)
         | Stmt::Drop(..)
+        | Stmt::DropField(..)
         | Stmt::DropElem(..)
         | Stmt::DropElemField(..)
         | Stmt::BorrowedElementReservation { .. }

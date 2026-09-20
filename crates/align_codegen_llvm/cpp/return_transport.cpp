@@ -84,6 +84,13 @@ struct ParamPlan {
   ResultLayout Layout;
 };
 
+struct FreshReturnPlan {
+  AllocaInst *Slot;
+  LoadInst *Load;
+  StoreInst *Zero;
+  SmallVector<IntrinsicInst *, 2> Lifetimes;
+};
+
 StructType *cleanupPair(FunctionType *FT, AttributeList Attrs) {
   if (!Attrs.hasFnAttr(CleanupCall)) return nullptr;
   auto *Pair = dyn_cast<StructType>(FT->getReturnType());
@@ -453,6 +460,112 @@ StoreInst *cleanupMaterializingStore(CallInst &Call,
         return nullptr;
     }
   return Store;
+}
+
+bool collectFreshReturnWrites(Value *Pointer, Type *Ty, LoadInst &FinalLoad,
+                              DominatorTree &Dominators, bool Root,
+                              StoreInst *&Zero,
+                              SmallVectorImpl<StoreInst *> &Writes,
+                              SmallVectorImpl<IntrinsicInst *> &Lifetimes) {
+  StoreInst *WholeWrite = nullptr;
+  DenseMap<unsigned, GetElementPtrInst *> Children;
+  for (User *User : Pointer->users()) {
+    auto *Use = dyn_cast<Instruction>(User);
+    if (!Use) return false;
+    if (Root && Use == &FinalLoad) continue;
+    if (auto *Intrinsic = dyn_cast<IntrinsicInst>(Use);
+        Intrinsic && Intrinsic->isLifetimeStartOrEnd()) {
+      Lifetimes.push_back(Intrinsic);
+      continue;
+    }
+    if (auto *Store = dyn_cast<StoreInst>(Use)) {
+      if (!Store->isSimple() || Store->getPointerOperand() != Pointer ||
+          Store->getValueOperand()->getType() != Ty ||
+          !Dominators.dominates(Store, &FinalLoad))
+        return false;
+      if (Root && isa<ConstantAggregateZero>(Store->getValueOperand())) {
+        if (Zero) return false;
+        Zero = Store;
+        continue;
+      }
+      if (Root || WholeWrite) return false;
+      WholeWrite = Store;
+      Writes.push_back(Store);
+      continue;
+    }
+    auto *GEP = dyn_cast<GetElementPtrInst>(Use);
+    auto *Struct = dyn_cast<StructType>(Ty);
+    if (!GEP || !Struct || GEP->getPointerOperand() != Pointer ||
+        GEP->getSourceElementType() != Ty || GEP->getNumIndices() != 2 ||
+        !GEP->isInBounds() || !Dominators.dominates(GEP, &FinalLoad))
+      return false;
+    auto Index = GEP->idx_begin();
+    auto *Base = dyn_cast<ConstantInt>(Index->get());
+    auto *Field = dyn_cast<ConstantInt>((++Index)->get());
+    if (!Base || !Base->isZero() || !Field ||
+        Field->getValue().getActiveBits() > 32)
+      return false;
+    unsigned FieldIndex = Field->getZExtValue();
+    if (FieldIndex >= Struct->getNumElements() ||
+        !Children.try_emplace(FieldIndex, GEP).second)
+      return false;
+  }
+  if (WholeWrite) return Children.empty();
+  auto *Struct = dyn_cast<StructType>(Ty);
+  if (!Struct || (Root && !Zero) || Children.size() != Struct->getNumElements())
+    return false;
+  for (unsigned I = 0; I < Struct->getNumElements(); ++I) {
+    auto It = Children.find(I);
+    if (It == Children.end() ||
+        !collectFreshReturnWrites(It->second, Struct->getElementType(I),
+                                  FinalLoad, Dominators, false, Zero,
+                                  Writes, Lifetimes))
+      return false;
+  }
+  return true;
+}
+
+std::optional<FreshReturnPlan> freshCleanupReturn(Value *Pair,
+                                                  const ResultLayout &Layout) {
+  auto *WithCleanup = dyn_cast<InsertValueInst>(Pair);
+  if (!WithCleanup || WithCleanup->getNumIndices() != 1 ||
+      *WithCleanup->idx_begin() != 1 || !WithCleanup->hasOneUse() ||
+      !isa<ReturnInst>(*WithCleanup->user_begin()))
+    return std::nullopt;
+  auto *WithValue = dyn_cast<InsertValueInst>(WithCleanup->getAggregateOperand());
+  if (!WithValue || WithValue->getNumIndices() != 1 ||
+      *WithValue->idx_begin() != 0 || !WithValue->hasOneUse())
+    return std::nullopt;
+  auto *Load = dyn_cast<LoadInst>(WithValue->getInsertedValueOperand());
+  auto *Slot = Load ? dyn_cast<AllocaInst>(Load->getPointerOperand()) : nullptr;
+  auto *Count = Slot ? dyn_cast<ConstantInt>(Slot->getArraySize()) : nullptr;
+  if (!Load || !Load->hasOneUse() || !Load->isSimple() ||
+      Load->getType() != Layout.Ty ||
+      Load->getAlign() < Layout.Alignment || !Slot || !Count ||
+      !Count->isOne() || Slot->getAllocatedType() != Layout.Ty ||
+      Slot->getAddressSpace() != Layout.AddressSpace ||
+      Slot->getAlign() < Layout.Alignment ||
+      Slot->getParent() != &Slot->getFunction()->getEntryBlock())
+    return std::nullopt;
+  DominatorTree Dominators(*Slot->getFunction());
+  StoreInst *Zero = nullptr;
+  SmallVector<StoreInst *, 8> Writes;
+  SmallVector<IntrinsicInst *, 2> Lifetimes;
+  if (!collectFreshReturnWrites(Slot, Layout.Ty, *Load, Dominators, true,
+                                Zero, Writes, Lifetimes))
+    return std::nullopt;
+  for (StoreInst *Write : Writes)
+    if (!Dominators.dominates(Zero, Write)) return std::nullopt;
+  return FreshReturnPlan{Slot, Load, Zero, std::move(Lifetimes)};
+}
+
+void forwardFreshReturn(FreshReturnPlan &Plan, Value *Destination) {
+  for (IntrinsicInst *Lifetime : Plan.Lifetimes) Lifetime->eraseFromParent();
+  Plan.Zero->eraseFromParent();
+  Plan.Load->replaceAllUsesWith(PoisonValue::get(Plan.Load->getType()));
+  Plan.Load->eraseFromParent();
+  Plan.Slot->replaceAllUsesWith(Destination);
+  Plan.Slot->eraseFromParent();
 }
 
 const ParamPlan *findParam(ArrayRef<ParamPlan> Plans, unsigned Index) {
@@ -962,17 +1075,25 @@ bool normalize(Module &M, TargetMachine &TM, ArrayRef<LLVMValueRef> Owned,
       if (!Ret) continue;
       Value *Pair = Ret->getReturnValue();
       if (!Pair) { Error = "cleanup return omitted its pair"; return false; }
+      std::optional<FreshReturnPlan> Fresh =
+          P.ValueIndirect ? freshCleanupReturn(Pair, P.ValueLayout)
+                          : std::nullopt;
       IRBuilder<> Builder(Ret);
       Builder.SetCurrentDebugLocation(Ret->getDebugLoc());
-      Value *ValuePart = Builder.CreateExtractValue(Pair, 0, "return.value");
+      Value *ValuePart = Fresh ? nullptr
+                               : Builder.CreateExtractValue(Pair, 0,
+                                                            "return.value");
       Value *CleanupBit = Builder.CreateExtractValue(Pair, 1, "return.cleanup");
       Value *CleanupByte = Builder.CreateZExt(CleanupBit,
                                               Type::getInt8Ty(M.getContext()),
                                               "return.cleanup.byte");
       Builder.CreateAlignedStore(CleanupByte, New->getArg(Hidden - 1), Align(1));
       if (P.ValueIndirect) {
-        Builder.CreateAlignedStore(ValuePart, New->getArg(0),
-                                   P.ValueLayout.Alignment);
+        if (Fresh)
+          forwardFreshReturn(*Fresh, New->getArg(0));
+        else
+          Builder.CreateAlignedStore(ValuePart, New->getArg(0),
+                                     P.ValueLayout.Alignment);
         Builder.CreateRetVoid();
       } else {
         Builder.CreateRet(ValuePart);

@@ -7,8 +7,8 @@ The align-llm audit issue batch is partly shipped. Merged: #1089 (plan 68),
 (plan 69 PR 1), #1113, #1114 (plan 70 ledger), #1115, #1116 (plan 69 PR 2,
 closes #1081), #1124 (build-performance items 7 and 8), #1125 (the first
 post-#1124 nightly repair), #1128 (plan 70 PR 2), #1129 (plan 70 PR 3), and
-#1130 (plan 71 ledger), #1131 (plan 71 PR 1), and #1132 (plan 71 PR 2). Plan 71
-PR 3 is implemented locally as the current candidate. Every remaining item
+#1130 (plan 71 ledger), #1131 (plan 71 PR 1), #1132 (plan 71 PR 2), and #1133
+(plan 71 PR 3). Plan 71 PR 4 is implemented locally as the current candidate. Every remaining item
 below starts from `main` with a fresh branch and follows the CLAUDE.md review
 flow.
 
@@ -60,10 +60,10 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    PR 2 merged in #1132: a serialized per-parameter drop-state effect
    specializes direct mutable-borrow cleanup transport, while function values,
    closures, and explicit exports retain conservative adapters; the unified
-   drop-state simplifier also removes only proved-dead move-out nulling. PR 3 is
-   the current candidate: target-selected `byval`, split cleanup-result
-   transport, and tag-first consumption. The remaining ordered capability is
-   fresh-whole-value destination construction with reached-exit partial cleanup.
+   drop-state simplifier also removes only proved-dead move-out nulling. PR 3
+   merged in #1133 with target-selected `byval`, split cleanup-result transport,
+   and tag-first consumption. PR 4 is the current candidate: fresh-whole-value
+   destination construction with reached-exit partial cleanup.
    Field replacement and indexed
    destinations deliberately retain temporaries to preserve RHS, Drop and
    bounds-error order.

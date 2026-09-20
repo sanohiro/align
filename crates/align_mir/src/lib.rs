@@ -756,6 +756,10 @@ pub enum Stmt {
     NullElemField(Slot, Operand, Vec<u32>),
     /// Drop a free-standing owned `array<T>` slot: free its buffer (null-safe).
     Drop(Slot),
+    /// Drop one initialized Move field of a struct slot during reached control-transfer cleanup.
+    /// The path is logical and may cross nested structs. Fresh aggregate construction emits this
+    /// only behind the field's exact runtime ownership flag; terminal paths have no cleanup edge.
+    DropField(Slot, Vec<u32>),
     /// Drop element `index` of a fixed Move-struct array slot: free that element's owned fields
     /// (recursively), before it is overwritten by a whole-element store (`us[i] = new`, Slice 4b).
     /// `u32` is the element struct id. Null-safe (a moved/unwritten element reads nulls).
@@ -4783,7 +4787,7 @@ fn simplify_drop_state(f: &mut Function) {
                 if f.blocks
                     .get(*then_bb as usize)
                     .and_then(|block| block.stmts.first())
-                    .is_some_and(|stmt| matches!(stmt, Stmt::Drop(_) | Stmt::DropValue(_)))
+                    .is_some_and(|stmt| matches!(stmt, Stmt::Drop(_) | Stmt::DropField(..) | Stmt::DropValue(_)))
         )
     }
 
@@ -4804,6 +4808,7 @@ fn simplify_drop_state(f: &mut Function) {
             Stmt::Let(_, Rvalue::CallWithCleanup(call)) => call.args.iter().all(|operand| !operand_mentions_slot(operand, slot)),
             Stmt::Store(target, operand) => *target != slot && !operand_mentions_slot(operand, slot),
             Stmt::Drop(target) => *target != slot,
+            Stmt::DropField(target, _) => *target != slot,
             Stmt::DropValue(operand) => !operand_mentions_slot(operand, slot),
             _ => false,
         }
@@ -5227,6 +5232,10 @@ struct Builder {
     /// Locals whose declaration initializer is individually owned (the initial flag value after
     /// their `let`; parameters in this set are live at entry).
     drop_individual_locals: Vec<Slot>,
+    /// Move fields already installed into fresh aggregate destinations that have not yet become
+    /// complete values. Reached exits drop these in reverse source order before ordinary locals;
+    /// successful construction truncates the corresponding suffix and publishes the whole flag.
+    partial_fields: Vec<PartialField>,
     /// Static per-expression allocation provenance produced by escape analysis. Branch lowering
     /// combines these constants with path-local flags loaded from moved locals.
     drop_individual_exprs: std::collections::HashMap<Span, bool>,
@@ -5306,6 +5315,13 @@ struct BuilderCtx {
     /// Monotonic identity for indexed shared-borrow reservation markers. Kept behind the existing
     /// context box so the recursively passed [`Builder`] retains its established stack footprint.
     next_borrow_reservation: u32,
+}
+
+#[derive(Clone)]
+struct PartialField {
+    destination: Slot,
+    path: Vec<u32>,
+    flag: Slot,
 }
 
 /// Located-lowering state carried through one function's [`BuilderCtx`].
@@ -5438,6 +5454,9 @@ struct LoopFrame {
     /// Owned locals declared inside the loop body (a subset of `drop_locals`). Their live flags are
     /// conditionally dropped at the back-edge and at each `break`.
     iter_drops: Vec<Slot>,
+    /// Partial fields already active outside this loop. A `break` drops only the suffix formed in
+    /// the loop body; an enclosing aggregate whose field expression is this loop stays live.
+    partial_fields_base: usize,
 }
 
 impl Builder {
@@ -5451,6 +5470,7 @@ impl Builder {
             self.push(Stmt::TgWait(Operand::Value(h)));
             self.push(Stmt::TgEnd(Operand::Value(h)));
         }
+        self.emit_partial_field_cleanup_from(0);
         for s in self.drop_locals.clone().into_iter().rev() {
             self.emit_drop_if_live(s);
         }
@@ -5625,6 +5645,26 @@ impl Builder {
         self.set_drop_flag(slot, false);
         self.terminate(Term::Goto(next_bb));
         self.cur = next_bb;
+    }
+
+    fn emit_drop_field_if_live(&mut self, field: PartialField) {
+        let live = self.fresh_value(Ty::Bool);
+        self.push(Stmt::Let(live, Rvalue::Load(field.flag)));
+        let drop_bb = self.new_block();
+        let next_bb = self.new_block();
+        self.terminate(Term::Branch(Operand::Value(live), drop_bb, next_bb));
+        self.cur = drop_bb;
+        self.push(Stmt::DropField(field.destination, field.path));
+        self.push(Stmt::Store(field.flag, Operand::Const(Const::Bool(false))));
+        self.terminate(Term::Goto(next_bb));
+        self.cur = next_bb;
+    }
+
+    fn emit_partial_field_cleanup_from(&mut self, base: usize) {
+        let fields = self.partial_fields[base..].to_vec();
+        for field in fields.into_iter().rev() {
+            self.emit_drop_field_if_live(field);
+        }
     }
 
     /// Drop an owned value only when its containing aggregate is individually owned. Unlike
@@ -5918,6 +5958,7 @@ fn lower_fn(
         drop_locals: f.drop_locals.clone(),
         drop_flags,
         drop_individual_locals: f.drop_individual_locals.clone(),
+        partial_fields: Vec::new(),
         drop_individual_exprs: f.drop_individual_exprs.clone(),
         borrowed_bindings: std::collections::HashMap::new(),
         tuples: tuples.to_vec(),
@@ -6868,18 +6909,12 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                         &b.tagged_types,
                     ) =>
                 {
-                    // A Move struct must use the guarded aggregate materializer. Completed fresh
-                    // fields remain owned until every later field succeeds, and the destination
-                    // inherits the runtime mode of a heap/arena-joined source member.
-                    let (op, owners) = lower_consumed_call_arg(b, init);
+                    // A fresh Move local is its final construction destination. Each completed
+                    // Move leaf is registered before the next expression is evaluated, so a
+                    // reached early exit drops exactly that prefix without a whole-value scratch.
+                    inherited_flag = store_fresh_struct_fields(b, *local, init);
                     if !lowering_continues(b) {
                         return;
-                    }
-                    inherited_flag = lowered_drop_flag(b, init, &op);
-                    b.push(Stmt::Store(*local, op));
-                    null_consumed_struct_sources(b, init);
-                    for owner in owners {
-                        b.set_drop_flag(owner, false);
                     }
                 }
                 hir::ExprKind::StructLit { .. } => store_value_at(b, *local, &mut Vec::new(), init),
@@ -7233,8 +7268,12 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 b.terminate(Term::Unreachable);
                 return;
             };
-            let (result_slot, iter_drops, exit) =
-                (frame.result_slot, frame.iter_drops.clone(), frame.exit);
+            let (result_slot, iter_drops, partial_fields_base, exit) = (
+                frame.result_slot,
+                frame.iter_drops.clone(),
+                frame.partial_fields_base,
+                frame.exit,
+            );
             let op = match value {
                 Some(e) => Some(lower_required!(b, lower_expr(b, e), ())),
                 None => None,
@@ -7245,6 +7284,11 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             if let Some(e) = value {
                 null_moved_source(b, e);
             }
+            // A construction started inside this loop will never publish its whole-value flag on
+            // this edge. Drop only that loop-local suffix; partial fields of an enclosing
+            // construction survive when this loop is itself one field expression.
+            b.emit_partial_field_cleanup_from(partial_fields_base);
+            b.partial_fields.truncate(partial_fields_base);
             // Conditionally drop this iteration's owned locals and clear their flags, so function
             // cleanup cannot drop the same values again. A moved-out `break` value already has a
             // clear flag. Sema forbids a
@@ -11041,6 +11085,89 @@ fn store_consumed_struct_fields(
         }
     }
     true
+}
+
+/// Construct a fresh Move struct directly in `slot`. The active partial-field suffix is a
+/// lowering-time ownership record: every reached exit emitted while a later field is evaluated
+/// observes the completed prefix and drops it in reverse order. Hard traps and divergence emit no
+/// successor cleanup. On success the suffix is retired and the caller publishes the whole flag.
+fn store_fresh_struct_fields(b: &mut Builder, slot: Slot, value: &hir::Expr) -> Option<Operand> {
+    fn store(
+        b: &mut Builder,
+        slot: Slot,
+        path: &mut Vec<u32>,
+        value: &hir::Expr,
+        aggregate_drop_flag: &mut Option<Operand>,
+    ) -> bool {
+        match &value.kind {
+            hir::ExprKind::StructLit { fields, .. } => {
+                for (index, field) in fields.iter().enumerate() {
+                    path.push(index as u32);
+                    let complete = store(b, slot, path, field, aggregate_drop_flag);
+                    path.pop();
+                    if !complete {
+                        return false;
+                    }
+                }
+            }
+            _ => {
+                let operand = lower_expr(b, value);
+                if !lowering_continues(b) {
+                    return false;
+                }
+                let move_field = needs_drop_flag(
+                    value.ty,
+                    &b.structs,
+                    &b.tuples,
+                    &b.enums,
+                    &b.tagged_types,
+                );
+                let live = move_field.then(|| {
+                    lowered_drop_flag(b, value, &operand)
+                        .unwrap_or(Operand::Const(Const::Bool(false)))
+                });
+                b.push(Stmt::StoreField(slot, path.clone(), operand));
+                if let Some(live) = live {
+                    // Ownership transfers only after the destination store completes. From this
+                    // point every reached exit sees the field record; the source is no longer live.
+                    null_moved_source(b, value);
+                    let flag = b.new_slot(Ty::Bool);
+                    b.push(Stmt::Store(flag, live.clone()));
+                    b.partial_fields.push(PartialField {
+                        destination: slot,
+                        path: path.clone(),
+                        flag,
+                    });
+                    *aggregate_drop_flag = Some(match aggregate_drop_flag.take() {
+                        None => live,
+                        Some(previous) => {
+                            let both = b.fresh_value(Ty::Bool);
+                            b.push(Stmt::Let(both, Rvalue::Bin(BinOp::And, previous, live)));
+                            Operand::Value(both)
+                        }
+                    });
+                }
+            }
+        }
+        true
+    }
+
+    let first_partial = b.partial_fields.len();
+    let mut aggregate_drop_flag = None;
+    if !store(
+        b,
+        slot,
+        &mut Vec::new(),
+        value,
+        &mut aggregate_drop_flag,
+    ) {
+        // The reached transfer already emitted cleanup on its edge. Restore the lowering-time
+        // lexical stack before another CFG arm or a loop exit resumes construction.
+        b.partial_fields.truncate(first_partial);
+        return None;
+    }
+    b.partial_fields.truncate(first_partial);
+    aggregate_drop_flag
 }
 
 /// Complete the delayed source transfer for a materialized struct literal. `null_moved_source`
@@ -23621,10 +23748,12 @@ fn lower_loop(b: &mut Builder, e: &hir::Expr) -> Operand {
     let exit = b.new_block();
     b.terminate(Term::Goto(header));
     b.cur = header;
+    let partial_fields_base = b.partial_fields.len();
     b.loops.push(LoopFrame {
         exit,
         result_slot,
         iter_drops,
+        partial_fields_base,
     });
     let _ = lower_block(b, body); // the body's trailing value is discarded each iteration
     // Fall-through end of an iteration: conditionally drop this pass's per-iteration owned locals
@@ -25889,6 +26018,7 @@ fn main() -> i32 {
             drop_locals: Vec::new(),
             drop_flags: Vec::new(),
             drop_individual_locals: Default::default(),
+            partial_fields: Vec::new(),
             drop_individual_exprs: Default::default(),
             borrowed_bindings: Default::default(),
             tuples: Vec::new(),
@@ -30064,25 +30194,41 @@ fn main() -> i32 = 0
         let p = lower(
             "Wrap { xs: array<i64>, n: i64 }\nfn make() -> array<i64> = [1].to_array()\nfn partial() -> i32 {\n  w := Wrap { xs: make(), n: { return 0 } }\n  return 1\n}\nfn partial_array() -> i32 {\n  rows := [Wrap { xs: make(), n: { return 0 } }]\n  return 1\n}\nfn joined(c: bool) -> i64 {\n  arena {\n    mut xs := make()\n    if c {\n      xs = [2].to_array()\n    }\n    w := Wrap { xs: xs, n: 0 }\n    return w.xs.len()\n  }\n}\nfn main() -> i32 = 0\n",
         );
-        for (name, shape) in [
-            ("partial", "direct struct let"),
-            ("partial_array", "fixed Move-struct array let"),
-        ] {
-            let partial = p
-                .fns
+        let function = |name: &str| {
+            p.fns
                 .iter()
                 .find(|f| f.name.as_str() == name)
-                .expect("partial aggregate MIR");
-            assert!(
-                partial
-                    .blocks
-                    .iter()
-                    .flat_map(|block| &block.stmts)
-                    .any(|stmt| matches!(stmt, Stmt::Drop(slot) if partial.slots[*slot as usize] == Ty::DynArray(scalar_of(i64_ty())))),
-                "a {shape} must retain its completed fresh field across a later return:\n{}",
-                print::function_to_string(partial)
-            );
-        }
+                .expect("aggregate MIR function")
+        };
+        let partial = function("partial");
+        assert!(
+            partial
+                .blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .any(|stmt| matches!(stmt, Stmt::DropField(_, path) if path == &[0])),
+            "a fresh struct destination must drop its completed field on a later return:\n{}",
+            print::function_to_string(partial)
+        );
+        assert!(
+            partial.blocks.iter().flat_map(|block| &block.stmts).all(|stmt| {
+                !matches!(stmt, Stmt::Store(slot, _) if matches!(partial.slots[*slot as usize], Ty::Struct(_)))
+                    && !matches!(stmt, Stmt::Let(_, Rvalue::Load(slot)) if matches!(partial.slots[*slot as usize], Ty::Struct(_)))
+            }),
+            "a fresh struct let must have no whole-aggregate scratch store/load:\n{}",
+            print::function_to_string(partial)
+        );
+
+        let partial_array = function("partial_array");
+        assert!(
+            partial_array
+                .blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .any(|stmt| matches!(stmt, Stmt::Drop(slot) if partial_array.slots[*slot as usize] == Ty::DynArray(scalar_of(i64_ty())))),
+            "the fixed-array fallback must retain its completed fresh field across a later return:\n{}",
+            print::function_to_string(partial_array)
+        );
 
         let joined = p
             .fns
@@ -30090,13 +30236,13 @@ fn main() -> i32 = 0
             .find(|f| f.name.as_str() == "joined")
             .expect("joined MIR");
         let forwards_runtime_flag = joined.blocks.iter().any(|block| {
-            let stores_struct = block.stmts.iter().any(
-                |stmt| matches!(stmt, Stmt::Store(slot, Operand::Value(_)) if matches!(joined.slots[*slot as usize], Ty::Struct(_))),
+            let stores_struct_field = block.stmts.iter().any(
+                |stmt| matches!(stmt, Stmt::StoreField(slot, path, Operand::Value(_)) if matches!(joined.slots[*slot as usize], Ty::Struct(_)) && path == &[0]),
             );
             let stores_dynamic_bool = block.stmts.iter().any(
                 |stmt| matches!(stmt, Stmt::Store(slot, Operand::Value(value)) if joined.slots[*slot as usize] == Ty::Bool && joined.value_tys[*value as usize] == Ty::Bool),
             );
-            stores_struct && stores_dynamic_bool
+            stores_struct_field && stores_dynamic_bool
         });
         assert!(
             forwards_runtime_flag,
@@ -30205,7 +30351,7 @@ fn main() -> i32 = 0
         });
         assert_no_post_clear_reload(
             "structured",
-            &|stmt| matches!(stmt, Stmt::Let(value, Rvalue::Load(_)) if p.fns.iter().find(|f| f.name.as_str() == "structured").is_some_and(|f| matches!(f.value_tys[*value as usize], Ty::Struct(_)))),
+            &|stmt| matches!(stmt, Stmt::StoreField(_, path, _) if path == &[0]),
         );
         assert_no_post_clear_reload("enumed", &|stmt| {
             matches!(stmt, Stmt::Let(_, Rvalue::MakeEnum { .. }))

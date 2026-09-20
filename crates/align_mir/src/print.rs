@@ -172,6 +172,9 @@ fn block_to_string(out: &mut String, b: &Block) {
             Stmt::Drop(slot) => {
                 let _ = writeln!(out, "    drop _{slot}");
             }
+            Stmt::DropField(slot, path) => {
+                let _ = writeln!(out, "    drop_field _{slot}{}", path_str(path));
+            }
             Stmt::DropElem(slot, idx, sid) => {
                 let _ = writeln!(out, "    drop_elem _{slot}[{}] (struct#{sid})", operand_str(idx));
             }

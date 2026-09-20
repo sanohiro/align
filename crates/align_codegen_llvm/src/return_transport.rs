@@ -245,6 +245,69 @@ attributes #0 = { "align.program.cleanup" }
     }
 
     #[test]
+    fn complete_fresh_cleanup_return_constructs_in_sret_and_incomplete_falls_back()
+    -> Result<(), String> {
+        let ctx = Context::create();
+        let module = parse(
+            &ctx,
+            r#"
+%Big = type { [27 x i64], i64 }
+define { %Big, i1 } @complete(i64 %value) #0 {
+entry:
+  %slot = alloca %Big, align 8
+  store %Big zeroinitializer, ptr %slot, align 8
+  %f0 = getelementptr inbounds %Big, ptr %slot, i32 0, i32 0
+  store [27 x i64] zeroinitializer, ptr %f0, align 8
+  %f1 = getelementptr inbounds %Big, ptr %slot, i32 0, i32 1
+  store i64 %value, ptr %f1, align 8
+  %loaded = load %Big, ptr %slot, align 8
+  %p0 = insertvalue { %Big, i1 } poison, %Big %loaded, 0
+  %p1 = insertvalue { %Big, i1 } %p0, i1 true, 1
+  ret { %Big, i1 } %p1
+}
+define { %Big, i1 } @incomplete(i64 %value) #0 {
+entry:
+  %slot = alloca %Big, align 8
+  store %Big zeroinitializer, ptr %slot, align 8
+  %f0 = getelementptr inbounds %Big, ptr %slot, i32 0, i32 0
+  store [27 x i64] zeroinitializer, ptr %f0, align 8
+  %loaded = load %Big, ptr %slot, align 8
+  %p0 = insertvalue { %Big, i1 } poison, %Big %loaded, 0
+  %p1 = insertvalue { %Big, i1 } %p0, i1 true, 1
+  ret { %Big, i1 } %p1
+}
+attributes #0 = { "align.program.cleanup" }
+"#,
+        )?;
+        let tm = target()?;
+        module.set_data_layout(&tm.get_target_data().get_data_layout());
+        module.set_triple(&tm.get_triple());
+        let owned: Vec<_> = module.get_functions().collect();
+        normalize(&module, &tm, &owned).map_err(|error| error.to_string())?;
+        let raw = module.print_to_string().to_string();
+        let complete = raw
+            .split("define void @complete(")
+            .nth(1)
+            .and_then(|body| body.split("\n}").next())
+            .ok_or_else(|| raw.clone())?;
+        assert!(complete.contains("ptr sret(%Big)"), "{raw}");
+        assert!(!complete.contains("alloca %Big"), "{complete}");
+        assert!(!complete.contains("load %Big"), "{complete}");
+        assert!(!complete.contains("store %Big"), "{complete}");
+        assert!(complete.contains("ptr %result.destination"), "{complete}");
+        let incomplete = raw
+            .split("define void @incomplete(")
+            .nth(1)
+            .and_then(|body| body.split("\n}").next())
+            .ok_or_else(|| raw.clone())?;
+        assert!(incomplete.contains("alloca %Big"), "{incomplete}");
+        assert!(incomplete.contains("load %Big"), "{incomplete}");
+        assert!(incomplete.contains("store %Big %return.value"), "{incomplete}");
+        assert!(module.verify().is_ok());
+        Ok(())
+    }
+
+    #[test]
     fn cleanup_transport_keeps_direct_pairs_and_splits_direct_values() -> Result<(), String> {
         let ctx = Context::create();
         let module = parse(
