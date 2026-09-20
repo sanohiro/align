@@ -368,6 +368,16 @@ grep -Fq 'timeout-minutes: 30' "$ci_workflow"
 grep -Fq 'name: PostgreSQL integration (${{ matrix.db-shard }})' "$ci_workflow"
 grep -Fq 'run: scripts/run-db-suites.sh "${{ matrix.db-shard }}"' "$ci_workflow"
 grep -Fq 'ALIGN_GATE_JOBS: "2"' "$ci_workflow"
+if grep -Fq 'database CI build: workspace' "$ci_workflow"; then
+  echo "database workflow restored the redundant workspace build" >&2
+  exit 1
+fi
+owner_line="$(grep -nF 'name: Required database owner suites' "$ci_workflow" | cut -d: -f1)"
+config_line="$(grep -nF 'name: Required-mode configuration self-test' "$ci_workflow" | cut -d: -f1)"
+[ -n "$owner_line" ] && [ -n "$config_line" ] && [ "$owner_line" -lt "$config_line" ] || {
+  echo "database owner build must precede the required-mode negative controls" >&2
+  exit 1
+}
 test "$(grep -Fc 'scripts/run-db-suites.sh' "$repo_root/scripts/db-verify-local.sh")" -eq 1
 test "$(grep -Fc 'scripts/run-quiet.sh --expect-failure' "$ci_workflow")" -eq 2
 test "$(grep -Fc 'scripts/run-quiet.sh --expect-failure' \

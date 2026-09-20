@@ -2790,3 +2790,25 @@ the script's Bash syntax, and fail-closed rejection of an unknown mode. The
 first PR run after this change records the codegen step and complete job timings
 on all three platforms. This item makes no runtime-performance claim and adds
 no benchmark or timeout.
+
+## Item 11: Remove the duplicate database workspace build
+
+PR #1149 exposed a separate 140-second build at the front of every required
+PostgreSQL shard. The workflow ran `cargo build --workspace --locked`, then
+`scripts/run-db-suites.sh` immediately built the shard's exact integration-test
+binaries with `cargo test --no-run`. Cargo artifact inspection of that exact
+owner build confirms that it also produces `alignc`, `align_driver`, and every
+`align_runtime` crate type, including the `libalign_runtime.a` used by generated
+programs. The broad workspace build contributes no artifact the owner run lacks.
+
+The workspace step is removed. Each shard now performs its exact owner
+build/run first. The catalog shard's two missing-configuration negative
+controls follow it and reuse the completed graph; otherwise deleting the broad
+step would merely move the cold build into the first control. The fourteen
+owners, four service shards, two controls, required aggregate, concurrency and
+30-minute timeout are unchanged.
+
+`scripts/test-db-ci-scope.sh` rejects restoration of the broad build and pins
+the owner-before-control order. The first PR run records the owner-step and
+complete job timings against #1149's 140-second workspace-build baseline. This
+item adds no benchmark and makes no runtime-performance claim.
