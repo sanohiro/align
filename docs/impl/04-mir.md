@@ -56,6 +56,44 @@ operations for codegen and inspection.
 
 Each value/place keeps its HIR-derived `Ty` and (for views) `Region`. codegen **does not recompute** types (anti-rewrite).
 
+### Floating-point mode
+
+[Plan 77](77-float-relaxation-scope-plan.md) adds a retained checked-HIR
+`FloatScope` with canonical `FloatMode { reassoc, contract }`, plus that effective
+mode on eligible checked arithmetic and reduction records. HIR validation walks
+the lexical scope stack and requires exact equality, rejecting invented and
+dropped known bits before MIR. The source `float(...) {}` expression then needs
+no runtime MIR begin/end node: authenticated construction walks its block under
+the union of the enclosing and selected bits, then restores the enclosing mode
+through plain blocks, `if`, `match`, `else`, `?`, `map_err`, loops and
+value-carrying `break`, `return`, `arena`, `unsafe`, and task-group blocks on
+every normal, join, early-exit, error and malformed path. The wrapper has
+exactly its body's type, value category, ownership, effect and region; every
+HIR analysis recurses through it exactly once, so it cannot hide a move, Drop,
+replacement, source null, borrow root or escape. f32/f64 scalar and
+explicit-vector add/subtract/multiply plus `ArraySum`, `ArrayDot`, `VecSum`,
+`VecSumWhere`, and `VecDot` carry the authenticated mode active where their
+source operation was written. Other MIR nodes carry no inferred relaxation.
+
+Every named, inline, lifted and escaping function body validates from strict mode. A lambda does
+not inherit the scope at its declaration site; relaxed lambda arithmetic has its own retained
+FloatScope inside the body. Direct, indirect and imported calls do not copy caller mode onto callee operations;
+the callee body already owns its modes. After LLVM body import/inlining, independently `reassoc`-
+flagged operations may compose across that boundary, while an unflagged participant prevents the rewrite.
+Format 15 generic
+templates and plan 74 concrete bodies retain exact source and the consumer re-derives the mode.
+MIR validation rejects unknown bits or a mode attached to an ineligible type/node before LLVM lowering. The mode changes permitted
+result bits only; it never licenses effect, memory, trap, cleanup or control-flow motion.
+
+That cross-boundary composition applies only to `reassoc`. Raw LLVM `contract`
+is never emitted because a consuming add/subtract could otherwise absorb a
+strict multiply. MIR recognizes only an immediate scalar/vector multiply
+operand of add/subtract when both authenticated modes carry `contract`, covers
+`a*b+c`, `c+a*b`, `a*b-c`, and `c-a*b`, and represents the selected use with
+the existing explicit FMA operation. Array/fixed-vector dot use the same fused
+accumulator step. A multiply behind a local, load, call or later LLVM inlining
+is not selected and remains separately rounded.
+
 ### 1.1 Borrow and resource operations
 
 The library boundary adds generic MIR operations, never package-specific variants:

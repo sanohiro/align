@@ -582,6 +582,39 @@ Comparison follows IEEE: NaN compares unequal to everything **including itself**
 `min`/`max` reducers' NaN policy is specified with the reducers (§8). Only conversion leaves pure
 IEEE behavior: `as` saturates and maps NaN to `0` (next section).
 
+Floating-point evaluation is ordered and uncontracted by default. A lexical block may explicitly
+relinquish either guarantee:
+
+```align
+sum := float(reassoc) { xs.sum() }
+dot := float(reassoc, contract) { xs.dot(ys) }
+fused := float(contract) { a * b + c }
+```
+
+`float(reassoc) { ... }` permits f32/f64 additions, subtractions, and multiplications written in
+the block to be reassociated, including array-pipeline `sum`/`dot` and fixed-vector `sum`,
+`sum_where`, and `dot` accumulation. `float(contract) { ... }`
+permits a multiply and its consuming add/subtract, when both are in the scope, to become one fused
+operation. The options are independent; nested scopes add permissions within one function body.
+Every named or inline function body starts strict, so relaxing arithmetic in a lambda requires its
+own visible inner scope; calling it does not copy the caller's mode. A scope grants permission to its
+operations; it is not an optimizer barrier for reassociation. Independently reassociable operations
+may combine after inlining, while a strict participant prevents that rewrite. Contraction is selected
+earlier: Align turns a direct multiply/add-subtract pair into explicit FMA only when both operations
+carry `contract`. It never emits LLVM's consumer-controlled raw `contract` flag, so an add inside a
+scope cannot absorb a strict multiply supplied through a local, load, call, or later inlining. The
+scope is otherwise an ordinary block expression: it has the block's value and does not change
+evaluation order, effects, ownership, errors, allocation, cleanup, or control flow.
+
+Relaxed results remain defined IEEE floating values, including for NaN and infinity, but their
+rounding, signed-zero result, and NaN payload may differ where the named reassociation or contraction
+allows it. Reassociation may also vary after equally permitted operations meet through inlining;
+contraction does not arise merely from later inlining. No accuracy or
+cross-target bit-identity promise applies to permitted expressions. `nnan`, `ninf`,
+`nsz`, reciprocal, approximate-function, and bundled `fast` modes do not exist. Outside a `float`
+scope, existing result bits remain unchanged. The exact contract and serialization rules are in
+`docs/impl/77-float-relaxation-scope-plan.md`.
+
 ### Numeric Conversion
 
 There is **no implicit numeric coercion** — not even widening. A value changes type only through the explicit `as` operator, so every conversion is visible in source ("nothing hidden"):

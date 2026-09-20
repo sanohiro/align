@@ -450,6 +450,15 @@ loop:
 
 - **mask** → LLVM `<W x i1>` and `select` (branchless, `04 §4`).
 - **dot / sum / min / max** → `llvm.vector.reduce.*`.
+- **scoped float mode** → plan 77's exact `reassoc` bit is copied only to eligible f32/f64
+  scalar/vector arithmetic or reduction calls represented by MIR. A strict sum uses LLVM's ordered
+  reduction form; a `float(reassoc)` sum uses its unordered form. Independently reassociable
+  operations may combine after inlining because no scope identity is emitted; an unflagged
+  participant remains a barrier. The backend never emits raw LLVM `contract`: MIR has already
+  replaced only an immediate multiply/add-subtract pair whose two authenticated modes permit
+  contraction with the existing explicit FMA operation. This prevents a permitted consumer from
+  absorbing a strict producer. It also never emits `nnan`, `ninf`, `nsz`, `arcp`, `afn`, or bundled
+  `fast`.
 - **no-alias** (`out`, `03 §6`) → scoped `!alias.scope`/`!noalias` metadata on the `map_into` fused
   loop's source load and `dst` store (a slice is passed by value as `{ptr,len}`, so its buffer
   pointer is not a standalone param to carry a `noalias` *attribute* — the scoped metadata is the

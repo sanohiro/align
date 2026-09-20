@@ -2476,6 +2476,22 @@ regression net that validates the upgrade.
   every 32-bit pattern.
   The existing `readonly`/`nocapture`/`memory` analysis deferral remains
   unchanged.
+  **SCOPED FLOAT RELAXATION DESIGNED 2026-09-20.**
+  [Plan 77](77-float-relaxation-scope-plan.md) completes plan 68 G4 Part 2 with
+  the value-producing `float(reassoc)` / `float(contract)` lexical block.
+  Strict IEEE operation order and separate rounding remain the default. The
+  two permissions are independent and nested scopes union them. Every function
+  and lambda body starts strict; lambda arithmetic needs its own inner scope.
+  Caller mode never marks a callee's strict operations. Equally permitted operations may compose
+  for reassociation after inlining; scopes are not optimization barriers. Contraction is selected
+  earlier only for a direct MIR-visible multiply/add-subtract pair whose two authenticated modes
+  permit it, then lowered as explicit FMA; raw LLVM `contract` is never emitted. Checked HIR retains each lexical scope and validates every
+  operation's exact effective mode, so known invented/dropped bits fail before
+  MIR. Generic and plan 74 concrete bodies retain exact source for consumer
+  rechecking. Poison-producing assumptions, reciprocal/approximate modes,
+  bundled `fast`, and ambient compiler flags are excluded. Implementation is
+  one parser-to-LLVM/interface capability after independent design review; no
+  benchmark or external-client build is a correctness gate.
 - **Slice V — verification bundle — DONE (#424, 2026-07-11; gate SHIP — ISA tests
   mutation-verified both directions, moot premise independently reproduced, harness honesty
   verified at both tiers; gemini's one high qualified-then-hardened: the shipped invocation
@@ -3909,7 +3925,7 @@ reflection                    → not used by Query bind/decode; out of v1 scope
 FFI                           → v1 shipped; L3 supplies its general persistent-resource boundary
 static source inputs          → settled narrow constructor registration; mandatory L5
 region plain-struct builder   → settled; mandatory L6
-backend/runtime perf          → measured backlog (VLA/SVE, nontemporal, fast-math, LTO,
+backend/runtime perf          → measured backlog (VLA/SVE, nontemporal, scoped float relaxation, LTO,
                                 -march=native, GPU codegen, SIMD JSON/str, perfect hash, mmap/
                                 io_uring); no DB-specific frontend shortcut
 ```

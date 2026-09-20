@@ -2234,3 +2234,41 @@ larger record by value. Malformed owners substitute wrong field ordinals,
 intermediate/final types, lengths, element kinds, stable roots, authorities,
 initialization states and borrow roots across whole-program and per-unit input.
 The complete closure matrix and named owners are maintained in plan 73.
+
+## Scoped floating-point relaxation (plan 77)
+
+Checked HIR retains each `FloatScope` with exactly two known bits, `reassoc` and
+`contract`, and records the effective mode on eligible arithmetic/reduction
+nodes. The validator walks the lexical scope stack and requires exact equality
+with that union. It rejects invented or dropped known bits, unknown bits, and a
+mode attached to an ineligible non-f32/f64 node. Scope construction restores
+the enclosing mode through plain blocks, `if`, `match`, `else`, `?`, `map_err`,
+loops and value-carrying `break`, `return`, `arena`, `unsafe`, and task-group
+blocks on every normal, join, early-exit, error and malformed path. The wrapper
+has its body's exact type, value category, ownership, effect and region;
+effect, replay/clone, depth/finalization, region/escape, MoveCheck, validation
+and MIR-production passes must recurse through that body exactly once. The
+variant sweep pins that classification. Every named, inline, lifted and escaping
+function body starts strict; a lambda body must retain its own FloatScope to
+relax an operation. A direct,
+indirect or imported call adds no caller mode to its target operations.
+This checked boundary authenticates permissions, not optimization isolation:
+LLVM may later combine independently reassociable operations after inlining.
+Contraction is selected before LLVM only for an immediate multiply/add-subtract
+pair whose two modes were authenticated. MIR uses the existing explicit FMA
+operation for that selected use; raw LLVM `contract` is never emitted, so a
+strict multiply cannot be absorbed by a permitted consumer.
+
+Format 15 generic templates and interface-carried concrete bodies preserve the
+exact source scope in their existing body string. Consumer parsing and checking
+derive the same canonical record before imported HIR; monomorphization and
+available-externally replay preserve it exactly.
+Malformed owners add a known bit outside a scope, drop one inside a scope,
+substitute unknown bits, attach known bits to integer, comparison, cast,
+min/max, call and memory nodes, copy an enclosing mode into any lambda target,
+invent caller-to-callee inheritance, or accept an unknown option while
+rechecking imported body source. The positive product covers `ArraySum`,
+`ArrayDot`, `VecSum`, `VecSumWhere`, and `VecDot`. Options are parsed as
+identifiers; the first unknown in source order outranks every duplicate, and only an all-known list
+reports the first duplicate's second occurrence. Plan 77 owns the parameterized
+formation, control-flow, interface and whole/per-unit acceptance matrix.

@@ -40,7 +40,7 @@ ident   = (letter | "_") (letter | digit | "_")*
 ### Keywords
 ```text
 reserved:
-fn  mut  return  if  else  match  arena  unsafe
+fn  mut  return  if  else  match  arena  unsafe  float
 module  import  pub
 true  false
 
@@ -478,7 +478,7 @@ Expression-oriented. `if` / `match` / `block` / `arena` / `unsafe` are all expre
 6  * / %
 7  unary  - !
 8  postfix  f(args)  .method(args)  .field  [index]  ?
-9  primary  literal / path / (expr) / struct_lit / block / if / match / arena / unsafe / lambda
+9  primary  literal / path / (expr) / struct_lit / block / if / match / arena / unsafe / float / lambda
 ```
 
 ### Primary expressions
@@ -493,6 +493,7 @@ primary   = literal
           | match_expr
           | arena_expr
           | unsafe_expr
+          | float_expr
           | lambda
           | str_prefixed                  // template/html/json/raw
           | field_selector                // .ident (projection shortcut at argument position)
@@ -583,7 +584,16 @@ Distinguished from named functions (`fn ident (`) by "name + presence/absence of
 ```ebnf
 arena_expr  = "arena" ident? block
 unsafe_expr = "unsafe" block
+float_expr  = "float" "(" (float_option ("," float_option)*)? ")" block
+float_option = ident
 ```
+
+`float` is reserved because the construct is an observable expression scope, not a library call.
+The parser accepts arbitrary identifier options and stores their source order; sema owns the closed
+`reassoc`/`contract` name set and its deterministic unknown-before-duplicate validation. At least one
+option is required. Both valid source orders are accepted, and the
+formatter writes `reassoc` before `contract`. The AST stores the source list for diagnostics and a
+checked expression stores plan 77's canonical two-bit mode.
 ```align
 arena {
   data := fs.read_file(path)?

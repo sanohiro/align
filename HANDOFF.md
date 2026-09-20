@@ -89,15 +89,45 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    accuracy/identity proof package.
    The five E1 functions stay one capability; #1064 remains a separate failure
    domain and does not share its PR.
-   #1075 is the current implementation candidate. [Plan 76](docs/impl/76-scalar-abi-facts-plan.md)
-   corrects the issue proposal before implementation: LLVM ABI extension
-   attributes must cover every declaration/definition and direct/indirect call
-   site, while stored i8 booleans and aggregate enum tags are not scalar call
-   boundaries. Implementation review also disproved the proposed `char` range:
-   integer casts admit all 32-bit patterns, so `char` receives only `zeroext`.
-   The focused structural owner passes in 0.03 seconds and the
-   whole/per-unit boundary-value execution owner in 1.03 seconds; no benchmark,
-   broad suite or external-client build belongs in the provider gate.
+   #1075 merged in PR #1143. [Plan 76](docs/impl/76-scalar-abi-facts-plan.md)
+   supplies the complete call-boundary `zeroext`/`signext` rule and excludes
+   stored aggregate facts and the unsound proposed `char` range. Focused owners
+   run in 0.03 and 1.03 seconds; no benchmark, broad suite or external-client
+   build belongs in the provider gate. Consumer mask/disassembly measurements
+   remain pending, so the tracking issue stays open.
+   #1082 Part 2 is now the next design candidate. [Plan 77](docs/impl/77-float-relaxation-scope-plan.md)
+   specifies the explicit `float(reassoc)` / `float(contract)` lexical block,
+   strict default, lambda/callee boundary, interface identity, exact permitted
+   reassociation flags, two-sided FMA selection and a benchmark-free acceptance matrix. Its first independent
+   review found that known mode bits needed authentication against source scope;
+   the revised design retains FloatScope in checked HIR and rejects invented or
+   dropped bits before MIR. The reopened full review found that lifted lambdas
+   also need an authenticated declaration-target root mode; the matrix now uses
+   a global parent-scope-to-lifted-target validation pass and rejects orphan or
+   duplicate targets. It also closes direct dot semantics and option-error
+   precedence. This second P1 reopens the lifted-declaration-provenance axis and
+   required another full review. A later review showed pipeline HIR erases the
+   parent lambda expression, so that declaration link was still not generally
+   authenticatable. The design now removes lambda inheritance: every callable
+   body starts strict and a lambda needs its own visible inner scope. This
+   deletes the special cross-function provenance mechanism. Another review exposed LLVM's lack of scope
+   identity: equally flagged operations can compose across sibling or inlined
+   function boundaries. The design now promises per-operation permission, not
+   optimizer isolation; strict operations receive no caller flags and remain
+   rewrite barriers. The lowered-rewrite-composition axis is reopened for a
+   fresh full design review before merge and implementation. The latest pass
+   removed one stale overpromise: generic `reduce` arithmetic belongs only to
+   its strict-root callable and needs a scope inside that body. The complete
+   reduction product now names all five existing HIR/MIR forms: `ArraySum`,
+   `ArrayDot`, `VecSum`, `VecSumWhere`, and `VecDot`. The latest review also
+   reopened the transparent-wrapper axis: every ownership, Drop, region,
+   escape, replay and control-flow pass must recurse through `FloatScope`
+   exactly once, with the complete lifecycle/control-path matrix in plan 77;
+   plan 12's obsolete `dot_fast` direction now points to the lexical scope.
+   The contraction-lowering axis is also reopened: LLVM's raw `contract` flag
+   is consumer-controlled and could absorb a strict multiply, so the design
+   now forbids that flag and forms explicit FMA only when both operations in a
+   direct MIR-visible pair carry authenticated permission.
 4. Follow-ups, independent and small (updated 2026-09-19):
    `fix/nightly-detector-restore` closed #1105, #1107, #1108, #1109, and
    #1112, and separately repaired two untracked first-night nightly failures
@@ -122,8 +152,8 @@ the design of record for issue 1088 and owns guarantees G1–G10 — the propert
 ordinary Align loops and pipelines need in order to vectorize by default, with
 one owner issue and one acceptance corpus entry each. It settles the promise/try
 split, the ownership map (planned plan 69 loop facts for G1–G3, planned plan 70
-runtime boundary effects for G5, issues 1082 Part 1 and 1083 in progress, 1082
-Part 2 as a future RFC), the locked-decision compliance record including the
+runtime boundary effects for G5, shipped 1082 Part 1 and 1083, and plan 77 for
+1082 Part 2), the locked-decision compliance record including the
 carve-out issue 1084's `assume` fallback would require, and rewritten acceptance
 criteria for issues 1063 and 1064, whose original criteria were measured false
 because they depended on the loop-facts work. Plan 70 PR 1 now implements
