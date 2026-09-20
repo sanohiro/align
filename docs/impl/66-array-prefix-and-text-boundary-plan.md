@@ -210,6 +210,13 @@ reconcile both in one public ledger, including signed literal normalization,
 range endpoints, overlaps, exhaustiveness and char's non-surrogate domain.
 This plan does not choose conflicting new range/error semantics.
 
+This refusal was historical and was superseded when #1055 later satisfied the
+friction-ledger process and shipped integer/character value patterns in PR
+#1060. It is not precedent for silently widening another domain: string literal
+patterns have their own measured consumer evidence and complete public ledger
+in [plan 72](72-string-literal-match-plan.md). Plan 72 adds no string ranges and
+does not adopt this section's speculative scalar-ladder transform.
+
 The optimization request can be investigated within existing syntax. An eligible
 future MIR transform must derive one already-evaluated scalar discriminator,
 constant comparisons and exact reached leaves; prove no reordered effect,
@@ -256,7 +263,8 @@ The first plan 65 capability is merged in PR 1056. The revised sequence is:
 1. U with P0 documentation, a small independently useful text capability.
 2. Finish the existing plan 61 + plan 65 A/O/W/M/P capability, adding T to its
    complete ownership/access closure. Preserve C0 with the narrow numeric owner.
-3. Record 1055 syntax as refused under the current restriction protocol. Keep
+3. Record 1055 syntax as refused under the then-current restriction protocol;
+   PR #1060 later superseded that disposition after the required evidence. Keep
    optimization research, aggregate byte equality and a fallible slicing API
    outside selected implementation; the earlier foreign/SIMD/native-target
    investigations remain in plan 65.

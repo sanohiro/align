@@ -197,8 +197,11 @@ A sum type models variation (there is no class / inheritance). Construct with `T
 (`Shape.Circle(3.0)`); branch with an exhaustive `match` expression (every variant covered or a
 `_` wildcard — a missing variant is a compile error). Several variants share one arm with an
 **or-pattern** `A | B` (bare variant names, binds nothing). `match` also supports integer and `char`
-values, inclusive ranges (`min..=max`), and literal or-patterns (`1 | 2 | 5..=10`); non-exhaustive
-integer matches and char matches require `_`. `Option<T>` / `Result<T,E>` are sum
+values, inclusive ranges (`min..=max`), exact string literals, and literal or-patterns
+(`1 | 2 | 5..=10`, `"get" | "head"`). Non-exhaustive integer matches and every `char`, `str`, or
+`string` match require `_`. String patterns have no ranges; they compare decoded UTF-8 bytes exactly
+and borrow the once-evaluated scrutinee without cloning, allocation, or moving an owned string.
+`Option<T>` / `Result<T,E>` are sum
 types; `match` works on them, with `else`-unwrap and `?` as the common-case shorthands.
 
 When the scrutinee is a stable place whose complete root/path pair has a direct shared or exclusive
