@@ -790,6 +790,18 @@ suffix. The scalar set is `u8`, `i8`, `u16`/`i16`, `u32`/`i32`, `u64`/`i64`, `f3
 same fail-closed policy as `slice[i]` — check `.len()` first. A read returns a Copy scalar carrying
 no region; the `bytes`/`buffer` stay borrowed. (`draft.md` §12.)
 
+Naturally aligned little-endian data also has one checked zero-copy view:
+`slice<u8>.view_le<T>() -> Option<slice<T>>`, with `T` inferred from the complete
+expected type and restricted to `u16`/`u32`/`u64`, `i16`/`i32`/`i64`, `f32`, or
+`f64`. It returns `None` for a negative or non-multiple byte length or a pointer
+not aligned to `T`; success preserves the pointer and divides the length by
+`sizeof(T)`. `slice<T>.as_bytes() -> slice<u8>` is the total inverse descriptor
+view. Both preserve source provenance and read/write authority, allocate
+nothing, and copy no payload. A future big-endian target rejects `view_le` at
+compile time. Packed, unaligned, or opposite-order data continues to use the
+scalar `_le`/`_be` accessors. The view itself carries no automatic-vectorization
+or final-machine-SIMD guarantee. (`draft.md` §12; plan 78.)
+
 `buffer.filled(length: i64, value: u8) -> buffer` allocates exactly initialized
 length, including zero, with capacity at least length. Nonempty construction
 acquires one payload; initialization is O(length). The handle may allocate.

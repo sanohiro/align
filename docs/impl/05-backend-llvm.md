@@ -610,6 +610,19 @@ no generic parallel-reduce lowering in the current surface. The ABI is in `06`.
 
 ---
 
+## Checked typed byte views (plan 78)
+
+`BytesView` first checks nonnegative byte length, exact divisibility by element
+size and pointer alignment without loading payload or forming a typed pointer.
+Only the successful edge forms the unchanged-pointer descriptor with divided
+length and wraps it in `Some`; failure forms `None`. A null empty descriptor is
+aligned. `SliceAsBytes` preserves the pointer and checked-scales the length;
+overflow is malformed checked MIR and cannot publish an object. Both lower
+inline with no allocation, memcpy or runtime call. Target admission accepts
+the currently supported little-endian x86-64/aarch64 triples and rejects a
+future big-endian target before object publication. This is a representation
+operation, not an automatic-vectorization or final-machine-SIMD promise.
+
 ## 10. Settled backend choices and remaining refinements
 
 ### Settled (M0; upgraded to LLVM 22 post-M13): inkwell / LLVM version and linking method

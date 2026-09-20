@@ -1,5 +1,17 @@
 # Checked-HIR validation ledger
 
+## Checked typed byte views (plan 78; planned)
+
+`BytesView` authenticates an exact `slice<u8>` receiver, one of the eight
+admitted multi-byte element types and the exact `Option<slice<T>>` result.
+`SliceAsBytes` authenticates the inverse `slice<T>` receiver and exact
+`slice<u8>` result. Both retain the source's precise provenance and authority;
+no binding-header mutation may manufacture backing-store write access. The
+validator re-derives all type equations and source roots and rejects every
+field mutation before MIR. The plan-78 closure matrix owns Option unwrap,
+branch/loop/call joins, interface format 16, malformed records and the complete
+enum/pass sweep.
+
 The [R77–R83 composition](56-r77-r83-composition-plan.md) implementation owns
 physical String/logical Str replay, exact shared paths, fresh/retained facts and
 the shared namespace classifier on its provider branch. R78 enum-field admission

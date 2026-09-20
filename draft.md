@@ -1893,6 +1893,33 @@ a parser checks `.len()` before reading, exactly as it checks a slice's length b
 read returns a Copy scalar (it never carries the view's region), so it composes freely; the
 `bytes`/`buffer` themselves stay borrowed (never consumed).
 
+Naturally aligned native-order binary data may instead be viewed without a
+conversion loop:
+
+```align
+values: slice<f32> := h.view_le() else { return Error.Invalid }
+raw: slice<u8> := values.as_bytes()
+```
+
+The declarations are `slice<u8>.view_le<T>() -> Option<slice<T>>` and
+`slice<T>.as_bytes() -> slice<u8>`; calls have no written type argument.
+`view_le` infers `T` from the complete expected result type, and `T` is exactly
+`u16`, `u32`, `u64`, `i16`, `i32`, `i64`, `f32`, or `f64`. It returns `None`
+unless the byte length is nonnegative and a whole multiple of `sizeof(T)` and
+the pointer is aligned to `alignof(T)`. On a supported little-endian target it
+otherwise preserves the pointer and divides the length by `sizeof(T)`; a future
+big-endian target rejects the operation at compile time. `as_bytes` preserves
+the pointer and scales the length by `sizeof(T)`.
+
+Both operations are Pure descriptor views: they allocate nothing, copy no
+payload, retain the receiver's exact storage generation and access authority,
+and cannot outlive the source. A `mut` header does not make immutable backing
+writable. Scalar `_le`/`_be` accessors remain the alignment-1 route for packed
+wire data and are not defined in terms of the naturally aligned view. No
+automatic-vectorization or final-machine-SIMD result is promised merely by
+constructing the view. Plan 78 owns the exact validation and implementation
+matrix.
+
 ### Literals and Escapes
 
 A string literal is double-quoted and **single-line** — a raw newline inside a literal is a

@@ -4470,6 +4470,18 @@ fast-systems-programming needs that any Align user hits, not engine-specific.
      logical `len` before appending, so encoding after a `reader.read` is well-defined. Records:
      `draft.md` §12 "Binary decode and encode"; `crates/align_driver/tests/runway_a2_binary_codec.rs`
      + runtime unit tests in `align_runtime`.
+   - **Checked typed byte views settled 2026-09-21 (plan 78, issue 1064).**
+     `slice<u8>.view_le<T>() -> Option<slice<T>>` is the one zero-copy bridge
+     from aligned little-endian bytes to typed storage; the call writes no type
+     argument and infers `T` from a complete expected type. The closed set is
+     `u16`/`u32`/`u64`, `i16`/`i32`/`i64`, `f32`, and `f64`. Misalignment,
+     negative length, or a non-multiple length yields `None`; a future
+     big-endian target rejects the operation at compile time. The total inverse
+     is `slice<T>.as_bytes() -> slice<u8>`. Both preserve pointer, backing
+     generation and access authority, allocate nothing, and copy no payload.
+     Scalar `_le`/`_be` accessors remain the alignment-1 packed-data route.
+     View construction does not promise automatic vectorization or final
+     machine SIMD. The public ledger and closure matrix are in plan 78.
 3. **`loop` implementation slice** — the settled design (Settled → "Sequential control") now has
    consumer pressure: streaming parses, the gateway server loop, the runtime scheduler. First
    unimplemented settle to build.

@@ -540,6 +540,16 @@ The runtime behind `HttpRespondUpgrade` computes checked exact head length, allo
 the handle shell before fd transfer, and exposes no partially initialized handle to MIR. Detectable
 malformed native header/readiness inputs hard-abort below MIR and never synthesize zero/false.
 
+## Checked typed byte views (plan 78)
+
+Two explicit MIR operations preserve the checked-HIR distinction:
+`BytesView { bytes, element }` produces `Option<slice<T>>`, and
+`SliceAsBytes { slice, element }` produces `slice<u8>`. They carry the exact
+source dependency through Option projection, assignments, fields, joins and
+calls. Validation rechecks the closed element set, operand/result equations and
+descriptor relationship; it does not reconstruct authority or target order in
+LLVM. They are Pure, allocation-free and do not introduce a runtime ABI call.
+
 ## 10. Remaining design refinements
 
 ```text

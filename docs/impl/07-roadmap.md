@@ -2440,6 +2440,15 @@ regression net that validates the upgrade.
     single growth/arena fallback. Release and dist archive inspection retained
     both `reserve` and `memcpy`, so the proposed one-codegen-unit override was
     refused rather than shipping an ineffective profile change.
+  **G7 SETTLED 2026-09-21; implementation planned:**
+  [Plan 78](78-checked-byte-view-plan.md) replaces issue 1064's per-type aliases
+  and disproved auto-vectorization criterion with
+  `slice<u8>.view_le<T>() -> Option<slice<T>>` plus the total
+  `slice<T>.as_bytes()` inverse. Natural alignment, whole-element length and
+  native little-endian order are explicit gates; the view preserves source
+  provenance and authority and allocates/copies nothing. Scalar binary
+  accessors remain the alignment-1 packed-data route. Plan 78 owns the one-PR
+  vertical implementation matrix and interface format 16.
   **DEFERRED with reasons (revisit post-M14 ThinLTO/runtime-bitcode — the wave that creates
   real non-inlined boundaries where argument attributes stop evaporating):** internal-ABI
   signature flattening (SROA already achieves it; FFI boundary correctly kept aggregate in the

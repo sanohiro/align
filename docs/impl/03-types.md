@@ -583,7 +583,19 @@ are Impure. Borrow overlap, move/drop/replacement, branch/loop joins, every valu
 form, whole/per-unit function-value pump signatures, and malformed checked HIR are cells in
 `pkg-design/ws.md`'s closure matrix. These records and restrictions are active in the compiler.
 
-## 13. Required next refinements
+## 13. Checked typed byte views (plan 78)
+
+`slice<u8>.view_le<T>()` forms `Option<slice<T>>` only for the closed
+multi-byte numeric set in plan 78. `T` is inferred from a complete expected
+Option or `else`-unwrapped slice type; there is no expression type argument.
+The result retains the receiver's exact region, storage generation and access
+authority. `slice<T>.as_bytes()` is the inverse view with the same provenance.
+Neither operation changes Copy/Move classification or makes a read-only source
+writable. Checked HIR carries explicit receiver, element and result records so
+validation can re-derive those equations before MIR. Interface format 16
+serializes either operation in a concrete public body.
+
+## 14. Required next refinements
 
 ```text
 - lint for the numeric default type (when i64 is excessive in large arrays)
