@@ -106,7 +106,12 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    a global parent-scope-to-lifted-target validation pass and rejects orphan or
    duplicate targets. It also closes direct dot semantics and option-error
    precedence. This second P1 reopens the lifted-declaration-provenance axis and
-   requires a fresh full design review before merge and implementation.
+   required another full review. That review exposed LLVM's lack of scope
+   identity: equally flagged operations can compose across sibling or inlined
+   function boundaries. The design now promises per-operation permission, not
+   optimizer isolation; strict operations receive no caller flags and remain
+   rewrite barriers. The lowered-rewrite-composition axis is reopened for a
+   fresh full design review before merge and implementation.
 4. Follow-ups, independent and small (updated 2026-09-19):
    `fix/nightly-detector-restore` closed #1105, #1107, #1108, #1109, and
    #1112, and separately repaired two untracked first-night nightly failures

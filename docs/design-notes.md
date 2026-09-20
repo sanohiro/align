@@ -2,8 +2,10 @@
 
 Floating-point relaxation is a visible lexical value scope, not an ambient build mode or a family
 of fast reducer names. `float(reassoc) {}` and `float(contract) {}` name exactly the two guarantees
-the programmer may relinquish. They compose independently, nest by union, and never change a
-separately declared callee. This keeps strict reproducibility as the default while making the cost
+the programmer may relinquish. They compose independently, nest by union, and never add flags to a
+separately declared callee's strict operations. They are permission regions rather than optimizer
+barriers: separately permitted operations may compose after inlining. This keeps strict
+reproducibility as the default while making the cost
 model selectable at the arithmetic use site. NaN and infinity remain values: Align deliberately
 offers no `nnan`, `ninf`, or bundled `fast` spelling that could turn them into poison. The mode
 survives lifted lambdas; generic and interface-carried concrete body source re-derives it, so separate

@@ -2244,7 +2244,9 @@ with that union. It rejects invented or dropped known bits, unknown bits, and a
 mode attached to an ineligible non-f32/f64 node. Scope construction restores
 the enclosing mode after every block, branch, loop and terminating expression
 path. Lifted and escaping lambdas retain declaration-site mode in their body; a
-direct, indirect or imported call carries no caller mode into its target.
+direct, indirect or imported call adds no caller mode to its target operations.
+This checked boundary authenticates permissions, not optimization isolation:
+LLVM may later combine independently permitted operations after inlining.
 
 Lambda root mode is never self-authenticating. The global validator walks named
 function roots under strict mode, records each lambda expression's exact target

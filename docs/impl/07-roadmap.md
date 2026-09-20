@@ -2481,8 +2481,9 @@ regression net that validates the upgrade.
   the value-producing `float(reassoc)` / `float(contract)` lexical block.
   Strict IEEE operation order and separate rounding remain the default. The
   two permissions are independent, nested scopes union them, inline lambdas
-  keep declaration-site mode, and separately declared callees never inherit
-  caller mode. Checked HIR retains each lexical scope and validates every
+  keep declaration-site mode, and caller mode never marks a separately declared
+  callee's strict operations. Equally permitted operations may compose after
+  inlining; scopes are not optimization barriers. Checked HIR retains each lexical scope and validates every
   operation's exact effective mode, so known invented/dropped bits fail before
   MIR. Lifted function root modes are derived from the unique parent lambda
   target under that same scope walk, never trusted from the lifted body itself.

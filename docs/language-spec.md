@@ -324,7 +324,9 @@ Float arithmetic is ordered and uncontracted by default. The block expressions
 contraction for arithmetic written lexically inside them, including built-in `sum`/`dot` products
 and accumulation. Nested scopes union permissions. An
 inline lambda retains the permissions at its declaration, while a separately declared callee never
-inherits them from a call site. Relaxed NaN and infinity inputs remain defined; only the named
+has flags added to its strict operations by a call site. Scopes grant per-operation permission, not
+optimization isolation: independently permitted operations may combine after inlining, while a
+strict participant blocks the rewrite. Relaxed NaN and infinity inputs remain defined; only the named
 rounding, association, signed-zero, and NaN-payload variation is permitted. There is no `nnan`,
 `ninf`, `nsz`, reciprocal, approximate-function, bundled fast mode, or ambient compiler switch.
 The scope otherwise behaves as a plain value-producing block. See plan 77 for the complete record.

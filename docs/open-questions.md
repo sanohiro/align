@@ -18,7 +18,9 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 Float arithmetic remains ordered and uncontracted by default. The only relaxation surface is the
 value-producing block `float(reassoc) {}`, `float(contract) {}`, or their explicit combination.
 Options are independent, nested scopes union them, an inline lambda keeps declaration-site mode,
-and a separately declared callee never inherits caller mode. `reassoc` permits reassociation of
+and a call site never adds flags to a separately declared callee's strict operations. Scopes grant
+operation permissions rather than optimization isolation; independently permitted operations may
+compose after inlining, while any strict participant blocks the rewrite. `reassoc` permits reassociation of
 f32/f64 add/subtract/multiply and unordered floating reduction; `contract` permits local fused
 multiply-add/subtract without implying reassociation. Direct `dot` applies the same permissions to
 its products and accumulation. NaN and infinity remain defined values.

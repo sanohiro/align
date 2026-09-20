@@ -50,8 +50,10 @@ Result contract   Both options are result-defined. Every input still produces
                   instead of two and its consequent signed-zero/NaN payload
                   choice. Neither option permits poison for NaN or infinity.
                   Results may differ across targets and optimization profiles
-                  only within the named permission. No reproducibility or
-                  accuracy bound is promised inside a relaxation scope.
+                  only within the named permission, including when inlining
+                  exposes equally permitted operations from distinct lexical
+                  scopes or functions. No reproducibility or accuracy bound is
+                  promised for a permitted expression.
 
 Excluded flags    `nnan`, `ninf`, `nsz`, `arcp`, `afn`, `fast`, and every
                   unnamed or future LLVM fast-math flag are unavailable.
@@ -64,9 +66,14 @@ Lexical extent    A scope affects operations whose source expression is inside
                   implicit way to restore a stricter mode within a relaxed
                   scope. A lambda written inside the scope retains the active
                   permissions in its own body wherever it is later invoked.
-                  A call to a separately declared function never changes that
-                  callee's semantics. A callee uses only scopes in its own
-                  source body.
+                  A call site never adds flags to operations in a separately
+                  declared callee; that body uses only its own source scopes.
+                  The scope is a permission boundary, not an optimization
+                  isolation boundary: after body import or inlining, operations
+                  from sibling scopes or caller/callee bodies may participate
+                  in one rewrite only when every participating operation
+                  independently carries the required permission. Any strict
+                  operation therefore remains a barrier.
 
 Lifted roots      Checking a lambda expression records its exact lifted target
                   function id and the mode active at that declaration. Global
@@ -206,8 +213,10 @@ flag; it does not mean that the optimizer may choose another one.
 LLVM treats `reassoc` and `contract` as rewrite permissions shared by all
 instructions participating in a rewrite. Tagging every eligible operation in
 the source scope therefore permits a local multiply-add/subtract contraction
-without creating a cross-scope candidate. This table deliberately promises
-permission, not that LLVM will perform a particular rewrite.
+without marking any strict operation. LLVM flags carry no scope identity, so
+independently permitted operations may compose after inlining. This table
+deliberately promises permission, not rewrite isolation or that LLVM will
+perform a particular rewrite.
 
 ## 2. Rejected alternatives
 
@@ -218,7 +227,8 @@ permission, not that LLVM will perform a particular rewrite.
 | One bundled `fast` level | Hides which guarantees are relinquished and would invite LLVM's poison-producing `nnan`/`ninf` flags. |
 | `sum_reassoc`, `dot_fast`, and similar terminals | Creates a second surface per operation, leaves hand-written loops and future reducers unanswered, and does not compose contraction independently. |
 | Function-only annotation | Is too coarse for mixed strict/relaxed numeric work and makes a call site unable to see the local semantic boundary. |
-| Caller mode inherited by a callee | Makes a function's result depend on its caller's compilation context and invalidates separate compilation. |
+| Caller mode copied onto a callee's strict operations | Makes an unannotated function depend on its caller and invalidates separate compilation. Each callee operation keeps only its own permission. Equally permitted operations may still compose after inlining because LLVM flags do not carry scope identity. |
+| Optimization barriers or forced `noinline` at every scope/function edge | Would make lexical scopes isolation regions, inhibit the optimization they exist to permit, and require a second call ABI. Strict operations already stop a rewrite because the required flag intersection is absent. |
 | A strict inner scope that removes an outer permission | Requires mode subtraction and makes one expression's arithmetic contract depend on nesting accidents. Move strict work to a separate function instead. |
 | `nnan` or `ninf` | A NaN or infinity would become poison, adding hidden undefined behavior to a language where floats never abort. |
 | Throughput thresholds in the provider gate | They test a host and optimizer cost model, not the source contract, and would repeat the waste identified in earlier performance issues. |
@@ -230,8 +240,8 @@ permission, not that LLVM will perform a particular rewrite.
 | Lex/parse/format | reserved `float`; option tokens remain identifiers; block-expression precedence; canonical formatting | parser/formatter owner |
 | Checked formation | canonical two-bit FloatScope record plus effective mode on eligible nodes; exact validation order; no-op body admitted | semantic owner |
 | Scope authentication | HIR validator recomputes the lexical union and requires exact equality on every eligible node; invented, dropped and unknown bits reject | checked-HIR mutation owner |
-| Scope propagation | retained HIR scope nests through all branch/block/loop/value positions; returns and early exits do not leak mode after the scope; MIR receives only authenticated effective modes | semantic/MIR owner |
-| Lambdas/calls | global HIR validation derives each lifted root mode from its unique parent lambda target under retained scopes; nested/lifted/escaping forms agree; missing/duplicate/orphan/wrong-origin targets reject; named/direct/indirect/imported callees start strict and do not inherit caller mode | semantic/HIR/MIR/interface owner |
+| Scope propagation | retained HIR scope nests through all branch/block/loop/value positions; returns and early exits do not attach mode to strict operations after the scope; MIR receives only authenticated effective modes | semantic/MIR owner |
+| Lambdas/calls | global HIR validation derives each lifted root mode from its unique parent lambda target under retained scopes; nested/lifted/escaping forms agree; missing/duplicate/orphan/wrong-origin targets reject; named/direct/indirect/imported callee operations receive no caller flags; optimized owners show equally permitted caller/callee operations may compose while any strict participant prevents the rewrite | semantic/HIR/MIR/interface/LLVM owner |
 | Scalar arithmetic | f32/f64 add/sub/mul receive selected flags; div/rem/comparison/cast/min/max and explicit fma do not gain unrelated flags | LLVM owner |
 | Vector arithmetic | vecN<f32/f64> follows the same table for every admitted width | LLVM owner |
 | Reductions | built-in sum and direct ArrayDot follow the exact product/add/reduction table; unordered reduction appears only under `reassoc`; strict and contract-only controls remain ordered | MIR/LLVM owner |
@@ -251,6 +261,7 @@ One parameterized owner may close multiple rows. No row requires a benchmark.
 |---|---|---|
 | `d4a2d307` independent design review | P1: checking only known bits and eligible types lets malformed HIR attach a valid relaxed mode to a strict source operation after the scope is discarded | Retain `FloatScope` in checked HIR; recompute the exact lexical union during HIR validation; reject both invented and dropped known bits before MIR. Reopened closure axis: float-mode provenance. |
 | `1d9838b9` reopened full review | P1: lifting separates a lambda body from its declaring FloatScope, so a copied root mode is unauthenticated. P2: direct ArrayDot product/reduction semantics, arbitrary option parsing and unknown/duplicate precedence were incomplete. | Reopen the matrix around lifted-declaration provenance. Global HIR validation derives a unique target root mode from the parent lambda expression and validates nested lifted bodies from that map. Add the exact dot product/add/reduction row, parse option identifiers before sema, and make any unknown outrank duplicates. |
+| `ae9983bb` reopened full review | P1: LLVM flags have no scope identity, so equally flagged operations can combine across sibling scopes or an inlined function boundary | Reopen lowered-rewrite composition. Define scopes as operation-permission boundaries, not optimization-isolation regions. Caller mode never marks strict callee operations; independently permitted operations may compose, while a strict participant blocks the rewrite through LLVM's flag intersection. Add positive cross-scope/callee and strict-barrier owners. |
 
 ## 5. PR boundary
 

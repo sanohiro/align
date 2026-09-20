@@ -597,13 +597,17 @@ the block to be reassociated, including built-in `sum` and `dot` accumulation. `
 permits a multiply and its consuming add/subtract, when both are in the scope, to become one fused
 operation. The options are independent; nested scopes add permissions. An inline lambda written
 inside the scope retains its declaration-site permissions, but calling a separately declared
-function never changes that function's semantics. The scope is otherwise an ordinary block
+function does not add flags to that function's strict operations. A scope grants permission to its
+operations; it is not an optimizer barrier. After inlining, operations from separate scopes or
+functions may combine only when every participating operation independently has the required
+permission. A strict operation prevents that rewrite. The scope is otherwise an ordinary block
 expression: it has the block's value and does not change evaluation order, effects, ownership,
 errors, allocation, cleanup, or control flow.
 
 Relaxed results remain defined IEEE floating values, including for NaN and infinity, but their
 rounding, signed-zero result, and NaN payload may differ where the named reassociation or contraction
-allows it. No accuracy or cross-target bit-identity promise applies inside the scope. `nnan`, `ninf`,
+allows it, including after equally permitted operations meet through inlining. No accuracy or
+cross-target bit-identity promise applies to permitted expressions. `nnan`, `ninf`,
 `nsz`, reciprocal, approximate-function, and bundled `fast` modes do not exist. Outside a `float`
 scope, existing result bits remain unchanged. The exact contract and serialization rules are in
 `docs/impl/77-float-relaxation-scope-plan.md`.

@@ -453,8 +453,11 @@ loop:
 - **scoped float mode** → plan 77's exact `reassoc` and `contract` bits are copied only to the
   eligible f32/f64 scalar/vector arithmetic or reduction call represented by MIR. A strict sum uses
   LLVM's ordered reduction form; a `float(reassoc)` sum uses its unordered form. Both operations in
-  a candidate multiply-add must carry `contract`; the backend never infers a flag from surrounding
-  source or a caller. It never emits `nnan`, `ninf`, `nsz`, `arcp`, `afn`, or bundled `fast`.
+  a candidate multiply-add must carry `contract`; the backend never copies a flag from surrounding
+  strict source or a caller. LLVM may combine independently flagged operations after inlining
+  because no scope identity is emitted; an unflagged operation remains a barrier through the
+  rewrite flag intersection. The backend never emits `nnan`, `ninf`, `nsz`, `arcp`, `afn`, or
+  bundled `fast`.
 - **no-alias** (`out`, `03 §6`) → scoped `!alias.scope`/`!noalias` metadata on the `map_into` fused
   loop's source load and `dst` store (a slice is passed by value as `{ptr,len}`, so its buffer
   pointer is not a standalone param to carry a `noalias` *attribute* — the scoped metadata is the

@@ -72,7 +72,10 @@ nodes carry no inferred relaxation.
 A lifted lambda's root mode is authenticated globally: validation walks each parent lambda
 expression under the retained scope stack, requires one exact lifted target, and then validates
 that target body under the derived mode, recursively for nested lambdas. A copied function field is
-not authority. Direct, indirect and imported calls do not carry caller mode; the callee body already owns its modes. Format 15 generic
+not authority. Direct, indirect and imported calls do not copy caller mode onto callee operations;
+the callee body already owns its modes. After LLVM body import/inlining, independently flagged
+operations may compose across that boundary, while an unflagged participant prevents the rewrite.
+Format 15 generic
 templates and plan 74 concrete bodies retain exact source and the consumer re-derives the mode.
 MIR validation rejects unknown bits or a mode attached to an ineligible type/node before LLVM lowering. The mode changes permitted
 result bits only; it never licenses effect, memory, trap, cleanup or control-flow motion.
