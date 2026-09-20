@@ -342,6 +342,7 @@ fake_codex="$fake_bin/codex"
   printf '  native-clean-two-sentences) echo "Read-only inspection found no actionable soundness or regression issues. No tests, builds, benchmarks, or network commands were run."; echo "Read-only inspection found no actionable soundness or regression issues. No tests, builds, benchmarks, or network commands were run." ;;\n'
   printf '  native-clean-defects) echo "No actionable soundness or regression defects found in the inspected diff. Review was inspection-only; no tests, builds, benchmarks, or network commands were run."; echo "No actionable soundness or regression defects found in the inspected diff. Review was inspection-only; no tests, builds, benchmarks, or network commands were run." ;;\n'
   printf '  native-clean-covered) echo "Inspection found no actionable soundness or regression defects in the requested diff. Review covered guard fusion, admission arithmetic, loop cloning, mutation tracking, and downstream consumers; no tests or builds were run."; echo "Inspection found no actionable soundness or regression defects in the requested diff. Review covered guard fusion, admission arithmetic, loop cloning, mutation tracking, and downstream consumers; no tests or builds were run." ;;\n'
+  printf '  native-clean-inconsistencies) echo "The reviewed slice closes the contract gaps without introducing inconsistencies."; echo "The reviewed slice closes the contract gaps without introducing inconsistencies." ;;\n'
   printf '  native-clean-caveat) echo "No actionable soundness or regression issues were found, but the P2 below should still be fixed."; echo "- P2: scripts/example.sh:1 leaks the temp file" ;;\n'
   printf '  native-clean-lowercase) echo "no actionable issues." ;;\n'
   printf '  native-clean-incomplete) echo "No actionable issues found so far; inspection is incomplete." ;;\n'
@@ -477,6 +478,10 @@ native_defects_status=$?
   ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
   "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
 native_covered_status=$?
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=native-clean-inconsistencies ALIGN_REVIEW_STALL_SECONDS=5 \
+  ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
+  "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
+native_inconsistencies_status=$?
 ( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=native-clean-caveat ALIGN_REVIEW_STALL_SECONDS=5 \
   ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
   "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
@@ -536,7 +541,7 @@ set -e
   exit 1
 }
 [[ $native_two_sentences_status -eq 0 && $native_defects_status -eq 0 &&
-  $native_covered_status -eq 0 ]] || {
+  $native_covered_status -eq 0 && $native_inconsistencies_status -eq 0 ]] || {
   echo "reworded native-clean summaries were rejected" >&2
   exit 1
 }
