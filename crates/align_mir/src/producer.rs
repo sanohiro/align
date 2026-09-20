@@ -6127,6 +6127,75 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     self.add_operand(&mut equation, &right, operand_ty, Vec::new());
                 }
             }
+            Rvalue::FloatBin { op, a, b, mode } => {
+                let left_ty = xml_operand_base_ty(self.graph.function, &a);
+                let right_ty = xml_operand_base_ty(self.graph.function, &b);
+                let operand_matches = if let Ty::Vec(Scalar::Float(float), lanes) = result_ty {
+                    let scalar = Ty::Float(float);
+                    [left_ty, right_ty]
+                        .into_iter()
+                        .all(|ty| ty == Some(result_ty) || ty == Some(scalar))
+                        && lanes > 0
+                } else {
+                    left_ty == Some(result_ty) && right_ty == Some(result_ty)
+                };
+                if !path.is_empty()
+                    || mode.has_unknown()
+                    || !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+                    || !matches!(result_ty, Ty::Float(_) | Ty::Vec(Scalar::Float(_), _))
+                    || !operand_matches
+                {
+                    equation.invalid = true;
+                } else {
+                    let (Some(left_ty), Some(right_ty)) = (left_ty, right_ty) else {
+                        equation.invalid = true;
+                        return equation;
+                    };
+                    self.add_operand(
+                        &mut equation,
+                        &a,
+                        left_ty,
+                        Vec::new(),
+                    );
+                    self.add_operand(
+                        &mut equation,
+                        &b,
+                        right_ty,
+                        Vec::new(),
+                    );
+                }
+            }
+            Rvalue::FloatFma { ty, a, b, c, mode } => {
+                let operand_tys = [
+                    xml_operand_base_ty(self.graph.function, &a),
+                    xml_operand_base_ty(self.graph.function, &b),
+                    xml_operand_base_ty(self.graph.function, &c),
+                ];
+                let operands_match = if let Ty::Vec(Scalar::Float(float), lanes) = ty {
+                    let scalar = Ty::Float(float);
+                    operand_tys
+                        .iter()
+                        .all(|operand| *operand == Some(ty) || *operand == Some(scalar))
+                        && lanes > 0
+                } else {
+                    operand_tys.iter().all(|operand| *operand == Some(ty))
+                };
+                if !path.is_empty()
+                    || result_ty != ty
+                    || !mode.contract()
+                    || mode.has_unknown()
+                    || !matches!(ty, Ty::Float(_) | Ty::Vec(Scalar::Float(_), _))
+                    || !operands_match
+                {
+                    equation.invalid = true;
+                } else {
+                    for (operand, operand_ty) in
+                        [a, b, c].into_iter().zip(operand_tys.into_iter().flatten())
+                    {
+                        self.add_operand(&mut equation, &operand, operand_ty, Vec::new());
+                    }
+                }
+            }
             Rvalue::IntArith {
                 mode, int_ty, a, b, ..
             } => {
@@ -6170,6 +6239,15 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     }
                 }
             }
+            Rvalue::VecSumWhere { elem, mode, .. }
+            | Rvalue::VecDot { elem, mode, .. }
+            | Rvalue::VecSum { elem, mode, .. } => {
+                if mode.has_unknown()
+                    || (!matches!(elem, Ty::Float(_)) && !mode.is_empty())
+                {
+                    equation.invalid = true;
+                }
+            }
             // Exhaustive non-protected producers. Keeping this in the equation match
             // makes a missing semantic producer arm a compiler error, not a fallback.
             Rvalue::SqliteCallbackDescriptor(..)
@@ -6195,10 +6273,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::MakeVec { .. }
             | Rvalue::VecExtract { .. }
             | Rvalue::VecInsert { .. }
-            | Rvalue::VecSumWhere { .. }
-            | Rvalue::VecDot { .. }
             | Rvalue::VecMinMax { .. }
-            | Rvalue::VecSum { .. }
             | Rvalue::MaskAny { .. }
             | Rvalue::VecLoad { .. }
             | Rvalue::ParMapParallel { .. }

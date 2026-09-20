@@ -17,7 +17,7 @@
 //! identical significant-token sequence — otherwise pass the source through unchanged. So a
 //! formatter bug can never change a program's meaning; at worst it declines to format.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use align_ast::*;
 use align_diag::Diagnostics;
@@ -82,7 +82,7 @@ fn sig_texts(tokens: &[Token], src: &str, ann: &Annotations) -> Vec<String> {
     tokens
         .iter()
         .filter(|t| !is_skipped(t, ann))
-        .map(|t| tok_text(src, t).to_string())
+        .map(|t| ann.token_text(src, t).to_string())
         .collect()
 }
 
@@ -99,6 +99,9 @@ struct Annotations {
     unary_ops: HashSet<u32>,
     /// Written semicolons that are structural `[T; N]` separators, not statement trivia.
     fixed_array_semicolons: HashSet<u32>,
+    /// Canonical spellings for a valid two-option `float` list. Mapping by source token position
+    /// lets the token reprinter reorder the two names without discarding comments or line breaks.
+    float_option_text: HashMap<u32, &'static str>,
 }
 
 impl Annotations {
@@ -107,6 +110,7 @@ impl Annotations {
             type_ranges: Vec::new(),
             unary_ops: HashSet::new(),
             fixed_array_semicolons: HashSet::new(),
+            float_option_text: HashMap::new(),
         };
         for item in &file.items {
             a.visit_item(item, src);
@@ -116,6 +120,13 @@ impl Annotations {
 
     fn in_type_range(&self, off: u32) -> bool {
         self.type_ranges.iter().any(|&(lo, hi)| off >= lo && off < hi)
+    }
+
+    fn token_text<'s>(&self, src: &'s str, token: &Token) -> &'s str {
+        self.float_option_text
+            .get(&token.span.lo)
+            .copied()
+            .unwrap_or_else(|| tok_text(src, token))
     }
 
     fn visit_item(&mut self, item: &Item, src: &str) {
@@ -299,6 +310,17 @@ impl Annotations {
             | ExprKind::TaskGroup(b)
             | ExprKind::Unsafe(b)
             | ExprKind::Loop(b) => self.visit_block(b),
+            ExprKind::FloatScope { options, block } => {
+                if options.len() == 2
+                    && options.iter().any(|option| option.name == "reassoc")
+                    && options.iter().any(|option| option.name == "contract")
+                {
+                    self.float_option_text.insert(options[0].span.lo, "reassoc");
+                    self.float_option_text
+                        .insert(options[1].span.lo, "contract");
+                }
+                self.visit_block(block);
+            }
             ExprKind::StructLit { fields, .. } => {
                 for f in fields {
                     self.visit_expr(&f.value);
@@ -509,7 +531,7 @@ impl<'a> Formatter<'a> {
         } else if let Some(p) = prev {
             self.out.push_str(self.sep(p, t));
         }
-        self.out.push_str(tok_text(self.src, t));
+        self.out.push_str(self.ann.token_text(self.src, t));
 
         let opening = matches!(
             t.kind,
@@ -605,9 +627,21 @@ impl<'a> Formatter<'a> {
         // A `(` / `[` directly after a value is a call / index (no space); otherwise a group / literal.
         // A closing generic `>` counts as a value end so a decl's param list hugs (`fn f<T>(...)`).
         let prev_type_close = matches!(p, Gt) && self.ann.in_type_range(prev.span.lo);
-        let value_end = matches!(p, Ident(_) | Int(_) | Float(_) | Str(_) | Char(_) | RParen | RBracket | RBrace | Question | True | False)
-            || prev_type_close;
-        if matches!(c, LParen | LBracket) && value_end {
+        let value_end = matches!(
+            p,
+            Ident(_)
+                | Int(_)
+                | Float(_)
+                | Str(_)
+                | Char(_)
+                | RParen
+                | RBracket
+                | RBrace
+                | Question
+                | True
+                | False
+        ) || prev_type_close;
+        if matches!(c, LParen | LBracket) && value_end || matches!((p, c), (FloatScope, LParen)) {
             return "";
         }
         // Braces: space around a non-empty `{ ... }`, but `{}` hugs.
@@ -670,6 +704,15 @@ mod tests {
         assert!(once.contains("arena out {"), "named arena spacing changed:\n{once}");
         assert!(once.contains("array_builder(out)"), "region argument changed:\n{once}");
         assert_eq!(fmt(&once), once);
+    }
+
+    #[test]
+    fn float_scope_options_use_canonical_order() {
+        let source = "fn f(x: f64) -> f64 {\n  return float(contract, reassoc) { x * x + x }\n}\n";
+        let expected =
+            "fn f(x: f64) -> f64 {\n  return float(reassoc, contract) { x * x + x }\n}\n";
+        assert_eq!(fmt(source), expected);
+        assert_eq!(fmt(expected), expected);
     }
 
     #[test]

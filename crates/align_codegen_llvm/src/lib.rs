@@ -93,7 +93,7 @@ use inkwell::types::{
 };
 use inkwell::values::{
     ArrayValue, AsValueRef, BasicMetadataValueEnum, BasicValue, BasicValueEnum, CallSiteValue,
-    FunctionValue, IntValue, OperandBundle, PointerValue, StructValue,
+    FastMathFlags, FunctionValue, IntValue, OperandBundle, PointerValue, StructValue,
 };
 
 fn freeze_struct_value<'c>(
@@ -9506,6 +9506,8 @@ fn rvalue_keeps_view_facts(f: &Function, rv: &Rvalue) -> bool {
         | Rvalue::Load(_)
         | Rvalue::Un(..)
         | Rvalue::Bin(..)
+        | Rvalue::FloatBin { .. }
+        | Rvalue::FloatFma { .. }
         | Rvalue::Cast { .. }
         | Rvalue::IntArith { .. }
         | Rvalue::MathOp { .. }
@@ -9855,6 +9857,8 @@ fn stack_header_plan(f: &Function) -> StackHeaderPlan {
                         | Rvalue::StrClone(_)
                         | Rvalue::SliceLen(_)
                         | Rvalue::Bin(..)
+                        | Rvalue::FloatBin { .. }
+                        | Rvalue::FloatFma { .. }
                         | Rvalue::Cast { .. } => {}
                         // This is intentionally fail-closed. A new or unaudited rvalue might retain
                         // a builder operand inside an aggregate even when its result is not itself
@@ -13577,6 +13581,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let a = self.operand(a)?.into_float_value();
                     self.builder.build_float_neg(a, "fneg").map_err(|e| self.err(e))?.into()
                 }
+                UnOp::Neg if matches!(self.f.operand_ty(a), Ty::Vec(Scalar::Float(_), _)) => {
+                    let a = self.operand(a)?.into_vector_value();
+                    self.builder
+                        .build_float_neg(a, "vfneg")
+                        .map_err(|e| self.err(e))?
+                        .into()
+                }
                 UnOp::Neg => {
                     let a = self.operand(a)?.into_int_value();
                     self.builder.build_int_neg(a, "neg").map_err(|e| self.err(e))?.into()
@@ -13592,7 +13603,51 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.gen_cast(val, *from, *to)?
             }
             Rvalue::Bin(op, a, b) => self.gen_bin(*op, a, b)?,
-            Rvalue::IntArith { op, mode, int_ty, a, b } => {
+            Rvalue::FloatBin { op, a, b, mode } => {
+                let value = match (self.f.operand_ty(a), self.f.operand_ty(b)) {
+                    (Ty::Vec(Scalar::Float(float), n), _)
+                    | (_, Ty::Vec(Scalar::Float(float), n)) => {
+                        self.gen_vec_bin(*op, a, b, Ty::Float(float), n)?
+                    }
+                    _ => self.gen_float_bin(*op, a, b)?,
+                };
+                self.apply_float_mode(value, *mode)?
+            }
+            Rvalue::FloatFma { ty, a, b, c, mode } => {
+                let (overload, operands): (BasicTypeEnum<'c>, Vec<BasicMetadataValueEnum<'c>>) =
+                    match ty {
+                        Ty::Float(_) => (
+                            float_type(self.ctx, *ty).into(),
+                            vec![
+                                self.operand(a)?.into(),
+                                self.operand(b)?.into(),
+                                self.operand(c)?.into(),
+                            ],
+                        ),
+                        Ty::Vec(Scalar::Float(float), n) => {
+                            let elem = Ty::Float(*float);
+                            let vector_ty = vec_llvm_ty(self.ctx, elem, *n);
+                            (
+                                vector_ty,
+                                vec![
+                                    self.operand_as_vector(a, elem, *n)?.into(),
+                                    self.operand_as_vector(b, elem, *n)?.into(),
+                                    self.operand_as_vector(c, elem, *n)?.into(),
+                                ],
+                            )
+                        }
+                        _ => return Err(self.err("FloatFma requires a float scalar or vector")),
+                    };
+                let value = self.call_intrinsic("llvm.fma", &[overload], &operands)?;
+                self.apply_float_mode(value, *mode)?
+            }
+            Rvalue::IntArith {
+                op,
+                mode,
+                int_ty,
+                a,
+                b,
+            } => {
                 let llvm_int = int_type(self.ctx, *int_ty);
                 let signed = is_signed(*int_ty);
                 let sign = if signed { 's' } else { 'u' };
@@ -14663,24 +14718,57 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder.build_insert_element(v, val, idx, "vins").map_err(|e| self.err(e))?.into()
             }
             // `vec.sum_where(mask)` — `select(mask, vec, 0)` then add all N lanes (M6).
-            Rvalue::VecSumWhere { vec, mask, elem, n } => {
+            Rvalue::VecSumWhere {
+                vec,
+                mask,
+                elem,
+                n,
+                mode,
+            } => {
                 let v = self.operand(vec)?.into_vector_value();
                 let m = self.operand(mask)?.into_vector_value();
-                let zero = vec_llvm_ty(self.ctx, *elem, *n).into_vector_type().const_zero();
-                let masked = self.builder.build_select(m, v, zero, "swsel").map_err(|e| self.err(e))?.into_vector_value();
-                self.horizontal_sum(masked, matches!(elem, Ty::Float(_)), *n)?
+                let zero = vec_llvm_ty(self.ctx, *elem, *n)
+                    .into_vector_type()
+                    .const_zero();
+                let masked = self
+                    .builder
+                    .build_select(m, v, zero, "swsel")
+                    .map_err(|e| self.err(e))?
+                    .into_vector_value();
+                self.horizontal_sum(masked, matches!(elem, Ty::Float(_)), *n, *mode)?
             }
             // `dot(a, b)` — multiply lane-wise, then a horizontal sum.
-            Rvalue::VecDot { a, b, elem, n } => {
+            Rvalue::VecDot {
+                a,
+                b,
+                elem,
+                n,
+                mode,
+            } => {
                 let av = self.operand(a)?.into_vector_value();
                 let bv = self.operand(b)?.into_vector_value();
                 let is_float = matches!(elem, Ty::Float(_));
-                let prod = if is_float {
-                    self.builder.build_float_mul(av, bv, "dotmul").map_err(|e| self.err(e))?
+                if is_float && mode.contract() {
+                    self.horizontal_float_dot(av, bv, *elem, *n, *mode)?
                 } else {
-                    self.builder.build_int_mul(av, bv, "dotmul").map_err(|e| self.err(e))?
+                    let prod: BasicValueEnum<'c> = if is_float {
+                        self.builder
+                            .build_float_mul(av, bv, "dotmul")
+                            .map_err(|e| self.err(e))?
+                            .into()
+                    } else {
+                        self.builder
+                            .build_int_mul(av, bv, "dotmul")
+                            .map_err(|e| self.err(e))?
+                            .into()
                 };
-                self.horizontal_sum(prod, is_float, *n)?
+                    let prod = if is_float {
+                        self.apply_float_mode(prod, *mode)?
+                    } else {
+                        prod
+                    };
+                    self.horizontal_sum(prod.into_vector_value(), is_float, *n, *mode)?
+                }
             }
             // `v.min()` / `v.max()` — fold the lanes with the scalar min/max intrinsic.
             Rvalue::VecMinMax { vec, elem, n, max } => {
@@ -14688,9 +14776,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.horizontal_minmax(v, *elem, *n, *max)?
             }
             // `v.sum()` — add all lanes (the shared horizontal sum).
-            Rvalue::VecSum { vec, elem, n } => {
+            Rvalue::VecSum { vec, elem, n, mode } => {
                 let v = self.operand(vec)?.into_vector_value();
-                self.horizontal_sum(v, matches!(elem, Ty::Float(_)), *n)?
+                self.horizontal_sum(v, matches!(elem, Ty::Float(_)), *n, *mode)?
             }
             // Reduce a mask to `bool` = true iff any lane is set (OR-fold), the vector div/rem guard.
             Rvalue::MaskAny { mask, n } => {
@@ -23977,17 +24065,83 @@ impl<'c, 'a> FnGen<'c, 'a> {
         self.builder.build_shuffle_vector(init, poison, mask, "splat").map_err(|e| self.err(e))
     }
 
+    fn apply_float_mode(
+        &self,
+        value: BasicValueEnum<'c>,
+        mode: hir::FloatMode,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
+        if mode.has_unknown() {
+            return Err(self.err("floating-point mode contains an unknown permission bit"));
+        }
+        if mode.reassoc() {
+            let instruction = value
+                .as_instruction_value()
+                .ok_or_else(|| self.err("relaxed float value is not an LLVM instruction"))?;
+            instruction
+                .set_fast_math_flags(FastMathFlags::AllowReassoc)
+                .map_err(|error| self.err(format!("could not set reassoc: {error}")))?;
+        }
+        Ok(value)
+    }
+
     /// Sum the `n` lanes of a vector into the element scalar (M6 reductions — `sum_where`, `dot`).
-    /// An extract-and-add chain; the optimizer turns it into a hardware reduction.
-    fn horizontal_sum(&self, v: inkwell::values::VectorValue<'c>, is_float: bool, n: u32) -> Result<BasicValueEnum<'c>, CodegenError> {
+    /// `reassoc` is attached only to the floating reduction instruction; no other fast-math bit is
+    /// inferred here.
+    fn horizontal_sum(
+        &self,
+        v: inkwell::values::VectorValue<'c>,
+        is_float: bool,
+        n: u32,
+        mode: hir::FloatMode,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
         // A vector type always has width ≥ 1 (`vecN` is 2/4/8/16) — guard the lane-0 extract below.
         assert!(n > 0, "vector width must be at least 1");
         if is_float {
-            let start = v.get_type().get_element_type().into_float_type().const_zero();
-            self.call_intrinsic("llvm.vector.reduce.fadd", &[v.get_type().into()], &[start.into(), v.into()])
+            let start = v
+                .get_type()
+                .get_element_type()
+                .into_float_type()
+                .const_zero();
+            let value = self.call_intrinsic(
+                "llvm.vector.reduce.fadd",
+                &[v.get_type().into()],
+                &[start.into(), v.into()],
+            )?;
+            self.apply_float_mode(value, mode)
         } else {
             self.call_intrinsic("llvm.vector.reduce.add", &[v.get_type().into()], &[v.into()])
         }
+    }
+
+    fn horizontal_float_dot(
+        &self,
+        a: inkwell::values::VectorValue<'c>,
+        b: inkwell::values::VectorValue<'c>,
+        elem: Ty,
+        n: u32,
+        mode: hir::FloatMode,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
+        assert!(n > 0, "vector width must be at least 1");
+        let float = float_type(self.ctx, elem);
+        let mut accumulator: BasicValueEnum<'c> = float.const_zero().into();
+        for lane in 0..n {
+            let index = self.ctx.i32_type().const_int(lane as u64, false);
+            let left = self
+                .builder
+                .build_extract_element(a, index, "dot.a")
+                .map_err(|error| self.err(error))?;
+            let right = self
+                .builder
+                .build_extract_element(b, index, "dot.b")
+                .map_err(|error| self.err(error))?;
+            let fused = self.call_intrinsic(
+                "llvm.fma",
+                &[float.into()],
+                &[left.into(), right.into(), accumulator.into()],
+            )?;
+            accumulator = self.apply_float_mode(fused, mode)?;
+        }
+        Ok(accumulator)
     }
 
     /// Reduce a `<N x i1>` mask to a scalar `i1` = true iff **any** lane is set (an OR-fold of the
@@ -28399,6 +28553,7 @@ fn main() -> i32 = 0
             expression = match expression_depth % 3 {
                 0 => hir::Expr {
                     kind: hir::ExprKind::Binary {
+                        float_mode: hir::FloatMode::STRICT,
                         op: BinOp::Add,
                         lhs: Box::new(expression),
                         rhs: Box::new(hir::Expr {

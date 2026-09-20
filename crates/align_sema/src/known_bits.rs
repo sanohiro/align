@@ -67,7 +67,7 @@ fn facts(expr: &Expr, budget: u8) -> Bits {
                 one: bits.zero,
             }
         }
-        ExprKind::Binary { op, lhs, rhs } if lhs.ty == expr.ty && rhs.ty == expr.ty => {
+        ExprKind::Binary { op, lhs, rhs, .. } if lhs.ty == expr.ty && rhs.ty == expr.ty => {
             let left = child(lhs);
             let right = child(rhs);
             match op {

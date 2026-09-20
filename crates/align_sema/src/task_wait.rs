@@ -1183,6 +1183,7 @@ impl<'a> Analyzer<'a> {
                         });
                     }
                     ExprKind::Block(block)
+                    | ExprKind::FloatScope { block, .. }
                     | ExprKind::Arena(block)
                     | ExprKind::NamedArena { block, .. }
                     | ExprKind::Unsafe(block) => {
@@ -1214,6 +1215,7 @@ impl<'a> Analyzer<'a> {
                         op: BinOp::And | BinOp::Or,
                         lhs,
                         rhs,
+                        ..
                     } => {
                         let Some(site) = self.site(expr) else {
                             last = Flow::dead();

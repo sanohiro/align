@@ -2856,6 +2856,9 @@ struct SpawnContext {
 #[derive(Clone)]
 struct BodyContext {
     function: usize,
+    /// Exact lexical floating-point permissions. Every callable root starts strict; only a
+    /// retained `FloatScope` may extend this value for its own block.
+    float_mode: hir::FloatMode,
     unsafe_depth: u32,
     arena_depth: u32,
     task_depth: u32,
@@ -3113,6 +3116,7 @@ impl<'a> LocalScopeValidator<'a> {
                     match &expression.kind {
                         hir::ExprKind::TaskGroup(block)
                         | hir::ExprKind::Block(block)
+                        | hir::ExprKind::FloatScope { block, .. }
                         | hir::ExprKind::Arena(block)
                         | hir::ExprKind::Unsafe(block)
                         | hir::ExprKind::Loop { body: block, .. } => {
@@ -3344,6 +3348,14 @@ fn tagged_type_as_ty(program: &hir::Program, id: u32) -> Option<Ty> {
     }
 }
 
+fn float_relaxation_ty(ty: Ty) -> bool {
+    matches!(ty, Ty::Float(_) | Ty::Vec(Scalar::Float(_), _))
+}
+
+fn exact_float_mode(actual: hir::FloatMode, expected: hir::FloatMode) -> bool {
+    !actual.has_unknown() && (actual.bits ^ expected.bits) == 0
+}
+
 impl<'a> BodyValidator<'a> {
     fn new(program: &'a hir::Program) -> Self {
         Self::with_implicit_local_params(program, false)
@@ -3383,6 +3395,7 @@ impl<'a> BodyValidator<'a> {
             }
             let context = BodyContext {
                 function: function_index,
+                float_mode: hir::FloatMode::STRICT,
                 unsafe_depth: 0,
                 arena_depth: 0,
                 task_depth: 0,
@@ -4377,7 +4390,6 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::Local(_)
             | hir::ExprKind::Unary { .. }
             | hir::ExprKind::Cast(_)
-            | hir::ExprKind::Binary { .. }
             | hir::ExprKind::IntArith { .. }
             | hir::ExprKind::MathOp { .. }
             | hir::ExprKind::CallFnValue { .. }
@@ -4420,6 +4432,21 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::TemplateHtmlWrite { .. }
             | hir::ExprKind::TemplateHtmlRaw { .. }
             | hir::ExprKind::TemplateHtmlToString { .. } => true,
+            hir::ExprKind::FloatScope { mode, .. } => {
+                !mode.is_empty() && !mode.has_unknown()
+            }
+            hir::ExprKind::Binary { op, float_mode, .. } => {
+                let expected = if matches!(
+                    op,
+                    align_ast::BinOp::Add | align_ast::BinOp::Sub | align_ast::BinOp::Mul
+                ) && float_relaxation_ty(expression.ty)
+                {
+                    context.float_mode
+                } else {
+                    hir::FloatMode::STRICT
+                };
+                exact_float_mode(*float_mode, expected)
+            }
             hir::ExprKind::ArrayTruncate { root, path, .. } => {
                 let place_ty = if path.is_empty() {
                     self.local_type(context, *root)
@@ -4509,11 +4536,17 @@ impl<'a> BodyValidator<'a> {
                     .tuples
                     .get(*tuple_id as usize)
                     .is_some_and(|tuple| tuple.elems.len() == sources.len()),
-            hir::ExprKind::Select { .. }
-            | hir::ExprKind::VecSumWhere { .. }
-            | hir::ExprKind::VecDot { .. }
-            | hir::ExprKind::VecMinMax { .. }
-            | hir::ExprKind::VecSum { .. } => true,
+            hir::ExprKind::Select { .. } | hir::ExprKind::VecMinMax { .. } => true,
+            hir::ExprKind::VecSumWhere { float_mode, .. }
+            | hir::ExprKind::VecDot { float_mode, .. }
+            | hir::ExprKind::VecSum { float_mode, .. } => {
+                let expected = if matches!(expression.ty, Ty::Float(_)) {
+                    context.float_mode
+                } else {
+                    hir::FloatMode::STRICT
+                };
+                exact_float_mode(*float_mode, expected)
+            }
             hir::ExprKind::VecLoad { elem, n, .. }
             | hir::ExprKind::VecStore { elem, n, .. } => {
                 valid_vector_scalar(*elem) && valid_vector_lanes(*n)
@@ -4524,8 +4557,21 @@ impl<'a> BodyValidator<'a> {
                         .ok()
                         .is_some_and(valid_vector_lanes)
             }
-            hir::ExprKind::ArraySum { stages, .. }
-            | hir::ExprKind::ArrayCount { stages, .. }
+            hir::ExprKind::ArraySum { stages, float_mode, .. } => {
+                self.pipeline_stages_envelope_ok(stages)
+                    && exact_float_mode(
+                        *float_mode,
+                        if matches!(
+                            expression.ty,
+                            Ty::Float(_) | Ty::Result(Scalar::Float(_), _)
+                        ) {
+                            context.float_mode
+                        } else {
+                            hir::FloatMode::STRICT
+                        },
+                    )
+            }
+            hir::ExprKind::ArrayCount { stages, .. }
             | hir::ExprKind::ArrayMinMax { stages, .. }
             | hir::ExprKind::ArrayReduce { stages, .. }
             | hir::ExprKind::ArrayScan { stages, .. }
@@ -4540,7 +4586,17 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::ArrayAnyAll { stages, func, .. } => {
                 valid_declaration_name(func) && self.pipeline_stages_envelope_ok(stages)
             }
-            hir::ExprKind::ArrayDot { elem, .. } => self.body_ty_ok(*elem),
+            hir::ExprKind::ArrayDot { elem, float_mode, .. } => {
+                self.body_ty_ok(*elem)
+                    && exact_float_mode(
+                        *float_mode,
+                        if matches!(elem, Ty::Float(_)) {
+                            context.float_mode
+                        } else {
+                            hir::FloatMode::STRICT
+                        },
+                    )
+            }
             hir::ExprKind::ArrayToSoa { struct_id, .. } => {
                 self.program.structs.get(*struct_id as usize).is_some()
             }
@@ -5479,6 +5535,7 @@ impl<'a> BodyValidator<'a> {
                         | hir::ExprKind::NamedArena { block, .. }
                         | hir::ExprKind::Unsafe(block)
                         | hir::ExprKind::Block(block)
+                        | hir::ExprKind::FloatScope { block, .. }
                         | hir::ExprKind::Loop { body: block, .. } => {
                             work.push(Scan::Block(block));
                         }
@@ -5765,6 +5822,7 @@ impl<'a> BodyValidator<'a> {
                         | hir::ExprKind::NamedArena { block, .. }
                         | hir::ExprKind::Unsafe(block)
                         | hir::ExprKind::Block(block)
+                        | hir::ExprKind::FloatScope { block, .. }
                         | hir::ExprKind::Loop { body: block, .. } => {
                             work.push(Scan::Block(block));
                         }
@@ -5794,6 +5852,7 @@ impl<'a> BodyValidator<'a> {
             match &current.kind {
                 hir::ExprKind::ReaderBuffered { .. } => return true,
                 hir::ExprKind::Block(block)
+                | hir::ExprKind::FloatScope { block, .. }
                 | hir::ExprKind::Arena(block)
                 | hir::ExprKind::NamedArena { block, .. }
                 | hir::ExprKind::Unsafe(block) => {
@@ -6505,6 +6564,7 @@ impl<'a> BodyValidator<'a> {
     fn task_group_is_fallible(&self, root: &'a hir::Block) -> bool {
         let context = BodyContext {
             function: 0,
+            float_mode: hir::FloatMode::STRICT,
             unsafe_depth: 0,
             arena_depth: 0,
             task_depth: 0,
@@ -6726,6 +6786,13 @@ impl<'a> BodyValidator<'a> {
                 push_expr!(cond, context.clone());
             }
             hir::ExprKind::TupleIndex { recv, .. } => push_expr!(recv, context.clone()),
+            hir::ExprKind::FloatScope { mode, block } => {
+                let mut child = context.clone();
+                child.float_mode = child.float_mode.union(*mode);
+                child.pooled_initializer = None;
+                child.allow_indexed_move_field_borrow = false;
+                work.push(BodyWork::EnterBlock(block, child));
+            }
             hir::ExprKind::Block(block)
             | hir::ExprKind::Arena(block)
             | hir::ExprKind::NamedArena { block, .. }
@@ -6836,15 +6903,15 @@ impl<'a> BodyValidator<'a> {
                 push_expr!(a, context.clone());
                 push_expr!(mask, context.clone());
             }
-            hir::ExprKind::VecSumWhere { vec, mask } => {
+            hir::ExprKind::VecSumWhere { vec, mask, .. } => {
                 push_expr!(mask, context.clone());
                 push_expr!(vec, context.clone());
             }
-            hir::ExprKind::VecDot { a, b } => {
+            hir::ExprKind::VecDot { a, b, .. } => {
                 push_expr!(b, context.clone());
                 push_expr!(a, context.clone());
             }
-            hir::ExprKind::VecMinMax { vec, .. } | hir::ExprKind::VecSum { vec } => {
+            hir::ExprKind::VecMinMax { vec, .. } | hir::ExprKind::VecSum { vec, .. } => {
                 push_expr!(vec, context.clone());
             }
             hir::ExprKind::VecLoad { src, index, .. } => {
@@ -6861,7 +6928,7 @@ impl<'a> BodyValidator<'a> {
                 push_expr!(index, context.clone());
                 push_expr!(dst, context.clone());
             }
-            hir::ExprKind::ArraySum { source, stages }
+            hir::ExprKind::ArraySum { source, stages, .. }
             | hir::ExprKind::ArrayCount { source, stages }
             | hir::ExprKind::ArrayMinMax { source, stages, .. }
             | hir::ExprKind::ArraySort { source, stages, .. }
@@ -7212,7 +7279,7 @@ impl<'a> BodyValidator<'a> {
                 let child = self.expr_flow(inner)?;
                 cast_result(child.ty, expression.ty).map(|_| (expression.ty, child.falls, child.breaks))
             }
-            hir::ExprKind::Binary { op, lhs, rhs } => {
+            hir::ExprKind::Binary { op, lhs, rhs, .. } => {
                 let left = self.expr_flow(lhs)?;
                 let right = self.expr_flow(rhs)?;
                 let result = binary_result(*op, left.ty, right.ty)?;
@@ -7736,7 +7803,9 @@ impl<'a> BodyValidator<'a> {
                             // pre-existing Move record. MIR's guarded element materializer owns
                             // the completed block value until the entire array succeeds.
                             let mut constructor = element;
-                            while let hir::ExprKind::Block(block) = &constructor.kind {
+                            while let hir::ExprKind::Block(block)
+                            | hir::ExprKind::FloatScope { block, .. } = &constructor.kind
+                            {
                                 let Some(tail) = block.value.as_deref() else { return false };
                                 constructor = tail;
                             }
@@ -7852,7 +7921,7 @@ impl<'a> BodyValidator<'a> {
                 let (falls, breaks) = strict_flow(&[mask, a, b]);
                 Some((Ty::Vec(scalar, lanes), falls, breaks))
             }
-            hir::ExprKind::VecSumWhere { vec, mask } => {
+                hir::ExprKind::VecSumWhere { vec, mask, .. } => {
                 let vector = self.expr_flow(vec)?;
                 let mask = self.expr_flow(mask)?;
                 let (scalar, lanes) = vector_numeric(vector.ty)?;
@@ -7862,7 +7931,7 @@ impl<'a> BodyValidator<'a> {
                 let (falls, breaks) = strict_flow(&[vector, mask]);
                 Some((align_sema::scalar_to_ty(scalar), falls, breaks))
             }
-            hir::ExprKind::VecDot { a, b } => {
+                hir::ExprKind::VecDot { a, b, .. } => {
                 let a = self.expr_flow(a)?;
                 let b = self.expr_flow(b)?;
                 let (scalar, lanes) = vector_numeric(a.ty)?;
@@ -7872,7 +7941,7 @@ impl<'a> BodyValidator<'a> {
                 let (falls, breaks) = strict_flow(&[a, b]);
                 Some((align_sema::scalar_to_ty(scalar), falls, breaks))
             }
-            hir::ExprKind::VecMinMax { vec, .. } | hir::ExprKind::VecSum { vec } => {
+                hir::ExprKind::VecMinMax { vec, .. } | hir::ExprKind::VecSum { vec, .. } => {
                 let vector = self.expr_flow(vec)?;
                 let (scalar, _) = vector_numeric(vector.ty)?;
                 Some((
@@ -7950,7 +8019,7 @@ impl<'a> BodyValidator<'a> {
                 let leaf = self.field_path_ty(Some(Ty::Struct(struct_id)), path)?;
                 Some((leaf, true, Vec::new()))
             }
-            hir::ExprKind::Block(block) => {
+                hir::ExprKind::Block(block) | hir::ExprKind::FloatScope { block, .. } => {
                 let flow = self.block_flow(block)?;
                 Some((flow.ty, flow.falls, flow.breaks))
             }
@@ -8783,6 +8852,7 @@ impl<'a> BodyValidator<'a> {
                 reaches_break: false,
             }),
             hir::ExprKind::Block(block)
+                | hir::ExprKind::FloatScope { block, .. }
             | hir::ExprKind::Arena(block)
             | hir::ExprKind::NamedArena { block, .. }
             | hir::ExprKind::TaskGroup(block)
@@ -8833,7 +8903,7 @@ impl<'a> BodyValidator<'a> {
                     reaches_break: option_flow.reaches_break || fallback_flow.reaches_break,
                 })
             }
-            hir::ExprKind::Binary { op, lhs, rhs } => {
+                hir::ExprKind::Binary { op, lhs, rhs, .. } => {
                 let left = *self.producer_exprs.get(&ptr_key(lhs.as_ref()))?;
                 if !left.falls {
                     return Some(left);
@@ -10395,7 +10465,7 @@ impl<'a> BodyValidator<'a> {
     ) -> Option<(Ty, bool, Vec<Ty>)> {
         let kind = &expression.kind;
         match kind {
-            hir::ExprKind::ArraySum { source, stages } => {
+            hir::ExprKind::ArraySum { source, stages, .. } => {
                 let (elem, flows) = self.pipeline_prefix(source, stages, context)?;
                 if !numeric_body_ty(elem) {
                     return None;
@@ -10530,7 +10600,7 @@ impl<'a> BodyValidator<'a> {
                     breaks,
                 ))
             }
-            hir::ExprKind::ArrayDot { a, b, elem } => {
+                hir::ExprKind::ArrayDot { a, b, elem, .. } => {
                 let left = self.expr_flow(a)?;
                 let right = self.expr_flow(b)?;
                 let (left_scalar, left_len) = fixed_array_shape(a, left.ty)?;
@@ -12854,9 +12924,17 @@ impl<'a> BodyValidator<'a> {
                         _ => return false,
                     }
                 }
-                hir::ExprKind::ArrayToSlice(inner) | hir::ExprKind::SliceRange { recv:inner,.. } => work.push(inner),
-                hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) | hir::ExprKind::Arena(block) | hir::ExprKind::NamedArena { block,.. } => {
-                    let Some(value)=block.value.as_deref() else { return false; }; work.push(value);
+                    hir::ExprKind::ArrayToSlice(inner)
+                    | hir::ExprKind::SliceRange { recv: inner, .. } => work.push(inner),
+                    hir::ExprKind::Block(block)
+                    | hir::ExprKind::FloatScope { block, .. }
+                    | hir::ExprKind::Unsafe(block)
+                    | hir::ExprKind::Arena(block)
+                    | hir::ExprKind::NamedArena { block, .. } => {
+                        let Some(value) = block.value.as_deref() else {
+                            return false;
+                        };
+                        work.push(value);
                 }
                 hir::ExprKind::If { then,els,.. } => {
                     for block in [then,els] { let Some(value)=block.value.as_deref() else { return false; }; work.push(value); }
@@ -13328,6 +13406,7 @@ impl<'a> BodyValidator<'a> {
                         | hir::ExprKind::NamedArena { block, .. }
                         | hir::ExprKind::Unsafe(block)
                         | hir::ExprKind::Block(block)
+                            | hir::ExprKind::FloatScope { block, .. }
                         | hir::ExprKind::Loop { body: block, .. } => {
                             work.push(Scan::Block(block));
                         }
@@ -13362,7 +13441,7 @@ impl<'a> BodyValidator<'a> {
         let hir::ExprKind::If { cond, then, els } = &initializer.kind else {
             return false;
         };
-        let hir::ExprKind::Binary { op, lhs, rhs } = &cond.kind else {
+            let hir::ExprKind::Binary { op, lhs, rhs, .. } = &cond.kind else {
             return false;
         };
         if *op != align_ast::BinOp::Eq
@@ -13390,7 +13469,7 @@ impl<'a> BodyValidator<'a> {
         let hir::ExprKind::RawAlloc(size) = &else_value.kind else {
             return false;
         };
-        let hir::ExprKind::Binary { op, lhs, rhs } = &size.kind else {
+            let hir::ExprKind::Binary { op, lhs, rhs, .. } = &size.kind else {
             return false;
         };
         let hir::ExprKind::Cast(cast) = &lhs.kind else {
@@ -13748,6 +13827,7 @@ fn context_polymorphic_expression(kind: &hir::ExprKind, falls: bool) -> bool {
                 | hir::ExprKind::Match { .. }
                 | hir::ExprKind::If { .. }
                 | hir::ExprKind::Block(_)
+                    | hir::ExprKind::FloatScope { .. }
                 | hir::ExprKind::Loop { .. }
                 | hir::ExprKind::Arena(_)
                 | hir::ExprKind::NamedArena { .. }
@@ -14130,7 +14210,9 @@ fn canonical_raw_null(root: &hir::Expr) -> bool {
     loop {
         match &current.kind {
             hir::ExprKind::RawNull => return current.ty == Ty::Raw,
-            hir::ExprKind::Unsafe(block) | hir::ExprKind::Block(block)
+                hir::ExprKind::Unsafe(block)
+                | hir::ExprKind::Block(block)
+                | hir::ExprKind::FloatScope { block, .. }
                 if block.stmts.is_empty() =>
             {
                 let Some(value) = block.value.as_deref() else {

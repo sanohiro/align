@@ -358,10 +358,16 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             expr: boxed!(expr),
         },
         ExprKind::Cast(expr) => ExprKind::Cast(boxed!(expr)),
-        ExprKind::Binary { op, lhs, rhs } => ExprKind::Binary {
+        ExprKind::Binary {
+            op,
+            lhs,
+            rhs,
+            float_mode,
+        } => ExprKind::Binary {
             op: *op,
             lhs: boxed!(lhs),
             rhs: boxed!(rhs),
+            float_mode: *float_mode,
         },
         ExprKind::IntArith { op, mode, lhs, rhs } => ExprKind::IntArith {
             op: *op,
@@ -436,6 +442,10 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             index: *index,
         },
         ExprKind::Block(_) => ExprKind::Block(clones.block()?),
+        ExprKind::FloatScope { mode, .. } => ExprKind::FloatScope {
+            mode: *mode,
+            block: clones.block()?,
+        },
         ExprKind::OptionSome(expr) => ExprKind::OptionSome(boxed!(expr)),
         ExprKind::ElseUnwrap { opt, fallback } => ExprKind::ElseUnwrap {
             opt: boxed!(opt),
@@ -607,19 +617,28 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             a: boxed!(a),
             b: boxed!(b),
         },
-        ExprKind::VecSumWhere { vec, mask } => ExprKind::VecSumWhere {
+        ExprKind::VecSumWhere {
+            vec,
+            mask,
+            float_mode,
+        } => ExprKind::VecSumWhere {
             vec: boxed!(vec),
             mask: boxed!(mask),
+            float_mode: *float_mode,
         },
-        ExprKind::VecDot { a, b } => ExprKind::VecDot {
+        ExprKind::VecDot { a, b, float_mode } => ExprKind::VecDot {
             a: boxed!(a),
             b: boxed!(b),
+            float_mode: *float_mode,
         },
         ExprKind::VecMinMax { vec, max } => ExprKind::VecMinMax {
             vec: boxed!(vec),
             max: *max,
         },
-        ExprKind::VecSum { vec } => ExprKind::VecSum { vec: boxed!(vec) },
+        ExprKind::VecSum { vec, float_mode } => ExprKind::VecSum {
+            vec: boxed!(vec),
+            float_mode: *float_mode,
+        },
         ExprKind::VecLoad {
             src,
             index,
@@ -648,9 +667,14 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             elems: take_exprs(clones, elems.len())?,
             elem: *elem,
         },
-        ExprKind::ArraySum { source, stages } => ExprKind::ArraySum {
+        ExprKind::ArraySum {
+            source,
+            stages,
+            float_mode,
+        } => ExprKind::ArraySum {
             source: boxed!(source),
             stages: clones.stages(stages.len())?,
+            float_mode: *float_mode,
         },
         ExprKind::ArrayCount { source, stages } => ExprKind::ArrayCount {
             source: boxed!(source),
@@ -706,10 +730,16 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             init: boxed!(init),
             elem: *elem,
         },
-        ExprKind::ArrayDot { a, b, elem } => ExprKind::ArrayDot {
+        ExprKind::ArrayDot {
+            a,
+            b,
+            elem,
+            float_mode,
+        } => ExprKind::ArrayDot {
             a: boxed!(a),
             b: boxed!(b),
             elem: *elem,
+            float_mode: *float_mode,
         },
         ExprKind::ArraySort {
             source,
@@ -2644,6 +2674,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         ExprKind::Spawn { closure, .. } => one!(closure),
         ExprKind::TaskGroup(block)
         | ExprKind::Block(block)
+        | ExprKind::FloatScope { block, .. }
         | ExprKind::Arena(block)
         | ExprKind::NamedArena { block, .. }
         | ExprKind::Unsafe(block) => block!(block),
@@ -2799,11 +2830,14 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             one!(name);
             optional!(default);
         }
-        ExprKind::VecSumWhere { vec, mask } | ExprKind::VecDot { a: vec, b: mask } => {
+        ExprKind::VecSumWhere { vec, mask, .. }
+        | ExprKind::VecDot {
+            a: vec, b: mask, ..
+        } => {
             one!(vec);
             one!(mask);
         }
-        ExprKind::VecMinMax { vec, .. } | ExprKind::VecSum { vec } => one!(vec),
+        ExprKind::VecMinMax { vec, .. } | ExprKind::VecSum { vec, .. } => one!(vec),
         ExprKind::VecLoad { src, index, .. } => {
             one!(src);
             one!(index);
@@ -2812,7 +2846,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             one!(source);
             one!(n);
         }
-        ExprKind::ArraySum { source, stages }
+        ExprKind::ArraySum { source, stages, .. }
         | ExprKind::ArrayCount { source, stages }
         | ExprKind::ArrayMinMax { source, stages, .. }
         | ExprKind::ArraySort { source, stages, .. }

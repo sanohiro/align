@@ -433,6 +433,8 @@ impl<'a> Facts<'a> {
                         | Rvalue::Use(_)
                         | Rvalue::Un(..)
                         | Rvalue::Bin(..)
+                        | Rvalue::FloatBin { .. }
+                        | Rvalue::FloatFma { .. }
                         | Rvalue::Cast { .. }
                         | Rvalue::SliceLen(_)
                         | Rvalue::SlicePtr(_)

@@ -35,6 +35,28 @@ fn main() {
 }
 ";
 
+const FLOAT_LIB: &str = "\
+module floatlib
+pub fn fused(a: f64, b: f64, c: f64) -> f64 = float(contract) { a * b + c }
+pub fn generic<T: Num>(a: T, b: T) -> T = float(reassoc) { a + b }
+pub fn move_value(values: array<i64>) -> array<i64> = float(reassoc) { values }
+pub fn clone_text(borrow value: str) -> string = (float(reassoc) { value }).clone()
+";
+
+const FLOAT_MAIN: &str = "\
+import floatlib
+fn main() {
+  print(floatlib.fused(2.0, 3.0, 4.0))
+  print(floatlib.generic(2.0, 3.0))
+  print(floatlib.generic(2, 3))
+  values := [1, 2, 3].to_array()
+  moved := floatlib.move_value(values)
+  print(moved.sum())
+  text := \"borrowed\"
+  print(floatlib.clone_text(text))
+}
+";
+
 #[test]
 fn admitted_body_is_a_consumer_definition_and_other_body_kinds_stay_distinct() {
     let built = build_per_unit_multi(
@@ -89,6 +111,66 @@ fn admitted_body_is_a_consumer_definition_and_other_body_kinds_stay_distinct() {
             .iter()
             .any(|function| function.name.as_str() == "tiny$with_local")
     );
+}
+
+#[test]
+fn float_scope_source_survives_interface_rechecking_and_per_unit_codegen() {
+    let files = [
+        ("floatlib.align", FLOAT_LIB),
+        ("main.align", FLOAT_MAIN),
+    ];
+    let built = build_per_unit_multi("interface-float-scope", &files, "main.align");
+    let producer = built.unit("floatlib");
+    let fused = producer
+        .summary
+        .fns
+        .iter()
+        .find(|function| function.name == "fused")
+        .expect("fused interface row");
+    let IFnBody::ConcreteInline { source, .. } = &fused.body else {
+        panic!("fused body must be transported for consumer codegen: {fused:#?}");
+    };
+    assert!(source.contains("float(contract)"), "concrete source: {source}");
+
+    let generic = producer
+        .summary
+        .fns
+        .iter()
+        .find(|function| function.name == "generic")
+        .expect("generic interface row");
+    let IFnBody::GenericTemplate(source) = &generic.body else {
+        panic!("generic body must be transported for monomorphization: {generic:#?}");
+    };
+    assert!(
+        source.contains("float(reassoc)"),
+        "generic source: {source}",
+    );
+
+    if !backend_available() {
+        return;
+    }
+    let consumer = built.unit("main");
+    let llvm = emit_llvm_ir(
+        &consumer.mir,
+        BuildTarget::Baseline,
+        align_driver::Profile::Release,
+        false,
+        &[],
+        false,
+    )
+    .expect("consumer LLVM IR");
+    assert!(llvm.contains("@llvm.fma.f64"), "consumer IR:\n{llvm}");
+    assert!(
+        llvm.lines()
+            .any(|line| line.contains("fadd reassoc double")),
+        "the floating generic instance lost reassoc during interface rechecking:\n{llvm}",
+    );
+
+    let whole = build_and_run_multi("interface-float-whole", &files, "main.align");
+    let per_unit = built.link_and_run();
+    assert_eq!(whole.status.code(), Some(0));
+    assert_eq!(per_unit.status.code(), Some(0));
+    assert_eq!(whole.stdout, per_unit.stdout);
 }
 
 #[test]

@@ -273,7 +273,28 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::Bin(op, a, b) => {
             format!("{} {} {}", operand_str(a), binop_str(*op), operand_str(b))
         }
-        Rvalue::IntArith { op, mode, int_ty, a, b } => {
+        Rvalue::FloatBin { op, a, b, mode } => format!(
+            "float[{}]({} {} {})",
+            mode.bits,
+            operand_str(a),
+            binop_str(*op),
+            operand_str(b)
+        ),
+        Rvalue::FloatFma { ty, a, b, c, mode } => format!(
+            "float[{}].fma({}, {}, {}) : {}",
+            mode.bits,
+            operand_str(a),
+            operand_str(b),
+            operand_str(c),
+            ty_name(*ty)
+        ),
+        Rvalue::IntArith {
+            op,
+            mode,
+            int_ty,
+            a,
+            b,
+        } => {
             let m = match mode {
                 align_sema::ArithMode::Saturating => "saturating",
                 align_sema::ArithMode::Checked => "checked",

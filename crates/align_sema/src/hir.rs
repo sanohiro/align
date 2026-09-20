@@ -636,6 +636,55 @@ pub struct Expr {
     pub span: Span,
 }
 
+/// Source-authenticated floating-point rewrite permissions. The two bits are independent; strict
+/// code is the all-false default. This record is retained on `FloatScope` and every eligible HIR
+/// operation so validation can recompute the exact lexical mode before MIR lowering.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct FloatMode {
+    pub bits: u8,
+}
+
+impl FloatMode {
+    pub const REASSOC_BIT: u8 = 1 << 0;
+    pub const CONTRACT_BIT: u8 = 1 << 1;
+    pub const KNOWN_BITS: u8 = Self::REASSOC_BIT | Self::CONTRACT_BIT;
+    pub const STRICT: Self = Self { bits: 0 };
+
+    pub const fn reassoc(self) -> bool {
+        self.bits & Self::REASSOC_BIT != 0
+    }
+
+    pub const fn contract(self) -> bool {
+        self.bits & Self::CONTRACT_BIT != 0
+    }
+
+    pub const fn has_unknown(self) -> bool {
+        self.bits & !Self::KNOWN_BITS != 0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.bits == 0
+    }
+
+    pub const fn with_reassoc(self) -> Self {
+        Self {
+            bits: self.bits | Self::REASSOC_BIT,
+        }
+    }
+
+    pub const fn with_contract(self) -> Self {
+        Self {
+            bits: self.bits | Self::CONTRACT_BIT,
+        }
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self {
+            bits: self.bits | other.bits,
+        }
+    }
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub enum ExprKind {
     Unit,
@@ -664,6 +713,7 @@ pub enum ExprKind {
         op: BinOp,
         lhs: Box<Expr>,
         rhs: Box<Expr>,
+        float_mode: FloatMode,
     },
     /// Explicit-overflow integer arithmetic (`core.math`): `x.saturating_add(y)` /
     /// `x.checked_mul(y)` etc. `op` is `Add`/`Sub`/`Mul`. `Saturating` clamps to the type's
@@ -781,6 +831,12 @@ pub enum ExprKind {
     /// A block used in expression position; its value is the trailing expression (or
     /// `Unit`). Preserves statements (e.g. a diverging `{ return … }`).
     Block(Block),
+    /// Retained lexical floating-point permission scope. It has exactly the block's type,
+    /// ownership, effect, and region and no runtime enter/exit operation.
+    FloatScope {
+        mode: FloatMode,
+        block: Block,
+    },
     /// `Some(x)` — the expression `ty` is the resulting `Option<T>`.
     OptionSome(Box<Expr>),
     /// `None` — the expression `ty` is the `Option<T>` fixed by context.
@@ -962,16 +1018,27 @@ pub enum ExprKind {
     Select { mask: Box<Expr>, a: Box<Expr>, b: Box<Expr> },
     /// `vec.sum_where(mask)` — masked horizontal sum (M6): sum of the lanes where the mask is set,
     /// yielding the element scalar. Lowers to `select(mask, vec, 0)` then a lane reduction.
-    VecSumWhere { vec: Box<Expr>, mask: Box<Expr> },
+    VecSumWhere {
+        vec: Box<Expr>,
+        mask: Box<Expr>,
+        float_mode: FloatMode,
+    },
     /// `dot(a, b)` — the dot product of two `vecN<T>` (M6): the element scalar `sum(a[i] * b[i])`.
     /// Lowers to a vector multiply then a lane reduction (the multiply dual of [`VecSumWhere`]).
-    VecDot { a: Box<Expr>, b: Box<Expr> },
+    VecDot {
+        a: Box<Expr>,
+        b: Box<Expr>,
+        float_mode: FloatMode,
+    },
     /// `v.min()` / `v.max()` — the horizontal min/max of a `vecN<T>` (M6): the smallest/largest lane,
     /// as the element scalar. `max` selects max vs min. Folded with the scalar min/max intrinsic.
     VecMinMax { vec: Box<Expr>, max: bool },
     /// `v.sum()` — the horizontal sum of a `vecN<T>` (M6): the sum of all lanes, as the element
     /// scalar (the unmasked sibling of [`VecSumWhere`]). Lowers via the shared lane reduction.
-    VecSum { vec: Box<Expr> },
+    VecSum {
+        vec: Box<Expr>,
+        float_mode: FloatMode,
+    },
     /// `s.load(i)` — load `N` consecutive elements of a `slice<T>` starting at index `i` into a
     /// `vecN<T>` (M6): a bounds-checked vector load. `N`/`elem` come from the target annotation.
     VecLoad { src: Box<Expr>, index: Box<Expr>, elem: crate::Scalar, n: u32 },
@@ -985,7 +1052,11 @@ pub enum ExprKind {
     VecLit { elems: Vec<Expr>, elem: crate::Scalar },
     /// A fused array pipeline ending in `sum`: `source.map(f).where(p)….sum()`. The
     /// stages and the reduction lower to a single loop (no intermediate arrays).
-    ArraySum { source: Box<Expr>, stages: Vec<Stage> },
+    ArraySum {
+        source: Box<Expr>,
+        stages: Vec<Stage>,
+        float_mode: FloatMode,
+    },
     /// `source.….count()` — count the elements that survive the stages. Always `i64`;
     /// the element value is irrelevant, so no scalar projection is required.
     ArrayCount { source: Box<Expr>, stages: Vec<Stage> },
@@ -1007,7 +1078,12 @@ pub enum ExprKind {
     /// `a.dot(b)` — the inner product `Σ a[i]*b[i]` of two fixed-length arrays of the same
     /// numeric scalar element and the same (statically known) length. `elem` is that scalar;
     /// the result has type `elem`.
-    ArrayDot { a: Box<Expr>, b: Box<Expr>, elem: crate::Ty },
+    ArrayDot {
+        a: Box<Expr>,
+        b: Box<Expr>,
+        elem: crate::Ty,
+        float_mode: FloatMode,
+    },
     /// `source.….sort()` — materialize the surviving (numeric scalar) elements into an owned
     /// `array<T>` and sort them ascending in place. `elem` is the element scalar; the result
     /// type is `DynArray(elem)`.

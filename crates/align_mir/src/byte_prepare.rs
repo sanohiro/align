@@ -30,6 +30,19 @@ fn map_rvalue(
         Rvalue::Use(a) => Rvalue::Use(operand(a)?),
         Rvalue::Un(op, a) => Rvalue::Un(*op, operand(a)?),
         Rvalue::Bin(op, a, b) => Rvalue::Bin(*op, operand(a)?, operand(b)?),
+        Rvalue::FloatBin { op, a, b, mode } => Rvalue::FloatBin {
+            op: *op,
+            a: operand(a)?,
+            b: operand(b)?,
+            mode: *mode,
+        },
+        Rvalue::FloatFma { ty, a, b, c, mode } => Rvalue::FloatFma {
+            ty: *ty,
+            a: operand(a)?,
+            b: operand(b)?,
+            c: operand(c)?,
+            mode: *mode,
+        },
         Rvalue::Cast {
             operand: a,
             from,

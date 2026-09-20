@@ -157,6 +157,7 @@ fn discard_expr_tree(root: DiscardExprTask) {
                 ExprKind::Block(block)
                 | ExprKind::Arena(block)
                 | ExprKind::NamedArena { block, .. }
+                | ExprKind::FloatScope { block, .. }
                 | ExprKind::Unsafe(block)
                 | ExprKind::TaskGroup(block)
                 | ExprKind::Loop(block) => pending.push(DiscardExprTask::Block(Box::new(block))),
@@ -298,6 +299,7 @@ fn cap_expr_depth(e: &mut Expr, depth: u32, diags: &mut Diagnostics) {
         ExprKind::Block(b)
         | ExprKind::Arena(b)
         | ExprKind::NamedArena { block: b, .. }
+        | ExprKind::FloatScope { block: b, .. }
         | ExprKind::Unsafe(b)
         | ExprKind::TaskGroup(b)
         | ExprKind::Loop(b) => cap_block_depth(b, d, diags),
@@ -413,6 +415,7 @@ fn reserved_word(kind: &TokKind) -> Option<&'static str> {
         TokKind::True => "true",
         TokKind::False => "false",
         TokKind::Arena => "arena",
+        TokKind::FloatScope => "float",
         TokKind::TaskGroup => "task_group",
         TokKind::Match => "match",
         TokKind::Loop => "loop",
@@ -1751,6 +1754,36 @@ impl<'a> Parser<'a> {
                 };
                 Some(Expr { kind, span })
             }
+            TokKind::FloatScope => {
+                let start = self.span();
+                self.bump();
+                if !self.eat(&TokKind::LParen) {
+                    self.diags.error("expected `(` after `float`", self.span());
+                    return None;
+                }
+                let mut options = Vec::new();
+                if !matches!(self.peek(), TokKind::RParen) {
+                    loop {
+                        options.push(self.parse_ident("floating-point relaxation option")?);
+                        if !self.eat(&TokKind::Comma) {
+                            break;
+                        }
+                    }
+                }
+                if !self.eat(&TokKind::RParen) {
+                    self.diags.error(
+                        "expected `)` after floating-point relaxation options",
+                        self.span(),
+                    );
+                    return None;
+                }
+                let block = self.parse_block()?;
+                let span = start.merge(self.prev_span());
+                Some(Expr {
+                    kind: ExprKind::FloatScope { options, block },
+                    span,
+                })
+            }
             TokKind::Unsafe => {
                 let start = self.span();
                 self.bump();
@@ -2313,9 +2346,26 @@ mod tests {
     #[test]
     fn reserved_identifier_recovery_covers_keywords_and_parameter_modes() {
         let words = [
-            "fn", "return", "mut", "pub", "module", "import", "if", "else", "true",
-            "false", "arena", "task_group", "match", "loop", "break", "template",
-            "unsafe", "extern", "as",
+            "fn",
+            "return",
+            "mut",
+            "pub",
+            "module",
+            "import",
+            "if",
+            "else",
+            "true",
+            "false",
+            "arena",
+            "task_group",
+            "match",
+            "loop",
+            "break",
+            "template",
+            "float",
+            "unsafe",
+            "extern",
+            "as",
         ];
         for word in words {
             for mode in ["", "borrow ", "borrow mut ", "out "] {
@@ -2332,6 +2382,36 @@ mod tests {
                 assert_eq!(span.lo as usize, "fn f(".len() + mode.len());
                 assert_eq!(file.items.len(), 2, "{src}: {file:?}");
             }
+        }
+    }
+
+    #[test]
+    fn float_scope_retains_arbitrary_and_empty_option_lists_for_sema() {
+        for (source, expected) in [
+            ("fn f() -> f64 = float() { 0.0 }\n", Vec::<&str>::new()),
+            (
+                "fn f() -> f64 = float(contract, mystery, reassoc) { 0.0 }\n",
+                vec!["contract", "mystery", "reassoc"],
+            ),
+        ] {
+            let (file, has_errors) = parse(source);
+            assert!(!has_errors, "option diagnostics belong to sema: {source}");
+            let Item::Fn(function) = &file.items[0] else {
+                panic!("fixture must parse as a function");
+            };
+            let FnBody::Expr(expression) = &function.body else {
+                panic!("fixture must retain its expression body");
+            };
+            let ExprKind::FloatScope { options, .. } = &expression.kind else {
+                panic!("fixture must retain a float scope");
+            };
+            assert_eq!(
+                options
+                    .iter()
+                    .map(|option| option.name.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+            );
         }
     }
 
