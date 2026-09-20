@@ -584,7 +584,7 @@ Distinguished from named functions (`fn ident (`) by "name + presence/absence of
 ```ebnf
 arena_expr  = "arena" ident? block
 unsafe_expr = "unsafe" block
-float_expr  = "float" "(" float_option ("," float_option)* ")" block
+float_expr  = "float" "(" (float_option ("," float_option)*)? ")" block
 float_option = ident
 ```
 

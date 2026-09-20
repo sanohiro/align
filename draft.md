@@ -588,16 +588,16 @@ relinquish either guarantee:
 ```align
 sum := float(reassoc) { xs.sum() }
 dot := float(reassoc, contract) {
-  zip(xs, ys).map(fn pair { pair.0 * pair.1 }).sum()
+  zip(xs, ys).map(fn pair { float(contract) { pair.0 * pair.1 } }).sum()
 }
 ```
 
 `float(reassoc) { ... }` permits f32/f64 additions, subtractions, and multiplications written in
 the block to be reassociated, including built-in `sum` and `dot` accumulation. `float(contract) { ... }`
 permits a multiply and its consuming add/subtract, when both are in the scope, to become one fused
-operation. The options are independent; nested scopes add permissions. An inline lambda written
-inside the scope retains its declaration-site permissions, but calling a separately declared
-function does not add flags to that function's strict operations. A scope grants permission to its
+operation. The options are independent; nested scopes add permissions within one function body.
+Every named or inline function body starts strict, so the lambda above needs its own visible
+`float(contract)` scope; calling it does not copy the caller's mode. A scope grants permission to its
 operations; it is not an optimizer barrier. After inlining, operations from separate scopes or
 functions may combine only when every participating operation independently has the required
 permission. A strict operation prevents that rewrite. The scope is otherwise an ordinary block

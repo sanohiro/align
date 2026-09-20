@@ -2480,14 +2480,12 @@ regression net that validates the upgrade.
   [Plan 77](77-float-relaxation-scope-plan.md) completes plan 68 G4 Part 2 with
   the value-producing `float(reassoc)` / `float(contract)` lexical block.
   Strict IEEE operation order and separate rounding remain the default. The
-  two permissions are independent, nested scopes union them, inline lambdas
-  keep declaration-site mode, and caller mode never marks a separately declared
-  callee's strict operations. Equally permitted operations may compose after
+  two permissions are independent and nested scopes union them. Every function
+  and lambda body starts strict; lambda arithmetic needs its own inner scope.
+  Caller mode never marks a callee's strict operations. Equally permitted operations may compose after
   inlining; scopes are not optimization barriers. Checked HIR retains each lexical scope and validates every
   operation's exact effective mode, so known invented/dropped bits fail before
-  MIR. Lifted function root modes are derived from the unique parent lambda
-  target under that same scope walk, never trusted from the lifted body itself.
-  Generic and plan 74 concrete bodies retain exact source for consumer
+  MIR. Generic and plan 74 concrete bodies retain exact source for consumer
   rechecking. Poison-producing assumptions, reciprocal/approximate modes,
   bundled `fast`, and ambient compiler flags are excluded. Implementation is
   one parser-to-LLVM/interface capability after independent design review; no

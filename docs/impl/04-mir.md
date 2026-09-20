@@ -69,10 +69,9 @@ on every normal and terminating construction path. f32/f64 scalar and explicit-v
 floating sum carry the authenticated mode active where their source operation was written. Other MIR
 nodes carry no inferred relaxation.
 
-A lifted lambda's root mode is authenticated globally: validation walks each parent lambda
-expression under the retained scope stack, requires one exact lifted target, and then validates
-that target body under the derived mode, recursively for nested lambdas. A copied function field is
-not authority. Direct, indirect and imported calls do not copy caller mode onto callee operations;
+Every named, inline, lifted and escaping function body validates from strict mode. A lambda does
+not inherit the scope at its declaration site; relaxed lambda arithmetic has its own retained
+FloatScope inside the body. Direct, indirect and imported calls do not copy caller mode onto callee operations;
 the callee body already owns its modes. After LLVM body import/inlining, independently flagged
 operations may compose across that boundary, while an unflagged participant prevents the rewrite.
 Format 15 generic

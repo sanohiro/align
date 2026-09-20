@@ -106,7 +106,11 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    a global parent-scope-to-lifted-target validation pass and rejects orphan or
    duplicate targets. It also closes direct dot semantics and option-error
    precedence. This second P1 reopens the lifted-declaration-provenance axis and
-   required another full review. That review exposed LLVM's lack of scope
+   required another full review. A later review showed pipeline HIR erases the
+   parent lambda expression, so that declaration link was still not generally
+   authenticatable. The design now removes lambda inheritance: every callable
+   body starts strict and a lambda needs its own visible inner scope. This
+   deletes the special cross-function provenance mechanism. Another review exposed LLVM's lack of scope
    identity: equally flagged operations can compose across sibling or inlined
    function boundaries. The design now promises per-operation permission, not
    optimizer isolation; strict operations receive no caller flags and remain

@@ -322,9 +322,9 @@ Float arithmetic is ordered and uncontracted by default. The block expressions
 `float(reassoc) { ... }`, `float(contract) { ... }`, and
 `float(reassoc, contract) { ... }` explicitly permit f32/f64 reassociation and/or multiply-add
 contraction for arithmetic written lexically inside them, including built-in `sum`/`dot` products
-and accumulation. Nested scopes union permissions. An
-inline lambda retains the permissions at its declaration, while a separately declared callee never
-has flags added to its strict operations by a call site. Scopes grant per-operation permission, not
+and accumulation. Nested scopes union permissions within one function body. Every named, inline,
+lifted, or escaping function body starts strict; a lambda needs its own visible inner scope for
+relaxed arithmetic, and no call site adds flags to callee operations. Scopes grant per-operation permission, not
 optimization isolation: independently permitted operations may combine after inlining, while a
 strict participant blocks the rewrite. Relaxed NaN and infinity inputs remain defined; only the named
 rounding, association, signed-zero, and NaN-payload variation is permitted. There is no `nnan`,

@@ -3,7 +3,7 @@
 Floating-point relaxation is a visible lexical value scope, not an ambient build mode or a family
 of fast reducer names. `float(reassoc) {}` and `float(contract) {}` name exactly the two guarantees
 the programmer may relinquish. They compose independently, nest by union, and never add flags to a
-separately declared callee's strict operations. They are permission regions rather than optimizer
+callee's operations. Every named or lambda body starts strict and requires its own scope. They are permission regions rather than optimizer
 barriers: separately permitted operations may compose after inlining. This keeps strict
 reproducibility as the default while making the cost
 model selectable at the arithmetic use site. NaN and infinity remain values: Align deliberately
