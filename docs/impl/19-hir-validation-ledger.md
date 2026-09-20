@@ -2242,9 +2242,15 @@ Checked HIR retains each `FloatScope` with exactly two known bits, `reassoc` and
 nodes. The validator walks the lexical scope stack and requires exact equality
 with that union. It rejects invented or dropped known bits, unknown bits, and a
 mode attached to an ineligible non-f32/f64 node. Scope construction restores
-the enclosing mode after every block, branch, loop and terminating expression
-path. Every named, inline, lifted and escaping function body starts strict; a
-lambda body must retain its own FloatScope to relax an operation. A direct,
+the enclosing mode through plain blocks, `if`, `match`, `else`, `?`, `map_err`,
+loops and value-carrying `break`, `return`, `arena`, `unsafe`, and task-group
+blocks on every normal, join, early-exit, error and malformed path. The wrapper
+has its body's exact type, value category, ownership, effect and region;
+effect, replay/clone, depth/finalization, region/escape, MoveCheck, validation
+and MIR-production passes must recurse through that body exactly once. The
+variant sweep pins that classification. Every named, inline, lifted and escaping
+function body starts strict; a lambda body must retain its own FloatScope to
+relax an operation. A direct,
 indirect or imported call adds no caller mode to its target operations.
 This checked boundary authenticates permissions, not optimization isolation:
 LLVM may later combine independently permitted operations after inlining.
@@ -2257,7 +2263,8 @@ Malformed owners add a known bit outside a scope, drop one inside a scope,
 substitute unknown bits, attach known bits to integer, comparison, cast,
 min/max, call and memory nodes, copy an enclosing mode into any lambda target,
 invent caller-to-callee inheritance, or accept an unknown option while
-rechecking imported body source. Options are parsed as identifiers; the first
-unknown in source order outranks every duplicate, and only an all-known list
+rechecking imported body source. The positive product covers `ArraySum`,
+`ArrayDot`, `VecSum`, `VecSumWhere`, and `VecDot`. Options are parsed as
+identifiers; the first unknown in source order outranks every duplicate, and only an all-known list
 reports the first duplicate's second occurrence. Plan 77 owns the parameterized
 formation, control-flow, interface and whole/per-unit acceptance matrix.

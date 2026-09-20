@@ -86,9 +86,13 @@ Pipelines         Built-in pipeline arithmetic belongs to the terminal or
                   its own visible scope for relaxed arithmetic. Fusion/inlining
                   does not change which source operations received permission.
 
-Control flow      The form is a transparent block expression. `return`, `?`,
-                  `else`, `match`, loop `break`, cleanup, ownership, regions
-                  and evaluation order behave exactly as in a plain block.
+Control flow      The form is a transparent block expression. Plain blocks,
+                  `if`, `match`, `else`, `?`, `map_err`, loops and value-carrying
+                  `break`, `return`, `arena`, `unsafe`, and task-group blocks
+                  may occur inside it; the effective mode enters each child
+                  and is restored on every normal, join, early-exit, error, and
+                  malformed-input path. Cleanup, ownership, regions and
+                  evaluation order behave exactly as in a plain block.
                   Relaxation permits reordering of the selected arithmetic
                   nodes, not reordering, erasure, duplication or speculation
                   of calls, loads, stores, traps or other observable effects.
@@ -99,7 +103,18 @@ Types             The block may contain mixed float and non-float code and may
                   semantics are unchanged. f32/f64 scalar and vecN<f32/f64>
                   arithmetic use the same permission record.
 
-Ownership         Parser/AST own the option list and block form. align_sema
+Ownership         The wrapper's type, value category, ownership, effect and
+                  region are
+                  exactly its body's. Formation allocates no value and moving
+                  a result into or out of the wrapper transfers the body result
+                  exactly once. `region_of`, `tracks_region`, local-slice and
+                  escape analysis, MoveCheck, effect scan, replay/clone,
+                  depth/finalization, checked-HIR validation and MIR production
+                  all recurse through the body. Source nulling, Drop,
+                  replacement and return therefore occur exactly where the
+                  same plain block would perform them; the wrapper adds none
+                  and cannot hide one. Parser/AST own the option list and
+                  block form. align_sema
                   validates options and carries one canonical two-bit
                   FloatMode on a checked-HIR FloatScope node. Every eligible
                   checked arithmetic/reduction node also records the effective
@@ -157,14 +172,22 @@ Prerequisite      Plan 68 G4 Part 1 is merged. Plans 69 and 74 are merged so
 Acceptance        One syntax/formatter owner covers the three canonical forms,
                   either source option order, empty/unknown/duplicate options
                   both unknown/duplicate relative orders and missing
-                  delimiters. One semantic/MIR owner covers scope
-                  entry/exit, nested union, branch/loop joins, early exits,
+                  delimiters. One parameterized semantic/MIR owner covers scope
+                  entry/restoration through a plain block, `if`, `match`,
+                  `else`, `?`, `map_err`, loop joins, value-carrying `break`,
+                  `return`, `arena`, `unsafe`, and task-group blocks, including
+                  normal, joining, early-exit, error and malformed paths,
                   strict named/inline/lifted/escaping function roots, explicit
                   scopes inside lambda bodies, scalar and
                   all five floating sum/dot reduction variants (`ArraySum`,
                   `ArrayDot`, `VecSum`, `VecSumWhere`, and `VecDot`), and
                   checked-HIR rejection of
                   invented, dropped and unknown bits against the retained scope.
+                  One transparent-wrapper owner covers Copy, Move, borrowed and
+                  arena-backed results through construction, move-in, move-out,
+                  source nulling, Drop, replacement and return, and proves all
+                  region/effect/escape/replay/depth/finalization passes recurse
+                  into the body exactly once.
                   One LLVM owner proves exact flags on admitted
                   nodes and their absence on strict, excluded and unrelated
                   nodes; optimized structural controls cover unordered sum and
@@ -237,7 +260,10 @@ perform a particular rewrite.
 | Lex/parse/format | reserved `float`; option tokens remain identifiers; block-expression precedence; canonical formatting | parser/formatter owner |
 | Checked formation | canonical two-bit FloatScope record plus effective mode on eligible nodes; exact validation order; no-op body admitted | semantic owner |
 | Scope authentication | HIR validator recomputes the lexical union and requires exact equality on every eligible node; invented, dropped and unknown bits reject | checked-HIR mutation owner |
-| Scope propagation | retained HIR scope nests through all branch/block/loop/value positions; returns and early exits do not attach mode to strict operations after the scope; MIR receives only authenticated effective modes | semantic/MIR owner |
+| Transparent analysis | the FloatScope wrapper has exactly its body's type, value category and Pure/Impure result; effect scan, replay/clone, HIR depth/finalization, validation and MIR production each visit the body exactly once; the expression-variant sweep tripwire requires every such pass to classify FloatScope | parameterized semantic/HIR/MIR structural owner |
+| Ownership lifecycle | Copy, Move, borrowed and arena-backed body results preserve construction, move-in, move-out, source nulling, Drop, replacement and return exactly as a plain block; the wrapper adds no owner, allocation, null or cleanup | MoveCheck/Drop driver owner with struct, sum, Option and Result carriers |
+| Region and escape | `region_of`, `tracks_region`, local-slice/view provenance and escape checking return the body's exact facts; arena-backed views cannot become static or escape through the wrapper, while valid borrowed returns retain their roots | region/escape owner over stack, arena, heap, static and borrowed origins |
+| Scope propagation | retained HIR scope enters and restores across plain blocks, `if`, `match`, `else`, `?`, `map_err`, loops, value-carrying `break`, `return`, `arena`, `unsafe` and task-group blocks on normal, branch-join, loop-join, early-exit, error and malformed-input paths; no path attaches mode to a later strict operation; MIR receives only authenticated effective modes | parameterized semantic/HIR/MIR control-flow owner |
 | Lambdas/calls | every named/inline/lifted/escaping body validates from a strict root; only a FloatScope retained inside that body changes its operations; named/direct/indirect/imported callee operations receive no caller flags; optimized owners show equally permitted caller/callee operations may compose while any strict participant prevents the rewrite | semantic/HIR/MIR/interface/LLVM owner |
 | Scalar arithmetic | f32/f64 add/sub/mul receive selected flags; div/rem/comparison/cast/min/max and explicit fma do not gain unrelated flags | LLVM owner |
 | Vector arithmetic | vecN<f32/f64> follows the same table for every admitted width | LLVM owner |
@@ -263,6 +289,7 @@ One parameterized owner may close multiple rows. No row requires a benchmark.
 | `09338df4` reopened full review | P1: pipeline HIR stores lifted target names rather than parent lambda expressions, so declaration-site mode still cannot be authenticated. P2: the grammar prevented the promised sema diagnostic for `float()` | Remove declaration-site inheritance entirely: every function and lambda body starts strict and must contain its own FloatScope. This deletes the cross-function provenance mechanism and treats all callable forms uniformly. Parse an optional identifier list so sema owns the empty-list diagnostic. |
 | `23b3be10` reopened full review | P1: the Reassoc prose still named generic `reduce`, contradicting strict callable roots and the complete operation table | Remove generic `reduce` from terminal-site relaxation. Its arithmetic lives only in the reducer function and is relaxed only by a scope written inside that body. Add the explicit negative matrix row. |
 | `1381360f` reopened full review | P1: the reduction matrix named only the array-pipeline forms and could leave the three distinct fixed-vector HIR/MIR variants without mode semantics or an owner | Reopen the reduction-variant axis. Enumerate `ArraySum`, `ArrayDot`, `VecSum`, `VecSumWhere`, and `VecDot` separately in the complete product and bind one parameterized HIR/MIR/LLVM owner to all five. |
+| `69949b68` reopened full review | P1: the new transparent expression wrapper had no ownership/region pass closure. P2: control-flow restoration omitted several block forms, and plan 12 still directed a future dot toward a rejected terminal-specific fast surface. | Reopen the transparent-wrapper axis. Add exact type/effect, ownership lifecycle, region/escape and exhaustive control-flow rows with parameterized owners; require every HIR analysis to recurse exactly once and the variant sweep to pin that classification. Replace plan 12's `fast dot` direction with this lexical permission scope. |
 
 ## 5. PR boundary
 

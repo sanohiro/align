@@ -667,8 +667,9 @@ zip(a, b, c)
   the destination disjoint from **every** source and emit destination-vs-source alias scopes, but
   must not claim that source inputs are disjoint from one another.
 - A runtime-length `dot` can later consume the same multi-source loop machinery. Do not silently
-  turn ordered floating-point `zip(...).map(mul).sum()` into a reassociated dot; an explicit fast
-  dot needs its own numeric contract.
+  turn ordered floating-point `zip(...).map(mul).sum()` into a reassociated dot. Plan 77's explicit
+  `float(reassoc)` / `float(contract)` lexical scope is the one numeric permission surface for a
+  future dot; do not add a terminal-specific `dot_fast` spelling.
 
 Acceptance requires an Align implementation to show one allocation-free counted loop, no tuple
 storage, expected SIMD on x86-64 and arm64, exact mismatch/effect/trap order, and parity with a

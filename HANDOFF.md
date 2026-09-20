@@ -119,7 +119,11 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    removed one stale overpromise: generic `reduce` arithmetic belongs only to
    its strict-root callable and needs a scope inside that body. The complete
    reduction product now names all five existing HIR/MIR forms: `ArraySum`,
-   `ArrayDot`, `VecSum`, `VecSumWhere`, and `VecDot`.
+   `ArrayDot`, `VecSum`, `VecSumWhere`, and `VecDot`. The latest review also
+   reopened the transparent-wrapper axis: every ownership, Drop, region,
+   escape, replay and control-flow pass must recurse through `FloatScope`
+   exactly once, with the complete lifecycle/control-path matrix in plan 77;
+   plan 12's obsolete `dot_fast` direction now points to the lexical scope.
 4. Follow-ups, independent and small (updated 2026-09-19):
    `fix/nightly-detector-restore` closed #1105, #1107, #1108, #1109, and
    #1112, and separately repaired two untracked first-night nightly failures

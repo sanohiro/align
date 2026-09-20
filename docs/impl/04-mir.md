@@ -65,9 +65,15 @@ the lexical scope stack and requires exact equality, rejecting invented and
 dropped known bits before MIR. The source `float(...) {}` expression then needs
 no runtime MIR begin/end node: authenticated construction walks its block under
 the union of the enclosing and selected bits, then restores the enclosing mode
-on every normal and terminating construction path. f32/f64 scalar and explicit-vector add/subtract/multiply plus built-in
-floating sum carry the authenticated mode active where their source operation was written. Other MIR
-nodes carry no inferred relaxation.
+through plain blocks, `if`, `match`, `else`, `?`, `map_err`, loops and
+value-carrying `break`, `return`, `arena`, `unsafe`, and task-group blocks on
+every normal, join, early-exit, error and malformed path. The wrapper has
+exactly its body's type, value category, ownership, effect and region; every
+HIR analysis recurses through it exactly once, so it cannot hide a move, Drop,
+replacement, source null, borrow root or escape. f32/f64 scalar and
+explicit-vector add/subtract/multiply plus `ArraySum`, `ArrayDot`, `VecSum`,
+`VecSumWhere`, and `VecDot` carry the authenticated mode active where their
+source operation was written. Other MIR nodes carry no inferred relaxation.
 
 Every named, inline, lifted and escaping function body validates from strict mode. A lambda does
 not inherit the scope at its declaration site; relaxed lambda arithmetic has its own retained
