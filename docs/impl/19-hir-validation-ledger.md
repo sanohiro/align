@@ -2237,20 +2237,22 @@ The complete closure matrix and named owners are maintained in plan 73.
 
 ## Scoped floating-point relaxation (plan 77)
 
-Checked HIR represents the active float mode as exactly two known bits,
-`reassoc` and `contract`. The validator rejects unknown bits and rejects a mode
-attached to an ineligible non-f32/f64 arithmetic or reduction node. Scope
-construction unions nested permissions and restores the enclosing mode after
-every block, branch, loop and terminating expression path. Lifted and escaping
-lambdas retain declaration-site mode in their body; a direct, indirect or
-imported call carries no caller mode into its target.
+Checked HIR retains each `FloatScope` with exactly two known bits, `reassoc` and
+`contract`, and records the effective mode on eligible arithmetic/reduction
+nodes. The validator walks the lexical scope stack and requires exact equality
+with that union. It rejects invented or dropped known bits, unknown bits, and a
+mode attached to an ineligible non-f32/f64 node. Scope construction restores
+the enclosing mode after every block, branch, loop and terminating expression
+path. Lifted and escaping lambdas retain declaration-site mode in their body; a
+direct, indirect or imported call carries no caller mode into its target.
 
 Format 15 generic templates and interface-carried concrete bodies preserve the
 exact source scope in their existing body string. Consumer parsing and checking
 derive the same canonical record before imported HIR; monomorphization and
 available-externally replay preserve it exactly.
-Malformed owners substitute unknown bits, attach known bits to integer,
-comparison, cast, min/max, call and memory nodes, drop a bit through lambda
-lifting, invent caller-to-callee inheritance, or accept an unknown option while
+Malformed owners add a known bit outside a scope, drop one inside a scope,
+substitute unknown bits, attach known bits to integer, comparison, cast,
+min/max, call and memory nodes, drop a bit through lambda lifting, invent
+caller-to-callee inheritance, or accept an unknown option while
 rechecking imported body source. Plan 77 owns the parameterized
 formation, control-flow, interface and whole/per-unit acceptance matrix.

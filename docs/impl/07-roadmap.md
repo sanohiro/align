@@ -2482,8 +2482,10 @@ regression net that validates the upgrade.
   Strict IEEE operation order and separate rounding remain the default. The
   two permissions are independent, nested scopes union them, inline lambdas
   keep declaration-site mode, and separately declared callees never inherit
-  caller mode. Generic and plan 74 concrete bodies serialize the canonical
-  two-bit record. Poison-producing assumptions, reciprocal/approximate modes,
+  caller mode. Checked HIR retains each lexical scope and validates every
+  operation's exact effective mode, so known invented/dropped bits fail before
+  MIR. Generic and plan 74 concrete bodies retain exact source for consumer
+  rechecking. Poison-producing assumptions, reciprocal/approximate modes,
   bundled `fast`, and ambient compiler flags are excluded. Implementation is
   one parser-to-LLVM/interface capability after independent design review; no
   benchmark or external-client build is a correctness gate.

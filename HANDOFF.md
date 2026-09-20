@@ -98,8 +98,11 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    #1082 Part 2 is now the next design candidate. [Plan 77](docs/impl/77-float-relaxation-scope-plan.md)
    specifies the explicit `float(reassoc)` / `float(contract)` lexical block,
    strict default, lambda/callee boundary, interface identity, exact permitted
-   LLVM flags and a benchmark-free acceptance matrix. It must merge after one
-   independent design review before its parser-to-LLVM implementation begins.
+   LLVM flags and a benchmark-free acceptance matrix. Its first independent
+   review found that known mode bits needed authentication against source scope;
+   the revised design retains FloatScope in checked HIR and rejects invented or
+   dropped bits before MIR. The P1 reopens the provenance axis and requires a
+   fresh full design review before merge and implementation.
 4. Follow-ups, independent and small (updated 2026-09-19):
    `fix/nightly-detector-restore` closed #1105, #1107, #1108, #1109, and
    #1112, and separately repaired two untracked first-night nightly failures

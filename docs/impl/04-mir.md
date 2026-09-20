@@ -58,12 +58,15 @@ Each value/place keeps its HIR-derived `Ty` and (for views) `Region`. codegen **
 
 ### Floating-point mode
 
-[Plan 77](77-float-relaxation-scope-plan.md) adds a canonical two-bit
-`FloatMode { reassoc, contract }` to eligible checked arithmetic and reduction records. The source
-`float(...) {}` expression has no runtime MIR begin/end node: construction walks its block under
-the union of the enclosing and selected bits, then restores the enclosing mode on every normal and
-terminating construction path. f32/f64 scalar and explicit-vector add/subtract/multiply plus built-in
-floating sum carry the mode that was active where their source operation was written. Other MIR
+[Plan 77](77-float-relaxation-scope-plan.md) adds a retained checked-HIR
+`FloatScope` with canonical `FloatMode { reassoc, contract }`, plus that effective
+mode on eligible checked arithmetic and reduction records. HIR validation walks
+the lexical scope stack and requires exact equality, rejecting invented and
+dropped known bits before MIR. The source `float(...) {}` expression then needs
+no runtime MIR begin/end node: authenticated construction walks its block under
+the union of the enclosing and selected bits, then restores the enclosing mode
+on every normal and terminating construction path. f32/f64 scalar and explicit-vector add/subtract/multiply plus built-in
+floating sum carry the authenticated mode active where their source operation was written. Other MIR
 nodes carry no inferred relaxation.
 
 A lifted lambda copies its declaration-site mode into its checked body. Direct, indirect and

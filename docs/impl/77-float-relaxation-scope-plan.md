@@ -91,11 +91,16 @@ Types             The block may contain mixed float and non-float code and may
 
 Ownership         Parser/AST own the option list and block form. align_sema
                   validates options and carries one canonical two-bit
-                  FloatMode while checking expressions and lifted lambdas.
-                  align_mir preserves the mode on each eligible arithmetic or
-                  reduction node. align_codegen_llvm translates only those
-                  bits to LLVM `reassoc` and `contract` flags. The formatter
-                  owns canonical option order.
+                  FloatMode on a checked-HIR FloatScope node. Every eligible
+                  checked arithmetic/reduction node also records the effective
+                  mode. HIR validation walks the retained lexical scope stack,
+                  recomputes the exact expected mode, and rejects an invented
+                  or dropped known bit as well as an unknown bit. align_mir is
+                  built only from that authenticated HIR and preserves the
+                  exact effective mode on each eligible arithmetic/reduction
+                  node. align_codegen_llvm translates only those bits to LLVM
+                  `reassoc` and `contract` flags. The formatter owns canonical
+                  option order.
 
 Errors            `float()` reports the missing option before checking body
                   errors. Options are validated left to right: the first
@@ -140,7 +145,8 @@ Acceptance        One syntax/formatter owner covers the three canonical forms,
                   entry/exit, nested union, branch/loop joins, early exits,
                   inline-lambda capture, named-call noninheritance, scalar and
                   explicit-vector operations, and checked-HIR rejection of
-                  unknown bits. One LLVM owner proves exact flags on admitted
+                  invented, dropped and unknown bits against the retained scope.
+                  One LLVM owner proves exact flags on admitted
                   nodes and their absence on strict, excluded and unrelated
                   nodes; optimized structural controls cover unordered sum and
                   contracted multiply-add. One interface owner covers generic
@@ -203,8 +209,9 @@ permission, not that LLVM will perform a particular rewrite.
 | Boundary | Required closure | Owner |
 |---|---|---|
 | Lex/parse/format | reserved `float`; option tokens remain identifiers; block-expression precedence; canonical formatting | parser/formatter owner |
-| Checked formation | canonical two-bit record; exact validation order; no-op body admitted | semantic owner |
-| Scope propagation | nested union; all branch/block/loop/value positions; returns and early exits do not leak mode after the scope | semantic/MIR owner |
+| Checked formation | canonical two-bit FloatScope record plus effective mode on eligible nodes; exact validation order; no-op body admitted | semantic owner |
+| Scope authentication | HIR validator recomputes the lexical union and requires exact equality on every eligible node; invented, dropped and unknown bits reject | checked-HIR mutation owner |
+| Scope propagation | retained HIR scope nests through all branch/block/loop/value positions; returns and early exits do not leak mode after the scope; MIR receives only authenticated effective modes | semantic/MIR owner |
 | Lambdas/calls | inline lambda records declaration-site mode; lifted/escaping forms agree; named/direct/indirect/imported callees do not inherit caller mode | semantic/MIR/interface owner |
 | Scalar arithmetic | f32/f64 add/sub/mul receive selected flags; div/rem/comparison/cast/min/max and explicit fma do not gain unrelated flags | LLVM owner |
 | Vector arithmetic | vecN<f32/f64> follows the same table for every admitted width | LLVM owner |
@@ -213,13 +220,19 @@ permission, not that LLVM will perform a particular rewrite.
 | Effects and traps | calls, memory operations, bounds/division traps and cleanup retain source order and receive no fast-math permission | MIR/LLVM negative owner |
 | Generic bodies | exact source scope survives template formation, interface round trip and monomorphization; consumer derives the same mode | interface/sema owner |
 | Concrete bodies | plan 74 eligible source preserves the scope when emitted `available_externally`; producer and consumer optimized forms agree | interface/codegen owner |
-| Malformed HIR/interface | unknown checked-HIR bits and mode on an ineligible node fail before MIR/codegen; unknown source options fail imported-body checking before cache publication | HIR/interface validator owner |
+| Malformed HIR/interface | known invented/dropped bits, unknown bits and mode on an ineligible node fail before MIR/codegen; unknown source options fail imported-body checking before cache publication | HIR/interface validator owner |
 | Whole/per-unit | identical source has the same semantic mode and runtime-defined behavior in both compilation modes | driver owner |
 | Numeric controls | strict exact-bit regression; relaxed NaN/Inf remains a defined float; no result pin inside the allowed envelope | driver owner |
 
 One parameterized owner may close multiple rows. No row requires a benchmark.
 
-## 4. PR boundary
+## 4. Review finding ledger
+
+| Review | Finding | Closure |
+|---|---|---|
+| `d4a2d307` independent design review | P1: checking only known bits and eligible types lets malformed HIR attach a valid relaxed mode to a strict source operation after the scope is discarded | Retain `FloatScope` in checked HIR; recompute the exact lexical union during HIR validation; reject both invented and dropped known bits before MIR. Reopened closure axis: float-mode provenance. |
+
+## 5. PR boundary
 
 The public design and the implementation are two PRs. The design must receive
 one independent adversarial review before implementation because it adds syntax
