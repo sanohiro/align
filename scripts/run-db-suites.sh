@@ -53,5 +53,13 @@ scripts/run-quiet.sh --stdout "$artifacts" "database gate: test binaries" -- \
   scripts/cargo.sh build --locked --message-format=json-render-diagnostics \
   "$@"
 
+# The integration-test graph enables align_runtime's test-only allocation
+# counters and leaves that archive under deps/. Generated programs use the
+# production archive beside alignc, so build only that missing artifact after
+# the shared dependencies are warm. A workspace build would rebuild alignc and
+# unrelated targets before this exact owner graph.
+scripts/run-quiet.sh "database gate: production runtime" -- \
+  scripts/cargo.sh build --locked -p align_runtime
+
 # shellcheck disable=SC2086
 scripts/run-gate-binaries.sh "$artifacts" $db_binaries

@@ -371,6 +371,7 @@ grep -Fq 'ALIGN_GATE_JOBS: "2"' "$ci_workflow"
 db_runner="$repo_root/scripts/run-db-suites.sh"
 grep -Fq 'set -- -p align_runtime -p align_driver --bin alignc' "$db_runner"
 grep -Fq 'scripts/cargo.sh build --locked --message-format=json-render-diagnostics' "$db_runner"
+grep -Fq 'scripts/cargo.sh build --locked -p align_runtime' "$db_runner"
 if grep -Fq 'cargo.sh test --no-run' "$db_runner"; then
   echo "database runner restored the test-only build that omits production artifacts" >&2
   exit 1
