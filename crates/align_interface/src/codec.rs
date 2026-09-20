@@ -19,7 +19,7 @@ use crate::{
 /// The interface-artifact format version. Bump on ANY encoding change; a bump invalidates every
 /// cached summary (an old version fails closed on read) and changes `interface_hash` (the version is
 /// part of the hashed surface).
-pub const FORMAT_VERSION: u32 = 12;
+pub const FORMAT_VERSION: u32 = 13;
 
 /// Narrow a length to the format's `u32` length-prefix width, or panic loudly. This is
 /// producer-side, compiler-internal data (interface surfaces built from the compiler's own source
@@ -240,12 +240,22 @@ fn write_fn(w: &mut Writer, f: &IFnSig) {
     write_return_borrow(w, &f.return_borrow);
     write_return_region(w, &f.return_region);
     write_return_cleanup(w, f.return_cleanup);
+    write_drop_state_effects(w, &f.drop_state_effects);
     write_producer_certification(w, f.producer_certification);
     write_effect(w, f.effect);
     w.seq(&f.parallel_transfer_params, |w, root| w.u32(*root));
     write_mutable_retention(w, &f.mutable_retention);
     w.bool(f.resource_hook_body);
     w.opt_str(&f.generic_body);
+}
+
+fn write_drop_state_effects(w: &mut Writer, effects: &[align_sema::hir::DropStateEffect]) {
+    w.seq(effects, |w, effect| w.u8(match effect {
+        align_sema::hir::DropStateEffect::NotApplicable => 0,
+        align_sema::hir::DropStateEffect::Invariant => 1,
+        align_sema::hir::DropStateEffect::MayChange => 2,
+        align_sema::hir::DropStateEffect::Deferred => 3,
+    }));
 }
 
 fn write_struct(w: &mut Writer, s: &IStructDef) {
@@ -592,6 +602,18 @@ fn read_producer_certification(
     }
 }
 
+fn read_drop_state_effects(
+    r: &mut Reader<'_>,
+) -> Result<Vec<align_sema::hir::DropStateEffect>, DecodeError> {
+    r.seq(|r| match r.u8()? {
+        0 => Ok(align_sema::hir::DropStateEffect::NotApplicable),
+        1 => Ok(align_sema::hir::DropStateEffect::Invariant),
+        2 => Ok(align_sema::hir::DropStateEffect::MayChange),
+        3 => Ok(align_sema::hir::DropStateEffect::Deferred),
+        tag => Err(DecodeError::BadTag { what: "drop-state effect", tag }),
+    })
+}
+
 fn read_fn(r: &mut Reader<'_>) -> Result<IFnSig, DecodeError> {
     let name = r.str()?;
     let type_params = read_type_params(r)?;
@@ -600,6 +622,24 @@ fn read_fn(r: &mut Reader<'_>) -> Result<IFnSig, DecodeError> {
     let return_borrow = read_return_borrow(r, params.len())?;
     let return_region = read_return_region(r, params.len())?;
     let return_cleanup = read_return_cleanup(r)?;
+    let drop_state_effects = read_drop_state_effects(r)?;
+    if drop_state_effects.len() != params.len() {
+        return Err(DecodeError::InvalidSummary("drop-state effect arity disagrees with parameters"));
+    }
+    let generic = !type_params.is_empty();
+    for (parameter, drop_state) in params.iter().zip(&drop_state_effects) {
+        let valid = if generic {
+            (*drop_state == align_sema::hir::DropStateEffect::Deferred)
+                == (parameter.mode == ParamMode::BorrowMut)
+        } else if parameter.mode == ParamMode::BorrowMut {
+            *drop_state != align_sema::hir::DropStateEffect::Deferred
+        } else {
+            *drop_state == align_sema::hir::DropStateEffect::NotApplicable
+        };
+        if !valid {
+            return Err(DecodeError::InvalidSummary("drop-state effect disagrees with parameter mode or template state"));
+        }
+    }
     let producer_certification = read_producer_certification(r)?;
     let effect = read_effect(r)?;
     let parallel_transfer_params = r.seq(|r| r.u32())?;
@@ -628,6 +668,7 @@ fn read_fn(r: &mut Reader<'_>) -> Result<IFnSig, DecodeError> {
         return_borrow,
         return_region,
         return_cleanup,
+        drop_state_effects,
         producer_certification,
         effect,
         parallel_transfer_params,
@@ -756,12 +797,42 @@ fn deserialize_impl(
     if Hash128::of(&bytes[..surface_len]) != summary.interface_hash {
         return Err(DecodeError::InterfaceHashMismatch);
     }
+    if matches!(
+        crate::validate_for_import(&summary),
+        Err(crate::ImportCompatibilityError::DropStateEffectMismatch)
+    ) {
+        return Err(DecodeError::InvalidSummary(
+            "drop-state effect disagrees with resolved parameter ownership",
+        ));
+    }
     Ok(summary)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drop_state_effect_tags_have_an_independent_v13_byte_golden() {
+        use align_sema::hir::DropStateEffect::{Deferred, Invariant, MayChange, NotApplicable};
+        let effects = vec![NotApplicable, Invariant, MayChange, Deferred];
+        let expected = [4, 0, 0, 0, 0, 1, 2, 3];
+        let mut writer = Writer::new();
+        write_drop_state_effects(&mut writer, &effects);
+        assert_eq!(writer.buf, expected);
+        let mut reader = Reader::new(&expected);
+        assert_eq!(read_drop_state_effects(&mut reader), Ok(effects));
+        assert_eq!(reader.finish(), Ok(()));
+        for end in 0..expected.len() {
+            assert!(read_drop_state_effects(&mut Reader::new(&expected[..end])).is_err());
+        }
+        let mut bad_tag = expected;
+        bad_tag[7] = 4;
+        assert_eq!(
+            read_drop_state_effects(&mut Reader::new(&bad_tag)),
+            Err(DecodeError::BadTag { what: "drop-state effect", tag: 4 })
+        );
+    }
 
     #[test]
     fn mutable_retention_has_independent_byte_goldens_and_rejects_malformed_records() {

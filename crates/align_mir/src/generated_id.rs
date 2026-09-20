@@ -77,10 +77,12 @@ pub enum GeneratedId {
     FnValue {
         target: ProgramCall,
         signature: CanonicalFnAbi,
+        drop_state_effects: Vec<u8>,
     },
     Closure {
         lifted: ProgramCall,
         explicit_signature: CanonicalFnAbi,
+        drop_state_effects: Vec<u8>,
         captures: Vec<CanonicalTy>,
     },
     Task {
@@ -103,21 +105,24 @@ impl GeneratedId {
     pub fn to_canonical_bytes(&self) -> Result<Box<[u8]>, CanonicalCodecError> {
         validate_generated(self)?;
         let mut out = Vec::new();
-        out.push(1);
+        out.push(2);
         match self {
-            Self::FnValue { target, signature } => {
+            Self::FnValue { target, signature, drop_state_effects } => {
                 out.push(0);
                 encode_call(&mut out, target)?;
                 out.extend(signature.as_bytes());
+                encode_bytes(&mut out, drop_state_effects)?;
             }
             Self::Closure {
                 lifted,
                 explicit_signature,
+                drop_state_effects,
                 captures,
             } => {
                 out.push(1);
                 encode_call(&mut out, lifted)?;
                 out.extend(explicit_signature.as_bytes());
+                encode_bytes(&mut out, drop_state_effects)?;
                 encode_types(&mut out, captures)?;
             }
             Self::Task { fallible, result } => {
@@ -156,17 +161,19 @@ impl GeneratedId {
 
     pub fn decode(bytes: &[u8]) -> Result<Self, CanonicalCodecError> {
         let mut cursor = IdentityCursor::new(bytes);
-        if cursor.byte()? != 1 {
+        if cursor.byte()? != 2 {
             return Err(CanonicalCodecError::UnsupportedVersion);
         }
         let value = match cursor.byte()? {
             0 => Self::FnValue {
                 target: cursor.call()?,
                 signature: cursor.abi()?,
+                drop_state_effects: cursor.bytes()?,
             },
             1 => Self::Closure {
                 lifted: cursor.call()?,
                 explicit_signature: cursor.abi()?,
+                drop_state_effects: cursor.bytes()?,
                 captures: cursor.types()?,
             },
             2 => Self::Task {
@@ -288,8 +295,14 @@ fn encode_stage(out: &mut Vec<u8>, value: &ParallelStageId) -> Result<(), Canoni
 
 fn validate_generated(value: &GeneratedId) -> Result<(), CanonicalCodecError> {
     match value {
-        GeneratedId::FnValue { target, .. } => validate_call(target),
-        GeneratedId::Closure { lifted, .. } => validate_call(lifted),
+        GeneratedId::FnValue { target, signature, drop_state_effects } => {
+            validate_call(target)?;
+            validate_drop_state_effects(signature, drop_state_effects)
+        }
+        GeneratedId::Closure { lifted, drop_state_effects, .. } => {
+            validate_call(lifted)?;
+            validate_drop_state_tags(drop_state_effects)
+        }
         GeneratedId::Task { .. } => Ok(()),
         GeneratedId::SqliteScalarCallback {
             target,
@@ -314,6 +327,37 @@ fn validate_generated(value: &GeneratedId) -> Result<(), CanonicalCodecError> {
         }
         GeneratedId::Parallel(value) => validate_parallel(value),
     }
+}
+
+fn validate_drop_state_effects(
+    signature: &CanonicalFnAbi,
+    effects: &[u8],
+) -> Result<(), CanonicalCodecError> {
+    let bytes = signature.as_bytes();
+    let count = bytes
+        .get(1..5)
+        .and_then(|raw| <[u8; 4]>::try_from(raw).ok())
+        .map(u32::from_le_bytes)
+        .and_then(|count| usize::try_from(count).ok());
+    if count != Some(effects.len()) {
+        Err(CanonicalCodecError::InvalidGraph)
+    } else {
+        validate_drop_state_tags(effects)
+    }
+}
+
+fn validate_drop_state_tags(effects: &[u8]) -> Result<(), CanonicalCodecError> {
+    if effects.iter().all(|effect| *effect <= 2) {
+        Ok(())
+    } else {
+        Err(CanonicalCodecError::InvalidGraph)
+    }
+}
+
+fn encode_bytes(out: &mut Vec<u8>, values: &[u8]) -> Result<(), CanonicalCodecError> {
+    out.extend(checked_count(values.len())?.to_le_bytes());
+    out.extend(values);
+    Ok(())
 }
 
 fn validate_call(value: &ProgramCall) -> Result<(), CanonicalCodecError> {
@@ -426,6 +470,21 @@ impl<'a> IdentityCursor<'a> {
         for _ in 0..count {
             values.push(self.u32()?);
         }
+        Ok(values)
+    }
+
+    fn bytes(&mut self) -> Result<Vec<u8>, CanonicalCodecError> {
+        let count = self.count(1)?;
+        let end = self
+            .offset
+            .checked_add(count)
+            .ok_or(CanonicalCodecError::Truncated)?;
+        let values = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(CanonicalCodecError::Truncated)?
+            .to_vec();
+        self.offset = end;
         Ok(values)
     }
 
@@ -622,31 +681,33 @@ mod tests {
             (
                 GeneratedId::FnValue {
                     target: call("f"),
-                    signature: empty_abi.clone(),
+                    signature: i64_abi.clone(),
+                    drop_state_effects: vec![0],
                 },
-                "010001000000660100000000030000000038000000",
+                "02000100000066010100000000030000000000014003000000000001400000000100000000",
             ),
             (
                 GeneratedId::Closure {
                     lifted: call("l"),
                     explicit_signature: empty_abi.clone(),
+                    drop_state_effects: vec![],
                     captures: vec![bool_ty.clone()],
                 },
-                "0101010000006c010000000003000000003800000001000000030000000002",
+                "0201010000006c01000000000300000000380000000000000001000000030000000002",
             ),
             (
                 GeneratedId::Task {
                     fallible: false,
                     result: unit.clone(),
                 },
-                "010200030000000038",
+                "020200030000000038",
             ),
             (
                 GeneratedId::Task {
                     fallible: true,
                     result: i64_ty.clone(),
                 },
-                "0102010300000000000140",
+                "0202010300000000000140",
             ),
             (
                 GeneratedId::SqliteScalarCallback {
@@ -658,7 +719,7 @@ mod tests {
                     kind: 0,
                     family_version: 1,
                 },
-                "010402000000636201000000000300000000380000000000000000010000000001000000",
+                "020402000000636201000000000300000000380000000000000000010000000001000000",
             ),
         ];
         for (value, expected) in goldens {
@@ -679,7 +740,7 @@ mod tests {
             work_weight: 1,
         });
         let expected = hex(
-            "01030003000000000d00014003000000000001400300000000000140010000006601010000000003000000000001400300000000000140000000000000000000000001",
+            "02030003000000000d00014003000000000001400300000000000140010000006601010000000003000000000001400300000000000140000000000000000000000001",
         );
         assert_eq!(roundtrip(parallel.clone()), expected);
         assert_eq!(GeneratedId::decode(&expected).unwrap(), parallel);
@@ -740,28 +801,56 @@ mod tests {
             Err(CanonicalCodecError::Truncated)
         );
         assert_eq!(
-            GeneratedId::decode(&[2]),
+            GeneratedId::decode(&[1]),
             Err(CanonicalCodecError::UnsupportedVersion)
         );
         assert_eq!(
-            GeneratedId::decode(&[1, 0xff]),
+            GeneratedId::decode(&[2, 0xff]),
             Err(CanonicalCodecError::UnknownTag)
         );
         assert_eq!(
-            GeneratedId::decode(&[1, 2, 2]),
+            GeneratedId::decode(&[2, 2, 2]),
             Err(CanonicalCodecError::InvalidBool)
         );
         assert_eq!(
-            GeneratedId::decode(&[1, 0, 0, 0, 0, 0]),
+            GeneratedId::decode(&[2, 0, 0, 0, 0, 0]),
             Err(CanonicalCodecError::InvalidGraph)
         );
         assert_eq!(
-            GeneratedId::decode(&[1, 0, 1, 0, 0, 0, 0xff]),
+            GeneratedId::decode(&[2, 0, 1, 0, 0, 0, 0xff]),
             Err(CanonicalCodecError::InvalidUtf8)
         );
         assert_eq!(
-            GeneratedId::decode(&[1, 0, 1, 0, 0, 0, 0]),
+            GeneratedId::decode(&[2, 0, 1, 0, 0, 0, 0]),
             Err(CanonicalCodecError::EmbeddedNul)
+        );
+        let empty = abi("0100000000030000000038000000");
+        for effects in [vec![1], vec![3], vec![4]] {
+            assert_eq!(
+                GeneratedId::FnValue {
+                    target: call("f"),
+                    signature: empty.clone(),
+                    drop_state_effects: effects,
+                }
+                .to_canonical_bytes(),
+                Err(CanonicalCodecError::InvalidGraph)
+            );
+        }
+        let closure = |effect| GeneratedId::Closure {
+            lifted: call("lifted"),
+            explicit_signature: empty.clone(),
+            drop_state_effects: vec![effect],
+            captures: Vec::new(),
+        };
+        // Test-only invariant: effect tags 1 and 2 are valid, so canonical encoding must succeed.
+        assert_ne!(
+            closure(1).to_canonical_bytes().unwrap(),
+            closure(2).to_canonical_bytes().unwrap(),
+            "a lifted ABI effect change must change the closure adapter identity"
+        );
+        assert_eq!(
+            closure(3).to_canonical_bytes(),
+            Err(CanonicalCodecError::InvalidGraph)
         );
 
         let valid = GeneratedId::Task {
@@ -836,6 +925,7 @@ mod tests {
         let value = GeneratedId::Closure {
             lifted: call("deep"),
             explicit_signature: abi("0100000000030000000038000000"),
+            drop_state_effects: Vec::new(),
             captures: vec![ty("030000000038"); 4096],
         };
         let bytes = value.to_canonical_bytes().unwrap();

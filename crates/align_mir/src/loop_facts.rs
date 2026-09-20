@@ -365,6 +365,7 @@ fn variant_sweep_tripwire(stmt: &Stmt) {
         | Stmt::TgWait { .. }
         | Stmt::TgEnd { .. }
         | Stmt::DropFlagInit { .. }
+        | Stmt::DropFlagMoveOut { .. }
         | Stmt::NullTupleField { .. }
         | Stmt::NullStructField { .. }
         | Stmt::NullElemField { .. }
@@ -452,6 +453,30 @@ fn rvalue_facts(rv: &Rvalue) -> RvalueFacts<'_> {
             Call(std::iter::once(callee).chain(args.iter()).collect())
         }
         unmodelled_rvalues!() => Unknown,
+    }
+}
+
+/// Drop-state call edges, backed by this module's exhaustive Rvalue classifier. The final arm is
+/// not a permissive default: it invokes [`rvalue_facts`], whose wildcard-free inventory makes a
+/// newly added Rvalue a compile error until its ownership effect is classified here or there.
+pub(crate) enum DropStateCall<'a> {
+    Direct(&'a crate::ProgramCall, &'a [Operand]),
+    Unknown(&'a [Operand]),
+    None,
+}
+
+pub(crate) fn drop_state_call(rv: &Rvalue) -> DropStateCall<'_> {
+    match rv {
+        Rvalue::Call(DirectCall::Program(target), args) => DropStateCall::Direct(target, args),
+        Rvalue::Call(DirectCall::Runtime(_), args)
+        | Rvalue::CallIndirect { args, .. }
+        | Rvalue::RawCall { args, .. } => DropStateCall::Unknown(args),
+        Rvalue::CallWithCleanup(call) => DropStateCall::Direct(&call.target, &call.args),
+        Rvalue::CallIndirectWithCleanup(call) => DropStateCall::Unknown(&call.args),
+        other => {
+            let _ = rvalue_facts(other);
+            DropStateCall::None
+        }
     }
 }
 
@@ -649,6 +674,7 @@ fn statement_facts<'a>(function: &Function, stmt: &'a Stmt) -> StmtFacts<'a> {
             KillsEverything
         }
         Stmt::DropFlagInit(slot) => WritesSlot(*slot, "DropFlagInit", Vec::new()),
+        Stmt::DropFlagMoveOut { slot, .. } => WritesSlot(*slot, "DropFlagMoveOut", Vec::new()),
         Stmt::NullTupleField(slot, _) => WritesSlot(*slot, "NullTupleField", Vec::new()),
         Stmt::NullStructField(slot, _) => WritesSlot(*slot, "NullStructField", Vec::new()),
         Stmt::NullElemField(slot, index, _) => {
@@ -695,7 +721,7 @@ fn stmt_operands_mut(stmt: &mut Stmt) -> Option<Vec<&mut Operand>> {
         Stmt::RawStore { ptr, offset, value } => vec![ptr, offset, value],
         Stmt::TgWait(handle) => vec![handle],
         Stmt::TgEnd(handle) => vec![handle],
-        Stmt::DropFlagInit(_) => Vec::new(),
+        Stmt::DropFlagInit(_) | Stmt::DropFlagMoveOut { .. } => Vec::new(),
         Stmt::NullTupleField(_, _) => Vec::new(),
         Stmt::NullStructField(_, _) => Vec::new(),
         Stmt::NullElemField(_, index, _) => vec![index],
@@ -2667,6 +2693,11 @@ mod tests {
             ("TgWait", Stmt::TgWait(value.clone()), false),
             ("TgEnd", Stmt::TgEnd(value.clone()), false),
             ("DropFlagInit", Stmt::DropFlagInit(1), false),
+            (
+                "DropFlagMoveOut",
+                Stmt::DropFlagMoveOut { slot: 1, flag: 2 },
+                false,
+            ),
             ("NullTupleField", Stmt::NullTupleField(1, 0), false),
             ("NullStructField", Stmt::NullStructField(1, 0), false),
             ("NullElemField", Stmt::NullElemField(1, scalar.clone(), vec![0]), false),

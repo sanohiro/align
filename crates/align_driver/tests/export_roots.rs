@@ -141,3 +141,102 @@ fn unknown_export_rejected() {
     let all_known = ["k1".to_string(), "k2".to_string(), "helper".to_string()];
     assert!(align_driver::unknown_exports(&mir, &all_known).is_empty());
 }
+
+#[test]
+fn c_harness_calls_conservative_borrow_mut_exports() {
+    if !backend_available() || !cc_available() {
+        return;
+    }
+    let source = "\
+pub fn inspect(prefix: i64, borrow mut value: string, suffix: i64) -> i64 = prefix + value.len() + suffix
+pub fn replace(tag: i64, borrow mut value: string) { if tag == 7 { value = \"abc\".clone() } }
+";
+    let mut sources = SourceMap::new();
+    let checked = check(&mut sources, "drop-state-export", source);
+    assert!(
+        !checked.diags.has_errors(),
+        "unexpected errors:\n{}",
+        align_driver::format_diagnostics(&sources, &checked.diags)
+    );
+    let mir = lower_to_mir(&checked.hir);
+    let directory = (0_u32..)
+        .find_map(|attempt| {
+            let candidate = std::env::temp_dir().join(format!(
+                "align-drop-state-export-{}-{attempt}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&candidate) {
+                Ok(()) => Some(candidate),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(error) => panic!("create private C-harness directory: {error}"),
+            }
+        })
+        .expect("exhausted C-harness directory names");
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(directory.clone());
+    let align_object = directory.join("align.o");
+    let c_source = directory.join("harness.c");
+    let c_object = directory.join("harness.o");
+    let executable = directory.join(format!("harness{}", std::env::consts::EXE_SUFFIX));
+    emit_object_file(
+        &mir,
+        &align_object,
+        BuildTarget::Baseline,
+        Profile::Release,
+        &["inspect".to_owned(), "replace".to_owned()],
+        false,
+    )
+    .expect("emit exported Align object");
+    std::fs::write(
+        &c_source,
+        r#"#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+typedef struct { const unsigned char *ptr; int64_t len; } AlignString;
+typedef struct { AlignString *value; bool *cleanup; } AlignBorrowMutString;
+extern int64_t inspect(int64_t prefix, AlignBorrowMutString value, int64_t suffix);
+extern void replace(int64_t tag, AlignBorrowMutString value);
+extern void align_rt_free(void *ptr);
+int main(void) {
+    AlignString value = { NULL, 0 };
+    bool cleanup = false;
+    AlignBorrowMutString borrow = { &value, &cleanup };
+    if (inspect(10, borrow, 32) != 42 || cleanup) return 2;
+    replace(7, borrow);
+    if (!cleanup || value.ptr == NULL || value.len != 3) return 3;
+    if (inspect(10, borrow, 29) != 42 || !cleanup) return 4;
+    align_rt_free((void *)value.ptr);
+    return 42;
+}
+"#,
+    )
+    .expect("write C harness");
+    let compiled = std::process::Command::new("cc")
+        .args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-c", "-O0"])
+        .arg(&c_source)
+        .arg("-o")
+        .arg(&c_object)
+        .output()
+        .expect("launch C compiler");
+    assert!(
+        compiled.status.success(),
+        "C harness compilation failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    link_objects(
+        &align_driver::CDriver::default(),
+        &[align_object.as_path(), c_object.as_path()],
+        &executable,
+        &mir.link_libs,
+        Profile::Release,
+    )
+    .expect("link C harness and Align exports");
+    let output = std::process::Command::new(&executable).output().expect("run C harness");
+    assert_eq!(output.status.code(), Some(42));
+}

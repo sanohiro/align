@@ -330,6 +330,7 @@ pub struct ImportedFn {
     pub return_borrow: hir::ReturnBorrowSummary,
     pub return_region: hir::ReturnRegionSummary,
     pub return_cleanup: hir::ReturnCleanupAbi,
+    pub drop_state_effects: Vec<hir::DropStateEffect>,
     /// The format-9 dependency record was emitted only after producer validation.
     pub producer_certified: bool,
 }
@@ -337,6 +338,8 @@ pub struct ImportedFn {
 #[derive(Clone, Debug, Default)]
 pub struct Program {
     pub fns: Vec<Function>,
+    /// Complete concrete callable graph's per-parameter ownership-state fixed point.
+    pub drop_state_effects: std::collections::BTreeMap<ProgramCall, Vec<hir::DropStateEffect>>,
     /// Located-only current-plan observations. This field is deliberately absent from canonical
     /// graph walks, hashes, MIR printing, runtime-key inventory, and codegen.
     pub plan_records: Vec<PlanRecord>,
@@ -735,7 +738,10 @@ pub enum Stmt {
     TgEnd(Operand),
     /// Zero an owned slot after entry or a move so its storage is safe to inspect recursively.
     /// Drop eligibility itself is tracked by a separate path-local boolean slot.
+    /// Construction/unwind safety initialization. This origin is never removable.
     DropFlagInit(Slot),
+    /// Move-out source nulling paired with the ownership flag becoming false.
+    DropFlagMoveOut { slot: Slot, flag: Slot },
     /// Null one owned field (`{null, 0}`) of a tuple slot, after a partial field move (`a := t.0`)
     /// took its buffer — so the tuple's exit `Drop` frees null there, not the buffer now owned by
     /// the new binding. The other fields are untouched.
@@ -3753,9 +3759,12 @@ fn lower_program_unchecked_with_plans(
         // Separate-compilation visibility (per-unit lowering only); whole-program lowering keeps
         // every function `internal` for byte-identity.
         mf.exportable = per_unit && f.origin.is_exportable();
-        simplify_known_drop_flags(&mut mf);
         fuse_builder_writes(&mut mf);
         fns.push(mf);
+    }
+    let drop_state_effects = derive_drop_state_effects(&mut fns, &program.imported_fns);
+    for function in &mut fns {
+        simplify_drop_state(function);
     }
     annotate_par_map_work(&mut fns);
     // User-declared `extern "C" link("name")` libraries come first (validated in sema); then the
@@ -3783,6 +3792,7 @@ fn lower_program_unchecked_with_plans(
     };
     let mut mir = Program {
         fns,
+        drop_state_effects,
         plan_records,
         plan_certification,
         plan_catalog_malformed,
@@ -3815,6 +3825,7 @@ fn lower_program_unchecked_with_plans(
                     return_borrow: import.return_borrow.clone(),
                     return_region: import.return_region.clone(),
                     return_cleanup: import.return_cleanup,
+                    drop_state_effects: import.drop_state_effects.clone(),
                     producer_certified: import.producer_certified,
                 })
                 .collect()
@@ -4622,12 +4633,117 @@ fn remap_function_embedded_types(
     }
 }
 
+fn borrowed_cleanup_slot(operand: &Operand) -> Option<Slot> {
+    match operand {
+        Operand::BorrowedPlace(place) => place.cleanup,
+        Operand::BorrowedFixedElementPlace(place) => place.cleanup,
+        Operand::BorrowedElementPlace(_) | Operand::Arg(_) | Operand::BorrowedCleanupArg(_)
+        | Operand::Value(_) | Operand::Const(_) => None,
+    }
+}
+
+/// Compute the least fixed point of ownership-state changes before any physical signature is
+/// formed. The proxy slot is the stable identity connecting local ownership operations and call
+/// edges; unknown/indirect edges conservatively change every proxy they receive.
+fn derive_drop_state_effects(
+    fns: &mut [Function],
+    imported: &[hir::ImportedFn],
+) -> std::collections::BTreeMap<ProgramCall, Vec<hir::DropStateEffect>> {
+    let local_index = fns
+        .iter()
+        .enumerate()
+        .map(|(index, function)| (function.name.clone(), index))
+        .collect::<std::collections::HashMap<_, _>>();
+    let imported_effects = imported
+        .iter()
+        .map(|function| (ProgramCall::from_validated(&function.name), function.drop_state_effects.clone()))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let mut effects = fns
+        .iter()
+        .map(|function| {
+            function
+                .borrow_mut_cleanup_slots
+                .iter()
+                .map(|slot| if slot.is_some() { hir::DropStateEffect::Invariant } else { hir::DropStateEffect::NotApplicable })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    loop {
+        let mut changed = false;
+        for (function_index, function) in fns.iter().enumerate() {
+            for (parameter, cleanup_slot) in function.borrow_mut_cleanup_slots.iter().enumerate() {
+                let Some(cleanup_slot) = *cleanup_slot else { continue };
+                if effects[function_index][parameter] == hir::DropStateEffect::MayChange {
+                    continue;
+                }
+                let mut may_change = false;
+                for block in &function.blocks {
+                    for statement in &block.stmts {
+                        match statement {
+                            Stmt::Store(slot, Operand::BorrowedCleanupArg(origin))
+                                if *slot == cleanup_slot && *origin as usize == parameter => {}
+                            Stmt::Store(slot, _) if *slot == cleanup_slot => may_change = true,
+                            Stmt::Let(_, rvalue) => match loop_facts::drop_state_call(rvalue) {
+                                loop_facts::DropStateCall::Direct(target, arguments) => {
+                                    for (ordinal, argument) in arguments.iter().enumerate() {
+                                        if borrowed_cleanup_slot(argument) != Some(cleanup_slot) {
+                                            continue;
+                                        }
+                                        let target_effect = local_index
+                                            .get(target)
+                                            .and_then(|index| effects.get(*index))
+                                            .and_then(|vector| vector.get(ordinal))
+                                            .copied()
+                                            .or_else(|| imported_effects.get(target).and_then(|vector| vector.get(ordinal)).copied())
+                                            .unwrap_or(hir::DropStateEffect::MayChange);
+                                        may_change |= target_effect != hir::DropStateEffect::Invariant;
+                                    }
+                                },
+                                loop_facts::DropStateCall::Unknown(arguments) => {
+                                    may_change |= arguments.iter().any(|argument| borrowed_cleanup_slot(argument) == Some(cleanup_slot));
+                                }
+                                loop_facts::DropStateCall::None => {}
+                            },
+                            _ => {}
+                        }
+                    }
+                }
+                if may_change {
+                    effects[function_index][parameter] = hir::DropStateEffect::MayChange;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    for (function, vector) in fns.iter_mut().zip(&effects) {
+        for (parameter, effect) in vector.iter().copied().enumerate() {
+            if effect != hir::DropStateEffect::Invariant {
+                continue;
+            }
+            let Some(slot) = function.borrow_mut_cleanup_slots.get(parameter).copied().flatten() else { continue };
+            for block in &mut function.blocks {
+                block.stmts.retain(|statement| {
+                    !matches!(statement, Stmt::Store(target, Operand::BorrowedCleanupArg(origin)) if *target == slot && *origin as usize == parameter)
+                });
+            }
+            function.borrow_mut_cleanup_slots[parameter] = None;
+        }
+    }
+    fns.iter().map(|function| function.name.clone()).zip(effects).collect()
+}
+
 /// Remove conditional-drop edges whose path-local flag has one compile-time value on every
 /// incoming path. Lowering deliberately materialises ownership as boolean slots so joins remain
 /// correct; this small forward pass recovers the straight-line cases after that conservative CFG
 /// construction. In particular, moving an owned local clears its flag immediately before exit, so
 /// the now-unreachable destructor block must not survive as a `*_free(null)` call in optimized IR.
-fn simplify_known_drop_flags(f: &mut Function) {
+fn simplify_drop_state(f: &mut Function) {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum BoolState {
         Const(bool),
@@ -4670,6 +4786,91 @@ fn simplify_known_drop_flags(f: &mut Function) {
                     .is_some_and(|stmt| matches!(stmt, Stmt::Drop(_) | Stmt::DropValue(_)))
         )
     }
+
+    fn operand_mentions_slot(operand: &Operand, slot: Slot) -> bool {
+        match operand {
+            Operand::BorrowedPlace(place) => place.slot == slot || place.cleanup == Some(slot),
+            Operand::BorrowedFixedElementPlace(place) => place.base == slot || place.cleanup == Some(slot),
+            Operand::BorrowedElementPlace(place) => place.base.slot == slot || place.base.cleanup == Some(slot),
+            Operand::Arg(_) | Operand::BorrowedCleanupArg(_) | Operand::Value(_) | Operand::Const(_) => false,
+        }
+    }
+
+    fn statement_does_not_read_slot(statement: &Stmt, slot: Slot) -> bool {
+        match statement {
+            Stmt::Let(_, Rvalue::Load(source)) => *source != slot,
+            Stmt::Let(_, Rvalue::Use(operand)) => !operand_mentions_slot(operand, slot),
+            Stmt::Let(_, Rvalue::Call(_, operands)) => operands.iter().all(|operand| !operand_mentions_slot(operand, slot)),
+            Stmt::Let(_, Rvalue::CallWithCleanup(call)) => call.args.iter().all(|operand| !operand_mentions_slot(operand, slot)),
+            Stmt::Store(target, operand) => *target != slot && !operand_mentions_slot(operand, slot),
+            Stmt::Drop(target) => *target != slot,
+            Stmt::DropValue(operand) => !operand_mentions_slot(operand, slot),
+            _ => false,
+        }
+    }
+
+    fn all_paths_leave_slot_unread(
+        f: &Function,
+        block_id: BlockId,
+        first_statement: usize,
+        slot: Slot,
+        visiting: &mut std::collections::HashSet<BlockId>,
+    ) -> bool {
+        if !visiting.insert(block_id) {
+            return false;
+        }
+        let Some(block) = f.blocks.get(block_id as usize) else {
+            return false;
+        };
+        if !block.stmts.iter().skip(first_statement).all(|statement| statement_does_not_read_slot(statement, slot)) {
+            visiting.remove(&block_id);
+            return false;
+        }
+        let result = match &block.term {
+            Term::Return(value) => value.as_ref().is_none_or(|operand| !operand_mentions_slot(operand, slot)),
+            Term::ReturnWithCleanup(returned) => {
+                let (value, cleanup) = returned.as_ref();
+                !operand_mentions_slot(value, slot) && !operand_mentions_slot(cleanup, slot)
+            }
+            Term::Goto(target) => all_paths_leave_slot_unread(f, *target, 0, slot, visiting),
+            Term::Branch(condition, then_block, else_block) => {
+                !operand_mentions_slot(condition, slot)
+                    && all_paths_leave_slot_unread(f, *then_block, 0, slot, visiting)
+                    && all_paths_leave_slot_unread(f, *else_block, 0, slot, visiting)
+            }
+            Term::Unreachable => true,
+        };
+        visiting.remove(&block_id);
+        result
+    }
+
+    let remove_dead_move_outs = |f: &mut Function| {
+        let mut removable = Vec::new();
+        for (block_index, block) in f.blocks.iter().enumerate() {
+            for index in 0..block.stmts.len().saturating_sub(1) {
+                let Stmt::DropFlagMoveOut { slot, flag } = &block.stmts[index] else { continue };
+                let paired_false = matches!(block.stmts.get(index + 1), Some(Stmt::Store(target, Operand::Const(Const::Bool(false)))) if target == flag);
+                if paired_false
+                    && all_paths_leave_slot_unread(
+                        f,
+                        block.id,
+                        index + 2,
+                        *slot,
+                        &mut std::collections::HashSet::new(),
+                    )
+                {
+                    removable.push((block_index, index));
+                }
+            }
+        }
+        for (block_index, index) in removable.into_iter().rev() {
+            f.blocks[block_index].stmts.remove(index);
+            if index < f.blocks[block_index].stmt_lines.len() {
+                f.blocks[block_index].stmt_lines.remove(index);
+            }
+        }
+    };
+    remove_dead_move_outs(f);
 
     // Numeric-only fused pipelines have no conditional drops. Keep this pass completely off their
     // compile path rather than allocating per-block dataflow state that cannot produce a rewrite.
@@ -4779,6 +4980,7 @@ fn simplify_known_drop_flags(f: &mut Function) {
         }
     }
     if reachable.iter().all(|value| *value) {
+        remove_dead_move_outs(f);
         return;
     }
 
@@ -4815,6 +5017,7 @@ fn simplify_known_drop_flags(f: &mut Function) {
         true
     });
     f.blocks = blocks;
+    remove_dead_move_outs(f);
 }
 
 /// Identifies which builder a write targets, so a `write_str`/`write_int`/`write_str` triple can be
@@ -5914,7 +6117,10 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
                 None => false,
             };
             if moved {
-                b.push(Stmt::DropFlagInit(*id));
+                let Some(flag) = b.drop_flags.get(*id as usize).copied().flatten() else {
+                    return;
+                };
+                b.push(Stmt::DropFlagMoveOut { slot: *id, flag });
                 b.set_drop_flag(*id, false);
             }
         }
@@ -23847,11 +24053,98 @@ mod tests {
             exportable: false,
         };
 
-        simplify_known_drop_flags(&mut function);
+        simplify_drop_state(&mut function);
 
         assert_eq!(function.blocks.len(), 5);
         assert_eq!(function.exceptional_edges[0].block, 2);
         assert!(matches!(function.blocks[2].term, Term::Branch(..)));
+    }
+
+    #[test]
+    fn drop_state_effect_fixed_point_specializes_direct_edges_and_refuses_indirect_ones() {
+        let program = lower(
+            "fn leaf(borrow mut value: string) -> i64 = value.len()\n\
+             fn relay(borrow mut value: string) -> i64 = leaf(value)\n\
+             fn replace(borrow mut value: string) { value = \"new\".clone() }\n\
+             fn changing(borrow mut value: string) { replace(value) }\n\
+             fn recur_a(borrow mut value: string) -> i64 = recur_b(value)\n\
+             fn recur_b(borrow mut value: string) -> i64 = recur_a(value)\n\
+             fn indirect(borrow mut value: string) -> i64 { callback := leaf; return callback(value) }\n\
+             fn generic<T>(borrow mut value: T) {}\n\
+             fn instantiate(number: i64, text: string) { mut n := number; mut s := text; generic(n); generic(s) }\n\
+             fn main() -> i32 = 0\n",
+        );
+        let effect = |name: &str| {
+            program
+                .drop_state_effects
+                .iter()
+                .find(|(target, _)| target.as_str() == name)
+                .and_then(|(_, effects)| effects.first())
+                .copied()
+        };
+        assert_eq!(effect("leaf"), Some(hir::DropStateEffect::Invariant));
+        assert_eq!(effect("relay"), Some(hir::DropStateEffect::Invariant));
+        assert_eq!(effect("replace"), Some(hir::DropStateEffect::MayChange));
+        assert_eq!(effect("changing"), Some(hir::DropStateEffect::MayChange));
+        assert_eq!(effect("recur_a"), Some(hir::DropStateEffect::Invariant));
+        assert_eq!(effect("recur_b"), Some(hir::DropStateEffect::Invariant));
+        assert_eq!(effect("indirect"), Some(hir::DropStateEffect::MayChange));
+        let generic_effects = program
+            .fns
+            .iter()
+            .filter(|function| function.name.as_str().starts_with("generic"))
+            .map(|function| {
+                (
+                    function.slots[function.params[0] as usize],
+                    program.drop_state_effects[&function.name][0],
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(generic_effects.len(), 2, "{generic_effects:?}");
+        assert!(
+            generic_effects.contains(&(i64_ty(), hir::DropStateEffect::NotApplicable))
+                && generic_effects.contains(&(Ty::String, hir::DropStateEffect::Invariant)),
+            "generic Copy and Move substitutions must derive their concrete effects: {generic_effects:?}"
+        );
+        // Test-only invariant: these functions are declared literally in the checked source above.
+        for name in ["leaf", "relay"] {
+            let function = program.fns.iter().find(|function| function.name.as_str() == name).unwrap();
+            assert_eq!(function.borrow_mut_cleanup_slots, vec![None]);
+            assert!(!function.blocks.iter().flat_map(|block| &block.stmts).any(|statement| {
+                matches!(statement, Stmt::Store(_, Operand::BorrowedCleanupArg(_)))
+            }));
+        }
+        let replace = program.fns.iter().find(|function| function.name.as_str() == "replace").unwrap();
+        assert!(replace.borrow_mut_cleanup_slots[0].is_some());
+    }
+
+    #[test]
+    fn terminal_move_out_nulling_is_removed_but_branching_and_initialization_are_retained() {
+        // Test-only invariant: both checked fixtures below declare a function named `take`.
+        let moved = lower("fn take(value: string) -> string = value\nfn main() -> i32 = 0\n");
+        let take = moved.fns.iter().find(|function| function.name.as_str() == "take").unwrap();
+        assert!(!take.blocks.iter().flat_map(|block| &block.stmts).any(|statement| matches!(statement, Stmt::DropFlagMoveOut { .. })), "{}", print::program_to_string(&moved));
+
+        let selected = lower("fn take(value: string, choose: bool) -> string { if choose { return value }; return value }\nfn main() -> i32 = 0\n");
+        let take = selected.fns.iter().find(|function| function.name.as_str() == "take").unwrap();
+
+        let mut read_after = take.clone();
+        read_after.blocks[0].stmts = vec![
+            Stmt::DropFlagMoveOut { slot: 0, flag: 2 },
+            Stmt::Store(2, Operand::Const(Const::Bool(false))),
+            Stmt::Let(0, Rvalue::Load(0)),
+        ];
+        read_after.blocks[0].stmt_lines.clear();
+        read_after.blocks[0].term = Term::Return(Some(Operand::Value(0)));
+        simplify_drop_state(&mut read_after);
+        assert!(matches!(read_after.blocks[0].stmts[0], Stmt::DropFlagMoveOut { .. }), "a possible storage read retains move-out nulling");
+
+        let mut initialize_empty = take.clone();
+        initialize_empty.blocks[0].stmts = vec![Stmt::DropFlagInit(0)];
+        initialize_empty.blocks[0].stmt_lines.clear();
+        initialize_empty.blocks[0].term = Term::Return(None);
+        simplify_drop_state(&mut initialize_empty);
+        assert!(matches!(initialize_empty.blocks[0].stmts[0], Stmt::DropFlagInit(0)), "construction initialization is never folded as move-out nulling");
     }
 
     #[test]
@@ -26519,6 +26812,7 @@ fn main() -> i32 = 0
         });
         let mut program = Program {
             sqlite_callback_effects: std::collections::BTreeMap::new(),
+            drop_state_effects: std::collections::BTreeMap::new(),
             plan_records: Vec::new(),
             plan_certification: Default::default(),
             plan_catalog_malformed: false,
@@ -27869,17 +28163,22 @@ fn main() -> i32 = 0
                 }
             }
 
-            let expected_inits = if case.first == First::Bound
-                && matches!(case.completion, Completion::Try | Completion::Success)
-            {
-                2
-            } else {
-                1
-            };
             assert_eq!(
                 owner_inits.len(),
-                expected_inits,
-                "{} must null a bound source only at the successful action:\n{rendered}",
+                1,
+                "{} must initialize the staging owner exactly once:\n{rendered}",
+                case.name
+            );
+            let move_outs = locations(function, |statement| {
+                matches!(statement, Stmt::DropFlagMoveOut { .. })
+            });
+            let expected_move_outs = usize::from(
+                case.first == First::Bound && case.completion == Completion::Try,
+            );
+            assert_eq!(
+                move_outs.len(),
+                expected_move_outs,
+                "{} must retain source nulling only when a later path can still inspect ownership:\n{rendered}",
                 case.name
             );
 
@@ -27920,29 +28219,17 @@ fn main() -> i32 = 0
                         case.name
                     );
                 }
-                if case.first == First::Bound {
-                    assert!(
-                        owner_inits
-                            .iter()
-                            .filter(|&&(block, index)| {
-                                block == action_clear.0 && index + 1 == action_clear.1
-                            })
-                            .count()
-                            == 1,
-                        "{} must null the bound source immediately before clearing it at the call action:\n{rendered}",
-                        case.name
+                let preceding_move_out = action_clear.1 > 0
+                    && matches!(
+                        function.blocks[action_clear.0 as usize].stmts[action_clear.1 - 1],
+                        Stmt::DropFlagMoveOut { slot, .. } if slot == owner
                     );
-                } else {
-                    assert!(
-                        action_clear.1 == 0
-                            || !matches!(
-                                function.blocks[action_clear. 0 as usize].stmts[action_clear. 1 - 1],
-                                Stmt::DropFlagInit(slot) if slot == owner
-                            ),
-                        "{} must not invent bound-source nulling for a fresh staged value:\n{rendered}",
-                        case.name
-                    );
-                }
+                assert_eq!(
+                    preceding_move_out,
+                    case.first == First::Bound && case.completion == Completion::Try,
+                    "{} must retain immediate bound-source nulling exactly when later cleanup can observe it:\n{rendered}",
+                    case.name
+                );
 
                 let call_statement = &function.blocks[call.0 as usize].stmts[call.1];
                 let args = outer_call_args(call_statement, case.call).unwrap_or_else(|| {
@@ -28597,13 +28884,12 @@ fn main() -> i32 = 0
             );
             let call_block = &function.blocks[call.0 as usize];
             assert!(
-                call.1 >= 2
-                    && matches!(call_block.stmts[call. 1 - 2], Stmt::DropFlagInit(slot) if slot == state.owner)
+                call.1 >= 1
                     && matches!(
-                        call_block.stmts[call. 1 - 1],
+                        call_block.stmts[call.1 - 1],
                         Stmt::Store(slot, Operand::Const(Const::Bool(false))) if slot == state.flag
                     ),
-                "the successful parent action must null the exact bound source and its flag immediately before the call:\n{rendered}"
+                "the successful parent action must clear the exact bound source flag immediately before the call:\n{rendered}"
             );
             let owner_inits = locations(
                 function,
@@ -28611,13 +28897,8 @@ fn main() -> i32 = 0
             );
             assert_eq!(
                 owner_inits.len(),
-                2,
-                "the bound source must be initialized once and nulled only at the successful action:\n{rendered}"
-            );
-            assert_eq!(
-                owner_inits[1],
-                (call.0, call.1 - 2),
-                "the second source initialization must be the exact action-time nulling:\n{rendered}"
+                1,
+                "the bound source must retain its one construction initialization after terminal nulling is proved dead:\n{rendered}"
             );
             let flag_clears = locations(function, |statement| {
                 matches!(

@@ -424,7 +424,9 @@ impl<'a> Facts<'a> {
                         !self.f.params.contains(slot)
                             || matches!(operand, Operand::Arg(arg) if self.f.params.get(*arg as usize) == Some(slot))
                     }
-                    Stmt::DropFlagInit(slot) => !self.f.params.contains(slot),
+                    Stmt::DropFlagInit(slot) | Stmt::DropFlagMoveOut { slot, .. } => {
+                        !self.f.params.contains(slot)
+                    }
                     Stmt::PtrStore(ptr, _, _) => self.fresh(ptr),
                     Stmt::Let(_, rv) => match rv {
                         Rvalue::Load(_)

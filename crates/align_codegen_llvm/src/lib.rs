@@ -1243,6 +1243,7 @@ pub fn emit_function_prelink_bc(
     let mut program = Program::default();
     program.fns = functions;
     program.sqlite_callback_effects = shared.callback_effects.clone();
+    program.drop_state_effects = shared.drop_state_effects.clone();
     program.externs = shared.externs.to_vec();
     program.imported_fns = shared.imported_fns.to_vec();
     program.structs = shared.structs.to_vec();
@@ -1597,6 +1598,7 @@ struct ProgramSignature {
     borrow: hir::ReturnBorrowSummary,
     region: hir::ReturnRegionSummary,
     cleanup: hir::ReturnCleanupAbi,
+    drop_state_effects: Vec<hir::DropStateEffect>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3016,6 +3018,7 @@ struct PartitionSharedCodegenTables<'a> {
     tuples: &'a [hir::TupleDef],
     externs: &'a [align_mir::ProgramExtern],
     imported_fns: &'a [align_mir::ImportedFn],
+    drop_state_effects: &'a std::collections::BTreeMap<ProgramCall, Vec<hir::DropStateEffect>>,
     callback_effects: &'a std::collections::BTreeMap<ProgramCall, align_sema::FnEffect>,
 }
 
@@ -3032,6 +3035,7 @@ pub struct PartitionSharedCodegenView<'a> {
     tuples: &'a [hir::TupleDef],
     externs: &'a [align_mir::ProgramExtern],
     imported_fns: &'a [align_mir::ImportedFn],
+    drop_state_effects: &'a std::collections::BTreeMap<ProgramCall, Vec<hir::DropStateEffect>>,
     callback_effects: &'a std::collections::BTreeMap<ProgramCall, align_sema::FnEffect>,
     fingerprint: Hash128,
 }
@@ -3047,6 +3051,7 @@ impl<'a> PartitionSharedCodegenView<'a> {
             tuples: &program.tuples,
             externs: &program.externs,
             imported_fns: &program.imported_fns,
+            drop_state_effects: &program.drop_state_effects,
             callback_effects: &program.sqlite_callback_effects,
         };
         let rendered = format!("align-thin-partition-shared-v1\n{tables:?}");
@@ -3059,6 +3064,7 @@ impl<'a> PartitionSharedCodegenView<'a> {
             tuples: tables.tuples,
             externs: tables.externs,
             imported_fns: tables.imported_fns,
+            drop_state_effects: tables.drop_state_effects,
             callback_effects: tables.callback_effects,
             fingerprint: Hash128::of(rendered.as_bytes()),
         }
@@ -3163,6 +3169,25 @@ impl ModuleScope<'_> {
                 }
                 .ok_or_else(|| callable_target_error(&function.name))?;
                 Ok((record.symbol.clone(), Some(record.linkage)))
+            }
+        }
+    }
+
+    fn explicitly_exports(self, function: &Function, exports: &[String]) -> bool {
+        if function.name.as_str() == "main" {
+            return false;
+        }
+        match self {
+            ModuleScope::Whole => exports.iter().any(|export| export == function.name.as_str()),
+            ModuleScope::Test { .. } => false,
+            ModuleScope::Function {
+                selected,
+                definition,
+                ..
+            } => {
+                &function.name == selected
+                    && definition.linkage == ThinFunctionLinkage::Root
+                    && definition.symbol == function.name.as_str()
             }
         }
     }
@@ -3672,8 +3697,13 @@ fn lower_prepared_module<'c>(
     // uses its ordinary encoded Align identity; the external C `main` wrapper is emitted later.
     let mut program_funcs: HashMap<ProgramCall, FunctionValue<'c>> = HashMap::new();
     let mut generated_funcs: HashMap<GeneratedId, FunctionValue<'c>> = HashMap::new();
+    let mut export_cores = Vec::new();
     for f in program.fns.iter().filter(|function| scope.declares(function)) {
-        let (symbol, partition_linkage) = scope.symbol(f, exports)?;
+        let (mut symbol, partition_linkage) = scope.symbol(f, exports)?;
+        let explicit_export = scope.explicitly_exports(f, exports);
+        if explicit_export {
+            symbol = encoded_program_symbol(&f.name);
+        }
         let fv = declare_fn(
             ctx,
             module,
@@ -3684,11 +3714,83 @@ fn lower_prepared_module<'c>(
             tagged_types,
             &tuple_types,
             program,
-            exports,
-            partition_linkage,
+            if explicit_export { &[] } else { exports },
+            if explicit_export {
+                None
+            } else {
+                partition_linkage
+            },
             scope.is_test(),
         );
+        if explicit_export {
+            // `f.exportable` may independently make a per-unit definition externally visible.
+            // The specialized core is never a native boundary: only its conservative wrapper owns
+            // the source-level export symbol.
+            mark_internal(fv);
+            export_cores.push((f, fv));
+        }
         program_funcs.insert(f.name.clone(), fv);
+    }
+    for (function, core) in export_cores {
+        // The body-specialized core is an ABI boundary, not an optimization detail of the public
+        // wrapper. Keeping it distinct guarantees that a body-effect change cannot silently
+        // rewrite the externally named function type during LTO.
+        add_enum_attr(ctx, core, inkwell::attributes::AttributeLoc::Function, "noinline");
+        let map = |ty: Ty| abi_map_ty(ctx, ty, &struct_types, &enum_types, tagged_types, &tuple_types);
+        let params = function
+            .params
+            .iter()
+            .zip(&function.param_modes)
+            .map(|(slot, mode)| {
+                let ty = function
+                    .slots
+                    .get(*slot as usize)
+                    .copied()
+                    .ok_or_else(|| callable_target_error(&function.name))?;
+                Ok(abi_param_type(
+                    ctx,
+                    map(ty),
+                    *mode,
+                    align_sema::needs_drop_flag(
+                        ty,
+                        &program.structs,
+                        &program.tuples,
+                        &program.enums,
+                        &program.tagged_types,
+                    ),
+                ))
+            })
+            .collect::<Result<Vec<_>, CodegenError>>()?;
+        let wrapper_ty = if function.ret == Ty::Unit {
+            ctx.void_type().fn_type(&params, false)
+        } else {
+            align_return_type(ctx, map(function.ret), function.return_cleanup).fn_type(&params, false)
+        };
+        let wrapper = module.add_function(function.name.as_str(), wrapper_ty, None);
+        mark_nounwind(ctx, wrapper);
+        mark_borrow_param_contracts(ctx, wrapper, &function.param_modes, &function.return_borrow);
+        let entry = ctx.append_basic_block(wrapper, "entry");
+        let builder = ctx.create_builder();
+        builder.position_at_end(entry);
+        let mut forwarded = Vec::with_capacity(function.params.len());
+        for (index, parameter) in wrapper.get_params().iter().enumerate() {
+            if program.drop_state_effects.get(&function.name).and_then(|effects| effects.get(index)) == Some(&hir::DropStateEffect::Invariant)
+                && function.param_modes.get(index) == Some(&align_ast::ParamMode::BorrowMut)
+            {
+                let pointer = builder
+                    .build_extract_value(parameter.into_struct_value(), 0, "export.borrow.ptr")
+                    .map_err(|error| CodegenError::Lowering(error.to_string()))?;
+                forwarded.push(pointer.into());
+            } else {
+                forwarded.push((*parameter).into());
+            }
+        }
+        let call = builder.build_call(core, &forwarded, "export.call")
+            .map_err(|error| CodegenError::Lowering(error.to_string()))?;
+        match call.try_as_basic_value().basic() {
+            Some(value) => builder.build_return(Some(&value)),
+            None => builder.build_return(None),
+        }.map_err(|error| CodegenError::Lowering(error.to_string()))?;
     }
     // M15 S2 (per-unit): non-generic `pub` functions declared by interface-only dependencies. Each is
     // an external, bodyless `declare` under the same Align ABI a defining unit emits
@@ -3826,6 +3928,7 @@ fn lower_prepared_module<'c>(
         let id = GeneratedId::FnValue {
             target: name.clone(),
             signature: canonical_signature(&declaration.signature, program)?,
+            drop_state_effects: drop_state_effect_tags(&declaration.signature.drop_state_effects),
         };
         let emitted_name = callable_preflight
             .generated_names
@@ -3834,9 +3937,16 @@ fn lower_prepared_module<'c>(
         let orig = *program_funcs
             .get(name)
             .ok_or_else(|| CodegenError::Lowering(format!("unknown function {name}")))?;
-        let orig_ty = orig.get_type();
         let mut params: Vec<BasicMetadataTypeEnum> = vec![ptr.into()];
-        params.extend(orig_ty.get_param_types().iter().copied());
+        params.extend(declaration.signature.params.iter().zip(&declaration.signature.modes).map(|(&ty, &mode)| {
+            abi_param_type(
+                ctx,
+                abi_map_ty(ctx, ty, &struct_types, &enum_types, tagged_types, &tuple_types),
+                mode,
+                align_sema::needs_drop_flag(ty, &program.structs, &program.tuples, &program.enums, &program.tagged_types),
+            )
+        }));
+        let orig_ty = orig.get_type();
         let thunk_ty = match orig_ty.get_return_type() {
             Some(rt) => rt.fn_type(&params, false),
             None => ctx.void_type().fn_type(&params, false),
@@ -3854,8 +3964,23 @@ fn lower_prepared_module<'c>(
         let bb = ctx.append_basic_block(thunk, "entry");
         let tb = ctx.create_builder();
         tb.position_at_end(bb);
-        let fwd: Vec<inkwell::values::BasicMetadataValueEnum> =
-            thunk.get_params().iter().skip(1).map(|p| (*p).into()).collect();
+        let mut fwd = Vec::with_capacity(declaration.signature.params.len());
+        for (index, parameter) in thunk.get_params().iter().skip(1).enumerate() {
+            let effect = declaration.signature.drop_state_effects
+                .get(index)
+                .copied()
+                .unwrap_or(hir::DropStateEffect::MayChange);
+            if effect == hir::DropStateEffect::Invariant
+                && declaration.signature.modes.get(index) == Some(&align_ast::ParamMode::BorrowMut)
+            {
+                let pointer = tb
+                    .build_extract_value(parameter.into_struct_value(), 0, "adapter.borrow.ptr")
+                    .map_err(|error| CodegenError::Lowering(error.to_string()))?;
+                fwd.push(pointer.into());
+            } else {
+                fwd.push((*parameter).into());
+            }
+        }
         let cs = tb.build_call(orig, &fwd, "r").map_err(|e| CodegenError::Lowering(e.to_string()))?;
         match cs.try_as_basic_value().basic() {
             Some(v) => tb.build_return(Some(&v)),
@@ -3921,10 +4046,12 @@ fn lower_prepared_module<'c>(
             )
             .ok_or_else(|| callable_target_error(lifted))?,
             cleanup: declaration.signature.cleanup,
+            drop_state_effects: conservative_drop_state_effects(explicit_params, explicit_modes, program),
         };
         let id = GeneratedId::Closure {
             lifted: lifted.clone(),
             explicit_signature: canonical_signature(&explicit_signature, program)?,
+            drop_state_effects: drop_state_effect_tags(&declaration.signature.drop_state_effects),
             captures: capture_tys
                 .iter()
                 .map(|ty| canonical_ty(*ty, program))
@@ -3939,7 +4066,7 @@ fn lower_prepared_module<'c>(
             .ok_or_else(|| CodegenError::Lowering(format!("unknown lifted function {lifted}")))?;
         let orig_ty = orig.get_type();
         let all_params = orig_ty.get_param_types();
-        let n_explicit = all_params.len().checked_sub(capture_tys.len()).ok_or_else(|| {
+        let _n_explicit = all_params.len().checked_sub(capture_tys.len()).ok_or_else(|| {
             CodegenError::Lowering(format!(
                 "lifted function {lifted} has {} parameters, fewer than its {} captures",
                 all_params.len(),
@@ -3947,7 +4074,14 @@ fn lower_prepared_module<'c>(
             ))
         })?;
         let mut tparams: Vec<BasicMetadataTypeEnum> = vec![ptr.into()];
-        tparams.extend(all_params[..n_explicit].iter().copied());
+        tparams.extend(explicit_params.iter().zip(explicit_modes).map(|(&ty, &mode)| {
+            abi_param_type(
+                ctx,
+                abi_map_ty(ctx, ty, &struct_types, &enum_types, tagged_types, &tuple_types),
+                mode,
+                align_sema::needs_drop_flag(ty, &program.structs, &program.tuples, &program.enums, &program.tagged_types),
+            )
+        }));
         let thunk_ty = match orig_ty.get_return_type() {
             Some(rt) => rt.fn_type(&tparams, false),
             None => ctx.void_type().fn_type(&tparams, false),
@@ -3966,8 +4100,23 @@ fn lower_prepared_module<'c>(
             .collect();
         let env_struct = ctx.struct_type(&env_fields, false);
         // The explicit parameters are forwarded as-is; the captures are loaded from the env.
-        let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> =
-            thunk.get_params().iter().skip(1).map(|p| (*p).into()).collect();
+        let mut call_args = Vec::with_capacity(all_params.len());
+        for (index, parameter) in thunk.get_params().iter().skip(1).enumerate() {
+            let effect = declaration.signature.drop_state_effects
+                .get(index)
+                .copied()
+                .unwrap_or(hir::DropStateEffect::MayChange);
+            if effect == hir::DropStateEffect::Invariant
+                && explicit_modes.get(index) == Some(&align_ast::ParamMode::BorrowMut)
+            {
+                let pointer = tb
+                    .build_extract_value(parameter.into_struct_value(), 0, "closure.adapter.borrow.ptr")
+                    .map_err(|error| CodegenError::Lowering(error.to_string()))?;
+                call_args.push(pointer.into());
+            } else {
+                call_args.push((*parameter).into());
+            }
+        }
         for (i, cty) in capture_tys.iter().enumerate() {
             let fld = tb
                 .build_struct_gep(env_struct, env, i as u32, "capg")
@@ -4454,7 +4603,7 @@ pub fn partition_function_symbol(
     ))
 }
 
-fn program_signature(function: &Function) -> Result<ProgramSignature, CodegenError> {
+fn program_signature(function: &Function, program: &Program) -> Result<ProgramSignature, CodegenError> {
     let params = function
         .params
         .iter()
@@ -4466,6 +4615,8 @@ fn program_signature(function: &Function) -> Result<ProgramSignature, CodegenErr
                 .ok_or_else(|| callable_target_error(&function.name))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let drop_state_effects = program.drop_state_effects.get(&function.name).cloned()
+        .unwrap_or_else(|| conservative_drop_state_effects(&params, &function.param_modes, program));
     Ok(ProgramSignature {
         params,
         modes: function.param_modes.clone(),
@@ -4473,7 +4624,76 @@ fn program_signature(function: &Function) -> Result<ProgramSignature, CodegenErr
         borrow: function.return_borrow.clone(),
         region: function.return_region.clone(),
         cleanup: function.return_cleanup,
+        drop_state_effects,
     })
+}
+
+fn conservative_drop_state_effects(
+    params: &[Ty],
+    modes: &[align_ast::ParamMode],
+    program: &Program,
+) -> Vec<hir::DropStateEffect> {
+    params
+        .iter()
+        .zip(modes)
+        .map(|(&ty, mode)| {
+            if *mode == align_ast::ParamMode::BorrowMut
+                && align_sema::needs_drop_flag(
+                    ty,
+                    &program.structs,
+                    &program.tuples,
+                    &program.enums,
+                    &program.tagged_types,
+                )
+            {
+                hir::DropStateEffect::MayChange
+            } else {
+                hir::DropStateEffect::NotApplicable
+            }
+        })
+        .collect()
+}
+
+fn validate_drop_state_signature(
+    name: &ProgramCall,
+    signature: &ProgramSignature,
+    program: &Program,
+) -> Result<(), CodegenError> {
+    if signature.params.len() != signature.modes.len()
+        || signature.params.len() != signature.drop_state_effects.len()
+    {
+        return Err(CodegenError::Lowering(format!(
+            "callable drop-state effect arity mismatch:{}",
+            callable_hex(name)
+        )));
+    }
+    for ((&ty, mode), effect) in signature
+        .params
+        .iter()
+        .zip(&signature.modes)
+        .zip(&signature.drop_state_effects)
+    {
+        let droppable_mut = *mode == align_ast::ParamMode::BorrowMut
+            && align_sema::needs_drop_flag(
+                ty,
+                &program.structs,
+                &program.tuples,
+                &program.enums,
+                &program.tagged_types,
+            );
+        let valid = if droppable_mut {
+            matches!(effect, hir::DropStateEffect::Invariant | hir::DropStateEffect::MayChange)
+        } else {
+            *effect == hir::DropStateEffect::NotApplicable
+        };
+        if !valid {
+            return Err(CodegenError::Lowering(format!(
+                "callable drop-state effect is incompatible with its parameter:{}",
+                callable_hex(name)
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn register_program_declaration(
@@ -4530,6 +4750,18 @@ fn canonical_signature(
         signature.cleanup,
         program,
     )).map_err(CodegenError::from)
+}
+
+fn drop_state_effect_tags(effects: &[hir::DropStateEffect]) -> Vec<u8> {
+    effects
+        .iter()
+        .map(|effect| match effect {
+            hir::DropStateEffect::NotApplicable => 0,
+            hir::DropStateEffect::Invariant => 1,
+            hir::DropStateEffect::MayChange => 2,
+            hir::DropStateEffect::Deferred => 3,
+        })
+        .collect()
 }
 
 fn validate_parallel_callable(
@@ -5009,7 +5241,7 @@ fn callable_declarations(
             &mut declarations,
             &function.name,
             ProgramDeclarationClass::Stored,
-            program_signature(function)?,
+            program_signature(function, program)?,
         )?;
     }
     for function in &program.imported_fns {
@@ -5024,6 +5256,7 @@ fn callable_declarations(
                 borrow: function.return_borrow.clone(),
                 region: function.return_region.clone(),
                 cleanup: function.return_cleanup,
+                drop_state_effects: function.drop_state_effects.clone(),
             },
         )?;
     }
@@ -5039,6 +5272,11 @@ fn callable_declarations(
                 borrow: function.return_borrow.clone(),
                 region: function.return_region.clone(),
                 cleanup: function.return_cleanup,
+                drop_state_effects: conservative_drop_state_effects(
+                    &function.params,
+                    &function.param_modes,
+                    program,
+                ),
             },
         )?;
     }
@@ -5053,7 +5291,8 @@ fn callable_declarations(
             return Err(callable_target_error(target).into());
         }
     }
-    for declaration in declarations.values() {
+    for (name, declaration) in &declarations {
+        validate_drop_state_signature(name, &declaration.signature, program)?;
         canonical_signature(&declaration.signature, program)?;
     }
     Ok(declarations)
@@ -5276,6 +5515,7 @@ fn callable_preflight(
                         generated.push(GeneratedId::FnValue {
                             target: target.clone(),
                             signature: canonical_signature(&declaration.signature, program)?,
+                            drop_state_effects: drop_state_effect_tags(&declaration.signature.drop_state_effects),
                         });
                     }
                     Rvalue::Closure {
@@ -5358,10 +5598,12 @@ fn callable_preflight(
                             borrow: closure_borrow,
                             region: closure_region,
                             cleanup: declaration.signature.cleanup,
+                            drop_state_effects: conservative_drop_state_effects(explicit_params, explicit_modes, program),
                         };
                         generated.push(GeneratedId::Closure {
                             lifted: lifted.clone(),
                             explicit_signature: canonical_signature(&explicit_signature, program)?,
+                            drop_state_effects: drop_state_effect_tags(&declaration.signature.drop_state_effects),
                             captures: capture_tys
                                 .iter()
                                 .map(|ty| canonical_metadata(CanonicalTy::from_program(*ty, program)))
@@ -5611,6 +5853,7 @@ fn static_plan_signature_matches(
             borrow,
             region,
             cleanup: hir::ReturnCleanupAbi::None,
+            drop_state_effects: vec![hir::DropStateEffect::NotApplicable; declaration.signature.params.len()],
         })
 }
 
@@ -7796,17 +8039,26 @@ fn declare_fn<'c>(
     let map = |ty: Ty| -> BasicTypeEnum<'c> {
         abi_map_ty(ctx, ty, struct_types, enum_types, tagged_types, tuple_types)
     };
+    let conservative_effects;
+    let effects = if let Some(effects) = program.drop_state_effects.get(&f.name) {
+        effects.as_slice()
+    } else {
+        let param_tys = f.params.iter().map(|slot| f.slots[*slot as usize]).collect::<Vec<_>>();
+        conservative_effects = conservative_drop_state_effects(&param_tys, &f.param_modes, program);
+        conservative_effects.as_slice()
+    };
     let param_types: Vec<BasicMetadataTypeEnum> = f
         .params
         .iter()
         .zip(&f.param_modes)
-        .map(|(s, mode)| {
+        .zip(effects)
+        .map(|((s, mode), effect)| {
             let ty = f.slots[*s as usize];
             abi_param_type(
                 ctx,
                 map(ty),
                 *mode,
-                align_sema::needs_drop_flag(
+                *effect != hir::DropStateEffect::Invariant && align_sema::needs_drop_flag(
                     ty,
                     &program.structs,
                     &program.tuples,
@@ -7910,12 +8162,13 @@ fn declare_imported_fn<'c>(
         .params
         .iter()
         .zip(&imp.param_modes)
-        .map(|(&ty, &mode)| {
+        .zip(&imp.drop_state_effects)
+        .map(|((&ty, &mode), &effect)| {
             abi_param_type(
                 ctx,
                 map(ty),
                 mode,
-                align_sema::needs_drop_flag(
+                effect != hir::DropStateEffect::Invariant && align_sema::needs_drop_flag(
                     ty,
                     &program.structs,
                     &program.tuples,
@@ -12299,7 +12552,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .build_call(self.runtime(RuntimeKey::TgEnd), &[handle], "")
                         .map_err(|e| self.err(e))?;
                 }
-                Stmt::DropFlagInit(slot) => {
+                Stmt::DropFlagInit(slot) | Stmt::DropFlagMoveOut { slot, .. } => {
                     // Null-initialise the slot so a drop on a never-allocated / moved-out path is
                     // a no-op. A `builder` slot holds a bare pointer (null); an Option/Result with
                     // an owned payload zeroes the whole aggregate (so its payload reads {null,0});
@@ -17946,7 +18199,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                 .get(index)
                                 .copied()
                                 .unwrap_or(align_ast::ParamMode::ByValue);
-                            Ok(self.operand_for_mode(operand, mode)?.into())
+                            let effect = declaration.signature.drop_state_effects
+                                .get(index)
+                                .copied()
+                                .unwrap_or(hir::DropStateEffect::MayChange);
+                            Ok(self.operand_for_mode_effect(operand, mode, effect)?.into())
                         })
                         .collect::<Result<_, CodegenError>>()?,
                 };
@@ -17991,7 +18248,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let argv = args
                     .iter()
                     .zip(&declaration.signature.modes)
-                    .map(|(operand, mode)| self.operand_for_mode(operand, *mode).map(Into::into))
+                    .zip(&declaration.signature.drop_state_effects)
+                    .map(|((operand, mode), effect)| self.operand_for_mode_effect(operand, *mode, *effect).map(Into::into))
                     .collect::<Result<Vec<BasicMetadataValueEnum<'c>>, _>>()?;
                 let returned = self
                     .builder
@@ -18022,6 +18280,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let id = GeneratedId::FnValue {
                     target: target.clone(),
                     signature: canonical_signature(&declaration.signature, self.program)?,
+                    drop_state_effects: drop_state_effect_tags(&declaration.signature.drop_state_effects),
                 };
                 let thunk = self
                     .generated_funcs
@@ -18109,10 +18368,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     )
                     .ok_or_else(|| callable_target_error(lifted))?,
                     cleanup: declaration.signature.cleanup,
+                    drop_state_effects: conservative_drop_state_effects(explicit_params, explicit_modes, self.program),
                 };
                 let id = GeneratedId::Closure {
                     lifted: lifted.clone(),
                     explicit_signature: canonical_signature(&explicit_signature, self.program)?,
+                    drop_state_effects: drop_state_effect_tags(&declaration.signature.drop_state_effects),
                     captures: capture_tys
                         .iter()
                         .map(|ty| canonical_ty(*ty, self.program))
@@ -23549,6 +23810,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             | Stmt::StoreConstArray { slot, .. }
             | Stmt::StoreElemField(slot, ..)
             | Stmt::DropFlagInit(slot)
+            | Stmt::DropFlagMoveOut { slot, .. }
             | Stmt::NullTupleField(slot, _)
             | Stmt::NullStructField(slot, _)
             | Stmt::NullElemField(slot, ..)
@@ -24032,6 +24294,27 @@ impl<'c, 'a> FnGen<'c, 'a> {
             align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut => {
                 self.operand_for_borrow(op)
             }
+        }
+    }
+
+    fn operand_for_mode_effect(
+        &self,
+        op: &Operand,
+        mode: align_ast::ParamMode,
+        effect: hir::DropStateEffect,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
+        if mode == align_ast::ParamMode::BorrowMut && effect == hir::DropStateEffect::Invariant {
+            return self.operand_for_plain_borrow(op);
+        }
+        self.operand_for_mode(op, mode)
+    }
+
+    fn operand_for_plain_borrow(&self, op: &Operand) -> Result<BasicValueEnum<'c>, CodegenError> {
+        match op {
+            Operand::BorrowedElementPlace(place) => Ok(self.borrowed_element_ptr(place)?.into()),
+            Operand::BorrowedFixedElementPlace(place) => Ok(self.borrowed_fixed_element_ptr(place)?.into()),
+            Operand::BorrowedPlace(place) => Ok(self.borrowed_place_ptr(place)?.into()),
+            _ => Err(self.err("drop-state-invariant BorrowMut argument is not a borrowed place")),
         }
     }
 
@@ -25645,6 +25928,7 @@ fn main() -> i32 = 0
             borrow: hir::ReturnBorrowSummary::None,
             region: hir::ReturnRegionSummary::None,
             cleanup: hir::ReturnCleanupAbi::None,
+            drop_state_effects: vec![hir::DropStateEffect::NotApplicable],
         };
         (program, signature)
     }
@@ -25689,6 +25973,170 @@ fn main() -> i32 = 0
 
     fn ir(src: &str) -> String {
         emit_llvm_ir(&mir(src), &BuildTarget::Baseline, Profile::Release, false, &[], None).unwrap()
+    }
+
+    #[test]
+    fn drop_state_effect_specializes_direct_abis_and_keeps_adapters_and_exports_conservative() {
+        // The unwraps and expects in this owner are test-only fixture invariants: the source is
+        // checked before MIR lowering, and every named function/symbol is declared by this fixture.
+        let source = "fn inspect(borrow mut value: string) -> i64 = value.len()\n\
+            fn relay(borrow mut value: string) -> i64 = inspect(value)\n\
+            fn replace(borrow mut value: string) { value = \"new\".clone() }\n\
+            fn indirect(borrow mut value: string) -> i64 { callback := inspect; return callback(value) }\n\
+            fn caller(value: string) -> i64 { mut local := value; return inspect(local) }\n\
+            fn main() -> i32 = 0\n";
+        let program = mir(source);
+        let raw = emit_llvm_ir(
+            &program,
+            &BuildTarget::Baseline,
+            Profile::Release,
+            false,
+            &[],
+            None,
+        )
+        .unwrap();
+        let header = |ir: &str, symbol: &str| {
+            ir.lines()
+                .find(|line| line.starts_with("define ") && line.contains(&format!("@\"{symbol}\"(")))
+                .or_else(|| ir.lines().find(|line| line.starts_with("define ") && line.contains(&format!("@{symbol}("))))
+                .unwrap_or_else(|| panic!("missing {symbol}:\n{ir}"))
+                .to_owned()
+        };
+        let inspect = encoded_program_symbol(&program_call("inspect"));
+        let relay = encoded_program_symbol(&program_call("relay"));
+        let replace = encoded_program_symbol(&program_call("replace"));
+        for symbol in [&inspect, &relay] {
+            let definition = header(&raw, symbol);
+            assert!(definition.contains("(ptr ") && !definition.contains("{ ptr, ptr }"), "{definition}");
+            let body = function_body(&raw, symbol);
+            assert!(!body.contains("borrow.cleanup.in") && !body.contains("borrow.cleanup.out"), "{body}");
+        }
+        assert!(header(&raw, &replace).contains("{ ptr, ptr }"), "{}", header(&raw, &replace));
+        let adapter = raw
+            .lines()
+            .find(|line| line.starts_with("define ") && line.contains("align_gen$fnval$"))
+            .expect("function-value adapter");
+        assert!(adapter.contains("{ ptr, ptr }"), "{adapter}");
+
+        let exported = emit_llvm_ir(
+            &program,
+            &BuildTarget::Baseline,
+            Profile::Release,
+            false,
+            &["inspect".to_owned(), "replace".to_owned()],
+            None,
+        )
+        .unwrap();
+        assert!(header(&exported, "inspect").contains("{ ptr, ptr }"));
+        assert!(header(&exported, "replace").contains("{ ptr, ptr }"));
+        assert!(header(&exported, &inspect).contains("(ptr "));
+        assert!(header(&exported, &replace).contains("{ ptr, ptr }"));
+
+        let mut partition_program = program.clone();
+        let selected_index = partition_program
+            .fns
+            .iter()
+            .position(|function| function.name.as_str() == "inspect")
+            .expect("inspect partition root");
+        // A per-unit public definition can also be an explicit native export. Its specialized core
+        // must remain internal while the source-level name keeps the conservative boundary ABI.
+        partition_program.fns[selected_index].exportable = true;
+        let selected = &partition_program.fns[selected_index];
+        let definition = ThinPeerDeclaration {
+            logical: selected.name.clone(),
+            abi: partition_function_abi(selected, &partition_program).expect("partition ABI"),
+            symbol: "inspect".to_owned(),
+            linkage: ThinFunctionLinkage::Root,
+        };
+        let ctx = Context::create();
+        let (module, _tm) = build_program_module(
+            &ctx,
+            &partition_program,
+            &BuildTarget::Baseline,
+            Profile::Release,
+            &[],
+            None,
+            ModuleScope::Function {
+                selected: &selected.name,
+                definition: &definition,
+                peers: &[],
+            },
+        )
+        .expect("explicit-export function partition");
+        let partition = module.print_to_string().to_string();
+        assert!(header(&partition, "inspect").contains("{ ptr, ptr }"));
+        let core = header(&partition, &inspect);
+        assert!(core.contains(" internal ") && core.contains("(ptr "), "{core}");
+
+        let mut consumer = mir("fn main() -> i32 = 0\n");
+        consumer.imported_fns.push(align_mir::ImportedFn {
+            name: program_call("inspect"),
+            params: vec![Ty::String],
+            param_modes: vec![align_ast::ParamMode::BorrowMut],
+            ret: Ty::Int(IntTy { bits: 64, signed: true }),
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
+            drop_state_effects: vec![hir::DropStateEffect::Invariant],
+            producer_certified: true,
+        });
+        let imported = emit_llvm_ir(
+            &consumer,
+            &BuildTarget::Baseline,
+            Profile::Release,
+            false,
+            &[],
+            None,
+        )
+        .unwrap();
+        let declaration = imported
+            .lines()
+            .find(|line| line.starts_with("declare ") && line.contains(&format!("@\"{inspect}\"(")))
+            .unwrap_or_else(|| panic!("missing imported declaration:\n{imported}"));
+        assert!(
+            (declaration.contains("(ptr ") || declaration.contains("(ptr)"))
+                && !declaration.contains("{ ptr, ptr }"),
+            "{declaration}"
+        );
+
+        let optimized = emit_llvm_ir(
+            &program,
+            &BuildTarget::Baseline,
+            Profile::Release,
+            true,
+            &["caller".to_owned()],
+            None,
+        )
+        .unwrap();
+        let caller = externally_named_function_body(&optimized, "caller");
+        assert!(!caller.contains("alloca i1") && !caller.contains("borrow.cleanup"), "{caller}");
+
+        let mut malformed = program.clone();
+        malformed
+            .drop_state_effects
+            .get_mut(&program_call("inspect"))
+            .unwrap()
+            .clear();
+        let error = emit_llvm_ir(
+            &malformed,
+            &BuildTarget::Baseline,
+            Profile::Release,
+            false,
+            &[],
+            None,
+        )
+        .expect_err("a malformed internal effect vector must fail before ABI emission");
+        assert!(error.to_string().contains("malformed BorrowMut cleanup storage"), "{error}");
+
+        let base_fingerprint = PartitionSharedCodegenView::from_program(&program).fingerprint;
+        let mut changed = program.clone();
+        changed.drop_state_effects.get_mut(&program_call("inspect")).unwrap()[0] =
+            hir::DropStateEffect::MayChange;
+        assert_ne!(
+            base_fingerprint,
+            PartitionSharedCodegenView::from_program(&changed).fingerprint,
+            "drop-state ABI facts participate in the partition cache identity"
+        );
     }
 
     #[test]
@@ -25785,9 +26233,12 @@ fn main() -> i32 = 0
         ) else {
             panic!("valid layout fixture failed codegen");
         };
+        let tried_core = encoded_program_symbol(&program_call("tried"));
         let Some(definition) = optimized
             .split("define ")
-            .find(|definition| definition.contains("@tried("))
+            .find(|definition| definition.contains(&format!("@\"{tried_core}\"("))
+                || definition.contains(&format!("@{tried_core}("))
+                || definition.contains("@tried("))
         else {
             panic!("tried definition missing from optimized IR:\n{optimized}");
         };
@@ -25967,6 +26418,7 @@ fn main() -> i32 = 0
             return_borrow: hir::ReturnBorrowSummary::None,
             return_region: hir::ReturnRegionSummary::None,
             return_cleanup: hir::ReturnCleanupAbi::None,
+            drop_state_effects: vec![hir::DropStateEffect::NotApplicable],
             producer_certified: true,
         });
         let per_unit = emit_llvm_ir(&per_unit, &BuildTarget::Baseline, Profile::Release, false, &[], None).unwrap();
@@ -26614,6 +27066,7 @@ fn main() -> i32 = 0
             return_borrow: view.return_borrow,
             return_region: view.return_region,
             return_cleanup: view.return_cleanup,
+            drop_state_effects: vec![hir::DropStateEffect::NotApplicable; view.params.len()],
             producer_certified: true,
         });
         let ctx = Context::create();
@@ -27645,6 +28098,7 @@ fn main() -> i32 = 0
             return_borrow: hir::ReturnBorrowSummary::None,
             return_region: hir::ReturnRegionSummary::None,
             return_cleanup: hir::ReturnCleanupAbi::None,
+            drop_state_effects: vec![hir::DropStateEffect::MayChange, hir::DropStateEffect::NotApplicable],
             producer_certified: true,
         });
         assert!(validate_resource_rvalues(&imported).is_ok());
@@ -29411,6 +29865,10 @@ fn main() -> i32 = 0
                     let name = if boundary == "imported" {
                         let index = xml_test_function(&candidate, "sink");
                         let sink = candidate.fns.remove(index);
+                        let drop_state_effects = candidate
+                            .drop_state_effects
+                            .remove(&sink.name)
+                            .unwrap_or_else(|| panic!("sink drop-state effects"));
                         candidate.imported_fns.push(align_mir::ImportedFn {
                             name: sink.name,
                             params: sink
@@ -29423,6 +29881,7 @@ fn main() -> i32 = 0
                             return_borrow: sink.return_borrow,
                             return_region: sink.return_region,
                             return_cleanup: sink.return_cleanup,
+                            drop_state_effects,
                             producer_certified: true,
                         });
                         "forward"
@@ -31500,6 +31959,7 @@ fn main() -> i32 = 0
             return_borrow: make_function.return_borrow,
             return_region: make_function.return_region,
             return_cleanup: make_function.return_cleanup,
+            drop_state_effects: Vec::new(),
             producer_certified: true,
         });
         assert!(
@@ -31618,6 +32078,7 @@ fn main() -> i32 = 0
             return_borrow: hir::ReturnBorrowSummary::None,
             return_region: hir::ReturnRegionSummary::None,
             return_cleanup: hir::ReturnCleanupAbi::None,
+            drop_state_effects: vec![hir::DropStateEffect::NotApplicable],
             producer_certified: true,
         });
 
@@ -32508,6 +32969,7 @@ fn main() -> i32 = 0
                         return_borrow: hir::ReturnBorrowSummary::None,
                         return_region: hir::ReturnRegionSummary::None,
                         return_cleanup: hir::ReturnCleanupAbi::None,
+                        drop_state_effects: vec![hir::DropStateEffect::NotApplicable; 2],
                         producer_certified: true,
                     }];
             program.structs = vec![row.clone(), other.clone()];
@@ -35644,7 +36106,7 @@ fn main() -> i32 = 0
         let encoded = ProgramCall::try_from_logical(name)
             .ok()
             .map(|name| encoded_program_symbol(&name));
-        [Some(name), encoded.as_deref()]
+        [encoded.as_deref(), Some(name)]
             .into_iter()
             .flatten()
             .find_map(|candidate| {
@@ -35659,6 +36121,20 @@ fn main() -> i32 = 0
             .and_then(|tail| tail.split_once("{\n").map(|(_, body)| body))
             .and_then(|body| body.split("\n}").next())
             .unwrap_or_else(|| panic!("{name} body not found"))
+    }
+
+    fn externally_named_function_body<'a>(ir: &'a str, name: &str) -> &'a str {
+        let unquoted = format!("@{name}(");
+        let quoted = format!("@\"{name}\"(");
+        ir.match_indices("define ")
+            .find_map(|(start, _)| {
+                let header = &ir[start..ir[start..].find('\n').map_or(ir.len(), |end| start + end)];
+                (header.contains(&unquoted) || header.contains(&quoted)).then_some(start)
+            })
+            .map(|start| &ir[start..])
+            .and_then(|tail| tail.split_once("{\n").map(|(_, body)| body))
+            .and_then(|body| body.split("\n}").next())
+            .unwrap_or_else(|| panic!("external {name} body not found"))
     }
 
     fn arena_allocation_case_ir() -> String {
@@ -36553,9 +37029,9 @@ fn main() -> i32 = 0
                     "optimized={optimized}: @{name} must carry a result: {definition}"
                 );
                 assert!(
-                    indirect_result || !function_body(&llvm, name).contains("ret void"),
-                    "optimized={optimized}: @{name} must not emit ret void:\n{}",
-                    function_body(&llvm, name)
+                    indirect_result || !externally_named_function_body(&llvm, name).contains("ret void"),
+                    "optimized={optimized}: @{name} must not emit ret void ({definition}):\n{}",
+                    externally_named_function_body(&llvm, name)
                 );
             }
             if !optimized {

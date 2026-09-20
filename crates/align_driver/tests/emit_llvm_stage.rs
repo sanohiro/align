@@ -158,8 +158,9 @@ fn a_main_less_unit_is_reported_through_its_own_pub_functions() {
     assert!(!ir.contains("defines no `main`"), "the note must not pollute stdout:\n{ir}");
 }
 
-/// An explicit `--export` still narrows the set exactly as before: it wins over the seeded roots,
-/// and every other function keeps the default `internal` linkage.
+/// An explicit `--export` still narrows the logical root set exactly as before: it wins over the
+/// seeded roots, emits that root's conservative wrapper plus specialized core, and eliminates every
+/// other function.
 #[test]
 fn an_explicit_export_narrows_the_inspection_roots() {
     if !align_driver::backend_available() {
@@ -175,9 +176,24 @@ fn an_explicit_export_narrows_the_inspection_roots() {
     assert!(out.status.success(), "exit: {:?}", out.status.code());
     let ir = String::from_utf8_lossy(&out.stdout);
     let err = String::from_utf8_lossy(&out.stderr);
-    let defines = ir.lines().filter(|l| l.trim_start().starts_with("define ")).count();
-    assert_eq!(defines, 1, "only the named root survives:\n{ir}");
-    assert!(ir.contains("@k1("), "the named root is the one emitted:\n{ir}");
+    let defined: Vec<&str> = ir
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| line.starts_with("define "))
+        .collect();
+    assert_eq!(defined.len(), 2, "only the named wrapper and core survive:\n{ir}");
+    assert!(
+        defined.iter().any(|line| line.contains("@k1(")),
+        "the named root keeps its conservative external wrapper:\n{ir}"
+    );
+    let core = encoded("k1");
+    assert!(
+        defined
+            .iter()
+            .any(|line| line.contains(" internal ") && line.contains(&format!("@\"{core}\"("))),
+        "the named root keeps one internal specialized core:\n{ir}"
+    );
+    assert!(!ir.contains(&encoded("k2")), "unnamed logical roots are eliminated:\n{ir}");
     assert!(
         !err.contains("defines no `main`"),
         "an explicit --export seeds nothing, so there is nothing to state:\n{err}"

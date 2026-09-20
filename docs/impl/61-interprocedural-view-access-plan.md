@@ -2405,8 +2405,9 @@ metadata describes an independently forged object file. This capability must
 not claim that stronger property.
 
 The exact bundle/instruction tags, sequence order, validation precedence and
-full-record golden vectors below define this integration. Format 13 is the
-single implementation transition; the current compiler still writes format 12.
+full-record golden vectors below define this integration. Format 14 is the
+single implementation transition; the current compiler writes format 13 after
+plan 71's drop-state effect addition.
 
 ### Cache contract and source-of-truth closure
 

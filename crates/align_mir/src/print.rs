@@ -152,6 +152,9 @@ fn block_to_string(out: &mut String, b: &Block) {
             Stmt::DropFlagInit(slot) => {
                 let _ = writeln!(out, "    drop_init _{slot}");
             }
+            Stmt::DropFlagMoveOut { slot, flag } => {
+                let _ = writeln!(out, "    drop_move_out _{slot} flag _{flag}");
+            }
             Stmt::NullTupleField(slot, idx) => {
                 let _ = writeln!(out, "    null _{slot}.{idx}");
             }
