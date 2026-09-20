@@ -77,6 +77,7 @@ Result<T,E>
 
 array<T>
 slice<T>
+[T; N]       // fixed inline array; N is an unsuffixed decimal u32 literal
 
 vecN<T>
 maskN<T>
@@ -85,6 +86,18 @@ bitset        // designed, not built yet (its layout is the SIMD vec/mask model)
 
 `()` is unit and `(e)` is grouping, so a **tuple has arity ≥ 2**. Its ownership derives from its
 elements (Move if any element is Move), exactly like a struct.
+
+`[T; N]` names the same fixed inline array inferred for an array literal. It is valid in every type
+annotation position. `N` is part of the structural type and is not an expression or const generic.
+The written `;` is required on the same logical line; a newline cannot replace it, and explicit
+semicolons continue to terminate statements elsewhere.
+Existing placement gates still reject aggregates at unsupported native extern/raw boundaries.
+The literal must have exactly `N` elements; `[]` constructs `[T; 0]`. A struct field contains all
+`N` elements inline, with no header, builder, heap allocation, or runtime allocation call. A fixed
+array may be rooted in a named local, parameter, or recursively selected field place for indexing,
+slicing, length, pipelines, and authorized mutation; a field slice borrows the containing storage.
+Copy and Move follow the element's existing fixed-array rules. Unsupported owning/nested element
+forms and arbitrary temporary receivers remain rejected. Exact contract: plan 73.
 
 ### Integer literals
 
@@ -1917,8 +1930,9 @@ An existing contiguous AoS record array can be borrowed as `slice<Record>`, even
 when the record is Move. Existing owned-string arrays can be borrowed as
 `slice<string>`. Annotation, argument and field coercion, range slicing and
 re-slicing use the same Copy slice header; they allocate and copy no elements.
-Fixed arrays retain their literal-or-named-local receiver restriction. Owning
-collection formation and other specialized collection forms are unchanged.
+Fixed arrays admit a literal, named local, parameter, or recursively selected
+field place as stable storage; arbitrary temporary receivers remain rejected.
+Owning collection formation and other specialized collection forms are unchanged.
 
 `view[i].field` reads Copy leaves and projects owned string leaves as `str`.
 `slice<string>[i]` likewise produces `str`. An entire Move record is addressable

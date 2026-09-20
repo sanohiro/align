@@ -28,7 +28,8 @@ Ty =
   Char
   Unit                      // ()
   Str | String | Bytes | Buffer | Builder
-  Array(Ty)                 // owning, contiguous memory
+  FixedArray(Ty, u32)       // [T; N], inline contiguous storage; structural
+  Array(Ty)                 // owning, contiguous heap/arena memory
   Slice(Ty, Region)         // view. Carries a Region
   Vec(n, Ty) | Mask(Ty) | Bitset
   Option(Ty)
@@ -50,6 +51,12 @@ Ty =
 ```
 
 `Named` is **nominal** (identity determined by name). Both struct and sum type are represented as `Named`, and the definition (fields/variants) is looked up via `DefId`.
+
+`FixedArray(T, N)` is structural and is the nameable form of an inferred fixed-array literal.
+`N` is a source u32 literal and part of identity. The implementation specializes primitive and
+record elements as `Ty::Array` / `Ty::StructArray`; those are one semantic constructor, not two
+source types. A fixed-array record field is inline and follows the same formation, ownership,
+stable-place and cleanup rules as a local. Plan 73 owns the closure.
 
 `Tuple` is **structural**: identity is the element-type list, so it is interned (deduplicated) into a tuple table — the anonymous dual of the struct table — and `Ty::Tuple(id)` indexes it. Multi-value return is returning a tuple (no separate mechanism). Elements: primitive scalars (Copy / `Static`), `str` (a Copy view — a tuple holding one is region-tracked, region-tied to the view's source, the struct-with-`str`-field rule), and owned `string`/`array<T>` (which make the tuple **Move**). Tuple Drop recursively dispatches each owned element through its concrete type, including deep `array<string>` and `array<Move-struct>` elements. An owned tuple is restricted to a **temporary** — returned or destructured, not bound to a variable or passed as a parameter — so it never occupies a drop slot; building `(a, b)` from owned locals nulls those source slots (move-out), and the destructure targets are ordinary owned locals freed by the normal drop set. `partition`/`chunks` and their tuple/view machinery have shipped; lifting the owned-tuple binding/parameter cut remains an additive follow-up. Lowered to an anonymous LLVM struct (by-value construct/index, like a small struct).
 

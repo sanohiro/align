@@ -1,5 +1,14 @@
 # Align Design Notes
 
+Nameable fixed arrays use `[T; N]`, the type-level form of the existing inline
+literal. The same type is valid in every annotation position, so a record field
+is ordinary composition rather than a field-only storage exception. Its elements
+remain inline, its Copy/Move classification derives from `T`, and a selected
+field place supplies stable storage for indexing, slicing and mutation without a
+header or allocation. Length is a literal u32 in the type, not a const-generic
+expression. Existing element exclusions remain singular. [Plan 73](impl/73-fixed-array-field-plan.md)
+owns the exact contract and implementation closure.
+
 Exact string dispatch belongs to the existing value-pattern family. A
 `match` over `str` or `string` evaluates and borrows its scrutinee once, requires
 the `_` that an infinite domain cannot enumerate, rejects duplicate decoded

@@ -21,6 +21,11 @@ slice<T>         borrowed view {ptr,len}, Copy, region = the data it points into
 
 `bytes` はドキュメントなどの文章表現における `slice<u8>` の略記であり、別個の型ではない。
 
+`[T; N]` は型注釈でも固定長配列型を表す。record field は N 個の slot を inline に保持し、
+array header、builder、allocation を追加しない。named local、parameter、stable field place は
+同じ checked index/range/slice/pipeline/mutation 操作を共有する。Copy/Move と element admission
+は literal の既存規則を維持する。正確な閉包は [plan 73](../../73-fixed-array-field-plan.md)。
+
 ## Signatures (verified)
 
 ```text
@@ -147,7 +152,8 @@ storage: field 'f' owns independent heap storage`。設計は
 既存の連続 AoS レコード配列は、要素が Move でも `slice<Record>` として借用できる。
 既存の所有文字列配列も `slice<string>` として借用できる。型注釈・引数・フィールドでの
 変換、範囲スライスと再スライスは同じ Copy ヘッダーを使い、要素の割り当てやコピーを
-行わない。固定配列の受け手は従来どおりリテラルか名前付きローカルに限る。
+行わない。固定配列はリテラル、名前付きローカル、parameter、または再帰的に選択した
+field place を stable storage として受け入れる。任意の temporary receiver は引き続き拒否する。
 所有コレクションの形成や特殊なコレクション形式は拡張しない。
 
 `view[i].field` は Copy フィールドを読み、所有文字列フィールドを `str` として借用する。
