@@ -330,10 +330,10 @@ s := Shape.Circle(3.0)
 ### Match
 
 `match` is an expression; every arm yields the match's value (or all arms diverge). Patterns are the
-(unqualified) variants of the scrutinee (binding any payload positionally), or integer and character
-values and inclusive ranges (`min..=max`). **`match` must be exhaustive** — cover every variant or
-integer value domain, or end with a `_` wildcard; a missing variant or uncovered value range is a
-compile error.
+(unqualified) variants of the scrutinee (binding any payload positionally), integer and character
+values and inclusive ranges (`min..=max`), or exact string literals. **`match` must be exhaustive** —
+cover every variant or integer value domain, or end with a `_` wildcard; a missing variant,
+uncovered integer range, or string/`char` match without `_` is a compile error.
 
 ```align
 area := match s {
@@ -355,8 +355,11 @@ warm := match signal {
 }
 ```
 
-`match` also supports integer and `char` values, inclusive ranges (`min..=max`), and literal or-patterns.
-Integer matches must cover the full type domain or end with `_`; `char` matches require a `_` wildcard:
+`match` also supports integer and `char` values, inclusive ranges (`min..=max`), exact string
+literals, and literal or-patterns. Integer matches must cover the full type domain or end with `_`;
+`char`, `str`, and `string` matches require a `_` wildcard. String patterns have no range form, use
+decoded byte equality (including embedded NUL), and borrow one once-evaluated scrutinee without a
+clone or allocation:
 
 ```align
 category := match b {
@@ -364,6 +367,12 @@ category := match b {
   0..=32               => 2,
   173                  => 3,
   _                    => 4,
+}
+
+verb_id := match verb {
+  "build" | "check" => 1,
+  "run"             => 2,
+  _                 => 0,
 }
 ```
 

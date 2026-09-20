@@ -7,8 +7,10 @@ The align-llm audit issue batch is partly shipped. Merged: #1089 (plan 68),
 (plan 69 PR 1), #1113, #1114 (plan 70 ledger), #1115, #1116 (plan 69 PR 2,
 closes #1081), #1124 (build-performance items 7 and 8), #1125 (the first
 post-#1124 nightly repair), #1128 (plan 70 PR 2), #1129 (plan 70 PR 3), and
-#1130 (plan 71 ledger), #1131 (plan 71 PR 1), #1132 (plan 71 PR 2), and #1133
-(plan 71 PR 3). Plan 71 PR 4 is implemented locally as the current candidate. Every remaining item
+#1130 (plan 71 ledger), #1131 (plan 71 PR 1), #1132 (plan 71 PR 2), #1133
+(plan 71 PR 3), and #1134 (plan 71 PR 4, closing the provider portion of
+#1077). Plan 72 for #1085 is the current design candidate; implementation starts
+only after its fresh independent adversarial review and design merge. Every remaining item
 below starts from `main` with a fresh branch and follows the CLAUDE.md review
 flow.
 
@@ -51,7 +53,7 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    against LLVM 22's nested `captures(address, read_provenance)` spelling;
    `deep_type_graphs` remains covered by the nightly full-suite detector.
 
-1. **plan 71 implementation** for #1076/#1077/#1078 (sum-type layout, aggregate
+1. **plan 71 implementation complete** for #1076/#1077/#1078 (sum-type layout, aggregate
    transport, drop-state model): the unified ledger shipped in #1130 and PR 1
    merged in #1131. User sums, `Option`, and `Result` use explicit-tag,
    max-variant union storage with an exact Unit/zero-size omission payload map;
@@ -62,12 +64,13 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    closures, and explicit exports retain conservative adapters; the unified
    drop-state simplifier also removes only proved-dead move-out nulling. PR 3
    merged in #1133 with target-selected `byval`, split cleanup-result transport,
-   and tag-first consumption. PR 4 is the current candidate: fresh-whole-value
+   and tag-first consumption. PR 4 merged in #1134: fresh-whole-value
    destination construction with reached-exit partial cleanup.
    Field replacement and indexed
    destinations deliberately retain temporaries to preserve RHS, Drop and
    bounds-error order.
-3. Language items after the codegen track: #1085 `str` patterns in `match`,
+3. Language items after the codegen track: #1085 `str` patterns in `match`
+   (plan 72 design current),
    #1065 fixed arrays in structs, #1066 proposal 2, #1064 → depends on #1063,
    #1075 scalar ABI facts, #1082 P2 RFC.
 4. Follow-ups, independent and small (updated 2026-09-19):
@@ -86,8 +89,8 @@ initialization proof, admitting parameters and multiple initializers on their
 runtime value. It widens §3.2 and needs its own owners; not scheduled.
 
 External register: `../align-llm/docs/align-requests.md` holds uncommitted
-status lines for every merge above (Requests 64, 95, 97–102, 107, 108, 110,
-111, 114–116). Leave it uncommitted unless the owner asks.
+status lines for every merge above (Requests 64, 95, 97–102, 105, 107, 108,
+110, 111, 114–116). Leave it uncommitted unless the owner asks.
 
 **Vectorization contract:** [Plan 68](docs/impl/68-vectorization-contract.md) is
 the design of record for issue 1088 and owns guarantees G1–G10 — the properties

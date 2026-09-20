@@ -1,5 +1,17 @@
 # History of Align
 
+## 2026-09-20: exact string alternatives complete value patterns
+
+`match` admits exact decoded string literals and literal or-patterns for both
+`str` and `string`. The infinite text domain always requires `_`; duplicates are
+checked after escape decoding, and string ranges remain excluded. Selection
+borrows one once-evaluated scrutinee without cloning, allocating, moving or
+retaining it. MIR owns one exact literal-to-target terminator, and LLVM lowers
+four or more cases through a deterministic byte-length and in-bounds byte
+decision tree with at most one full equality comparison on any path. There is no
+hash surface, normalization, case folding, locale rule or new runtime export.
+Exact contract and implementation closure: `docs/impl/72-string-literal-match-plan.md`.
+
 ## 2026-09-04: pkg.template ships one explicit HTML builder
 
 The first `pkg.template` implementation exposes one opaque Move `html_builder`, escaped `write`,

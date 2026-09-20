@@ -1,5 +1,15 @@
 # Align Design Notes
 
+Exact string dispatch belongs to the existing value-pattern family. A
+`match` over `str` or `string` evaluates and borrows its scrutinee once, requires
+the `_` that an infinite domain cannot enumerate, rejects duplicate decoded
+literals, and has no lexical-range form. MIR owns one exact literal-to-target
+dispatch; LLVM lowers four or more cases through byte length and deterministic
+in-bounds discriminator bytes, with at most one full equality comparison on any
+path. This preserves the `match` = alternatives / `if` = conditions boundary
+without a hash contract, hidden copy, or pattern-specific allocation. [Plan
+72](impl/72-string-literal-match-plan.md) owns the exact records and closure.
+
 UTF-8 byte offsets can be queried with `str.is_char_boundary(i64)` before slicing.
 The total predicate shares MIR boundary logic with ordinary slicing, while
 slicing retains its terminal failure contract. Prefix/suffix comparison already
