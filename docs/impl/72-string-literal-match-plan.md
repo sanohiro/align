@@ -52,7 +52,9 @@ Validation order  Lex and parse validity first; then scrutinee formation and
                   checked at its source position. Exhaustiveness is checked
                   after all arms. Arm bodies retain the existing checking and
                   result-type unification order, so a pattern error does not
-                  invent a different body contract.
+                  invent a different body contract. A half-open `..` is a
+                  parser error and preempts all sema diagnostics for that
+                  recovered pattern, including the string-range error.
 
 Ownership         The scrutinee expression evaluates exactly once. Selection
                   shared-borrows its two-word text view and never moves a local
@@ -112,8 +114,8 @@ Benchmark         A local vocabulary-scan kernel records N=4, 8 and 29 distinct
                   absolute latency or CPU-wide promise.
 
 Mirrors           draft.md, docs/language-spec.md, docs/design-notes.md,
-                  docs/history.md, docs/open-questions.md, this plan and
-                  HANDOFF.md.
+                  docs/history.md, docs/open-questions.md, the plan 19
+                  checked-HIR ledger, this plan and HANDOFF.md.
 ```
 
 No public declaration syntax is added. The examples above are call-site
@@ -132,13 +134,22 @@ The AST retains the existing `ValuePattern` shape:
 ```text
 LiteralPat = Int(i128) | Char(u32) | Str(String)
 ValuePattern = Single(LiteralPat, Span) |
-               Range { start: LiteralPat, end: LiteralPat, span: Span }
+               Range {
+                 start: LiteralPat,
+                 end: LiteralPat,
+                 inclusive: bool,
+                 span: Span,
+               }
 ```
 
 `LiteralPat` is no longer `Copy`. The parser admits `TokKind::Str` at the same
-value-pattern gate as integers and characters. It parses a following `..=` or
-`..` into the ordinary range form so sema can issue the domain-specific string
-range diagnostic rather than a cascading arm-syntax error.
+value-pattern gate as integers and characters. `..=` records `inclusive=true`.
+The recovery record for `..` has `inclusive=false`: the parser emits exactly the
+existing half-open-range diagnostic, consumes the endpoint, and sema skips all
+domain, range and duplicate checks for that recovered pattern. Thus
+`"a".."z"` produces only the half-open diagnostic; `"a"..="z"` reaches sema
+and produces only the string-range diagnostic. Existing valid integer/char
+range HIR and behavior are unchanged.
 
 Checked HIR is:
 
@@ -251,3 +262,20 @@ rewrite `alignpack$role_id` and `tokenizer_qwen2$eog_text`, verify tokenizer
 smoke output and pack digests byte-for-byte, record the whole-image comparison
 count and re-profile the tokenizer path. Align reports its merged surface and
 limits in the request register but does not modify the consumer implementation.
+
+## 5. Design review closure
+
+One fresh independent adversarial inspection reviewed candidate `07eeada8`
+after the author ledger-to-prose pass. It returned three P2 findings. All were
+verified and resolved together before implementation:
+
+| Finding | Contract correction |
+| --- | --- |
+| Settled boundary | The Settled decision now defines `match` as alternatives over one compiler-owned discriminator, covering the already-shipped numeric domains and the planned string domain while leaving arbitrary conditions and guards with `if`. |
+| Checked-HIR authority | Plan 19's `MatchArm` record now enumerates sum, integer/char and string modes, including exact value discriminators and wildcard/body invariants. |
+| Half-open string range | `ValuePattern::Range` records the operator for recovery. Parser-diagnosed `..` suppresses sema diagnostics for that pattern; inclusive string ranges receive only the string-range diagnostic. |
+
+These changes reconcile existing authorities and diagnostic recovery; they do
+not change the selected surface, ownership or lowering strategy. The preserved
+review verdict is FINDINGS, with the finding-to-fix ledger above. Implementation
+owner tests and the performance measurement remain pending.
