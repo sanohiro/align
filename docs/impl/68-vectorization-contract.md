@@ -480,6 +480,12 @@ can actually satisfy on its own.
 
 ### 6.1 Issue 1063 — `core.math` exponential and logarithmic family
 
+The detailed artifact, accuracy and implementation gate is
+[plan 75](75-portable-math-plan.md). It keeps the five-function E1 capability
+together and leaves the existing scalar `pow` on its current contract until the
+later power tier can satisfy the same proof; merely deleting the example's
+caveat would not make `pow` portable.
+
 The issue's criterion "loop vectorizer successfully vectorizes loops over slices
 using these operations" is unreachable by adding intrinsics. Worse, with no
 vector implementation configured, LLVM 22 turns an `llvm.exp.v2f32` loop into
@@ -530,8 +536,10 @@ Acceptance criteria that replace the issue's current ones:
    owner checks each function against the reference at the bound, including the
    sub-normal and infinity edges; floats never abort, so every input has a
    defined result.
-3. `examples/vec_math.align`'s "`pow` is a libcall, so it stays scalar" caveat
-   is deleted, because `pow` is covered by the same policy.
+3. `pow` is assigned to the same portable policy, but its current scalar-only
+   caveat remains accurate until the power tier ships. That tier deletes the
+   caveat only when scalar/vector accuracy and target identity are proved; E1
+   must not claim a dormant vector `pow` implementation.
 4. The auto-vectorization of an ordinary `slice<f32>` loop over these functions
    is **not** a criterion of 1063. It moves to the umbrella corpus (§7), under
    the one gating rule in §6.3.

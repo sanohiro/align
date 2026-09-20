@@ -194,7 +194,11 @@ every item below has since completed as recorded in the per-milestone sections, 
    add/sub/mul **DONE** (methods on integers; `checked_*` → `Option<T>`, via LLVM `.sat` /
    `.with.overflow`). Scalar `abs` / `min` / `max` **DONE** (methods on numerics; `a.min(b)`
    pairwise is arity-dispatched alongside the `arr.min()` reduction; LLVM `abs`/`fabs`/
-   `{s,u}min`/`{s,u}max`/`minimum`/`maximum`). Float `sqrt`/`floor`/`ceil`/`round`/`trunc`/`pow` DONE (float-only methods, LLVM intrinsics; `round` = ties-away-from-zero). **core.math DONE.**
+   `{s,u}min`/`{s,u}max`/`minimum`/`maximum`). Float
+   `sqrt`/`floor`/`ceil`/`round`/`trunc`/`pow` DONE (float-only methods, LLVM intrinsics;
+   `round` = ties-away-from-zero). This historical tier is complete; the portable
+   elementary-function extension is planned separately in
+   [plan 75](75-portable-math-plan.md). **Existing core.math tier DONE.**
 2. **core.bytes / core.buffer** — design SETTLED, **build deferred until a consumer**:
    `bytes` = `slice<u8>` (no separate type — largely exists already); `buffer` = a distinct
    growable owned byte container (distinct from fixed `array<u8>` and the text-only `builder`).

@@ -78,6 +78,12 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    shipped in #1135/#1136, and #1065 fixed arrays in structs shipped in
    #1137/#1138. #1066 proposal 2 is plan 74's current implementation candidate; then
    #1064 → depends on #1063, #1075 scalar ABI facts, #1082 P2 RFC.
+   #1063 is now under the plan 75 design/feasibility gate: direct LLVM
+   transcendental intrinsics are rejected because LLVM 22 scalarizes the
+   vector form without a configured vector library, while the existing
+   `str_prims.bc` admission budget is not valid for accurate math kernels.
+   The five E1 functions stay one capability; #1064 remains a separate failure
+   domain and does not share its PR.
 4. Follow-ups, independent and small (updated 2026-09-19):
    `fix/nightly-detector-restore` closed #1105, #1107, #1108, #1109, and
    #1112, and separately repaired two untracked first-night nightly failures
