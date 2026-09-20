@@ -1247,6 +1247,22 @@ bytes through `slice<u8>`. A flag that changes an accessor's type, silent lossy 
 truncation would create hidden mode or partial success. Two named terminals over one capture engine
 keep the type and allocation contract visible.
 
+## Why checked typed byte views do not replace scalar binary accessors
+
+Packed formats and typed storage have different alignment contracts. The
+existing `u32_le(off)` family accepts alignment-1 input and decodes one scalar;
+pretending it is indexing a `slice<u32>` would invent natural alignment that
+the source does not have. Conversely, copying every aligned tensor into typed
+storage hides an avoidable allocation and blocks explicit vector loads.
+
+The single bridge is therefore `view_le<T>()`: it checks whole-element length
+and natural alignment, requires the named order to be native, and returns
+`Option<slice<T>>`. Its inverse `as_bytes()` is total. Both are descriptor-only
+views that preserve the source's storage generation and access authority. This
+keeps packed decode and aligned typed access as two explicit operations with
+one rule each; it does not turn view construction into a promise that an
+ordinary consumer loop reaches machine SIMD. Plan 78 records the exact ledger.
+
 Overflow uses the existing `Error.Invalid` category because the requested operation cannot produce
 a complete value under its declared bound; it adds no process-specific error model. Timeout remains
 distinct and is checked before each poll/read checkpoint and while waiting for the direct child after

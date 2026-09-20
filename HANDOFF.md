@@ -89,8 +89,10 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    scalarized outcomes before instruction selection. Retained provider-less
    rows warn that final lowering may still scalarize. Final machine SIMD
    requires object inspection. A target-specific provider is a later
-   independent capability. #1064 follows as a separate failure domain and does
-   not share its PR.
+   independent capability. #1064 is settled separately by
+   [plan 78](docs/impl/78-checked-byte-view-plan.md): one checked
+   `view_le<T>` plus `as_bytes`, with no copy/allocation and exact
+   provenance/authority. Its implementation is the next capability.
    #1075 merged in PR #1143. [Plan 76](docs/impl/76-scalar-abi-facts-plan.md)
    supplies the complete call-boundary `zeroext`/`signext` rule and excludes
    stored aggregate facts and the unsound proposed `char` range. Focused owners
@@ -210,7 +212,10 @@ fail-closed cold inference over the direct call graph. PR 3 implements the
 guarded heap scalar-push store with exact native-header layout pins and one
 unchanged growth/arena fallback call. The proposed one-codegen-unit runtime
 override was measured in release and dist builds and refused because both
-artifacts retained the `reserve` and `memcpy` relocations.
+artifacts retained the `reserve` and `memcpy` relocations. Issue #1072 is
+closed: PR #1129 is its shipped scalar fast path. Record `push_bytes` remains a
+separate ownership/layout capability and the refused archive override is not
+unfinished #1072 scope.
 
 **Decode representation costs:** [plan 62](docs/impl/62-decode-optimization-plan.md)
 implements bounded nonescaping byte storage and direct synchronous chunks

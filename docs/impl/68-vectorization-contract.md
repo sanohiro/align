@@ -576,8 +576,9 @@ access authority the view carries the source borrow's authority. A slice<u8>
 **Recommended shape: one generic operation, not a method per type.** The issue's
 `as_f32_slice`/`as_i32_slice`/`as_f64_slice`/`as_i64_slice` repeats the same
 per-width enumeration the `<ty>_le`/`<ty>_be` accessor family already carries
-across 36 methods, and G7's whole point is to make the view the one primitive
-that those accessors are then defined on top of.
+across 36 methods. G7 instead supplies one primitive for naturally aligned
+typed storage. The scalar accessors remain a distinct alignment-1 packed-data
+route and are not defined on top of the view.
 
 Align has no expression-position type-argument syntax — `docs/language-spec.md`
 states the no-turbofish rule three times (`:313`, `:333`, `:792`) — so the
@@ -627,26 +628,12 @@ Acceptance criteria that replace the issue's current ones:
    **not** a criterion of 1064. It moves to the umbrella corpus (§7), under the
    one gating rule in §6.3.
 
-**Open on 1064, not settled here.** These are design questions the issue must
-close before implementation; this document records the recommended shape, not
-the final surface.
-
-```text
-spelling         view_le, view_native, or a name that does not repeat the
-                 order for the only order a target can have; the call site
-                 itself is fixed by the no-turbofish rule
-_be at all       a _be view on a little-endian target is always a compile
-                 error; is the name worth having for the sake of keeping
-                 "every multi-byte access names its order" total?
-accessor fate    are the 36 <ty>_le/<ty>_be accessors respecified as
-                 "view then index" now, later, or removed?
-byte elements    are u8/i8 views included, where the order is meaningless?
-partial length   fail with None (recommended) or truncate to the whole prefix?
-provenance       how the view participates in plan 52's read-only provenance
-                 retention and plan 57's validated-text observation
-foreign route    whether the checked view and resource.view_from_raw stay two
-                 routes permanently or unify once plan 61 lands
-```
+**Settled by plan 78.** The spelling is `view_le`; there is no `_be` view and
+no `u8`/`i8` identity member. Partial length and misalignment yield `None`.
+Scalar accessors remain alignment-1 operations, provenance and authority are
+preserved exactly, and foreign publication remains owned by
+`resource.view_from_raw`. Plan 78 is authoritative where this earlier contract
+summary is less detailed.
 
 ### 6.3 The one gating rule for auto-vectorization
 
@@ -735,7 +722,7 @@ Recorded per the large-design authoring gate.
   and the single-expression `fn f() -> T = expr` form. Two examples use a
   surface that does not exist yet and are marked as such where they appear:
   `softmax_weight`'s `v.exp()` on a vector receiver is what G6 adds, and
-  `peak`'s `view_le` is G7's recommended, unsettled name.
+  `peak`'s `view_le` is G7's settled plan-78 name.
 - Existing and planned artifacts are distinguished in every corpus cell.
   Existing: `crates/align_driver/tests/vectorize_shapes.rs` and its
   `k6_float_sum_does_not_vectorize_without_fast_math` at `:258`,
@@ -755,5 +742,5 @@ Recorded per the large-design authoring gate.
   fast-math row as the much narrower `reassoc`/`contract` source scope and owns
   the corresponding Settled entry.
 - This contract itself added no language surface. Plan 77 now owns the required
-  `draft.md` and `docs/language-spec.md` changes for G4 Part 2. G7's view remains
-  deferred to its own issue.
+  `draft.md` and `docs/language-spec.md` changes for G4 Part 2. Plan 78 owns
+  G7's settled view surface and implementation matrix.
