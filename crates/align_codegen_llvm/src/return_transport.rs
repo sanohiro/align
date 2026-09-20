@@ -1,6 +1,7 @@
-//! Expose target-selected indirect results before LLVM optimization. The shim
-//! rewrites the complete verified module at once, after LLVM handles used by
-//! ordinary lowering have finished their work. No semantic MIR ABI is changed.
+//! Expose target-selected aggregate parameters and results before LLVM
+//! optimization. The shim rewrites the complete verified module at once,
+//! after LLVM handles used by ordinary lowering have finished their work. No
+//! semantic MIR ABI is changed.
 
 use std::ffi::{CStr, c_char, c_int};
 
@@ -37,12 +38,19 @@ pub(super) fn build_indirect_call<'ctx>(
     callee: PointerValue<'ctx>,
     args: &[BasicMetadataValueEnum<'ctx>],
     name: &str,
+    dynamic_cleanup: bool,
 ) -> Result<CallSiteValue<'ctx>, BuilderError> {
     let call = builder.build_indirect_call(signature, callee, args, name)?;
     call.add_attribute(
         AttributeLoc::Function,
         ctx.create_string_attribute("align.program.return", ""),
     );
+    if dynamic_cleanup {
+        call.add_attribute(
+            AttributeLoc::Function,
+            ctx.create_string_attribute("align.program.cleanup", ""),
+        );
+    }
     Ok(call)
 }
 
@@ -180,6 +188,233 @@ entry:
         );
         assert!(!optimized.contains("call.result.storage"), "{optimized}");
         assert!(!optimized.contains("llvm.memcpy"), "{optimized}");
+        Ok(())
+    }
+
+    #[test]
+    fn indirect_cleanup_result_splits_value_and_canonical_byte() -> Result<(), String> {
+        let ctx = Context::create();
+        let module = parse(
+            &ctx,
+            r#"
+%Big = type { [27 x i64] }
+define { %Big, i1 } @make(i1 %live) #0 {
+entry:
+  %p0 = insertvalue { %Big, i1 } poison, %Big zeroinitializer, 0
+  %p1 = insertvalue { %Big, i1 } %p0, i1 %live, 1
+  ret { %Big, i1 } %p1
+}
+define i64 @probe(i1 %live) {
+entry:
+  %dst = alloca %Big, align 8
+  %pair = call { %Big, i1 } @make(i1 %live)
+  %value = extractvalue { %Big, i1 } %pair, 0
+  store %Big %value, ptr %dst, align 8
+  %bit = extractvalue { %Big, i1 } %pair, 1
+  %last.ptr = getelementptr inbounds %Big, ptr %dst, i32 0, i32 0, i64 26
+  %last = load i64, ptr %last.ptr, align 8
+  %owned = zext i1 %bit to i64
+  %sum = add i64 %last, %owned
+  ret i64 %sum
+}
+attributes #0 = { "align.program.cleanup" }
+"#,
+        )?;
+        let tm = target()?;
+        module.set_data_layout(&tm.get_target_data().get_data_layout());
+        module.set_triple(&tm.get_triple());
+        let owned: Vec<_> = module.get_functions().collect();
+        normalize(&module, &tm, &owned).map_err(|error| error.to_string())?;
+        let raw = module.print_to_string().to_string();
+        assert!(
+            raw.contains("define void @make(ptr sret(%Big)")
+                && raw.contains("align 1 captures(none) %cleanup.destination"),
+            "{raw}"
+        );
+        assert!(raw.contains("zext i1 %return.cleanup to i8"), "{raw}");
+        assert!(raw.contains("store i8"), "{raw}");
+        assert!(
+            raw.contains("call void @make(ptr sret(%Big) align 8 captures(none) %dst"),
+            "{raw}"
+        );
+        assert!(!raw.contains("call.value.storage"), "{raw}");
+        assert!(!raw.contains("align.program.cleanup"), "{raw}");
+        crate::run_opt_pipeline(&module, &tm, "default<O2>").map_err(|error| error.to_string())?;
+        assert!(module.verify().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_transport_keeps_direct_pairs_and_splits_direct_values() -> Result<(), String> {
+        let ctx = Context::create();
+        let module = parse(
+            &ctx,
+            r#"
+%Mid = type { [8 x i64] }
+define { i64, i1 } @small(i64 %value, i1 %live) #0 {
+entry:
+  %p0 = insertvalue { i64, i1 } poison, i64 %value, 0
+  %p1 = insertvalue { i64, i1 } %p0, i1 %live, 1
+  ret { i64, i1 } %p1
+}
+define { %Mid, i1 } @middle(%Mid %value, i1 %live) #0 {
+entry:
+  %p0 = insertvalue { %Mid, i1 } poison, %Mid %value, 0
+  %p1 = insertvalue { %Mid, i1 } %p0, i1 %live, 1
+  ret { %Mid, i1 } %p1
+}
+attributes #0 = { "align.program.cleanup" }
+"#,
+        )?;
+        let tm = target()?;
+        module.set_data_layout(&tm.get_target_data().get_data_layout());
+        module.set_triple(&tm.get_triple());
+        let owned: Vec<_> = module.get_functions().collect();
+        normalize(&module, &tm, &owned).map_err(|error| error.to_string())?;
+        let raw = module.print_to_string().to_string();
+        assert!(raw.contains("define { i64, i1 } @small("), "{raw}");
+        assert!(
+            raw.contains("define %Mid @middle(ptr align 1 captures(none) %cleanup.destination")
+                || raw.contains("define void @middle(ptr sret(%Mid)"),
+            "{raw}"
+        );
+        if tm
+            .get_triple()
+            .as_str()
+            .to_string_lossy()
+            .starts_with("aarch64")
+            || tm
+                .get_triple()
+                .as_str()
+                .to_string_lossy()
+                .starts_with("arm64")
+        {
+            assert!(
+                raw.contains("define %Mid @middle(ptr align 1 captures(none) %cleanup.destination"),
+                "AArch64 must cover DirectValueCleanupOut: {raw}"
+            );
+        }
+        assert!(!raw.contains("align.program.cleanup"), "{raw}");
+        assert!(module.verify().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn target_stack_aggregate_parameter_becomes_byval() -> Result<(), String> {
+        let ctx = Context::create();
+        let module = parse(
+            &ctx,
+            r#"
+%Big = type { [27 x i64] }
+%Small = type { i64, i64 }
+define i64 @consume(%Big %value) #0 {
+entry:
+  %slot = alloca %Big, align 8
+  store %Big %value, ptr %slot, align 8
+  %field = getelementptr inbounds %Big, ptr %slot, i32 0, i32 0, i64 26
+  %last = load i64, ptr %field, align 8
+  ret i64 %last
+}
+define i64 @probe(i64 %n) #0 {
+entry:
+  %slot = alloca %Big, align 8
+  store %Big zeroinitializer, ptr %slot, align 8
+  %field = getelementptr inbounds %Big, ptr %slot, i32 0, i32 0, i64 26
+  store i64 %n, ptr %field, align 8
+  %value = load %Big, ptr %slot, align 8
+  %result = call i64 @consume(%Big %value)
+  ret i64 %result
+}
+define i64 @probe_snapshot(i64 %n) #0 {
+entry:
+  %slot = alloca %Big, align 8
+  store %Big zeroinitializer, ptr %slot, align 8
+  %snapshot = load %Big, ptr %slot, align 8
+  %replacement = insertvalue %Big zeroinitializer, i64 %n, 0, 26
+  store %Big %replacement, ptr %slot, align 8
+  %result = call i64 @consume(%Big %snapshot)
+  ret i64 %result
+}
+define i64 @small_direct(%Small %value) #0 {
+entry:
+  %slot = alloca %Small, align 8
+  store %Small %value, ptr %slot, align 8
+  %field = getelementptr inbounds %Small, ptr %slot, i32 0, i32 1
+  %last = load i64, ptr %field, align 8
+  ret i64 %last
+}
+define i64 @small_after_pressure(i64 %a0, i64 %a1, i64 %a2, i64 %a3, i64 %a4, i64 %a5, i64 %a6, i64 %a7, %Small %value) #0 {
+entry:
+  %slot = alloca %Small, align 8
+  store %Small %value, ptr %slot, align 8
+  %field = getelementptr inbounds %Small, ptr %slot, i32 0, i32 1
+  %last = load i64, ptr %field, align 8
+  ret i64 %last
+}
+define %Big @small_after_sret(i64 %a0, i64 %a1, i64 %a2, i64 %a3, i64 %a4, %Small %value) #0 {
+entry:
+  %slot = alloca %Small, align 8
+  store %Small %value, ptr %slot, align 8
+  ret %Big zeroinitializer
+}
+define i64 @native_shape(%Big %value) {
+entry:
+  %slot = alloca %Big, align 8
+  store %Big %value, ptr %slot, align 8
+  %field = getelementptr inbounds %Big, ptr %slot, i32 0, i32 0, i64 26
+  %last = load i64, ptr %field, align 8
+  ret i64 %last
+}
+attributes #0 = { "align.program.parameters" }
+"#,
+        )?;
+        let tm = target()?;
+        module.set_data_layout(&tm.get_target_data().get_data_layout());
+        module.set_triple(&tm.get_triple());
+        let owned: Vec<_> = module.get_functions().collect();
+        normalize(&module, &tm, &owned).map_err(|error| error.to_string())?;
+        let raw = module.print_to_string().to_string();
+        assert!(raw.contains("define i64 @consume(ptr byval(%Big)"), "{raw}");
+        let body = raw
+            .split("define i64 @consume(")
+            .nth(1)
+            .and_then(|text| text.split("\n}").next())
+            .ok_or("consume body")?;
+        assert!(!body.contains("alloca %Big"), "{body}");
+        assert!(!body.contains("store %Big"), "{body}");
+        assert!(raw.contains("call i64 @consume(ptr byval(%Big)"), "{raw}");
+        let probe = raw
+            .split("define i64 @probe(")
+            .nth(1)
+            .and_then(|text| text.split("\n}").next())
+            .ok_or("probe body")?;
+        assert!(!probe.contains("call.byval.storage"), "{probe}");
+        let snapshot = raw
+            .split("define i64 @probe_snapshot(")
+            .nth(1)
+            .and_then(|text| text.split("\n}").next())
+            .ok_or("probe_snapshot body")?;
+        assert!(
+            snapshot.contains("call.byval.storage"),
+            "a pre-call write must preserve the earlier SSA snapshot: {snapshot}"
+        );
+        assert!(raw.contains("define i64 @small_direct(%Small"), "{raw}");
+        assert!(
+            raw.contains("define i64 @native_shape(%Big"),
+            "an unmarked native-shaped boundary must retain its ABI: {raw}"
+        );
+        assert!(
+            raw.contains("i64 %a7, ptr byval(%Small)"),
+            "preceding arguments must participate in target register pressure: {raw}"
+        );
+        let triple = tm.get_triple().as_str().to_string_lossy().into_owned();
+        if triple.starts_with("x86_64") {
+            assert!(
+                raw.contains("i64 %a4, ptr byval(%Small)"),
+                "the target's sret register must participate in parameter pressure: {raw}"
+            );
+        }
+        assert!(module.verify().is_ok());
         Ok(())
     }
 
@@ -361,6 +596,37 @@ entry:
         let wrong_owner = other.get_function("other").ok_or("other")?;
         assert!(normalize(&module, &tm, &[wrong_owner]).is_err());
         assert_eq!(module.print_to_string().to_string(), before);
+
+        let parameter_module = parse(
+            &ctx,
+            r#"
+%Big = type { [27 x i64] }
+define i64 @malformed(%Big %value) #0 {
+entry:
+  %first = extractvalue %Big %value, 0
+  %last = extractvalue [27 x i64] %first, 26
+  ret i64 %last
+}
+attributes #0 = { "align.program.parameters" }
+"#,
+        )?;
+        parameter_module.set_data_layout(&tm.get_target_data().get_data_layout());
+        parameter_module.set_triple(&tm.get_triple());
+        let parameter_before = parameter_module.print_to_string().to_string();
+        let parameter_owned: Vec<_> = parameter_module.get_functions().collect();
+        let parameter_error = normalize(&parameter_module, &tm, &parameter_owned)
+            .expect_err("target-indirect parameters require canonical entry storage");
+        assert!(
+            parameter_error
+                .to_string()
+                .contains("target-indirect parameter has noncanonical entry storage"),
+            "{parameter_error}"
+        );
+        assert_eq!(
+            parameter_module.print_to_string().to_string(),
+            parameter_before,
+            "parameter refusal must leave the original module untouched"
+        );
         Ok(())
     }
 
@@ -415,6 +681,38 @@ entry:
                 "not a sole adjacent local materialization: {text}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn tagged_reload_does_not_cross_an_intervening_write() -> Result<(), String> {
+        let ctx = Context::create();
+        let module = parse(
+            &ctx,
+            r#"
+%Tagged = type { i8, [31 x i64] }
+declare void @fill(ptr sret(%Tagged))
+define i8 @probe() {
+entry:
+  %slot = alloca %Tagged, align 8
+  call void @fill(ptr sret(%Tagged) %slot)
+  %snapshot = load %Tagged, ptr %slot, align 8
+  store %Tagged zeroinitializer, ptr %slot, align 8
+  %tag = extractvalue %Tagged %snapshot, 0
+  ret i8 %tag
+}
+"#,
+        )?;
+        let tm = target()?;
+        module.set_data_layout(&tm.get_target_data().get_data_layout());
+        module.set_triple(&tm.get_triple());
+        let owned: Vec<_> = module.get_functions().collect();
+        normalize(&module, &tm, &owned).map_err(|error| error.to_string())?;
+        let raw = module.print_to_string().to_string();
+        assert!(raw.contains("%snapshot = load %Tagged"), "{raw}");
+        assert!(raw.contains("extractvalue %Tagged %snapshot, 0"), "{raw}");
+        assert!(!raw.contains("call.tag.pointer"), "{raw}");
+        assert!(module.verify().is_ok());
         Ok(())
     }
 
