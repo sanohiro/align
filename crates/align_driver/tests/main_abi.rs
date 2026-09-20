@@ -114,6 +114,50 @@ fn non_entry_generic_main_is_an_ordinary_module_function() {
 }
 
 #[test]
+fn scalar_boundary_values_survive_whole_and_per_unit_calls() {
+    if !backend_available() {
+        return;
+    }
+    let library = concat!(
+        "module scalar\n",
+        "pub fn bool_id(value: bool) -> bool = value\n",
+        "pub fn u8_id(value: u8) -> u8 = value\n",
+        "pub fn u16_id(value: u16) -> u16 = value\n",
+        "pub fn u32_id(value: u32) -> u32 = value\n",
+        "pub fn i8_id(value: i8) -> i8 = value\n",
+        "pub fn i16_id(value: i16) -> i16 = value\n",
+        "pub fn i32_id(value: i32) -> i32 = value\n",
+        "pub fn char_id(value: char) -> char = value\n",
+    );
+    let entry = concat!(
+        "module main\n",
+        "import scalar\n",
+        "fn indirect(value: bool) -> bool { callback := scalar.bool_id\n return callback(value) }\n",
+        "fn spawned() -> bool { return task_group { task := spawn(fn { true })\n wait()\n task.get() } }\n",
+        "fn main() -> i32 {\n",
+        "  if !scalar.bool_id(true) { return 1 }\n",
+        "  if scalar.bool_id(false) { return 2 }\n",
+        "  if !indirect(true) { return 3 }\n",
+        "  if !spawned() { return 4 }\n",
+        "  if scalar.u8_id(255) != 255 { return 5 }\n",
+        "  if scalar.u16_id(65535) != 65535 { return 6 }\n",
+        "  if scalar.u32_id(4294967295) != 4294967295 { return 7 }\n",
+        "  if scalar.i8_id(-128) != -128 { return 8 }\n",
+        "  if scalar.i16_id(-32768) != -32768 { return 9 }\n",
+        "  if scalar.i32_id(-2147483648) != -2147483648 { return 10 }\n",
+        "  if scalar.char_id('\\0') != '\\0' { return 11 }\n",
+        "  if scalar.char_id('\\u{10ffff}') != '\\u{10ffff}' { return 12 }\n",
+        "  return 0\n",
+        "}\n",
+    );
+    let files = &[("scalar.align", library), ("main.align", entry)];
+    let whole = build_and_run_multi("scalar-abi-whole", files, "main.align");
+    let per = build_per_unit_multi("scalar-abi-per", files, "main.align").link_and_run();
+    assert_eq!(whole.status.code(), Some(0), "whole-program scalar boundary");
+    assert_eq!(per.status.code(), Some(0), "per-unit scalar boundary");
+}
+
+#[test]
 fn raw_and_optimized_whole_and_per_unit_c_signatures_are_exact() {
     if !backend_available() {
         return;

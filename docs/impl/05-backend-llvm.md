@@ -101,7 +101,7 @@ the target transport above applies consistently to wrapper and harness.
 
 ### Narrow scalar program ABI facts
 
-[Plan 76](76-scalar-abi-facts-plan.md) owns the pending type-derived
+[Plan 76](76-scalar-abi-facts-plan.md) owns the implemented candidate's type-derived
 `zeroext`/`signext`/`range` rule for Align-owned program calls. ABI extension
 facts must agree on definitions or declarations and every direct or indirect
 call site; declaration-only attribution is invalid. The rule applies only when

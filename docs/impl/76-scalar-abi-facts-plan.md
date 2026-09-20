@@ -1,6 +1,6 @@
 # Scalar ABI facts at program call boundaries
 
-Status: design candidate for
+Status: implementation candidate for
 [issue 1075](https://github.com/sanohiro/align/issues/1075). This document is
 the public-contract ledger and implementation closure matrix. Evidence
 baseline: Align `0aab8796457defcd11b0586fed5c8f5a0499e2ac`, LLVM 22.1.8.
@@ -210,21 +210,38 @@ helper or to carry an explicit foreign/runtime/native exclusion. A repository
 search is part of the owner test only when it checks a stable wrapper API; a
 source-line count is not a correctness test.
 
+This capability crosses the repository's approximate 1,000-line explanation
+threshold because the reviewed ledger, closure matrix and one parameterized IR
+owner ship with the single ABI rule. Splitting declarations, direct calls,
+generated adapters or indirect calls would leave an ABI-inconsistent
+intermediate state and duplicate the same semantic-type-to-transport proof.
+They are one failure domain and have no independently safe consumer boundary.
+
 ## 4. Verification bundle
 
 The narrow owner is the `align_codegen_llvm` scalar-boundary test filter. It
 builds tiny in-memory fixtures and inspects emitted IR; it does not invoke the
-full workspace suite or any benchmark. The per-unit driver owner is added only
-if the codegen-level imported declaration fixture cannot observe both modules.
-Existing wrapper and parallel tests are reused rather than duplicated.
+full workspace suite or any benchmark. A single `main_abi` driver owner executes
+the same boundary values through whole-program and per-unit builds. Existing
+wrapper and parallel paths reuse the canonical helper rather than gaining new
+test binaries.
 
 ```text
 owner             scripts/cargo.sh test -p align_codegen_llvm scalar_boundary -- --nocapture
+execution         scripts/cargo.sh test -p align_driver --test main_abi scalar_boundary_values_survive_whole_and_per_unit_calls -- --nocapture
 structural        LLVM module verification in every emitted fixture
 platform          existing codegen platform matrix
 benchmark         none
 external client   pending consumer-owned mask/instruction recount
 ```
+
+Candidate verification on 2026-09-20: the codegen owner passed in 0.04 seconds
+(one test, 221 filtered out), and the whole/per-unit execution owner passed in
+0.76 seconds. Compilation took 14.60 seconds and 16.59 seconds respectively.
+No benchmark or broad test suite was run. The helper owner also rejects a
+semantic `bool` mapped onto a physical `i8` function or call before module
+verification, pins the environment offset, and proves that a dynamic-cleanup
+aggregate return receives no nested scalar result attribute.
 
 The implementation is complete when the matrix is closed, the focused owner
 passes, the standard bounded code gate passes, and the merged issue comment
