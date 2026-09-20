@@ -1102,7 +1102,9 @@ table: [i64; 32]
 `array<T>` is owned contiguous memory.
 
 `[T; N]` is a fixed array: exactly `N` consecutive inline `T` values, with no heap allocation or
-runtime header. `N` is an unsuffixed decimal integer literal in `0..=u32::MAX`, is part of the type,
+runtime header. The written `;` is required on the same logical line; a newline cannot replace it,
+though explicit semicolons retain their existing statement-termination role. `N` is an unsuffixed
+decimal integer literal in `0..=u32::MAX`, is part of the type,
 and may be written anywhere a type annotation is accepted. Existing placement rules still reject
 aggregates at unsupported native extern/raw boundaries. `N` is not an expression or const generic.
 The element uses the same closed domain as a fixed array literal; nested fixed arrays and

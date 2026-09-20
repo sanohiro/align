@@ -24,8 +24,14 @@ same type and place proof and leave no independently useful intermediate state.
 Surface           [T; N]
 
 Syntax            A fixed-array type starts with `[`, contains one element type,
-                  `;`, one unsuffixed decimal integer literal, and `]`. Whitespace
-                  is insignificant. It is accepted anywhere an ordinary type
+                  the explicit-semicolon token `;`, one unsuffixed decimal
+                  integer literal, and `]`, all on one logical line. Horizontal
+                  whitespace is insignificant. The lexer separates a written
+                  semicolon as `Semicolon` while newline remains `End`; ordinary
+                  statement termination accepts either token, but this type
+                  separator accepts only `Semicolon`. Thus `[T\nN]` is invalid
+                  and existing `statement;` source retains its meaning. The type
+                  is accepted anywhere an ordinary type
                   annotation is accepted, including record fields, locals,
                   parameters, results, generic arguments and function-value
                   signatures. This makes the type syntactically available; the
@@ -114,8 +120,20 @@ Artifact/cache    The AST and checked type carry T and u32 N. Public signatures,
                   fingerprints include the complete reachable element graph and
                   N. Interface format 14 adds `IType::FixedArray { element,
                   length:u32 }` and replaces format 13 outright; there is no
-                  compatibility reader. Resolved HIR continues to use the
-                  existing Ty::Array/StructArray records.
+                  compatibility reader. Its canonical type-record tag is u8
+                  `3`, followed by the recursively encoded element `IType`, then
+                  the length as little-endian u32. The reader bounds the complete
+                  IType graph to 128 nested records, rejects an unknown tag,
+                  truncation, trailing bytes or a 129th record before publishing
+                  a summary, and semantic import validation rejects an element
+                  outside the fixed-array domain before HIR/codegen. The exact
+                  standalone record for `[i64; 32]` is:
+                    03 00 03 00 00 00 69 36 34 00 00 00 00 20 00 00 00
+                  (`FixedArray`, `Named`, byte string `i64`, zero type arguments,
+                  length 32). Independent semantic-to-byte and byte-to-semantic
+                  goldens own this vector; tag/truncation/trailing/depth and
+                  invalid-element mutations own rejection. Resolved HIR
+                  continues to use the existing Ty::Array/StructArray records.
                   Object/cache identity already includes source, compiler,
                   interface, target and profile identity.
 
@@ -156,7 +174,7 @@ parameterized owner may close several cells when it would fail for each defect.
 
 | Cell | Required behavior | Owner evidence |
 |---|---|---|
-| Lex/parse/format | `;` is accepted only inside `[T; N]`; nested type parsing and round-trip formatting preserve T and N; missing/negative/non-decimal/overflowing lengths reject deterministically | lexer/parser/formatter positive and recovery owners |
+| Lex/parse/format | split written `Semicolon` from newline `End`; statement termination accepts both while `[T; N]` requires `Semicolon`; nested type parsing and round-trip formatting preserve T and N; newline separator and missing/negative/non-decimal/overflowing lengths reject deterministically | lexer/parser/formatter statement-compatibility, positive and recovery owners |
 | Type formation | every annotation position resolves to the existing exact Array/StructArray representation; unsupported/nested/owning elements and bad generic substitutions reject through one classifier | sema table over primitive, str, function, Copy/Move record, generic and excluded T |
 | Construction | exact, short, long and zero literal cardinalities; declaration-order record construction; reached partial initialization cleans only live Move elements | driver runtime owners plus malformed/reached-exit owners |
 | Move in/out | Copy whole values copy all slots; Move-record arrays move/null/drop once; nested Move-array field extraction stays rejected; whole containing-record move works | move-check and recursive-Drop counters |
@@ -164,7 +182,7 @@ parameterized owner may close several cells when it would fail for each defect.
 | Mutation/replacement | mutable field elements use existing authority and escape checks; whole field/record replacement preserves RHS, bounds, drop-old and source-nulling order | indexed-store, replacement and alias owners |
 | Control flow | fixed-array fields survive if/match/else/?/map_err joins, loop-carried values, break, early return and divergence with correct partial cleanup | parameterized control-path owner |
 | Lifetime | str/view-bearing admitted arrays and field-rooted slices retain the exact containing storage roots across copies, joins, calls and invalidation | EscapeCheck generation/root owners and negative escapes |
-| Generic/interface | generic record/function monomorphization substitutes T once; public whole/per-unit signatures and nominal definitions preserve T/N and dependency identity | interface round trip, cache-difference and whole/per-unit twins |
+| Generic/interface | generic record/function monomorphization substitutes T once; public whole/per-unit signatures and nominal definitions preserve T/N and dependency identity; tag-3 element-then-u32-LE encoding, depth bound and malformed rejection are exact | independent encode/decode goldens, corruption/depth mutations, interface round trip, cache-difference and whole/per-unit twins |
 | ABI/layout | semantic and LLVM size/alignment/offset/stride agree for N=0/1/32/37, mixed surrounding fields, nested records and supported over-aligned array elements; malformed checked types reject before LLVM | layout validators, raw/optimized LLVM assertions and platform CI |
 | Allocation | construction/access/return/Drop of the 13x32 acceptance record has no builder/runtime allocator call; explicit materialization remains the only allocation | IR symbol scan plus runtime allocation counter |
 | Malformed input | forged type/field/cardinality/place/layout equations fail in checked-HIR or MIR validation, never by panic or backend guess | one mutation owner per producer-owned discriminator/equation |
@@ -204,3 +222,15 @@ field, hidden boxing, C flexible-array member, native extern/raw array ABI,
 equality/hash/print behavior, reflection, data serialization widening or new
 runtime ABI. An arbitrary temporary is still not stable fixed-array storage;
 bind it before indexing or slicing.
+
+## 5. Design-review finding closure
+
+The fresh full-diff review of candidate `b8e23187` found three P2 contract gaps.
+They are closed together before implementation; no public surface or strategy
+changed.
+
+| Finding | Root cause | Closure |
+|---|---|---|
+| Explicit `;` and newline shared `TokKind::End` | the ledger named a glyph but not its lexer provenance or existing statement role | specify `Semicolon` versus newline `End`, dual statement termination, fixed-type-only separator use, newline negative and compatibility owners |
+| Format 14 named a Rust record but not canonical bytes | artifact identity lacked a complete producer/consumer byte contract | fix tag 3, element/length order, u32 little endian, 128-record depth, malformed rules and independent bidirectional `[i64; 32]` golden |
+| Japanese receiver prose contradicted the English contract | only the newly inserted mirror paragraph was compared | update the later receiver paragraph to stable local/parameter/field places plus arbitrary-temporary exclusion and re-scan both mirrors for the old restriction |

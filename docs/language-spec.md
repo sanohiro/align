@@ -89,6 +89,8 @@ elements (Move if any element is Move), exactly like a struct.
 
 `[T; N]` names the same fixed inline array inferred for an array literal. It is valid in every type
 annotation position. `N` is part of the structural type and is not an expression or const generic.
+The written `;` is required on the same logical line; a newline cannot replace it, and explicit
+semicolons continue to terminate statements elsewhere.
 Existing placement gates still reject aggregates at unsupported native extern/raw boundaries.
 The literal must have exactly `N` elements; `[]` constructs `[T; 0]`. A struct field contains all
 `N` elements inline, with no header, builder, heap allocation, or runtime allocation call. A fixed
