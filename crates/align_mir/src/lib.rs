@@ -5454,6 +5454,9 @@ struct LoopFrame {
     /// Owned locals declared inside the loop body (a subset of `drop_locals`). Their live flags are
     /// conditionally dropped at the back-edge and at each `break`.
     iter_drops: Vec<Slot>,
+    /// Partial fields already active outside this loop. A `break` drops only the suffix formed in
+    /// the loop body; an enclosing aggregate whose field expression is this loop stays live.
+    partial_fields_base: usize,
 }
 
 impl Builder {
@@ -5467,9 +5470,7 @@ impl Builder {
             self.push(Stmt::TgWait(Operand::Value(h)));
             self.push(Stmt::TgEnd(Operand::Value(h)));
         }
-        for field in self.partial_fields.clone().into_iter().rev() {
-            self.emit_drop_field_if_live(field);
-        }
+        self.emit_partial_field_cleanup_from(0);
         for s in self.drop_locals.clone().into_iter().rev() {
             self.emit_drop_if_live(s);
         }
@@ -5657,6 +5658,13 @@ impl Builder {
         self.push(Stmt::Store(field.flag, Operand::Const(Const::Bool(false))));
         self.terminate(Term::Goto(next_bb));
         self.cur = next_bb;
+    }
+
+    fn emit_partial_field_cleanup_from(&mut self, base: usize) {
+        let fields = self.partial_fields[base..].to_vec();
+        for field in fields.into_iter().rev() {
+            self.emit_drop_field_if_live(field);
+        }
     }
 
     /// Drop an owned value only when its containing aggregate is individually owned. Unlike
@@ -7260,8 +7268,12 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 b.terminate(Term::Unreachable);
                 return;
             };
-            let (result_slot, iter_drops, exit) =
-                (frame.result_slot, frame.iter_drops.clone(), frame.exit);
+            let (result_slot, iter_drops, partial_fields_base, exit) = (
+                frame.result_slot,
+                frame.iter_drops.clone(),
+                frame.partial_fields_base,
+                frame.exit,
+            );
             let op = match value {
                 Some(e) => Some(lower_required!(b, lower_expr(b, e), ())),
                 None => None,
@@ -7272,6 +7284,11 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             if let Some(e) = value {
                 null_moved_source(b, e);
             }
+            // A construction started inside this loop will never publish its whole-value flag on
+            // this edge. Drop only that loop-local suffix; partial fields of an enclosing
+            // construction survive when this loop is itself one field expression.
+            b.emit_partial_field_cleanup_from(partial_fields_base);
+            b.partial_fields.truncate(partial_fields_base);
             // Conditionally drop this iteration's owned locals and clear their flags, so function
             // cleanup cannot drop the same values again. A moved-out `break` value already has a
             // clear flag. Sema forbids a
@@ -11144,6 +11161,9 @@ fn store_fresh_struct_fields(b: &mut Builder, slot: Slot, value: &hir::Expr) -> 
         value,
         &mut aggregate_drop_flag,
     ) {
+        // The reached transfer already emitted cleanup on its edge. Restore the lowering-time
+        // lexical stack before another CFG arm or a loop exit resumes construction.
+        b.partial_fields.truncate(first_partial);
         return None;
     }
     b.partial_fields.truncate(first_partial);
@@ -23728,10 +23748,12 @@ fn lower_loop(b: &mut Builder, e: &hir::Expr) -> Operand {
     let exit = b.new_block();
     b.terminate(Term::Goto(header));
     b.cur = header;
+    let partial_fields_base = b.partial_fields.len();
     b.loops.push(LoopFrame {
         exit,
         result_slot,
         iter_drops,
+        partial_fields_base,
     });
     let _ = lower_block(b, body); // the body's trailing value is discarded each iteration
     // Fall-through end of an iteration: conditionally drop this pass's per-iteration owned locals
@@ -30172,11 +30194,13 @@ fn main() -> i32 = 0
         let p = lower(
             "Wrap { xs: array<i64>, n: i64 }\nfn make() -> array<i64> = [1].to_array()\nfn partial() -> i32 {\n  w := Wrap { xs: make(), n: { return 0 } }\n  return 1\n}\nfn partial_array() -> i32 {\n  rows := [Wrap { xs: make(), n: { return 0 } }]\n  return 1\n}\nfn joined(c: bool) -> i64 {\n  arena {\n    mut xs := make()\n    if c {\n      xs = [2].to_array()\n    }\n    w := Wrap { xs: xs, n: 0 }\n    return w.xs.len()\n  }\n}\nfn main() -> i32 = 0\n",
         );
-        let partial = p
-            .fns
-            .iter()
-            .find(|f| f.name.as_str() == "partial")
-            .expect("partial aggregate MIR");
+        let function = |name: &str| {
+            p.fns
+                .iter()
+                .find(|f| f.name.as_str() == name)
+                .expect("aggregate MIR function")
+        };
+        let partial = function("partial");
         assert!(
             partial
                 .blocks
@@ -30195,11 +30219,7 @@ fn main() -> i32 = 0
             print::function_to_string(partial)
         );
 
-        let partial_array = p
-            .fns
-            .iter()
-            .find(|f| f.name.as_str() == "partial_array")
-            .expect("partial array MIR");
+        let partial_array = function("partial_array");
         assert!(
             partial_array
                 .blocks

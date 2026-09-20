@@ -151,6 +151,26 @@ fn nested_exit() -> i32 {
   return nested.number as i32
 }
 
+fn loop_exit() -> i32 {
+  loop {
+    pair := Pair {
+      first: "first".clone(),
+      second: "second".clone(),
+      number: { break }
+    }
+  }
+  return 15
+}
+
+fn loop_field() -> i32 {
+  pair := Pair {
+    first: "first".clone(),
+    second: "second".clone(),
+    number: loop { break 17 }
+  }
+  return pair.number as i32
+}
+
 fn returned() -> Pair {
   pair := Pair {
     first: "first".clone(),
@@ -184,10 +204,14 @@ fn main() -> i32 {
   if unsafe { align_rt_requested_live_bytes() } != 0 { return 7 }
   if nested_exit() != 11 { return 8 }
   if unsafe { align_rt_requested_live_bytes() } != 0 { return 9 }
-  if consume(returned()) != 9 { return 10 }
+  if loop_exit() != 15 { return 10 }
   if unsafe { align_rt_requested_live_bytes() } != 0 { return 11 }
-  if consume_large(returned_large()) != 13 { return 12 }
+  if loop_field() != 17 { return 12 }
   if unsafe { align_rt_requested_live_bytes() } != 0 { return 13 }
+  if consume(returned()) != 9 { return 14 }
+  if unsafe { align_rt_requested_live_bytes() } != 0 { return 15 }
+  if consume_large(returned_large()) != 13 { return 16 }
+  if unsafe { align_rt_requested_live_bytes() } != 0 { return 17 }
   return 0
 }
 "#;
@@ -607,6 +631,27 @@ fn fresh_move_struct_destinations_cleanup_reached_partial_prefixes() {
     assert!(
         array_drop < string_drop,
         "nested Move leaves must drop in reverse order:\n{nested}"
+    );
+    let loop_exit = mir
+        .split("fn loop_exit")
+        .nth(1)
+        .and_then(|body| body.split("\n}\n").next())
+        .expect("loop break destination MIR function");
+    let second = loop_exit
+        .find("drop_field _0.1")
+        .expect("loop break second field cleanup");
+    let first = loop_exit
+        .find("drop_field _0.0")
+        .expect("loop break first field cleanup");
+    assert!(second < first, "loop break cleanup must be reverse order:\n{loop_exit}");
+    let loop_field = mir
+        .split("fn loop_field")
+        .nth(1)
+        .and_then(|body| body.split("\n}\n").next())
+        .expect("loop-valued field MIR function");
+    assert!(
+        !loop_field.contains("drop_field"),
+        "breaking a loop used as a field must preserve the enclosing partial destination:\n{loop_field}"
     );
     if backend_available() {
         let ir = emit_llvm(FRESH_STRUCT_DESTINATION_SOURCE);

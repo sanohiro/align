@@ -609,7 +609,8 @@ Fresh Move-struct bindings store leaves directly into the final slot, publish
 the whole cleanup flag only after completion, and lower reached exits to
 flag-guarded `DropField` statements in reverse source order. Nested Move
 leaves, explicit `return`, `?`, success, allocation parity, hard division
-termination, and generic whole/per-unit compilation share the
+termination, loop-local `break` cleanup, enclosing-construction preservation,
+and generic whole/per-unit compilation share the
 `move_return_cleanup` owner. LLVM forwards a completed large cleanup-bearing
 return into its caller-owned sret destination only when a recursive use proof
 finds one exact alloca, one initial zero state, complete once-only field
