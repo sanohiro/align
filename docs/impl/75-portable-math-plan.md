@@ -1,7 +1,10 @@
 # Portable elementary math
 
-Status: design candidate for
-[issue 1063](https://github.com/sanohiro/align/issues/1063) and G6 of the
+Status: design merged in PR #1141; E1 implementation deferred after the
+candidate feasibility probes in §3.1 failed the vector/identity closure. Resume
+only with a kernel source and proof package that closes every §3 cell; do not
+land a partial intrinsic or scalar-libcall surface. This plan remains the
+contract for [issue 1063](https://github.com/sanohiro/align/issues/1063) and G6 of the
 [vectorization contract](68-vectorization-contract.md). This document is the
 public-contract ledger, feasibility gate and implementation closure matrix.
 Evidence baseline: Align `854815acef2d7e2403532b40d7226aeb4fcbb66a`, LLVM
@@ -223,6 +226,41 @@ integration regressions after admission; it never substitutes for the
 universal proof above. The exhaustive f32 run and f64 certificate checker rerun
 only when the kernel operation graph, coefficients, tables or proof-tool
 identity changes.
+
+### 3.1 Recorded candidate results (2026-09-20)
+
+The first feasibility pass is negative. One failed mandatory cell rejects a
+candidate; running the remaining architecture matrix or a throughput benchmark
+would add no decision evidence.
+
+| Candidate | Evidence | Result |
+|---|---|---|
+| LLVM 22 transcendental intrinsics | The plan-68 Apple M1 probe lowered `llvm.exp.v2f32` to scalar `_expf` calls plus lane insertion/extraction when no vector library was configured. | Rejected: fails optimized shape and target-independent implementation. |
+| Rust `libm` 0.2.16, soft-float path | Upstream assigns 1 ULP to all five f32/f64 E1 families against MPFR and provides exhaustive f32/high-iteration f64 tooling. A local Rust 1.96.1/LLVM 22.1.8 fat-LTO probe expanded four `libm::expf`/`logf` lanes. Default inlining retained four scalar calls. Raising LLVM's inline threshold to 10000 removed the calls, but `expf` remained 626 lines of scalar IR with no vector type; `logf` retained 12 `extractelement`/`insertelement` operations. | Rejected: useful accuracy reference, but fails the mandatory explicit-vector shape even after non-default forced inlining. |
+| LLVM libc mathvec at `f28f0baf` | The generic portable vector tree currently supplies f32 `expf` and `logf` only. `logf` is a scalar `cpp::map`; `exp2`, `log2`, `log10` and every f64 E1 vector kernel are absent. The separate scalar correctly-rounded implementation is dependency-rich and does not close the vector surface. | Rejected for E1: incomplete type/function matrix and scalar-map shape. |
+| SLEEF at `7623d6cf` | SLEEF supplies broad 1-ULP SIMD algorithms, but upstream issue 187 still records deterministic results across CPU architectures as unsupported. Its target-specific vector-extension implementations are precisely the result-identity variation this contract excludes. | Rejected as the guaranteed default: fails cross-target bit identity. It remains eligible only for a future explicit nondeterministic opt-in. |
+
+The disposable local probe used `/tmp/align-math-spike` and
+`/tmp/align-math-spike-target*`; it is not a repository test or artifact. Its
+essential commands were:
+
+```text
+CARGO_TARGET_DIR=/tmp/align-math-spike-target \
+  cargo rustc --manifest-path /tmp/align-math-spike/Cargo.toml \
+  --release --lib -- --emit=llvm-ir
+
+CARGO_TARGET_DIR=/tmp/align-math-spike-inline-target \
+RUSTFLAGS='-Cllvm-args=-inline-threshold=10000' \
+  cargo rustc --manifest-path /tmp/align-math-spike/Cargo.toml \
+  --release --lib -- --emit=llvm-ir
+```
+
+The host was `aarch64-apple-darwin`; rustc was 1.96.1
+(`31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd`) with LLVM 22.1.8. No benchmark
+was run: both Rust-libm shapes had already failed the deterministic IR gate.
+The next admissible candidate must bring a truly vector operation graph for all
+ten kernels plus its universal error/identity proof, not another request to
+raise an inline threshold or test budget.
 
 ## 4. Implementation closure matrix
 
