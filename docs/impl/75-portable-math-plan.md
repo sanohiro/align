@@ -1,7 +1,8 @@
 # Elementary math lowering and SIMD visibility
 
-Status: design amendment in progress. PR #1141 recorded the first contract and
-PR #1142 its negative feasibility result. That contract incorrectly made an
+Status: implemented 2026-09-21. PR #1141 recorded the first contract, PR #1142
+its negative feasibility result, and PR #1152 the corrected contract. The first
+contract incorrectly made an
 Align-owned, cross-target bit-identical math implementation a prerequisite for
 adding the public functions. Align has no general Java/StrictMath-style
 cross-target bit-identity policy, and the existing scalar `pow` has no such
@@ -10,6 +11,11 @@ parts of the issue: the five-function family lands together, explicit vectors
 lower as vectors, and pre-instruction-selection LLVM scalarization is
 inspectable rather than hidden. Retaining vector LLVM IR is not misrepresented
 as proof of final machine SIMD.
+
+The implementation ships all five scalar/vector methods through the exact LLVM
+intrinsics and adds the three-state `explain-opt` record. Provider absence is a
+supported, visible outcome: the functions remain available, while retained
+provider-less vector IR warns that final instruction selection may scalarize it.
 
 This plan remains the contract for [issue 1063](https://github.com/sanohiro/align/issues/1063)
 and G6 of the [vectorization contract](68-vectorization-contract.md). It is the
@@ -353,6 +359,13 @@ is a later, independent capability because the functions remain useful and
 correct without one. Issue 1064 remains separate: typed byte views have a
 different public contract, ownership model and failure domain.
 
+The implementation is slightly above the roughly 1,000-line review threshold
+because the five-function/type/width special-value matrix and the strict
+producer-to-consumer visibility path close one failure domain. Splitting the
+intrinsic producer from its `explain-opt` consumer would leave a dormant,
+unverifiable metadata contract and duplicate whole/per-unit and malformed-input
+proof; splitting by function would duplicate the same exhaustive enum sweeps.
+
 ## 6. Superseded review findings
 
 PR #1141's review findings correctly closed gaps in its proposed
@@ -375,3 +388,13 @@ closed here before implementation:
 | The public visibility promise named only retained and scalarized operations while verbose output admitted eliminated rows | The public promise and mirrors now use the same exhaustive three-state classification, with default/verbose presence rules stated separately. |
 | Public mirrors could read as if optimized-IR inspection observed scalarization during instruction selection | Every public mirror now limits `explain-opt` to the pre-instruction-selection disposition, warns that retained provider-less IR may still scalarize, and assigns final machine SIMD to emitted-object inspection. |
 | Whole/per-unit coverage required identical optimized visibility even when their legal optimization opportunities differ | Raw lowering and runtime results retain parity; each mode instead validates visibility against its own optimized module. |
+
+## 8. Implementation review closure
+
+The implementation review found two P2 gaps in the inspection producer. Both
+are closed as one visibility-integrity class:
+
+| Finding | Closure |
+|---|---|
+| A synthetic interface function could lend its nonzero statement coordinate to the current unit's filename | Located MIR now carries a diagnostic-only, catalog-authenticated user-source fact per function. Math inventory publishes a coordinate only when that fact is present; synthetic interface bodies remain source-less even when LLVM debug coordinates exist. |
+| Captured LLVM scalarization reasons never reached `MathVisibilityRecord` | The inspection producer now correlates explicit scalarization remarks by exact authenticated file, line and column. Unrelated or differently located remarks are ignored; absence retains the stable `LLVM supplied no reason` fallback. |

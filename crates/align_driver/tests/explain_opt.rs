@@ -203,6 +203,56 @@ fn current_plan_measurement_override_banner_is_exact_and_first() {
     );
 }
 
+#[test]
+fn elementary_vector_math_reports_pre_instruction_selection_visibility() {
+    if !align_driver::backend_available() {
+        return;
+    }
+    let source = concat!(
+        "fn main(args: array<str>) -> Result<(), Error> {\n",
+        "  x := args.len() as f32\n",
+        "  v: vec4<f32> := [x, x + 1.0, x + 2.0, x + 3.0]\n",
+        "  dead := v.log()\n",
+        "  result := v.exp()\n",
+        "  same := v.exp()\n",
+        "  print(result[0] + same[0])\n",
+        "  return Ok(())\n",
+        "}\n",
+    );
+    let src = write_src("elementary-math", source);
+    let default = alignc().args(["explain-opt"]).arg(src.path()).output().expect("run alignc");
+    let verbose = alignc()
+        .args(["explain-opt"])
+        .arg(src.path())
+        .arg("--verbose")
+        .output()
+        .expect("run alignc verbose");
+    assert!(default.status.success(), "{}", String::from_utf8_lossy(&default.stderr));
+    assert!(verbose.status.success(), "{}", String::from_utf8_lossy(&verbose.stderr));
+    let default = String::from_utf8_lossy(&default.stdout);
+    let verbose = String::from_utf8_lossy(&verbose.stdout);
+    assert!(default.contains("vector math `exp`"), "{default}");
+    assert!(
+        default.contains("remains vector IR") || default.contains("was scalarized before instruction selection"),
+        "the report must state the optimized-IR disposition:\n{default}",
+    );
+    assert!(default.contains("no vector math provider is configured"), "{default}");
+    assert!(!default.contains("vector math `log` has no independent"), "{default}");
+    assert!(
+        verbose.contains("vector math `log` has no independent optimized operation; it was eliminated or merged"),
+        "{verbose}",
+    );
+    assert!(
+        verbose.lines().any(|line| line.contains(":5:") && line.contains("vector math `exp`") && !line.contains("eliminated or merged")),
+        "the lower ordinal must own the CSE survivor:\n{verbose}",
+    );
+    assert!(
+        verbose.lines().any(|line| line.contains(":6:") && line.contains("vector math `exp`") && line.contains("eliminated or merged")),
+        "the later duplicate must be classified eliminated-or-merged:\n{verbose}",
+    );
+    assert!(!default.contains("became machine SIMD"), "{default}");
+}
+
 /// A compile error → exit 1 (not a report), with a diagnostic, never a panic.
 #[test]
 fn compile_error_exits_one() {

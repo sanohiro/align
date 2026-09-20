@@ -338,6 +338,10 @@ pub struct ImportedFn {
 #[derive(Clone, Debug, Default)]
 pub struct Program {
     pub fns: Vec<Function>,
+    /// Located-inspection-only set of functions whose HIR spans belong to a walk-authenticated
+    /// user source. It is private diagnostic provenance: absent from MIR text, serialization,
+    /// hashes, codegen identity, and ordinary unlocated lowering.
+    authenticated_user_functions: std::collections::BTreeSet<ProgramCall>,
     /// Complete concrete callable graph's per-parameter ownership-state fixed point.
     pub drop_state_effects: std::collections::BTreeMap<ProgramCall, Vec<hir::DropStateEffect>>,
     /// Located-only current-plan observations. This field is deliberately absent from canonical
@@ -388,6 +392,10 @@ pub struct Program {
 }
 
 impl Program {
+    pub fn has_authenticated_user_source(&self, function: &ProgramCall) -> bool {
+        self.authenticated_user_functions.contains(function)
+    }
+
     /// Irreversibly reject publication after an enclosing source-catalog owner finds malformed
     /// provenance that the per-unit HIR catalog cannot represent itself.
     pub fn mark_current_plan_malformed(&mut self) {
@@ -966,9 +974,9 @@ pub enum Rvalue {
         a: Operand,
         b: Operand,
     },
-    /// A scalar math builtin (`core.math`): `abs` (1 operand) / `min` / `max` (2). `ty` is the
-    /// numeric operand type; float inspection returns bool or the same-width unsigned integer.
-    /// Other operations return `ty`, using its signedness/float kind for intrinsic selection.
+    /// A scalar or explicit-vector math builtin (`core.math`). `ty` is the numeric operand type;
+    /// float inspection returns bool or the same-width unsigned integer. Other operations return
+    /// `ty`, using its signedness/float kind for intrinsic selection.
     MathOp {
         fn_: align_sema::MathFn,
         ty: Ty,
@@ -3775,8 +3783,18 @@ fn lower_program_unchecked_with_plans(
             .collect::<std::collections::HashMap<_, _>>(),
     );
     let mut fns = Vec::with_capacity(program.fns.len());
+    let mut authenticated_user_functions = std::collections::BTreeSet::new();
     let mut plan_records = Vec::new();
     for f in &program.fns {
+        if let Some(resolver) = &plan_resolver {
+            match resolver.resolve(f.span) {
+                Ok(Some(_)) => {
+                    authenticated_user_functions.insert(ProgramCall::from_validated(&f.name));
+                }
+                Ok(None) => {}
+                Err(()) => plan_catalog_malformed = true,
+            }
+        }
         let (mut mf, plans, malformed) = lower_fn(
             f,
             &program.tuples,
@@ -3829,6 +3847,7 @@ fn lower_program_unchecked_with_plans(
     };
     let mut mir = Program {
         fns,
+        authenticated_user_functions,
         drop_state_effects,
         plan_records,
         plan_certification,
@@ -25071,6 +25090,44 @@ mod tests {
         (program, source_map)
     }
 
+    #[test]
+    fn located_function_source_authentication_rejects_synthetic_interface_spans() -> Result<(), LoweringRejected> {
+        let source = "fn first(v: vec4<f32>) -> f32 {\n  out := v.exp()\n  return out[0]\n}\n";
+        let mut diagnostics = Diagnostics::new();
+        let mut source_map = SourceMap::new();
+        let file = source_map.add_file("visibility.align", source);
+        let ast = parse_file(tokenize(file, source, &mut diagnostics), &mut diagnostics);
+        let hir = check_file(&ast, &mut diagnostics);
+        assert!(!diagnostics.has_errors());
+        let function = ProgramCall::from_validated("first");
+
+        let user_catalog = LocatedPlanSourceCatalog {
+            files: vec![LocatedPlanSourceOrigin::User {
+                source_name: "visibility.align".into(),
+                exact_source: source.into(),
+            }],
+        };
+        let user = lower_program_checked_with_plan_catalog(
+            &hir,
+            false,
+            &source_map,
+            &user_catalog,
+        )?;
+        assert!(user.has_authenticated_user_source(&function));
+
+        let synthetic_catalog = LocatedPlanSourceCatalog {
+            files: vec![LocatedPlanSourceOrigin::SyntheticInterface],
+        };
+        let synthetic = lower_program_checked_with_plan_catalog(
+            &hir,
+            false,
+            &source_map,
+            &synthetic_catalog,
+        )?;
+        assert!(!synthetic.has_authenticated_user_source(&function));
+        Ok(())
+    }
+
     fn one_kind(program: &Program, kind: PlanKind) -> &PlanRecord {
         let records = program
             .plan_records
@@ -27660,6 +27717,7 @@ fn main() -> i32 = 0
             signed: true,
         });
         let mut program = Program {
+            authenticated_user_functions: std::collections::BTreeSet::new(),
             sqlite_callback_effects: std::collections::BTreeMap::new(),
             drop_state_effects: std::collections::BTreeMap::new(),
             plan_records: Vec::new(),

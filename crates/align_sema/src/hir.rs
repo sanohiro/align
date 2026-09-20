@@ -50,6 +50,16 @@ pub enum MathFn {
     Round,
     /// `x.trunc()` — round toward zero (float).
     Trunc,
+    /// `x.exp()` — base-e exponential (float scalar or vector).
+    Exp,
+    /// `x.exp2()` — base-2 exponential (float scalar or vector).
+    Exp2,
+    /// `x.log()` — natural logarithm (float scalar or vector).
+    Log,
+    /// `x.log2()` — base-2 logarithm (float scalar or vector).
+    Log2,
+    /// `x.log10()` — base-10 logarithm (float scalar or vector).
+    Log10,
     /// `b.pow(e)` — `b` raised to `e` (float).
     Pow,
     /// `fma(a, b, c)` — fused multiply-add `a*b + c` with a single rounding (float scalar or
@@ -68,7 +78,8 @@ impl MathFn {
         match self {
             Self::ToBits | Self::IsFinite | Self::IsNan | Self::IsInfinite => true,
             Self::Abs | Self::Min | Self::Max | Self::Sqrt | Self::Floor | Self::Ceil
-            | Self::Round | Self::Trunc | Self::Pow | Self::Fma => false,
+            | Self::Round | Self::Trunc | Self::Exp | Self::Exp2 | Self::Log | Self::Log2
+            | Self::Log10 | Self::Pow | Self::Fma => false,
         }
     }
 
@@ -81,7 +92,36 @@ impl MathFn {
             Self::ToBits => Some(crate::Ty::Int(crate::IntTy { bits, signed: false })),
             Self::IsFinite | Self::IsNan | Self::IsInfinite => Some(crate::Ty::Bool),
             Self::Abs | Self::Min | Self::Max | Self::Sqrt | Self::Floor | Self::Ceil
-            | Self::Round | Self::Trunc | Self::Pow | Self::Fma => None,
+            | Self::Round | Self::Trunc | Self::Exp | Self::Exp2 | Self::Log | Self::Log2
+            | Self::Log10 | Self::Pow | Self::Fma => None,
+        }
+    }
+
+    pub fn is_elementary_e1(self) -> bool {
+        matches!(self, Self::Exp | Self::Exp2 | Self::Log | Self::Log2 | Self::Log10)
+    }
+
+    pub fn source_name(self) -> &'static str {
+        match self {
+            Self::Abs => "abs",
+            Self::Min => "min",
+            Self::Max => "max",
+            Self::Sqrt => "sqrt",
+            Self::Floor => "floor",
+            Self::Ceil => "ceil",
+            Self::Round => "round",
+            Self::Trunc => "trunc",
+            Self::Exp => "exp",
+            Self::Exp2 => "exp2",
+            Self::Log => "log",
+            Self::Log2 => "log2",
+            Self::Log10 => "log10",
+            Self::Pow => "pow",
+            Self::Fma => "fma",
+            Self::ToBits => "to_bits",
+            Self::IsFinite => "is_finite",
+            Self::IsNan => "is_nan",
+            Self::IsInfinite => "is_infinite",
         }
     }
 }

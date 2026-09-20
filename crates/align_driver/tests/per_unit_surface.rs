@@ -504,6 +504,50 @@ fn explain_opt_imported_generic_uses_the_source_less_default_and_verbose_grammar
     );
 }
 
+#[test]
+fn elementary_vector_math_crosses_per_unit_interfaces_with_mode_local_visibility() {
+    if !backend() {
+        return;
+    }
+    let dependency = concat!(
+        "module util.math\n",
+        "pub fn first_exp(v: vec4<f32>) -> f32 {\n",
+        "  result := v.exp()\n",
+        "  return result[0]\n",
+        "}\n",
+    );
+    let main = concat!(
+        "module main\n",
+        "import util.math\n",
+        "fn main(args: array<str>) -> Result<(), Error> {\n",
+        "  x := args.len() as f32\n",
+        "  v: vec4<f32> := [x, x + 1.0, x + 2.0, x + 3.0]\n",
+        "  print(util.math.first_exp(v))\n",
+        "  return Ok(())\n",
+        "}\n",
+    );
+    let proj = Proj::new(
+        "elementary-math-per-unit",
+        &[("util/math.align", dependency), ("main.align", main)],
+    );
+    let run = proj.run(&["run", "main.align"]);
+    assert_eq!(run.status.code(), Some(0), "{}", String::from_utf8_lossy(&run.stderr));
+
+    let explain = proj.run(&["explain-opt", "main.align"]);
+    assert!(explain.status.success(), "{}", String::from_utf8_lossy(&explain.stderr));
+    let output = String::from_utf8_lossy(&explain.stdout);
+    let dependency_section = output
+        .split("==== unit: main (main.align) ====")
+        .next()
+        .expect("dependency section");
+    assert!(
+        dependency_section.contains("vector math `exp`")
+            && (dependency_section.contains("remains vector IR")
+                || dependency_section.contains("was scalarized before instruction selection")),
+        "the dependency mode must validate visibility against its own optimized module:\n{output}",
+    );
+}
+
 // ---- 6. size multi-file --------------------------------------------------------------------------
 
 #[test]

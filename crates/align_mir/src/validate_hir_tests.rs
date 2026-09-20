@@ -8528,6 +8528,56 @@ fn hir_body_validator_expression_inventory() {
             ),
         ),
         body_unit_case(
+            "math_exp_case",
+            body_test_expr(
+                hir::ExprKind::MathOp {
+                    fn_: hir::MathFn::Exp,
+                    operands: vec![body_test_expr(hir::ExprKind::Float(1.0), float)],
+                },
+                float,
+            ),
+        ),
+        body_unit_case(
+            "math_exp2_case",
+            body_test_expr(
+                hir::ExprKind::MathOp {
+                    fn_: hir::MathFn::Exp2,
+                    operands: vec![body_test_expr(hir::ExprKind::Float(1.0), float)],
+                },
+                float,
+            ),
+        ),
+        body_unit_case(
+            "math_log_case",
+            body_test_expr(
+                hir::ExprKind::MathOp {
+                    fn_: hir::MathFn::Log,
+                    operands: vec![body_test_expr(hir::ExprKind::Float(1.0), float)],
+                },
+                float,
+            ),
+        ),
+        body_unit_case(
+            "math_log2_case",
+            body_test_expr(
+                hir::ExprKind::MathOp {
+                    fn_: hir::MathFn::Log2,
+                    operands: vec![body_test_expr(hir::ExprKind::Float(1.0), float)],
+                },
+                float,
+            ),
+        ),
+        body_unit_case(
+            "math_log10_case",
+            body_test_expr(
+                hir::ExprKind::MathOp {
+                    fn_: hir::MathFn::Log10,
+                    operands: vec![body_test_expr(hir::ExprKind::Float(1.0), float)],
+                },
+                float,
+            ),
+        ),
+        body_unit_case(
             "math_pow_case",
             body_test_expr(
                 hir::ExprKind::MathOp {
@@ -9319,6 +9369,60 @@ fn hir_body_validator_expression_inventory() {
     };
     expression.ty = Ty::Int(IntTy { bits: 32, signed: true });
     assert!(!body_core_metadata_is_valid(&malformed));
+}
+
+#[test]
+fn hir_body_validator_rejects_malformed_elementary_math_rows() {
+    let operations = [
+        hir::MathFn::Exp,
+        hir::MathFn::Exp2,
+        hir::MathFn::Log,
+        hir::MathFn::Log2,
+        hir::MathFn::Log10,
+    ];
+    for operation in operations {
+        let mut wrong_arity = baseline_program();
+        wrong_arity.fns.push(body_unit_case(
+            &format!("math_{}_wrong_arity", operation.source_name()),
+            body_test_expr(
+                hir::ExprKind::MathOp {
+                    fn_: operation,
+                    operands: Vec::new(),
+                },
+                Ty::Float(FloatTy { bits: 64 }),
+            ),
+        ));
+        assert!(!body_core_metadata_is_valid(&wrong_arity));
+
+        let mut wrong_type = baseline_program();
+        wrong_type.fns.push(body_unit_case(
+            &format!("math_{}_wrong_type", operation.source_name()),
+            body_test_expr(
+                hir::ExprKind::MathOp {
+                    fn_: operation,
+                    operands: vec![body_test_expr(hir::ExprKind::Int(1), int(64))],
+                },
+                int(64),
+            ),
+        ));
+        assert!(!body_core_metadata_is_valid(&wrong_type));
+
+        let mut wrong_result = baseline_program();
+        wrong_result.fns.push(body_unit_case(
+            &format!("math_{}_wrong_result", operation.source_name()),
+            body_test_expr(
+                hir::ExprKind::MathOp {
+                    fn_: operation,
+                    operands: vec![body_test_expr(
+                        hir::ExprKind::Float(1.0),
+                        Ty::Float(FloatTy { bits: 64 }),
+                    )],
+                },
+                Ty::Bool,
+            ),
+        ));
+        assert!(!body_core_metadata_is_valid(&wrong_result));
+    }
 }
 
 #[test]

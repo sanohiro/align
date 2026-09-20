@@ -5,7 +5,8 @@
 //! integration tests call this.
 pub use align_codegen_llvm::{
     BuildTarget, DebugInfo, ObjectFormat, PartitionCodegenView, PartitionSharedCodegenView,
-    Profile, SupportThunkOwner, SupportThunkRecord, TestRoot, ThinFunctionLinkage,
+    MathProvider, MathVisibilityRecord, MathVisibilityState, OptInspection, Profile,
+    SupportThunkOwner, SupportThunkRecord, TestRoot, ThinFunctionLinkage,
     ThinPeerDeclaration, target_object_format,
 };
 use align_diag::{Diagnostics, Severity};
@@ -5357,6 +5358,17 @@ pub fn collect_opt_remarks(
     roots: &[String],
 ) -> Result<Vec<String>, String> {
     align_codegen_llvm::collect_opt_remarks(mir, &target, profile, debug, roots)
+        .map_err(|e| e.to_string())
+}
+
+pub fn collect_opt_inspection(
+    mir: &align_mir::Program,
+    target: BuildTarget,
+    profile: Profile,
+    debug: &DebugInfo,
+    roots: &[String],
+) -> Result<OptInspection, String> {
+    align_codegen_llvm::collect_opt_inspection(mir, &target, profile, debug, roots)
         .map_err(|e| e.to_string())
 }
 

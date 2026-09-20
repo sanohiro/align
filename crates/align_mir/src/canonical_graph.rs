@@ -3116,6 +3116,7 @@ mod tests {
 
     fn mir_program(program: &hir::Program) -> Program {
         Program {
+            authenticated_user_functions: std::collections::BTreeSet::new(),
             sqlite_callback_effects: std::collections::BTreeMap::new(),
             fns: Vec::new(),
             drop_state_effects: std::collections::BTreeMap::new(),
@@ -4233,6 +4234,7 @@ mod tests {
         let mut tuples = hir.tuples.clone();
         tuples[0].elems = vec![Scalar::Fn(2)];
         let mut program = Program {
+            authenticated_user_functions: std::collections::BTreeSet::new(),
             sqlite_callback_effects: std::collections::BTreeMap::new(),
             fns: Vec::new(),
             drop_state_effects: std::collections::BTreeMap::new(),

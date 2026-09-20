@@ -897,7 +897,7 @@ The roadmap pairs these two as "#6", but they split cleanly by their prerequisit
     `examples/hash.align`. Record on build: `draft.md` §18.1, `docs/language-spec.md`,
     `docs/design-notes.md`, `examples/hash.align`, `tests/hash.rs`.
 
-### Elementary float functions — design SETTLED (2026-09-21; implementation pending)
+### Elementary float functions — DONE (2026-09-21)
 
 **Decision:** add `exp`, `exp2`, `log`, `log2`, and `log10` together as
 zero-argument methods on `f32`, `f64`, and the corresponding

@@ -78,20 +78,19 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    shipped in #1135/#1136, #1065 fixed arrays in structs shipped in
    #1137/#1138, and #1066 proposal 2 shipped in #1139/#1140. #1075 scalar ABI
    facts and #1082 Part 2 also shipped in #1143 and #1144/#1145.
-   #1063 is the current design/implementation candidate. Plan 75's original
-   portable-kernel contract merged in PR #1141 and its
-   negative feasibility evidence in PR #1142. The contract is now being
-   amended: Align does not promise Java/StrictMath-style scalar/vector or
-   cross-target bit identity and will not build `portable_math.bc`. The five E1
-   functions stay one capability and lower directly to LLVM scalar/vector
-   intrinsics. Explicit vectors are lane-wise but may be scalarized when the
-   target has no vector math provider; optimized IR and `explain-opt` must
-   account for eliminated or merged, retained-vector, and scalarized outcomes
-   before instruction selection, and retained provider-less rows warn that
-   final lowering may still scalarize. Final machine SIMD requires object
-   inspection. A target-specific
-   provider is a later independent capability. #1064 follows as a separate
-   failure domain and does not share its PR.
+   #1063 is implemented under plan 75. Its original portable-kernel contract
+   merged in PR #1141, its negative feasibility evidence in PR #1142, and the
+   corrected contract in PR #1152. Align does not promise Java/StrictMath-style
+   scalar/vector or cross-target bit identity and does not build
+   `portable_math.bc`. The five E1 functions lower directly to LLVM
+   scalar/vector intrinsics. Explicit vectors are lane-wise but may be
+   scalarized when the target has no vector math provider; optimized IR and
+   `explain-opt` account for eliminated or merged, retained-vector, and
+   scalarized outcomes before instruction selection. Retained provider-less
+   rows warn that final lowering may still scalarize. Final machine SIMD
+   requires object inspection. A target-specific provider is a later
+   independent capability. #1064 follows as a separate failure domain and does
+   not share its PR.
    #1075 merged in PR #1143. [Plan 76](docs/impl/76-scalar-abi-facts-plan.md)
    supplies the complete call-boundary `zeroext`/`signext` rule and excludes
    stored aggregate facts and the unsound proposed `char` range. Focused owners

@@ -704,7 +704,7 @@ Japanese toolchain guides must both say that `explain-opt` reports compiler
 storage/execution choices as well as LLVM optimization remarks; examples need
 not enumerate this internal schema.
 
-## Elementary vector-math visibility (plan 75; implementation pending)
+## Elementary vector-math visibility (plan 75; implemented)
 
 `exp`, `exp2`, `log`, `log2`, and `log10` preserve a vector operation in raw
 LLVM IR, but that fact alone does not prove machine SIMD. For each reached
