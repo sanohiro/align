@@ -2669,8 +2669,8 @@ module triple, the link flag and the cache key all derive from that one string,
 so the OS patch level is not a build input and the deployment target is.
 `docs/impl/65-open-issue-batch-plan.md` owns the exact rule.
 
-Apple SDK provenance is also explicit but is not a deployment constraint. The
-planned `--sdk-version major[.minor[.patch]]` (#1093) records the selected value in
+Apple SDK provenance is also explicit but is not a deployment constraint.
+`--sdk-version major[.minor[.patch]]` records the selected value in
 `LC_BUILD_VERSION` and in every object-producing cache identity. Omission keeps
 the field unspecified; there is no `SDKROOT`, `xcrun`, SDK-path, or other
 ambient fallback, and the option does not select a sysroot or affect linking.

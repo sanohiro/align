@@ -43,6 +43,7 @@ fn base_key() -> CodegenKey {
         dep_interface_hashes: vec![("dep".to_string(), hh(3))],
         exports: vec![],
         target_triple: "x86_64-unknown-linux-gnu".to_string(),
+        sdk_version: None,
         object_format: 0,
         resolved_cpu: "x86-64".to_string(),
         resolved_features: String::new(),

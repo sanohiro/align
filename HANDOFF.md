@@ -117,7 +117,10 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    production-parity comparison: integration tests linked the feature-built
    `deps/libalign_runtime.a` while `alignc` linked the production archive beside
    it. Test-side driver links now select the production archive, and the known
-   failure manifest is empty. #1093 is untouched and still open.
+   failure manifest is empty. #1093 adds explicit `--sdk-version` provenance:
+   the selected canonical value stamps every LLVM/Mach-O object path and every
+   object-producing cache identity, while omission remains `sdk n/a`; it does
+   no SDK discovery and adds no benchmark or broad-suite requirement.
 Recorded follow-up from PR #1116's review (plan 69 §3.7): the static
 initializer scan in `align_mir::loop_facts::admit` can be replaced by an
 initialization proof, admitting parameters and multiple initializers on their

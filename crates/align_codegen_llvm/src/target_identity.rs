@@ -323,12 +323,118 @@ fn host_product_version() -> Result<Option<String>, CodegenError> {
 
 /// The `--deployment-target` value, installed once before any triple is resolved.
 static EXPLICIT_DEPLOYMENT_TARGET: OnceLock<Option<String>> = OnceLock::new();
+/// Explicit SDK provenance for Apple objects. Absence is intentionally not replaced by an ambient
+/// toolchain query: no flag means no SDK module flag and preserves the previous `sdk n/a` object.
+static EXPLICIT_SDK_VERSION: OnceLock<SdkVersion> = OnceLock::new();
 /// The resolved triple, computed once. Both [`crate::resolve_target_identity`] and
 /// [`crate::create_target_machine`] read it, so they are byte-identical by construction rather than
 /// by two matching code paths.
 static RESOLVED_TRIPLE: OnceLock<Result<String, String>> = OnceLock::new();
 /// The resolved Apple deployment target (`None` on a non-Apple host), computed with the triple.
 static RESOLVED_DEPLOYMENT: OnceLock<Option<(ApplePlatform, String)>> = OnceLock::new();
+
+/// The three fields Mach-O packs into `LC_BUILD_VERSION.sdk`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SdkVersion {
+    major: u16,
+    minor: u8,
+    patch: u8,
+}
+
+impl SdkVersion {
+    /// Canonical cache spelling. Missing input components and leading zeroes cannot create distinct
+    /// identities for the same packed Mach-O value.
+    pub fn canonical(self) -> String {
+        format!("{}.{}.{}", self.major, self.minor, self.patch)
+    }
+
+    pub(crate) fn components(self) -> (u16, u8, u8) {
+        (self.major, self.minor, self.patch)
+    }
+}
+
+/// Parse the explicit SDK provenance grammar and the exact Mach-O packed-version bounds.
+pub fn parse_sdk_version(value: &str) -> Result<SdkVersion, CodegenError> {
+    let reject = |why: &str| {
+        Err(CodegenError::Target(format!(
+            "--sdk-version value {value:?} is not a valid SDK version: {why} (expected `major`, \
+             `major.minor`, or `major.minor.patch`)"
+        )))
+    };
+    if value.is_empty() {
+        return reject("it is empty");
+    }
+    if value.as_bytes().contains(&0) {
+        return reject("it contains NUL");
+    }
+    if value.len() > 64 {
+        return reject("it is longer than 64 bytes");
+    }
+    let parts: Vec<&str> = value.split('.').collect();
+    if parts.len() > 3 {
+        return reject("it has more than three components");
+    }
+    let mut numbers = [0u32; 3];
+    for (index, part) in parts.iter().enumerate() {
+        if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            return reject("every component must be one or more decimal digits");
+        }
+        numbers[index] = match part.parse::<u32>() {
+            Ok(number) => number,
+            Err(_) => return reject("a component does not fit in 32 bits"),
+        };
+    }
+    if numbers[0] == 0 || numbers[0] > u16::MAX.into() {
+        return reject("major must be in 1..=65535");
+    }
+    if numbers[1] > u8::MAX.into() {
+        return reject("minor must be in 0..=255");
+    }
+    if numbers[2] > u8::MAX.into() {
+        return reject("patch must be in 0..=255");
+    }
+    Ok(SdkVersion {
+        major: numbers[0] as u16,
+        minor: numbers[1] as u8,
+        patch: numbers[2] as u8,
+    })
+}
+
+/// Install explicit SDK provenance before target resolution or module construction.
+pub fn set_sdk_version(version: &str) -> Result<(), CodegenError> {
+    let canonical = parse_sdk_version(version)?;
+    let host = raw_default_triple();
+    if apple_platform(&host).is_none() {
+        return Err(CodegenError::Target(format!(
+            "--sdk-version does not apply to target '{host}': SDK provenance is recorded only in \
+             Apple objects"
+        )));
+    }
+    if RESOLVED_TRIPLE.get().is_some() {
+        return Err(CodegenError::Target(
+            "--sdk-version must be set before the target identity is resolved".to_string(),
+        ));
+    }
+    match EXPLICIT_SDK_VERSION.set(canonical) {
+        Ok(()) => Ok(()),
+        Err(_) if EXPLICIT_SDK_VERSION.get() == Some(&canonical) => Ok(()),
+        Err(_) => Err(CodegenError::Target(format!(
+            "--sdk-version was already resolved as {} in this process",
+            EXPLICIT_SDK_VERSION
+                .get()
+                .copied()
+                .expect("failed OnceLock set implies an installed SDK version")
+                .canonical()
+        ))),
+    }
+}
+
+/// Resolve optional SDK provenance together with the target identity. Calling this freezes the
+/// target first, so a direct caller cannot install a late value after observing absence.
+pub fn resolved_sdk_version() -> Result<Option<SdkVersion>, CodegenError> {
+    resolved_triple()?;
+    Ok(EXPLICIT_SDK_VERSION.get().copied())
+}
 
 /// Install the explicit `--deployment-target` value. The CLI calls this once, before any codegen,
 /// cache key, or link.
@@ -453,6 +559,30 @@ mod tests {
             panic!("an iOS triple must resolve to the iOS platform");
         };
         platform
+    }
+
+    #[test]
+    fn sdk_versions_canonicalize_to_the_exact_macho_fields() {
+        for (input, expected) in [
+            ("1", SdkVersion { major: 1, minor: 0, patch: 0 }),
+            ("027.0", SdkVersion { major: 27, minor: 0, patch: 0 }),
+            ("65535.255.255", SdkVersion { major: 65535, minor: 255, patch: 255 }),
+        ] {
+            let parsed = parse_sdk_version(input).expect(input);
+            assert_eq!(parsed, expected);
+            assert_eq!(parse_sdk_version(&parsed.canonical()).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn sdk_versions_reject_shape_length_and_packed_field_overflow() {
+        for bad in [
+            "", "0", "-1", "1.", ".1", "1.2.3.4", "1.x", "65536", "1.256", "1.2.256",
+            "1\0.0", "00000000000000000000000000000000000000000000000000000000000000001",
+        ] {
+            let error = parse_sdk_version(bad).unwrap_err().to_string();
+            assert!(error.contains("--sdk-version"), "{bad:?}: {error}");
+        }
     }
 
     /// Every Apple spelling normalizes to its canonical OS plus an explicit version, the

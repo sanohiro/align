@@ -119,6 +119,12 @@ fn main() -> ExitCode {
         eprintln!("alignc: {error}");
         return ExitCode::FAILURE;
     }
+    // Preserve the same missing-value guarantee for explicit SDK provenance before any other
+    // stripper can remove the option that followed it.
+    if let Err(error) = parse_sdk_version(compiler_args) {
+        eprintln!("alignc: {error}");
+        return ExitCode::FAILURE;
+    }
     // Validate PGO on the original prefix without stripping a token that could be a missing
     // --cc value. The compiler never parses flags in the program suffix.
     if let Err(error) = parse_pgo(compiler_args) {
@@ -158,6 +164,13 @@ fn main() -> ExitCode {
     // Pull `--deployment-target <version>` next. It is installed below, before any triple is
     // resolved, so the machine, every module triple, the cache key and the link all derive from it.
     let (deployment_target, args) = match parse_deployment_target(&args) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("alignc: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (sdk_version, args) = match parse_sdk_version(&args) {
         Ok(parsed) => parsed,
         Err(error) => {
             eprintln!("alignc: {error}");
@@ -385,6 +398,12 @@ fn main() -> ExitCode {
     // host, is a clean argument error here rather than a surprise inside codegen.
     if let Some(version) = deployment_target.as_deref()
         && let Err(error) = align_codegen_llvm::target_identity::set_deployment_target(version)
+    {
+        eprintln!("alignc: {}", target_message(&error));
+        return ExitCode::FAILURE;
+    }
+    if let Some(version) = sdk_version.as_deref()
+        && let Err(error) = align_codegen_llvm::target_identity::set_sdk_version(version)
     {
         eprintln!("alignc: {}", target_message(&error));
         return ExitCode::FAILURE;
@@ -678,6 +697,31 @@ mod test_limit_tests {
         let (absent, rest) = parse_deployment_target(&strings(&["alignc", "build", "x.align"]))
             .expect("no flag is not an error");
         assert_eq!(absent, None);
+        assert_eq!(rest, strings(&["alignc", "build", "x.align"]));
+    }
+
+    #[test]
+    fn sdk_version_rejects_missing_values_before_flag_stripping() {
+        for args in [
+            vec!["alignc", "build", "x.align", "--sdk-version"],
+            vec!["alignc", "--sdk-version="],
+            vec!["alignc", "--sdk-version", ""],
+            vec!["alignc", "--sdk-version=27\0.0"],
+            vec!["alignc", "--sdk-version", "--target-cpu", "baseline", "27.0"],
+            vec!["alignc", "--sdk-version=-27.0"],
+        ] {
+            assert!(parse_sdk_version(&strings(&args)).is_err(), "{args:?}");
+        }
+        let (version, rest) = parse_sdk_version(&strings(&[
+            "alignc",
+            "build",
+            "x.align",
+            "--sdk-version=26.0",
+            "--sdk-version",
+            "27.0.1",
+        ]))
+        .expect("well-formed explicit SDK version");
+        assert_eq!(version.as_deref(), Some("27.0.1"));
         assert_eq!(rest, strings(&["alignc", "build", "x.align"]));
     }
 
@@ -1028,6 +1072,43 @@ fn parse_deployment_target(args: &[String]) -> Result<(Option<String>, Vec<Strin
                 );
             }
             version = Some(v);
+        }
+        i += 1;
+    }
+    Ok((version, rest))
+}
+
+/// Pull explicit Apple SDK provenance out of the compiler-option prefix. Semantic component/range
+/// validation is owned by `target_identity`; this lexical pass prevents a missing value from
+/// consuming another option after later strippers run.
+fn parse_sdk_version(args: &[String]) -> Result<(Option<String>, Vec<String>), String> {
+    let mut version: Option<String> = None;
+    let mut rest = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let argument = &args[i];
+        let value = if let Some(value) = argument.strip_prefix("--sdk-version=") {
+            Some(value.to_string())
+        } else if argument == "--sdk-version" {
+            let value = args
+                .get(i + 1)
+                .filter(|value| !value.starts_with('-'))
+                .cloned()
+                .ok_or_else(|| "--sdk-version requires a version".to_owned())?;
+            i += 1;
+            Some(value)
+        } else {
+            rest.push(argument.clone());
+            None
+        };
+        if let Some(value) = value {
+            if value.is_empty() || value.as_bytes().contains(&0) || value.starts_with('-') {
+                return Err(
+                    "--sdk-version requires a nonempty version without NUL, not an option"
+                        .to_owned(),
+                );
+            }
+            version = Some(value);
         }
         i += 1;
     }
@@ -1671,6 +1752,8 @@ fn usage() {
          --deployment-target VERSION (Apple targets only) the macOS/iOS/… deployment target every\n  \
                        object, module triple, cache key and link is stamped with; defaults to\n  \
                        $<PLATFORM>_DEPLOYMENT_TARGET, then the host product version\n  \
+         --sdk-version VERSION (Apple targets only) explicit SDK provenance recorded in objects;\n  \
+                       does not select an SDK/sysroot and has no ambient fallback\n  \
          --profile     dev (O0; test default), release (O2; other default), fast (O3), small (Os), tiny (Oz)\n  \
          --cc PATH     (build/run/size/test) one absolute executable C-driver path; no PATH fallback\n  \
          --export      (emit-obj/emit-llvm/explain-opt only; repeatable) keep an entry-file top-level\n  \

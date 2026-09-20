@@ -64,7 +64,9 @@ pub const CACHE_SCHEMA_VERSION: u32 = 1;
 ///
 /// **Bumped to 5 at build-performance item 6**: ThinLTO prelink/backend keys identify the
 /// destination partition, and backend import edges/digests identify the exact source partition.
-pub const CACHE_KEY_FORMAT_VERSION: u32 = 5;
+/// **Bumped to 6 for explicit Apple SDK provenance**: every object-producing key carries the
+/// canonical optional SDK version immediately after the target triple.
+pub const CACHE_KEY_FORMAT_VERSION: u32 = 6;
 
 /// The manifest wire-format version. Bump on ANY change to the encoded byte layout; an old manifest
 /// then fails closed on decode (treated as a miss, its bytes unreferenced). **Bumped to 2 at ThinLTO
@@ -72,7 +74,7 @@ pub const CACHE_KEY_FORMAT_VERSION: u32 = 5;
 /// separate `prelink`/`thinbackend` phase keys instead), and the two ThinLTO manifests were added.
 /// **Bumped to 3 at instrument-PGO S2**: the codegen-key manifest body gains the [`PgoKey`] `pgo_mode`
 /// field (a tag byte + an optional `Hash128` profdata digest), so the wire layout changed.
-const MANIFEST_FORMAT_VERSION: u32 = 5;
+const MANIFEST_FORMAT_VERSION: u32 = 6;
 
 /// The stderr note emitted (always on, per doc-10 §6.4 fail-closed matrix) when a cache blob fails its
 /// digest check and is discarded before a rebuild.
@@ -151,6 +153,8 @@ pub struct CodegenKey {
     /// compilation input — no longer invalidates the cache, while a deployment-target change does
     /// (`docs/impl/65-open-issue-batch-plan.md`, "Target identity and inspection roots").
     pub target_triple: String,
+    /// Explicit Apple SDK provenance; `None` preserves unstamped object metadata.
+    pub sdk_version: Option<String>,
     /// #6 (cont.) object format (`0` = ELF, `1` = Mach-O).
     pub object_format: u8,
     /// #7 resolved cpu (never the literal `"native"`).
@@ -298,7 +302,10 @@ fn first_diff(stored: &CodegenKey, current: &CodegenKey) -> FirstDiff {
     if stored.llvm_version != current.llvm_version || stored.llvm_build_id != current.llvm_build_id {
         return FirstDiff::LlvmVersion;
     }
-    if stored.target_triple != current.target_triple || stored.object_format != current.object_format {
+    if stored.target_triple != current.target_triple
+        || stored.sdk_version != current.sdk_version
+        || stored.object_format != current.object_format
+    {
         return FirstDiff::Target;
     }
     if stored.resolved_cpu != current.resolved_cpu || stored.resolved_features != current.resolved_features {
@@ -1207,6 +1214,15 @@ impl Writer {
             None => self.u8(0),
         }
     }
+    fn opt_str(&mut self, value: Option<&str>) {
+        match value {
+            Some(value) => {
+                self.u8(1);
+                self.str(value);
+            }
+            None => self.u8(0),
+        }
+    }
     /// The [`PgoKey`] component: a tag byte (`0` Off, `1` Instrument, `2` Use) plus, for `Use`, the
     /// profdata content digest. Distinct tags make `Off`/`Instrument`/`Use` digests structurally
     /// disjoint; the `Use` digest folds the profile bytes into the key.
@@ -1252,6 +1268,7 @@ fn write_full_key(w: &mut Writer, k: &CodegenKey) {
         w.str(e);
     }
     w.str(&k.target_triple);
+    w.opt_str(k.sdk_version.as_deref());
     w.u8(k.object_format);
     w.str(&k.resolved_cpu);
     w.str(&k.resolved_features);
@@ -1332,6 +1349,13 @@ impl<'a> Reader<'a> {
             tag => Err(CacheDecodeError::BadTag { what: "option", tag }),
         }
     }
+    fn opt_str(&mut self) -> Result<Option<String>, CacheDecodeError> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.str()?)),
+            tag => Err(CacheDecodeError::BadTag { what: "option", tag }),
+        }
+    }
     /// The [`PgoKey`] component (mirror of [`Writer::pgo`]). Fail-closed on an unknown tag.
     fn pgo(&mut self) -> Result<PgoKey, CacheDecodeError> {
         match self.u8()? {
@@ -1386,6 +1410,7 @@ fn deserialize_manifest(bytes: &[u8]) -> Result<(CodegenKey, Hash128), CacheDeco
     let dep_interface_hashes = r.seq(|r| Ok((r.str()?, r.h128()?)))?;
     let exports = r.seq(|r| r.str())?;
     let target_triple = r.str()?;
+    let sdk_version = r.opt_str()?;
     let object_format = r.u8()?;
     let resolved_cpu = r.str()?;
     let resolved_features = r.str()?;
@@ -1412,6 +1437,7 @@ fn deserialize_manifest(bytes: &[u8]) -> Result<(CodegenKey, Hash128), CacheDeco
             dep_interface_hashes,
             exports,
             target_triple,
+            sdk_version,
             object_format,
             resolved_cpu,
             resolved_features,
@@ -1490,6 +1516,7 @@ pub struct PrelinkKey {
     /// Kept (soundness): the triple fixes the module datalayout embedded in the bitcode, so an
     /// x86-64 prelink `.bc` must never be shared with an aarch64 build under the same other inputs.
     pub target_triple: String,
+    pub sdk_version: Option<String>,
     pub object_format: u8,
     pub profile_name: String,
     pub pipeline: String,
@@ -1529,7 +1556,10 @@ fn prelink_first_diff(stored: &PrelinkKey, current: &PrelinkKey) -> FirstDiff {
     if stored.llvm_version != current.llvm_version || stored.llvm_build_id != current.llvm_build_id {
         return FirstDiff::LlvmVersion;
     }
-    if stored.target_triple != current.target_triple || stored.object_format != current.object_format {
+    if stored.target_triple != current.target_triple
+        || stored.sdk_version != current.sdk_version
+        || stored.object_format != current.object_format
+    {
         return FirstDiff::Target;
     }
     if stored.impl_hash != current.impl_hash {
@@ -1581,6 +1611,7 @@ pub struct BackendKey {
     pub llvm_version: String,
     pub llvm_build_id: Hash128,
     pub target_triple: String,
+    pub sdk_version: Option<String>,
     pub object_format: u8,
     pub resolved_cpu: String,
     pub resolved_features: String,
@@ -1627,7 +1658,10 @@ fn backend_first_diff(stored: &BackendKey, current: &BackendKey) -> FirstDiff {
     {
         return FirstDiff::LlvmVersion;
     }
-    if stored.target_triple != current.target_triple || stored.object_format != current.object_format {
+    if stored.target_triple != current.target_triple
+        || stored.sdk_version != current.sdk_version
+        || stored.object_format != current.object_format
+    {
         return FirstDiff::Target;
     }
     if stored.resolved_cpu != current.resolved_cpu || stored.resolved_features != current.resolved_features {
@@ -1901,6 +1935,7 @@ fn write_prelink_key(w: &mut Writer, k: &PrelinkKey) {
     w.digest_seq(&k.dep_interface_hashes);
     w.str_seq(&k.exports);
     w.str(&k.target_triple);
+    w.opt_str(k.sdk_version.as_deref());
     w.u8(k.object_format);
     w.str(&k.profile_name);
     w.str(&k.pipeline);
@@ -1919,6 +1954,7 @@ fn write_backend_key(w: &mut Writer, k: &BackendKey) {
     w.str(&k.llvm_version);
     w.h128(k.llvm_build_id);
     w.str(&k.target_triple);
+    w.opt_str(k.sdk_version.as_deref());
     w.u8(k.object_format);
     w.str(&k.resolved_cpu);
     w.str(&k.resolved_features);
@@ -2024,6 +2060,7 @@ fn deserialize_prelink_manifest(bytes: &[u8]) -> Result<(PrelinkKey, Hash128), C
         dep_interface_hashes: r.digest_seq()?,
         exports: r.str_seq()?,
         target_triple: r.str()?,
+        sdk_version: r.opt_str()?,
         object_format: r.u8()?,
         profile_name: r.str()?,
         pipeline: r.str()?,
@@ -2052,6 +2089,7 @@ fn deserialize_backend_manifest(bytes: &[u8]) -> Result<(BackendKey, Hash128), C
         llvm_version: r.str()?,
         llvm_build_id: r.h128()?,
         target_triple: r.str()?,
+        sdk_version: r.opt_str()?,
         object_format: r.u8()?,
         resolved_cpu: r.str()?,
         resolved_features: r.str()?,
@@ -2087,6 +2125,7 @@ mod tests {
             dep_interface_hashes: vec![("dep".to_string(), Hash128 { lo: 5, hi: 6 })],
             exports: vec!["a".to_string(), "b".to_string()],
             target_triple: "x86_64-unknown-linux-gnu".to_string(),
+            sdk_version: None,
             object_format: 0,
             resolved_cpu: "x86-64-v2".to_string(),
             resolved_features: String::new(),
@@ -2114,9 +2153,9 @@ mod tests {
             .collect()
     }
 
-    const CODEGEN_V5_GOLDEN: &str = concat!(
-        "05000000",                         // manifest v5
-        "05000000",                         // key v5
+    const CODEGEN_V6_GOLDEN: &str = concat!(
+        "06000000",                         // manifest v6
+        "06000000",                         // key v6
         "01000000000000000200000000000000", // compiler build
         "01000000",
         "00",                               // frontend schema, located
@@ -2128,7 +2167,8 @@ mod tests {
         "0100000061",
         "0100000062", // exports
         "180000007838365f36342d756e6b6e6f776e2d6c696e75782d676e75",
-        "00", // target
+        "00",
+        "00", // target, no SDK, ELF
         "090000007838362d36342d7632",
         "00000000", // cpu, features
         "0700000072656c65617365",
@@ -2146,8 +2186,8 @@ mod tests {
     );
 
     #[test]
-    fn codegen_v5_manifest_golden_is_bidirectional() {
-        let expected = golden_bytes(CODEGEN_V5_GOLDEN);
+    fn codegen_v6_manifest_golden_is_bidirectional() {
+        let expected = golden_bytes(CODEGEN_V6_GOLDEN);
         let key = sample_key();
         let blob = Hash128 { lo: 9, hi: 10 };
         assert_eq!(serialize_manifest(&key, blob), expected);
@@ -2214,6 +2254,10 @@ mod tests {
         let mut k = base.clone();
         k.target_triple = "aarch64-unknown-linux-gnu".to_string();
         assert_eq!(first_diff(&base, &k), FirstDiff::Target);
+        let mut k = base.clone();
+        k.sdk_version = Some("27.0.0".to_string());
+        assert_eq!(first_diff(&base, &k), FirstDiff::Target);
+        assert_ne!(base.full_digest(), k.full_digest());
         let mut k = base.clone();
         k.resolved_cpu = "native-cpu".to_string();
         assert_eq!(first_diff(&base, &k), FirstDiff::Cpu);
@@ -2804,6 +2848,7 @@ mod tests {
             dep_interface_hashes: vec![("dep".to_string(), Hash128 { lo: 6, hi: 7 })],
             exports: vec!["a".to_string()],
             target_triple: "x86_64-unknown-linux-gnu".to_string(),
+            sdk_version: None,
             object_format: 0,
             profile_name: "release".to_string(),
             pipeline: "default<O2>".to_string(),
@@ -2823,6 +2868,7 @@ mod tests {
             llvm_version: "22.1.8".to_string(),
             llvm_build_id: Hash128 { lo: 12, hi: 13 },
             target_triple: "x86_64-unknown-linux-gnu".to_string(),
+            sdk_version: None,
             object_format: 0,
             resolved_cpu: "x86-64-v2".to_string(),
             resolved_features: String::new(),
@@ -2854,10 +2900,10 @@ mod tests {
         }
     }
 
-    const PRELINK_V5_GOLDEN: &str = concat!(
-        "05000000",
+    const PRELINK_V6_GOLDEN: &str = concat!(
+        "06000000",
         "01",
-        "05000000", // manifest, phase, key
+        "06000000", // manifest, phase, key
         "01000000000000000200000000000000",
         "03000000",
         "00",                               // compiler, frontend, located
@@ -2868,7 +2914,8 @@ mod tests {
         "01000000",
         "0100000061", // exports
         "180000007838365f36342d756e6b6e6f776e2d6c696e75782d676e75",
-        "00", // target
+        "00",
+        "00", // target, no SDK, ELF
         "0700000072656c65617365",
         "0b00000064656661756c743c4f323e", // profile, pipeline
         "0600000032322e312e38",
@@ -2881,15 +2928,16 @@ mod tests {
         "63000000000000006400000000000000", // blob
     );
 
-    const BACKEND_V5_GOLDEN: &str = concat!(
-        "05000000",
+    const BACKEND_V6_GOLDEN: &str = concat!(
+        "06000000",
         "02",
-        "05000000",                         // manifest, phase, key
+        "06000000",                         // manifest, phase, key
         "01000000000000000200000000000000", // compiler
         "0600000032322e312e38",
         "0c000000000000000d00000000000000", // LLVM
         "180000007838365f36342d756e6b6e6f776e2d6c696e75782d676e75",
-        "00", // target
+        "00",
+        "00", // target, no SDK, ELF
         "090000007838362d36342d7632",
         "00000000", // cpu, features
         "03000000504943",
@@ -2920,8 +2968,8 @@ mod tests {
     );
 
     #[test]
-    fn thin_codegen_v5_manifest_goldens_are_bidirectional() {
-        let prelink = golden_bytes(PRELINK_V5_GOLDEN);
+    fn thin_codegen_v6_manifest_goldens_are_bidirectional() {
+        let prelink = golden_bytes(PRELINK_V6_GOLDEN);
         let prelink_key = sample_prelink_key();
         let prelink_blob = Hash128 { lo: 99, hi: 100 };
         assert_eq!(
@@ -2933,7 +2981,7 @@ mod tests {
             Ok((prelink_key, prelink_blob))
         );
 
-        let backend = golden_bytes(BACKEND_V5_GOLDEN);
+        let backend = golden_bytes(BACKEND_V6_GOLDEN);
         let backend_key = sample_backend_key();
         let backend_blob = Hash128 { lo: 5, hi: 6 };
         assert_eq!(
@@ -3017,6 +3065,10 @@ mod tests {
         let mut k = base.clone();
         k.target_triple = "aarch64-unknown-linux-gnu".to_string();
         assert_eq!(prelink_first_diff(&base, &k), FirstDiff::Target);
+        let mut sdk = base.clone();
+        sdk.sdk_version = Some("27.0.0".to_string());
+        assert_eq!(prelink_first_diff(&base, &sdk), FirstDiff::Target);
+        assert_ne!(base.full_digest(), sdk.full_digest());
         k.llvm_build_id = Hash128 { lo: 99, hi: 100 };
         assert_eq!(
             prelink_first_diff(&base, &k),
@@ -3033,6 +3085,10 @@ mod tests {
     #[test]
     fn backend_first_diff_priority() {
         let base = sample_backend_key();
+        let mut sdk = base.clone();
+        sdk.sdk_version = Some("27.0.0".to_string());
+        assert_eq!(backend_first_diff(&base, &sdk), FirstDiff::Target);
+        assert_ne!(base.full_digest(), sdk.full_digest());
         // Own prelink digest changed (own code) beats cross-unit.
         let mut k = base.clone();
         k.own_prelink_digest = Hash128 { lo: 0, hi: 0 };
