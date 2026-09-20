@@ -16,6 +16,8 @@ The implementation ships all five scalar/vector methods through the exact LLVM
 intrinsics and adds the three-state `explain-opt` record. Provider absence is a
 supported, visible outcome: the functions remain available, while retained
 provider-less vector IR warns that final instruction selection may scalarize it.
+Section 9 records the planned provider follow-up and feasibility assessment;
+it is not part of the shipped SIMD guarantee.
 
 This plan remains the contract for [issue 1063](https://github.com/sanohiro/align/issues/1063)
 and G6 of the [vectorization contract](68-vectorization-contract.md). It is the
@@ -398,3 +400,78 @@ are closed as one visibility-integrity class:
 |---|---|
 | A synthetic interface function could lend its nonzero statement coordinate to the current unit's filename | Located MIR now carries a diagnostic-only, catalog-authenticated user-source fact per function. Math inventory publishes a coordinate only when that fact is present; synthetic interface bodies remain source-less even when LLVM debug coordinates exist. |
 | Captured LLVM scalarization reasons never reached `MathVisibilityRecord` | The inspection producer now correlates explicit scalarization remarks by exact authenticated file, line and column. Unrelated or differently located remarks are ignored; absence retains the stable `LLVM supplied no reason` fallback. |
+
+## 9. Planned follow-up: vector providers and machine-code verification
+
+Status: planned investigation, recorded 2026-09-21.
+Provider selection, integration and machine-code qualification remain unimplemented.
+This section records direction and acceptance questions, not a new public
+contract or an extension of issue 1063's completed acceptance boundary.
+
+### Feasibility assessment
+
+The engineering assessment is that a bounded machine-SIMD guarantee is
+practical: qualify a named provider version for exact CPU features, functions,
+element types and vector widths. Cross-target bit identity is not necessary
+for this guarantee. Existing vector math implementations make integration and
+verification a credible route without developing Align-owned approximation
+kernels. This is a feasibility judgment, not evidence that Align's LLVM 22
+pipeline already supports every required combination.
+
+[LLVM documents vector-library mappings](https://llvm.org/docs/Vectorizers.html)
+for providers including SLEEF, libmvec and Darwin libsystem.
+[SLEEF's support matrix](https://github.com/shibatch/sleef#supported-environment)
+lists AVX2 and AArch64 AdvSIMD as mainline implementations and Linux/macOS
+support. Its current SSE2 status is experimental, so AVX2 evidence cannot
+qualify Align's default x86-64-v2 baseline. These upstream capabilities justify
+probes; they do not establish function completeness, ABI compatibility or
+intrinsic-to-provider mapping in Align's pinned toolchain.
+
+The recommended first scope is the five E1 operations on explicit float
+vectors. Ordinary scalar-loop auto-vectorization remains dependent on loop
+legality, aliasing, control flow and the vectorizer's decisions; qualifying a
+math provider does not guarantee arbitrary loops will vectorize. A wide vector
+may use several narrower SIMD calls. The intended guarantee concerns vector
+execution, not a single instruction or an unmeasured speedup.
+
+### Investigation and implementation sequence
+
+1. **Measure a complete candidate matrix.** Start with SLEEF as a shared
+   candidate for macOS/Linux AArch64 and Linux x86_64; compare platform
+   providers where coverage or integration requires it. Pin provider and LLVM
+   revisions, target triple/features, profile and link mode. Probe all five
+   functions, f32/f64 and vec2/4/8/16, including widths smaller and larger than
+   the provider ABI. Record supported, unsupported and unverified combinations
+   separately, with reproducible commands and retained objects. Check the
+   existing special-value contract and mixed ordinary/exceptional lanes.
+2. **Specify one integration capability from the evidence.** Before production
+   changes, extend the public ledger and closure matrix with exact deterministic
+   provider configuration/defaults, availability and failure behavior, artifact
+   packaging/licensing, ABI and link ownership, cache identity, whole/per-unit
+   behavior, and diagnostic semantics. Verify how explicit LLVM vector
+   intrinsics reach provider calls; upstream auto-vectorizer support alone is
+   insufficient. Keep unavailable configurations usable under the existing
+   fallback contract and distinguish configuration errors from unavailable SIMD.
+3. **Qualify final code, including the provider.** Inspect emitted objects and
+   the linked implementation or pinned provider artifact. Check that admitted
+   operations reach actual SIMD implementations rather than per-lane scalar
+   math calls; a vector symbol name or an unrelated SIMD instruction is not
+   proof. Account for width splitting, dynamic dispatch and exceptional-input
+   paths. If a provider uses scalar repair paths, record that limitation before
+   deciding what guarantee the combination can carry. Add negative controls
+   for absent providers, unsupported features and scalarized calls, plus
+   bounded runtime owners for special values and representative finite inputs.
+4. **Publish only qualified coverage.** Integrate provider selection, lowering,
+   evidence-backed diagnostics and owner tests together as one useful
+   capability. Specify how configured, qualified and unavailable/unverified
+   coverage are distinguished; the current IR-stage report cannot certify an
+   arbitrary final executable. LLVM/provider upgrades must rerun the affected
+   qualification matrix. Benchmark only if making an explicit performance
+   claim, separately from structural SIMD and numerical correctness checks.
+
+Completion means that each advertised combination has reproducible final-code
+evidence and each unsupported or unverified combination has truthful visibility.
+The follow-up may narrow its supported matrix based on evidence; it must not
+silently widen the shipped numerical contract or equate provider presence with
+machine-SIMD success. Any new public promise follows the repository's design
+review gate and updates the mirrors listed in Section 1 before implementation.
