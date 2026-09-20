@@ -4211,15 +4211,18 @@ impl<'a> BodyValidator<'a> {
                 let Some(local) = function.locals.get(*base as usize) else {
                     return false;
                 };
+                let place_ty = if path.is_empty() {
+                    Some(local.ty)
+                } else {
+                    self.field_path_ty(Some(local.ty), path)
+                };
                 local.id == *base
                     && local.is_mut
-                    && (if path.is_empty() {
-                        Some(local.ty)
-                    } else {
-                        self.field_path_ty(Some(local.ty), path)
+                    && place_ty.is_some_and(|ty| {
+                        (path.is_empty() || matches!(ty, Ty::Array(..)))
+                            && index_element_ty(ty)
+                                .is_some_and(|ty| self.indexed_element_store_ty_ok(ty))
                     })
-                    .and_then(index_element_ty)
-                    .is_some_and(|ty| self.indexed_element_store_ty_ok(ty))
             }
             hir::Stmt::AssignVecLane { local, lane, .. } => {
                 let Some(function) = self.program.fns.get(context.function) else {
@@ -12211,6 +12214,9 @@ impl<'a> BodyValidator<'a> {
                 }) else {
                     return false;
                 };
+                if !path.is_empty() && !matches!(base_ty, Ty::Array(..)) {
+                    return false;
+                }
                 let Some(element_ty) = index_element_ty(base_ty) else {
                     return false;
                 };

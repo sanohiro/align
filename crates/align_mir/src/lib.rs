@@ -7097,7 +7097,7 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 field_ty_at(b, *base, path)
             };
             match base_ty {
-                Ty::Slice(s) | Ty::DynArray(s) => {
+                Ty::Slice(s) | Ty::DynArray(s) if path.is_empty() => {
                     let sv = b.fresh_value(base_ty);
                     b.push(Stmt::Let(sv, Rvalue::Load(*base)));
                     let len = b.fresh_value(i64_ty());
@@ -7107,29 +7107,25 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                     b.push(Stmt::Let(ptr, Rvalue::SlicePtr(Operand::Value(sv))));
                     b.push(Stmt::PtrStore(Operand::Value(ptr), idx, val));
                 }
-                Ty::Array(_, n) => {
+                Ty::Array(element, n) => {
                     emit_bounds_check(b, &idx, Operand::Const(Const::Int(n as i128, i64_ty())));
                     if path.is_empty() {
                         b.push(Stmt::StoreIndex(*base, idx, val));
                     } else {
-                        let slice_ty = match base_ty {
-                            Ty::Array(element, _) => Ty::Slice(element),
-                            _ => unreachable!(),
-                        };
+                        let slice_ty = Ty::Slice(element);
                         let descriptor = b.fresh_value(slice_ty);
                         b.push(Stmt::Let(
                             descriptor,
                             Rvalue::MakeFieldSlice(*base, path.clone(), i128::from(n)),
                         ));
-                        let ptr = b.fresh_value(Ty::Box(match base_ty {
-                            Ty::Array(element, _) => element,
-                            _ => unreachable!(),
-                        }));
+                        let ptr = b.fresh_value(Ty::Box(element));
                         b.push(Stmt::Let(ptr, Rvalue::SlicePtr(Operand::Value(descriptor))));
                         b.push(Stmt::PtrStore(Operand::Value(ptr), idx, val));
                     }
                 }
-                other => unreachable!("element assignment into non-array/slice {other:?}"),
+                _ => {
+                    b.terminate(Term::Unreachable);
+                }
             }
         }
         hir::Stmt::AssignElemField {
@@ -14651,10 +14647,13 @@ fn setup_source(
             let slice_val = if path.is_empty() {
                 None
             } else {
-                let element = match source.ty {
-                    Ty::Array(element, _) => element,
-                    Ty::StructArray(id, _) => Scalar::Struct(id),
-                    _ => unreachable!("fixed source setup requires a fixed array"),
+                let Some(element) = (match source.ty {
+                    Ty::Array(element, _) => Some(element),
+                    Ty::StructArray(id, _) => Some(Scalar::Struct(id)),
+                    _ => None,
+                }) else {
+                    b.terminate(Term::Unreachable);
+                    return None;
                 };
                 let view = b.fresh_value(Ty::Slice(element));
                 b.push(Stmt::Let(view, Rvalue::MakeFieldSlice(slot, path, n)));

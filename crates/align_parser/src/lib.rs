@@ -2158,13 +2158,22 @@ impl<'a> Parser<'a> {
                 // `out` is a weak keyword. Consume it as a mode only when another type starts
                 // after it; otherwise `fn(out) -> T` continues to name the by-value type `out`.
                 let has_out_mode = matches!(self.peek(), TokKind::Ident(name) if name == "out")
-                    && matches!(self.peek_at(1), TokKind::Fn | TokKind::LParen | TokKind::Ident(_));
-                let borrow_type_follows = matches!(self.peek_at(1), TokKind::Fn | TokKind::LParen | TokKind::Ident(_));
+                    && matches!(
+                        self.peek_at(1),
+                        TokKind::Fn | TokKind::LParen | TokKind::LBracket | TokKind::Ident(_)
+                    );
+                let borrow_type_follows = matches!(
+                    self.peek_at(1),
+                    TokKind::Fn | TokKind::LParen | TokKind::LBracket | TokKind::Ident(_)
+                );
                 let has_borrow_mode = matches!(self.peek(), TokKind::Ident(name) if name == "borrow")
                     && borrow_type_follows;
                 let has_borrow_mut_mode = matches!(self.peek(), TokKind::Ident(name) if name == "borrow")
                     && matches!(self.peek_at(1), TokKind::Mut)
-                    && matches!(self.peek_at(2), TokKind::Fn | TokKind::LParen | TokKind::Ident(_));
+                    && matches!(
+                        self.peek_at(2),
+                        TokKind::Fn | TokKind::LParen | TokKind::LBracket | TokKind::Ident(_)
+                    );
                 let mode = if has_out_mode {
                     self.bump();
                     ParamMode::Out
@@ -2790,6 +2799,14 @@ fn good() {}"#,
             let (_, error) = parse(invalid);
             assert!(error, "must reject {invalid:?}");
         }
+
+        let (_, mode_error) = parse(
+            "Callbacks {\n  output: fn(out [i64; 4]) -> (),\n  shared: fn(borrow [i64; 4]) -> (),\n  exclusive: fn(borrow mut [i64; 4]) -> ()\n}\n",
+        );
+        assert!(
+            !mode_error,
+            "fixed-array syntax must remain visible after every function-type parameter mode"
+        );
     }
 
     #[test]

@@ -70,7 +70,7 @@ Access            `.len()` is the compile-time N. `place[i]`, `place[a..b]`,
                   a mutable root use the existing fixed-array operations and
                   bounds behavior.
                   A nameable fixed array may be rooted in a named local,
-                  parameter, or recursively selected record/tuple field place;
+                  parameter, or recursively selected record field place;
                   receiver and index/bounds evaluate once in source order. An
                   arbitrary temporary fixed-array expression remains rejected:
                   bind it first, so a slice or indexed place always has stable
@@ -242,7 +242,9 @@ expression, array repetition syntax, nested fixed-array element, dynamic-length
 field, hidden boxing, C flexible-array member, native extern/raw array ABI,
 equality/hash/print behavior, reflection, data serialization widening or new
 runtime ABI. An arbitrary temporary is still not stable fixed-array storage;
-bind it before indexing or slicing.
+bind it before indexing or slicing. Tuple element syntax still reaches the
+existing placement gate, which does not admit inline aggregate tuple elements;
+this capability adds no tuple-projected fixed-array storage.
 
 ## 5. Design-review finding closure
 
@@ -255,3 +257,13 @@ changed.
 | Explicit `;` and newline shared `TokKind::End` | the ledger named a glyph but not its lexer provenance or existing statement role | specify `Semicolon` versus newline `End`, dual statement termination, fixed-type-only separator use, newline negative and compatibility owners |
 | Format 14 named a Rust record but not canonical bytes | artifact identity lacked a complete producer/consumer byte contract | fix tag 3, element/length order, u32 little endian, 128-record depth, malformed rules and independent bidirectional `[i64; 32]` golden |
 | Japanese receiver prose contradicted the English contract | only the newly inserted mirror paragraph was compared | update the later receiver paragraph to stable local/parameter/field places plus arbitrary-temporary exclusion and re-scan both mirrors for the old restriction |
+
+The implementation review of candidate `6e548441` found one P1 and two P2
+closure gaps. The complete root-cause class was audited before the single fix
+commit.
+
+| Finding | Root cause | Closure |
+|---|---|---|
+| A field-path indexed store could admit a slice/dynamic-array leaf but lower the containing record as its header | the new field-place path widened every indexable leaf although MIR added address formation only for inline fixed fields | sema and checked HIR admit a nonempty `AssignIndex.path` only for a fixed-array leaf; MIR also terminates malformed input before a load; negative source and forged-HIR owners pin the boundary |
+| The plan alone named tuple-projected fixed-array storage | the implementation ledger exceeded `draft.md`, the language digest and the settled decision, while tuple formation deliberately stores only scalar elements | restore the authoritative record-field boundary and state the unchanged tuple placement exclusion explicitly |
+| Function-type weak modes did not look through `[` | the type-start lookahead duplicated the pre-fixed-array constructor set | add `LBracket` to `out`, `borrow` and `borrow mut` lookahead plus parser owners for all three modes |

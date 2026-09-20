@@ -48220,6 +48220,14 @@ impl<'a, 't> Checker<'a, 't> {
                 self.diags.error("invalid assignment target".to_string(), place.span);
                 return Place::Err;
             };
+            if !path.is_empty() && !matches!(local_ty, Ty::Array(..) | Ty::StructArray(..)) {
+                self.diags.error(
+                    "indexed assignment through a field is supported only for fixed-array fields"
+                        .to_string(),
+                    place.span,
+                );
+                return Place::Err;
+            }
             if !self.locals[id as usize].is_mut {
                 let name = self.locals[id as usize].name.clone();
                 self.diags.error(

@@ -245,6 +245,25 @@ fn fixed_array_field_element_store_preserves_borrow_lifetime() {
 }
 
 #[test]
+fn indexed_store_does_not_widen_nonfixed_field_places() {
+    let mut sources = SourceMap::new();
+    let checked = check(
+        &mut sources,
+        "nonfixed-field-index-store.align",
+        concat!(
+            "Holder { values: slice<i64> }\n",
+            "fn bad(borrow mut holder: Holder) { holder.values[0] = 1 }\n",
+            "fn main() {}\n",
+        ),
+    );
+    assert!(checked.diags.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("only for fixed-array fields")
+    }));
+}
+
+#[test]
 fn generic_record_substitutes_fixed_array_element_once() {
     if !backend_available() {
         return;
