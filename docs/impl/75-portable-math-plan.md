@@ -97,10 +97,13 @@ Feasibility       Section 3 is a fail-closed prerequisite, not a benchmark to
                   waive. Before the surface is implemented, one disposable
                   spike must prove all ten scalar kernels and every explicit
                   vector type on aarch64 and x86-64 baseline optimized IR. It
-                  must also prove the 1-ULP and cross-target-bit conditions on
-                  the conformance corpus. If any cell fails, E1 is deferred and
-                  no partial intrinsic/libcall surface lands. The spike is not
-                  retained as a recurring test suite.
+                  must also provide a complete, independently checked error
+                  proof for every finite input and an operation-graph proof of
+                  cross-target bit identity; a sampled conformance corpus is
+                  regression evidence, never the proof. If any cell fails, E1
+                  is deferred and no partial intrinsic/libcall surface lands.
+                  The spike and proof tools are not retained as a recurring
+                  compiler test suite.
 
 Ownership         align_sema owns method/type/arity checks and the exhaustive
                   MathFn classification. align_mir owns preservation and
@@ -125,15 +128,24 @@ Errors            Invalid receiver kind is diagnosed before arity. A valid
                   externally dependent or semantically mismatched bitcode is a
                   compiler error before object/cache publication; unlike the
                   optional string rt-LTO optimization, portable math never
-                  falls back to host libm.
+                  falls back to host libm. Validation order is: embedded byte
+                  presence and digest; bitcode parse; target triple; data
+                  layout; exact exported-symbol manifest and signatures;
+                  forbidden definitions/globals/attributes; undefined-symbol
+                  closure; then module verification. The first failing phase is
+                  the reported error, including when later phases are also
+                  invalid.
 
 Artifact/cache    `portable_math.bc` is separate from `str_prims.bc` and from
                   the optional `--rt-lto` digest. It contains only the E1
                   kernels, private helpers and constant tables. The driver
-                  embeds its bytes. A versioned digest over the kernel source,
-                  tables, operation-graph policy and exported-symbol manifest
-                  enters every unit key that contains an E1 operation; units
-                  without E1 retain their existing key. Whole-program and
+                  embeds its bytes. The existing executable-byte
+                  `compiler_build_id` therefore changes for every kernel,
+                  table, operation-policy or manifest edit and invalidates all
+                  unit codegen keys, including units without E1. The artifact's
+                  versioned content digest is still checked against the baked
+                  manifest for stale/corrupt-artifact diagnostics; it is not a
+                  second selective cache-key component. Whole-program and
                   per-unit builds consume identical bytes. The complete set of
                   definitions is internalized after linking, and no portable
                   math symbol remains undefined in an emitted object.
@@ -150,12 +162,12 @@ Acceptance        Section 4 owns surface/type failures, checked-HIR/MIR
                   absence of host-libm symbols. One parameterized owner closes
                   each family of cells; there is no test per input or width.
 
-Performance       The only performance admission claim is that an explicit
-                  vector kernel is not a scalar-libcall/lane-shuffle
-                  pessimization. A short local comparison records scalar and
-                  vector throughput on one aarch64 and one x86-64 baseline.
-                  It is implementation evidence, not a correctness gate or a
-                  permanent benchmark in scripts/test-pr.sh.
+Performance       No latency or throughput number is promised, so no benchmark
+                  is an admission or recurring correctness gate. The optimized
+                  IR shape owner proves only the stated structural contract:
+                  vector arithmetic with no scalar math/kernel call or
+                  extract/insert chain. A later numerical performance promise
+                  requires its own ledger and reproducible benchmark protocol.
 
 Mirrors           This plan, plan 68 G6, draft.md float/core.math/SIMD,
                   docs/language-spec.md, docs/design-notes.md,
@@ -195,19 +207,22 @@ kernel source land.
 |---|---|
 | Source closure | The candidate dependency graph contains no allocator, panic/abort path, libc/libm symbol, TLS, mutable global, target intrinsic or dynamic rounding-mode query. Tables are immutable literal bits. |
 | Artifact closure | `llvm-nm --undefined-only` is empty for the merged kernel closure; the exported manifest is exactly ten scalar entries before internalization. |
-| Scalar accuracy | Deterministic boundary, exact-value and hard-to-round corpora for each function/type compare to an independently correctly rounded reference and stay <= 1 ULP. Every special-value row compares exact bits. |
-| Target identity | The same corpus executes on aarch64 and x86-64 baseline and emits identical result-bit files. Comparing two runs on one host is insufficient. |
-| Vector identity | For widths 2/4/8/16 and both element types, lane results equal the scalar result bits over the same corpus. |
+| Universal accuracy | For f32, an exhaustive all-input run against an independently correctly rounded reference; for f64, an independently checkable range-reduction and polynomial error certificate covering every finite input interval, with every approximation/rounding term and table bit included. The certificate checker and exact tool versions are recorded. Named special values compare exact bits. A corpus alone cannot close this cell. |
+| Target identity | A machine-checked operation-graph audit proves that every admitted operation has target-independent IEEE bits: explicit fused versus unfused nodes, fixed-width integer operations, immutable table bits, preserved subnormals and no excess precision. aarch64 and x86-64 execution of the corpus is a negative control, not the universal proof. |
+| Vector identity | The scalar and vector forms are generated from one typed operation graph. A structural checker proves node-for-node lane isomorphism for widths 2/4/8/16 and both element types; corpus execution checks the proof plumbing. |
 | Optimized shape | Release and fast optimized IR on both baselines has vector arithmetic and has no scalar math/kernel call or surviving per-lane extract/insert chain for every explicit-vector method. |
-| Size/build cost | Record bitcode bytes, alignc binary delta and clean/incremental driver build time. There is no numeric budget yet; the evidence decides whether embedding the artifact is proportionate. |
-| Throughput | Record scalar versus each native-width vector throughput. A regression or scalar-equivalent result rejects the candidate; no threshold is converted into a permanent CI benchmark. |
+| Size/build cost | Record bitcode bytes, alignc binary delta and clean/incremental driver build time. There is no numeric performance promise or threshold; this evidence only decides whether embedding the artifact is proportionate. |
 
-The corpus has four bounded parts: all named special/exact values; every
+The recurring corpus has four bounded parts: all named special/exact values; every
 range-reduction boundary and its two adjacent representable values; the
 published hard cases for the adopted algorithms; and a fixed-seed stratified
 sample by sign/exponent/fraction. Its checked input-bit manifest and expected
 result bits are content-addressed. Increasing a sample count without adding a
-new invariant is not coverage and is rejected as test inflation.
+new invariant is not coverage and is rejected as test inflation. It detects
+integration regressions after admission; it never substitutes for the
+universal proof above. The exhaustive f32 run and f64 certificate checker rerun
+only when the kernel operation graph, coefficients, tables or proof-tool
+identity changes.
 
 ## 4. Implementation closure matrix
 
@@ -219,12 +234,13 @@ input.
 |---|---|---|
 | Type formation | Five zero-argument methods accept f32/f64 and every float vector; integers, masks, arrays, unconstrained numerics and arguments reject in deterministic order | one sema table plus checked-HIR replay |
 | IR exhaustiveness | Every new MathFn survives serialization/checking and reaches MIR/codegen; every exhaustive classifier is updated | existing variant tripwire plus one MIR shape owner |
+| Proof binding | the admitted operation graph, coefficients, tables, exported manifest and proof-tool identity hash to the exact implementation inputs; any change invalidates admission before build publication | digest owner over the proof record and kernel inputs |
 | Scalar values | Exact special cases and <=1 ULP finite corpus for ten entries | one runtime conformance owner over the content-addressed corpus |
 | Vector values | Every vector width/type is lane-bit-identical to scalar | the same conformance owner parameterized by width |
 | Vector shape | aarch64/x86-64 baseline optimized IR contains no forbidden call/extract/insert shape | one cross-target IR owner over generated cases |
-| Artifact validation | truncation, wrong target/layout, missing/extra symbol, undefined dependency, mutable global and digest mismatch reject before publication | mutation table over one valid fixture |
+| Artifact validation | truncation, wrong target/layout, missing/extra symbol, undefined dependency, mutable global and digest mismatch reject before publication in the ledger's fixed order | mutation table over one valid fixture plus one all-invalid fixture that reports only the earliest phase |
 | Whole/per-unit | results, optimized shapes and symbol closure agree; only units containing E1 consume the artifact digest | direct whole/per-unit owner |
-| Cache | kernel source/table/policy/manifest changes miss affected units; unrelated units hit; exact revert restores identity | cache edit/revert owner |
+| Cache | kernel source/table/policy/manifest changes alter the embedded compiler bytes and therefore miss every unit through `compiler_build_id`; exact source and binary revert restores identity | cache edit/revert owner with E1 and non-E1 units |
 | Profiles/options | dev is value-correct; release/fast satisfy shape; small/tiny stay value-correct; `--rt-lto` on/off cannot change bits | one profile/option table |
 | Existing math | abs/min/max/sqrt/floor/ceil/round/trunc/fma and scalar pow retain their current semantics and lowering | existing scalar_math and vec_math owners; no duplicate fixture |
 | Failure hygiene | no host math symbol or new dynamic library enters emitted objects; malformed artifact publishes no cache/object | symbol owner plus failed-build residue check |
@@ -238,3 +254,15 @@ proofs. This is intentionally not combined with issue 1064: typed byte views
 have a different public contract, ownership model and failure domain. Within
 1063, all five E1 functions stay together to avoid repeating the artifact,
 cache and target proof five times.
+
+## 6. Design-review closure
+
+The fresh review of candidate `6153efd1` found four P2 contract defects. The
+fix commit closes the complete set without a second full-diff review:
+
+| Finding | Closure |
+|---|---|
+| A bounded corpus did not prove the universal 1-ULP promise | f32 now requires an exhaustive all-input admission run; f64 requires an independently checked full-domain error certificate; the recurring corpus is explicitly only a regression owner. |
+| Multiply-invalid artifact precedence was unspecified | the ledger fixes eight validation phases and the matrix adds one combined-invalid earliest-error owner. |
+| Selective cache hits contradicted the embedded compiler build identity | every unit now invalidates through the existing executable-byte `compiler_build_id`; the artifact digest is validation metadata, not a selective key. |
+| The throughput rejection was unquantified and noise-dependent | the benchmark gate is removed. No throughput number is promised; optimized IR structure is the sole stated performance-shape contract. |
