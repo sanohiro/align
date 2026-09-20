@@ -8941,7 +8941,23 @@ pub fn order_link_libs(link_libs: &[String]) -> Vec<String> {
 /// by the FFI tests that link an Align object against a compiled C-helper object (a by-value struct
 /// callee), and by any future multi-translation-unit build.
 pub fn link_objects(cc: &crate::CDriver, objs: &[&std::path::Path], exe: &std::path::Path, link_libs: &[String], profile: Profile) -> Result<(), String> {
-    link_objects_inner(cc, objs, exe, link_libs, profile, None)
+    link_objects_inner(cc, objs, exe, link_libs, profile, None, None)
+}
+
+/// [`link_objects`] with an explicit Align runtime archive.
+///
+/// Artifact-parity owners use this to hold the runtime input equal to the archive beside the
+/// compiler under test. Ordinary library callers retain current-executable discovery, including
+/// feature-built integration-test runtimes under `target/<profile>/deps/`.
+pub fn link_objects_with_runtime_archive(
+    cc: &crate::CDriver,
+    objs: &[&std::path::Path],
+    exe: &std::path::Path,
+    link_libs: &[String],
+    profile: Profile,
+    runtime: &std::path::Path,
+) -> Result<(), String> {
+    link_objects_inner(cc, objs, exe, link_libs, profile, Some(runtime), None)
 }
 
 /// [`link_objects`] for an instrument-PGO (`--pgo-instrument`) build: additionally links the clang
@@ -8959,7 +8975,7 @@ pub fn link_objects_instrumented(
     profile: Profile,
     profile_rt: &std::path::Path,
 ) -> Result<(), String> {
-    link_objects_inner(cc, objs, exe, link_libs, profile, Some(profile_rt))
+    link_objects_inner(cc, objs, exe, link_libs, profile, None, Some(profile_rt))
 }
 
 /// Everything one link is made of — the complete input to [`link_command_args`].
@@ -9070,9 +9086,23 @@ pub fn link_command_args(plan: &LinkPlan<'_>) -> Vec<std::ffi::OsString> {
     args
 }
 
-fn link_objects_inner(cc: &crate::CDriver, objs: &[&std::path::Path], exe: &std::path::Path, link_libs: &[String], profile: Profile, profile_rt: Option<&std::path::Path>) -> Result<(), String> {
+fn link_objects_inner(
+    cc: &crate::CDriver,
+    objs: &[&std::path::Path],
+    exe: &std::path::Path,
+    link_libs: &[String],
+    profile: Profile,
+    runtime: Option<&std::path::Path>,
+    profile_rt: Option<&std::path::Path>,
+) -> Result<(), String> {
     let format = target_object_format()?;
-    let runtime = runtime_archive()?;
+    let runtime = match runtime {
+        Some(runtime) => {
+            ensure_archive_fresh(runtime)?;
+            runtime.to_path_buf()
+        }
+        None => runtime_archive()?,
+    };
     let ordered_link_libs = order_link_libs(link_libs);
     // Which linker `cc` drives (build-perf track item 2, `docs/impl/21-build-perf-plan.md`). ELF
     // only, and optimization-neutral: `ld.lld` produces an equally optimized image, just faster.
