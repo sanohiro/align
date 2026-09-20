@@ -1,5 +1,15 @@
 # Align Design Notes
 
+Floating-point relaxation is a visible lexical value scope, not an ambient build mode or a family
+of fast reducer names. `float(reassoc) {}` and `float(contract) {}` name exactly the two guarantees
+the programmer may relinquish. They compose independently, nest by union, and never change a
+separately declared callee. This keeps strict reproducibility as the default while making the cost
+model selectable at the arithmetic use site. NaN and infinity remain values: Align deliberately
+offers no `nnan`, `ninf`, or bundled `fast` spelling that could turn them into poison. The mode
+survives lifted lambdas; generic and interface-carried concrete body source re-derives it, so separate
+compilation cannot silently change semantics. [Plan 77](impl/77-float-relaxation-scope-plan.md)
+owns the exact contract.
+
 Nameable fixed arrays use `[T; N]`, the type-level form of the existing inline
 literal. The same type is valid in every annotation position, so a record field
 is ordinary composition rather than a field-only storage exception. Its elements

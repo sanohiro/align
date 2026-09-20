@@ -94,7 +94,7 @@ widened into this table.
 | G1 | A borrowed view header is materialized once per function or loop preheader, and header memory is stated distinct from element memory | one header load per loop, dominating the loop; a TBAA node pair separating `align.view.header` from `align.elem`; `noalias dereferenceable(16) align 8` on `borrow` header parameters | that LICM then hoists everything else | LLVM lowering | `vectorize_shapes` owners `g1_view_header_hoisted` and the `bytes_to_f32_out` conjunction pin (both planned) | 1079 |
 | G2 | At most one bounds check per loop, in the preheader, for a monotone index | the check is fused to one unsigned compare; for a monotone index with loop-invariant bound the guard is *moved* to the preheader, not deleted; trap text and first-failing-access iteration unchanged | which residual checks LLVM then folds | MIR | `vectorize_shapes` owner `g2_monotone_check_hoisted` (planned); trap-parity owners for zero-length, length-1, first-out-of-range | 1081, 1080 |
 | G3 | A counted loop lowers with its trip-count exit at the latch; the recognized shape produces one named MIR fact | recognition is total for the canonical early-exit shape: zero-trip test peeled into the fast-copy preheader, only body-derived exits in its header, `i + step REL bound` at the latch; the fact carries trip count, step and monotone index and is the single source rotation and extent emission read | whether LLVM's early-exit vectorizer then fires | MIR lowering | `g3_counted_latch_exit_aarch64`, `g3_counted_latch_exit_x86_v2`, `g3_counted_exit_value_matrix_is_unchanged` | 1084 |
-| G4 | One floating-point semantics model: uniform `minimum`/`maximum` lowering, ordered by default, relaxation only inside an explicit lexical scope | Part 1: all three spellings of a float min/max emit `llvm.minimum`/`llvm.maximum`, with NaN propagation and ±0 ordering unchanged. Part 2 (future): `reassoc` and `contract` are named individually and scoped lexically without inheriting across a function boundary; `nnan` and `ninf` are permanently excluded | the vector width LLVM picks for the resulting reduction | MIR (Part 1); MIR with sema (Part 2) | `vectorize_shapes` owner `g4_minmax_uniform_lowering` and the NaN, `-0.0`/`+0.0` and all-NaN conformance owners (planned); the existing `vectorize_shapes.rs:258` negative control `k6_float_sum_does_not_vectorize_without_fast_math` | 1082 Part 1 (now), 1082 Part 2 (future RFC) |
+| G4 | One floating-point semantics model: uniform `minimum`/`maximum` lowering, ordered by default, relaxation only inside an explicit lexical scope | Part 1: all three spellings of a float min/max emit `llvm.minimum`/`llvm.maximum`, with NaN propagation and ±0 ordering unchanged. Part 2 (plan 77): `float(reassoc)` and `float(contract)` name the permissions independently, nest by union and do not alter separately declared callees; poison-producing and bundled flags are excluded | the vector width LLVM picks for the resulting reduction | MIR (Part 1); parser/sema/MIR/interface/LLVM (Part 2) | Part 1 owners plus plan 77's syntax, semantic, interface, exact-flag and strict-negative owners | 1082 Parts 1 and 2 |
 | G5 | Every runtime primitive that can appear in a loop has an effects record and either an inline fast path or a vector form | each runtime ABI symbol carries a complete memory-effects record and every sound subset is emitted as an attribute; per-element primitives have a visible inline fast path and a visible slow path; `Result`/`?` failure edges are cold with one model | which of the fast paths LLVM then widens | runtime ABI, with LLVM lowering | the existing runtime-ABI owner in `20-runtime-abi-ledger.md`, extended by plan 70 | 1071, 1072, 1073, and 1074, which this contract adds to issue 1088's B6 owner set |
 | G6 | Every `core.math` function has a vector lowering on every supported target and one accuracy contract that holds for both lowerings | a documented ULP bound per function against the correctly rounded result; the scalar and vector lowerings produce bit-identical results, and so does every supported target; no scalar libcall inside a vector body | which loops the vectorizer chooses to widen | LLVM lowering, with the driver | the existing `crates/align_driver/tests/vec_simd.rs` and `crates/align_driver/tests/scalar_math.rs` owners extended to the exp/log family; a ULP conformance owner (planned); `examples/vec_math.align` | 1063 (revised, §6.1), with 1069 as a prerequisite |
 | G7 | Bytes reach typed slices through one checked, order-explicit, zero-copy view | construction allocates nothing and copies nothing; alignment and length are validated and yield `None` rather than trapping; the view carries the source borrow's authority and provenance; the named byte order must be the target's native order or the program is rejected at compile time | that a loop over the result then vectorizes — that is §6.3's gate, not this guarantee | sema, with MIR for the lowering | a view owner asserting no allocation and no copy in emitted IR; a `vecN` load reachable from `buffer.bytes()`; a negative owner for a non-native order (all planned) | 1064 (revised, §6.2) |
@@ -109,9 +109,10 @@ G1, G2, G3  no prerequisite milestone; each changes emission only. No unit
             interface, cache key or artifact identity changes: the object
             content changes, the interface hash does not.
 G4 Part 1   no prerequisite; emission only, no identity change.
-G4 Part 2   prerequisite: its own RFC. A relaxation scope is observable
-            semantics, so the scope must enter the unit interface and the
-            implementation identity; it cannot be a codegen-only flag.
+G4 Part 2   plan 77 is the RFC. The relaxation scope is observable semantics,
+            so its exact source enters existing generic and concrete-body
+            interfaces and implementation identity; it is never a codegen-only
+            flag or a new interface field.
 G5          prerequisite: the runtime ABI inventory in 20-runtime-abi-ledger.md
             is the record of truth. Compiler-owned effect records enter
             `compiler_build_id`; `rt_lto_digest` changes only when the guarded
@@ -266,9 +267,7 @@ operation the scalar path already chose for exactly the reason Align cares
 about — identical results across builds and targets — so routing all three
 through it changes no semantics. This is a "one way to do things" repair.
 
-Part 2 is a genuinely missing surface and is deferred to a separate RFC (§4).
-What this contract settles now is only its boundary, because the boundary is
-what protects the locked decisions:
+Part 2 is the surface settled by plan 77. Its boundary remains:
 
 ```text
 default              strictly ordered, IEEE 754, no reassociation, no
@@ -284,8 +283,9 @@ excluded forever     nnan and ninf: they make the result poison for a NaN or
 outside any scope    bit-for-bit unchanged, and that is testable
 ```
 
-The surface itself — attribute, block, spelling, level names — is not settled
-here and must not be inferred from this paragraph.
+The concrete spelling is `float(reassoc) {}`, `float(contract) {}`, or their
+explicit combination. Plan 77 is authoritative for nesting, lambdas,
+serialization, diagnostics and exact LLVM-flag admission.
 
 ### G5 — runtime primitives in loops
 
@@ -356,7 +356,7 @@ plan 70 runtime boundary effects
   (planned)                           G5  1071, 1072, 1073, 1074
 in progress, parallel PR              G4 Part 1  1082 Part 1
                                       G8  1083
-future RFC, surface not settled       G4 Part 2  1082 Part 2
+design candidate, plan 77             G4 Part 2  1082 Part 2
 revised by this document              G6  1063 (§6.1)
                                       G7  1064 (§6.2)
 implementation candidate              G9  1066, plan 74
@@ -392,11 +392,10 @@ G4 Part 1 and G8 are being implemented in a parallel PR at the time of writing.
 Neither changes a public contract stated here: Part 1 unifies a lowering and G8
 widens a type-check predicate.
 
-G4 Part 2 is a separate future RFC. It introduces a new source annotation for
-scoped reassociation and contraction, which is a language surface addition and
-must go through the normal design gate on its own evidence. This document
-records its direction and its permanent exclusions (§3, G4) and settles nothing
-about its spelling.
+G4 Part 2 is the separate public-contract design in plan 77. It introduces the
+`float(...) {}` block for scoped reassociation and contraction and keeps the
+permanent exclusions in §3. Implementation follows only after that design's
+independent review and merge.
 
 ## 5. Compliance with the locked decisions and standing rejections
 
@@ -751,16 +750,16 @@ Recorded per the large-design authoring gate.
   `examples/vec_simd.align`, and the runtime-ABI owner in
   `20-runtime-abi-ledger.md`. Everything else in §3 is marked planned, including
   every `g<N>_` owner name and `examples/vec_argmax.align`.
-- No guarantee consumes a decision scheduled for a later milestone: G4 Part 2's
-  surface is explicitly deferred, and §6.3's gate never makes an earlier
-  guarantee depend on it.
+- No guarantee consumes a decision scheduled for a later milestone. Plan 77
+  now owns G4 Part 2's surface; §6.3's gate does not claim it before that
+  separate design and implementation merge.
 - The locked decisions nearest this work are checked explicitly in §5, and so is
   the status of the two `docs/open-questions.md` records this contract leans on:
   the `llvm.assume` rejection at `:4198-4204` and the ordered-reduction rule at
   `:4970` are both in the **Open** section, not Settled, and this document
-  neither promotes nor changes either. `:5974` (opt-in fast-math flags) is in
-  Future, where G4 Part 2 belongs. No Settled entry changes as a result of this
-  document, and none is claimed to.
-- `draft.md` and `docs/language-spec.md` need no change: this contract adds no
-  language surface. The two it would eventually touch — G4 Part 2's scope and
-  G7's view — are both deferred to their own issues, which own those updates.
+  neither promotes nor changes either. Plan 77 later settles the former Future
+  fast-math row as the much narrower `reassoc`/`contract` source scope and owns
+  the corresponding Settled entry.
+- This contract itself added no language surface. Plan 77 now owns the required
+  `draft.md` and `docs/language-spec.md` changes for G4 Part 2. G7's view remains
+  deferred to its own issue.

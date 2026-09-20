@@ -582,6 +582,32 @@ Comparison follows IEEE: NaN compares unequal to everything **including itself**
 `min`/`max` reducers' NaN policy is specified with the reducers (§8). Only conversion leaves pure
 IEEE behavior: `as` saturates and maps NaN to `0` (next section).
 
+Floating-point evaluation is ordered and uncontracted by default. A lexical block may explicitly
+relinquish either guarantee:
+
+```align
+sum := float(reassoc) { xs.sum() }
+dot := float(reassoc, contract) {
+  zip(xs, ys).map(fn pair { pair.0 * pair.1 }).sum()
+}
+```
+
+`float(reassoc) { ... }` permits f32/f64 additions, subtractions, and multiplications written in
+the block to be reassociated, including a built-in `sum` accumulator. `float(contract) { ... }`
+permits a multiply and its consuming add/subtract, when both are in the scope, to become one fused
+operation. The options are independent; nested scopes add permissions. An inline lambda written
+inside the scope retains its declaration-site permissions, but calling a separately declared
+function never changes that function's semantics. The scope is otherwise an ordinary block
+expression: it has the block's value and does not change evaluation order, effects, ownership,
+errors, allocation, cleanup, or control flow.
+
+Relaxed results remain defined IEEE floating values, including for NaN and infinity, but their
+rounding, signed-zero result, and NaN payload may differ where the named reassociation or contraction
+allows it. No accuracy or cross-target bit-identity promise applies inside the scope. `nnan`, `ninf`,
+`nsz`, reciprocal, approximate-function, and bundled `fast` modes do not exist. Outside a `float`
+scope, existing result bits remain unchanged. The exact contract and serialization rules are in
+`docs/impl/77-float-relaxation-scope-plan.md`.
+
 ### Numeric Conversion
 
 There is **no implicit numeric coercion** — not even widening. A value changes type only through the explicit `as` operator, so every conversion is visible in source ("nothing hidden"):

@@ -89,15 +89,17 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    accuracy/identity proof package.
    The five E1 functions stay one capability; #1064 remains a separate failure
    domain and does not share its PR.
-   #1075 is the current implementation candidate. [Plan 76](docs/impl/76-scalar-abi-facts-plan.md)
-   corrects the issue proposal before implementation: LLVM ABI extension
-   attributes must cover every declaration/definition and direct/indirect call
-   site, while stored i8 booleans and aggregate enum tags are not scalar call
-   boundaries. Implementation review also disproved the proposed `char` range:
-   integer casts admit all 32-bit patterns, so `char` receives only `zeroext`.
-   The focused structural owner passes in 0.03 seconds and the
-   whole/per-unit boundary-value execution owner in 1.03 seconds; no benchmark,
-   broad suite or external-client build belongs in the provider gate.
+   #1075 merged in PR #1143. [Plan 76](docs/impl/76-scalar-abi-facts-plan.md)
+   supplies the complete call-boundary `zeroext`/`signext` rule and excludes
+   stored aggregate facts and the unsound proposed `char` range. Focused owners
+   run in 0.03 and 1.03 seconds; no benchmark, broad suite or external-client
+   build belongs in the provider gate. Consumer mask/disassembly measurements
+   remain pending, so the tracking issue stays open.
+   #1082 Part 2 is now the next design candidate. [Plan 77](docs/impl/77-float-relaxation-scope-plan.md)
+   specifies the explicit `float(reassoc)` / `float(contract)` lexical block,
+   strict default, lambda/callee boundary, interface identity, exact permitted
+   LLVM flags and a benchmark-free acceptance matrix. It must merge after one
+   independent design review before its parser-to-LLVM implementation begins.
 4. Follow-ups, independent and small (updated 2026-09-19):
    `fix/nightly-detector-restore` closed #1105, #1107, #1108, #1109, and
    #1112, and separately repaired two untracked first-night nightly failures
@@ -122,8 +124,8 @@ the design of record for issue 1088 and owns guarantees G1–G10 — the propert
 ordinary Align loops and pipelines need in order to vectorize by default, with
 one owner issue and one acceptance corpus entry each. It settles the promise/try
 split, the ownership map (planned plan 69 loop facts for G1–G3, planned plan 70
-runtime boundary effects for G5, issues 1082 Part 1 and 1083 in progress, 1082
-Part 2 as a future RFC), the locked-decision compliance record including the
+runtime boundary effects for G5, shipped 1082 Part 1 and 1083, and plan 77 for
+1082 Part 2), the locked-decision compliance record including the
 carve-out issue 1084's `assume` fallback would require, and rewritten acceptance
 criteria for issues 1063 and 1064, whose original criteria were measured false
 because they depended on the loop-facts work. Plan 70 PR 1 now implements

@@ -13,6 +13,20 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### Explicit lexical floating-point relaxation (SETTLED 2026-09-20)
+
+Float arithmetic remains ordered and uncontracted by default. The only relaxation surface is the
+value-producing block `float(reassoc) {}`, `float(contract) {}`, or their explicit combination.
+Options are independent, nested scopes union them, an inline lambda keeps declaration-site mode,
+and a separately declared callee never inherits caller mode. `reassoc` permits reassociation of
+f32/f64 add/subtract/multiply and unordered floating reduction; `contract` permits local fused
+multiply-add/subtract without implying reassociation. NaN and infinity remain defined values.
+`nnan`, `ninf`, `nsz`, reciprocal, approximate-function, bundled `fast`, and ambient compiler flags
+are excluded. Generic and interface-carried concrete bodies retain the exact source scope and
+re-derive its mode in the consumer. No benchmark or client build defines correctness. Record:
+draft §4, language digest and
+[plan 77](impl/77-float-relaxation-scope-plan.md).
+
 ### Nameable fixed arrays and inline fields (SETTLED 2026-09-20)
 
 `[T; N]` is the type spelling for the existing fixed inline array and is valid
@@ -5951,8 +5965,9 @@ e.g. `xs.map(dbl).sum()` lowers to one SSE2 loop (`movdqu` + `paddq`, two `i64` 
 the `dbl` call inlined) with a horizontal-reduction tail — verified via `objdump`, and all
 end-to-end tests stay correct under `-O2` (no miscompile from latent IR UB). `emit-llvm` still
 prints the *un*-optimized IR (it is for inspecting codegen output). This was the prerequisite for
-every vectorization lever below; the remaining ones (the explicit `vec`/`mask`/SoA surface, VLA,
-non-temporal, fast-math, `-march=native`) are **M6** proper, alongside the LLVM-version upgrade.
+every vectorization lever below. The explicit `vec`/`mask`/SoA surface shipped in M6; VLA,
+non-temporal stores, and `-march=native` remain backlog. Plan 77 separately settles the only
+admitted floating relaxation as explicit lexical `reassoc`/`contract`, not general fast math.
 
 ```text
 Backend / codegen lowering (MIR -> LLVM, source unchanged):
@@ -6008,7 +6023,8 @@ Backend / codegen lowering (MIR -> LLVM, source unchanged):
   group_by) benefits more from extra GPRs than typical code. Implementation (LLVM/inkwell upgrade,
   --target-cpu apx) rides the same LLVM-upgrade checkpoint as AVX10/SME2 above; nothing to do now.
 - Non-temporal stores: tag large materializing writes with !nontemporal to bypass cache.
-- Fast-math flags on float ops (opt-in): unlock float reassociation / autovectorization.
+- Scoped float reassociation/contraction is settled by plan 77; wider fast-math flags remain
+  excluded rather than future work.
 - -march=native / host CPU feature detection (opt-in; breaks portable "predictable").
 - Cross-language LTO: build the Rust runtime to bitcode so align_rt_* helpers inline into
   user loops across the language boundary.

@@ -318,6 +318,16 @@ borrowed `str`. `else` works on `Result` as
 well as `Option` — the intent triangle is `?` propagates / `else` falls back / `match` inspects.
 Details: `draft.md` §4 (display, equality, ordering, floats) and §12 (literals and escapes).
 
+Float arithmetic is ordered and uncontracted by default. The block expressions
+`float(reassoc) { ... }`, `float(contract) { ... }`, and
+`float(reassoc, contract) { ... }` explicitly permit f32/f64 reassociation and/or multiply-add
+contraction for arithmetic written lexically inside them. Nested scopes union permissions. An
+inline lambda retains the permissions at its declaration, while a separately declared callee never
+inherits them from a call site. Relaxed NaN and infinity inputs remain defined; only the named
+rounding, association, signed-zero, and NaN-payload variation is permitted. There is no `nnan`,
+`ninf`, `nsz`, reciprocal, approximate-function, bundled fast mode, or ambient compiler switch.
+The scope otherwise behaves as a plain value-producing block. See plan 77 for the complete record.
+
 Comparison operators and `Eq`/`Ord` bounds accept both `str` and owned `string`. An owned operand
 is compared through a non-consuming, zero-cost `str` borrow, including in mixed `string`/`str`
 comparisons and monomorphized generic functions.
