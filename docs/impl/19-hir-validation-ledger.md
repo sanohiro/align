@@ -1,6 +1,6 @@
 # Checked-HIR validation ledger
 
-## Checked typed byte views (plan 78; planned)
+## Checked typed byte views (plan 78; implemented)
 
 `BytesView` authenticates an exact `slice<u8>` receiver, one of the eight
 admitted multi-byte element types and the exact `Option<slice<T>>` result.
@@ -25,7 +25,7 @@ serialized field or optimistic producer evidence.
 owns the five FsTree cases, access/identity qualified schemas, OsIdentity,
 Utf8Lossy/Sha1 discriminators and shared filesystem-owner projection closure.
 The five FsTree cases and OsIdentity are implemented with exact argument/result
-and globally reserved schema validation. The ExprKind sweep contains 333 variants.
+and globally reserved schema validation. The ExprKind sweep contains 341 variants.
 Utf8Lossy/Sha1 use the existing transform/hash validators. Shared filesystem
 projections retain complete place provenance; borrowed String-to-Str normalization
 certifies the physical source and read-only authority before descriptor use.
@@ -1500,7 +1500,7 @@ if any of those five variants is absent from validation or ownership analysis.
 
 The implementation must derive an exhaustiveness constant from the Rust enum
 definitions and assert that this file has exactly one owner id for every
-`Stmt`, all 266 `ExprKind` variants, `ArithMode`, `MathFn`, every
+`Stmt`, all 341 `ExprKind` variants, `ArithMode`, `MathFn`, every
 `BuilderWriteKind`, `StrPredKind`, `StrTrimKind`, `TemplatePart`, `StageKind`,
 `GroupSource`, `GroupAgg1`, `GroupOp`, `CliFlagKind`, `EncodingKind`, `CompressKind`,
 `PathComponentKind`, `AeadCipher`, `AeadDir`, and `HashAlgo`. The test fails on

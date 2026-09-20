@@ -401,6 +401,18 @@ impl Program {
     pub fn mark_current_plan_malformed(&mut self) {
         self.plan_catalog_malformed = true;
     }
+
+    /// Whether checked MIR contains the plan-78 operation whose named byte order
+    /// requires a little-endian target. The driver consumes this before cache or LLVM work.
+    pub fn requires_little_endian_byte_views(&self) -> bool {
+        self.fns.iter().any(|function| {
+            function.blocks.iter().any(|block| {
+                block.stmts.iter().any(|statement| {
+                    matches!(statement, Stmt::Let(_, Rvalue::BytesView { .. }))
+                })
+            })
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2025,6 +2037,17 @@ pub enum Rvalue {
     BufferLen(Operand),
     /// The fixed caller-selected read window, independent of the buffer's current published len.
     BufferCapacity(Operand),
+    /// Checked zero-copy `slice<u8>` to `Option<slice<T>>` descriptor view.
+    /// The little-endian requirement is retained for driver target admission.
+    BytesView {
+        bytes: Operand,
+        elem: Ty,
+    },
+    /// Total descriptor-only inverse of [`Rvalue::BytesView`].
+    SliceAsBytes {
+        slice: Operand,
+        elem: Ty,
+    },
     /// `bytes.<scalar>_<le|be>(off)` — a binary scalar read from the `slice<u8>` operand at byte
     /// offset `off`. `scalar` is the result type (its width sets how many bytes are loaded); `be`
     /// selects big-endian. Bounds are checked (`emit_range_bounds_check`) **before** this rvalue, so
@@ -4205,6 +4228,8 @@ pub fn function_embedded_types(f: &Function) -> Vec<Ty> {
                     | Rvalue::JsonDecodeScalar { scalar: elem, .. }
                     | Rvalue::JsonDocAsScalar { scalar: elem, .. }
                     | Rvalue::BytesRead { scalar: elem, .. }
+                    | Rvalue::BytesView { elem, .. }
+                    | Rvalue::SliceAsBytes { elem, .. }
                     | Rvalue::BytesSet { scalar: elem, .. }
                     | Rvalue::BytesFill { scalar: elem, .. }
                     | Rvalue::BufferPut { scalar: elem, .. }
@@ -4648,6 +4673,8 @@ fn remap_function_embedded_types(
                     Rvalue::JsonDecodeScalar { scalar, .. }
                     | Rvalue::JsonDocAsScalar { scalar, .. }
                     | Rvalue::BytesRead { scalar, .. }
+                    | Rvalue::BytesView { elem: scalar, .. }
+                    | Rvalue::SliceAsBytes { elem: scalar, .. }
                     | Rvalue::BytesSet { scalar, .. }
                     | Rvalue::BytesFill { scalar, .. }
                     | Rvalue::BufferPut { scalar, .. }
@@ -8962,6 +8989,32 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 );
                 let v = b.fresh_value(e.ty);
                 b.push(Stmt::Let(v, Rvalue::BufferLen(bop)));
+                Operand::Value(v)
+            }
+            hir::ExprKind::BytesView { bytes, elem } => {
+                lower_required_binding!(
+                    b,
+                    bytes = lower_expr(b, bytes),
+                    Operand::Const(Const::Unit)
+                );
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::BytesView { bytes, elem: align_sema::scalar_to_ty(*elem) },
+                ));
+                Operand::Value(v)
+            }
+            hir::ExprKind::SliceAsBytes { slice, elem } => {
+                lower_required_binding!(
+                    b,
+                    slice = lower_expr(b, slice),
+                    Operand::Const(Const::Unit)
+                );
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::SliceAsBytes { slice, elem: align_sema::scalar_to_ty(*elem) },
+                ));
                 Operand::Value(v)
             }
             hir::ExprKind::BytesRead { bytes, offset, be } => {

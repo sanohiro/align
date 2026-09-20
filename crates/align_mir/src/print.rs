@@ -941,6 +941,12 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::BufferBytes(buf) => format!("buffer_bytes({})", operand_str(buf)),
         Rvalue::BufferLen(buf) => format!("buffer_len({})", operand_str(buf)),
         Rvalue::BufferCapacity(buf) => format!("buffer_capacity({})", operand_str(buf)),
+        Rvalue::BytesView { bytes, elem } => {
+            format!("bytes_view_le<{elem:?}>({})", operand_str(bytes))
+        }
+        Rvalue::SliceAsBytes { slice, elem } => {
+            format!("slice_as_bytes<{elem:?}>({})", operand_str(slice))
+        }
         Rvalue::BytesRead { bytes, offset, be, .. } => {
             format!("bytes_read{}({}, {})", if *be { "_be" } else { "_le" }, operand_str(bytes), operand_str(offset))
         }

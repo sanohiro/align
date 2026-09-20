@@ -19,7 +19,7 @@ use crate::{
 /// The interface-artifact format version. Bump on ANY encoding change; a bump invalidates every
 /// cached summary (an old version fails closed on read) and changes `interface_hash` (the version is
 /// part of the hashed surface).
-pub const FORMAT_VERSION: u32 = 15;
+pub const FORMAT_VERSION: u32 = 16;
 
 const MAX_TYPE_DEPTH: u32 = 128;
 
@@ -911,7 +911,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn function_body_kinds_have_independent_v15_byte_goldens() {
+    fn function_body_kinds_have_independent_v16_byte_goldens() {
         let i64_type = IType::Named {
             path: "i64".to_string(),
             args: Vec::new(),
@@ -1006,7 +1006,7 @@ mod tests {
     }
 
     #[test]
-    fn drop_state_effect_tags_have_an_independent_v15_byte_golden() {
+    fn drop_state_effect_tags_have_an_independent_v16_byte_golden() {
         use align_sema::hir::DropStateEffect::{Deferred, Invariant, MayChange, NotApplicable};
         let effects = vec![NotApplicable, Invariant, MayChange, Deferred];
         let expected = [4, 0, 0, 0, 0, 1, 2, 3];

@@ -25,7 +25,8 @@ use align_mir::producer::{
     canonical_ty, source_ty_matches, callable_metadata_error, preflight_operand_ty,
     slice_index_physical_element, slice_index_result_matches, validate_slice_index_rvalues,
     validate_str_match_terminators,
-    validate_fixed_element_nulling, template_piece_is_type_safe, direct_operands_match_modes,
+    validate_fixed_element_nulling, validate_checked_byte_views, template_piece_is_type_safe,
+    direct_operands_match_modes,
     direct_runtime_key_is_valid
 };
 
@@ -1109,6 +1110,7 @@ pub fn validate_thin_partition_program(
     validate_slice_index_rvalues(program)?;
     validate_str_match_terminators(program)?;
     validate_fixed_element_nulling(program)?;
+    validate_checked_byte_views(program)?;
     let declarations = callable_declarations(program)?;
     callable_preflight(program, exports, declarations, ModuleScope::Whole)?;
     Ok(())
@@ -3517,6 +3519,7 @@ fn validate_module_program(
     validate_slice_index_rvalues(program)?;
     validate_str_match_terminators(program)?;
     validate_fixed_element_nulling(program)?;
+    validate_checked_byte_views(program)?;
     Ok(())
 }
 
@@ -16682,6 +16685,119 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value()
                     .basic()
                     .ok_or_else(|| self.err("buffer_capacity returned no basic value"))?
+            }
+            Rvalue::BytesView { bytes, elem } => {
+                let (pointer, length) = self.split_str(bytes)?;
+                let pointer = pointer.into_pointer_value();
+                let length = length.into_int_value();
+                let i64_ty = self.ctx.i64_type();
+                let zero = i64_ty.const_zero();
+                let llvm_elem = self.llvm_type(*elem);
+                let size = self.target_data.get_store_size(&llvm_elem);
+                let align = u64::from(self.type_align(*elem));
+                if size == 0 || !align.is_power_of_two() {
+                    return Err(self.err("byte view element has invalid size or alignment"));
+                }
+                let nonnegative = self
+                    .builder
+                    .build_int_compare(IntPredicate::SGE, length, zero, "bytes.view.len.nonnegative")
+                    .map_err(|e| self.err(e))?;
+                let remainder = self
+                    .builder
+                    .build_int_unsigned_rem(length, i64_ty.const_int(size, false), "bytes.view.remainder")
+                    .map_err(|e| self.err(e))?;
+                let whole = self
+                    .builder
+                    .build_int_compare(IntPredicate::EQ, remainder, zero, "bytes.view.whole")
+                    .map_err(|e| self.err(e))?;
+                let address = self
+                    .builder
+                    .build_ptr_to_int(pointer, i64_ty, "bytes.view.address")
+                    .map_err(|e| self.err(e))?;
+                let misalignment = self
+                    .builder
+                    .build_and(address, i64_ty.const_int(align - 1, false), "bytes.view.misalignment")
+                    .map_err(|e| self.err(e))?;
+                let aligned = self
+                    .builder
+                    .build_int_compare(IntPredicate::EQ, misalignment, zero, "bytes.view.aligned")
+                    .map_err(|e| self.err(e))?;
+                let valid = self.builder.build_and(nonnegative, whole, "bytes.view.valid.length").map_err(|e| self.err(e))?;
+                let valid = self.builder.build_and(valid, aligned, "bytes.view.valid").map_err(|e| self.err(e))?;
+                let element_len = self
+                    .builder
+                    .build_int_unsigned_div(length, i64_ty.const_int(size, false), "bytes.view.len")
+                    .map_err(|e| self.err(e))?;
+                let slice_ty = slice_struct_type(self.ctx);
+                let slice = self
+                    .builder
+                    .build_insert_value(slice_ty.const_zero(), pointer, 0, "bytes.view.ptr")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value();
+                let slice = self
+                    .builder
+                    .build_insert_value(slice, element_len, 1, "bytes.view.header")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value();
+                let payload = Scalar::Slice(
+                    align_sema::ty_to_scalar(*elem)
+                        .and_then(align_sema::scalar_to_prim)
+                        .ok_or_else(|| self.err("byte view element is not primitive"))?,
+                );
+                if result_ty != Ty::Option(payload) {
+                    return Err(self.err("byte view result type does not match its element"));
+                }
+                self.conditional_option_value(valid, payload, slice.into(), "bytes.view")?.into()
+            }
+            Rvalue::SliceAsBytes { slice, elem } => {
+                let (pointer, length) = self.split_str(slice)?;
+                let pointer = pointer.into_pointer_value();
+                let length = length.into_int_value();
+                let size = self.target_data.get_store_size(&self.llvm_type(*elem));
+                if size == 0 || result_ty != Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })) {
+                    return Err(self.err("slice-as-bytes has invalid element or result type"));
+                }
+                let i64_ty = self.ctx.i64_type();
+                let product = self
+                    .call_overflow_intrinsic(
+                        "llvm.umul.with.overflow",
+                        i64_ty,
+                        length,
+                        i64_ty.const_int(size, false),
+                    )?
+                    .into_struct_value();
+                let byte_len = self
+                    .builder
+                    .build_extract_value(product, 0, "slice.as_bytes.len")
+                    .map_err(|e| self.err(e))?
+                    .into_int_value();
+                let overflow = self
+                    .builder
+                    .build_extract_value(product, 1, "slice.as_bytes.overflow")
+                    .map_err(|e| self.err(e))?
+                    .into_int_value();
+                let negative = self
+                    .builder
+                    .build_int_compare(IntPredicate::SLT, byte_len, i64_ty.const_zero(), "slice.as_bytes.negative")
+                    .map_err(|e| self.err(e))?;
+                let malformed = self.builder.build_or(overflow, negative, "slice.as_bytes.malformed").map_err(|e| self.err(e))?;
+                let malformed_block = self.ctx.append_basic_block(self.func, "slice.as_bytes.invalid");
+                let valid_block = self.ctx.append_basic_block(self.func, "slice.as_bytes.valid");
+                self.builder.build_conditional_branch(malformed, malformed_block, valid_block).map_err(|e| self.err(e))?;
+                self.builder.position_at_end(malformed_block);
+                self.builder.build_unreachable().map_err(|e| self.err(e))?;
+                self.builder.position_at_end(valid_block);
+                let slice_ty = slice_struct_type(self.ctx);
+                let bytes = self
+                    .builder
+                    .build_insert_value(slice_ty.const_zero(), pointer, 0, "slice.as_bytes.ptr")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value();
+                self.builder
+                    .build_insert_value(bytes, byte_len, 1, "slice.as_bytes.header")
+                    .map_err(|e| self.err(e))?
+                    .into_struct_value()
+                    .into()
             }
             // `bytes.<scalar>_<le|be>(off)` — inline binary scalar read. The byte address is a plain
             // (non-`inbounds`) GEP into the bounds-checked `slice<u8>` view; the load is alignment-1

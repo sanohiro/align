@@ -2252,7 +2252,10 @@ impl<'a> XmlAccessAnalyzer<'a> {
             Rvalue::MakeFieldSlice(_, _, _) => {
                 equation.invalid = true;
             }
-            Rvalue::Use(operand) | Rvalue::SubSlice { base: operand, .. } => {
+            Rvalue::Use(operand)
+            | Rvalue::SubSlice { base: operand, .. }
+            | Rvalue::BytesView { bytes: operand, .. }
+            | Rvalue::SliceAsBytes { slice: operand, .. } => {
                 equation.seed = None;
                 equation.dependencies.clear();
                 equation.read_dependencies.clear();
@@ -5392,6 +5395,45 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     ),
                 });
             }
+            Rvalue::BytesView { bytes, elem } => {
+                let bytes_ty = Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false }));
+                let Some(primitive) = align_sema::ty_to_scalar(elem)
+                    .filter(|element| align_sema::checked_byte_view_element(*element))
+                    .and_then(align_sema::scalar_to_prim)
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                if result_ty != Ty::Option(Scalar::Slice(primitive))
+                    || xml_operand_base_ty(self.graph.function, &bytes) != Some(bytes_ty)
+                    || !(path.is_empty() || path.starts_with(&[XmlAccessPathSegment::OptionSome]))
+                {
+                    equation.invalid = true;
+                    return equation;
+                }
+                self.check_operand(&mut equation, &bytes, bytes_ty);
+                self.add_operand(&mut equation, &bytes, bytes_ty, Vec::new());
+            }
+            Rvalue::SliceAsBytes { slice, elem } => {
+                let source_ty = align_sema::ty_to_scalar(elem).map(Ty::Slice);
+                let valid_elem = align_sema::ty_to_scalar(elem)
+                    .is_some_and(align_sema::checked_byte_view_element);
+                if !valid_elem
+                    || result_ty != Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false }))
+                    || source_ty.is_none()
+                    || xml_operand_base_ty(self.graph.function, &slice) != source_ty
+                    || !path.is_empty()
+                {
+                    equation.invalid = true;
+                    return equation;
+                }
+                let Some(source_ty) = source_ty else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                self.check_operand(&mut equation, &slice, source_ty);
+                self.add_operand(&mut equation, &slice, source_ty, Vec::new());
+            }
             Rvalue::Chunks { src, n, elem } => {
                 let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
                 let Some(primitive) = align_sema::ty_to_scalar(elem)
@@ -7817,6 +7859,7 @@ pub fn validate_mir_producers(program: &Program) -> Result<HashSet<String>, Prod
     validate_str_match_terminators(program)?;
     validate_fixed_element_nulling(program)?;
     validate_fixed_field_slices(program)?;
+    validate_checked_byte_views(program)?;
     // Publication certifies the typed producer graph, not final native codegen.
     // Generated callback/parallel-kernel preflight runs at emission, after the
     // consumer's interface checks and diagnostic precedence have completed.
@@ -7836,6 +7879,48 @@ pub fn validate_mir_producers(program: &Program) -> Result<HashSet<String>, Prod
         ));
     }
     Ok(certified)
+}
+
+/// Authenticate the exact operand, element, and result equations for descriptor-only byte views.
+/// This is deliberately independent of the broader producer graph: even a view whose result is
+/// dead must not let malformed MIR reach an interface artifact, cache entry, or LLVM module.
+pub fn validate_checked_byte_views(program: &Program) -> Result<(), ProducerError> {
+    let bytes_ty = Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false }));
+    for function in &program.fns {
+        for statement in function.blocks.iter().flat_map(|block| &block.stmts) {
+            let Stmt::Let(value, rvalue) = statement else { continue };
+            let result_ty = function.value_tys.get(*value as usize).copied();
+            let valid = match rvalue {
+                Rvalue::BytesView { bytes, elem } => {
+                    let primitive = align_sema::ty_to_scalar(*elem)
+                        .and_then(align_sema::scalar_to_prim);
+                    checked_byte_view_element(*elem)
+                        && xml_operand_base_ty(function, bytes) == Some(bytes_ty)
+                        && primitive.is_some_and(|primitive| {
+                            result_ty == Some(Ty::Option(Scalar::Slice(primitive)))
+                        })
+                }
+                Rvalue::SliceAsBytes { slice, elem } => {
+                    checked_byte_view_element(*elem)
+                        && align_sema::ty_to_scalar(*elem).is_some_and(|elem| {
+                            xml_operand_base_ty(function, slice) == Some(Ty::Slice(elem))
+                        })
+                        && result_ty == Some(bytes_ty)
+                }
+                _ => continue,
+            };
+            if !valid {
+                return Err(ProducerError::Lowering(
+                    "malformed checked byte view".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn checked_byte_view_element(ty: Ty) -> bool {
+    align_sema::ty_to_scalar(ty).is_some_and(align_sema::checked_byte_view_element)
 }
 
 fn validate_fixed_field_slices(program: &Program) -> Result<(), ProducerError> {
@@ -11239,6 +11324,59 @@ mod tests {
         assert!(validate_mir_producers(&duplicate).is_err(), "duplicate producer identity");
         assert_eq!(ProducerError::Lowering("invalid producer".to_owned()).to_string(),
             "lowering failed: invalid producer");
+    }
+
+    #[test]
+    fn checked_byte_view_mir_relations_fail_closed_before_publication() {
+        let mut diagnostics = align_diag::Diagnostics::new();
+        let source = "fn view(raw: slice<u8>) -> Option<slice<u32>> = raw.view_le()\n\
+                      fn inverse(values: slice<u32>) -> slice<u8> = values.as_bytes()\n\
+                      fn main() -> i32 = 0\n";
+        let tokens = align_lexer::tokenize(0, source, &mut diagnostics);
+        let ast = align_parser::parse_file(tokens, &mut diagnostics);
+        let hir = align_sema::check_file(&ast, &mut diagnostics);
+        assert!(!diagnostics.has_errors());
+        let program = crate::lower_program(&hir);
+        validate_mir_producers(&program).unwrap_or_else(|error| panic!("valid views: {error}"));
+
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        for mutation in 0..6 {
+            let mut malformed = program.clone();
+            let name = if mutation < 3 { "view" } else { "inverse" };
+            let function = malformed
+                .fns
+                .iter_mut()
+                .find(|function| function.name.as_str() == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            let mut result = None;
+            for statement in function.blocks.iter_mut().flat_map(|block| &mut block.stmts) {
+                match (mutation, statement) {
+                    (0, Stmt::Let(_, Rvalue::BytesView { elem, .. })) => *elem = Ty::Bool,
+                    (1, Stmt::Let(id, Rvalue::BytesView { .. })) => result = Some(*id),
+                    (2, Stmt::Let(_, Rvalue::BytesView { bytes, .. })) => {
+                        *bytes = Operand::Const(Const::Int(0, i64_ty));
+                    }
+                    (3, Stmt::Let(_, Rvalue::SliceAsBytes { elem, .. })) => *elem = Ty::Bool,
+                    (4, Stmt::Let(id, Rvalue::SliceAsBytes { .. })) => result = Some(*id),
+                    (5, Stmt::Let(_, Rvalue::SliceAsBytes { slice, .. })) => {
+                        *slice = Operand::Const(Const::Int(0, i64_ty));
+                    }
+                    _ => continue,
+                }
+                if !matches!(mutation, 1 | 4) {
+                    result = Some(u32::MAX);
+                }
+                break;
+            }
+            let result = result.unwrap_or_else(|| panic!("mutation {mutation} did not reach {name}"));
+            if matches!(mutation, 1 | 4) {
+                function.value_tys[result as usize] = Ty::Bool;
+            }
+            assert!(
+                validate_mir_producers(&malformed).is_err(),
+                "accepted checked-byte-view mutation {mutation}"
+            );
+        }
     }
 
     #[test]

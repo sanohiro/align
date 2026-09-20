@@ -231,6 +231,191 @@ pub fn main() -> Result<(), Error> {
     );
 }
 
+#[test]
+fn checked_typed_byte_view_round_trip_and_failures() {
+    if !backend_available() {
+        return;
+    }
+    let program = r#"
+fn read_word(raw: slice<u8>) -> i64 {
+  words: slice<u32> := raw.view_le() else { return -1 }
+  back := words.as_bytes()
+  if back.len() != raw.len() { return -2 }
+  return words[0] as i64
+}
+
+fn main() -> i32 {
+  mut aligned := buffer(0)
+  aligned.put_u32_le(305419896)
+  if read_word(aligned.bytes()) != 305419896 { return 1 }
+
+  mut short := buffer(0)
+  short.put_u16_le(7)
+  if read_word(short.bytes()) != -1 { return 2 }
+
+  mut shifted := buffer(0)
+  shifted.put_u8(0)
+  shifted.put_u32_le(9)
+  if read_word(shifted.bytes()[1..5]) != -1 { return 3 }
+  return 0
+}
+"#;
+    for per_unit in [false, true] {
+        let output = if per_unit {
+            build_per_unit_multi("checked-byte-view-unit", &[("main.align", program)], "main.align")
+                .link_and_run()
+        } else {
+            build_and_run("checked-byte-view", program)
+        };
+        assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    let library = r#"module views
+pub fn read_word(raw: slice<u8>) -> i64 {
+  words: slice<u32> := raw.view_le() else { return -1 }
+  return words[0] as i64
+}
+"#;
+    let caller = r#"import views
+fn main() -> i32 {
+  mut bytes := buffer(0)
+  bytes.put_u32_le(305419896)
+  if views.read_word(bytes.bytes()) != 305419896 { return 1 }
+  return 0
+}
+"#;
+    let output = build_per_unit_multi(
+        "checked-byte-view-interface",
+        &[("views.align", library), ("main.align", caller)],
+        "main.align",
+    )
+    .link_and_run();
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn checked_typed_byte_views_reach_vector_loads_and_stores() {
+    if !backend_available() {
+        return;
+    }
+    for (label, elem, lanes, llvm_elem, increment) in [
+        ("f32x2", "f32", 2, "float", "1.0"),
+        ("f32x4", "f32", 4, "float", "1.0"),
+        ("f32x8", "f32", 8, "float", "1.0"),
+        ("f32x16", "f32", 16, "float", "1.0"),
+        ("i32x4", "i32", 4, "i32", "1"),
+    ] {
+        let source = format!(
+            "fn transform(out raw: slice<u8>) -> {elem} {{\n  mut values: slice<{elem}> := raw.view_le() else {{ return 0 as {elem} }}\n  lanes: vec{lanes}<{elem}> := values.load(0)\n  values.store(0, lanes + {increment})\n  return lanes[0]\n}}\n"
+        );
+        let ir = emit_llvm_with_exports(&source, &["transform"]);
+        assert!(ir.contains(&format!("load <{lanes} x {llvm_elem}>")), "{label}: {ir}");
+        assert!(ir.contains(&format!("store <{lanes} x {llvm_elem}>")), "{label}: {ir}");
+        assert!(!ir.contains("llvm.memcpy"), "{label}: conversion copied payload: {ir}");
+    }
+}
+
+#[test]
+fn checked_typed_byte_views_are_descriptor_only_in_llvm() {
+    if !backend_available() {
+        return;
+    }
+    let source = "fn view(raw: slice<u8>) -> Option<slice<u64>> = raw.view_le()\n\
+                  fn inverse(values: slice<u64>) -> slice<u8> = values.as_bytes()\n";
+    let ir = emit_llvm_with_exports(source, &["view", "inverse"]);
+    let view = explicit_export_core_body(&ir, "view");
+    assert!(view.contains("ptrtoint ptr"), "{view}");
+    assert!(view.contains("urem i64"), "{view}");
+    assert!(view.contains("udiv i64"), "{view}");
+    assert!(!view.contains("@align_rt_"), "{view}");
+    assert!(!view.contains("memcpy"), "{view}");
+
+    let inverse = explicit_export_core_body(&ir, "inverse");
+    assert!(inverse.contains("@llvm.umul.with.overflow.i64"), "{inverse}");
+    assert!(!inverse.contains("@align_rt_"), "{inverse}");
+    assert!(!inverse.contains("memcpy"), "{inverse}");
+}
+
+#[test]
+fn checked_typed_byte_view_runtime_predicates_cover_the_closed_domain() {
+    if !backend_available() {
+        return;
+    }
+    let domain = [
+        ("u16", 2), ("u32", 4), ("u64", 8),
+        ("i16", 2), ("i32", 4), ("i64", 8),
+        ("f32", 4), ("f64", 8),
+    ];
+    let mut source = String::new();
+    for (elem, _) in domain {
+        source.push_str(&format!(
+            "fn view_{elem}(raw: slice<u8>) -> i64 {{ values: slice<{elem}> := raw.view_le() else {{ return -1 }}; return values.len() }}\n"
+        ));
+    }
+    source.push_str("fn main() -> i32 {\n");
+    for (index, (elem, width)) in domain.into_iter().enumerate() {
+        let failure = index * 4 + 1;
+        source.push_str(&format!(
+            "  mut exact_{index} := buffer.filled({width}, 0)\n\
+             if view_{elem}(exact_{index}.bytes()) != 1 {{ return {failure} }}\n\
+             if view_{elem}(exact_{index}.bytes()[0..0]) != 0 {{ return {} }}\n\
+             mut uneven_{index} := buffer.filled({}, 0)\n\
+             if view_{elem}(uneven_{index}.bytes()) != -1 {{ return {} }}\n\
+             if view_{elem}(uneven_{index}.bytes()[1..1]) != -1 {{ return {} }}\n",
+            failure + 1,
+            width + 1,
+            failure + 2,
+            failure + 3,
+        ));
+    }
+    source.push_str("  return 0\n}\n");
+    let output = build_and_run("checked-byte-view-domain", &source);
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn checked_typed_byte_view_inference_and_domain_diagnostics() {
+    let valid = [
+        "fn f(raw: slice<u8>) -> i64 { xs: slice<u16> := raw.view_le() else { return 0 }; return xs.len() }",
+        "fn f(xs: slice<f64>) -> slice<u8> = xs.as_bytes()",
+        "fn f(raw: slice<u8>) -> Option<slice<i32>> = raw.view_le()",
+        "fn f(raw: slice<u8>) -> i64 { xs: Option<slice<i64>> := raw.view_le(); return 0 }",
+        "fn use(xs: slice<u16>) -> i64 = xs.len()\nfn f(raw: slice<u8>) -> i64 = use(raw.view_le() else { return 0 })",
+        "fn identity(raw: slice<u8>) -> slice<u8> = raw\nfn f(raw: slice<u8>) -> Option<slice<u32>> = identity(raw).view_le()",
+        "Packet { raw: slice<u8> }\nfn f(p: Packet) -> Option<slice<u32>> = p.raw.view_le()",
+        "fn f(a: slice<u8>, b: slice<u8>, first: bool) -> Option<slice<u32>> = (if first { a } else { b }).view_le()",
+        "fn main() -> i32 { mut b := buffer(0); b.put_u32_le(1); mut xs: slice<u32> := b.bytes().view_le() else { return 1 }; xs[0] = 9; return b.bytes().u32_le(0) as i32 }",
+    ];
+    let invalid = [
+        "fn f(raw: slice<u8>) { x := raw.view_le() }",
+        "fn f(raw: slice<u8>) -> Option<slice<u8>> = raw.view_le()",
+        "fn f(raw: slice<u8>) -> Option<slice<bool>> = raw.view_le()",
+        "fn f(xs: slice<u8>) -> slice<u8> = xs.as_bytes()",
+        "fn f(xs: slice<u32>) -> slice<u8> = xs.as_bytes(1)",
+        "fn f(xs: i64) -> slice<u8> = xs.as_bytes()",
+        "fn f() { mut xs: slice<u32> := \"abcd\".bytes().view_le() else { return }; xs[0] = 1 }",
+        "fn f() { xs: slice<u32> := \"abcd\".bytes().view_le() else { return }; mut raw := xs.as_bytes(); raw.set_u8(0, 1) }",
+        "fn f() -> slice<u8> { mut b := buffer(0); b.put_u32_le(1); xs: slice<u32> := b.bytes().view_le() else { return []; }; return xs.as_bytes() }",
+    ];
+    for (sources, errors) in [(valid.as_slice(), false), (invalid.as_slice(), true)] {
+        for source in sources {
+            for per_unit in [false, true] {
+                let mut source_map = SourceMap::new();
+                let diagnostics = if per_unit {
+                    check_per_unit(&mut source_map, "checked-byte-view.align", source).diags
+                } else {
+                    check(&mut source_map, "checked-byte-view.align", source).diags
+                };
+                assert_eq!(
+                    diagnostics.has_errors(),
+                    errors,
+                    "{source}: {}",
+                    align_driver::format_diagnostics(&source_map, &diagnostics)
+                );
+            }
+        }
+    }
+}
 /// Reading is signedness-aware: the byte `0xff` reads as `255` through `u8` but `-1` through `i8`;
 /// a little-endian `u16` and a big-endian `u16` of the same two bytes differ. Decode source is a
 /// `buffer` from `hex_decode` (the encoding-domain producer), viewed as `bytes`.

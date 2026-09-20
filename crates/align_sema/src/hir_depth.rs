@@ -920,6 +920,8 @@ fn walk_body_records<'a>(
                 | ExprKind::FileLen { file: recv }
                 | ExprKind::BufferBytes { buffer: recv }
                 | ExprKind::StrBytes { inner: recv }
+                | ExprKind::BytesView { bytes: recv, .. }
+                | ExprKind::SliceAsBytes { slice: recv, .. }
                 | ExprKind::BufferLen { buffer: recv }
                 | ExprKind::FsExists { path: recv }
                 | ExprKind::FsRemove { path: recv }
