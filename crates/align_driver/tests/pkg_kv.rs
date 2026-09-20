@@ -8,7 +8,7 @@ use common::*;
 
 use align_ast::ParamMode;
 use align_interface::{
-    Effect, Hash128, IResourceDef, IType, ITypeParam, ImportCompatibilityError,
+    Effect, Hash128, IFnBody, IResourceDef, IType, ITypeParam, ImportCompatibilityError,
     ReturnBorrowSummary, ReturnRegionSummary, deserialize, serialize, validate_for_import,
 };
 use align_mir::{DirectCall, Operand, Rvalue, Stmt};
@@ -1299,7 +1299,7 @@ fn main() -> i32 = 0
             "parallel-transfer roots for `{name}`",
         );
         assert!(function.resource_hook_body);
-        assert!(function.generic_body.is_none());
+        assert_eq!(function.body, IFnBody::Absent);
     }
     assert_eq!(
         summary

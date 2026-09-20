@@ -11,15 +11,15 @@
 //!   or malformed buffer returns [`DecodeError`], never a panic.
 
 use crate::{
-    Effect, Hash128, IConst, IEnumDef, IFnSig, IParam, IResourceDef, IStructDef, IType, ITypeParam,
-    InterfaceSummary, OwnedJsonGraphInterfaceEntry, OwnedJsonTarget, ParamMode,
-    ReturnBorrowSummary, ReturnRegionSummary,
+    Effect, Hash128, IConst, IEnumDef, IFnBody, IFnSig, IInlineExtern, IParam, IResourceDef,
+    IStructDef, IType, ITypeParam, InterfaceSummary, OwnedJsonGraphInterfaceEntry, OwnedJsonTarget,
+    ParamMode, ReturnBorrowSummary, ReturnRegionSummary,
 };
 
 /// The interface-artifact format version. Bump on ANY encoding change; a bump invalidates every
 /// cached summary (an old version fails closed on read) and changes `interface_hash` (the version is
 /// part of the hashed surface).
-pub const FORMAT_VERSION: u32 = 14;
+pub const FORMAT_VERSION: u32 = 15;
 
 const MAX_TYPE_DEPTH: u32 = 128;
 
@@ -253,7 +253,32 @@ fn write_fn(w: &mut Writer, f: &IFnSig) {
     w.seq(&f.parallel_transfer_params, |w, root| w.u32(*root));
     write_mutable_retention(w, &f.mutable_retention);
     w.bool(f.resource_hook_body);
-    w.opt_str(&f.generic_body);
+    write_fn_body(w, &f.body);
+}
+
+fn write_fn_body(w: &mut Writer, body: &IFnBody) {
+    match body {
+        IFnBody::Absent => w.u8(0),
+        IFnBody::GenericTemplate(source) => {
+            w.u8(1);
+            w.str(source);
+        }
+        IFnBody::ConcreteInline {
+            policy_version,
+            source,
+            externs,
+        } => {
+            w.u8(2);
+            w.u32(*policy_version);
+            w.str(source);
+            w.seq(externs, |w, external| {
+                w.opt_str(&external.link);
+                w.str(&external.name);
+                w.seq(&external.params, write_type);
+                write_type(w, &external.ret);
+            });
+        }
+    }
 }
 
 fn write_drop_state_effects(w: &mut Writer, effects: &[align_sema::hir::DropStateEffect]) {
@@ -673,13 +698,13 @@ fn read_fn(r: &mut Reader<'_>) -> Result<IFnSig, DecodeError> {
     validate_transfer_roots(&parallel_transfer_params, params.len())?;
     let mutable_retention = read_mutable_retention(r, &params, !type_params.is_empty())?;
     let resource_hook_body = r.bool()?;
-    let generic_body = r.opt_str()?;
+    let body = read_fn_body(r)?;
     let certification_matches_body = match producer_certification {
         crate::ProducerCertification::RevalidateGenericBody => {
-            !type_params.is_empty() && generic_body.is_some()
+            !type_params.is_empty() && matches!(body, IFnBody::GenericTemplate(_))
         }
         crate::ProducerCertification::ValidatedBody => {
-            type_params.is_empty() && generic_body.is_none()
+            type_params.is_empty() && !matches!(body, IFnBody::GenericTemplate(_))
         }
     };
     if !certification_matches_body {
@@ -701,8 +726,54 @@ fn read_fn(r: &mut Reader<'_>) -> Result<IFnSig, DecodeError> {
         parallel_transfer_params,
         mutable_retention,
         resource_hook_body,
-        generic_body,
+        body,
     })
+}
+
+fn read_fn_body(r: &mut Reader<'_>) -> Result<IFnBody, DecodeError> {
+    match r.u8()? {
+        0 => Ok(IFnBody::Absent),
+        1 => Ok(IFnBody::GenericTemplate(r.str()?)),
+        2 => {
+            let policy_version = r.u32()?;
+            if policy_version != crate::INLINE_BODY_POLICY_VERSION {
+                return Err(DecodeError::InvalidSummary(
+                    "unsupported concrete-inline policy version",
+                ));
+            }
+            let source = r.str()?;
+            let externs = r.seq(|r| {
+                Ok(IInlineExtern {
+                    link: r.opt_str()?,
+                    name: r.str()?,
+                    params: r.seq(read_type)?,
+                    ret: read_type(r)?,
+                })
+            })?;
+            if externs.windows(2).any(|pair| {
+                (pair[0].link.as_deref(), pair[0].name.as_str())
+                    >= (pair[1].link.as_deref(), pair[1].name.as_str())
+            }) || {
+                let mut symbols = std::collections::HashSet::new();
+                externs
+                    .iter()
+                    .any(|external| !symbols.insert(external.name.as_str()))
+            } {
+                return Err(DecodeError::InvalidSummary(
+                    "concrete-inline externs are not canonical",
+                ));
+            }
+            Ok(IFnBody::ConcreteInline {
+                policy_version,
+                source,
+                externs,
+            })
+        }
+        tag => Err(DecodeError::BadTag {
+            what: "function body",
+            tag,
+        }),
+    }
 }
 
 fn read_struct(r: &mut Reader<'_>) -> Result<IStructDef, DecodeError> {
@@ -840,7 +911,102 @@ mod tests {
     use super::*;
 
     #[test]
-    fn drop_state_effect_tags_have_an_independent_v14_byte_golden() {
+    fn function_body_kinds_have_independent_v15_byte_goldens() {
+        let i64_type = IType::Named {
+            path: "i64".to_string(),
+            args: Vec::new(),
+        };
+        let cases = [
+            (IFnBody::Absent, vec![0]),
+            (IFnBody::GenericTemplate(String::new()), vec![1, 0, 0, 0, 0]),
+            (
+                IFnBody::ConcreteInline {
+                    policy_version: crate::INLINE_BODY_POLICY_VERSION,
+                    source: String::new(),
+                    externs: Vec::new(),
+                },
+                vec![2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            ),
+            (
+                IFnBody::ConcreteInline {
+                    policy_version: crate::INLINE_BODY_POLICY_VERSION,
+                    source: String::new(),
+                    externs: vec![IInlineExtern {
+                        link: None,
+                        name: "f".to_string(),
+                        params: vec![i64_type.clone()],
+                        ret: i64_type,
+                    }],
+                },
+                vec![
+                    2, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, b'f', 1, 0, 0, 0, 0, 3,
+                    0, 0, 0, b'i', b'6', b'4', 0, 0, 0, 0, 0, 3, 0, 0, 0, b'i', b'6', b'4', 0, 0,
+                    0, 0,
+                ],
+            ),
+        ];
+        for (body, expected) in cases {
+            let mut writer = Writer::new();
+            write_fn_body(&mut writer, &body);
+            assert_eq!(writer.buf, expected);
+            let mut reader = Reader::new(&expected);
+            assert_eq!(read_fn_body(&mut reader), Ok(body));
+            assert_eq!(reader.finish(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn concrete_inline_body_decode_rejects_tag_policy_and_duplicate_symbols() {
+        assert_eq!(
+            read_fn_body(&mut Reader::new(&[0xff])),
+            Err(DecodeError::BadTag {
+                what: "function body",
+                tag: 0xff,
+            })
+        );
+        assert_eq!(
+            read_fn_body(&mut Reader::new(&[2, 2, 0, 0, 0])),
+            Err(DecodeError::InvalidSummary(
+                "unsupported concrete-inline policy version"
+            ))
+        );
+
+        let duplicate = IFnBody::ConcreteInline {
+            policy_version: crate::INLINE_BODY_POLICY_VERSION,
+            source: String::new(),
+            externs: vec![
+                IInlineExtern {
+                    link: None,
+                    name: "same".to_string(),
+                    params: Vec::new(),
+                    ret: IType::Named {
+                        path: "i64".to_string(),
+                        args: Vec::new(),
+                    },
+                },
+                IInlineExtern {
+                    link: Some("m".to_string()),
+                    name: "same".to_string(),
+                    params: Vec::new(),
+                    ret: IType::Named {
+                        path: "i64".to_string(),
+                        args: Vec::new(),
+                    },
+                },
+            ],
+        };
+        let mut writer = Writer::new();
+        write_fn_body(&mut writer, &duplicate);
+        assert_eq!(
+            read_fn_body(&mut Reader::new(&writer.buf)),
+            Err(DecodeError::InvalidSummary(
+                "concrete-inline externs are not canonical"
+            ))
+        );
+    }
+
+    #[test]
+    fn drop_state_effect_tags_have_an_independent_v15_byte_golden() {
         use align_sema::hir::DropStateEffect::{Deferred, Invariant, MayChange, NotApplicable};
         let effects = vec![NotApplicable, Invariant, MayChange, Deferred];
         let expected = [4, 0, 0, 0, 0, 1, 2, 3];
@@ -951,7 +1117,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_array_has_independent_format_14_goldens_and_bounded_decode() {
+    fn fixed_array_has_independent_format_15_goldens_and_bounded_decode() {
         let ty = IType::FixedArray {
             element: Box::new(IType::Named {
                 path: "i64".to_string(),

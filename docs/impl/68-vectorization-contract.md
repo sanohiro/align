@@ -359,7 +359,7 @@ in progress, parallel PR              G4 Part 1  1082 Part 1
 future RFC, surface not settled       G4 Part 2  1082 Part 2
 revised by this document              G6  1063 (§6.1)
                                       G7  1064 (§6.2)
-design candidate                      G9  1066, plan 74
+implementation candidate              G9  1066, plan 74
                                       G10 needs its own issue against
                                           09-explain-opt.md's owner
 ```

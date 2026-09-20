@@ -98,6 +98,47 @@ pub enum ProducerCertification {
     ValidatedBody,
 }
 
+/// Version of the target-independent concrete-inline admission policy. This value is serialized in
+/// every concrete body record, so changing the budget or eligibility rules invalidates consumers.
+pub const INLINE_BODY_POLICY_VERSION: u32 = 1;
+
+/// One C-ABI declaration required to recheck and lower a transported concrete body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IInlineExtern {
+    pub link: Option<String>,
+    pub name: String,
+    pub params: Vec<IType>,
+    pub ret: IType,
+}
+
+/// The mutually exclusive body authority carried by an exported function record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IFnBody {
+    Absent,
+    GenericTemplate(String),
+    ConcreteInline {
+        policy_version: u32,
+        source: String,
+        externs: Vec<IInlineExtern>,
+    },
+}
+
+impl IFnBody {
+    fn generic_source(&self) -> Option<&str> {
+        match self {
+            Self::GenericTemplate(source) => Some(source),
+            Self::Absent | Self::ConcreteInline { .. } => None,
+        }
+    }
+
+    fn concrete_source(&self) -> Option<&str> {
+        match self {
+            Self::ConcreteInline { source, .. } => Some(source),
+            Self::Absent | Self::GenericTemplate(_) => None,
+        }
+    }
+}
+
 impl From<align_sema::FnEffect> for Effect {
     fn from(e: align_sema::FnEffect) -> Effect {
         match e {
@@ -167,10 +208,8 @@ pub struct IFnSig {
     /// Whether the producer source has the exact top-level `unsafe {}` body shape required of a
     /// resource Drop hook. This is semantic validation metadata, not an importable hook path.
     pub resource_hook_body: bool,
-    /// For a generic `pub` template: the declaration's source text (the body is part of the
-    /// interface, C++-template-like — editing it invalidates consumers). `None` for a non-generic fn
-    /// (whose body lives in the implementation, not the interface).
-    pub generic_body: Option<String>,
+    /// Generic-template or admitted concrete source carried through the interface.
+    pub body: IFnBody,
 }
 
 /// An exported (`pub`) struct definition. Field order is preserved (it is the layout).
@@ -555,11 +594,79 @@ pub fn build_summaries_with_effects(
         .collect();
     let caps_by_unit = partition_capabilities(modules, mir);
     let impl_hash_by_unit = partition_impl_hashes(modules, mir);
+    let resource_hooks = program
+        .resources
+        .iter()
+        .map(|resource| resource.drop_hook.as_str())
+        .collect::<HashSet<_>>();
 
     let mut summaries = Vec::with_capacity(modules.len());
     for m in modules {
         let empty = String::new();
         let src = sources.get(&m.path).unwrap_or(&empty);
+
+        let same_unit_functions = m
+            .file
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                align_ast::Item::Fn(function) => {
+                    Some(mangle(&m.path, m.is_entry, &function.name.name))
+                }
+                align_ast::Item::Test(_)
+                | align_ast::Item::Struct(_)
+                | align_ast::Item::Enum(_)
+                | align_ast::Item::Resource(_)
+                | align_ast::Item::Const(_)
+                | align_ast::Item::Extern(_) => None,
+            })
+            .collect::<HashSet<_>>();
+        let same_unit_constants = m
+            .file
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                align_ast::Item::Const(constant) => Some(constant.name.name.as_str()),
+                align_ast::Item::Fn(_)
+                | align_ast::Item::Test(_)
+                | align_ast::Item::Struct(_)
+                | align_ast::Item::Enum(_)
+                | align_ast::Item::Resource(_)
+                | align_ast::Item::Extern(_) => None,
+            })
+            .collect::<HashSet<_>>();
+        let inline_extern_inventory = m
+            .file
+            .items
+            .iter()
+            .flat_map(|item| match item {
+                align_ast::Item::Extern(block) => block
+                    .fns
+                    .iter()
+                    .map(|function| {
+                        (
+                            function.name.name.clone(),
+                            IInlineExtern {
+                                link: block.link.clone(),
+                                name: function.name.name.clone(),
+                                params: function
+                                    .params
+                                    .iter()
+                                    .map(|parameter| convert_type(&parameter.ty))
+                                    .collect(),
+                                ret: convert_ret(&function.ret),
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                align_ast::Item::Fn(_)
+                | align_ast::Item::Test(_)
+                | align_ast::Item::Struct(_)
+                | align_ast::Item::Enum(_)
+                | align_ast::Item::Resource(_)
+                | align_ast::Item::Const(_) => Vec::new(),
+            })
+            .collect::<HashMap<_, _>>();
 
         let mut fns: Vec<IFnSig> = Vec::new();
         let mut structs: Vec<IStructDef> = Vec::new();
@@ -576,7 +683,7 @@ pub fn build_summaries_with_effects(
                         let is_generic = !fd.type_params.is_empty();
                         let effect = if is_generic {
                             // A generic template's effect is derived by the consumer on instantiation;
-                            // its body ships in `generic_body`. Reserve Unknown.
+                            // its body ships as a generic template. Reserve Unknown.
                             Effect::Unknown
                         } else {
                             let canonical = mangle(&m.path, m.is_entry, &fd.name.name);
@@ -668,6 +775,47 @@ pub fn build_summaries_with_effects(
                                     )
                                 })?
                         };
+                        let resource_hook_body =
+                            align_sema::resource_hook_has_unsafe_body(&fd.body);
+                        let body_source = safe_slice(src, fd.span);
+                        let body = if is_generic {
+                            IFnBody::GenericTemplate(body_source)
+                        } else if !resource_hooks.contains(canonical.as_str())
+                            && !source_references_any_name(&body_source, &same_unit_constants)
+                            && drop_state_effects.iter().all(|effect| {
+                                *effect == align_sema::hir::DropStateEffect::NotApplicable
+                            })
+                            && let Some(function) = program
+                                .fns
+                                .iter()
+                                .find(|function| function.name == canonical)
+                            && let Some(referenced) = align_sema::concrete_inline_body_externs(
+                                function,
+                                program,
+                                &same_unit_functions,
+                            )
+                        {
+                            let mut externs = referenced
+                                .iter()
+                                .map(|name| inline_extern_inventory.get(name).cloned())
+                                .collect::<Option<Vec<_>>>();
+                            match externs.as_mut() {
+                                Some(externs) => {
+                                    externs.sort_by(|left, right| {
+                                        (left.link.as_deref(), left.name.as_str())
+                                            .cmp(&(right.link.as_deref(), right.name.as_str()))
+                                    });
+                                    IFnBody::ConcreteInline {
+                                        policy_version: INLINE_BODY_POLICY_VERSION,
+                                        source: body_source,
+                                        externs: std::mem::take(externs),
+                                    }
+                                }
+                                None => IFnBody::Absent,
+                            }
+                        } else {
+                            IFnBody::Absent
+                        };
                         fns.push(IFnSig {
                             name: fd.name.name.clone(),
                             type_params: convert_type_params(&fd.type_params),
@@ -687,8 +835,8 @@ pub fn build_summaries_with_effects(
                             mutable_retention: if is_generic { None } else {
                                 mutable_retention.get(canonical.as_str()).cloned().flatten()
                             },
-                            resource_hook_body: align_sema::resource_hook_has_unsafe_body(&fd.body),
-                            generic_body: is_generic.then(|| safe_slice(src, fd.span)),
+                            resource_hook_body,
+                            body,
                         });
                     }
                     // Non-pub fns are module-private: not part of the exported interface surface.
@@ -874,6 +1022,18 @@ pub fn build_summaries_with_effects(
         summaries.push(summary);
     }
     Ok(summaries)
+}
+
+fn source_references_any_name(source: &str, names: &HashSet<&str>) -> bool {
+    if names.is_empty() {
+        return false;
+    }
+    let mut diagnostics = align_diag::Diagnostics::new();
+    align_lexer::tokenize(0, source, &mut diagnostics)
+        .iter()
+        .any(|token| {
+            matches!(&token.kind, align_lexer::TokKind::Ident(name) if names.contains(name.as_str()))
+        })
 }
 
 /// Attribute each MIR function's capabilities to the unit that owns its base name, unioning per unit.
@@ -1130,6 +1290,9 @@ pub enum ImportCompatibilityError {
     GenericCLayoutUnsupported(String),
     GenericBodySyntax(String),
     GenericBodyMismatch(String),
+    InlineBodySyntax(String),
+    InlineBodyMismatch(String),
+    InlineExternInvalid(String),
     ResourceArityMismatch(String),
     ResourceRepresentationVersion {
         name: String,
@@ -1198,6 +1361,21 @@ impl std::fmt::Display for ImportCompatibilityError {
                     f,
                     "generic interface declaration `{name}` disagrees with its structured record"
                 )
+            }
+            ImportCompatibilityError::InlineBodySyntax(name) => {
+                write!(
+                    f,
+                    "concrete inline body `{name}` is not one valid declaration fragment"
+                )
+            }
+            ImportCompatibilityError::InlineBodyMismatch(name) => {
+                write!(
+                    f,
+                    "concrete inline body `{name}` disagrees with its structured record"
+                )
+            }
+            ImportCompatibilityError::InlineExternInvalid(name) => {
+                write!(f, "concrete inline extern `{name}` is invalid or ambiguous")
             }
             ImportCompatibilityError::ResourceArityMismatch(name) => {
                 write!(f, "interface resource `{name}` has inconsistent generic arity")
@@ -2313,7 +2491,7 @@ fn validate_import_headers(
         validate_import_summary_header(
             &function.return_borrow,
             &function.return_region,
-            function.generic_body.is_none(),
+            !matches!(function.body, IFnBody::GenericTemplate(_)),
         )?;
     }
     for structure in &summary.structs {
@@ -2358,26 +2536,81 @@ fn parse_generic_fragment(
 }
 
 fn validate_generic_function(function: &IFnSig) -> Result<(), ImportCompatibilityError> {
-    let Some(body) = &function.generic_body else {
-        return if function.type_params.is_empty() {
-            Ok(())
-        } else {
-            Err(ImportCompatibilityError::GenericBodyMismatch(
-                function.name.clone(),
-            ))
-        };
+    let (body, concrete) = match &function.body {
+        IFnBody::Absent => {
+            return if function.type_params.is_empty() {
+                Ok(())
+            } else {
+                Err(ImportCompatibilityError::GenericBodyMismatch(
+                    function.name.clone(),
+                ))
+            };
+        }
+        IFnBody::GenericTemplate(body) => {
+            if function.type_params.is_empty() {
+                return Err(ImportCompatibilityError::GenericBodyMismatch(
+                    function.name.clone(),
+                ));
+            }
+            (body, false)
+        }
+        IFnBody::ConcreteInline {
+            policy_version,
+            source,
+            externs,
+        } => {
+            if !function.type_params.is_empty()
+                || *policy_version != INLINE_BODY_POLICY_VERSION
+                || externs.windows(2).any(|pair| {
+                    (pair[0].link.as_deref(), pair[0].name.as_str())
+                        >= (pair[1].link.as_deref(), pair[1].name.as_str())
+                })
+                || {
+                    let mut symbols = std::collections::HashSet::new();
+                    externs
+                        .iter()
+                        .any(|external| !symbols.insert(external.name.as_str()))
+                }
+            {
+                return Err(ImportCompatibilityError::InlineBodyMismatch(
+                    function.name.clone(),
+                ));
+            }
+            for external in externs {
+                if !valid_inline_extern_identifier(&external.name)
+                    || external.link.as_ref().is_some_and(|link| {
+                        link.is_empty()
+                            || link.starts_with('-')
+                            || !link.bytes().all(|byte| {
+                                byte.is_ascii_alphanumeric()
+                                    || matches!(byte, b'_' | b'.' | b'+' | b'-')
+                            })
+                    })
+                {
+                    return Err(ImportCompatibilityError::InlineExternInvalid(
+                        external.name.clone(),
+                    ));
+                }
+                for ty in external.params.iter().chain(std::iter::once(&external.ret)) {
+                    validate_import_type_headers(ty)?;
+                }
+            }
+            (source, true)
+        }
     };
-    if function.type_params.is_empty() {
-        return Err(ImportCompatibilityError::GenericBodyMismatch(
-            function.name.clone(),
-        ));
-    }
-    let align_ast::Item::Fn(parsed) =
-        parse_generic_fragment(&function.name, body, "")?
-    else {
-        return Err(ImportCompatibilityError::GenericBodyMismatch(
-            function.name.clone(),
-        ));
+    let parsed_item = parse_generic_fragment(&function.name, body, "").map_err(|error| {
+        if concrete {
+            ImportCompatibilityError::InlineBodySyntax(function.name.clone())
+        } else {
+            error
+        }
+    })?;
+    let align_ast::Item::Fn(parsed) = parsed_item else {
+        return Err(if concrete {
+            ImportCompatibilityError::InlineBodyMismatch(function.name.clone())
+        } else {
+            ImportCompatibilityError::GenericBodyMismatch(function.name.clone())
+        });
     };
     let params = parsed
         .params
@@ -2391,12 +2624,36 @@ fn validate_generic_function(function: &IFnSig) -> Result<(), ImportCompatibilit
         || convert_type_params(&parsed.type_params) != function.type_params
         || params != function.params
         || convert_ret(&parsed.ret) != function.ret
+        || (concrete
+            && align_sema::resource_hook_has_unsafe_body(&parsed.body)
+                != function.resource_hook_body)
     {
-        return Err(ImportCompatibilityError::GenericBodyMismatch(
-            function.name.clone(),
-        ));
+        return Err(if concrete {
+            ImportCompatibilityError::InlineBodyMismatch(function.name.clone())
+        } else {
+            ImportCompatibilityError::GenericBodyMismatch(function.name.clone())
+        });
     }
     Ok(())
+}
+
+fn valid_inline_extern_identifier(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    if first != b'_' && !first.is_ascii_alphabetic() {
+        return false;
+    }
+    if !bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric()) {
+        return false;
+    }
+    !matches!(
+        name,
+        "fn" | "return" | "mut" | "pub" | "module" | "import" | "if" | "else"
+            | "true" | "false" | "arena" | "task_group" | "match" | "loop" | "break"
+            | "template" | "unsafe" | "extern" | "as"
+    )
 }
 
 fn validate_generic_struct(structure: &IStructDef) -> Result<(), ImportCompatibilityError> {
@@ -2615,11 +2872,38 @@ pub fn validate_for_import(
     let analysis = CapabilityAnalysis::new(index)?;
 
     for function in &summary.fns {
+        if matches!(function.body, IFnBody::ConcreteInline { .. })
+            && (function
+                .params
+                .iter()
+                .any(|parameter| matches!(parameter.mode, ParamMode::Out | ParamMode::BorrowMut))
+                || function.return_cleanup != align_sema::hir::ReturnCleanupAbi::None
+                || !matches!(function.return_borrow, ReturnBorrowSummary::None)
+                || !matches!(function.return_region, ReturnRegionSummary::None)
+                || !function.parallel_transfer_params.is_empty()
+                || function
+                    .mutable_retention
+                    .as_ref()
+                    .is_some_and(|roots| roots.iter().any(|root| !root.is_empty()))
+                || function
+                    .drop_state_effects
+                    .iter()
+                    .any(|effect| *effect != align_sema::hir::DropStateEffect::NotApplicable))
+        {
+            return Err(ImportCompatibilityError::InlineBodyMismatch(
+                function.name.clone(),
+            ));
+        }
         align_sema::hir::validate_mutable_retention(
             &function.mutable_retention,
-            &function.params.iter().map(|param| param.mode).collect::<Vec<_>>(),
-            !function.type_params.is_empty() || function.generic_body.is_some(),
-        ).map_err(ImportCompatibilityError::InvalidMutableRetention)?;
+            &function
+                .params
+                .iter()
+                .map(|param| param.mode)
+                .collect::<Vec<_>>(),
+            matches!(function.body, IFnBody::GenericTemplate(_)),
+        )
+        .map_err(ImportCompatibilityError::InvalidMutableRetention)?;
         if function.params.iter().any(|parameter| {
             matches!(parameter.mode, ParamMode::Borrow | ParamMode::BorrowMut)
                 && matches!(&parameter.ty, IType::Named { path, args }
@@ -2637,17 +2921,24 @@ pub fn validate_for_import(
             return Err(ImportCompatibilityError::DropStateEffectMismatch);
         }
         for (parameter, effect) in function.params.iter().zip(&function.drop_state_effects) {
-            let generic = !function.type_params.is_empty() || function.generic_body.is_some();
-            let expected_move = !generic
-                && parameter.mode == ParamMode::BorrowMut
-                && analysis.return_cleanup(&parameter.ty, &[]) == Some(align_sema::hir::ReturnCleanupAbi::DynamicBit);
+            let generic = matches!(function.body, IFnBody::GenericTemplate(_));
             let valid = if generic {
                 (*effect == align_sema::hir::DropStateEffect::Deferred)
                     == (parameter.mode == ParamMode::BorrowMut)
-            } else if expected_move {
-                matches!(effect, align_sema::hir::DropStateEffect::Invariant | align_sema::hir::DropStateEffect::MayChange)
-            } else {
+            } else if parameter.mode != ParamMode::BorrowMut {
                 *effect == align_sema::hir::DropStateEffect::NotApplicable
+            } else {
+                match analysis.return_cleanup(&parameter.ty, &[]) {
+                    Some(align_sema::hir::ReturnCleanupAbi::DynamicBit) => matches!(
+                        effect,
+                        align_sema::hir::DropStateEffect::Invariant
+                            | align_sema::hir::DropStateEffect::MayChange
+                    ),
+                    Some(align_sema::hir::ReturnCleanupAbi::None) => {
+                        *effect == align_sema::hir::DropStateEffect::NotApplicable
+                    }
+                    None => *effect != align_sema::hir::DropStateEffect::Deferred,
+                }
             };
             if !valid {
                 return Err(ImportCompatibilityError::DropStateEffectMismatch);
@@ -2676,7 +2967,9 @@ pub fn validate_for_import(
         {
             return Err(ImportCompatibilityError::ParallelTransferRootsNonCanonical);
         }
-        if function.generic_body.is_some() && !function.parallel_transfer_params.is_empty() {
+        if matches!(function.body, IFnBody::GenericTemplate(_))
+            && !function.parallel_transfer_params.is_empty()
+        {
             return Err(ImportCompatibilityError::ReturnSummaryOnUnsupportedSignature);
         }
         for &index in &function.parallel_transfer_params {
@@ -2714,9 +3007,9 @@ pub fn validate_for_import(
 }
 
 fn render_fn(f: &IFnSig) -> String {
-    if let Some(body) = &f.generic_body {
-        // A generic `pub` template ships its full declaration (incl. body) as source — the consumer
-        // monomorphizes it. `fd.span` starts at `fn`, so re-add the `pub` the slice omitted.
+    if let Some(body) = f.body.generic_source().or_else(|| f.body.concrete_source()) {
+        // A transported body ships its full declaration. Generic bodies are monomorphized;
+        // concrete bodies are separately rechecked as available-externally definitions.
         return format!("pub {}\n", body.trim_start());
     }
     // A non-generic `pub` fn: signature only, with an empty body. The body is never type-checked (the
@@ -2837,6 +3130,14 @@ pub fn summary_to_source(
             collect_type(&parameter.ty);
         }
         collect_type(&function.ret);
+        if let IFnBody::ConcreteInline { externs, .. } = &function.body {
+            for external in externs {
+                for ty in &external.params {
+                    collect_type(ty);
+                }
+                collect_type(&external.ret);
+            }
+        }
     }
     for constant in &summary.consts {
         if let Some(ty) = &constant.ty {
@@ -2855,6 +3156,50 @@ pub fn summary_to_source(
     }
     for import in imports {
         out.push_str(&format!("import {import}\n"));
+    }
+    let mut inline_externs = std::collections::BTreeMap::new();
+    for function in &summary.fns {
+        let IFnBody::ConcreteInline { externs, .. } = &function.body else {
+            continue;
+        };
+        for external in externs {
+            if let Some(existing) = inline_externs.insert(external.name.clone(), external)
+                && existing != external
+            {
+                return Err(ImportCompatibilityError::InlineExternInvalid(
+                    external.name.clone(),
+                ));
+            }
+        }
+    }
+    let mut inline_externs = inline_externs.into_values().collect::<Vec<_>>();
+    inline_externs.sort_by(|left, right| {
+        (left.link.as_deref(), left.name.as_str())
+            .cmp(&(right.link.as_deref(), right.name.as_str()))
+    });
+    for external in inline_externs {
+        out.push_str("extern \"C\"");
+        if let Some(link) = &external.link {
+            out.push_str(&format!(" link(\"{link}\")"));
+        }
+        out.push_str(" {\n  fn ");
+        out.push_str(&external.name);
+        out.push('(');
+        out.push_str(
+            &external
+                .params
+                .iter()
+                .enumerate()
+                .map(|(index, ty)| format!("arg{index}: {}", render_itype(ty)))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        out.push(')');
+        if !is_unit_itype(&external.ret) {
+            out.push_str(" -> ");
+            out.push_str(&render_itype(&external.ret));
+        }
+        out.push_str("\n}\n");
     }
     for c in &summary.consts {
         out.push_str("pub ");
@@ -2893,7 +3238,7 @@ pub fn summary_effects(
 ) -> HashMap<String, align_sema::FnEffect> {
     let mut m = HashMap::new();
     for f in &summary.fns {
-        if f.generic_body.is_some() {
+        if matches!(f.body, IFnBody::GenericTemplate(_)) {
             continue;
         }
         let canonical = mangle(&summary.unit, is_entry, &f.name);
@@ -2916,7 +3261,7 @@ pub fn summary_return_provenance(
 ) -> align_sema::ExternalReturnProvenance {
     let mut facts = HashMap::new();
     for function in &summary.fns {
-        if function.generic_body.is_some() {
+        if matches!(function.body, IFnBody::GenericTemplate(_)) {
             continue;
         }
         facts.insert(
@@ -2929,6 +3274,17 @@ pub fn summary_return_provenance(
                 function.producer_certification == ProducerCertification::ValidatedBody,
                 function.mutable_retention.clone(),
                 function.drop_state_effects.clone(),
+                match &function.body {
+                    IFnBody::ConcreteInline { externs, .. } => {
+                        let mut names = externs
+                            .iter()
+                            .map(|external| external.name.clone())
+                            .collect::<Vec<_>>();
+                        names.sort();
+                        Some(names)
+                    }
+                    IFnBody::Absent | IFnBody::GenericTemplate(_) => None,
+                },
             ),
         );
     }
@@ -2967,7 +3323,7 @@ pub fn summary_resource_hook_facts(
     summary
         .fns
         .iter()
-        .filter(|function| function.generic_body.is_none())
+        .filter(|function| !matches!(function.body, IFnBody::GenericTemplate(_)))
         .map(|function| {
             (
                 mangle(&summary.unit, is_entry, &function.name),
@@ -3078,7 +3434,7 @@ mod builtin_spelling_tests {
                 parallel_transfer_params: Vec::new(),
                 mutable_retention: None,
                 resource_hook_body: false,
-                generic_body: None,
+                body: IFnBody::Absent,
             }],
             structs: Vec::new(),
             owned_json_graphs: Vec::new(),

@@ -353,6 +353,7 @@ mod tests {
             exceptional_edges: Vec::new(),
             cold: false,
             exportable: false,
+            available_externally: false,
         }
     }
 

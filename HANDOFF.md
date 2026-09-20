@@ -12,9 +12,10 @@ post-#1124 nightly repair), #1128 (plan 70 PR 2), #1129 (plan 70 PR 3), and
 #1135 (plan 72 design), #1136 (plan 72 implementation), #1137 (plan 73 design),
 and #1138 (plan 73 implementation). Issue #1065's Align capability is complete;
 align-llm Request 94 retains consumer-owned migration and allocation evidence.
-Plan 74 for #1066 proposal 2 is the current design candidate: target-independent
-admission of small concrete public bodies, exact extern closure, interface format
-15, producer-fact revalidation and consumer `available_externally` linkage.
+Plan 74 for #1066 proposal 2 is the current implementation candidate:
+target-independent admission of small concrete public bodies, exact extern
+closure, interface format 15, producer-fact revalidation and consumer
+`available_externally` linkage are implemented together in one capability.
 Every remaining item below starts from `main` with a fresh branch and follows
 the CLAUDE.md review flow.
 
@@ -75,7 +76,7 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    bounds-error order.
 3. Language items after the codegen track: #1085 `str` patterns in `match`
    shipped in #1135/#1136, and #1065 fixed arrays in structs shipped in
-   #1137/#1138. #1066 proposal 2 is plan 74's current design candidate; then
+   #1137/#1138. #1066 proposal 2 is plan 74's current implementation candidate; then
    #1064 → depends on #1063, #1075 scalar ABI facts, #1082 P2 RFC.
 4. Follow-ups, independent and small (updated 2026-09-19):
    `fix/nightly-detector-restore` closed #1105, #1107, #1108, #1109, and

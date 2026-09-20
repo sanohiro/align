@@ -2986,6 +2986,7 @@ fn emit_sqlite_scalar_callback_trampoline<'c>(
 pub enum ThinFunctionLinkage {
     Root,
     UnitLocal,
+    AvailableExternally,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3723,6 +3724,7 @@ fn lower_prepared_module<'c>(
             } else {
                 partition_linkage
             },
+            scope.defines(f),
             scope.is_test(),
         );
         if explicit_export {
@@ -4602,6 +4604,12 @@ pub fn partition_function_symbol(
         && exports
             .iter()
             .any(|export| export == function.name.as_str());
+    if function.available_externally {
+        return Ok((
+            symbol_name(function, exports),
+            ThinFunctionLinkage::AvailableExternally,
+        ));
+    }
     if direct_main || explicit_export || function.exportable {
         return Ok((symbol_name(function, exports), ThinFunctionLinkage::Root));
     }
@@ -8072,6 +8080,7 @@ fn declare_fn<'c>(
     program: &Program,
     exports: &[String],
     partition_linkage: Option<ThinFunctionLinkage>,
+    has_body: bool,
     test_mode: bool,
 ) -> FunctionValue<'c> {
     let map = |ty: Ty| -> BasicTypeEnum<'c> {
@@ -8166,12 +8175,19 @@ fn declare_fn<'c>(
         && f.ret != Ty::Unit;
     let explicit_export = f.name.as_str() != "main"
         && exports.iter().any(|export| export == f.name.as_str());
+    if f.available_externally && has_body {
+        fv.set_linkage(Linkage::AvailableExternally);
+    }
     match partition_linkage {
         Some(ThinFunctionLinkage::Root) => {}
         Some(ThinFunctionLinkage::UnitLocal) => {
             fv.as_global_value().set_visibility(GlobalVisibility::Hidden);
         }
-        None if !direct_main && !explicit_export && !f.exportable => mark_internal(fv),
+        Some(ThinFunctionLinkage::AvailableExternally) => {}
+        None if !direct_main
+            && !explicit_export
+            && !f.exportable
+            && !f.available_externally => mark_internal(fv),
         None => {}
     }
     fv
@@ -28261,6 +28277,7 @@ fn main() -> i32 = 0
             exceptional_edges: Vec::new(),
             cold: false,
             exportable: false,
+            available_externally: false,
         }];
         fns.extend(extra_fns);
         let mut program = Program::default();
@@ -28293,6 +28310,7 @@ fn main() -> i32 = 0
             exceptional_edges: Vec::new(),
             cold: false,
             exportable: true,
+            available_externally: false,
         }
     }
 
@@ -29295,6 +29313,7 @@ fn main() -> i32 = 0
             exceptional_edges: Vec::new(),
             cold: false,
             exportable: false,
+            available_externally: false,
         };
         assert!(validate_mir_producers(&static_array).is_ok());
         let mut bad_constant = static_array;
@@ -29343,6 +29362,7 @@ fn main() -> i32 = 0
             exceptional_edges: Vec::new(),
             cold: false,
             exportable: false,
+            available_externally: false,
         };
         assert!(validate_mir_producers(&pooled_array).is_ok());
         let mut bad_pooled = pooled_array;
@@ -31276,6 +31296,7 @@ fn main() -> i32 = 0
                 exceptional_edges: Vec::new(),
                 cold: false,
                 exportable: false,
+                available_externally: false,
             }];
         program
     }
@@ -32598,6 +32619,7 @@ fn main() -> i32 = 0
             exceptional_edges: Vec::new(),
             cold: false,
             exportable: false,
+            available_externally: false,
         };
         let result = codegen_program(
             vec![
@@ -32975,6 +32997,7 @@ fn main() -> i32 = 0
                 exceptional_edges: Vec::new(),
                 cold: false,
                 exportable: false,
+                available_externally: false,
             }
         };
         let mut callbacks = vec![
@@ -33239,6 +33262,7 @@ fn main() -> i32 = 0
             exceptional_edges: Vec::new(),
             cold: false,
             exportable: false,
+            available_externally: false,
         });
         let emit_descriptor = |version: u32,
                                stored_count: u32,
@@ -33296,6 +33320,7 @@ fn main() -> i32 = 0
                 exceptional_edges: Vec::new(),
                 cold: false,
                 exportable: false,
+                available_externally: false,
             };
             let mut program = Program::default();
             program.fns = std::iter::once(main)
@@ -33600,6 +33625,7 @@ fn main() -> i32 = 0
                 exceptional_edges: Vec::new(),
                 cold: false,
                 exportable: false,
+                available_externally: false,
             };
             let mut program = Program::default();
             program.fns = vec![function];
@@ -34507,6 +34533,7 @@ fn main() -> i32 = 0
                 exceptional_edges: Vec::new(),
                 cold: false,
                 exportable: false,
+                available_externally: false,
             }];
         let err = emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
             .expect_err("a missing nested tagged id must fail closed");
@@ -34555,6 +34582,7 @@ fn main() -> i32 = 0
                 exceptional_edges: Vec::new(),
                 cold: false,
                 exportable: false,
+                available_externally: false,
             }];
         let err = emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
             .expect_err("an embedded missing nested tagged id must fail closed");
@@ -34598,6 +34626,7 @@ fn main() -> i32 = 0
                 exceptional_edges: Vec::new(),
                 cold: false,
                 exportable: false,
+                available_externally: false,
             }];
         let err = emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
             .expect_err("a RawLoad missing nested tagged id must fail closed");
@@ -34634,6 +34663,7 @@ fn main() -> i32 = 0
                 exceptional_edges: Vec::new(),
                 cold: false,
                 exportable: false,
+                available_externally: false,
             }];
             program.tagged_types = vec![hir::TaggedType::Option(payload)];
             program
@@ -34684,6 +34714,7 @@ fn main() -> i32 = 0
                 exceptional_edges: Vec::new(),
                 cold: false,
                 exportable: false,
+                available_externally: false,
             }];
             program.structs = structs;
             program.enums = enums;
@@ -34902,6 +34933,7 @@ fn main() -> i32 = 0
                 exceptional_edges: Vec::new(),
                 cold: false,
                 exportable: false,
+                available_externally: false,
             }];
             program
         };
@@ -35153,6 +35185,7 @@ fn main() -> i32 = 0
                 exceptional_edges: Vec::new(),
                 cold: false,
                 exportable: false,
+                available_externally: false,
             }];
         program.tagged_types = vec![hir::TaggedType::Option(Scalar::String)];
         let ir = emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
@@ -35189,6 +35222,7 @@ fn main() -> i32 = 0
                 exceptional_edges: Vec::new(),
                 cold: false,
                 exportable: false,
+                available_externally: false,
             }];
         program.tuples = vec![TupleDef {
                 elems: vec![Scalar::DynArray(align_sema::PrimScalar::String)],
@@ -35223,6 +35257,7 @@ fn main() -> i32 = 0
                 exceptional_edges: Vec::new(),
                 cold: false,
                 exportable: false,
+                available_externally: false,
             }];
         program.structs = vec![StructDef {
                 name: "MoveElem".to_string(),
@@ -35277,6 +35312,7 @@ fn main() -> i32 = 0
                 exceptional_edges: Vec::new(),
                 cold: false,
                 exportable: false,
+                available_externally: false,
             }];
             program.tagged_types = tagged_types;
             program
@@ -35390,6 +35426,7 @@ fn main() -> i32 = 0
             exceptional_edges: Vec::new(),
             cold: false,
             exportable: false,
+            available_externally: false,
         };
         let err = codegen_program(
             vec![
@@ -35495,6 +35532,7 @@ fn main() -> i32 = 0
             exceptional_edges: Vec::new(),
             cold: false,
             exportable: false,
+            available_externally: false,
         };
         let valid_source = ParallelSource::VirtualChunks {
             base: Operand::Value(0),
@@ -35650,6 +35688,7 @@ fn main() -> i32 = 0
             exceptional_edges: Vec::new(),
             cold: false,
             exportable: false,
+            available_externally: false,
         };
         let err = codegen_program(
             vec![
@@ -35703,6 +35742,7 @@ fn main() -> i32 = 0
             exceptional_edges: Vec::new(),
             cold: false,
             exportable: false,
+            available_externally: false,
         };
         let source_ty = Ty::Slice(Scalar::Int(IntTy { bits: 64, signed: true }));
         for result_scalar in [Scalar::Str, Scalar::String] {
@@ -35761,6 +35801,7 @@ fn main() -> i32 = 0
             exceptional_edges: Vec::new(),
             cold: false,
             exportable: false,
+            available_externally: false,
         };
         let source_ty = Ty::Slice(Scalar::String);
         let err = codegen_program(
@@ -35811,6 +35852,7 @@ fn main() -> i32 = 0
             exceptional_edges: Vec::new(),
             cold: false,
             exportable: false,
+            available_externally: false,
         };
         let err = codegen_program(
             vec![
@@ -35860,6 +35902,7 @@ fn main() -> i32 = 0
             exceptional_edges: Vec::new(),
             cold: false,
             exportable: false,
+            available_externally: false,
         };
         let err = codegen_program(
             vec![
@@ -35910,6 +35953,7 @@ fn main() -> i32 = 0
             exceptional_edges: Vec::new(),
             cold: false,
             exportable: false,
+            available_externally: false,
         };
         let finish = Function {
             name: program_call("finish"),
@@ -35928,6 +35972,7 @@ fn main() -> i32 = 0
             exceptional_edges: Vec::new(),
             cold: false,
             exportable: false,
+            available_externally: false,
         };
         let err = codegen_program(
             vec![
@@ -35990,6 +36035,7 @@ fn main() -> i32 = 0
             exceptional_edges: Vec::new(),
             cold: false,
             exportable: false,
+            available_externally: false,
         };
         let err = codegen_program(
             vec![
@@ -36046,6 +36092,7 @@ fn main() -> i32 = 0
             exceptional_edges: Vec::new(),
             cold: false,
             exportable: false,
+            available_externally: false,
         };
         let err = codegen_program(
             vec![Stmt::Let(
@@ -36146,6 +36193,7 @@ fn main() -> i32 = 0
             exceptional_edges: Vec::new(),
             cold: false,
             exportable: false,
+            available_externally: false,
         };
         let source_ty = Ty::Slice(Scalar::Int(IntTy { bits: 64, signed: true }));
         let err = codegen_program(
@@ -36195,6 +36243,7 @@ fn main() -> i32 = 0
             exceptional_edges: Vec::new(),
             cold: false,
             exportable: false,
+            available_externally: false,
         };
         let source_ty = Ty::Slice(Scalar::Int(IntTy { bits: 64, signed: true }));
         let err = codegen_program(
@@ -36440,6 +36489,7 @@ fn main() -> i32 = 0
                 exceptional_edges: Vec::new(),
                 cold: false,
                 exportable: false,
+                available_externally: false,
             }];
         program.structs = structs;
         emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, optimized, &[], None).unwrap()
@@ -36514,6 +36564,7 @@ fn main() -> i32 = 0
                 exceptional_edges: Vec::new(),
                 cold: false,
                 exportable: false,
+                available_externally: false,
             }];
         emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None).unwrap()
     }
@@ -36557,6 +36608,7 @@ fn main() -> i32 = 0
                 exceptional_edges: Vec::new(),
                 cold: false,
                 exportable: false,
+                available_externally: false,
             }];
         program.structs = vec![row];
         emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, optimized, &[], None).unwrap()
@@ -37552,6 +37604,7 @@ fn main() -> i32 = 0
             exceptional_edges: Vec::new(),
             cold: false,
             exportable: false,
+            available_externally: false,
         };
         assert!(stack_header_plan(&f).slots.is_empty(), "an unaudited wrapper must retain the boxed ABI");
     }
@@ -38190,6 +38243,7 @@ fn main() -> i32 = 0
                 exceptional_edges: Vec::new(),
                 cold: false,
                 exportable: false,
+                available_externally: false,
             }
         }
 

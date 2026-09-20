@@ -9377,9 +9377,9 @@ fn validate_tagged_program_inner(
         if function.name.as_str() != "main" {
             return Ok(());
         }
-        if function.exportable {
+        if function.exportable || function.available_externally {
             return Err(ProducerError::Lowering(
-                "entry function `main` cannot be a per-unit export".to_string(),
+                "entry function `main` cannot have per-unit dependency linkage".to_string(),
             ));
         }
         let exact_i32 = Ty::Int(IntTy {
@@ -10187,6 +10187,12 @@ fn validate_tagged_program_inner(
             &mut type_graph,
         )?;
         check_mode_types(&format!("function `{}`", f.name), &f.param_modes, &param_types)?;
+        if f.exportable && f.available_externally {
+            return Err(ProducerError::Lowering(format!(
+                "function `{}` cannot be both exportable and available externally",
+                f.name
+            )));
+        }
         validate_main_abi(f, &param_types, program)?;
         check_ty(f.ret, &mut type_graph)?;
         for &ty in f.slots.iter().chain(&f.value_tys) {

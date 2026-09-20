@@ -1598,6 +1598,7 @@ fn checked_interface_program(
                 true,
                 None,
                 vec![hir::DropStateEffect::NotApplicable],
+                None,
             ),
         );
     }

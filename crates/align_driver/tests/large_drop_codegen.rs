@@ -92,6 +92,7 @@ fn deep_drop_program(depth: usize) -> Program {
             exceptional_edges: Vec::new(),
             cold: false,
             exportable: false,
+            available_externally: false,
         }];
     program.structs = structs;
     program

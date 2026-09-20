@@ -869,6 +869,7 @@ fn install_static_descriptor_data(
             exceptional_edges: Vec::new(),
             cold: false,
             exportable: false,
+            available_externally: false,
         });
         generated_functions.push(Function {
             name: parameter_count_name.clone(),
@@ -895,6 +896,7 @@ fn install_static_descriptor_data(
             exceptional_edges: Vec::new(),
             cold: false,
             exportable: false,
+            available_externally: false,
         });
 
         let align_sema::StaticContractType::Named { path, args } =
@@ -1000,6 +1002,7 @@ fn install_static_descriptor_data(
             exceptional_edges: Vec::new(),
             cold: false,
             exportable: false,
+            available_externally: false,
         });
 
         let mut static_calls: Vec<(ProgramCall, Vec<Operand>, Option<String>)> = Vec::new();
@@ -1151,6 +1154,7 @@ fn install_static_descriptor_data(
             exceptional_edges: Vec::new(),
             cold: false,
             exportable: false,
+            available_externally: false,
         });
 
         let mut header = vec![0u8; 144];
@@ -1455,6 +1459,7 @@ fn install_static_descriptor_data(
                 exceptional_edges: Vec::new(),
                 cold: false,
                 exportable: false,
+                available_externally: false,
             });
 
             let row_ty = descriptor
@@ -1722,6 +1727,7 @@ fn install_static_descriptor_data(
                 exceptional_edges: Vec::new(),
                 cold: false,
                 exportable: false,
+                available_externally: false,
             });
             generated_functions.push(Function {
                 name: stream_decode_name.clone(),
@@ -1749,6 +1755,7 @@ fn install_static_descriptor_data(
                 exceptional_edges: Vec::new(),
                 cold: false,
                 exportable: false,
+                available_externally: false,
             });
 
             let batch_names = batch_resource_names_for_descriptor(row_definition);
@@ -1823,6 +1830,7 @@ fn install_static_descriptor_data(
                 exceptional_edges: Vec::new(),
                 cold: false,
                 exportable: false,
+                available_externally: false,
             });
             let mut batch_append_stmts = Vec::new();
             let mut batch_append_values = Vec::new();
@@ -1918,6 +1926,7 @@ fn install_static_descriptor_data(
                 exceptional_edges: Vec::new(),
                 cold: false,
                 exportable: false,
+                available_externally: false,
             });
             generated_functions.push(Function {
                 name: batch_finish_name.clone(),
@@ -1944,6 +1953,7 @@ fn install_static_descriptor_data(
                 exceptional_edges: Vec::new(),
                 cold: false,
                 exportable: false,
+                available_externally: false,
             });
             generated_functions.push(Function {
                 name: batch_row_name.clone(),
@@ -1976,6 +1986,7 @@ fn install_static_descriptor_data(
                 exceptional_edges: Vec::new(),
                 cold: false,
                 exportable: false,
+                available_externally: false,
             });
             if soa_plain {
                 generated_functions.push(Function {
@@ -2014,6 +2025,7 @@ fn install_static_descriptor_data(
                     exceptional_edges: Vec::new(),
                     cold: false,
                     exportable: false,
+                    available_externally: false,
                 });
             }
             generated_functions.push(Function {
@@ -2041,6 +2053,7 @@ fn install_static_descriptor_data(
                 exceptional_edges: Vec::new(),
                 cold: false,
                 exportable: false,
+                available_externally: false,
             });
             let mut batch_plan_bytes = vec![0u8; 72];
             batch_plan_bytes[0..4].copy_from_slice(&1u32.to_le_bytes());

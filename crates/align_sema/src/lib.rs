@@ -4497,6 +4497,152 @@ pub fn needs_drop_flag(
     is_owned_droppable(ty, structs, enums, tagged_types) || ty_tuple_is_move(ty, tuples)
 }
 
+/// Plan 74's target-independent admission check for one concrete interface body. The returned names
+/// are the producer-local C externs the body references, in canonical order. `None` means the
+/// function remains an ordinary bodyless import; rejection never changes source semantics.
+pub fn concrete_inline_body_externs(
+    function: &hir::Fn,
+    program: &hir::Program,
+    same_unit_functions: &std::collections::HashSet<String>,
+) -> Option<Vec<String>> {
+    const NODE_LIMIT: usize = 24;
+    if !matches!(
+        function.origin,
+        hir::FnOrigin::Source {
+            is_entry: false,
+            is_public: true
+        } | hir::FnOrigin::ImportedInline
+    ) || (function.body.stmts.is_empty() && function.body.value.is_none())
+        || function.locals.len() != function.params.len()
+        || function.return_cleanup != hir::ReturnCleanupAbi::None
+        || !matches!(function.return_borrow, hir::ReturnBorrowSummary::None)
+        || !matches!(function.return_region, hir::ReturnRegionSummary::None)
+        || !matches!(function.parallel_transfer, hir::ReturnBorrowSummary::None)
+        || function
+            .mutable_retention
+            .as_ref()
+            .is_some_and(|roots| roots.iter().any(|root| !root.is_empty()))
+        || ty_capture_is_move(
+            function.ret,
+            &program.structs,
+            &program.tuples,
+            &program.enums,
+            &program.tagged_types,
+        )
+        || matches!(function.ret, Ty::Fn(_))
+    {
+        return None;
+    }
+    for (&local, mode) in function.params.iter().zip(&function.param_modes) {
+        let ty = function.locals.get(local as usize)?.ty;
+        let admitted = match mode {
+            ast::ParamMode::ByValue => {
+                !ty_capture_is_move(
+                    ty,
+                    &program.structs,
+                    &program.tuples,
+                    &program.enums,
+                    &program.tagged_types,
+                ) && !matches!(ty, Ty::Fn(_))
+            }
+            ast::ParamMode::Borrow => !matches!(ty, Ty::Fn(_)),
+            ast::ParamMode::Out | ast::ParamMode::BorrowMut => false,
+        };
+        if !admitted {
+            return None;
+        }
+    }
+
+    let extern_names = program
+        .externs
+        .iter()
+        .map(|external| external.name.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let params = function
+        .params
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let mut referenced_externs = std::collections::BTreeSet::new();
+    let mut nodes = 1usize;
+    let mut returns = 0usize;
+    let root_has_terminal_return = function.body.value.is_none()
+        && matches!(function.body.stmts.as_slice(), [hir::Stmt::Return(_)]);
+    for event in hir_depth::body_events(&function.body) {
+        match event {
+            hir_depth::BodyEvent::StmtEnter(statement) => {
+                nodes = nodes.checked_add(1)?;
+                match statement {
+                    hir::Stmt::Return(_) => {
+                        returns += 1;
+                        if returns > 1 {
+                            return None;
+                        }
+                    }
+                    hir::Stmt::Let { .. }
+                    | hir::Stmt::LetTuple { .. }
+                    | hir::Stmt::Assign { .. }
+                    | hir::Stmt::AssignIndex { .. }
+                    | hir::Stmt::AssignVecLane { .. }
+                    | hir::Stmt::AssignField { .. }
+                    | hir::Stmt::AssignElemField { .. }
+                    | hir::Stmt::AssignElem { .. }
+                    | hir::Stmt::Break { .. }
+                    | hir::Stmt::TestAssert { .. }
+                    | hir::Stmt::Expr(_) => return None,
+                }
+            }
+            hir_depth::BodyEvent::ExprEnter(expression) => {
+                nodes = nodes.checked_add(1)?;
+                match &expression.kind {
+                    hir::ExprKind::Unit
+                    | hir::ExprKind::Int(_)
+                    | hir::ExprKind::Float(_)
+                    | hir::ExprKind::Char(_)
+                    | hir::ExprKind::Str(_)
+                    | hir::ExprKind::Bool(_)
+                    | hir::ExprKind::Unary { .. }
+                    | hir::ExprKind::Cast(_)
+                    | hir::ExprKind::Binary { .. }
+                    | hir::ExprKind::IntArith { .. }
+                    | hir::ExprKind::MathOp { .. }
+                    | hir::ExprKind::Block(_)
+                    | hir::ExprKind::Unsafe(_)
+                    | hir::ExprKind::RawNull
+                    | hir::ExprKind::RawIsNull(_)
+                    | hir::ExprKind::Field { .. }
+                    | hir::ExprKind::TupleIndex { .. }
+                    | hir::ExprKind::ResourceBorrow { .. }
+                    | hir::ExprKind::ResourceRaw { .. } => {}
+                    hir::ExprKind::Local(local) if params.contains(local) => {}
+                    hir::ExprKind::Local(_) => return None,
+                    hir::ExprKind::Call {
+                        func, type_args, ..
+                    } if type_args.is_empty() => {
+                        if same_unit_functions.contains(func) {
+                            return None;
+                        }
+                        if extern_names.contains(func.as_str()) {
+                            referenced_externs.insert(func.clone());
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            hir_depth::BodyEvent::StmtExit(_)
+            | hir_depth::BodyEvent::ExprExit { .. }
+            | hir_depth::BodyEvent::MatchArmEnter { .. } => {}
+        }
+        if nodes > NODE_LIMIT {
+            return None;
+        }
+    }
+    if returns != usize::from(root_has_terminal_return) {
+        return None;
+    }
+    Some(referenced_externs.into_iter().collect())
+}
+
 /// The [`Ty`] a **builtin** type spelling denotes, for the builtin heads whose ownership does not
 /// depend on a type argument (an owned `array<T>` owns its buffer for every `T`; a `slice<T>` /
 /// `soa<T>` borrows for every `T`). `None` for a user-defined, imported, or nominal-argument
@@ -7503,6 +7649,7 @@ pub type ExternalReturnProvenance = std::collections::HashMap<
         bool,
         hir::MutableRetentionSummary,
         Vec<hir::DropStateEffect>,
+        Option<Vec<String>>,
     ),
 >;
 
@@ -9950,7 +10097,9 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
     // Synthesized interface source cannot spell compiler-owned provenance facts. Restore those
     // facts after signature collection. The driver supplies the complete transitive fact map, so
     // entries outside the modules visible to this check are intentionally ignored.
-    for (name, (return_borrow, return_region, return_cleanup, _, _, _, _)) in external_return_provenance {
+    for (name, (return_borrow, return_region, return_cleanup, _, _, _, _, _)) in
+        external_return_provenance
+    {
         if let Some(sig) = sigs.get_mut(name) {
             sig.return_borrow = return_borrow.clone();
             sig.return_region = return_region.clone();
@@ -10308,9 +10457,16 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         // templates are reached only through the monomorphization worklist below.
         if interface_only_modules.contains(module) {
             let is_generic = !f.type_params.is_empty();
-            if !is_generic && matches!(f.vis, ast::Vis::Pub) {
-                let mangled = mangle_fn(module, is_entry, &f.name.name);
-                if let Some(sig) = sigs.get(&mangled) {
+            let mangled = mangle_fn(module, is_entry, &f.name.name);
+            let concrete_inline = !is_generic
+                && external_return_provenance
+                    .get(&mangled)
+                    .is_some_and(|(_, _, _, _, _, _, _, externs)| externs.is_some());
+            if !is_generic
+                && !concrete_inline
+                && matches!(f.vis, ast::Vis::Pub)
+                && let Some(sig) = sigs.get(&mangled)
+            {
                     let expected_cleanup = return_cleanup_abi(
                         sig.ret,
                         &structs,
@@ -10328,14 +10484,14 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                         external_return_provenance.contains_key(&mangled);
                     let producer_certified = external_return_provenance
                         .get(&mangled)
-                        .is_some_and(|(_, _, _, _, certified, _, _)| *certified);
+                        .is_some_and(|(_, _, _, _, certified, _, _, _)| *certified);
                     let effect = external_effects
                         .get(&mangled)
                         .copied()
                         .unwrap_or(FnEffect::Impure);
                     let parallel_transfer_params = external_return_provenance
                         .get(&mangled)
-                        .map(|(_, _, _, roots, _, _, _)| roots.clone())
+                        .map(|(_, _, _, roots, _, _, _, _)| roots.clone())
                         .unwrap_or_else(|| {
                             sig.params
                                 .iter()
@@ -10356,10 +10512,12 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                                 })
                                 .collect()
                         });
-                    let mutable_retention = external_return_provenance.get(&mangled)
-                        .and_then(|(_, _, _, _, _, summary, _)| summary.clone());
-                    let drop_state_effects = external_return_provenance.get(&mangled)
-                        .map(|(_, _, _, _, _, _, effects)| effects.clone())
+                    let mutable_retention = external_return_provenance
+                        .get(&mangled)
+                        .and_then(|(_, _, _, _, _, summary, _, _)| summary.clone());
+                    let drop_state_effects = external_return_provenance
+                        .get(&mangled)
+                        .map(|(_, _, _, _, _, _, effects, _)| effects.clone())
                         .unwrap_or_else(|| {
                             sig.params
                                 .iter()
@@ -10402,9 +10560,10 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                         parallel_transfer_params,
                         mutable_retention,
                     });
-                }
             }
-            continue;
+            if !concrete_inline {
+                continue;
+            }
         }
         let mangled = mangle_fn(module, is_entry, &f.name.name);
         let is_template = !f.type_params.is_empty();
@@ -10501,9 +10660,13 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
             // under separate compilation (its `module$name` mangling is collision-free). The entry
             // unit's functions are never imported (nothing imports the entry), so they stay
             // internal — which also keeps a single-file (N=1) build byte-identical to today.
-            checked.origin = hir::FnOrigin::Source {
-                is_entry,
-                is_public: matches!(f.vis, ast::Vis::Pub),
+            checked.origin = if interface_only_modules.contains(module) {
+                hir::FnOrigin::ImportedInline
+            } else {
+                hir::FnOrigin::Source {
+                    is_entry,
+                    is_public: matches!(f.vis, ast::Vis::Pub),
+                }
             };
             worklist.extend(instantiations);
             fns.push(checked);
@@ -10701,6 +10864,64 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         diags,
         false,
     );
+    let inferred_effects = fn_effects(&program, external_effects);
+    for function in program
+        .fns
+        .iter()
+        .filter(|function| function.origin == hir::FnOrigin::ImportedInline)
+    {
+        let same_unit_prefix = function
+            .name
+            .rsplit_once('$')
+            .map(|(prefix, _)| format!("{prefix}$"));
+        let same_unit_functions = program
+            .fns
+            .iter()
+            .map(|candidate| candidate.name.as_str())
+            .chain(
+                program
+                    .imported_fns
+                    .iter()
+                    .map(|candidate| candidate.name.as_str()),
+            )
+            .filter(|name| {
+                same_unit_prefix
+                    .as_ref()
+                    .is_some_and(|prefix| name.starts_with(prefix))
+            })
+            .map(|name| name.to_string())
+            .collect::<std::collections::HashSet<_>>();
+        let expected = external_return_provenance.get(&function.name);
+        let exact_facts = expected.is_some_and(
+            |(borrow, region, cleanup, transfer, certified, retention, effects, externs)| {
+                *certified
+                    && borrow == &function.return_borrow
+                    && region == &function.return_region
+                    && *cleanup == function.return_cleanup
+                    && transfer.as_slice()
+                        == match &function.parallel_transfer {
+                            hir::ReturnBorrowSummary::None => &[],
+                            hir::ReturnBorrowSummary::Roots { params, .. } => params.as_slice(),
+                        }
+                    && retention == &function.mutable_retention
+                    && effects
+                        .iter()
+                        .all(|effect| *effect == hir::DropStateEffect::NotApplicable)
+                    && externs.as_ref().is_some_and(|expected_externs| {
+                        concrete_inline_body_externs(function, &program, &same_unit_functions)
+                            .is_some_and(|actual| &actual == expected_externs)
+                    })
+            },
+        ) && external_effects.get(&function.name)
+            == inferred_effects.get(&function.name);
+        if !exact_facts {
+            diags.error(
+                "imported concrete inline body disagrees with its producer-certified facts"
+                    .to_owned(),
+                function.span,
+            );
+        }
+    }
     static_descriptors.sort_by(|left, right| {
         left.descriptor_id.as_bytes().cmp(right.descriptor_id.as_bytes())
     });
@@ -13458,7 +13679,10 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
 
             let capture_count = match function.origin {
                 hir::FnOrigin::Lifted { capture_count } => capture_count,
-                hir::FnOrigin::Source { .. } | hir::FnOrigin::Monomorph | hir::FnOrigin::Test => 0,
+                hir::FnOrigin::Source { .. }
+                | hir::FnOrigin::Monomorph
+                | hir::FnOrigin::ImportedInline
+                | hir::FnOrigin::Test => 0,
             };
             let explicit_params = (function.params.len() as u32).saturating_sub(capture_count);
             // Storage-generation roots are useful inside MoveCheck even for non-borrowing Move

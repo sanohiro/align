@@ -1,10 +1,11 @@
 # Interface-carried inline bodies
 
-Status: design candidate for
+Status: implementation candidate for
 [issue 1066](https://github.com/sanohiro/align/issues/1066) and G9 of the
 [vectorization contract](68-vectorization-contract.md). This document is the
-public artifact ledger and implementation closure matrix. It implements
-nothing. Evidence baseline: Align
+public artifact ledger and implementation closure matrix. The provider
+implementation spans interface format 15, checked-HIR revalidation, MIR origin,
+LLVM `available_externally` linkage and the focused two-unit owner. Evidence baseline: Align
 `2907d5e56b3bdbc4652787376ec268db5507bdc4`, LLVM 22.1.8, and align-llm
 Request 95.
 
@@ -308,3 +309,32 @@ selected source-transport/available-externally strategy.
 |---|---|---|
 | Budget-version invalidation had no canonical byte | identity prose named a version but format 15 encoded only body source and extern closure | concrete-inline tag 2 now encodes exact little-endian u32 policy version 1 immediately after the tag; every other version rejects, exact goldens include it, and any eligibility/count change increments it or the interface format |
 | Local bindings were neither admitted nor rejected | statements contributed to the node budget but the domain listed only parameter reads | reject every immutable, mutable, inferred, annotated and tuple-destructuring binding and all dependent local reads; admit only wrapper blocks/unsafe plus a terminal return or tail expression, and add each binding form to the eligibility owner |
+
+## 7. Implementation-review finding closure
+
+The fresh full-diff review of implementation candidate `7a5ae92e` found one
+P2 canonical-order mismatch. The interface record orders externs by `(link,
+symbol)`, while the body walker reports referenced names by symbol. The
+producer-fact bridge now sorts its name-only projection by symbol before the
+consumer comparison. The focused interface owner and the two-unit native
+wrapper owner both cover the previously failing linked-`acos` plus unlinked-
+`labs` combination.
+
+The first CI run then exercised the existing function-partition ThinLTO owner
+and found that consumer bodies were classified as duplicate external roots.
+ThinLTO now carries a distinct available-external partition linkage: only the
+selected definition receives LLVM `available_externally`, peer declarations
+remain ordinary external declarations, and only the producer is a preserved
+root. The complete `function_thin_lto` target owns this integration boundary.
+
+The second CI run exercised the required database consumers and found two
+source-closure boundaries. A concrete source fragment that names a same-unit
+constant is now rejected alongside a same-unit function dependency; constants
+are folded out of HIR, so admission checks the producer declaration's tokenized
+source before publication. The same run exposed an existing validator gap for
+`borrow mut` parameters whose resource nominal belongs to another interface:
+the isolated summary cannot resolve that nominal's cleanup class. It now
+rejects `Deferred` but accepts the three concrete producer classifications;
+resolved local and builtin types retain their exact ownership check. The
+focused interface admission and foreign-nominal owners plus the required
+database suites cover both boundaries.
