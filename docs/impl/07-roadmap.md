@@ -578,6 +578,9 @@ Completion condition (met): data allocated inside `arena {}` is freed at block e
   array-valued results, and the materializing terminals `scan`/`sort`/`to_array` all landed on
   the owned/dynamic-heap-array + drop foundation. Non-materializing terminals
   (`sum`/`reduce`/`count`/`any`/`all`) were already complete.
+- [designed, plan 73] nameable fixed arrays `[T; N]` in every type position, including inline
+  record fields. Stable field places use the existing fixed-array operations and ownership model;
+  no header or allocation is added. Implementation is tracked by issue #1065.
 - [done] **`sort_by_key(f)`** — materialize the surviving (primitive scalar) elements and sort
   ascending by `f(element)` (an orderable scalar key: int/float/char). Reuses the MIR insertion
   sort (`lower_array_sort` gained an optional `SortKey`), comparing `key(a) > key(b)` instead of

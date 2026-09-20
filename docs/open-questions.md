@@ -13,6 +13,18 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### Nameable fixed arrays and inline fields (SETTLED 2026-09-20)
+
+`[T; N]` is the type spelling for the existing fixed inline array and is valid
+wherever a type annotation is accepted. `N` is one unsuffixed decimal u32
+literal and part of structural identity, not an expression or const generic. A
+record field stores the array inline and its stable field place supports the
+ordinary fixed-array operations without allocation. Copy/Move, recursive
+Move-record cleanup, element exclusions, bounds, mutation and borrowed-slice
+lifetime remain the existing singular rules. Arbitrary temporary receivers,
+nested fixed-array elements and independently owned scalar elements remain
+excluded. Record: draft §7, language digest and [plan 73](impl/73-fixed-array-field-plan.md).
+
 ### Total UTF-8 boundary inspection (SETTLED 2026-09-15)
 
 `str.is_char_boundary(index: i64) -> bool` borrows its text receiver (including

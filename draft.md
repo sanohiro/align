@@ -1096,9 +1096,28 @@ unsafe {
 
 ```align
 users: array<User>
+table: [i64; 32]
 ```
 
 `array<T>` is owned contiguous memory.
+
+`[T; N]` is a fixed array: exactly `N` consecutive inline `T` values, with no heap allocation or
+runtime header. `N` is an unsuffixed decimal integer literal in `0..=u32::MAX`, is part of the type,
+and may be written anywhere a type annotation is accepted. Existing placement rules still reject
+aggregates at unsupported native extern/raw boundaries. `N` is not an expression or const generic.
+The element uses the same closed domain as a fixed array literal; nested fixed arrays and
+independently owned scalar elements remain excluded, while an admitted Move record retains the
+existing in-place construction and recursive element-Drop rules. A literal checked against
+`[T; N]` must contain exactly `N` elements; `[]` constructs `[T; 0]`.
+
+A struct field of type `[T; N]` is the array itself, inline in the struct layout. Reading, passing,
+or returning a Copy-element array copies its complete inline value; an array of admitted Move
+records is Move and follows the existing whole-owner rules. A fixed array may be rooted in a named
+local, parameter, or recursively selected field place, so `table.op[i]`, `table.op[a..b]`,
+`table.op.len()`, and `table.op[i] = value` on a mutable root use the ordinary checked fixed-array operations.
+A slice of a field borrows the containing storage. An arbitrary temporary remains ineligible as an
+index/slice place: bind it first. The exact type, layout, ownership, interface and validation
+contract is [plan 73](docs/impl/73-fixed-array-field-plan.md).
 
 A function-local array literal is fixed storage and normally infers its element type from its
 elements. The empty literal `[]` is accepted only when the surrounding expression supplies one
@@ -4441,8 +4460,9 @@ An existing contiguous AoS record array can be borrowed as `slice<Record>`, even
 when the record is Move. Existing owned-string arrays can be borrowed as
 `slice<string>`. Annotation, argument and field coercion, range slicing and
 re-slicing use the same Copy slice header; they allocate and copy no elements.
-Fixed arrays retain their literal-or-named-local receiver restriction. Owning
-collection formation and other specialized collection forms are unchanged.
+Fixed arrays admit a literal, named local, parameter, or recursively selected
+field place as stable storage; arbitrary temporary receivers remain rejected.
+Owning collection formation and other specialized collection forms are unchanged.
 
 `view[i].field` reads Copy leaves and projects owned string leaves as `str`.
 `slice<string>[i]` likewise produces `str`. An entire Move record is addressable

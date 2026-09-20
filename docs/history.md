@@ -1,5 +1,16 @@
 # History of Align
 
+## 2026-09-20: fixed arrays become nameable inline types
+
+`[T; N]` names the existing fixed inline array in every type-annotation position.
+A struct field therefore stores all elements directly in the record and uses
+ordinary fixed-array indexing, slicing, mutation, transport and ownership with
+the containing field as stable storage. `N` is an unsuffixed decimal u32 literal
+and part of structural type identity; there is no const generic, hidden header,
+builder, heap allocation or runtime ABI. Existing fixed-element exclusions and
+Move-record element cleanup remain one shared rule. Exact contract and closure:
+`docs/impl/73-fixed-array-field-plan.md`.
+
 ## 2026-09-20: exact string alternatives complete value patterns
 
 `match` admits exact decoded string literals and literal or-patterns for both

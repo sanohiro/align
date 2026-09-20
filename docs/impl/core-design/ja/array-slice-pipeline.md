@@ -21,6 +21,11 @@ slice<T>         borrowed view {ptr,len}, Copy, region = the data it points into
 
 `bytes` はドキュメントなどの文章表現における `slice<u8>` の略記であり、別個の型ではない。
 
+`[T; N]` は型注釈でも固定長配列型を表す。record field は N 個の slot を inline に保持し、
+array header、builder、allocation を追加しない。named local、parameter、stable field place は
+同じ checked index/range/slice/pipeline/mutation 操作を共有する。Copy/Move と element admission
+は literal の既存規則を維持する。正確な閉包は [plan 73](../../73-fixed-array-field-plan.md)。
+
 ## Signatures (verified)
 
 ```text

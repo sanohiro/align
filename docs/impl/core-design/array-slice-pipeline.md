@@ -24,6 +24,11 @@ slice<T>         borrowed view {ptr,len}, Copy, region = the data it points into
 
 `bytes` is prose shorthand for `slice<u8>`, not a distinct type.
 
+`[T; N]` also names the fixed-array type in annotations. A record field contains its N slots
+inline; no array header, builder or allocation is introduced. Named locals, parameters and stable
+field places share the same checked index/range/slice/pipeline/mutation operations. Copy/Move and
+element admission remain the literal's existing rules. Exact closure: [plan 73](../73-fixed-array-field-plan.md).
+
 ## Signatures (verified)
 
 ```text
@@ -193,8 +198,9 @@ An existing contiguous AoS record array can be borrowed as `slice<Record>`, even
 when the record is Move. Existing owned-string arrays can be borrowed as
 `slice<string>`. Annotation, argument and field coercion, range slicing and
 re-slicing use the same Copy slice header; they allocate and copy no elements.
-Fixed arrays retain their literal-or-named-local receiver restriction. Owning
-collection formation and other specialized collection forms are unchanged.
+Fixed arrays admit a literal, named local, parameter, or recursively selected
+field place as stable storage; arbitrary temporary receivers remain rejected.
+Owning collection formation and other specialized collection forms are unchanged.
 
 `view[i].field` reads Copy leaves and projects owned string leaves as `str`.
 `slice<string>[i]` likewise produces `str`. An entire Move record is addressable

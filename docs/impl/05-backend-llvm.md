@@ -28,7 +28,7 @@ Unit              void for a function return; it has no ordinary SSA value
 Vec(n, T)         <n x T'>      ← maps directly to LLVM vector type
 Mask(T)           <n x i1>
 Bitset            iN / [iW]
-fixed array<T,N>  [N x T]                        inline, contiguous
+[T; N]            [N x T]                        inline, contiguous, including as a struct field
 owned array<T>    { T* ptr, i64 len }            owned, contiguous
 Slice(T, _)       { T* ptr, i64 len }            view (Region does not surface in the type)
 Str               { i8* ptr, i64 len }           (+ meta is separate, §6)

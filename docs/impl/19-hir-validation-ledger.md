@@ -2214,3 +2214,23 @@ initialization. LLVM selects the existing object/array writer from that type.
 Plan 59 owns the public boundary; `json_array_root_checked_hir_requires_exact_source_and_element`,
 the parameterized owned-JSON mutation sweep and borrowed-root producer owner
 reject source, element, graph, layout and initialization mismatches.
+
+## Nameable fixed arrays and inline fields (plan 73)
+
+`[T; N]` resolves before HIR to the existing exact `Ty::Array` or
+`Ty::StructArray` representation. Every declaration, local, parameter, result,
+generic substitution and interface-format-14 record must preserve the same
+element type and u32 length. Struct literals require the declared field type and
+exact literal cardinality. Fixed-array indexing, range formation, coercion,
+pipeline use and mutation admit a stable root that is a named local, parameter,
+or recursively selected field place; validation replays every field ordinal,
+intermediate record type, final array type, static length, mutation authority
+and containing-storage borrow root. Arbitrary temporary roots remain invalid.
+
+Construction and replacement use the existing aggregate destination protocol.
+Copy arrays copy every inline element; arrays of admitted Move records retain
+their element initialization/null/Drop state and cannot be extracted from a
+larger record by value. Malformed owners substitute wrong field ordinals,
+intermediate/final types, lengths, element kinds, stable roots, authorities,
+initialization states and borrow roots across whole-program and per-unit input.
+The complete closure matrix and named owners are maintained in plan 73.
