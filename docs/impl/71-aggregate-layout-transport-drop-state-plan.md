@@ -7,8 +7,8 @@ Status: plan of record for issues
 implementation starts only after one fresh independent adversarial review of
 this ledger. Evidence baseline: Align `9583d8c8`, LLVM 22.1.8.
 
-Implementation status (2026-09-20): PR 1 merged in #1131 and PR 2 merged in
-#1132. PR 3 is implemented as the current candidate; PR 4 remains pending.
+Implementation status (2026-09-20): PR 1 merged in #1131, PR 2 merged in
+#1132, and PR 3 merged in #1133. PR 4 is implemented as the current candidate.
 
 These issues expose one boundary. A tagged value's physical size determines its
 argument and result transport; that transport carries the value's cleanup
@@ -603,6 +603,19 @@ One invariant-level owner may close several cells when it would fail for the
 same defect. New fixtures are required only where existing tests would not
 detect the changed invariant. Benchmarks remain local evidence and do not
 replace correctness owners.
+
+The PR 4 candidate closes the matrix with one MIR-owned partial-field record.
+Fresh Move-struct bindings store leaves directly into the final slot, publish
+the whole cleanup flag only after completion, and lower reached exits to
+flag-guarded `DropField` statements in reverse source order. Nested Move
+leaves, explicit `return`, `?`, success, allocation parity, hard division
+termination, and generic whole/per-unit compilation share the
+`move_return_cleanup` owner. LLVM forwards a completed large cleanup-bearing
+return into its caller-owned sret destination only when a recursive use proof
+finds one exact alloca, one initial zero state, complete once-only field
+coverage, dominating writes, and no alias or extra read; an incomplete field
+set retains the whole-value fallback. Field, element, replacement, join, and
+fixed-array destinations remain on their existing paths.
 
 ## 6. Acceptance and delivery
 

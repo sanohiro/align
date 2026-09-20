@@ -91,6 +91,107 @@ fn inspect_sum(left: bool) -> i32 {
 fn main() -> i32 = inspect_sum(true) + inspect_sum(false)
 "#;
 
+const FRESH_STRUCT_DESTINATION_SOURCE: &str = r#"
+extern "C" fn align_rt_requested_live_reset()
+extern "C" fn align_rt_requested_live_bytes() -> i64
+
+Failure { Bad }
+Pair { first: string, second: string, number: i64 }
+Inner { text: string }
+Nested { inner: Inner, values: array<i64>, number: i64 }
+Large { a: string, b: string, c: string, d: string, e: string, f: string, g: string, h: string, number: i64 }
+
+fn number(ok: bool) -> Result<i64, Failure> {
+  if ok { return Ok(9) }
+  return Err(Failure.Bad)
+}
+
+fn explicit_exit() -> i32 {
+  pair := Pair {
+    first: "first".clone(),
+    second: "second".clone(),
+    number: { return 7 }
+  }
+  return pair.number as i32
+}
+
+fn try_exit() -> Result<i32, Failure> {
+  pair := Pair {
+    first: "first".clone(),
+    second: "second".clone(),
+    number: number(false)?
+  }
+  return Ok(pair.number as i32)
+}
+
+fn success() -> i32 {
+  pair := Pair {
+    first: "first".clone(),
+    second: "second".clone(),
+    number: 9
+  }
+  return pair.number as i32
+}
+
+fn hard_trap(divisor: i64) -> i64 {
+  pair := Pair {
+    first: "first".clone(),
+    second: "second".clone(),
+    number: 18 / divisor
+  }
+  return pair.number
+}
+
+fn nested_exit() -> i32 {
+  nested := Nested {
+    inner: Inner { text: "nested".clone() },
+    values: [1, 2].to_array(),
+    number: { return 11 }
+  }
+  return nested.number as i32
+}
+
+fn returned() -> Pair {
+  pair := Pair {
+    first: "first".clone(),
+    second: "second".clone(),
+    number: 9
+  }
+  return pair
+}
+
+fn consume(pair: Pair) -> i32 = pair.number as i32
+
+fn returned_large() -> Large {
+  value := Large {
+    a: "a".clone(), b: "b".clone(), c: "c".clone(), d: "d".clone(),
+    e: "e".clone(), f: "f".clone(), g: "g".clone(), h: "h".clone(), number: 13
+  }
+  return value
+}
+
+fn consume_large(value: Large) -> i32 = value.number as i32
+
+fn main() -> i32 {
+  unsafe { align_rt_requested_live_reset() }
+  if explicit_exit() != 7 { return 1 }
+  if unsafe { align_rt_requested_live_bytes() } != 0 { return 2 }
+  _ := try_exit()
+  if unsafe { align_rt_requested_live_bytes() } != 0 { return 3 }
+  if success() != 9 { return 4 }
+  if unsafe { align_rt_requested_live_bytes() } != 0 { return 5 }
+  if hard_trap(2) != 9 { return 6 }
+  if unsafe { align_rt_requested_live_bytes() } != 0 { return 7 }
+  if nested_exit() != 11 { return 8 }
+  if unsafe { align_rt_requested_live_bytes() } != 0 { return 9 }
+  if consume(returned()) != 9 { return 10 }
+  if unsafe { align_rt_requested_live_bytes() } != 0 { return 11 }
+  if consume_large(returned_large()) != 13 { return 12 }
+  if unsafe { align_rt_requested_live_bytes() } != 0 { return 13 }
+  return 0
+}
+"#;
+
 /// One `?` per cleanup-bit provenance, inside a `DynamicBit` function (`05 §3`). The five
 /// `copy_*` scope probes are the same missing-bit cell reached through each borrow-transparent
 /// scope kind, which `moved_drop_flag` recurses into separately; `copy_abi` is the
@@ -448,6 +549,90 @@ fn indirect_tagged_result_reads_the_tag_before_selected_payload() {
 }
 
 #[test]
+fn fresh_move_struct_destinations_cleanup_reached_partial_prefixes() {
+    let mir = mir_text(FRESH_STRUCT_DESTINATION_SOURCE);
+    for name in ["explicit_exit", "try_exit"] {
+        let function = mir
+            .split(&format!("fn {name}"))
+            .nth(1)
+            .and_then(|body| body.split("\n}\n").next())
+            .expect("fresh destination MIR function");
+        let second = function.find("drop_field _0.1").expect("second field cleanup");
+        let first = function.find("drop_field _0.0").expect("first field cleanup");
+        assert!(
+            second < first,
+            "partial fields must be dropped in reverse source order:\n{function}"
+        );
+        assert!(
+            !function.lines().any(|line| line.starts_with("    _0 <-")),
+            "the final local must not receive a whole-aggregate scratch store:\n{function}"
+        );
+    }
+    let success = mir
+        .split("fn success")
+        .nth(1)
+        .and_then(|body| body.split("\n}\n").next())
+        .expect("success MIR function");
+    for path in ["_0.0 <-", "_0.1 <-", "_0.2 <-"] {
+        assert_eq!(
+            success.matches(path).count(),
+            1,
+            "each field must be stored exactly once into final storage:\n{success}"
+        );
+    }
+    assert!(
+        !success.lines().any(|line| line.starts_with("    _0 <-")),
+        "successful construction must not publish through a whole scratch store:\n{success}"
+    );
+    let hard_trap = mir
+        .split("fn hard_trap")
+        .nth(1)
+        .and_then(|body| body.split("\n}\n").next())
+        .expect("hard trap MIR function");
+    assert!(
+        !hard_trap.contains("drop_field"),
+        "a terminal hard-error edge must not gain successor cleanup:\n{hard_trap}"
+    );
+    let nested = mir
+        .split("fn nested_exit")
+        .nth(1)
+        .and_then(|body| body.split("\n}\n").next())
+        .expect("nested destination MIR function");
+    let array_drop = nested
+        .find("drop_field _0.1")
+        .expect("nested array cleanup");
+    let string_drop = nested
+        .find("drop_field _0.0.0")
+        .expect("nested string cleanup");
+    assert!(
+        array_drop < string_drop,
+        "nested Move leaves must drop in reverse order:\n{nested}"
+    );
+    if backend_available() {
+        let ir = emit_llvm(FRESH_STRUCT_DESTINATION_SOURCE);
+        let returned = ir
+            .split("define internal void @\"align_fn$14$72657475726e65645f6c61726765\"")
+            .nth(1)
+            .and_then(|body| body.split("\n}").next())
+            .unwrap_or_else(|| panic!("returned sret definition:\n{ir}"));
+        assert!(
+            returned.contains("sret(")
+                && !returned.contains("store %Large")
+                && !returned.contains("load %Large"),
+            "the caller sret destination must receive fields without a whole aggregate load/store:\n{returned}"
+        );
+    }
+    if backend_available() {
+        assert_eq!(
+            build_and_run("fresh-struct-destination", FRESH_STRUCT_DESTINATION_SOURCE)
+                .status
+                .code(),
+            Some(0),
+        );
+    }
+}
+
+#[test]
 fn local_named_function_value_preserves_move_return_cleanup_abi() {
     let mir = mir_text(LOCAL_FUNCTION_VALUE_SOURCE);
     assert!(
@@ -503,5 +688,50 @@ fn main() -> i32 = length(values.owned(true)) + length(values.owned(false)) + va
         align_mir::print::program_to_string(main_mir)
             .contains("call_with_cleanup program values$owned"),
         "the importing unit must consume the producer's DynamicBit ABI"
+    );
+}
+
+#[test]
+fn generic_fresh_struct_construction_matches_whole_and_per_unit_compilation() {
+    if !backend_available() {
+        return;
+    }
+    let files = &[
+        (
+            "values.align",
+            r#"
+module values
+pub Wrapper<T> { value: T, label: string, number: i64 }
+pub fn wrap<T>(value: T) -> Wrapper<T> {
+  wrapped := Wrapper { value: value, label: "x".clone(), number: 7 }
+  return wrapped
+}
+"#,
+        ),
+        (
+            "main.align",
+            r#"
+import values
+fn main() -> i32 {
+  wrapped := values.wrap("a".clone())
+  return (wrapped.value.len() + wrapped.label.len() + wrapped.number) as i32
+}
+"#,
+        ),
+    ];
+    let whole = build_and_run_multi("fresh-struct-generic-whole", files, "main.align");
+    let per_unit = build_per_unit_multi("fresh-struct-generic-per-unit", files, "main.align");
+    assert_eq!(whole.status.code(), Some(9));
+    assert_eq!(per_unit.link_and_run().status.code(), Some(9));
+    let main_mir = align_mir::print::program_to_string(&per_unit.unit("main").mir);
+    let wrap = main_mir
+        .split("fn values$wrap")
+        .nth(1)
+        .and_then(|body| body.split("\n}\n").next())
+        .unwrap_or_else(|| panic!("monomorphized generic wrapper MIR:\n{main_mir}"));
+    assert!(wrap.contains(".0 <-") && wrap.contains(".1 <-") && wrap.contains(".2 <-"));
+    assert!(
+        !wrap.lines().any(|line| line.starts_with("    _1 <- %")),
+        "the monomorphized fresh destination must not receive a whole scratch value:\n{wrap}"
     );
 }
