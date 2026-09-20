@@ -10483,7 +10483,11 @@ fn hir_body_validator_pipeline_array_views() {
             Ty::Unit,
         ));
         assert!(
-            body_core_metadata_is_valid(&reject) == matches!(source_ty, Ty::DynArray(_) | Ty::DynStructArray(..)),
+            body_core_metadata_is_valid(&reject)
+                == matches!(
+                    source_ty,
+                    Ty::StructArray(..) | Ty::DynArray(_) | Ty::DynStructArray(..)
+                ),
             "{name}: view admission must preserve existing owning-array type formation"
         );
     }
@@ -15627,6 +15631,7 @@ fn hir_body_validator_statement_inventory() {
         "stmt_assign_index",
         hir::Stmt::AssignIndex {
             base: 0,
+            path: Vec::new(),
             index: expr(hir::ExprKind::Int(0), integer),
             value: expr(hir::ExprKind::Int(3), integer),
         },

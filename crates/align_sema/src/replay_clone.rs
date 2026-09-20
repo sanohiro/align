@@ -203,8 +203,9 @@ fn clone_stmt(clones: &mut ChildValues, stmt: &Stmt) -> Option<Stmt> {
             drop_old: std::cell::Cell::new(drop_old.get()),
             drop_new: std::cell::Cell::new(drop_new.get()),
         },
-        Stmt::AssignIndex { base, .. } => Stmt::AssignIndex {
+        Stmt::AssignIndex { base, path, .. } => Stmt::AssignIndex {
             base: *base,
+            path: path.clone(),
             index: clones.expr()?,
             value: clones.expr()?,
         },
@@ -2014,6 +2015,7 @@ fn drop_functions(fns: Vec<hir::Fn>) {
                     base: _,
                     index,
                     value,
+                    ..
                 } => {
                     work.push(DropWork::Expr(index));
                     work.push(DropWork::Expr(value));

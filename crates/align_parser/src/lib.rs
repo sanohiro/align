@@ -429,7 +429,7 @@ fn reserved_word(kind: &TokKind) -> Option<&'static str> {
         | TokKind::Minus | TokKind::Star | TokKind::Slash | TokKind::Percent
         | TokKind::EqEq | TokKind::NotEq | TokKind::Lt | TokKind::Le | TokKind::Gt
         | TokKind::Ge | TokKind::AndAnd | TokKind::OrOr | TokKind::Amp | TokKind::Pipe
-        | TokKind::Caret | TokKind::Tilde | TokKind::Bang | TokKind::Question
+        | TokKind::Caret | TokKind::Tilde | TokKind::Bang | TokKind::Question | TokKind::Semicolon
         | TokKind::End | TokKind::Eof => return None,
     })
 }
@@ -504,9 +504,22 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Skip statement separators (`End` from newlines or `;`).
+    fn at_stmt_end(&self) -> bool {
+        matches!(self.peek(), TokKind::End | TokKind::Semicolon)
+    }
+
+    fn eat_stmt_end(&mut self) -> bool {
+        if self.at_stmt_end() {
+            self.bump();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Skip statement separators (newline `End` or written `;`).
     fn skip_ends(&mut self) {
-        while self.at(&TokKind::End) {
+        while self.at_stmt_end() {
             self.bump();
         }
     }
@@ -516,7 +529,7 @@ impl<'a> Parser<'a> {
     /// terminates a statement" rule so two statements can't silently run together on one line
     /// without a `;` (`x := 1 return x`). Consumes the `End` (and any run of them) when present.
     fn expect_stmt_end(&mut self) {
-        if self.at(&TokKind::End) {
+        if self.at_stmt_end() {
             self.skip_ends();
         } else if !self.at(&TokKind::RBrace) && !self.at(&TokKind::Eof) {
             self.diags.error("expected a newline or `;` to separate statements".to_string(), self.span());
@@ -528,7 +541,7 @@ impl<'a> Parser<'a> {
         let module = if self.at(&TokKind::Module) {
             self.bump();
             let p = self.parse_path();
-            self.eat(&TokKind::End);
+            self.eat_stmt_end();
             Some(p)
         } else {
             None
@@ -540,7 +553,7 @@ impl<'a> Parser<'a> {
             if self.at(&TokKind::Import) {
                 self.bump();
                 imports.push(self.parse_path());
-                self.eat(&TokKind::End);
+                self.eat_stmt_end();
             } else {
                 break;
             }
@@ -556,7 +569,10 @@ impl<'a> Parser<'a> {
                 Some(item) => items.push(item),
                 None => {
                     self.bump();
-                    while !matches!(self.peek(), TokKind::Fn | TokKind::Eof | TokKind::End) {
+                    while !matches!(
+                        self.peek(),
+                        TokKind::Fn | TokKind::Eof | TokKind::End | TokKind::Semicolon
+                    ) {
                         self.bump();
                     }
                 }
@@ -649,10 +665,13 @@ impl<'a> Parser<'a> {
             );
             // Recovery stays committed to the test: skip its forbidden signature/name tail and,
             // when present, parse the following block so the next top-level item remains aligned.
-            while !matches!(self.peek(), TokKind::LBrace | TokKind::End | TokKind::Eof) {
+            while !matches!(
+                self.peek(),
+                TokKind::LBrace | TokKind::End | TokKind::Semicolon | TokKind::Eof
+            ) {
                 self.bump();
             }
-            if self.at(&TokKind::End) || self.at(&TokKind::Eof) {
+            if self.at_stmt_end() || self.at(&TokKind::Eof) {
                 return None;
             }
         }
@@ -690,7 +709,7 @@ impl<'a> Parser<'a> {
         }
         self.expect(&TokKind::Eq, "'='");
         let drop_hook = self.parse_path();
-        self.eat(&TokKind::End);
+        self.eat_stmt_end();
         let span = start.merge(self.prev_span());
         Some(ResourceDecl { vis, name, type_params, drop_hook, span })
     }
@@ -707,7 +726,7 @@ impl<'a> Parser<'a> {
         };
         self.expect(&TokKind::ColonEq, "':='");
         let value = self.parse_expr(0)?;
-        self.eat(&TokKind::End);
+        self.eat_stmt_end();
         let span = start.merge(self.prev_span());
         Some(Item::Const(ConstDecl { vis, name, ty, value, span }))
     }
@@ -944,7 +963,7 @@ impl<'a> Parser<'a> {
 
         let body = if self.eat(&TokKind::Eq) {
             let e = self.parse_expr(0)?;
-            self.eat(&TokKind::End);
+            self.eat_stmt_end();
             FnBody::Expr(Box::new(e))
         } else {
             FnBody::Block(self.parse_block()?)
@@ -1056,7 +1075,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        self.eat(&TokKind::End);
+        self.eat_stmt_end();
         let span = start.merge(self.prev_span());
         Some(ExternSig { name, params, ret, span })
     }
@@ -1129,7 +1148,7 @@ impl<'a> Parser<'a> {
                 let value = self.parse_expr(0)?;
                 self.expect_stmt_end();
                 stmts.push(Stmt::Assign { place: e, value });
-            } else if self.at(&TokKind::End) {
+            } else if self.at_stmt_end() {
                 self.bump();
                 // A trailing expression (last thing before `}`) is the block's value,
                 // even on its own line (newline inserts `End`).
@@ -1262,7 +1281,7 @@ impl<'a> Parser<'a> {
 
     fn parse_return(&mut self) -> Option<Stmt> {
         self.bump(); // return
-        let value = if self.at(&TokKind::End) || self.at(&TokKind::RBrace) {
+        let value = if self.at_stmt_end() || self.at(&TokKind::RBrace) {
             None
         } else {
             Some(self.parse_expr(0)?)
@@ -1276,7 +1295,7 @@ impl<'a> Parser<'a> {
     fn parse_break(&mut self) -> Option<Stmt> {
         let span = self.span();
         self.bump(); // break
-        let value = if self.at(&TokKind::End) || self.at(&TokKind::RBrace) {
+        let value = if self.at_stmt_end() || self.at(&TokKind::RBrace) {
             None
         } else {
             Some(self.parse_expr(0)?)
@@ -1336,7 +1355,11 @@ impl<'a> Parser<'a> {
         let mut hole_diags = Diagnostics::new();
         let tokens: Vec<Token> = align_lexer::tokenize(str_span.file, src, &mut hole_diags)
             .into_iter()
-            .map(|t| Token { kind: t.kind, span: remap(t.span) })
+            .map(|t| Token {
+                kind: t.kind,
+                span: remap(t.span),
+                integer_radix: t.integer_radix,
+            })
             .collect();
         for d in hole_diags.iter() {
             self.diags.push(Diagnostic {
@@ -1352,7 +1375,7 @@ impl<'a> Parser<'a> {
         let expr = sub.parse_expr(0);
         // The lexer appends an implicit `End` before `Eof`; skip it, then reject any
         // remaining tokens (e.g. `{x y}`): a hole must be exactly one expression.
-        while matches!(sub.peek(), TokKind::End) {
+        while matches!(sub.peek(), TokKind::End | TokKind::Semicolon) {
             sub.bump();
         }
         if expr.is_some() && !matches!(sub.peek(), TokKind::Eof) {
@@ -1577,7 +1600,7 @@ impl<'a> Parser<'a> {
             && matches!(self.peek_at(1),
                 TokKind::LParen | TokKind::LBracket | TokKind::Lt | TokKind::Gt
                 | TokKind::Dot | TokKind::RParen | TokKind::RBracket | TokKind::RBrace
-                | TokKind::End | TokKind::Eof | TokKind::Comma | TokKind::Question
+                | TokKind::Semicolon | TokKind::End | TokKind::Eof | TokKind::Comma | TokKind::Question
                 | TokKind::Eq | TokKind::Plus | TokKind::Minus | TokKind::Star
                 | TokKind::Slash | TokKind::Percent | TokKind::EqEq | TokKind::NotEq
                 | TokKind::Le | TokKind::Ge | TokKind::AndAnd | TokKind::OrOr
@@ -2069,6 +2092,62 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_type(&mut self) -> Option<Type> {
+        // A fixed inline array type `[T; N]`. The written semicolon is distinct from the
+        // newline-derived `End`, so a line break can never silently become the type separator.
+        if self.at(&TokKind::LBracket) {
+            let start = self.span();
+            self.bump();
+            let element = Box::new(self.parse_type()?);
+            let separator = if self.at(&TokKind::Semicolon) {
+                self.bump().span
+            } else {
+                self.diags.error(
+                    "expected ';' in fixed-array type `[T; N]`".to_string(),
+                    self.span(),
+                );
+                return None;
+            };
+            let length_token = self.bump();
+            let length = match length_token.kind {
+                TokKind::Int(value)
+                    if length_token.integer_radix == Some(10)
+                        && (0..=u32::MAX as i128).contains(&value) =>
+                {
+                    value as u32
+                }
+                TokKind::Int(_) if length_token.integer_radix != Some(10) => {
+                    self.diags.error(
+                        "a fixed-array length must be an unsuffixed decimal integer literal"
+                            .to_string(),
+                        length_token.span,
+                    );
+                    0
+                }
+                TokKind::Int(_) => {
+                    self.diags.error(
+                        "fixed-array length is outside 0..=u32::MAX".to_string(),
+                        length_token.span,
+                    );
+                    0
+                }
+                _ => {
+                    self.diags.error(
+                        "expected a decimal integer length in fixed-array type `[T; N]`"
+                            .to_string(),
+                        length_token.span,
+                    );
+                    0
+                }
+            };
+            self.expect(&TokKind::RBracket, "']'");
+            let span = start.merge(self.prev_span());
+            return Some(Type::FixedArray {
+                element,
+                length,
+                separator,
+                span,
+            });
+        }
         // A function type `fn(T, U) -> R` (a higher-order-function parameter).
         if self.at(&TokKind::Fn) {
             let start = self.span();
@@ -2688,6 +2767,29 @@ fn good() {}"#,
             "after a broken condition, `P {{ a: 5 }}` must still parse as a struct literal, got {:?}",
             init.kind
         );
+    }
+
+    #[test]
+    fn fixed_array_type_requires_a_written_decimal_semicolon_length() {
+        let (file, error) = parse("Table { values: [i64; 32] }\n");
+        assert!(!error);
+        let Item::Struct(declaration) = &file.items[0] else {
+            panic!("record declaration")
+        };
+        assert!(matches!(
+            declaration.fields[0].ty,
+            Type::FixedArray { length: 32, .. }
+        ));
+
+        for invalid in [
+            "Bad { values: [i64\n32] }\n",
+            "Bad { values: [i64; -1] }\n",
+            "Bad { values: [i64; 0x20] }\n",
+            "Bad { values: [i64; 4294967296] }\n",
+        ] {
+            let (_, error) = parse(invalid);
+            assert!(error, "must reject {invalid:?}");
+        }
     }
 
     #[test]

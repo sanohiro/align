@@ -1598,6 +1598,24 @@ impl<'a> PlacementValidator<'a> {
                     && self.scalar_ok(element, ScalarPlacement::Collection)
             }
             Ty::DynStructArray(id, Layout::Aos) => self.dynamic_struct_array_ok(id),
+            Ty::Array(element, length) => {
+                align_sema::fixed_array_type(
+                    align_sema::scalar_to_ty(element),
+                    length,
+                    &self.program.structs,
+                    &self.program.enums,
+                    &self.program.tagged_types,
+                ) == Some(ty)
+            }
+            Ty::StructArray(id, length) => {
+                align_sema::fixed_array_type(
+                    Ty::Struct(id),
+                    length,
+                    &self.program.structs,
+                    &self.program.enums,
+                    &self.program.tagged_types,
+                ) == Some(ty)
+            }
             Ty::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
             _ if align_sema::is_move_handle(ty) => true,
             Ty::HttpHeaders => true,
@@ -1948,6 +1966,24 @@ impl<'a> PlacementValidator<'a> {
                     && matches!(element, Scalar::Int(_) | Scalar::Float(_))
                     && self.scalar_ok(element, ScalarPlacement::FnParameter { allow_param })
             }
+            Ty::Array(element, length) => {
+                align_sema::fixed_array_type(
+                    align_sema::scalar_to_ty(element),
+                    length,
+                    &self.program.structs,
+                    &self.program.enums,
+                    &self.program.tagged_types,
+                ) == Some(ty)
+            }
+            Ty::StructArray(id, length) => {
+                align_sema::fixed_array_type(
+                    Ty::Struct(id),
+                    length,
+                    &self.program.structs,
+                    &self.program.enums,
+                    &self.program.tagged_types,
+                ) == Some(ty)
+            }
             Ty::DynStructArray(id, Layout::Aos) => self.dynamic_struct_array_ok(id),
             Ty::Slice(element) => self.scalar_ok(element, ScalarPlacement::Collection),
             Ty::DynArray(element) => {
@@ -2023,8 +2059,6 @@ impl<'a> PlacementValidator<'a> {
             // in a declaration/header position.
             Ty::IntVar(_)
             | Ty::FloatVar(_)
-            | Ty::Array(_, _)
-            | Ty::StructArray(_, _)
             | Ty::Task(_)
             | Ty::Builder
             | Ty::StrFinder
@@ -2185,6 +2219,12 @@ impl<'a> PlacementValidator<'a> {
                         {
                             return false;
                         }
+                    }
+                    Ty::Array(element, _) => {
+                        work.push(Work::Enter(align_sema::scalar_to_ty(element)));
+                    }
+                    Ty::StructArray(id, _) => {
+                        work.push(Work::Enter(Ty::Struct(id)));
                     }
                     Ty::Option(payload) => {
                         work.push(Work::Enter(align_sema::scalar_to_ty(payload)))
@@ -4164,7 +4204,7 @@ impl<'a> BodyValidator<'a> {
                     && locals.iter().flatten().all(|&id| self.local_ok(context, id))
             }
             hir::Stmt::Assign { local, .. } => self.mutable_local_ok(context, *local),
-            hir::Stmt::AssignIndex { base, .. } => {
+            hir::Stmt::AssignIndex { base, path, .. } => {
                 let Some(function) = self.program.fns.get(context.function) else {
                     return false;
                 };
@@ -4173,8 +4213,13 @@ impl<'a> BodyValidator<'a> {
                 };
                 local.id == *base
                     && local.is_mut
-                    && index_element_ty(local.ty)
-                        .is_some_and(|ty| self.indexed_element_store_ty_ok(ty))
+                    && (if path.is_empty() {
+                        Some(local.ty)
+                    } else {
+                        self.field_path_ty(Some(local.ty), path)
+                    })
+                    .and_then(index_element_ty)
+                    .is_some_and(|ty| self.indexed_element_store_ty_ok(ty))
             }
             hir::Stmt::AssignVecLane { local, lane, .. } => {
                 let Some(function) = self.program.fns.get(context.function) else {
@@ -10160,7 +10205,7 @@ impl<'a> BodyValidator<'a> {
                 usize::try_from(capture_count).ok() == Some(captures.len())
             }
             Some(hir::FnOrigin::Test) => false,
-                Some(hir::FnOrigin::Source { .. }) | Some(hir::FnOrigin::Monomorph) | None => true,
+            Some(hir::FnOrigin::Source { .. }) | Some(hir::FnOrigin::Monomorph) | None => true,
         }
     }
 
@@ -10180,7 +10225,9 @@ impl<'a> BodyValidator<'a> {
         if needs_var
             && !matches!(
                 source.kind,
-                hir::ExprKind::Local(_) | hir::ExprKind::ArrayLit { .. }
+                hir::ExprKind::Local(_)
+                    | hir::ExprKind::ArrayLit { .. }
+                    | hir::ExprKind::Field { .. }
             )
         {
             return None;
@@ -10529,7 +10576,9 @@ impl<'a> BodyValidator<'a> {
                 let source_flow = self.expr_flow(source)?;
                 if !matches!(
                     source.kind,
-                    hir::ExprKind::Local(_) | hir::ExprKind::ArrayLit { .. }
+                    hir::ExprKind::Local(_)
+                        | hir::ExprKind::ArrayLit { .. }
+                        | hir::ExprKind::Field { .. }
                 ) {
                     return None;
                 }
@@ -10666,7 +10715,9 @@ impl<'a> BodyValidator<'a> {
                     || (matches!(source_flow.ty, Ty::Array(..))
                         && !matches!(
                             source.kind,
-                            hir::ExprKind::Local(_) | hir::ExprKind::ArrayLit { .. }
+                                hir::ExprKind::Local(_)
+                                    | hir::ExprKind::ArrayLit { .. }
+                                    | hir::ExprKind::Field { .. }
                         ))
                 {
                     return None;
@@ -10684,7 +10735,9 @@ impl<'a> BodyValidator<'a> {
                         }
                         if !matches!(
                             source.kind,
-                            hir::ExprKind::Local(_) | hir::ExprKind::ArrayLit { .. }
+                            hir::ExprKind::Local(_)
+                                | hir::ExprKind::ArrayLit { .. }
+                                | hir::ExprKind::Field { .. }
                         ) {
                             return None;
                         }
@@ -10696,7 +10749,9 @@ impl<'a> BodyValidator<'a> {
                         }
                         if !matches!(
                             source.kind,
-                            hir::ExprKind::Local(_) | hir::ExprKind::ArrayLit { .. }
+                            hir::ExprKind::Local(_)
+                                | hir::ExprKind::ArrayLit { .. }
+                                | hir::ExprKind::Field { .. }
                         ) {
                             return None;
                         }
@@ -10790,7 +10845,9 @@ impl<'a> BodyValidator<'a> {
                 if matches!(receiver.ty, Ty::Array(..) | Ty::StructArray(..))
                     && !matches!(
                         recv.kind,
-                        hir::ExprKind::Local(_) | hir::ExprKind::ArrayLit { .. }
+                        hir::ExprKind::Local(_)
+                            | hir::ExprKind::ArrayLit { .. }
+                            | hir::ExprKind::Field { .. }
                     )
                 {
                     return None;
@@ -10867,12 +10924,14 @@ impl<'a> BodyValidator<'a> {
                         if !self.collection_element_view_ok(align_sema::scalar_to_ty(scalar)) {
                             return None;
                         }
-                        // A fixed array is a stack slot, so only a named local or a literal can
-                        // be viewed; an owned dynamic array is already `{ptr,len}`.
+                        // A fixed array is a stack slot, so only a stable local/field place or a
+                        // literal can be viewed; an owned dynamic array is already `{ptr,len}`.
                         if matches!(receiver.ty, Ty::Array(..) | Ty::StructArray(..))
                             && !matches!(
                                 recv.kind,
-                                hir::ExprKind::Local(_) | hir::ExprKind::ArrayLit { .. }
+                                hir::ExprKind::Local(_)
+                                    | hir::ExprKind::ArrayLit { .. }
+                                    | hir::ExprKind::Field { .. }
                             )
                         {
                             return None;
@@ -10909,7 +10968,9 @@ impl<'a> BodyValidator<'a> {
                     || (matches!(receiver.ty, Ty::StructArray(..))
                         && !matches!(
                             recv.kind,
-                            hir::ExprKind::Local(_) | hir::ExprKind::ArrayLit { .. }
+                                hir::ExprKind::Local(_)
+                                    | hir::ExprKind::ArrayLit { .. }
+                                    | hir::ExprKind::Field { .. }
                         ))
                 {
                     return None;
@@ -12141,8 +12202,13 @@ impl<'a> BodyValidator<'a> {
                 }
                 self.store_statement(statement, Ty::Unit, children_fall, sequence_breaks)
             }
-            hir::Stmt::AssignIndex { base, .. } => {
-                let Some(base_ty) = self.local_type(context, *base) else {
+            hir::Stmt::AssignIndex { base, path, .. } => {
+                let root_ty = self.local_type(context, *base);
+                let Some(base_ty) = (if path.is_empty() {
+                    root_ty
+                } else {
+                    self.field_path_ty(root_ty, path)
+                }) else {
                     return false;
                 };
                 let Some(element_ty) = index_element_ty(base_ty) else {
@@ -13683,7 +13749,7 @@ fn orderable_body_ty(ty: Ty) -> bool {
 fn fixed_array_shape(expression: &hir::Expr, ty: Ty) -> Option<(Scalar, u32)> {
     if !matches!(
         expression.kind,
-        hir::ExprKind::Local(_) | hir::ExprKind::ArrayLit { .. }
+            hir::ExprKind::Local(_) | hir::ExprKind::ArrayLit { .. } | hir::ExprKind::Field { .. }
     ) {
         return None;
     }

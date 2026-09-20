@@ -19,7 +19,9 @@ use crate::{
 /// The interface-artifact format version. Bump on ANY encoding change; a bump invalidates every
 /// cached summary (an old version fails closed on read) and changes `interface_hash` (the version is
 /// part of the hashed surface).
-pub const FORMAT_VERSION: u32 = 13;
+pub const FORMAT_VERSION: u32 = 14;
+
+const MAX_TYPE_DEPTH: u32 = 128;
 
 /// Narrow a length to the format's `u32` length-prefix width, or panic loudly. This is
 /// producer-side, compiler-internal data (interface surfaces built from the compiler's own source
@@ -94,6 +96,11 @@ fn write_type(w: &mut Writer, t: &IType) {
         IType::Tuple(elems) => {
             w.u8(1);
             w.seq(elems, write_type);
+        }
+        IType::FixedArray { element, length } => {
+            w.u8(3);
+            write_type(w, element);
+            w.u32(*length);
         }
         IType::Fn {
             params,
@@ -460,22 +467,42 @@ impl<'a> Reader<'a> {
 }
 
 fn read_type(r: &mut Reader<'_>) -> Result<IType, DecodeError> {
+    read_type_at_depth(r, 1)
+}
+
+fn read_type_at_depth(r: &mut Reader<'_>, depth: u32) -> Result<IType, DecodeError> {
+    if depth > MAX_TYPE_DEPTH {
+        return Err(DecodeError::InvalidSummary(
+            "interface type nesting exceeds 128 records",
+        ));
+    }
     match r.u8()? {
-        0 => Ok(IType::Named { path: r.str()?, args: r.seq(read_type)? }),
-        1 => Ok(IType::Tuple(r.seq(read_type)?)),
+        0 => Ok(IType::Named {
+            path: r.str()?,
+            args: r.seq(|r| read_type_at_depth(r, depth + 1))?,
+        }),
+        1 => Ok(IType::Tuple(r.seq(|r| read_type_at_depth(r, depth + 1))?)),
         2 => {
-            let params = r.seq(read_param)?;
-            let ret = Box::new(read_type(r)?);
+            let params = r.seq(|r| read_param_at_depth(r, depth + 1))?;
+            let ret = Box::new(read_type_at_depth(r, depth + 1)?);
             let return_borrow = read_return_borrow(r, params.len())?;
             let return_region = read_return_region(r, params.len())?;
             let return_cleanup = read_return_cleanup(r)?;
             Ok(IType::Fn { params, ret, return_borrow, return_region, return_cleanup })
         }
+        3 => Ok(IType::FixedArray {
+            element: Box::new(read_type_at_depth(r, depth + 1)?),
+            length: r.u32()?,
+        }),
         tag => Err(DecodeError::BadTag { what: "type", tag }),
     }
 }
 
 fn read_param(r: &mut Reader<'_>) -> Result<IParam, DecodeError> {
+    read_param_at_depth(r, 1)
+}
+
+fn read_param_at_depth(r: &mut Reader<'_>, depth: u32) -> Result<IParam, DecodeError> {
     let mode = match r.u8()? {
         0 => ParamMode::ByValue,
         1 => ParamMode::Out,
@@ -483,7 +510,7 @@ fn read_param(r: &mut Reader<'_>) -> Result<IParam, DecodeError> {
         3 => ParamMode::BorrowMut,
         tag => return Err(DecodeError::BadTag { what: "parameter mode", tag }),
     };
-    Ok(IParam { mode, ty: read_type(r)? })
+    Ok(IParam { mode, ty: read_type_at_depth(r, depth)? })
 }
 
 fn validate_roots(
@@ -813,7 +840,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn drop_state_effect_tags_have_an_independent_v13_byte_golden() {
+    fn drop_state_effect_tags_have_an_independent_v14_byte_golden() {
         use align_sema::hir::DropStateEffect::{Deferred, Invariant, MayChange, NotApplicable};
         let effects = vec![NotApplicable, Invariant, MayChange, Deferred];
         let expected = [4, 0, 0, 0, 0, 1, 2, 3];
@@ -908,10 +935,10 @@ mod tests {
         assert_eq!(read_type(&mut reader), Ok(ty));
         assert_eq!(reader.finish(), Ok(()));
 
-        let mut unknown = Reader::new(&[3]);
+        let mut unknown = Reader::new(&[4]);
         assert_eq!(
             read_type(&mut unknown),
-            Err(DecodeError::BadTag { what: "type", tag: 3 })
+            Err(DecodeError::BadTag { what: "type", tag: 4 })
         );
         for malformed in [
             &expected[..4],
@@ -921,5 +948,57 @@ mod tests {
             let mut reader = Reader::new(malformed);
             assert!(read_type(&mut reader).and_then(|_| reader.finish()).is_err());
         }
+    }
+
+    #[test]
+    fn fixed_array_has_independent_format_14_goldens_and_bounded_decode() {
+        let ty = IType::FixedArray {
+            element: Box::new(IType::Named {
+                path: "i64".to_string(),
+                args: Vec::new(),
+            }),
+            length: 32,
+        };
+        let expected = [3, 0, 3, 0, 0, 0, b'i', b'6', b'4', 0, 0, 0, 0, 32, 0, 0, 0];
+        let mut writer = Writer::new();
+        write_type(&mut writer, &ty);
+        assert_eq!(writer.buf, expected);
+
+        let mut reader = Reader::new(&expected);
+        assert_eq!(read_type(&mut reader), Ok(ty.clone()));
+        assert_eq!(reader.finish(), Ok(()));
+
+        for end in 0..expected.len() {
+            assert!(read_type(&mut Reader::new(&expected[..end])).is_err());
+        }
+        let mut trailing = expected.to_vec();
+        trailing.push(0);
+        let mut reader = Reader::new(&trailing);
+        assert_eq!(read_type(&mut reader), Ok(ty));
+        assert_eq!(reader.finish(), Err(DecodeError::TrailingBytes));
+
+        let named = IType::Named {
+            path: "i64".into(),
+            args: Vec::new(),
+        };
+        let at_limit = (0..127).fold(named.clone(), |element, _| IType::FixedArray {
+            element: Box::new(element),
+            length: 1,
+        });
+        let over_limit = IType::FixedArray {
+            element: Box::new(at_limit.clone()),
+            length: 1,
+        };
+        let mut bytes = Writer::new();
+        write_type(&mut bytes, &at_limit);
+        assert!(read_type(&mut Reader::new(&bytes.buf)).is_ok());
+        let mut bytes = Writer::new();
+        write_type(&mut bytes, &over_limit);
+        assert!(matches!(
+            read_type(&mut Reader::new(&bytes.buf)),
+            Err(DecodeError::InvalidSummary(
+                "interface type nesting exceeds 128 records"
+            ))
+        ));
     }
 }

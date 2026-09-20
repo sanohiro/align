@@ -9,11 +9,12 @@ closes #1081), #1124 (build-performance items 7 and 8), #1125 (the first
 post-#1124 nightly repair), #1128 (plan 70 PR 2), #1129 (plan 70 PR 3), and
 #1130 (plan 71 ledger), #1131 (plan 71 PR 1), #1132 (plan 71 PR 2), #1133
 (plan 71 PR 3), #1134 (plan 71 PR 4, closing the provider portion of #1077),
-#1135 (plan 72 design), and #1136 (plan 72 implementation). Plan 73 for #1065
-is the current design candidate; implementation starts only after its fresh
-independent adversarial review and design merge. Every remaining item
-below starts from `main` with a fresh branch and follows the CLAUDE.md review
-flow.
+#1135 (plan 72 design), #1136 (plan 72 implementation), and #1137 (plan 73
+design). Plan 73 for #1065 is the current implementation candidate: nameable
+fixed arrays and inline record fields now span syntax, sema, checked HIR, MIR,
+LLVM layout, interface format 14 and whole/per-unit compilation, with the
+provider owner corpus in `fixed_array_fields`. Every remaining item below
+starts from `main` with a fresh branch and follows the CLAUDE.md review flow.
 
 Suggested order (item 0 first; then each its own PR set: implement, one review, one fix,
 preflight, `scripts/open-pr.sh`, CI, merge):
@@ -72,7 +73,7 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    bounds-error order.
 3. Language items after the codegen track: #1085 `str` patterns in `match`
    shipped in #1135/#1136. #1065 fixed arrays in structs is plan 73's current
-   design candidate; then #1066 proposal 2, #1064 → depends on #1063,
+   implementation candidate; then #1066 proposal 2, #1064 → depends on #1063,
    #1075 scalar ABI facts, #1082 P2 RFC.
 4. Follow-ups, independent and small (updated 2026-09-19):
    `fix/nightly-detector-restore` closed #1105, #1107, #1108, #1109, and

@@ -4986,7 +4986,7 @@ enum Place {
     Field { root: LocalId, path: Vec<u32>, ty: Ty },
     /// `base[index] = value` — an element store into a `mut` array local or an `out` slice
     /// parameter. `index` is the checked (`i64`) subscript; `elem` is the element type.
-    Index { base: LocalId, index: Expr, elem: Ty },
+    Index { base: LocalId, path: Vec<u32>, index: Expr, elem: Ty },
     /// `v[lane] = value` — write one lane of a `mut vecN<T>` local (M6). `lane` is a constant in
     /// `0..N`; `elem` is the element scalar. Lowers to `v = insertelement(v, value, lane)`.
     VecLane { local: LocalId, lane: u32, elem: Ty },
@@ -6564,7 +6564,7 @@ struct ExposureCtx<'a> {
 
 /// Recursively verify that every same-module user type named in `ty` (a type reachable from a `pub`
 /// item's signature) is itself `pub`. This walks EVERY `ast::Type` constructor (`Named`/`Tuple`/`Fn`)
-/// exhaustively — no wildcard — so nested exposure (`Option<array<Secret>>`, `fn(Secret) -> ()`,
+/// exhaustively — no wildcard — so nested exposure (`Option<array<Secret>>`, `[Secret; 2]`, `fn(Secret) -> ()`,
 /// `(i64, Secret)`) is caught. Emits a diagnostic (never panics) per violation.
 fn check_type_exposure(ty: &ast::Type, cx: &ExposureCtx, diags: &mut Diagnostics) {
     match ty {
@@ -6594,6 +6594,7 @@ fn check_type_exposure(ty: &ast::Type, cx: &ExposureCtx, diags: &mut Diagnostics
                 check_type_exposure(a, cx, diags);
             }
         }
+        ast::Type::FixedArray { element, .. } => check_type_exposure(element, cx, diags),
         ast::Type::Tuple { elems, .. } => {
             for e in elems {
                 check_type_exposure(e, cx, diags);
@@ -6720,6 +6721,7 @@ impl<'a, 'd> GenericBodyWalker<'a, 'd> {
                     self.walk_type(a);
                 }
             }
+            ast::Type::FixedArray { element, .. } => self.walk_type(element),
             ast::Type::Tuple { elems, .. } => {
                 for e in elems {
                     self.walk_type(e);
@@ -15115,7 +15117,9 @@ impl EffectScan<'_> {
                     }
                 }
             }
-            Stmt::AssignIndex { base, index, value } => {
+            Stmt::AssignIndex {
+                base, index, value, ..
+            } => {
                 if !hir_expr_diverges(index) && !hir_expr_diverges(value) {
                     self.mark_view_write(*base);
                 }
@@ -23433,19 +23437,30 @@ impl<'a> EscapeCheck<'a> {
     fn replace_callable_array_path(
         &mut self,
         local: LocalId,
+        collection_fields: &[u32],
         index: &Expr,
-        fields: &[u32],
+        element_fields: &[u32],
         value: &Expr,
         depth: u32,
     ) {
-        let length = self
-            .f
-            .locals
-            .get(local as usize)
-            .and_then(|local| match local.ty {
+        let length = self.f.locals.get(local as usize).and_then(|local| {
+            let mut ty = local.ty;
+            for field in collection_fields {
+                let Ty::Struct(id) = expand_tagged_ty(ty, self.tagged_types) else {
+                    return None;
+                };
+                ty = self
+                    .structs
+                    .get(id as usize)?
+                    .fields
+                    .get(*field as usize)?
+                    .ty;
+            }
+            match ty {
                 Ty::Array(_, length) | Ty::StructArray(_, length) => Some(length),
                 _ => None,
-            });
+            }
+        });
         let exact = match (&index.kind, length) {
             (ExprKind::Int(value), Some(length))
                 if *value >= 0 && (*value as u128) < length as u128 =>
@@ -23465,8 +23480,18 @@ impl<'a> EscapeCheck<'a> {
                 .entry(local)
                 .or_default();
             for index in 0..length {
-                let mut prefix = vec![BorrowProjection::ArrayElement(index)];
-                prefix.extend(fields.iter().copied().map(BorrowProjection::StructField));
+                let mut prefix = collection_fields
+                    .iter()
+                    .copied()
+                    .map(BorrowProjection::StructField)
+                    .collect::<Vec<_>>();
+                prefix.push(BorrowProjection::ArrayElement(index));
+                prefix.extend(
+                    element_fields
+                        .iter()
+                        .copied()
+                        .map(BorrowProjection::StructField),
+                );
                 for (suffix, &region) in &incoming {
                     let mut destination = prefix.clone();
                     destination.extend(suffix);
@@ -23478,8 +23503,18 @@ impl<'a> EscapeCheck<'a> {
             }
             return;
         };
-        let mut path = vec![BorrowProjection::ArrayElement(index)];
-        path.extend(fields.iter().copied().map(BorrowProjection::StructField));
+        let mut path = collection_fields
+            .iter()
+            .copied()
+            .map(BorrowProjection::StructField)
+            .collect::<Vec<_>>();
+        path.push(BorrowProjection::ArrayElement(index));
+        path.extend(
+            element_fields
+                .iter()
+                .copied()
+                .map(BorrowProjection::StructField),
+        );
         self.replace_callable_region_path(local, &path, value, depth);
     }
 
@@ -27166,8 +27201,9 @@ impl<'a> EscapeCheck<'a> {
     fn apply_escape_index_store(
         &mut self,
         base: LocalId,
+        collection_fields: &[u32],
         index: &Expr,
-        fields: &[u32],
+        element_fields: &[u32],
         value: &Expr,
     ) {
         let Some(storage) = self.state.storage_values.get(&base).cloned() else {
@@ -27182,11 +27218,34 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::Int(value) if value >= 0 => Some(value as u128),
             _ => None,
         };
-        let field_path = fields
+        let collection_path = collection_fields
             .iter()
             .copied()
             .map(BorrowProjection::StructField)
             .collect::<Vec<_>>();
+        let element_path = element_fields
+            .iter()
+            .copied()
+            .map(BorrowProjection::StructField)
+            .collect::<Vec<_>>();
+        let local_fixed_len = self.f.locals.get(base as usize).and_then(|local| {
+            let mut ty = local.ty;
+            for field in collection_fields {
+                let Ty::Struct(id) = expand_tagged_ty(ty, self.tagged_types) else {
+                    return None;
+                };
+                ty = self
+                    .structs
+                    .get(id as usize)?
+                    .fields
+                    .get(*field as usize)?
+                    .ty;
+            }
+            match ty {
+                Ty::Array(_, len) | Ty::StructArray(_, len) => Some(len),
+                _ => None,
+            }
+        });
 
         for leaf in storage.headers.leaves.values() {
             for reference in &leaf.generations {
@@ -27207,12 +27266,12 @@ impl<'a> EscapeCheck<'a> {
                 else {
                     continue;
                 };
-                let fixed_len = descriptor.and_then(|descriptor| {
+                let fixed_len = local_fixed_len.or_else(|| descriptor.and_then(|descriptor| {
                     match expand_tagged_ty(descriptor.ty, self.tagged_types) {
                         Ty::Array(_, len) | Ty::StructArray(_, len) => Some(len),
                         _ => None,
                     }
-                });
+                }));
                 if let Some(len) = fixed_len {
                     let indices: Box<dyn Iterator<Item = u32>> = match exact_index {
                         Some(index) if index < u128::from(len) => {
@@ -27223,8 +27282,9 @@ impl<'a> EscapeCheck<'a> {
                     };
                     for selected in indices {
                         let mut path = reference.content_path.clone();
+                        path.extend(&collection_path);
                         path.push(BorrowProjection::ArrayElement(selected));
-                        path.extend(&field_path);
+                        path.extend(&element_path);
                         if exact_index.is_some() {
                             content.direct_regions.replace_path(
                                 &path,
@@ -27252,7 +27312,8 @@ impl<'a> EscapeCheck<'a> {
                     // A dynamic collection aliases all runtime indices. Preserve the previous
                     // possible elements and add the installed value at the selected field path.
                     let mut path = reference.content_path.clone();
-                    path.extend(&field_path);
+                    path.extend(&collection_path);
+                    path.extend(&element_path);
                     let selected = EscapeGenerationContent {
                         direct_regions: incoming_content
                             .direct_regions
@@ -27356,6 +27417,7 @@ impl<'a> EscapeCheck<'a> {
                 base,
                 index: _,
                 value,
+                ..
             }
             | Stmt::AssignElemField {
                 base,
@@ -27434,9 +27496,21 @@ impl<'a> EscapeCheck<'a> {
                     }
                 }
                 match s {
-                    Stmt::AssignIndex { base, index, value } => {
-                        self.replace_callable_array_path(*base, index, &[], value, depth);
-                        self.apply_escape_index_store(*base, index, &[], value);
+                    Stmt::AssignIndex {
+                        base,
+                        path,
+                        index,
+                        value,
+                    } => {
+                        self.replace_callable_array_path(
+                            *base,
+                            path,
+                            index,
+                            &[],
+                            value,
+                            depth,
+                        );
+                        self.apply_escape_index_store(*base, path, index, &[], value);
                     }
                     Stmt::AssignElemField {
                         base,
@@ -27445,8 +27519,15 @@ impl<'a> EscapeCheck<'a> {
                         value,
                         ..
                     } => {
-                        self.replace_callable_array_path(*base, index, path, value, depth);
-                        self.apply_escape_index_store(*base, index, path, value);
+                        self.replace_callable_array_path(
+                            *base,
+                            &[],
+                            index,
+                            path,
+                            value,
+                            depth,
+                        );
+                        self.apply_escape_index_store(*base, &[], index, path, value);
                     }
                     Stmt::AssignElem {
                         base,
@@ -27454,8 +27535,15 @@ impl<'a> EscapeCheck<'a> {
                         value,
                         ..
                     } => {
-                        self.replace_callable_array_path(*base, index, &[], value, depth);
-                        self.apply_escape_index_store(*base, index, &[], value);
+                        self.replace_callable_array_path(
+                            *base,
+                            &[],
+                            index,
+                            &[],
+                            value,
+                            depth,
+                        );
+                        self.apply_escape_index_store(*base, &[], index, &[], value);
                     }
                     _ => unreachable!("array assignment group"),
                 }
@@ -39727,15 +39815,24 @@ impl<'a> MoveCheck<'a> {
     fn update_local_array_projection(
         &mut self,
         local: LocalId,
+        collection_path: &[u32],
         index: &Expr,
-        field_path: &[u32],
+        element_path: &[u32],
         value: &Expr,
     ) {
         if !self.local_may_borrow(local) {
             return;
         }
         let local_ty = self.f.locals[local as usize].ty;
-        let Some((element_ty, len)) = self.fixed_array_shape(local_ty) else {
+        let collection_projections = collection_path
+            .iter()
+            .copied()
+            .map(BorrowProjection::StructField)
+            .collect::<Vec<_>>();
+        let array_ty = collection_projections
+            .iter()
+            .try_fold(local_ty, |ty, projection| self.projection_ty(ty, *projection));
+        let Some((element_ty, len)) = array_ty.and_then(|ty| self.fixed_array_shape(ty)) else {
             self.join_local_borrow_fallback(local, value);
             return;
         };
@@ -39744,13 +39841,13 @@ impl<'a> MoveCheck<'a> {
             self.borrows.facts.get(&local).cloned().unwrap_or_default(),
         );
         let incoming = self.normalize_borrow_fact(value.ty, self.borrow_fact(value));
-        let mut suffix = field_path
+        let element_suffix = element_path
             .iter()
             .copied()
             .map(BorrowProjection::StructField)
             .collect::<Vec<_>>();
         let mut destination_ty = Some(element_ty);
-        for &projection in &suffix {
+        for &projection in &element_suffix {
             destination_ty = destination_ty.and_then(|ty| self.projection_ty(ty, projection));
         }
         if destination_ty.is_none_or(|ty| {
@@ -39762,13 +39859,15 @@ impl<'a> MoveCheck<'a> {
             return;
         }
         if let Some(exact) = self.exact_fixed_index(index, len) {
-            suffix.insert(0, BorrowProjection::ArrayElement(exact));
-            current.replace_exact(&suffix, incoming);
+            let mut destination = collection_projections.clone();
+            destination.push(BorrowProjection::ArrayElement(exact));
+            destination.extend(&element_suffix);
+            current.replace_exact(&destination, incoming);
         } else {
             for candidate in 0..len {
-                let mut path = Vec::with_capacity(suffix.len() + 1);
+                let mut path = collection_projections.clone();
                 path.push(BorrowProjection::ArrayElement(candidate));
-                path.extend(&suffix);
+                path.extend(&element_suffix);
                 current.join_at(&path, &incoming);
             }
         }
@@ -39781,8 +39880,9 @@ impl<'a> MoveCheck<'a> {
     fn update_mutable_collection_contents(
         &mut self,
         base: LocalId,
+        collection_path: &[u32],
         index: &Expr,
-        field_path: &[u32],
+        element_path: &[u32],
         value: &Expr,
     ) {
         self.reject_readonly_local_write(base, index.span);
@@ -39791,7 +39891,13 @@ impl<'a> MoveCheck<'a> {
         let storage = BorrowFact::from_direct(self.local_storage_roots(base));
         let byte_backing = self.byte_backing(&self.local_headers(base), &storage, &backing);
         self.borrows.invalidate_validated_bytes(&byte_backing);
-        self.update_generation_collection_contents(base, index, field_path, value);
+        self.update_generation_collection_contents(
+            base,
+            collection_path,
+            index,
+            element_path,
+            value,
+        );
         let observers = self.mutable_observer_locals(&backing, &storage);
         for local in self.resolved_mutable_destinations(&backing, &observers) {
             self.invalidate_mutable_place(local, &[]);
@@ -39802,7 +39908,7 @@ impl<'a> MoveCheck<'a> {
         // fact (`values[1..2][0]` is `values[1]`, not `values[0]`). Keep the visible base precise and
         // conservatively join the incoming owner into every distinct backing collection and
         // pre-existing observer captured before the visible fact changes.
-        self.update_local_array_projection(base, index, field_path, value);
+        self.update_local_array_projection(base, collection_path, index, element_path, value);
         let mut destinations = self.resolved_mutable_destinations(&backing, &observers);
         destinations.remove(&base);
         for local in destinations {
@@ -39813,8 +39919,9 @@ impl<'a> MoveCheck<'a> {
     fn update_generation_collection_contents(
         &mut self,
         base: LocalId,
+        collection_path: &[u32],
         index: &Expr,
-        field_path: &[u32],
+        element_path: &[u32],
         value: &Expr,
     ) {
         let Some(headers) = self.borrows.headers.get(&base).cloned() else {
@@ -39825,9 +39932,17 @@ impl<'a> MoveCheck<'a> {
         };
         let incoming = self.normalize_borrow_fact(value.ty, self.borrow_fact(value));
         let incoming_headers = self.completed_headers(value);
-        let fixed = self.fixed_array_shape(base_ty);
+        let collection_prefix = collection_path
+            .iter()
+            .copied()
+            .map(BorrowProjection::StructField)
+            .collect::<Vec<_>>();
+        let array_ty = collection_prefix
+            .iter()
+            .try_fold(base_ty, |ty, projection| self.projection_ty(ty, *projection));
+        let fixed = array_ty.and_then(|ty| self.fixed_array_shape(ty));
         let exact = fixed.and_then(|(_, len)| self.exact_fixed_index(index, len));
-        let field_suffix = field_path
+        let element_suffix = element_path
             .iter()
             .copied()
             .map(BorrowProjection::StructField)
@@ -39849,8 +39964,11 @@ impl<'a> MoveCheck<'a> {
             };
             if let Some(exact) = exact {
                 let path = reference.select_content_path(
-                    std::iter::once(BorrowProjection::ArrayElement(exact))
-                        .chain(field_suffix.iter().copied()),
+                    collection_prefix
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(BorrowProjection::ArrayElement(exact)))
+                        .chain(element_suffix.iter().copied()),
                 );
                 content.non_storage.replace_exact(&path, incoming.clone());
                 content
@@ -39859,8 +39977,11 @@ impl<'a> MoveCheck<'a> {
             } else if let Some((_, len)) = fixed {
                 for candidate in 0..len {
                     let path = reference.select_content_path(
-                        std::iter::once(BorrowProjection::ArrayElement(candidate))
-                            .chain(field_suffix.iter().copied()),
+                        collection_prefix
+                            .iter()
+                            .copied()
+                            .chain(std::iter::once(BorrowProjection::ArrayElement(candidate)))
+                            .chain(element_suffix.iter().copied()),
                     );
                     content.non_storage.join_at(&path, &incoming);
                     let mut prefixed = incoming_headers.clone();
@@ -39870,7 +39991,12 @@ impl<'a> MoveCheck<'a> {
                     content.headers = content.headers.join(&prefixed);
                 }
             } else {
-                let path = reference.select_content_path(field_suffix.iter().copied());
+                let path = reference.select_content_path(
+                    collection_prefix
+                        .iter()
+                        .copied()
+                        .chain(element_suffix.iter().copied()),
+                );
                 if path.is_empty() {
                     content.non_storage.direct.extend(incoming.flatten());
                 } else {
@@ -40944,7 +41070,12 @@ impl<'a> MoveCheck<'a> {
                 }
                 // `base[index] = value` — AssignIndex admits only Copy scalars and borrowed `str`,
                 // so the index and value are read without consuming either.
-                Stmt::AssignIndex { base, index, value } => {
+                Stmt::AssignIndex {
+                    base,
+                    path,
+                    index,
+                    value,
+                } => {
                     self.check_borrow_use(*base, index.span);
                     if whole_moved(moved, *base) {
                         let name = &self.f.locals[*base as usize].name;
@@ -40952,7 +41083,7 @@ impl<'a> MoveCheck<'a> {
                     }
                     move_expr!(self, index, moved, false, false);
                     move_expr!(self, value, moved, false, false);
-                    self.update_mutable_collection_contents(*base, index, &[], value);
+                    self.update_mutable_collection_contents(*base, path, index, &[], value);
                     self.clear_expression_value_snapshots(index);
                     self.clear_expression_value_snapshots(value);
                 }
@@ -40977,7 +41108,7 @@ impl<'a> MoveCheck<'a> {
                     if self.is_move_ty(value.ty) {
                         self.invalidate_collection_content_owner(*base);
                     }
-                    self.update_mutable_collection_contents(*base, index, path, value);
+                    self.update_mutable_collection_contents(*base, &[], index, path, value);
                     self.clear_expression_value_snapshots(index);
                     self.clear_expression_value_snapshots(value);
                 }
@@ -40998,7 +41129,7 @@ impl<'a> MoveCheck<'a> {
                     if self.is_move_ty(value.ty) {
                         self.invalidate_collection_content_owner(*base);
                     }
-                    self.update_mutable_collection_contents(*base, index, &[], value);
+                    self.update_mutable_collection_contents(*base, &[], index, &[], value);
                     self.clear_expression_value_snapshots(index);
                     self.clear_expression_value_snapshots(value);
                 }
@@ -43083,7 +43214,8 @@ impl<'a> MoveCheck<'a> {
                 base: LocalId,
                 index: &'e Expr,
                 value: &'e Expr,
-                field_path: &'e [u32],
+                collection_path: &'e [u32],
+                element_path: &'e [u32],
                 value_consuming: bool,
                 invalidates_owner: bool,
             },
@@ -43091,7 +43223,8 @@ impl<'a> MoveCheck<'a> {
                 base: LocalId,
                 index: &'e Expr,
                 value: &'e Expr,
-                field_path: &'e [u32],
+                collection_path: &'e [u32],
+                element_path: &'e [u32],
                 invalidates_owner: bool,
                 index_complete: bool,
             },
@@ -43235,6 +43368,7 @@ impl<'a> MoveCheck<'a> {
                     {
                         let [Stmt::AssignIndex {
                             base,
+                            path,
                             index,
                             value,
                         }] = block.stmts.as_slice()
@@ -43264,7 +43398,8 @@ impl<'a> MoveCheck<'a> {
                                     base: *base,
                                     index,
                                     value,
-                                    field_path: &[],
+                                    collection_path: path,
+                                    element_path: &[],
                                     value_consuming: false,
                                     invalidates_owner: false,
                                 },
@@ -43282,7 +43417,8 @@ impl<'a> MoveCheck<'a> {
                                     base: *base,
                                     index,
                                     value,
-                                    field_path: &[],
+                                    collection_path: path,
+                                    element_path: &[],
                                     invalidates_owner: false,
                                     index_complete: false,
                                 },
@@ -43301,7 +43437,7 @@ impl<'a> MoveCheck<'a> {
                                     | Stmt::AssignElem { .. }]
                             ) =>
                     {
-                        let (base, index, value, field_path) = match &block.stmts[0] {
+                        let (base, index, value, element_path) = match &block.stmts[0] {
                             Stmt::AssignElemField {
                                 base,
                                 index,
@@ -43340,7 +43476,8 @@ impl<'a> MoveCheck<'a> {
                                     base,
                                     index,
                                     value,
-                                    field_path,
+                                    collection_path: &[],
+                                    element_path,
                                     value_consuming: true,
                                     invalidates_owner: true,
                                 },
@@ -43358,7 +43495,8 @@ impl<'a> MoveCheck<'a> {
                                     base,
                                     index,
                                     value,
-                                    field_path,
+                                    collection_path: &[],
+                                    element_path,
                                     invalidates_owner: true,
                                     index_complete: false,
                                 },
@@ -44141,7 +44279,8 @@ impl<'a> MoveCheck<'a> {
                     base,
                     index,
                     value,
-                    field_path,
+                    collection_path,
+                    element_path,
                     value_consuming,
                     invalidates_owner,
                 } => {
@@ -44160,8 +44299,9 @@ impl<'a> MoveCheck<'a> {
                             }
                             self.update_mutable_collection_contents(
                                 base,
+                                collection_path,
                                 index,
-                                field_path,
+                                element_path,
                                 value,
                             );
                             self.clear_expression_value_snapshots(index);
@@ -44174,7 +44314,8 @@ impl<'a> MoveCheck<'a> {
                     base,
                     index,
                     value,
-                    field_path,
+                    collection_path,
+                    element_path,
                     invalidates_owner,
                     index_complete,
                     ..
@@ -44185,7 +44326,13 @@ impl<'a> MoveCheck<'a> {
                         {
                             self.invalidate_collection_content_owner(base);
                         }
-                        self.update_mutable_collection_contents(base, index, field_path, value);
+                        self.update_mutable_collection_contents(
+                            base,
+                            collection_path,
+                            index,
+                            element_path,
+                            value,
+                        );
                         self.clear_expression_value_snapshots(index);
                         self.clear_expression_value_snapshots(value);
                     }
@@ -47623,9 +47770,9 @@ impl<'a, 't> Checker<'a, 't> {
                         let v = self.check_expr(value, Some(ty));
                         stmts.push(Stmt::AssignField { root, path, value: v });
                     }
-                    Place::Index { base, index, elem } => {
+                    Place::Index { base, path, index, elem } => {
                         let v = self.check_expr(value, Some(elem));
-                        stmts.push(Stmt::AssignIndex { base, index, value: v });
+                        stmts.push(Stmt::AssignIndex { base, path, index, value: v });
                     }
                     Place::VecLane { local, lane, elem } => {
                         let v = self.check_expr(value, Some(elem));
@@ -48022,6 +48169,14 @@ impl<'a, 't> Checker<'a, 't> {
                 }
                 output
             }
+            ast::Type::FixedArray {
+                element, length, ..
+            } => {
+                format!(
+                    "[{}; {length}]",
+                    self.source_type_spelling_with_mono(element)
+                )
+            }
             ast::Type::Tuple { elems, .. } => {
                 let values = elems
                     .iter()
@@ -48061,7 +48216,7 @@ impl<'a, 't> Checker<'a, 't> {
     fn check_place(&mut self, place: &ast::Expr) -> Place {
         // `local[index] = v` — element store into a `mut` array local or `out` slice parameter.
         if let ast::ExprKind::Index { recv, index } = &place.kind {
-            let Some((id, local_ty)) = self.place_local(recv) else {
+            let Some((id, path, local_ty)) = self.resolve_place(recv) else {
                 self.diags.error("invalid assignment target".to_string(), place.span);
                 return Place::Err;
             };
@@ -48074,6 +48229,13 @@ impl<'a, 't> Checker<'a, 't> {
             }
             // `v[lane] = x` — write one lane of a `mut` vector (a constant lane in `0..N`, M6).
             if let Ty::Vec(s, n) = local_ty {
+                if !path.is_empty() {
+                    self.diags.error(
+                        "vector field lane assignment is not supported yet".to_string(),
+                        place.span,
+                    );
+                    return Place::Err;
+                }
                 let lane = match &index.kind {
                     ast::ExprKind::Int(v) if *v >= 0 && (*v as u128) < n as u128 => *v as u32,
                     _ => {
@@ -48088,6 +48250,14 @@ impl<'a, 't> Checker<'a, 't> {
             // (flat primitive numeric/bool/char fields), so the value is Copy with no region; a str /
             // nested / owned field would need escape handling and is deferred.
             if let Ty::StructArray(sid, _) | Ty::Soa(sid) = local_ty {
+                if !path.is_empty() {
+                    self.diags.error(
+                        "whole struct-array field element assignment is not supported yet"
+                            .to_string(),
+                        place.span,
+                    );
+                    return Place::Err;
+                }
                 let soa = matches!(local_ty, Ty::Soa(_));
                 let fields = &self.structs[sid as usize].fields;
                 // `!is_empty()` guards the vacuous-true on a zero-field struct: it must not count as
@@ -48187,7 +48357,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.diags.error(format!("an array index must be an integer, got {}", ty_name(i.ty)), index.span);
                 return Place::Err;
             }
-            return Place::Index { base: id, index: i, elem };
+            return Place::Index { base: id, path, index: i, elem };
         }
         // `local[index].f0.f1.… = v` — store the leaf field of a (possibly nested) struct-array /
         // soa element (the write counterpart of the `c[i].f0.f1.…` read). One leaf is written, no
@@ -48578,6 +48748,44 @@ impl<'a, 't> Checker<'a, 't> {
                 let lit = match want {
                     // `[…]` under a `vecN<T>` annotation builds a SIMD vector, not an array.
                     Ty::Vec(s, n) => self.check_vec_lit(elems, s, n, e.span),
+                    Ty::Array(element, length) => {
+                        if elems.len() != length as usize {
+                            self.diags.error(
+                                format!(
+                                    "a fixed-array literal of type {} needs exactly {length} elements, got {}",
+                                    self.ty_display(want),
+                                    elems.len()
+                                ),
+                                e.span,
+                            );
+                            Expr {
+                                kind: ExprKind::Bool(false),
+                                ty: Ty::Error,
+                                span: e.span,
+                            }
+                        } else {
+                            self.check_array_lit(elems, Some(scalar_to_ty(element)), e.span)
+                        }
+                    }
+                    Ty::StructArray(id, length) => {
+                        if elems.len() != length as usize {
+                            self.diags.error(
+                                format!(
+                                    "a fixed-array literal of type {} needs exactly {length} elements, got {}",
+                                    self.ty_display(want),
+                                    elems.len()
+                                ),
+                                e.span,
+                            );
+                            Expr {
+                                kind: ExprKind::Bool(false),
+                                ty: Ty::Error,
+                                span: e.span,
+                            }
+                        } else {
+                            self.check_array_lit(elems, Some(Ty::Struct(id)), e.span)
+                        }
+                    }
                     _ => self.check_array_lit(elems, None, e.span),
                 };
                 // A fixed array literal is a *stack* value; an owned `array<T>` (`DynArray`) is
@@ -48589,6 +48797,24 @@ impl<'a, 't> Checker<'a, 't> {
                 {
                     self.diags.error(
                         "a fixed array literal is not an owned `array<T>` — materialize it with `.to_array()` (its heap allocation is explicit)".to_string(),
+                        e.span,
+                    );
+                    return Expr {
+                        kind: ExprKind::Bool(false),
+                        ty: Ty::Error,
+                        span: e.span,
+                    };
+                }
+                if matches!(want, Ty::Array(..) | Ty::StructArray(..))
+                    && lit.ty != Ty::Error
+                    && !self.source_ty_matches(lit.ty, want)
+                {
+                    self.diags.error(
+                        format!(
+                            "expected {}, found {}",
+                            self.ty_display(want),
+                            self.ty_display(lit.ty)
+                        ),
                         e.span,
                     );
                     return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span: e.span };
@@ -51637,7 +51863,10 @@ impl<'a, 't> Checker<'a, 't> {
             if self.slice_borrow_element_rejected(scalar_to_ty(ps), e.span) {
                 return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span: e.span };
             }
-            if !matches!(e.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
+            if !matches!(
+                e.kind,
+                ExprKind::ArrayLit { .. } | ExprKind::Local(_) | ExprKind::Field { .. }
+            ) {
                 self.diags.error(
                     "an array coerced to a slice must be an array literal or a variable (an arbitrary array expression is not supported yet)".to_string(),
                     e.span,
@@ -51660,22 +51889,26 @@ impl<'a, 't> Checker<'a, 't> {
             return Expr { kind: ExprKind::ArrayToSlice(Box::new(e)), ty: Ty::Slice(ps), span };
         }
         if let Ty::Array(es, _) = e.ty
-            && self.payload_ty_matches(scalar_to_ty(es), scalar_to_ty(ps)) {
-                if self.slice_borrow_element_rejected(scalar_to_ty(ps), e.span) {
-                    return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span: e.span };
-                }
-                // The borrow lowers via the same slot-materialization as a pipeline source,
-                // so the same restriction applies: only a literal or a named local.
-                if !matches!(e.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
-                    self.diags.error(
-                        "an array coerced to a slice must be an array literal or a variable (an arbitrary array expression is not supported yet)".to_string(),
-                        e.span,
-                    );
-                    return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span: e.span };
-                }
-                let span = e.span;
-                return Expr { kind: ExprKind::ArrayToSlice(Box::new(e)), ty: Ty::Slice(ps), span };
+            && self.payload_ty_matches(scalar_to_ty(es), scalar_to_ty(ps))
+        {
+            if self.slice_borrow_element_rejected(scalar_to_ty(ps), e.span) {
+                return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span: e.span };
             }
+            // The borrow lowers via the same slot-materialization as a pipeline source, so the
+            // same restriction applies: only a literal or a stable local/field place.
+            if !matches!(
+                e.kind,
+                ExprKind::ArrayLit { .. } | ExprKind::Local(_) | ExprKind::Field { .. }
+            ) {
+                self.diags.error(
+                    "an array coerced to a slice must be an array literal or a variable (an arbitrary array expression is not supported yet)".to_string(),
+                    e.span,
+                );
+                return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span: e.span };
+            }
+            let span = e.span;
+            return Expr { kind: ExprKind::ArrayToSlice(Box::new(e)), ty: Ty::Slice(ps), span };
+        }
         // Already a slice, or a mismatch: let unification report any error.
         let slice_match = matches!(e.ty, Ty::Slice(es)
             if self.payload_ty_matches(scalar_to_ty(es), scalar_to_ty(ps)));
@@ -56834,7 +57067,17 @@ impl<'a, 't> Checker<'a, 't> {
     /// checked source, its stages, and the final element type. `elem_expected_no_stages`
     /// is the element type to push into an inline literal when there are no stages.
     fn check_pipeline(&mut self, recv: &ast::Expr, elem_expected_no_stages: Option<Ty>, span: Span) -> Option<(Expr, Vec<Stage>, Ty)> {
-        let (source_ast, raw_stages) = self.collect_pipeline(recv);
+        // A field whose value is itself a fixed array is the pipeline source place, not a
+        // projection stage over the containing record. Resolve that stable place before the
+        // syntax-only collector interprets `.field` as an element projection.
+        let fixed_field_source = self.resolve_place(recv).filter(|(_, path, ty)| {
+            !path.is_empty() && matches!(ty, Ty::Array(..) | Ty::StructArray(..))
+        });
+        let (source_ast, raw_stages) = if fixed_field_source.is_some() {
+            (recv, Vec::new())
+        } else {
+            self.collect_pipeline(recv)
+        };
         // The expected element type for an inline scalar literal source: the first Map
         // stage's parameter, or (with no stages) the caller-provided hint.
         let elem_expected = match raw_stages.first() {
@@ -56847,14 +57090,22 @@ impl<'a, 't> Checker<'a, 't> {
             None => elem_expected_no_stages,
             _ => None,
         };
-        let source = match &source_ast.kind {
-            ast::ExprKind::Call { callee, args }
-                if matches!(&callee.kind, ast::ExprKind::Path(path) if single_name(path) == Some("zip")) =>
-            {
-                self.check_zip_source(args, source_ast.span)?
+        let source = if let Some((root, path, ty)) = fixed_field_source {
+            Expr {
+                kind: ExprKind::Field { root, path },
+                ty,
+                span: source_ast.span,
             }
-            ast::ExprKind::ArrayLit(elems) => self.check_array_lit(elems, elem_expected, span),
-            _ => self.check_expr(source_ast, None),
+        } else {
+            match &source_ast.kind {
+                ast::ExprKind::Call { callee, args }
+                    if matches!(&callee.kind, ast::ExprKind::Path(path) if single_name(path) == Some("zip")) =>
+                {
+                    self.check_zip_source(args, source_ast.span)?
+                }
+                ast::ExprKind::ArrayLit(elems) => self.check_array_lit(elems, elem_expected, span),
+                _ => self.check_expr(source_ast, None),
+            }
         };
         let mut elem = match source.ty {
             Ty::Tuple(_) if matches!(source.kind, ExprKind::ArrayZip { .. }) => source.ty,
@@ -56916,7 +57167,12 @@ impl<'a, 't> Checker<'a, 't> {
         // projection indexes through the buffer pointer (`IndexFieldPtr`), and binding it first
         // keeps the owned buffer alive across the loop. Reject other array shapes cleanly here.
         let needs_var = matches!(source.ty, Ty::Array(..) | Ty::StructArray(..) | Ty::DynStructArray(..) | Ty::Soa(_));
-        if needs_var && !matches!(source.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
+        if needs_var
+            && !matches!(
+                source.kind,
+                ExprKind::ArrayLit { .. } | ExprKind::Local(_) | ExprKind::Field { .. }
+            )
+        {
             self.diags.error(
                 "a pipeline over an array must start from an array literal or a variable (an arbitrary array expression is not supported yet)".to_string(),
                 span,
@@ -60703,10 +60959,14 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     /// Whether a receiver's storage is a stack slot MIR addresses directly, so only a literal or
-    /// a named local can be read or viewed. Shared for the same reason as the predicate above.
+    /// a stable literal/local/field place can be read or viewed. Shared for the same reason as the
+    /// predicate above.
     fn collection_receiver_needs_slot_binding(&self, receiver: &Expr) -> bool {
         matches!(receiver.ty, Ty::Array(..) | Ty::StructArray(..))
-            && !matches!(receiver.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_))
+            && !matches!(
+                receiver.kind,
+                ExprKind::ArrayLit { .. } | ExprKind::Local(_) | ExprKind::Field { .. }
+            )
     }
 
     /// `recv[start..end]` — a half-open range slice of a `str` / `array<T>` / `slice<T>`. Yields a
@@ -65791,7 +66051,12 @@ impl<'a, 't> Checker<'a, 't> {
         };
         // A fixed `array<Struct>` slot must be a literal or a variable (same restriction as a
         // pipeline source — MIR addresses it through a slot). A `{ptr,len}` view is fine as a value.
-        if matches!(r.ty, Ty::StructArray(..)) && !matches!(r.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
+        if matches!(r.ty, Ty::StructArray(..))
+            && !matches!(
+                r.kind,
+                ExprKind::ArrayLit { .. } | ExprKind::Local(_) | ExprKind::Field { .. }
+            )
+        {
             self.diags.error(
                 "indexing a fixed array requires an array literal or a variable (an arbitrary array expression is not supported yet)".to_string(),
                 span,
@@ -68636,6 +68901,7 @@ fn walk_type(t: &ast::Type, out: &mut std::collections::HashSet<String>) {
                 walk_type(a, out);
             }
         }
+        ast::Type::FixedArray { element, .. } => walk_type(element, out),
         ast::Type::Tuple { elems, .. } => elems.iter().for_each(|e| walk_type(e, out)),
         ast::Type::Fn { params, ret, .. } => {
             params.iter().for_each(|p| walk_type(&p.ty, out));
@@ -69785,6 +70051,11 @@ fn source_type_spelling(ty: &ast::Type) -> String {
             }
             output
         }
+        ast::Type::FixedArray {
+            element, length, ..
+        } => {
+            format!("[{}; {length}]", source_type_spelling(element))
+        }
         ast::Type::Tuple { elems, .. } => {
             let mut output = String::from("(");
             for (index, elem) in elems.iter().enumerate() {
@@ -70003,7 +70274,7 @@ fn dynamic_array_type(
 /// Form the exact fixed-array representation after a generic literal element is substituted.
 /// A template temporarily represents `[value: T]` as `Ty::Array(Param, N)`; a struct argument must
 /// select the dedicated inline `StructArray` form before body analysis and MIR validation.
-fn fixed_array_type(
+pub fn fixed_array_type(
     element: Ty,
     length: u32,
     structs: &[StructDef],
@@ -70012,6 +70283,12 @@ fn fixed_array_type(
 ) -> Option<Ty> {
     match element {
         Ty::Struct(id) => Some(Ty::StructArray(id, length)),
+        // Fixed arrays are the one inline aggregate form, not a recursive aggregate tree. Move
+        // records remain the deliberate exception because StructArray owns and drops each element
+        // through its nominal definition; independently owned scalar elements would instead copy
+        // one owner word on indexing.
+        Ty::Array(..) | Ty::StructArray(..) => None,
+        other if ty_is_move(other, structs, &[], enums, tagged_types) => None,
         other if ty_contains_restricted_collection_owner(other, structs, &[], enums, tagged_types) => None,
         other => collection_scalar_type(other).map(|scalar| Ty::Array(scalar, length)),
     }
@@ -71102,6 +71379,43 @@ fn resolve_type(
 ) -> Ty {
     let (path, args, span) = match t {
         ast::Type::Named { path, args, span } => (path, args.as_slice(), *span),
+        ast::Type::FixedArray {
+            element,
+            length,
+            span,
+            ..
+        } => {
+            let element_ty = resolve_type(element, cx, type_params, diags);
+            if element_ty == Ty::Error {
+                return Ty::Error;
+            }
+            return match fixed_array_type(
+                element_ty,
+                *length,
+                cx.structs,
+                cx.enums,
+                cx.tagged_types,
+            ) {
+                Some(ty) => ty,
+                None => {
+                    diags.error(
+                        format!(
+                            "`{}` cannot be an element of a fixed array",
+                            ty_display(
+                                element_ty,
+                                cx.structs,
+                                cx.enums,
+                                cx.tagged_types,
+                                cx.tuples,
+                                type_params,
+                            )
+                        ),
+                        *span,
+                    );
+                    Ty::Error
+                }
+            };
+        }
         // `fn(T, U) -> R` — a function-value type. Scalar parameters/return (matching first-class
         // function values); interned into `fn_types` like a tuple type.
         ast::Type::Fn { params, ret, span: _ } => {
@@ -72442,6 +72756,9 @@ fn is_field_ok(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
         // the declared signature's `FnTy`; an indirect call through `place.field(args)` reads its
         // (Unknown-by-default) effect bit and fails closed at Pure/parallel boundaries.
         Ty::Fn(_) => {}
+            // A fixed array is the same inline value whether it is inferred from a literal or named by
+            // `[T; N]`. Element formation already selected one of these exact representations.
+            Ty::Array(..) | Ty::StructArray(..) => {}
         // The payload is a `Scalar`; converting it back to `Ty` lets the same field-shape walker
         // admit producer-valid nested forms such as `Option<array<T>>`.
         Ty::Option(s) => work.push(scalar_to_ty(s)),
@@ -72485,7 +72802,7 @@ fn collect_inline_struct_ids(
     let mut visited_tagged = HashSet::new();
     while let Some(ty) = work.pop() {
         match ty {
-            Ty::Struct(id) => {
+            Ty::Struct(id) | Ty::StructArray(id, _) => {
                 if !output.contains(&id) {
                     output.push(id);
                 }
@@ -72635,6 +72952,9 @@ fn type_graph_acyclic(
                 for field in definition.fields.iter().rev() {
                     work.push(Work::Enter(field.ty));
                 }
+            }
+            Work::Enter(Ty::StructArray(id, _)) => {
+                work.push(Work::Enter(Ty::Struct(id)));
             }
             Work::Enter(Ty::Enum(id)) => {
                 let node = Node::Enum(id);

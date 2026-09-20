@@ -282,6 +282,13 @@ pub enum FnBody {
 #[derive(Clone, Debug)]
 pub enum Type {
     Named { path: Path, args: Vec<Type>, span: Span },
+    /// `[T; N]` — a fixed inline array whose length is part of its structural type.
+    FixedArray {
+        element: Box<Type>,
+        length: u32,
+        separator: Span,
+        span: Span,
+    },
     /// `(T, U, ...)` — an anonymous product type (arity ≥ 2; `()` is unit, `(T)` is grouping).
     Tuple { elems: Vec<Type>, span: Span },
     /// `fn(T, out U) -> R` — a function-value type with an explicit mode per parameter (a
@@ -300,7 +307,10 @@ pub struct FnTypeParam {
 impl Type {
     pub fn span(&self) -> Span {
         match self {
-            Type::Named { span, .. } | Type::Tuple { span, .. } | Type::Fn { span, .. } => *span,
+            Type::Named { span, .. }
+            | Type::FixedArray { span, .. }
+            | Type::Tuple { span, .. }
+            | Type::Fn { span, .. } => *span,
         }
     }
 }

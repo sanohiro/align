@@ -470,6 +470,10 @@ fn rvalue_str(rv: &Rvalue) -> String {
         }
         Rvalue::TupleIndex { tuple, index } => format!("{}.{index}", operand_str(tuple)),
         Rvalue::MakeSlice(slot, n) => format!("slice(_{slot}, {n})"),
+        Rvalue::MakeFieldSlice(slot, path, n) => format!(
+            "slice(_{slot}.{}, {n})",
+            path.iter().map(u32::to_string).collect::<Vec<_>>().join(".")
+        ),
         Rvalue::ArenaAlloc { handle, count, elem } => {
             format!("arena_alloc({}, {} x {})", operand_str(handle), operand_str(count), crate::ty_name(*elem))
         }

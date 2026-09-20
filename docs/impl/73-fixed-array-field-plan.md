@@ -1,10 +1,11 @@
 # Fixed-array types and inline record fields
 
-Status: plan of record for
+Status: implementation candidate for
 [issue 1065](https://github.com/sanohiro/align/issues/1065). The language
-contract is complete; implementation starts only after one fresh independent
-adversarial review of this ledger. Evidence baseline: Align `e4395337`, LLVM
-22.1.8. The requesting consumer baseline is align-llm Request 94.
+contract and its independent design review shipped in PR #1137. The provider
+implementation closes the matrix below as one capability. Evidence baseline:
+Align `44282ee7`, LLVM 22.1.8. The requesting consumer baseline is align-llm
+Request 94.
 
 This capability makes the already implemented fixed array a nameable type and
 therefore permits it as an inline record field. Syntax, formation, stable-place
@@ -186,6 +187,26 @@ parameterized owner may close several cells when it would fail for each defect.
 | ABI/layout | semantic and LLVM size/alignment/offset/stride agree for N=0/1/32/37, mixed surrounding fields, nested records and supported over-aligned array elements; malformed checked types reject before LLVM | layout validators, raw/optimized LLVM assertions and platform CI |
 | Allocation | construction/access/return/Drop of the 13x32 acceptance record has no builder/runtime allocator call; explicit materialization remains the only allocation | IR symbol scan plus runtime allocation counter |
 | Malformed input | forged type/field/cardinality/place/layout equations fail in checked-HIR or MIR validation, never by panic or backend guess | one mutation owner per producer-owned discriminator/equation |
+
+Candidate owner evidence is concentrated in
+`crates/align_driver/tests/fixed_array_fields.rs`: its parameterized cases own
+cardinality and excluded-element formation; runtime cases own field
+read/index/range/len/pipeline, indexed and whole-field replacement, generic
+substitution, zero/37 lengths, Move-record construction/Drop and whole/per-unit
+transport; the 13x32 case owns the no-allocation IR assertion; and the forged
+field-slice case owns MIR rejection. Lexer, parser and formatter unit owners
+close the semicolon/newline distinction. Interface codec and summary owners
+close format 14, the independent tag-3 golden, malformed input, depth and
+round-trip identity. Existing parameterized ownership, control-flow, layout
+and escape owners remain the invariant-level evidence for their unchanged
+rules; the new negative field-slice return exercises the added storage root.
+
+This capability deliberately exceeds roughly 1,000 changed hand-written lines.
+Splitting syntax/interface publication from field-place lowering would leave a
+dormant type that no stable consumer could use, while splitting MIR from LLVM
+would duplicate the same layout, lifetime and malformed-producer proof. One
+atomic provider PR therefore has less duplicated evidence and lower integration
+risk than partial producer/consumer branches.
 
 ## 3. Acceptance corpus
 
