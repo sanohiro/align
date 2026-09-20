@@ -96,7 +96,7 @@ widened into this table.
 | G3 | A counted loop lowers with its trip-count exit at the latch; the recognized shape produces one named MIR fact | recognition is total for the canonical early-exit shape: zero-trip test peeled into the fast-copy preheader, only body-derived exits in its header, `i + step REL bound` at the latch; the fact carries trip count, step and monotone index and is the single source rotation and extent emission read | whether LLVM's early-exit vectorizer then fires | MIR lowering | `g3_counted_latch_exit_aarch64`, `g3_counted_latch_exit_x86_v2`, `g3_counted_exit_value_matrix_is_unchanged` | 1084 |
 | G4 | One floating-point semantics model: uniform `minimum`/`maximum` lowering, ordered by default, relaxation only inside an explicit lexical scope | Part 1: all three spellings of a float min/max emit `llvm.minimum`/`llvm.maximum`, with NaN propagation and ±0 ordering unchanged. Part 2 (plan 77): `float(reassoc)` and `float(contract)` name per-operation permissions independently and nest by union within one function body; every named/lambda body starts strict; reassociation may compose after inlining, while contraction is selected only from a two-sided authenticated MIR pair and never uses raw LLVM `contract`; poison-producing and bundled flags are excluded | the vector width LLVM picks for the resulting reduction | MIR (Part 1); parser/sema/MIR/interface/LLVM (Part 2) | Part 1 owners plus plan 77's syntax, semantic, interface, exact-flag, FMA-pair and strict-barrier owners | 1082 Parts 1 and 2 |
 | G5 | Every runtime primitive that can appear in a loop has an effects record and either an inline fast path or a vector form | each runtime ABI symbol carries a complete memory-effects record and every sound subset is emitted as an attribute; per-element primitives have a visible inline fast path and a visible slow path; `Result`/`?` failure edges are cold with one model | which of the fast paths LLVM then widens | runtime ABI, with LLVM lowering | the existing runtime-ABI owner in `20-runtime-abi-ledger.md`, extended by plan 70 | 1071, 1072, 1073, and 1074, which this contract adds to issue 1088's B6 owner set |
-| G6 | Every `core.math` function has a vector lowering on every supported target and one accuracy contract that holds for both lowerings | a documented ULP bound per function against the correctly rounded result; the scalar and vector lowerings produce bit-identical results, and so does every supported target; no scalar libcall inside a vector body | which loops the vectorizer chooses to widen | LLVM lowering, with the driver | the existing `crates/align_driver/tests/vec_simd.rs` and `crates/align_driver/tests/scalar_math.rs` owners extended to the exp/log family; a ULP conformance owner (planned); `examples/vec_math.align` | 1063 (revised, §6.1), with 1069 as a prerequisite |
+| G6 | Every `core.math` elementary function has scalar and explicit-vector LLVM lowering, and LLVM-level scalarization is inspectable | scalar and vector receivers lower to the exact LLVM intrinsic; explicit vectors reach raw LLVM IR without a compiler-built lane loop; optimized IR and `explain-opt` account for eliminated or merged operations, retained vector IR and pre-instruction-selection scalarization, and disclose provider absence without claiming final machine SIMD; no scalar/vector or cross-target bit identity is promised | final instruction selection, whether the selected target has a vector math provider, and which ordinary loops the vectorizer widens | LLVM lowering and `explain-opt` | the existing `crates/align_driver/tests/vec_simd.rs` and `crates/align_driver/tests/scalar_math.rs` owners extended to the exp/log family, plus eliminated-or-merged/retained-vector/scalarized/provider-absence explanation owners | 1063 (amended, §6.1) |
 | G7 | Bytes reach typed slices through one checked, order-explicit, zero-copy view | construction allocates nothing and copies nothing; alignment and length are validated and yield `None` rather than trapping; the view carries the source borrow's authority and provenance; the named byte order must be the target's native order or the program is rejected at compile time | that a loop over the result then vectorizes — that is §6.3's gate, not this guarantee | sema, with MIR for the lowering | a view owner asserting no allocation and no copy in emitted IR; a `vecN` load reachable from `buffer.bytes()`; a negative owner for a non-native order (all planned) | 1064 (revised, §6.2) |
 | G8 | A mask is structural: lane count and lane bit width, not element type | `select` accepts any mask whose lane count and lane width match the blended vectors; emitted IR is a plain `select <N x i1>` with no conversion; a lane-count or lane-width mismatch keeps its existing diagnostic | nothing | sema | `examples/vec_argmax.align` plus its codegen owner, and negative owners for `mask4<f32>` gating `vec2<f64>` and `vec8<i32>` (all planned) | 1083 |
 | G9 | A function called from a pipeline stage or a hot loop is inlinable across units | a non-generic `pub fn` admitted by plan 74's target-independent checked-HIR budget travels in the unit interface with its exact extern closure and is emitted in the consumer as `available_externally`; no admitted call has a definition-unavailable refusal | whether LLVM inlines it at a given call site | `align_interface`, with sema, LLVM and the driver | plan 74's two-unit scalar, pipeline/explain-opt, extern-wrapper, symbol/link and cache corpus | 1066; plan 74 |
@@ -118,12 +118,11 @@ G5          prerequisite: the runtime ABI inventory in 20-runtime-abi-ledger.md
             `compiler_build_id`; `rt_lto_digest` changes only when the guarded
             set or baked runtime bitcode changes. The record adds no cache-key
             component of its own.
-G6          prerequisite: issue 1069, because the portable kernels ship as
-            runtime bitcode and 1069 is why --rt-lto does not inline them at
-            the default target on aarch64. The kernels and the selected
-            accuracy tier are part of the runtime artifact identity; the
-            per-target vector-library opt-in must enter the implementation
-            identity, because it changes results.
+G6          no prerequisite milestone. Scalar and explicit-vector operations
+            lower directly to LLVM intrinsics and add no artifact identity.
+            A later vector-provider configuration must enter the existing
+            target/toolchain implementation identity because it can change
+            optimized shape and result bits.
 G7          no prerequisite milestone. A view type is a new public type
             constructor in the interface, so it changes the interface hash of
             any unit exposing one.
@@ -483,11 +482,11 @@ can actually satisfy on its own.
 
 ### 6.1 Issue 1063 — `core.math` exponential and logarithmic family
 
-The detailed artifact, accuracy and implementation gate is
+The detailed lowering and visibility contract is
 [plan 75](75-portable-math-plan.md). It keeps the five-function E1 capability
-together and leaves the existing scalar `pow` on its current contract until the
-later power tier can satisfy the same proof; merely deleting the example's
-caveat would not make `pow` portable.
+together and leaves the existing scalar `pow` on its current contract. It does
+not introduce an Align-owned math library or a Java/StrictMath-style
+cross-target bit-identity promise.
 
 The issue's criterion "loop vectorizer successfully vectorizes loops over slices
 using these operations" is unreachable by adding intrinsics. Worse, with no
@@ -497,27 +496,23 @@ per-lane `bl _expf` with lane insert and extract overhead — slower than scalar
 
 The real contract has two parts, and neither depends on the loop-facts work.
 
-**Accuracy.** Every `core.math` function has one documented ULP bound. The
-scalar lowering, the vector lowering, and every supported target produce results
-within that bound of the correctly rounded result, and the scalar and vector
-lowerings of the same function agree with each other. A program's results do not
-change because the vectorizer fired or because the target changed. Align already
-pays for this class of determinism: `llvm.maximum` was chosen over `maxnum` for
-identical-across-builds results.
+**One semantic operation.** Scalar and explicit-vector receivers lower to the
+matching LLVM intrinsic. Vector semantics are lane-wise, but neither a ULP
+ceiling nor scalar/vector or cross-target bit identity is promised. Result bits
+may differ with LLVM, target library, vector width and target, as they already
+may for scalar `pow`. Special-value classes remain defined and floats never
+abort.
 
-**Vector lowering on every target.** A vector form exists on every supported
-target, from Align-owned portable kernels shipped as runtime bitcode — the
-mechanism `--rt-lto` already uses for four string primitives. This is
-target-independent, bit-identical across targets, inlinable into the caller's
-loop, and adds no link dependency. It has one prerequisite, which 1063's own
-comment names and which this contract adopts as G6's gate: **issue 1069**,
-`--rt-lto` does not inline at the default `--target-cpu baseline` on aarch64.
-Until 1069 is fixed the portable kernel stays an out-of-line call on exactly
-the host all of this evidence came from, so criterion 1 below cannot pass
-without it. A per-target vector library
-(`Darwin_libsystem_m`, libmvec, SLEEF, SVML) is an explicit opt-in for users who
-accept non-identical results, never the default. The portable kernel is the
-contract; the library is the escape hatch.
+**Truthful SIMD visibility.** A vector receiver reaches raw LLVM IR as a vector
+intrinsic, with no compiler-built lane loop. LLVM may scalarize it before or
+during instruction selection when the selected target has no vector math
+provider. That is a legal optimization outcome, not a reason to withhold the
+functions. Optimized IR and `explain-opt` account for eliminated or merged
+operations, retained vector IR, and pre-instruction-selection scalarization and
+disclose provider absence; neither claims final machine SIMD from vector-shaped
+IR alone. A final machine-shape promise belongs to a provider capability with emitted-object disassembly
+owners. Provider selection must be deterministic toolchain configuration rather
+than ambient discovery.
 
 ```align
 fn softmax_weight(v: vec4<f32>) -> vec4<f32> = v.exp()
@@ -525,24 +520,19 @@ fn softmax_weight(v: vec4<f32>) -> vec4<f32> = v.exp()
 
 Acceptance criteria that replace the issue's current ones:
 
-1. For each shipped function, the explicit vector receiver (`vecN<f32>`,
-   `vecN<f64>`) emits a vector body containing **no scalar libcall and no
-   per-lane insert/extract** on aarch64 and x86-64 at the default target. This
-   is pinned on the explicit SIMD surface, which is reachable today, instead of
-   on auto-vectorization of a slice loop, which is G1–G3's promise.
-2. The scalar and vector lowerings produce **bit-identical** results, and so
-   does every supported target; the ULP bound is stated against the correctly
-   rounded reference, not against the other lowering. Bit-identity is what the
-   portable kernel buys and what the `llvm.maximum` precedent already commits
-   to; a ULP band between lowerings would reintroduce the "results change when
-   the vectorizer fires" problem this section exists to remove. A conformance
-   owner checks each function against the reference at the bound, including the
-   sub-normal and infinity edges; floats never abort, so every input has a
-   defined result.
-3. `pow` is assigned to the same portable policy, but its current scalar-only
-   caveat remains accurate until the power tier ships. That tier deletes the
-   caveat only when scalar/vector accuracy and target identity are proved; E1
-   must not claim a dormant vector `pow` implementation.
+1. Each scalar receiver lowers to the exact scalar LLVM intrinsic; each explicit
+   vector receiver (`vecN<f32>`, `vecN<f64>`) lowers to the exact vector LLVM
+   intrinsic without a compiler-built lane loop, temporary array or
+   pre-optimization insert/extract chain.
+2. `emit-llvm --stage optimized` and `explain-opt` account for every reached
+   explicit-vector operation as eliminated or merged, retained vector IR, or
+   scalarized before instruction selection. Provider absence is visible,
+   retained vector IR is never called final machine SIMD, and a later provider promise requires
+   emitted-object disassembly evidence.
+3. The special-value result classes are identical across scalar and vector
+   forms. Finite last bits, NaN payloads, ULP accuracy and cross-target identity
+   are deliberately not promised. Existing scalar `pow` remains unchanged and
+   scalar-only.
 4. The auto-vectorization of an ordinary `slice<f32>` loop over these functions
    is **not** a criterion of 1063. It moves to the umbrella corpus (§7), under
    the one gating rule in §6.3.

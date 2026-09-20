@@ -196,9 +196,12 @@ every item below has since completed as recorded in the per-milestone sections, 
    pairwise is arity-dispatched alongside the `arr.min()` reduction; LLVM `abs`/`fabs`/
    `{s,u}min`/`{s,u}max`/`minimum`/`maximum`). Float
    `sqrt`/`floor`/`ceil`/`round`/`trunc`/`pow` DONE (float-only methods, LLVM intrinsics;
-   `round` = ties-away-from-zero). This historical tier is complete; the portable
-   elementary-function extension is planned separately in
-   [plan 75](75-portable-math-plan.md). **Existing core.math tier DONE.**
+   `round` = ties-away-from-zero). This historical tier is complete. The
+   `exp`/`exp2`/`log`/`log2`/`log10` scalar-and-vector extension is planned in
+   [plan 75](75-portable-math-plan.md): direct LLVM intrinsic lowering, no
+   cross-target bit-identity promise, visibility of LLVM's pre-instruction-
+   selection disposition, and a warning that retained provider-less IR may
+   still scalarize later. **Existing core.math tier DONE; E1 implementation pending.**
 2. **core.bytes / core.buffer** — design SETTLED, **build deferred until a consumer**:
    `bytes` = `slice<u8>` (no separate type — largely exists already); `buffer` = a distinct
    growable owned byte container (distinct from fixed `array<u8>` and the text-only `builder`).

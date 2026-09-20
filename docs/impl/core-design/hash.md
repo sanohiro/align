@@ -54,9 +54,12 @@ None — values in, values out.
   tests pin *properties*: determinism, lane equality, view acceptance).
 - Not DoS-resistant, not cryptographic — `std.crypto` (M11, designed in `../std-design/
   crypto.md`) is the answer for security contexts; refuse "just use hash64" shortcuts there.
-- No transcendentals (`sin`/`cos`/`log`/`exp`) — the `MathFn` enum stops at `pow`/`fma`.
-  Adding them is small mechanically but decide the precision/libm-dependence stance once, in
-  `open-questions.md`, not per-function.
+- Elementary `exp`/`exp2`/`log`/`log2`/`log10` are settled together by plan 75
+  (implementation pending): direct LLVM scalar/vector intrinsics, no ULP or
+  cross-target bit-identity promise, visibility of pre-instruction-selection
+  scalarization, and a warning that retained provider-less IR may still
+  scalarize later. Final machine SIMD requires object inspection.
+  Trigonometric functions remain unavailable.
 - `core.bitset` (§18.1 neighbor) — not implemented; bit work uses integer operators. Its layout
   question is tied to packed-bool soa columns; settle together.
 
