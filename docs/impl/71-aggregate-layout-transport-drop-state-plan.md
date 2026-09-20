@@ -7,8 +7,8 @@ Status: plan of record for issues
 implementation starts only after one fresh independent adversarial review of
 this ledger. Evidence baseline: Align `9583d8c8`, LLVM 22.1.8.
 
-Implementation status (2026-09-20): PR 1 merged in #1131. PR 2 is implemented
-as the current candidate; PR 3 and PR 4 remain pending.
+Implementation status (2026-09-20): PR 1 merged in #1131 and PR 2 merged in
+#1132. PR 3 is implemented as the current candidate; PR 4 remains pending.
 
 These issues expose one boundary. A tagged value's physical size determines its
 argument and result transport; that transport carries the value's cleanup
@@ -547,6 +547,45 @@ PR 2's author-side matrix-to-diff pass maps these cells to one closed chain:
 | Native boundaries | runtime/extern/callback/raw descriptors retain their ledgers; no accidental marker selection; FFI, DB, task and callback owners; local DB verification if classified |
 | Artifact/cache | no physical LLVM handle serialized; target/LLVM/CPU/type/effect changes select the right plan and cache entry; ThinLTO, per-unit and inprocess owners |
 | Performance | whole-local cleanup result has no `{T,i1}` scratch; large byval has no field rebuild; fixed witness region/copy counts fall with small/direct and fallback reverse controls |
+
+PR 3's author-side matrix-to-diff pass maps these cells to one closed LLVM
+transport chain:
+
+- `align_codegen_llvm` marks only compiler-owned program definitions,
+  declarations, explicit-export wrappers, function-value thunks, closure
+  thunks, and checked indirect calls. Runtime, extern, callback, raw-descriptor,
+  and native edges retain their existing contracts.
+- The LLVM 22 normalizer classifies the complete post-result physical
+  signature in source order with the target call lowerer, so hidden `sret` and
+  cleanup outputs participate in register pressure. It rewrites selected
+  aggregate parameters to exact `byval(T)` pointers, removes the callee entry
+  rebuild, and keeps direct controls unchanged.
+- Cleanup-bearing returns cover direct pairs, direct values plus a canonical
+  byte output, and indirect values plus `sret(T)` and that byte output. Fresh
+  whole-local forwarding is limited to proved materialization slots; malformed
+  or unsupported edges refuse transactionally on a verified preflight clone,
+  then the deterministic rewrite replays on the stable original module after
+  its finalized debug builder is disposed.
+- Result and user-sum owners load the i8/i32 discriminator directly from final
+  storage, reload payloads only in selected arms, and retain the aggregate
+  fallback when aliases or intervening writes make delayed loads unsafe.
+- Unit owners cover target register pressure, exact attributes, native
+  negative controls, rollback, and cleanup-form classification. Driver owners
+  execute Move/Drop paths and whole/per-unit large by-value calls, and assert
+  definition/call agreement and absence of redundant aggregate staging.
+
+PR 3 review finding-to-fix ledger (candidate `301867e6`):
+
+- Selected-arm tag/payload reloads could move beyond the result slot's
+  `lifetime.end`. The rewrite now removes that end hint when it splits the
+  aggregate load, leaving the entry alloca live through every selected arm;
+  the tagged-result owner asserts the invalid early end is absent.
+- Cleanup-result destination forwarding checked only direct alloca users and
+  could miss writes through a derived GEP or cast. Forwarding now admits only
+  a recursively proved read-only derived-pointer graph plus canonical root
+  zero-state stores; every write or escaping use through a derived pointer
+  retains the separate result slot. A derived-alias reverse owner pins that
+  fallback and the original SSA snapshot.
 
 ### 5.4 PR 4: fresh-value destination construction
 

@@ -59,6 +59,38 @@ fn main() -> i32 {
 }
 "#;
 
+const TAG_ONLY_SOURCE: &str = r#"
+fn make(ok: bool) -> Result<string, string> =
+  if ok { Ok("yes".clone()) } else { Err("no".clone()) }
+
+fn inspect(ok: bool) -> i32 {
+  value := make(ok)
+  return match value {
+    Ok(text) => text.len() as i32
+    Err(text) => text.len() as i32
+  }
+}
+
+fn main() -> i32 = inspect(true) + inspect(false)
+"#;
+
+const USER_SUM_TAG_ONLY_SOURCE: &str = r#"
+Choice { Left(string), Right(string) }
+
+fn make_sum(left: bool) -> Choice =
+  if left { Choice.Left("left".clone()) } else { Choice.Right("right".clone()) }
+
+fn inspect_sum(left: bool) -> i32 {
+  value := make_sum(left)
+  return match value {
+    Left(text) => text.len() as i32
+    Right(text) => text.len() as i32
+  }
+}
+
+fn main() -> i32 = inspect_sum(true) + inspect_sum(false)
+"#;
+
 /// One `?` per cleanup-bit provenance, inside a `DynamicBit` function (`05 §3`). The five
 /// `copy_*` scope probes are the same missing-bit cell reached through each borrow-transparent
 /// scope kind, which `moved_drop_flag` recurses into separately; `copy_abi` is the
@@ -186,7 +218,9 @@ fn mir_text(source: &str) -> String {
 
 fn function<'a>(mir: &'a str, name: &str) -> &'a str {
     let marker = format!("fn {name}(");
-    let start = mir.find(&marker).unwrap_or_else(|| panic!("missing {marker} in MIR:\n{mir}"));
+    let start = mir
+        .find(&marker)
+        .unwrap_or_else(|| panic!("missing {marker} in MIR:\n{mir}"));
     let body = &mir[start..];
     let end = body.find("\n}").map_or(body.len(), |i| i + 2);
     &body[..end]
@@ -256,7 +290,10 @@ fn try_err_edges_forward_a_cleanup_bit_for_every_operand_provenance() {
     ] {
         let body = function(&mir, name);
         let bits = cleanup_bits(body);
-        assert!(!bits.is_empty(), "{name} must return through the cleanup ABI:\n{body}");
+        assert!(
+            !bits.is_empty(),
+            "{name} must return through the cleanup ABI:\n{body}"
+        );
         for bit in bits {
             assert!(
                 defines_runtime_bit(body, bit),
@@ -288,7 +325,9 @@ fn try_err_edges_forward_a_cleanup_bit_for_every_operand_provenance() {
     );
     if backend_available() {
         assert_eq!(
-            build_and_run("try-err-edge-provenance", TRY_ERR_EDGE_SOURCE).status.code(),
+            build_and_run("try-err-edge-provenance", TRY_ERR_EDGE_SOURCE)
+                .status
+                .code(),
             Some(114),
         );
     }
@@ -315,7 +354,97 @@ fn move_return_cleanup_executes_none_some_try_and_map_err_paths() {
     if !backend_available() {
         return;
     }
-    assert_eq!(build_and_run("move-return-cleanup", SOURCE).status.code(), Some(25));
+    assert_eq!(
+        build_and_run("move-return-cleanup", SOURCE).status.code(),
+        Some(25)
+    );
+}
+
+#[test]
+fn indirect_cleanup_results_use_final_value_slots_and_byte_outputs() {
+    if !backend_available() {
+        return;
+    }
+    let ir = emit_llvm(SOURCE);
+    assert!(
+        ir.contains("cleanup.destination") && ir.contains("call.cleanup.storage"),
+        "dynamic cleanup must use its independent byte channel:\n{ir}"
+    );
+    assert!(
+        !ir.lines()
+            .any(|line| line.contains("sret({") && line.contains("i1")),
+        "a cleanup bit must not remain inside indirect result storage:\n{ir}"
+    );
+    let main = ir
+        .split("define i32 @main()")
+        .nth(1)
+        .and_then(|body| body.split("\n}").next())
+        .expect("main body");
+    assert!(
+        !main.contains("call.value.storage"),
+        "fresh whole locals must be the indirect value destination:\n{main}"
+    );
+    assert!(
+        !main.contains("call.byval.storage"),
+        "a final result slot must feed a target-indirect parameter directly:\n{main}"
+    );
+}
+
+#[test]
+fn indirect_tagged_result_reads_the_tag_before_selected_payload() {
+    if !backend_available() {
+        return;
+    }
+    let ir = emit_llvm(TAG_ONLY_SOURCE);
+    let inspect = ir
+        .split("define internal i32 @\"align_fn$7$696e7370656374\"")
+        .nth(1)
+        .and_then(|body| body.split("\n}").next())
+        .expect("inspect body");
+    let branch = inspect.find("br i1").expect("tag branch");
+    let before_branch = &inspect[..branch];
+    assert!(
+        before_branch.contains("call.tag.pointer") && before_branch.contains("call.tag = load i8"),
+        "the discriminator must be loaded directly from final result storage:\n{inspect}"
+    );
+    assert!(
+        !before_branch.contains("call.value = load"),
+        "the aggregate payload must not be loaded before its tag branch:\n{inspect}"
+    );
+    assert!(
+        !inspect.contains("llvm.lifetime.end.p0(ptr %call.value.storage)"),
+        "a selected-arm reload must remain inside its storage lifetime:\n{inspect}"
+    );
+    assert_eq!(
+        build_and_run("tag-only-cleanup-result", TAG_ONLY_SOURCE)
+            .status
+            .code(),
+        Some(5)
+    );
+
+    let sum_ir = emit_llvm(USER_SUM_TAG_ONLY_SOURCE);
+    let inspect_sum = sum_ir
+        .split("define internal i32 @\"align_fn$11$696e73706563745f73756d\"")
+        .nth(1)
+        .and_then(|body| body.split("\n}").next())
+        .expect("inspect_sum body");
+    let sum_branch = inspect_sum.find("br i1").expect("user-sum tag branch");
+    let sum_before_branch = &inspect_sum[..sum_branch];
+    assert!(
+        sum_before_branch.contains("call.tag.pointer")
+            && sum_before_branch.contains("call.tag = load i32"),
+        "a user-sum discriminator must be loaded directly from final result storage:\n{inspect_sum}"
+    );
+    assert!(
+        !sum_before_branch.contains("call.value = load"),
+        "a user-sum payload must not be loaded before its tag branch:\n{inspect_sum}"
+    );
+    assert_eq!(
+        build_and_run("user-sum-tag-only-cleanup-result", USER_SUM_TAG_ONLY_SOURCE)
+            .status
+            .code(),
+        Some(9)
+    );
 }
 
 #[test]

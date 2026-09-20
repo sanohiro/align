@@ -3768,6 +3768,8 @@ fn lower_prepared_module<'c>(
         };
         let wrapper = module.add_function(function.name.as_str(), wrapper_ty, None);
         mark_nounwind(ctx, wrapper);
+        mark_dynamic_cleanup(ctx, wrapper, function.return_cleanup);
+        mark_program_transport(ctx, wrapper);
         mark_borrow_param_contracts(ctx, wrapper, &function.param_modes, &function.return_borrow);
         let entry = ctx.append_basic_block(wrapper, "entry");
         let builder = ctx.create_builder();
@@ -3953,6 +3955,8 @@ fn lower_prepared_module<'c>(
         };
         let thunk = module.add_function(emitted_name, thunk_ty, None);
         mark_nounwind(ctx, thunk);
+        mark_dynamic_cleanup(ctx, thunk, declaration.signature.cleanup);
+        mark_program_transport(ctx, thunk);
         mark_borrow_param_contracts_at(
             ctx,
             thunk,
@@ -4088,6 +4092,8 @@ fn lower_prepared_module<'c>(
         };
         let thunk = module.add_function(emitted_name, thunk_ty, None);
         mark_nounwind(ctx, thunk);
+        mark_dynamic_cleanup(ctx, thunk, explicit_signature.cleanup);
+        mark_program_transport(ctx, thunk);
         mark_borrow_param_contracts_at(ctx, thunk, explicit_modes, &explicit_signature.borrow, 1);
         mark_private_helper(thunk);
         let bb = ctx.append_basic_block(thunk, "entry");
@@ -4204,7 +4210,7 @@ fn lower_prepared_module<'c>(
                 ],
                 &target_data,
             )?;
-            let agg = return_transport::build_indirect_call(ctx, &tb, result_ty.fn_type(&[ptr.into()], false), thunk, &[env.into()], "r")
+            let agg = return_transport::build_indirect_call(ctx, &tb, result_ty.fn_type(&[ptr.into()], false), thunk, &[env.into()], "r", false)
                 .map_err(lower)?
                 .try_as_basic_value()
                 .basic()
@@ -4228,13 +4234,13 @@ fn lower_prepared_module<'c>(
         } else if *r == Ty::Unit {
             // A `()`-returning closure is `void(ptr)` in LLVM (not `i32(ptr)`); call it with a void
             // signature and store a dummy into the (i32-sized) slot.
-            return_transport::build_indirect_call(ctx, &tb, ctx.void_type().fn_type(&[ptr.into()], false), thunk, &[env.into()], "")
+            return_transport::build_indirect_call(ctx, &tb, ctx.void_type().fn_type(&[ptr.into()], false), thunk, &[env.into()], "", false)
                 .map_err(lower)?;
             tb.build_store(slot, i32t.const_zero()).map_err(lower)?;
             tb.build_return(Some(&i32t.const_zero())).map_err(lower)?;
         } else {
             let rt = scalar_type(ctx, *r, &struct_types, &enum_types, tagged_types);
-            let res = return_transport::build_indirect_call(ctx, &tb, rt.fn_type(&[ptr.into()], false), thunk, &[env.into()], "r")
+            let res = return_transport::build_indirect_call(ctx, &tb, rt.fn_type(&[ptr.into()], false), thunk, &[env.into()], "r", false)
                 .map_err(lower)?
                 .try_as_basic_value()
                 .basic()
@@ -4444,6 +4450,11 @@ fn lower_prepared_module<'c>(
     if let Some(dc) = &debug_ctx {
         dc.dib.finalize();
     }
+    // Aggregate transport publishes a verified clone into the stable Module
+    // object. Dispose the finalized DIBuilder first: its native handle still
+    // points at the pre-publication module internals even though no more debug
+    // records will be emitted.
+    drop(debug_ctx);
     // A `Result`- or `Unit`-returning main needs a C `main` wrapper: `Result` maps Ok/Err to an
     // exit code (and, when `main(args: array<str>)`, marshals argv into the `array<str>`
     // argument — the argv form is Result-only, sema-enforced); `Unit` has no error to report, so
@@ -7994,6 +8005,26 @@ fn align_return_type<'c>(
     }
 }
 
+fn mark_dynamic_cleanup(
+    ctx: &Context,
+    function: FunctionValue<'_>,
+    cleanup: hir::ReturnCleanupAbi,
+) {
+    if cleanup == hir::ReturnCleanupAbi::DynamicBit {
+        function.add_attribute(
+            inkwell::attributes::AttributeLoc::Function,
+            ctx.create_string_attribute("align.program.cleanup", ""),
+        );
+    }
+}
+
+fn mark_program_transport(ctx: &Context, function: FunctionValue<'_>) {
+    function.add_attribute(
+        inkwell::attributes::AttributeLoc::Function,
+        ctx.create_string_attribute("align.program.parameters", ""),
+    );
+}
+
 fn abi_param_type<'c>(
     ctx: &'c Context,
     value: BasicTypeEnum<'c>,
@@ -8075,6 +8106,8 @@ fn declare_fn<'c>(
     };
     let fv = module.add_function(symbol, fn_ty, None);
     mark_nounwind(ctx, fv);
+    mark_dynamic_cleanup(ctx, fv, f.return_cleanup);
+    mark_program_transport(ctx, fv);
     if f.cold {
         add_enum_attr(
             ctx,
@@ -8185,6 +8218,8 @@ fn declare_imported_fn<'c>(
     };
     let fv = module.add_function(&encoded_program_symbol(&imp.name), fn_ty, None);
     mark_nounwind(ctx, fv);
+    mark_dynamic_cleanup(ctx, fv, imp.return_cleanup);
+    mark_program_transport(ctx, fv);
     mark_borrow_param_contracts(ctx, fv, &imp.param_modes, &imp.return_borrow);
     // An imported declaration has no body, so it never carries `noalias` (plan 69 I3); the
     // structural header facts are unaffected by that.
@@ -18433,12 +18468,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // that opaque pointers cannot verify, so keep the indirect call Unit-aware just
                     // like the spawn trampoline above.
                     let fn_ty = self.ctx.void_type().fn_type(&param_meta, false);
-                    return_transport::build_indirect_call(self.ctx, self.builder, fn_ty, fn_ptr, &argv, "")
+                    return_transport::build_indirect_call(self.ctx, self.builder, fn_ty, fn_ptr, &argv, "", false)
                         .map_err(|e| self.err(e))?;
                     return Ok(None);
                 }
                 let fn_ty = self.llvm_type(*ret_ty).fn_type(&param_meta, false);
-                let cs = return_transport::build_indirect_call(self.ctx, self.builder, fn_ty, fn_ptr, &argv, "icall")
+                let cs = return_transport::build_indirect_call(self.ctx, self.builder, fn_ty, fn_ptr, &argv, "icall", false)
                     .map_err(|e| self.err(e))?;
                 return Ok(cs.try_as_basic_value().basic());
             }
@@ -18550,6 +18585,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         fn_ptr,
                         &argv,
                         "icall.cleanup",
+                        true,
                     )
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value()
