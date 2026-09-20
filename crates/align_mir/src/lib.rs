@@ -25091,7 +25091,7 @@ mod tests {
     }
 
     #[test]
-    fn located_function_source_authentication_rejects_synthetic_interface_spans() {
+    fn located_function_source_authentication_rejects_synthetic_interface_spans() -> Result<(), LoweringRejected> {
         let source = "fn first(v: vec4<f32>) -> f32 {\n  out := v.exp()\n  return out[0]\n}\n";
         let mut diagnostics = Diagnostics::new();
         let mut source_map = SourceMap::new();
@@ -25112,8 +25112,7 @@ mod tests {
             false,
             &source_map,
             &user_catalog,
-        )
-        .expect("user-located lowering");
+        )?;
         assert!(user.has_authenticated_user_source(&function));
 
         let synthetic_catalog = LocatedPlanSourceCatalog {
@@ -25124,9 +25123,9 @@ mod tests {
             false,
             &source_map,
             &synthetic_catalog,
-        )
-        .expect("synthetic-located lowering");
+        )?;
         assert!(!synthetic.has_authenticated_user_source(&function));
+        Ok(())
     }
 
     fn one_kind(program: &Program, kind: PlanKind) -> &PlanRecord {

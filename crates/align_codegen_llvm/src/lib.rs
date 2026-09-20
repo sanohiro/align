@@ -25798,7 +25798,7 @@ mod tests {
     }
 
     #[test]
-    fn math_visibility_resolution_is_total_and_rejects_malformed_inventory() {
+    fn math_visibility_resolution_is_total_and_rejects_malformed_inventory() -> Result<(), CodegenError> {
         let records = vec![
             math_visibility_record(1, hir::MathFn::Exp),
             math_visibility_record(2, hir::MathFn::Exp2),
@@ -25818,7 +25818,7 @@ mod tests {
             math_visibility_tag(&records[3].function, 4, records[3].operation, records[3].ty),
             (true, true),
         );
-        let mut resolved = resolve_math_visibility(records.clone(), shapes).expect("valid inventory");
+        let mut resolved = resolve_math_visibility(records.clone(), shapes)?;
         assert_eq!(
             resolved.iter().map(|record| record.state).collect::<Vec<_>>(),
             vec![
@@ -25857,16 +25857,16 @@ mod tests {
         let mut malformed = records;
         malformed[0].source = Some((0, 1));
         assert!(resolve_math_visibility(malformed, HashMap::new()).is_err());
+        Ok(())
     }
 
     #[test]
-    fn math_visibility_inspection_does_not_change_normal_optimized_ir() {
+    fn math_visibility_inspection_does_not_change_normal_optimized_ir() -> Result<(), CodegenError> {
         let program = mir(
             "pub fn first(v: vec4<f32>) -> f32 {\n  out := v.exp()\n  return out[0]\n}\nfn main() -> i32 = 0\n",
         );
         let target = BuildTarget::Baseline;
-        let before = emit_llvm_ir(&program, &target, Profile::Release, true, &[], None)
-            .expect("normal optimized IR before inspection");
+        let before = emit_llvm_ir(&program, &target, Profile::Release, true, &[], None)?;
         let inspection = collect_opt_inspection(
             &program,
             &target,
@@ -25876,13 +25876,12 @@ mod tests {
                 directory: ".".into(),
             },
             &["first".into()],
-        )
-        .expect("opt inspection");
+        )?;
         assert_eq!(inspection.math.len(), 1);
-        let after = emit_llvm_ir(&program, &target, Profile::Release, true, &[], None)
-            .expect("normal optimized IR after inspection");
+        let after = emit_llvm_ir(&program, &target, Profile::Release, true, &[], None)?;
         assert_eq!(before, after, "the inspection lens must not mutate ordinary output");
         assert!(!after.contains("align.math.visibility"));
+        Ok(())
     }
 
 
