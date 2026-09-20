@@ -54,18 +54,26 @@ Budget             Admission uses one target-independent checked-HIR budget:
                   statement and each expression exactly once after checking.
                   Type records, spans and diagnostics cost zero. The exhaustive
                   node walker rejects rather than assigning a default cost to a
-                  new statement or expression variant. Changing 24 or changing
-                  the count definition changes the compiler build identity and
-                  the interface body set.
+                  new statement or expression variant. Concrete inline records
+                  carry exact u32 policy version 1. Changing 24, the count
+                  definition or any eligibility rule requires incrementing that
+                  version (or the containing interface format); every other
+                  policy version rejects. The policy constant also enters the
+                  compiler build identity.
 
 Body domain        The body is straight-line: expression form or nested blocks,
                   `unsafe` blocks and one explicit return are allowed. `if`,
                   `match`, `else`, `?`, `map_err`, short-circuit control, loops,
                   `break`, early/multiple returns, arenas, tasks, pipelines,
                   lambdas, local function values, assignment, aggregate Move
-                  construction, allocation and Drop reject. Scalar/raw
-                  literals, parameter reads, arithmetic, comparisons, casts,
-                  pure projections, builtin/raw operations and direct calls are
+                  construction, allocation and Drop reject. Every local-binding
+                  statement rejects, including immutable, `mut`, inferred,
+                  annotated and tuple-destructuring forms; consequently only
+                  parameter reads are admitted local reads. A block may contain
+                  only nested block/unsafe wrappers and zero or one terminal
+                  return, or supply one tail expression. Scalar/raw literals,
+                  parameter reads, arithmetic, comparisons, casts, pure
+                  projections, builtin/raw operations and direct calls are
                   allowed. A direct call may target an imported public function,
                   a compiler builtin, or a producer-local C extern captured by
                   the record. A call to any ordinary same-unit function rejects;
@@ -115,9 +123,10 @@ Effects/ownership  Rechecking is not authority to change facts. The consumer
 
 Errors/precedence  Format header/version and byte-structural errors precede
                   semantic body validation. Within a body record: invalid body
-                  kind, source length/UTF-8/truncation, extern sequence shape,
-                  extern type shape/order/duplication, declaration syntax/header,
-                  dependency closure, domain/budget, then inferred-fact mismatch.
+                  kind, invalid concrete-inline policy version, source length/
+                  UTF-8/truncation, extern sequence shape, extern type shape/
+                  order/duplication, declaration syntax/header, dependency
+                  closure, domain/budget, then inferred-fact mismatch.
                   Import failure occurs before consumer MIR, object, cache
                   publication or link side effects. A rejected candidate is not
                   serialized by a trusted producer; malformed serialized input
@@ -134,22 +143,24 @@ Owner              align_interface owns selection input, format 15, canonical
 Artifact/cache     Interface format 15 replaces format 14 outright. Function
                   body kind is encoded after `resource_hook_body`: u8 `0`
                   absent; u8 `1`, then the existing u32-length UTF-8 source for
-                  a generic template; or u8 `2`, then the same source string,
-                  u32 extern count, and canonical extern records. Each extern
-                  record is option-link (`00`, or `01` + string), symbol string,
-                  u32 parameter count, parameter ITypes in order, then result
-                  IType. Integers are little-endian. Struct/sum generic-body
-                  fields retain their existing option encoding. Unknown tags,
-                  old format 14, invalid UTF-8, truncation, trailing bytes,
-                  noncanonical extern order/duplicates and invalid nested IType
-                  graphs reject before publication.
+                  a generic template; or u8 `2`, exact little-endian u32 inline-
+                  policy version `1`, then the same source string, u32 extern
+                  count, and canonical extern records. Each extern record is
+                  option-link (`00`, or `01` + string), symbol string, u32
+                  parameter count, parameter ITypes in order, then result IType.
+                  Integers are little-endian. Struct/sum generic-body fields
+                  retain their existing option encoding. Unknown body tags,
+                  inline-policy versions other than 1, old format 14, invalid
+                  UTF-8, truncation, trailing bytes, noncanonical extern order/
+                  duplicates and invalid nested IType graphs reject before
+                  publication.
 
-Identity           The complete body-kind record and the admission budget
-                  version enter `interface_hash`; dependency interface hashes
-                  already enter frontend and object keys. Editing an admitted
-                  body, crossing the admission boundary, changing a referenced
-                  extern signature/link requirement, or changing the budget
-                  invalidates consumers. A private-body edit that remains
+Identity           The complete body-kind record, including concrete-inline u32
+                  policy version 1, enters `interface_hash`; dependency interface
+                  hashes already enter frontend and object keys. Editing an
+                  admitted body, crossing the admission boundary, changing a
+                  referenced extern signature/link requirement, or changing the
+                  budget invalidates consumers. A private-body edit that remains
                   nonadmitted retains current interface-hash stability. Exact
                   edit-and-revert restores the prior hash and cache key. Target,
                   profile, runtime and producer `impl_hash` retain their existing
@@ -190,8 +201,8 @@ the codec; semantic import validation rejects those empty declarations:
 ```text
 Absent:                         00
 Generic empty source:           01 00000000
-Inline, empty source/externs:   02 00000000 00000000
-Inline, one libc extern `f`:    02 00000000 01000000
+Inline, empty source/externs:   02 01000000 00000000 00000000
+Inline, one libc extern `f`:    02 01000000 00000000 01000000
                                 00
                                 01000000 66
                                 01000000
@@ -212,7 +223,7 @@ owner may close several cells when it would fail for every listed defect.
 
 | Cell | Implementation obligation | Owner evidence |
 |---|---|---|
-| Formation/selection | select only validated non-generic public bodies satisfying every signature, provenance, ownership, domain and 24-node rule; crossing each boundary removes the body without changing program semantics | interface/sema eligibility table with one positive and one negative per rule; exhaustive node-variant tripwire |
+| Formation/selection | select only validated non-generic public bodies satisfying every signature, provenance, ownership, domain and 24-node rule; crossing each boundary removes the body without changing program semantics | interface/sema eligibility table with one positive and one negative per rule, including immutable/mutable/inferred/annotated/tuple-destructuring local bindings and subsequent local reads; exhaustive statement/expression-variant tripwire |
 | Interface bytes | emit format 15 and exact 0/1/2 body kinds plus canonical extern closure; format 14 and every malformed ordering/tag/length/type combination reject | independent semantic-to-byte and byte-to-semantic goldens, mutation/depth/trailing corpus |
 | Source reconstruction | parse exactly one reconstructed declaration, match its structured header and resolve only admitted public/builtin/extern dependencies | forged name/type/mode/result/body/dependency cases; private/same-unit helper negatives |
 | Producer facts | rechecked concrete body agrees exactly with effect, return borrow/region/cleanup, drop-state, transfer, retention and resource-hook facts | one mutation per field; whole producer/importer twins |
@@ -286,3 +297,14 @@ continues to compile and call exactly as it does today.
   residual-call and multi-consumer cases appear in the closure matrix.
 - No later milestone or language change is consumed. Issue 1070 is already
   merged; the implementation needs no runtime ABI addition.
+
+## 6. Design-review finding closure
+
+The fresh full-diff review of candidate `27968e42` found two P2 specification
+gaps. Both are closed in the ledger before implementation; neither changes the
+selected source-transport/available-externally strategy.
+
+| Finding | Root cause | Closure |
+|---|---|---|
+| Budget-version invalidation had no canonical byte | identity prose named a version but format 15 encoded only body source and extern closure | concrete-inline tag 2 now encodes exact little-endian u32 policy version 1 immediately after the tag; every other version rejects, exact goldens include it, and any eligibility/count change increments it or the interface format |
+| Local bindings were neither admitted nor rejected | statements contributed to the node budget but the domain listed only parameter reads | reject every immutable, mutable, inferred, annotated and tuple-destructuring binding and all dependent local reads; admit only wrapper blocks/unsafe plus a terminal return or tail expression, and add each binding form to the eligibility owner |

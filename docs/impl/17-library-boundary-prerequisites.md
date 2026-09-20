@@ -29,7 +29,8 @@ Issue 1066's concrete inline-body extension is owned by
 template or imported-header rules. Interface format 15 gives function bodies an
 explicit `Absent | GenericTemplate | ConcreteInline` discriminator. Only the
 generic arm enters monomorphization or recomputes public facts. A concrete inline
-body is rechecked against every producer-certified fact, carries only its exact
+body carries exact little-endian u32 policy version 1, is rechecked against every
+producer-certified fact, carries only its exact
 canonical C-extern closure, lowers in a consumer with an explicit imported-inline
 origin, and reaches LLVM as `available_externally`; the producer object remains
 the sole external definition. Plan 74's ledger, malformed-input order, budget,
