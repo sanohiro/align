@@ -7913,7 +7913,10 @@ fn lower_plain_block_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
             hir::ExprKind::Block(block)
             | hir::ExprKind::FloatScope { block, .. }
             | hir::ExprKind::Unsafe(block) => block,
-            _ => unreachable!("a plain block spine starts at Block, FloatScope, or Unsafe"),
+            _ => {
+                b.terminate(Term::Unreachable);
+                return terminated_operand();
+            }
         };
         return lower_block(b, block).unwrap_or(Operand::Const(Const::Unit));
     }

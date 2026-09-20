@@ -194,37 +194,36 @@ fn checked_source_program(source: &str) -> hir::Program {
     program
 }
 
-fn float_scope_modes(program: &mut hir::Program) -> (&mut hir::FloatMode, &mut hir::FloatMode) {
-    let expression = program.fns[0]
-        .body
-        .value
-        .as_deref_mut()
-        .expect("expression-bodied float fixture");
+fn float_scope_parts(
+    program: &mut hir::Program,
+) -> Option<(&mut hir::FloatMode, &mut align_ast::BinOp, &mut hir::FloatMode)> {
+    let expression = program.fns.get_mut(0)?.body.value.as_deref_mut()?;
     let hir::ExprKind::FloatScope { mode, block } = &mut expression.kind else {
-        panic!("fixture root is a float scope");
+        return None;
     };
-    let operation = block.value.as_deref_mut().expect("float scope value");
-    let hir::ExprKind::Binary { float_mode, .. } = &mut operation.kind else {
-        panic!("float scope value is binary arithmetic");
+    let operation = block.value.as_deref_mut()?;
+    let hir::ExprKind::Binary { op, float_mode, .. } = &mut operation.kind else {
+        return None;
     };
-    (mode, float_mode)
+    Some((mode, op, float_mode))
 }
 
 #[test]
-fn float_scope_modes_are_recomputed_from_retained_lexical_hir() {
+fn float_scope_modes_are_recomputed_from_retained_lexical_hir() -> Result<(), &'static str> {
     let source = "fn f(a: f64, b: f64) -> f64 = float(reassoc) { a + b }\n";
     let base = checked_source_program(source);
     assert!(validate_hir::body_only_metadata_is_valid(&base));
 
     for mutation in 0..4 {
         let mut malformed = base.clone();
-        let (scope, operation) = float_scope_modes(&mut malformed);
+        let (scope, _, operation) =
+            float_scope_parts(&mut malformed).ok_or("float scope fixture")?;
         match mutation {
             0 => scope.bits = 0,
             1 => scope.bits |= 0x80,
             2 => *operation = hir::FloatMode::STRICT,
             3 => *operation = operation.with_contract(),
-            _ => unreachable!(),
+            _ => return Err("four float-mode mutations"),
         }
         assert!(
             !validate_hir::body_only_metadata_is_valid(&malformed),
@@ -233,23 +232,13 @@ fn float_scope_modes_are_recomputed_from_retained_lexical_hir() {
     }
 
     let mut ineligible = base;
-    let expression = ineligible.fns[0]
-        .body
-        .value
-        .as_deref_mut()
-        .expect("expression-bodied float fixture");
-    let hir::ExprKind::FloatScope { block, .. } = &mut expression.kind else {
-        panic!("fixture root is a float scope");
-    };
-    let operation = block.value.as_deref_mut().expect("float scope value");
-    let hir::ExprKind::Binary { op, .. } = &mut operation.kind else {
-        panic!("float scope value is binary arithmetic");
-    };
+    let (_, op, _) = float_scope_parts(&mut ineligible).ok_or("float scope fixture")?;
     *op = align_ast::BinOp::Div;
     assert!(
         !validate_hir::body_only_metadata_is_valid(&ineligible),
         "an ineligible division retained a reassociation mode",
     );
+    Ok(())
 }
 
 #[test]
