@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use align_interface::{
-    DecodeError, Effect, Hash128, IParam, IType, ITypeParam, ImportCompatibilityError,
+    DecodeError, Effect, Hash128, IFnBody, IParam, IType, ITypeParam, ImportCompatibilityError,
     InterfaceSummary, OwnedJsonObjectFormat, OwnedJsonTarget, ParamMode, ProducerCertification,
     ReturnBorrowSummary, ReturnRegionSummary, build_summaries, deserialize, deserialize_for_target,
     encode_interface_surface, serialize, summary_to_source, validate_for_import,
@@ -256,13 +256,19 @@ fn two_module(target: &str, generic: &str, secret: &str) -> Vec<InterfaceSummary
 }
 
 #[test]
-fn split_a_private_body_edit_keeps_interface_changes_impl() {
+fn split_a_admitted_public_body_edit_changes_interface_and_impl() {
     let v1 = two_module("a + b", "a", "x * 2");
     let v2 = two_module("a + b + 0", "a", "x * 2"); // target body differs, same sig + effect
     let l1 = find(&v1, "lib");
     let l2 = find(&v2, "lib");
-    assert_eq!(l1.interface_hash, l2.interface_hash, "body edit must NOT change interface hash");
-    assert_ne!(l1.impl_hash, l2.impl_hash, "body edit MUST change impl hash");
+    assert_ne!(
+        l1.interface_hash, l2.interface_hash,
+        "an admitted concrete body edit must change interface hash"
+    );
+    assert_ne!(
+        l1.impl_hash, l2.impl_hash,
+        "body edit MUST change impl hash"
+    );
     // Headline win: the dependent unit's interface is entirely untouched.
     assert_eq!(find(&v1, "main").interface_hash, find(&v2, "main").interface_hash);
 }
@@ -2089,8 +2095,8 @@ fn semantic_import_type_shape_errors_are_exact_and_precede_headers() {
     };
     let mut function_shadow = base.clone();
     function_shadow.fns[0].type_params = vec![type_parameter("Wrapper")];
-    function_shadow.fns[0].generic_body =
-        Some("pub fn identity<Wrapper>(value: str) -> str = value".to_string());
+    function_shadow.fns[0].body =
+        IFnBody::GenericTemplate("pub fn identity<Wrapper>(value: str) -> str = value".to_string());
     assert_eq!(
         validate_for_import(&function_shadow),
         Err(ImportCompatibilityError::TypeParameterShadowsLocalType(
@@ -2311,7 +2317,7 @@ fn semantic_import_generic_fragments_match_their_structured_records() {
         ("malformed", "fn identity<T: Eq>("),
     ] {
         let mut forged = valid.clone();
-        forged.fns[0].generic_body = Some(body.to_string());
+        forged.fns[0].body = IFnBody::GenericTemplate(body.to_string());
         assert_eq!(
             validate_for_import(&forged),
             Err(ImportCompatibilityError::GenericBodySyntax(
@@ -2322,8 +2328,8 @@ fn semantic_import_generic_fragments_match_their_structured_records() {
     }
 
     let mut wrong_function = valid.clone();
-    wrong_function.fns[0].generic_body =
-        Some("fn renamed<T: Eq>(value: T) -> T = value".to_string());
+    wrong_function.fns[0].body =
+        IFnBody::GenericTemplate("fn renamed<T: Eq>(value: T) -> T = value".to_string());
     assert_eq!(
         validate_for_import(&wrong_function),
         Err(ImportCompatibilityError::GenericBodyMismatch(
@@ -2332,8 +2338,8 @@ fn semantic_import_generic_fragments_match_their_structured_records() {
     );
 
     let mut wrong_function_header = valid.clone();
-    wrong_function_header.fns[0].generic_body =
-        Some("fn identity<T: Ord>(out value: T) -> i64 = 0".to_string());
+    wrong_function_header.fns[0].body =
+        IFnBody::GenericTemplate("fn identity<T: Ord>(out value: T) -> i64 = 0".to_string());
     assert_eq!(
         validate_for_import(&wrong_function_header),
         Err(ImportCompatibilityError::GenericBodyMismatch(
@@ -2369,6 +2375,80 @@ fn semantic_import_generic_fragments_match_their_structured_records() {
         validate_for_import(&wrong_enum),
         Err(ImportCompatibilityError::GenericBodyMismatch(
             "Choice".to_string()
+        ))
+    );
+}
+
+#[test]
+fn concrete_inline_admission_rejects_local_control_move_and_same_unit_dependencies() {
+    let library = "\
+module lib
+pub fn tiny(x: i64) -> i64 = x + 1
+pub fn shared(borrow value: i64) -> i64 = value
+pub fn returned(x: i64) -> i64 { return x + 1 }
+pub fn local_inferred(x: i64) -> i64 { y := x + 1; return y }
+pub fn local_annotated(x: i64) -> i64 { y: i64 := x + 1; return y }
+pub fn local_mutable(x: i64) -> i64 { mut y := x + 1; return y }
+pub fn local_tuple(x: i64) -> i64 { (y, _) := (x + 1, 0); return y }
+pub fn branch(x: i64) -> i64 = if x == 0 { 1 } else { 2 }
+pub fn move_value(value: string) -> i64 = value.len()
+pub fn helper(x: i64) -> i64 = x + 2
+pub fn calls_helper(x: i64) -> i64 = helper(x)
+pub fn early(x: i64) -> i64 = { return x; x + 1 }
+pub fn too_many(x: i64) -> i64 = x + 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12
+pub fn identity<T>(value: T) -> T = value
+";
+    let sums = summaries(&[
+        unit("lib", false, library),
+        unit("main", true, "import lib\nfn main() -> i32 = 0\n"),
+    ]);
+    let summary = find(&sums, "lib");
+    let body = |name: &str| {
+        &summary
+            .fns
+            .iter()
+            .find(|function| function.name == name)
+            .unwrap_or_else(|| panic!("missing {name}"))
+            .body
+    };
+    assert!(matches!(body("tiny"), IFnBody::ConcreteInline { .. }));
+    assert!(matches!(body("shared"), IFnBody::ConcreteInline { .. }));
+    assert!(matches!(body("returned"), IFnBody::ConcreteInline { .. }));
+    for name in [
+        "local_inferred",
+        "local_annotated",
+        "local_mutable",
+        "local_tuple",
+        "branch",
+        "move_value",
+        "calls_helper",
+        "early",
+        "too_many",
+    ] {
+        assert_eq!(body(name), &IFnBody::Absent, "{name} must remain bodyless");
+    }
+    assert!(matches!(body("identity"), IFnBody::GenericTemplate(_)));
+}
+
+#[test]
+fn concrete_inline_extern_names_are_validated_before_source_reconstruction() {
+    let sums = summaries(&[
+        unit(
+            "lib",
+            false,
+            "module lib\nextern \"C\" fn abs(x: i32) -> i32\npub fn cabs(x: i32) -> i64 = unsafe { abs(x) as i64 }\n",
+        ),
+        unit("main", true, "import lib\nfn main() -> i32 = 0\n"),
+    ]);
+    let mut summary = find(&sums, "lib").clone();
+    let IFnBody::ConcreteInline { externs, .. } = &mut summary.fns[0].body else {
+        panic!("cabs must carry its extern closure");
+    };
+    externs[0].name = "bad) }\nfn injected".to_string();
+    assert_eq!(
+        validate_for_import(&summary),
+        Err(ImportCompatibilityError::InlineExternInvalid(
+            "bad) }\nfn injected".to_string()
         ))
     );
 }
@@ -2429,7 +2509,7 @@ fn semantic_import_rejects_generic_and_recursive_capability_summaries() {
         "the complete type-shape walk precedes generic-body/header classification"
     );
     let mut missing_generic_body = generic.clone();
-    missing_generic_body.fns[0].generic_body = None;
+    missing_generic_body.fns[0].body = IFnBody::Absent;
     assert_eq!(
         validate_for_import(&missing_generic_body),
         Err(ImportCompatibilityError::GenericBodyMismatch(
@@ -2612,7 +2692,7 @@ fn parameter_mode_and_producer_certificate_codec_have_a_byte_golden() {
     let hex = surface.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
     assert_eq!(
         hex,
-        "0e000000040000006d61696e0100000007000000696e73706563740000000001000000010005000000736c696365010000000003000000693634000000000003000000693634000000000000000100000000010000000000010100000001000000010000000000000000000000000000000000000000000000000000"
+        "0f000000040000006d61696e0100000007000000696e73706563740000000001000000010005000000736c696365010000000003000000693634000000000003000000693634000000000000000100000000010000000000010100000001000000010000000000000000000000000000000000000000000000000000"
     );
 
     let mut artifact = serialize(&summary);
@@ -2680,21 +2760,20 @@ fn parameter_mode_and_producer_certificate_codec_have_a_byte_golden() {
 }
 
 #[test]
-fn v14_drop_state_surface_has_independent_full_record_goldens() {
-    let summary = one(
-        "pub fn plain(value: i64) -> i64 = value\n\
+fn v15_drop_state_surface_has_independent_full_record_goldens() {
+    let summary = one("pub fn plain(value: i64) -> i64 = value\n\
          pub fn invariant(borrow mut value: string) -> i64 = value.len()\n\
          pub fn changing(borrow mut value: string) { value = \"x\".clone() }\n\
          pub fn deferred<T>(borrow mut value: T) {}\n\
          fn main() -> i32 = 0\n",
     )
     .remove(0);
-    let expected_hex = "0e000000040000006d61696e04000000080000006368616e67696e670000000001000000030006000000737472696e6700000000000200000028290000000000000001000000020100000000000101000000000000000000080000006465666572726564010000000100000054000100000003000100000054000000000002000000282900000000000000010000000300020000000000000126000000666e2064656665727265643c543e28626f72726f77206d75742076616c75653a205429207b7d09000000696e76617269616e740000000001000000030006000000737472696e670000000000030000006936340000000000000001000000010100000000000101000000010000000000000000000005000000706c61696e000000000100000000000300000069363400000000000300000069363400000000000000010000000001000000000001010000000000000000000000000000000000000000000000000000000000";
+    let expected_hex = "0f000000040000006d61696e04000000080000006368616e67696e670000000001000000030006000000737472696e6700000000000200000028290000000000000001000000020100000000000101000000000000000000080000006465666572726564010000000100000054000100000003000100000054000000000002000000282900000000000000010000000300020000000000000126000000666e2064656665727265643c543e28626f72726f77206d75742076616c75653a205429207b7d09000000696e76617269616e740000000001000000030006000000737472696e670000000000030000006936340000000000000001000000010100000000000101000000010000000000000000000005000000706c61696e000000000100000000000300000069363400000000000300000069363400000000000000010000000001000000000001010000000000000000000000000000000000000000000000000000000000";
     let surface = encode_interface_surface(&summary);
     assert_eq!(
         surface.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
         expected_hex,
-        "the semantic-to-byte v14 surface must retain exact function and effect ordering"
+        "the semantic-to-byte v15 surface must retain exact function and effect ordering"
     );
     let mut artifact = (0..expected_hex.len() / 2)
         .map(|index| {
@@ -2708,7 +2787,7 @@ fn v14_drop_state_surface_has_independent_full_record_goldens() {
     artifact.extend(interface_hash.hi.to_le_bytes());
     artifact.extend(summary.impl_hash.lo.to_le_bytes());
     artifact.extend(summary.impl_hash.hi.to_le_bytes());
-    let decoded = deserialize(&artifact).expect("independent v14 bytes decode");
+    let decoded = deserialize(&artifact).expect("independent v15 bytes decode");
     assert_eq!(decoded, summary);
     assert_eq!(
         decoded

@@ -1,10 +1,11 @@
 # Interface-carried inline bodies
 
-Status: design candidate for
+Status: implementation candidate for
 [issue 1066](https://github.com/sanohiro/align/issues/1066) and G9 of the
 [vectorization contract](68-vectorization-contract.md). This document is the
-public artifact ledger and implementation closure matrix. It implements
-nothing. Evidence baseline: Align
+public artifact ledger and implementation closure matrix. The provider
+implementation spans interface format 15, checked-HIR revalidation, MIR origin,
+LLVM `available_externally` linkage and the focused two-unit owner. Evidence baseline: Align
 `2907d5e56b3bdbc4652787376ec268db5507bdc4`, LLVM 22.1.8, and align-llm
 Request 95.
 

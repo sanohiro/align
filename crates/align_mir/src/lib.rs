@@ -435,6 +435,9 @@ pub struct Function {
     /// lowering** ([`lower_program`]) so the default object is byte-identical to today; set from HIR
     /// only by per-unit lowering ([`lower_program_per_unit`]).
     pub exportable: bool,
+    /// Whether a transported dependency body is emitted with LLVM `available_externally`
+    /// linkage. The producer object remains the sole externally visible definition.
+    pub available_externally: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3772,6 +3775,7 @@ fn lower_program_unchecked_with_plans(
         // Separate-compilation visibility (per-unit lowering only); whole-program lowering keeps
         // every function `internal` for byte-identity.
         mf.exportable = per_unit && f.origin.is_exportable();
+        mf.available_externally = per_unit && f.origin == hir::FnOrigin::ImportedInline;
         fuse_builder_writes(&mut mf);
         fns.push(mf);
     }
@@ -6163,6 +6167,7 @@ fn lower_fn(
         cold: false,
         // Set by `lower_program_impl` after this returns (needs the whole-program vs per-unit mode).
         exportable: false,
+        available_externally: false,
     };
     (function, plans, plan_malformed)
 }
@@ -24606,6 +24611,7 @@ mod tests {
             }],
             cold: false,
             exportable: false,
+            available_externally: false,
         };
 
         simplify_drop_state(&mut function);
@@ -27410,6 +27416,7 @@ fn main() -> i32 = 0
                 exceptional_edges: Vec::new(),
                 cold: false,
                 exportable: false,
+                available_externally: false,
             }],
             externs: vec![],
             imported_fns: vec![],

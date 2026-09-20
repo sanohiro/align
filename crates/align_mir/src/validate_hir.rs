@@ -710,6 +710,36 @@ impl<'a> DeclarationValidator<'a> {
                 hir::ReturnBorrowSummary::None => true,
                 hir::ReturnBorrowSummary::Roots { captures, .. } => captures.is_empty(),
             },
+            hir::FnOrigin::ImportedInline => {
+                let same_unit_prefix = function
+                    .name
+                    .rsplit_once('$')
+                    .map(|(prefix, _)| format!("{prefix}$"));
+                let same_unit_functions = self
+                    .program
+                    .fns
+                    .iter()
+                    .map(|candidate| candidate.name.as_str())
+                    .chain(
+                        self.program
+                            .imported_fns
+                            .iter()
+                            .map(|candidate| candidate.name.as_str()),
+                    )
+                    .filter_map(|name| {
+                        same_unit_prefix
+                            .as_ref()
+                            .is_some_and(|prefix| name.starts_with(prefix))
+                            .then(|| name.to_string())
+                    })
+                    .collect();
+                align_sema::concrete_inline_body_externs(
+                    function,
+                    self.program,
+                    &same_unit_functions,
+                )
+                .is_some()
+            }
             hir::FnOrigin::Test => {
                 let expected = self
                     .builtin_error_id()
@@ -844,7 +874,9 @@ impl<'a> DeclarationValidator<'a> {
                 &function.param_modes,
                 match function.origin {
                     hir::FnOrigin::Lifted { capture_count } => capture_count,
-                    hir::FnOrigin::Source { .. } | hir::FnOrigin::Monomorph
+                    hir::FnOrigin::Source { .. }
+                    | hir::FnOrigin::Monomorph
+                    | hir::FnOrigin::ImportedInline
                     | hir::FnOrigin::Test => 0,
                 },
             )
@@ -10208,7 +10240,10 @@ impl<'a> BodyValidator<'a> {
                 usize::try_from(capture_count).ok() == Some(captures.len())
             }
             Some(hir::FnOrigin::Test) => false,
-            Some(hir::FnOrigin::Source { .. }) | Some(hir::FnOrigin::Monomorph) | None => true,
+            Some(hir::FnOrigin::Source { .. })
+            | Some(hir::FnOrigin::Monomorph)
+            | Some(hir::FnOrigin::ImportedInline)
+            | None => true,
         }
     }
 
@@ -12062,7 +12097,10 @@ impl<'a> BodyValidator<'a> {
                 usize::try_from(capture_count).ok() == Some(captures.len())
             }
             Some(hir::FnOrigin::Test) => false,
-                Some(hir::FnOrigin::Source { .. }) | Some(hir::FnOrigin::Monomorph) | None => true,
+            Some(hir::FnOrigin::Source { .. })
+            | Some(hir::FnOrigin::Monomorph)
+            | Some(hir::FnOrigin::ImportedInline)
+            | None => true,
         }
     }
 

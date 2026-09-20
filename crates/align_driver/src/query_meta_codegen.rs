@@ -372,6 +372,7 @@ pub(crate) fn generate_query_meta_thunk(
             exceptional_edges: Vec::new(),
             cold: false,
             exportable: false,
+            available_externally: false,
         },
     ))
 }

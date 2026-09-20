@@ -475,6 +475,9 @@ pub enum FnOrigin {
     Source { is_entry: bool, is_public: bool,
     },
     Monomorph,
+    /// A concrete body reconstructed from a dependency interface. It is rechecked locally and
+    /// lowers to LLVM `available_externally`; the producer object owns the external definition.
+    ImportedInline,
     Lifted { capture_count: u32,
     },
     /// Compiler-private zero-parameter root synthesized from a top-level `test` declaration.
