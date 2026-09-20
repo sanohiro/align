@@ -99,6 +99,20 @@ conservative cleanup-state form, then calls the Invariant or MayChange private
 core. Body effect changes therefore cannot change an external function type;
 the target transport above applies consistently to wrapper and harness.
 
+### Narrow scalar program ABI facts
+
+[Plan 76](76-scalar-abi-facts-plan.md) owns the implemented candidate's type-derived
+`zeroext`/`signext` rule for Align-owned program calls. ABI extension
+facts must agree on definitions or declarations and every direct or indirect
+call site; declaration-only attribution is invalid. The rule applies only when
+the selected physical transport is the scalar itself. It excludes runtime,
+foreign and raw calls, native entry/export shells, aggregate cleanup results,
+stored i8 booleans and aggregate enum tags. `char` has no `range`: the settled
+integer cast can produce any 32-bit pattern. Calls from native wrappers into
+Align cores do use the Align rule. No language or interface field is added:
+whole and per-unit compilation derive the facts from the existing checked
+semantic type and transport.
+
 ### Module verification (every profile, on every emit path)
 
 `build_module` verifies the module it just built. Every emit path — object, PGO, ThinLTO prelink,

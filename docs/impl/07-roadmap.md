@@ -2464,6 +2464,18 @@ regression net that validates the upgrade.
   The rest of this deferral stands: internal-ABI signature flattening and the
   `AddProvenNoOverflow` nsw/nuw distinction are unchanged, `readonly`/`nocapture`/`memory` stay
   deferred, and plan 69 does not extend `noalias` to a writable `borrow mut` header.
+  **RETRACTED IN PART 2026-09-20 — narrow scalar ABI extension facts.**
+  The FunctionAttrs premise does not cover target ABI extension convention:
+  LLVM requires `zeroext`/`signext` to agree on the declaration or definition
+  and every call site, including indirect calls. [Plan 76](76-scalar-abi-facts-plan.md)
+  owns the type-derived rule for direct scalar `bool`, i8/i16/i32, u8/u16/u32
+  and `char` transports. Native C entry/export shells are excluded while their
+  calls into Align cores follow the rule. Stored i8 booleans and aggregate enum
+  tags are not function-boundary scalars and remain outside that capability;
+  `char` receives `zeroext` but no unsound range because integer casts admit
+  every 32-bit pattern.
+  The existing `readonly`/`nocapture`/`memory` analysis deferral remains
+  unchanged.
 - **Slice V — verification bundle — DONE (#424, 2026-07-11; gate SHIP — ISA tests
   mutation-verified both directions, moot premise independently reproduced, harness honesty
   verified at both tiers; gemini's one high qualified-then-hardened: the shipped invocation

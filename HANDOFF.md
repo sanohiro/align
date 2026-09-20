@@ -89,6 +89,15 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    accuracy/identity proof package.
    The five E1 functions stay one capability; #1064 remains a separate failure
    domain and does not share its PR.
+   #1075 is the current implementation candidate. [Plan 76](docs/impl/76-scalar-abi-facts-plan.md)
+   corrects the issue proposal before implementation: LLVM ABI extension
+   attributes must cover every declaration/definition and direct/indirect call
+   site, while stored i8 booleans and aggregate enum tags are not scalar call
+   boundaries. Implementation review also disproved the proposed `char` range:
+   integer casts admit all 32-bit patterns, so `char` receives only `zeroext`.
+   The focused structural owner passes in 0.03 seconds and the
+   whole/per-unit boundary-value execution owner in 1.03 seconds; no benchmark,
+   broad suite or external-client build belongs in the provider gate.
 4. Follow-ups, independent and small (updated 2026-09-19):
    `fix/nightly-detector-restore` closed #1105, #1107, #1108, #1109, and
    #1112, and separately repaired two untracked first-night nightly failures

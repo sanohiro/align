@@ -92,8 +92,8 @@ use inkwell::types::{
     StructType,
 };
 use inkwell::values::{
-    ArrayValue, AsValueRef, BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue,
-    IntValue, OperandBundle, PointerValue, StructValue,
+    ArrayValue, AsValueRef, BasicMetadataValueEnum, BasicValue, BasicValueEnum, CallSiteValue,
+    FunctionValue, IntValue, OperandBundle, PointerValue, StructValue,
 };
 
 fn freeze_struct_value<'c>(
@@ -3726,7 +3726,7 @@ fn lower_prepared_module<'c>(
             },
             scope.defines(f),
             scope.is_test(),
-        );
+        )?;
         if explicit_export {
             // `f.exportable` may independently make a per-unit definition externally visible.
             // The specialized core is never a native boundary: only its conservative wrapper owns
@@ -3742,6 +3742,17 @@ fn lower_prepared_module<'c>(
         // rewrite the externally named function type during LTO.
         add_enum_attr(ctx, core, inkwell::attributes::AttributeLoc::Function, "noinline");
         let map = |ty: Ty| abi_map_ty(ctx, ty, &struct_types, &enum_types, tagged_types, &tuple_types);
+        let semantic_params = function
+            .params
+            .iter()
+            .map(|slot| {
+                function
+                    .slots
+                    .get(*slot as usize)
+                    .copied()
+                    .ok_or_else(|| CodegenError::from(callable_target_error(&function.name)))
+            })
+            .collect::<Result<Vec<_>, CodegenError>>()?;
         let params = function
             .params
             .iter()
@@ -3794,6 +3805,15 @@ fn lower_prepared_module<'c>(
         }
         let call = builder.build_call(core, &forwarded, "export.call")
             .map_err(|error| CodegenError::Lowering(error.to_string()))?;
+        add_scalar_call_facts(
+            ctx,
+            call,
+            &semantic_params,
+            &function.param_modes,
+            function.ret,
+            function.return_cleanup,
+            0,
+        )?;
         match call.try_as_basic_value().basic() {
             Some(value) => builder.build_return(Some(&value)),
             None => builder.build_return(None),
@@ -3820,7 +3840,7 @@ fn lower_prepared_module<'c>(
             tagged_types,
             &tuple_types,
             program,
-        );
+        )?;
         program_funcs.insert(imp.name.clone(), fv);
     }
     // Keep the semantic signatures alongside the LLVM declarations. The latter intentionally
@@ -3962,6 +3982,15 @@ fn lower_prepared_module<'c>(
         mark_nounwind(ctx, thunk);
         mark_dynamic_cleanup(ctx, thunk, declaration.signature.cleanup);
         mark_program_transport(ctx, thunk);
+        add_scalar_function_facts(
+            ctx,
+            thunk,
+            &declaration.signature.params,
+            &declaration.signature.modes,
+            declaration.signature.ret,
+            declaration.signature.cleanup,
+            1,
+        )?;
         mark_borrow_param_contracts_at(
             ctx,
             thunk,
@@ -3991,6 +4020,15 @@ fn lower_prepared_module<'c>(
             }
         }
         let cs = tb.build_call(orig, &fwd, "r").map_err(|e| CodegenError::Lowering(e.to_string()))?;
+        add_scalar_call_facts(
+            ctx,
+            cs,
+            &declaration.signature.params,
+            &declaration.signature.modes,
+            declaration.signature.ret,
+            declaration.signature.cleanup,
+            0,
+        )?;
         match cs.try_as_basic_value().basic() {
             Some(v) => tb.build_return(Some(&v)),
             None => tb.build_return(None),
@@ -4099,6 +4137,15 @@ fn lower_prepared_module<'c>(
         mark_nounwind(ctx, thunk);
         mark_dynamic_cleanup(ctx, thunk, explicit_signature.cleanup);
         mark_program_transport(ctx, thunk);
+        add_scalar_function_facts(
+            ctx,
+            thunk,
+            &explicit_signature.params,
+            &explicit_signature.modes,
+            explicit_signature.ret,
+            explicit_signature.cleanup,
+            1,
+        )?;
         mark_borrow_param_contracts_at(ctx, thunk, explicit_modes, &explicit_signature.borrow, 1);
         mark_private_helper(thunk);
         let bb = ctx.append_basic_block(thunk, "entry");
@@ -4142,6 +4189,15 @@ fn lower_prepared_module<'c>(
             call_args.push(v.into());
         }
         let cs = tb.build_call(orig, &call_args, "r").map_err(|e| CodegenError::Lowering(e.to_string()))?;
+        add_scalar_call_facts(
+            ctx,
+            cs,
+            &declaration.signature.params,
+            &declaration.signature.modes,
+            declaration.signature.ret,
+            declaration.signature.cleanup,
+            0,
+        )?;
         match cs.try_as_basic_value().basic() {
             Some(v) => tb.build_return(Some(&v)),
             None => tb.build_return(None),
@@ -4245,8 +4301,26 @@ fn lower_prepared_module<'c>(
             tb.build_return(Some(&i32t.const_zero())).map_err(lower)?;
         } else {
             let rt = scalar_type(ctx, *r, &struct_types, &enum_types, tagged_types);
-            let res = return_transport::build_indirect_call(ctx, &tb, rt.fn_type(&[ptr.into()], false), thunk, &[env.into()], "r", false)
-                .map_err(lower)?
+            let call = return_transport::build_indirect_call(
+                ctx,
+                &tb,
+                rt.fn_type(&[ptr.into()], false),
+                thunk,
+                &[env.into()],
+                "r",
+                false,
+            )
+            .map_err(lower)?;
+            add_scalar_call_facts(
+                ctx,
+                call,
+                &[],
+                &[],
+                *r,
+                hir::ReturnCleanupAbi::None,
+                1,
+            )?;
+            let res = call
                 .try_as_basic_value()
                 .basic()
                 .ok_or_else(|| CodegenError::Lowering("spawn closure returned no value".into()))?;
@@ -8064,6 +8138,170 @@ fn abi_param_type<'c>(
     }
 }
 
+#[derive(Clone, Copy)]
+struct ScalarBoundaryFacts {
+    bits: u32,
+    extension: &'static str,
+}
+
+/// The complete narrow-scalar fact table for Align-owned program boundaries (plan 76).
+///
+/// These are representation facts, not value-flow inference. In particular, aggregates do not
+/// inherit facts from an integer field and 64-bit integers need no target ABI extension convention.
+fn scalar_boundary_facts(ty: Ty) -> Option<ScalarBoundaryFacts> {
+    match ty {
+        Ty::Bool => Some(ScalarBoundaryFacts { bits: 1, extension: "zeroext" }),
+        Ty::Int(IntTy { bits, signed: false }) if matches!(bits, 8 | 16 | 32) => {
+            Some(ScalarBoundaryFacts { bits: u32::from(bits), extension: "zeroext" })
+        }
+        Ty::Int(IntTy { bits, signed: true }) if matches!(bits, 8 | 16 | 32) => {
+            Some(ScalarBoundaryFacts { bits: u32::from(bits), extension: "signext" })
+        }
+        // Integer-to-char casts preserve the low 32 bits, including values outside Unicode's
+        // scalar domain. `char` therefore has an unsigned ABI convention but no truthful range.
+        Ty::Char => Some(ScalarBoundaryFacts { bits: 32, extension: "zeroext" }),
+        _ => None,
+    }
+}
+
+fn add_scalar_function_facts(
+    ctx: &Context,
+    function: FunctionValue<'_>,
+    params: &[Ty],
+    modes: &[align_ast::ParamMode],
+    ret: Ty,
+    cleanup: hir::ReturnCleanupAbi,
+    offset: u32,
+) -> Result<(), CodegenError> {
+    let expected = u32::try_from(params.len())
+        .ok()
+        .and_then(|count| count.checked_add(offset));
+    if params.len() != modes.len() || expected != Some(function.count_params()) {
+        return Err(CodegenError::Lowering(
+            "scalar ABI facts do not match the physical function parameter inventory".into(),
+        ));
+    }
+    for (index, (&ty, &mode)) in params.iter().zip(modes).enumerate() {
+        if !matches!(mode, align_ast::ParamMode::ByValue | align_ast::ParamMode::Out) {
+            continue;
+        }
+        let Some(facts) = scalar_boundary_facts(ty) else { continue };
+        let ordinal = u32::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_add(offset))
+            .ok_or_else(|| CodegenError::Lowering("scalar ABI parameter ordinal overflows".into()))?;
+        let location = inkwell::attributes::AttributeLoc::Param(ordinal);
+        let physical = function
+            .get_nth_param(ordinal)
+            .and_then(|value| match value {
+                BasicValueEnum::IntValue(value) => Some(value.get_type().get_bit_width()),
+                _ => None,
+            });
+        if physical != Some(facts.bits) {
+            return Err(CodegenError::Lowering(
+                "scalar ABI fact does not match the physical function parameter type".into(),
+            ));
+        }
+        function.add_attribute(
+            location,
+            ctx.create_enum_attribute(enum_kind_id(facts.extension), 0),
+        );
+    }
+    if cleanup == hir::ReturnCleanupAbi::None
+        && let Some(facts) = scalar_boundary_facts(ret)
+    {
+        let physical = function.get_type().get_return_type().and_then(|ty| match ty {
+            BasicTypeEnum::IntType(ty) => Some(ty.get_bit_width()),
+            _ => None,
+        });
+        if physical != Some(facts.bits) {
+            return Err(CodegenError::Lowering(
+                "scalar ABI fact does not match the physical function return type".into(),
+            ));
+        }
+        let location = inkwell::attributes::AttributeLoc::Return;
+        function.add_attribute(
+            location,
+            ctx.create_enum_attribute(enum_kind_id(facts.extension), 0),
+        );
+    }
+    Ok(())
+}
+
+fn add_scalar_call_facts(
+    ctx: &Context,
+    call: CallSiteValue<'_>,
+    params: &[Ty],
+    modes: &[align_ast::ParamMode],
+    ret: Ty,
+    cleanup: hir::ReturnCleanupAbi,
+    offset: u32,
+) -> Result<(), CodegenError> {
+    let expected = u32::try_from(params.len())
+        .ok()
+        .and_then(|count| count.checked_add(offset));
+    if params.len() != modes.len() || expected != Some(call.count_arguments()) {
+        return Err(CodegenError::Lowering(
+            "scalar ABI facts do not match the physical call parameter inventory".into(),
+        ));
+    }
+    let physical_params = call.get_called_fn_type().get_param_types();
+    if expected != u32::try_from(physical_params.len()).ok() {
+        return Err(CodegenError::Lowering(
+            "scalar ABI facts do not match the physical call signature".into(),
+        ));
+    }
+    for (index, (&ty, &mode)) in params.iter().zip(modes).enumerate() {
+        if !matches!(mode, align_ast::ParamMode::ByValue | align_ast::ParamMode::Out) {
+            continue;
+        }
+        let Some(facts) = scalar_boundary_facts(ty) else { continue };
+        let ordinal = u32::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_add(offset))
+            .ok_or_else(|| CodegenError::Lowering("scalar ABI call ordinal overflows".into()))?;
+        let physical = usize::try_from(ordinal)
+            .ok()
+            .and_then(|ordinal| physical_params.get(ordinal))
+            .and_then(|ty| match ty {
+                BasicMetadataTypeEnum::IntType(ty) => Some(ty.get_bit_width()),
+                _ => None,
+            });
+        if physical != Some(facts.bits) {
+            return Err(CodegenError::Lowering(
+                "scalar ABI fact does not match the physical call parameter type".into(),
+            ));
+        }
+        let location = inkwell::attributes::AttributeLoc::Param(ordinal);
+        call.add_attribute(
+            location,
+            ctx.create_enum_attribute(enum_kind_id(facts.extension), 0),
+        );
+    }
+    if cleanup == hir::ReturnCleanupAbi::None
+        && let Some(facts) = scalar_boundary_facts(ret)
+    {
+        let physical = call
+            .get_called_fn_type()
+            .get_return_type()
+            .and_then(|ty| match ty {
+                BasicTypeEnum::IntType(ty) => Some(ty.get_bit_width()),
+                _ => None,
+            });
+        if physical != Some(facts.bits) {
+            return Err(CodegenError::Lowering(
+                "scalar ABI fact does not match the physical call return type".into(),
+            ));
+        }
+        let location = inkwell::attributes::AttributeLoc::Return;
+        call.add_attribute(
+            location,
+            ctx.create_enum_attribute(enum_kind_id(facts.extension), 0),
+        );
+    }
+    Ok(())
+}
+
 // The type-table + `exports` parameters are each independently threaded through from `build_module`
 // (no natural grouping struct exists yet for "the type tables"); splitting them into a bag-of-fields
 // struct would obscure more than it clarifies for a single call site.
@@ -8082,7 +8320,7 @@ fn declare_fn<'c>(
     partition_linkage: Option<ThinFunctionLinkage>,
     has_body: bool,
     test_mode: bool,
-) -> FunctionValue<'c> {
+) -> Result<FunctionValue<'c>, CodegenError> {
     let map = |ty: Ty| -> BasicTypeEnum<'c> {
         abi_map_ty(ctx, ty, struct_types, enum_types, tagged_types, tuple_types)
     };
@@ -8140,6 +8378,21 @@ fn declare_fn<'c>(
         .iter()
         .map(|slot| f.slots.get(*slot as usize).copied().unwrap_or(Ty::Unit))
         .collect();
+    let direct_main = !test_mode
+        && f.name.as_str() == "main"
+        && !matches!(f.ret, Ty::Result(..))
+        && f.ret != Ty::Unit;
+    if !direct_main {
+        add_scalar_function_facts(
+            ctx,
+            fv,
+            &param_tys,
+            &f.param_modes,
+            f.ret,
+            f.return_cleanup,
+            0,
+        )?;
+    }
     let param_values: Vec<BasicTypeEnum<'c>> = param_tys.iter().copied().map(map).collect();
     mark_view_header_param_facts(
         ctx,
@@ -8169,10 +8422,6 @@ fn declare_fn<'c>(
     //    so a dependent unit's object can resolve the cross-unit call. `f.exportable` is set only by
     //    per-unit lowering; the whole-program path leaves it `false`, so the default object is
     //    byte-identical (every function but `main`/`--export` still internalizes).
-    let direct_main = !test_mode
-        && f.name.as_str() == "main"
-        && !matches!(f.ret, Ty::Result(..))
-        && f.ret != Ty::Unit;
     let explicit_export = f.name.as_str() != "main"
         && exports.iter().any(|export| export == f.name.as_str());
     if f.available_externally && has_body {
@@ -8190,7 +8439,7 @@ fn declare_fn<'c>(
             && !f.available_externally => mark_internal(fv),
         None => {}
     }
-    fv
+    Ok(fv)
 }
 
 /// M15 S2: declare a non-generic `pub` function from an interface-only dependency (a potential
@@ -8210,7 +8459,7 @@ fn declare_imported_fn<'c>(
     tagged_types: TaggedTypes<'c, '_>,
     tuple_types: &[StructType<'c>],
     program: &Program,
-) -> FunctionValue<'c> {
+) -> Result<FunctionValue<'c>, CodegenError> {
     let map = |ty: Ty| -> BasicTypeEnum<'c> {
         abi_map_ty(ctx, ty, struct_types, enum_types, tagged_types, tuple_types)
     };
@@ -8247,6 +8496,15 @@ fn declare_imported_fn<'c>(
     // An imported declaration has no body, so it never carries `noalias` (plan 69 I3); the
     // structural header facts are unaffected by that.
     let param_values: Vec<BasicTypeEnum<'c>> = imp.params.iter().copied().map(map).collect();
+    add_scalar_function_facts(
+        ctx,
+        fv,
+        &imp.params,
+        &imp.param_modes,
+        imp.ret,
+        imp.return_cleanup,
+        0,
+    )?;
     mark_view_header_param_facts(
         ctx,
         fv,
@@ -8256,7 +8514,7 @@ fn declare_imported_fn<'c>(
         program,
         false,
     );
-    fv
+    Ok(fv)
 }
 
 fn mark_borrow_param_contracts(
@@ -12023,10 +12281,25 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let mut call_args: Vec<BasicMetadataValueEnum<'c>> = Vec::with_capacity(1 + stage.capture_tys.len());
                     call_args.push(current.into());
                     call_args.extend(capture_values[capture_start..capture_end].iter().map(|value| BasicMetadataValueEnum::from(*value)));
-                    let stage_value = self
+                    let stage_call = self
                         .builder
                         .build_call(target, &call_args, "stage")
-                        .map_err(|e| self.err(e))?
+                        .map_err(|e| self.err(e))?;
+                    let stage_declaration = self
+                        .callable_preflight
+                        .declarations
+                        .get(stage_func)
+                        .ok_or_else(|| callable_target_error(stage_func))?;
+                    add_scalar_call_facts(
+                        self.ctx,
+                        stage_call,
+                        &stage_declaration.signature.params,
+                        &stage_declaration.signature.modes,
+                        stage_declaration.signature.ret,
+                        stage_declaration.signature.cleanup,
+                        0,
+                    )?;
+                    let stage_value = stage_call
                         .try_as_basic_value()
                         .basic()
                         .ok_or_else(|| self.err(format!("par_map stage function `{stage_func}` must return a value")))?;
@@ -12128,10 +12401,25 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     Vec::with_capacity(1 + capture_values.len().saturating_sub(capture_start));
                 call_args.push(current.into());
                 call_args.extend(capture_values[capture_start..].iter().map(|value| BasicMetadataValueEnum::from(*value)));
-                let r = self
+                let terminal_call = self
                     .builder
                     .build_call(target, &call_args, "r")
-                    .map_err(|e| self.err(e))?
+                    .map_err(|e| self.err(e))?;
+                let terminal_declaration = self
+                    .callable_preflight
+                    .declarations
+                    .get(func)
+                    .ok_or_else(|| callable_target_error(func))?;
+                add_scalar_call_facts(
+                    self.ctx,
+                    terminal_call,
+                    &terminal_declaration.signature.params,
+                    &terminal_declaration.signature.modes,
+                    terminal_declaration.signature.ret,
+                    terminal_declaration.signature.cleanup,
+                    0,
+                )?;
+                let r = terminal_call
                     .try_as_basic_value()
                     .basic()
                     .ok_or_else(|| self.err("par_map function must return a value"))?;
@@ -12177,10 +12465,25 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 Vec::with_capacity(1 + capture_values.len().saturating_sub(capture_start));
             call_args.push(current.into());
             call_args.extend(capture_values[capture_start..].iter().map(|value| BasicMetadataValueEnum::from(*value)));
-            let r = self
+            let terminal_call = self
                 .builder
                 .build_call(target, &call_args, "r")
-                .map_err(|e| self.err(e))?
+                .map_err(|e| self.err(e))?;
+            let terminal_declaration = self
+                .callable_preflight
+                .declarations
+                .get(func)
+                .ok_or_else(|| callable_target_error(func))?;
+            add_scalar_call_facts(
+                self.ctx,
+                terminal_call,
+                &terminal_declaration.signature.params,
+                &terminal_declaration.signature.modes,
+                terminal_declaration.signature.ret,
+                terminal_declaration.signature.cleanup,
+                0,
+            )?;
+            let r = terminal_call
                 .try_as_basic_value()
                 .basic()
                 .ok_or_else(|| self.err("par_map function must return a value"))?;
@@ -18307,6 +18610,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .builder
                     .build_call(callee, &argv, "call")
                     .map_err(|e| self.err(e))?;
+                if !self.extern_abi.contains_key(name) {
+                    add_scalar_call_facts(
+                        self.ctx,
+                        cs,
+                        &declaration.signature.params,
+                        &declaration.signature.modes,
+                        declaration.signature.ret,
+                        declaration.signature.cleanup,
+                        0,
+                    )?;
+                }
                 // Reconstruct a by-value struct return from its register form.
                 if let Some(ExternAbi { ret: ReturnAbi::StructRegs(sabi), .. }) = self.extern_abi.get(name) {
                     let rv = cs
@@ -18347,10 +18661,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .zip(&declaration.signature.drop_state_effects)
                     .map(|((operand, mode), effect)| self.operand_for_mode_effect(operand, *mode, *effect).map(Into::into))
                     .collect::<Result<Vec<BasicMetadataValueEnum<'c>>, _>>()?;
-                let returned = self
+                let call_site = self
                     .builder
                     .build_call(callee, &argv, "call.cleanup")
-                    .map_err(|error| self.err(error))?
+                    .map_err(|error| self.err(error))?;
+                add_scalar_call_facts(
+                    self.ctx,
+                    call_site,
+                    &declaration.signature.params,
+                    &declaration.signature.modes,
+                    declaration.signature.ret,
+                    declaration.signature.cleanup,
+                    0,
+                )?;
+                let returned = call_site
                     .try_as_basic_value()
                     .basic()
                     .ok_or_else(|| self.err("dynamic-cleanup call returned void"))?
@@ -18529,13 +18853,39 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // that opaque pointers cannot verify, so keep the indirect call Unit-aware just
                     // like the spawn trampoline above.
                     let fn_ty = self.ctx.void_type().fn_type(&param_meta, false);
-                    return_transport::build_indirect_call(self.ctx, self.builder, fn_ty, fn_ptr, &argv, "", false)
-                        .map_err(|e| self.err(e))?;
+                    let cs = return_transport::build_indirect_call(
+                        self.ctx,
+                        self.builder,
+                        fn_ty,
+                        fn_ptr,
+                        &argv,
+                        "",
+                        false,
+                    )
+                    .map_err(|e| self.err(e))?;
+                    add_scalar_call_facts(
+                        self.ctx,
+                        cs,
+                        param_tys,
+                        &signature.param_modes,
+                        *ret_ty,
+                        signature.return_cleanup,
+                        1,
+                    )?;
                     return Ok(None);
                 }
                 let fn_ty = self.llvm_type(*ret_ty).fn_type(&param_meta, false);
                 let cs = return_transport::build_indirect_call(self.ctx, self.builder, fn_ty, fn_ptr, &argv, "icall", false)
                     .map_err(|e| self.err(e))?;
+                add_scalar_call_facts(
+                    self.ctx,
+                    cs,
+                    param_tys,
+                    &signature.param_modes,
+                    *ret_ty,
+                    signature.return_cleanup,
+                    1,
+                )?;
                 return Ok(cs.try_as_basic_value().basic());
             }
             Rvalue::RawCall {
@@ -18639,7 +18989,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     self.llvm_type(*ret_ty),
                     hir::ReturnCleanupAbi::DynamicBit,
                 );
-                let returned = return_transport::build_indirect_call(
+                let call_site = return_transport::build_indirect_call(
                         self.ctx,
                         self.builder,
                         return_ty.fn_type(&param_meta, false),
@@ -18648,7 +18998,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         "icall.cleanup",
                         true,
                     )
-                    .map_err(|e| self.err(e))?
+                    .map_err(|e| self.err(e))?;
+                add_scalar_call_facts(
+                    self.ctx,
+                    call_site,
+                    param_tys,
+                    &signature.param_modes,
+                    *ret_ty,
+                    signature.return_cleanup,
+                    1,
+                )?;
+                let returned = call_site
                     .try_as_basic_value()
                     .basic()
                     .ok_or_else(|| self.err("dynamic-cleanup indirect call returned void"))?
@@ -27003,7 +27363,8 @@ fn main() -> i32 = 0
         let program_symbol =
             encoded_program_symbol(&program_call("align_rt_tcp_conn_set_io_timeout"));
         assert!(collision_ir.lines().any(|line| {
-            line.starts_with("define internal i32 ") && line.contains(&program_symbol)
+            line.starts_with("define internal signext i32 ")
+                && line.contains(&program_symbol)
         }));
         let collision = emit_llvm_ir(
             &collision,
@@ -37232,6 +37593,8 @@ fn main() -> i32 = 0
     fn main_abi_matrix() -> Result<(), &'static str> {
         let direct = ir("fn main() -> i32 = 7\n");
         assert!(direct.contains("define i32 @main()"));
+        assert!(!direct.lines().find(|line| line.contains("@main()"))
+            .is_some_and(|line| line.contains("signext")));
         assert!(!direct.contains("@align_main"));
 
         let unit = ir("fn main() {}\n");
@@ -37375,6 +37738,251 @@ fn main() -> i32 = 0
         missing_variant.enums[error_id as usize].variants.pop();
         rejects("error-variant-count", &missing_variant);
         Ok(())
+    }
+
+    #[test]
+    fn scalar_boundary_facts_cover_direct_indirect_task_and_per_unit_calls() {
+        let source = "Choice { A, B }\n\
+            fn bool_id(value: bool) -> bool = value\n\
+            fn u8_id(value: u8) -> u8 = value\n\
+            fn u16_id(value: u16) -> u16 = value\n\
+            fn u32_id(value: u32) -> u32 = value\n\
+            fn i8_id(value: i8) -> i8 = value\n\
+            fn i16_id(value: i16) -> i16 = value\n\
+            fn i32_id(value: i32) -> i32 = value\n\
+            fn char_id(value: char) -> char = value\n\
+            fn i64_id(value: i64) -> i64 = value\n\
+            fn f64_id(value: f64) -> f64 = value\n\
+            fn enum_id(value: Choice) -> Choice = value\n\
+            fn indirect(value: bool) -> bool { callback := bool_id\n return callback(value) }\n\
+            fn captured(value: bool) -> bool { seed := true\n callback := fn item: bool { item && seed }\n return callback(value) }\n\
+            fn parallel(value: u8) -> u8 { values := [value].par_map(u8_id)\n return values[0] }\n\
+            fn spawned() -> bool { return task_group { task := spawn(fn { true })\n wait()\n task.get() } }\n\
+            fn main() -> i32 {\n\
+              b := bool_id(true)\n u8v := u8_id(255)\n u16v := u16_id(65535)\n\
+              u32v := u32_id(4294967295)\n i8v := i8_id(-1)\n i16v := i16_id(-1)\n\
+              i32v := i32_id(-1)\n c := char_id('A')\n i64v := i64_id(-1)\n f := f64_id(1.0)\n e := enum_id(Choice.A)\n x := indirect(b)\n z := captured(x)\n p := parallel(u8v)\n y := spawned()\n\
+              if x && z && y { return i32v + i8v as i32 + i16v as i32 + p as i32 + u16v as i32 + u32v as i32 + c as i32 }\n\
+              return 0\n }\n";
+        let program = mir(source);
+        let llvm = emit_llvm_ir(
+            &program,
+            &BuildTarget::Baseline,
+            Profile::Release,
+            false,
+            &[],
+            None,
+        )
+        .unwrap_or_else(|error| panic!("scalar-boundary fixture: {error}"));
+
+        let boundary_line = |kind: &str, logical: &str| {
+            let symbol = encoded_program_symbol(&program_call(logical));
+            llvm.lines()
+                .find(|line| line.starts_with(kind) && line.contains(&symbol))
+                .unwrap_or_else(|| panic!("missing {kind} for {logical}:\n{llvm}"))
+        };
+        for (logical, llvm_ty, extension) in [
+            ("bool_id", "i1", "zeroext"),
+            ("u8_id", "i8", "zeroext"),
+            ("u16_id", "i16", "zeroext"),
+            ("u32_id", "i32", "zeroext"),
+            ("i8_id", "i8", "signext"),
+            ("i16_id", "i16", "signext"),
+            ("i32_id", "i32", "signext"),
+        ] {
+            let definition = boundary_line("define ", logical);
+            assert!(definition.contains(&format!("{extension} {llvm_ty}")), "{definition}");
+            assert!(definition.contains(&format!("{llvm_ty} {extension}")), "{definition}");
+            let call = boundary_line("  %", logical);
+            assert!(call.contains(&format!("call {extension} {llvm_ty}")), "{call}");
+            assert!(call.contains(&format!("{llvm_ty} {extension}")), "{call}");
+        }
+        let char_definition = boundary_line("define ", "char_id");
+        assert!(char_definition.matches("zeroext").count() == 2, "{char_definition}");
+        assert!(!char_definition.contains("range("), "{char_definition}");
+        let char_call = boundary_line("  %", "char_id");
+        assert!(char_call.matches("zeroext").count() == 2, "{char_call}");
+        assert!(!char_call.contains("range("), "{char_call}");
+        for logical in ["i64_id", "f64_id", "enum_id"] {
+            let definition = boundary_line("define ", logical);
+            assert!(
+                !definition.contains("zeroext")
+                    && !definition.contains("signext")
+                    && !definition.contains("range("),
+                "non-narrow or aggregate boundary acquired scalar facts: {definition}"
+            );
+            let call = boundary_line("  %", logical);
+            assert!(
+                !call.contains("zeroext")
+                    && !call.contains("signext")
+                    && !call.contains("range("),
+                "non-narrow or aggregate call acquired scalar facts: {call}"
+            );
+        }
+        assert!(
+            llvm.lines().filter(|line| line.contains("call zeroext i1 %")).count() >= 2,
+            "ordinary indirect and task-trampoline bool calls must both carry zeroext:\n{llvm}"
+        );
+
+        let exported = emit_llvm_ir(
+            &program,
+            &BuildTarget::Baseline,
+            Profile::Release,
+            false,
+            &["bool_id".to_owned()],
+            None,
+        )
+        .unwrap_or_else(|error| panic!("scalar export fixture: {error}"));
+        let wrapper = exported
+            .lines()
+            .find(|line| line.starts_with("define ") && line.contains("@bool_id("))
+            .unwrap_or_else(|| panic!("missing bool export wrapper:\n{exported}"));
+        assert!(!wrapper.contains("zeroext"), "native export shell acquired Align facts: {wrapper}");
+        let wrapper_call = externally_named_function_body(&exported, "bool_id")
+            .lines()
+            .find(|line| line.contains("call zeroext i1"))
+            .unwrap_or_else(|| panic!("export wrapper omitted core call facts:\n{exported}"));
+        assert!(wrapper_call.contains("i1 zeroext"), "{wrapper_call}");
+
+        let u8_symbol = encoded_program_symbol(&program_call("u8_id"));
+        assert_eq!(
+            llvm.lines()
+                .filter(|line| line.contains("call zeroext i8") && line.contains(&u8_symbol))
+                .count(),
+            2,
+            "the ordinary and generated parallel calls must share scalar facts:\n{llvm}",
+        );
+        assert!(
+            llvm.lines().any(|line| {
+                line.starts_with("define private zeroext i1")
+                    && line.contains("align_gen$clos$")
+                    && line.contains("i1 zeroext")
+            }),
+            "the capturing closure thunk must carry env-offset scalar facts:\n{llvm}",
+        );
+
+        let mut consumer = mir(
+            "fn dep(value: bool) -> bool = value\n\
+             fn caller(value: bool) -> bool = dep(value)\n\
+             fn main() -> i32 = if caller(true) { 0 } else { 1 }\n",
+        );
+        consumer.fns.retain(|function| function.name.as_str() != "dep");
+        consumer.imported_fns.push(align_mir::ImportedFn {
+            name: program_call("dep"),
+            params: vec![Ty::Bool],
+            param_modes: vec![align_ast::ParamMode::ByValue],
+            ret: Ty::Bool,
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
+            drop_state_effects: vec![hir::DropStateEffect::NotApplicable],
+            producer_certified: true,
+        });
+        let imported = emit_llvm_ir(
+            &consumer,
+            &BuildTarget::Baseline,
+            Profile::Release,
+            false,
+            &[],
+            None,
+        )
+        .unwrap_or_else(|error| panic!("scalar per-unit fixture: {error}"));
+        let dep = encoded_program_symbol(&program_call("dep"));
+        let declaration = imported
+            .lines()
+            .find(|line| line.starts_with("declare ") && line.contains(&dep))
+            .unwrap_or_else(|| panic!("missing scalar import:\n{imported}"));
+        assert!(declaration.contains("zeroext i1") && declaration.contains("i1 zeroext"), "{declaration}");
+        let call = imported
+            .lines()
+            .find(|line| line.contains("call zeroext i1") && line.contains(&dep))
+            .unwrap_or_else(|| panic!("missing scalar imported call:\n{imported}"));
+        assert!(call.contains("i1 zeroext"), "{call}");
+
+        // The helper owns the physical env offset and aggregate-cleanup exclusion shared by
+        // function-value, closure and cleanup-bearing calls. Exercise those mechanics directly so
+        // this owner does not need another source fixture or test binary. Every fallible operation
+        // below consumes constant test-owned LLVM input, so construction failure is a broken
+        // fixture and deliberately panics in the test rather than entering production diagnostics.
+        let ctx = Context::create();
+        let module = ctx.create_module("scalar-boundary-helper");
+        let ptr = ctx.ptr_type(AddressSpace::default());
+        let i1 = ctx.bool_type();
+        let cleanup_result = ctx.struct_type(&[i1.into(), i1.into()], false);
+        let cleanup_fn = module.add_function(
+            "cleanup",
+            cleanup_result.fn_type(&[ptr.into(), i1.into()], false),
+            None,
+        );
+        add_scalar_function_facts(
+            &ctx,
+            cleanup_fn,
+            &[Ty::Bool],
+            &[align_ast::ParamMode::ByValue],
+            Ty::Bool,
+            hir::ReturnCleanupAbi::DynamicBit,
+            1,
+        )
+        .unwrap_or_else(|error| panic!("valid env-offset cleanup signature: {error}"));
+        assert!(
+            cleanup_fn
+                .get_enum_attribute(
+                    inkwell::attributes::AttributeLoc::Param(1),
+                    enum_kind_id("zeroext"),
+                )
+                .is_some(),
+        );
+        assert!(
+            cleanup_fn
+                .get_enum_attribute(
+                    inkwell::attributes::AttributeLoc::Param(0),
+                    enum_kind_id("zeroext"),
+                )
+                .is_none(),
+        );
+        assert!(
+            cleanup_fn
+                .get_enum_attribute(
+                    inkwell::attributes::AttributeLoc::Return,
+                    enum_kind_id("zeroext"),
+                )
+                .is_none(),
+        );
+
+        let malformed = module.add_function(
+            "malformed",
+            ctx.i8_type().fn_type(&[ctx.i8_type().into()], false),
+            None,
+        );
+        let function_error = add_scalar_function_facts(
+            &ctx,
+            malformed,
+            &[Ty::Bool],
+            &[align_ast::ParamMode::ByValue],
+            Ty::Bool,
+            hir::ReturnCleanupAbi::None,
+            0,
+        )
+        .expect_err("a semantic bool must not describe a physical i8 function");
+        assert!(function_error.to_string().contains("physical function parameter type"));
+
+        let caller = module.add_function("caller", ctx.void_type().fn_type(&[], false), None);
+        let builder = ctx.create_builder();
+        builder.position_at_end(ctx.append_basic_block(caller, "entry"));
+        let malformed_call = builder
+            .build_call(malformed, &[ctx.i8_type().const_zero().into()], "bad")
+            .unwrap_or_else(|error| panic!("well-typed physical call: {error}"));
+        let call_error = add_scalar_call_facts(
+            &ctx,
+            malformed_call,
+            &[Ty::Bool],
+            &[align_ast::ParamMode::ByValue],
+            Ty::Bool,
+            hir::ReturnCleanupAbi::None,
+            0,
+        )
+        .expect_err("a semantic bool must not describe a physical i8 call");
+        assert!(call_error.to_string().contains("physical call parameter type"));
     }
 
     #[test]
