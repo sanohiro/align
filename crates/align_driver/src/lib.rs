@@ -5357,6 +5357,7 @@ pub fn collect_opt_remarks(
     debug: &DebugInfo,
     roots: &[String],
 ) -> Result<Vec<String>, String> {
+    validate_byte_view_target(mir, &target)?;
     align_codegen_llvm::collect_opt_remarks(mir, &target, profile, debug, roots)
         .map_err(|e| e.to_string())
 }
@@ -5368,6 +5369,7 @@ pub fn collect_opt_inspection(
     debug: &DebugInfo,
     roots: &[String],
 ) -> Result<OptInspection, String> {
+    validate_byte_view_target(mir, &target)?;
     align_codegen_llvm::collect_opt_inspection(mir, &target, profile, debug, roots)
         .map_err(|e| e.to_string())
 }
@@ -5450,6 +5452,16 @@ fn validate_byte_view_target(mir: &align_mir::Program, target: &BuildTarget) -> 
     }
     let resolved = align_codegen_llvm::resolve_target_identity(target).map_err(|error| error.to_string())?;
     validate_byte_view_target_triple(true, &resolved.triple)
+}
+
+fn validate_byte_view_targets<'a>(
+    mirs: impl IntoIterator<Item = &'a align_mir::Program>,
+    target: &BuildTarget,
+) -> Result<(), String> {
+    for mir in mirs {
+        validate_byte_view_target(mir, target)?;
+    }
+    Ok(())
 }
 
 fn validate_byte_view_target_triple(requires_little_endian: bool, triple: &str) -> Result<(), String> {
@@ -5538,6 +5550,7 @@ pub fn emit_test_objects(
     if all_roots.len() != catalog_ids.len() {
         return Err("test catalog and root counts disagree".to_owned());
     }
+    validate_byte_view_targets(inputs.iter().map(|input| input.mir), target)?;
     let root_symbols = all_roots
         .iter()
         .map(|root| root.symbol.clone())
@@ -7038,6 +7051,7 @@ fn emit_unit_object(
     rt_lto: bool,
     pgo: &PgoMode,
 ) -> Result<UnitPgoRun, String> {
+    validate_byte_view_target(mir, target)?;
     let action = match pgo {
         PgoMode::Off => {
             emit_object_file(mir, obj, target.clone(), profile, &[], rt_lto)?;
@@ -7856,6 +7870,7 @@ pub fn build_thin_lto(
 ) -> Result<ThinLtoBuild, String> {
     assert_eq!(units.len(), obj_paths.len(), "one object path per unit");
     assert!(units.len() >= 2, "N=1 must skip ThinLTO entirely (caller's responsibility)");
+    validate_byte_view_targets(units.iter().map(|unit| &unit.mir), target)?;
     align_codegen_llvm::ensure_target_initialized().map_err(|e| e.to_string())?;
 
     let enabled = cache.codegen_is_enabled();
@@ -8409,6 +8424,7 @@ pub fn build_function_thin_lto(
             ));
         }
     }
+    validate_byte_view_targets(units.iter().map(|unit| &unit.mir), target)?;
     let stage_parent = validate_thin_stage_parent()?;
     let object_stage = ArtifactStage::in_canonical_dir(&stage_parent, "align-function-thin")
         .map_err(|error| format!("cannot create object staging directory: {error}"))?;
@@ -8798,6 +8814,7 @@ where
 /// output shows what LLVM actually did (inlined, fused, vectorized). `exports` is the same
 /// export-roots list as [`emit_object_file`].
 pub fn emit_llvm_ir(mir: &align_mir::Program, target: BuildTarget, profile: Profile, optimized: bool, exports: &[String], rt_lto: bool) -> Result<String, String> {
+    validate_byte_view_target(mir, &target)?;
     align_codegen_llvm::emit_llvm_ir(mir, &target, profile, optimized, exports, rt_lto_bytes(rt_lto)).map_err(|e| e.to_string())
 }
 
