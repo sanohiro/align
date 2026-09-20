@@ -16,7 +16,7 @@
 //! `docs/impl/65-open-issue-batch-plan.md` §"Target identity and inspection roots" owns the exact
 //! rule; issue 1087 owns the evidence.
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use crate::CodegenError;
 
@@ -323,9 +323,9 @@ fn host_product_version() -> Result<Option<String>, CodegenError> {
 
 /// The `--deployment-target` value, installed once before any triple is resolved.
 static EXPLICIT_DEPLOYMENT_TARGET: OnceLock<Option<String>> = OnceLock::new();
-/// Explicit SDK provenance for Apple objects. Absence is intentionally not replaced by an ambient
-/// toolchain query: no flag means no SDK module flag and preserves the previous `sdk n/a` object.
-static EXPLICIT_SDK_VERSION: OnceLock<SdkVersion> = OnceLock::new();
+/// Explicit SDK provenance for Apple objects, including the point where target resolution freezes
+/// an omitted value. One lock makes selection and absence atomic for concurrent direct callers.
+static SDK_VERSION_STATE: Mutex<SdkVersionState> = Mutex::new(SdkVersionState::Open);
 /// The resolved triple, computed once. Both [`crate::resolve_target_identity`] and
 /// [`crate::create_target_machine`] read it, so they are byte-identical by construction rather than
 /// by two matching code paths.
@@ -339,6 +339,13 @@ pub struct SdkVersion {
     major: u16,
     minor: u8,
     patch: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SdkVersionState {
+    Open,
+    Selected(SdkVersion),
+    FrozenAbsent,
 }
 
 impl SdkVersion {
@@ -398,6 +405,45 @@ pub fn parse_sdk_version(value: &str) -> Result<SdkVersion, CodegenError> {
     })
 }
 
+fn install_sdk_version(
+    state: &Mutex<SdkVersionState>,
+    canonical: SdkVersion,
+) -> Result<(), CodegenError> {
+    let mut state = state.lock().map_err(|_| {
+        CodegenError::Target("the SDK-version identity lock was poisoned".to_string())
+    })?;
+    match *state {
+        SdkVersionState::Open => {
+            *state = SdkVersionState::Selected(canonical);
+            Ok(())
+        }
+        SdkVersionState::Selected(existing) if existing == canonical => Ok(()),
+        SdkVersionState::Selected(existing) => Err(CodegenError::Target(format!(
+            "--sdk-version was already resolved as {} in this process",
+            existing.canonical()
+        ))),
+        SdkVersionState::FrozenAbsent => Err(CodegenError::Target(
+            "--sdk-version must be set before the target identity is resolved".to_string(),
+        )),
+    }
+}
+
+fn freeze_sdk_version(
+    state: &Mutex<SdkVersionState>,
+) -> Result<Option<SdkVersion>, CodegenError> {
+    let mut state = state.lock().map_err(|_| {
+        CodegenError::Target("the SDK-version identity lock was poisoned".to_string())
+    })?;
+    match *state {
+        SdkVersionState::Open => {
+            *state = SdkVersionState::FrozenAbsent;
+            Ok(None)
+        }
+        SdkVersionState::Selected(version) => Ok(Some(version)),
+        SdkVersionState::FrozenAbsent => Ok(None),
+    }
+}
+
 /// Install explicit SDK provenance before target resolution or module construction.
 pub fn set_sdk_version(version: &str) -> Result<(), CodegenError> {
     let canonical = parse_sdk_version(version)?;
@@ -408,30 +454,14 @@ pub fn set_sdk_version(version: &str) -> Result<(), CodegenError> {
              Apple objects"
         )));
     }
-    if RESOLVED_TRIPLE.get().is_some() {
-        return Err(CodegenError::Target(
-            "--sdk-version must be set before the target identity is resolved".to_string(),
-        ));
-    }
-    match EXPLICIT_SDK_VERSION.set(canonical) {
-        Ok(()) => Ok(()),
-        Err(_) if EXPLICIT_SDK_VERSION.get() == Some(&canonical) => Ok(()),
-        Err(_) => Err(CodegenError::Target(format!(
-            "--sdk-version was already resolved as {} in this process",
-            EXPLICIT_SDK_VERSION
-                .get()
-                .copied()
-                .expect("failed OnceLock set implies an installed SDK version")
-                .canonical()
-        ))),
-    }
+    install_sdk_version(&SDK_VERSION_STATE, canonical)
 }
 
 /// Resolve optional SDK provenance together with the target identity. Calling this freezes the
 /// target first, so a direct caller cannot install a late value after observing absence.
 pub fn resolved_sdk_version() -> Result<Option<SdkVersion>, CodegenError> {
     resolved_triple()?;
-    Ok(EXPLICIT_SDK_VERSION.get().copied())
+    freeze_sdk_version(&SDK_VERSION_STATE)
 }
 
 /// Install the explicit `--deployment-target` value. The CLI calls this once, before any codegen,
@@ -522,6 +552,7 @@ fn resolve_once() -> &'static Result<String, String> {
 /// unchanged. Resolved once per process, so the `TargetMachine`, the module triples copied from it,
 /// the link, and the cache key can never disagree.
 pub fn resolved_triple() -> Result<String, CodegenError> {
+    freeze_sdk_version(&SDK_VERSION_STATE)?;
     resolve_once().clone().map_err(CodegenError::Target)
 }
 
@@ -560,35 +591,72 @@ mod tests {
     }
 
     #[test]
-    fn sdk_versions_canonicalize_to_the_exact_macho_fields() {
+    fn sdk_versions_canonicalize_to_the_exact_macho_fields() -> Result<(), String> {
         for (input, expected) in [
             ("1", SdkVersion { major: 1, minor: 0, patch: 0 }),
             ("027.0", SdkVersion { major: 27, minor: 0, patch: 0 }),
             ("65535.255.255", SdkVersion { major: 65535, minor: 255, patch: 255 }),
         ] {
-            let parsed = parse_sdk_version(input).expect(input);
+            let parsed = parse_sdk_version(input).map_err(|error| error.to_string())?;
             assert_eq!(parsed, expected);
-            assert_eq!(parse_sdk_version(&parsed.canonical()).unwrap(), expected);
+            let reparsed = parse_sdk_version(&parsed.canonical())
+                .map_err(|error| error.to_string())?;
+            assert_eq!(reparsed, expected);
         }
+        Ok(())
     }
 
     #[test]
-    fn sdk_versions_reject_shape_length_and_packed_field_overflow() {
+    fn sdk_versions_reject_shape_length_and_packed_field_overflow() -> Result<(), String> {
         for bad in [
             "", "0", "-1", "1.", ".1", "1.2.3.4", "1.x", "65536", "1.256", "1.2.256",
             "1\0.0", "00000000000000000000000000000000000000000000000000000000000000001",
         ] {
-            let error = parse_sdk_version(bad).unwrap_err().to_string();
+            let error = parse_sdk_version(bad)
+                .err()
+                .ok_or_else(|| format!("{bad:?} unexpectedly parsed"))?
+                .to_string();
             assert!(error.contains("--sdk-version"), "{bad:?}: {error}");
         }
+        Ok(())
     }
 
     #[test]
-    fn sdk_version_range_errors_follow_component_order() {
+    fn sdk_version_range_errors_follow_component_order() -> Result<(), String> {
         let error = parse_sdk_version("65536.4294967296")
-            .unwrap_err()
+            .err()
+            .ok_or_else(|| "invalid SDK version unexpectedly parsed".to_string())?
             .to_string();
         assert!(error.contains("major must be in 1..=65535"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_version_selection_and_absence_freeze_atomically() -> Result<(), String> {
+        use std::sync::{Arc, Barrier};
+
+        let selected = SdkVersion { major: 27, minor: 1, patch: 2 };
+        let state = Arc::new(Mutex::new(SdkVersionState::Open));
+        let barrier = Arc::new(Barrier::new(2));
+        let setter_state = Arc::clone(&state);
+        let setter_barrier = Arc::clone(&barrier);
+        let setter = std::thread::spawn(move || {
+            setter_barrier.wait();
+            install_sdk_version(&setter_state, selected)
+        });
+        barrier.wait();
+        let frozen = freeze_sdk_version(&state).map_err(|error| error.to_string())?;
+        let installed = setter
+            .join()
+            .map_err(|_| "SDK-version setter thread panicked".to_string())?;
+        match frozen {
+            Some(version) => {
+                assert_eq!(version, selected);
+                assert!(installed.is_ok());
+            }
+            None => assert!(installed.is_err()),
+        }
+        Ok(())
     }
 
     /// Every Apple spelling normalizes to its canonical OS plus an explicit version, the
