@@ -78,10 +78,15 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    shipped in #1135/#1136, and #1065 fixed arrays in structs shipped in
    #1137/#1138. #1066 proposal 2 is plan 74's current implementation candidate; then
    #1064 → depends on #1063, #1075 scalar ABI facts, #1082 P2 RFC.
-   #1063 is now under the plan 75 design/feasibility gate: direct LLVM
+   #1063 plan 75 merged in PR #1141. Its first feasibility pass is negative and
+   implementation is deferred: direct LLVM
    transcendental intrinsics are rejected because LLVM 22 scalarizes the
    vector form without a configured vector library, while the existing
-   `str_prims.bc` admission budget is not valid for accurate math kernels.
+   `str_prims.bc` admission budget is not valid for accurate math kernels;
+   forced-inline Rust libm stays scalar/retains lane shuffles, LLVM libc
+   mathvec lacks most of the E1 matrix, and SLEEF does not promise cross-CPU
+   bit identity. Resume only with a ten-kernel vector graph and universal
+   accuracy/identity proof package.
    The five E1 functions stay one capability; #1064 remains a separate failure
    domain and does not share its PR.
 4. Follow-ups, independent and small (updated 2026-09-19):
