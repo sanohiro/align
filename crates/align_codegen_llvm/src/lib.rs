@@ -8,7 +8,7 @@
 //! loads, writes are stores; `if` is conditional branches; comparisons are `icmp`;
 //! calls are `call`. The generated `main` is the C entry (crt0 calls it).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 #[cfg(test)]
@@ -24,6 +24,7 @@ use align_mir::producer::{
     validate_partition_tagged_program, callable_hex, callable_target_error, canonical_metadata,
     canonical_ty, source_ty_matches, callable_metadata_error, preflight_operand_ty,
     slice_index_physical_element, slice_index_result_matches, validate_slice_index_rvalues,
+    validate_str_match_terminators,
     validate_fixed_element_nulling, template_piece_is_type_safe, direct_operands_match_modes,
     direct_runtime_key_is_valid
 };
@@ -1070,6 +1071,7 @@ pub fn validate_thin_partition_program(
     validate_resource_program(program)?;
     validate_resource_rvalues(program)?;
     validate_slice_index_rvalues(program)?;
+    validate_str_match_terminators(program)?;
     validate_fixed_element_nulling(program)?;
     let declarations = callable_declarations(program)?;
     callable_preflight(program, exports, declarations, ModuleScope::Whole)?;
@@ -3259,6 +3261,7 @@ fn validate_module_program(
         }
     }
     validate_slice_index_rvalues(program)?;
+    validate_str_match_terminators(program)?;
     validate_fixed_element_nulling(program)?;
     Ok(())
 }
@@ -8843,6 +8846,11 @@ impl BorrowedElementValidationIndex {
             let targets = match block.term {
                 Term::Goto(next) => vec![next],
                 Term::Branch(_, yes, no) => vec![yes, no],
+                Term::StrMatch { ref cases, otherwise, .. } => cases
+                    .iter()
+                    .map(|(_, target)| *target)
+                    .chain(std::iter::once(otherwise))
+                    .collect(),
                 Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => Vec::new(),
             };
             for target in targets {
@@ -9587,6 +9595,9 @@ fn stack_header_plan(f: &Function) -> StackHeaderPlan {
             Term::ReturnWithCleanup(returned) => {
                 reject_header_operand(&returned.0, &load_defs, &owner, &mut bad);
                 reject_header_operand(&returned.1, &load_defs, &owner, &mut bad);
+            }
+            Term::StrMatch { scrutinee, .. } => {
+                reject_header_operand(scrutinee, &load_defs, &owner, &mut bad);
             }
             _ => {}
         }
@@ -13066,6 +13077,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .set_metadata(weights, self.ctx.get_kind_id("prof"))
                         .map_err(|_| self.err("set exceptional branch weights"))?;
                 }
+            }
+            Term::StrMatch { scrutinee, cases, otherwise } => {
+                self.gen_str_match(scrutinee, cases, *otherwise)?;
             }
             Term::Return(Some(op)) => {
                 if self.f.return_cleanup != hir::ReturnCleanupAbi::None {
@@ -18693,6 +18707,190 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.tagged_types,
             ),
         }
+    }
+
+    fn mir_block(&self, block: align_mir::BlockId, context: &str) -> Result<BasicBlock<'c>, CodegenError> {
+        let index = usize::try_from(block)
+            .map_err(|_| self.err(format!("{context} block id is not target-representable")))?;
+        self.blocks
+            .get(index)
+            .copied()
+            .ok_or_else(|| self.err(format!("{context} references an invalid MIR block {block}")))
+    }
+
+    /// Lower one MIR-owned exact string dispatch. Four or more cases use the plan-72
+    /// length/discriminator-byte tree; small matches retain source-ordered full comparisons.
+    fn gen_str_match(
+        &mut self,
+        scrutinee: &Operand,
+        cases: &[(String, align_mir::BlockId)],
+        otherwise: align_mir::BlockId,
+    ) -> Result<(), CodegenError> {
+        if cases.is_empty() {
+            return Err(self.err("string match has no literal cases"));
+        }
+        let otherwise = self.mir_block(otherwise, "string match wildcard")?;
+        let value = self.operand_by_value(scrutinee)?.into_struct_value();
+        let pointer = self
+            .builder
+            .build_extract_value(value, 0, "strmatch.ptr")
+            .map_err(|error| self.err(error))?
+            .into_pointer_value();
+        let length = self
+            .builder
+            .build_extract_value(value, 1, "strmatch.len")
+            .map_err(|error| self.err(error))?
+            .into_int_value();
+
+        if cases.len() < 4 {
+            for (index, (literal, target)) in cases.iter().enumerate() {
+                let miss = if index + 1 == cases.len() {
+                    otherwise
+                } else {
+                    self.ctx.append_basic_block(self.func, "strmatch.next")
+                };
+                self.emit_str_match_candidate(pointer, length, literal, *target, miss)?;
+                if index + 1 != cases.len() {
+                    self.builder.position_at_end(miss);
+                }
+            }
+            return Ok(());
+        }
+
+        let mut groups = BTreeMap::<usize, Vec<(String, align_mir::BlockId)>>::new();
+        for (literal, target) in cases {
+            groups.entry(literal.len()).or_default().push((literal.clone(), *target));
+        }
+        let mut length_cases = Vec::with_capacity(groups.len());
+        let mut bodies = Vec::with_capacity(groups.len());
+        for (literal_len, group) in groups {
+            let body = self.ctx.append_basic_block(self.func, "strmatch.length");
+            let literal_len_u64 = u64::try_from(literal_len)
+                .map_err(|_| self.err("string match literal length is not representable"))?;
+            length_cases.push((self.ctx.i64_type().const_int(literal_len_u64, false), body));
+            bodies.push((literal_len, group, body));
+        }
+        self.builder
+            .build_switch(length, otherwise, &length_cases)
+            .map_err(|error| self.err(error))?;
+        for (literal_len, group, body) in bodies {
+            self.builder.position_at_end(body);
+            self.emit_str_match_group(pointer, length, group, vec![false; literal_len], otherwise)?;
+        }
+        Ok(())
+    }
+
+    fn emit_str_match_group(
+        &mut self,
+        pointer: PointerValue<'c>,
+        length: IntValue<'c>,
+        cases: Vec<(String, align_mir::BlockId)>,
+        used_offsets: Vec<bool>,
+        otherwise: BasicBlock<'c>,
+    ) -> Result<(), CodegenError> {
+        let entry = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| self.err("string match group has no insertion block"))?;
+        let mut work = vec![(entry, cases, used_offsets)];
+        while let Some((block, cases, mut used_offsets)) = work.pop() {
+            self.builder.position_at_end(block);
+            if cases.len() == 1 {
+                let (literal, target) = &cases[0];
+                self.emit_str_match_candidate(pointer, length, literal, *target, otherwise)?;
+                continue;
+            }
+            let Some((offset, _)) = (0..used_offsets.len())
+                .filter(|offset| !used_offsets[*offset])
+                .map(|offset| {
+                    let distinct = cases
+                        .iter()
+                        .map(|(literal, _)| literal.as_bytes()[offset])
+                        .collect::<HashSet<_>>()
+                        .len();
+                    (offset, distinct)
+                })
+                .max_by_key(|(offset, distinct)| (*distinct, std::cmp::Reverse(*offset)))
+            else {
+                return Err(self.err("string match contains indistinguishable duplicate literals"));
+            };
+            used_offsets[offset] = true;
+            let offset_u64 = u64::try_from(offset)
+                .map_err(|_| self.err("string match byte offset is not representable"))?;
+            let byte_pointer = unsafe {
+                self.builder
+                    .build_in_bounds_gep(
+                        self.ctx.i8_type(),
+                        pointer,
+                        &[self.ctx.i64_type().const_int(offset_u64, false)],
+                        "strmatch.byte.ptr",
+                    )
+                    .map_err(|error| self.err(error))?
+            };
+            let load = self
+                .builder
+                .build_load(self.ctx.i8_type(), byte_pointer, "strmatch.byte")
+                .map_err(|error| self.err(error))?;
+            if let Some(instruction) = load.as_instruction_value() {
+                instruction
+                    .set_alignment(1)
+                    .map_err(|_| self.err("set string-match byte-load alignment"))?;
+            }
+            let byte = load.into_int_value();
+            let mut groups = BTreeMap::<u8, Vec<(String, align_mir::BlockId)>>::new();
+            for case in cases {
+                groups.entry(case.0.as_bytes()[offset]).or_default().push(case);
+            }
+            let mut switch_cases = Vec::with_capacity(groups.len());
+            let mut bodies = Vec::with_capacity(groups.len());
+            for (discriminator, group) in groups {
+                let body = self.ctx.append_basic_block(self.func, "strmatch.byte.case");
+                switch_cases.push((self.ctx.i8_type().const_int(u64::from(discriminator), false), body));
+                bodies.push((body, group, used_offsets.clone()));
+            }
+            self.builder
+                .build_switch(byte, otherwise, &switch_cases)
+                .map_err(|error| self.err(error))?;
+            work.extend(bodies.into_iter().rev());
+        }
+        Ok(())
+    }
+
+    fn emit_str_match_candidate(
+        &mut self,
+        pointer: PointerValue<'c>,
+        length: IntValue<'c>,
+        literal: &str,
+        target: align_mir::BlockId,
+        otherwise: BasicBlock<'c>,
+    ) -> Result<(), CodegenError> {
+        let target = self.mir_block(target, "string match literal")?;
+        let (literal_pointer, literal_length) = self.str_global(literal);
+        let equal = self
+            .builder
+            .build_call(
+                self.runtime(RuntimeKey::StrEq),
+                &[
+                    pointer.into(),
+                    length.into(),
+                    literal_pointer.into(),
+                    literal_length.into(),
+                ],
+                "strmatch.eq",
+            )
+            .map_err(|error| self.err(error))?
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| self.err("string equality returned no value"))?
+            .into_int_value();
+        let matched = self
+            .builder
+            .build_int_compare(IntPredicate::NE, equal, self.ctx.i32_type().const_zero(), "strmatch.matched")
+            .map_err(|error| self.err(error))?;
+        self.builder
+            .build_conditional_branch(matched, target, otherwise)
+            .map_err(|error| self.err(error))?;
+        Ok(())
     }
 
     /// Clone every view-bearing leaf of a checked `RegionPlain` value into `handle`. The explicit

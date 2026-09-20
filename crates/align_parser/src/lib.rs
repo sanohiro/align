@@ -1861,7 +1861,7 @@ impl<'a> Parser<'a> {
     }
 
     fn at_value_pattern(&self) -> bool {
-        matches!(self.peek(), TokKind::Int(_) | TokKind::Char(_))
+        matches!(self.peek(), TokKind::Int(_) | TokKind::Char(_) | TokKind::Str(_))
             || (self.peek() == &TokKind::Minus && matches!(self.peek_at(1), TokKind::Int(_)))
     }
 
@@ -1888,8 +1888,12 @@ impl<'a> Parser<'a> {
             let span = self.span();
             self.bump();
             Some((LiteralPat::Char(c), span))
+        } else if matches!(self.peek(), TokKind::Str(_)) {
+            let token = self.bump();
+            let TokKind::Str(value) = token.kind else { return None };
+            Some((LiteralPat::Str(value), token.span))
         } else {
-            self.diags.error("expected integer or character literal in pattern".to_string(), self.span());
+            self.diags.error("expected integer, character, or string literal in pattern".to_string(), self.span());
             None
         }
     }
@@ -1901,6 +1905,7 @@ impl<'a> Parser<'a> {
             Some(ValuePattern::Range {
                 start: start_lit,
                 end: end_lit,
+                inclusive: true,
                 span: start_span.merge(end_span),
             })
         } else if self.eat(&TokKind::DotDot) {
@@ -1912,6 +1917,7 @@ impl<'a> Parser<'a> {
             Some(ValuePattern::Range {
                 start: start_lit,
                 end: end_lit,
+                inclusive: false,
                 span: start_span.merge(end_span),
             })
         } else {

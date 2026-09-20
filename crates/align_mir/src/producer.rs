@@ -5,7 +5,7 @@
 
 use align_ast::{BinOp, UnOp};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use crate::{Block, QueryMetaTypes, CanonicalTy, Const, ConstElem, DirectCall, Function,
+use crate::{Block, BlockId, QueryMetaTypes, CanonicalTy, Const, ConstElem, DirectCall, Function,
     Operand, Program, ProgramCall, RuntimeKey, Rvalue, Slot, Stmt, Term, ValueId};
 use align_sema::{ArrayBuilderElem, ERROR_VARIANT_CODE, FloatTy,
     IntTy, Layout, Scalar, StructDef, Ty, hir, scalar_to_ty};
@@ -7733,6 +7733,7 @@ pub fn validate_mir_producers(program: &Program) -> Result<HashSet<String>, Prod
     validate_tagged_program(program)?;
     validate_resource_program(program)?;
     validate_slice_index_rvalues(program)?;
+    validate_str_match_terminators(program)?;
     validate_fixed_element_nulling(program)?;
     // Publication certifies the typed producer graph, not final native codegen.
     // Generated callback/parallel-kernel preflight runs at emission, after the
@@ -8218,7 +8219,7 @@ fn validate_resource_rvalues_component(
                     }
                     (None, None)
                 }
-                Term::Goto(_) | Term::Branch(..) | Term::Unreachable => (None, None),
+                Term::Goto(_) | Term::Branch(..) | Term::StrMatch { .. } | Term::Unreachable => (None, None),
             };
             if let Some(returned) = returned
             {
@@ -10697,6 +10698,119 @@ pub fn validate_slice_index_rvalues(program: &Program) -> Result<(), ProducerErr
     Ok(())
 }
 
+/// Reject malformed exact-string dispatch before LLVM builds target blocks or reads a text header.
+/// The semantic record is intentionally closed: one live text operand, at least one unique decoded
+/// literal, and only in-range block targets including the required wildcard target.
+pub fn validate_str_match_terminators(program: &Program) -> Result<(), ProducerError> {
+    for function in &program.fns {
+        let block_count = function.blocks.len();
+        for block in &function.blocks {
+            let Term::StrMatch { scrutinee, cases, otherwise } = &block.term else {
+                continue;
+            };
+            if !matches!(preflight_operand_ty(function, scrutinee), Some(Ty::Str | Ty::String)) {
+                return Err(ProducerError::Lowering(format!(
+                    "string match in function '{}' has a non-text scrutinee",
+                    function.name
+                )));
+            }
+            if !str_match_operand_dominates(function, scrutinee, block.id) {
+                return Err(ProducerError::Lowering(format!(
+                    "string match in function '{}' has a non-dominating scrutinee",
+                    function.name
+                )));
+            }
+            if cases.is_empty()
+                || usize::try_from(*otherwise).ok().is_none_or(|target| target >= block_count)
+            {
+                return Err(ProducerError::Lowering(format!(
+                    "string match in function '{}' has no cases or an invalid wildcard target",
+                    function.name
+                )));
+            }
+            let mut seen = HashSet::new();
+            for (value, target) in cases {
+                if !seen.insert(value)
+                    || usize::try_from(*target).ok().is_none_or(|target| target >= block_count)
+                {
+                    return Err(ProducerError::Lowering(format!(
+                        "string match in function '{}' has a duplicate literal or invalid target",
+                        function.name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A string dispatch may read only an argument or one exactly-once SSA definition that dominates
+/// the terminator. This is intentionally independent of LLVM's verifier: cached or handcrafted MIR
+/// must fail before backend construction rather than publish an invalid cross-block SSA use.
+fn str_match_operand_dominates(function: &Function, operand: &Operand, use_block: BlockId) -> bool {
+    let definition = match operand {
+        Operand::Arg(index) => {
+            return usize::try_from(*index)
+                .ok()
+                .is_some_and(|index| function.params.get(index).is_some());
+        }
+        Operand::Value(value) => {
+            let mut definition = None;
+            for block in &function.blocks {
+                for statement in &block.stmts {
+                    if matches!(statement, Stmt::Let(candidate, _) if candidate == value)
+                        && definition.replace(block.id).is_some()
+                    {
+                        return false;
+                    }
+                }
+            }
+            let Some(definition) = definition else { return false };
+            definition
+        }
+        _ => return false,
+    };
+    if definition == use_block {
+        return true;
+    }
+    let Some(reaches_use) = mir_block_reachable_avoiding(function, use_block, None) else {
+        return false;
+    };
+    let Some(reaches_without_definition) =
+        mir_block_reachable_avoiding(function, use_block, Some(definition))
+    else {
+        return false;
+    };
+    reaches_use && !reaches_without_definition
+}
+
+fn mir_block_reachable_avoiding(
+    function: &Function,
+    target: BlockId,
+    avoided: Option<BlockId>,
+) -> Option<bool> {
+    let mut seen = vec![false; function.blocks.len()];
+    let mut pending = vec![function.entry];
+    while let Some(block) = pending.pop() {
+        if avoided == Some(block) {
+            continue;
+        }
+        let index = usize::try_from(block).ok()?;
+        if std::mem::replace(seen.get_mut(index)?, true) {
+            continue;
+        }
+        let record = function.blocks.get(index)?;
+        if record.id != block {
+            return None;
+        }
+        if block == target {
+            return Some(true);
+        }
+        pending.extend(crate::byte_ranges::successors(&record.term));
+    }
+    Some(false)
+}
+
 /// Reject a malformed fixed-record resource nulling statement before LLVM indexes a slot, record,
 /// or field table. This statement is emitted only after moving a canonical `pkg.template`
 /// resource leaf out of a source-formed fixed record array.
@@ -10983,6 +11097,126 @@ mod tests {
         assert!(validate_mir_producers(&duplicate).is_err(), "duplicate producer identity");
         assert_eq!(ProducerError::Lowering("invalid producer".to_owned()).to_string(),
             "lowering failed: invalid producer");
+    }
+
+    #[test]
+    fn malformed_string_match_terminators_fail_before_codegen() {
+        let mut diagnostics = align_diag::Diagnostics::new();
+        let source = "fn classify(value: str) -> i32 = match value { \"a\" => 1, \"b\" => 2, _ => 0 }\nfn main() -> i32 = 0\n";
+        let tokens = align_lexer::tokenize(0, source, &mut diagnostics);
+        let ast = align_parser::parse_file(tokens, &mut diagnostics);
+        let hir = align_sema::check_file(&ast, &mut diagnostics);
+        assert!(!diagnostics.has_errors());
+        let program = crate::lower_program(&hir);
+        assert!(validate_str_match_terminators(&program).is_ok(), "valid string match");
+
+        let mutate = |program: &mut Program, edit: fn(&mut Term, usize)| {
+            let function = program
+                .fns
+                .iter_mut()
+                .find(|function| function.name.as_str() == "classify")
+                .unwrap_or_else(|| panic!("classify function"));
+            let block_count = function.blocks.len();
+            let term = function
+                .blocks
+                .iter_mut()
+                .map(|block| &mut block.term)
+                .find(|term| matches!(term, Term::StrMatch { .. }))
+                .unwrap_or_else(|| panic!("string match terminator"));
+            edit(term, block_count);
+        };
+
+        let edits: [fn(&mut Term, usize); 4] = [
+            |term, _| {
+                let Term::StrMatch { scrutinee, .. } = term else { panic!("string match") };
+                *scrutinee = Operand::Const(Const::Int(0, Ty::Int(align_sema::IntTy { bits: 64, signed: true })));
+            },
+            |term, _| {
+                let Term::StrMatch { cases, .. } = term else { panic!("string match") };
+                cases.clear();
+            },
+            |term, _| {
+                let Term::StrMatch { cases, .. } = term else { panic!("string match") };
+                cases.push(cases[0].clone());
+            },
+            |term, block_count| {
+                let Term::StrMatch { otherwise, .. } = term else { panic!("string match") };
+                *otherwise = u32::try_from(block_count)
+                    .unwrap_or_else(|_| panic!("block count"));
+            },
+        ];
+        for edit in edits {
+            let mut malformed = program.clone();
+            mutate(&mut malformed, edit);
+            assert!(validate_str_match_terminators(&malformed).is_err());
+            assert!(validate_mir_producers(&malformed).is_err());
+        }
+
+        let mut non_dominating = program.clone();
+        let function = non_dominating
+            .fns
+            .iter_mut()
+            .find(|function| function.name.as_str() == "classify")
+            .unwrap_or_else(|| panic!("classify function"));
+        let (scrutinee, target) = function
+            .blocks
+            .iter()
+            .find_map(|block| match &block.term {
+                Term::StrMatch { scrutinee, cases, .. } => {
+                    cases.first().map(|(_, target)| (scrutinee.clone(), *target))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("string match terminator"));
+        let value = u32::try_from(function.value_tys.len())
+            .unwrap_or_else(|_| panic!("value count"));
+        function.value_tys.push(Ty::Str);
+        let target_index = usize::try_from(target).unwrap_or_else(|_| panic!("target block"));
+        function.blocks[target_index]
+            .stmts
+            .push(Stmt::Let(value, Rvalue::Use(scrutinee)));
+        let term = function
+            .blocks
+            .iter_mut()
+            .map(|block| &mut block.term)
+            .find(|term| matches!(term, Term::StrMatch { .. }))
+            .unwrap_or_else(|| panic!("string match terminator"));
+        let Term::StrMatch { scrutinee, .. } = term else { panic!("string match") };
+        *scrutinee = Operand::Value(value);
+        assert!(validate_str_match_terminators(&non_dominating).is_err());
+        assert!(validate_mir_producers(&non_dominating).is_err());
+
+        let mut duplicate_definition = program.clone();
+        let function = duplicate_definition
+            .fns
+            .iter_mut()
+            .find(|function| function.name.as_str() == "classify")
+            .unwrap_or_else(|| panic!("classify function"));
+        let (term_block, original, target) = function
+            .blocks
+            .iter()
+            .find_map(|block| match &block.term {
+                Term::StrMatch { scrutinee, cases, .. } => cases
+                    .first()
+                    .map(|(_, target)| (block.id, scrutinee.clone(), *target)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("string match terminator"));
+        let value = u32::try_from(function.value_tys.len())
+            .unwrap_or_else(|_| panic!("value count"));
+        function.value_tys.push(Ty::Str);
+        for block in [term_block, target] {
+            let index = usize::try_from(block).unwrap_or_else(|_| panic!("block id"));
+            function.blocks[index]
+                .stmts
+                .push(Stmt::Let(value, Rvalue::Use(original.clone())));
+        }
+        let term = &mut function.blocks[usize::try_from(term_block)
+            .unwrap_or_else(|_| panic!("term block"))].term;
+        let Term::StrMatch { scrutinee, .. } = term else { panic!("string match") };
+        *scrutinee = Operand::Value(value);
+        assert!(validate_str_match_terminators(&duplicate_definition).is_err());
+        assert!(validate_mir_producers(&duplicate_definition).is_err());
     }
 
     #[test]

@@ -3132,6 +3132,13 @@ pub enum ConstElem {
 pub enum Term {
     Goto(BlockId),
     Branch(Operand, BlockId, BlockId),
+    /// Exact string-literal dispatch. Cases are unique decoded UTF-8 values in source order;
+    /// `otherwise` is the required wildcard arm. The scrutinee is read, never consumed.
+    StrMatch {
+        scrutinee: Operand,
+        cases: Vec<(String, BlockId)>,
+        otherwise: BlockId,
+    },
     Return(Option<Operand>),
     /// Return a recursively Move value and its path-selected ownership bit atomically.
     ReturnWithCleanup(Box<(Operand, Operand)>),
@@ -4843,6 +4850,13 @@ fn simplify_drop_state(f: &mut Function) {
                     && all_paths_leave_slot_unread(f, *then_block, 0, slot, visiting)
                     && all_paths_leave_slot_unread(f, *else_block, 0, slot, visiting)
             }
+            Term::StrMatch { scrutinee, cases, otherwise } => {
+                !operand_mentions_slot(scrutinee, slot)
+                    && cases.iter().all(|(_, target)| {
+                        all_paths_leave_slot_unread(f, *target, 0, slot, visiting)
+                    })
+                    && all_paths_leave_slot_unread(f, *otherwise, 0, slot, visiting)
+            }
             Term::Unreachable => true,
         };
         visiting.remove(&block_id);
@@ -4942,6 +4956,12 @@ fn simplify_drop_state(f: &mut Function) {
                 propagate(*then_bb);
                 propagate(*else_bb);
             }
+            (Term::StrMatch { cases, otherwise, .. }, _) => {
+                for (_, target) in cases {
+                    propagate(*target);
+                }
+                propagate(*otherwise);
+            }
             (Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable, _) => {}
         }
     }
@@ -4981,6 +5001,10 @@ fn simplify_drop_state(f: &mut Function) {
                 pending.push(then_bb);
                 pending.push(else_bb);
             }
+            Term::StrMatch { ref cases, otherwise, .. } => {
+                pending.extend(cases.iter().map(|(_, target)| *target));
+                pending.push(otherwise);
+            }
             Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => {}
         }
     }
@@ -5006,6 +5030,20 @@ fn simplify_drop_state(f: &mut Function) {
             Term::Branch(_, then_bb, else_bb) => {
                 *then_bb = remap[*then_bb as usize];
                 *else_bb = remap[*else_bb as usize];
+            }
+            Term::StrMatch { cases, otherwise, .. } => {
+                for (_, target) in cases {
+                    if let Ok(index) = usize::try_from(*target)
+                        && let Some(mapped) = remap.get(index)
+                    {
+                        *target = *mapped;
+                    }
+                }
+                if let Ok(index) = usize::try_from(*otherwise)
+                    && let Some(mapped) = remap.get(index)
+                {
+                    *otherwise = *mapped;
+                }
             }
             Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => {}
         }
@@ -5769,6 +5807,12 @@ impl Builder {
                 Term::Branch(_, then_bb, else_bb) => {
                     mark(*then_bb);
                     mark(*else_bb);
+                }
+                Term::StrMatch { cases, otherwise, .. } => {
+                    for (_, target) in cases {
+                        mark(*target);
+                    }
+                    mark(*otherwise);
                 }
                 Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => {}
             }
@@ -23017,6 +23061,19 @@ fn lower_match(
                 borrow_result,
             ),
         ),
+        Ty::Str | Ty::String => lower_match_string(
+            b,
+            arms,
+            &scrut,
+            (
+                result_slot,
+                result_flag,
+                result_temp_flag,
+                join_bb,
+                borrow_result,
+                scrut_owner,
+            ),
+        ),
         Ty::Enum(enum_id) => lower_match_enum(
                 b,
                 enum_id,
@@ -23049,7 +23106,7 @@ fn lower_match(
                 scrutinee,
                 scrut_flag,
         ),
-        // Guarded by sema (`match` requires a sum type or integer/char); be defensive rather than panic.
+        // Guarded by sema (`match` requires a sum type or a supported value domain); be defensive rather than panic.
         _ => b.terminate(Term::Goto(join_bb)),
     }
     b.cur = join_bb;
@@ -23057,6 +23114,69 @@ fn lower_match(
         return Operand::Const(Const::Unit);
     }
     load_control_result(b, ty, result_slot, result_flag, result_temp_flag)
+}
+
+/// An exact `str`/`string` match. MIR retains the literal-to-target relation; LLVM chooses the
+/// deterministic length/byte decision tree. Selection borrows the scrutinee. A synthetic owner for
+/// a fresh `string` is discharged after selection and before the selected arm body.
+fn lower_match_string(
+    b: &mut Builder,
+    arms: &[hir::MatchArm],
+    scrut: &Operand,
+    target: (
+        Option<Slot>,
+        Option<Slot>,
+        Option<Slot>,
+        BlockId,
+        bool,
+        Option<Slot>,
+    ),
+) {
+    let (result_slot, result_flag, result_temp_flag, join_bb, borrow_result, scrut_owner) = target;
+    if arms.is_empty() {
+        b.terminate(Term::Goto(join_bb));
+        return;
+    }
+
+    let default_idx = arms
+        .iter()
+        .position(|arm| arm.values.is_empty())
+        .unwrap_or(arms.len().saturating_sub(1));
+    let arm_blocks: Vec<BlockId> = (0..arms.len()).map(|_| b.new_block()).collect();
+    let mut cases = Vec::new();
+    for (arm_index, arm) in arms.iter().enumerate() {
+        if arm_index == default_idx {
+            continue;
+        }
+        for pattern in &arm.values {
+            if let hir::HirValuePattern::Str(value) = pattern {
+                cases.push((value.clone(), arm_blocks[arm_index]));
+            }
+        }
+    }
+    if cases.is_empty() {
+        b.terminate(Term::Goto(arm_blocks[default_idx]));
+    } else {
+        b.terminate(Term::StrMatch {
+            scrutinee: scrut.clone(),
+            cases,
+            otherwise: arm_blocks[default_idx],
+        });
+    }
+
+    for (arm, block) in arms.iter().zip(arm_blocks) {
+        b.cur = block;
+        discharge_match_scrutinee(b, scrut_owner, false, true);
+        finish_arm(
+            b,
+            &arm.body,
+            result_slot,
+            result_flag,
+            result_temp_flag,
+            join_bb,
+            borrow_result,
+        );
+    }
 }
 
 /// Whether a fresh match scrutinee structurally consumes a bound source into the hidden owner.
@@ -23512,6 +23632,9 @@ fn lower_match_value(
                             Rvalue::Bin(BinOp::Le, scrut.clone(), make_const(*end)),
                         ));
                         b.terminate(Term::Branch(Operand::Value(le), arm_bb, on_pat_fail));
+                    }
+                    hir::HirValuePattern::Str(_) => {
+                        b.terminate(Term::Goto(on_pat_fail));
                     }
                 }
 
@@ -24039,6 +24162,52 @@ mod tests {
             d.iter().map(|diag| &diag.message).collect::<Vec<_>>()
         );
         lower_program(&hir)
+    }
+
+    #[test]
+    fn malformed_checked_hir_string_matches_fail_closed() {
+        let mut diagnostics = Diagnostics::new();
+        let tokens = tokenize(
+            0,
+            "fn classify(value: str) -> i32 = match value { \"a\" => 1, \"b\" => 2, _ => 0 }\nfn main() -> i32 = 0\n",
+            &mut diagnostics,
+        );
+        let file = parse_file(tokens, &mut diagnostics);
+        let checked = check_file(&file, &mut diagnostics);
+        assert!(!diagnostics.has_errors());
+        assert!(validate_hir::body_only_metadata_is_valid(&checked));
+
+        let mutate = |program: &mut hir::Program, edit: fn(&mut Vec<hir::MatchArm>)| {
+            let function = program
+                .fns
+                .iter_mut()
+                .find(|function| function.name == "classify")
+                .unwrap_or_else(|| panic!("classify function"));
+            let expression = function
+                .body
+                .value
+                .as_deref_mut()
+                .unwrap_or_else(|| panic!("expression body"));
+            let hir::ExprKind::Match { arms, .. } = &mut expression.kind else {
+                panic!("string match body");
+            };
+            edit(arms);
+        };
+
+        let edits: [fn(&mut Vec<hir::MatchArm>); 4] = [
+            |arms| {
+                assert!(arms.pop().is_some(), "wildcard arm");
+            },
+            |arms| arms[1].values[0] = hir::HirValuePattern::Str("a".to_owned()),
+            |arms| arms[0].values[0] = hir::HirValuePattern::Single(1),
+            |arms| arms[0].bindings.push(0),
+        ];
+        for edit in edits {
+            let mut malformed = checked.clone();
+            mutate(&mut malformed, edit);
+            assert!(!validate_hir::body_only_metadata_is_valid(&malformed));
+            assert!(lower_program_checked(&malformed, false, None).is_err());
+        }
     }
 
     #[test]
@@ -27371,11 +27540,18 @@ fn main() -> i32 = 0
                 if std::mem::replace(&mut reached[block as usize], true) {
                     continue;
                 }
-                match function.blocks[block as usize].term {
+                let Ok(index) = usize::try_from(block) else {
+                    return vec![false; function.blocks.len()];
+                };
+                match function.blocks[index].term {
                     Term::Goto(target) => pending.push(target),
                     Term::Branch(_, then_block, else_block) => {
                         pending.push(then_block);
                         pending.push(else_block);
+                    }
+                    Term::StrMatch { ref cases, otherwise, .. } => {
+                        pending.extend(cases.iter().map(|(_, target)| *target));
+                        pending.push(otherwise);
                     }
                     Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => {}
                 }
@@ -27407,6 +27583,15 @@ fn main() -> i32 = 0
                         Term::Goto(next) => inevitable[next as usize],
                         Term::Branch(_, then_block, else_block) => {
                             inevitable[then_block as usize] && inevitable[else_block as usize]
+                        }
+                        Term::StrMatch { ref cases, otherwise, .. } => {
+                            let Ok(otherwise) = usize::try_from(otherwise) else { return false };
+                            inevitable[otherwise]
+                                && cases.iter().all(|(_, target)| usize::try_from(*target)
+                                    .ok()
+                                    .and_then(|target| inevitable.get(target))
+                                    .copied()
+                                    .unwrap_or(false))
                         }
                         Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => false,
                     };
@@ -27719,6 +27904,9 @@ fn main() -> i32 = 0
                     Term::Branch(_, then_block, else_block) => {
                         then_block == drop.0 || else_block == drop.0
                     }
+                    Term::StrMatch { ref cases, otherwise, .. } => {
+                        otherwise == drop.0 || cases.iter().any(|(_, target)| *target == drop.0)
+                    }
                     Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => false,
                 })
                 .collect::<Vec<_>>();
@@ -27763,6 +27951,9 @@ fn main() -> i32 = 0
                 }
                 Term::Branch(_, _, _) => {
                     panic!("cleanup guard must branch on an SSA flag value:\n{rendered}")
+                }
+                Term::StrMatch { .. } => {
+                    panic!("cleanup guard must not be a string dispatch:\n{rendered}")
                 }
             }
             CleanupEdge {
@@ -28893,6 +29084,10 @@ fn main() -> i32 = 0
                     Term::Branch(_, then_block, else_block) => {
                         then_block == trap_block.id || else_block == trap_block.id
                     }
+                    Term::StrMatch { ref cases, otherwise, .. } => {
+                        otherwise == trap_block.id
+                            || cases.iter().any(|(_, target)| *target == trap_block.id)
+                    }
                     Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => false,
                 })
                 .collect::<Vec<_>>();
@@ -29298,6 +29493,9 @@ fn main() -> i32 = 0
                     Term::Goto(target) => target == success,
                     Term::Branch(_, then_block, else_block) => {
                         then_block == success || else_block == success
+                    }
+                    Term::StrMatch { ref cases, otherwise, .. } => {
+                        otherwise == success || cases.iter().any(|(_, target)| *target == success)
                     }
                     Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => false,
                 })

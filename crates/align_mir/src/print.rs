@@ -233,6 +233,14 @@ fn block_to_string(out: &mut String, b: &Block) {
         Term::Branch(c, t, e) => {
             let _ = writeln!(out, "    branch {} ? bb{t} : bb{e}", operand_str(c));
         }
+        Term::StrMatch { scrutinee, cases, otherwise } => {
+            let rendered = cases
+                .iter()
+                .map(|(value, target)| format!("{value:?} => bb{target}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(out, "    str_match {} [{rendered}] else bb{otherwise}", operand_str(scrutinee));
+        }
         Term::Return(Some(op)) => {
             let _ = writeln!(out, "    return {}", operand_str(op));
         }
