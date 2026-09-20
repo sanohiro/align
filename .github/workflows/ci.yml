@@ -579,7 +579,7 @@ jobs:
         shell: bash
         run: >
           scripts/run-quiet.sh "CI test: codegen performance contracts" --
-          scripts/test-codegen-performance.sh
+          scripts/test-codegen-performance.sh --ci-core
 
       - name: Native process and signal regressions
         if: matrix.scope != 'light'

@@ -2762,3 +2762,31 @@ combines one codegen unit with thin LTO, completed in 12.38 s and retained both 
 codegen. Plan 70's compiler-emitted fast path removes the runtime call from capacity-available
 scalar iterations. Any future archive-only change needs a new measured Rust-source strategy; inline
 attributes remain outside this capability's contract.
+
+## Item 10: Codegen owner scope in PR CI
+
+PR #1147 measured the full Linux x86_64 leg at 10m29s. Its three largest
+repository-controlled steps were the PR-workflow self-test (about 80s), the
+unconditional codegen owner bundle (185s), and the bounded gate (205s: 12s
+workspace build, 109s test-binary build, 83s execution). The codegen bundle had
+grown by accumulation: its introducing change needed the binary-codec and CPU
+owners, then later changes appended native return transport, but every full
+code-tier PR thereafter ran all ten targets on Linux x86_64, Linux ARM64, and
+macOS. It also began with `cargo build --workspace`; that was a duplicate after
+the explicit workspace-build step on the non-lint legs and broader than the
+selected owners on the lint leg.
+
+The recurring PR subset is now the target-dependent cross-platform contract:
+native aggregate return transport, CLI CPU-value admission, target/triple and
+native execution, ISA selection, function ThinLTO, the entry ABI, and runtime
+LTO. Profile selection, the x86-only `emit-llvm`/`explain-opt` owners, and the
+platform-independent binary-codec suite stay in the script's default full mode
+for a change that owns those boundaries; the nightly full-suite remains their
+out-of-gate detector. CI requests `--ci-core`. Neither mode performs a separate
+workspace build: Cargo builds the exact selected test targets and dependencies.
+
+`scripts/test-pr-workflow.sh` pins the workflow's explicit `--ci-core` spelling,
+the script's Bash syntax, and fail-closed rejection of an unknown mode. The
+first PR run after this change records the codegen step and complete job timings
+on all three platforms. This item makes no runtime-performance claim and adds
+no benchmark or timeout.
