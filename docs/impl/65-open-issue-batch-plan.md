@@ -616,12 +616,59 @@ level is part of none — a kernel patch bump alone no longer invalidates the
 build cache. No key format version changes: the triple component simply carries
 a different, correct string, so a stale entry misses rather than falsely hits.
 
-**Deliberately not closed:** `LC_BUILD_VERSION`'s `sdk` field stays `n/a` in
-`alignc`-produced objects. A truthful SDK version needs an SDK provenance source
-(`xcrun --show-sdk-version`), which is ambient toolchain configuration this
-contract does not name and would add a subprocess to every compile. The linked
-image still carries the linker's SDK version. Resume this when the compiler
-gains an explicit SDK selector.
+### Explicit SDK provenance (issue 1093)
+
+`LC_BUILD_VERSION`'s `sdk` field is provenance, not a deployment constraint.
+The compiler records it only when the invocation explicitly supplies
+`--sdk-version <version>`. Omission preserves the old behavior byte-for-byte:
+objects carry no SDK module flag and therefore report `sdk n/a`; the linker
+continues to choose and record the SDK for a linked image. The selector does not
+choose a sysroot, add headers or libraries, or alter the deployment target.
+
+There is deliberately no `--sdk <path>`, `SDKROOT`, `xcrun`, filesystem probe,
+or other fallback. Align does not consume SDK headers, and deriving a version
+from ambient toolchain state would hide a build input and add work to every
+compile. A build system that selected an SDK states the corresponding version
+at the same visible invocation boundary.
+
+The accepted grammar is `major`, `major.minor`, or `major.minor.patch`, all
+decimal. It canonicalizes to the three unsigned components that Mach-O actually
+encodes. `major` is in `1..=65535`; `minor` and `patch` are in `0..=255`.
+Leading zeroes and omitted trailing components do not create distinct
+identities (`027.0` and `27` both become `27.0.0`). Empty, signed,
+non-numeric, overlong, embedded-NUL, or out-of-range values are hard argument
+errors naming `--sdk-version`. A following option is a missing value, and a
+repeated flag follows the CLI's existing last-value rule. An explicit value on
+a non-Apple target is a hard error. Validation and installation happen before
+source, cache, or artifact work and before any module can freeze the process
+identity; a direct API caller may repeat the same canonical value but cannot
+install a different or late value.
+
+For every compiler-created LLVM module, including per-unit, test-harness,
+runtime-LTO, and ThinLTO prelink/backend paths, the selected value is the LLVM
+module flag `!"SDK Version"` with warning merge behavior and an exact
+`[3 x i32] [major, minor, patch]` payload. That is LLVM's input to the Mach-O
+writer's packed SDK field. Modules on non-Apple targets and modules built with
+no selector carry no such flag. Runtime bitcode supplies no competing value;
+the program module owns the selected provenance before any merge.
+
+#### SDK-version public-contract ledger
+
+| Surface | Exact contract | Owner and acceptance |
+| --- | --- | --- |
+| CLI | `--sdk-version VERSION`, accepted anywhere in the compiler-option prefix and by every verb that can reach codegen. No default, environment layer, path selector, subprocess, or filesystem input. | Driver parser owners reject missing/empty/NUL/option-shaped values before positional parsing; CLI process tests reject non-Apple use before source I/O. |
+| Value | Owned canonical triple `(u16, u8, u8)` plus canonical cache spelling `major.minor.patch`; grammar and ranges are fixed above. No borrowed lifetime crosses the parser/target boundary and resolution allocates at most the canonical string once per process. | Target-identity unit owners cover omitted components, leading zeroes, all bounds, malformed components, and deterministic first validation failure. |
+| LLVM IR | When selected, every emitted module contains exactly one warning-behavior `SDK Version` flag with a three-element `i32` array; when absent it contains none. The flag is installed before runtime-bitcode merge and survives raw/optimized IR, ordinary object emission, test harnesses, and ThinLTO. | Codegen raw-IR owner checks the exact semantic flag; the existing module-path owners plus native object acceptance cover the shared constructor. |
+| Mach-O | The object writer packs the selected components into `LC_BUILD_VERSION.sdk`; `otool -l` reports the selected semantic version. `minos`, target triple, ABI, and linking are unchanged. No value is written for ELF or other formats. | Native macOS `emit-obj` integration owner checks `otool -l`; absence owner keeps `sdk n/a`. No benchmark: this is metadata correctness with no performance promise. |
+| Cache | `sdk_version: Option<String>` is hashed immediately after `target_triple` in the codegen, ThinLTO prelink, and ThinLTO backend keys. `None` and each canonical value are distinct. The frontend `UnitKey` excludes it because checked HIR is unchanged. Cache-key and manifest format versions advance together; decoders reject old/unknown layouts rather than reinterpret bytes. | Cache semantic-difference owners cover `None`/`Some` and changed versions; byte-golden/round-trip owners pin field order for ordinary, prelink, and backend manifests. |
+| Failure/side effects | CLI lexical validation precedes all other strippers; semantic/range/platform validation precedes source reads, cache lookup, module creation, or output creation. When several SDK components are invalid, validation reports the first component from left to right; shape/count errors precede numeric range errors. | Parser and target-identity negative owners assert the named layer and absence of output. |
+| Documentation | This ledger owns the implementation contract; the toolchain guide and its Japanese mirror expose the user surface, and `docs/open-questions.md` records the settled no-ambient-input decision. | Author consistency pass plus one independent adversarial review before implementation. |
+
+The implementation closure is correspondingly small: parse and install the
+optional value; carry it through the resolved target; stamp the shared module
+constructor; include it in all three object-producing cache identities and
+their codecs; verify ordinary and ThinLTO paths. There is no ownership, FFI,
+cleanup, runtime ABI, or language-semantic change.
 
 ### Inspection roots
 

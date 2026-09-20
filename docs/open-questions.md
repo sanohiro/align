@@ -2669,6 +2669,14 @@ module triple, the link flag and the cache key all derive from that one string,
 so the OS patch level is not a build input and the deployment target is.
 `docs/impl/65-open-issue-batch-plan.md` owns the exact rule.
 
+Apple SDK provenance is also explicit but is not a deployment constraint.
+`--sdk-version major[.minor[.patch]]` records the selected value in
+`LC_BUILD_VERSION` and in every object-producing cache identity. Omission keeps
+the field unspecified; there is no `SDKROOT`, `xcrun`, SDK-path, or other
+ambient fallback, and the option does not select a sysroot or affect linking.
+The same implementation-plan section owns the exact grammar, encoding, and
+validation order.
+
 **Decision: the default build targets a safe, portable, per-architecture baseline; anything more is
 opt-in; wide SIMD on a varied fleet comes from runtime dispatch in the library, not a fixed high
 baseline.** Driven by the real deployment model — cloud VMs and containers are *build-once, run on an
