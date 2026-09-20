@@ -11971,10 +11971,10 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        // StrCharBoundary, ArrayTruncate, BytesSet, BytesFill, BytesCopyFrom, BufferAppendFilled
-        // are explicit in validation, source-shape, replay and ownership.
+        // StrCharBoundary, ArrayTruncate, BytesSet, BytesFill, BytesCopyFrom, BufferAppendFilled,
+        // and FloatScope are explicit in validation, source-shape, replay and ownership.
         variants,
-        338,
+        339,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }

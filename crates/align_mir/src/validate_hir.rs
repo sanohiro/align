@@ -3353,7 +3353,7 @@ fn float_relaxation_ty(ty: Ty) -> bool {
 }
 
 fn exact_float_mode(actual: hir::FloatMode, expected: hir::FloatMode) -> bool {
-    !actual.has_unknown() && actual == expected
+    !actual.has_unknown() && (actual.bits ^ expected.bits) == 0
 }
 
 impl<'a> BodyValidator<'a> {
