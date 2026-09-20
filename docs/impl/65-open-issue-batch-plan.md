@@ -664,6 +664,16 @@ the program module owns the selected provenance before any merge.
 | Failure/side effects | CLI lexical validation precedes all other strippers; semantic/range/platform validation precedes source reads, cache lookup, module creation, or output creation. Validation order is empty/NUL/option-shaped value, total UTF-8 byte length (`>64`), component count and decimal shape, numeric range from left to right, then Apple platform applicability. | Parser and target-identity negative owners assert the named layer and absence of output. |
 | Documentation | This ledger owns the implementation contract; the toolchain guide and its Japanese mirror expose the user surface, and `docs/open-questions.md` records the settled no-ambient-input decision. | Author consistency pass plus one independent adversarial review before implementation. |
 
+#### SDK-version implementation closure matrix
+
+| Invariant | Implementation | Discriminating owner |
+| --- | --- | --- |
+| Component count and decimal shape are validated before any numeric range result. | `target_identity::parse_sdk_version` completes the shape pass before conversion. | `sdk_versions_reject_shape_length_and_packed_field_overflow` |
+| Numeric bounds are decided from major to minor to patch, including a later decimal component too wide for an intermediate integer type. | Each component is converted and checked against its final Mach-O field width before parsing advances. | `sdk_version_range_errors_follow_component_order` uses an invalid major followed by an oversized minor. |
+| Platform applicability and target-identity installation happen only after the canonical value is valid. | `set_sdk_version` parses first, checks the Apple target, then installs the process value. | Target-identity unit owners plus the non-Apple pre-source CLI owner. |
+| Every object-producing module carries the selected flag and omission carries none. | Shared module construction, test-harness construction, runtime-LTO merge, and ThinLTO support construction call `stamp_sdk_version`. | Raw-IR and native Mach-O `gate14c` rows; absence remains `sdk n/a`. |
+| Every object-producing cache identity separates omission and canonical values. | Codegen, ThinLTO prelink, and ThinLTO backend keys encode `sdk_version` immediately after the triple. | Semantic-difference, byte-golden, round-trip, and first-difference cache owners. |
+
 The implementation closure is correspondingly small: parse and install the
 optional value; carry it through the resolved target; stamp the shared module
 constructor; include it in all three object-producing cache identities and
