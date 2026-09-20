@@ -741,6 +741,7 @@ fn term_operands(term: &Term) -> Vec<&Operand> {
     match term {
         Term::Goto(_) | Term::Unreachable => Vec::new(),
         Term::Branch(cond, _, _) => vec![cond],
+        Term::StrMatch { scrutinee, .. } => vec![scrutinee],
         Term::Return(value) => value.iter().collect(),
         Term::ReturnWithCleanup(pair) => vec![&pair.0, &pair.1],
     }
@@ -750,6 +751,7 @@ fn term_operands_mut(term: &mut Term) -> Vec<&mut Operand> {
     match term {
         Term::Goto(_) | Term::Unreachable => Vec::new(),
         Term::Branch(cond, _, _) => vec![cond],
+        Term::StrMatch { scrutinee, .. } => vec![scrutinee],
         Term::Return(value) => value.iter_mut().collect(),
         Term::ReturnWithCleanup(pair) => vec![&mut pair.0, &mut pair.1],
     }
@@ -774,6 +776,11 @@ fn successors(term: &Term) -> Vec<BlockId> {
     match term {
         Term::Goto(target) => vec![*target],
         Term::Branch(_, yes, no) => vec![*yes, *no],
+        Term::StrMatch { cases, otherwise, .. } => cases
+            .iter()
+            .map(|(_, target)| *target)
+            .chain(std::iter::once(*otherwise))
+            .collect(),
         Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => Vec::new(),
     }
 }
@@ -782,6 +789,11 @@ fn term_targets_mut(term: &mut Term) -> Vec<&mut BlockId> {
     match term {
         Term::Goto(target) => vec![target],
         Term::Branch(_, yes, no) => vec![yes, no],
+        Term::StrMatch { cases, otherwise, .. } => cases
+            .iter_mut()
+            .map(|(_, target)| target)
+            .chain(std::iter::once(otherwise))
+            .collect(),
         Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => Vec::new(),
     }
 }

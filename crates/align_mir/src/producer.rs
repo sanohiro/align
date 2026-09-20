@@ -7733,6 +7733,7 @@ pub fn validate_mir_producers(program: &Program) -> Result<HashSet<String>, Prod
     validate_tagged_program(program)?;
     validate_resource_program(program)?;
     validate_slice_index_rvalues(program)?;
+    validate_str_match_terminators(program)?;
     validate_fixed_element_nulling(program)?;
     // Publication certifies the typed producer graph, not final native codegen.
     // Generated callback/parallel-kernel preflight runs at emission, after the
@@ -8218,7 +8219,7 @@ fn validate_resource_rvalues_component(
                     }
                     (None, None)
                 }
-                Term::Goto(_) | Term::Branch(..) | Term::Unreachable => (None, None),
+                Term::Goto(_) | Term::Branch(..) | Term::StrMatch { .. } | Term::Unreachable => (None, None),
             };
             if let Some(returned) = returned
             {
@@ -10697,6 +10698,46 @@ pub fn validate_slice_index_rvalues(program: &Program) -> Result<(), ProducerErr
     Ok(())
 }
 
+/// Reject malformed exact-string dispatch before LLVM builds target blocks or reads a text header.
+/// The semantic record is intentionally closed: one live text operand, at least one unique decoded
+/// literal, and only in-range block targets including the required wildcard target.
+pub fn validate_str_match_terminators(program: &Program) -> Result<(), ProducerError> {
+    for function in &program.fns {
+        let block_count = function.blocks.len();
+        for block in &function.blocks {
+            let Term::StrMatch { scrutinee, cases, otherwise } = &block.term else {
+                continue;
+            };
+            if !matches!(preflight_operand_ty(function, scrutinee), Some(Ty::Str | Ty::String)) {
+                return Err(ProducerError::Lowering(format!(
+                    "string match in function '{}' has a non-text scrutinee",
+                    function.name
+                )));
+            }
+            if cases.is_empty()
+                || usize::try_from(*otherwise).ok().is_none_or(|target| target >= block_count)
+            {
+                return Err(ProducerError::Lowering(format!(
+                    "string match in function '{}' has no cases or an invalid wildcard target",
+                    function.name
+                )));
+            }
+            let mut seen = HashSet::new();
+            for (value, target) in cases {
+                if !seen.insert(value)
+                    || usize::try_from(*target).ok().is_none_or(|target| target >= block_count)
+                {
+                    return Err(ProducerError::Lowering(format!(
+                        "string match in function '{}' has a duplicate literal or invalid target",
+                        function.name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reject a malformed fixed-record resource nulling statement before LLVM indexes a slot, record,
 /// or field table. This statement is emitted only after moving a canonical `pkg.template`
 /// resource leaf out of a source-formed fixed record array.
@@ -10983,6 +11024,60 @@ mod tests {
         assert!(validate_mir_producers(&duplicate).is_err(), "duplicate producer identity");
         assert_eq!(ProducerError::Lowering("invalid producer".to_owned()).to_string(),
             "lowering failed: invalid producer");
+    }
+
+    #[test]
+    fn malformed_string_match_terminators_fail_before_codegen() {
+        let mut diagnostics = align_diag::Diagnostics::new();
+        let source = "fn classify(value: str) -> i32 = match value { \"a\" => 1, \"b\" => 2, _ => 0 }\nfn main() -> i32 = 0\n";
+        let tokens = align_lexer::tokenize(0, source, &mut diagnostics);
+        let ast = align_parser::parse_file(tokens, &mut diagnostics);
+        let hir = align_sema::check_file(&ast, &mut diagnostics);
+        assert!(!diagnostics.has_errors());
+        let program = crate::lower_program(&hir);
+        assert!(validate_str_match_terminators(&program).is_ok(), "valid string match");
+
+        let mutate = |program: &mut Program, edit: fn(&mut Term, usize)| {
+            let function = program
+                .fns
+                .iter_mut()
+                .find(|function| function.name.as_str() == "classify")
+                .unwrap_or_else(|| panic!("classify function"));
+            let block_count = function.blocks.len();
+            let term = function
+                .blocks
+                .iter_mut()
+                .map(|block| &mut block.term)
+                .find(|term| matches!(term, Term::StrMatch { .. }))
+                .unwrap_or_else(|| panic!("string match terminator"));
+            edit(term, block_count);
+        };
+
+        let edits: [fn(&mut Term, usize); 4] = [
+            |term, _| {
+                let Term::StrMatch { scrutinee, .. } = term else { panic!("string match") };
+                *scrutinee = Operand::Const(Const::Int(0, Ty::Int(align_sema::IntTy { bits: 64, signed: true })));
+            },
+            |term, _| {
+                let Term::StrMatch { cases, .. } = term else { panic!("string match") };
+                cases.clear();
+            },
+            |term, _| {
+                let Term::StrMatch { cases, .. } = term else { panic!("string match") };
+                cases.push(cases[0].clone());
+            },
+            |term, block_count| {
+                let Term::StrMatch { otherwise, .. } = term else { panic!("string match") };
+                *otherwise = u32::try_from(block_count)
+                    .unwrap_or_else(|_| panic!("block count"));
+            },
+        ];
+        for edit in edits {
+            let mut malformed = program.clone();
+            mutate(&mut malformed, edit);
+            assert!(validate_str_match_terminators(&malformed).is_err());
+            assert!(validate_mir_producers(&malformed).is_err());
+        }
     }
 
     #[test]

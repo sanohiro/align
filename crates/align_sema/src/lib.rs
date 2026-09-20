@@ -11964,10 +11964,13 @@ fn borrowed_match_metadata_is_valid(program: &hir::Program) -> bool {
             else {
                 continue;
             };
-            if matches!(scrutinee.ty, Ty::Int(_) | Ty::Char) {
+            if matches!(scrutinee.ty, Ty::Int(_) | Ty::Char | Ty::Str | Ty::String) {
                 if borrowed_place.is_some() {
                     return false;
                 }
+                let text = matches!(scrutinee.ty, Ty::Str | Ty::String);
+                let mut strings = std::collections::HashSet::new();
+                let mut wildcard = false;
                 for arm in arms {
                     if !arm.bindings.is_empty()
                         || !arm.borrowed_bindings.is_empty()
@@ -11975,13 +11978,31 @@ fn borrowed_match_metadata_is_valid(program: &hir::Program) -> bool {
                     {
                         return false;
                     }
-                    for val in &arm.values {
-                        if let hir::HirValuePattern::Range(start, end) = val
-                            && start > end
-                        {
+                    if arm.values.is_empty() {
+                        if wildcard {
                             return false;
                         }
+                        wildcard = true;
+                        continue;
                     }
+                    if wildcard {
+                        return false;
+                    }
+                    for val in &arm.values {
+                        match val {
+                            hir::HirValuePattern::Str(value) if text => {
+                                if !strings.insert(value) {
+                                    return false;
+                                }
+                            }
+                            hir::HirValuePattern::Single(_) if !text => {}
+                            hir::HirValuePattern::Range(start, end) if !text && start <= end => {}
+                            _ => return false,
+                        }
+                    }
+                }
+                if (scrutinee.ty == Ty::Char || text) && !wildcard {
+                    return false;
                 }
                 continue;
             }
@@ -66353,14 +66374,14 @@ impl<'a, 't> Checker<'a, 't> {
             self.constrain(s.ty, Some(Ty::Int(IntTy { bits: 64, signed: true })), scrutinee.span);
             resolved_scrutinee_ty = self.resolve(s.ty);
         }
-        if matches!(resolved_scrutinee_ty, Ty::Int(_) | Ty::Char) {
+        if matches!(resolved_scrutinee_ty, Ty::Int(_) | Ty::Char | Ty::Str | Ty::String) {
             let mut s = s;
             s.ty = resolved_scrutinee_ty;
             return self.check_match_value(s, resolved_scrutinee_ty, arms, expected, span);
         }
         let borrowed_place = self.stable_borrowed_match_place(&s, resolved_scrutinee_ty);
         let Some((type_name, variants)) = self.match_variants(resolved_scrutinee_ty) else {
-            self.diags.error(format!("`match` expects a sum type, integer, or char, got {}", ty_name(s.ty)), scrutinee.span);
+            self.diags.error(format!("`match` expects a sum type, integer, char, str, or string, got {}", ty_name(s.ty)), scrutinee.span);
             return err;
         };
         // A **Move** enum matched through a *nested* struct-field place (`match o.inner.c { … }`, J3)
@@ -66647,6 +66668,13 @@ impl<'a, 't> Checker<'a, 't> {
                 }
                 Some(i128::from(*c))
             }
+            ast::LiteralPat::Str(_) => {
+                self.diags.error(
+                    format!("expected {} literal in pattern, found string literal", if scrut_ty == Ty::Char { "char" } else { "integer" }),
+                    span,
+                );
+                None
+            }
         }
     }
 
@@ -66684,6 +66712,7 @@ impl<'a, 't> Checker<'a, 't> {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let scrutinee_diverges = hir_expr_diverges(&s);
 
+        let text_match = matches!(scrut_ty, Ty::Str | Ty::String);
         let (min_bound, max_bound) = match scrut_ty {
             Ty::Int(it) => int_range(it),
             Ty::Char => (0, 0x10FFFF),
@@ -66692,6 +66721,7 @@ impl<'a, 't> Checker<'a, 't> {
 
         let mut has_wildcard = false;
         let mut covered_intervals: Vec<(i128, i128)> = Vec::new();
+        let mut covered_strings = std::collections::HashSet::new();
         let mut checked: Vec<hir::MatchArm> = Vec::with_capacity(arms.len());
         let mut result_ty: Option<Ty> = expected;
         let mut unconstrained_diverging_arms = Vec::new();
@@ -66717,12 +66747,64 @@ impl<'a, 't> Checker<'a, 't> {
                     for pat in patterns {
                         match pat {
                             ast::ValuePattern::Single(lit, pat_sp) => {
-                                if let Some(val) = self.check_match_literal(lit, scrut_ty, min_bound, max_bound, *pat_sp) {
+                                if text_match {
+                                    match lit {
+                                        ast::LiteralPat::Str(value) => {
+                                            if !covered_strings.insert(value.clone()) {
+                                                self.diags.error(
+                                                    format!("duplicate string pattern in `match`: {:?}", value),
+                                                    *pat_sp,
+                                                );
+                                            }
+                                            arm_values.push(hir::HirValuePattern::Str(value.clone()));
+                                        }
+                                        ast::LiteralPat::Int(_) => self.diags.error(
+                                            format!("expected string literal in pattern for {} match, found integer literal", ty_name(scrut_ty)),
+                                            *pat_sp,
+                                        ),
+                                        ast::LiteralPat::Char(_) => self.diags.error(
+                                            format!("expected string literal in pattern for {} match, found char literal", ty_name(scrut_ty)),
+                                            *pat_sp,
+                                        ),
+                                    }
+                                } else if let Some(val) = self.check_match_literal(lit, scrut_ty, min_bound, max_bound, *pat_sp) {
                                     self.check_match_interval_overlap(val, val, &mut covered_intervals, *pat_sp);
                                     arm_values.push(hir::HirValuePattern::Single(val));
                                 }
                             }
-                            ast::ValuePattern::Range { start, end, span: pat_sp } => {
+                            ast::ValuePattern::Range { start, end, inclusive, span: pat_sp } => {
+                                if !inclusive {
+                                    continue;
+                                }
+                                if text_match {
+                                    let mut compatible = true;
+                                    for literal in [start, end] {
+                                        match literal {
+                                            ast::LiteralPat::Str(_) => {}
+                                            ast::LiteralPat::Int(_) => {
+                                                compatible = false;
+                                                self.diags.error(
+                                                    format!("expected string literal in pattern for {} match, found integer literal", ty_name(scrut_ty)),
+                                                    *pat_sp,
+                                                );
+                                            }
+                                            ast::LiteralPat::Char(_) => {
+                                                compatible = false;
+                                                self.diags.error(
+                                                    format!("expected string literal in pattern for {} match, found char literal", ty_name(scrut_ty)),
+                                                    *pat_sp,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    if compatible {
+                                        self.diags.error(
+                                            "string range patterns are not supported; use literal alternatives and `_`".to_string(),
+                                            *pat_sp,
+                                        );
+                                    }
+                                    continue;
+                                }
                                 let s_val = self.check_match_literal(start, scrut_ty, min_bound, max_bound, *pat_sp);
                                 let e_val = self.check_match_literal(end, scrut_ty, min_bound, max_bound, *pat_sp);
                                 if let (Some(sv), Some(ev)) = (s_val, e_val) {
@@ -66773,7 +66855,7 @@ impl<'a, 't> Checker<'a, 't> {
         }
 
         if !has_wildcard {
-            let is_exhaustive = if scrut_ty == Ty::Char {
+            let is_exhaustive = if scrut_ty == Ty::Char || text_match {
                 false
             } else {
                 covered_intervals.sort_by_key(|k| k.0);

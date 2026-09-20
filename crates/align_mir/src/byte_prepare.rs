@@ -335,6 +335,14 @@ fn order_blocks(f: &mut Function) -> Vec<u32> {
                 *yes = remap[*yes as usize];
                 *no = remap[*no as usize];
             }
+            Term::StrMatch { cases, otherwise, .. } => {
+                for (_, target) in cases {
+                    let Ok(index) = usize::try_from(*target) else { return Vec::new() };
+                    *target = remap[index];
+                }
+                let Ok(index) = usize::try_from(*otherwise) else { return Vec::new() };
+                *otherwise = remap[index];
+            }
             _ => {}
         }
         blocks.push(b);

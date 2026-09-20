@@ -222,6 +222,7 @@ fn argument_confined(f: &Function, arg: usize, calls: &CallEscapeSummary) -> boo
         let safe = match &block.term {
             Term::Goto(_) | Term::Unreachable | Term::Return(None) => true,
             Term::Branch(op, ..) | Term::Return(Some(op)) => !related(op),
+            Term::StrMatch { scrutinee, .. } => !related(scrutinee),
             Term::ReturnWithCleanup(result) => !related(&result.0) && !related(&result.1),
         };
         if !safe {
@@ -486,6 +487,7 @@ fn nonescaping(
         let valid = match &block.term {
             Term::Goto(_) | Term::Unreachable | Term::Return(None) => true,
             Term::Branch(op, ..) | Term::Return(Some(op)) => !is_related(op),
+            Term::StrMatch { scrutinee, .. } => !is_related(scrutinee),
             Term::ReturnWithCleanup(result) => !is_related(&result.0) && !is_related(&result.1),
         };
         if !valid {
@@ -596,12 +598,17 @@ fn object_plan(
         for stmt in &block.stmts {
             state = transfer(stmt, state, slot, constructor, &handles, literals);
         }
-        let successors: &[u32] = match &block.term {
-            Term::Goto(target) => std::slice::from_ref(target),
-            Term::Branch(_, a, b) => &[*a, *b],
-            _ => &[],
+        let successors: Vec<u32> = match &block.term {
+            Term::Goto(target) => vec![*target],
+            Term::Branch(_, a, b) => vec![*a, *b],
+            Term::StrMatch { cases, otherwise, .. } => cases
+                .iter()
+                .map(|(_, target)| *target)
+                .chain(std::iter::once(*otherwise))
+                .collect(),
+            _ => Vec::new(),
         };
-        for &next in successors {
+        for next in successors {
             let entry = incoming.get_mut(next as usize)?;
             let joined = Some(entry.map_or(state, |old| old.join(state)));
             if *entry != joined {

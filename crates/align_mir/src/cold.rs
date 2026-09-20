@@ -141,6 +141,10 @@ fn reachable(function: &Function) -> Vec<bool> {
         match block.term {
             Term::Goto(next) => pending.push(next),
             Term::Branch(_, yes, no) => pending.extend([yes, no]),
+            Term::StrMatch { ref cases, otherwise, .. } => {
+                pending.extend(cases.iter().map(|(_, target)| *target));
+                pending.push(otherwise);
+            }
             Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => {}
         }
     }
@@ -158,6 +162,11 @@ fn exceptional_region(function: &Function) -> HashSet<u32> {
         let successors = match block.term {
             Term::Goto(next) => vec![next],
             Term::Branch(_, yes, no) => vec![yes, no],
+            Term::StrMatch { ref cases, otherwise, .. } => cases
+                .iter()
+                .map(|(_, target)| *target)
+                .chain(std::iter::once(otherwise))
+                .collect(),
             Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => Vec::new(),
         };
         for target in successors {
@@ -258,7 +267,7 @@ fn returns_only_err(function: &Function) -> bool {
             Term::Return(Some(value)) => Some(value),
             Term::ReturnWithCleanup(value) => Some(&value.0),
             Term::Return(None) => return false,
-            Term::Goto(_) | Term::Branch(..) | Term::Unreachable => None,
+            Term::Goto(_) | Term::Branch(..) | Term::StrMatch { .. } | Term::Unreachable => None,
         };
         if let Some(value) = returned
             && !operand_is_err(value, &values, &stores, &mut HashSet::new())

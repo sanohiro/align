@@ -7258,11 +7258,13 @@ impl<'a> BodyValidator<'a> {
                     return None;
                 }
                 let scrutinee_flow = self.expr_flow(scrutinee)?;
-                if matches!(scrutinee_flow.ty, Ty::Int(_) | Ty::Char) {
+                if matches!(scrutinee_flow.ty, Ty::Int(_) | Ty::Char | Ty::Str | Ty::String) {
                     if arms.is_empty() {
                         return None;
                     }
+                    let text = matches!(scrutinee_flow.ty, Ty::Str | Ty::String);
                     let mut wildcard = false;
+                    let mut strings = HashSet::new();
                     let mut result = None;
                     let mut breaks = scrutinee_flow.breaks.clone();
                     let mut any_arm_falls = false;
@@ -7275,6 +7277,20 @@ impl<'a> BodyValidator<'a> {
                                 return None;
                             }
                             wildcard = true;
+                        } else if wildcard {
+                            return None;
+                        }
+                        for pattern in &arm.values {
+                            match pattern {
+                                hir::HirValuePattern::Str(value) if text => {
+                                    if !strings.insert(value) {
+                                        return None;
+                                    }
+                                }
+                                hir::HirValuePattern::Single(_) if !text => {}
+                                hir::HirValuePattern::Range(start, end) if !text && start <= end => {}
+                                _ => return None,
+                            }
                         }
                         let flow = self.arms.get(&ptr_key(arm))?;
                         if scrutinee_flow.falls {
@@ -7287,6 +7303,9 @@ impl<'a> BodyValidator<'a> {
                             }
                             result = Some(flow.ty);
                         }
+                    }
+                    if (scrutinee_flow.ty == Ty::Char || text) && !wildcard {
+                        return None;
                     }
                     return if !scrutinee_flow.falls || !any_arm_falls {
                         Some((expression.ty, false, breaks))
@@ -12322,13 +12341,22 @@ impl<'a> BodyValidator<'a> {
                 return false;
             }
             for val in &arm.values {
-                if let hir::HirValuePattern::Range(start, end) = val
-                    && start > end
-                {
-                    return false;
+                match val {
+                    hir::HirValuePattern::Single(_) => {}
+                    hir::HirValuePattern::Range(start, end) if start <= end => {}
+                    hir::HirValuePattern::Range(..) | hir::HirValuePattern::Str(_) => return false,
                 }
             }
             return true;
+        }
+        if matches!(scrutinee_ty, Ty::Str | Ty::String) {
+            return arm.variants.is_empty()
+                && arm.bindings.is_empty()
+                && arm.borrowed_bindings.is_empty()
+                && arm
+                    .values
+                    .iter()
+                    .all(|pattern| matches!(pattern, hir::HirValuePattern::Str(_)));
         }
         if !arm.values.is_empty() {
             return false;

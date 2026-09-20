@@ -627,6 +627,11 @@ pub(crate) fn successors(term: &Term) -> Vec<BlockId> {
     match term {
         Term::Goto(target) => vec![*target],
         Term::Branch(_, yes, no) => vec![*yes, *no],
+        Term::StrMatch { cases, otherwise, .. } => cases
+            .iter()
+            .map(|(_, target)| *target)
+            .chain(std::iter::once(*otherwise))
+            .collect(),
         Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => Vec::new(),
     }
 }
