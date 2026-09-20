@@ -27388,7 +27388,8 @@ fn main() -> i32 = 0
         let program_symbol =
             encoded_program_symbol(&program_call("align_rt_tcp_conn_set_io_timeout"));
         assert!(collision_ir.lines().any(|line| {
-            line.starts_with("define internal i32 ") && line.contains(&program_symbol)
+            line.starts_with("define internal signext i32 ")
+                && line.contains(&program_symbol)
         }));
         let collision = emit_llvm_ir(
             &collision,
