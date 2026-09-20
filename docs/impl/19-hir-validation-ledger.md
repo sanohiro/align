@@ -2253,7 +2253,11 @@ function body starts strict; a lambda body must retain its own FloatScope to
 relax an operation. A direct,
 indirect or imported call adds no caller mode to its target operations.
 This checked boundary authenticates permissions, not optimization isolation:
-LLVM may later combine independently permitted operations after inlining.
+LLVM may later combine independently reassociable operations after inlining.
+Contraction is selected before LLVM only for an immediate multiply/add-subtract
+pair whose two modes were authenticated. MIR uses the existing explicit FMA
+operation for that selected use; raw LLVM `contract` is never emitted, so a
+strict multiply cannot be absorbed by a permitted consumer.
 
 Format 15 generic templates and interface-carried concrete bodies preserve the
 exact source scope in their existing body string. Consumer parsing and checking

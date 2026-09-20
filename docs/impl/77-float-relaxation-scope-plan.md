@@ -38,12 +38,22 @@ Reassoc           Permits reassociation only on f32/f64 add, subtract and
                   functions, NaN/Inf assumptions, signed-zero erasure or
                   algebra that is not justified by reassociation itself.
 
-Contract          Marks every f32/f64 add, subtract and multiply formed
-                  lexically under `contract`; LLVM may contract a multiply and
-                  its consuming add/subtract only when every participating
-                  operation carries that permission. It does not imply
-                  reassociation. Explicit `fma` retains its existing always-
-                  fused semantics inside and outside the scope.
+Contract          Authenticates every f32/f64 add, subtract and multiply formed
+                  lexically under `contract`, but never emits LLVM's raw
+                  `contract` fast-math flag. That flag is consumer-controlled
+                  and could let a permitted add absorb a strict multiply.
+                  Instead, before LLVM optimization, Align recognizes a direct
+                  multiply operand of an add/subtract only when both checked
+                  operations carry `contract` and lowers that use to the
+                  existing explicit `fma` operation. The four scalar/vector
+                  shapes are `a*b+c`, `c+a*b`, `a*b-c`, and `c-a*b`; subtraction
+                  uses an exact sign inversion on one FMA operand. Array and
+                  fixed-vector dot use the same authenticated fused
+                  product/accumulator step. A multiply reached only through a
+                  local, load, call or later LLVM inlining is not a recognized
+                  pair and remains separate; permission does not promise that
+                  every candidate contracts. Explicit source `fma` retains its
+                  existing always-fused semantics inside and outside the scope.
 
 Result contract   Both options are result-defined. Every input still produces
                   an IEEE floating value and never aborts. `reassoc` permits
@@ -52,9 +62,11 @@ Result contract   Both options are result-defined. Every input still produces
                   instead of two and its consequent signed-zero/NaN payload
                   choice. Neither option permits poison for NaN or infinity.
                   Results may differ across targets and optimization profiles
-                  only within the named permission, including when inlining
-                  exposes equally permitted operations from distinct lexical
-                  scopes or functions. No reproducibility or accuracy bound is
+                  only within the named permission. Reassociation may compose
+                  when LLVM inlining exposes independently permitted
+                  operations. Contraction is decided from authenticated MIR
+                  pairs before LLVM optimization and never arises merely from
+                  later inlining. No reproducibility or accuracy bound is
                   promised for a permitted expression.
 
 Excluded flags    `nnan`, `ninf`, `nsz`, `arcp`, `afn`, `fast`, and every
@@ -72,12 +84,15 @@ Lexical extent    A scope affects operations whose source expression is inside
                   `float(...)` scope inside that lambda body.
                   A call site never adds flags to operations in a separately
                   declared callee; that body uses only its own source scopes.
-                  The scope is a permission boundary, not an optimization
-                  isolation boundary: after body import or inlining, operations
-                  from sibling scopes or caller/callee bodies may participate
-                  in one rewrite only when every participating operation
-                  independently carries the required permission. Any strict
-                  operation therefore remains a barrier.
+                  For reassociation, the scope is a permission boundary rather
+                  than an optimization-isolation boundary: after body import or
+                  inlining, independently permitted operations may compose and
+                  a strict participant remains a barrier. Contraction is
+                  stricter: Align forms an explicit FMA only from a MIR-visible
+                  multiply/add-subtract pair whose two authenticated modes both
+                  permit it. It emits no raw LLVM `contract` flag, so a strict
+                  producer cannot be absorbed by a relaxed consumer after
+                  inlining.
 
 Pipelines         Built-in pipeline arithmetic belongs to the terminal or
                   stage expression that requests it. A `sum` terminal written
@@ -123,9 +138,11 @@ Ownership         The wrapper's type, value category, ownership, effect and
                   or dropped known bit as well as an unknown bit. align_mir is
                   built only from that authenticated HIR and preserves the
                   exact effective mode on each eligible arithmetic/reduction
-                  node. align_codegen_llvm translates only those bits to LLVM
-                  `reassoc` and `contract` flags. The formatter owns canonical
-                  option order.
+                  node. align_mir selects only authenticated contraction pairs
+                  and represents them with the existing explicit FMA operation.
+                  align_codegen_llvm translates `reassoc` to that LLVM flag and
+                  lowers the selected pairs to `llvm.fma`; it never emits raw
+                  `contract`. The formatter owns canonical option order.
 
 Errors            `float()` reports the missing option before checking body
                   errors. Sema scans the complete option list before the body.
@@ -188,10 +205,11 @@ Acceptance        One syntax/formatter owner covers the three canonical forms,
                   source nulling, Drop, replacement and return, and proves all
                   region/effect/escape/replay/depth/finalization passes recurse
                   into the body exactly once.
-                  One LLVM owner proves exact flags on admitted
-                  nodes and their absence on strict, excluded and unrelated
-                  nodes; optimized structural controls cover unordered sum and
-                  contracted multiply-add. One interface owner covers generic
+                  One MIR/LLVM owner proves exact `reassoc` flags, the complete
+                  authenticated FMA-pair product, absence of raw `contract`,
+                  and absence of fusion when either producer or consumer is
+                  strict; optimized structural controls cover unordered sum
+                  and explicit fused multiply-add. One interface owner covers generic
                   and concrete-body source round trips, consumer rechecking,
                   whole/per-unit parity and cache invalidation. Runtime numeric
                   controls prove
@@ -215,28 +233,30 @@ Mirrors           This plan, draft.md, docs/language-spec.md,
 ```
 
 The complete operation/option product is fixed here. A dash means no fast-math
-flag; it does not mean that the optimizer may choose another one.
+flag or special lowering; it does not mean that the optimizer may choose one.
+`contract` below always means an Align-selected explicit FMA, never LLVM's raw
+flag.
 
 | Source operation | strict | `reassoc` | `contract` | both |
 |---|---|---|---|---|
-| f32/f64 or vec fadd/fsub | — | `reassoc` | `contract` | `reassoc contract` |
-| f32/f64 or vec fmul | — | `reassoc` | `contract` | `reassoc contract` |
-| array-pipeline floating `sum` (`ArraySum`) | ordered adds/reduction | adds and reduction carry `reassoc`; reduction is unordered | adds and reduction carry `contract`; reduction stays ordered | adds and reduction carry both; reduction is unordered |
-| array-pipeline floating `dot` (`ArrayDot`) | ordered products/adds/reduction | products, adds, and reduction carry `reassoc`; reduction is unordered | products, adds, and reduction carry `contract`; reduction stays ordered | products, adds, and reduction carry both; reduction is unordered |
-| fixed-vector floating `sum` (`VecSum`) | ordered lane adds/reduction | lane adds and reduction carry `reassoc`; reduction is unordered | lane adds and reduction carry `contract`; reduction stays ordered | lane adds and reduction carry both; reduction is unordered |
-| fixed-vector masked floating `sum_where` (`VecSumWhere`) | ordered selected-lane adds/reduction | selected-lane adds and reduction carry `reassoc`; reduction is unordered | selected-lane adds and reduction carry `contract`; reduction stays ordered | selected-lane adds and reduction carry both; reduction is unordered |
-| fixed-vector floating `dot` (`VecDot`) | ordered lane products/adds/reduction | products, adds, and reduction carry `reassoc`; reduction is unordered | products, adds, and reduction carry `contract`; reduction stays ordered | products, adds, and reduction carry both; reduction is unordered |
+| f32/f64 or vec fadd/fsub | — | raw operation carries `reassoc` | raw operation stays unflagged; an immediate multiply operand becomes explicit FMA only when both modes permit | unmatched raw operation carries `reassoc`; an authenticated pair becomes explicit FMA carrying `reassoc` |
+| f32/f64 or vec fmul | — | raw operation carries `reassoc` | raw operation stays unflagged; an authenticated direct consumer may replace that use with explicit FMA | unmatched raw operation carries `reassoc`; an authenticated direct consumer may replace that use with explicit FMA carrying `reassoc` |
+| array-pipeline floating `sum` (`ArraySum`) | ordered adds/reduction | adds and reduction carry `reassoc`; reduction is unordered | unchanged ordered adds/reduction; no multiply exists to contract | adds and reduction carry `reassoc`; reduction is unordered |
+| array-pipeline floating `dot` (`ArrayDot`) | ordered products/adds/reduction | products, adds, and reduction carry `reassoc`; reduction is unordered | ordered accumulation uses authenticated explicit FMA steps | authenticated FMA accumulation carries `reassoc` and may reduce unordered |
+| fixed-vector floating `sum` (`VecSum`) | ordered lane adds/reduction | lane adds and reduction carry `reassoc`; reduction is unordered | unchanged ordered lane adds/reduction; no multiply exists to contract | lane adds and reduction carry `reassoc`; reduction is unordered |
+| fixed-vector masked floating `sum_where` (`VecSumWhere`) | ordered selected-lane adds/reduction | selected-lane adds and reduction carry `reassoc`; reduction is unordered | unchanged ordered selected-lane adds/reduction; no multiply exists to contract | selected-lane adds and reduction carry `reassoc`; reduction is unordered |
+| fixed-vector floating `dot` (`VecDot`) | ordered lane products/adds/reduction | products, adds, and reduction carry `reassoc`; reduction is unordered | ordered lane accumulation uses authenticated explicit FMA steps | authenticated FMA accumulation carries `reassoc` and may reduce unordered |
 | explicit `fma` | existing fused call | unchanged | unchanged | unchanged |
 | fdiv/frem, comparison, conversion, min/max, math call | — | — | — | — |
 | integer/bool/char/pointer/memory/control operation | — | — | — | — |
 
-LLVM treats `reassoc` and `contract` as rewrite permissions shared by all
-instructions participating in a rewrite. Tagging every eligible operation in
-the source scope therefore permits a local multiply-add/subtract contraction
-without marking any strict operation. LLVM flags carry no scope identity, so
-independently permitted operations may compose after inlining. This table
-deliberately promises permission, not rewrite isolation or that LLVM will
-perform a particular rewrite.
+LLVM's `reassoc` flag permits composition according to the participating
+instructions' flags and carries no lexical scope identity. LLVM's `contract`
+flag does not provide the same two-sided boundary: permission on a consuming
+add/subtract can absorb an unpermitted multiply. Align therefore emits no raw
+`contract` flag. Its pre-LLVM contraction selection checks both authenticated
+modes and emits an explicit FMA only for that use. This table promises
+permission, not that every eligible source pattern will be selected.
 
 ## 2. Rejected alternatives
 
@@ -247,8 +267,9 @@ perform a particular rewrite.
 | One bundled `fast` level | Hides which guarantees are relinquished and would invite LLVM's poison-producing `nnan`/`ninf` flags. |
 | `sum_reassoc`, `dot_fast`, and similar terminals | Creates a second surface per operation, leaves hand-written loops and future reducers unanswered, and does not compose contraction independently. |
 | Function-only annotation | Is too coarse for mixed strict/relaxed numeric work and makes a call site unable to see the local semantic boundary. |
-| Caller mode copied onto a callee's strict operations | Makes an unannotated function depend on its caller and invalidates separate compilation. Each callee operation keeps only its own permission. Equally permitted operations may still compose after inlining because LLVM flags do not carry scope identity. |
-| Optimization barriers or forced `noinline` at every scope/function edge | Would make lexical scopes isolation regions, inhibit the optimization they exist to permit, and require a second call ABI. Strict operations already stop a rewrite because the required flag intersection is absent. |
+| Caller mode copied onto a callee's strict operations | Makes an unannotated function depend on its caller and invalidates separate compilation. Each callee operation keeps only its own permission. Reassociation may still compose after inlining because LLVM flags do not carry scope identity; contraction is selected before that point. |
+| Raw LLVM `contract` on relaxed add/subtract/multiply | The consuming add/subtract alone can authorize fusion with a strict multiply, so flags on both source operations do not enforce the lexical boundary. Align instead checks both authenticated modes and emits an explicit FMA for the selected use. |
+| Optimization barriers or forced `noinline` at every scope/function edge | Would make lexical scopes isolation regions, inhibit reassociation, and require a second call ABI. Strict operations already stop reassociation through missing flags; pre-LLVM pair selection makes contraction safe without a barrier. |
 | A strict inner scope that removes an outer permission | Requires mode subtraction and makes one expression's arithmetic contract depend on nesting accidents. Move strict work to a separate function instead. |
 | `nnan` or `ninf` | A NaN or infinity would become poison, adding hidden undefined behavior to a language where floats never abort. |
 | Throughput thresholds in the provider gate | They test a host and optimizer cost model, not the source contract, and would repeat the waste identified in earlier performance issues. |
@@ -264,12 +285,12 @@ perform a particular rewrite.
 | Ownership lifecycle | Copy, Move, borrowed and arena-backed body results preserve construction, move-in, move-out, source nulling, Drop, replacement and return exactly as a plain block; the wrapper adds no owner, allocation, null or cleanup | MoveCheck/Drop driver owner with struct, sum, Option and Result carriers |
 | Region and escape | `region_of`, `tracks_region`, local-slice/view provenance and escape checking return the body's exact facts; arena-backed views cannot become static or escape through the wrapper, while valid borrowed returns retain their roots | region/escape owner over stack, arena, heap, static and borrowed origins |
 | Scope propagation | retained HIR scope enters and restores across plain blocks, `if`, `match`, `else`, `?`, `map_err`, loops, value-carrying `break`, `return`, `arena`, `unsafe` and task-group blocks on normal, branch-join, loop-join, early-exit, error and malformed-input paths; no path attaches mode to a later strict operation; MIR receives only authenticated effective modes | parameterized semantic/HIR/MIR control-flow owner |
-| Lambdas/calls | every named/inline/lifted/escaping body validates from a strict root; only a FloatScope retained inside that body changes its operations; named/direct/indirect/imported callee operations receive no caller flags; optimized owners show equally permitted caller/callee operations may compose while any strict participant prevents the rewrite | semantic/HIR/MIR/interface/LLVM owner |
-| Scalar arithmetic | f32/f64 add/sub/mul receive selected flags; div/rem/comparison/cast/min/max and explicit fma do not gain unrelated flags | LLVM owner |
+| Lambdas/calls | every named/inline/lifted/escaping body validates from a strict root; only a FloatScope retained inside that body changes its operations; named/direct/indirect/imported callee operations receive no caller flags; optimized owners show reassociation may compose among independently permitted caller/callee operations while a strict participant blocks it; later LLVM inlining never creates a new contraction | semantic/HIR/MIR/interface/LLVM owner |
+| Scalar arithmetic | f32/f64 add/sub/mul receive only selected `reassoc`; div/rem/comparison/cast/min/max and explicit source fma do not gain unrelated flags; raw `contract` is absent everywhere | LLVM owner |
 | Vector arithmetic | vecN<f32/f64> follows the same table for every admitted width | LLVM owner |
 | Reductions | every existing floating sum/dot reduction variant — `ArraySum`, `ArrayDot`, `VecSum`, `VecSumWhere`, and `VecDot` — follows its exact product/add/reduction row above; unordered reduction appears only under `reassoc`; strict and contract-only controls remain ordered; integer instances remain unchanged | parameterized HIR/MIR/LLVM owner over all five variants |
 | Generic reduce | reducer callable starts strict like every function; only a FloatScope written inside its body may mark its arithmetic; enclosing terminal scope is not inherited | semantic/MIR/LLVM negative owner |
-| Contraction | eligible multiply plus consuming add/sub carry `contract`; optimizer fixture contains fused operation; `contract` alone does not set `reassoc` | LLVM owner |
+| Contraction | scalar and vector `a*b+c`, `c+a*b`, `a*b-c`, and `c-a*b` become the existing explicit FMA only when the immediate multiply and consumer both carry authenticated `contract`; subtraction uses exact operand negation; strict-producer/relaxed-consumer, relaxed-producer/strict-consumer, local/load/call producers and post-LLVM inlining remain unfused; no raw LLVM `contract` flag is emitted; `contract` alone does not set `reassoc` | parameterized MIR/LLVM positive-and-negative owner |
 | Effects and traps | calls, memory operations, bounds/division traps and cleanup retain source order and receive no fast-math permission | MIR/LLVM negative owner |
 | Generic bodies | exact source scope survives template formation, interface round trip and monomorphization; consumer derives the same mode | interface/sema owner |
 | Concrete bodies | plan 74 eligible source preserves the scope when emitted `available_externally`; producer and consumer optimized forms agree | interface/codegen owner |
@@ -285,11 +306,12 @@ One parameterized owner may close multiple rows. No row requires a benchmark.
 |---|---|---|
 | `d4a2d307` independent design review | P1: checking only known bits and eligible types lets malformed HIR attach a valid relaxed mode to a strict source operation after the scope is discarded | Retain `FloatScope` in checked HIR; recompute the exact lexical union during HIR validation; reject both invented and dropped known bits before MIR. Reopened closure axis: float-mode provenance. |
 | `1d9838b9` reopened full review | P1: lifting separates a lambda body from its declaring FloatScope, so a copied root mode is unauthenticated. P2: direct ArrayDot product/reduction semantics, arbitrary option parsing and unknown/duplicate precedence were incomplete. | Reopen the matrix around lifted-declaration provenance. Global HIR validation derives a unique target root mode from the parent lambda expression and validates nested lifted bodies from that map. Add the exact dot product/add/reduction row, parse option identifiers before sema, and make any unknown outrank duplicates. |
-| `ae9983bb` reopened full review | P1: LLVM flags have no scope identity, so equally flagged operations can combine across sibling scopes or an inlined function boundary | Reopen lowered-rewrite composition. Define scopes as operation-permission boundaries, not optimization-isolation regions. Caller mode never marks strict callee operations; independently permitted operations may compose, while a strict participant blocks the rewrite through LLVM's flag intersection. Add positive cross-scope/callee and strict-barrier owners. |
+| `ae9983bb` reopened full review | P1: LLVM flags have no scope identity, so equally flagged operations can combine across sibling scopes or an inlined function boundary | Reopen lowered-rewrite composition. Define scopes as operation-permission boundaries, not optimization-isolation regions. Caller mode never marks strict callee operations. The reassociation half remains: independently permitted operations may compose while a strict participant blocks the rewrite through flag intersection. The later `a8d2e264` finding supersedes the contraction half. |
 | `09338df4` reopened full review | P1: pipeline HIR stores lifted target names rather than parent lambda expressions, so declaration-site mode still cannot be authenticated. P2: the grammar prevented the promised sema diagnostic for `float()` | Remove declaration-site inheritance entirely: every function and lambda body starts strict and must contain its own FloatScope. This deletes the cross-function provenance mechanism and treats all callable forms uniformly. Parse an optional identifier list so sema owns the empty-list diagnostic. |
 | `23b3be10` reopened full review | P1: the Reassoc prose still named generic `reduce`, contradicting strict callable roots and the complete operation table | Remove generic `reduce` from terminal-site relaxation. Its arithmetic lives only in the reducer function and is relaxed only by a scope written inside that body. Add the explicit negative matrix row. |
 | `1381360f` reopened full review | P1: the reduction matrix named only the array-pipeline forms and could leave the three distinct fixed-vector HIR/MIR variants without mode semantics or an owner | Reopen the reduction-variant axis. Enumerate `ArraySum`, `ArrayDot`, `VecSum`, `VecSumWhere`, and `VecDot` separately in the complete product and bind one parameterized HIR/MIR/LLVM owner to all five. |
 | `69949b68` reopened full review | P1: the new transparent expression wrapper had no ownership/region pass closure. P2: control-flow restoration omitted several block forms, and plan 12 still directed a future dot toward a rejected terminal-specific fast surface. | Reopen the transparent-wrapper axis. Add exact type/effect, ownership lifecycle, region/escape and exhaustive control-flow rows with parameterized owners; require every HIR analysis to recurse exactly once and the variant sweep to pin that classification. Replace plan 12's `fast dot` direction with this lexical permission scope. |
+| `a8d2e264` reopened full review | P1: LLVM contraction is authorized by the consuming add/subtract, so tagging both operations does not prevent a relaxed consumer from absorbing a strict multiply | Reopen the contraction-lowering axis. Never emit raw LLVM `contract`; select only a direct MIR-visible multiply/add-subtract pair whose two modes are authenticated, lower that use to existing explicit FMA, and keep unmatched or later-inlined operations separate. Add all four scalar/vector shapes, all dot variants and both asymmetric strict/relaxed negative controls. |
 
 ## 5. PR boundary
 

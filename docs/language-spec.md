@@ -325,8 +325,10 @@ contraction for arithmetic written lexically inside them, including array-pipeli
 fixed-vector `sum`/`sum_where`/`dot` products and accumulation. Nested scopes union permissions within one function body. Every named, inline,
 lifted, or escaping function body starts strict; a lambda needs its own visible inner scope for
 relaxed arithmetic, and no call site adds flags to callee operations. Scopes grant per-operation permission, not
-optimization isolation: independently permitted operations may combine after inlining, while a
-strict participant blocks the rewrite. Relaxed NaN and infinity inputs remain defined; only the named
+optimization isolation for reassociation: independently permitted operations may combine after
+inlining, while a strict participant blocks the rewrite. Contraction is selected before LLVM only
+for a direct multiply/add-subtract pair whose two operations both carry `contract`; no raw LLVM
+`contract` flag is emitted, so later inlining cannot absorb a strict multiply. Relaxed NaN and infinity inputs remain defined; only the named
 rounding, association, signed-zero, and NaN-payload variation is permitted. There is no `nnan`,
 `ninf`, `nsz`, reciprocal, approximate-function, bundled fast mode, or ambient compiler switch.
 The scope otherwise behaves as a plain value-producing block. See plan 77 for the complete record.

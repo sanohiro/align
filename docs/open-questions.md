@@ -19,11 +19,13 @@ Float arithmetic remains ordered and uncontracted by default. The only relaxatio
 value-producing block `float(reassoc) {}`, `float(contract) {}`, or their explicit combination.
 Options are independent and nested scopes union them within a function body. Every named or lambda
 body starts strict and requires its own visible scope; a call site never adds flags to callee
-operations. Scopes grant
-operation permissions rather than optimization isolation; independently permitted operations may
-compose after inlining, while any strict participant blocks the rewrite. `reassoc` permits reassociation of
+operations. Scopes grant operation permissions rather than optimization isolation for
+reassociation; independently permitted operations may compose after inlining, while any strict
+participant blocks the rewrite. `reassoc` permits reassociation of
 f32/f64 add/subtract/multiply and unordered floating reduction; `contract` permits local fused
-multiply-add/subtract without implying reassociation. Direct `dot` applies the same permissions to
+multiply-add/subtract without implying reassociation. Align selects contraction before LLVM only
+when both operations in a direct MIR-visible pair carry the permission, emits explicit FMA, and
+never emits LLVM's raw consumer-controlled `contract` flag. Direct `dot` applies the same permissions to
 its products and accumulation. NaN and infinity remain defined values.
 `nnan`, `ninf`, `nsz`, reciprocal, approximate-function, bundled `fast`, and ambient compiler flags
 are excluded. Generic and interface-carried concrete bodies retain the exact source scope and

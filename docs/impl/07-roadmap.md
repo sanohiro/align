@@ -2482,8 +2482,10 @@ regression net that validates the upgrade.
   Strict IEEE operation order and separate rounding remain the default. The
   two permissions are independent and nested scopes union them. Every function
   and lambda body starts strict; lambda arithmetic needs its own inner scope.
-  Caller mode never marks a callee's strict operations. Equally permitted operations may compose after
-  inlining; scopes are not optimization barriers. Checked HIR retains each lexical scope and validates every
+  Caller mode never marks a callee's strict operations. Equally permitted operations may compose
+  for reassociation after inlining; scopes are not optimization barriers. Contraction is selected
+  earlier only for a direct MIR-visible multiply/add-subtract pair whose two authenticated modes
+  permit it, then lowered as explicit FMA; raw LLVM `contract` is never emitted. Checked HIR retains each lexical scope and validates every
   operation's exact effective mode, so known invented/dropped bits fail before
   MIR. Generic and plan 74 concrete bodies retain exact source for consumer
   rechecking. Poison-producing assumptions, reciprocal/approximate modes,

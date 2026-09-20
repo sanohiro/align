@@ -78,12 +78,21 @@ source operation was written. Other MIR nodes carry no inferred relaxation.
 Every named, inline, lifted and escaping function body validates from strict mode. A lambda does
 not inherit the scope at its declaration site; relaxed lambda arithmetic has its own retained
 FloatScope inside the body. Direct, indirect and imported calls do not copy caller mode onto callee operations;
-the callee body already owns its modes. After LLVM body import/inlining, independently flagged
-operations may compose across that boundary, while an unflagged participant prevents the rewrite.
+the callee body already owns its modes. After LLVM body import/inlining, independently `reassoc`-
+flagged operations may compose across that boundary, while an unflagged participant prevents the rewrite.
 Format 15 generic
 templates and plan 74 concrete bodies retain exact source and the consumer re-derives the mode.
 MIR validation rejects unknown bits or a mode attached to an ineligible type/node before LLVM lowering. The mode changes permitted
 result bits only; it never licenses effect, memory, trap, cleanup or control-flow motion.
+
+That cross-boundary composition applies only to `reassoc`. Raw LLVM `contract`
+is never emitted because a consuming add/subtract could otherwise absorb a
+strict multiply. MIR recognizes only an immediate scalar/vector multiply
+operand of add/subtract when both authenticated modes carry `contract`, covers
+`a*b+c`, `c+a*b`, `a*b-c`, and `c-a*b`, and represents the selected use with
+the existing explicit FMA operation. Array/fixed-vector dot use the same fused
+accumulator step. A multiply behind a local, load, call or later LLVM inlining
+is not selected and remains separately rounded.
 
 ### 1.1 Borrow and resource operations
 
