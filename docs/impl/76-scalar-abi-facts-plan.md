@@ -25,9 +25,10 @@ They receive explicit dispositions in section 2 rather than meaningless tests.
 Surface           Internal Align program functions only: stored definitions,
                   imported per-unit declarations, noncapturing function-value
                   thunks, closure thunks, generated parallel callbacks, direct
-                  calls, indirect closure calls, export adapters and entry
-                  adapters. Foreign C calls, RawCall, runtime declarations and
-                  runtime calls retain their independently owned ABIs.
+                  calls, indirect closure calls, task-trampoline calls, export
+                  adapters and entry adapters. Foreign C calls, RawCall,
+                  runtime declarations and runtime calls retain their
+                  independently owned ABIs.
 
 Canonical rule    scalar_boundary_facts(Ty, transport) is the sole derivation.
                   It returns an extension convention and an optional range.
@@ -82,8 +83,12 @@ Direct calls      Ordinary MIR direct calls, direct calls with dynamic cleanup,
 Indirect calls    Function-value and closure calls derive facts from their
                   checked `param_tys`, `ret_ty`, `FnSignatureFacts` and physical
                   env-ABI offset. Both ordinary and dynamic-cleanup forms are
-                  covered. RawCall is excluded because it denotes a native
-                  pointer whose ABI is not owned by Align.
+                  covered. A non-fallible task trampoline also calls a closure
+                  thunk indirectly and derives its return fact from the task's
+                  checked result Ty; Unit has no result fact and a fallible
+                  task's aggregate `Result` has none. RawCall is excluded
+                  because it denotes a native pointer whose ABI is not owned
+                  by Align.
 
 Return cleanup    `ReturnCleanupAbi::DynamicBit` returns `{value, i1}`. LLVM
                   parameter attributes cannot describe a nested aggregate
@@ -125,12 +130,14 @@ Acceptance        One parameterized codegen owner checks the complete direct
                   negative rows prove no attribute leaks to i64, floats or
                   aggregates. One per-unit owner checks imported caller/callee
                   agreement. One indirect owner checks the env offset and both
-                  ordinary and cleanup forms. Existing wrapper/parallel owners
-                  gain structural assertions only where they exercise a scalar
-                  program call. Boundary-value execution covers signed minima,
-                  unsigned maxima, bool values and char envelope endpoints on
-                  the native target. LLVM module verification remains the final
-                  structural control.
+                  ordinary and cleanup forms. One spawn fixture checks the
+                  non-fallible task trampoline's indirect scalar return and the
+                  fallible aggregate negative case. Existing wrapper/parallel
+                  owners gain structural assertions only where they exercise a
+                  scalar program call. Boundary-value execution covers signed
+                  minima, unsigned maxima, bool values and char envelope
+                  endpoints on the native target. LLVM module verification
+                  remains the final structural control.
 
 Performance       No latency, throughput or instruction-count promise is made,
                   so no benchmark and no align-llm build is a provider gate.
@@ -180,17 +187,18 @@ not separate hand-written cases or separate test binaries.
 | Closure thunk definition/call | same env offset; captured tail uses lifted target signature at its physical call | capture fixture inspects definition and lifted call |
 | Indirect ordinary call | derive from checked `param_tys` / signature, offset by env; scalar result fact | indirect owner checks call-site attributes |
 | Indirect cleanup call | parameter facts offset by env; aggregate result gets none | indirect owned-result fixture |
+| Task-trampoline indirect call | non-fallible scalar `R` derives the return fact from `GeneratedId::Task.result`; Unit and fallible aggregate results get none | spawn owner checks bool/char/narrow-int returns plus fallible negative control |
 | Export / entry adapter | adapter definition follows its actual external surface; adapter-to-Align-body call follows the Align signature | existing export and main-wrapper fixtures gain focused assertions |
 | Generated parallel program call | derive from the recorded stage/terminal signature, not the current SSA value | existing generated-parallel fixture gains focused assertion |
 | Foreign/runtime/raw call | no program-scalar helper invocation | negative scan covers representative C, runtime and RawCall sites |
 | Whole/per-unit | identical facts from identical semantic types; no interface field | paired optimized-IR owner and existing interface round trip |
 | Target baselines | LLVM verifies the same IR contract; native boundary values run on each required platform | owner target in normal platform matrix; no separate benchmark job |
 
-Author-side matrix-to-diff closure requires every program-function
-`build_call` site either to use the canonical helper or to carry an explicit
-foreign/runtime exclusion. A repository search is part of the owner test only
-when it checks a stable wrapper API; a source-line count is not a correctness
-test.
+Author-side matrix-to-diff closure requires every program-function `build_call`
+and `return_transport::build_indirect_call` site either to use the canonical
+helper or to carry an explicit foreign/runtime/native exclusion. A repository
+search is part of the owner test only when it checks a stable wrapper API; a
+source-line count is not a correctness test.
 
 ## 4. Verification bundle
 
@@ -212,3 +220,16 @@ The implementation is complete when the matrix is closed, the focused owner
 passes, the standard bounded code gate passes, and the merged issue comment
 records the external recount as remaining work rather than pretending it was a
 provider acceptance gate.
+
+## 5. Design-review closure
+
+The first independent review of candidate `3b7eef67` found one P1: the matrix
+covered MIR indirect calls but omitted the separate generated task-trampoline
+call to a closure thunk. The complete root-cause audit found three owned
+`return_transport::build_indirect_call` families: non-fallible/fallible task
+trampolines, ordinary MIR indirect calls and cleanup-bearing MIR indirect
+calls. This revision adds the task family to the surface, derivation rule,
+acceptance set and matrix, and changes the author-side inventory from only
+`build_call` to both call builders. `build_native_indirect_call` remains the
+intentional RawCall/native exclusion. A fresh design review is required before
+implementation because the finding was ABI-correctness severity.
