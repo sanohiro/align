@@ -22,13 +22,14 @@ They receive explicit dispositions in section 2 rather than meaningless tests.
 ## 1. Public-contract ledger
 
 ```text
-Surface           Internal Align program functions only: stored definitions,
-                  imported per-unit declarations, noncapturing function-value
-                  thunks, closure thunks, generated parallel callbacks, direct
-                  calls, indirect closure calls, task-trampoline calls, export
-                  adapters and entry adapters. Foreign C calls, RawCall,
-                  runtime declarations and runtime calls retain their
-                  independently owned ABIs.
+Surface           Align-owned program ABI only: stored cores, imported per-unit
+                  declarations, noncapturing function-value thunks, closure
+                  thunks, generated parallel callbacks, direct calls, indirect
+                  closure calls and task-trampoline calls. Externally visible
+                  per-unit `pub` definitions still use this Align ABI. Native C
+                  entry/export shells, foreign C calls, RawCall, runtime
+                  declarations and runtime calls retain their independently
+                  owned ABIs.
 
 Canonical rule    scalar_boundary_facts(Ty, transport) is the sole derivation.
                   It returns an extension convention and an optional range.
@@ -63,6 +64,15 @@ Agreement         ABI extension facts are attached to both sides: every stored
                   cleanup proxies, byval values and aggregate result carriers
                   are indexed from the physical signature and never inherit a
                   neighboring source parameter's fact.
+
+Native shells     A direct non-Unit/non-Result source `main` is itself the C
+                  entry and receives no Align scalar facts, including no
+                  `signext` on its i32 return. Generated C `main` and named
+                  export wrappers likewise receive none. Their calls into an
+                  encoded/internal Align body do receive the body's canonical
+                  Align call-site facts. An externally linked per-unit `pub`
+                  definition is not a native shell: its consumer is an Align
+                  unit and both units derive the same facts.
 
 Range semantics   `range` is an optimization attribute, but the same canonical
                   record is applied to declarations/definitions and call sites
@@ -178,7 +188,7 @@ not separate hand-written cases or separate test binaries.
 
 | Boundary / state | Formation and emission | Owner proof |
 |---|---|---|
-| Stored definition | derive from `Function.params`, modes, cleanup transport and `ret`; attach at physical ordinals | direct-table IR owner, malformed transport negative control |
+| Stored Align definition | derive from `Function.params`, modes, cleanup transport and `ret`; attach at physical ordinals; exclude direct C `main` | direct-table IR owner, malformed transport negative control, direct-main negative assertion |
 | Imported declaration | derive from `ImportedFn` through the same helper | per-unit caller/callee IR comparison |
 | Direct MIR call | derive from callable-preflight `ProgramSignature`; exclude extern rows | direct-table IR owner checks call operands and return |
 | Direct cleanup call | parameter facts only; aggregate return gets none | owned-result fixture checks params and negative return |
@@ -188,7 +198,7 @@ not separate hand-written cases or separate test binaries.
 | Indirect ordinary call | derive from checked `param_tys` / signature, offset by env; scalar result fact | indirect owner checks call-site attributes |
 | Indirect cleanup call | parameter facts offset by env; aggregate result gets none | indirect owned-result fixture |
 | Task-trampoline indirect call | non-fallible scalar `R` derives the return fact from `GeneratedId::Task.result`; Unit and fallible aggregate results get none | spawn owner checks bool/char/narrow-int returns plus fallible negative control |
-| Export / entry adapter | adapter definition follows its actual external surface; adapter-to-Align-body call follows the Align signature | existing export and main-wrapper fixtures gain focused assertions |
+| Native export / entry shell | generated wrapper definition and direct C `main` receive no Align scalar facts; wrapper-to-Align-body call follows the Align signature | existing export/main fixtures assert the shell exclusion and the body-call inclusion |
 | Generated parallel program call | derive from the recorded stage/terminal signature, not the current SSA value | existing generated-parallel fixture gains focused assertion |
 | Foreign/runtime/raw call | no program-scalar helper invocation | negative scan covers representative C, runtime and RawCall sites |
 | Whole/per-unit | identical facts from identical semantic types; no interface field | paired optimized-IR owner and existing interface round trip |
@@ -233,3 +243,12 @@ acceptance set and matrix, and changes the author-side inventory from only
 `build_call` to both call builders. `build_native_indirect_call` remains the
 intentional RawCall/native exclusion. A fresh design review is required before
 implementation because the finding was ABI-correctness severity.
+
+That fresh review of candidate `1e4c07fa` found one P2: a direct i32-returning
+source `main` is the C entry itself, not an adapter, so the stored-definition
+row was ambiguous about `signext`. The complete native-surface audit separates
+three shells from Align-owned boundaries: direct C `main`, generated C `main`
+and named export wrappers receive no scalar facts; an export wrapper's call to
+its internal core does. Per-unit `pub` linkage remains Align-owned and is not
+excluded. The surface, agreement rule and matrix now state that distinction,
+and existing entry/export fixtures own the positive and negative assertions.

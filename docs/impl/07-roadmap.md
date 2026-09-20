@@ -2469,9 +2469,11 @@ regression net that validates the upgrade.
   LLVM requires `zeroext`/`signext` to agree on the declaration or definition
   and every call site, including indirect calls. [Plan 76](76-scalar-abi-facts-plan.md)
   owns the type-derived rule for direct scalar `bool`, i8/i16/i32, u8/u16/u32
-  and `char` transports. Stored i8 booleans and aggregate enum tags are not
-  function-boundary scalars and remain outside that capability. The existing
-  `readonly`/`nocapture`/`memory` analysis deferral remains unchanged.
+  and `char` transports. Native C entry/export shells are excluded while their
+  calls into Align cores follow the rule. Stored i8 booleans and aggregate enum
+  tags are not function-boundary scalars and remain outside that capability.
+  The existing `readonly`/`nocapture`/`memory` analysis deferral remains
+  unchanged.
 - **Slice V — verification bundle — DONE (#424, 2026-07-11; gate SHIP — ISA tests
   mutation-verified both directions, moot premise independently reproduced, harness honesty
   verified at both tiers; gemini's one high qualified-then-hardened: the shipped invocation
