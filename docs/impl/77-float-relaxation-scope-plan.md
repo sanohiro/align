@@ -29,7 +29,8 @@ Default           Outside a float scope, every operation retains today's
 
 Reassoc           Permits reassociation only on f32/f64 add, subtract and
                   multiply operations formed lexically in the scope, including
-                  built-in `sum` and direct `dot` arithmetic. A generic
+                  `ArraySum`, `ArrayDot`, `VecSum`, `VecSumWhere`, and `VecDot`
+                  arithmetic. A generic
                   `reduce` is only its callable body and receives no terminal-
                   site mode. The permission selects LLVM's unordered floating
                   reduction form where such a reduction is recognized. It
@@ -160,7 +161,9 @@ Acceptance        One syntax/formatter owner covers the three canonical forms,
                   entry/exit, nested union, branch/loop joins, early exits,
                   strict named/inline/lifted/escaping function roots, explicit
                   scopes inside lambda bodies, scalar and
-                  explicit-vector operations, and checked-HIR rejection of
+                  all five floating sum/dot reduction variants (`ArraySum`,
+                  `ArrayDot`, `VecSum`, `VecSumWhere`, and `VecDot`), and
+                  checked-HIR rejection of
                   invented, dropped and unknown bits against the retained scope.
                   One LLVM owner proves exact flags on admitted
                   nodes and their absence on strict, excluded and unrelated
@@ -195,8 +198,11 @@ flag; it does not mean that the optimizer may choose another one.
 |---|---|---|---|---|
 | f32/f64 or vec fadd/fsub | — | `reassoc` | `contract` | `reassoc contract` |
 | f32/f64 or vec fmul | — | `reassoc` | `contract` | `reassoc contract` |
-| built-in floating `sum` reduction | ordered adds/reduction | adds and reduction carry `reassoc`; reduction is unordered | adds carry `contract`; reduction stays ordered | adds carry both; reduction is unordered and carries both |
-| direct floating `dot` | ordered products and accumulator | products/adds carry `reassoc`; reduction is unordered | products/adds carry `contract`; reduction stays ordered | products/adds carry both; reduction is unordered |
+| array-pipeline floating `sum` (`ArraySum`) | ordered adds/reduction | adds and reduction carry `reassoc`; reduction is unordered | adds and reduction carry `contract`; reduction stays ordered | adds and reduction carry both; reduction is unordered |
+| array-pipeline floating `dot` (`ArrayDot`) | ordered products/adds/reduction | products, adds, and reduction carry `reassoc`; reduction is unordered | products, adds, and reduction carry `contract`; reduction stays ordered | products, adds, and reduction carry both; reduction is unordered |
+| fixed-vector floating `sum` (`VecSum`) | ordered lane adds/reduction | lane adds and reduction carry `reassoc`; reduction is unordered | lane adds and reduction carry `contract`; reduction stays ordered | lane adds and reduction carry both; reduction is unordered |
+| fixed-vector masked floating `sum_where` (`VecSumWhere`) | ordered selected-lane adds/reduction | selected-lane adds and reduction carry `reassoc`; reduction is unordered | selected-lane adds and reduction carry `contract`; reduction stays ordered | selected-lane adds and reduction carry both; reduction is unordered |
+| fixed-vector floating `dot` (`VecDot`) | ordered lane products/adds/reduction | products, adds, and reduction carry `reassoc`; reduction is unordered | products, adds, and reduction carry `contract`; reduction stays ordered | products, adds, and reduction carry both; reduction is unordered |
 | explicit `fma` | existing fused call | unchanged | unchanged | unchanged |
 | fdiv/frem, comparison, conversion, min/max, math call | — | — | — | — |
 | integer/bool/char/pointer/memory/control operation | — | — | — | — |
@@ -235,7 +241,7 @@ perform a particular rewrite.
 | Lambdas/calls | every named/inline/lifted/escaping body validates from a strict root; only a FloatScope retained inside that body changes its operations; named/direct/indirect/imported callee operations receive no caller flags; optimized owners show equally permitted caller/callee operations may compose while any strict participant prevents the rewrite | semantic/HIR/MIR/interface/LLVM owner |
 | Scalar arithmetic | f32/f64 add/sub/mul receive selected flags; div/rem/comparison/cast/min/max and explicit fma do not gain unrelated flags | LLVM owner |
 | Vector arithmetic | vecN<f32/f64> follows the same table for every admitted width | LLVM owner |
-| Reductions | built-in sum and direct ArrayDot follow the exact product/add/reduction table; unordered reduction appears only under `reassoc`; strict and contract-only controls remain ordered | MIR/LLVM owner |
+| Reductions | every existing floating sum/dot reduction variant — `ArraySum`, `ArrayDot`, `VecSum`, `VecSumWhere`, and `VecDot` — follows its exact product/add/reduction row above; unordered reduction appears only under `reassoc`; strict and contract-only controls remain ordered; integer instances remain unchanged | parameterized HIR/MIR/LLVM owner over all five variants |
 | Generic reduce | reducer callable starts strict like every function; only a FloatScope written inside its body may mark its arithmetic; enclosing terminal scope is not inherited | semantic/MIR/LLVM negative owner |
 | Contraction | eligible multiply plus consuming add/sub carry `contract`; optimizer fixture contains fused operation; `contract` alone does not set `reassoc` | LLVM owner |
 | Effects and traps | calls, memory operations, bounds/division traps and cleanup retain source order and receive no fast-math permission | MIR/LLVM negative owner |
@@ -256,6 +262,7 @@ One parameterized owner may close multiple rows. No row requires a benchmark.
 | `ae9983bb` reopened full review | P1: LLVM flags have no scope identity, so equally flagged operations can combine across sibling scopes or an inlined function boundary | Reopen lowered-rewrite composition. Define scopes as operation-permission boundaries, not optimization-isolation regions. Caller mode never marks strict callee operations; independently permitted operations may compose, while a strict participant blocks the rewrite through LLVM's flag intersection. Add positive cross-scope/callee and strict-barrier owners. |
 | `09338df4` reopened full review | P1: pipeline HIR stores lifted target names rather than parent lambda expressions, so declaration-site mode still cannot be authenticated. P2: the grammar prevented the promised sema diagnostic for `float()` | Remove declaration-site inheritance entirely: every function and lambda body starts strict and must contain its own FloatScope. This deletes the cross-function provenance mechanism and treats all callable forms uniformly. Parse an optional identifier list so sema owns the empty-list diagnostic. |
 | `23b3be10` reopened full review | P1: the Reassoc prose still named generic `reduce`, contradicting strict callable roots and the complete operation table | Remove generic `reduce` from terminal-site relaxation. Its arithmetic lives only in the reducer function and is relaxed only by a scope written inside that body. Add the explicit negative matrix row. |
+| `1381360f` reopened full review | P1: the reduction matrix named only the array-pipeline forms and could leave the three distinct fixed-vector HIR/MIR variants without mode semantics or an owner | Reopen the reduction-variant axis. Enumerate `ArraySum`, `ArrayDot`, `VecSum`, `VecSumWhere`, and `VecDot` separately in the complete product and bind one parameterized HIR/MIR/LLVM owner to all five. |
 
 ## 5. PR boundary
 

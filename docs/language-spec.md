@@ -321,8 +321,8 @@ Details: `draft.md` §4 (display, equality, ordering, floats) and §12 (literals
 Float arithmetic is ordered and uncontracted by default. The block expressions
 `float(reassoc) { ... }`, `float(contract) { ... }`, and
 `float(reassoc, contract) { ... }` explicitly permit f32/f64 reassociation and/or multiply-add
-contraction for arithmetic written lexically inside them, including built-in `sum`/`dot` products
-and accumulation. Nested scopes union permissions within one function body. Every named, inline,
+contraction for arithmetic written lexically inside them, including array-pipeline `sum`/`dot` and
+fixed-vector `sum`/`sum_where`/`dot` products and accumulation. Nested scopes union permissions within one function body. Every named, inline,
 lifted, or escaping function body starts strict; a lambda needs its own visible inner scope for
 relaxed arithmetic, and no call site adds flags to callee operations. Scopes grant per-operation permission, not
 optimization isolation: independently permitted operations may combine after inlining, while a

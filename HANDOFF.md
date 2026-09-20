@@ -117,8 +117,9 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    rewrite barriers. The lowered-rewrite-composition axis is reopened for a
    fresh full design review before merge and implementation. The latest pass
    removed one stale overpromise: generic `reduce` arithmetic belongs only to
-   its strict-root callable and needs a scope inside that body; only builtin
-   `sum` and direct `dot` consume terminal-site mode.
+   its strict-root callable and needs a scope inside that body. The complete
+   reduction product now names all five existing HIR/MIR forms: `ArraySum`,
+   `ArrayDot`, `VecSum`, `VecSumWhere`, and `VecDot`.
 4. Follow-ups, independent and small (updated 2026-09-19):
    `fix/nightly-detector-restore` closed #1105, #1107, #1108, #1109, and
    #1112, and separately repaired two untracked first-night nightly failures
