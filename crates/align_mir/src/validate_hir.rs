@@ -4766,6 +4766,8 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::BufferNew { .. }
             | hir::ExprKind::BufferBytes { .. }
             | hir::ExprKind::StrBytes { .. }
+            | hir::ExprKind::BytesView { .. }
+            | hir::ExprKind::SliceAsBytes { .. }
             | hir::ExprKind::BufferLen { .. }
             | hir::ExprKind::BytesRead { .. }
             | hir::ExprKind::BytesSet { .. }
@@ -5085,6 +5087,8 @@ impl<'a> BodyValidator<'a> {
             },
             hir::ExprKind::EncodingDecode { kind, .. } => !matches!(kind, hir::EncodingKind::Utf8Lossy | hir::EncodingKind::Html | hir::EncodingKind::PercentPath),
             hir::ExprKind::BytesRead { .. }
+            | hir::ExprKind::BytesView { .. }
+            | hir::ExprKind::SliceAsBytes { .. }
             | hir::ExprKind::BytesSet { .. }
             | hir::ExprKind::BytesFill { .. }
             | hir::ExprKind::BytesCopyFrom { .. } => true,
@@ -9229,6 +9233,25 @@ impl<'a> BodyValidator<'a> {
             }
             hir::ExprKind::StrBytes { inner } => {
                 (inner.ty == Ty::Str).then(|| strict(Ty::Slice(u8_scalar), &[inner]))?
+            }
+            hir::ExprKind::BytesView { bytes, elem } => {
+                let primitive = align_sema::scalar_to_prim(*elem)?;
+                if !align_sema::checked_byte_view_element(*elem) {
+                    return None;
+                }
+                if !self.body_ty_matches(bytes.ty, Ty::Slice(u8_scalar)) {
+                    return None;
+                }
+                strict(Ty::Option(Scalar::Slice(primitive)), &[bytes])
+            }
+            hir::ExprKind::SliceAsBytes { slice, elem } => {
+                if !align_sema::checked_byte_view_element(*elem) {
+                    return None;
+                }
+                if !self.body_ty_matches(slice.ty, Ty::Slice(*elem)) {
+                    return None;
+                }
+                strict(Ty::Slice(u8_scalar), &[slice])
             }
             hir::ExprKind::BufferLen { buffer } => {
                 (self.handle_receiver_place(buffer, context, Ty::Buffer) && buffer.ty == Ty::Buffer)

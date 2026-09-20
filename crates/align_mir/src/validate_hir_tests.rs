@@ -12076,9 +12076,10 @@ fn request11_expr_kind_inventory_tripwire() {
     }
     assert_eq!(
         // StrCharBoundary, ArrayTruncate, BytesSet, BytesFill, BytesCopyFrom, BufferAppendFilled,
-        // and FloatScope are explicit in validation, source-shape, replay and ownership.
+        // FloatScope, BytesView, and SliceAsBytes are explicit in validation, source-shape,
+        // replay and ownership.
         variants,
-        339,
+        341,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -19170,5 +19171,51 @@ fn bytes_ops_hir_rejects_forged_types_in_every_entrypoint() {
             _ => expression.ty = Ty::Int(IntTy { bits: 64, signed: true }),
         }
         assert_body_entrypoints_empty("bytes-copy-forged", &malformed);
+    }
+}
+
+#[test]
+fn checked_byte_views_hir_rejects_forged_type_equations_in_every_entrypoint() {
+    let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+    let i32_scalar = Scalar::Int(IntTy { bits: 32, signed: true });
+    let u32_scalar = Scalar::Int(IntTy { bits: 32, signed: false });
+
+    let view = checked_source_program(
+        "fn f(raw: slice<u8>) -> Option<slice<u32>> = raw.view_le()",
+    );
+    assert!(!is_empty(&lower_program(&view)));
+    for mutation in 0..3 {
+        let mut malformed = view.clone();
+        let expression = body_value_expression_mut(&mut malformed, "f");
+        let hir::ExprKind::BytesView { bytes, elem } = &mut expression.kind else {
+            panic!("byte view fixture")
+        };
+        match mutation {
+            0 => **bytes = body_test_expr(hir::ExprKind::Int(0), i64_ty),
+            1 => *elem = i32_scalar,
+            _ => expression.ty = Ty::Option(Scalar::Slice(PrimScalar::Int(IntTy {
+                bits: 64,
+                signed: false,
+            }))),
+        }
+        assert_body_entrypoints_empty("byte-view-forged", &malformed);
+    }
+
+    let inverse = checked_source_program(
+        "fn f(values: slice<u32>) -> slice<u8> = values.as_bytes()",
+    );
+    assert!(!is_empty(&lower_program(&inverse)));
+    for mutation in 0..3 {
+        let mut malformed = inverse.clone();
+        let expression = body_value_expression_mut(&mut malformed, "f");
+        let hir::ExprKind::SliceAsBytes { slice, elem } = &mut expression.kind else {
+            panic!("inverse byte view fixture")
+        };
+        match mutation {
+            0 => **slice = body_test_expr(hir::ExprKind::Int(0), i64_ty),
+            1 => *elem = i32_scalar,
+            _ => expression.ty = Ty::Slice(u32_scalar),
+        }
+        assert_body_entrypoints_empty("inverse-byte-view-forged", &malformed);
     }
 }

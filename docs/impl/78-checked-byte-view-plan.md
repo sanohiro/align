@@ -1,6 +1,6 @@
 # Checked zero-copy byte views
 
-Status: proposed design for issue 1064. This plan implements G7 of the
+Status: implemented for issue 1064. This plan implements G7 of the
 [vectorization contract](68-vectorization-contract.md). It replaces the issue's
 per-type `as_f32_slice` family and its disproved automatic-vectorization
 criterion with one checked, order-explicit view operation and its inverse.
@@ -138,6 +138,18 @@ Neither is specified as an implementation of the other.
 
 One parameterized owner may close multiple type and producer rows. The matrix
 requires discriminating failures, not one fixture per spelling.
+
+Implementation evidence is concentrated in
+`runway_a2_binary_codec::{checked_typed_byte_view_inference_and_domain_diagnostics,
+checked_typed_byte_view_runtime_predicates_cover_the_closed_domain,
+checked_typed_byte_views_are_descriptor_only_in_llvm,
+checked_typed_byte_views_reach_vector_loads_and_stores,
+checked_typed_byte_view_round_trip_and_failures}`. Checked-HIR field mutations
+are owned by `checked_byte_views_hir_rejects_forged_type_equations_in_every_entrypoint`;
+MIR mutations by `checked_byte_view_mir_relations_fail_closed_before_publication`;
+target refusal by `checked_byte_view_target_admission_precedes_backend_lowering`.
+The exhaustive HIR storage-generation and MIR fact inventories remain the
+compile-time pass-closure owners.
 
 ## 3. Validation and diagnostic order
 

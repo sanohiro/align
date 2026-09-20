@@ -92,7 +92,8 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    independent capability. #1064 is settled separately by
    [plan 78](docs/impl/78-checked-byte-view-plan.md): one checked
    `view_le<T>` plus `as_bytes`, with no copy/allocation and exact
-   provenance/authority. Its implementation is the next capability.
+   provenance/authority. The capability is implemented with checked HIR/MIR,
+   interface format 16, target admission and direct descriptor lowering.
    #1075 merged in PR #1143. [Plan 76](docs/impl/76-scalar-abi-facts-plan.md)
    supplies the complete call-boundary `zeroext`/`signext` rule and excludes
    stored aggregate facts and the unsound proposed `char` range. Focused owners

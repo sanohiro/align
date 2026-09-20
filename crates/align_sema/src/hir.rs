@@ -1533,6 +1533,13 @@ pub enum ExprKind {
     /// receiver is first wrapped in `StrBorrow`, so this node always borrows a `str` and inherits
     /// its storage region. Pure; the `{ptr,len}` representation is unchanged in MIR.
     StrBytes { inner: Box<Expr> },
+    /// `bytes.view_le()` — checked zero-copy reinterpretation of naturally aligned
+    /// little-endian bytes as a typed numeric slice. `elem` is one of the closed
+    /// multi-byte numeric set and `ty` is exactly `Option<slice<elem>>`.
+    BytesView { bytes: Box<Expr>, elem: crate::Scalar },
+    /// `slice<T>.as_bytes()` — total descriptor-only inverse of [`BytesView`].
+    /// `elem` records the typed receiver element and `ty` is `slice<u8>`.
+    SliceAsBytes { slice: Box<Expr>, elem: crate::Scalar },
     /// `b.len()` — the buffer's current byte count (an `i64`). Pure.
     BufferLen { buffer: Box<Expr> },
     /// `bytes.<scalar>_<le|be>(off)` — a bounds-checked binary scalar **read** from a `bytes`

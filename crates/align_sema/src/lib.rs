@@ -16591,6 +16591,8 @@ impl EffectScan<'_> {
             // `.bytes()` re-views string/buffer memory and `.len()` reads it — pure (no I/O), like
             // a field read.
             ExprKind::StrBytes { inner } => walk!(inner),
+            ExprKind::BytesView { bytes, .. } => walk!(bytes),
+            ExprKind::SliceAsBytes { slice, .. } => walk!(slice),
             ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => walk!(buffer),
             // Binary decode/encode (A2) are pure in-memory reads/growth (no I/O — a buffer `put`
             // mutates local heap like a `mut` array store, never a syscall). Walk the sub-exprs.
@@ -24208,6 +24210,10 @@ impl<'a> EscapeCheck<'a> {
                         .then_some(Region::Frame),
                 )],
             ),
+            // Descriptor reinterpretation changes only the element view. Both directions retain
+            // the receiver's backing lifetime exactly, including Option unwrap around `view_le`.
+            ExprKind::BytesView { bytes, .. } => work.push(Work::Eval(bytes, depth)),
+            ExprKind::SliceAsBytes { slice, .. } => work.push(Work::Eval(slice, depth)),
             // Wrapping/unwrapping preserves the payload's region: `Ok(decoded)` is as short-lived
             // as `decoded`, and `res?` re-exposes whatever region `res` carried. Without this a
             // region-tied struct could escape through a `Result`-typed local (use-after-free).
@@ -25103,6 +25109,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::StrTrim { .. }
             | ExprKind::StrBorrow(..)
             | ExprKind::StrBytes { .. }
+            | ExprKind::BytesView { .. }
+            | ExprKind::SliceAsBytes { .. }
             | ExprKind::BuilderNew { .. }
             | ExprKind::BuilderWrite { .. }
             | ExprKind::BuilderToString(..)
@@ -28378,7 +28386,7 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::HeapNew(i) | ExprKind::RawAlloc(i) | ExprKind::RawFree(i)
             | ExprKind::RawIsNull(i) | ExprKind::BoxGet(i)
-            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::StrBytes { inner: i } | ExprKind::BuilderToString(i) | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayToSlice(i)
+            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::StrBytes { inner: i } | ExprKind::BytesView { bytes: i, .. } | ExprKind::SliceAsBytes { slice: i, .. } | ExprKind::BuilderToString(i) | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.walk(i, depth),
             ExprKind::CloneIn { value, region } => {
                 self.walk(value, depth);
@@ -31062,6 +31070,8 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::CodecBatchStrs { .. }
         | ExprKind::CodecColumnAt { .. }
         | ExprKind::StrBytes { .. }
+        | ExprKind::BytesView { .. }
+        | ExprKind::SliceAsBytes { .. }
         | ExprKind::RunBytesStdout { .. }
         | ExprKind::RunBytesStderr { .. }
         | ExprKind::HttpRespBody { .. }
@@ -39068,7 +39078,9 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::StrBorrow(inner)
             | ExprKind::ArrayToSlice(inner)
-            | ExprKind::SliceRange { recv: inner, .. } => self.storage_roots(inner),
+            | ExprKind::SliceRange { recv: inner, .. }
+            | ExprKind::BytesView { bytes: inner, .. }
+            | ExprKind::SliceAsBytes { slice: inner, .. } => self.storage_roots(inner),
             ExprKind::StrBytes { inner } => {
                 // Text retains its UTF-8 invariant even when its owner is mutable.
                 // UnknownView formation preserves the lifetime roots and read-only
@@ -45518,6 +45530,8 @@ impl<'a> MoveCheck<'a> {
                 }
             }
             ExprKind::StrBytes { inner } => move_expr!(self, inner, moved, false, false),
+            ExprKind::BytesView { bytes, .. } => move_expr!(self, bytes, moved, false, false),
+            ExprKind::SliceAsBytes { slice, .. } => move_expr!(self, slice, moved, false, false),
             ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => move_expr!(self, buffer, moved, false, false),
             // Binary decode/encode (A2): every operand is borrowed (a read, or a buffer grown in
             // place), never consumed.
@@ -49747,6 +49761,8 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::SliceRange { recv, .. } => self.expr_root_local(recv),
             ExprKind::StrBytes { inner } => self.expr_root_local(inner),
             ExprKind::BufferBytes { buffer } => self.expr_root_local(buffer),
+            ExprKind::BytesView { bytes, .. } => self.expr_root_local(bytes),
+            ExprKind::SliceAsBytes { slice, .. } => self.expr_root_local(slice),
             ExprKind::Field { root, .. } => Some(self.root_local(*root)),
             ExprKind::TupleIndex { recv, .. } => self.expr_root_local(recv),
             _ => None,
@@ -53314,6 +53330,13 @@ impl<'a, 't> Checker<'a, 't> {
                 );
             }
             return err;
+        }
+        // Checked, descriptor-only byte/typed-slice views (plan 78). Evaluate the receiver once,
+        // then dispatch by its exact slice element type. `view_le` is result-directed because
+        // Align has no expression-position type arguments.
+        if matches!(method, "view_le" | "as_bytes") {
+            let recv_expr = self.check_expr(recv, None);
+            return self.check_checked_byte_view(recv_expr, method, args, expected, span);
         }
         // Binary **encode** on a `buffer`: `b.put_u32_le(v)` / `b.append(data)` (align-LLM runway
         // A2). Checked before the decode reads so a `put_`-prefixed name never falls through to the
@@ -65922,6 +65945,89 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    fn check_checked_byte_view(
+        &mut self,
+        recv_expr: Expr,
+        method: &str,
+        args: &[ast::Expr],
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let recv_ty = self.resolve(recv_expr.ty);
+        match method {
+            "view_le" => {
+                if recv_ty != Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })) {
+                    if recv_ty != Ty::Error {
+                        self.diags.error(
+                            format!("'.view_le()' requires a bytes (slice<u8>) receiver, got {}", ty_name(recv_ty)),
+                            span,
+                        );
+                    }
+                    return err;
+                }
+                if !args.is_empty() {
+                    self.diags.error(format!("'.view_le()' takes no arguments, got {}", args.len()), span);
+                    return err;
+                }
+                let expected = self.resolve(expected.unwrap_or(Ty::Error));
+                let elem = match expected {
+                    Ty::Option(Scalar::Slice(elem)) => prim_to_scalar(elem),
+                    _ => {
+                        self.diags.error(
+                            "cannot infer the element type for '.view_le()'; annotate the binding or return as slice<u16|u32|u64|i16|i32|i64|f32|f64>".to_string(),
+                            span,
+                        );
+                        return err;
+                    }
+                };
+                if !checked_byte_view_element(elem) {
+                    self.diags.error(
+                        format!("'.view_le()' does not support element type {}", ty_name(scalar_to_ty(elem))),
+                        span,
+                    );
+                    return err;
+                }
+                let Some(primitive) = scalar_to_prim(elem) else {
+                    return err;
+                };
+                Expr {
+                    kind: ExprKind::BytesView { bytes: Box::new(recv_expr), elem },
+                    ty: Ty::Option(Scalar::Slice(primitive)),
+                    span,
+                }
+            }
+            "as_bytes" => {
+                let Ty::Slice(elem) = recv_ty else {
+                    if recv_ty != Ty::Error {
+                        self.diags.error(
+                            format!("'.as_bytes()' requires a typed numeric slice receiver, got {}", ty_name(recv_ty)),
+                            span,
+                        );
+                    }
+                    return err;
+                };
+                if !args.is_empty() {
+                    self.diags.error(format!("'.as_bytes()' takes no arguments, got {}", args.len()), span);
+                    return err;
+                }
+                if !checked_byte_view_element(elem) {
+                    self.diags.error(
+                        format!("'.as_bytes()' does not support element type {}", ty_name(scalar_to_ty(elem))),
+                        span,
+                    );
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::SliceAsBytes { slice: Box::new(recv_expr), elem },
+                    ty: Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })),
+                    span,
+                }
+            }
+            _ => err,
+        }
+    }
+
     /// `f.pread(b: mut buffer, off)` / `f.pwrite(data, off)` / `f.len()` on a `file` ([`Ty::File`]),
     /// the receiver already evaluated. Each **borrows** the file (never consumed — no move-out) and
     /// yields `Result<i64, Error>` (`pread`/`len` a count, `pwrite` the full byte count written). A
@@ -66841,6 +66947,13 @@ impl<'a, 't> Checker<'a, 't> {
                                 if path.segments.len() == 1
                                     && path.segments[0].name == "resource"
                         )
+            ) => Some(Ty::Option(payload)),
+            (
+                ast::ExprKind::Call { callee, .. },
+                Some(payload @ Scalar::Slice(_)),
+            ) if matches!(
+                &callee.kind,
+                ast::ExprKind::FieldAccess { field, .. } if field.name == "view_le"
             ) => Some(Ty::Option(payload)),
             _ => None,
         };
@@ -68253,7 +68366,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
             | ExprKind::Try(inner) | ExprKind::HeapNew(inner)
-            | ExprKind::BoxClone(inner) | ExprKind::StrClone(inner) | ExprKind::StrBorrow(inner) | ExprKind::StrBytes { inner } | ExprKind::BuilderToString(inner) | ExprKind::ArrayToSoa { source: inner, .. } | ExprKind::ArrayToSlice(inner)
+            | ExprKind::BoxClone(inner) | ExprKind::StrClone(inner) | ExprKind::StrBorrow(inner) | ExprKind::StrBytes { inner } | ExprKind::BytesView { bytes: inner, .. } | ExprKind::SliceAsBytes { slice: inner, .. } | ExprKind::BuilderToString(inner) | ExprKind::ArrayToSoa { source: inner, .. } | ExprKind::ArrayToSlice(inner)
             | ExprKind::Len(inner) => {
                 self.finalize_expr(inner)
             }
@@ -69854,6 +69967,15 @@ fn binary_scalar_suffix(name: &str) -> Option<(Ty, bool)> {
         _ => return None,
     };
     Some((ty, be))
+}
+
+/// The closed multi-byte scalar domain shared by source, checked-HIR, MIR, and backend admission.
+pub fn checked_byte_view_element(element: Scalar) -> bool {
+    matches!(
+        element,
+        Scalar::Int(IntTy { bits: 16 | 32 | 64, .. })
+            | Scalar::Float(FloatTy { bits: 32 | 64 })
+    )
 }
 
 /// The surface method name of a builder writer (for diagnostics).
@@ -74942,7 +75064,7 @@ mod tests {
         // FloatScope is an explicit forwarding wrapper with no storage of its own.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 339,
+            variants, 341,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

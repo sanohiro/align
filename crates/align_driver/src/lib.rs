@@ -5407,6 +5407,7 @@ pub fn default_rt_lto(profile: Profile) -> bool {
 }
 
 pub fn emit_object_file(mir: &align_mir::Program, obj: &std::path::Path, target: BuildTarget, profile: Profile, exports: &[String], rt_lto: bool) -> Result<(), String> {
+    validate_byte_view_target(mir, &target)?;
     // Process-in-memory memoization (`memo.rs`; `docs/impl/10-cache-first-optimization.md` §6.6).
     // `emit_object` is a pure function of the key material below, so replaying the retained bytes is
     // byte-identical to rerunning codegen. Only the failure MESSAGE of an unwritable output path
@@ -5434,6 +5435,31 @@ pub fn emit_object_file(mir: &align_mir::Program, obj: &std::path::Path, target:
         memo::object_store(key, bytes);
     }
     Ok(())
+}
+
+fn target_triple_is_little_endian(triple: &str) -> bool {
+    matches!(
+        triple.split('-').next().unwrap_or_default().to_ascii_lowercase().as_str(),
+        "x86_64" | "amd64" | "aarch64" | "arm64"
+    )
+}
+
+fn validate_byte_view_target(mir: &align_mir::Program, target: &BuildTarget) -> Result<(), String> {
+    if !mir.requires_little_endian_byte_views() {
+        return Ok(());
+    }
+    let resolved = align_codegen_llvm::resolve_target_identity(target).map_err(|error| error.to_string())?;
+    validate_byte_view_target_triple(true, &resolved.triple)
+}
+
+fn validate_byte_view_target_triple(requires_little_endian: bool, triple: &str) -> Result<(), String> {
+    if !requires_little_endian || target_triple_is_little_endian(triple) {
+        Ok(())
+    } else {
+        Err(format!(
+            "'.view_le()' requires a little-endian target, but target '{triple}' is not little-endian; decode with the scalar _le accessors instead"
+        ))
+    }
 }
 
 /// Form the versioned identities for one per-unit test object and the sole-entry harness. The
@@ -5758,6 +5784,9 @@ pub fn emit_object_cached(
     exports: &[String],
     rt_lto: bool,
 ) -> Result<CacheOutcome, String> {
+    // Semantic target admission precedes even a possible object-cache hit. A target-incompatible
+    // checked operation must never be hidden by an artifact lookup.
+    validate_byte_view_target(mir, &target)?;
     // When the cache is disabled (the default), skip building the key entirely — the codegen-key
     // inputs (`compiler_build_id`'s one-time `alignc`-binary hash, `resolve_target_identity`,
     // `llvm_version`, `target_object_format`) are pure cache overhead a cache-off build must not pay.
@@ -5837,6 +5866,10 @@ pub fn codegen_units_parallel(
     pgo: &PgoMode,
 ) -> Result<UnitCodegen, String> {
     assert_eq!(units.len(), obj_paths.len(), "one object path per unit");
+    let staged = stage_pgo(pgo)?;
+    for unit in units {
+        validate_byte_view_target(&unit.mir, target)?;
+    }
     let inputs: Vec<CodegenUnitInput<'_>> = units
         .iter()
         .map(|unit| CodegenUnitInput {
@@ -5845,7 +5878,6 @@ pub fn codegen_units_parallel(
             dep_interface_hashes: &unit.dep_interface_hashes,
         })
         .collect();
-    let staged = stage_pgo(pgo)?;
     let phase1 = codegen_lookup_phase(&inputs, obj_paths, cache, target, profile, rt_lto, staged.key)?;
     // Every MIR is already lowered on this path, so there is nothing to materialize between the
     // phases.
@@ -5874,6 +5906,26 @@ pub fn codegen_package_parallel(
 ) -> Result<UnitCodegen, PackageCodegenError> {
     assert_eq!(build.units.len(), obj_paths.len(), "one object path per unit");
     let staged = stage_pgo(pgo).map_err(PackageCodegenError::Failed)?;
+    // A little-endian target admits every unit without reconstructing frontend hits. On a future
+    // big-endian target, rehydrate before the object-cache lookup so a private `view_le` body cannot
+    // be hidden behind a cached object merely because its interface has no public-body spelling.
+    let resolved = align_codegen_llvm::resolve_target_identity(target)
+        .map_err(|error| PackageCodegenError::Failed(error.to_string()))?;
+    if !target_triple_is_little_endian(&resolved.triple) {
+        for index in 0..build.units.len() {
+            if build.units[index].is_reused() {
+                let unit = build.units[index].unit.clone();
+                build
+                    .materialize(index)
+                    .map_err(|failure| PackageCodegenError::StaleCacheEntry { unit, failure })?;
+            }
+        }
+    }
+    for unit in &build.units {
+        if let Some(mir) = unit.mir() {
+            validate_byte_view_target(mir, target).map_err(PackageCodegenError::Failed)?;
+        }
+    }
     let phase1 = {
         let inputs: Vec<CodegenUnitInput<'_>> = build
             .units
@@ -10925,7 +10977,21 @@ impl Drop for ArtifactStage {
 
 #[cfg(test)]
 mod artifact_stage_tests {
-    use super::ArtifactStage;
+    use super::{ArtifactStage, validate_byte_view_target_triple};
+
+    #[test]
+    fn checked_byte_view_target_admission_precedes_backend_lowering() {
+        for triple in ["x86_64-unknown-linux-gnu", "aarch64-apple-macosx15.0.0"] {
+            assert_eq!(validate_byte_view_target_triple(true, triple), Ok(()));
+        }
+        let error = validate_byte_view_target_triple(true, "powerpc64-unknown-linux-gnu")
+            .expect_err("big-endian target must reject view_le");
+        assert!(error.contains("requires a little-endian target"), "{error}");
+        assert_eq!(
+            validate_byte_view_target_triple(false, "powerpc64-unknown-linux-gnu"),
+            Ok(())
+        );
+    }
 
     #[test]
     fn concurrent_stages_are_distinct_and_remove_only_their_own_directory() {

@@ -1121,6 +1121,14 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         ExprKind::StrBytes { inner } => ExprKind::StrBytes {
             inner: boxed!(inner),
         },
+        ExprKind::BytesView { bytes, elem } => ExprKind::BytesView {
+            bytes: boxed!(bytes),
+            elem: *elem,
+        },
+        ExprKind::SliceAsBytes { slice, elem } => ExprKind::SliceAsBytes {
+            slice: boxed!(slice),
+            elem: *elem,
+        },
         ExprKind::BufferLen { buffer } => ExprKind::BufferLen {
             buffer: boxed!(buffer),
         },
@@ -2751,6 +2759,8 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::FileLen { file: recv }
         | ExprKind::BufferBytes { buffer: recv }
         | ExprKind::StrBytes { inner: recv }
+        | ExprKind::BytesView { bytes: recv, .. }
+        | ExprKind::SliceAsBytes { slice: recv, .. }
         | ExprKind::BufferLen { buffer: recv }
         | ExprKind::FsExists { path: recv }
         | ExprKind::FsRemove { path: recv }
