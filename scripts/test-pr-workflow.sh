@@ -3135,6 +3135,7 @@ for script in \
   scripts/run-suite-binaries.sh \
   scripts/test-apt-llvm.sh \
   scripts/test-binaries-lib.sh \
+  scripts/test-codegen-performance.sh \
   scripts/test-pr-workflow.sh \
   scripts/test-review-bounded.sh \
   scripts/test-pr.sh \
@@ -3152,3 +3153,22 @@ python3 -c 'import ast, sys; ast.parse(open(sys.argv[1], "rb").read(), sys.argv[
 # self-test step that guards the PR machinery also guards the installer.
 bash "$repo_root/scripts/test-apt-llvm.sh"
 bash "$repo_root/scripts/test-review-bounded.sh"
+
+grep -Fq 'scripts/test-codegen-performance.sh --ci-core' "$repo_root/.github/workflows/ci.yml" || {
+  echo "full-tier CI must select the bounded cross-platform codegen owner set" >&2
+  exit 1
+}
+if grep -Fq 'scripts/cargo.sh build --workspace' "$repo_root/scripts/test-codegen-performance.sh"; then
+  echo "the codegen owner must not rebuild the whole workspace before selected targets" >&2
+  exit 1
+fi
+for target in build_profiles emit_llvm_stage explain_opt runway_a2_binary_codec; do
+  grep -Fq -- "--test $target" "$repo_root/scripts/test-codegen-performance.sh" || {
+    echo "the codegen full owner lost $target" >&2
+    exit 1
+  }
+done
+if "$repo_root/scripts/test-codegen-performance.sh" --unknown >/dev/null 2>&1; then
+  echo "the codegen owner accepted an unknown mode" >&2
+  exit 1
+fi
