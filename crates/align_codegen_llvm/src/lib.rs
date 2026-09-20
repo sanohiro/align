@@ -37797,7 +37797,7 @@ fn main() -> i32 = 0
             &[],
             None,
         )
-        .expect("scalar-boundary fixture");
+        .unwrap_or_else(|error| panic!("scalar-boundary fixture: {error}"));
 
         let boundary_line = |kind: &str, logical: &str| {
             let symbol = encoded_program_symbol(&program_call(logical));
@@ -37856,7 +37856,7 @@ fn main() -> i32 = 0
             &["bool_id".to_owned()],
             None,
         )
-        .expect("scalar export fixture");
+        .unwrap_or_else(|error| panic!("scalar export fixture: {error}"));
         let wrapper = exported
             .lines()
             .find(|line| line.starts_with("define ") && line.contains("@bool_id("))
@@ -37910,7 +37910,7 @@ fn main() -> i32 = 0
             &[],
             None,
         )
-        .expect("scalar per-unit fixture");
+        .unwrap_or_else(|error| panic!("scalar per-unit fixture: {error}"));
         let dep = encoded_program_symbol(&program_call("dep"));
         let declaration = imported
             .lines()
@@ -37925,7 +37925,9 @@ fn main() -> i32 = 0
 
         // The helper owns the physical env offset and aggregate-cleanup exclusion shared by
         // function-value, closure and cleanup-bearing calls. Exercise those mechanics directly so
-        // this owner does not need another source fixture or test binary.
+        // this owner does not need another source fixture or test binary. Every fallible operation
+        // below consumes constant test-owned LLVM input, so construction failure is a broken
+        // fixture and deliberately panics in the test rather than entering production diagnostics.
         let ctx = Context::create();
         let module = ctx.create_module("scalar-boundary-helper");
         let ptr = ctx.ptr_type(AddressSpace::default());
@@ -37945,7 +37947,7 @@ fn main() -> i32 = 0
             hir::ReturnCleanupAbi::DynamicBit,
             1,
         )
-        .expect("valid env-offset cleanup signature");
+        .unwrap_or_else(|error| panic!("valid env-offset cleanup signature: {error}"));
         assert!(
             cleanup_fn
                 .get_enum_attribute(
@@ -37993,7 +37995,7 @@ fn main() -> i32 = 0
         builder.position_at_end(ctx.append_basic_block(caller, "entry"));
         let malformed_call = builder
             .build_call(malformed, &[ctx.i8_type().const_zero().into()], "bad")
-            .expect("well-typed physical call");
+            .unwrap_or_else(|error| panic!("well-typed physical call: {error}"));
         let call_error = add_scalar_call_facts(
             &ctx,
             malformed_call,
