@@ -374,24 +374,22 @@ pub fn parse_sdk_version(value: &str) -> Result<SdkVersion, CodegenError> {
     if parts.len() > 3 {
         return reject("it has more than three components");
     }
-    let mut numbers = [0u32; 3];
-    for (index, part) in parts.iter().enumerate() {
+    for part in &parts {
         if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
             return reject("every component must be one or more decimal digits");
         }
-        numbers[index] = match part.parse::<u32>() {
-            Ok(number) => number,
-            Err(_) => return reject("a component does not fit in 32 bits"),
-        };
     }
-    if numbers[0] == 0 || numbers[0] > u16::MAX.into() {
-        return reject("major must be in 1..=65535");
-    }
-    if numbers[1] > u8::MAX.into() {
-        return reject("minor must be in 0..=255");
-    }
-    if numbers[2] > u8::MAX.into() {
-        return reject("patch must be in 0..=255");
+    let mut numbers = [0u64; 3];
+    for (index, part) in parts.iter().enumerate() {
+        let number = part.parse::<u64>().unwrap_or(u64::MAX);
+        match index {
+            0 if number == 0 || number > u16::MAX.into() => {
+                return reject("major must be in 1..=65535");
+            }
+            1 if number > u8::MAX.into() => return reject("minor must be in 0..=255"),
+            2 if number > u8::MAX.into() => return reject("patch must be in 0..=255"),
+            _ => numbers[index] = number,
+        }
     }
     Ok(SdkVersion {
         major: numbers[0] as u16,
@@ -583,6 +581,14 @@ mod tests {
             let error = parse_sdk_version(bad).unwrap_err().to_string();
             assert!(error.contains("--sdk-version"), "{bad:?}: {error}");
         }
+    }
+
+    #[test]
+    fn sdk_version_range_errors_follow_component_order() {
+        let error = parse_sdk_version("65536.4294967296")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("major must be in 1..=65535"), "{error}");
     }
 
     /// Every Apple spelling normalizes to its canonical OS plus an explicit version, the
