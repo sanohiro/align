@@ -12,12 +12,13 @@ on the definition or declaration and the call site. This capability therefore
 cannot be implemented only in `declare_fn` and `declare_imported_fn`: the same
 type-derived record must reach every direct and indirect Align call.
 
-This plan deliberately removes two rows from the issue's proposed boundary
+This plan deliberately rejects three claims from the issue's proposed boundary
 table. An `i8` boolean in aggregate storage is a memory-load fact, not a
 function parameter or result. A fieldless enum currently crosses the Align ABI
 as the ordinary enum aggregate, not as its integer tag. Giving either row a
 function attribute would describe a value that is not present at that boundary.
-They receive explicit dispositions in section 2 rather than meaningless tests.
+The proposed `char` range is also false for integer-cast values. They receive
+explicit dispositions in section 2 rather than meaningless or unsound tests.
 
 ## 1. Public-contract ledger
 
@@ -32,28 +33,27 @@ Surface           Align-owned program ABI only: stored cores, imported per-unit
                   owned ABIs.
 
 Canonical rule    scalar_boundary_facts(Ty, transport) is the sole derivation.
-                  It returns an extension convention and an optional range.
-                  The record is derived from the semantic Ty and the selected
-                  LLVM transport, never from source spelling or an observed
-                  operand. Aggregate, pointer, view, float and unit types have
-                  no scalar facts.
+                  It returns an extension convention derived from the semantic
+                  Ty and selected LLVM transport, never from source spelling
+                  or an observed operand. Aggregate, pointer, view, float and
+                  unit types have no scalar facts.
 
 Type table        bool / direct i1       zeroext
                   u8, u16, u32           zeroext
                   i8, i16, i32           signext
-                  char / direct i32      zeroext, range(i32 0, 0x110000)
+                  char / direct i32      zeroext
                   u64, i64               none
                   f32, f64               none
                   aggregate enum         none
                   aggregate cleanup ret  none on the aggregate return
 
-Char range        Align construction and validation already reject surrogate
-                  code points. LLVM's parameter `range` attribute has one
-                  half-open interval, so the truthful representable boundary
-                  fact is the conservative envelope [0, 0x110000). It does not
-                  claim that surrogate values are valid Align chars. An exact
-                  disjoint-set fact would need a different LLVM mechanism and
-                  is not required here.
+Char range        None. Integer-to-char casts are defined as the low 32-bit
+                  code-point representation and currently admit values outside
+                  Unicode's scalar domain. Even the conservative envelope
+                  [0, 0x110000) would therefore be false and could create LLVM
+                  poison. `char` receives only its truthful unsigned extension
+                  convention. Tightening cast semantics is a separate language
+                  decision, not an ABI optimization precondition.
 
 Agreement         ABI extension facts are attached to both sides: every stored
                   definition or imported declaration and every corresponding
@@ -74,15 +74,11 @@ Native shells     A direct non-Unit/non-Result source `main` is itself the C
                   definition is not a native shell: its consumer is an Align
                   unit and both units derive the same facts.
 
-Range semantics   `range` is an optimization attribute, but the same canonical
-                  record is applied to declarations/definitions and call sites
-                  so IR inspection has one stable rule. Out-of-range values
-                  become poison under LLVM semantics; facts are therefore
-                  emitted only for representations guaranteed by checked HIR,
-                  MIR validation and codegen construction. The inkwell 0.9 API
-                  has no constant-range constructor, so one small wrapper over
-                  LLVM 22's `LLVMCreateConstantRangeAttribute` owns the unsafe
-                  conversion and accepts only 1..=64-bit half-open ranges.
+Range semantics   No function-boundary range is emitted by this capability.
+                  Stored booleans and enum tags are not scalar call-boundary
+                  values, and `char` lacks a truthful range under the settled
+                  cast implementation. This avoids both invented facts and an
+                  otherwise unnecessary raw LLVM attribute constructor.
 
 Direct calls      Ordinary MIR direct calls, direct calls with dynamic cleanup,
                   calls made inside generated adapters and parallel kernels,
@@ -102,7 +98,7 @@ Indirect calls    Function-value and closure calls derive facts from their
 
 Return cleanup    `ReturnCleanupAbi::DynamicBit` returns `{value, i1}`. LLVM
                   parameter attributes cannot describe a nested aggregate
-                  member, so no extension/range fact is put on that aggregate
+                  member, so no extension fact is put on that aggregate
                   return. Its value and cleanup extraction semantics are
                   unchanged. Parameters of the same function still receive
                   their facts. `ReturnCleanupAbi::None` scalar results receive
@@ -162,9 +158,8 @@ Mirrors           This plan, docs/impl/05-backend-llvm.md,
                   does not change, so draft.md and docs/language-spec.md do not.
 ```
 
-The rule follows LLVM's distinction precisely: `zeroext` and `signext` affect
-the target ABI and must match at both ends, while `range` supplies an
-optimization guarantee. See the LLVM 22
+The rule follows LLVM's ABI distinction precisely: `zeroext` and `signext`
+affect the target ABI and must match at both ends. See the LLVM 22
 [parameter-attribute contract](https://llvm.org/docs/LangRef.html#parameter-attributes).
 
 ## 2. Dispositions and rejected shortcuts
@@ -175,6 +170,7 @@ optimization guarantee. See the LLVM 22
 | Add attributes only in `declare_fn` and `declare_imported_fn` | Rejected. LLVM requires ABI attributes at call sites too, including indirect calls. |
 | Mark stored `bool` i8 as a function `range` | Rejected. The i8 is a memory representation, not the i1 parameter/result. A future load-facts capability may attach load metadata where storage provenance proves it. |
 | Mark a fieldless enum parameter with integer `range` | Rejected. The current parameter is an enum aggregate. Tag-load facts or an enum ABI representation change are separate capabilities. |
+| Mark `char` with `range(i32 0, 0x110000)` | Rejected. Valid integer-to-char casts can produce any 32-bit pattern, so the attribute would turn accepted values into poison. |
 | Put a range on a dynamic-cleanup aggregate return | Rejected. LLVM cannot attach an integer range to the nested value or cleanup member through an aggregate return attribute. |
 | Add `llvm.assume` at each callee entry | Rejected. It does not define the caller's ABI extension convention and duplicates facts as instructions. |
 | Run an align-llm benchmark in CI or preflight | Rejected. The provider contract is structural and semantic; external instruction counts are consumer-owned follow-up evidence. |
@@ -188,7 +184,7 @@ not separate hand-written cases or separate test binaries.
 
 | Boundary / state | Formation and emission | Owner proof |
 |---|---|---|
-| Stored Align definition | derive from `Function.params`, modes, cleanup transport and `ret`; attach at physical ordinals; exclude direct C `main` | direct-table IR owner, malformed transport negative control, direct-main negative assertion |
+| Stored Align definition | derive from `Function.params`, modes, cleanup transport and `ret`; attach at physical ordinals; exclude direct C `main` | direct-table IR owner including char's no-range control, malformed transport negative control, direct-main negative assertion |
 | Imported declaration | derive from `ImportedFn` through the same helper | per-unit caller/callee IR comparison |
 | Direct MIR call | derive from callable-preflight `ProgramSignature`; exclude extern rows | direct-table IR owner checks call operands and return |
 | Direct cleanup call | parameter facts only; aggregate return gets none | owned-result fixture checks params and negative return |
@@ -235,9 +231,9 @@ benchmark         none
 external client   pending consumer-owned mask/instruction recount
 ```
 
-Candidate verification on 2026-09-20: the codegen owner passed in 0.04 seconds
+Candidate verification on 2026-09-20: the codegen owner passed in 0.03 seconds
 (one test, 221 filtered out), and the whole/per-unit execution owner passed in
-0.76 seconds. Compilation took 14.60 seconds and 16.59 seconds respectively.
+1.03 seconds. Compilation took 16.88 seconds and 18.05 seconds respectively.
 No benchmark or broad test suite was run. The helper owner also rejects a
 semantic `bool` mapped onto a physical `i8` function or call before module
 verification, pins the environment offset, and proves that a dynamic-cleanup
@@ -269,3 +265,13 @@ and named export wrappers receive no scalar facts; an export wrapper's call to
 its internal core does. Per-unit `pub` linkage remains Align-owned and is not
 excluded. The surface, agreement rule and matrix now state that distinction,
 and existing entry/export fixtures own the positive and negative assertions.
+
+The implementation review of candidate `b4996e02` found one P1: the proposed
+`char` range was unsound because the settled integer-to-char codegen preserves
+any low 32-bit pattern. The root-cause audit confirmed that literals are Unicode
+scalars but `gen_cast` performs an unchecked integer cast, and accepted values
+then cross every ordinary direct, indirect and per-unit boundary. This revision
+reopens the scalar-fact matrix, removes the range field and raw LLVM constructor
+entirely, retains only `zeroext` for `char`, and adds both an IR no-range control
+and whole/per-unit execution of `0xffffffff as char`. Because this P1 changes
+the implementation strategy, the revised candidate requires one fresh review.

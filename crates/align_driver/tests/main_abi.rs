@@ -147,6 +147,8 @@ fn scalar_boundary_values_survive_whole_and_per_unit_calls() {
         "  if scalar.i32_id(-2147483648) != -2147483648 { return 10 }\n",
         "  if scalar.char_id('\\0') != '\\0' { return 11 }\n",
         "  if scalar.char_id('\\u{10ffff}') != '\\u{10ffff}' { return 12 }\n",
+        "  invalid: char := (4294967295 as u32) as char\n",
+        "  if scalar.char_id(invalid) as u32 != 4294967295 { return 13 }\n",
         "  return 0\n",
         "}\n",
     );

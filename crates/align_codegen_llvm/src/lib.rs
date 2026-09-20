@@ -74,7 +74,7 @@ use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
-use inkwell::context::{AsContextRef, Context};
+use inkwell::context::Context;
 use inkwell::debug_info::{
     AsDIScope, DIFlags, DIFlagsConstants, DIFile, DISubprogram, DWARFEmissionKind,
     DWARFSourceLanguage, DebugInfoBuilder,
@@ -8167,7 +8167,6 @@ fn abi_param_type<'c>(
 struct ScalarBoundaryFacts {
     bits: u32,
     extension: &'static str,
-    range: Option<(u32, u64, u64)>,
 }
 
 /// The complete narrow-scalar fact table for Align-owned program boundaries (plan 76).
@@ -8176,51 +8175,18 @@ struct ScalarBoundaryFacts {
 /// inherit facts from an integer field and 64-bit integers need no target ABI extension convention.
 fn scalar_boundary_facts(ty: Ty) -> Option<ScalarBoundaryFacts> {
     match ty {
-        Ty::Bool => Some(ScalarBoundaryFacts { bits: 1, extension: "zeroext", range: None }),
+        Ty::Bool => Some(ScalarBoundaryFacts { bits: 1, extension: "zeroext" }),
         Ty::Int(IntTy { bits, signed: false }) if matches!(bits, 8 | 16 | 32) => {
-            Some(ScalarBoundaryFacts { bits: u32::from(bits), extension: "zeroext", range: None })
+            Some(ScalarBoundaryFacts { bits: u32::from(bits), extension: "zeroext" })
         }
         Ty::Int(IntTy { bits, signed: true }) if matches!(bits, 8 | 16 | 32) => {
-            Some(ScalarBoundaryFacts { bits: u32::from(bits), extension: "signext", range: None })
+            Some(ScalarBoundaryFacts { bits: u32::from(bits), extension: "signext" })
         }
-        // LLVM's parameter range attribute accepts one interval. This conservative envelope is
-        // true for every Unicode scalar while deliberately not claiming the surrogate gap.
-        Ty::Char => Some(ScalarBoundaryFacts {
-            bits: 32,
-            extension: "zeroext",
-            range: Some((32, 0, 0x11_0000)),
-        }),
+        // Integer-to-char casts preserve the low 32 bits, including values outside Unicode's
+        // scalar domain. `char` therefore has an unsigned ABI convention but no truthful range.
+        Ty::Char => Some(ScalarBoundaryFacts { bits: 32, extension: "zeroext" }),
         _ => None,
     }
-}
-
-fn constant_range_attribute(
-    ctx: &Context,
-    bits: u32,
-    lower: u64,
-    upper: u64,
-) -> Result<inkwell::attributes::Attribute, CodegenError> {
-    if !(1..=64).contains(&bits) {
-        return Err(CodegenError::Lowering(
-            "scalar ABI range width is outside LLVM's single-word representation".into(),
-        ));
-    }
-    let lower_words = [lower];
-    let upper_words = [upper];
-    // SAFETY: both word arrays contain ceil(bits / 64) == 1 live element for the supported width,
-    // the context outlives the returned module-owned attribute, and `range` is resolved against the
-    // same linked LLVM 22 used by inkwell.
-    Ok(unsafe {
-        inkwell::attributes::Attribute::new(
-            llvm_sys::core::LLVMCreateConstantRangeAttribute(
-                ctx.as_ctx_ref(),
-                enum_kind_id("range"),
-                bits,
-                lower_words.as_ptr(),
-                upper_words.as_ptr(),
-            ),
-        )
-    })
 }
 
 fn add_scalar_function_facts(
@@ -8265,12 +8231,6 @@ fn add_scalar_function_facts(
             location,
             ctx.create_enum_attribute(enum_kind_id(facts.extension), 0),
         );
-        if let Some((bits, lower, upper)) = facts.range {
-            function.add_attribute(
-                location,
-                constant_range_attribute(ctx, bits, lower, upper)?,
-            );
-        }
     }
     if cleanup == hir::ReturnCleanupAbi::None
         && let Some(facts) = scalar_boundary_facts(ret)
@@ -8289,12 +8249,6 @@ fn add_scalar_function_facts(
             location,
             ctx.create_enum_attribute(enum_kind_id(facts.extension), 0),
         );
-        if let Some((bits, lower, upper)) = facts.range {
-            function.add_attribute(
-                location,
-                constant_range_attribute(ctx, bits, lower, upper)?,
-            );
-        }
     }
     Ok(())
 }
@@ -8348,12 +8302,6 @@ fn add_scalar_call_facts(
             location,
             ctx.create_enum_attribute(enum_kind_id(facts.extension), 0),
         );
-        if let Some((bits, lower, upper)) = facts.range {
-            call.add_attribute(
-                location,
-                constant_range_attribute(ctx, bits, lower, upper)?,
-            );
-        }
     }
     if cleanup == hir::ReturnCleanupAbi::None
         && let Some(facts) = scalar_boundary_facts(ret)
@@ -8375,12 +8323,6 @@ fn add_scalar_call_facts(
             location,
             ctx.create_enum_attribute(enum_kind_id(facts.extension), 0),
         );
-        if let Some((bits, lower, upper)) = facts.range {
-            call.add_attribute(
-                location,
-                constant_range_attribute(ctx, bits, lower, upper)?,
-            );
-        }
     }
     Ok(())
 }
@@ -37881,10 +37823,10 @@ fn main() -> i32 = 0
         }
         let char_definition = boundary_line("define ", "char_id");
         assert!(char_definition.matches("zeroext").count() == 2, "{char_definition}");
-        assert!(char_definition.matches("range(i32 0, 1114112)").count() == 2, "{char_definition}");
+        assert!(!char_definition.contains("range("), "{char_definition}");
         let char_call = boundary_line("  %", "char_id");
         assert!(char_call.matches("zeroext").count() == 2, "{char_call}");
-        assert!(char_call.matches("range(i32 0, 1114112)").count() == 2, "{char_call}");
+        assert!(!char_call.contains("range("), "{char_call}");
         for logical in ["i64_id", "f64_id", "enum_id"] {
             let definition = boundary_line("define ", logical);
             assert!(
