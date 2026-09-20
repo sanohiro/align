@@ -897,6 +897,26 @@ The roadmap pairs these two as "#6", but they split cleanly by their prerequisit
     `examples/hash.align`. Record on build: `draft.md` §18.1, `docs/language-spec.md`,
     `docs/design-notes.md`, `examples/hash.align`, `tests/hash.rs`.
 
+### Elementary float functions — design SETTLED (2026-09-21; implementation pending)
+
+**Decision:** add `exp`, `exp2`, `log`, `log2`, and `log10` together as
+zero-argument methods on `f32`, `f64`, and the corresponding
+`vec2/4/8/16` types. Scalar and explicit-vector forms lower directly to the
+matching LLVM intrinsic. Align does not build `portable_math.bc`, own
+approximation kernels, or promise a ULP ceiling or scalar/vector/cross-target
+bit identity. Explicit vectors are lane-wise in source and raw LLVM IR, but a
+target without a vector math provider may scalarize them before or during
+instruction selection. The pre-instruction-selection disposition is visible:
+optimized IR is authoritative at that stage, and `explain-opt` accounts for
+eliminated or merged operations, retained vector form, and scalarization.
+Eliminated-or-merged rows are verbose-only; retained provider-less rows warn
+that instruction selection may still scalarize. Final machine SIMD requires
+emitted-object inspection. Future Darwin/libmvec/SVML/
+SLEEF providers are target/toolchain capabilities whose selection and cache
+identity must be explicit; ambient discovery is rejected. Existing scalar
+`pow` is unchanged. [Plan 75](impl/75-portable-math-plan.md) owns the exact
+special-value and closure matrix.
+
 ### Radix integer literals (DONE 2026-06-26)
 **Decision: base-prefixed integer literals `0x` (hex) / `0o` (octal) / `0b` (binary), `_` separators
 in any base.** A radix literal is an ordinary integer literal — same `i128` storage, width inferred

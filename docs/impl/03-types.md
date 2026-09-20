@@ -122,6 +122,18 @@ float → int    llvm.fpto{s,u}i.sat        (SATURATING — out-of-range → MIN
 
 `char` is treated as a 32-bit unsigned integer for the conversion. The source/target must be concrete — casting a generic type parameter is rejected (deferred). `bool` and composite types do not participate.
 
+### Elementary float methods
+
+Plan 75 adds `exp`, `exp2`, `log`, `log2`, and `log10` as one
+zero-argument `MathFn` family. Each accepts exactly a concrete `f32`, `f64`, or
+`vec2/4/8/16` of those floats and returns that exact receiver type. Integers,
+masks, arrays, unconstrained numeric variables and calls with arguments reject
+in deterministic receiver-before-arity order. The methods are Pure and Copy;
+they add no ownership, lifetime, allocation or error channel. Checked HIR
+replays the same exhaustive type equation. Finite last bits and NaN payloads
+may vary by target implementation; type checking does not mint an accuracy or
+SIMD fact.
+
 ---
 
 ## 3. Inference and checking (bidirectional)

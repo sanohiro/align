@@ -113,6 +113,20 @@ Align cores do use the Align rule. No language or interface field is added:
 whole and per-unit compilation derive the facts from the existing checked
 semantic type and transport.
 
+### Elementary float math
+
+Plan 75's `exp`, `exp2`, `log`, `log2`, and `log10` operations lower directly
+to the matching LLVM scalar or vector intrinsic. Codegen does not synthesize a
+per-lane loop, link an Align-owned math artifact, choose approximation
+coefficients or infer cross-target identity. An explicit vector therefore
+reaches raw LLVM IR as one vector operation, but LLVM may scalarize it when the
+selected target has no vector math provider. Optimized IR is authoritative;
+`explain-opt` accounts for eliminated or merged operations, retained vector IR,
+and pre-instruction-selection scalarization and must not infer final machine
+SIMD merely from the raw or optimized intrinsic. A future provider is explicit
+target/toolchain configuration and enters cache identity; codegen never
+discovers one ambiently.
+
 ### Module verification (every profile, on every emit path)
 
 `build_module` verifies the module it just built. Every emit path — object, PGO, ThinLTO prelink,

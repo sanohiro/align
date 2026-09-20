@@ -704,6 +704,38 @@ Japanese toolchain guides must both say that `explain-opt` reports compiler
 storage/execution choices as well as LLVM optimization remarks; examples need
 not enumerate this internal schema.
 
+## Elementary vector-math visibility (plan 75; implementation pending)
+
+`exp`, `exp2`, `log`, `log2`, and `log10` preserve a vector operation in raw
+LLVM IR, but that fact alone does not prove machine SIMD. For each reached
+explicit-vector E1 operation, the optimized inspection path classifies the
+selected optimized LLVM shape as eliminated or merged, retained vector IR, or
+scalarized before instruction selection. A scalarized row uses an LLVM reason when one is
+available. Provider absence is a separate stable fact: when no provider is
+configured, the report says final instruction selection may still scalarize a
+retained intrinsic. It never calls retained vector IR final machine SIMD, and
+never reports retained-vector success when optimized IR already contains the
+corresponding per-lane scalar math-call chain. The analysis is inspection-only,
+deterministic for the selected target/profile and absent from ordinary build
+allocation and artifact identity. `emit-llvm --stage optimized` remains the
+independent exact LLVM view; a provider-level machine-shape promise requires an
+emitted-object disassembly owner.
+
+Plan 75 owns the exact `MathVisibilityRecord`. The producer is a companion of
+the existing optimization runner: it inventories reached E1 vector
+operations before the selected pipeline, inspects the optimized module before
+instruction selection, and returns the private records with the LLVM remarks.
+Its three exhaustive states are `EliminatedOrMerged`, `RetainedVectorIr`, and
+`Scalarized`; dead, folded, and commoned operations take the first state, while
+a structurally invalid or otherwise unclassifiable surviving operation fails
+the inspection instead of guessing. Records use MIR function/evaluation order,
+render after current-plan rows and before LLVM remarks, and use the existing authenticated
+source catalog. Default output shows scalarization and retained vector IR with
+no configured provider; verbose additionally shows eliminated-or-merged and
+provider-backed retained rows. Plan 75 owns the exact located, source-less
+aggregate, and source-less verbose renderings. No record is serialized or
+enters cache/artifact identity.
+
 ## Deferrals (recorded)
 
 - The C++ remark shim (structured `(pass, RemarkName, args)` keying) — revisit at the LLVM

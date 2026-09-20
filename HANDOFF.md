@@ -75,20 +75,23 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    destinations deliberately retain temporaries to preserve RHS, Drop and
    bounds-error order.
 3. Language items after the codegen track: #1085 `str` patterns in `match`
-   shipped in #1135/#1136, and #1065 fixed arrays in structs shipped in
-   #1137/#1138. #1066 proposal 2 is plan 74's current implementation candidate; then
-   #1064 → depends on #1063, #1075 scalar ABI facts, #1082 P2 RFC.
-   #1063 plan 75 merged in PR #1141. Its first feasibility pass is negative and
-   implementation is deferred: direct LLVM
-   transcendental intrinsics are rejected because LLVM 22 scalarizes the
-   vector form without a configured vector library, while the existing
-   `str_prims.bc` admission budget is not valid for accurate math kernels;
-   forced-inline Rust libm stays scalar/retains lane shuffles, LLVM libc
-   mathvec lacks most of the E1 matrix, and SLEEF does not promise cross-CPU
-   bit identity. Resume only with a ten-kernel vector graph and universal
-   accuracy/identity proof package.
-   The five E1 functions stay one capability; #1064 remains a separate failure
-   domain and does not share its PR.
+   shipped in #1135/#1136, #1065 fixed arrays in structs shipped in
+   #1137/#1138, and #1066 proposal 2 shipped in #1139/#1140. #1075 scalar ABI
+   facts and #1082 Part 2 also shipped in #1143 and #1144/#1145.
+   #1063 is the current design/implementation candidate. Plan 75's original
+   portable-kernel contract merged in PR #1141 and its
+   negative feasibility evidence in PR #1142. The contract is now being
+   amended: Align does not promise Java/StrictMath-style scalar/vector or
+   cross-target bit identity and will not build `portable_math.bc`. The five E1
+   functions stay one capability and lower directly to LLVM scalar/vector
+   intrinsics. Explicit vectors are lane-wise but may be scalarized when the
+   target has no vector math provider; optimized IR and `explain-opt` must
+   account for eliminated or merged, retained-vector, and scalarized outcomes
+   before instruction selection, and retained provider-less rows warn that
+   final lowering may still scalarize. Final machine SIMD requires object
+   inspection. A target-specific
+   provider is a later independent capability. #1064 follows as a separate
+   failure domain and does not share its PR.
    #1075 merged in PR #1143. [Plan 76](docs/impl/76-scalar-abi-facts-plan.md)
    supplies the complete call-boundary `zeroext`/`signext` rule and excludes
    stored aggregate facts and the unsound proposed `char` range. Focused owners

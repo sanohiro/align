@@ -1,39 +1,31 @@
-# Portable elementary math
+# Elementary math lowering and SIMD visibility
 
-Status: design merged in PR #1141; E1 implementation deferred after the
-candidate feasibility probes in §3.1 failed the vector/identity closure. Resume
-only with a kernel source and proof package that closes every §3 cell; do not
-land a partial intrinsic or scalar-libcall surface. This plan remains the
-contract for [issue 1063](https://github.com/sanohiro/align/issues/1063) and G6 of the
-[vectorization contract](68-vectorization-contract.md). This document is the
-public-contract ledger, feasibility gate and implementation closure matrix.
-Evidence baseline: Align `854815acef2d7e2403532b40d7226aeb4fcbb66a`, LLVM
-22.1.8, and align-llm Request 92.
+Status: design amendment in progress. PR #1141 recorded the first contract and
+PR #1142 its negative feasibility result. That contract incorrectly made an
+Align-owned, cross-target bit-identical math implementation a prerequisite for
+adding the public functions. Align has no general Java/StrictMath-style
+cross-target bit-identity policy, and the existing scalar `pow` has no such
+promise. This amendment removes that prerequisite while retaining the useful
+parts of the issue: the five-function family lands together, explicit vectors
+lower as vectors, and pre-instruction-selection LLVM scalarization is
+inspectable rather than hidden. Retaining vector LLVM IR is not misrepresented
+as proof of final machine SIMD.
 
-The issue's original implementation — map five new `MathFn` variants directly
-to LLVM intrinsics — is rejected. On the measured Apple M1 baseline, LLVM 22
-lowers a vector transcendental to scalar libcalls plus lane extraction and
-insertion when no vector library is configured. That is slower than the scalar
-loop and differs by platform library. A public intrinsic name would therefore
-promise neither vector execution nor reproducible results.
-
-The existing `str_prims.bc` path is not itself the answer. Its four admitted
-rows are dependency-free leaf predicates, each bounded to 200 LLVM
-instructions and admitted only after a paired performance measurement. Accurate
-`f64` exp/log kernels need range-reduction tables and substantially larger
-bodies. Folding them into that guarded set would silently discard the
-admission predicate settled by plan 70. Portable math gets a distinct mandatory
-artifact and a distinct proof.
+This plan remains the contract for [issue 1063](https://github.com/sanohiro/align/issues/1063)
+and G6 of the [vectorization contract](68-vectorization-contract.md). It is the
+public-contract ledger and implementation closure matrix. Evidence baseline:
+Align `854815acef2d7e2403532b40d7226aeb4fcbb66a`, LLVM 22.1.8, and align-llm
+Request 92.
 
 ## 1. Public-contract ledger
 
 ```text
 Surface           x.exp(), x.exp2(), x.log(), x.log2(), x.log10() on f32,
-                  f64, vec2/4/8/16<f32> and vec2/4/8/16<f64>. The five
-                  methods take no argument and return the receiver type.
-                  Existing b.pow(e) remains scalar during this capability; it
-                  moves to the same portable policy before vector pow ships.
-                  No free-function aliases or implicit conversions are added.
+                  f64, vec2/4/8/16<f32> and vec2/4/8/16<f64>. Each method
+                  takes no argument and returns the receiver type. Existing
+                  b.pow(e) remains scalar-only. No free-function alias,
+                  implicit conversion or source-visible provider selection is
+                  added.
 
 Closed set        core.math reserves the IEEE 754-2019 §9.2 elementary family
                   as one design domain rather than reopening the compiler for
@@ -45,262 +37,341 @@ Closed set        core.math reserves the IEEE 754-2019 §9.2 elementary family
                     E4  sin, cos, tan, sinPi, cosPi, tanPi, asin, acos, atan,
                         atan2, asinPi, acosPi, atanPi, atan2Pi, sinh, cosh,
                         tanh, asinh, acosh, atanh
-                  Reservation is not availability. Only E1 names type-check in
-                  this capability. Each later tier needs its own complete
-                  ledger, kernel evidence and implementation PR. The current
-                  scalar pow does not imply the E3 accuracy or determinism
-                  contract and is not renamed or removed here.
+                  Reservation is not availability. Only E1 ships here. A
+                  later tier needs its own complete ledger and implementation
+                  capability. The current pow surface is unchanged.
 
-Numeric result    Round-to-nearest, ties-to-even is the sole arithmetic mode;
-                  Align exposes neither a mutable rounding mode nor floating-
-                  point exception flags. Each E1 result is at most 1 ULP from
-                  the correctly rounded binary32/binary64 value, including
-                  subnormal outputs. The scalar result, every lane of every
-                  explicit vector width and both supported baseline targets
-                  are bit-identical for the same input bits.
+Numeric result    Each operation denotes the named real elementary function
+                  rounded to the receiver's IEEE binary format by the selected
+                  LLVM target implementation. No ULP ceiling, correctly-
+                  rounded promise, scalar/vector bit equality or cross-target
+                  bit equality is part of this capability. Results may differ
+                  in their last bits across LLVM versions, target libraries,
+                  vector widths and targets. This is the existing scalar pow
+                  precision posture, made explicit for the new family rather
+                  than strengthened into a repository-owned math library.
 
 Special values    Every E1 operation is total and never aborts.
                   - exp/exp2: both zeros -> +1; +inf -> +inf; -inf -> +0.
                   - log/log2/log10: +1 -> +0; +0 and -0 -> -inf; +inf ->
-                    +inf; every negative nonzero value, including -inf, ->
-                    the canonical quiet NaN.
-                  - Every quiet or signaling NaN input -> the canonical quiet
-                    NaN, 0x7fc00000 for f32 and 0x7ff8000000000000 for f64.
-                  NaN sign/payload and signaling state are deliberately not
-                  preserved. Overflow returns +inf. Underflow returns the
-                  correctly signed nonnegative subnormal or +0 selected by the
-                  numeric-result rule. There is no errno or observable
-                  floating-point status side effect.
+                    +inf; every negative nonzero value, including -inf, -> NaN.
+                  - Every NaN input produces NaN. NaN sign, payload, quieting
+                    and the exact NaN bits are unspecified.
+                  Overflow returns +inf. Underflow may return a nonnegative
+                  subnormal or +0 according to the selected implementation.
+                  Align exposes no errno or floating-point exception status.
 
-Vector contract   Vector evaluation is lane-wise in lane order and has no
-                  cross-lane state. Optimized release/fast lowering at the
-                  default baseline target contains vector arithmetic for every
-                  admitted width and no scalar exp/exp2/log/log2/log10 libcall,
-                  no per-lane kernel call, and no surviving extract/insert
-                  chain. Dev builds retain identical values but make no
-                  instruction-shape promise. Ordinary slice-loop
-                  auto-vectorization remains plan 68's G1-G3 corpus, not an E1
-                  acceptance condition.
+Scalar lowering   Scalar receivers lower directly to llvm.exp.*, llvm.exp2.*,
+                  llvm.log.*, llvm.log2.* and llvm.log10.*. LLVM may select a
+                  target instruction, compiler-rt implementation or platform
+                  libm call. Align adds no portable_math.bc, approximation
+                  kernel, coefficient table, runtime dispatch or fallback
+                  implementation of its own.
 
-Implementation    One repository-owned scalar source defines each f32/f64
-                  kernel and is compiled to `portable_math.bc` with the same
-                  rustc and target triple as alignc. MIR carries the semantic
-                  MathFn operation; LLVM lowering emits calls to those exact
-                  definitions. Scalar calls and the lane maps used for explicit
-                  vectors are merged before optimization. The optimizer may
-                  scalarize machine vectors, but the optimized IR must satisfy
-                  the vector contract. Kernel arithmetic uses one fixed
-                  operation graph: explicit `llvm.fma` where the algorithm
-                  requires fused rounding, otherwise strict IEEE operations;
-                  no fast-math, ambient libm call, target feature branch,
-                  runtime dispatch, host table generation or excess-precision
-                  intermediate is allowed.
+Vector lowering   Explicit vector receivers lower directly to the matching
+                  LLVM vector intrinsic. Semantics are lane-wise with no
+                  cross-lane state. This preserves the operation as a vector
+                  at the Align-to-LLVM boundary and gives LLVM or a configured
+                  vector-function provider the exact operation identity.
+                  Machine SIMD is not universally available: LLVM may legally
+                  scalarize the intrinsic when the selected target has no
+                  usable vector mapping. Scalarization changes neither the
+                  source type nor the lane-wise semantic contract.
 
-Feasibility       Section 3 is a fail-closed prerequisite, not a benchmark to
-                  waive. Before the surface is implemented, one disposable
-                  spike must prove all ten scalar kernels and every explicit
-                  vector type on aarch64 and x86-64 baseline optimized IR. It
-                  must also provide a complete, independently checked error
-                  proof for every finite input and an operation-graph proof of
-                  cross-target bit identity; a sampled conformance corpus is
-                  regression evidence, never the proof. If any cell fails, E1
-                  is deferred and no partial intrinsic/libcall surface lands.
-                  The spike and proof tools are not retained as a recurring
-                  compiler test suite.
+SIMD visibility   `alignc emit-llvm --stage optimized` exposes the exact
+                  optimized LLVM shape. `alignc explain-opt` accounts for each
+                  reached E1 vector operation as eliminated or merged, retained
+                  vector IR, or scalarized before instruction selection, and
+                  names the available LLVM reason. When no vector provider is configured
+                  it also says that final instruction selection may scalarize
+                  a retained intrinsic. It never reports machine-SIMD success
+                  merely because raw or optimized IR is vector-shaped. Final
+                  machine shape belongs to emitted-object disassembly and to
+                  any target-provider acceptance test that promises it. Normal
+                  builds remain quiet and behavior-preserving. A future vector
+                  provider may improve the outcome without changing source
+                  semantics; its selection must be explicit, deterministic
+                  toolchain configuration and never ambient library discovery.
 
-Ownership         align_sema owns method/type/arity checks and the exhaustive
+Unavailable SIMD The public scalar and vector functions remain available when
+                  machine SIMD is unavailable. The operation may be
+                  scalarized; there is no build failure and no silent claim
+                  that SIMD occurred. `explain-opt` exposes the LLVM-level
+                  disposition and provider availability; code that requires a
+                  particular machine shape additionally inspects the emitted
+                  object on its target. Align does not expose a source-level
+                  `require_simd` mode in this capability.
+
+Ownership         align_sema owns method/type/arity checking and the exhaustive
                   MathFn classification. align_mir owns preservation and
-                  checked-HIR/MIR validation of the operation and type.
-                  align_driver owns construction, embedding, digesting and
-                  fail-closed loading of `portable_math.bc` plus target/layout
-                  validation. align_codegen_llvm owns pure lowering to the
-                  artifact entry points and optimized vector-shape owners. The
-                  kernel source owns range reduction, tables, special values
-                  and the exact operation graph.
+                  checked-HIR/MIR validation. align_codegen_llvm owns direct
+                  intrinsic lowering. align_driver/explain-opt owns the
+                  post-optimization visibility record. LLVM and the selected
+                  target toolchain own the final scalar or vector math
+                  implementation.
 
-Effects           Pure. No allocation, I/O, global initialization, TLS,
-                  locale, errno, floating-point environment read/write, panic,
-                  abort or runtime host state. Arguments are Copy values and
-                  results are Copy values. There is no borrow, lifetime, Drop,
-                  cleanup or ownership transfer.
+Effects           Pure in Align. No Align allocation, I/O, global state,
+                  locale, panic, abort, ownership transfer, borrow, lifetime,
+                  Drop or cleanup is introduced. Arguments and results are
+                  Copy values. Align does not expose errno or floating-point
+                  exception flags as an effect channel.
 
 Errors            Invalid receiver kind is diagnosed before arity. A valid
-                  receiver with arguments reports arity. Artifact construction
-                  failure fails the alignc build. At compilation, absent,
-                  malformed, wrong-triple, wrong-datalayout, incomplete-symbol,
-                  externally dependent or semantically mismatched bitcode is a
-                  compiler error before object/cache publication; unlike the
-                  optional string rt-LTO optimization, portable math never
-                  falls back to host libm. Validation order is: embedded byte
-                  presence and digest; bitcode parse; target triple; data
-                  layout; exact exported-symbol manifest and signatures;
-                  forbidden definitions/globals/attributes; undefined-symbol
-                  closure; then module verification. The first failing phase is
-                  the reported error, including when later phases are also
-                  invalid.
+                  receiver with arguments reports arity. Checked HIR/MIR reject
+                  an E1 operation whose arity, operand type or result type does
+                  not match its MathFn row. Lack of a vector provider is not a
+                  language or build error; it is an optimization outcome
+                  reported by explain-opt.
 
-Artifact/cache    `portable_math.bc` is separate from `str_prims.bc` and from
-                  the optional `--rt-lto` digest. It contains only the E1
-                  kernels, private helpers and constant tables. The driver
-                  embeds its bytes. The existing executable-byte
-                  `compiler_build_id` therefore changes for every kernel,
-                  table, operation-policy or manifest edit and invalidates all
-                  unit codegen keys, including units without E1. The artifact's
-                  versioned content digest is still checked against the baked
-                  manifest for stale/corrupt-artifact diagnostics; it is not a
-                  second selective cache-key component. Whole-program and
-                  per-unit builds consume identical bytes. The complete set of
-                  definitions is internalized after linking, and no portable
-                  math symbol remains undefined in an emitted object.
+Allocation        None in Align IR or runtime. A selected external scalar or
+                  vector implementation is outside Align ownership; no hidden
+                  temporary array or per-lane heap allocation is permitted by
+                  compiler lowering.
 
-Prerequisite      Issue 1069 parts 1-3 are merged. The plan 70 runtime-effects
-                  registry and its rt-LTO admission predicate are reused as
-                  patterns but are not widened. Plan 68 G1-G3 are not a
-                  prerequisite for the explicit-vector contract.
+Artifact/cache    There is no new embedded bitcode artifact, digest, manifest,
+                  runtime ABI row or cache component. MathFn and MIR/interface
+                  serialization changes flow through the existing compiler
+                  build identity and interface-format versioning rules. A
+                  future provider configuration that changes code generation
+                  must enter the existing target/toolchain cache identity.
 
-Acceptance        Section 4 owns surface/type failures, checked-HIR/MIR
-                  exhaustiveness, scalar/vector special values, ULP corpus,
-                  cross-target golden bits, whole/per-unit parity, artifact
-                  rejection, cache isolation, optimized IR shape and the
-                  absence of host-libm symbols. One parameterized owner closes
-                  each family of cells; there is no test per input or width.
+Prerequisite      None from issue 1069 or plan 70. G1-G3 remain prerequisites
+                  only for auto-vectorizing ordinary slice loops, not for the
+                  E1 surface or explicit-vector lowering.
 
-Performance       No latency or throughput number is promised, so no benchmark
-                  is an admission or recurring correctness gate. The optimized
-                  IR shape owner proves only the stated structural contract:
-                  vector arithmetic with no scalar math/kernel call or
-                  extract/insert chain. A later numerical performance promise
-                  requires its own ledger and reproducible benchmark protocol.
+Acceptance        Section 3 owns surface/type failures, checked-HIR/MIR
+                  exhaustiveness, special-value classes, scalar and vector
+                  intrinsic spelling, whole/per-unit raw-lowering and result
+                  parity, mode-local optimized visibility, absence of a new
+                  artifact/runtime ABI surface, and truthful SIMD visibility.
+                  It does not pin result bits or a performance number.
+
+Performance       No latency, throughput or universal machine-SIMD promise is
+                  made. The structural promise is exact: explicit vectors
+                  reach LLVM as vector intrinsics, and the selected optimized
+                  outcome is inspectable. A later provider capability may make
+                  a target-specific performance promise with its own benchmark
+                  and availability ledger.
 
 Mirrors           This plan, plan 68 G6, draft.md float/core.math/SIMD,
                   docs/language-spec.md, docs/design-notes.md,
                   docs/open-questions.md, docs/impl/03-types.md,
                   docs/impl/05-backend-llvm.md, docs/impl/07-roadmap.md,
-                  docs/impl/19-hir-validation-ledger.md and HANDOFF.md. Public
-                  mirrors change only after the feasibility gate passes; this
-                  candidate does not claim that E1 is shipped.
+                  docs/impl/09-explain-opt.md,
+                  docs/impl/19-hir-validation-ledger.md and HANDOFF.md.
 ```
 
-The accuracy contract is one ULP, not "whatever the platform libm returns."
-Correctly rounded implementations may be used as references, but importing an
-implementation does not import its build system, dynamic rounding mode, errno,
-exception flags or target dispatch. The repository owns the exact source and
-tables that define Align's result.
+The distinction is deliberate. A `vec4<f32>.exp()` is always one lane-wise
+vector operation in Align and in raw LLVM IR. It is not a promise that every
+LLVM target owns a native four-lane exponential. The optimizer inspection says
+whether vector IR survived and whether a provider is configured; it does not
+pretend to replace final object inspection. Align does not manufacture
+cross-target result identity to hide that target fact.
 
-## 2. Rejected shortcuts
+### 1.1 Exact visibility record
 
-| Shortcut | Rejection |
-|---|---|
-| Emit `llvm.exp.*` / `llvm.log.*` | Without a configured vector library LLVM 22 lowers vector calls to scalar libcalls and lane shuffles. Host libm also breaks cross-target bit identity. |
-| Configure Darwin libsystem / libmvec / SVML / SLEEF by target | Availability, version and result bits differ by host. This can only become an explicit nondeterministic opt-in under a later contract. |
-| Add the kernels to `str_prims.bc` | Accurate kernels do not satisfy the settled leaf/200-instruction admission predicate. Math is mandatory semantics; string rt-LTO is optional optimization with fallback. |
-| Vendor an upstream math library and its test suite | LLVM libc's relevant f32/f64 support headers alone are large and dependency-rich; SLEEF does not currently promise cross-CPU bit identity. Upstream sources are algorithm evidence, not a substitute for Align's closed artifact and proof. |
-| Exhaust all f32 inputs in every PR | It consumes the detector budget without detecting integration regressions better than a fixed boundary/hard-case corpus. Exhaustive or proof-tool evidence is an admission artifact for a changed kernel, not a recurring compiler gate. |
-| Sample random inputs without recording them | It is irreproducible and cannot bind a kernel revision. The checked corpus is deterministic and content-addressed. |
-| Ship f32 first under the final names | It makes the same source program type-dependent in an arbitrary way and leaves the promised f64/vector contract dormant. E1 lands as one capability or is deferred. |
-
-## 3. Feasibility gate
-
-The gate runs before implementation and records its commands, compiler/LLVM
-versions, artifact digest and results in this document. The disposable spike
-may live outside the repository; only the evidence and the eventual reviewed
-kernel source land.
-
-| Cell | Required evidence |
-|---|---|
-| Source closure | The candidate dependency graph contains no allocator, panic/abort path, libc/libm symbol, TLS, mutable global, target intrinsic or dynamic rounding-mode query. Tables are immutable literal bits. |
-| Artifact closure | `llvm-nm --undefined-only` is empty for the merged kernel closure; the exported manifest is exactly ten scalar entries before internalization. |
-| Universal accuracy | For f32, an exhaustive all-input run against an independently correctly rounded reference; for f64, an independently checkable range-reduction and polynomial error certificate covering every finite input interval, with every approximation/rounding term and table bit included. The certificate checker and exact tool versions are recorded. Named special values compare exact bits. A corpus alone cannot close this cell. |
-| Target identity | A machine-checked operation-graph audit proves that every admitted operation has target-independent IEEE bits: explicit fused versus unfused nodes, fixed-width integer operations, immutable table bits, preserved subnormals and no excess precision. aarch64 and x86-64 execution of the corpus is a negative control, not the universal proof. |
-| Vector identity | The scalar and vector forms are generated from one typed operation graph. A structural checker proves node-for-node lane isomorphism for widths 2/4/8/16 and both element types; corpus execution checks the proof plumbing. |
-| Optimized shape | Release and fast optimized IR on both baselines has vector arithmetic and has no scalar math/kernel call or surviving per-lane extract/insert chain for every explicit-vector method. |
-| Size/build cost | Record bitcode bytes, alignc binary delta and clean/incremental driver build time. There is no numeric performance promise or threshold; this evidence only decides whether embedding the artifact is proportionate. |
-
-The recurring corpus has four bounded parts: all named special/exact values; every
-range-reduction boundary and its two adjacent representable values; the
-published hard cases for the adopted algorithms; and a fixed-seed stratified
-sample by sign/exponent/fraction. Its checked input-bit manifest and expected
-result bits are content-addressed. Increasing a sample count without adding a
-new invariant is not coverage and is rejected as test inflation. It detects
-integration regressions after admission; it never substitutes for the
-universal proof above. The exhaustive f32 run and f64 certificate checker rerun
-only when the kernel operation graph, coefficients, tables or proof-tool
-identity changes.
-
-### 3.1 Recorded candidate results (2026-09-20)
-
-The first feasibility pass is negative. One failed mandatory cell rejects a
-candidate; running the remaining architecture matrix or a throughput benchmark
-would add no decision evidence.
-
-| Candidate | Evidence | Result |
-|---|---|---|
-| LLVM 22 transcendental intrinsics | The plan-68 Apple M1 probe lowered `llvm.exp.v2f32` to scalar `_expf` calls plus lane insertion/extraction when no vector library was configured. | Rejected: fails optimized shape and target-independent implementation. |
-| Rust `libm` 0.2.16, soft-float path | Upstream assigns 1 ULP to all five f32/f64 E1 families against MPFR and provides exhaustive f32/high-iteration f64 tooling. A local Rust 1.96.1/LLVM 22.1.8 fat-LTO probe expanded four `libm::expf`/`logf` lanes. Default inlining retained four scalar calls. Raising LLVM's inline threshold to 10000 removed the calls, but `expf` remained 626 lines of scalar IR with no vector type; `logf` retained 12 `extractelement`/`insertelement` operations. | Rejected: useful accuracy reference, but fails the mandatory explicit-vector shape even after non-default forced inlining. |
-| LLVM libc mathvec at `f28f0baf` | The generic portable vector tree currently supplies f32 `expf` and `logf` only. `logf` is a scalar `cpp::map`; `exp2`, `log2`, `log10` and every f64 E1 vector kernel are absent. The separate scalar correctly-rounded implementation is dependency-rich and does not close the vector surface. | Rejected for E1: incomplete type/function matrix and scalar-map shape. |
-| SLEEF at `7623d6cf` | SLEEF supplies broad 1-ULP SIMD algorithms, but upstream issue 187 still records deterministic results across CPU architectures as unsupported. Its target-specific vector-extension implementations are precisely the result-identity variation this contract excludes. | Rejected as the guaranteed default: fails cross-target bit identity. It remains eligible only for a future explicit nondeterministic opt-in. |
-
-The disposable local probe used `/tmp/align-math-spike` and
-`/tmp/align-math-spike-target*`; it is not a repository test or artifact. Its
-essential commands were:
+The inspection path builds one private record for every reached, user-written
+explicit-vector E1 operation before optimization and resolves it after the
+selected profile pipeline:
 
 ```text
-CARGO_TARGET_DIR=/tmp/align-math-spike-target \
-  cargo rustc --manifest-path /tmp/align-math-spike/Cargo.toml \
-  --release --lib -- --emit=llvm-ir
+MathVisibilityRecord {
+  function: ProgramCall
+  operation_ordinal: u32
+  operation: Exp | Exp2 | Log | Log2 | Log10
+  ty: Vec(FloatWidth, LaneCount)
+  state: EliminatedOrMerged | RetainedVectorIr | Scalarized
+  provider: None | Configured(ProviderId)
+  source: Option<MathVisibilitySource>
+  llvm_reason: Option<String>
+}
 
-CARGO_TARGET_DIR=/tmp/align-math-spike-inline-target \
-RUSTFLAGS='-Cllvm-args=-inline-threshold=10000' \
-  cargo rustc --manifest-path /tmp/align-math-spike/Cargo.toml \
-  --release --lib -- --emit=llvm-ir
+MathVisibilitySource {
+  file: String
+  line: u32
+  column: u32
+}
 ```
 
-The host was `aarch64-apple-darwin`; rustc was 1.96.1
-(`31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd`) with LLVM 22.1.8. No benchmark
-was run: both Rust-libm shapes had already failed the deterministic IR gate.
-The next admissible candidate must bring a truly vector operation graph for all
-ten kernels plus its universal error/identity proof, not another request to
-raise an inline threshold or test budget.
+`operation_ordinal` is one-based within the concrete function in HIR evaluation
+order across E1 vector operations only. `FloatWidth` is exactly `F32 | F64`;
+`LaneCount` is exactly `2 | 4 | 8 | 16`. `ProviderId` is compiler-owned ASCII
+toolchain identity, never an ambient path or soname; this capability produces
+only `None`. `llvm_reason` is diagnostic text and never artifact identity. A
+missing LLVM reason is rendered with the stable compiler explanation below.
 
-## 4. Implementation closure matrix
+The states are exhaustive. `EliminatedOrMerged` means no independent
+result-producing operation with that source identity survives because ordinary
+optimization removed it as dead, folded it, or merged it with another
+operation. Every reached source record remains in the inventory: when common
+subexpression elimination merges calls, the lowest `operation_ordinal` in the
+equivalent surviving group owns the `RetainedVectorIr` or `Scalarized`
+operation and every other record is `EliminatedOrMerged`, in original ordinal
+order. The inspection contract does not guess which LLVM transformation removed
+the independent operation.
+`RetainedVectorIr` means an LLVM vector intrinsic or vector arithmetic
+implementing the operation survives. `Scalarized` means the optimized module
+instead contains its per-lane scalar math-call/operation chain. A mixed
+surviving vector-and-scalar expansion is `Scalarized`; it cannot be reported as
+retained success. A record with no independent surviving operation is the
+defined `EliminatedOrMerged` outcome, not an analysis failure. Structurally
+invalid type, ordinal, source identity, or an otherwise unclassifiable
+surviving operation makes `explain-opt` fail with an internal diagnostic rather
+than guess. This analysis occurs before instruction selection and therefore
+never claims final machine SIMD.
 
-This matrix becomes actionable only after every §3 cell passes. A row may cite
-one parameterized owner; it does not require one test per spelling, width or
-input.
+Records use the same authenticated located-source catalog and escaping rules as
+the existing current-plan report. They retain MIR function order and ascending
+`operation_ordinal`. In each unit they render after current-plan records and
+before LLVM remark records. Default output includes `Scalarized` and every
+`RetainedVectorIr` row whose provider is `None`; `--verbose` additionally shows
+`EliminatedOrMerged` and provider-backed retained rows. The exact rendered state
+spellings are `eliminated-or-merged`, `retained-vector-ir`, and `scalarized`.
+Source-less rows never fabricate line 0. Default output replaces all
+default-eligible source-less rows with one aggregate after the located math
+rows; verbose output renders every source-less row in record order.
+
+The state/provider presence matrix is exhaustive:
+
+| State | Provider | Default | Verbose |
+|---|---|---|---|
+| `EliminatedOrMerged` | `None` or `Configured` | omitted | exact eliminated-or-merged row |
+| `RetainedVectorIr` | `None` | exact provider-absent row | same row |
+| `RetainedVectorIr` | `Configured(id)` | omitted | exact provider-backed row |
+| `Scalarized` | `None` | exact provider-absent scalarized row | same row |
+| `Scalarized` | `Configured(id)` | exact provider-backed scalarized row | same row |
+
+The exact default messages are:
+
+```text
+<file>:<line>:<column>: vector math `<operation>` was scalarized before instruction selection — <LLVM reason or "LLVM supplied no reason">; no vector math provider is configured
+<file>:<line>:<column>: vector math `<operation>` was scalarized before instruction selection with provider `<provider>` — <LLVM reason or "LLVM supplied no reason">
+<file>:<line>:<column>: vector math `<operation>` remains vector IR, but no vector math provider is configured; final instruction selection may scalarize it
+```
+
+An eliminated-or-merged row is verbose-only:
+
+```text
+<file>:<line>:<column>: vector math `<operation>` has no independent optimized operation; it was eliminated or merged
+```
+
+Source-less rows use these exact forms:
+
+```text
++ <N> vector-math visibility record(s) without user source (see --verbose)
+  [vector math `<function>` #<ordinal> `<operation>` `<type>`] <state> — <explanation>; source location is unavailable
+```
+
+The first line is the single default aggregate. The second is the verbose form
+for each source-less row. Its explanation is the corresponding located message
+without the source prefix; `<state>` uses the exact spellings above.
+`<function>` is the canonical `ProgramCall` spelling, `<ordinal>` is unsigned
+decimal without padding, `<operation>` is the lowercase source spelling, and
+`<type>` is canonical `vec<N><f32|f64>` syntax such as `vec4<f32>`.
+
+The provider-backed success wording, reserved for a later provider capability,
+is verbose-only:
+
+```text
+<file>:<line>:<column>: vector math `<operation>` remains vector IR with provider `<provider>`; final machine shape is owned by that provider's object-disassembly contract
+```
+
+The filename, function spelling, provider id and LLVM detail follow the existing
+single-line escaping rules. There is no unavailable numeric field, estimated
+speedup, result-bit sample or source text in the record.
+
+## 2. Provider and fallback policy
+
+| Candidate | Policy |
+|---|---|
+| LLVM scalar/vector intrinsics | Canonical lowering. They preserve operation identity without making a false final-machine-code promise. |
+| Darwin libsystem, libmvec, SVML or SLEEF | Eligible future vector providers. Target/version availability and result bits may differ; that is permitted and must be visible in toolchain identity and explain-opt. |
+| Align-owned portable_math.bc | Not built. Cross-target bit identity is not an Align requirement, so owning ten approximation kernels, tables and universal proofs is unjustified. |
+| Per-lane compiler-generated scalar calls | Legal LLVM fallback, but never reported as SIMD. The optimized shape and explain-opt record expose it. |
+| Ambient provider discovery | Rejected. A host library appearing on PATH or a linker search path cannot silently change optimization or cache identity. |
+| Source-level provider selector | Not added. Provider choice is a compiler/toolchain concern; source retains one math operation. |
+
+The previous investigation remains useful evidence: LLVM 22 without a vector
+library scalarizes `llvm.exp.v2f32`; Rust `libm` inlining does not form a vector
+operation graph; the inspected LLVM libc mathvec revision lacks most of E1; and
+SLEEF offers broad SIMD algorithms without cross-CPU bit identity. Under the
+amended contract these results mean "report scalarization" or "candidate future
+provider", not "withhold the language surface".
+
+## 3. Implementation closure matrix
+
+This capability crosses sema, HIR/interface validation, MIR, LLVM lowering and
+the inspection path. Every applicable row must close before implementation is
+published.
 
 | Cell | Required behavior | Owner evidence |
 |---|---|---|
-| Type formation | Five zero-argument methods accept f32/f64 and every float vector; integers, masks, arrays, unconstrained numerics and arguments reject in deterministic order | one sema table plus checked-HIR replay |
-| IR exhaustiveness | Every new MathFn survives serialization/checking and reaches MIR/codegen; every exhaustive classifier is updated | existing variant tripwire plus one MIR shape owner |
-| Proof binding | the admitted operation graph, coefficients, tables, exported manifest and proof-tool identity hash to the exact implementation inputs; any change invalidates admission before build publication | digest owner over the proof record and kernel inputs |
-| Scalar values | Exact special cases and <=1 ULP finite corpus for ten entries | one runtime conformance owner over the content-addressed corpus |
-| Vector values | Every vector width/type is lane-bit-identical to scalar | the same conformance owner parameterized by width |
-| Vector shape | aarch64/x86-64 baseline optimized IR contains no forbidden call/extract/insert shape | one cross-target IR owner over generated cases |
-| Artifact validation | truncation, wrong target/layout, missing/extra symbol, undefined dependency, mutable global and digest mismatch reject before publication in the ledger's fixed order | mutation table over one valid fixture plus one all-invalid fixture that reports only the earliest phase |
-| Whole/per-unit | results, optimized shapes and symbol closure agree; only units containing E1 consume the artifact digest | direct whole/per-unit owner |
-| Cache | kernel source/table/policy/manifest changes alter the embedded compiler bytes and therefore miss every unit through `compiler_build_id`; exact source and binary revert restores identity | cache edit/revert owner with E1 and non-E1 units |
-| Profiles/options | dev is value-correct; release/fast satisfy shape; small/tiny stay value-correct; `--rt-lto` on/off cannot change bits | one profile/option table |
-| Existing math | abs/min/max/sqrt/floor/ceil/round/trunc/fma and scalar pow retain their current semantics and lowering | existing scalar_math and vec_math owners; no duplicate fixture |
-| Failure hygiene | no host math symbol or new dynamic library enters emitted objects; malformed artifact publishes no cache/object | symbol owner plus failed-build residue check |
+| Type formation | Five zero-argument methods accept f32/f64 and every float vector; integers, masks, arrays, unconstrained numerics and arguments reject in deterministic order | one sema table plus negative controls |
+| HIR exhaustiveness | Every new MathFn has one exact arity/type/result row; malformed checked HIR rejects before MIR | MathFn tripwire plus checked-HIR mutation table |
+| MIR preservation | Every E1 operation and scalar/vector type survives lowering, whole-program construction and per-unit/interface replay | parameterized MIR and whole/per-unit owners |
+| LLVM scalar lowering | f32/f64 map to the exact scalar LLVM intrinsic with no pow decomposition | raw-IR owner over ten rows |
+| LLVM vector lowering | every width/type maps to the exact vector LLVM intrinsic with no compiler-built lane loop, extract/insert chain or temporary array in raw IR | raw-IR owner parameterized by function, width and type |
+| Special values | the named zero/infinity/NaN result classes hold for scalar and every vector lane; NaN payload and finite last bits are not compared | runtime classification corpus on supported hosts |
+| Optimized vector IR | when LLVM retains vector form, explain-opt reports retained vector IR and optimized IR contains no per-lane scalar call chain; the wording makes no final-machine claim | one deterministic retained-vector fixture |
+| Optimizer scalarization | when LLVM expands the operation before instruction selection, explain-opt reports scalarization and never reports vector success; optimized IR supplies the independent truth | one target-independent synthetic analyzer owner plus the LLVM 22 E1 negative fixture where stable |
+| Elimination and merging | dead, folded and commoned operations retain their source inventory rows as `EliminatedOrMerged`; a CSE survivor owns exactly one retained/scalarized row and original ordinal order remains stable | synthetic analyzer owners for dead, folded and duplicate live operations |
+| Source availability | located rows use exact source messages; source-less default output aggregates their count and verbose output identifies function, ordinal, operation, type and state without line 0 | located/source-less rendering goldens |
+| Machine-shape boundary | without a configured provider, retained vector IR reports that final instruction selection may scalarize; a future provider's machine-SIMD promise requires object-disassembly owners | provider-absent explanation owner |
+| Provider absence | normal build and execution remain successful and lane-correct without a configured vector provider | explicit-vector runtime owner with provider absent |
+| Whole/per-unit | raw intrinsic spelling and runtime results agree across modes; each mode's visibility records agree with its own optimized module, while legal inlining, folding, merging and elimination may produce different classifications | direct whole/per-unit owner with mode-local optimized-IR comparison |
+| Cache/toolchain | no E1-specific artifact enters identity; any later provider configuration must change the existing target/toolchain identity | cache identity assertion plus future-provider tripwire |
+| Existing math | abs/min/max/sqrt/floor/ceil/round/trunc/fma and scalar pow retain their current semantics and lowering | existing scalar_math and vec_math owners |
+| Failure hygiene | malformed IR publishes no object/cache; explanation analysis does not mutate optimized output | mutation owner plus normal/explain byte-parity owner |
+
+One parameterized owner may close every function/type/width cell. The matrix
+does not require one fixture per spelling.
+
+## 4. Historical feasibility result
+
+PR #1142 measured four implementation candidates under the superseded
+bit-identity contract:
+
+| Candidate | Recorded result | Amended disposition |
+|---|---|---|
+| LLVM 22 intrinsics | Vector transcendental scalarized without a vector library. | Adopt as canonical lowering; expose the scalarized outcome. |
+| Rust `libm` 0.2.16 | Useful accuracy reference, but forced inlining stayed scalar or retained lane extraction/insertion. | No longer a candidate implementation; no Align-owned kernel is needed. |
+| LLVM libc mathvec | Incomplete E1 f32/f64 matrix at the inspected revision. | May become a provider when its exact target matrix is sufficient. |
+| SLEEF | Broad 1-ULP SIMD algorithms; no cross-CPU bit-identity guarantee. | Eligible provider because cross-target bit identity is no longer promised. |
+
+The disposable probe and its exact revisions remain recorded in PR #1142. They
+need not be rerun to add the language surface. A future provider capability
+must measure its own exact version, target matrix, accuracy claim, optimized
+shape, artifact/link dependency and cache identity.
 
 ## 5. PR boundary
 
-The feasibility evidence and this contract form one design PR. Implementation,
-if admitted, is one capability PR because the public surface has no useful
-state without the mandatory artifact, scalar/vector parity and both target
-proofs. This is intentionally not combined with issue 1064: typed byte views
-have a different public contract, ownership model and failure domain. Within
-1063, all five E1 functions stay together to avoid repeating the artifact,
-cache and target proof five times.
+The contract amendment is one design PR. After its independent review, the
+five E1 functions and their truthful inspection record form one implementation
+capability: splitting by function would repeat every enum, validation,
+serialization, LLVM and explanation proof. A target-specific vector provider
+is a later, independent capability because the functions remain useful and
+correct without one. Issue 1064 remains separate: typed byte views have a
+different public contract, ownership model and failure domain.
 
-## 6. Design-review closure
+## 6. Superseded review findings
 
-The fresh review of candidate `6153efd1` found four P2 contract defects. The
-fix commit closes the complete set without a second full-diff review:
+PR #1141's review findings correctly closed gaps in its proposed
+repository-owned artifact: universal proof coverage, malformed-artifact error
+precedence, cache invalidation and an unjustified throughput gate. This
+amendment removes that artifact and its bit-identity promise, so those closures
+remain historical evidence rather than implementation requirements. The new
+matrix instead owns intrinsic exhaustiveness and truthful post-optimization
+visibility.
+
+## 7. Amendment review closure
+
+The independent reviews of this amendment found five contract gaps. They are
+closed here before implementation:
 
 | Finding | Closure |
 |---|---|
-| A bounded corpus did not prove the universal 1-ULP promise | f32 now requires an exhaustive all-input admission run; f64 requires an independently checked full-domain error certificate; the recurring corpus is explicitly only a regression owner. |
-| Multiply-invalid artifact precedence was unspecified | the ledger fixes eight validation phases and the matrix adds one combined-invalid earliest-error owner. |
-| Selective cache hits contradicted the embedded compiler build identity | every unit now invalidates through the existing executable-byte `compiler_build_id`; the artifact digest is validation metadata, not a selective key. |
-| The throughput rejection was unquantified and noise-dependent | the benchmark gate is removed. No throughput number is promised; optimized IR structure is the sole stated performance-shape contract. |
+| Source-less math records had no exact rendering | Section 1.1 now fixes both the default aggregate and per-record verbose form, including field order and state spelling. |
+| Common-subexpression elimination could leave a reached call without an independent optimized operation | `EliminatedOrMerged` now covers dead, folded and merged operations; ordinal ownership and the CSE survivor rule are explicit and have matrix coverage. |
+| The public visibility promise named only retained and scalarized operations while verbose output admitted eliminated rows | The public promise and mirrors now use the same exhaustive three-state classification, with default/verbose presence rules stated separately. |
+| Public mirrors could read as if optimized-IR inspection observed scalarization during instruction selection | Every public mirror now limits `explain-opt` to the pre-instruction-selection disposition, warns that retained provider-less IR may still scalarize, and assigns final machine SIMD to emitted-object inspection. |
+| Whole/per-unit coverage required identical optimized visibility even when their legal optimization opportunities differ | Raw lowering and runtime results retain parity; each mode instead validates visibility against its own optimized module. |

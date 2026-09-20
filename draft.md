@@ -582,6 +582,17 @@ Comparison follows IEEE: NaN compares unequal to everything **including itself**
 `min`/`max` reducers' NaN policy is specified with the reducers (§8). Only conversion leaves pure
 IEEE behavior: `as` saturates and maps NaN to `0` (next section).
 
+The elementary family `exp`, `exp2`, `log`, `log2`, and `log10` is available as
+zero-argument methods on `f32`, `f64`, and the corresponding `vec2/4/8/16`
+types. Scalar and vector forms lower to the matching LLVM intrinsic; vector
+semantics are lane-wise. These functions make no ULP, scalar/vector bit-
+identity, or cross-target bit-identity promise. LLVM versions, target math
+libraries, vector widths, and targets may differ in their last result bits and
+NaN payloads. Every function is total and never aborts. The usual result
+classes are fixed: exponentials map ±0 to +1, +∞ to +∞ and -∞ to +0;
+logarithms map +1 to +0, ±0 to -∞, +∞ to +∞, and negative nonzero values to
+NaN; NaN inputs produce NaN.
+
 Floating-point evaluation is ordered and uncontracted by default. A lexical block may explicitly
 relinquish either guarantee:
 
@@ -1437,8 +1448,16 @@ r := a.sqrt()              // elementwise float math: one vector instruction
 f := fma(a, b, c)          // fused a*b + c, one rounding (one vfmadd/fmla)
 ```
 
-The unary float math functions — `sqrt`, `abs`, `floor`, `ceil`, `round`, `trunc` — apply lane-wise
-to a float vector (the same names as on a scalar float), each one lane-wise hardware instruction. The
+The directly supported unary float math functions — `sqrt`, `abs`, `floor`, `ceil`, `round`,
+`trunc` — apply lane-wise to a float vector (the same names as on a scalar float), each one
+lane-wise hardware instruction. The elementary functions `exp`, `exp2`, `log`, `log2`, and
+`log10` are also lane-wise, but not every target has a machine-vector implementation: LLVM may
+scalarize them. `emit-llvm --stage optimized` exposes the exact pre-instruction-selection result,
+and `explain-opt` accounts for eliminated or merged operations, retained vector form, and
+scalarization at that stage; default output emphasizes actionable retained and scalarized rows,
+while verbose output also shows eliminated-or-merged rows. A retained operation without a provider
+warns that instruction selection may still scalarize it. Final machine SIMD is established only by
+emitted-object inspection. The
 element-wise `a.min(b)` / `a.max(b)` of two vectors, and `abs`, also work on integer vectors (`a.min()`
 with no argument is the reduction instead). Each maps to one SIMD instruction; `pow` (a libcall) stays
 scalar-only. `fma(a, b, c)` is the fused multiply-add `a*b + c` with a single rounding (a free builtin,

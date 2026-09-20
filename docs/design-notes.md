@@ -1,5 +1,21 @@
 # Align Design Notes
 
+Elementary float functions preserve operation identity without inventing a
+repository-owned math library. `exp`, `exp2`, `log`, `log2`, and `log10` lower
+to LLVM scalar or vector intrinsics; explicit vectors are lane-wise at the
+Align boundary. Target libraries and LLVM may produce different last bits or
+scalarize a vector intrinsic, and Align makes neither a ULP nor a cross-target
+bit-identity promise. That variability is not hidden: optimized IR is the exact
+pre-instruction-selection shape, and `explain-opt` accounts for operations that
+were eliminated or merged, retained vector form, and scalarization at that
+stage. Default output emphasizes actionable retained and scalarized rows;
+verbose output also shows eliminated-or-merged rows. A retained operation with
+no provider warns that instruction selection may still scalarize it; emitted-
+object disassembly is the authority for final machine SIMD.
+This keeps source portable while leaving target math engines responsible for
+their implementations. [Plan 75](impl/75-portable-math-plan.md) owns the exact
+surface, special values and inspection contract.
+
 Floating-point relaxation is a visible lexical value scope, not an ambient build mode or a family
 of fast reducer names. `float(reassoc) {}` and `float(contract) {}` name exactly the two guarantees
 the programmer may relinquish. They compose independently, nest by union, and never add flags to a

@@ -638,7 +638,17 @@ backend and stays a hardware detail. `vecN<T>` / `maskN<T>` (below) are the fixe
 for hand-written register kernels.
 
 The register layer's surface: a vector is built from an array literal under a `vecN<T>` annotation;
-elementwise `+ - * / %` and the unary float math map one-to-one to lane-wise instructions; a
+elementwise `+ - * / %` and directly supported unary float math map one-to-one to lane-wise
+instructions. `exp`, `exp2`, `log`, `log2`, and `log10` are zero-argument methods on `f32`, `f64`,
+and the corresponding `vec2/4/8/16` types. They lower to matching LLVM intrinsics and vector
+semantics are lane-wise, but LLVM may scalarize a vector intrinsic when the selected target has no
+vector math provider. No ULP or scalar/vector/cross-target bit-identity guarantee applies; last
+bits and NaN payloads may vary by LLVM, target library, vector width and target. The usual
+zero/infinity/NaN result classes are defined and the functions never abort. Optimized IR shows the
+exact pre-instruction-selection shape, and `explain-opt` accounts for eliminated or merged
+operations, retained vector form, and scalarization at that stage. Eliminated-or-merged rows are
+verbose-only. A retained operation without a provider warns that instruction selection may still
+scalarize it; only emitted-object inspection establishes final machine SIMD. A
 comparison yields a `maskN<T>`, which is a **nameable** type (annotation, parameter, return) with the
 same element and width as the compared vectors; `select(m, a, b)` blends. A mask **gates
 structurally**: because a mask is one bool lane per lane and has no machine-level element type,
