@@ -1245,6 +1245,26 @@ fn semantic_import_does_not_resolve_foreign_qualified_nominals_as_local() {
         Ok(()),
         "an unresolved foreign nominal remains conservatively borrow-capable even when this interface defines a scalar local type with the same bare name"
     );
+
+    summary.fns[0].params[0].mode = ParamMode::BorrowMut;
+    for effect in [
+        align_sema::hir::DropStateEffect::NotApplicable,
+        align_sema::hir::DropStateEffect::Invariant,
+        align_sema::hir::DropStateEffect::MayChange,
+    ] {
+        summary.fns[0].drop_state_effects[0] = effect;
+        assert_eq!(
+            validate_for_import(&summary),
+            Ok(()),
+            "the owning dependency resolves a foreign nominal's concrete drop-state class"
+        );
+    }
+    summary.fns[0].drop_state_effects[0] = align_sema::hir::DropStateEffect::Deferred;
+    assert_eq!(
+        validate_for_import(&summary),
+        Err(ImportCompatibilityError::DropStateEffectMismatch),
+        "only a generic template may defer drop-state classification"
+    );
 }
 
 #[test]
@@ -2383,6 +2403,7 @@ fn semantic_import_generic_fragments_match_their_structured_records() {
 fn concrete_inline_admission_rejects_local_control_move_and_same_unit_dependencies() {
     let library = "\
 module lib
+OFFSET: i64 := 1
 pub fn tiny(x: i64) -> i64 = x + 1
 pub fn shared(borrow value: i64) -> i64 = value
 pub fn returned(x: i64) -> i64 { return x + 1 }
@@ -2394,6 +2415,7 @@ pub fn branch(x: i64) -> i64 = if x == 0 { 1 } else { 2 }
 pub fn move_value(value: string) -> i64 = value.len()
 pub fn helper(x: i64) -> i64 = x + 2
 pub fn calls_helper(x: i64) -> i64 = helper(x)
+pub fn reads_same_unit_const(x: i64) -> i64 = x + OFFSET
 pub fn early(x: i64) -> i64 = { return x; x + 1 }
 pub fn too_many(x: i64) -> i64 = x + 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12
 pub fn identity<T>(value: T) -> T = value
@@ -2422,6 +2444,7 @@ pub fn identity<T>(value: T) -> T = value
         "branch",
         "move_value",
         "calls_helper",
+        "reads_same_unit_const",
         "early",
         "too_many",
     ] {

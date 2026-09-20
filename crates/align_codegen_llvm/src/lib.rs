@@ -2986,6 +2986,7 @@ fn emit_sqlite_scalar_callback_trampoline<'c>(
 pub enum ThinFunctionLinkage {
     Root,
     UnitLocal,
+    AvailableExternally,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3723,6 +3724,7 @@ fn lower_prepared_module<'c>(
             } else {
                 partition_linkage
             },
+            scope.defines(f),
             scope.is_test(),
         );
         if explicit_export {
@@ -4602,7 +4604,13 @@ pub fn partition_function_symbol(
         && exports
             .iter()
             .any(|export| export == function.name.as_str());
-    if direct_main || explicit_export || function.exportable || function.available_externally {
+    if function.available_externally {
+        return Ok((
+            symbol_name(function, exports),
+            ThinFunctionLinkage::AvailableExternally,
+        ));
+    }
+    if direct_main || explicit_export || function.exportable {
         return Ok((symbol_name(function, exports), ThinFunctionLinkage::Root));
     }
     let unit_hex = lowercase_hex(unit.as_bytes());
@@ -8072,6 +8080,7 @@ fn declare_fn<'c>(
     program: &Program,
     exports: &[String],
     partition_linkage: Option<ThinFunctionLinkage>,
+    has_body: bool,
     test_mode: bool,
 ) -> FunctionValue<'c> {
     let map = |ty: Ty| -> BasicTypeEnum<'c> {
@@ -8166,7 +8175,7 @@ fn declare_fn<'c>(
         && f.ret != Ty::Unit;
     let explicit_export = f.name.as_str() != "main"
         && exports.iter().any(|export| export == f.name.as_str());
-    if f.available_externally {
+    if f.available_externally && has_body {
         fv.set_linkage(Linkage::AvailableExternally);
     }
     match partition_linkage {
@@ -8174,6 +8183,7 @@ fn declare_fn<'c>(
         Some(ThinFunctionLinkage::UnitLocal) => {
             fv.as_global_value().set_visibility(GlobalVisibility::Hidden);
         }
+        Some(ThinFunctionLinkage::AvailableExternally) => {}
         None if !direct_main
             && !explicit_export
             && !f.exportable

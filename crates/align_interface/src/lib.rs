@@ -621,6 +621,20 @@ pub fn build_summaries_with_effects(
                 | align_ast::Item::Extern(_) => None,
             })
             .collect::<HashSet<_>>();
+        let same_unit_constants = m
+            .file
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                align_ast::Item::Const(constant) => Some(constant.name.name.as_str()),
+                align_ast::Item::Fn(_)
+                | align_ast::Item::Test(_)
+                | align_ast::Item::Struct(_)
+                | align_ast::Item::Enum(_)
+                | align_ast::Item::Resource(_)
+                | align_ast::Item::Extern(_) => None,
+            })
+            .collect::<HashSet<_>>();
         let inline_extern_inventory = m
             .file
             .items
@@ -763,9 +777,11 @@ pub fn build_summaries_with_effects(
                         };
                         let resource_hook_body =
                             align_sema::resource_hook_has_unsafe_body(&fd.body);
+                        let body_source = safe_slice(src, fd.span);
                         let body = if is_generic {
-                            IFnBody::GenericTemplate(safe_slice(src, fd.span))
+                            IFnBody::GenericTemplate(body_source)
                         } else if !resource_hooks.contains(canonical.as_str())
+                            && !source_references_any_name(&body_source, &same_unit_constants)
                             && drop_state_effects.iter().all(|effect| {
                                 *effect == align_sema::hir::DropStateEffect::NotApplicable
                             })
@@ -791,7 +807,7 @@ pub fn build_summaries_with_effects(
                                     });
                                     IFnBody::ConcreteInline {
                                         policy_version: INLINE_BODY_POLICY_VERSION,
-                                        source: safe_slice(src, fd.span),
+                                        source: body_source,
                                         externs: std::mem::take(externs),
                                     }
                                 }
@@ -1006,6 +1022,18 @@ pub fn build_summaries_with_effects(
         summaries.push(summary);
     }
     Ok(summaries)
+}
+
+fn source_references_any_name(source: &str, names: &HashSet<&str>) -> bool {
+    if names.is_empty() {
+        return false;
+    }
+    let mut diagnostics = align_diag::Diagnostics::new();
+    align_lexer::tokenize(0, source, &mut diagnostics)
+        .iter()
+        .any(|token| {
+            matches!(&token.kind, align_lexer::TokKind::Ident(name) if names.contains(name.as_str()))
+        })
 }
 
 /// Attribute each MIR function's capabilities to the unit that owns its base name, unioning per unit.
@@ -2894,16 +2922,23 @@ pub fn validate_for_import(
         }
         for (parameter, effect) in function.params.iter().zip(&function.drop_state_effects) {
             let generic = matches!(function.body, IFnBody::GenericTemplate(_));
-            let expected_move = !generic
-                && parameter.mode == ParamMode::BorrowMut
-                && analysis.return_cleanup(&parameter.ty, &[]) == Some(align_sema::hir::ReturnCleanupAbi::DynamicBit);
             let valid = if generic {
                 (*effect == align_sema::hir::DropStateEffect::Deferred)
                     == (parameter.mode == ParamMode::BorrowMut)
-            } else if expected_move {
-                matches!(effect, align_sema::hir::DropStateEffect::Invariant | align_sema::hir::DropStateEffect::MayChange)
-            } else {
+            } else if parameter.mode != ParamMode::BorrowMut {
                 *effect == align_sema::hir::DropStateEffect::NotApplicable
+            } else {
+                match analysis.return_cleanup(&parameter.ty, &[]) {
+                    Some(align_sema::hir::ReturnCleanupAbi::DynamicBit) => matches!(
+                        effect,
+                        align_sema::hir::DropStateEffect::Invariant
+                            | align_sema::hir::DropStateEffect::MayChange
+                    ),
+                    Some(align_sema::hir::ReturnCleanupAbi::None) => {
+                        *effect == align_sema::hir::DropStateEffect::NotApplicable
+                    }
+                    None => *effect != align_sema::hir::DropStateEffect::Deferred,
+                }
             };
             if !valid {
                 return Err(ImportCompatibilityError::DropStateEffectMismatch);

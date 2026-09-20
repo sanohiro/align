@@ -4833,7 +4833,11 @@ fn simplify_drop_state(f: &mut Function) {
         first_statement: usize,
         slot: Slot,
         visiting: &mut std::collections::HashSet<BlockId>,
+        memo: &mut std::collections::HashMap<(BlockId, usize), bool>,
     ) -> bool {
+        if let Some(result) = memo.get(&(block_id, first_statement)) {
+            return *result;
+        }
         if !visiting.insert(block_id) {
             return false;
         }
@@ -4850,22 +4854,25 @@ fn simplify_drop_state(f: &mut Function) {
                 let (value, cleanup) = returned.as_ref();
                 !operand_mentions_slot(value, slot) && !operand_mentions_slot(cleanup, slot)
             }
-            Term::Goto(target) => all_paths_leave_slot_unread(f, *target, 0, slot, visiting),
+            Term::Goto(target) => {
+                all_paths_leave_slot_unread(f, *target, 0, slot, visiting, memo)
+            }
             Term::Branch(condition, then_block, else_block) => {
                 !operand_mentions_slot(condition, slot)
-                    && all_paths_leave_slot_unread(f, *then_block, 0, slot, visiting)
-                    && all_paths_leave_slot_unread(f, *else_block, 0, slot, visiting)
+                    && all_paths_leave_slot_unread(f, *then_block, 0, slot, visiting, memo)
+                    && all_paths_leave_slot_unread(f, *else_block, 0, slot, visiting, memo)
             }
             Term::StrMatch { scrutinee, cases, otherwise } => {
                 !operand_mentions_slot(scrutinee, slot)
                     && cases.iter().all(|(_, target)| {
-                        all_paths_leave_slot_unread(f, *target, 0, slot, visiting)
+                        all_paths_leave_slot_unread(f, *target, 0, slot, visiting, memo)
                     })
-                    && all_paths_leave_slot_unread(f, *otherwise, 0, slot, visiting)
+                    && all_paths_leave_slot_unread(f, *otherwise, 0, slot, visiting, memo)
             }
             Term::Unreachable => true,
         };
         visiting.remove(&block_id);
+        memo.insert((block_id, first_statement), result);
         result
     }
 
@@ -4882,6 +4889,7 @@ fn simplify_drop_state(f: &mut Function) {
                         index + 2,
                         *slot,
                         &mut std::collections::HashSet::new(),
+                        &mut std::collections::HashMap::new(),
                     )
                 {
                     removable.push((block_index, index));
@@ -24706,6 +24714,57 @@ mod tests {
         initialize_empty.blocks[0].term = Term::Return(None);
         simplify_drop_state(&mut initialize_empty);
         assert!(matches!(initialize_empty.blocks[0].stmts[0], Stmt::DropFlagInit(0)), "construction initialization is never folded as move-out nulling");
+
+        let mut function = take.clone();
+        let mut blocks = vec![Block {
+            id: 0,
+            stmts: vec![
+                Stmt::DropFlagMoveOut { slot: 0, flag: 2 },
+                Stmt::Store(2, Operand::Const(Const::Bool(false))),
+            ],
+            stmt_lines: vec![(0, 0), (0, 0)],
+            term: Term::Branch(Operand::Const(Const::Bool(true)), 1, 2),
+        }];
+        for level in 0..64 {
+            let left = blocks.len() as BlockId;
+            let right = left + 1;
+            let join = left + 2;
+            blocks.push(Block {
+                id: left,
+                stmts: vec![],
+                stmt_lines: vec![],
+                term: Term::Goto(join),
+            });
+            blocks.push(Block {
+                id: right,
+                stmts: vec![],
+                stmt_lines: vec![],
+                term: Term::Goto(join),
+            });
+            blocks.push(Block {
+                id: join,
+                stmts: vec![],
+                stmt_lines: vec![],
+                term: if level == 63 {
+                    Term::Return(None)
+                } else {
+                    Term::Branch(
+                        Operand::Const(Const::Bool(true)),
+                        join + 1,
+                        join + 2,
+                    )
+                },
+            });
+        }
+        function.blocks = blocks;
+        function.entry = 0;
+        function.exceptional_edges.clear();
+
+        simplify_drop_state(&mut function);
+
+        assert!(!function.blocks.iter().flat_map(|block| &block.stmts).any(|statement| {
+            matches!(statement, Stmt::DropFlagMoveOut { .. })
+        }));
     }
 
     #[test]

@@ -319,3 +319,22 @@ producer-fact bridge now sorts its name-only projection by symbol before the
 consumer comparison. The focused interface owner and the two-unit native
 wrapper owner both cover the previously failing linked-`acos` plus unlinked-
 `labs` combination.
+
+The first CI run then exercised the existing function-partition ThinLTO owner
+and found that consumer bodies were classified as duplicate external roots.
+ThinLTO now carries a distinct available-external partition linkage: only the
+selected definition receives LLVM `available_externally`, peer declarations
+remain ordinary external declarations, and only the producer is a preserved
+root. The complete `function_thin_lto` target owns this integration boundary.
+
+The second CI run exercised the required database consumers and found two
+source-closure boundaries. A concrete source fragment that names a same-unit
+constant is now rejected alongside a same-unit function dependency; constants
+are folded out of HIR, so admission checks the producer declaration's tokenized
+source before publication. The same run exposed an existing validator gap for
+`borrow mut` parameters whose resource nominal belongs to another interface:
+the isolated summary cannot resolve that nominal's cleanup class. It now
+rejects `Deferred` but accepts the three concrete producer classifications;
+resolved local and builtin types retain their exact ownership check. The
+focused interface admission and foreign-nominal owners plus the required
+database suites cover both boundaries.
