@@ -587,9 +587,8 @@ relinquish either guarantee:
 
 ```align
 sum := float(reassoc) { xs.sum() }
-dot := float(reassoc, contract) {
-  zip(xs, ys).map(fn pair { float(contract) { pair.0 * pair.1 } }).sum()
-}
+dot := float(reassoc, contract) { xs.dot(ys) }
+fused := float(contract) { a * b + c }
 ```
 
 `float(reassoc) { ... }` permits f32/f64 additions, subtractions, and multiplications written in
@@ -597,8 +596,8 @@ the block to be reassociated, including array-pipeline `sum`/`dot` and fixed-vec
 `sum_where`, and `dot` accumulation. `float(contract) { ... }`
 permits a multiply and its consuming add/subtract, when both are in the scope, to become one fused
 operation. The options are independent; nested scopes add permissions within one function body.
-Every named or inline function body starts strict, so the lambda above needs its own visible
-`float(contract)` scope; calling it does not copy the caller's mode. A scope grants permission to its
+Every named or inline function body starts strict, so relaxing arithmetic in a lambda requires its
+own visible inner scope; calling it does not copy the caller's mode. A scope grants permission to its
 operations; it is not an optimizer barrier for reassociation. Independently reassociable operations
 may combine after inlining, while a strict participant prevents that rewrite. Contraction is selected
 earlier: Align turns a direct multiply/add-subtract pair into explicit FMA only when both operations
