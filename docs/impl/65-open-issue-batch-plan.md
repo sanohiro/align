@@ -636,8 +636,8 @@ decimal. It canonicalizes to the three unsigned components that Mach-O actually
 encodes. `major` is in `1..=65535`; `minor` and `patch` are in `0..=255`.
 Leading zeroes and omitted trailing components do not create distinct
 identities (`027.0` and `27` both become `27.0.0`). Empty, signed,
-non-numeric, overlong, embedded-NUL, or out-of-range values are hard argument
-errors naming `--sdk-version`. A following option is a missing value, and a
+non-numeric, embedded-NUL, out-of-range, or more-than-64-byte UTF-8 values are
+hard argument errors naming `--sdk-version`. A following option is a missing value, and a
 repeated flag follows the CLI's existing last-value rule. An explicit value on
 a non-Apple target is a hard error. Validation and installation happen before
 source, cache, or artifact work and before any module can freeze the process
@@ -661,7 +661,7 @@ the program module owns the selected provenance before any merge.
 | LLVM IR | When selected, every emitted module contains exactly one warning-behavior `SDK Version` flag with a three-element `i32` array; when absent it contains none. The flag is installed before runtime-bitcode merge and survives raw/optimized IR, ordinary object emission, test harnesses, and ThinLTO. | Codegen raw-IR owner checks the exact semantic flag; the existing module-path owners plus native object acceptance cover the shared constructor. |
 | Mach-O | The object writer packs the selected components into `LC_BUILD_VERSION.sdk`; `otool -l` reports the selected semantic version. `minos`, target triple, ABI, and linking are unchanged. No value is written for ELF or other formats. | Native macOS `emit-obj` integration owner checks `otool -l`; absence owner keeps `sdk n/a`. No benchmark: this is metadata correctness with no performance promise. |
 | Cache | `sdk_version: Option<String>` is hashed immediately after `target_triple` in the codegen, ThinLTO prelink, and ThinLTO backend keys. `None` and each canonical value are distinct. The frontend `UnitKey` excludes it because checked HIR is unchanged. Cache-key and manifest format versions advance together; decoders reject old/unknown layouts rather than reinterpret bytes. | Cache semantic-difference owners cover `None`/`Some` and changed versions; byte-golden/round-trip owners pin field order for ordinary, prelink, and backend manifests. |
-| Failure/side effects | CLI lexical validation precedes all other strippers; semantic/range/platform validation precedes source reads, cache lookup, module creation, or output creation. When several SDK components are invalid, validation reports the first component from left to right; shape/count errors precede numeric range errors. | Parser and target-identity negative owners assert the named layer and absence of output. |
+| Failure/side effects | CLI lexical validation precedes all other strippers; semantic/range/platform validation precedes source reads, cache lookup, module creation, or output creation. Validation order is empty/NUL/option-shaped value, total UTF-8 byte length (`>64`), component count and decimal shape, numeric range from left to right, then Apple platform applicability. | Parser and target-identity negative owners assert the named layer and absence of output. |
 | Documentation | This ledger owns the implementation contract; the toolchain guide and its Japanese mirror expose the user surface, and `docs/open-questions.md` records the settled no-ambient-input decision. | Author consistency pass plus one independent adversarial review before implementation. |
 
 The implementation closure is correspondingly small: parse and install the
