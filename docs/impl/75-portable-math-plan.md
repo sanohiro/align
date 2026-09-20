@@ -388,3 +388,13 @@ closed here before implementation:
 | The public visibility promise named only retained and scalarized operations while verbose output admitted eliminated rows | The public promise and mirrors now use the same exhaustive three-state classification, with default/verbose presence rules stated separately. |
 | Public mirrors could read as if optimized-IR inspection observed scalarization during instruction selection | Every public mirror now limits `explain-opt` to the pre-instruction-selection disposition, warns that retained provider-less IR may still scalarize, and assigns final machine SIMD to emitted-object inspection. |
 | Whole/per-unit coverage required identical optimized visibility even when their legal optimization opportunities differ | Raw lowering and runtime results retain parity; each mode instead validates visibility against its own optimized module. |
+
+## 8. Implementation review closure
+
+The implementation review found two P2 gaps in the inspection producer. Both
+are closed as one visibility-integrity class:
+
+| Finding | Closure |
+|---|---|
+| A synthetic interface function could lend its nonzero statement coordinate to the current unit's filename | Located MIR now carries a diagnostic-only, catalog-authenticated user-source fact per function. Math inventory publishes a coordinate only when that fact is present; synthetic interface bodies remain source-less even when LLVM debug coordinates exist. |
+| Captured LLVM scalarization reasons never reached `MathVisibilityRecord` | The inspection producer now correlates explicit scalarization remarks by exact authenticated file, line and column. Unrelated or differently located remarks are ignored; absence retains the stable `LLVM supplied no reason` fallback. |

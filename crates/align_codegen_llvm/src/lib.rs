@@ -1538,11 +1538,16 @@ fn math_visibility_inventory(program: &Program) -> Vec<MathVisibilityRecord> {
                     continue;
                 }
                 ordinal += 1;
-                let source = block
-                    .stmt_lines
-                    .get(index)
-                    .copied()
-                    .filter(|(line, _)| *line != 0);
+                let source = program
+                    .has_authenticated_user_source(&function.name)
+                    .then(|| {
+                        block
+                            .stmt_lines
+                            .get(index)
+                            .copied()
+                            .filter(|(line, _)| *line != 0)
+                    })
+                    .flatten();
                 records.push(MathVisibilityRecord {
                     function: function.name.clone(),
                     operation_ordinal: ordinal,
@@ -1647,6 +1652,36 @@ fn resolve_math_visibility(
     Ok(records)
 }
 
+fn llvm_remark_location_and_message(remark: &str) -> Option<(&str, u32, u32, &str)> {
+    let (location, message) = remark.split_once(": ")?;
+    let mut fields = location.rsplitn(3, ':');
+    let column = fields.next()?.parse().ok()?;
+    let line = fields.next()?.parse().ok()?;
+    let file = fields.next()?;
+    (!file.is_empty()).then_some((file, line, column, message))
+}
+
+fn attach_math_scalarization_reasons(
+    records: &mut [MathVisibilityRecord],
+    remarks: &[String],
+    debug_file: &str,
+) {
+    for record in records {
+        if record.state != MathVisibilityState::Scalarized {
+            continue;
+        }
+        let Some(source) = record.source else {
+            continue;
+        };
+        record.llvm_reason = remarks.iter().find_map(|remark| {
+            let (file, line, column, message) = llvm_remark_location_and_message(remark)?;
+            let explicit_scalarization = message.to_ascii_lowercase().contains("scalariz");
+            (file == debug_file && source == (line, column) && explicit_scalarization)
+                .then(|| message.to_owned())
+        });
+    }
+}
+
 /// Compile `program` with opt-in debug locations and the selected profile, and return LLVM's raw
 /// optimization-remark strings (each `"<file>:<line>:<col>: <message>"`) captured via the
 /// diagnostic handler (`docs/impl/09-explain-opt.md`, Slice 3b, Mechanism A). The driver's
@@ -1704,7 +1739,8 @@ pub fn collect_opt_inspection(
 
     drop(_detach_guard);
     ran?;
-    let math = classify_math_visibility(&ctx, &module, inventory)?;
+    let mut math = classify_math_visibility(&ctx, &module, inventory)?;
+    attach_math_scalarization_reasons(&mut math, &sink, &debug.file);
     Ok(OptInspection { remarks: *sink, math })
 }
 
@@ -25782,7 +25818,7 @@ mod tests {
             math_visibility_tag(&records[3].function, 4, records[3].operation, records[3].ty),
             (true, true),
         );
-        let resolved = resolve_math_visibility(records.clone(), shapes).expect("valid inventory");
+        let mut resolved = resolve_math_visibility(records.clone(), shapes).expect("valid inventory");
         assert_eq!(
             resolved.iter().map(|record| record.state).collect::<Vec<_>>(),
             vec![
@@ -25792,6 +25828,22 @@ mod tests {
                 MathVisibilityState::Scalarized,
             ],
         );
+        attach_math_scalarization_reasons(
+            &mut resolved,
+            &[
+                "visibility.align:3:1: unrelated vector remark".into(),
+                "visibility.align:4:2: scalarized for the wrong source column".into(),
+                "other.align:3:1: scalarized for the wrong source file".into(),
+                "visibility.align:3:1: Scalarized because no vector mapping was available".into(),
+            ],
+            "visibility.align",
+        );
+        assert_eq!(
+            resolved[2].llvm_reason.as_deref(),
+            Some("Scalarized because no vector mapping was available"),
+        );
+        assert_eq!(resolved[1].llvm_reason, None);
+        assert_eq!(resolved[3].llvm_reason, None);
 
         let mut malformed = records.clone();
         malformed[1].operation_ordinal = 3;
