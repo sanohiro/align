@@ -601,11 +601,11 @@ entry:
             &ctx,
             r#"
 %Big = type { [27 x i64] }
+declare i64 @consume(%Big %value) #0
 define i64 @malformed(%Big %value) #0 {
 entry:
-  %first = extractvalue %Big %value, 0
-  %last = extractvalue [27 x i64] %first, 26
-  ret i64 %last
+  %result = musttail call i64 @consume(%Big %value)
+  ret i64 %result
 }
 attributes #0 = { "align.program.parameters" }
 "#,
@@ -615,11 +615,11 @@ attributes #0 = { "align.program.parameters" }
         let parameter_before = parameter_module.print_to_string().to_string();
         let parameter_owned: Vec<_> = parameter_module.get_functions().collect();
         let parameter_error = normalize(&parameter_module, &tm, &parameter_owned)
-            .expect_err("target-indirect parameters require canonical entry storage");
+            .expect_err("target-indirect parameters cannot retain musttail");
         assert!(
             parameter_error
                 .to_string()
-                .contains("target-indirect parameter has noncanonical entry storage"),
+                .contains("unsupported target-indirect parameter call edge"),
             "{parameter_error}"
         );
         assert_eq!(

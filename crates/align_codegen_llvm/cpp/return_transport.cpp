@@ -513,6 +513,7 @@ bool sameParams(ArrayRef<ParamPlan> A, ArrayRef<ParamPlan> B) {
 struct ParameterFunctionPlan {
   Function *Old;
   SmallVector<ParamPlan, 4> Params;
+  SmallVector<AllocaInst *, 4> EntrySlots;
   Function *Replacement = nullptr;
 };
 struct ParameterCallPlan {
@@ -571,31 +572,27 @@ bool normalizeParameters(Module &M, TargetMachine &TM,
                                    F->getAttributes(), *F, Plans, Error))
         return false;
       if (Plans.empty()) continue;
+      SmallVector<AllocaInst *, 4> EntrySlots;
       for (const ParamPlan &P : Plans) {
         Argument *Arg = F->getArg(P.Index);
-        if (F->isDeclaration()) continue;
-        if (!Arg->hasOneUse()) {
-          Error = "target-indirect parameter lacks one entry materialization";
-          return false;
-        }
-        auto *Store = dyn_cast<StoreInst>(*Arg->user_begin());
+        auto *Store = !F->isDeclaration() && Arg->hasOneUse()
+                          ? dyn_cast<StoreInst>(*Arg->user_begin())
+                          : nullptr;
         auto *Slot = Store ? dyn_cast<AllocaInst>(Store->getPointerOperand()) : nullptr;
         auto *Count = Slot ? dyn_cast<ConstantInt>(Slot->getArraySize()) : nullptr;
-        if (!Store || !Store->isSimple() || Store->getValueOperand() != Arg ||
-            !Slot || Slot->getFunction() != F ||
-            Slot->getParent() != &F->getEntryBlock() ||
-            Store->getParent() != &F->getEntryBlock() ||
-            !Count || !Count->isOne() || !Slot->comesBefore(Store) ||
-            Slot->getAllocatedType() != P.Layout.Ty ||
-            Slot->getAddressSpace() != P.Layout.AddressSpace ||
-            Slot->getAlign() < P.Layout.Alignment ||
-            Store->getAlign() < P.Layout.Alignment) {
-          Error = "target-indirect parameter has noncanonical entry storage";
-          return false;
-        }
+        bool Canonical = Store && Store->isSimple() &&
+            Store->getValueOperand() == Arg && Slot && Slot->getFunction() == F &&
+            Slot->getParent() == &F->getEntryBlock() &&
+            Store->getParent() == &F->getEntryBlock() && Count && Count->isOne() &&
+            Slot->comesBefore(Store) && Slot->getAllocatedType() == P.Layout.Ty &&
+            Slot->getAddressSpace() == P.Layout.AddressSpace &&
+            Slot->getAlign() >= P.Layout.Alignment &&
+            Store->getAlign() >= P.Layout.Alignment;
+        EntrySlots.push_back(Canonical ? Slot : nullptr);
       }
       Index[F] = Functions.size();
-      Functions.push_back(ParameterFunctionPlan{F, std::move(Plans)});
+      Functions.push_back(ParameterFunctionPlan{
+          F, std::move(Plans), std::move(EntrySlots)});
     }
     for (Function &F : M) for (BasicBlock &B : F) for (Instruction &I : B) {
       auto *CB = dyn_cast<CallBase>(&I);
@@ -628,6 +625,7 @@ bool normalizeParameters(Module &M, TargetMachine &TM,
   }
   for (auto &P : Functions) {
     Function &Old = *P.Old;
+    bool WasDeclaration = Old.isDeclaration();
     Function *New = Function::Create(parameterType(Old.getFunctionType(), P.Params),
                                      Old.getLinkage(), Old.getAddressSpace(), "", &M);
     New->copyAttributesFrom(&Old);
@@ -635,17 +633,30 @@ bool normalizeParameters(Module &M, TargetMachine &TM,
                                            Old.arg_size(), P.Params));
     New->copyMetadata(&Old, 0);
     New->takeName(&Old);
+    New->splice(New->end(), &Old);
     auto NewArg = New->arg_begin();
     for (unsigned I = 0; I < Old.arg_size(); ++I, ++NewArg) {
       Argument *OldArg = Old.getArg(I);
       NewArg->takeName(OldArg);
-      if (!findParam(P.Params, I)) {
+      auto Plan = llvm::find_if(P.Params, [I](const ParamPlan &Candidate) {
+        return Candidate.Index == I;
+      });
+      if (Plan == P.Params.end()) {
         OldArg->replaceAllUsesWith(&*NewArg);
         continue;
       }
-      if (Old.isDeclaration()) continue;
+      if (WasDeclaration) continue;
+      unsigned PlanIndex = std::distance(P.Params.begin(), Plan);
+      auto *Slot = P.EntrySlots[PlanIndex];
+      if (!Slot) {
+        IRBuilder<> Entry(&*New->getEntryBlock().getFirstInsertionPt());
+        Value *Loaded = Entry.CreateAlignedLoad(
+            Plan->Layout.Ty, &*NewArg, Plan->Layout.Alignment,
+            "parameter.value");
+        OldArg->replaceAllUsesWith(Loaded);
+        continue;
+      }
       auto *Store = cast<StoreInst>(*OldArg->user_begin());
-      auto *Slot = cast<AllocaInst>(Store->getPointerOperand());
       SmallVector<Instruction *, 2> Lifetimes;
       for (User *User : Slot->users())
         if (auto *Use = dyn_cast<Instruction>(User);
@@ -656,7 +667,6 @@ bool normalizeParameters(Module &M, TargetMachine &TM,
       Store->eraseFromParent();
       Slot->eraseFromParent();
     }
-    New->splice(New->end(), &Old);
     P.Replacement = New;
   }
   for (auto &P : Calls) {
@@ -1221,10 +1231,18 @@ extern "C" int align_normalize_return_transport(
   if (verifyModule(*Candidate, &Stream)) {
     *ErrorOut = LLVMCreateMessage(Error.c_str()); return 1;
   }
-  // The Rust side deliberately drops every FunctionValue/Argument handle before
-  // this last module operation. Moving the verified candidate into the stable
-  // Module object makes every refusal transactional: malformed input cannot
-  // leave a half-rewritten module behind.
-  M = std::move(*Candidate);
+  // The verified clone proves every refusal path before publication. Replay
+  // the deterministic rewrite on the stable Module object so finalized debug
+  // metadata and the caller's module handle keep their native owner identity.
+  // No original IR has changed if the preflight clone refuses.
+  Error.clear();
+  if (!normalize(M, *reinterpret_cast<TargetMachine *>(TMRef),
+                 ArrayRef<LLVMValueRef>(Owned, Count), Error)) {
+    *ErrorOut = LLVMCreateMessage(Error.c_str()); return 1;
+  }
+  Error.clear();
+  if (verifyModule(M, &Stream)) {
+    *ErrorOut = LLVMCreateMessage(Error.c_str()); return 1;
+  }
   return 0;
 }

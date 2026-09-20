@@ -4450,6 +4450,11 @@ fn lower_prepared_module<'c>(
     if let Some(dc) = &debug_ctx {
         dc.dib.finalize();
     }
+    // Aggregate transport publishes a verified clone into the stable Module
+    // object. Dispose the finalized DIBuilder first: its native handle still
+    // points at the pre-publication module internals even though no more debug
+    // records will be emitted.
+    drop(debug_ctx);
     // A `Result`- or `Unit`-returning main needs a C `main` wrapper: `Result` maps Ok/Err to an
     // exit code (and, when `main(args: array<str>)`, marshals argv into the `array<str>`
     // argument — the argv form is Result-only, sema-enforced); `Unit` has no error to report, so

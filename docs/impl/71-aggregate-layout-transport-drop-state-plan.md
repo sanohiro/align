@@ -563,7 +563,9 @@ transport chain:
 - Cleanup-bearing returns cover direct pairs, direct values plus a canonical
   byte output, and indirect values plus `sret(T)` and that byte output. Fresh
   whole-local forwarding is limited to proved materialization slots; malformed
-  or unsupported edges refuse transactionally on a cloned module.
+  or unsupported edges refuse transactionally on a verified preflight clone,
+  then the deterministic rewrite replays on the stable original module after
+  its finalized debug builder is disposed.
 - Result and user-sum owners load the i8/i32 discriminator directly from final
   storage, reload payloads only in selected arms, and retain the aggregate
   fallback when aliases or intervening writes make delayed loads unsafe.
