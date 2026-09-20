@@ -45,12 +45,12 @@ artifacts="$(mktemp)"
 trap 'rm -f "$artifacts"' EXIT
 
 # Build argv without eval so fixed target names cannot become shell syntax.
-set -- -p align_driver
+set -- -p align_runtime -p align_driver --bin alignc
 for db_binary in $db_binaries; do
   set -- "$@" --test "$db_binary"
 done
 scripts/run-quiet.sh --stdout "$artifacts" "database gate: test binaries" -- \
-  scripts/cargo.sh test --no-run --locked --message-format=json-render-diagnostics \
+  scripts/cargo.sh build --locked --message-format=json-render-diagnostics \
   "$@"
 
 # shellcheck disable=SC2086

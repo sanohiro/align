@@ -2796,10 +2796,12 @@ no benchmark or timeout.
 PR #1149 exposed a separate 140-second build at the front of every required
 PostgreSQL shard. The workflow ran `cargo build --workspace --locked`, then
 `scripts/run-db-suites.sh` immediately built the shard's exact integration-test
-binaries with `cargo test --no-run`. Cargo artifact inspection of that exact
-owner build confirms that it also produces `alignc`, `align_driver`, and every
-`align_runtime` crate type, including the `libalign_runtime.a` used by generated
-programs. The broad workspace build contributes no artifact the owner run lacks.
+binaries in a second Cargo invocation. The old `cargo test --no-run` graph does
+not place the production runtime archive beside `alignc`, so the replacement is
+one exact `cargo build` graph selecting `align_runtime`, the `alignc` binary and
+the shard's test binaries together. It produces `target/debug/alignc`,
+`target/debug/libalign_runtime.a`, and the executable owner artifacts without
+building unrelated workspace targets.
 
 The workspace step is removed. Each shard now performs its exact owner
 build/run first. The catalog shard's two missing-configuration negative

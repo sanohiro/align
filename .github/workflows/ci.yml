@@ -290,8 +290,8 @@ jobs:
           test "$vector_version" = "0.8.6"
           echo "pgvector $vector_version"
 
-      # This exact-owner build also produces alignc and every align_runtime
-      # crate type, including the static archive used by generated programs.
+      # This exact-owner graph explicitly builds alignc and align_runtime,
+      # including the production static archive used by generated programs.
       # Keep it before the catalog-only negative controls so those controls
       # reuse this graph instead of triggering a second cold build.
       - name: Required database owner suites
