@@ -20,7 +20,8 @@ value-producing block `float(reassoc) {}`, `float(contract) {}`, or their explic
 Options are independent, nested scopes union them, an inline lambda keeps declaration-site mode,
 and a separately declared callee never inherits caller mode. `reassoc` permits reassociation of
 f32/f64 add/subtract/multiply and unordered floating reduction; `contract` permits local fused
-multiply-add/subtract without implying reassociation. NaN and infinity remain defined values.
+multiply-add/subtract without implying reassociation. Direct `dot` applies the same permissions to
+its products and accumulation. NaN and infinity remain defined values.
 `nnan`, `ninf`, `nsz`, reciprocal, approximate-function, bundled `fast`, and ambient compiler flags
 are excluded. Generic and interface-carried concrete bodies retain the exact source scope and
 re-derive its mode in the consumer. No benchmark or client build defines correctness. Record:

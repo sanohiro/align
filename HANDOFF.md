@@ -101,8 +101,12 @@ preflight, `scripts/open-pr.sh`, CI, merge):
    LLVM flags and a benchmark-free acceptance matrix. Its first independent
    review found that known mode bits needed authentication against source scope;
    the revised design retains FloatScope in checked HIR and rejects invented or
-   dropped bits before MIR. The P1 reopens the provenance axis and requires a
-   fresh full design review before merge and implementation.
+   dropped bits before MIR. The reopened full review found that lifted lambdas
+   also need an authenticated declaration-target root mode; the matrix now uses
+   a global parent-scope-to-lifted-target validation pass and rejects orphan or
+   duplicate targets. It also closes direct dot semantics and option-error
+   precedence. This second P1 reopens the lifted-declaration-provenance axis and
+   requires a fresh full design review before merge and implementation.
 4. Follow-ups, independent and small (updated 2026-09-19):
    `fix/nightly-detector-restore` closed #1105, #1107, #1108, #1109, and
    #1112, and separately repaired two untracked first-night nightly failures

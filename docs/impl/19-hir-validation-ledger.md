@@ -2246,6 +2246,12 @@ the enclosing mode after every block, branch, loop and terminating expression
 path. Lifted and escaping lambdas retain declaration-site mode in their body; a
 direct, indirect or imported call carries no caller mode into its target.
 
+Lambda root mode is never self-authenticating. The global validator walks named
+function roots under strict mode, records each lambda expression's exact target
+id and current lexical union, then validates each lifted target under that
+derived root mode, recursively. Each lifted function has exactly one declaring
+lambda; missing, duplicate, orphan and non-lifted targets reject before MIR.
+
 Format 15 generic templates and interface-carried concrete bodies preserve the
 exact source scope in their existing body string. Consumer parsing and checking
 derive the same canonical record before imported HIR; monomorphization and
@@ -2254,5 +2260,7 @@ Malformed owners add a known bit outside a scope, drop one inside a scope,
 substitute unknown bits, attach known bits to integer, comparison, cast,
 min/max, call and memory nodes, drop a bit through lambda lifting, invent
 caller-to-callee inheritance, or accept an unknown option while
-rechecking imported body source. Plan 77 owns the parameterized
+rechecking imported body source. Options are parsed as identifiers; the first
+unknown in source order outranks every duplicate, and only an all-known list
+reports the first duplicate's second occurrence. Plan 77 owns the parameterized
 formation, control-flow, interface and whole/per-unit acceptance matrix.

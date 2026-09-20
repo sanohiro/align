@@ -585,12 +585,13 @@ Distinguished from named functions (`fn ident (`) by "name + presence/absence of
 arena_expr  = "arena" ident? block
 unsafe_expr = "unsafe" block
 float_expr  = "float" "(" float_option ("," float_option)* ")" block
-float_option = "reassoc" | "contract"
+float_option = ident
 ```
 
 `float` is reserved because the construct is an observable expression scope, not a library call.
-The option tokens remain ordinary identifiers and are validated left to right. At least one is
-required; duplicates and unknown names are errors. Both source orders are accepted, and the
+The parser accepts arbitrary identifier options and stores their source order; sema owns the closed
+`reassoc`/`contract` name set and its deterministic unknown-before-duplicate validation. At least one
+option is required. Both valid source orders are accepted, and the
 formatter writes `reassoc` before `contract`. The AST stores the source list for diagnostics and a
 checked expression stores plan 77's canonical two-bit mode.
 ```align

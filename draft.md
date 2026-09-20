@@ -593,7 +593,7 @@ dot := float(reassoc, contract) {
 ```
 
 `float(reassoc) { ... }` permits f32/f64 additions, subtractions, and multiplications written in
-the block to be reassociated, including a built-in `sum` accumulator. `float(contract) { ... }`
+the block to be reassociated, including built-in `sum` and `dot` accumulation. `float(contract) { ... }`
 permits a multiply and its consuming add/subtract, when both are in the scope, to become one fused
 operation. The options are independent; nested scopes add permissions. An inline lambda written
 inside the scope retains its declaration-site permissions, but calling a separately declared

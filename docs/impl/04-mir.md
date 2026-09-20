@@ -69,8 +69,10 @@ on every normal and terminating construction path. f32/f64 scalar and explicit-v
 floating sum carry the authenticated mode active where their source operation was written. Other MIR
 nodes carry no inferred relaxation.
 
-A lifted lambda copies its declaration-site mode into its checked body. Direct, indirect and
-imported calls do not carry caller mode; the callee body already owns its modes. Format 15 generic
+A lifted lambda's root mode is authenticated globally: validation walks each parent lambda
+expression under the retained scope stack, requires one exact lifted target, and then validates
+that target body under the derived mode, recursively for nested lambdas. A copied function field is
+not authority. Direct, indirect and imported calls do not carry caller mode; the callee body already owns its modes. Format 15 generic
 templates and plan 74 concrete bodies retain exact source and the consumer re-derives the mode.
 MIR validation rejects unknown bits or a mode attached to an ineligible type/node before LLVM lowering. The mode changes permitted
 result bits only; it never licenses effect, memory, trap, cleanup or control-flow motion.

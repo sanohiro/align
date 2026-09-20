@@ -2484,7 +2484,9 @@ regression net that validates the upgrade.
   keep declaration-site mode, and separately declared callees never inherit
   caller mode. Checked HIR retains each lexical scope and validates every
   operation's exact effective mode, so known invented/dropped bits fail before
-  MIR. Generic and plan 74 concrete bodies retain exact source for consumer
+  MIR. Lifted function root modes are derived from the unique parent lambda
+  target under that same scope walk, never trusted from the lifted body itself.
+  Generic and plan 74 concrete bodies retain exact source for consumer
   rechecking. Poison-producing assumptions, reciprocal/approximate modes,
   bundled `fast`, and ambient compiler flags are excluded. Implementation is
   one parser-to-LLVM/interface capability after independent design review; no

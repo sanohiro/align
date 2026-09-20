@@ -68,6 +68,16 @@ Lexical extent    A scope affects operations whose source expression is inside
                   callee's semantics. A callee uses only scopes in its own
                   source body.
 
+Lifted roots      Checking a lambda expression records its exact lifted target
+                  function id and the mode active at that declaration. Global
+                  checked-HIR validation first walks named roots under strict
+                  mode, discovers every lambda declaration through retained
+                  FloatScope nodes, and builds the unique target-to-root-mode
+                  map. It then validates each lifted body under that
+                  authenticated root mode and repeats for nested lambdas.
+                  Missing, duplicate, orphan or wrong-origin targets reject.
+                  A mode copied only onto a lifted function is never trusted.
+
 Pipelines         Built-in pipeline arithmetic belongs to the terminal or
                   stage expression that requests it. A `sum` terminal written
                   in `float(reassoc)` may use an unordered reduction. Arithmetic
@@ -103,9 +113,14 @@ Ownership         Parser/AST own the option list and block form. align_sema
                   option order.
 
 Errors            `float()` reports the missing option before checking body
-                  errors. Options are validated left to right: the first
-                  unknown option is reported before a later duplicate; after
-                  all names are known, the first duplicate is reported.
+                  errors. Sema scans the complete option list before the body.
+                  If any name is unknown, it reports the first unknown in
+                  source order, regardless of an earlier or later duplicate.
+                  Only when every name is known does it report the first
+                  duplicate's second occurrence. Thus both
+                  `reassoc,reassoc,bogus` and `bogus,reassoc,reassoc` report
+                  unknown `bogus`; `reassoc,contract,reassoc` reports duplicate
+                  `reassoc` at its second occurrence.
                   Missing comma/parenthesis/brace remains a parser error at the
                   first missing token. A valid no-op scope is accepted.
 
@@ -141,9 +156,12 @@ Prerequisite      Plan 68 G4 Part 1 is merged. Plans 69 and 74 are merged so
 
 Acceptance        One syntax/formatter owner covers the three canonical forms,
                   either source option order, empty/unknown/duplicate options
-                  and missing delimiters. One semantic/MIR owner covers scope
+                  both unknown/duplicate relative orders and missing
+                  delimiters. One semantic/MIR owner covers scope
                   entry/exit, nested union, branch/loop joins, early exits,
-                  inline-lambda capture, named-call noninheritance, scalar and
+                  inline-lambda capture, unique declaration-target mapping,
+                  nested lifted lambdas, orphan/duplicate/wrong-origin targets,
+                  named-call noninheritance, scalar and
                   explicit-vector operations, and checked-HIR rejection of
                   invented, dropped and unknown bits against the retained scope.
                   One LLVM owner proves exact flags on admitted
@@ -180,6 +198,7 @@ flag; it does not mean that the optimizer may choose another one.
 | f32/f64 or vec fadd/fsub | — | `reassoc` | `contract` | `reassoc contract` |
 | f32/f64 or vec fmul | — | `reassoc` | `contract` | `reassoc contract` |
 | built-in floating `sum` reduction | ordered call | unordered `reassoc` call | ordered call | unordered `reassoc` call |
+| direct floating `dot` | ordered products and accumulator | products/adds carry `reassoc`; reduction is unordered | products/adds carry `contract`; reduction stays ordered | products/adds carry both; reduction is unordered |
 | explicit `fma` | existing fused call | unchanged | unchanged | unchanged |
 | fdiv/frem, comparison, conversion, min/max, math call | — | — | — | — |
 | integer/bool/char/pointer/memory/control operation | — | — | — | — |
@@ -212,10 +231,10 @@ permission, not that LLVM will perform a particular rewrite.
 | Checked formation | canonical two-bit FloatScope record plus effective mode on eligible nodes; exact validation order; no-op body admitted | semantic owner |
 | Scope authentication | HIR validator recomputes the lexical union and requires exact equality on every eligible node; invented, dropped and unknown bits reject | checked-HIR mutation owner |
 | Scope propagation | retained HIR scope nests through all branch/block/loop/value positions; returns and early exits do not leak mode after the scope; MIR receives only authenticated effective modes | semantic/MIR owner |
-| Lambdas/calls | inline lambda records declaration-site mode; lifted/escaping forms agree; named/direct/indirect/imported callees do not inherit caller mode | semantic/MIR/interface owner |
+| Lambdas/calls | global HIR validation derives each lifted root mode from its unique parent lambda target under retained scopes; nested/lifted/escaping forms agree; missing/duplicate/orphan/wrong-origin targets reject; named/direct/indirect/imported callees start strict and do not inherit caller mode | semantic/HIR/MIR/interface owner |
 | Scalar arithmetic | f32/f64 add/sub/mul receive selected flags; div/rem/comparison/cast/min/max and explicit fma do not gain unrelated flags | LLVM owner |
 | Vector arithmetic | vecN<f32/f64> follows the same table for every admitted width | LLVM owner |
-| Reductions | built-in sum and dot-shaped fused lowering select unordered reduction only under `reassoc`; strict negative control remains ordered | MIR/LLVM owner |
+| Reductions | built-in sum and direct ArrayDot follow the exact product/add/reduction table; unordered reduction appears only under `reassoc`; strict and contract-only controls remain ordered | MIR/LLVM owner |
 | Contraction | eligible multiply plus consuming add/sub carry `contract`; optimizer fixture contains fused operation; `contract` alone does not set `reassoc` | LLVM owner |
 | Effects and traps | calls, memory operations, bounds/division traps and cleanup retain source order and receive no fast-math permission | MIR/LLVM negative owner |
 | Generic bodies | exact source scope survives template formation, interface round trip and monomorphization; consumer derives the same mode | interface/sema owner |
@@ -231,6 +250,7 @@ One parameterized owner may close multiple rows. No row requires a benchmark.
 | Review | Finding | Closure |
 |---|---|---|
 | `d4a2d307` independent design review | P1: checking only known bits and eligible types lets malformed HIR attach a valid relaxed mode to a strict source operation after the scope is discarded | Retain `FloatScope` in checked HIR; recompute the exact lexical union during HIR validation; reject both invented and dropped known bits before MIR. Reopened closure axis: float-mode provenance. |
+| `1d9838b9` reopened full review | P1: lifting separates a lambda body from its declaring FloatScope, so a copied root mode is unauthenticated. P2: direct ArrayDot product/reduction semantics, arbitrary option parsing and unknown/duplicate precedence were incomplete. | Reopen the matrix around lifted-declaration provenance. Global HIR validation derives a unique target root mode from the parent lambda expression and validates nested lifted bodies from that map. Add the exact dot product/add/reduction row, parse option identifiers before sema, and make any unknown outrank duplicates. |
 
 ## 5. PR boundary
 
