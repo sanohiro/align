@@ -81,10 +81,17 @@ Range semantics   No function-boundary range is emitted by this capability.
                   otherwise unnecessary raw LLVM attribute constructor.
 
 Direct calls      Ordinary MIR direct calls, direct calls with dynamic cleanup,
-                  calls made inside generated adapters and parallel kernels,
-                  and wrapper-to-body calls all use one call-site helper. A
-                  foreign declaration found in the program-call table is
-                  excluded before facts are attached.
+                  generated adapters whose semantic signature can carry a
+                  scalar transport, parallel kernels and wrapper-to-body calls
+                  use one call-site helper. A foreign declaration found in the
+                  program-call table is excluded before facts are attached.
+
+Fixed adapters    The SQLite callback target is fixed to aggregate
+                  `DbFunctionArgs -> Result<DbValue, string>`, resource Drop is
+                  fixed to `raw -> Unit`, and generated C-main bodies accept an
+                  aggregate argv or no parameter and return Unit/Result. None
+                  can carry this capability's scalar transport, so they remain
+                  explicit no-op exclusions rather than invoking the helper.
 
 Indirect calls    Function-value and closure calls derive facts from their
                   checked `param_tys`, `ret_ty`, `FnSignatureFacts` and physical
@@ -196,6 +203,7 @@ not separate hand-written cases or separate test binaries.
 | Task-trampoline indirect call | non-fallible scalar `R` derives the return fact from `GeneratedId::Task.result`; Unit and fallible aggregate results get none | spawn owner checks bool/char/narrow-int returns plus fallible negative control |
 | Native export / entry shell | generated wrapper definition and direct C `main` receive no Align scalar facts; wrapper-to-Align-body call follows the Align signature | existing export/main fixtures assert the shell exclusion and the body-call inclusion |
 | Generated parallel program call | derive from the recorded stage/terminal signature, not the current SSA value | existing generated-parallel fixture gains focused assertion |
+| Fixed aggregate/pointer adapters | SQLite callback, resource Drop and generated C-main calls have no eligible scalar transport; do not invoke the helper | signature-shape audit and existing adapter owners |
 | Foreign/runtime/raw call | no program-scalar helper invocation | negative scan covers representative C, runtime and RawCall sites |
 | Whole/per-unit | identical facts from identical semantic types; no interface field | paired optimized-IR owner and existing interface round trip |
 | Target baselines | LLVM verifies the same IR contract; native boundary values run on each required platform | owner target in normal platform matrix; no separate benchmark job |

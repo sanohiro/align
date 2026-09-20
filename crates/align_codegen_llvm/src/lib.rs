@@ -2793,19 +2793,9 @@ fn emit_sqlite_scalar_callback_trampoline<'c>(
     let values_view = builder.build_insert_value(values_view, scratch_base, 0, "values.ptr").map_err(lower)?.into_struct_value();
     let values_view = builder.build_insert_value(values_view, argc64, 1, "values.len").map_err(lower)?.into_struct_value();
     let function_args = builder.build_insert_value(args_llvm_ty.const_zero(), values_view, 0, "function.args").map_err(lower)?.into_struct_value();
-    let target_call = builder
+    let callback_result = builder
         .build_call(target_fn, &[function_args.into()], "callback.result")
-        .map_err(lower)?;
-    add_scalar_call_facts(
-        ctx,
-        target_call,
-        &declaration.signature.params,
-        &declaration.signature.modes,
-        declaration.signature.ret,
-        declaration.signature.cleanup,
-        0,
-    )?;
-    let callback_result = target_call
+        .map_err(lower)?
         .try_as_basic_value()
         .basic()
         .ok_or_else(|| callable_target_error(target))?
@@ -4418,11 +4408,9 @@ fn lower_prepared_module<'c>(
             .set_visibility(GlobalVisibility::Hidden);
         mark_nounwind(ctx, thunk);
         if scope.emits_resource_thunks()
-            && let Some((hook_name, hook)) = program_funcs
-                .iter()
-                .find_map(|(name, function)| {
-                    (name.as_str() == resource.drop_hook).then_some((name, *function))
-                })
+            && let Some(hook) = program_funcs
+            .iter()
+            .find_map(|(name, function)| (name.as_str() == resource.drop_hook).then_some(*function))
         {
             let block = ctx.append_basic_block(thunk, "entry");
             let builder = ctx.create_builder();
@@ -4430,22 +4418,9 @@ fn lower_prepared_module<'c>(
             let handle = thunk
                 .get_nth_param(0)
                 .ok_or_else(|| CodegenError::Lowering("resource drop thunk lost its handle parameter".into()))?;
-            let call = builder
+            builder
                 .build_call(hook, &[handle.into()], "")
                 .map_err(|error| CodegenError::Lowering(error.to_string()))?;
-            let declaration = callable_preflight
-                .declarations
-                .get(hook_name)
-                .ok_or_else(|| callable_target_error(hook_name))?;
-            add_scalar_call_facts(
-                ctx,
-                call,
-                &declaration.signature.params,
-                &declaration.signature.modes,
-                declaration.signature.ret,
-                declaration.signature.cleanup,
-                0,
-            )?;
             builder
                 .build_return(None)
                 .map_err(|error| CodegenError::Lowering(error.to_string()))?;
