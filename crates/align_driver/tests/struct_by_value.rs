@@ -177,7 +177,13 @@ fn main() -> i32 = probe(10) as i32
     assert_eq!(built.link_and_run().status.code(), Some(47));
     let ir = align_driver::emit_llvm_ir(&built.unit("main").mir, BuildTarget::Baseline,
         align_driver::Profile::Release, true, &["probe".to_owned()], false).expect("optimized caller");
-    let ir = ir.split("define i64 @probe(").nth(1).expect("exported probe").split("\n}").next().expect("probe body");
+    let ir = ir
+        .split("define internal fastcc i64 @\"align_fn$5$70726f6265\"(")
+        .nth(1)
+        .expect("specialized probe core")
+        .split("\n}")
+        .next()
+        .expect("probe body");
     // External definitions are unavailable in this module: both calls must
     // survive, and the two records must be independent until both consumers.
     assert_eq!(ir.lines().filter(|line| line.contains("call void") && line.contains("sret(")).count(), 2, "{ir}");

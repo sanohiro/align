@@ -219,8 +219,8 @@ fn str_bytes_lowers_without_a_mir_operation() {
     let ir = emit_llvm_with_exports(src, &["view"]);
     let view = ir
         .split("define ")
-        .find(|body| body.contains("@view("))
-        .expect("exported view function in LLVM IR");
+        .find(|body| body.contains("@\"align_fn$4$76696577\"("))
+        .expect("specialized view core in LLVM IR");
     let view = view.split("\n}").next().expect("view function body");
     assert!(!view.contains(" call "), "str.bytes() must not introduce a codegen call:\n{view}");
 }

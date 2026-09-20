@@ -842,6 +842,7 @@ mod tests {
             drop_state_effects: vec![effect],
             captures: Vec::new(),
         };
+        // Test-only invariant: effect tags 1 and 2 are valid, so canonical encoding must succeed.
         assert_ne!(
             closure(1).to_canonical_bytes().unwrap(),
             closure(2).to_canonical_bytes().unwrap(),

@@ -9,6 +9,27 @@
 mod common;
 use common::*;
 
+fn explicit_export_core_body<'a>(ir: &'a str, name: &str) -> &'a str {
+    let hex = name
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let symbol = format!("align_fn${}${hex}", name.len());
+    let header = ir
+        .find(&format!("@\"{symbol}\"("))
+        .unwrap_or_else(|| panic!("missing specialized core {symbol}:\n{ir}"));
+    let body = ir[header..]
+        .find("{\n")
+        .map(|offset| header + offset + 2)
+        .unwrap_or_else(|| panic!("missing specialized core body {symbol}:\n{ir}"));
+    let end = ir[body..]
+        .find("\n}")
+        .map(|offset| body + offset)
+        .unwrap_or_else(|| panic!("unterminated specialized core {symbol}:\n{ir}"));
+    &ir[body..end]
+}
+
 #[test]
 fn constructor_termination_stops_later_operands_and_allocation() {
     if !backend_available() { return; }
@@ -99,8 +120,13 @@ fn float_inspection_exact_bits_and_classification() {
     for (optimized, ir) in [(false, emit_llvm_with_exports(&src, &exports)), (true, emit_llvm_optimized(&src, &exports))] {
         assert!(ir.contains("bitcast float") && ir.contains("bitcast double"), "{ir}");
         // LLVM may recognize bit classification as register-only fabs/comparison intrinsics.
-        for line in ir.lines().filter(|line| line.contains("call ")) {
-            assert!(optimized && line.contains("@llvm."), "{line}");
+        for export in exports {
+            for line in explicit_export_core_body(&ir, export)
+                .lines()
+                .filter(|line| line.contains("call "))
+            {
+                assert!(optimized && line.contains("@llvm."), "{line}");
+            }
         }
         if optimized {
             assert!(!ir.contains("alloca "), "{ir}");
@@ -449,8 +475,9 @@ fn literal() -> u16 {
     assert!(!ir.contains("call ptr @align_rt_buffer_new"), "{ir}");
     assert!(!ir.contains("call void @align_rt_buffer_free"), "{ir}");
     let optimized = emit_llvm_optimized("fn bits(x: f32) -> u32 { mut b := buffer(4); b.put_f32_le(x); return b.bytes().u32_le(0) }\n", &["bits"]);
-    assert!(optimized.contains("bitcast float"), "{optimized}");
-    assert!(!optimized.contains("call "), "{optimized}");
+    let bits = explicit_export_core_body(&optimized, "bits");
+    assert!(bits.contains("bitcast float"), "{optimized}");
+    assert!(!bits.contains("call "), "{optimized}");
     let main = "fn main() -> Result<(), Error> { print(bits(1.5)); print(branch(true)); print(branch(false)); print(repeated(5)); print(literal()); return Ok(()) }\n";
     let out = build_and_run("bounded-byte-control", &format!("{functions}{main}"));
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));

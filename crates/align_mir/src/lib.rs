@@ -24106,6 +24106,7 @@ mod tests {
                 && generic_effects.contains(&(Ty::String, hir::DropStateEffect::Invariant)),
             "generic Copy and Move substitutions must derive their concrete effects: {generic_effects:?}"
         );
+        // Test-only invariant: these functions are declared literally in the checked source above.
         for name in ["leaf", "relay"] {
             let function = program.fns.iter().find(|function| function.name.as_str() == name).unwrap();
             assert_eq!(function.borrow_mut_cleanup_slots, vec![None]);
@@ -24119,6 +24120,7 @@ mod tests {
 
     #[test]
     fn terminal_move_out_nulling_is_removed_but_branching_and_initialization_are_retained() {
+        // Test-only invariant: both checked fixtures below declare a function named `take`.
         let moved = lower("fn take(value: string) -> string = value\nfn main() -> i32 = 0\n");
         let take = moved.fns.iter().find(|function| function.name.as_str() == "take").unwrap();
         assert!(!take.blocks.iter().flat_map(|block| &block.stmts).any(|statement| matches!(statement, Stmt::DropFlagMoveOut { .. })), "{}", print::program_to_string(&moved));

@@ -31,10 +31,19 @@ use common::*;
 
 /// One function's emitted IR, from its `define` line through its closing brace.
 fn function_ir(ir: &str, name: &str) -> String {
-    let needle = format!(" @{name}(");
+    let hex = name
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let specialized = format!("@\"align_fn${}${hex}\"(", name.len());
+    let external = format!(" @{name}(");
     let start = ir
         .lines()
-        .position(|line| line.starts_with("define") && line.contains(&needle))
+        .position(|line| {
+            line.starts_with("define")
+                && (line.contains(&specialized) || line.contains(&external))
+        })
         .unwrap_or_else(|| panic!("function `{name}` is not in the emitted IR:\n{ir}"));
     ir.lines()
         .skip(start)

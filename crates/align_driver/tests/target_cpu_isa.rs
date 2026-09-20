@@ -149,21 +149,55 @@ fn arm_generic_and_apple_cpu_select_neon_instructions() {
     }
 }
 
-// Mach-O's default disassembler can prefer the section alias `ltmp0` over
-// the exported function. Its explicit Mach-O mode emits bare named labels.
-fn sampler_disassembly(assembly: &str) -> Option<&str> {
-    ["<select>:", "<_select>:", "\n_select:", "\nselect:"]
-        .into_iter().find_map(|label| assembly.split_once(label).map(|(_, body)| body))
+fn encoded_program_symbol(name: &str) -> String {
+    let hex = name
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("align_fn${}${hex}", name.len())
+}
+
+fn function_ir_body<'a>(ir: &'a str, symbol: &str) -> &'a str {
+    let header = ir
+        .lines()
+        .find(|line| {
+            line.starts_with("define ")
+                && (line.contains(&format!("@{symbol}("))
+                    || line.contains(&format!("@\"{symbol}\"(")))
+        })
+        .unwrap_or_else(|| panic!("missing {symbol}:\n{ir}"));
+    let start = ir.find(header).expect("definition header belongs to the IR") + header.len();
+    ir[start..]
+        .split_once("\n}")
+        .map(|(body, _)| body)
+        .unwrap_or_else(|| panic!("unterminated {symbol}:\n{ir}"))
+}
+
+// Mach-O's default disassembler can prefer a section alias over the requested function. Its
+// explicit Mach-O mode emits bare named labels; ELF wraps the same symbol in angle brackets.
+fn function_disassembly<'a>(assembly: &'a str, symbol: &str) -> Option<&'a str> {
+    [
+        format!("<{symbol}>:"),
+        format!("<_{symbol}>:"),
+        format!("\n_{symbol}:"),
+        format!("\n{symbol}:"),
+    ]
+    .iter()
+    .find_map(|label| assembly.split_once(label).map(|(_, body)| body))
 }
 
 #[test]
-fn sampler_disassembly_accepts_named_elf_and_macho_labels_only() {
+fn function_disassembly_accepts_named_elf_and_macho_labels_only() {
     for header in ["0000 <select>:", "0000 <_select>:", "_select:", "select:"] {
         let text = format!("file/section\n{header}\nbody\n");
-        assert_eq!(sampler_disassembly(&text), Some("\nbody\n"), "{header}");
+        assert_eq!(function_disassembly(&text, "select"), Some("\nbody\n"), "{header}");
     }
     for text in ["file\n0000 <ltmp0>:\nbody", "file\n_other:\nbody", "call _select"] {
-        assert!(sampler_disassembly(text).is_none(), "must identify the named function: {text}");
+        assert!(
+            function_disassembly(text, "select").is_none(),
+            "must identify the named function: {text}"
+        );
     }
 }
 
@@ -178,10 +212,11 @@ fn composed_sampler_native_cpu_controls_preserve_scalar_policy_without_byte_trap
     let checked = check(&mut sm, "composed-native", source);
     assert!(!checked.diags.has_errors(), "{}", align_driver::format_diagnostics(&sm, &checked.diags));
     let mir = lower_to_mir(&checked.hir);
+    let core_symbol = encoded_program_symbol("select");
     for cpu in cpus {
         let target = BuildTarget::Cpu((*cpu).to_string());
         let ir = align_driver::emit_llvm_ir(&mir, target.clone(), Profile::Release, true, &["select".into()], false).unwrap();
-        let function = ir.split("@select(").nth(1).expect("exported sampler").split("\n}").next().unwrap();
+        let function = function_ir_body(&ir, &core_symbol);
         assert_eq!(function.lines().filter(|line| line.contains("load ptr, ptr %0,")).count(), 1, "{cpu}: {function}");
         assert!(!function.contains("@align_rt_range_fail"), "{cpu}: logits loop retains a trap");
         assert!(function.contains("@align_rt_bounds_fail"), "{cpu}: candidate bounds remain");
@@ -195,8 +230,8 @@ fn composed_sampler_native_cpu_controls_preserve_scalar_policy_without_byte_trap
         let output = command.arg("-dr").arg(&obj).output().expect("disassemble");
         assert!(output.status.success());
         let assembly = String::from_utf8_lossy(&output.stdout);
-        let function = sampler_disassembly(&assembly)
-            .unwrap_or_else(|| panic!("native sampler symbol for {cpu}: {assembly}"));
+        let function = function_disassembly(&assembly, &core_symbol)
+            .unwrap_or_else(|| panic!("specialized sampler core for {cpu}: {assembly}"));
         assert!(!function.contains("align_rt_range_fail"), "{cpu}: {function}");
         assert!(function.contains("align_rt_bounds_fail"), "{cpu}: {function}");
         if cfg!(target_arch = "aarch64") {

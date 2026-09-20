@@ -3173,6 +3173,25 @@ impl ModuleScope<'_> {
         }
     }
 
+    fn explicitly_exports(self, function: &Function, exports: &[String]) -> bool {
+        if function.name.as_str() == "main" {
+            return false;
+        }
+        match self {
+            ModuleScope::Whole => exports.iter().any(|export| export == function.name.as_str()),
+            ModuleScope::Test { .. } => false,
+            ModuleScope::Function {
+                selected,
+                definition,
+                ..
+            } => {
+                &function.name == selected
+                    && definition.linkage == ThinFunctionLinkage::Root
+                    && definition.symbol == function.name.as_str()
+            }
+        }
+    }
+
     fn emits_resource_thunks(self) -> bool {
         matches!(self, ModuleScope::Whole | ModuleScope::Test { .. })
     }
@@ -3681,9 +3700,7 @@ fn lower_prepared_module<'c>(
     let mut export_cores = Vec::new();
     for f in program.fns.iter().filter(|function| scope.declares(function)) {
         let (mut symbol, partition_linkage) = scope.symbol(f, exports)?;
-        let explicit_export = matches!(scope, ModuleScope::Whole)
-            && f.name.as_str() != "main"
-            && exports.iter().any(|export| export == f.name.as_str());
+        let explicit_export = scope.explicitly_exports(f, exports);
         if explicit_export {
             symbol = encoded_program_symbol(&f.name);
         }
@@ -3698,10 +3715,18 @@ fn lower_prepared_module<'c>(
             &tuple_types,
             program,
             if explicit_export { &[] } else { exports },
-            partition_linkage,
+            if explicit_export {
+                None
+            } else {
+                partition_linkage
+            },
             scope.is_test(),
         );
         if explicit_export {
+            // `f.exportable` may independently make a per-unit definition externally visible.
+            // The specialized core is never a native boundary: only its conservative wrapper owns
+            // the source-level export symbol.
+            mark_internal(fv);
             export_cores.push((f, fv));
         }
         program_funcs.insert(f.name.clone(), fv);
@@ -25952,6 +25977,8 @@ fn main() -> i32 = 0
 
     #[test]
     fn drop_state_effect_specializes_direct_abis_and_keeps_adapters_and_exports_conservative() {
+        // The unwraps and expects in this owner are test-only fixture invariants: the source is
+        // checked before MIR lowering, and every named function/symbol is declared by this fixture.
         let source = "fn inspect(borrow mut value: string) -> i64 = value.len()\n\
             fn relay(borrow mut value: string) -> i64 = inspect(value)\n\
             fn replace(borrow mut value: string) { value = \"new\".clone() }\n\
@@ -26004,6 +26031,42 @@ fn main() -> i32 = 0
         assert!(header(&exported, "replace").contains("{ ptr, ptr }"));
         assert!(header(&exported, &inspect).contains("(ptr "));
         assert!(header(&exported, &replace).contains("{ ptr, ptr }"));
+
+        let mut partition_program = program.clone();
+        let selected_index = partition_program
+            .fns
+            .iter()
+            .position(|function| function.name.as_str() == "inspect")
+            .expect("inspect partition root");
+        // A per-unit public definition can also be an explicit native export. Its specialized core
+        // must remain internal while the source-level name keeps the conservative boundary ABI.
+        partition_program.fns[selected_index].exportable = true;
+        let selected = &partition_program.fns[selected_index];
+        let definition = ThinPeerDeclaration {
+            logical: selected.name.clone(),
+            abi: partition_function_abi(selected, &partition_program).expect("partition ABI"),
+            symbol: "inspect".to_owned(),
+            linkage: ThinFunctionLinkage::Root,
+        };
+        let ctx = Context::create();
+        let (module, _tm) = build_program_module(
+            &ctx,
+            &partition_program,
+            &BuildTarget::Baseline,
+            Profile::Release,
+            &[],
+            None,
+            ModuleScope::Function {
+                selected: &selected.name,
+                definition: &definition,
+                peers: &[],
+            },
+        )
+        .expect("explicit-export function partition");
+        let partition = module.print_to_string().to_string();
+        assert!(header(&partition, "inspect").contains("{ ptr, ptr }"));
+        let core = header(&partition, &inspect);
+        assert!(core.contains(" internal ") && core.contains("(ptr "), "{core}");
 
         let mut consumer = mir("fn main() -> i32 = 0\n");
         consumer.imported_fns.push(align_mir::ImportedFn {
