@@ -358,7 +358,9 @@ raw operation remains outside the closed const grammar, while ordinary expressio
 type plus exact `value_src`, so importers reparse and re-fold the same closed form without a format
 change; an omitted annotation is transported as `ty=None` and inferred again. `raw` remains outside the
 aggregate-constant element domain, so direct `[raw.null()]` and aliased `[NULL]` elements reject
-before aggregate HIR formation.
+before aggregate HIR formation. Checked-HIR validation admits the correctly typed `RawNull` leaf
+without an enclosing `Unsafe` node because substitution erases its source origin; sema still owns
+the expression-level unsafe rule, and every effectful raw HIR operation keeps its unsafe-depth gate.
 
 **Aggregate (array) constants (S1, 2026-07-17).** An initializer may be an array literal. `ConstEval::array` folds each element with the same evaluation as a scalar (element type inferred from the elements, or pushed down from a `slice<T>` annotation), yielding `ConstVal::Array(elems, elem)`. Unlike a scalar constant this *does* reach the backend: `const_literal` substitutes it as `hir::ExprKind::ConstArray { elems, elem, len }` typed **`slice<elem>` / `Region::Static`** (not a synthesized `ArrayLit` — that would reproduce the §8.4 alloca+stores), lowered to `mir::Rvalue::ConstArray` and then to a `[N x T]` (or `[N x {ptr,len}]` for `str`) `private unnamed_addr constant` global with a static `{ptr,len}` view. A **constant index folds to the element** in sema (`check_index`, no load); a dynamic index / `.len()` / pipeline flows through the existing borrowed-slice paths. The type gate accepts only a `slice<T>` annotation of a scalar / `str` element (an `array<T>` annotation, or a `slice<Struct>`, is rejected); struct constants / elements and non-scalar element positions (calls, `as`, nested arrays, aggregate-const refs) stay deferred. The new `ExprKind::ConstArray` / `Rvalue::ConstArray` are wired through every exhaustive HIR/MIR analysis arm (effect scan, `region_of`, escape/`slice_is_local`, `MoveCheck`, `finalize_expr`, `print`) as an inert, Copy, `Static` leaf.
 

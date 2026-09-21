@@ -1,6 +1,6 @@
 # Immutable raw-null module constant
 
-Status: design candidate for issue 1159 and align-llm Request 117.
+Status: implementation candidate for issue 1159 and align-llm Request 117.
 
 This capability adds one compile-time sentinel, not general call evaluation in
 constant initializers. The constant declaration, substitution, interface
@@ -57,8 +57,13 @@ Effects           Pure and side-effect free. It does not make an enclosing
                   the declaration or use site.
 
 Owner             align_sema owns recognition, folding and literal
-                  substitution. Existing checked HIR, MIR and LLVM RawNull
-                  owners retain their exact type and target-null proofs.
+                  substitution. Checked HIR admits a correctly typed RawNull
+                  leaf without requiring an enclosing Unsafe node because
+                  constant substitution intentionally erases source origin;
+                  every effectful raw operation retains its unsafe-depth gate,
+                  and sema still rejects expression-level raw.null outside
+                  unsafe. Existing MIR and LLVM RawNull owners retain their
+                  exact type and target-null proofs.
                   align_interface transports a public declaration's existing
                   type plus exact initializer source and importers reparse and
                   re-fold it before any HIR or code generation.
@@ -115,13 +120,23 @@ to name a universal ABI sentinel once.
 | Aggregate exclusion | `[raw.null()]`, `[NULL]`, mixed and annotated `slice<raw>` forms reject before aggregate HIR/MIR; existing admitted element types are unchanged | direct/alias/mixed/annotated negative table plus existing aggregate positives |
 | Substitution | bare and qualified references become the existing typed RawNull HIR leaf with no declaration artifact | HIR inspection plus local execution |
 | Restricted grammar | alloc/offset/load/store/free, user calls, unsafe blocks, arguments and field/method near misses all reject; ordinary raw.null remains unsafe-only | parameterized negative source owner plus existing raw-unsafe owner |
-| Interface | summary records raw plus exact initializer source; whole/per-unit accept and reject the same cases; edited source changes interface identity | interface summary/hash and per-unit twins |
+| Interface | summary records the written raw annotation option plus exact initializer source; whole/per-unit accept and reject the same cases; edited source changes interface identity | interface summary/hash, altered-source reconstruction negative and per-unit twins |
+| Checked HIR | a typed RawNull leaf is valid without Unsafe after constant substitution; a non-raw result rejects; RawAlloc/load/store/free/offset/call retain their unsafe-depth gates | checked-HIR raw-leaf positive/type mutation plus existing unsafe-operation negatives |
 | MIR/backend | the use lowers to existing RawNull and LLVM null; raw and optimized IR contain no allocator, constructor call, global initializer or hidden allocation | MIR assertion and LLVM structural scan |
 | Control paths | null constants pass through binding, parameter, return, if/match/loop joins and repeated reads as Copy without cleanup | existing raw Copy owners plus focused branch/return execution |
 | Malformed input | invalid interface initializer and forged non-raw RawNull type reject before object/cache publication without panic | interface reconstruction negative and existing checked-HIR/MIR validation |
 
 The enum addition is limited to `ConstVal`; every exhaustive use is updated in
 one pass. No AST, HIR, MIR, interface or runtime variant is added.
+
+Implementation evidence is concentrated in `align_driver`'s `constants` owner:
+local and whole/per-unit execution, closed initializer and aggregate-element
+negative tables, checked-HIR type mutation, and raw/optimized LLVM shape.
+`per_unit::cross_module_raw_null_constant_accepts_and_other_raw_calls_reject`
+owns accept/reject parity. `align_interface`'s
+`raw_null_constants_preserve_the_written_annotation_option` owns both type
+option states, hash identity, source reconstruction and altered-initializer
+rejection.
 
 ## 3. Deliberate exclusions
 

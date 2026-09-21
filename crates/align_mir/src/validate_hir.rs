@@ -8138,7 +8138,11 @@ impl<'a> BodyValidator<'a> {
                 Some((flow.ty, flow.falls, flow.breaks))
             }
             hir::ExprKind::RawNull => {
-                (context.unsafe_depth > 0).then_some((Ty::Raw, true, Vec::new()))
+                // A module raw-null constant substitutes directly to this leaf, intentionally
+                // without an `Unsafe` wrapper: forming the target null value has no memory effect.
+                // Source sema still requires `unsafe` for an expression-level `raw.null()`; every
+                // effectful raw operation below retains its checked-HIR unsafe-depth gate.
+                Some((Ty::Raw, true, Vec::new()))
             }
             hir::ExprKind::RawAlloc(size) => {
                 let flow = self.expr_flow(size)?;
