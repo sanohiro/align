@@ -2233,7 +2233,9 @@ impl<'a> XmlAccessAnalyzer<'a> {
             return equation;
         };
         match (*definition).clone() {
-            Rvalue::MakeSlice(slot, _) if path.is_empty() => {
+            Rvalue::MakeSlice(slot, _) | Rvalue::MakeFieldSlice(slot, _, _)
+                if path.is_empty() =>
+            {
                 // Keep the ordinary exact inline-layout and initialized-element checks.
                 let Ok(parameter) = self.buffer_parameter(slot) else {
                     equation.invalid = true;
@@ -3795,8 +3797,77 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                 }
             }
-            Rvalue::MakeFieldSlice(_, _, _) => {
-                equation.invalid = true;
+            Rvalue::MakeFieldSlice(slot, fields, length) => {
+                let Some(slot_ty) = self.graph.function.slots.get(slot as usize).copied() else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let field_path = fields
+                    .iter()
+                    .copied()
+                    .map(XmlAccessPathSegment::StructField)
+                    .collect::<Vec<_>>();
+                let Some(field_ty) = xml_selected_ty(self.graph.program, slot_ty, &field_path)
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let view_matches = match (field_ty, result_ty) {
+                    (Ty::Array(element, actual), Ty::Slice(view)) => {
+                        xml_source_ty_matches(
+                            self.graph.program,
+                            scalar_to_ty(element),
+                            scalar_to_ty(view),
+                        ) && u32::try_from(length) == Ok(actual)
+                    }
+                    (Ty::StructArray(id, actual), Ty::Slice(Scalar::Struct(view))) => {
+                        xml_source_ty_matches(
+                            self.graph.program,
+                            Ty::Struct(id),
+                            Ty::Struct(view),
+                        ) && u32::try_from(length) == Ok(actual)
+                    }
+                    _ => false,
+                };
+                if fields.is_empty() || !view_matches {
+                    equation.invalid = true;
+                } else if length == 0 {
+                    equation.seed = Some(XmlAccessProvenance::Shared);
+                } else if path.is_empty() {
+                    let mut source_path = field_path;
+                    source_path.push(XmlAccessPathSegment::Element);
+                    let source = self.queue(XmlAccessNode::Slot(slot, source_path));
+                    Self::add_required_source(
+                        &mut equation,
+                        source,
+                        OperandRequirement::READ,
+                    );
+                    equation.seed = Some(XmlAccessProvenance::Shared);
+                } else if let Some(remaining) =
+                    path.strip_prefix(&[XmlAccessPathSegment::Element])
+                {
+                    let mut source_path = field_path;
+                    source_path.push(XmlAccessPathSegment::Element);
+                    source_path.extend_from_slice(remaining);
+                    if !xml_selected_ty(self.graph.program, slot_ty, &source_path)
+                        .is_some_and(|source_selected| {
+                            xml_source_ty_matches(
+                                self.graph.program,
+                                source_selected,
+                                selected_ty,
+                            )
+                        })
+                    {
+                        equation.invalid = true;
+                        return equation;
+                    }
+                    Self::add_source(
+                        &mut equation,
+                        self.queue(XmlAccessNode::Slot(slot, source_path)),
+                    );
+                } else {
+                    equation.invalid = true;
+                }
             }
             Rvalue::ConstArray { elems, elem } => {
                 let result_matches = align_sema::ty_to_scalar(elem)
@@ -7050,6 +7121,27 @@ impl<'a> XmlAccessAnalyzer<'a> {
             .iter()
             .map(|(index, operand)| ((*index).clone(), (*operand).clone()))
             .collect::<Vec<_>>();
+        let constant_element_indexes = element_stores
+            .iter()
+            .filter_map(|(index, _)| match index {
+                Operand::Const(Const::Int(value, ty))
+                    if *ty == Ty::Int(IntTy {
+                        bits: 64,
+                        signed: true,
+                    }) => Some(*value),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let whole_array_from_elements = path.is_empty()
+            && matches!(slot_ty, Ty::Array(_, length) if
+                element_stores.iter().all(|(index, _)| match index {
+                    Operand::Const(Const::Int(value, ty)) =>
+                        *ty == Ty::Int(IntTy { bits: 64, signed: true })
+                            && *value >= 0
+                            && *value < i128::from(length),
+                    _ => true,
+                })
+                && usize::try_from(length) == Ok(constant_element_indexes.len()));
         let Some(element_field_stores) = self.graph.slot_stores.element_fields.get(slot as usize)
         else {
             equation.invalid = true;
@@ -7164,6 +7256,9 @@ impl<'a> XmlAccessAnalyzer<'a> {
             self.check_operand(&mut equation, &index, i64_ty);
             self.check_whole_operand(&mut equation, &operand, element_ty);
             let Some(remaining) = element_path.as_ref() else {
+                if whole_array_from_elements {
+                    continue;
+                }
                 equation.invalid = true;
                 continue;
             };
@@ -7181,6 +7276,9 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 selected_ty,
                 remaining.clone(),
             );
+        }
+        if whole_array_from_elements {
+            equation.seed = merge_xml_access(equation.seed, XmlAccessProvenance::Owned);
         }
         for (index, fields, operand) in element_field_stores {
             let i64_ty = Ty::Int(IntTy {
@@ -7233,8 +7331,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 || elements
                     .iter()
                     .any(|element| !xml_const_element_matches_ty(element, element_ty))
-                || element_path.as_deref() != Some(&[])
-                || selected_ty != element_ty
+                || !(path.is_empty()
+                    || element_path.as_deref() == Some(&[]) && selected_ty == element_ty)
             {
                 equation.invalid = true;
                 continue;
