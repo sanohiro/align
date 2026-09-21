@@ -1064,6 +1064,10 @@ cleanup.
 Native ABIs also need an actual null pointer. `raw.null()` forms it explicitly inside `unsafe`; it
 does not introduce a second optional-value model into ordinary code. `Option<T>` remains the only
 language-level absence, while raw ABI sentinels remain visible and grep-able at the boundary.
+An immutable module constant may use the exact initializer `NULL: raw := raw.null()` so a package
+can name that universal sentinel once. The compiler folds it directly to the existing null leaf:
+there is no runtime constructor, hidden allocation, general call evaluation, or route to a non-null
+pointer, and normal expression-level construction stays visibly `unsafe`.
 
 A declared non-Unit return is also a control-flow obligation. The compiler accepts a path only when
 it produces the declared value or provably does not continue; it never repairs reachable

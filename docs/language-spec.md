@@ -166,6 +166,17 @@ across modules), so an unannotated integer defaults to `i64` / a float to `f64`;
 `pub` exports it; an importer names it qualified (`mod.NAME`), like a `pub` function/type.
 (`draft.md` §4 "Constants".)
 
+The one non-literal leaf admitted specially is the exact zero-argument native-null constructor:
+
+```align
+pub NULL: raw := raw.null()
+```
+
+It folds to an immutable target null pointer with no allocation, runtime initializer, or constructor
+call. Other calls, `unsafe` blocks, raw operations, and non-null pointer expressions remain rejected
+in constants. A normal expression-level `raw.null()` still requires `unsafe`; reading the folded
+constant does not. This does not add a second absence model: ordinary absence remains `Option<T>`.
+
 An initializer may be an **array literal** — an aggregate constant, typed **`slice<T>` not `array<T>`**
 (ownership is a property of the type, so a top-level constant owns nothing; like a `str` literal, it
 is a `{ptr,len}` view of a per-unit read-only table, shared and never copied):
@@ -1001,7 +1012,9 @@ values are primitive scalars, `raw` pointers, and eligible non-empty `layout(C)`
 slots therefore retain native handles without integer casts, while pointer validity, allocation
 size, and effective type remain the enclosing `unsafe` block's obligation.
 `raw.null()` is the sole explicit null-pointer constructor for native ABI arguments and sentinels;
-ordinary Align values still have no null model, and a raw pointer is tested with `p.is_null()`.
+its only non-`unsafe` spelling is the exact initializer of an immutable module constant. That
+initializer is folded and emits no operation. Ordinary Align values still have no null model, and a
+raw pointer is tested with `p.is_null()`.
 
 A normal (non-`layout(C)`) struct has an **unspecified field order**: the compiler reorders fields by
 descending alignment to eliminate padding (`{ a: i8, b: i64, c: i8 }` → 16 bytes, not 24), a

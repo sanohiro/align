@@ -783,6 +783,12 @@ canonical, entry unmangled so single-file programs stay byte-identical): `pub` e
 importer names it qualified (`mod.NAME`), and a name may not be both a function and a constant in
 one module. Overflow wraps (defined two's-complement); division by zero, a cyclic definition, and a
 type mismatch are compile-time errors. Folded values feed the const string pool (`draft.md` §12).
+**Extension — immutable raw-null sentinel (issue 1159).** The exact initializer
+`NULL: raw := raw.null()` folds to the target null pointer and may be exported or aliased under the
+existing constant-reference rule. It adds no general call evaluation, runtime initializer,
+allocation, or non-null raw construction; normal expression use of `raw.null()` remains
+`unsafe`-only. Record: `impl/79-raw-null-constant-plan.md`.
+
 Record: `draft.md` §3/§4, `docs/language-spec.md`, `impl/02-frontend.md` §3, `examples/constants.align`, `tests/constants.rs`
 
 **Extension — aggregate (array) constants (S1, DONE 2026-07-17).** An initializer may be an **array
@@ -2242,9 +2248,14 @@ language. This is the existing one-way / nothing-hidden / data-oriented stance, 
     a new `raw` (a plain, non-`inbounds` i8 GEP, so out-of-bounds arithmetic stays well-defined — the
     same GEP the load/store address uses). `hir::ExprKind::RawOffset` / `mir::Rvalue::RawOffset`.
     **Explicit native null — `raw.null()` SHIPPED:** forms the sole null `raw` pointer for a native
-    ABI argument or sentinel, only inside `unsafe`. This does not create a general null value or a
-    second optional model; ordinary absence remains `Option<T>`, and `p.is_null()` is the explicit
-    boundary test.
+    ABI argument or sentinel, only inside `unsafe`. **Immutable module-constant extension (issue
+    1159):** the exact zero-argument initializer `NULL: raw := raw.null()` is folded directly to the
+    existing target-null leaf and may be exported; reading it needs no `unsafe` because no operation
+    executes. No other call/raw operation/unsafe block enters const evaluation, no non-null raw
+    constant can be formed, and no runtime initializer or allocation is emitted. This does not
+    create a general null value or a second optional model; ordinary absence remains `Option<T>`,
+    and `p.is_null()` is the explicit boundary test. Record:
+    `impl/79-raw-null-constant-plan.md`.
     **FFI first slice — DONE (2026-07-01):** `extern "C" fn name(params) -> ret` (and the braced group
     `extern "C" { fn … }`) declares a bodyless foreign function bound to the C symbol; a call is only
     valid inside `unsafe {}` (reuses the `unsafe_depth` gate + `unsafe`→impure inference, exactly like
