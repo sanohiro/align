@@ -728,3 +728,13 @@ representations:
 | Unit and i32 both use an LLVM `i32` value type, but Unit is omitted while i32 owns storage, so an LLVM-type-only semantic key could still merge their shells. | Both predeclaration and resolved lookup key every payload as Unit or Value(LLVM identity); nested tagged children use their canonical logical class during predeclaration. Physical storage never decides semantic identity. | Option/Result Unit-versus-i32 collision owner plus nested and source-spelling identity owners. |
 | Stored-payload constructors wrote a poison-bearing base into scratch before freezing the reloaded result. | The shared completion authority runs before every scratch initialization store and again after active fields are written. Callback construction uses the same ordering. | Raw IR order owner requiring freeze before the first aggregate store for enum, Option/Result and callback paths. |
 | Explicitly aligned zero-sized structs were rejected through user-sum payloads but remained admissible in direct or nested builtin Option/Result formation. | One recursive aligned-payload predicate is consumed by user-sum closure and by Option/Result type resolution, including generic substitution; inference constructors retain the same checked type boundary. | Direct parameter/local/return Option/Result rejection, nested builtin rejection and existing user-sum/generic controls. |
+
+Issue #1157 reopened one PR 2 ownership-operation cell. The correction keeps
+the existing effect type and ABI boundary: an operation that reads the
+mutable-borrow cleanup state in order to replace an owned field is MayChange,
+even when the containing record remains initialized and the operation writes
+the same root-state value back.
+
+| Reopened cell | Closure | Owner |
+| --- | --- | --- |
+| Owned-field replacement after `?`, `else`, `match`, or an ordinary join | Effect derivation treats every body read of the parameter cleanup proxy as ownership-state use requiring the conservative pair. It therefore retains proxy initialization before any replacement guard; only a body that neither reads nor changes the state is Invariant. Scalar field writes remain Invariant. | MIR effect owner with owned/scalar field controls; executable driver owner covering borrowed and local records after `?`, an `else`-rewrapped inner Result, and explicit `match`, with correct values and exactly-once cleanup. |
