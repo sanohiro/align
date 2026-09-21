@@ -1523,6 +1523,13 @@ fn xml_const_element_matches_ty(element: &ConstElem, ty: Ty) -> bool {
     )
 }
 
+fn xml_plain_fixed_array_element(element: Scalar) -> bool {
+    matches!(
+        element,
+        Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char
+    )
+}
+
 /// Exact native-owner contracts, shared by value and out-slot producer checks.
 pub struct NativeOwnerMirContract<'a> {
     pub result: Ty,
@@ -2233,7 +2240,9 @@ impl<'a> XmlAccessAnalyzer<'a> {
             return equation;
         };
         match (*definition).clone() {
-            Rvalue::MakeSlice(slot, _) if path.is_empty() => {
+            Rvalue::MakeSlice(slot, _) | Rvalue::MakeFieldSlice(slot, _, _)
+                if path.is_empty() =>
+            {
                 // Keep the ordinary exact inline-layout and initialized-element checks.
                 let Ok(parameter) = self.buffer_parameter(slot) else {
                     equation.invalid = true;
@@ -3795,8 +3804,58 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                 }
             }
-            Rvalue::MakeFieldSlice(_, _, _) => {
-                equation.invalid = true;
+            Rvalue::MakeFieldSlice(slot, fields, length) => {
+                let Some(slot_ty) = self.graph.function.slots.get(slot as usize).copied() else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let field_path = fields
+                    .iter()
+                    .copied()
+                    .map(XmlAccessPathSegment::StructField)
+                    .collect::<Vec<_>>();
+                let Some(field_ty) = xml_selected_ty(self.graph.program, slot_ty, &field_path)
+                else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let view_matches = match (field_ty, result_ty) {
+                    (Ty::Array(element, actual), Ty::Slice(view)) => {
+                        xml_source_ty_matches(
+                            self.graph.program,
+                            scalar_to_ty(element),
+                            scalar_to_ty(view),
+                        ) && xml_plain_fixed_array_element(element)
+                            && u32::try_from(length) == Ok(actual)
+                    }
+                    _ => false,
+                };
+                if fields.is_empty() || !view_matches {
+                    equation.invalid = true;
+                } else if length == 0 {
+                    equation.seed = Some(XmlAccessProvenance::Shared);
+                } else if path.is_empty() {
+                    let mut source_path = field_path;
+                    source_path.push(XmlAccessPathSegment::Element);
+                    let source = self.queue(XmlAccessNode::Slot(slot, source_path));
+                    Self::add_required_source(
+                        &mut equation,
+                        source,
+                        OperandRequirement::READ,
+                    );
+                    equation.seed = Some(XmlAccessProvenance::Shared);
+                } else if path.as_slice() == [XmlAccessPathSegment::Element]
+                    && xml_inline_array_element(self.graph.program, field_ty) == Some(selected_ty)
+                {
+                    let mut source_path = field_path;
+                    source_path.push(XmlAccessPathSegment::Element);
+                    Self::add_source(
+                        &mut equation,
+                        self.queue(XmlAccessNode::Slot(slot, source_path)),
+                    );
+                } else {
+                    equation.invalid = true;
+                }
             }
             Rvalue::ConstArray { elems, elem } => {
                 let result_matches = align_sema::ty_to_scalar(elem)
@@ -7006,6 +7065,126 @@ impl<'a> XmlAccessAnalyzer<'a> {
         }
     }
 
+    fn check_plain_fixed_array_operand(
+        &mut self,
+        equation: &mut XmlAccessEquation,
+        operand: &Operand,
+        expected: Ty,
+    ) -> bool {
+        let Ty::Array(element, length) = expected else {
+            return false;
+        };
+        if !xml_plain_fixed_array_element(element)
+            || xml_operand_base_ty(self.graph.function, operand) != Some(expected)
+        {
+            return false;
+        }
+        let Operand::Value(value) = operand else {
+            self.check_whole_operand(equation, operand, expected);
+            return true;
+        };
+        let Some(Some(Rvalue::Load(array_slot))) =
+            self.graph.value_definitions.get(*value as usize)
+        else {
+            self.check_whole_operand(equation, operand, expected);
+            return true;
+        };
+        if self.graph.duplicate_values.get(*value as usize) != Some(&false)
+            || self.graph.function.slots.get(*array_slot as usize) != Some(&expected)
+        {
+            return false;
+        }
+        if self.graph.function.params.contains(array_slot)
+            || self
+                .graph
+                .slot_stores
+                .roots
+                .get(*array_slot as usize)
+                .is_some_and(|stores| !stores.is_empty())
+        {
+            // This is an ordinary initialized array slot, not an anonymous literal-construction
+            // temporary. The caller's exact projected add_operand edge authenticates its root
+            // stores and later element writes; applying the construction-cardinality scan here
+            // would reject parameters, copies, joins, and mutations as duplicate initialization.
+            return true;
+        }
+        let mut load_site = None;
+        for block in &self.graph.function.blocks {
+            for (position, statement) in block.stmts.iter().enumerate() {
+                if matches!(statement, Stmt::Let(candidate, Rvalue::Load(slot))
+                    if candidate == value && slot == array_slot)
+                    && load_site.replace((block.id, position)).is_some()
+                {
+                    return false;
+                }
+            }
+        }
+        let Some((load_block, load_position)) = load_site else {
+            return false;
+        };
+        let element_ty = scalar_to_ty(element);
+        let mut initialized = HashSet::new();
+        let mut constant_array = false;
+        for block in &self.graph.function.blocks {
+            for (position, statement) in block.stmts.iter().enumerate() {
+                match statement {
+                    Stmt::StoreIndex(slot, index, value) if slot == array_slot => {
+                        if block.id != load_block || position >= load_position || constant_array {
+                            return false;
+                        }
+                        let Operand::Const(Const::Int(index_value, index_ty)) = index else {
+                            return false;
+                        };
+                        if *index_ty != Ty::Int(IntTy { bits: 64, signed: true })
+                            || *index_value < 0
+                            || *index_value >= i128::from(length)
+                            || !initialized.insert(*index_value)
+                            || xml_operand_base_ty(self.graph.function, value) != Some(element_ty)
+                        {
+                            return false;
+                        }
+                        self.check_operand(equation, index, Ty::Int(IntTy {
+                            bits: 64,
+                            signed: true,
+                        }));
+                        self.check_whole_operand(equation, value, element_ty);
+                    }
+                    Stmt::StoreConstArray { slot, elems, elem } if slot == array_slot => {
+                        if block.id != load_block
+                            || position >= load_position
+                            || constant_array
+                            || !initialized.is_empty()
+                            || *elem != element_ty
+                            || usize::try_from(length) != Ok(elems.len())
+                            || elems.iter().any(|element| {
+                                !xml_const_element_matches_ty(element, element_ty)
+                            })
+                        {
+                            return false;
+                        }
+                        constant_array = true;
+                    }
+                    Stmt::Store(slot, _)
+                    | Stmt::StoreField(slot, _, _)
+                    | Stmt::StoreElemField(slot, _, _, _)
+                        if slot == array_slot =>
+                    {
+                        return false;
+                    }
+                    Stmt::Let(_, rvalue)
+                        if xml_written_slots(rvalue)
+                            .iter()
+                            .any(|(slot, _)| slot == array_slot) =>
+                    {
+                        return false;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        constant_array || usize::try_from(length) == Ok(initialized.len())
+    }
+
     fn slot_equation(
         &mut self,
         slot: Slot,
@@ -7130,7 +7309,14 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 equation.invalid = true;
                 continue;
             }
-            self.check_whole_operand(&mut equation, &operand, stored_ty);
+            if matches!(stored_ty, Ty::Array(element, _) if xml_plain_fixed_array_element(element)) {
+                if !self.check_plain_fixed_array_operand(&mut equation, &operand, stored_ty) {
+                    equation.invalid = true;
+                    continue;
+                }
+            } else {
+                self.check_whole_operand(&mut equation, &operand, stored_ty);
+            }
             if path.is_empty() {
                 self.add_operand(&mut equation, &operand, stored_ty, Vec::new());
             } else if path.starts_with(&stored_path) {
