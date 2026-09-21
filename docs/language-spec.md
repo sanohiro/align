@@ -175,7 +175,9 @@ pub NULL: raw := raw.null()
 It folds to an immutable target null pointer with no allocation, runtime initializer, or constructor
 call. Other calls, `unsafe` blocks, raw operations, and non-null pointer expressions remain rejected
 in constants. A normal expression-level `raw.null()` still requires `unsafe`; reading the folded
-constant does not. This does not add a second absence model: ordinary absence remains `Option<T>`.
+constant does not. Raw null remains outside the aggregate-constant element domain, whether written
+directly or through another constant. This does not add a second absence model: ordinary absence
+remains `Option<T>`.
 
 An initializer may be an **array literal** — an aggregate constant, typed **`slice<T>` not `array<T>`**
 (ownership is a property of the type, so a top-level constant owns nothing; like a `str` literal, it

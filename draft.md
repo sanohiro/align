@@ -188,7 +188,8 @@ exported or aliased like another constant. It allocates nothing and emits no run
 constructor call. This is not general call evaluation: every other call, `unsafe` block, raw
 operation, and non-null pointer expression remains invalid in a constant initializer. Ordinary
 expression use of `raw.null()` still requires `unsafe`; reading the immutable folded `NULL` value
-does not. `Option<T>` remains the only ordinary absence model.
+does not. Raw null is not an aggregate-constant element: `[raw.null()]` and `[NULL]` are rejected.
+`Option<T>` remains the only ordinary absence model.
 
 An initializer may also be an **array literal** — an *aggregate constant*:
 

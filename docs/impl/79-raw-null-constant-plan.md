@@ -26,6 +26,10 @@ Initializer       The only new expression admitted by constant evaluation is
                   remains rejected. Normal expression use of raw.null() still
                   requires an unsafe block; only this compile-time initializer
                   grammar is exempt because it cannot inspect or mutate memory.
+                  Raw null is not an aggregate-constant element: both a direct
+                  [raw.null()] element and an aliased [NULL] element reject
+                  before aggregate HIR formation. The existing aggregate
+                  element domain remains integer/float/bool/char/str.
 
 Value             The result type is raw and its target value is exactly the
                   all-zero null pointer. It is Copy, immutable and may be read
@@ -59,9 +63,14 @@ Owner             align_sema owns recognition, folding and literal
                   type plus exact initializer source and importers reparse and
                   re-fold it before any HIR or code generation.
 
-Interface/wire    IConst already represents ty=Named("raw") and UTF-8
-                  value_src="raw.null()". Both fields already participate in
-                  interface_hash. No tag, field, ordering or format-version
+Interface/wire    IConst already represents the annotated form as
+                  ty=Some(Named("raw")) and UTF-8
+                  value_src="raw.null()". For `pub NULL := raw.null()`, ty is
+                  None and the same value_src is carried; the importer infers
+                  raw again while folding. The annotation option and source
+                  both already participate in interface_hash, so adding or
+                  removing `: raw` changes identity even though the inferred
+                  value type agrees. No tag, field, ordering or format-version
                   change is required. Invalid UTF-8 is already rejected by the
                   interface codec; a decoded altered initializer is parsed and
                   checked by the same closed constant grammar before consumer
@@ -82,9 +91,11 @@ Validation order  Resolve an optional annotation; recognize an exact
 Prerequisite      The shipped raw type and HIR/MIR/LLVM RawNull lowering, plus
                   the shipped source-carried public-constant interface.
 
-Acceptance        Local private/public and imported uses produce exact null in
+Acceptance        Local private/public and imported uses, with and without the
+                  raw annotation, produce exact null in
                   whole-program and per-unit builds. Interface summaries retain
-                  raw and raw.null(). Raw and optimized LLVM contain a null
+                  the written annotation option and raw.null(). Raw and
+                  optimized LLVM contain a null
                   pointer and no constructor, allocator or module initializer.
                   Non-null operations and arbitrary calls remain rejected.
 
@@ -101,6 +112,7 @@ to name a universal ABI sentinel once.
 | Cell | Required behavior | Owner evidence |
 |---|---|---|
 | Formation | annotated and inferred direct null constants fold to one raw value; a raw-null alias remains null; wrong annotation rejects | constant sema and diagnostic cases |
+| Aggregate exclusion | `[raw.null()]`, `[NULL]`, mixed and annotated `slice<raw>` forms reject before aggregate HIR/MIR; existing admitted element types are unchanged | direct/alias/mixed/annotated negative table plus existing aggregate positives |
 | Substitution | bare and qualified references become the existing typed RawNull HIR leaf with no declaration artifact | HIR inspection plus local execution |
 | Restricted grammar | alloc/offset/load/store/free, user calls, unsafe blocks, arguments and field/method near misses all reject; ordinary raw.null remains unsafe-only | parameterized negative source owner plus existing raw-unsafe owner |
 | Interface | summary records raw plus exact initializer source; whole/per-unit accept and reject the same cases; edited source changes interface identity | interface summary/hash and per-unit twins |
@@ -117,3 +129,13 @@ There is no general pure-function constant evaluation, unsafe constant block,
 compile-time FFI, non-null raw constant, pointer arithmetic, address-to-integer
 conversion, static mutable pointer, new optional-value model or runtime global.
 `Option<T>` remains the sole ordinary absence model.
+
+## 4. Design-review finding closure
+
+The fresh full-diff review of `66fdec55` found one P1 and one P2 contract gap.
+Both are closed in the ledger and matrix before implementation.
+
+| Finding | Root cause | Closure |
+|---|---|---|
+| Raw null could enter aggregate folding | the new leaf was specified without intersecting it with the existing aggregate element domain | exclude direct and aliased raw-null elements before aggregate HIR and add the complete negative table |
+| Unannotated public encoding unspecified | the ledger described only `IConst.ty=Some` although the surface allowed omission | specify `Some(Named("raw"))` versus `None`, shared value source, re-inference and hash behavior |

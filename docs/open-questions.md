@@ -787,7 +787,8 @@ type mismatch are compile-time errors. Folded values feed the const string pool 
 `NULL: raw := raw.null()` folds to the target null pointer and may be exported or aliased under the
 existing constant-reference rule. It adds no general call evaluation, runtime initializer,
 allocation, or non-null raw construction; normal expression use of `raw.null()` remains
-`unsafe`-only. Record: `impl/79-raw-null-constant-plan.md`.
+`unsafe`-only. Raw null is excluded from aggregate-constant elements in direct and aliased form.
+Record: `impl/79-raw-null-constant-plan.md`.
 
 Record: `draft.md` §3/§4, `docs/language-spec.md`, `impl/02-frontend.md` §3, `examples/constants.align`, `tests/constants.rs`
 
