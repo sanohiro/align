@@ -274,3 +274,89 @@ fn main() -> i32 {
 ";
     assert_eq!(build_and_run("owned-field-repl-opt-str", src).status.code(), Some(0));
 }
+
+#[test]
+fn owned_field_replacement_after_fallible_control_flow() {
+    if !backend_available() {
+        return;
+    }
+    let src = r#"
+extern "C" {
+  fn align_rt_requested_live_reset()
+  fn align_rt_requested_live_bytes() -> i64
+}
+
+Fault { code: string, detail: string }
+Session { decode_key: string, count: i64 }
+
+fn act(kind: i64) -> Result<(), Fault> {
+  if kind < 0 {
+    return Err(Fault { code: "CONFIG".clone(), detail: "kind".clone() })
+  }
+  return Ok(())
+}
+
+fn prepare(kind: i64) -> Result<(), Fault> {
+  act(kind) else {
+    return Err(Fault { code: "PREPARE".clone(), detail: "act".clone() })
+  }
+  return Ok(())
+}
+
+fn drive_borrowed(borrow mut session: Session, n: i64) -> Result<i64, Fault> {
+  key := "graph-key".clone()
+  prepare(n)?
+  session.decode_key = key.clone()
+  return Ok(session.decode_key.len())
+}
+
+fn drive_local(n: i64) -> Result<i64, Fault> {
+  mut session := Session { decode_key: "old".clone(), count: 0 }
+  prepare(n)?
+  session.decode_key = "local-key".clone()
+  return Ok(session.decode_key.len())
+}
+
+fn drive_match(borrow mut session: Session, n: i64) -> Result<i64, Fault> {
+  match prepare(n) {
+    Ok(unit) => {},
+    Err(error) => { return Err(error) },
+  }
+  session.decode_key = "match-key".clone()
+  return Ok(session.decode_key.len())
+}
+
+fn exercise() -> i32 {
+  mut session := Session { decode_key: "".clone(), count: 0 }
+  borrowed := drive_borrowed(session, 3) else { return 1 }
+  if borrowed != 9 || session.decode_key.len() != 9 { return 2 }
+  local := drive_local(3) else { return 3 }
+  if local != 9 { return 4 }
+  matched := drive_match(session, 3) else { return 5 }
+  if matched != 9 || session.decode_key.len() != 9 { return 6 }
+  match drive_borrowed(session, -1) {
+    Ok(value) => { return 7 },
+    Err(error) => {
+      if error.code.len() != 7 || error.detail.len() != 3 { return 8 }
+    },
+  }
+  return 0
+}
+
+fn main() -> i32 {
+  unsafe { align_rt_requested_live_reset() }
+  status := exercise()
+  if status != 0 { return status }
+  if unsafe { align_rt_requested_live_bytes() } != 0 { return 9 }
+  return 0
+}
+"#;
+
+    let output = build_and_run("owned-field-repl-fallible", src);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

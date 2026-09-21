@@ -4771,6 +4771,13 @@ fn derive_drop_state_effects(
                         match statement {
                             Stmt::Store(slot, Operand::BorrowedCleanupArg(origin))
                                 if *slot == cleanup_slot && *origin as usize == parameter => {}
+                            Stmt::Let(_, Rvalue::Load(slot)) if *slot == cleanup_slot => {
+                                // A field replacement can leave the root live bit unchanged while
+                                // still consulting it before dropping the old owned leaf. Such a
+                                // body needs the conservative cleanup pair just as a writer does;
+                                // removing only the entry transport leaves this load uninitialized.
+                                may_change = true;
+                            }
                             Stmt::Store(slot, _) if *slot == cleanup_slot => may_change = true,
                             Stmt::Let(_, rvalue) => match loop_facts::drop_state_call(rvalue) {
                                 loop_facts::DropStateCall::Direct(target, arguments) => {
@@ -24985,6 +24992,64 @@ mod tests {
         }
         let replace = program.fns.iter().find(|function| function.name.as_str() == "replace").unwrap();
         assert!(replace.borrow_mut_cleanup_slots[0].is_some());
+    }
+
+    #[test]
+    fn drop_state_effect_retains_cleanup_transport_for_owned_field_replacement() {
+        let program = lower(
+            "State { text: string, count: i64 }\n\
+             fn inspect(borrow mut value: State) -> i64 = value.text.len()\n\
+             fn write_scalar(borrow mut value: State) { value.count = 1 }\n\
+             fn replace_owned(borrow mut value: State) { value.text = \"new\".clone() }\n\
+             fn main() -> i32 = 0\n",
+        );
+        let effect = |name: &str| {
+            program
+                .drop_state_effects
+                .iter()
+                .find(|(target, _)| target.as_str() == name)
+                .and_then(|(_, effects)| effects.first())
+                .copied()
+        };
+
+        assert_eq!(effect("inspect"), Some(hir::DropStateEffect::Invariant));
+        assert_eq!(
+            effect("write_scalar"),
+            Some(hir::DropStateEffect::Invariant)
+        );
+        assert_eq!(
+            effect("replace_owned"),
+            Some(hir::DropStateEffect::MayChange)
+        );
+
+        for name in ["inspect", "write_scalar"] {
+            let invariant = program
+                .fns
+                .iter()
+                .find(|function| function.name.as_str() == name);
+            assert!(invariant.is_some(), "missing invariant fixture function {name}");
+            let Some(invariant) = invariant else { return };
+            assert_eq!(invariant.borrow_mut_cleanup_slots, vec![None]);
+        }
+
+        let replacement = program
+            .fns
+            .iter()
+            .find(|function| function.name.as_str() == "replace_owned");
+        assert!(replacement.is_some(), "missing replacement fixture function");
+        let Some(replacement) = replacement else { return };
+        let cleanup = replacement.borrow_mut_cleanup_slots[0];
+        assert!(cleanup.is_some(), "owned field replacement lost its cleanup proxy");
+        let Some(cleanup) = cleanup else { return };
+        assert!(
+            replacement
+                .blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .any(|statement| {
+                    matches!(statement, Stmt::Store(slot, Operand::BorrowedCleanupArg(0)) if *slot == cleanup)
+                })
+        );
     }
 
     #[test]
