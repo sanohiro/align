@@ -286,6 +286,38 @@ contracts do not change.
 | Interface and per-unit compilation | imported record layout, borrow mode, return provenance, and producer certification agree with whole-program compilation | three-module differential check, per-unit object link, and execution |
 | Drop and return | propagated owned strings drop once, while borrowed record/fixed-array storage is never dropped by the callee | success/error execution under the existing cleanup validation |
 
-The correction belongs to the backend-independent producer proof. It must
-audit all fixed-array place forms accepted by MIR, not special-case the
-align-llm function or weaken certification of an owned return leaf.
+The correction belongs to the backend-independent producer proof. It audits
+the plain-scalar fixed-array field-slice form without special-casing the
+align-llm function or weakening certification of an owned return leaf.
+
+The first implementation review found one P1: a function-wide set of element
+stores could certify a whole fixed array even when those stores did not reach
+the load. A reopened implementation then received a second P1: attaching that
+proof to every load rejected later runtime-index mutation and could ignore a
+whole-slot replacement. A further review rejected a parallel current-writer
+scan because it omitted whole-record and prefix-field stores and could select
+an obsolete writer. The next review caught a remaining classification error:
+the construction scan also treated parameter and whole-value array slots as
+anonymous construction temporaries.
+
+The final boundary adds no whole-array seed and reconstructs no current writer.
+A plain-scalar `MakeFieldSlice` follows the existing exact
+`Slot(field..., Element)` producer edge. At each `Store` or `StoreField` that
+the producer graph reaches, a fixed-array operand loaded from a construction
+temporary is accepted only when that value has one exact load and every write
+to the temporary is in the same block before the load: either one complete
+`StoreConstArray` or one well-typed constant-index `StoreIndex` for every
+element. No other write to that temporary is accepted. A parameter or slot
+with a whole-value root store is not a construction temporary; its exact
+projected edge continues through the ordinary producer graph, which also
+authenticates later element writes. Every reachable record store is checked
+independently, and whole-record and prefix-field operands recurse through that
+same graph. This authenticates replacement, copy, call-result, branch-result,
+array-parameter, array-copy/mutation, and nested-record paths without choosing
+one writer as current. The slice value grants only Shared descriptor and
+element access; it does not mint whole-array ownership or region provenance.
+Region-bearing and record-element field slices retain their pre-correction
+producer behavior. Mutation owners remove, duplicate, move, and place an
+initialization store out of range; runtime-index mutation, whole-field
+replacement, whole-record stores, and nested-record stores remain accepted
+controls.

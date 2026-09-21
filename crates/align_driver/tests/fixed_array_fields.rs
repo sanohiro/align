@@ -138,10 +138,12 @@ fn borrowed_fixed_array_record_certifies_across_fallible_calls() {
                 "import table\n",
                 "pub Fault { code: string, detail: string }\n",
                 "LocalTable { values: [i64; 4] }\n",
+                "NestedTable { inner: LocalTable }\n",
                 "fn step(value: i64) -> Result<(), Fault> {\n",
                 "  if value < 0 { return Err(Fault{code: \"NEGATIVE\".clone(), detail: \"value\".clone()}) }\n",
                 "  return Ok(())\n",
                 "}\n",
+                "fn make(value: i64) -> LocalTable = LocalTable{values: [value, 2, 3, 4]}\n",
                 "pub fn walk_imported(borrow input: table.Table) -> Result<(), Fault> {\n",
                 "  values := input.values[0..input.values.len()]\n",
                 "  step(values[0])?\n",
@@ -164,6 +166,50 @@ fn borrowed_fixed_array_record_certifies_across_fallible_calls() {
                 "  step(values[0])?\n",
                 "  return Ok(())\n",
                 "}\n",
+                "pub fn walk_mutated(value: i64, index: i64) -> Result<(), Fault> {\n",
+                "  mut input := LocalTable{values: [1, 2, 3, 4]}\n",
+                "  input.values[index] = value\n",
+                "  values := input.values[0..input.values.len()]\n",
+                "  step(values[index])?\n",
+                "  return Ok(())\n",
+                "}\n",
+                "pub fn walk_replaced(value: i64) -> Result<(), Fault> {\n",
+                "  mut input := LocalTable{values: [1, 2, 3, 4]}\n",
+                "  input.values = [value, 6, 7, 8]\n",
+                "  values := input.values[0..input.values.len()]\n",
+                "  step(values[0])?\n",
+                "  return Ok(())\n",
+                "}\n",
+                "pub fn walk_nested(value: i64) -> Result<(), Fault> {\n",
+                "  input := NestedTable{inner: LocalTable{values: [value, 2, 3, 4]}}\n",
+                "  values := input.inner.values[0..input.inner.values.len()]\n",
+                "  step(values[0])?\n",
+                "  return Ok(())\n",
+                "}\n",
+                "pub fn walk_nested_variable(value: i64) -> Result<(), Fault> {\n",
+                "  inner := make(value)\n",
+                "  input := NestedTable{inner: inner}\n",
+                "  values := input.inner.values[0..input.inner.values.len()]\n",
+                "  step(values[0])?\n",
+                "  return Ok(())\n",
+                "}\n",
+                "pub fn walk_record_stores(value: i64, choose: bool) -> Result<(), Fault> {\n",
+                "  returned := make(value)\n",
+                "  copied := returned\n",
+                "  mut input := if choose { copied } else { make(value) }\n",
+                "  input = make(value)\n",
+                "  values := input.values[0..input.values.len()]\n",
+                "  step(values[0])?\n",
+                "  return Ok(())\n",
+                "}\n",
+                "pub fn walk_array_stores(values: [i64; 4]) -> Result<(), Fault> {\n",
+                "  mut selected := values\n",
+                "  selected[1] = 2\n",
+                "  input := LocalTable{values: selected}\n",
+                "  view := input.values[0..input.values.len()]\n",
+                "  step(view[0])?\n",
+                "  return Ok(())\n",
+                "}\n",
             ),
         ),
         (
@@ -184,6 +230,20 @@ fn borrowed_fixed_array_record_certifies_across_fallible_calls() {
                 "  negative_values := [-1, 2, 3, 4]\n",
                 "  match walker.walk_array(negative_values) { Ok(_) => { return Err(Error.Invalid) } Err(_) => {} }\n",
                 "  walker.walk_constant() else { return Err(Error.Invalid) }\n",
+                "  walker.walk_mutated(9, 2) else { return Err(Error.Invalid) }\n",
+                "  match walker.walk_mutated(-1, 2) { Ok(_) => { return Err(Error.Invalid) } Err(_) => {} }\n",
+                "  walker.walk_replaced(9) else { return Err(Error.Invalid) }\n",
+                "  match walker.walk_replaced(-1) { Ok(_) => { return Err(Error.Invalid) } Err(_) => {} }\n",
+                "  walker.walk_nested(9) else { return Err(Error.Invalid) }\n",
+                "  match walker.walk_nested(-1) { Ok(_) => { return Err(Error.Invalid) } Err(_) => {} }\n",
+                "  walker.walk_nested_variable(9) else { return Err(Error.Invalid) }\n",
+                "  match walker.walk_nested_variable(-1) { Ok(_) => { return Err(Error.Invalid) } Err(_) => {} }\n",
+                "  walker.walk_record_stores(9, true) else { return Err(Error.Invalid) }\n",
+                "  match walker.walk_record_stores(-1, false) { Ok(_) => { return Err(Error.Invalid) } Err(_) => {} }\n",
+                "  positive_array_stores := [9, 0, 0, 0]\n",
+                "  walker.walk_array_stores(positive_array_stores) else { return Err(Error.Invalid) }\n",
+                "  negative_array_stores := [-1, 0, 0, 0]\n",
+                "  match walker.walk_array_stores(negative_array_stores) { Ok(_) => { return Err(Error.Invalid) } Err(_) => {} }\n",
                 "  return Ok(())\n",
                 "}\n",
             ),
@@ -422,17 +482,17 @@ fn incomplete_fixed_array_construction_cannot_certify_a_fallible_return() {
     assert!(!checked.diags.has_errors());
     let mir = lower_to_mir(&checked.hir);
     assert!(align_mir::producer::validate_mir_producers(&mir).is_ok());
-    for mutation in 0..3 {
+    for mutation in 0..5 {
         let mut malformed = mir.clone();
         let function = malformed
             .fns
             .iter_mut()
             .find(|function| function.name.as_str() == "walk")
             .expect("walk MIR");
-        let block = function
+        let block_index = function
             .blocks
-            .iter_mut()
-            .find(|block| {
+            .iter()
+            .position(|block| {
                 block
                     .stmts
                     .iter()
@@ -441,7 +501,7 @@ fn incomplete_fixed_array_construction_cannot_certify_a_fallible_return() {
                     >= 2
             })
             .expect("fixed-array construction block");
-        let stores = block
+        let stores = function.blocks[block_index]
             .stmts
             .iter()
             .enumerate()
@@ -449,28 +509,54 @@ fn incomplete_fixed_array_construction_cannot_certify_a_fallible_return() {
                 matches!(statement, align_mir::Stmt::StoreIndex(..)).then_some(index)
             })
             .collect::<Vec<_>>();
+        let array_slot = match &function.blocks[block_index].stmts[stores[0]] {
+            align_mir::Stmt::StoreIndex(slot, _, _) => *slot,
+            _ => unreachable!(),
+        };
         match mutation {
             0 => {
-                block.stmts.remove(stores[0]);
+                function.blocks[block_index].stmts.remove(stores[0]);
             }
             1 => {
-                let first = match &block.stmts[stores[0]] {
+                let first = match &function.blocks[block_index].stmts[stores[0]] {
                     align_mir::Stmt::StoreIndex(_, index, _) => index.clone(),
                     _ => unreachable!(),
                 };
-                let align_mir::Stmt::StoreIndex(_, index, _) = &mut block.stmts[stores[1]] else {
+                let align_mir::Stmt::StoreIndex(_, index, _) =
+                    &mut function.blocks[block_index].stmts[stores[1]]
+                else {
                     unreachable!();
                 };
                 *index = first;
             }
             2 => {
-                let align_mir::Stmt::StoreIndex(_, index, _) = &mut block.stmts[stores[0]] else {
+                let align_mir::Stmt::StoreIndex(_, index, _) =
+                    &mut function.blocks[block_index].stmts[stores[0]]
+                else {
                     unreachable!();
                 };
                 let align_mir::Operand::Const(align_mir::Const::Int(value, _)) = index else {
                     unreachable!();
                 };
                 *value = 4;
+            }
+            3 => {
+                let store = function.blocks[block_index].stmts.remove(stores[0]);
+                let load = function.blocks[block_index]
+                    .stmts
+                    .iter()
+                    .position(|statement| {
+                        matches!(statement,
+                            align_mir::Stmt::Let(_, align_mir::Rvalue::Load(slot))
+                                if *slot == array_slot)
+                    })
+                    .expect("fixed-array load");
+                function.blocks[block_index].stmts.insert(load + 1, store);
+            }
+            4 => {
+                let store = function.blocks[block_index].stmts.remove(stores[0]);
+                let other = (block_index + 1) % function.blocks.len();
+                function.blocks[other].stmts.push(store);
             }
             _ => unreachable!(),
         }
