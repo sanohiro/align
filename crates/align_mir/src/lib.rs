@@ -25026,18 +25026,21 @@ mod tests {
             let invariant = program
                 .fns
                 .iter()
-                .find(|function| function.name.as_str() == name)
-                .expect("invariant fixture function");
+                .find(|function| function.name.as_str() == name);
+            assert!(invariant.is_some(), "missing invariant fixture function {name}");
+            let Some(invariant) = invariant else { return };
             assert_eq!(invariant.borrow_mut_cleanup_slots, vec![None]);
         }
 
         let replacement = program
             .fns
             .iter()
-            .find(|function| function.name.as_str() == "replace_owned")
-            .expect("replacement fixture function");
-        let cleanup = replacement.borrow_mut_cleanup_slots[0]
-            .expect("owned field replacement retains its cleanup proxy");
+            .find(|function| function.name.as_str() == "replace_owned");
+        assert!(replacement.is_some(), "missing replacement fixture function");
+        let Some(replacement) = replacement else { return };
+        let cleanup = replacement.borrow_mut_cleanup_slots[0];
+        assert!(cleanup.is_some(), "owned field replacement lost its cleanup proxy");
+        let Some(cleanup) = cleanup else { return };
         assert!(
             replacement
                 .blocks
