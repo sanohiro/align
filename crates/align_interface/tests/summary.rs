@@ -689,6 +689,54 @@ fn editing_an_aggregate_constant_value_changes_the_interface_hash() {
     );
 }
 
+#[test]
+fn raw_null_constants_preserve_the_written_annotation_option() {
+    let annotated = one("pub NULL: raw := raw.null()\nfn main() -> i32 = 0\n");
+    let inferred = one("pub NULL := raw.null()\nfn main() -> i32 = 0\n");
+    let annotated_summary = find(&annotated, "main");
+    let inferred_summary = find(&inferred, "main");
+    let annotated_const = &annotated_summary.consts[0];
+    let inferred_const = &inferred_summary.consts[0];
+
+    assert_eq!(annotated_const.value_src, "raw.null()");
+    assert_eq!(inferred_const.value_src, "raw.null()");
+    assert_eq!(
+        annotated_const.ty,
+        Some(IType::Named { path: "raw".to_string(), args: Vec::new() })
+    );
+    assert_eq!(inferred_const.ty, None);
+    assert_ne!(
+        annotated_summary.interface_hash, inferred_summary.interface_hash,
+        "the written annotation option is part of interface identity"
+    );
+
+    let annotated_source = summary_to_source(annotated_summary, &[]).expect("render annotated summary");
+    let inferred_source = summary_to_source(inferred_summary, &[]).expect("render inferred summary");
+    assert!(annotated_source.contains("pub NULL: raw := raw.null()"));
+    assert!(inferred_source.contains("pub NULL := raw.null()"));
+
+    let mut altered = annotated_summary.clone();
+    altered.consts[0].value_src = "raw.alloc(8)".to_string();
+    rehash(&mut altered);
+    let altered_source = summary_to_source(&altered, &[]).expect("structurally valid altered summary renders");
+    let mut diagnostics = align_diag::Diagnostics::new();
+    let tokens = align_lexer::tokenize(0, &altered_source, &mut diagnostics);
+    let ast = align_parser::parse_file(tokens, &mut diagnostics);
+    let _ = align_sema::check_program(
+        &[align_sema::Module {
+            path: "main".to_string(),
+            file: &ast,
+            is_entry: false,
+            interface_only: true,
+        }],
+        &mut diagnostics,
+    );
+    assert!(
+        diagnostics.has_errors(),
+        "an altered interface initializer must fail closed when the consumer reparses it"
+    );
+}
+
 // ---- 3. round-trip + fail-closed version --------------------------------------------------------
 
 #[test]

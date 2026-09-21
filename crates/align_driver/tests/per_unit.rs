@@ -173,6 +173,31 @@ fn cross_module_const_accepts() {
 }
 
 #[test]
+fn cross_module_raw_null_constant_accepts_and_other_raw_calls_reject() {
+    let cfg = "module cfg\npub NULL: raw := raw.null()\n";
+    let main = concat!(
+        "module main\n",
+        "import cfg\n",
+        "fn main() -> i32 { unsafe { if cfg.NULL.is_null() { return 0 }; return 1 } }\n",
+    );
+    let accepted = assert_same_verdict(
+        "s1b-cross-raw-null-const",
+        &[("cfg.align", cfg), ("main.align", main)],
+        "main.align",
+    );
+    assert!(!accepted.diags.has_errors());
+
+    let invalid_cfg = "module cfg\npub BAD: raw := raw.alloc(8)\n";
+    let invalid_main = "module main\nimport cfg\nfn main() -> i32 = 0\n";
+    let rejected = assert_same_verdict(
+        "s1b-cross-raw-call-const",
+        &[("cfg.align", invalid_cfg), ("main.align", invalid_main)],
+        "main.align",
+    );
+    assert!(rejected.diags.has_errors());
+}
+
+#[test]
 fn cross_module_aggregate_const_accepts() {
     // A `pub` aggregate constant is used qualified across a unit boundary; per-unit reconstruction
     // rematerializes it from `value_src`, so the verdict matches whole-program.

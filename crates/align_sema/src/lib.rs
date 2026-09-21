@@ -7072,8 +7072,9 @@ impl<'a, 'd> GenericBodyWalker<'a, 'd> {
 
 // --- top-level constants ---------------------------------------------------------------------
 //
-// A top-level `NAME := expr` is a **compile-time constant**: it is evaluated to a scalar / string
-// value here in sema and substituted as a literal at every use, so it never reaches MIR/codegen.
+// A top-level `NAME := expr` is a **compile-time constant**: it is evaluated to a scalar / string,
+// aggregate-slice, or the exact raw-null sentinel here in sema and substituted at every use, so the
+// declaration itself never reaches MIR/codegen.
 // Constants are per-module namespaced like functions/types (`pub` exports; a qualified `mod.NAME`
 // reaches an imported module's `pub` constant), and a constant initializer may reference other
 // constants *in the same module* (cross-module references inside an initializer are deferred).
@@ -7086,6 +7087,9 @@ enum ConstVal {
     Bool(bool),
     Char(u32),
     Str(String),
+    /// The sole raw constant value: the target null pointer formed by the exact `raw.null()`
+    /// initializer. No non-null raw value enters constant evaluation.
+    RawNull,
     /// A folded aggregate constant `[e0, e1, …]` — the elements (each a scalar `ConstVal`) plus
     /// their shared scalar element type. Substituted as a static `slice<elem>` view (see
     /// [`hir::ExprKind::ConstArray`]).
@@ -7170,8 +7174,8 @@ fn check_pub_const_refs(
     }
 }
 
-/// Build the HIR literal `ExprKind` for a folded **scalar** constant value. Shared by scalar-constant
-/// substitution and per-element aggregate-constant substitution.
+/// Build the HIR leaf `ExprKind` for a folded non-aggregate constant value. Shared by standalone
+/// constant substitution and per-element aggregate-constant substitution.
 fn const_scalar_kind(val: &ConstVal) -> ExprKind {
     match val {
         ConstVal::Int(v) => ExprKind::Int(*v),
@@ -7179,6 +7183,7 @@ fn const_scalar_kind(val: &ConstVal) -> ExprKind {
         ConstVal::Bool(b) => ExprKind::Bool(*b),
         ConstVal::Char(c) => ExprKind::Char(*c),
         ConstVal::Str(s) => ExprKind::Str(s.clone()),
+        ConstVal::RawNull => ExprKind::RawNull,
         ConstVal::Array(..) => unreachable!("an aggregate constant may not be an array element (rejected during folding)"),
     }
 }
@@ -7346,6 +7351,17 @@ impl<'a, 'd> ConstEval<'a, 'd> {
             K::Bool(b) => self.expect_scalar(Ty::Bool, ConstVal::Bool(*b), expected, e.span),
             K::Char(c) => self.expect_scalar(Ty::Char, ConstVal::Char(*c), expected, e.span),
             K::Str(s) => self.expect_scalar(Ty::Str, ConstVal::Str(s.clone()), expected, e.span),
+            K::Call { callee, args }
+                if args.is_empty()
+                    && matches!(
+                        &callee.kind,
+                        K::FieldAccess { recv, field }
+                            if field.name == "null"
+                                && matches!(&recv.kind, K::Path(path) if single_name(path) == Some("raw"))
+                    ) =>
+            {
+                self.expect_scalar(Ty::Raw, ConstVal::RawNull, expected, e.span)
+            }
             K::Unary { op, expr } => self.unary(*op, expr, expected, module, e.span),
             K::Binary { op, lhs, rhs } => self.binary(*op, lhs, rhs, expected, module, e.span),
             K::Path(p) => {
@@ -7375,7 +7391,7 @@ impl<'a, 'd> ConstEval<'a, 'd> {
             K::ArrayLit(elems) => self.array(elems, expected, module, e.span),
             _ => {
                 self.diags.error(
-                    "a constant initializer must be a literal, a unary/binary expression, or another constant".to_string(),
+                    "a constant initializer must be a literal, the exact `raw.null()` sentinel, a unary/binary expression, or another constant".to_string(),
                     e.span,
                 );
                 None
@@ -7445,6 +7461,16 @@ impl<'a, 'd> ConstEval<'a, 'd> {
             self.diags.error(format!("`{}` cannot be an array-constant element type", ty_name(ty)), span);
             return None;
         };
+        // The direct raw-null leaf and an alias of it are valid standalone constants but never
+        // aggregate elements. `ConstArray` lowering has the deliberately smaller S1 scalar/str
+        // domain; reject here before a RawNull element can reach HIR/MIR materialization.
+        if !is_aggregate_const_elem(es) {
+            self.diags.error(
+                format!("an aggregate constant's element type must be a scalar or `str`, got {}", ty_name(ty)),
+                span,
+            );
+            return None;
+        }
         Some((Ty::Slice(es), ConstVal::Array(vals, es)))
     }
 
@@ -9767,8 +9793,8 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
     // Pass 0d: collect top-level constants and fold them to compile-time values. A constant is
     // per-module namespaced like a function (`module$NAME` canonical, unmangled in the entry so a
     // single-file program is byte-identical); a bare name resolves in its own module, a qualified
-    // `mod.NAME` in an imported module's `pub` constant. The folded value is substituted as a literal
-    // at every use (`check_path` / `check_field_access`), so constants never reach MIR/codegen.
+    // `mod.NAME` in an imported module's `pub` constant. The folded value is substituted at every
+    // use (`check_path` / `check_field_access`), so the declaration never reaches MIR/codegen.
     let mut const_table = ConstTable::default();
     {
         let mut decls: HashMap<String, ConstDeclInfo> = HashMap::new();
@@ -9790,7 +9816,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                 let ann_ty = c.ty.as_ref().map(|t| {
                     let ty = resolve_type(t, tcx!(&m.path.as_str(), &no_imports), &[], diags);
                     match ty {
-                        Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::Error => ty,
+                        Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::Raw | Ty::Error => ty,
                         // A top-level aggregate constant is a **static `slice<T>` view** of per-unit
                         // rodata (ownership is a property of the type — like a `str` literal), so the
                         // only aggregate annotation is `slice<T>`; an owned `array<T>` annotation is
@@ -9814,7 +9840,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                             Ty::Error // suppress a cascading mismatch when folding the initializer
                         }
                         _ => {
-                            diags.error(format!("a constant's type must be a scalar, `str`, or `slice<T>`, got {}", ty_name(ty)), t.span());
+                            diags.error(format!("a constant's type must be a scalar, `str`, `raw`, or `slice<T>`, got {}", ty_name(ty)), t.span());
                             Ty::Error
                         }
                     }

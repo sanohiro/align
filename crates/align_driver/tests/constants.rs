@@ -1,9 +1,9 @@
 //! Top-level named constants — `NAME := expr` / `NAME: Type := expr` (`draft.md` §3). A constant is
-//! keyword-less and immutable (`mut` is rejected), **evaluated at compile time** to a scalar / string
-//! value, and substituted as a literal at every use (so it never reaches MIR/codegen). Constants are
+//! keyword-less and immutable (`mut` is rejected), **evaluated at compile time** to a scalar / string,
+//! aggregate slice, or the exact raw-null sentinel and substituted at every use. Constants are
 //! per-module namespaced like functions/types: `pub` exports one, and an importer names it qualified
-//! (`mod.NAME`). A constant initializer may be a literal, a unary/binary expression, or a reference
-//! to another constant in the same module.
+//! (`mod.NAME`). A constant initializer may be a literal, the exact `raw.null()` sentinel, a
+//! unary/binary expression, or a reference to another constant in the same module.
 
 mod common;
 use common::*;
@@ -126,6 +126,100 @@ fn the_same_constant_name_in_two_modules_does_not_collide() {
     );
     let out = build_and_run_multi("const-namespace", &[("cfg.align", cfg), ("main.align", main)], "main.align");
     assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn raw_null_constants_are_exact_locally_and_across_units() {
+    if !backend_available() {
+        return;
+    }
+    let cfg = concat!(
+        "module cfg\n",
+        "pub NULL: raw := raw.null()\n",
+        "pub INFERRED := raw.null()\n",
+        "pub ALIAS: raw := NULL\n",
+    );
+    let main = concat!(
+        "import cfg\n",
+        "LOCAL: raw := raw.null()\n",
+        "fn is_null(p: raw) -> bool { unsafe { return p.is_null() } }\n",
+        "fn main() -> i32 {\n",
+        "  if is_null(LOCAL) && is_null(cfg.NULL) && is_null(cfg.INFERRED) && is_null(cfg.ALIAS) { return 42 }\n",
+        "  return 1\n",
+        "}\n",
+    );
+    let files = [("cfg.align", cfg), ("main.align", main)];
+    let whole = build_and_run_multi("const-raw-null-whole", &files, "main.align");
+    assert_eq!(whole.status.code(), Some(42));
+    let per_unit = build_per_unit_multi("const-raw-null-unit", &files, "main.align").link_and_run();
+    assert_eq!(per_unit.status.code(), Some(42));
+}
+
+#[test]
+fn raw_null_constant_substitution_is_a_direct_llvm_null() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "NULL: raw := raw.null()\n",
+        "pub fn probe() -> raw = NULL\n",
+        "fn main() -> i32 { unsafe { if probe().is_null() { return 0 }; return 1 } }\n",
+    );
+    let mut sources = SourceMap::new();
+    let checked = check(&mut sources, "raw-null-ir", src);
+    assert!(!checked.diags.has_errors());
+    assert_eq!(
+        checked.hir.fns.iter().map(|function| function.name.as_str()).collect::<Vec<_>>(),
+        ["probe", "main"]
+    );
+    let mir = lower_to_mir(&checked.hir);
+    assert_eq!(mir.fns.len(), 2, "both raw-null consumer functions must reach MIR");
+    let mut malformed = checked.hir.clone();
+    let probe = malformed.fns.iter_mut().find(|function| function.name == "probe").expect("probe HIR");
+    let value = probe.body.value.as_deref_mut().expect("probe expression body");
+    value.ty = align_sema::Ty::Int(align_sema::IntTy { bits: 64, signed: true });
+    assert!(
+        align_driver::try_lower_to_mir(&malformed).is_err(),
+        "checked HIR must reject a RawNull leaf forged with a non-raw result type"
+    );
+    for ir in [emit_llvm_with_exports(src, &["probe"]), emit_llvm_optimized(src, &["probe"])] {
+        assert!(ir.contains("ret ptr null"), "raw-null constant must lower to an LLVM null pointer:\n{ir}");
+        assert!(!ir.contains("call ptr @align_rt_alloc"), "raw-null constant must not allocate:\n{ir}");
+        assert!(!ir.contains("raw_null"), "raw-null constant must not call a constructor:\n{ir}");
+        assert!(!ir.contains("@llvm.global_ctors"), "raw-null constant must not create a module initializer:\n{ir}");
+    }
+}
+
+#[test]
+fn raw_null_constant_keeps_the_initializer_grammar_closed() {
+    let rejected = [
+        ("wrong annotation", "BAD: i64 := raw.null()\n"),
+        ("argument", "BAD: raw := raw.null(1)\n"),
+        ("allocator", "BAD: raw := raw.alloc(8)\n"),
+        ("offset", "BAD: raw := raw.offset(raw.null(), 1)\n"),
+        ("unsafe block", "BAD: raw := unsafe { raw.null() }\n"),
+        ("user call", "fn make() -> raw { unsafe { return raw.null() } }\nBAD: raw := make()\n"),
+        ("ordinary expression", "fn main() -> raw = raw.null()\n"),
+    ];
+    for (name, declaration) in rejected {
+        let src = format!("{declaration}fn main() -> i32 = 0\n");
+        assert!(check_errs(&format!("const-raw-null-{name}"), &src), "{name} must reject");
+    }
+}
+
+#[test]
+fn raw_null_is_not_an_aggregate_constant_element() {
+    let rejected = [
+        "TABLE := [raw.null()]\n",
+        "NULL: raw := raw.null()\nTABLE := [NULL]\n",
+        "NULL := raw.null()\nTABLE := [NULL, NULL]\n",
+        "TABLE: slice<raw> := [raw.null()]\n",
+        "NULL := raw.null()\nTABLE := [NULL, 1]\n",
+    ];
+    for (index, declaration) in rejected.into_iter().enumerate() {
+        let src = format!("{declaration}fn main() -> i32 = 0\n");
+        assert!(check_errs(&format!("const-raw-null-array-{index}"), &src));
+    }
 }
 
 #[test]

@@ -177,6 +177,20 @@ and a float to `f64`, so annotate when another width is wanted. `pub` exports a 
 importing modules, where it is named qualified — `mod.NAME` — exactly like a `pub` function or
 type. Division by zero, a cyclic definition, or a type mismatch is a compile-time error.
 
+One deliberately narrow native-boundary sentinel is also a constant value:
+
+```align
+pub NULL: raw := raw.null()
+```
+
+The exact zero-argument `raw.null()` initializer folds to the target null pointer and may be
+exported or aliased like another constant. It allocates nothing and emits no runtime initializer or
+constructor call. This is not general call evaluation: every other call, `unsafe` block, raw
+operation, and non-null pointer expression remains invalid in a constant initializer. Ordinary
+expression use of `raw.null()` still requires `unsafe`; reading the immutable folded `NULL` value
+does not. Raw null is not an aggregate-constant element: `[raw.null()]` and `[NULL]` are rejected.
+`Option<T>` remains the only ordinary absence model.
+
 An initializer may also be an **array literal** — an *aggregate constant*:
 
 ```align
@@ -2244,7 +2258,9 @@ itself. The result's validity is the enclosing `unsafe` block's obligation, exac
 pointer it derives from.
 
 `raw.null()` is the only null-pointer constructor and is explicit at the unsafe boundary; a raw
-pointer is tested with `p.is_null()`. There is no general null value in ordinary Align types.
+pointer is tested with `p.is_null()`. The sole compile-time exception is the exact initializer of an
+immutable module constant (`NULL: raw := raw.null()`), which merely names that target null pointer
+and emits no operation. There is no general null value in ordinary Align types.
 The stored/loaded type is inferred (from the value
 for `store`, from the expected type for `load`) —
 Align has **no turbofish**, so an explicit `raw.op<T>(...)` is not the surface. (An unchecked pointer
@@ -2530,7 +2546,7 @@ fn main() -> i32 {
 
 `import geom` resolves by **filename convention** to `geom.align` in the entry file's directory (its `module` declaration must match the filename). A nested path follows the directory tree: `import util.math` → `util/math.align` declaring `module util.math`, called `util.math.fn(...)`. A cross-module reference is written qualified — `geom.area(...)` for a function, `geom.Point` for a type — and reaches only `pub` members; a bare name resolves within the calling module (so an imported type *must* be qualified). Each module has its own function and type namespace, so two modules may define a function or type with the same name. That includes compiler-provided bare type aliases in non-entry modules: a same-module declaration wins locally, the builtin remains available by its provider-qualified spelling such as `core.Error`, and importers use the ordinary module-qualified user type. Entry-module declarations that would collide with an unmangled builtin canonical name remain errors.
 
-A `pub` item's signature may name only `pub` types: a `pub` function's parameter and return types, a `pub` struct's field types, and a `pub` sum type's payload types (a `pub` constant's type is a scalar, `str`, or a `slice<T>` of one — so its element type is transitively `pub` by construction) must all be `pub` — a private type cannot leak through a public interface. The rule holds transitively (a type nested under `Option`, `array`, a tuple, or a fn-type is checked too), so a module's public interface is fully self-contained: everything it exposes is itself exported and usable by an importer. A **generic** `pub` function's *body* is part of its interface too — its template is instantiated in importing modules, where the defining module's private items do not exist — so a generic `pub` function's body may reference only `pub` same-module items (its params, locals, and type parameters aside): a private same-module function, type, or constant in a generic `pub` body is rejected at the defining module.
+A `pub` item's signature may name only `pub` types: a `pub` function's parameter and return types, a `pub` struct's field types, and a `pub` sum type's payload types (a `pub` constant's type is a scalar, `str`, a `slice<T>` of one, or the built-in `raw` type for the null sentinel — so any named element type is transitively `pub` by construction) must all be `pub` — a private type cannot leak through a public interface. The rule holds transitively (a type nested under `Option`, `array`, a tuple, or a fn-type is checked too), so a module's public interface is fully self-contained: everything it exposes is itself exported and usable by an importer. A **generic** `pub` function's *body* is part of its interface too — its template is instantiated in importing modules, where the defining module's private items do not exist — so a generic `pub` function's body may reference only `pub` same-module items (its params, locals, and type parameters aside): a private same-module function, type, or constant in a generic `pub` body is rejected at the defining module.
 
 The module import graph must be a DAG: a cycle of `import`s — direct (`a` imports `b`, `b` imports `a`), transitive, or a module importing itself — is a compile error. Mutual dependency means the two modules are one unit of meaning: merge them, or extract the shared part into a third module both import. The restriction keeps every module's interface computable bottom-up (each module is checked against the already-checked interfaces of its imports), which is what makes per-module compilation and caching possible.
 
