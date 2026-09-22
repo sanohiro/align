@@ -100,7 +100,7 @@ pub enum ProducerCertification {
 
 /// Version of the target-independent concrete-inline admission policy. This value is serialized in
 /// every concrete body record, so changing the budget or eligibility rules invalidates consumers.
-pub const INLINE_BODY_POLICY_VERSION: u32 = 1;
+pub const INLINE_BODY_POLICY_VERSION: u32 = 2;
 
 /// One C-ABI declaration required to recheck and lower a transported concrete body.
 #[derive(Clone, Debug, PartialEq, Eq)]

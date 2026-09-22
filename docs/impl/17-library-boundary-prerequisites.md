@@ -26,14 +26,17 @@ manual close functions through its safe public API.
 
 Issue 1066's concrete inline-body extension is owned by
 `74-interface-inline-body-plan.md`. It does not weaken this document's generic
-template or imported-header rules. Interface format 15 gives function bodies an
+template or imported-header rules. The function-body record introduced by
+interface format 15 and retained by current format 16 gives functions an
 explicit `Absent | GenericTemplate | ConcreteInline` discriminator. Only the
 generic arm enters monomorphization or recomputes public facts. A concrete inline
-body carries exact little-endian u32 policy version 1, is rechecked against every
+body carries exact little-endian u32 policy version 2, is rechecked against every
 producer-certified fact, carries only its exact
 canonical C-extern closure, lowers in a consumer with an explicit imported-inline
-origin, and reaches LLVM as `available_externally`; the producer object remains
-the sole external definition. Plan 74's ledger, malformed-input order, budget,
+origin, and reaches LLVM as `available_externally`; release/fast add
+`alwaysinline` so direct speed-profile calls must inline, while dev/small/tiny
+retain their optimization contracts and the producer remains the sole external definition.
+Plan 74's ledger, malformed-input order, budget,
 cache contract and closure matrix are authoritative for that extension.
 
 ## Request 14 native filesystem boundary (design accepted; implementation pending)

@@ -925,7 +925,7 @@ mod tests {
                     source: String::new(),
                     externs: Vec::new(),
                 },
-                vec![2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                vec![2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             ),
             (
                 IFnBody::ConcreteInline {
@@ -939,7 +939,7 @@ mod tests {
                     }],
                 },
                 vec![
-                    2, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, b'f', 1, 0, 0, 0, 0, 3,
+                    2, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, b'f', 1, 0, 0, 0, 0, 3,
                     0, 0, 0, b'i', b'6', b'4', 0, 0, 0, 0, 0, 3, 0, 0, 0, b'i', b'6', b'4', 0, 0,
                     0, 0,
                 ],
@@ -965,7 +965,7 @@ mod tests {
             })
         );
         assert_eq!(
-            read_fn_body(&mut Reader::new(&[2, 2, 0, 0, 0])),
+            read_fn_body(&mut Reader::new(&[2, 1, 0, 0, 0])),
             Err(DecodeError::InvalidSummary(
                 "unsupported concrete-inline policy version"
             ))

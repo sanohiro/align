@@ -2457,8 +2457,17 @@ pub fn shared(borrow value: i64) -> i64 = value
 pub fn returned(x: i64) -> i64 { return x + 1 }
 pub fn local_inferred(x: i64) -> i64 { y := x + 1; return y }
 pub fn local_annotated(x: i64) -> i64 { y: i64 := x + 1; return y }
+pub fn local_bool(x: bool) -> bool { y := x; return y || false }
+pub fn local_float(x: f64) -> f64 { y := x; return y }
+pub fn local_char(x: char) -> char { y := x; return y }
+pub fn local_raw(x: raw) -> bool { y := x; return unsafe { y.is_null() } }
 pub fn local_mutable(x: i64) -> i64 { mut y := x + 1; return y }
 pub fn local_tuple(x: i64) -> i64 { (y, _) := (x + 1, 0); return y }
+pub fn local_unit(x: i64) -> i64 { value := (); return x }
+pub fn local_str() -> i64 { value := \"x\"; return value.len() }
+pub fn local_fixed(x: i64) -> i64 { value := [x, 0]; return value[0] }
+pub fn local_function(x: i64) -> i64 { value := tiny; return value(x) }
+pub fn local_move() -> i64 { value := buffer(1); return value.len() }
 pub fn branch(x: i64) -> i64 = if x == 0 { 1 } else { 2 }
 pub fn move_value(value: string) -> i64 = value.len()
 pub fn helper(x: i64) -> i64 = x + 2
@@ -2487,8 +2496,21 @@ pub fn identity<T>(value: T) -> T = value
     for name in [
         "local_inferred",
         "local_annotated",
+        "local_bool",
+        "local_float",
+        "local_char",
+        "local_raw",
+    ] {
+        assert!(matches!(body(name), IFnBody::ConcreteInline { .. }), "{name}");
+    }
+    for name in [
         "local_mutable",
         "local_tuple",
+        "local_unit",
+        "local_str",
+        "local_fixed",
+        "local_function",
+        "local_move",
         "branch",
         "move_value",
         "calls_helper",

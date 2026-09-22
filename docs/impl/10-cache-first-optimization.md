@@ -405,14 +405,17 @@ process-local numeric ids or hash-map iteration order.
 
 > **Plan 74 concrete inline bodies:** issue 1066 deliberately moves only an
 > admitted small non-generic `pub fn` body from implementation-only identity
-> into interface identity. Format 15's explicit `ConcreteInline` record carries
-> exact little-endian u32 policy version 1, the checked source and canonical
+> into interface identity. The explicit `ConcreteInline` record introduced by
+> format 15 and retained by current format 16 carries
+> exact little-endian u32 policy version 2, the checked source and canonical
 > C-extern closure. Its body-kind bytes, extern records and policy version enter
 > `interface_hash`, so an
 > admitted edit or an admission-boundary crossing invalidates consumers; an
 > edit that remains nonadmitted retains the ordinary private-body behavior.
 > Consumers recheck the producer facts and emit the definition as LLVM
-> `available_externally`; the producer object remains the sole external symbol.
+> `available_externally`, adding `alwaysinline` only under release/fast; direct
+> speed-profile calls must inline while dev/small/tiny retain their optimization
+> contracts and the producer object remains the sole external symbol.
 > Exact edit-and-revert restores the previous interface hash and dependent unit
 > key. `docs/impl/74-interface-inline-body-plan.md` owns the full contract.
 
