@@ -4514,7 +4514,6 @@ pub fn concrete_inline_body_externs(
             is_public: true
         } | hir::FnOrigin::ImportedInline
     ) || (function.body.stmts.is_empty() && function.body.value.is_none())
-        || function.locals.len() != function.params.len()
         || function.return_cleanup != hir::ReturnCleanupAbi::None
         || !matches!(function.return_borrow, hir::ReturnBorrowSummary::None)
         || !matches!(function.return_region, hir::ReturnRegionSummary::None)
@@ -4564,11 +4563,12 @@ pub fn concrete_inline_body_externs(
         .iter()
         .copied()
         .collect::<std::collections::HashSet<_>>();
+    let mut admitted_locals = params.clone();
     let mut referenced_externs = std::collections::BTreeSet::new();
     let mut nodes = 1usize;
     let mut returns = 0usize;
     let root_has_terminal_return = function.body.value.is_none()
-        && matches!(function.body.stmts.as_slice(), [hir::Stmt::Return(_)]);
+        && matches!(function.body.stmts.last(), Some(hir::Stmt::Return(_)));
     for event in hir_depth::body_events(&function.body) {
         match event {
             hir_depth::BodyEvent::StmtEnter(statement) => {
@@ -4580,8 +4580,23 @@ pub fn concrete_inline_body_externs(
                             return None;
                         }
                     }
-                    hir::Stmt::Let { .. }
-                    | hir::Stmt::LetTuple { .. }
+                    hir::Stmt::Let { local, .. } => {
+                        let binding = function.locals.get(*local as usize)?;
+                        if binding.id != *local
+                            || binding.is_param
+                            || binding.is_mut
+                            || binding.align.is_some()
+                            || function.drop_locals.contains(local)
+                            || function.drop_individual_locals.contains(local)
+                            || !matches!(
+                                binding.ty,
+                                Ty::Bool | Ty::Int(_) | Ty::Float(_) | Ty::Char | Ty::Raw
+                            )
+                        {
+                            return None;
+                        }
+                    }
+                    hir::Stmt::LetTuple { .. }
                     | hir::Stmt::Assign { .. }
                     | hir::Stmt::AssignIndex { .. }
                     | hir::Stmt::AssignVecLane { .. }
@@ -4616,7 +4631,7 @@ pub fn concrete_inline_body_externs(
                     | hir::ExprKind::TupleIndex { .. }
                     | hir::ExprKind::ResourceBorrow { .. }
                     | hir::ExprKind::ResourceRaw { .. } => {}
-                    hir::ExprKind::Local(local) if params.contains(local) => {}
+                    hir::ExprKind::Local(local) if admitted_locals.contains(local) => {}
                     hir::ExprKind::Local(_) => return None,
                     hir::ExprKind::Call {
                         func, type_args, ..
@@ -4631,6 +4646,11 @@ pub fn concrete_inline_body_externs(
                     _ => return None,
                 }
             }
+            hir_depth::BodyEvent::StmtExit(hir::Stmt::Let { local, .. }) => {
+                if !admitted_locals.insert(*local) {
+                    return None;
+                }
+            }
             hir_depth::BodyEvent::StmtExit(_)
             | hir_depth::BodyEvent::ExprExit { .. }
             | hir_depth::BodyEvent::MatchArmEnter { .. } => {}
@@ -4639,7 +4659,9 @@ pub fn concrete_inline_body_externs(
             return None;
         }
     }
-    if returns != usize::from(root_has_terminal_return) {
+    if returns != usize::from(root_has_terminal_return)
+        || admitted_locals.len() != function.locals.len()
+    {
         return None;
     }
     Some(referenced_externs.into_iter().collect())

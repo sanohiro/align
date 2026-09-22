@@ -150,8 +150,9 @@ Owner              align_interface owns selection input, format 15, canonical
                   reconstruction, external fact/extern closure injection,
                   cache identity, object/link parity and acceptance evidence.
 
-Artifact/cache     Interface format 15 replaces format 14 outright. Function
-                  body kind is encoded after `resource_hook_body`: u8 `0`
+Artifact/cache     Current interface format 16 retains the function-body record
+                  introduced by format 15. The body kind is encoded after
+                  `resource_hook_body`: u8 `0`
                   absent; u8 `1`, then the existing u32-length UTF-8 source for
                   a generic template; or u8 `2`, exact little-endian u32 inline-
                   policy version `2`, then the same source string, u32 extern
@@ -160,7 +161,7 @@ Artifact/cache     Interface format 15 replaces format 14 outright. Function
                   parameter count, parameter ITypes in order, then result IType.
                   Integers are little-endian. Struct/sum generic-body fields
                   retain their existing option encoding. Unknown body tags,
-                  inline-policy versions other than 2, old format 14, invalid
+                  inline-policy versions other than 2, old interface formats, invalid
                   UTF-8, truncation, trailing bytes, noncanonical extern order/
                   duplicates and invalid nested IType graphs reject before
                   publication.
@@ -205,7 +206,7 @@ Mirrors            This plan, 17-library-boundary-prerequisites.md, the G9 row
                   open-questions.md receive no restatement.
 ```
 
-The canonical standalone function-body records use an empty source only to pin
+The canonical standalone format-16 function-body records use an empty source only to pin
 the codec; semantic import validation rejects those empty declarations:
 
 ```text

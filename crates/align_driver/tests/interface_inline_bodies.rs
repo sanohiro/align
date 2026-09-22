@@ -21,6 +21,10 @@ pub fn with_local(x: i64) -> i64 {
   y := x + 8
   return y
 }
+pub fn with_mutable_local(x: i64) -> i64 {
+  mut y := x + 8
+  return y
+}
 pub fn identity<T>(x: T) -> T = x
 ";
 
@@ -86,7 +90,14 @@ fn admitted_body_is_a_consumer_definition_and_other_body_kinds_stay_distinct() {
         .iter()
         .find(|function| function.name == "with_local")
         .expect("with_local interface row");
-    assert_eq!(with_local.body, IFnBody::Absent);
+    assert!(matches!(with_local.body, IFnBody::ConcreteInline { .. }));
+    let with_mutable_local = producer
+        .summary
+        .fns
+        .iter()
+        .find(|function| function.name == "with_mutable_local")
+        .expect("with_mutable_local interface row");
+    assert_eq!(with_mutable_local.body, IFnBody::Absent);
     let identity = producer
         .summary
         .fns
@@ -104,12 +115,15 @@ fn admitted_body_is_a_consumer_definition_and_other_body_kinds_stay_distinct() {
         .expect("consumer MIR definition");
     assert!(transported.available_externally);
     assert!(!transported.exportable);
+    assert!(consumer.mir.fns.iter().any(|function| {
+        function.name.as_str() == "tiny$with_local" && function.available_externally
+    }));
     assert!(
         consumer
             .mir
             .imported_fns
             .iter()
-            .any(|function| function.name.as_str() == "tiny$with_local")
+            .any(|function| function.name.as_str() == "tiny$with_mutable_local")
     );
 }
 
@@ -243,6 +257,7 @@ extern \"C\" link(\"m\") { fn acos(x: f64) -> f64 }
 pub fn cabs(x: i32) -> i64 = unsafe { abs(x) as i64 }
 pub fn mixed_extern_order(x: i64) -> i64 = unsafe { labs(x) + acos(1.0) as i64 }
 pub fn null_is_null() -> bool = unsafe { raw.null().is_null() }
+pub fn handle_absent(handle: raw) -> bool = unsafe { handle.is_null() }
 ";
     let main = "\
 import native
@@ -250,6 +265,7 @@ fn main() {
   print(native.cabs(-42))
   print(native.mixed_extern_order(-42))
   print(native.null_is_null())
+  print(native.handle_absent(unsafe { raw.null() }))
 }
 ";
     let files = [("native.align", library), ("main.align", main)];
@@ -273,6 +289,7 @@ fn main() {
         "native$cabs",
         "native$mixed_extern_order",
         "native$null_is_null",
+        "native$handle_absent",
     ] {
         assert!(
             consumer
@@ -284,10 +301,26 @@ fn main() {
         );
     }
     if backend_available() {
+        let optimized = emit_llvm_ir(
+            &consumer.mir,
+            BuildTarget::Baseline,
+            align_driver::Profile::Release,
+            true,
+            &[],
+            false,
+        )
+        .expect("optimized consumer LLVM IR");
+        let handle_symbol = encoded("native$handle_absent");
+        assert!(
+            !optimized.lines().any(|line| {
+                line.contains("call ") && line.contains(&format!("@\"{handle_symbol}\""))
+            }),
+            "raw wrapper direct call survived release optimization:\n{optimized}"
+        );
         let whole = build_and_run_multi("interface-inline-native-whole", &files, "main.align");
         let per_unit = built.link_and_run();
         assert_eq!(whole.stdout, per_unit.stdout);
-        assert_eq!(String::from_utf8_lossy(&per_unit.stdout), "42\n42\ntrue\n");
+        assert_eq!(String::from_utf8_lossy(&per_unit.stdout), "42\n42\ntrue\ntrue\n");
     }
 }
 
@@ -299,12 +332,17 @@ module bridge
 import base
 fn local(x: i64) -> i64 = x + 10
 pub fn imported(x: i64) -> i64 = base.inc(x)
+pub fn fused(x: i64) -> bool {
+  policy := base.inc(x - 1)
+  return policy == 1 || policy == 2
+}
 pub fn same_unit(x: i64) -> i64 = local(x)
 ";
     let main = "\
 import bridge
 fn main() {
   print(bridge.imported(41))
+  print(bridge.fused(2))
   print(bridge.same_unit(32))
 }
 ";
@@ -324,6 +362,15 @@ fn main() {
             .body,
         IFnBody::ConcreteInline { .. }
     ));
+    assert!(matches!(
+        summary
+            .fns
+            .iter()
+            .find(|function| function.name == "fused")
+            .expect("fused row")
+            .body,
+        IFnBody::ConcreteInline { .. }
+    ));
     assert_eq!(
         summary
             .fns
@@ -334,9 +381,26 @@ fn main() {
         IFnBody::Absent
     );
     if backend_available() {
+        let consumer = built.unit("main");
+        let optimized = emit_llvm_ir(
+            &consumer.mir,
+            BuildTarget::Baseline,
+            align_driver::Profile::Release,
+            true,
+            &[],
+            false,
+        )
+        .expect("optimized consumer LLVM IR");
+        let fused_symbol = encoded("bridge$fused");
+        assert!(
+            !optimized.lines().any(|line| {
+                line.contains("call ") && line.contains(&format!("@\"{fused_symbol}\""))
+            }),
+            "fused-shaped direct call survived release optimization:\n{optimized}"
+        );
         let whole = build_and_run_multi("interface-inline-transitive-whole", &files, "main.align");
         let per_unit = built.link_and_run();
         assert_eq!(whole.stdout, per_unit.stdout);
-        assert_eq!(String::from_utf8_lossy(&per_unit.stdout), "42\n42\n");
+        assert_eq!(String::from_utf8_lossy(&per_unit.stdout), "42\ntrue\n42\n");
     }
 }
