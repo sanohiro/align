@@ -804,7 +804,7 @@ named where it already discriminates the defect; a new owner is named `planned`.
 | Access kind | single index | `emit_bounds_check`'s guard | planned |
 | | range `xs[i..i+k]` | `emit_range_bounds_check`'s guard; `start > end` and `end > len` both proved, including the loop-invariant overflow test 1081 §3 measures as un-hoisted | planned (`window_first`) |
 | | `vecN` load/store | `emit_vec_bounds_check` delegates, so it inherits both fusion and movement | `vec_simd`, planned |
-| | byte accessors | the guards `lower_bytes_read` emits for `b.u32_le(off)` and `b.set_u32_le(off, v)` are `byte_ranges`' territory; `loop_facts` does not re-prove them | `runway_a2_binary_codec`, `bytes_ops` |
+| | byte accessors | multi-byte reads and every write keep the signed guards that `byte_ranges` re-derives. A width-one read has the ordinary range shape `i..i+1`; it uses the fused range guard so `loop_facts` owns its versioning, trap-preserving slow copy and extent exactly as it does for a source slice range | `runway_a2_binary_codec`, `bytes_ops`, `g3_width_one_byte_accessor_reaches_counted_loop` |
 | View shape | zero-length view | admission fails for any access, so the loop is versioned into a slow loop that traps identically, or runs zero times and traps not at all | `runway_a2_binary_codec::read_past_end_aborts`, planned |
 | | negative index | impossible after fusion only in the sense that it still fails the unsigned compare; the trap text still reports the original signed index | `runway_a2_binary_codec::negative_offset_aborts` |
 | | length-1 view | one-trip admission; the fast loop's single iteration is identical | planned |
@@ -1068,6 +1068,73 @@ not remembered             initializer's own value: a non-negative constant, a
                            `choose_start` case (two writes to the index slot
                            outside the loop, one per `if` arm) closes it
 ```
+
+### 3.8 Residual closure matrix: width-one byte reads (1084)
+
+The exact `kv_plane.all_zero` client shape still stopped at
+`loop kept checks: guard-not-fused` after the borrowed-view header proof was
+restored. Its element load is `Rvalue::BytesRead` from `view.u8(i)`. Section
+3.7 deliberately kept every byte-accessor guard in the signed form consumed by
+`byte_ranges`, while `loop_facts` deliberately refuses that form. Removing
+`BytesRead` from the unmodelled inventory alone is not sufficient: it would
+make an unauthenticated read clonable without proving that the removed guard
+owns that exact access.
+
+The residual is one capability boundary with two coordinated halves:
+
+```text
+producer      `lower_bytes_read` emits the ordinary fused range guard only for
+              a one-byte scalar. The trap remains `RangeFail(start, end, len)`,
+              with `end = start + 1`. Wider reads and every byte write keep the
+              signed predicate that `byte_ranges` re-derives literally.
+consumer      `loop_facts` gives `BytesRead` a distinct guarded-read classifier,
+              not the general `Pure` class. Each occurrence is admitted only
+              when a recognized fused range guard has the same view, start,
+              `start + 1` end and length, and the guard's success block
+              dominates the read. The mutable classifier lists and remaps both
+              operands. A read in the rotated header, a wider read, or any read
+              without that exact dominating guard remains refused.
+boundary      Neither half is useful alone: the producer alone changes which
+              pass may own the guard but still reaches `unmodelled-statement`;
+              the consumer alone has no fused proof to authenticate. They ship
+              together in PR 3 without changing syntax, ABI, interfaces or the
+              cache key shape.
+```
+
+This is a safety-strategy extension, so the following matrix is authoritative
+for the change. A reused owner is named where it discriminates the defect; a
+new owner is named `planned`.
+
+| Axis | Cell | Required behavior | Owner |
+| --- | --- | --- | --- |
+| Formation | `u8`/`i8` read | width is exactly one; lowering emits the same fused unsigned range predicate as `emit_range_bounds_check` | planned MIR-shape owner over both signednesses |
+| | wider byte read | widths 2/4/8 retain the signed predicate and remain `byte_ranges` territory | `runway_a2_binary_codec`, planned negative MIR owner |
+| | every byte write | retains the signed predicate and its existing invalidation semantics | `bytes_ops`, `runway_a2_binary_codec` |
+| Construction | range operands | `start` is the read offset, `end` is exactly the SSA value `start + 1`, and `len` is `SliceLen` of the exact read view | planned positive and operand-mismatch negatives |
+| | failure edge | the original `RangeFail(start, end, len)` block and `Unreachable` terminator are unchanged; the slow copy retains them | planned MIR owner, existing range trap owners |
+| Authentication | control | the recognized guard's success block dominates the read block; a guard after the read or on only one incoming arm does not authenticate it | planned dominance negatives |
+| | width | the read scalar is independently checked as one byte; a forged wider read behind a one-byte guard is refused | planned malformed-MIR negative |
+| | completeness | every `BytesRead` in the versioned body must authenticate independently; one unmatched read refuses the whole loop | planned paired-read negative |
+| | header | `BytesRead` is not general `Pure`, so the rotated header's dependency cone cannot contain one and then skip it on the latch | planned header negative |
+| Body modelling | effects | an authenticated read writes no reachable memory, retains no pointer and uses exactly `bytes` and `offset`; it does not kill the borrowed-view header proof | `g1_len_range_survives_inline_byte_reads`, planned G3 owner |
+| | cloning | the mutable classifier remaps exactly `bytes` and `offset` in the fast copy; the exhaustive paired classifier still trips at compile time for a new variant | `variant_sweep_tripwire`, planned cloned-MIR owner |
+| Control paths | `if`, `match`, joins and early return | the existing G2/G3 control rules remain authoritative; domination and all-occurrences authentication make a conditionally guarded read fail closed | §3.4 owners plus planned branch negative |
+| | loop and early exits | the slow version preserves the source guard and trap iteration; the fast version is entered only when the existing preheader arithmetic proves every iteration | planned zero/one/first/last/no-match executable owner |
+| Extent | borrowed view | the authenticated guard's `len` remains the sole source of the G3 `DataExtent`; after the nonempty peel codegen publishes one `dereferenceable(len)` fact | planned exact `all_zero` raw/optimized IR owner |
+| | raw/foreign view | no `SliceLen` of the exact read view means no authentication and no extent | planned malformed-MIR negative |
+| Validation | malformed producer | mismatched view, offset, end, length, scalar width, fail key or non-`Unreachable` failure remains refused before rewriting | planned parameterized malformed-MIR owner |
+| | validation order | ordinary HIR/MIR validation still runs before `loop_facts`; the pass adds no recovery path and performs no side effect before refusal | `analysis_coverage`, planned malformed-MIR owner |
+| Trap parity | invalid range | negative, overflowing and past-end offsets retain exact range text, arguments, precedence and the effect prefix before the failing iteration | `runway_a2_binary_codec::negative_offset_aborts`, `read_past_end_aborts`, planned width-one executable owners |
+| Compilation model | whole-program, per-unit and function partition | the producer and consumer run in the existing common paths; no interface record, hash component or serialized body contract changes | `emit_llvm_stage`, `per_unit`, `function_thin_lto`, planned exact-client owner |
+| | `byte_prepare` | its later splice and `byte_ranges` rerun see wider reads and writes unchanged; an authenticated width-one read has already been versioned with its slow guard intact | `composed_reader_per_unit_and_thin_cache_bind_private_body_edits`, planned composition owner |
+| Acceptance | exact client | `kv_plane.all_zero` keeps one borrowed length load with `!range`, has no retained `smax`, reaches a counted/vector body on x86-64-v2 and AArch64, and preserves executable results | planned `g3_width_one_byte_accessor_reaches_counted_loop`; exact client IR measurement |
+| | negative controls | width 2/4/8, writes, unauthenticated reads and operand/control mismatches keep their guards and report a stable refusal | planned parameterized owner |
+
+The author-side matrix-to-prose pass treats the guard as the proof owner in
+every cell: the read-only classification permits inventory and cloning, but
+never substitutes for exact guard authentication. Because the producer and
+consumer form one dormant chain, splitting them would add an intermediate
+state with no usable consumer and duplicate the proof.
 
 ## 4. PR 3 — the trip-count exit at the latch (1084)
 
