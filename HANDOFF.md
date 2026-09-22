@@ -11,11 +11,15 @@ post-#1124 nightly repair), #1128 (plan 70 PR 2), #1129 (plan 70 PR 3), and
 (plan 71 PR 3), #1134 (plan 71 PR 4, closing the provider portion of #1077),
 #1135 (plan 72 design), #1136 (plan 72 implementation), #1137 (plan 73 design),
 and #1138 (plan 73 implementation). Issue #1065's Align capability is complete;
-align-llm Request 94 retains consumer-owned migration and allocation evidence.
-Plan 74 for #1066 proposal 2 is the current implementation candidate:
-target-independent admission of small concrete public bodies, exact extern
-closure, interface format 15, producer-fact revalidation and consumer
-`available_externally` linkage are implemented together in one capability.
+align-llm Request 94 confirms inline zero-allocation tables and retains only a
+capable-host decode owner. Plan 74 for #1066 proposal 2 shipped in #1139/#1140.
+Its first consumer measurement found that policy version 1 excludes the named
+`runtime_attention.fused` body because it uses an immutable scalar local and
+short-circuit result. Policy version 2 is the current implementation candidate:
+it admits only immutable primitive-scalar/raw locals and short-circuit boolean
+expressions, increments the canonical interface policy field, and keeps the
+existing exact extern closure, fact revalidation and consumer
+`available_externally` linkage.
 Every remaining item below starts from `main` with a fresh branch and follows
 the CLAUDE.md review flow.
 

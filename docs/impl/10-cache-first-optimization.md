@@ -406,7 +406,7 @@ process-local numeric ids or hash-map iteration order.
 > **Plan 74 concrete inline bodies:** issue 1066 deliberately moves only an
 > admitted small non-generic `pub fn` body from implementation-only identity
 > into interface identity. Format 15's explicit `ConcreteInline` record carries
-> exact little-endian u32 policy version 1, the checked source and canonical
+> exact little-endian u32 policy version 2, the checked source and canonical
 > C-extern closure. Its body-kind bytes, extern records and policy version enter
 > `interface_hash`, so an
 > admitted edit or an admission-boundary crossing invalidates consumers; an

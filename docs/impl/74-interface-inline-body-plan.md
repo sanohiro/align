@@ -64,16 +64,21 @@ Budget             Admission uses one target-independent checked-HIR budget:
                   compiler build identity.
 
 Body domain        The body is bounded scalar control: expression form or nested
-                  blocks, `unsafe` blocks, immutable Copy-local bindings,
+                  blocks, `unsafe` blocks, immutable primitive-scalar/raw local
+                  bindings,
                   short-circuit `&&`/`||`, and one explicit return are allowed.
                   `if`, `match`, `else`, `?`, `map_err`, loops, `break`,
                   early/multiple returns, arenas, tasks, pipelines, lambdas,
                   local function values, assignment, aggregate Move
                   construction, allocation and Drop reject. Each admitted
-                  binding has one initializer, is not `mut`, has a Copy type,
-                  owns no cleanup state and may be read only after its
-                  declaration; annotated and inferred bindings use the same
-                  checked type rule. Tuple destructuring rejects. A block may
+                  binding has one initializer, is not `mut`, and has exact type
+                  `bool`, an integer, a float, `char`, or `raw`. Unit, `str`,
+                  resources, structs, tuples, fixed/vector arrays and every
+                  owning or function-valued type reject even when their value
+                  representation is Copy. The local owns no cleanup state and
+                  may be read only after its declaration; annotated and
+                  inferred bindings use the same checked type rule. Tuple
+                  destructuring rejects. A block may
                   contain admitted bindings followed by nested block/unsafe
                   wrappers and zero or one terminal return, or supply one tail
                   expression. Scalar/raw literals, parameter and admitted-local
@@ -228,7 +233,7 @@ owner may close several cells when it would fail for every listed defect.
 
 | Cell | Implementation obligation | Owner evidence |
 |---|---|---|
-| Formation/selection | select only validated non-generic public bodies satisfying every signature, provenance, ownership, domain and 24-node rule; admit immutable Copy locals while mutable, Move, cleanup-bearing and destructured locals remove the body without changing program semantics | interface/sema eligibility table with inferred/annotated immutable Copy positives, mutable/Move/tuple negatives, declaration-before-read validation and exhaustive statement/expression-variant tripwire |
+| Formation/selection | select only validated non-generic public bodies satisfying every signature, provenance, ownership, domain and 24-node rule; admit immutable primitive-scalar/raw locals while mutable, aggregate, view/resource, Move, cleanup-bearing and destructured locals remove the body without changing program semantics | interface/sema eligibility table with inferred/annotated bool/integer/float/char/raw positives, Unit/str/resource/struct/tuple/fixed-array/vector/function/Move/mutable/tuple-destructure negatives, declaration-before-read validation and exhaustive statement/expression-variant tripwire |
 | Interface bytes | emit format 15 and exact 0/1/2 body kinds plus canonical extern closure; format 14 and every malformed ordering/tag/length/type combination reject | independent semantic-to-byte and byte-to-semantic goldens, mutation/depth/trailing corpus |
 | Source reconstruction | parse exactly one reconstructed declaration, match its structured header and resolve only admitted public/builtin/extern dependencies | forged name/type/mode/result/body/dependency cases; private/same-unit helper negatives |
 | Producer facts | rechecked concrete body agrees exactly with effect, return borrow/region/cleanup, drop-state, transfer, retention and resource-hook facts | one mutation per field; whole producer/importer twins |
@@ -298,7 +303,7 @@ continues to compile and call exactly as it does today.
 - Concrete inline bodies retain producer-certified effects, ownership, cleanup,
   provenance and linkage; no body presence is treated as genericity.
 - The 24-node rule is target-independent, exhaustive and versioned in identity;
-  policy version 2 admits only immutable Copy locals and short-circuit boolean
+  policy version 2 admits only immutable primitive-scalar/raw locals and short-circuit boolean
   expressions, while every ownership-changing or general control form rejects.
 - Direct native externs have a complete symbol/signature/link closure; private
   Align helper graphs and recursive closure are excluded.
@@ -359,8 +364,10 @@ attributed to it.
 
 Policy version 2 widens only the first boundary. The source record and wire
 shape stay format 15, but the exact policy field becomes `2`; version `1` and
-every other value reject. An admitted local must be immutable, Copy,
-non-function-valued, non-cleanup-bearing and initialized before its first read.
+every other value reject. An admitted local must be immutable, have exact type
+`bool`, an integer, a float, `char`, or `raw`, and be initialized before its
+first read. Aggregate, view, resource, Unit, function-valued and
+cleanup-bearing locals reject regardless of Copy classification.
 Its initializer and every read remain inside the existing 24-node budget.
 Short-circuit `&&` and `||` are admitted with their existing left-to-right,
 right-hand-side-conditional semantics. They add no new effect authority:
@@ -375,7 +382,7 @@ reconstruction. The author-side matrix-to-diff pass must show:
 | Cell | Required closure |
 |---|---|
 | Policy identity | canonical tag-2 bytes carry u32 version 2; versions 0, 1, 3 and truncated records reject; hash/build identity changes |
-| Local formation | inferred and annotated immutable scalar locals admit; mutable, Move, function-valued, cleanup-bearing and tuple bindings reject |
+| Local formation | inferred and annotated bool/integer/float/char/raw locals admit; Unit, str, resource, struct, tuple, fixed-array, vector, function-valued, Move, mutable, cleanup-bearing and destructured bindings reject |
 | Local use | every admitted read names an admitted earlier binding or parameter; malformed checked HIR with an undeclared/forward local rejects |
 | Short circuit | false-`&&` and true-`||` skip the RHS; true-`&&` and false-`||` evaluate it once; producer/consumer effects and results agree |
 | Client shapes | a `fused`-shaped imported query is a consumer `available_externally` definition and its optimized direct calls disappear; a `handle_absent`-shaped raw wrapper has the same optimized-call owner independently |
@@ -384,3 +391,11 @@ reconstruction. The author-side matrix-to-diff pass must show:
 The align-llm aggregate census remains external evidence. Policy version 2
 closes the named admission defect; it does not introduce `alwaysinline` or turn
 the fewer-than-100 measurement into a provider guarantee.
+
+The fresh review of policy-version-2 candidate `49cd697c` found two P2 ledger
+gaps. Both are closed before implementation:
+
+| Finding | Closure |
+|---|---|
+| "Copy local" unintentionally included Copy aggregates while the client need and owner matrix named scalars | the exact admitted local domain is now only bool, integer, float, char and raw; every aggregate, view, resource, Unit, function-valued and owning type rejects, with one boundary owner per listed family |
+| the ledger's declared mirrors still named policy version 1 | `17-library-boundary-prerequisites.md`, `10-cache-first-optimization.md` and `HANDOFF.md` now name policy version 2 and its exact admission delta |
