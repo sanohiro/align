@@ -1,7 +1,7 @@
 # Interface-carried inline bodies
 
-Status: implemented through policy version 2; the post-adoption widening and
-speed-profile mandatory-inline policy shipped in PR #1163 for
+Status: implemented through policy version 2; policy version 3 closes the
+nested terminal-wrapper admission mismatch reported after PR #1163 for
 [issue 1066](https://github.com/sanohiro/align/issues/1066) and G9 of the
 [vectorization contract](68-vectorization-contract.md). This document is the
 public artifact ledger and implementation closure matrix. The provider
@@ -60,7 +60,7 @@ Budget             Admission uses one target-independent checked-HIR budget:
                   Type records, spans and diagnostics cost zero. The exhaustive
                   node walker rejects rather than assigning a default cost to a
                   new statement or expression variant. Concrete inline records
-                  carry exact u32 policy version 2. Changing 24, the count
+                  carry exact u32 policy version 3. Changing 24, the count
                   definition or any eligibility rule requires incrementing that
                   version (or the containing interface format); every other
                   policy version rejects. The policy constant also enters the
@@ -159,19 +159,19 @@ Artifact/cache     Current interface format 16 retains the function-body record
                   `resource_hook_body`: u8 `0`
                   absent; u8 `1`, then the existing u32-length UTF-8 source for
                   a generic template; or u8 `2`, exact little-endian u32 inline-
-                  policy version `2`, then the same source string, u32 extern
+                  policy version `3`, then the same source string, u32 extern
                   count, and canonical extern records. Each extern record is
                   option-link (`00`, or `01` + string), symbol string, u32
                   parameter count, parameter ITypes in order, then result IType.
                   Integers are little-endian. Struct/sum generic-body fields
                   retain their existing option encoding. Unknown body tags,
-                  inline-policy versions other than 2, old interface formats, invalid
+                  inline-policy versions other than 3, old interface formats, invalid
                   UTF-8, truncation, trailing bytes, noncanonical extern order/
                   duplicates and invalid nested IType graphs reject before
                   publication.
 
 Identity           The complete body-kind record, including concrete-inline u32
-                  policy version 2, enters `interface_hash`; dependency interface
+                  policy version 3, enters `interface_hash`; dependency interface
                   hashes already enter frontend and object keys. Editing an
                   admitted body, crossing the admission boundary, changing a
                   referenced extern signature/link requirement, or changing the
@@ -416,3 +416,29 @@ contract gaps. Both are closed before LLVM implementation:
 |---|---|
 | unconditional `alwaysinline` would override the established small/tiny size contract | only release and fast add `alwaysinline`; dev remains unoptimized and small/tiny retain ordinary `optsize`/`minsize` profitability, with five-profile attribute and call-shape controls |
 | G9 and one closure sentence still described ordinary profitability and residual direct calls | G9 now promises mandatory direct inlining only in release/fast and leaves excluded or indirect calls outside the guarantee; the closure names indirect calls explicitly |
+
+## 9. Policy version 3 terminal-wrapper correction
+
+The policy-version-2 implementation recognizes an explicit return only when it
+is the root block's final statement. A source-equivalent admitted wrapper such
+as `unsafe { return handle.is_null() }` reaches checked HIR as a terminal
+expression statement containing the return, so the producer rejects it even
+though the ledger admits nested blocks, unsafe blocks and one explicit terminal
+return. Policy version 3 corrects that mismatch without widening the body
+domain: a terminal spine may traverse only `Block`, `FloatScope` and `Unsafe`
+expressions whose block has no tail value and whose final statement is either
+the sole return or another terminal wrapper. A wrapper before another statement,
+a wrapper with a tail value, an expression statement that is not one of those
+three wrappers, and every early or multiple return still reject.
+
+The wire shape remains format 16 tag 2, but its exact little-endian policy field
+becomes `3`; versions 0, 1, 2, 4 and every other value reject. The source,
+extern closure, producer facts, 24-node budget, cache identity, consumer
+revalidation, profile attributes and LLVM linkage are unchanged.
+
+| Cell | Required closure |
+|---|---|
+| Terminal wrapper | the exact block/unsafe/explicit-return client shape and nested block/float/unsafe siblings publish a concrete body and inline in release |
+| Early-return refusal | a wrapper followed by another statement or carrying a tail value remains bodyless; multiple returns remain bodyless |
+| Policy identity | canonical tag-2 bytes carry u32 version 3; old version 2 and adjacent version 4 reject; interface/build identities change |
+| Existing domain | policy-version-2 local, short-circuit, extern, malformed-input, five-profile and whole/per-unit owners pass unchanged |
