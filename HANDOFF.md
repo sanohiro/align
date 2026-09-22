@@ -187,7 +187,10 @@ with one implementation closure matrix each. PR 1 (1079, 1080) has shipped: a
 borrowed view header is materialized once in the entry block, header and
 element memory are separate TBAA classes, a read-only `borrow` header of a
 body that writes no header carries `noalias`, and every length load states its
-non-negativity. PR 2 (1081) has shipped: every emitted element guard is one
+non-negativity. A post-merge client residual is also closed: inline
+`BytesRead` is classified as the non-retaining element load it is, so the
+canonical borrowed-byte `all_zero` loop keeps that materialization and its
+`!range` fact. PR 2 (1081) has shipped: every emitted element guard is one
 unsigned compare and every range guard two, except the borrowed-element and
 byte-accessor guards another stage re-derives literally; and a new MIR module
 `loop_facts`, registered after `byte_ranges::simplify`, versions an admissible

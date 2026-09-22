@@ -9796,6 +9796,10 @@ fn rvalue_keeps_view_facts(f: &Function, rv: &Rvalue) -> bool {
         | Rvalue::SliceIndex(..)
         | Rvalue::SliceIndexNoalias { .. }
         | Rvalue::SubSlice { .. }
+        // An inline binary read extracts the data pointer from an already checked byte view and
+        // performs one element load. It neither writes header memory nor retains a pointer, so it
+        // must not disable the borrowed-header materialization (issue 1080's `all_zero` residual).
+        | Rvalue::BytesRead { .. }
         | Rvalue::MakeSlice(..)
         | Rvalue::MakeFieldSlice(..)
         | Rvalue::MakeVec { .. }
