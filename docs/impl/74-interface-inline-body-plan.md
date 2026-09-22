@@ -1,6 +1,7 @@
 # Interface-carried inline bodies
 
-Status: implementation candidate for
+Status: implemented through policy version 1; policy version 2 is the
+post-adoption implementation candidate for
 [issue 1066](https://github.com/sanohiro/align/issues/1066) and G9 of the
 [vectorization contract](68-vectorization-contract.md). This document is the
 public artifact ledger and implementation closure matrix. The provider
@@ -56,24 +57,27 @@ Budget             Admission uses one target-independent checked-HIR budget:
                   Type records, spans and diagnostics cost zero. The exhaustive
                   node walker rejects rather than assigning a default cost to a
                   new statement or expression variant. Concrete inline records
-                  carry exact u32 policy version 1. Changing 24, the count
+                  carry exact u32 policy version 2. Changing 24, the count
                   definition or any eligibility rule requires incrementing that
                   version (or the containing interface format); every other
                   policy version rejects. The policy constant also enters the
                   compiler build identity.
 
-Body domain        The body is straight-line: expression form or nested blocks,
-                  `unsafe` blocks and one explicit return are allowed. `if`,
-                  `match`, `else`, `?`, `map_err`, short-circuit control, loops,
-                  `break`, early/multiple returns, arenas, tasks, pipelines,
-                  lambdas, local function values, assignment, aggregate Move
-                  construction, allocation and Drop reject. Every local-binding
-                  statement rejects, including immutable, `mut`, inferred,
-                  annotated and tuple-destructuring forms; consequently only
-                  parameter reads are admitted local reads. A block may contain
-                  only nested block/unsafe wrappers and zero or one terminal
-                  return, or supply one tail expression. Scalar/raw literals,
-                  parameter reads, arithmetic, comparisons, casts, pure
+Body domain        The body is bounded scalar control: expression form or nested
+                  blocks, `unsafe` blocks, immutable Copy-local bindings,
+                  short-circuit `&&`/`||`, and one explicit return are allowed.
+                  `if`, `match`, `else`, `?`, `map_err`, loops, `break`,
+                  early/multiple returns, arenas, tasks, pipelines, lambdas,
+                  local function values, assignment, aggregate Move
+                  construction, allocation and Drop reject. Each admitted
+                  binding has one initializer, is not `mut`, has a Copy type,
+                  owns no cleanup state and may be read only after its
+                  declaration; annotated and inferred bindings use the same
+                  checked type rule. Tuple destructuring rejects. A block may
+                  contain admitted bindings followed by nested block/unsafe
+                  wrappers and zero or one terminal return, or supply one tail
+                  expression. Scalar/raw literals, parameter and admitted-local
+                  reads, arithmetic, comparisons, casts, pure
                   projections, builtin/raw operations and direct calls are
                   allowed. A direct call may target an imported public function,
                   a compiler builtin, or a producer-local C extern captured by
@@ -145,19 +149,19 @@ Artifact/cache     Interface format 15 replaces format 14 outright. Function
                   body kind is encoded after `resource_hook_body`: u8 `0`
                   absent; u8 `1`, then the existing u32-length UTF-8 source for
                   a generic template; or u8 `2`, exact little-endian u32 inline-
-                  policy version `1`, then the same source string, u32 extern
+                  policy version `2`, then the same source string, u32 extern
                   count, and canonical extern records. Each extern record is
                   option-link (`00`, or `01` + string), symbol string, u32
                   parameter count, parameter ITypes in order, then result IType.
                   Integers are little-endian. Struct/sum generic-body fields
                   retain their existing option encoding. Unknown body tags,
-                  inline-policy versions other than 1, old format 14, invalid
+                  inline-policy versions other than 2, old format 14, invalid
                   UTF-8, truncation, trailing bytes, noncanonical extern order/
                   duplicates and invalid nested IType graphs reject before
                   publication.
 
 Identity           The complete body-kind record, including concrete-inline u32
-                  policy version 1, enters `interface_hash`; dependency interface
+                  policy version 2, enters `interface_hash`; dependency interface
                   hashes already enter frontend and object keys. Editing an
                   admitted body, crossing the admission boundary, changing a
                   referenced extern signature/link requirement, or changing the
@@ -202,8 +206,8 @@ the codec; semantic import validation rejects those empty declarations:
 ```text
 Absent:                         00
 Generic empty source:           01 00000000
-Inline, empty source/externs:   02 01000000 00000000 00000000
-Inline, one libc extern `f`:    02 01000000 00000000 01000000
+Inline, empty source/externs:   02 02000000 00000000 00000000
+Inline, one libc extern `f`:    02 02000000 00000000 01000000
                                 00
                                 01000000 66
                                 01000000
@@ -224,7 +228,7 @@ owner may close several cells when it would fail for every listed defect.
 
 | Cell | Implementation obligation | Owner evidence |
 |---|---|---|
-| Formation/selection | select only validated non-generic public bodies satisfying every signature, provenance, ownership, domain and 24-node rule; crossing each boundary removes the body without changing program semantics | interface/sema eligibility table with one positive and one negative per rule, including immutable/mutable/inferred/annotated/tuple-destructuring local bindings and subsequent local reads; exhaustive statement/expression-variant tripwire |
+| Formation/selection | select only validated non-generic public bodies satisfying every signature, provenance, ownership, domain and 24-node rule; admit immutable Copy locals while mutable, Move, cleanup-bearing and destructured locals remove the body without changing program semantics | interface/sema eligibility table with inferred/annotated immutable Copy positives, mutable/Move/tuple negatives, declaration-before-read validation and exhaustive statement/expression-variant tripwire |
 | Interface bytes | emit format 15 and exact 0/1/2 body kinds plus canonical extern closure; format 14 and every malformed ordering/tag/length/type combination reject | independent semantic-to-byte and byte-to-semantic goldens, mutation/depth/trailing corpus |
 | Source reconstruction | parse exactly one reconstructed declaration, match its structured header and resolve only admitted public/builtin/extern dependencies | forged name/type/mode/result/body/dependency cases; private/same-unit helper negatives |
 | Producer facts | rechecked concrete body agrees exactly with effect, return borrow/region/cleanup, drop-state, transfer, retention and resource-hook facts | one mutation per field; whole producer/importer twins |
@@ -232,7 +236,7 @@ owner may close several cells when it would fail for every listed defect.
 | Calls/function values | direct calls may see the body; residual and indirect/address uses retain the producer external symbol identity | optimized/unoptimized direct, function-value, callback and address-bearing object/IR owners |
 | Extern/link closure | raw/builtin and captured C-extern wrappers compile in consumers; ABI, symbol and link library are exact and deduplicated | null/is-null, widening C-return and linked-library fixtures; forged/missing/conflicting extern negatives |
 | Ownership/cleanup | shared resource borrow is admitted; ByValue Move, mutable/out, owned return, cleanup, returned view/region, replacement and Drop paths are rejected from transport and keep external-call behavior | parameter/result matrix and allocation/Drop counters |
-| Control flow | straight-line expression/block/unsafe/return forms pass; if/match/else/?/map_err/short-circuit/loop/break/early return/arena/task/pipeline/lambda/assignment fail admission but still compile through the ordinary external path | parameterized syntax/HIR matrix with identical whole/per-unit runtime results |
+| Control flow | expression/block/unsafe/return and short-circuit forms pass; if/match/else/?/map_err/loop/break/early return/arena/task/pipeline/lambda/assignment fail admission but still compile through the ordinary external path | parameterized syntax/HIR matrix with both short-circuit outcomes, side-effect order, and identical whole/per-unit runtime results |
 | Generic separation | generic templates keep tag 1, monomorphization and recomputed facts; concrete inline tag 2 never enters generic worklists or disappears from external fact maps | generic/concrete sibling fixture and forged tag/type-parameter mismatches |
 | LLVM/linkage | consumer definition is `available_externally`, producer definition is external, no consumer object exports/defines a duplicate, and a non-inlined call links to the producer | release/dev IR, `llvm-nm`, forced residual-call executable and multi-consumer link owners |
 | Optimization evidence | a tiny scalar call is absent in release consumer IR/native output without ThinLTO; a stage call has no definition-unavailable remark; profitability negative remains legal | two-unit release, pipeline/explain-opt and deliberately non-inlined control |
@@ -256,7 +260,8 @@ sema, MIR and LLVM unit owners.
 
 1. A two-unit scalar fixture carries and inlines `pub fn tiny(x: i64) -> i64 =
    x + 7` in release without ThinLTO. A larger sibling remains an external call.
-2. A shared-borrow resource query calling an imported public function, a
+2. A shared-borrow resource query calling an imported public function, an
+   immutable scalar local followed by short-circuit comparisons, a
    `raw.null()` / `raw.is_null()` pair, and a direct C-extern wrapper cover the
    client shapes. An `i32` extern result widened to `i64` remains visible for
    tail-call and ordinary inlining inspection.
@@ -279,7 +284,8 @@ site census. That work remains consumer-owned.
 No default ThinLTO, source `inline`/`always_inline` keyword, target-specific
 budget, profile-dependent interface, arbitrary private-helper closure, recursive
 body transport, generic-policy change, serialized HIR/MIR/LLVM bitcode,
-cross-version reader, optimizer-result guarantee, new runtime ABI, native symbol
+cross-version reader, mutable or Move local transport, general control-flow
+transport, optimizer-result guarantee, new runtime ABI, native symbol
 alias, reflection or dynamic loading is added. A body rejected by admission
 continues to compile and call exactly as it does today.
 
@@ -291,7 +297,9 @@ continues to compile and call exactly as it does today.
   order, width, malformed-input rule and independent golden requirement.
 - Concrete inline bodies retain producer-certified effects, ownership, cleanup,
   provenance and linkage; no body presence is treated as genericity.
-- The 24-node rule is target-independent, exhaustive and versioned in identity.
+- The 24-node rule is target-independent, exhaustive and versioned in identity;
+  policy version 2 admits only immutable Copy locals and short-circuit boolean
+  expressions, while every ownership-changing or general control form rejects.
 - Direct native externs have a complete symbol/signature/link closure; private
   Align helper graphs and recursive closure are excluded.
 - Whole-program, per-unit, every profile, cache edit/revert, function-value,
@@ -338,3 +346,41 @@ rejects `Deferred` but accepts the three concrete producer classifications;
 resolved local and builtin types retain their exact ownership check. The
 focused interface admission and foreign-nominal owners plus the required
 database suites cover both boundaries.
+
+## 8. Post-adoption policy version 2 closure
+
+The first align-llm adoption measured 545 surviving calls to functions of at
+most eight native instructions. Two named controls expose distinct boundaries:
+`runtime_attention.fused` was absent from consumer IR because its immutable
+scalar local and short-circuit result were deliberate policy-version-1
+exclusions, while `ggml_ffi.handle_absent` is already within the admitted raw
+wrapper domain and requires an optimized-IR owner before any policy widening is
+attributed to it.
+
+Policy version 2 widens only the first boundary. The source record and wire
+shape stay format 15, but the exact policy field becomes `2`; version `1` and
+every other value reject. An admitted local must be immutable, Copy,
+non-function-valued, non-cleanup-bearing and initialized before its first read.
+Its initializer and every read remain inside the existing 24-node budget.
+Short-circuit `&&` and `||` are admitted with their existing left-to-right,
+right-hand-side-conditional semantics. They add no new effect authority:
+consumer rechecking must still reproduce the producer's exact effect and
+ownership records.
+
+The implementation closure is one sema/interface policy change plus focused
+owners. It does not change HIR, MIR or LLVM representation: those layers
+already lower ordinary locals and short-circuit expressions after source
+reconstruction. The author-side matrix-to-diff pass must show:
+
+| Cell | Required closure |
+|---|---|
+| Policy identity | canonical tag-2 bytes carry u32 version 2; versions 0, 1, 3 and truncated records reject; hash/build identity changes |
+| Local formation | inferred and annotated immutable scalar locals admit; mutable, Move, function-valued, cleanup-bearing and tuple bindings reject |
+| Local use | every admitted read names an admitted earlier binding or parameter; malformed checked HIR with an undeclared/forward local rejects |
+| Short circuit | false-`&&` and true-`||` skip the RHS; true-`&&` and false-`||` evaluate it once; producer/consumer effects and results agree |
+| Client shapes | a `fused`-shaped imported query is a consumer `available_externally` definition and its optimized direct calls disappear; a `handle_absent`-shaped raw wrapper has the same optimized-call owner independently |
+| Reverse controls | excluded bodies remain ordinary external calls and whole/per-unit runtime output stays identical |
+
+The align-llm aggregate census remains external evidence. Policy version 2
+closes the named admission defect; it does not introduce `alwaysinline` or turn
+the fewer-than-100 measurement into a provider guarantee.
