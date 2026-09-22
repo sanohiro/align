@@ -33,8 +33,9 @@ generic arm enters monomorphization or recomputes public facts. A concrete inlin
 body carries exact little-endian u32 policy version 2, is rechecked against every
 producer-certified fact, carries only its exact
 canonical C-extern closure, lowers in a consumer with an explicit imported-inline
-origin, and reaches LLVM as `available_externally`; the producer object remains
-the sole external definition. Plan 74's ledger, malformed-input order, budget,
+origin, and reaches LLVM as `available_externally alwaysinline`; direct consumer
+calls must inline while the producer object remains the sole external definition.
+Plan 74's ledger, malformed-input order, budget,
 cache contract and closure matrix are authoritative for that extension.
 
 ## Request 14 native filesystem boundary (design accepted; implementation pending)

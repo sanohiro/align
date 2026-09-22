@@ -13,8 +13,8 @@ Request 95.
 The accepted direction is issue 1066 proposal 2. Release builds do not enable
 ThinLTO by default. Instead, a deliberately small non-generic `pub fn` may
 publish a checked source body in its unit interface. A consuming unit lowers
-that body as an LLVM `available_externally` definition: the ordinary optimizer
-can inspect and inline it, while any residual call still resolves to the one
+that body as an LLVM `available_externally alwaysinline` definition: direct
+calls consume it without ThinLTO, while indirect uses resolve to the one
 external definition in the producer object.
 
 This is not the existing generic-template mechanism. `generic_body` means that
@@ -29,13 +29,13 @@ body-kind record: absent, generic template, or concrete inline candidate.
 ## 1. Public artifact ledger
 
 ```text
-Promise           Under per-unit compilation at release optimization, every
+Promise           Under per-unit compilation, every
                   admitted concrete inline candidate is visible to LLVM in the
-                  consuming unit as an `available_externally` definition. An
-                  admitted direct call therefore has no "definition is
-                  unavailable" refusal. LLVM retains its ordinary profitability
-                  decision; Align does not promise that every visible body is
-                  inlined at every call site or target.
+                  consuming unit as an `available_externally` definition with
+                  LLVM `alwaysinline`. Every direct consumer call is therefore
+                  inlined by the mandatory always-inliner rather than left to
+                  the target profitability heuristic. Indirect/function-value
+                  uses retain the producer's external symbol.
 
 Source surface     No keyword, attribute, annotation, profile default or source
                   convention is added. Admission is compiler-selected and has
@@ -113,15 +113,13 @@ Source closure     The body fragment is the producer's exact item-span source,
                   compiler builtins, imported public surface and its recorded
                   extern closure. A missing/private/extra dependency rejects.
 
-Semantics           The producer object remains the sole external definition.
+Semantics          The producer object remains the sole external definition.
                   Each consumer gets the same canonical function name with
-                  LLVM `available_externally` linkage. LLVM may inline it; if it
-                  does not, the available body is discarded and the call binds
-                  to the producer's external symbol. Address-taking, indirect
-                  calls and debug names therefore retain ordinary external
-                  identity. No body is emitted for an unused transitive
-                  dependency after LLVM optimization, and no duplicate exported
-                  symbol enters an object.
+                  LLVM `available_externally` linkage and `alwaysinline`.
+                  Direct calls consume that body. Address-taking, indirect calls
+                  and debug names retain ordinary external identity and bind to
+                  the producer definition. No consumer body becomes an exported
+                  symbol, and no duplicate definition enters an object.
 
 Effects/ownership  Rechecking is not authority to change facts. The consumer
                   compares all producer-certified signature, effect, borrow,
@@ -239,13 +237,13 @@ owner may close several cells when it would fail for every listed defect.
 | Source reconstruction | parse exactly one reconstructed declaration, match its structured header and resolve only admitted public/builtin/extern dependencies | forged name/type/mode/result/body/dependency cases; private/same-unit helper negatives |
 | Producer facts | rechecked concrete body agrees exactly with effect, return borrow/region/cleanup, drop-state, transfer, retention and resource-hook facts | one mutation per field; whole producer/importer twins |
 | Construction/lowering | imported inline candidates become checked HIR/MIR definitions with an explicit imported-inline origin; ordinary bodyless imports and generic monomorphs retain their existing paths | checked-HIR and MIR structural owners plus generic/bodyless negative controls |
-| Calls/function values | direct calls may see the body; residual and indirect/address uses retain the producer external symbol identity | optimized/unoptimized direct, function-value, callback and address-bearing object/IR owners |
+| Calls/function values | direct consumer calls must inline; indirect/address uses retain the producer external symbol identity | optimized direct-call absence in dev and release, function-value, callback and address-bearing object/IR owners |
 | Extern/link closure | raw/builtin and captured C-extern wrappers compile in consumers; ABI, symbol and link library are exact and deduplicated | null/is-null, widening C-return and linked-library fixtures; forged/missing/conflicting extern negatives |
 | Ownership/cleanup | shared resource borrow is admitted; ByValue Move, mutable/out, owned return, cleanup, returned view/region, replacement and Drop paths are rejected from transport and keep external-call behavior | parameter/result matrix and allocation/Drop counters |
 | Control flow | expression/block/unsafe/return and short-circuit forms pass; if/match/else/?/map_err/loop/break/early return/arena/task/pipeline/lambda/assignment fail admission but still compile through the ordinary external path | parameterized syntax/HIR matrix with both short-circuit outcomes, side-effect order, and identical whole/per-unit runtime results |
 | Generic separation | generic templates keep tag 1, monomorphization and recomputed facts; concrete inline tag 2 never enters generic worklists or disappears from external fact maps | generic/concrete sibling fixture and forged tag/type-parameter mismatches |
-| LLVM/linkage | consumer definition is `available_externally`, producer definition is external, no consumer object exports/defines a duplicate, and a non-inlined call links to the producer | release/dev IR, `llvm-nm`, forced residual-call executable and multi-consumer link owners |
-| Optimization evidence | a tiny scalar call is absent in release consumer IR/native output without ThinLTO; a stage call has no definition-unavailable remark; profitability negative remains legal | two-unit release, pipeline/explain-opt and deliberately non-inlined control |
+| LLVM/linkage | consumer definition is `available_externally alwaysinline`, producer definition is external, no consumer object exports/defines a duplicate, and indirect calls link to the producer | release/dev IR, `llvm-nm`, function-value executable and multi-consumer link owners |
+| Optimization evidence | every admitted direct consumer call is absent after the mandatory always-inliner without ThinLTO; a stage call has no definition-unavailable or profitability refusal | two-unit dev/release, pipeline/explain-opt and an excluded-body external-call control |
 | Cache/determinism | admitted edit, eligibility crossing, extern edit and budget-version change invalidate exact dependent keys; nonadmitted private edit does not; revert restores keys/bytes; warm/cold and jobs=1/N agree | unit-cache edit matrix, two-build byte identity and scheduling matrix |
 | Malformed/recovery | every invalid interface or forged checked-HIR origin fails before MIR/object/cache/link publication without panic; no malformed candidate is downgraded to external silently | codec/import/HIR mutation corpus and no-artifact assertions |
 | Whole/per-unit/profile | whole-program output is unchanged; per-unit dev/release/fast/small/tiny preserve results, with release body visibility independent of ThinLTO and target CPU | profile matrix on Linux x86_64, Linux ARM64 and macOS Apple Silicon |
@@ -274,8 +272,8 @@ sema, MIR and LLVM unit owners.
 3. A pipeline-stage fixture has no definition-unavailable remark naming its
    admitted callee and retains identical output in whole/per-unit builds.
 4. Producer and two consumers prove one external producer symbol, no exported
-   consumer duplicate, valid function-value/address use and a residual call that
-   links back to the producer.
+   consumer duplicate, valid function-value/address use and an indirect call
+   that links back to the producer.
 5. The eligibility and malformed matrices exercise every row in §2. Format 15
    exact bytes, hash changes, cache cold/hit/edit/revert and deterministic
    parallel builds are mandatory.
@@ -291,14 +289,14 @@ No default ThinLTO, source `inline`/`always_inline` keyword, target-specific
 budget, profile-dependent interface, arbitrary private-helper closure, recursive
 body transport, generic-policy change, serialized HIR/MIR/LLVM bitcode,
 cross-version reader, mutable or Move local transport, general control-flow
-transport, optimizer-result guarantee, new runtime ABI, native symbol
+transport, arbitrary-body force-inline, new runtime ABI, native symbol
 alias, reflection or dynamic loading is added. A body rejected by admission
 continues to compile and call exactly as it does today.
 
 ## 5. Author-side consistency pass
 
-- The ledger separates the promised available definition from LLVM's
-  profitability decision and makes the client site count evidence only.
+- The ledger limits mandatory inlining to authenticated concrete consumer
+  definitions and makes the aggregate client site count evidence only.
 - Every transported scalar, tag, sequence and nested extern record has a fixed
   order, width, malformed-input rule and independent golden requirement.
 - Concrete inline bodies retain producer-certified effects, ownership, cleanup,
@@ -359,9 +357,10 @@ The first align-llm adoption measured 545 surviving calls to functions of at
 most eight native instructions. Two named controls expose distinct boundaries:
 `runtime_attention.fused` was absent from consumer IR because its immutable
 scalar local and short-circuit result were deliberate policy-version-1
-exclusions, while `ggml_ffi.handle_absent` is already within the admitted raw
-wrapper domain and requires an optimized-IR owner before any policy widening is
-attributed to it.
+exclusions. `ggml_ffi.handle_absent` is already within the admitted raw wrapper
+domain: a focused small-caller owner proves its body is transported and can
+inline, while the 118 surviving real-client calls prove ordinary profitability
+does not close the named acceptance boundary in large consumers.
 
 Policy version 2 widens only the first boundary. The source record and wire
 shape stay format 15, but the exact policy field becomes `2`; version `1` and
@@ -373,7 +372,8 @@ Its initializer and every read remain inside the existing 24-node budget.
 Short-circuit `&&` and `||` are admitted with their existing left-to-right,
 right-hand-side-conditional semantics. They add no new effect authority:
 consumer rechecking must still reproduce the producer's exact effect and
-ownership records.
+ownership records. Every authenticated consumer definition receives
+`alwaysinline`; producer definitions and bodyless imports do not.
 
 The implementation closure is one sema/interface policy change plus focused
 owners. It does not change HIR, MIR or LLVM representation: those layers
@@ -387,11 +387,12 @@ reconstruction. The author-side matrix-to-diff pass must show:
 | Local use | every admitted read names an admitted earlier binding or parameter; malformed checked HIR with an undeclared/forward local rejects |
 | Short circuit | false-`&&` and true-`||` skip the RHS; true-`&&` and false-`||` evaluate it once; producer/consumer effects and results agree |
 | Client shapes | a `fused`-shaped imported query is a consumer `available_externally` definition and its optimized direct calls disappear; a `handle_absent`-shaped raw wrapper has the same optimized-call owner independently |
+| Inlining authority | only `available_externally` definitions selected by the authenticated concrete-inline record receive `alwaysinline`; producer, generic, bodyless, native and malformed controls do not |
 | Reverse controls | excluded bodies remain ordinary external calls and whole/per-unit runtime output stays identical |
 
 The align-llm aggregate census remains external evidence. Policy version 2
-closes the named admission defect; it does not introduce `alwaysinline` or turn
-the fewer-than-100 measurement into a provider guarantee.
+closes both named provider defects without turning the fewer-than-100 aggregate
+measurement into a language-wide code-size or latency guarantee.
 
 The fresh review of policy-version-2 candidate `49cd697c` found two P2 ledger
 gaps. Both are closed before implementation:
