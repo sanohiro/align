@@ -19,7 +19,7 @@ short-circuit result. Policy version 2 is the current implementation candidate:
 it admits only immutable primitive-scalar/raw locals and short-circuit boolean
 expressions, increments the canonical format-16 interface policy field, and keeps the
 existing exact extern closure and fact revalidation. Authenticated consumer
-definitions use `available_externally alwaysinline`: the client proved ordinary
+release/fast definitions use `available_externally alwaysinline`: the client proved ordinary
 profitability still leaves 118 calls to the already-admitted three-instruction
 `ggml_ffi.handle_absent` wrapper.
 Every remaining item below starts from `main` with a fresh branch and follows

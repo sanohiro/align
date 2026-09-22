@@ -413,8 +413,9 @@ process-local numeric ids or hash-map iteration order.
 > admitted edit or an admission-boundary crossing invalidates consumers; an
 > edit that remains nonadmitted retains the ordinary private-body behavior.
 > Consumers recheck the producer facts and emit the definition as LLVM
-> `available_externally alwaysinline`; direct consumer calls must inline while
-> the producer object remains the sole external symbol.
+> `available_externally`, adding `alwaysinline` only under release/fast; direct
+> speed-profile calls must inline while dev/small/tiny retain their optimization
+> contracts and the producer object remains the sole external symbol.
 > Exact edit-and-revert restores the previous interface hash and dependent unit
 > key. `docs/impl/74-interface-inline-body-plan.md` owns the full contract.
 

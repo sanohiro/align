@@ -13,9 +13,10 @@ Request 95.
 The accepted direction is issue 1066 proposal 2. Release builds do not enable
 ThinLTO by default. Instead, a deliberately small non-generic `pub fn` may
 publish a checked source body in its unit interface. A consuming unit lowers
-that body as an LLVM `available_externally alwaysinline` definition: direct
-calls consume it without ThinLTO, while indirect uses resolve to the one
-external definition in the producer object.
+that body as an LLVM `available_externally` definition. Release and fast add
+`alwaysinline`, so direct speed-profile calls consume it without ThinLTO.
+Dev, small and tiny retain their established optimization policies, while
+indirect uses resolve to the one external definition in the producer object.
 
 This is not the existing generic-template mechanism. `generic_body` means that
 the importer must instantiate a type-parameterized declaration and recompute
@@ -29,13 +30,16 @@ body-kind record: absent, generic template, or concrete inline candidate.
 ## 1. Public artifact ledger
 
 ```text
-Promise           Under per-unit compilation, every
+Promise           Under per-unit release or fast compilation, every
                   admitted concrete inline candidate is visible to LLVM in the
                   consuming unit as an `available_externally` definition with
                   LLVM `alwaysinline`. Every direct consumer call is therefore
                   inlined by the mandatory always-inliner rather than left to
                   the target profitability heuristic. Indirect/function-value
-                  uses retain the producer's external symbol.
+                  uses retain the producer's external symbol. Dev preserves the
+                  unoptimized call shape; small and tiny retain their
+                  `optsize`/`minsize` profitability decisions so the speed
+                  policy cannot duplicate code against a size contract.
 
 Source surface     No keyword, attribute, annotation, profile default or source
                   convention is added. Admission is compiler-selected and has
@@ -115,11 +119,14 @@ Source closure     The body fragment is the producer's exact item-span source,
 
 Semantics          The producer object remains the sole external definition.
                   Each consumer gets the same canonical function name with
-                  LLVM `available_externally` linkage and `alwaysinline`.
-                  Direct calls consume that body. Address-taking, indirect calls
-                  and debug names retain ordinary external identity and bind to
-                  the producer definition. No consumer body becomes an exported
-                  symbol, and no duplicate definition enters an object.
+                  LLVM `available_externally` linkage. Release and fast add
+                  `alwaysinline`, and their direct calls consume that body.
+                  Dev, small and tiny retain their existing optimization
+                  attributes and profitability decisions. Address-taking,
+                  indirect calls and debug names retain ordinary external
+                  identity and bind to the producer definition. No consumer
+                  body becomes an exported symbol, and no duplicate definition
+                  enters an object.
 
 Effects/ownership  Rechecking is not authority to change facts. The consumer
                   compares all producer-certified signature, effect, borrow,
@@ -237,16 +244,16 @@ owner may close several cells when it would fail for every listed defect.
 | Source reconstruction | parse exactly one reconstructed declaration, match its structured header and resolve only admitted public/builtin/extern dependencies | forged name/type/mode/result/body/dependency cases; private/same-unit helper negatives |
 | Producer facts | rechecked concrete body agrees exactly with effect, return borrow/region/cleanup, drop-state, transfer, retention and resource-hook facts | one mutation per field; whole producer/importer twins |
 | Construction/lowering | imported inline candidates become checked HIR/MIR definitions with an explicit imported-inline origin; ordinary bodyless imports and generic monomorphs retain their existing paths | checked-HIR and MIR structural owners plus generic/bodyless negative controls |
-| Calls/function values | direct consumer calls must inline; indirect/address uses retain the producer external symbol identity | optimized direct-call absence in dev and release, function-value, callback and address-bearing object/IR owners |
+| Calls/function values | direct consumer calls must inline in release/fast; dev and size profiles plus indirect/address uses retain their established behavior and producer symbol identity | optimized direct-call absence in release/fast, dev and small/tiny attribute/call controls, function-value, callback and address-bearing object/IR owners |
 | Extern/link closure | raw/builtin and captured C-extern wrappers compile in consumers; ABI, symbol and link library are exact and deduplicated | null/is-null, widening C-return and linked-library fixtures; forged/missing/conflicting extern negatives |
 | Ownership/cleanup | shared resource borrow is admitted; ByValue Move, mutable/out, owned return, cleanup, returned view/region, replacement and Drop paths are rejected from transport and keep external-call behavior | parameter/result matrix and allocation/Drop counters |
 | Control flow | expression/block/unsafe/return and short-circuit forms pass; if/match/else/?/map_err/loop/break/early return/arena/task/pipeline/lambda/assignment fail admission but still compile through the ordinary external path | parameterized syntax/HIR matrix with both short-circuit outcomes, side-effect order, and identical whole/per-unit runtime results |
 | Generic separation | generic templates keep tag 1, monomorphization and recomputed facts; concrete inline tag 2 never enters generic worklists or disappears from external fact maps | generic/concrete sibling fixture and forged tag/type-parameter mismatches |
-| LLVM/linkage | consumer definition is `available_externally alwaysinline`, producer definition is external, no consumer object exports/defines a duplicate, and indirect calls link to the producer | release/dev IR, `llvm-nm`, function-value executable and multi-consumer link owners |
-| Optimization evidence | every admitted direct consumer call is absent after the mandatory always-inliner without ThinLTO; a stage call has no definition-unavailable or profitability refusal | two-unit dev/release, pipeline/explain-opt and an excluded-body external-call control |
+| LLVM/linkage | release/fast consumer definitions are `available_externally alwaysinline`; dev/small/tiny consumer definitions are only `available_externally`; producer definition is external, no consumer object exports/defines a duplicate, and indirect calls link to the producer | five-profile raw/optimized IR, `llvm-nm`, function-value executable and multi-consumer link owners |
+| Optimization evidence | every admitted direct release/fast consumer call is absent after the mandatory always-inliner without ThinLTO; a stage call has no definition-unavailable or profitability refusal | two-unit release/fast, pipeline/explain-opt and dev/small/tiny plus excluded-body external-call controls |
 | Cache/determinism | admitted edit, eligibility crossing, extern edit and budget-version change invalidate exact dependent keys; nonadmitted private edit does not; revert restores keys/bytes; warm/cold and jobs=1/N agree | unit-cache edit matrix, two-build byte identity and scheduling matrix |
 | Malformed/recovery | every invalid interface or forged checked-HIR origin fails before MIR/object/cache/link publication without panic; no malformed candidate is downgraded to external silently | codec/import/HIR mutation corpus and no-artifact assertions |
-| Whole/per-unit/profile | whole-program output is unchanged; per-unit dev/release/fast/small/tiny preserve results, with release body visibility independent of ThinLTO and target CPU | profile matrix on Linux x86_64, Linux ARM64 and macOS Apple Silicon |
+| Whole/per-unit/profile | whole-program output is unchanged; per-unit dev/release/fast/small/tiny preserve results, with release/fast mandatory direct inlining and dev/small/tiny body visibility independent of ThinLTO and target CPU | profile matrix on Linux x86_64, Linux ARM64 and macOS Apple Silicon |
 
 This crosses interface, sema, HIR, MIR, LLVM and driver layers. It is one
 capability PR after this reviewed design: splitting body publication from
@@ -307,7 +314,7 @@ continues to compile and call exactly as it does today.
 - Direct native externs have a complete symbol/signature/link closure; private
   Align helper graphs and recursive closure are excluded.
 - Whole-program, per-unit, every profile, cache edit/revert, function-value,
-  residual-call and multi-consumer cases appear in the closure matrix.
+  indirect-call and multi-consumer cases appear in the closure matrix.
 - No later milestone or language change is consumed. Issue 1070 is already
   merged; the implementation needs no runtime ABI addition.
 
@@ -372,8 +379,9 @@ Its initializer and every read remain inside the existing 24-node budget.
 Short-circuit `&&` and `||` are admitted with their existing left-to-right,
 right-hand-side-conditional semantics. They add no new effect authority:
 consumer rechecking must still reproduce the producer's exact effect and
-ownership records. Every authenticated consumer definition receives
-`alwaysinline`; producer definitions and bodyless imports do not.
+ownership records. Every authenticated release/fast consumer definition
+receives `alwaysinline`; producer definitions, bodyless imports and
+dev/small/tiny consumers do not.
 
 The implementation closure is one sema/interface policy change plus focused
 owners. It does not change HIR, MIR or LLVM representation: those layers
@@ -387,7 +395,7 @@ reconstruction. The author-side matrix-to-diff pass must show:
 | Local use | every admitted read names an admitted earlier binding or parameter; malformed checked HIR with an undeclared/forward local rejects |
 | Short circuit | false-`&&` and true-`||` skip the RHS; true-`&&` and false-`||` evaluate it once; producer/consumer effects and results agree |
 | Client shapes | a `fused`-shaped imported query is a consumer `available_externally` definition and its optimized direct calls disappear; a `handle_absent`-shaped raw wrapper has the same optimized-call owner independently |
-| Inlining authority | only `available_externally` definitions selected by the authenticated concrete-inline record receive `alwaysinline`; producer, generic, bodyless, native and malformed controls do not |
+| Inlining authority | only release/fast `available_externally` definitions selected by the authenticated concrete-inline record receive `alwaysinline`; dev/small/tiny, producer, generic, bodyless, native and malformed controls do not |
 | Reverse controls | excluded bodies remain ordinary external calls and whole/per-unit runtime output stays identical |
 
 The align-llm aggregate census remains external evidence. Policy version 2
@@ -401,3 +409,11 @@ gaps. Both are closed before implementation:
 |---|---|
 | "Copy local" unintentionally included Copy aggregates while the client need and owner matrix named scalars | the exact admitted local domain is now only bool, integer, float, char and raw; every aggregate, view, resource, Unit, function-valued and owning type rejects, with one boundary owner per listed family |
 | the ledger's declared mirrors still named policy version 1 | `17-library-boundary-prerequisites.md`, `10-cache-first-optimization.md` and `HANDOFF.md` now name policy version 2 and its exact admission delta |
+
+The fresh review of mandatory-inlining candidate `ff043b6a` found two P2
+contract gaps. Both are closed before LLVM implementation:
+
+| Finding | Closure |
+|---|---|
+| unconditional `alwaysinline` would override the established small/tiny size contract | only release and fast add `alwaysinline`; dev remains unoptimized and small/tiny retain ordinary `optsize`/`minsize` profitability, with five-profile attribute and call-shape controls |
+| G9 and one closure sentence still described ordinary profitability and residual direct calls | G9 now promises mandatory direct inlining only in release/fast and leaves excluded or indirect calls outside the guarantee; the closure names indirect calls explicitly |
