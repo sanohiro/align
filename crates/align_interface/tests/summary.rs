@@ -2455,6 +2455,9 @@ OFFSET: i64 := 1
 pub fn tiny(x: i64) -> i64 = x + 1
 pub fn shared(borrow value: i64) -> i64 = value
 pub fn returned(x: i64) -> i64 { return x + 1 }
+pub fn returned_unsafe(handle: raw) -> bool { unsafe { return handle.is_null() } }
+pub fn returned_nested(handle: raw) -> bool { { unsafe { return handle.is_null() } } }
+pub fn returned_float(x: f64) -> f64 { float(contract) { return x } }
 pub fn local_inferred(x: i64) -> i64 { y := x + 1; return y }
 pub fn local_annotated(x: i64) -> i64 { y: i64 := x + 1; return y }
 pub fn local_bool(x: bool) -> bool { y := x; return y || false }
@@ -2474,6 +2477,7 @@ pub fn helper(x: i64) -> i64 = x + 2
 pub fn calls_helper(x: i64) -> i64 = helper(x)
 pub fn reads_same_unit_const(x: i64) -> i64 = x + OFFSET
 pub fn early(x: i64) -> i64 = { return x; x + 1 }
+pub fn nested_early(handle: raw) -> bool { unsafe { return handle.is_null(); false } }
 pub fn too_many(x: i64) -> i64 = x + 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12
 pub fn identity<T>(value: T) -> T = value
 ";
@@ -2493,6 +2497,9 @@ pub fn identity<T>(value: T) -> T = value
     assert!(matches!(body("tiny"), IFnBody::ConcreteInline { .. }));
     assert!(matches!(body("shared"), IFnBody::ConcreteInline { .. }));
     assert!(matches!(body("returned"), IFnBody::ConcreteInline { .. }));
+    assert!(matches!(body("returned_unsafe"), IFnBody::ConcreteInline { .. }));
+    assert!(matches!(body("returned_nested"), IFnBody::ConcreteInline { .. }));
+    assert!(matches!(body("returned_float"), IFnBody::ConcreteInline { .. }));
     for name in [
         "local_inferred",
         "local_annotated",
@@ -2516,6 +2523,7 @@ pub fn identity<T>(value: T) -> T = value
         "calls_helper",
         "reads_same_unit_const",
         "early",
+        "nested_early",
         "too_many",
     ] {
         assert_eq!(body(name), &IFnBody::Absent, "{name} must remain bodyless");

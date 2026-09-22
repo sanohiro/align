@@ -321,7 +321,11 @@ extern \"C\" link(\"m\") { fn acos(x: f64) -> f64 }
 pub fn cabs(x: i32) -> i64 = unsafe { abs(x) as i64 }
 pub fn mixed_extern_order(x: i64) -> i64 = unsafe { labs(x) + acos(1.0) as i64 }
 pub fn null_is_null() -> bool = unsafe { raw.null().is_null() }
-pub fn handle_absent(handle: raw) -> bool = unsafe { handle.is_null() }
+pub fn handle_absent(handle: raw) -> bool {
+  unsafe {
+    return handle.is_null()
+  }
+}
 ";
     let main = "\
 import native

@@ -4567,8 +4567,7 @@ pub fn concrete_inline_body_externs(
     let mut referenced_externs = std::collections::BTreeSet::new();
     let mut nodes = 1usize;
     let mut returns = 0usize;
-    let root_has_terminal_return = function.body.value.is_none()
-        && matches!(function.body.stmts.last(), Some(hir::Stmt::Return(_)));
+    let root_has_terminal_return = concrete_inline_terminal_return(&function.body);
     for event in hir_depth::body_events(&function.body) {
         match event {
             hir_depth::BodyEvent::StmtEnter(statement) => {
@@ -4604,8 +4603,10 @@ pub fn concrete_inline_body_externs(
                     | hir::Stmt::AssignElemField { .. }
                     | hir::Stmt::AssignElem { .. }
                     | hir::Stmt::Break { .. }
-                    | hir::Stmt::TestAssert { .. }
-                    | hir::Stmt::Expr(_) => return None,
+                    | hir::Stmt::TestAssert { .. } => return None,
+                    hir::Stmt::Expr(expression)
+                        if concrete_inline_terminal_wrapper(expression) => {}
+                    hir::Stmt::Expr(_) => return None,
                 }
             }
             hir_depth::BodyEvent::ExprEnter(expression) => {
@@ -4665,6 +4666,42 @@ pub fn concrete_inline_body_externs(
         return None;
     }
     Some(referenced_externs.into_iter().collect())
+}
+
+/// Whether `block` ends in the one explicit return admitted by Plan 74. Checked HIR represents a
+/// source terminal wrapper such as `unsafe { return value }` as an expression statement, so the
+/// terminal spine must traverse the three already-admitted transparent wrapper kinds. Requiring no
+/// tail value and following only the final statement keeps early returns and ordinary expression
+/// statements excluded.
+fn concrete_inline_terminal_return(block: &hir::Block) -> bool {
+    let mut current = block;
+    loop {
+        let wrapper = if let Some(value) = current.value.as_deref() {
+            value
+        } else {
+            match current.stmts.last() {
+                Some(hir::Stmt::Return(_)) => return true,
+                Some(hir::Stmt::Expr(expression)) => expression,
+                _ => return false,
+            }
+        };
+        let Some(next) = concrete_inline_wrapper_block(wrapper) else {
+            return false;
+        };
+        current = next;
+    }
+}
+
+fn concrete_inline_terminal_wrapper(expression: &hir::Expr) -> bool {
+    concrete_inline_wrapper_block(expression).is_some_and(concrete_inline_terminal_return)
+}
+
+fn concrete_inline_wrapper_block(expression: &hir::Expr) -> Option<&hir::Block> {
+    match &expression.kind {
+        hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) => Some(block),
+        hir::ExprKind::FloatScope { block, .. } => Some(block),
+        _ => None,
+    }
 }
 
 /// The [`Ty`] a **builtin** type spelling denotes, for the builtin heads whose ownership does not

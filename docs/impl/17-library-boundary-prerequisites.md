@@ -30,7 +30,7 @@ template or imported-header rules. The function-body record introduced by
 interface format 15 and retained by current format 16 gives functions an
 explicit `Absent | GenericTemplate | ConcreteInline` discriminator. Only the
 generic arm enters monomorphization or recomputes public facts. A concrete inline
-body carries exact little-endian u32 policy version 2, is rechecked against every
+body carries exact little-endian u32 policy version 3, is rechecked against every
 producer-certified fact, carries only its exact
 canonical C-extern closure, lowers in a consumer with an explicit imported-inline
 origin, and reaches LLVM as `available_externally`; release/fast add

@@ -925,7 +925,7 @@ mod tests {
                     source: String::new(),
                     externs: Vec::new(),
                 },
-                vec![2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                vec![2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             ),
             (
                 IFnBody::ConcreteInline {
@@ -939,7 +939,7 @@ mod tests {
                     }],
                 },
                 vec![
-                    2, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, b'f', 1, 0, 0, 0, 0, 3,
+                    2, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, b'f', 1, 0, 0, 0, 0, 3,
                     0, 0, 0, b'i', b'6', b'4', 0, 0, 0, 0, 0, 3, 0, 0, 0, b'i', b'6', b'4', 0, 0,
                     0, 0,
                 ],
@@ -964,12 +964,16 @@ mod tests {
                 tag: 0xff,
             })
         );
-        assert_eq!(
-            read_fn_body(&mut Reader::new(&[2, 1, 0, 0, 0])),
-            Err(DecodeError::InvalidSummary(
-                "unsupported concrete-inline policy version"
-            ))
-        );
+        for version in [0u32, 1, 2, 4] {
+            let mut bytes = vec![2];
+            bytes.extend_from_slice(&version.to_le_bytes());
+            assert_eq!(
+                read_fn_body(&mut Reader::new(&bytes)),
+                Err(DecodeError::InvalidSummary(
+                    "unsupported concrete-inline policy version"
+                ))
+            );
+        }
 
         let duplicate = IFnBody::ConcreteInline {
             policy_version: crate::INLINE_BODY_POLICY_VERSION,

@@ -22,6 +22,10 @@ existing exact extern closure and fact revalidation. Authenticated consumer
 release/fast definitions use `available_externally alwaysinline`; dev and the
 two size profiles retain their established policies. Consumer repinning and a
 fresh call-site census remain align-llm-owned verification.
+The next consumer census exposed one contract-admitted nested
+`unsafe { return ... }` wrapper that policy version 2 still rejects. Policy
+version 3 owns that terminal-wrapper correction; no source surface, body budget,
+effect authority, profile policy or LLVM representation changes.
 Every remaining item below starts from `main` with a fresh branch and follows
 the CLAUDE.md review flow.
 
