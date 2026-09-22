@@ -1,14 +1,13 @@
 # Interface-carried inline bodies
 
-Status: implemented through policy version 1; policy version 2 is the
-post-adoption implementation candidate for
+Status: implemented through policy version 2; the post-adoption widening and
+speed-profile mandatory-inline policy shipped in PR #1163 for
 [issue 1066](https://github.com/sanohiro/align/issues/1066) and G9 of the
 [vectorization contract](68-vectorization-contract.md). This document is the
 public artifact ledger and implementation closure matrix. The provider
 implementation spans interface format 15, checked-HIR revalidation, MIR origin,
-LLVM `available_externally` linkage and the focused two-unit owner. Evidence baseline: Align
-`2907d5e56b3bdbc4652787376ec268db5507bdc4`, LLVM 22.1.8, and align-llm
-Request 95.
+LLVM `available_externally` linkage and the focused two-unit owner. Evidence
+baseline: Align merge `bc784654`, LLVM 22.1.8, and align-llm Request 95.
 
 The accepted direction is issue 1066 proposal 2. Release builds do not enable
 ThinLTO by default. Instead, a deliberately small non-generic `pub fn` may

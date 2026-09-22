@@ -1,6 +1,6 @@
 # Session handoff
 
-## Next work (handoff updated 2026-09-20)
+## Next work (handoff updated 2026-09-23)
 
 The align-llm audit issue batch is partly shipped. Merged: #1089 (plan 68),
 #1090, #1091, #1092, #1096, #1099, #1100 (plan 69), #1101, #1110, #1111
@@ -15,13 +15,13 @@ align-llm Request 94 confirms inline zero-allocation tables and retains only a
 capable-host decode owner. Plan 74 for #1066 proposal 2 shipped in #1139/#1140.
 Its first consumer measurement found that policy version 1 excludes the named
 `runtime_attention.fused` body because it uses an immutable scalar local and
-short-circuit result. Policy version 2 is the current implementation candidate:
-it admits only immutable primitive-scalar/raw locals and short-circuit boolean
-expressions, increments the canonical format-16 interface policy field, and keeps the
+short-circuit result. Policy version 2 shipped in #1163: it admits only
+immutable primitive-scalar/raw locals and short-circuit boolean expressions,
+increments the canonical format-16 interface policy field, and keeps the
 existing exact extern closure and fact revalidation. Authenticated consumer
-release/fast definitions use `available_externally alwaysinline`: the client proved ordinary
-profitability still leaves 118 calls to the already-admitted three-instruction
-`ggml_ffi.handle_absent` wrapper.
+release/fast definitions use `available_externally alwaysinline`; dev and the
+two size profiles retain their established policies. Consumer repinning and a
+fresh call-site census remain align-llm-owned verification.
 Every remaining item below starts from `main` with a fresh branch and follows
 the CLAUDE.md review flow.
 
