@@ -14,6 +14,27 @@ fn encoded(name: &str) -> String {
     format!("align_fn${}${hex}", name.len())
 }
 
+fn function_has_attr(llvm: &str, symbol: &str, attr: &str) -> bool {
+    let quoted = format!("@\"{symbol}\"");
+    let definition = llvm
+        .lines()
+        .find(|line| line.starts_with("define ") && line.contains(&quoted))
+        .unwrap_or_else(|| panic!("missing definition for {symbol}:\n{llvm}"));
+    if definition.split_whitespace().any(|word| word == attr) {
+        return true;
+    }
+    let Some(group) = definition.split_whitespace().find_map(|word| {
+        let digits = word.strip_prefix('#')?.trim_end_matches(|ch: char| !ch.is_ascii_digit());
+        (!digits.is_empty()).then_some(digits)
+    }) else {
+        return false;
+    };
+    let prefix = format!("attributes #{group} =");
+    llvm.lines()
+        .find(|line| line.starts_with(&prefix))
+        .is_some_and(|line| line.split_whitespace().any(|word| word == attr))
+}
+
 const LIB: &str = "\
 module tiny
 pub fn add7(x: i64) -> i64 = x + 7
@@ -212,19 +233,63 @@ fn consumer_llvm_uses_available_externally_and_runtime_matches_whole_program() {
         llvm.contains("define available_externally i64 @\"align_fn$9$74696e792461646437\""),
         "consumer IR:\n{llvm}"
     );
-    let optimized = emit_llvm_ir(
-        &consumer.mir,
-        BuildTarget::Baseline,
-        align_driver::Profile::Release,
-        true,
-        &[],
-        false,
-    )
-    .expect("optimized consumer LLVM IR");
+    let symbol = encoded("tiny$add7");
+    assert!(!function_has_attr(&llvm, &symbol, "alwaysinline"));
     assert!(
-        !optimized.contains("call i64 @\"align_fn$9$74696e792461646437\""),
-        "the tiny direct call should inline without ThinLTO:\n{optimized}"
+        llvm.contains(&format!("call i64 @\"{symbol}\"")),
+        "dev must retain the unoptimized direct call:\n{llvm}"
     );
+
+    for (profile, always_inline, optsize, minsize) in [
+        (align_driver::Profile::Release, true, false, false),
+        (align_driver::Profile::Fast, true, false, false),
+        (align_driver::Profile::Small, false, true, false),
+        (align_driver::Profile::Tiny, false, true, true),
+    ] {
+        let raw = emit_llvm_ir(
+            &consumer.mir,
+            BuildTarget::Baseline,
+            profile,
+            false,
+            &[],
+            false,
+        )
+        .expect("raw consumer LLVM IR");
+        assert_eq!(
+            function_has_attr(&raw, &symbol, "alwaysinline"),
+            always_inline,
+            "{} profile has wrong alwaysinline policy:\n{raw}",
+            profile.name()
+        );
+        assert_eq!(
+            function_has_attr(&raw, &symbol, "optsize"),
+            optsize,
+            "{} profile has wrong optsize policy:\n{raw}",
+            profile.name()
+        );
+        assert_eq!(
+            function_has_attr(&raw, &symbol, "minsize"),
+            minsize,
+            "{} profile has wrong minsize policy:\n{raw}",
+            profile.name()
+        );
+        if always_inline {
+            let optimized = emit_llvm_ir(
+                &consumer.mir,
+                BuildTarget::Baseline,
+                profile,
+                true,
+                &[],
+                false,
+            )
+            .expect("optimized consumer LLVM IR");
+            assert!(
+                !optimized.contains(&format!("call i64 @\"{symbol}\"")),
+                "{} direct call survived mandatory inlining without ThinLTO:\n{optimized}",
+                profile.name()
+            );
+        }
+    }
 
     let objects = built.emit_objects_with(align_driver::Profile::Dev, false);
     let main_index = built
@@ -234,7 +299,6 @@ fn consumer_llvm_uses_available_externally_and_runtime_matches_whole_program() {
         .position(|unit| unit.unit == "main")
         .expect("main object index");
     if let Some(symbols) = nm_symbols(&objects[main_index]) {
-        let symbol = encoded("tiny$add7");
         let matching = symbols
             .iter()
             .filter(|(_, name)| name.strip_prefix('_').unwrap_or(name) == symbol)

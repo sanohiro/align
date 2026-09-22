@@ -236,7 +236,7 @@ pub unsafe fn run_pgo_pipeline(
 mod tests {
     use super::*;
     use crate::{
-        apply_size_attrs, build_module, create_target_machine, BuildTarget, ModuleScope, Profile,
+        apply_profile_attrs, build_module, create_target_machine, BuildTarget, ModuleScope, Profile,
     };
     use align_diag::Diagnostics;
     use align_lexer::tokenize;
@@ -351,7 +351,7 @@ fn main() -> i32 {\n\
         let tm = create_target_machine(&BuildTarget::Baseline, Profile::Release.codegen_opt_level())
             .unwrap();
         build_module(&ctx, &module, &program, &tm, None, &[], false, ModuleScope::Whole).unwrap();
-        apply_size_attrs(&ctx, &module, Profile::Release);
+        apply_profile_attrs(&ctx, &module, Profile::Release);
         let report = unsafe {
             run_pgo_pipeline(module.as_mut_ptr(), tm.as_mut_ptr(), opt_o2(), PgoAction::Instrument)
         }
@@ -370,7 +370,7 @@ fn main() -> i32 {\n\
         let tm = create_target_machine(&BuildTarget::Baseline, Profile::Release.codegen_opt_level())
             .unwrap();
         build_module(&ctx, &module, &program, &tm, None, &[], false, ModuleScope::Whole).unwrap();
-        apply_size_attrs(&ctx, &module, Profile::Release);
+        apply_profile_attrs(&ctx, &module, Profile::Release);
 
         let report = unsafe {
             run_pgo_pipeline(module.as_mut_ptr(), tm.as_mut_ptr(), opt_o2(), PgoAction::Instrument)
@@ -403,7 +403,7 @@ fn main() -> i32 {\n\
         let tm = create_target_machine(&BuildTarget::Baseline, Profile::Release.codegen_opt_level())
             .unwrap();
         build_module(&ctx, &module, &program, &tm, None, &[], false, ModuleScope::Whole).unwrap();
-        apply_size_attrs(&ctx, &module, Profile::Release);
+        apply_profile_attrs(&ctx, &module, Profile::Release);
         module.run_passes("default<O2>", &tm, PassBuilderOptions::create()).unwrap();
         let ir = module.print_to_string().to_string();
         assert!(!ir.contains("__profc_"), "control IR unexpectedly has __profc_ counters");
@@ -514,7 +514,7 @@ fn main() -> i32 {\n\
         let tm = create_target_machine(&BuildTarget::Baseline, Profile::Release.codegen_opt_level())
             .unwrap();
         build_module(&ctx, &module, &program, &tm, None, &[], false, ModuleScope::Whole).unwrap();
-        apply_size_attrs(&ctx, &module, Profile::Release);
+        apply_profile_attrs(&ctx, &module, Profile::Release);
         let report = unsafe {
             run_pgo_pipeline(module.as_mut_ptr(), tm.as_mut_ptr(), opt_o2(), PgoAction::Use(&profdata))
         }

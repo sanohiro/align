@@ -557,8 +557,8 @@ fn build_program_module<'c>(
         // declares re-curated, no merge) — see its doc comment; nothing left to do here either way.
         link_in_rt_lto(ctx, &module, rt, &runtime)?;
     }
-    // The raw IR lens and object path observe the same pre-optimization size attributes.
-    apply_size_attrs(ctx, &module, profile);
+    // The raw IR lens and object path observe the same pre-optimization profile attributes.
+    apply_profile_attrs(ctx, &module, profile);
     Ok((module, tm))
 }
 
@@ -1008,7 +1008,7 @@ pub fn emit_test_harness_object(
             "generated test harness failed LLVM verification: {error}"
         ))
     })?;
-    apply_size_attrs(&ctx, &module, profile);
+    apply_profile_attrs(&ctx, &module, profile);
     write_object(&module, out, &tm, profile.pipeline())
 }
 
@@ -1735,7 +1735,7 @@ pub fn collect_opt_inspection(
         ModuleScope::Whole,
     );
     let ran = built.and_then(|_| {
-        apply_size_attrs(&ctx, &module, profile);
+        apply_profile_attrs(&ctx, &module, profile);
         run_opt_pipeline(&module, &tm, profile.pipeline())
     });
 
@@ -9265,26 +9265,36 @@ fn link_in_rt_lto<'c>(
         .map_err(|e| CodegenError::Target(format!("--rt-lto: merged module failed verification: {e}")))
 }
 
-/// Apply the size-optimization function attributes for the build `profile` to every Align-generated
-/// *definition* in the module. `small` gets `optsize`; `tiny` gets `optsize` + `minsize` (`minsize`
-/// implies `optsize`, but clang `-Oz` emits both explicitly, so we do too). All other profiles are a
-/// no-op — the speed profiles carry no size attrs.
+/// Apply function attributes selected by the build `profile` to Align-generated definitions.
+/// `small` gets `optsize`; `tiny` gets `optsize` + `minsize` (`minsize` implies `optsize`, but clang
+/// `-Oz` emits both explicitly, so we do too). Release and fast mark only authenticated imported
+/// inline bodies — represented by `available_externally` definitions — `alwaysinline`. Dev and the
+/// size profiles leave those bodies to their established optimization policy.
 ///
 /// Filters to definitions (`count_basic_blocks() > 0`), so it never touches a native declaration.
 /// Called on the object path (after `build_module`, before the opt pipeline);
-/// Raw IR and LLVM remarks use the same selected size attributes.
-fn apply_size_attrs<'c>(ctx: &'c Context, module: &Module<'c>, profile: Profile) {
-    let names: &[&str] = match profile {
+/// Raw IR and LLVM remarks use the same selected profile attributes.
+fn apply_profile_attrs<'c>(ctx: &'c Context, module: &Module<'c>, profile: Profile) {
+    let size_names: &[&str] = match profile {
         Profile::Small => &["optsize"],
         Profile::Tiny => &["optsize", "minsize"],
-        _ => return,
+        _ => &[],
     };
+    let mandatory_import_inline = matches!(profile, Profile::Release | Profile::Fast);
     for f in module.get_functions() {
         if f.count_basic_blocks() == 0 {
-            continue; // a declaration (`align_rt_*`, an extern) — never a size-attr target
+            continue; // a declaration (`align_rt_*`, an extern) — never a profile-attr target
         }
-        for &name in names {
+        for &name in size_names {
             add_enum_attr(ctx, f, inkwell::attributes::AttributeLoc::Function, name);
+        }
+        if mandatory_import_inline && f.get_linkage() == Linkage::AvailableExternally {
+            add_enum_attr(
+                ctx,
+                f,
+                inkwell::attributes::AttributeLoc::Function,
+                "alwaysinline",
+            );
         }
     }
 }
@@ -29204,10 +29214,10 @@ fn main() -> i32 = 0
         assert_eq!(Profile::Tiny.codegen_opt_level(), OptimizationLevel::Default);
     }
 
-    /// Build a module for `profile`, run the size-attr sweep, and report `(name, is_decl, optsize,
-    /// minsize)` for every function — enough to pin the sweep exactly (definitions vs declarations,
-    /// optsize vs minsize).
-    fn size_attr_probe(src: &str, profile: Profile) -> Vec<(String, bool, bool, bool)> {
+    /// Build a whole-program module for `profile`, run the profile-attr sweep, and report
+    /// `(name, is_decl, optsize, minsize, alwaysinline)` for every function. Whole-program
+    /// definitions are a negative control for the imported-body-only inline authority.
+    fn profile_attr_probe(src: &str, profile: Profile) -> Vec<(String, bool, bool, bool, bool)> {
         let mut d = Diagnostics::new();
         let toks = tokenize(0, src, &mut d);
         let f = parse_file(toks, &mut d);
@@ -29219,10 +29229,11 @@ fn main() -> i32 = 0
         let module = ctx.create_module("align");
         let tm = create_target_machine(&BuildTarget::Baseline, OptimizationLevel::Default).unwrap();
         build_module(&ctx, &module, &program, &tm, None, &[], false, ModuleScope::Whole).unwrap();
-        apply_size_attrs(&ctx, &module, profile);
+        apply_profile_attrs(&ctx, &module, profile);
 
         let optsize = inkwell::attributes::Attribute::get_named_enum_kind_id("optsize");
         let minsize = inkwell::attributes::Attribute::get_named_enum_kind_id("minsize");
+        let alwaysinline = inkwell::attributes::Attribute::get_named_enum_kind_id("alwaysinline");
         let loc = inkwell::attributes::AttributeLoc::Function;
         module
             .get_functions()
@@ -29231,7 +29242,8 @@ fn main() -> i32 = 0
                 let is_decl = f.count_basic_blocks() == 0;
                 let has_optsize = f.get_enum_attribute(loc, optsize).is_some();
                 let has_minsize = f.get_enum_attribute(loc, minsize).is_some();
-                (name, is_decl, has_optsize, has_minsize)
+                let has_alwaysinline = f.get_enum_attribute(loc, alwaysinline).is_some();
+                (name, is_decl, has_optsize, has_minsize, has_alwaysinline)
             })
             .collect()
     }
@@ -29244,10 +29256,11 @@ fn main() -> i32 = 0
                    fn main() -> i32 {\n  print(helper(41))\n  return 0\n}\n";
 
         // Tiny: every definition carries BOTH optsize and minsize; every declaration stays bare.
-        let tiny = size_attr_probe(src, Profile::Tiny);
+        let tiny = profile_attr_probe(src, Profile::Tiny);
         let mut saw_def = false;
         let mut saw_rt_decl = false;
-        for (name, is_decl, optsize, minsize) in &tiny {
+        for (name, is_decl, optsize, minsize, alwaysinline) in &tiny {
+            assert!(!alwaysinline, "tiny: {name} must not gain alwaysinline");
             if *is_decl {
                 if name.starts_with("align_rt_") {
                     saw_rt_decl = true;
@@ -29262,7 +29275,10 @@ fn main() -> i32 = 0
         assert!(saw_rt_decl, "test needs at least one align_rt_ declaration to be meaningful");
 
         // Small: definitions get optsize only, never minsize; declarations stay bare.
-        for (name, is_decl, optsize, minsize) in size_attr_probe(src, Profile::Small) {
+        for (name, is_decl, optsize, minsize, alwaysinline) in
+            profile_attr_probe(src, Profile::Small)
+        {
+            assert!(!alwaysinline, "small: {name} must not gain alwaysinline");
             if is_decl {
                 assert!(!optsize && !minsize, "small: declaration {name} must stay attr-free");
             } else {
@@ -29270,10 +29286,18 @@ fn main() -> i32 = 0
             }
         }
 
-        // The speed profiles are a no-op sweep — nothing gains a size attr anywhere.
+        // No speed profile adds size attrs, and ordinary whole-program definitions never gain the
+        // imported-body inline authority.
         for profile in [Profile::Dev, Profile::Release, Profile::Fast] {
-            for (name, _is_decl, optsize, minsize) in size_attr_probe(src, profile) {
+            for (name, _is_decl, optsize, minsize, alwaysinline) in
+                profile_attr_probe(src, profile)
+            {
                 assert!(!optsize && !minsize, "{}: {name} must have no size attrs", profile.name());
+                assert!(
+                    !alwaysinline,
+                    "{}: ordinary definition {name} must not gain alwaysinline",
+                    profile.name()
+                );
             }
         }
     }
