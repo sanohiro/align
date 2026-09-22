@@ -281,6 +281,7 @@ restriction later cannot silently invalidate it.
 | Conditionally initialized view | no preheader materialization (I1) | new `loop_facts` owner |
 | `map_into` scoped metadata | unchanged domain, unchanged nodes, now coexisting with TBAA | `map_into::map_into_emits_scoped_noalias_metadata`, `map_into_fixed_source_omits_load_metadata` |
 | Length fact coverage | `!range` on the borrowed header field load and on a fixed-array constant length (a no-op there); asserted absent on the by-value `extractvalue` path, where no IR mechanism exists | new `loop_facts` owner, positive and negative; `fixed_array_len` |
+| Inline byte read in a borrowed-view loop | `BytesRead` is a non-retaining element load and therefore keeps the whole-body header proof alive; the borrowed length is still materialized once with `!range`. Byte writes and every unaudited byte operation continue to fail closed | `g1_len_range_survives_inline_byte_reads`, the exact `all_zero` client shape |
 | Trap parity | `align_rt_bounds_fail` and `align_rt_range_fail` text byte-identical | `runway_a2_binary_codec::read_past_end_aborts`, `negative_offset_aborts`, `out_params::out_write_out_of_bounds_aborts` |
 
 ### 2.5 Acceptance corpus and the architecture gate
@@ -399,6 +400,15 @@ one whole-body gate         I2, I3 and I5 are decided together by one
                             makes "the fail-closed default is no caching" true
                             by construction, and it is one predicate for the
                             cache, the TBAA pair and `noalias` alike
+inline byte reads           the shipped whitelist initially omitted
+                            `Rvalue::BytesRead`, even though its lowering only
+                            extracts the view's data pointer and performs an
+                            element load. That false negative disabled the
+                            whole gate in the canonical `all_zero` scan and
+                            removed the promised `!range` fact. `BytesRead` is
+                            admitted as a non-retaining read; write forms and
+                            every other unaudited byte operation remain
+                            rejected by the wildcard
 owner names                 `g1_noalias_absent_on_mutable_and_imported_headers`
                             ships as two owners: the mutable half is
                             `g1_noalias_absent_on_mutable_headers` in

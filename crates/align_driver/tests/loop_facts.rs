@@ -358,6 +358,49 @@ fn g1_len_range_on_borrowed_and_fixed_lengths() {
     );
 }
 
+/// The real issue-1080 residual: an inline binary element read is still only a read. It must not
+/// make the whole-body proof discard the borrowed header materialization and its length fact.
+#[test]
+fn g1_len_range_survives_inline_byte_reads() {
+    let source = "\
+fn all_zero(borrow view: slice<u8>) -> bool {
+  mut at := 0
+  loop {
+    if at >= view.len() { break }
+    if view.u8(at) as i64 != 0 { return false }
+    at = at + 1
+  }
+  return true
+}
+";
+    let ir = emit_llvm_with_exports(source, &["all_zero"]);
+    let body = function_ir(&ir, "all_zero");
+    let length = body
+        .lines()
+        .find(|line| line.contains("load i64, ptr %view.len"))
+        .unwrap_or_else(|| panic!("the borrowed length was not materialized in the entry block:\n{body}"));
+    assert!(
+        length.contains("!range !"),
+        "the inline byte read must preserve the borrowed length fact:\n{length}"
+    );
+    assert_eq!(
+        body.matches("load i64, ptr %view.len").count(),
+        1,
+        "the borrowed length is materialized exactly once:\n{body}"
+    );
+    assert!(
+        body.contains("%rawbits = load i8"),
+        "the fixture must exercise the inline byte-read lowering:\n{body}"
+    );
+
+    let optimized = emit_llvm_optimized(source, &["all_zero"]);
+    let optimized_body = function_ir(&optimized, "all_zero");
+    assert!(
+        !optimized_body.contains("llvm.smax.i64"),
+        "the named client loop must not rebuild a non-negative length clamp:\n{optimized_body}"
+    );
+}
+
 /// The non-negativity claim is about a *length*, not about the `{ptr,i64}` layout. Several types
 /// share that layout and give the second field another meaning entirely: a `json.doc` is
 /// `{tape, node}`, and its node index is `-1` for Missing. Claiming `!range !{i64 0, i64 …}` there
