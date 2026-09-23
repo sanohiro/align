@@ -177,6 +177,25 @@ fn bare_literal_in_value_position_is_rejected() {
         "fn pick(x: Option<i64>) {\n  xs := match x {\n    Some(_) => [1, 2]\n    None => [3, 4]\n  }\n  print(xs[0])\n}\nfn main() {}\n",
     );
     assert!(match_value.contains("bare array literal cannot be used as a `match` arm value"), "expected a match-arm value diagnostic:\n{match_value}");
+
+    for (name, src, context) in [
+        (
+            "bare-array-expression-function",
+            "fn zero() -> [i64; 1] = [0]\nfn main() -> i32 = 0\n",
+            "a function value",
+        ),
+        (
+            "bare-array-return",
+            "fn zero() -> [i64; 1] { return [0] }\nfn main() -> i32 = 0\n",
+            "a `return` value",
+        ),
+    ] {
+        let diagnostics = check_diagnostics(name, src);
+        assert!(
+            diagnostics.contains(&format!("bare array literal cannot be used as {context}")),
+            "expected a source diagnostic for {name}:\n{diagnostics}",
+        );
+    }
 }
 
 #[test]
