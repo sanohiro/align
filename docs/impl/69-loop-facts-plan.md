@@ -804,7 +804,7 @@ named where it already discriminates the defect; a new owner is named `planned`.
 | Access kind | single index | `emit_bounds_check`'s guard | planned |
 | | range `xs[i..i+k]` | `emit_range_bounds_check`'s guard; `start > end` and `end > len` both proved, including the loop-invariant overflow test 1081 §3 measures as un-hoisted | planned (`window_first`) |
 | | `vecN` load/store | `emit_vec_bounds_check` delegates, so it inherits both fusion and movement | `vec_simd`, planned |
-| | byte accessors | multi-byte reads and every write keep the signed guards that `byte_ranges` re-derives. A width-one read has the ordinary range shape `i..i+1`; it uses the fused range guard so `loop_facts` owns its versioning, trap-preserving slow copy and extent exactly as it does for a source slice range. `byte_ranges` also recognizes that exact width-one fused form, preserving its broader Ge-exit and Lt-admission capability outside the narrower `loop_facts` shape | `runway_a2_binary_codec`, `bytes_ops`, `g3_width_one_byte_accessor_reaches_counted_loop` |
+| | byte accessors | every byte accessor keeps the signed guard that `byte_ranges` re-derives. At the first simplification site, a proved width-one read is deliberately retained until `loop_facts` has had the opportunity to authenticate it; the ordinary second simplification site removes any still-proved guard. `loop_facts` accepts only an exactly associated signed width-one read, and owns its versioning, trap-preserving slow copy and extent | `runway_a2_binary_codec`, `bytes_ops`, `g3_width_one_byte_accessor_reaches_counted_loop` |
 | View shape | zero-length view | admission fails for any access, so the loop is versioned into a slow loop that traps identically, or runs zero times and traps not at all | `runway_a2_binary_codec::read_past_end_aborts`, planned |
 | | negative index | impossible after fusion only in the sense that it still fails the unsigned compare; the trap text still reports the original signed index | `runway_a2_binary_codec::negative_offset_aborts` |
 | | length-1 view | one-trip admission; the fast loop's single iteration is identical | planned |
@@ -822,8 +822,8 @@ named where it already discriminates the defect; a new owner is named `planned`.
 | | ThinLTO | a partition body is rewritten by the same pass and re-validated by `validate_thin_partition_program`; import decisions are unchanged because no linkage or signature changes | `thin_lto`, `function_thin_lto`, `partition` |
 | | generic monomorphization | each instantiation is rewritten independently after monomorphization; an instantiation whose element type changes the admission is not forced to agree with its siblings | `generics`, planned |
 | | interface serialization | nothing serialized changes; the interface hash of a unit whose bodies are rewritten is byte-identical | `per_unit_surface`, and `cache_codegen`'s `interface_hash` / `dep_interface_hashes` gates |
-| Composition | `byte_ranges::simplify`, first site | runs before `loop_facts` in `lower_program_checked_with_catalog` and is unchanged; `loop_facts` derives from the simplified function and never consumes `byte_ranges`' facts, so a rolled-back byte-range proof cannot leave `loop_facts` holding a stale one | `runway_a2_binary_codec::byte_range_recurrence_preserves_tails_and_eliminates_only_proved_guards`, `paired_byte_ranges_keep_unproved_guards`, `composed_byte_effects_and_reaching_definitions_fail_closed` |
-| | `byte_prepare::prepare`, the second site | runs in codegen **after** `loop_facts`, on versioned bodies: it splices leaf bodies into callers and re-runs `byte_ranges::simplify` and `snapshot_descriptors` on the result. `loop_facts` touches only element/range/vec guards and never a byte-accessor guard, so plan 64's rule that the original failure block is retained for every unproved byte edge is evaluated on guards `loop_facts` did not modify; a spliced fast copy keeps `structurally_valid` true, pinned by an owner | `runway_a2_binary_codec::composed_reader_per_unit_and_thin_cache_bind_private_body_edits`, planned owner splicing a leaf whose loop is versioned |
+| Composition | `byte_ranges::simplify_before_loop_facts`, first site | runs before `loop_facts` in `lower_program_checked_with_catalog` with the same proof and rollback machinery as ordinary `simplify`, but defers the branch rewrite for a proved width-one read. No proof record is handed across: the retained signed guard remains the exact proof source `loop_facts` authenticates. Wider proved reads are removed as today, and every unproved guard remains | `runway_a2_binary_codec::byte_range_recurrence_preserves_tails_and_eliminates_only_proved_guards`, `paired_byte_ranges_keep_unproved_guards`, `composed_byte_effects_and_reaching_definitions_fail_closed`, planned width-one deferral owner |
+| | `byte_prepare::prepare`, the second site | runs in codegen **after** `loop_facts`, on versioned bodies: it splices leaf bodies into callers and runs ordinary `byte_ranges::simplify` plus `snapshot_descriptors`. Thus a loop `loop_facts` refuses and every slow copy recover the exact shipped width-one elimination result before LLVM lowering, while a fast copy already bypasses its authenticated guard. Every unproved slow edge and trap block remains; a spliced fast copy stays `structurally_valid` | `runway_a2_binary_codec::composed_reader_per_unit_and_thin_cache_bind_private_body_edits`, planned overlap owner spanning admitted, refused and outside-loop width-one reads |
 | | `byte_prepare`'s statement budget | its 2048/32 admission counts the post-`loop_facts` body; a leaf that straddles the budget is inlined without versioning and not inlined with it, deterministically (§3.2.2) | planned straddle owner; `composed_leaf_exposure_covers_generics_returns_and_has_bounded_growth` |
 | | `annotate_par_map_work` (I8) | runs in `lower_program_unchecked_with_plans`, before `loop_facts`, so the work weight — and with it the `ParMapReduce` partition and float reduction order — is byte-identical with and without versioning; a kernel is versioned only under the same admission as any loop | planned owner asserting equal annotated weights; `par_map`, `vectorize_shapes::k6_float_sum_does_not_vectorize_without_fast_math` |
 | IR identity | `Stmt::BorrowedElementReservation` in the body | not admitted: the token is function-unique and `unique_reservation` requires exactly one occurrence; the `total`/`inspect` witness (a `borrow` record element passed to a call) compiles, runs and keeps its guard | planned owner `total` (builds and runs); `cache_codegen::borrowed_element_graph_edit_invalidates_exact_dependents_and_reverts` |
@@ -1080,30 +1080,35 @@ restored. Its element load is `Rvalue::BytesRead` from `view.u8(i)`. Section
 make an unauthenticated read clonable without proving that the removed guard
 owns that exact access.
 
-The residual is one capability boundary with three coordinated parts:
+The residual is one capability boundary with three coordinated parts. Lowering
+does **not** change the guard spelling:
 
 ```text
-producer      `lower_bytes_read` emits the ordinary fused range guard only for
-              a one-byte scalar. The trap remains `RangeFail(start, end, len)`,
-              with `end = start + 1`. Wider reads and every byte write keep the
-              signed predicate that `byte_ranges` re-derives literally.
+preservation  the first byte-range site uses
+              `byte_ranges::simplify_before_loop_facts`. It runs the ordinary
+              proof but defers the branch rewrite for every proved width-one
+              read. The signed guard itself, not an auxiliary fact record,
+              survives as the exact evidence for the next pass. Wider reads
+              retain ordinary Plan 64 behavior.
 consumer      `loop_facts` gives `BytesRead` a distinct guarded-read classifier,
               not the general `Pure` class. Each occurrence is admitted only
-              when a recognized fused range guard has the same view, start,
-              `start + 1` end and length, and the guard's success block
+              when a recognized signed range guard has the same view, start,
+              `start + 1` end and length, an independently checked scalar width
+              of one, and the guard's success block
               dominates the read. The mutable classifier lists and remaps both
               operands. A read in the rotated header, a wider read, or any read
               without that exact dominating guard remains refused.
-compatibility `byte_ranges` recognizes the same exact fused unsigned predicate
-              as an alternative only when the access width is one. Its existing
-              signed recognition remains authoritative for every width and for
-              writes, while width-one Ge-exit and Lt-admission loops outside the
-              `loop_facts` shape retain their shipped check-elimination result.
-boundary      No part is useful alone: the producer alone changes which
-              pass may own the guard but still reaches `unmodelled-statement`;
-              the consumer alone has no fused proof to authenticate. They ship
-              with the compatibility consumer in PR 3 without changing syntax,
-              ABI, interfaces or the cache key shape.
+restoration   codegen's existing `byte_prepare::prepare` site runs ordinary
+              `byte_ranges::simplify` after `loop_facts`. A refused or
+              outside-loop width-one read therefore recovers the exact shipped
+              Ge-exit/Lt-admission elimination result before LLVM lowering. An
+              admitted fast copy already bypasses its proved guard; its slow
+              copy retains the original trap unless ordinary Plan 64 can prove
+              that copy safe too.
+boundary      The preservation mode, authenticated consumer and restoration
+              site ship together. No serialized proof or new MIR variant spans
+              the passes, and syntax, ABI, interfaces and cache-key shape stay
+              unchanged.
 ```
 
 This is a safety-strategy extension, so the following matrix is authoritative
@@ -1112,11 +1117,13 @@ new owner is named `planned`.
 
 | Axis | Cell | Required behavior | Owner |
 | --- | --- | --- | --- |
-| Formation | `u8`/`i8` read | width is exactly one; lowering emits the same fused unsigned range predicate as `emit_range_bounds_check` | planned MIR-shape owner over both signednesses |
+| Formation | `u8`/`i8` read | lowering is unchanged: the guard remains the signed `RangeFail(start, start + 1, len)` predicate that `byte_ranges` re-derives | `g2_byte_accessor_guard_keeps_its_signed_form`, planned owner over both signednesses |
 | | wider byte read | widths 2/4/8 retain the signed predicate and remain `byte_ranges` territory | `runway_a2_binary_codec`, planned negative MIR owner |
 | | every byte write | retains the signed predicate and its existing invalidation semantics | `bytes_ops`, `runway_a2_binary_codec` |
-| Compatibility | width-one `byte_ranges` recurrence | the exact fused predicate is accepted only for width one, and both Plan 64 Ge-exit and Lt-admission forms still eliminate their proved guards outside a G2/G3 loop | `runway_a2_binary_codec`, planned width-one variants |
-| | false fused lookalike | wrong width, cast source, start/end/length, fail key, dominance or access association is rejected; the original guard remains | planned parameterized malformed-MIR owner |
+| Pass order | proved width-one guard at site 1 | the proof is computed but its branch rewrite is deferred; statements, exceptional edge, trap block and IDs remain byte-identical for `loop_facts` | planned site-1 deferral owner |
+| | proved wider guard at site 1 | ordinary Plan 64 elimination remains immediate | `runway_a2_binary_codec`, planned mixed-width owner |
+| | width-one refused/outside G2 at site 2 | ordinary `simplify` eliminates exactly the guards it eliminated before this change, before every LLVM lowering scope | planned Ge-exit/Lt-admission whole-program, per-unit and partition owners |
+| | overlap with admitted G2/G3 | site 1 retains the proof source, `loop_facts` authenticates and versions, and site 2 simplifies each copy independently; no pass consumes evidence before its downstream user | planned overlap owner |
 | Construction | range operands | `start` is the read offset, `end` is exactly the SSA value `start + 1`, and `len` is `SliceLen` of the exact read view | planned positive and operand-mismatch negatives |
 | | failure edge | the original `RangeFail(start, end, len)` block and `Unreachable` terminator are unchanged; the slow copy retains them | planned MIR owner, existing range trap owners |
 | Authentication | control | the recognized guard's success block dominates the read block; a guard after the read or on only one incoming arm does not authenticate it | planned dominance negatives |
@@ -1132,25 +1139,29 @@ new owner is named `planned`.
 | Validation | malformed producer | mismatched view, offset, end, length, scalar width, fail key or non-`Unreachable` failure remains refused before rewriting | planned parameterized malformed-MIR owner |
 | | validation order | ordinary HIR/MIR validation still runs before `loop_facts`; the pass adds no recovery path and performs no side effect before refusal | `analysis_coverage`, planned malformed-MIR owner |
 | Trap parity | invalid range | negative, overflowing and past-end offsets retain exact range text, arguments, precedence and the effect prefix before the failing iteration | `runway_a2_binary_codec::negative_offset_aborts`, `read_past_end_aborts`, planned width-one executable owners |
-| Compilation model | whole-program, per-unit and function partition | the producer and both consumers run in the existing common paths; no interface record, hash component or serialized body contract changes | `emit_llvm_stage`, `per_unit`, `function_thin_lto`, planned exact-client owner |
-| | `byte_prepare` | its later splice and `byte_ranges` rerun see wider reads and writes unchanged and recognize the exact width-one fused form; an authenticated width-one read already versioned by `loop_facts` keeps its slow guard intact | `composed_reader_per_unit_and_thin_cache_bind_private_body_edits`, planned composition owner |
+| Compilation model | whole-program, per-unit and function partition | `build_module` invokes `byte_prepare::prepare` for every defined function in each scope, and that preparation selects every function containing `BytesRead`; therefore every deferred read reaches restoration before LLVM lowering. No interface record, hash component or serialized body contract changes | `emit_llvm_stage`, `per_unit`, `function_thin_lto`, planned exact-client owner |
+| | `byte_prepare` | its splice precedes ordinary site-2 simplification. Wider reads and writes are unchanged, refused/outside-loop width-one proofs are restored, and an authenticated fast copy already bypasses its guard | `composed_reader_per_unit_and_thin_cache_bind_private_body_edits`, planned composition owner |
 | Acceptance | exact client | `kv_plane.all_zero` keeps one borrowed length load with `!range`, has no retained `smax`, reaches a counted/vector body on x86-64-v2 and AArch64, and preserves executable results | planned `g3_width_one_byte_accessor_reaches_counted_loop`; exact client IR measurement |
 | | negative controls | width 2/4/8, writes, unauthenticated reads and operand/control mismatches keep their guards and report a stable refusal | planned parameterized owner |
 
-The author-side matrix-to-prose pass treats the guard as the proof owner in
-every cell: the read-only classification permits inventory and cloning, but
-never substitutes for exact guard authentication. The `byte_ranges` extension
-preserves a shipped capability; it does not publish a fact to `loop_facts` or
-broaden any non-width-one guard. Because the producer and two consumers form
-one dormant chain, splitting them would add an intermediate state with either
-no usable G3 consumer or a width-one regression and would duplicate the proof.
+The author-side matrix-to-prose pass treats the retained guard as the proof
+owner in every cell: the guarded-read classification permits inventory and
+cloning, but never substitutes for exact guard authentication. Site 1 exports
+no fact, site 2 consumes no `loop_facts` fact, and malformed or unproved guards
+are never rewritten. Because preservation, authentication and restoration form
+one ordered chain, splitting them would leave either no G3 consumer or a
+width-one regression and would duplicate the proof.
 
 **Independent residual-matrix review, 2026-09-23: one P2.** The first draft
 redirected every width-one read to the fused form without preserving Plan 64's
 broader `byte_ranges` admission outside a G2/G3 loop. The compatibility part
-and its two matrix rows above close the complete finding class: the fused form
-is an additional exact width-one input to `byte_ranges`, not a replacement for
-its signed form and not a general unsigned-guard admission.
+in the second draft made `byte_ranges` understand a fused width-one guard, but
+the second review found the overlap defect: site 1 could consume that guard
+before `loop_facts` authenticated it. That repeated pass-order/safety class
+reopened the matrix. The final strategy changes no producer spelling and makes
+the pass order explicit: retain proved width-one guards at site 1, authenticate
+them in `loop_facts`, then restore ordinary simplification at site 2. The
+overlap and all compilation scopes now have named owners above.
 
 ## 4. PR 3 — the trip-count exit at the latch (1084)
 
