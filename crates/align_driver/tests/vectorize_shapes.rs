@@ -688,6 +688,18 @@ fn first_nonzero(borrow xs: slice<u8>) -> i64 {
 }
 ";
 
+const COUNTED_BYTE_ALL_ZERO: &str = "\
+fn all_zero(borrow view: slice<u8>) -> bool {
+  mut at := 0
+  loop {
+    if at >= view.len() { break }
+    if view.u8(at) as i64 != 0 { return false }
+    at = at + 1
+  }
+  return true
+}
+";
+
 fn counted_remarks(name: &str, target: BuildTarget) -> Vec<String> {
     let mut sm = SourceMap::new();
     let checked = check(&mut sm, name, COUNTED_FIRST_NONZERO);
@@ -759,4 +771,28 @@ fn g3_counted_latch_exit_aarch64() {
         }),
         "rotation and the extent close both measured blockers: {remarks:#?}"
     );
+}
+
+/// The exact issue-1084 client spelling uses `BytesRead`, not `SliceIndex`. Both architecture
+/// baselines must consume the authenticated width-one guard and reach the same 128-bit early-exit
+/// vector loop as the ordinary-index control above.
+#[test]
+fn g3_width_one_byte_accessor_reaches_counted_loop() {
+    if x86_backend() {
+        let ir = opt_ir_rooted(
+            "g3-byte-all-zero-v2",
+            COUNTED_BYTE_ALL_ZERO,
+            V2,
+            &["all_zero"],
+        );
+        assert!(ir.contains("vector.body"), "want an early-exit vector body:\n{ir}");
+        assert!(ir.contains("<16 x i8>"), "want one 128-bit byte vector at v2:\n{ir}");
+    } else if aarch64_backend() {
+        let ir = emit_llvm_optimized(COUNTED_BYTE_ALL_ZERO, &["all_zero"]);
+        assert!(ir.contains("vector.body"), "want an early-exit vector body:\n{ir}");
+        assert!(
+            ir.contains("<16 x i8>"),
+            "want one 128-bit byte vector at the aarch64 baseline:\n{ir}"
+        );
+    }
 }

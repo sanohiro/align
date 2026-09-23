@@ -3562,13 +3562,14 @@ fn lower_program_checked_with_catalog(
     }
     let mut loop_decisions: Vec<loop_facts::FunctionDecisions> = Vec::new();
     for function in &mut mir.fns {
-        byte_ranges::simplify(function);
+        let eliminated_byte_guards = byte_ranges::simplify(function);
         // Plan 69 §3.1(b): registered immediately after the byte-range proof, in the same loop and
         // the same fail-closed shape. `loop_facts` derives from the simplified function and never
         // consumes `byte_ranges`' facts, so a rolled-back byte-range proof cannot leave it holding
         // a stale one. It runs after `annotate_par_map_work` (invariant I8), which
         // `lower_program_unchecked_with_plans` already completed above.
-        let (decisions, counted) = loop_facts::version_loops(function);
+        let (decisions, counted) =
+            loop_facts::version_loops(function, &eliminated_byte_guards);
         if !decisions.is_empty() {
             loop_decisions.push(loop_facts::FunctionDecisions {
                 function: function.name.to_string(),

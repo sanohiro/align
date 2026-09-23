@@ -360,9 +360,7 @@ fn g1_len_range_on_borrowed_and_fixed_lengths() {
 
 /// The real issue-1080 residual: an inline binary element read is still only a read. It must not
 /// make the whole-body proof discard the borrowed header materialization and its length fact.
-#[test]
-fn g1_len_range_survives_inline_byte_reads() {
-    let source = "\
+const BYTE_ALL_ZERO: &str = "\
 fn all_zero(borrow view: slice<u8>) -> bool {
   mut at := 0
   loop {
@@ -373,6 +371,10 @@ fn all_zero(borrow view: slice<u8>) -> bool {
   return true
 }
 ";
+
+#[test]
+fn g1_len_range_survives_inline_byte_reads() {
+    let source = BYTE_ALL_ZERO;
     let ir = emit_llvm_with_exports(source, &["all_zero"]);
     let body = function_ir(&ir, "all_zero");
     let length = body
@@ -1523,6 +1525,106 @@ fn first_nonzero(borrow xs: slice<u8>) -> i64 {
   }
 }
 ";
+
+const BYTE_PROVED_ANY: &str = "\
+fn any_nonzero(view: slice<u8>) -> bool {
+  mut at := 0
+  loop {
+    if at >= view.len() / 1 { break }
+    if view.u8(at * 1) != 0 { return true }
+    at = at + 1
+  }
+  return false
+}
+";
+
+/// Issue 1084's exact client spelling: the signed width-one byte guard is authenticated rather
+/// than treated as a generic pure read. It reaches the same counted fact and one-shot view extent
+/// as an ordinary slice index, while the slow copy retains the original range trap.
+#[test]
+fn g3_width_one_byte_accessor_reaches_counted_loop() {
+    let report = loop_facts_report("g3-byte-all-zero-report", BYTE_ALL_ZERO);
+    assert!(
+        decision(&report, "all_zero").starts_with("versioned "),
+        "the exact byte-accessor loop is versioned: {report:#?}"
+    );
+
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "g3-byte-all-zero", BYTE_ALL_ZERO);
+    assert!(
+        !checked.diags.has_errors(),
+        "unexpected errors:\n{}",
+        align_driver::format_diagnostics(&sm, &checked.diags)
+    );
+    let program = lower_to_mir(&checked.hir);
+    let function = program
+        .loop_facts
+        .iter()
+        .find(|facts| facts.function == "all_zero")
+        .expect("the byte scan has loop facts");
+    assert_eq!(function.counted.len(), 1, "one counted byte scan");
+    assert_eq!(function.counted[0].extents.len(), 1, "the exact byte view supplies one extent");
+
+    let body = mir_fn(&mir_text("g3-byte-all-zero-mir", BYTE_ALL_ZERO), "all_zero");
+    assert_eq!(
+        body.matches("call runtime range_fail").count(),
+        1,
+        "the fast copy bypasses the byte guard and the slow copy retains one trap:\n{body}"
+    );
+    let ir = emit_llvm_with_exports(BYTE_ALL_ZERO, &["all_zero"]);
+    let body = function_ir(&ir, "all_zero");
+    assert_eq!(
+        body.matches("\"dereferenceable\"").count(),
+        1,
+        "the counted byte scan publishes one data extent:\n{body}"
+    );
+
+    let proved_report = loop_facts_report("g3-byte-proved-report", BYTE_PROVED_ANY);
+    assert!(
+        decision(&proved_report, "any_nonzero").starts_with("versioned "),
+        "a Plan 64-eliminated guard is authenticated through the direct handoff: {proved_report:#?}"
+    );
+    let proved = mir_fn(&mir_text("g3-byte-proved-mir", BYTE_PROVED_ANY), "any_nonzero");
+    assert!(
+        guard_blocks(&proved).is_empty(),
+        "Plan 64's already-proved branch remains removed:\n{proved}"
+    );
+    assert_eq!(
+        proved.matches("call runtime range_fail").count(),
+        1,
+        "Plan 64 retains the now-unreachable trap block and its stable IDs:\n{proved}"
+    );
+
+    let executable = format!(
+        "{BYTE_ALL_ZERO}{BYTE_PROVED_ANY}\
+fn main() -> i32 {{\n\
+  empty := [0 as u8]\n\
+  one := [0 as u8]\n\
+  first := [9 as u8, 0, 0, 0]\n\
+  last := [0 as u8, 0, 0, 9]\n\
+  none := [0 as u8, 0, 0, 0]\n\
+  e: slice<u8> := empty[0..0]\n\
+  print(all_zero(e))\n\
+  print(all_zero(one))\n\
+  print(all_zero(first))\n\
+  print(all_zero(last))\n\
+  print(all_zero(none))\n\
+  print(any_nonzero(e))\n\
+  print(any_nonzero(one))\n\
+  print(any_nonzero(first))\n\
+  print(any_nonzero(last))\n\
+  print(any_nonzero(none))\n\
+  return 0\n\
+}}\n"
+    );
+    let out = build_and_run("g3-byte-boundaries", &executable);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "true\ntrue\nfalse\nfalse\ntrue\nfalse\nfalse\ntrue\ntrue\nfalse\n",
+        "zero, one, first, last and no-match results survive both byte-guard paths"
+    );
+}
 
 /// The producer-owned record is the single source for rotation and codegen. Pin the fields that
 /// distinguish it from a codegen pattern match: live entry, trip count, induction slot, step,

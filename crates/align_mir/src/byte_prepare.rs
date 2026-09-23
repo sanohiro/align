@@ -416,7 +416,7 @@ pub fn prepare<'a>(program: &'a Program, defined: &BTreeSet<ProgramCall>) -> Cow
             let _ = expose(function, bi, si, leaf);
         }
         let block_remap = order_blocks(function);
-        super::byte_ranges::simplify(function);
+        let _ = super::byte_ranges::simplify(function);
         super::byte_ranges::snapshot_descriptors(function);
         if let Some(facts) = prepared
             .loop_facts

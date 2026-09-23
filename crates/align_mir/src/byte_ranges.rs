@@ -8,6 +8,24 @@ use align_ast::BinOp;
 use align_sema::{IntTy, Scalar, Ty};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// One byte-read guard this invocation proved and removed. The record is passed directly to the
+/// immediately following `loop_facts` invocation; it is not MIR and is never serialized.
+#[derive(Clone, Debug)]
+pub struct EliminatedReadGuard {
+    pub(crate) loop_header: BlockId,
+    pub(crate) read: ValueId,
+    pub(crate) bytes: Operand,
+    pub(crate) start: Operand,
+    pub(crate) end: Operand,
+    pub(crate) len: Operand,
+    pub(crate) scalar: Ty,
+}
+
+struct SafeGuard {
+    ok: BlockId,
+    proof: EliminatedReadGuard,
+}
+
 fn integer() -> Ty {
     Ty::Int(IntTy {
         bits: 64,
@@ -465,7 +483,7 @@ impl<'a> Facts<'a> {
         true
     }
 
-    fn safe_guard(&self, block: BlockId) -> Option<BlockId> {
+    fn safe_guard(&self, block: BlockId) -> Option<SafeGuard> {
         let current = &self.f.blocks[block as usize];
         let Term::Branch(condition, fail, ok) = &current.term else {
             return None;
@@ -523,7 +541,7 @@ impl<'a> Facts<'a> {
             return None;
         }
         // The actual read must agree with all three checked operands and width.
-        let mut read_position = None;
+        let mut read = None;
         for (position, statement) in self.f.blocks[*ok as usize].stmts.iter().enumerate() {
             if let Stmt::Let(
                 id,
@@ -546,12 +564,12 @@ impl<'a> Facts<'a> {
                     && i128::from(bits) == width * 8
                     && self.f.value_tys.get(*id as usize) == Some(scalar)
                 {
-                    read_position = Some(position);
+                    read = Some((*id, position, view.clone(), *scalar));
                     break;
                 }
             }
         }
-        let read_position = read_position?;
+        let (read, read_position, bytes, scalar) = read?;
         if !self.expression_precedes(start, *ok, read_position) {
             return None;
         }
@@ -619,7 +637,18 @@ impl<'a> Facts<'a> {
             {
                 continue;
             }
-            return Some(*ok);
+            return Some(SafeGuard {
+                ok: *ok,
+                proof: EliminatedReadGuard {
+                    loop_header: header.id,
+                    read,
+                    bytes,
+                    start: start.clone(),
+                    end: end.clone(),
+                    len: length.clone(),
+                    scalar,
+                },
+            });
         }
         None
     }
@@ -705,34 +734,41 @@ pub(crate) fn snapshot_descriptors(function: &mut Function) {
 /// Prove byte recurrences against the effects that can reach each use. Rewriting
 /// a proven branch retains statements, trap blocks, IDs and source coordinates;
 /// there is no hoisted trap, speculative load or unchecked-load IR extension.
-pub fn simplify(function: &mut Function) {
+pub fn simplify(function: &mut Function) -> Vec<EliminatedReadGuard> {
     if !function
         .blocks
         .iter()
         .flat_map(|block| &block.stmts)
         .any(|stmt| matches!(stmt, Stmt::Let(_, Rvalue::BytesRead { .. })))
     {
-        return;
+        return Vec::new();
     }
     let edits = {
         let Some(facts) = Facts::new(function) else {
-            return;
+            return Vec::new();
         };
         function
             .blocks
             .iter()
-            .filter_map(|block| facts.safe_guard(block.id).map(|ok| (block.id, ok)))
+            .filter_map(|block| {
+                facts
+                    .safe_guard(block.id)
+                    .map(|guard| (block.id, guard.ok, guard.proof))
+            })
             .collect::<Vec<_>>()
     };
     let mut original = Vec::new();
-    for (block, ok) in edits {
+    let mut proofs = Vec::new();
+    for (block, ok, proof) in edits {
         let term = std::mem::replace(&mut function.blocks[block as usize].term, Term::Goto(ok));
         original.push((block, term));
+        proofs.push(proof);
     }
     if Facts::new(function).is_none() {
         for (block, term) in original {
             function.blocks[block as usize].term = term;
         }
+        Vec::new()
     } else {
         function.exceptional_edges.retain(|edge| {
             matches!(
@@ -740,5 +776,6 @@ pub fn simplify(function: &mut Function) {
                 Some(Term::Branch(..))
             )
         });
+        proofs
     }
 }

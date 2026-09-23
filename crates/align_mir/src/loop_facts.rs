@@ -23,6 +23,7 @@
 //! here rather than a silent "this statement does not mutate anything".
 
 use crate::{
+    byte_ranges::EliminatedReadGuard,
     BlockId, Const, DirectCall, Function, Operand, RuntimeKey, Rvalue, Slot, Stmt, Term, ValueId,
 };
 use align_ast::{BinOp, ParamMode};
@@ -56,6 +57,10 @@ fn u64_ty() -> Ty {
 
 fn int(value: i128) -> Operand {
     Operand::Const(Const::Int(value, i64_ty()))
+}
+
+fn width_one_byte_scalar(ty: Ty) -> bool {
+    matches!(ty, Ty::Int(IntTy { bits: 8, .. }))
 }
 
 /// What `loop_facts` decided about one source loop, in innermost-first order.
@@ -285,7 +290,7 @@ macro_rules! unmodelled_rvalues {
         Rvalue::FileCreateRw { .. } | Rvalue::FileOpenRw { .. } | Rvalue::FilePread { .. } |
         Rvalue::FilePwrite { .. } | Rvalue::FileLen { .. } | Rvalue::BufferNew { .. } |
         Rvalue::BufferBytes { .. } | Rvalue::BufferLen { .. } | Rvalue::BufferCapacity { .. } |
-        Rvalue::BytesRead { .. } | Rvalue::BytesSet { .. } | Rvalue::BytesFill { .. } |
+        Rvalue::BytesSet { .. } | Rvalue::BytesFill { .. } |
         Rvalue::BytesCopyFrom { .. } | Rvalue::BufferPut { .. } | Rvalue::BufferAppend { .. } |
         Rvalue::BufferAppendFilled { .. } | Rvalue::ArrayBuilderNew { .. } | Rvalue::ArrayBuilderPush { .. } |
         Rvalue::ArrayBuilderPushStr { .. } | Rvalue::ArrayBuilderAppend { .. } | Rvalue::ArrayBuilderBuild { .. } |
@@ -386,6 +391,9 @@ enum RvalueFacts<'a> {
     /// An opaque call. Kills every root that is not a read-only `borrow` parameter of the enclosing
     /// function, and every root reaching one of its arguments; the payload is its complete use list.
     Call(Vec<&'a Operand>),
+    /// A non-retaining byte load. It is clonable only after `admit` authenticates the exact live
+    /// guard or the invocation-scoped proof of the guard `byte_ranges` removed.
+    GuardedByteRead(Vec<&'a Operand>),
     /// Not modelled. May write any memory and may use any value.
     Unknown,
 }
@@ -394,7 +402,7 @@ enum RvalueFacts<'a> {
 /// lists *all* of its `Operand` fields explicitly rather than using `..`: an omitted operand would
 /// under-report uses and make the escape check unsound.
 fn rvalue_facts(rv: &Rvalue) -> RvalueFacts<'_> {
-    use RvalueFacts::{Call, Pure, Unknown};
+    use RvalueFacts::{Call, GuardedByteRead, Pure, Unknown};
     match rv {
         Rvalue::Use(a) => Pure(vec![a]),
         Rvalue::Load(_) => Pure(Vec::new()),
@@ -451,6 +459,9 @@ fn rvalue_facts(rv: &Rvalue) -> RvalueFacts<'_> {
         Rvalue::BoxGet(a) => Pure(vec![a]),
         Rvalue::BytesView { bytes, elem: _ } => Pure(vec![bytes]),
         Rvalue::SliceAsBytes { slice, elem: _ } => Pure(vec![slice]),
+        Rvalue::BytesRead { bytes, offset, scalar: _, be: _ } => {
+            GuardedByteRead(vec![bytes, offset])
+        }
         Rvalue::SoaColumn { base: _, struct_id: _, field: _ } => Pure(Vec::new()),
         Rvalue::SoaGather { base, index, struct_id: _ } => Pure(vec![base, index]),
         Rvalue::IndexColumn { base, index, field: _, struct_id: _ } => Pure(vec![base, index]),
@@ -546,6 +557,7 @@ fn rvalue_operands_mut(rv: &mut Rvalue) -> Option<Vec<&mut Operand>> {
         Rvalue::BoxGet(a) => vec![a],
         Rvalue::BytesView { bytes, elem: _ } => vec![bytes],
         Rvalue::SliceAsBytes { slice, elem: _ } => vec![slice],
+        Rvalue::BytesRead { bytes, offset, scalar: _, be: _ } => vec![bytes, offset],
         Rvalue::SoaColumn { base: _, struct_id: _, field: _ } => Vec::new(),
         Rvalue::SoaGather { base, index, struct_id: _ } => vec![base, index],
         Rvalue::IndexColumn { base, index, field: _, struct_id: _ } => vec![base, index],
@@ -631,6 +643,7 @@ fn statement_facts<'a>(function: &Function, stmt: &'a Stmt) -> StmtFacts<'a> {
     match stmt {
         Stmt::Let(_, rv) => match rvalue_facts(rv) {
             RvalueFacts::Pure(uses) => Pure(uses),
+            RvalueFacts::GuardedByteRead(uses) => Pure(uses),
             RvalueFacts::Call(uses) => Call(uses),
             RvalueFacts::Unknown => KillsEverything,
         },
@@ -1023,6 +1036,9 @@ struct Guard {
     end: Option<Operand>,
     /// The length operand the guard compares against.
     len: Operand,
+    /// Width-one byte reads authenticated by this signed byte-accessor guard. Empty for ordinary
+    /// fused element/range guards.
+    byte_reads: Vec<ValueId>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1094,6 +1110,77 @@ impl<'a> Analysis<'a> {
         }
     }
 
+    /// Recognize the exact signed width-one range guard emitted for `bytes.u8/i8(offset)` and name
+    /// every matching read dominated by its success edge. Wider byte guards remain Plan 64's
+    /// territory and therefore return `None` here.
+    fn signed_width_one_byte_guard(
+        &self,
+        block: BlockId,
+        fail: BlockId,
+        ok: BlockId,
+        condition: &Operand,
+        range: [&Operand; 3],
+    ) -> Option<Guard> {
+        let [start, end, len] = range;
+        let (prefix, over) = self.binary(condition, BinOp::Or)?;
+        let (negative, inverted) = self.binary(prefix, BinOp::Or)?;
+        let (negative_start, zero) = self.binary(negative, BinOp::Lt)?;
+        let (inverted_start, inverted_end) = self.binary(inverted, BinOp::Gt)?;
+        let (over_end, over_len) = self.binary(over, BinOp::Gt)?;
+        if !same_operand(negative_start, start)
+            || !same_operand(zero, &int(0))
+            || !same_operand(inverted_start, start)
+            || !same_operand(inverted_end, end)
+            || !same_operand(over_end, end)
+            || !same_operand(over_len, len)
+        {
+            return None;
+        }
+        let (end_start, width) = self.binary(end, BinOp::Add)?;
+        if !same_operand(end_start, start) || !same_operand(width, &int(1)) {
+            return None;
+        }
+        let (_, _, Rvalue::SliceLen(view)) = self.def(len)? else {
+            return None;
+        };
+        let mut byte_reads = Vec::new();
+        for read_block in &self.function.blocks {
+            if !self.cfg.dominates(ok, read_block.id) {
+                continue;
+            }
+            for statement in &read_block.stmts {
+                let Stmt::Let(
+                    value,
+                    Rvalue::BytesRead {
+                        bytes,
+                        offset,
+                        scalar,
+                        be: _,
+                    },
+                ) = statement
+                else {
+                    continue;
+                };
+                if width_one_byte_scalar(*scalar)
+                    && self.function.value_tys.get(*value as usize) == Some(scalar)
+                    && same_operand(bytes, view)
+                    && same_operand(offset, start)
+                {
+                    byte_reads.push(*value);
+                }
+            }
+        }
+        (!byte_reads.is_empty()).then_some(Guard {
+            block,
+            fail,
+            ok,
+            start: start.clone(),
+            end: Some(end.clone()),
+            len: len.clone(),
+            byte_reads,
+        })
+    }
+
     /// Recognize the guard a block branches on, if any. Returns `Err(())` when the block holds a
     /// trap edge that is *not* in the fused form, which is the fail-closed refusal (§3.7).
     fn guard(&self, block: BlockId) -> Result<Option<Guard>, ()> {
@@ -1134,9 +1221,19 @@ impl<'a> Analysis<'a> {
                     start: index.clone(),
                     end: None,
                     len: len.clone(),
+                    byte_reads: Vec::new(),
                 }))
             }
             (RuntimeKey::RangeFail, [start, end, len]) => {
+                if let Some(guard) = self.signed_width_one_byte_guard(
+                    block,
+                    *fail,
+                    *ok,
+                    condition,
+                    [start, end, len],
+                ) {
+                    return Ok(Some(guard));
+                }
                 let Some((inverted, over)) = self.binary(condition, BinOp::Or) else {
                     return Err(());
                 };
@@ -1168,6 +1265,7 @@ impl<'a> Analysis<'a> {
                     start: start.clone(),
                     end: Some(end.clone()),
                     len: len.clone(),
+                    byte_reads: Vec::new(),
                 }))
             }
             _ => Err(()),
@@ -1274,6 +1372,16 @@ struct BodyFacts {
     /// Present when some statement is not modelled at all.
     unmodelled: bool,
     borrowed_element: bool,
+    byte_reads: Vec<ByteReadUse>,
+}
+
+#[derive(Clone)]
+struct ByteReadUse {
+    block: BlockId,
+    value: ValueId,
+    bytes: Operand,
+    offset: Operand,
+    scalar: Ty,
 }
 
 fn body_facts(function: &Function, body: &BTreeSet<BlockId>) -> BodyFacts {
@@ -1282,11 +1390,30 @@ fn body_facts(function: &Function, body: &BTreeSet<BlockId>) -> BodyFacts {
         opaque_call: false,
         unmodelled: false,
         borrowed_element: false,
+        byte_reads: Vec::new(),
     };
     for block in body {
         for stmt in &function.blocks[*block as usize].stmts {
             if matches!(stmt, Stmt::BorrowedElementReservation { .. }) {
                 facts.borrowed_element = true;
+            }
+            if let Stmt::Let(
+                value,
+                Rvalue::BytesRead {
+                    bytes,
+                    offset,
+                    scalar,
+                    be: _,
+                },
+            ) = stmt
+            {
+                facts.byte_reads.push(ByteReadUse {
+                    block: *block,
+                    value: *value,
+                    bytes: bytes.clone(),
+                    offset: offset.clone(),
+                    scalar: *scalar,
+                });
             }
             match statement_facts(function, stmt) {
                 StmtFacts::Pure(_) => {}
@@ -1492,6 +1619,9 @@ impl Remat<'_> {
                 let b = self.get(b, pre)?;
                 pre.bin(*op, ty, a, b)
             }
+            // Plan 64 states a byte recurrence's element bound as `len / width`. For the only
+            // width this handoff consumes, division by one is the exact identity and cannot trap.
+            Rvalue::Bin(BinOp::Div, a, b) if same_operand(b, &int(1)) => self.get(a, pre)?,
             _ => return None,
         };
         self.memo.insert(*value, rebuilt.clone());
@@ -1584,6 +1714,44 @@ fn view_extent_source<'a>(
     Some((root_slot(analysis, view)?, view, elem))
 }
 
+fn eliminated_byte_guard_matches(
+    analysis: &Analysis<'_>,
+    header: BlockId,
+    read: &ByteReadUse,
+    proof: &EliminatedReadGuard,
+) -> bool {
+    if proof.loop_header != header
+        || proof.read != read.value
+        || proof.scalar != read.scalar
+        || !width_one_byte_scalar(proof.scalar)
+        || !same_operand(&proof.bytes, &read.bytes)
+        || !same_operand(&proof.start, &read.offset)
+    {
+        return false;
+    }
+    let read_operand = Operand::Value(read.value);
+    if !matches!(
+        analysis.def(&read_operand),
+        Some((block, _, Rvalue::BytesRead { bytes, offset, scalar, be: _ }))
+            if block == read.block
+                && *scalar == read.scalar
+                && same_operand(bytes, &read.bytes)
+                && same_operand(offset, &read.offset)
+    ) {
+        return false;
+    }
+    let Some((end_start, width)) = analysis.binary(&proof.end, BinOp::Add) else {
+        return false;
+    };
+    if !same_operand(end_start, &proof.start) || !same_operand(width, &int(1)) {
+        return false;
+    }
+    matches!(
+        analysis.def(&proof.len),
+        Some((_, _, Rvalue::SliceLen(view))) if same_operand(view, &proof.bytes)
+    )
+}
+
 /// Decide whether one loop may be versioned, and build the rewrite it would receive.
 ///
 /// `ignore` names blocks that are not part of this decision — the fast copy produced for this same
@@ -1594,6 +1762,7 @@ fn admit(
     analysis: &Analysis<'_>,
     shape: &LoopShape,
     ignore: &BTreeSet<BlockId>,
+    eliminated_byte_guards: &[EliminatedReadGuard],
 ) -> Result<Plan, KeptReason> {
     if shape.body.is_empty() {
         return Err(KeptReason::LoopShape);
@@ -1617,10 +1786,10 @@ fn admit(
             }
         }
     }
-    // Every trap edge in the body must be in the fused form; a signed one is a channel this pass
-    // does not own (a byte accessor guard `byte_ranges` re-derives literally, §3.7). This is
-    // decided before the unmodelled-statement default so the report names the specific reason
-    // rather than the fail-closed one.
+    // Every trap edge in the body must be fused, except the exact signed width-one byte guard
+    // authenticated by `Analysis::signed_width_one_byte_guard`. This is decided before the
+    // unmodelled-statement default so a wider or malformed signed guard reports the specific
+    // `guard-not-fused` reason.
     let mut guards = Vec::new();
     for block in body {
         match analysis.guard(*block) {
@@ -1628,6 +1797,26 @@ fn admit(
             Ok(None) => {}
             Err(()) => return Err(KeptReason::GuardNotFused),
         }
+    }
+    let live_byte_reads: BTreeSet<ValueId> = guards
+        .iter()
+        .flat_map(|guard| guard.byte_reads.iter().copied())
+        .collect();
+    let mut eliminated_reads = Vec::new();
+    for read in &facts.byte_reads {
+        if !width_one_byte_scalar(read.scalar) {
+            return Err(KeptReason::UnmodelledStatement);
+        }
+        if live_byte_reads.contains(&read.value) {
+            continue;
+        }
+        let Some(proof) = eliminated_byte_guards
+            .iter()
+            .find(|proof| eliminated_byte_guard_matches(analysis, header, read, proof))
+        else {
+            return Err(KeptReason::UnmodelledStatement);
+        };
+        eliminated_reads.push(proof);
     }
     if facts.unmodelled {
         return Err(KeptReason::UnmodelledStatement);
@@ -1976,6 +2165,34 @@ fn admit(
     let mut proved = Vec::new();
     let mut extent_slots = BTreeSet::new();
     let mut extents = Vec::new();
+    if has_early_exit {
+        for proof in &eliminated_reads {
+            let Some((slot, view, elem)) = view_extent_source(analysis, &proof.len) else {
+                return Err(KeptReason::ArithmeticUnproved);
+            };
+            if !same_operand(view, &proof.bytes) {
+                return Err(KeptReason::ArithmeticUnproved);
+            }
+            if !extent_slots.insert(slot) {
+                continue;
+            }
+            let Some(len) = remat.get(&proof.len, &mut pre) else {
+                return Err(if remat.blocked_by.is_some() {
+                    root_killed(&remat)
+                } else {
+                    KeptReason::ArithmeticUnproved
+                });
+            };
+            let Some(view) = remat.get(view, &mut pre) else {
+                return Err(if remat.blocked_by.is_some() {
+                    root_killed(&remat)
+                } else {
+                    KeptReason::ArithmeticUnproved
+                });
+            };
+            extents.push(DataExtent { view, len, elem });
+        }
+    }
     for guard in &guards {
         let Some(len) = remat.get(&guard.len, &mut pre) else {
             return Err(if remat.blocked_by.is_some() {
@@ -2344,7 +2561,10 @@ fn structurally_valid(function: &Function) -> bool {
 /// Version every admissible loop of one function, innermost-first, and report one decision per
 /// source loop. Fail-closed throughout: any disagreement between the facts the rewrite was built
 /// from and the facts the rewritten function re-derives discards the whole rewrite.
-pub fn version_loops(function: &mut Function) -> (Vec<LoopDecision>, Vec<CountedLoopFact>) {
+pub(crate) fn version_loops(
+    function: &mut Function,
+    eliminated_byte_guards: &[EliminatedReadGuard],
+) -> (Vec<LoopDecision>, Vec<CountedLoopFact>) {
     let original = function.clone();
     let original_traps = trap_call_count(&original);
     let mut decided: BTreeSet<BlockId> = BTreeSet::new();
@@ -2368,7 +2588,14 @@ pub fn version_loops(function: &mut Function) -> (Vec<LoopDecision>, Vec<Counted
             decisions.push(LoopDecision::KeptChecks(KeptReason::LoopShape));
             continue;
         };
-        match admit(function, &cfg, &analysis, &shape, &cloned) {
+        match admit(
+            function,
+            &cfg,
+            &analysis,
+            &shape,
+            &cloned,
+            eliminated_byte_guards,
+        ) {
             Err(reason) => decisions.push(LoopDecision::KeptChecks(reason)),
             Ok(plan) => {
                 let budget_used = plan.budget_used;
@@ -2400,6 +2627,7 @@ pub fn version_loops(function: &mut Function) -> (Vec<LoopDecision>, Vec<Counted
         &versioned,
         &cloned,
         &counted,
+        eliminated_byte_guards,
     ) {
         *function = original;
         return (
@@ -2426,6 +2654,7 @@ fn rederives(
     versioned: &[VersionedLoop],
     cloned: &BTreeSet<BlockId>,
     counted: &[CountedLoopFact],
+    eliminated_byte_guards: &[EliminatedReadGuard],
 ) -> bool {
     if !structurally_valid(function) || trap_call_count(function) != original_traps {
         return false;
@@ -2564,7 +2793,14 @@ fn rederives(
         let Some(shape) = loops.iter().find(|shape| shape.header == *header) else {
             return false;
         };
-        match admit(function, &cfg, &analysis, shape, cloned) {
+        match admit(
+            function,
+            &cfg,
+            &analysis,
+            shape,
+            cloned,
+            eliminated_byte_guards,
+        ) {
             Ok(plan) => {
                 if plan.proved != *proved {
                     return false;
@@ -2580,6 +2816,111 @@ fn rederives(
 mod tests {
     use super::*;
     use crate::{Block, ProgramCall};
+    use align_diag::Diagnostics;
+    use align_lexer::tokenize;
+    use align_parser::parse_file;
+
+    fn unchecked_source(source: &str) -> Function {
+        let mut diagnostics = Diagnostics::new();
+        let ast = parse_file(tokenize(0, source, &mut diagnostics), &mut diagnostics);
+        let hir = align_sema::check_file(&ast, &mut diagnostics);
+        assert!(
+            !diagnostics.has_errors(),
+            "proof fixture must check: {:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| &diagnostic.message)
+                .collect::<Vec<_>>()
+        );
+        let mut lowered = crate::lower_program_unchecked(&hir, None, false);
+        assert_eq!(lowered.fns.len(), 1, "proof fixture function");
+        lowered.fns.remove(0)
+    }
+
+    #[test]
+    fn eliminated_byte_guard_record_is_authenticated_field_by_field() {
+        let source = "fn any_nonzero(view: slice<u8>) -> bool {\n  mut at := 0\n  loop {\n    if at >= view.len() / 1 { break }\n    if view.u8(at * 1) != 0 { return true }\n    at = at + 1\n  }\n  return false\n}\n";
+        let mut simplified = unchecked_source(source);
+        let proofs = crate::byte_ranges::simplify(&mut simplified);
+        assert_eq!(proofs.len(), 1, "Plan 64 supplies one committed proof");
+
+        let mut missing = simplified.clone();
+        let (decisions, _) = version_loops(&mut missing, &[]);
+        assert!(
+            decisions.iter().any(|decision| matches!(
+                decision,
+                LoopDecision::KeptChecks(KeptReason::UnmodelledStatement)
+            )),
+            "an eliminated guard without its invocation-scoped record fails closed: {decisions:?}"
+        );
+
+        let mut accepted = simplified.clone();
+        let (decisions, _) = version_loops(&mut accepted, &proofs);
+        assert!(
+            decisions
+                .iter()
+                .any(|decision| matches!(decision, LoopDecision::Versioned { .. })),
+            "the exact invocation-scoped record authenticates its read: {decisions:?}"
+        );
+
+        for mutation in 0..7 {
+            let mut forged = proofs[0].clone();
+            match mutation {
+                0 => forged.loop_header = forged.loop_header.saturating_add(1),
+                1 => forged.read = forged.read.saturating_add(1),
+                2 => forged.bytes = int(0),
+                3 => forged.start = int(0),
+                4 => forged.end = int(0),
+                5 => forged.len = int(0),
+                _ => forged.scalar = i64_ty(),
+            }
+            let mut rejected = simplified.clone();
+            let (decisions, _) = version_loops(&mut rejected, &[forged]);
+            assert!(
+                decisions.iter().any(|decision| matches!(
+                    decision,
+                    LoopDecision::KeptChecks(KeptReason::UnmodelledStatement)
+                )),
+                "mutation {mutation} must fail closed: {decisions:?}"
+            );
+        }
+
+        let wider_source = "fn any_nonzero(view: slice<u8>) -> bool {\n  mut at := 0\n  loop {\n    if at >= view.len() / 2 { break }\n    if view.u16_le(at * 2) != 0 { return true }\n    at = at + 1\n  }\n  return false\n}\n";
+        let mut wider = unchecked_source(wider_source);
+        let wider_proofs = crate::byte_ranges::simplify(&mut wider);
+        assert_eq!(wider_proofs.len(), 1, "Plan 64 may prove a wider byte read");
+        let (decisions, _) = version_loops(&mut wider, &wider_proofs);
+        assert!(
+            decisions.iter().any(|decision| matches!(
+                decision,
+                LoopDecision::KeptChecks(KeptReason::UnmodelledStatement)
+            )),
+            "a wider proof cannot authenticate loop_facts: {decisions:?}"
+        );
+    }
+
+    #[test]
+    fn live_width_one_byte_guard_authenticates_only_its_dominated_read() {
+        for accessor in ["u8", "i8"] {
+            let source = format!(
+                "fn all_zero(borrow view: slice<u8>) -> bool {{\n  mut at := 0\n  loop {{\n    if at >= view.len() {{ break }}\n    if view.{accessor}(at) as i64 != 0 {{ return false }}\n    at = at + 1\n  }}\n  return true\n}}\n"
+            );
+            let mut function = unchecked_source(&source);
+            let (decisions, counted) = version_loops(&mut function, &[]);
+            assert!(
+                decisions
+                    .iter()
+                    .any(|decision| matches!(decision, LoopDecision::Versioned { .. })),
+                "the exact live {accessor} guard authenticates its read: {decisions:?}"
+            );
+            assert_eq!(counted.len(), 1, "the live guard supplies one counted fact");
+            assert_eq!(
+                counted[0].extents.len(),
+                1,
+                "the live guard supplies one exact view extent"
+            );
+        }
+    }
 
     /// A body with one `i64` slot, one `i64` value and one `slice<i64>` slot, enough to build every
     /// statement shape the kill-set owner classifies.
