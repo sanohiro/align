@@ -10640,6 +10640,42 @@ impl<'c, 'a> FnGen<'c, 'a> {
         self.view_headers.get(&slot).copied()
     }
 
+    /// A borrowed parameter's typed header remains a valid length source even when the
+    /// whole-body proof disables entry-block caching and alias facts.
+    fn borrowed_length_header_ty(&self, slot: Slot) -> Option<Ty> {
+        let index = self.f.params.iter().position(|parameter| *parameter == slot)?;
+        if !matches!(
+            self.f.param_modes.get(index),
+            Some(align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut)
+        ) {
+            return None;
+        }
+        let ty = *self.f.slots.get(slot as usize)?;
+        (view_len_field_is_a_length(ty) && self.llvm_type(ty) == slice_struct_type(self.ctx).into())
+            .then_some(ty)
+    }
+
+    /// Read an uncached borrowed header at its use. Splitting the aggregate read leaves the
+    /// pointer mutable while putting `!range` on the actual scalar length load.
+    fn load_uncached_borrowed_length_header(
+        &self,
+        pointer: inkwell::values::PointerValue<'c>,
+        ty: Ty,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let data = self.load_view_part(pointer, 0, ty, "uncached.view.ptr")?;
+        let length = self.load_view_part(pointer, 1, ty, "uncached.view.len")?;
+        let header = self
+            .builder
+            .build_insert_value(slice_struct_type(self.ctx).get_poison(), data, 0, "uncached.view.hdr.ptr")
+            .map_err(|error| self.err(error))?;
+        Ok(self
+            .builder
+            .build_insert_value(header, length, 1, "uncached.view.hdr")
+            .map_err(|error| self.err(error))?
+            .into_struct_value()
+            .into())
+    }
+
     /// Translate a MIR (logical) field index into the LLVM (physical) index for struct `struct_id`.
     /// Non-`layout(C)` structs are reordered by descending alignment (padding elimination); every
     /// struct-field GEP goes through here so the reorder stays invisible. `layout(C)` structs use the
@@ -13883,13 +13919,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let v: BasicValueEnum<'c> = match rv {
             Rvalue::Use(op) => self.operand_by_value(op)?,
             Rvalue::Load(slot) => {
-                // A borrowed header parameter reads its one entry-block materialization.
+                // Reuse a proved entry-block header, or load its typed fields at the use when
+                // whole-body caching is disabled. Both paths preserve the independent length fact.
                 if let Some(header) = self.cached_view_header(*slot) {
                     header
+                } else if let Some(ty) = self.borrowed_length_header_ty(*slot) {
+                    let pointer = *self.slots.get(slot).ok_or_else(|| self.err("borrowed header slot is missing"))?;
+                    self.load_uncached_borrowed_length_header(pointer, ty)?
                 } else {
-                    let ty = self.llvm_type(self.f.slots[*slot as usize]);
+                    let slot_ty = *self.f.slots.get(*slot as usize).ok_or_else(|| self.err("load slot type is missing"))?;
+                    let pointer = *self.slots.get(slot).ok_or_else(|| self.err("load slot is missing"))?;
+                    let ty = self.llvm_type(slot_ty);
                     self.builder
-                        .build_load(ty, self.slots[slot], "load")
+                        .build_load(ty, pointer, "load")
                         .map_err(|e| self.err(e))?
                 }
             }
@@ -25798,6 +25840,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     && let Some(header) = self.cached_view_header(place.slot)
                 {
                     header
+                } else if place.path.is_empty()
+                    && self.borrowed_length_header_ty(place.slot) == Some(place.ty)
+                {
+                    let pointer = self.borrowed_place_ptr(place)?;
+                    self.load_uncached_borrowed_length_header(pointer, place.ty)?
                 } else {
                     let pointer = self.borrowed_place_ptr(place)?;
                     self.builder
