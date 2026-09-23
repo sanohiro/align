@@ -1105,8 +1105,8 @@ consumer      `loop_facts` gives `BytesRead` a distinct guarded-read classifier,
 extent        the live signed guard supplies its existing length and admission
               arithmetic. An eliminated-guard record supplies the same exact
               view/length as an already-proved extent source; it adds no guard
-              conjunct and no slow trap, because Plan 64 proved that edge
-              unreachable before deleting it.
+              conjunct and no reachable slow trap, because Plan 64 proved that
+              edge unreachable before replacing it with `Goto`.
 boundary      Proof production, authenticated consumption and extent use ship
               together. The producer's rewrite and budget input stay
               byte-identical, and syntax, ABI, MIR shape, interfaces and cache
@@ -1114,41 +1114,40 @@ boundary      Proof production, authenticated consumption and extent use ship
 ```
 
 This is a safety-strategy extension, so the following matrix is authoritative
-for the change. A reused owner is named where it discriminates the defect; a
-new owner is named `planned`.
+for the change. A reused owner is named where it discriminates the defect.
 
 | Axis | Cell | Required behavior | Owner |
 | --- | --- | --- | --- |
-| Formation | `u8`/`i8` read | lowering is unchanged: the guard remains the signed `RangeFail(start, start + 1, len)` predicate that `byte_ranges` re-derives | `g2_byte_accessor_guard_keeps_its_signed_form`, planned owner over both signednesses |
-| | wider byte read | widths 2/4/8 retain the signed predicate and remain `byte_ranges` territory | `runway_a2_binary_codec`, planned negative MIR owner |
+| Formation | `u8`/`i8` read | lowering is unchanged: the guard remains the signed `RangeFail(start, start + 1, len)` predicate that `byte_ranges` re-derives | `g2_byte_accessor_guard_keeps_its_signed_form`, `live_width_one_byte_guard_authenticates_only_its_dominated_read` |
+| | wider byte read | widths 2/4/8 retain the signed predicate and remain `byte_ranges` territory | `runway_a2_binary_codec`, `eliminated_byte_guard_record_is_authenticated_field_by_field` |
 | | every byte write | retains the signed predicate and its existing invalidation semantics | `bytes_ops`, `runway_a2_binary_codec` |
-| Proof handoff | successful removal | one record is returned only after the rewrite passes its existing post-edit structural validation; it names the removed guard and associated read exactly | planned positive/rollback owner |
-| | rollback or unproved guard | returns no record for that edge; the original signed guard and exceptional edge remain | `paired_byte_ranges_keep_unproved_guards`, planned rollback owner |
-| | identity and lifetime | value/block IDs are unchanged by `simplify`; the vector is passed directly to `version_loops` in the same per-function loop and dropped afterward. The second codegen-site return value is ignored | planned first/second-site owner |
-| | width | records for wider reads may exist for Plan 64 accounting but cannot authenticate `loop_facts`; only an exact independently rechecked width-one record is consumed | planned mixed-width owner |
-| Construction | range operands | `start` is the read offset, `end` is exactly the SSA value `start + 1`, and `len` is `SliceLen` of the exact read view | planned positive and operand-mismatch negatives |
-| | live-guard failure edge | the original `RangeFail(start, end, len)` block and `Unreachable` terminator are unchanged; the slow copy retains them | planned MIR owner, existing range trap owners |
-| | eliminated-record edge | Plan 64 already replaced the proved branch with `Goto` and removed its exceptional edge before `loop_facts`; neither copy recreates a guard or trap, and the handoff is valid only for that committed removal | planned removed-edge MIR/proof owner |
+| Proof handoff | successful removal | one record is returned only after the rewrite passes its existing post-edit structural validation; it names the removed guard and associated read exactly | `byte_range_malformed_and_invalidated_proofs_fail_closed`, `eliminated_byte_guard_record_is_authenticated_field_by_field` |
+| | rollback or unproved guard | returns no record for that edge; the original signed guard and exceptional edge remain | `paired_byte_ranges_keep_unproved_guards`, `byte_range_malformed_and_invalidated_proofs_fail_closed` |
+| | identity and lifetime | value/block IDs are unchanged by `simplify`; the vector is passed directly to `version_loops` in the same per-function loop and dropped afterward. The second codegen-site return value is ignored | `g3_width_one_byte_accessor_reaches_counted_loop`, `composed_reader_per_unit_and_thin_cache_bind_private_body_edits` |
+| | width | records for wider reads may exist for Plan 64 accounting but cannot authenticate `loop_facts`; only an exact independently rechecked width-one record is consumed | `eliminated_byte_guard_record_is_authenticated_field_by_field` |
+| Construction | range operands | `start` is the read offset, `end` is exactly the SSA value `start + 1`, and `len` is `SliceLen` of the exact read view | `eliminated_byte_guard_record_is_authenticated_field_by_field` |
+| | live-guard failure edge | the original `RangeFail(start, end, len)` block and `Unreachable` terminator are unchanged; the slow copy retains them | `g3_width_one_byte_accessor_reaches_counted_loop`, existing range trap owners |
+| | eliminated-record edge | Plan 64 already replaced the proved branch with `Goto` and removed its exceptional edge before `loop_facts`; neither copy recreates a guard branch. The original now-unreachable trap block, call and IDs remain once outside the natural loop exactly as Plan 64 specifies, and the handoff is valid only for that committed removal | `g3_width_one_byte_accessor_reaches_counted_loop` |
 | Authentication | control | the recognized guard's success block dominates the read block; a guard after the read or on only one incoming arm does not authenticate it | planned dominance negatives |
-| | width | the read scalar is independently checked as one byte; a forged wider read behind a one-byte guard is refused | planned malformed-MIR negative |
-| | eliminated edge | the record's read ID, view, start/end/length and scalar must all equal the live `BytesRead` and its definitions; a partial or stale-looking record is refused | planned parameterized record-mismatch negatives |
+| | width | the read scalar is independently checked as one byte; a forged wider read behind a one-byte guard is refused | `eliminated_byte_guard_record_is_authenticated_field_by_field` |
+| | eliminated edge | the record's read ID, view, start/end/length and scalar must all equal the live `BytesRead` and its definitions; a partial or stale-looking record is refused | `eliminated_byte_guard_record_is_authenticated_field_by_field` |
 | | completeness | every `BytesRead` in the versioned body must authenticate independently through a live guard or record; one unmatched read refuses the whole loop | planned paired-read negative |
 | | header | `BytesRead` is not general `Pure`, so the rotated header's dependency cone cannot contain one and then skip it on the latch | planned header negative |
-| Body modelling | effects | an authenticated read writes no reachable memory, retains no pointer and uses exactly `bytes` and `offset`; it does not kill the borrowed-view header proof | `g1_len_range_survives_inline_byte_reads`, planned G3 owner |
-| | cloning | the mutable classifier remaps exactly `bytes` and `offset` in the fast copy; the exhaustive paired classifier still trips at compile time for a new variant | `variant_sweep_tripwire`, planned cloned-MIR owner |
+| Body modelling | effects | an authenticated read writes no reachable memory, retains no pointer and uses exactly `bytes` and `offset`; it does not kill the borrowed-view header proof | `g1_len_range_survives_inline_byte_reads`, `g3_width_one_byte_accessor_reaches_counted_loop` |
+| | cloning | the mutable classifier remaps exactly `bytes` and `offset` in the fast copy; the exhaustive paired classifier still trips at compile time for a new variant | `variant_sweep_tripwire`, `g3_width_one_byte_accessor_reaches_counted_loop` |
 | Control paths | `if`, `match`, joins and early return | the existing G2/G3 control rules remain authoritative; domination and all-occurrences authentication make a conditionally live-guarded read fail closed, while a removed-edge record applies only to its exact read ID | §3.4 owners plus planned branch and record-scope negatives |
-| | live-guard loop and early exits | the slow version preserves the source guard and trap iteration; the fast version is entered only when the existing preheader arithmetic proves every iteration | planned zero/one/first/last/no-match executable owner |
-| | eliminated-record loop and early exits | both copies start from the already check-free Plan 64 body; rotation preserves the same iterations and data exit, and no impossible trap is recreated | planned proved-recurrence zero/one/first/last/no-match owner |
-| Extent | borrowed view | a live guard or exact eliminated-guard record supplies the same view/`len` pair for G3 `DataExtent`; after the nonempty peel codegen publishes one `dereferenceable(len)` fact | planned exact `all_zero` raw/optimized IR owner |
+| | live-guard loop and early exits | the slow version preserves the source guard and trap iteration; the fast version is entered only when the existing preheader arithmetic proves every iteration | `g3_width_one_byte_accessor_reaches_counted_loop` (zero/one/first/last/no-match) |
+| | eliminated-record loop and early exits | both copies start from the already check-free Plan 64 body; rotation preserves the same iterations and data exit, no guard branch is recreated, and the one unreachable original trap block remains outside both loop bodies | `g3_width_one_byte_accessor_reaches_counted_loop` (zero/one/first/last/no-match) |
+| Extent | borrowed view | a live guard or exact eliminated-guard record supplies the same view/`len` pair for G3 `DataExtent`; after the nonempty peel codegen publishes one `dereferenceable(len)` fact | `g3_width_one_byte_accessor_reaches_counted_loop` |
 | | raw/foreign view | no `SliceLen` of the exact read view means no authentication and no extent | planned malformed-MIR negative |
 | Validation | malformed producer | mismatched view, offset, end, length, scalar width, fail key or non-`Unreachable` failure remains refused before rewriting | planned parameterized malformed-MIR owner |
 | | validation order | ordinary HIR/MIR validation still runs before `loop_facts`; the pass adds no recovery path and performs no side effect before refusal | `analysis_coverage`, planned malformed-MIR owner |
 | Trap parity | live-guard invalid range | negative, overflowing and past-end offsets retain exact range text, arguments, precedence and the effect prefix before the failing iteration | `runway_a2_binary_codec::negative_offset_aborts`, `read_past_end_aborts`, planned width-one executable owners |
-| | eliminated-record range | Plan 64's proof establishes that no reached iteration can take the removed edge; executable boundary owners establish the same answers before and after rotation, while one invalid recurrence stays unproved and retains its live trap | planned proved/unproved paired recurrence owner |
+| | eliminated-record range | Plan 64's proof establishes that no reached iteration can take the removed edge; its retained trap call is unreachable. Executable boundary owners establish the same answers before and after rotation, while one invalid recurrence stays unproved and retains its live trap | planned proved/unproved paired recurrence owner |
 | Compilation model | whole-program, per-unit and function partition | all four checked-lowering entry points share the same immediate producer-to-consumer call; no interface record, hash component or serialized body contract changes | `emit_llvm_stage`, `per_unit`, `function_thin_lto`, planned exact-client owner |
 | | `byte_prepare` | its later splice and ordinary simplification retain current behavior. Its returned records are ignored, so no proof can be applied after block remapping or escape its producing invocation | `composed_reader_per_unit_and_thin_cache_bind_private_body_edits`, planned composition owner |
 | Resource | version budget | Plan 64 removes exactly the same proved blocks before `loop_facts` as today. A live unproved signed guard was already present in the budget input; authenticating it adds no statement or block. The budget decision is therefore byte-identical apart from loops newly eligible because `BytesRead` is now modelled | planned boundary owner at `LOOP_FACTS_VERSION_BUDGET - 1`, exact limit and limit + 1 |
-| Acceptance | exact client | `kv_plane.all_zero` keeps one borrowed length load with `!range`, has no retained `smax`, reaches a counted/vector body on x86-64-v2 and AArch64, and preserves executable results | planned `g3_width_one_byte_accessor_reaches_counted_loop`; exact client IR measurement |
+| Acceptance | exact client | `kv_plane.all_zero` keeps one borrowed length load with `!range`, has no retained `smax`, reaches a counted/vector body on x86-64-v2 and AArch64, and preserves executable results | `g1_len_range_survives_inline_byte_reads`, `g3_width_one_byte_accessor_reaches_counted_loop`; exact client IR measurement |
 | | negative controls | width 2/4/8, writes, unauthenticated reads and operand/control mismatches keep their guards and report a stable refusal | planned parameterized owner |
 
 The author-side matrix-to-prose pass treats either the live guard or its exact

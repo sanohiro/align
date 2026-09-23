@@ -948,7 +948,8 @@ fn byte_range_malformed_and_invalidated_proofs_fail_closed() {
     let induction = induction.expect("induction initialization");
     assert_eq!(reached_byte_guards(&base), 1);
     let mut valid = base.clone();
-    align_mir::byte_ranges::simplify(&mut valid);
+    let proofs = align_mir::byte_ranges::simplify(&mut valid);
+    assert_eq!(proofs.len(), 1, "one committed rewrite returns one proof");
     assert_eq!(reached_byte_guards(&valid), 0);
     // A comparison fact belongs to one branch arm, even when destinations
     // coincide or a rejected arm rejoins the admitted arm later.
@@ -966,7 +967,8 @@ fn byte_range_malformed_and_invalidated_proofs_fail_closed() {
             }
         }
         let mut positive = oriented.clone();
-        align_mir::byte_ranges::simplify(&mut positive);
+        let proofs = align_mir::byte_ranges::simplify(&mut positive);
+        assert_eq!(proofs.len(), 1, "one admitted arm returns one proof");
         assert_eq!(reached_byte_guards(&positive), 0, "admitted arm: lt={use_lt}");
         for rejoin in [false, true] {
             let mut bad = oriented.clone();
@@ -977,7 +979,8 @@ fn byte_range_malformed_and_invalidated_proofs_fail_closed() {
             } else if let Term::Branch(_, yes, no) = &mut bad.blocks[header].term {
                 if use_lt { *no = admitted; } else { *yes = admitted; }
             }
-            align_mir::byte_ranges::simplify(&mut bad);
+            let proofs = align_mir::byte_ranges::simplify(&mut bad);
+            assert!(proofs.is_empty(), "a rejected arm returns no proof");
             assert_eq!(reached_byte_guards(&bad), 1, "rejected arm: lt={use_lt}, rejoin={rejoin}");
         }
     }
@@ -1009,7 +1012,8 @@ fn byte_range_malformed_and_invalidated_proofs_fail_closed() {
             _ => {}
         }
         assert!(changed, "mutation {mutation} must reach the proof");
-        align_mir::byte_ranges::simplify(&mut bad);
+        let proofs = align_mir::byte_ranges::simplify(&mut bad);
+        assert!(proofs.is_empty(), "mutation {mutation} returns no proof");
         assert_eq!(reached_byte_guards(&bad), 1, "mutation {mutation}");
     }
 }
