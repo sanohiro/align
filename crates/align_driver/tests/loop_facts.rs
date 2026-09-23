@@ -403,6 +403,56 @@ fn g1_len_range_survives_inline_byte_reads() {
     );
 }
 
+/// Allocation disables the whole-body header cache, but cannot erase the independent length
+/// invariant on a borrowed slice. This is the second #1080 client residual.
+#[test]
+fn g1_len_range_survives_uncached_borrowed_header() {
+    let source = format!(
+        "{BYTE_ALL_ZERO}\nfn allocated(borrow view: slice<u8>) -> bool {{\n  scratch := [0].to_array()\n  mut at := 0\n  loop {{\n    if at >= view.len() {{ break }}\n    if view.u8(at) as i64 != 0 {{ return false }}\n    at = at + 1\n  }}\n  return scratch.len() == 1\n}}\n"
+    );
+    let raw = emit_llvm_with_exports(&source, &["all_zero", "allocated"]);
+    let plain = function_ir(&raw, "all_zero");
+    assert!(plain.contains("load i64, ptr %view.len"), "plain scan must retain its cached header:\n{plain}");
+    let allocated = function_ir(&raw, "allocated");
+    assert!(!signature(&raw, "allocated").contains("noalias"), "allocation must still disable the alias claim");
+    assert!(!allocated.contains("!tbaa"), "allocation must still disable header caching's alias class");
+    assert!(
+        allocated.lines().any(|line| line.contains("load i64, ptr %uncached.view.len") && line.contains("!range !")),
+        "the uncached borrowed header must carry its length fact on a scalar load:\n{allocated}",
+    );
+    assert!(
+        !allocated.contains("load { ptr, i64 }, ptr %0"),
+        "the borrowed header must not bypass the length load through an aggregate read:\n{allocated}",
+    );
+    let optimized = emit_llvm_optimized(&source, &["allocated"]);
+    let optimized_body = function_ir(&optimized, "allocated");
+    assert!(
+        !optimized_body.contains("llvm.smax.i64"),
+        "the named residual must not rebuild a non-negative clamp:\n{optimized_body}",
+    );
+
+    let non_length = emit_llvm_with_exports(
+        "fn identity(borrow d: json.doc) -> json.doc { scratch := [0].to_array()\n return d }\n",
+        &["identity"],
+    );
+    let non_length_body = function_ir(&non_length, "identity");
+    assert!(non_length_body.contains("load { ptr, i64 }"), "cache must be disabled in the control:\n{non_length_body}");
+    assert!(!non_length_body.contains("!range"), "a json.doc node is not a length:\n{non_length_body}");
+
+    let other_lengths = emit_llvm_with_exports(
+        "fn array_len(borrow xs: array<i64>) -> i64 { scratch := [0].to_array()\n return xs.len() + scratch.len() }\n\
+         fn mutable_len(borrow mut xs: slice<f32>) -> i64 { scratch := [0].to_array()\n return xs.len() + scratch.len() }\n",
+        &["array_len", "mutable_len"],
+    );
+    for name in ["array_len", "mutable_len"] {
+        let body = function_ir(&other_lengths, name);
+        assert!(
+            body.lines().any(|line| line.contains("load i64, ptr %uncached.view.len") && line.contains("!range !")),
+            "{name}: borrowed array and mutable slice lengths retain the same fact:\n{body}",
+        );
+    }
+}
+
 /// The non-negativity claim is about a *length*, not about the `{ptr,i64}` layout. Several types
 /// share that layout and give the second field another meaning entirely: a `json.doc` is
 /// `{tape, node}`, and its node index is `-1` for Missing. Claiming `!range !{i64 0, i64 …}` there
