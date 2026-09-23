@@ -47766,6 +47766,7 @@ impl<'a, 't> Checker<'a, 't> {
                 body
             }
             ast::FnBody::Expr(e) => {
+                self.reject_bare_array_value(e, Some(ret), "a function value");
                 let value = self.check_completion_expr(e, Some(ret));
                 Block {
                     stmts: Vec::new(),
@@ -48093,6 +48094,9 @@ impl<'a, 't> Checker<'a, 't> {
                             ),
                             b.span,
                         );
+                    }
+                    if let Some(e) = value {
+                        self.reject_bare_array_value(e, Some(self.ret_hint), "a `return` value");
                     }
                     let v = value.as_ref().map(|e| self.check_expr(e, Some(self.ret_hint)));
                     stmts.push(Stmt::Return(v));

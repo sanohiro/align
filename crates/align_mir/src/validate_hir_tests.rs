@@ -18507,6 +18507,44 @@ fn fixed_array_len_child_and_result_contract() -> Result<(), &'static str> {
 }
 
 #[test]
+fn free_fixed_array_returns_are_rejected_before_mir_lowering() {
+    for (name, source, context) in [
+        (
+            "expression-body",
+            "fn zero() -> [i64; 1] = [0]\nfn main() -> i32 = 0\n",
+            "a function value",
+        ),
+        (
+            "return-statement",
+            "fn zero() -> [i64; 1] { return [0] }\nfn main() -> i32 = 0\n",
+            "a `return` value",
+        ),
+    ] {
+        let outcome = frontend_then_boundary(source);
+        let Err(message) = outcome else {
+            panic!("{name}: a free fixed array value reached MIR lowering");
+        };
+        assert!(
+            message.contains(&format!("bare array literal cannot be used as {context}")),
+            "{name}: expected a source diagnostic, got:\n{message}",
+        );
+        assert!(!message.contains("report this program shape"), "{name}: {message}");
+    }
+
+    let mut program = checked_source_program(
+        "fn zero() -> [i64; 1] { xs := [0]\n return xs }\nfn main() -> i32 = 0\n",
+    );
+    assert!(validate_hir::body_only_metadata_is_valid(&program));
+    let Some(function) = program.fns.iter_mut().find(|function| function.name == "zero") else { panic!("zero function") };
+    let hir::Stmt::Let { init, .. } = &function.body.stmts[0] else { panic!("fixed initializer") };
+    let literal = init.clone();
+    let Some(hir::Stmt::Return(Some(returned))) = function.body.stmts.last_mut() else { panic!("return value") };
+    *returned = literal;
+    assert!(!validate_hir::body_only_metadata_is_valid(&program));
+    assert!(is_empty(&lower_program(&program)));
+}
+
+#[test]
 fn fixed_array_len_rejects_free_literal_placement() -> Result<(), &'static str> {
     for literal in ["[1,2]", "[Row{value: 1},Row{value: 2}]"] {
         for (name, receiver) in [

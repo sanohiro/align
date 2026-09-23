@@ -12417,6 +12417,9 @@ impl<'a> BodyValidator<'a> {
                 self.store_statement(statement, Ty::Unit, children_fall, sequence_breaks)
             }
             hir::Stmt::Return(value) => {
+                if value.as_ref().is_some_and(|value| matches!(value.kind, hir::ExprKind::ArrayLit { .. })) {
+                    return false;
+                }
                 let Some(function_ret) = self.program.fns.get(context.function).map(|function| function.ret) else {
                     return false;
                 };
