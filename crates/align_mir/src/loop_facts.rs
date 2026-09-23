@@ -2832,11 +2832,9 @@ mod tests {
                 .map(|diagnostic| &diagnostic.message)
                 .collect::<Vec<_>>()
         );
-        crate::lower_program_unchecked(&hir, None, false)
-            .fns
-            .into_iter()
-            .next()
-            .expect("proof fixture function")
+        let mut lowered = crate::lower_program_unchecked(&hir, None, false);
+        assert_eq!(lowered.fns.len(), 1, "proof fixture function");
+        lowered.fns.remove(0)
     }
 
     #[test]
@@ -2874,8 +2872,7 @@ mod tests {
                 3 => forged.start = int(0),
                 4 => forged.end = int(0),
                 5 => forged.len = int(0),
-                6 => forged.scalar = i64_ty(),
-                _ => unreachable!(),
+                _ => forged.scalar = i64_ty(),
             }
             let mut rejected = simplified.clone();
             let (decisions, _) = version_loops(&mut rejected, &[forged]);
