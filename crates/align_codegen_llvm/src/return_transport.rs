@@ -363,6 +363,31 @@ attributes #0 = { "align.program.cleanup" }
     }
 
     #[test]
+    fn parameter_replacements_follow_module_order() -> Result<(), String> {
+        let ctx = Context::create();
+        let mut source = String::from("%Big = type { [27 x i64] }\n");
+        for index in 0..8 {
+            source.push_str(&format!(
+                "define i64 @f{index}(%Big %value) #0 {{\nentry:\n  ret i64 {index}\n}}\n"
+            ));
+        }
+        source.push_str("attributes #0 = { \"align.program.parameters\" }\n");
+        let module = parse(&ctx, &source)?;
+        let tm = target()?;
+        module.set_data_layout(&tm.get_target_data().get_data_layout());
+        module.set_triple(&tm.get_triple());
+        let mut owned = module.get_functions().collect::<Vec<_>>();
+        owned.reverse();
+        normalize(&module, &tm, &owned).map_err(|error| error.to_string())?;
+        let raw = module.print_to_string().to_string();
+        let positions = (0..8)
+            .map(|index| raw.find(&format!("define i64 @f{index}(")).ok_or("missing function"))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{raw}");
+        Ok(())
+    }
+
+    #[test]
     fn target_stack_aggregate_parameter_becomes_byval() -> Result<(), String> {
         let ctx = Context::create();
         let module = parse(
