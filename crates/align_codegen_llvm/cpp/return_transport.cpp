@@ -1283,7 +1283,11 @@ bool normalize(Module &M, TargetMachine &TM, ArrayRef<LLVMValueRef> Owned,
     Old.eraseFromParent();
   }
   SmallVector<Function *, 32> ParameterOwners;
-  for (Function *F : Selected) {
+  // SmallPtrSet iteration follows pointer allocation order. Rewriting parameter owners in that
+  // order changes definition order and object bytes across otherwise identical compiler runs.
+  for (Function &Candidate : M) {
+    Function *F = &Candidate;
+    if (!Selected.contains(F)) continue;
     if (!F->hasFnAttribute(ParameterOwner)) continue;
     if (auto It = Index.find(F); It != Index.end())
       ParameterOwners.push_back(Functions[It->second].Replacement);
