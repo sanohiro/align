@@ -580,18 +580,14 @@ one monotone index      exactly one slot i is written in the body, by exactly
                         in the body, including from a nested inner loop. The
                         exit test i >= N reads the header value by construction
 non-negative entry      the arithmetic reads the value the index slot holds at
-                        the preheader — a live load, not the initializer's
-                        value. The static initializer (a non-negative constant,
-                        a length, or an operand under a dominating
-                        non-negativity guard, with dominance over the header)
-                        is evidence only that the slot is initialized and
-                        statically non-negative on its first entry: an
-                        enclosing loop can re-enter the header without
-                        re-executing that initializer, so a later entry's live
-                        value can differ from it. `e >= 0` is therefore a
-                        runtime conjunct of the admission test, exactly as
-                        every other operand's proof is. An unproved static
-                        initializer fails closed. §3.2.1 depends on it
+                        the preheader — a live load, not an initializer's
+                        remembered value. §3.7.1's must-init proof covers
+                        every reachable entry, including re-entry from an
+                        enclosing loop; no static sign assumption is made.
+                        `e >= 0` is a runtime conjunct of the nonempty
+                        admission test, exactly as every other operand's
+                        proof is. An unproved initialization fails closed.
+                        §3.2.1 depends on the live read and runtime check
 loop-invariant bound    the loop exits on i >= N with N a loop-invariant i64
                         operand not killed in the body. Any other exit is an
                         ordinary exit and is preserved in both versions; only
@@ -1060,17 +1056,48 @@ not remembered             initializer's own value: a non-negative constant, a
                            other admission operand, with `e >= 0` as its own
                            runtime conjunct — the same treatment `N`, every
                            guard length, and the affine offset `b` already had.
-                           A recorded follow-up, not done in this PR: the
-                           static initializer scan could be replaced entirely
-                           by an initialization proof, which would let a
-                           parameter or a value with multiple initializers
-                           admit on its own live value instead of failing
-                           `entry-unproved`. `entry-unproved` itself had no
-                           reason-code owner before this fix;
-                           `g2_index_forms_get_their_stated_decision`'s
-                           `choose_start` case (two writes to the index slot
-                           outside the loop, one per `if` arm) closes it
+                           PR 2 recorded a follow-up to replace the static
+                           initializer scan with an initialization proof.
+                           §3.7.1 implements it; the parameter and
+                           `choose_start` branch entries now admit on their
+                           live value. `entry-unproved` remains the reason
+                           for a path without a proved initialization
 ```
+
+### 3.7.1 Follow-up closure matrix: live-entry initialization
+
+The §3.7 follow-up replaces the single static initializer scan with a must-init
+proof for the index slot at the original loop header. Every path starts false,
+including a parameter path: an actual `Store` from `Arg` must precede the
+header. A full-width `i64` `Store` initializes only when its source is an exact
+`i64` constant, a matching ByValue argument, or a typed available SSA value
+whose pure defining expression and inputs are validated. The body step already
+authenticated by the recurrence proof and its generated fast-copy twin are
+full stores on their backedges; neither can initialize a missing outside
+entry. Re-derivation recognizes the twin only by the same typed
+load/add/store recurrence inside generated blocks. A load in another source
+requires its own must-init proof at the load statement; cycles in value
+definitions and proof chains deeper than 256 nodes fail closed. A non-`Store`
+write to the index slot clears the
+proof. The merge is intersection over reachable predecessors. The entry starts
+false and all other blocks start true; iteration removes a fact when an actual
+path lacks initialization. Every reachable cycle has a path from entry, so a
+cycle cannot justify its own initial load, while an initialized value survives
+an enclosing loop's unchanged re-entry. The
+proof checks the slot's state before the header's first statement, including
+every entry from an enclosing loop.
+Every admission operand still reads its live value in the preheader, and the
+runtime `e >= 0` conjunct still guards a nonempty fast execution. The
+`entry-unproved` reason remains for any path without a complete initialization.
+No new MIR fact, wire record, artifact identity, source surface, or runtime ABI
+is introduced.
+
+| Boundary | Proof and owner |
+|---|---|
+| formation and move | Only an exact `i64` index slot with the existing recurrence is considered. The parameter's real `Store` and other full-width typed/available `Store` values establish initialization; missing parameter stores, wrong-width/undefined/non-dominating sources, cyclic or deeper-than-256 source chains, partial writes, Drop and move-out clear the fact. The existing index-write, escape, and type checks remain. A MIR-level dataflow owner covers each transfer and malformed slot/source. |
+| control joins | Entry, `if`/`match`/`else`, loop and early-exit joins use intersection of reachable predecessors; unreachable blocks cannot supply a proof, and a reachable cycle inherits its entry path rather than certifying itself. Source owners cover parameter entry, two branch initializers, a negative live value and both enclosing-loop re-entry cases; an isolated MIR owner covers a missing predecessor initialization. |
+| rewrite and return | The original slow copy keeps its guards and trap order. The fast copy reads the current slot at every preheader entry, including after a prior slow-copy run; re-derivation checks the same must-init fact after rewriting. Existing trap-prefix, re-entry, clone and return owners remain applicable. |
+| compilation modes | Generic monomorphization, whole-program, per-unit, function partition, and runtime allocation are unchanged by this MIR-only admission proof. The existing mode and allocation owners remain applicable; no new benchmark or ABI owner is required. |
 
 ### 3.8 Residual closure matrix: width-one byte reads (1084)
 

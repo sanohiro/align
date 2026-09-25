@@ -40,6 +40,9 @@ pub const LOOP_FACTS_VERSION_BUDGET: usize = 256;
 /// The largest function `loop_facts` analyses. Dominance is a dense bit matrix, so a pathological
 /// machine-generated body is refused rather than paid for quadratically.
 const MAX_ANALYSED_BLOCKS: usize = 1024;
+/// Recursive initializer-source proofs are an optimization only; bound malformed or very deep
+/// SSA/slot chains before they can exhaust the compiler stack.
+const MAX_INIT_PROOF_DEPTH: usize = 256;
 
 fn i64_ty() -> Ty {
     Ty::Int(IntTy {
@@ -87,7 +90,7 @@ pub enum KeptReason {
     /// The step can execute before a guarded access on some path, so the value reaching that access
     /// is not the value the header saw (the `shifted_sum` witness).
     StepPrecedesAccess,
-    /// The entry value of the index is not a loop-invariant operand proved non-negative.
+    /// The index slot is not definitely initialized before every entry to the loop.
     EntryUnproved,
     /// The trip-count bound is missing, not loop-invariant, or killed in the body.
     BoundKilled,
@@ -1537,6 +1540,271 @@ fn slot_initialized_before(
     })
 }
 
+/// A full-width source available before a store. This deliberately accepts only the scalar
+/// expression forms needed by an index initializer; an unknown MIR producer cannot turn an
+/// uninitialized slot into an admission fact. `active` also rejects a cyclic SSA/load proof.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum InitProofNode {
+    Slot(Slot, BlockId, usize),
+    Value(ValueId),
+}
+
+fn initialized_store_source(
+    function: &Function,
+    cfg: &Cfg,
+    analysis: &Analysis<'_>,
+    operand: &Operand,
+    expected: Ty,
+    use_block: BlockId,
+    use_position: usize,
+    trusted_steps: &BTreeSet<(Slot, BlockId, usize)>,
+    active: &mut BTreeSet<InitProofNode>,
+) -> bool {
+    if operand_ty(function, operand) != Some(expected) {
+        return false;
+    }
+    match operand {
+        Operand::Const(Const::Int(_, ty)) => *ty == expected,
+        Operand::Arg(index) => function
+            .params
+            .get(*index as usize)
+            .zip(function.param_modes.get(*index as usize))
+            .is_some_and(|(slot, mode)| {
+                function.slots.get(*slot as usize) == Some(&expected)
+                    && if expected == i64_ty() {
+                        *mode == ParamMode::ByValue
+                    } else {
+                        *mode != ParamMode::Out
+                    }
+            }),
+        Operand::Value(_) => {
+            let Some((def_block, def_position, rvalue)) = analysis.def(operand) else {
+                return false;
+            };
+            if !cfg.dominates(def_block, use_block)
+                || (def_block == use_block && def_position >= use_position)
+            {
+                return false;
+            }
+            let Operand::Value(value) = operand else {
+                return false;
+            };
+            if active.len() >= MAX_INIT_PROOF_DEPTH
+                || !active.insert(InitProofNode::Value(*value))
+            {
+                return false;
+            }
+            let valid = match rvalue {
+                Rvalue::Use(source) => initialized_store_source(
+                    function,
+                    cfg,
+                    analysis,
+                    source,
+                    expected,
+                    def_block,
+                    def_position,
+                    trusted_steps,
+                    active,
+                ),
+                Rvalue::Load(slot) => {
+                    function.slots.get(*slot as usize) == Some(&expected)
+                        && slot_initialized_at(
+                            function,
+                            cfg,
+                            analysis,
+                            *slot,
+                            def_block,
+                            def_position,
+                            trusted_steps,
+                            active,
+                        )
+                }
+                Rvalue::SliceLen(view) if expected == i64_ty() => operand_ty(function, view)
+                    .is_some_and(|view_ty| {
+                        matches!(
+                            view_ty,
+                            Ty::Slice(_) | Ty::Array(_, _) | Ty::DynArray(_) | Ty::Str | Ty::String
+                        ) && initialized_store_source(
+                            function,
+                            cfg,
+                            analysis,
+                            view,
+                            view_ty,
+                            def_block,
+                            def_position,
+                            trusted_steps,
+                            active,
+                        )
+                    }),
+                Rvalue::Bin(
+                    BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Div
+                    | BinOp::Rem
+                    | BinOp::BitAnd
+                    | BinOp::BitOr
+                    | BinOp::BitXor
+                    | BinOp::Shl
+                    | BinOp::Shr,
+                    left,
+                    right,
+                ) if expected == i64_ty() => {
+                    initialized_store_source(
+                        function,
+                        cfg,
+                        analysis,
+                        left,
+                        expected,
+                        def_block,
+                        def_position,
+                        trusted_steps,
+                        active,
+                    ) && initialized_store_source(
+                        function,
+                        cfg,
+                        analysis,
+                        right,
+                        expected,
+                        def_block,
+                        def_position,
+                        trusted_steps,
+                        active,
+                    )
+                }
+                _ => false,
+            };
+            active.remove(&InitProofNode::Value(*value));
+            valid
+        }
+        Operand::Const(_)
+        | Operand::BorrowedPlace(_)
+        | Operand::BorrowedElementPlace(_)
+        | Operand::BorrowedFixedElementPlace(_)
+        | Operand::BorrowedCleanupArg(_) => false,
+    }
+}
+
+/// Must-init at a statement boundary. The entry starts false; a reachable cycle cannot certify
+/// itself because every path into it comes from that entry. Other blocks start true so a cycle
+/// that preserves an earlier full store retains its fact until an actual uninitialized path
+/// drives the intersection false.
+fn slot_initialized_at(
+    function: &Function,
+    cfg: &Cfg,
+    analysis: &Analysis<'_>,
+    slot: Slot,
+    target: BlockId,
+    position: usize,
+    trusted_steps: &BTreeSet<(Slot, BlockId, usize)>,
+    active: &mut BTreeSet<InitProofNode>,
+) -> bool {
+    if function.slots.get(slot as usize).is_none()
+        || function
+            .blocks
+            .get(target as usize)
+            .is_none_or(|block| position > block.stmts.len())
+        || active.len() >= MAX_INIT_PROOF_DEPTH
+        || !active.insert(InitProofNode::Slot(slot, target, position))
+    {
+        return false;
+    }
+    let reachable = cfg.reachable_from(function, function.entry, &BTreeSet::new());
+    let mut relevant = BTreeSet::new();
+    let mut pending = vec![target];
+    while let Some(block) = pending.pop() {
+        if reachable.contains(&block) && relevant.insert(block) {
+            pending.extend(cfg.preds[block as usize].iter().copied());
+        }
+    }
+    let mut out = vec![true; cfg.blocks];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &function.blocks {
+            if !relevant.contains(&block.id) {
+                continue;
+            }
+            let mut initialized = block.id != function.entry
+                && !cfg.preds[block.id as usize].is_empty()
+                && cfg.preds[block.id as usize]
+                    .iter()
+                    .filter(|pred| reachable.contains(pred))
+                    .all(|pred| out[*pred as usize]);
+            for (stmt_position, stmt) in block.stmts.iter().enumerate() {
+                match stmt {
+                    Stmt::Store(written, value) if *written == slot => {
+                        if !trusted_steps.contains(&(slot, block.id, stmt_position)) {
+                            initialized = initialized_store_source(
+                                function,
+                                cfg,
+                                analysis,
+                                value,
+                                function.slots[slot as usize],
+                                block.id,
+                                stmt_position,
+                                trusted_steps,
+                                active,
+                            );
+                        } else {
+                            initialized = true;
+                        }
+                    }
+                    _ if matches!(statement_facts(function, stmt), StmtFacts::WritesSlot(written, _, _) if written == slot) =>
+                    {
+                        initialized = false;
+                    }
+                    _ => {}
+                }
+            }
+            if out[block.id as usize] != initialized {
+                out[block.id as usize] = initialized;
+                changed = true;
+            }
+        }
+    }
+    let mut initialized = target != function.entry
+        && !cfg.preds[target as usize].is_empty()
+        && cfg.preds[target as usize]
+            .iter()
+            .filter(|pred| reachable.contains(pred))
+            .all(|pred| out[*pred as usize]);
+    if !reachable.contains(&target) {
+        initialized = false;
+    }
+    for (stmt_position, stmt) in function.blocks[target as usize].stmts[..position]
+        .iter()
+        .enumerate()
+    {
+        match stmt {
+            Stmt::Store(written, value) if *written == slot => {
+                if !trusted_steps.contains(&(slot, target, stmt_position)) {
+                    initialized = initialized_store_source(
+                        function,
+                        cfg,
+                        analysis,
+                        value,
+                        function.slots[slot as usize],
+                        target,
+                        stmt_position,
+                        trusted_steps,
+                        active,
+                    );
+                } else {
+                    initialized = true;
+                }
+            }
+            _ if matches!(statement_facts(function, stmt), StmtFacts::WritesSlot(written, _, _) if written == slot) =>
+            {
+                initialized = false;
+            }
+            _ => {}
+        }
+    }
+    active.remove(&InitProofNode::Slot(slot, target, position));
+    initialized
+}
+
 /// Rebuild one loop-invariant operand in the preheader.
 struct Remat<'a> {
     analysis: &'a Analysis<'a>,
@@ -2001,7 +2269,13 @@ fn admit(
     if *step_ty != i64_ty() || *step <= 0 || *step > i128::from(i64::MAX) {
         return Err(KeptReason::MultipleIndexWrites);
     }
-    if !matches!(analysis.def(previous), Some((_, _, Rvalue::Load(slot))) if *slot == index_slot) {
+    let Some((arithmetic_block, arithmetic_position, _)) = analysis.def(stepped) else {
+        return Err(KeptReason::MultipleIndexWrites);
+    };
+    if arithmetic_block != *step_block
+        || arithmetic_position >= *step_position
+        || !matches!(analysis.def(previous), Some((block, position, Rvalue::Load(slot))) if block == *step_block && position < arithmetic_position && *slot == index_slot)
+    {
         return Err(KeptReason::MultipleIndexWrites);
     }
     let step = *step;
@@ -2033,35 +2307,43 @@ fn admit(
         }
     }
 
-    // The entry value: exactly one write to the index slot outside the loop, dominating the header.
-    // Dominance proves only that this initializer runs before the *first* entry, not before every
-    // one: an enclosing (unversioned) loop can re-enter this header without re-executing it, and a
-    // previous slow-copy run may have left the slot wrapped (defined two's-complement wrap). So the
-    // initializer is evidence only that the slot is initialized and statically non-negative here;
-    // the admission arithmetic itself reads the slot's *live* value at the preheader (§3.2.1).
-    let mut entries = Vec::new();
-    for block in &function.blocks {
-        if body.contains(&block.id) || ignore.contains(&block.id) {
-            continue;
-        }
-        for stmt in &block.stmts {
-            if matches!(statement_facts(function, stmt), StmtFacts::WritesSlot(slot, _, _) if slot == index_slot)
+    // The preheader reads the current slot on every outside entry, including re-entry from an
+    // enclosing loop. Prove that every path reaching the original header has a full-width value;
+    // the already authenticated body step and its generated fast-copy twin are full stores.
+    // The latter can reach this header through an enclosing loop, so re-derivation must recognize
+    // it without treating an unrelated write as a trusted recurrence. Non-negativity of the
+    // *live* value is tested below at runtime.
+    let mut trusted_steps = BTreeSet::from([(index_slot, *step_block, *step_position)]);
+    for block in ignore {
+        for (position, statement) in function.blocks[*block as usize].stmts.iter().enumerate() {
+            let Stmt::Store(slot, stepped) = statement else {
+                continue;
+            };
+            if *slot == index_slot
+                && matches!(
+                    analysis.binary(stepped, BinOp::Add),
+                    Some((previous, Operand::Const(Const::Int(delta, ty))))
+                        if *delta == step && *ty == i64_ty()
+                            && analysis.def(stepped).is_some_and(|(source, arithmetic, _)| {
+                                source == *block && arithmetic < position
+                                    && matches!(analysis.def(previous), Some((load_block, load, Rvalue::Load(found))) if load_block == *block && load < arithmetic && *found == index_slot)
+                            })
+                )
             {
-                entries.push((block.id, stmt));
+                trusted_steps.insert((index_slot, *block, position));
             }
         }
     }
-    let [(entry_block, Stmt::Store(_, entry_value))] = entries.as_slice() else {
-        return Err(KeptReason::EntryUnproved);
-    };
-    if !cfg.dominates(*entry_block, header) {
-        return Err(KeptReason::EntryUnproved);
-    }
-    let entry_non_negative = match entry_value {
-        Operand::Const(Const::Int(value, ty)) => *ty == i64_ty() && *value >= 0,
-        other => matches!(analysis.def(other), Some((_, _, Rvalue::SliceLen(_)))),
-    };
-    if !entry_non_negative {
+    if !slot_initialized_at(
+        function,
+        cfg,
+        analysis,
+        index_slot,
+        header,
+        0,
+        &trusted_steps,
+        &mut BTreeSet::new(),
+    ) {
         return Err(KeptReason::EntryUnproved);
     }
 
@@ -2120,11 +2402,10 @@ fn admit(
     let root_killed = |remat: &Remat<'_>| {
         KeptReason::RootKilled(remat.blocked_by.unwrap_or("Call"))
     };
-    // The initializer proves the slot's first value. An enclosing loop can re-enter this header
-    // without re-executing it, and a slow-copy run may have wrapped the index, so the admission
-    // must read the value the header will actually see. The preheader sits on every edge into the
-    // header (`apply`) and the slot's address never leaves the function (checked above), so this
-    // load is that value.
+    // Must-init proves a value exists, but an enclosing loop can re-enter this header after a
+    // slow-copy run wrapped the index. Read the value the header will actually see. The preheader
+    // sits on every outside edge into the header (`apply`), and the slot's address never leaves
+    // the function (checked above).
     let entry = pre.emit(i64_ty(), Rvalue::Load(index_slot));
     let Some(bound) = remat.get(bound, &mut pre) else {
         return Err(if remat.blocked_by.is_some() {
@@ -2158,8 +2439,7 @@ fn admit(
         int(i128::from(i64::MAX) - step),
     );
 
-    // The initializer only proved non-negativity of the *first* entry (§3.2); the live entry read
-    // above needs its own runtime check, exactly as every other admission operand does.
+    // Must-init supplies no sign fact; check the live entry like every other admission operand.
     let entry_ok = pre.bin(BinOp::Ge, Ty::Bool, entry.clone(), int(0));
     let mut conjuncts = vec![entry_ok, induction];
     let mut proved = Vec::new();
@@ -2951,6 +3231,142 @@ mod tests {
             exportable: false,
             available_externally: false,
         }
+    }
+
+    #[test]
+    fn index_initialization_intersects_paths_and_rejects_malformed_sources() {
+        let block = |id, stmts, term| Block {
+            id,
+            stmts,
+            stmt_lines: Vec::new(),
+            term,
+        };
+        let mut function = scratch();
+        function.blocks = vec![
+            block(
+                0,
+                Vec::new(),
+                Term::Branch(Operand::Const(Const::Bool(true)), 1, 2),
+            ),
+            block(1, vec![Stmt::Store(0, int(1))], Term::Goto(3)),
+            block(2, vec![Stmt::Store(0, int(2))], Term::Goto(3)),
+            block(3, Vec::new(), Term::Goto(4)),
+            block(4, vec![Stmt::Store(0, int(3))], Term::Goto(3)),
+        ];
+        let proves = |function: &Function| {
+            let cfg = Cfg::build(function).expect("well-shaped fixture CFG");
+            let analysis = Analysis::new(function, &cfg).expect("well-shaped fixture SSA");
+            slot_initialized_at(
+                function,
+                &cfg,
+                &analysis,
+                0,
+                3,
+                0,
+                &BTreeSet::from([(0, 4, 0)]),
+                &mut BTreeSet::new(),
+            )
+        };
+        assert!(
+            proves(&function),
+            "both branch stores initialize the live entry"
+        );
+
+        function.blocks[2].stmts.clear();
+        assert!(!proves(&function), "one missing branch store must refuse");
+        function.blocks[2].stmts.push(Stmt::Store(0, int(2)));
+        function.blocks[1].stmts.push(Stmt::Drop(0));
+        assert!(
+            !proves(&function),
+            "a later non-Store write clears initialization"
+        );
+        function.blocks[1].stmts.pop();
+
+        for bad in [
+            Operand::Const(Const::Int(
+                1,
+                Ty::Int(IntTy {
+                    bits: 32,
+                    signed: true,
+                }),
+            )),
+            Operand::Value(42),
+        ] {
+            function.blocks[2].stmts[0] = Stmt::Store(0, bad);
+            assert!(
+                !proves(&function),
+                "a wrong-width or undefined source refuses"
+            );
+        }
+
+        function.blocks[2].stmts = vec![
+            Stmt::Store(0, Operand::Value(0)),
+            Stmt::Let(0, Rvalue::Use(int(2))),
+        ];
+        assert!(!proves(&function), "a later SSA definition cannot initialize a store");
+        function.blocks[2].stmts = vec![
+            Stmt::Let(0, Rvalue::Use(Operand::Value(0))),
+            Stmt::Store(0, Operand::Value(0)),
+        ];
+        assert!(!proves(&function), "a cyclic SSA source cannot initialize itself");
+
+        function.value_tys = vec![i64_ty(); MAX_INIT_PROOF_DEPTH + 1];
+        function.blocks[2].stmts = vec![Stmt::Let(0, Rvalue::Use(int(2)))];
+        for value in 1..=MAX_INIT_PROOF_DEPTH {
+            function.blocks[2].stmts.push(Stmt::Let(
+                value as ValueId,
+                Rvalue::Use(Operand::Value((value - 1) as ValueId)),
+            ));
+        }
+        function.blocks[2].stmts.push(Stmt::Store(
+            0,
+            Operand::Value(MAX_INIT_PROOF_DEPTH as ValueId),
+        ));
+        assert!(!proves(&function), "a deep SSA chain refuses before stack exhaustion");
+
+        function.blocks[2].stmts = vec![Stmt::Store(0, int(2))];
+        function.blocks[0].term = Term::Goto(3);
+        assert!(
+            !proves(&function),
+            "the body backedge cannot initialize its own first entry"
+        );
+
+        let mut parameter = scratch();
+        parameter.params = vec![0];
+        parameter.param_modes = vec![ParamMode::ByValue];
+        parameter.blocks[0].term = Term::Return(None);
+        assert!(
+            !{
+                let cfg = Cfg::build(&parameter).unwrap();
+                let analysis = Analysis::new(&parameter, &cfg).unwrap();
+                slot_initialized_at(
+                    &parameter,
+                    &cfg,
+                    &analysis,
+                    0,
+                    0,
+                    0,
+                    &BTreeSet::new(),
+                    &mut BTreeSet::new(),
+                )
+            },
+            "parameter metadata alone is not an initialization"
+        );
+        parameter.blocks[0]
+            .stmts
+            .push(Stmt::Store(0, Operand::Arg(0)));
+        let cfg = Cfg::build(&parameter).unwrap();
+        let analysis = Analysis::new(&parameter, &cfg).unwrap();
+        assert!(slot_initialized_at(
+            &parameter,
+            &cfg,
+            &analysis,
+            0,
+            0,
+            1,
+            &BTreeSet::new(),
+            &mut BTreeSet::new(),
+        ));
     }
 
     /// The kill set, closed once for the whole `Stmt` inventory rather than by one Align fixture per
