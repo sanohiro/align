@@ -133,8 +133,8 @@ fn gate_sv1_subprocess_build_twice_byte_identical() {
             .expect("spawn alignc");
         assert!(out.status.success(), "--thin-lto build failed: {}", String::from_utf8_lossy(&out.stderr));
         let err = String::from_utf8_lossy(&out.stderr);
-        assert!(err.contains("prelink: 0 hit, 5 miss"), "the build must be cold (all function partitions prelink-miss):\n{err}");
-        assert!(err.contains("backend: 0 hit, 5 miss"), "the build must be cold (all function partitions backend-miss):\n{err}");
+        assert!(err.contains("prelink: 0 hit, 7 miss"), "the build must be cold (all function partitions prelink-miss):\n{err}");
+        assert!(err.contains("backend: 0 hit, 7 miss"), "the build must be cold (all function partitions backend-miss):\n{err}");
         assert!(exe_path.exists(), "the build produced the exe");
         std::fs::read(&exe_path).expect("read built exe")
     };

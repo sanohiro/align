@@ -107,7 +107,7 @@ fn cross_module_pub_fn_exposing_own_private_type_is_rejected() {
     );
 }
 
-// A `pub const` can never name a user type: a constant's type is restricted to a scalar / `str` /
+// A `pub const` can never name a user type: a constant's type is restricted to a scalar / `str` / `raw` /
 // `slice<T>` of a scalar (Pass 0d), so the exposure hole is structurally impossible for consts. This
 // documents WHY the exposure check does not (and need not) walk pub consts.
 #[test]
@@ -117,9 +117,10 @@ fn pub_const_cannot_name_a_user_type() {
                fn main() -> i32 = 0\n";
     let d = check_diagnostics("pub-const-user-type", src);
     assert!(
-        d.contains("a constant's type must be a scalar, `str`, or `slice<T>`"),
+        d.contains("a constant's type must be a scalar, `str`, `raw`, or `slice<T>`"),
         "a const naming a user type is caught by the scalar-only rule, not the exposure check, got:\n{d}"
     );
+    assert!(!d.contains("constant has type"), "an invalid annotation must not cause a second type mismatch:\n{d}");
 }
 
 // ---- positive controls: legal shapes still compile ----------------------------------------------

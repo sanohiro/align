@@ -1,6 +1,6 @@
 //! ThinLTO S1 (`--thin-lto`) — the serial cross-unit-optimizing build. Gates:
 //!
-//!  1. **Cross-unit inline, mutation-checked both directions** — a two-unit program (unit B: small
+//!  1. **Cross-unit inline, mutation-checked both directions** — a two-unit program (unit B:
 //!     `pub` fns; unit A: calls them). Under `--thin-lto` the entry object's undefined cross-unit
 //!     references (`U lib$add1`, `U lib$mul2`) VANISH (imported + inlined); without the flag they
 //!     remain. And the built program runs with identical output.
@@ -78,7 +78,9 @@ fn has_ext_def(syms: &[(char, String)], want: &str) -> bool {
 
 // ---- Gate 1: cross-unit inline, mutation-checked both directions --------------------------------
 
-const LIB1: &str = "module lib\npub fn add1(x: i64) -> i64 = x + 1\npub fn mul2(x: i64) -> i64 = x * 2\n";
+// Calls to producer-local helpers exclude these public bodies from interface transport, leaving
+// the flag-off symbol boundary in place so this test still isolates ThinLTO's cross-unit import.
+const LIB1: &str = "module lib\nfn inc(x: i64) -> i64 = x + 1\nfn double(x: i64) -> i64 = x * 2\npub fn add1(x: i64) -> i64 = inc(x)\npub fn mul2(x: i64) -> i64 = double(x)\n";
 const MAIN1: &str = "\
 import lib
 fn main() {

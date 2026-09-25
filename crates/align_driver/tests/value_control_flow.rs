@@ -700,6 +700,10 @@ fn bound_if_result_flag_transfer() {
                             values[*id as usize] = slots[*slot as usize]
                         }
                         Stmt::DropFlagInit(slot) => slots[*slot as usize] = Value::Empty,
+                        Stmt::DropFlagMoveOut { slot, flag } => {
+                            slots[*slot as usize] = Value::Empty;
+                            slots[*flag as usize] = Value::Bool(false);
+                        }
                         Stmt::Drop(slot) => {
                             if let Value::Payload(id) = slots[*slot as usize] {
                                 drops[id] += 1

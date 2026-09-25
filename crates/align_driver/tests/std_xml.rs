@@ -982,9 +982,6 @@ pub fn main() -> Result<(), Error> {
         "i32 1, label %xml.next.start",
         "i32 2, label %xml.next.end",
         "i32 3, label %xml.next.text",
-        "[ { i8 1, %xml.event zeroinitializer }, %xml.next.start ]",
-        "[ { i8 1, %xml.event { i32 1 } }, %xml.next.end ]",
-        "[ { i8 1, %xml.event { i32 2 } }, %xml.next.text ]",
         "%xml.attribute_count.nonnegative = icmp sge i64 %xml.attribute_count, 0",
         "%xml.attribute_count.bounded = icmp sle i64 %xml.attribute_count, 256",
     ] {
@@ -993,6 +990,16 @@ pub fn main() -> Result<(), Error> {
             "missing atomic XML status/result fragment `{fragment}`:\n{llvm}"
         );
     }
+    for (arm, payload) in [
+        ("start", "zeroinitializer"),
+        ("end", "{ i32 1 }"),
+        ("text", "{ i32 2 }"),
+    ] {
+        let label = format!("xml.next.{arm}:");
+        let block = llvm.split(&label).nth(1).and_then(|tail| tail.split("\n\n").next()).expect("XML status arm");
+        assert!(block.contains("{ i8 1,") && block.contains(&format!("store %xml.event {payload}, ptr %union.payload")), "XML {arm} must construct Some with its selected event payload:\n{block}");
+    }
+    assert!(llvm.lines().any(|line| line.contains("%xml.next.result = phi") && ["%xml.next.start", "%xml.next.end", "%xml.next.text"].iter().all(|arm| line.contains(arm))), "all event arms must join in the Option result:\n{llvm}");
     for operation in [
         "xml_name",
         "xml_attribute_name",
