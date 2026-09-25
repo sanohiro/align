@@ -744,9 +744,8 @@ fn drain(borrow mut data: array<i64>) -> i64 {
 }
 ";
 
-/// No single dominating initializer: the index slot is written on both arms of an `if` before the
-/// loop, so the entries scan finds more than one write outside the body and never gets far enough
-/// to check dominance or non-negativity.
+/// Both branches leave the index initialized before the loop. Admission reads the selected live
+/// value; it does not require one static initializer.
 const TWO_ENTRY_WRITES: &str = "\
 fn choose_start(borrow xs: slice<i64>, flag: bool) -> i64 {
   mut acc := 0
@@ -758,6 +757,19 @@ fn choose_start(borrow xs: slice<i64>, flag: bool) -> i64 {
     i = i + 1
   }
   return acc
+}
+";
+
+const PARAM_ENTRY: &str = "\
+fn scan_from(borrow xs: slice<i64>, start: i64) -> i64 {
+  mut total := 0
+  mut i := start
+  loop {
+    if i >= xs.len() { break }
+    total = total + xs[i]
+    i = i + 1
+  }
+  return total
 }
 ";
 
@@ -974,7 +986,7 @@ fn g2_version_budget_is_pinned() {
 fn g2_index_forms_get_their_stated_decision() {
     let program = format!(
         "{SUM}{SCAN_REPORT}{SHIFTED_SUM}{STRIDE_SUM}{MATVEC}{WINDOW_FIRST}{SKIP_ZEROS}{DRAIN}\
-{TWO_ENTRY_WRITES}\
+{TWO_ENTRY_WRITES}{PARAM_ENTRY}\
 fn main() {{ }}\n"
     );
     let report = loop_facts_report("index-forms", &program);
@@ -996,9 +1008,10 @@ fn main() {{ }}\n"
         ("skip_zeros", "kept checks: multiple-index-writes"),
         // `truncate` changes the published length inside the body.
         ("drain", "kept checks: root-killed:ArrayTruncate"),
-        // Two writes to the index slot outside the loop (one per `if` arm): no single dominating
-        // initializer, so the entry cannot even be checked for non-negativity.
-        ("choose_start", "kept checks: entry-unproved"),
+        // Branch stores and a parameter-derived store are definitely initialized. Both still
+        // undergo the live non-negativity test in the admission preheader.
+        ("choose_start", "versioned"),
+        ("scan_from", "versioned"),
     ] {
         let found = decision(&report, function);
         assert!(
@@ -1006,6 +1019,33 @@ fn main() {{ }}\n"
             "[{function}] expected `{expected}`, got `{found}`"
         );
     }
+}
+
+#[test]
+fn g2_multiple_and_parameter_entries_use_the_live_value() {
+    let source = format!(
+        "{TWO_ENTRY_WRITES}{PARAM_ENTRY}\
+fn main() -> i32 {{\n  data := [1, 2, 3, 4]\n  print(choose_start(data, true))\n  print(choose_start(data, false))\n  print(scan_from(data, 3))\n  return 0\n}}\n"
+    );
+    let out = build_and_run("loop-facts-entry-init", &source);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "9\n7\n4\n",
+        "each entry reaches the same guarded values:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let negative = format!(
+        "{PARAM_ENTRY}fn main() -> i32 {{\n  data := [1, 2, 3, 4]\n  print(7)\n  print(scan_from(data, -1))\n  return 0\n}}\n"
+    );
+    let out = build_and_run("loop-facts-negative-entry", &negative);
+    assert!(!out.status.success(), "negative live entry keeps its guard");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("index out of bounds"),
+        "the slow copy retains the original trap: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// The IR-identity refusal. `Stmt::BorrowedElementReservation` is a function-unique token that
