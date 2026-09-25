@@ -2864,6 +2864,8 @@ pub enum Rvalue {
         server: Operand,
         out: Slot,
     },
+    /// Set or clear the inbound request-body cap on a borrowed server. Pure.
+    HttpServerMaxRequestBodyBytes { server: Operand, limit: Operand },
     /// `ctx.method()` / `ctx.path()` — the request method / target as a `str` **view** `{ptr,len}` into
     /// `ctx`'s buffer (region-bound to `ctx`). Pure.
     HttpCtxMethod {
@@ -8190,6 +8192,7 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
             | hir::ExprKind::HttpSseStreamNext { .. }
             | hir::ExprKind::HttpGetMany { .. }
             | hir::ExprKind::HttpServe { .. }
+            | hir::ExprKind::HttpServerMaxRequestBodyBytes { .. }
             | hir::ExprKind::HttpAccept { .. }
             | hir::ExprKind::HttpCtxMethod { .. }
             | hir::ExprKind::HttpCtxPath { .. }
@@ -8385,7 +8388,8 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         | hir::ExprKind::HttpSseStreamNext { .. }
         | hir::ExprKind::HttpGetMany { .. }
         | hir::ExprKind::HttpServe { .. }
-        | hir::ExprKind::HttpAccept { .. }
+        | hir::ExprKind::HttpServerMaxRequestBodyBytes { .. }
+            | hir::ExprKind::HttpAccept { .. }
         | hir::ExprKind::HttpCtxMethod { .. }
         | hir::ExprKind::HttpCtxPath { .. }
         | hir::ExprKind::HttpCtxHeaders { .. }
@@ -9722,6 +9726,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             | hir::ExprKind::HttpSseStreamNext { .. }
             | hir::ExprKind::HttpGetMany { .. }
             | hir::ExprKind::HttpServe { .. }
+            | hir::ExprKind::HttpServerMaxRequestBodyBytes { .. }
             | hir::ExprKind::HttpAccept { .. }
             | hir::ExprKind::HttpCtxMethod { .. }
             | hir::ExprKind::HttpCtxPath { .. }
@@ -21974,6 +21979,13 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
                 e.ty,
                 false,
             )
+        }
+        hir::ExprKind::HttpServerMaxRequestBodyBytes { server, limit } => {
+            let s = lower_required!(b, lower_expr(b, server), Operand::Const(Const::Unit));
+            let l = lower_required!(b, lower_expr(b, limit), Operand::Const(Const::Unit));
+            let v = b.fresh_value(Ty::Unit);
+            b.push(Stmt::Let(v, Rvalue::HttpServerMaxRequestBodyBytes { server: s, limit: l }));
+            Operand::Const(Const::Unit)
         }
         // `ctx.method()` / `ctx.path()` → a `str` view `{ptr,len}` into the ctx buffer (region-bound to
         // `ctx`; not owned — no `Drop`).

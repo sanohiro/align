@@ -2066,10 +2066,14 @@ pub enum ExprKind {
     /// `srv.accept()` — block for one inbound connection, read + parse its request, and yield
     /// `Result<http_request_ctx, Error>` (the `ty`). The `http_request_ctx`
     /// ([`crate::Ty::HttpRequestCtx`]) is an owned **Move** handle owning the accepted fd + the parsed
-    /// request (zero-copy offset table, http.md R1). A malformed / smuggling request is `Error.Invalid`
-    /// (the listener stays alive). `srv` is a bound [`crate::Ty::HttpServer`] local (borrowed, not
+    /// request (zero-copy offset table, http.md R1). Malformed / smuggling requests are skipped;
+    /// an explicitly configured inbound-body cap refusal is `Error.Invalid` (the listener stays
+    /// alive). `srv` is a bound [`crate::Ty::HttpServer`] local (borrowed, not
     /// consumed — a server accepts many). **Impure** (network I/O).
     HttpAccept { server: Box<Expr> },
+    /// `srv.max_request_body_bytes(limit)` — set or clear the inbound body cap on a borrowed,
+    /// exclusively configured server. Pure; the runtime validates the i64 range before mutation.
+    HttpServerMaxRequestBodyBytes { server: Box<Expr>, limit: Box<Expr> },
     /// `ctx.method()` — the request method as a `str` **view** into `ctx`'s buffer (the `ty` is
     /// [`crate::Ty::Str`]), region-bound to `ctx`. `ctx` is a bound [`crate::Ty::HttpRequestCtx`] local.
     /// Pure.

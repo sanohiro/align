@@ -1526,6 +1526,10 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         ExprKind::HttpAccept { server } => ExprKind::HttpAccept {
             server: boxed!(server),
         },
+        ExprKind::HttpServerMaxRequestBodyBytes { server, limit } => ExprKind::HttpServerMaxRequestBodyBytes {
+            server: boxed!(server),
+            limit: boxed!(limit),
+        },
         ExprKind::HttpCtxMethod { ctx } => ExprKind::HttpCtxMethod { ctx: boxed!(ctx) },
         ExprKind::HttpCtxPath { ctx } => ExprKind::HttpCtxPath { ctx: boxed!(ctx) },
         ExprKind::HttpCtxHeaders { ctx } => ExprKind::HttpCtxHeaders { ctx: boxed!(ctx) },
@@ -2490,6 +2494,10 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         }
         | ExprKind::HttpClientMaxResponseBodyBytes {
             client: lhs,
+            limit: rhs,
+        }
+        | ExprKind::HttpServerMaxRequestBodyBytes {
+            server: lhs,
             limit: rhs,
         }
         | ExprKind::HttpClientGet {

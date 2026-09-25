@@ -1378,6 +1378,13 @@ supervision and cleanup policy. No privileged deployment or implicit sandbox is
 introduced. Common child operations are implemented first; signal subscriptions
 and Linux-only authority follow the capability order in plan 50.
 
+`std.http` servers expose `srv.max_request_body_bytes(limit: i64) -> ()` on a
+bound `http_server`. Zero restores the 1 GiB inbound body default; a positive
+value up to 1 GiB limits receive growth. An explicitly over-limit request
+closes its connection and returns `Error.Invalid` from `accept()` while the
+listener remains usable. Other malformed requests are skipped. The full
+contract is in `docs/impl/std-design/http.md`.
+
 `std.http` whole-body clients expose
 `cl.max_response_body_bytes(limit: i64)` and the request-local
 `r.max_response_body_bytes(limit: i64)`. Zero clears/inherits; a positive request value only

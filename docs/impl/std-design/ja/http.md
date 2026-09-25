@@ -75,6 +75,8 @@ srv := http.serve_shared(host: str, port: i64) -> Result<http_server, Error>
 srv.accept() -> Result<http_request_ctx, Error>   // one request; caller writes the response.
                                              // Yields the next request off a KEPT-ALIVE connection
                                              // before accepting a new one (item 9 ②) — same surface
+srv.max_request_body_bytes(limit: i64)        // 0 は 1 GiB の既定値に戻す。
+                                             // 正値は次の accept の受信本文を制限する
 ctx.method() -> str                          // view into ctx (region-bound)
 ctx.path() -> str                            // view into ctx (region-bound)
 ctx.headers() -> http_headers                // the parsed header table as a Copy, non-owning VIEW
@@ -278,9 +280,8 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
    `http.serve(host, port) -> Result<http_server, Error>`(listen 中の fd を所有する Move ハンドル —
    net の `tcp.listen` を包み、SO_REUSEADDR + backlog 128 の後に fd を取り出す)。`srv.accept() ->
    Result<http_request_ctx, Error>`(accept 済みの fd + ゼロコピーのオフセットテーブルにパースしたリクエストを
-   所有する Move ハンドル。`HttpResponse` の R1 の鏡像 — head の終端まで 32 KiB ずつストリーミング read +
-   Content-Length によるボディフレーミング。Incomplete/Invalid の分岐と 256 KiB-head / 128-header /
-   1 GiB-body の上限を再利用する。不正なリクエストはそのコネクションを閉じて `Error.Invalid` を返し、
+   所有する Move ハンドル。`HttpResponse` の R1 の鏡像 — 最初の 2 KiB head バッファで読み始め、その後 Content-Length の残りまでに制限した本文 read。Incomplete/Invalid の分岐と 256 KiB-head / 128-header /
+   1 GiB-body の上限を再利用する。不正なリクエストはそのコネクションを閉じて次を待ち、
    リスナーは生き続ける)。`ctx.method()/path()`(`str` ビュー)、`ctx.headers()`(パース済みヘッダー
    テーブルの Copy な `http_headers` ビュー。大文字小文字を無視する `Option<str>` の lookup は
    `hs.get(name)` — item 10 であり、`ctx.header(name)` を**置換した**)、`ctx.body()`(`slice<u8>`
@@ -632,6 +633,8 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
        返していたために、スキャナが 1 本繋いだだけで呼び出し側の accept ループ（`srv.accept()?`）が
        死んでいた; prefork では worker ごとに 1 本ずつでサーバ全体が落ちた。エラーを返すのは実際の
        `accept(2)` の失敗だけであり、それこそが serve ループにおける `srv.accept()?` を正しくする。
+       明示的な本文上限を設定した場合の超過だけは別の admission 拒否で、`Error.Invalid` を返す。
+       続行するサーバーはその `Err` を処理してから再度 `accept` する。
      - **一時的な `accept(2)` の errno も表に出ない** — 同じ論法をシステムコール自体に適用したもので
        ある。分類ひとつ（`classify_accept_error`）が、3 つのケースで全てを決める:
        - **ノイズ → `Again`。** `EINTR`; **`ECONNABORTED`**（client が SYN と `accept` の間に消えて
@@ -1518,3 +1521,38 @@ test contract は `../pkg-design/ws.md`。generated declaration は reused shape
 [http-client-composition.md](http-client-composition.md) を参照してください。
 キャリア、受信者の権限、保持ルートの正確な規則は、従来の無名ローカル限定を置き換えます。
 HTTPワイヤ、通信、timeout、上限、割り当て、再試行は本台帳の規則を維持します。
+
+### サーバーの受信本文上限（#1171）
+
+`srv.max_request_body_bytes(limit: i64) -> ()` は bound な `http_server` を排他的に
+借用する Pure setter であり、I/O は行わない。サーバーが上限を保持し、`accept` の開始時に
+値を固定する。`0` は 1,073,741,824 バイトの既定値に戻し、正値は
+`1..=1,073,741,824` かつ対象の `usize` に収まらなければならない。不正な値や null
+ハンドルは状態変更前に abort する。
+
+有効なヘッダーの `Content-Length` が明示的な上限を超える場合、本文のための追加の確保や
+読み取りを行わず、その接続だけを閉じて `accept()` から `Error.Invalid` を返す。
+リスナーと他の parked 接続は生き続ける。呼び出し側が拒否後も受け付ける場合、
+`srv.accept()?` だけに依存せず、この `Err` を処理して再度 `accept` する。
+上限を設定していない場合の 1 GiB 超過、およびその他の不正なリクエストは、従来どおり
+接続を閉じて次を待つ。早期 EOF も同様である。
+
+最初の 2 KiB ヘッダー読み取りには本文の先読みが含まれ得る。この固定確保は相手が
+宣言した長さに依存しない。ヘッダー解釈後の読み取りは宣言された残量までに制限し、
+本文の格納量は設定上限とヘッダー格納量で抑える。成功した `accept` は従来どおり fd と
+バッファを `http_request_ctx` に移し、失敗時の context 出力は null のままである。
+ABI は `void align_rt_http_server_max_request_body_bytes(ptr, i64)`（A66）。
+型検査、HIR/MIR 検証、runtime key、LLVM 宣言、native 実装は同じ署名を使う。
+
+受け入れテストは通常要求、境界ちょうど、宣言超過、分割ヘッダー、fresh/parked 接続の
+拒否後に同じリスナーで受け付けられること、malformed Content-Length と EOF の従来動作、
+ゼロへの戻し、不正 setter 入力の状態不変、fd/context の解放、受信バッファの上限を確認する。
+外部 consumer の align-llm は Align のマージ後にこの surface を採用する。
+
+| 確認する経路 | 実装 | owner |
+|---|---|---|
+| method の形成・排他的 borrow・checked HIR・MIR・実行 | `check_http_server_method`、`validate_hir`、`HttpServerMaxRequestBodyBytes`、LLVM codegen | `server_request_body_limit_rejects_wrong_arguments`、`hir_body_validator_native`、`serve_accept_respond_round_trip` |
+| setter の入力・変更・zero reset | `align_rt_http_server_max_request_body_bytes` と `HttpServer` | `http_server_body_cap_invalid_setter_aborts`、`http_server_explicit_body_cap_refuses_then_keeps_listener` |
+| fresh/parked の拒否、fd close、listener 再利用 | `http_read_request` と `align_rt_http_accept` | `http_server_explicit_body_cap_refuses_then_keeps_listener`、`http_server_body_cap_refuses_parked_connection` |
+| 分割受信、先読み、ctx cleanup | `http_read_into` と `HttpRequestCtx::drop` | `http_read_request_reassembles_a_body_larger_than_one_read`、`http_request_cap_counts_only_the_framed_body_in_a_head_co_read`、既存 `http_keepalive_` と malformed-request owner |
+| native symbol・署名・件数 | runtime key、A66 宣言/effect、export inventory | `runtime_abi_registry_matches_checked_in_declaration_golden`、`scripts/test-runtime-abi-exports.sh` |

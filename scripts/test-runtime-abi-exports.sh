@@ -23,8 +23,8 @@ trap 'rm -rf -- "$work_dir"' EXIT
 audit_target="$work_dir/audit-target"
 archive="$audit_target/debug/libalign_runtime.a"
 sed -nE 's/.*@(align_rt_[A-Za-z0-9_]+)\(.*/\1/p' "$golden" | sort -u > "$work_dir/base"
-if [[ "$(wc -l < "$work_dir/base" | tr -d ' ')" != 464 ]]; then
-  echo "test-runtime-abi-exports: declaration golden does not contain 464 base symbols" >&2
+if [[ "$(wc -l < "$work_dir/base" | tr -d ' ')" != 465 ]]; then
+  echo "test-runtime-abi-exports: declaration golden does not contain 465 base symbols" >&2
   exit 1
 fi
 
@@ -34,7 +34,7 @@ fi
 # cross the native ABI as the same ordered pair of 64-bit machine words. Parameter types are all
 # scalar/pointer primitives, so the normalized record remains exact by return and every ordinal.
 ir_target="$work_dir/ir-target"
-cargo rustc --quiet --locked --manifest-path "$repo_root/Cargo.toml" \
+"$repo_root/scripts/cargo.sh" rustc --quiet --locked --manifest-path "$repo_root/Cargo.toml" \
   -p align_runtime --lib --crate-type=lib --target-dir "$ir_target" -- \
   --emit=llvm-ir -Ccodegen-units=1
 runtime_ir="$(find "$ir_target/debug/deps" -maxdepth 1 -name 'align_runtime-*.ll' -print -quit)"
@@ -111,13 +111,13 @@ perl -ne '
   print join("|", $symbol, native_type($ret), @params), "\n";
 ' "$runtime_ir" | sort > "$work_dir/runtime-abi"
 
-if [[ "$(wc -l < "$work_dir/golden-abi" | tr -d ' ')" != 464 ]] \
-  || [[ "$(wc -l < "$work_dir/runtime-abi" | tr -d ' ')" != 464 ]]; then
-  echo "test-runtime-abi-exports: normalized base ABI does not contain 464 rows" >&2
+if [[ "$(wc -l < "$work_dir/golden-abi" | tr -d ' ')" != 465 ]] \
+  || [[ "$(wc -l < "$work_dir/runtime-abi" | tr -d ' ')" != 465 ]]; then
+  echo "test-runtime-abi-exports: normalized base ABI does not contain 465 rows" >&2
   exit 1
 fi
 diff -u "$work_dir/golden-abi" "$work_dir/runtime-abi"
-printf 'runtime-abi-signatures base 464\n'
+printf 'runtime-abi-signatures base 465\n'
 
 audit_case() {
   local label=$1
@@ -163,10 +163,10 @@ audit_case() {
   sort -u "$expected.raw" > "$expected"
 
   if [[ -n "$features" ]]; then
-    cargo build --quiet --locked --manifest-path "$repo_root/Cargo.toml" \
+    "$repo_root/scripts/cargo.sh" build --quiet --locked --manifest-path "$repo_root/Cargo.toml" \
       -p align_runtime --target-dir "$audit_target" --features "$features"
   else
-    cargo build --quiet --locked --manifest-path "$repo_root/Cargo.toml" \
+    "$repo_root/scripts/cargo.sh" build --quiet --locked --manifest-path "$repo_root/Cargo.toml" \
       -p align_runtime --target-dir "$audit_target"
   fi
   "$llvm_nm" --defined-only --extern-only "$archive" 2>/dev/null \
@@ -182,8 +182,8 @@ audit_case() {
   printf 'runtime-abi-exports %s %s\n' "$label" "$expected_count"
 }
 
-audit_case base "" 464
-audit_case alloc alloc-count 471
-audit_case par par-map-probe 468
-audit_case task task-group-probe 464
-audit_case all alloc-count,par-map-probe,task-group-probe 475
+audit_case base "" 465
+audit_case alloc alloc-count 472
+audit_case par par-map-probe 469
+audit_case task task-group-probe 465
+audit_case all alloc-count,par-map-probe,task-group-probe 476

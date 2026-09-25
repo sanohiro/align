@@ -18570,6 +18570,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_accept returns i32 status")
             }
+            Rvalue::HttpServerMaxRequestBodyBytes { server, limit } => {
+                let s = self.operand(server)?.into_pointer_value();
+                let n = self.operand(limit)?;
+                self.builder
+                    .build_call(self.runtime(RuntimeKey::HttpServerMaxRequestBodyBytes), &[s.into(), n.into()], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
             Rvalue::HttpCtxMethod { ctx } => {
                 let p = self.operand(ctx)?.into_pointer_value();
                 self.builder

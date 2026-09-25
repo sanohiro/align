@@ -680,6 +680,10 @@ fn walk_body_records<'a>(
                     client: lhs,
                     limit: rhs,
                 }
+                | ExprKind::HttpServerMaxRequestBodyBytes {
+                    server: lhs,
+                    limit: rhs,
+                }
                 | ExprKind::HttpClientGet {
                     client: lhs,
                     url: rhs,

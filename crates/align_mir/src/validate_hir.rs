@@ -4884,6 +4884,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::HttpSseStreamNext { .. }
             | hir::ExprKind::HttpGetMany { .. }
             | hir::ExprKind::HttpServe { .. }
+            | hir::ExprKind::HttpServerMaxRequestBodyBytes { .. }
             | hir::ExprKind::HttpAccept { .. }
             | hir::ExprKind::HttpCtxMethod { .. }
             | hir::ExprKind::HttpCtxPath { .. }
@@ -5259,6 +5260,7 @@ impl<'a> BodyValidator<'a> {
                 | hir::ExprKind::HttpSseStreamRetryMs { .. }
                 | hir::ExprKind::HttpSseStreamNext { .. }
             | hir::ExprKind::HttpGetMany { .. }
+            | hir::ExprKind::HttpServerMaxRequestBodyBytes { .. }
             | hir::ExprKind::HttpAccept { .. }
             | hir::ExprKind::HttpCtxMethod { .. }
             | hir::ExprKind::HttpCtxPath { .. }
@@ -9964,6 +9966,11 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::HttpAccept { server } => {
                 (local(server, Ty::HttpServer) && server.ty == Ty::HttpServer)
                     .then(|| result(Ty::HttpRequestCtx, &[server]))?
+            }
+            hir::ExprKind::HttpServerMaxRequestBodyBytes { server, limit } => {
+                (self.exclusive_handle_place(context, server, Ty::HttpServer)
+                    && server.ty == Ty::HttpServer && limit.ty == i64)
+                    .then(|| strict(Ty::Unit, &[server, limit]))?
             }
             hir::ExprKind::HttpCtxMethod { ctx }
             | hir::ExprKind::HttpCtxPath { ctx }

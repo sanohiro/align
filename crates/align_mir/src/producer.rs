@@ -1688,6 +1688,9 @@ pub fn native_owner_mir_contract<'a>(
         | Rvalue::HttpClientMaxResponseBodyBytes { client, limit } => {
             contract.operands = vec![(client, Ty::HttpClient, write), (limit, i64_ty, read)];
         }
+        Rvalue::HttpServerMaxRequestBodyBytes { server, limit } => {
+            contract.operands = vec![(server, Ty::HttpServer, write), (limit, i64_ty, read)];
+        }
         Rvalue::HttpParse { data, out } => {
             contract.result = i32_ty;
             contract.outputs = vec![(*out, Ty::HttpResponse)];
@@ -2033,6 +2036,7 @@ fn xml_out_producer_operands(rvalue: &Rvalue) -> Vec<&Operand> {
             ..
         } => vec![client, urls, max_concurrency],
         Rvalue::HttpServe { host, port, .. } => vec![host, port],
+        Rvalue::HttpServerMaxRequestBodyBytes { server, limit } => vec![server, limit],
         Rvalue::HttpCtxHeader { ctx, name, .. } => vec![ctx, name],
         Rvalue::HttpRespondStream { ctx, rb, .. }
         | Rvalue::HttpRespondUpgrade { ctx, rb, .. } => vec![ctx, rb],
@@ -6566,6 +6570,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::HttpGetMany { .. }
             | Rvalue::HttpServe { .. }
             | Rvalue::HttpAccept { .. }
+            | Rvalue::HttpServerMaxRequestBodyBytes { .. }
             | Rvalue::HttpCtxHeader { .. }
             | Rvalue::HttpHeadersCount { .. }
             | Rvalue::HttpHeadersTokensValid { .. }
