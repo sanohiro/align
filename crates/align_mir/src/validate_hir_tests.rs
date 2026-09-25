@@ -12076,10 +12076,10 @@ fn request11_expr_kind_inventory_tripwire() {
     }
     assert_eq!(
         // StrCharBoundary, ArrayTruncate, BytesSet, BytesFill, BytesCopyFrom, BufferAppendFilled,
-        // FloatScope, BytesView, and SliceAsBytes are explicit in validation, source-shape,
-        // replay and ownership.
+        // FloatScope, BytesView, SliceAsBytes, and HttpServerMaxRequestBodyBytes are explicit in
+        // validation, source-shape, replay and ownership.
         variants,
-        341,
+        342,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
