@@ -62,6 +62,12 @@ fn cyclic_components(f: &align_mir::Function) -> usize {
                 reach[from][*then_target as usize] = true;
                 reach[from][*else_target as usize] = true;
             }
+            Term::StrMatch { cases, otherwise, .. } => {
+                for (_, target) in cases {
+                    reach[from][*target as usize] = true;
+                }
+                reach[from][*otherwise as usize] = true;
+            }
             Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => {}
         }
     }
@@ -93,7 +99,11 @@ fn cyclic_components(f: &align_mir::Function) -> usize {
 }
 
 fn llvm_function<'a>(ir: &'a str, name: &str) -> &'a str {
-    let symbol = format!("@{name}(");
+    let symbol = if name.starts_with("align_fn$") {
+        format!("@\"{name}\"(")
+    } else {
+        format!("@{name}(")
+    };
     let mut search_from = 0;
     let start = loop {
         let symbol_pos = ir[search_from..]
@@ -119,6 +129,32 @@ fn llvm_function<'a>(ir: &'a str, name: &str) -> &'a str {
         .unwrap_or_else(|| panic!("unterminated LLVM definition for `{name}`"))
         + 3;
     &tail[..end]
+}
+
+fn llvm_kernel_function<'a>(ir: &'a str, name: &str) -> &'a str {
+    let exported = llvm_function(ir, name);
+    // An exported ABI wrapper can tail-call the internal body. Inspect that body's pipeline,
+    // rather than treating the one ABI forwarding call as an uninlined stage.
+    let Some(wrapper_call) = exported
+        .lines()
+        .find(|line| line.contains("%export.call = tail call fastcc"))
+    else {
+        return exported;
+    };
+    assert_eq!(
+        exported.lines().filter(|line| line.contains(" call ")).count(),
+        1,
+        "`{name}` export wrapper contains an additional call:\n{exported}"
+    );
+    let start = wrapper_call
+        .find("@\"align_fn$")
+        .unwrap_or_else(|| panic!("`{name}` export wrapper has no internal target:\n{exported}"))
+        + 2;
+    let end = wrapper_call[start..]
+        .find('"')
+        .unwrap_or_else(|| panic!("`{name}` export wrapper has an unterminated target:\n{exported}"))
+        + start;
+    llvm_function(ir, &wrapper_call[start..end])
 }
 
 struct TempObject(PathBuf);
@@ -176,7 +212,7 @@ fn depth_sweep_preserves_fusion_inlining_vectorization_and_small_stack_survival(
             let ir =
                 emit_llvm_ir(&mir, target(), align_driver::Profile::Release, true, &names, false).expect("emit optimized LLVM");
             for name in &names {
-                let body = llvm_function(&ir, name);
+                let body = llvm_kernel_function(&ir, name);
                 for line in body.lines().filter(|line| line.contains(" call ")) {
                     assert!(
                         line.contains("@llvm."),
@@ -213,7 +249,7 @@ fn depth_sweep_preserves_fusion_inlining_vectorization_and_small_stack_survival(
                 for family in VECTORIZABLE_FAMILIES {
                     for depth in DEPTHS {
                         let name = format!("{family}_{depth}");
-                        let body = llvm_function(&ir, &name);
+                        let body = llvm_kernel_function(&ir, &name);
                         assert!(
                             body.contains("llvm.vector.reduce.add"),
                             "`{name}` lost its vector reduction:\n{body}"
