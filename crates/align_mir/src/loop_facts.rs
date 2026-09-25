@@ -3228,6 +3228,8 @@ mod tests {
             block(4, vec![Stmt::Store(0, int(3))], Term::Goto(3)),
         ];
         let proves = |function: &Function| {
+            // These hand-built fixture graphs must satisfy CFG and SSA shape independently of
+            // the initialization result under test; construction failure is a broken test.
             let cfg = Cfg::build(function).expect("well-shaped fixture CFG");
             let analysis = Analysis::new(function, &cfg).expect("well-shaped fixture SSA");
             let trusted_steps = BTreeSet::from([(0, 4, 0)]);
@@ -3309,6 +3311,7 @@ mod tests {
         parameter.blocks[0].term = Term::Return(None);
         assert!(
             !{
+                // The parameter fixture is well-shaped even before its prologue Store exists.
                 let cfg = Cfg::build(&parameter).unwrap();
                 let analysis = Analysis::new(&parameter, &cfg).unwrap();
                 let trusted_steps = BTreeSet::new();
@@ -3325,6 +3328,7 @@ mod tests {
         parameter.blocks[0]
             .stmts
             .push(Stmt::Store(0, Operand::Arg(0)));
+        // The added Store changes initialization, not CFG or SSA validity.
         let cfg = Cfg::build(&parameter).unwrap();
         let analysis = Analysis::new(&parameter, &cfg).unwrap();
         let trusted_steps = BTreeSet::new();
