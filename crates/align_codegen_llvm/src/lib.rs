@@ -24390,7 +24390,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let Some(element) = builder_ty.array_builder_element() else {
                     return Err(self.err("array_builder push receiver is not an array_builder"));
                 };
-                if element.ty() != *scalar || self.checked_operand_ty(value)? != *scalar {
+                let element_ty = align_sema::expand_tagged_ty(element.ty(), self.tagged_defs);
+                let scalar_ty = align_sema::expand_tagged_ty(*scalar, self.tagged_defs);
+                let value_ty = align_sema::expand_tagged_ty(self.checked_operand_ty(value)?, self.tagged_defs);
+                if element_ty == Ty::Error
+                    || scalar_ty == Ty::Error
+                    || value_ty == Ty::Error
+                    || !source_ty_matches(element_ty, scalar_ty, self.program)?
+                    || !source_ty_matches(value_ty, scalar_ty, self.program)?
+                {
                     return Err(self.err("array_builder push element type mismatch"));
                 }
                 let bp = self.operand(builder)?.into_pointer_value();

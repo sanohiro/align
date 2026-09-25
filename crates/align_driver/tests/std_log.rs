@@ -207,8 +207,7 @@ pub fn main() -> Result<(), Error> {
     assert!(llvm.contains("call i32 @align_rt_log_line(ptr"));
     assert!(llvm.contains("call i32 @align_rt_log_flush(ptr"));
     assert!(llvm.contains("call void @align_rt_log_free(ptr"));
-    assert!(
-        llvm.matches("extractvalue").count() >= 3,
-        "each log.level operand must remain an aggregate until its runtime call:\n{llvm}",
-    );
+    assert!(llvm.contains("call ptr @align_rt_log_new(ptr %wstd, i32 0)"), "Debug level must reach log_new:\n{llvm}");
+    assert!(llvm.contains("call i32 @align_rt_log_enabled(ptr %load, i32 1)"), "Info level must reach log_enabled:\n{llvm}");
+    assert!(llvm.contains("call i32 @align_rt_log_line(ptr %load1, i32 1,"), "Info level must reach log_line:\n{llvm}");
 }

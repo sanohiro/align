@@ -522,8 +522,8 @@ fn indirect_tagged_result_reads_the_tag_before_selected_payload() {
     }
     let ir = emit_llvm(TAG_ONLY_SOURCE);
     let inspect = ir
-        .split("define internal i32 @\"align_fn$7$696e7370656374\"")
-        .nth(1)
+        .split("define ")
+        .find(|body| body.lines().next().is_some_and(|line| line.contains("@\"align_fn$7$696e7370656374\"")))
         .and_then(|body| body.split("\n}").next())
         .expect("inspect body");
     let branch = inspect.find("br i1").expect("tag branch");
@@ -549,8 +549,8 @@ fn indirect_tagged_result_reads_the_tag_before_selected_payload() {
 
     let sum_ir = emit_llvm(USER_SUM_TAG_ONLY_SOURCE);
     let inspect_sum = sum_ir
-        .split("define internal i32 @\"align_fn$11$696e73706563745f73756d\"")
-        .nth(1)
+        .split("define ")
+        .find(|body| body.lines().next().is_some_and(|line| line.contains("@\"align_fn$11$696e73706563745f73756d\"")))
         .and_then(|body| body.split("\n}").next())
         .expect("inspect_sum body");
     let sum_branch = inspect_sum.find("br i1").expect("user-sum tag branch");

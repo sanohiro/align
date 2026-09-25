@@ -168,7 +168,7 @@ fn par_map_over_struct_field() {
     let kernel = parallel_kernel(&ir, 0)
         .unwrap_or_else(|| panic!("an AoS struct source should use the parallel range kernel:\n{ir}"));
     assert!(
-        kernel.contains(&format!("call i32 @\"{}\"", align_symbol("net"))),
+        kernel.lines().any(|line| line.contains("call ") && line.contains(&format!("@\"{}\"(%Emp %x)", align_symbol("net")))),
         "the kernel must call the struct-consuming body directly:\n{kernel}"
     );
 }
@@ -289,7 +289,7 @@ fn par_map_after_struct_map_keeps_struct_abi_in_the_range_kernel() {
 
     let ir = emit_llvm(src);
     assert!(
-        ir.contains(&format!("call i32 @\"{}\"", align_symbol("net"))),
+        ir.lines().any(|line| line.contains("call ") && line.contains(&format!("@\"{}\"(%Emp %x)", align_symbol("net")))),
         "the range kernel must call the aggregate map body directly:\n{ir}"
     );
 }
@@ -314,7 +314,7 @@ fn par_map_after_struct_projection_uses_range_kernel() {
         .unwrap_or_else(|| panic!("no projected par_map range kernel in IR:\n{ir}"));
     assert!(kernel.contains("extractvalue"), "the projected kernel must extract the AoS field in the range loop:\n{kernel}");
     assert!(
-        kernel.contains(&format!("call i32 @\"{}\"", align_symbol("twice"))),
+        kernel.lines().any(|line| line.contains("call ") && line.contains(&format!("@\"{}\"(i32 signext %project)", align_symbol("twice")))),
         "the projected kernel must call the terminal body directly:\n{kernel}"
     );
 }

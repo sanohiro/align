@@ -434,14 +434,14 @@ fn concurrent_different_same_basename_builds_keep_distinct_actions() {
     assert_eq!(Command::new(a.dir.join("main")).output().unwrap().stdout, b"11\n");
     assert_eq!(Command::new(b.dir.join("main")).output().unwrap().stdout, b"12\n");
 
-    // b/main are byte-identical shared actions; c has two implementation keys. A racing slot-pointer
-    // update may name either c key, but both full actions remain immutable and directly hittable.
+    // Inline body transport gives c, b, and main a distinct action in each DAG. A racing
+    // slot-pointer update may name either key, but all full actions remain immutable and hittable.
     let actions = std::fs::read_dir(shared.join("actions").join("codegen"))
         .unwrap()
         .filter_map(Result::ok)
         .filter(|e| e.path().is_file())
         .count();
-    assert_eq!(actions, 4, "two same-basename DAGs retain both distinct c actions plus shared b/main");
+    assert_eq!(actions, 6, "two same-basename DAGs retain both complete action sets");
     for p in [&a, &b] {
         let hot = p.alignc(shared.to_str().unwrap(), &["build", "main.align", "--cache-stats"]);
         assert!(hot.status.success());

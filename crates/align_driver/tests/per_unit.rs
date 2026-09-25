@@ -614,9 +614,8 @@ fn dep_hashes_for<'a>(r: &'a PerUnitCheck, unit: &str) -> &'a [(String, Hash128)
 #[test]
 fn transitive_pub_change_changes_dependent_hash_set_private_change_does_not() {
     // main -> B -> C. C's interface hash is what B and (transitively) main key on. A private-body
-    // edit of C, AND a body-only edit of C's non-generic `pub` fn (a fn body is IMPLEMENTATION, not
-    // interface — only its signature + effect bit are), both leave C's interface hash — and thus
-    // main's transitive dep set — identical; a pub SIGNATURE change to C changes it.
+    // edit of C leaves its interface hash unchanged. An eligible public inline body and a public
+    // signature are both part of the interface and change the transitive dependency set.
     let c_v1 = "module c\npub fn base(x: i64) -> i64 = x + 1\nfn helper() -> i64 = 99\n";
     let c_priv = "module c\npub fn base(x: i64) -> i64 = x + 1\nfn helper() -> i64 = 12345\n"; // private body only
     let c_pub_body = "module c\npub fn base(x: i64) -> i64 = x + 100\nfn helper() -> i64 = 99\n"; // pub fn BODY only, same signature + effect
@@ -641,8 +640,8 @@ fn transitive_pub_change_changes_dependent_hash_set_private_change_does_not() {
     assert_eq!(hash_of(base_set, "c"), hash_of(dep_hashes_for(&rp, "main"), "c"), "private-body edit must not change C's interface hash");
     assert_eq!(hash_of(base_set, "b"), hash_of(dep_hashes_for(&rp, "main"), "b"), "B unaffected by C's private edit");
 
-    // Body-only edit of C's non-generic pub fn (same signature + effect): interface hash unchanged.
-    assert_eq!(hash_of(base_set, "c"), hash_of(dep_hashes_for(&rb, "main"), "c"), "a non-generic pub fn body is implementation, not interface");
+    // An eligible public inline body is transported in the interface.
+    assert_ne!(hash_of(base_set, "c"), hash_of(dep_hashes_for(&rb, "main"), "c"), "an eligible inline body must change C's interface hash");
 
     // Pub SIGNATURE change of C: C's interface hash changes → main's transitive set changes at C.
     assert_ne!(hash_of(base_set, "c"), hash_of(dep_hashes_for(&rs, "main"), "c"), "pub signature change must change C's interface hash");

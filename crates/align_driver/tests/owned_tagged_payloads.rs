@@ -1357,7 +1357,7 @@ fn nested_tagged_payload_executes_exact_pkg_db_shape() {
         "nested Option/Result payloads must use identified tagged LLVM types:\n{ir}"
     );
     assert!(
-        ir.contains("%align.tagged.0 = type { i8, %Output }")
+        ir.contains("%align.tagged.0 = type { i8, { [0 x { %Output }], [40 x i8] } }")
             && ir.contains("dropoptissome"),
         "nested layout and recursive Option Drop must preserve their tags:\n{ir}"
     );
@@ -2029,7 +2029,7 @@ fn one_tagged_type_lowers_to_one_llvm_type_across_spellings() {
     );
     let ir = emit_llvm(src);
     assert!(
-        ir.contains("%align.tagged.0 = type { i8, i64 }"),
+        ir.contains("%align.tagged.0 = type { i8, { [0 x { i64 }], [8 x i8] } }"),
         "the interned `Option<i64>` must be an identified struct:\n{ir}"
     );
     // `Option<i64>` reaches every spelling here — an `Ok`/`Some` payload, a local, a parameter, a
@@ -2037,7 +2037,7 @@ fn one_tagged_type_lowers_to_one_llvm_type_across_spellings() {
     // `map_err`, and `match`. Its literal spelling must therefore appear exactly once in the whole
     // module: in the type definition asserted above, and nowhere as an operand or slot type.
     assert_eq!(
-        ir.matches("{ i8, i64 }").count(),
+        ir.matches("{ i8, { [0 x { i64 }], [8 x i8] } }").count(),
         1,
         "an interned tagged shape must never also appear as a literal struct:\n{ir}"
     );
@@ -2235,14 +2235,14 @@ fn tagged_shapes_with_one_body_share_one_identified_struct() {
     );
     let ir = emit_llvm(src);
     assert!(
-        ir.contains("%align.tagged.0 = type { i8, { ptr, i64 } }"),
+        ir.contains("%align.tagged.0 = type { i8, { [0 x { { ptr, i64 } }], [16 x i8] } }"),
         "the nested `Option<str>` must be an identified struct:\n{ir}"
     );
     // `Option<string>` is never a table entry here, only `Option<str>` is. They are one LLVM body,
     // so the owned local must reach the same identified struct: the body's literal spelling belongs
     // in the type definition above and nowhere else.
     assert_eq!(
-        ir.matches("{ i8, { ptr, i64 } }").count(),
+        ir.matches("{ i8, { [0 x { { ptr, i64 } }], [16 x i8] } }").count(),
         1,
         "one LLVM body must have one LLVM type across both tagged shapes:\n{ir}"
     );

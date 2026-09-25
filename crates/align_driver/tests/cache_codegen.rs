@@ -782,11 +782,11 @@ fn gate3_transitive_invalidation() {
     if !backend() {
         return;
     }
-    let c_v1 = "module c\npub fn cval() -> i64 = 1\n";
+    let c_v1 = "module c\nfn helper() -> i64 = 1\npub fn cval() -> i64 = helper()\n";
     // A public-SURFACE change (a new pub fn) flips c's interface_hash — b and a both key on it.
-    let c_pub = "module c\npub fn cval() -> i64 = 1\npub fn extra() -> i64 = 7\n";
+    let c_pub = "module c\nfn helper() -> i64 = 1\npub fn cval() -> i64 = helper()\npub fn extra() -> i64 = 7\n";
     // A private-BODY change (existing fn body only) flips only c's impl_hash.
-    let c_body = "module c\npub fn cval() -> i64 = 2\n";
+    let c_body = "module c\nfn helper() -> i64 = 2\npub fn cval() -> i64 = helper()\n";
     let b = "module b\nimport c\npub fn bval() -> i64 = c.cval() + 10\n";
     let a = "import b\nfn main() {\n  print(b.bval())\n}\n";
     let files = &[("c.align", c_v1), ("b.align", b), ("main.align", a)];

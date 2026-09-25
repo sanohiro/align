@@ -7362,7 +7362,7 @@ impl<'a, 'd> ConstEval<'a, 'd> {
         self.in_progress.remove(canonical);
         // Enforce the annotation type if one was written and evaluation produced a concrete type.
         let result = match (result, info.ann_ty) {
-            (Some((ty, val)), Some(ann)) if ty != ann && ty != Ty::Error => {
+            (Some((ty, val)), Some(ann)) if ty != ann && ty != Ty::Error && ann != Ty::Error => {
                 self.diags.error(
                     format!("constant has type {} but its value is {}", ty_name(ann), ty_name(ty)),
                     info.value.span,
