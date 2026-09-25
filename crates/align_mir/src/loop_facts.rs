@@ -1549,17 +1549,22 @@ enum InitProofNode {
     Value(ValueId),
 }
 
+struct InitProofInputs<'f, 'a, 't> {
+    function: &'f Function,
+    cfg: &'f Cfg,
+    analysis: &'a Analysis<'f>,
+    trusted_steps: &'t BTreeSet<(Slot, BlockId, usize)>,
+}
+
 fn initialized_store_source(
-    function: &Function,
-    cfg: &Cfg,
-    analysis: &Analysis<'_>,
+    inputs: &InitProofInputs<'_, '_, '_>,
     operand: &Operand,
     expected: Ty,
     use_block: BlockId,
     use_position: usize,
-    trusted_steps: &BTreeSet<(Slot, BlockId, usize)>,
     active: &mut BTreeSet<InitProofNode>,
 ) -> bool {
+    let InitProofInputs { function, cfg, analysis, .. } = inputs;
     if operand_ty(function, operand) != Some(expected) {
         return false;
     }
@@ -1596,26 +1601,20 @@ fn initialized_store_source(
             }
             let valid = match rvalue {
                 Rvalue::Use(source) => initialized_store_source(
-                    function,
-                    cfg,
-                    analysis,
+                    inputs,
                     source,
                     expected,
                     def_block,
                     def_position,
-                    trusted_steps,
                     active,
                 ),
                 Rvalue::Load(slot) => {
                     function.slots.get(*slot as usize) == Some(&expected)
                         && slot_initialized_at(
-                            function,
-                            cfg,
-                            analysis,
+                            inputs,
                             *slot,
                             def_block,
                             def_position,
-                            trusted_steps,
                             active,
                         )
                 }
@@ -1625,14 +1624,11 @@ fn initialized_store_source(
                             view_ty,
                             Ty::Slice(_) | Ty::Array(_, _) | Ty::DynArray(_) | Ty::Str | Ty::String
                         ) && initialized_store_source(
-                            function,
-                            cfg,
-                            analysis,
+                            inputs,
                             view,
                             view_ty,
                             def_block,
                             def_position,
-                            trusted_steps,
                             active,
                         )
                     }),
@@ -1651,24 +1647,18 @@ fn initialized_store_source(
                     right,
                 ) if expected == i64_ty() => {
                     initialized_store_source(
-                        function,
-                        cfg,
-                        analysis,
+                        inputs,
                         left,
                         expected,
                         def_block,
                         def_position,
-                        trusted_steps,
                         active,
                     ) && initialized_store_source(
-                        function,
-                        cfg,
-                        analysis,
+                        inputs,
                         right,
                         expected,
                         def_block,
                         def_position,
-                        trusted_steps,
                         active,
                     )
                 }
@@ -1690,15 +1680,13 @@ fn initialized_store_source(
 /// that preserves an earlier full store retains its fact until an actual uninitialized path
 /// drives the intersection false.
 fn slot_initialized_at(
-    function: &Function,
-    cfg: &Cfg,
-    analysis: &Analysis<'_>,
+    inputs: &InitProofInputs<'_, '_, '_>,
     slot: Slot,
     target: BlockId,
     position: usize,
-    trusted_steps: &BTreeSet<(Slot, BlockId, usize)>,
     active: &mut BTreeSet<InitProofNode>,
 ) -> bool {
+    let InitProofInputs { function, cfg, trusted_steps, .. } = inputs;
     if function.slots.get(slot as usize).is_none()
         || function
             .blocks
@@ -1736,14 +1724,11 @@ fn slot_initialized_at(
                     Stmt::Store(written, value) if *written == slot => {
                         if !trusted_steps.contains(&(slot, block.id, stmt_position)) {
                             initialized = initialized_store_source(
-                                function,
-                                cfg,
-                                analysis,
+                                inputs,
                                 value,
                                 function.slots[slot as usize],
                                 block.id,
                                 stmt_position,
-                                trusted_steps,
                                 active,
                             );
                         } else {
@@ -1780,14 +1765,11 @@ fn slot_initialized_at(
             Stmt::Store(written, value) if *written == slot => {
                 if !trusted_steps.contains(&(slot, target, stmt_position)) {
                     initialized = initialized_store_source(
-                        function,
-                        cfg,
-                        analysis,
+                        inputs,
                         value,
                         function.slots[slot as usize],
                         target,
                         stmt_position,
-                        trusted_steps,
                         active,
                     );
                 } else {
@@ -2334,16 +2316,8 @@ fn admit(
             }
         }
     }
-    if !slot_initialized_at(
-        function,
-        cfg,
-        analysis,
-        index_slot,
-        header,
-        0,
-        &trusted_steps,
-        &mut BTreeSet::new(),
-    ) {
+    let init_inputs = InitProofInputs { function, cfg, analysis, trusted_steps: &trusted_steps };
+    if !slot_initialized_at(&init_inputs, index_slot, header, 0, &mut BTreeSet::new()) {
         return Err(KeptReason::EntryUnproved);
     }
 
@@ -3256,16 +3230,14 @@ mod tests {
         let proves = |function: &Function| {
             let cfg = Cfg::build(function).expect("well-shaped fixture CFG");
             let analysis = Analysis::new(function, &cfg).expect("well-shaped fixture SSA");
-            slot_initialized_at(
+            let trusted_steps = BTreeSet::from([(0, 4, 0)]);
+            let inputs = InitProofInputs {
                 function,
-                &cfg,
-                &analysis,
-                0,
-                3,
-                0,
-                &BTreeSet::from([(0, 4, 0)]),
-                &mut BTreeSet::new(),
-            )
+                cfg: &cfg,
+                analysis: &analysis,
+                trusted_steps: &trusted_steps,
+            };
+            slot_initialized_at(&inputs, 0, 3, 0, &mut BTreeSet::new())
         };
         assert!(
             proves(&function),
@@ -3339,16 +3311,14 @@ mod tests {
             !{
                 let cfg = Cfg::build(&parameter).unwrap();
                 let analysis = Analysis::new(&parameter, &cfg).unwrap();
-                slot_initialized_at(
-                    &parameter,
-                    &cfg,
-                    &analysis,
-                    0,
-                    0,
-                    0,
-                    &BTreeSet::new(),
-                    &mut BTreeSet::new(),
-                )
+                let trusted_steps = BTreeSet::new();
+                let inputs = InitProofInputs {
+                    function: &parameter,
+                    cfg: &cfg,
+                    analysis: &analysis,
+                    trusted_steps: &trusted_steps,
+                };
+                slot_initialized_at(&inputs, 0, 0, 0, &mut BTreeSet::new())
             },
             "parameter metadata alone is not an initialization"
         );
@@ -3357,16 +3327,14 @@ mod tests {
             .push(Stmt::Store(0, Operand::Arg(0)));
         let cfg = Cfg::build(&parameter).unwrap();
         let analysis = Analysis::new(&parameter, &cfg).unwrap();
-        assert!(slot_initialized_at(
-            &parameter,
-            &cfg,
-            &analysis,
-            0,
-            0,
-            1,
-            &BTreeSet::new(),
-            &mut BTreeSet::new(),
-        ));
+        let trusted_steps = BTreeSet::new();
+        let inputs = InitProofInputs {
+            function: &parameter,
+            cfg: &cfg,
+            analysis: &analysis,
+            trusted_steps: &trusted_steps,
+        };
+        assert!(slot_initialized_at(&inputs, 0, 0, 1, &mut BTreeSet::new()));
     }
 
     /// The kill set, closed once for the whole `Stmt` inventory rather than by one Align fixture per
