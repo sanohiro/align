@@ -31449,7 +31449,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::HttpGetMany { .. }
         | ExprKind::HttpServe { .. }
         | ExprKind::HttpServerMaxRequestBodyBytes { .. }
-            | ExprKind::HttpAccept { .. }
+        | ExprKind::HttpAccept { .. }
         | ExprKind::HttpCtxMethod { .. }
         | ExprKind::HttpCtxPath { .. }
         | ExprKind::HttpCtxHeaders { .. }
@@ -75209,9 +75209,10 @@ mod tests {
         // BufferAppendFilled mutates an existing owned buffer and produces Unit, so it shares
         // BufferAppend's fresh-missing policy.
         // FloatScope is an explicit forwarding wrapper with no storage of its own.
+        // HttpServerMaxRequestBodyBytes mutates a server setting and returns Unit.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 341,
+            variants, 342,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 
