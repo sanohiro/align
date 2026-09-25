@@ -59,16 +59,18 @@ prepend_library_path() {
   esac
 }
 
-# Homebrew keeps LLVM, OpenSSL, and libpq keg-only (keg-only kegs are not
+# Homebrew keeps LLVM, OpenSSL, zstd, and libpq keg-only (keg-only kegs are not
 # symlinked into /opt/homebrew/lib). Debian/Ubuntu packages install their link
 # libraries in compiler-default paths, so Linux needs no mutation.
 if [[ "$(uname -s)" == Darwin ]]; then
   prepend_library_path "$llvm_prefix/lib"
   prepend_library_path /opt/homebrew/lib
   prepend_library_path /opt/homebrew/opt/openssl@3/lib
+  prepend_library_path /opt/homebrew/opt/zstd/lib
   prepend_library_path /opt/homebrew/opt/libpq/lib
   prepend_library_path /usr/local/lib
   prepend_library_path /usr/local/opt/openssl@3/lib
+  prepend_library_path /usr/local/opt/zstd/lib
   prepend_library_path /usr/local/opt/libpq/lib
   export LIBRARY_PATH
   align_use_private_dyld_region

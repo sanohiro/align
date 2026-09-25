@@ -247,6 +247,7 @@ key|HttpResponseNew|http_response_new|AllocNew|declare noalias ptr @align_rt_htt
 key|HttpServe|http_serve|Callback|declare i32 @align_rt_http_serve(ptr, i64, i64, ptr) #2
 key|HttpServeShared|http_serve_shared|Callback|declare i32 @align_rt_http_serve_shared(ptr, i64, i64, ptr) #2
 key|HttpServerFree|http_server_free|HostState|declare void @align_rt_http_server_free(ptr) #2
+key|HttpServerMaxRequestBodyBytes|http_server_max_request_body_bytes|HostState|declare void @align_rt_http_server_max_request_body_bytes(ptr, i64) #2
 key|HttpSseStreamLastEventId|http_sse_stream_last_event_id|HostState|declare { ptr, i64 } @align_rt_http_sse_stream_last_event_id(ptr) #2
 key|HttpSseStreamNext|http_sse_stream_next|HostState|declare i32 @align_rt_http_sse_stream_next(ptr, ptr, ptr) #2
 key|HttpSseStreamRetryMs|http_sse_stream_retry_ms|HostState|declare i64 @align_rt_http_sse_stream_retry_ms(ptr) #2

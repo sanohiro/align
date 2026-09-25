@@ -17098,6 +17098,10 @@ impl EffectScan<'_> {
                 walk!(server);
                 self.impure_direct = true;
             }
+            ExprKind::HttpServerMaxRequestBodyBytes { server, limit } => {
+                walk!(server);
+                walk!(limit);
+            }
             ExprKind::HttpRespond { ctx, rb } => {
                 walk!(ctx);
                 walk!(rb);
@@ -24932,6 +24936,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpSseStreamRetryMs { .. }
             | ExprKind::HttpGetMany { .. }
             | ExprKind::HttpServe { .. }
+            | ExprKind::HttpServerMaxRequestBodyBytes { .. }
             | ExprKind::HttpAccept { .. }
             | ExprKind::HttpResponseBuilder { .. }
             | ExprKind::HttpRbHeader { .. }
@@ -25407,6 +25412,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpSseStreamNext { .. }
             | ExprKind::HttpGetMany { .. }
             | ExprKind::HttpServe { .. }
+            | ExprKind::HttpServerMaxRequestBodyBytes { .. }
             | ExprKind::HttpAccept { .. }
             | ExprKind::HttpCtxMethod { .. }
             | ExprKind::HttpCtxPath { .. }
@@ -28962,6 +28968,10 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(host, depth);
                 self.walk(port, depth);
             }
+            ExprKind::HttpServerMaxRequestBodyBytes { server, limit } => {
+                self.walk(server, depth);
+                self.walk(limit, depth);
+            }
             ExprKind::HttpAccept { server } => self.walk(server, depth),
             ExprKind::HttpRespond { ctx, rb } => {
                 self.walk(ctx, depth);
@@ -31438,7 +31448,8 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::HttpSseStreamNext { .. }
         | ExprKind::HttpGetMany { .. }
         | ExprKind::HttpServe { .. }
-        | ExprKind::HttpAccept { .. }
+        | ExprKind::HttpServerMaxRequestBodyBytes { .. }
+            | ExprKind::HttpAccept { .. }
         | ExprKind::HttpCtxMethod { .. }
         | ExprKind::HttpCtxPath { .. }
         | ExprKind::HttpCtxHeaders { .. }
@@ -39605,7 +39616,8 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::HttpClientGet { .. } | ExprKind::HttpClientPost { .. } | ExprKind::HttpClientRequest { .. }
             | ExprKind::HttpReadStreamStatus { .. } | ExprKind::HttpReadStreamRead { .. }
             | ExprKind::HttpSseStreamRetryMs { .. }
-            | ExprKind::HttpGetMany { .. } | ExprKind::HttpServe { .. } | ExprKind::HttpAccept { .. }
+            | ExprKind::HttpGetMany { .. } | ExprKind::HttpServe { .. } | ExprKind::HttpServerMaxRequestBodyBytes { .. }
+            | ExprKind::HttpAccept { .. }
             | ExprKind::HttpResponseBuilder { .. } | ExprKind::HttpRbHeader { .. } | ExprKind::HttpRbBody { .. }
             | ExprKind::HttpRespond { .. } | ExprKind::HttpRespondStream { .. } | ExprKind::HttpStreamSend { .. }
             | ExprKind::HttpHeadersCount { .. } | ExprKind::HttpHeadersTokensValid { .. }
@@ -46561,6 +46573,10 @@ impl<'a> MoveCheck<'a> {
             ExprKind::HttpServe { host, port, .. } => {
                 move_expr!(self, host, moved, false, false);
                 move_expr!(self, port, moved, false, false);
+            }
+            ExprKind::HttpServerMaxRequestBodyBytes { server, limit } => {
+                move_expr!(self, server, moved, false, false);
+                move_expr!(self, limit, moved, false, false);
             }
             ExprKind::HttpAccept { server } => move_expr!(self, server, moved, false, false),
             ExprKind::HttpRespond { ctx, rb } => {
@@ -53909,6 +53925,9 @@ impl<'a, 't> Checker<'a, 't> {
             }
             "code" | "stdout" | "stderr" if recv_ty == Ty::RunBytes => {
                 self.check_run_bytes_method(recv_expr, method, args, span)
+            }
+            "max_request_body_bytes" if recv_ty == Ty::HttpServer => {
+                self.check_http_server_method(recv_expr, method, args, span)
             }
             // `std.http` request methods on an `http request`: `r.header(name, value)` /
             // `r.body(data)` mutate the builder in place; `r.timeout(ns)` sets a per-request I/O
@@ -64063,6 +64082,27 @@ impl<'a, 't> Checker<'a, 't> {
         Some(limit)
     }
 
+    fn check_http_request_limit_arg(&mut self, args: &[ast::Expr], span: Span) -> Option<Expr> {
+        if args.len() != 1 {
+            self.diags.error(format!("'.max_request_body_bytes()' takes 1 argument (the byte limit, i64), got {}", args.len()), span);
+            return None;
+        }
+        let limit = self.check_expr(&args[0], None);
+        if limit.ty == Ty::Error {
+            return None;
+        }
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        match self.resolve(limit.ty) {
+            Ty::Int(IntTy { bits: 64, signed: true }) => {}
+            Ty::IntVar(_) => self.constrain(limit.ty, Some(i64_ty), args[0].span),
+            other => {
+                self.diags.error(format!("'.max_request_body_bytes()' expects a byte limit (i64), got {}", ty_name(other)), args[0].span);
+                return None;
+            }
+        }
+        Some(limit)
+    }
+
     /// `r.header(name, value)` / `r.body(data)` / `r.timeout(ns)` on an `http request`
     /// ([`Ty::HttpRequest`]), the receiver already evaluated. The receiver must be a **bound local**
     /// (the v1 Move-temporary gate, `check_cli_command_method` precedent); all mutate the builder in
@@ -64778,8 +64818,22 @@ impl<'a, 't> Checker<'a, 't> {
                     span,
                 }
             }
+            "max_request_body_bytes" => {
+                if !self.require_exclusive_handle_receiver(&recv_expr, "http_server", method, "configure") {
+                    return err;
+                }
+                let Some(limit) = self.check_http_request_limit_arg(args, span) else { return err };
+                Expr {
+                    kind: ExprKind::HttpServerMaxRequestBodyBytes {
+                        server: Box::new(recv_expr),
+                        limit: Box::new(limit),
+                    },
+                    ty: Ty::Unit,
+                    span,
+                }
+            }
             _ => {
-                self.diags.error(format!("'.{method}()' is not a method on an http server (try accept)"), span);
+                self.diags.error(format!("'.{method}()' is not a method on an http server (try accept / max_request_body_bytes)"), span);
                 err
             }
         }
@@ -68883,6 +68937,10 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::HttpServe { host, port, .. } => {
                 self.finalize_expr(host);
                 self.finalize_expr(port);
+            }
+            ExprKind::HttpServerMaxRequestBodyBytes { server, limit } => {
+                self.finalize_expr(server);
+                self.finalize_expr(limit);
             }
             ExprKind::HttpAccept { server } => self.finalize_expr(server),
             ExprKind::HttpRespond { ctx, rb } => {

@@ -77,6 +77,8 @@ srv := http.serve_shared(host: str, port: i64) -> Result<http_server, Error>
 srv.accept() -> Result<http_request_ctx, Error>   // one request; caller writes the response.
                                              // Yields the next request off a KEPT-ALIVE connection
                                              // before accepting a new one (item 9 ②) — same surface
+srv.max_request_body_bytes(limit: i64)        // 0 restores the 1 GiB default; positive sets an
+                                             // inbound decoded-body cap before the next accept
 ctx.method() -> str                          // view into ctx (region-bound)
 ctx.path() -> str                            // view into ctx (region-bound)
 ctx.headers() -> http_headers                // the parsed header table as a Copy, non-owning VIEW
@@ -278,13 +280,14 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
    stale-conn retry; `http_head_keep_alive` decision table) + a driver test (two gets reuse one conn,
    observed via the server's accept count).
 4. server primitive (serve/accept, caller writes response). **DONE** (branch `http-slice4-server`).
+
    Shipped surface (behind `import std.http`, the server ops **Impure**): `http.serve(host, port) ->
    Result<http_server, Error>` (Move handle owning the listening fd — wraps net's `tcp.listen`,
    SO_REUSEADDR + backlog 128, then lifts the fd out); `srv.accept() -> Result<http_request_ctx,
    Error>` (Move handle owning the accepted fd + the request parsed to a zero-copy offset table,
-   mirror of `HttpResponse` R1 — streaming 32 KiB reads to the head's end + Content-Length body
+   mirror of `HttpResponse` R1 — an initial 2 KiB head buffer followed by Content-Length-framed reads clamped to the remaining body
    framing, reusing the Incomplete/Invalid split and the 256 KiB-head / 128-header / 1 GiB-body caps;
-   a malformed request closes that conn and returns `Error.Invalid`, the listener stays alive);
+   a malformed request closes that conn and `accept` keeps waiting, the listener stays alive);
    `ctx.method()/path()` (`str` views), `ctx.headers()` (a Copy `http_headers` view of the parsed
    header table; `hs.get(name)` is the case-insensitive `Option<str>` lookup — item 10, which
    REPLACED `ctx.header(name)`), `ctx.body()` (`slice<u8>` view) — all region-bound to `ctx` (#297); `http.response(status)` ->
@@ -650,7 +653,11 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
        did. Returning it handed every caller a `Result` that killed the accept loop
        (`srv.accept()?`) the first time a scanner connected; with prefork, one such connection
        per worker took the whole server down. Only a real `accept(2)` failure returns an error,
-       which is what makes `srv.accept()?` correct in a serve loop.
+       which is what makes `srv.accept()?` correct in a serve loop. A server with an
+       explicitly configured inbound body cap is a distinct admission policy:
+       exceeding that cap returns `Error.Invalid`, closes the selected connection,
+       and keeps the listener live. Its caller must handle this expected error
+       explicitly if it wants to continue serving after a refusal.
      - **Nor does a transient `accept(2)` errno** — the same argument, applied to the syscall
        itself. One classification (`classify_accept_error`) decides all of it, in three cases:
        - **Noise → `Again`.** `EINTR`; **`ECONNABORTED`** (the client vanished between its SYN and
@@ -1577,3 +1584,25 @@ The complete nameable client/request/response ownership boundary is specified in
 receiver-authority and retained-root records supersede the old unnamed-local
 limitation. HTTP wire,
 transport, timeouts, caps, allocation and retry behavior remain as specified here.
+
+### Inbound server body cap (#1171) — public contract and implementation closure
+
+| Surface | Contract |
+|---|---|
+| Signature and owner | `srv.max_request_body_bytes(limit: i64) -> ()` is a Pure, in-place setter on an exclusively borrowed, bound `http_server`; it performs no I/O. The server owns the stored limit; `align_runtime` owns receive allocation and connection cleanup. |
+| Input/default | `0` restores `HTTP_MAX_BODY = 1,073,741,824` bytes. Positive limits are `1..=HTTP_MAX_BODY` and must fit `usize`; invalid values or a null handle abort before mutation or network work, like the client setter. The current request keeps the limit snapshot taken at `accept` entry. |
+| Framing and error | Existing request-line, header, Content-Length syntax/duplicate, CL/TE and EOF checks retain their order. Once the head is valid, a declared body greater than an explicitly configured cap returns `Error.Invalid` from `accept`, closes only that connection, and leaves the listener usable. This is a new, caller-visible admission refusal: a `srv.accept()?` loop exits on it, so a server that continues after refusals must handle that `Err` and call `accept` again. An incomplete head and other malformed requests retain the existing skip-and-wait policy, on fresh and parked connections alike. With the default/unset cap, the existing 1 GiB excess remains malformed and skipped. Early EOF remains malformed and skipped. |
+| Allocation | The initial 2 KiB head buffer may contain co-read body bytes or pipelined bytes; this fixed allocation is independent of a peer-declared length. After framing, each read is clamped to the declared remainder, and the receive buffer grows only toward `body_start + declared_length`, never toward a larger peer declaration. The 256 KiB head cap remains; body storage is bounded by the configured cap plus head storage. Excess is rejected before reserve or another body read. An already co-read excess is rejected as soon as the head is parsed. |
+| Ownership/lifetime | The setter borrows the server without moving it. A successful `accept` still transfers one fd and buffer into `http_request_ctx`; an error closes the selected fd, returns a null context, and leaves the server and parked peers live. Drop and response behavior are unchanged. |
+| ABI/artifact | New native `void align_rt_http_server_max_request_body_bytes(ptr, i64)` receives the opaque server handle. It changes no persisted format or artifact/cache identity beyond the normal compiler source fingerprint. Runtime key, HIR/MIR validation, codegen declaration and FFI signature must agree. |
+| Verification | Runtime owner: configured normal request; declared over-limit before body send on fresh and parked connections; fragmented declaration; split-head small-body co-read; at-limit body; malformed CL and EOF skip; same listener serves the next normal request after each refusal; default and zero reset; negative/above-maximum/null-handle setter abort before changing the previous value; context and fd cleanup. Driver owner: setter compiles, runs, and rejects wrong receiver/count/type. A local bounded-memory assertion checks buffer capacity against head plus configured body bound, without a gigabyte allocation. The external align-llm serving owner adopts the setting after Align merges. |
+
+Closure matrix: formation is a bound `http_server` receiver plus one checked `i64` argument; mutation writes its stored cap; `accept` snapshots it before choosing a parked or new connection; both paths use the same read function and excess-result handling; success transfers the context, error closes the chosen fd, replacement writes a new cap, zero resets it, and server Drop closes listener/parked fds. No source move, return of the server, interface serialization, generic monomorphization or per-unit special case is introduced. The existing `http_server` Move and FFI owners continue to cover those cells; the runtime and driver owners above cover the changed cells.
+
+| Closure cell | Implementation | Owner |
+|---|---|---|
+| Method formation, exclusive borrowing, checked HIR, lowering and executable call | `check_http_server_method`, `validate_hir`, `Rvalue::HttpServerMaxRequestBodyBytes`, LLVM codegen | `server_request_body_limit_rejects_wrong_arguments`, `hir_body_validator_native`, `serve_accept_respond_round_trip` |
+| Setter validation, replacement and zero reset | `align_rt_http_server_max_request_body_bytes`, `HttpServer.max_request_body_bytes` | `http_server_body_cap_invalid_setter_aborts`, `http_server_explicit_body_cap_refuses_then_keeps_listener` |
+| Fresh/parked refusal, fd close and listener reuse | `http_read_request`, `align_rt_http_accept` | `http_server_explicit_body_cap_refuses_then_keeps_listener`, `http_server_body_cap_refuses_parked_connection` |
+| Incremental receive, co-read boundary and cleanup | `http_read_into`, `HttpRequestCtx::drop` | `http_read_request_reassembles_a_body_larger_than_one_read`, `http_request_cap_counts_only_the_framed_body_in_a_head_co_read`, existing `http_keepalive_` and malformed-request owners |
+| Native symbol/type/count | runtime key, A66 declaration/effects and export inventory | `runtime_abi_registry_matches_checked_in_declaration_golden`, `scripts/test-runtime-abi-exports.sh` |

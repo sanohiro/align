@@ -24850,6 +24850,7 @@ enum ParkSlot {
 /// one.
 pub struct HttpServer {
     fd: i32,
+    max_request_body_bytes: Option<usize>,
     park: std::sync::Arc<std::sync::Mutex<ParkSlot>>,
     /// Scratch for `accept`'s `poll` array, reused across calls (it is rebuilt every request, and at
     /// capacity that is a 257-entry allocation on the hot path).
@@ -24979,6 +24980,7 @@ unsafe fn http_serve_impl(host_ptr: *const u8, host_len: i64, port: i64, out: *m
     unsafe {
         *out = Box::into_raw(Box::new(HttpServer {
             fd,
+            max_request_body_bytes: None,
             park: std::sync::Arc::new(std::sync::Mutex::new(ParkSlot::Live(Vec::new()))),
             poll_buf: Vec::new(),
             poll_cursor: 0,
@@ -24996,6 +24998,20 @@ pub unsafe extern "C" fn align_rt_http_server_free(srv: *mut HttpServer) {
     if !srv.is_null() {
         drop(unsafe { Box::from_raw(srv) }); // `Drop` closes the fd
     }
+}
+
+/// Set the inbound body cap on a borrowed server. Zero restores the default 1 GiB cap.
+/// Invalid input aborts before the stored limit changes.
+///
+/// # Safety
+/// `srv` must be a live, exclusively borrowed server handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_server_max_request_body_bytes(srv: *mut HttpServer, limit: i64) {
+    if srv.is_null() || !(0..=HTTP_MAX_BODY as i64).contains(&limit) {
+        panic_abort("http.server.max_request_body_bytes: invalid server or limit");
+    }
+    let selected = if limit == 0 { None } else { Some(usize::try_from(limit).unwrap_or_else(|_| panic_abort("http.server.max_request_body_bytes: limit exceeds target size"))) };
+    unsafe { (*srv).max_request_body_bytes = selected };
 }
 
 /// The parsed request line + header block of an inbound request plus the body-framing decision. The
@@ -25310,15 +25326,15 @@ fn http_request_wants_close(buf: &[u8], headers: &[HttpHeaderSpan]) -> bool {
 /// so the common request costs exactly one modest allocation and one `read`.
 const HTTP_HEAD_CHUNK: usize = 2 * 1024;
 
-/// The most spare capacity [`http_read_into`] asks for in one go once a body is framed. Larger than
-/// [`HTTP_HEAD_CHUNK`] so a big body streams in few reads, and bounded so the buffer cannot be grown
-/// far past what the framing actually needs.
+/// The minimum body-growth step while a large framed remainder remains. Larger than
+/// [`HTTP_HEAD_CHUNK`] so a big body streams in few reads; each reserve target and read still
+/// obey the framed end, even when the buffer already has more spare capacity.
 const HTTP_READ_CHUNK: usize = 16 * 1024;
 
 /// One `read(2)` **directly into `buf`'s uninitialised spare capacity**, appending what arrives.
 /// `want` is the framed remainder — `Some(n)` once the head is parsed, `None` while it is not, which
-/// is the difference between "grow to exactly what is left" and "grow the way any buffer of unknown
-/// final size should". Returns the byte count (`0` = EOF), retrying `EINTR`.
+/// is the difference between "grow and read at most what is left" and "grow the way any buffer of
+/// unknown final size should". Returns the byte count (`0` = EOF), retrying `EINTR`.
 ///
 /// The obvious spelling — read into a `[u8; 32 * 1024]` stack buffer, then `extend_from_slice` —
 /// costs a **32 KiB `memset` and an eight-page stack probe on every request** (the array is
@@ -25361,7 +25377,10 @@ unsafe fn http_read_into(fd: i32, buf: &mut Vec<u8>, want: Option<usize>) -> Res
     // Captured before the `EINTR` loop, which cannot touch `buf` — keep it that way if this loop
     // ever grows a body: a `reserve` inside it would leave `ptr`/`spare` stale.
     let len = buf.len();
-    let spare = buf.capacity() - len;
+    // `reserve_exact` does not shrink existing spare capacity. Clamp the syscall too: a framed
+    // read must not consume bytes beyond the declared remainder merely because the head buffer
+    // happened to have spare capacity.
+    let spare = (buf.capacity() - len).min(want.unwrap_or(usize::MAX));
     debug_assert!(spare > 0, "reserve guarantees spare capacity");
     loop {
         let r = unsafe { read(fd, buf.as_mut_ptr().add(len) as *mut core::ffi::c_void, spare) };
@@ -25393,7 +25412,13 @@ unsafe fn http_read_into(fd: i32, buf: &mut Vec<u8>, want: Option<usize>) -> Res
 ///
 /// # Safety
 /// `fd` must be a valid connected socket.
-unsafe fn http_read_request(fd: i32) -> Result<HttpRequestCtx, i32> {
+#[derive(Debug)]
+enum HttpReadRequestError {
+    Malformed,
+    ExplicitBodyLimit,
+}
+
+unsafe fn http_read_request(fd: i32, explicit_body_limit: Option<usize>) -> Result<HttpRequestCtx, HttpReadRequestError> {
     // Sized so an ordinary request head lands in ONE read with no growth. This is capacity, not
     // initialised bytes: the read below writes straight into the spare tail (see `http_read_into`),
     // so nothing here is zeroed or copied.
@@ -25411,10 +25436,10 @@ unsafe fn http_read_request(fd: i32) -> Result<HttpRequestCtx, i32> {
                 Ok(h) => head = Some(h),
                 Err(HttpParseErr::Incomplete) => {
                     if buf.len() > HTTP_MAX_HEADER_BLOCK {
-                        return Err(AL_INVALID); // header block never terminated within the cap
+                        return Err(HttpReadRequestError::Malformed); // head cap
                     }
                 }
-                Err(HttpParseErr::Invalid | HttpParseErr::BodyLimit) => return Err(AL_INVALID),
+                Err(HttpParseErr::Invalid | HttpParseErr::BodyLimit) => return Err(HttpReadRequestError::Malformed),
             }
         }
         // If the head is parsed, compute the framed end ONCE — both the completeness test below and
@@ -25423,14 +25448,17 @@ unsafe fn http_read_request(fd: i32) -> Result<HttpRequestCtx, i32> {
         let framed_need = if let Some(h) = head.as_ref() {
             let need = match h.content_length {
                 Some(n) => {
+                    if explicit_body_limit.is_some_and(|limit| n > limit) {
+                        return Err(HttpReadRequestError::ExplicitBodyLimit);
+                    }
                     if n > HTTP_MAX_BODY {
-                        return Err(AL_INVALID); // over cap
+                        return Err(HttpReadRequestError::Malformed);
                     }
                     // `checked_add` (Gate-2): a wrap would turn an out-of-buffer body into an in-bounds
                     // one. `body_start + n` never wraps here (both bounded), but be explicit.
                     match h.body_start.checked_add(n) {
                         Some(t) => t,
-                        None => return Err(AL_INVALID),
+                        None => return Err(HttpReadRequestError::Malformed),
                     }
                 }
                 None => h.body_start, // no Content-Length → no body
@@ -25445,16 +25473,11 @@ unsafe fn http_read_request(fd: i32) -> Result<HttpRequestCtx, i32> {
             // (http.md item 9 ②): 1.1, no `Connection: close`, and nothing read past this request's
             // own body. 1.0 keep-alive is not supported.
             //
-            // **Residual comes from the pre-head window, and from any read whose buffer had slack
-            // past the framing.** #602 recorded this as "reads are clamped to the framed remainder";
-            // that overstates it. `http_read_into` *reserves* by the remainder, but `reserve_exact`
-            // is a no-op when the capacity already suffices and the read then takes the whole spare —
-            // so a 2 KiB buffer holding a small framed request still overshoots into pipelined bytes
-            // (and closes on them), while one grown to exactly the framed total does not. Both
-            // outcomes are correct here: an overshoot sets `residual` and closes, and no overshoot
-            // leaves the pipelined request to be re-read on the next `accept`. Bytes cannot be lost
-            // either way — `truncate` discards only when `buf.len() > need`, which is exactly the
-            // condition that already set `residual`.
+            // Residual bytes can come from the pre-head read, before framing is known. Once the
+            // head is parsed, `http_read_into` clamps the syscall to the framed remainder. A
+            // pre-head overshoot closes after the response; otherwise a pipelined request stays in
+            // the socket for the next `accept`. Truncation discards only bytes already marked as
+            // residual.
             let residual = buf.len() > need;
             let keep_alive = h.http11 && !residual && !http_request_wants_close(&buf, &h.headers);
             buf.truncate(need); // drop any pipelined bytes — the eligibility check above saw them
@@ -25480,14 +25503,14 @@ unsafe fn http_read_request(fd: i32) -> Result<HttpRequestCtx, i32> {
         // subtraction cannot underflow: control only reaches here when `buf.len() < need`, and
         // `need` was bounded by the `HTTP_MAX_BODY` + `checked_add` gate just above.
         let want = framed_need.map(|need| need - buf.len());
-        let n = unsafe { http_read_into(fd, &mut buf, want) }?;
+        let n = unsafe { http_read_into(fd, &mut buf, want) }.map_err(|_| HttpReadRequestError::Malformed)?;
         if n == 0 {
             // EOF before a complete request (client closed / truncated head or body) → malformed.
-            return Err(AL_INVALID);
+            return Err(HttpReadRequestError::Malformed);
         }
         // Bound the pre-head scan region too (an adversary that never sends the blank line).
         if head.is_none() && buf.len() > HTTP_MAX_HEADER_BLOCK {
-            return Err(AL_INVALID);
+            return Err(HttpReadRequestError::Malformed);
         }
     }
 }
@@ -25695,8 +25718,9 @@ unsafe fn http_accept_conn(lfd: i32) -> Result<i32, AcceptFail> {
 /// death of a warm connection is not an application-visible event.
 ///
 /// **A malformed request never surfaces.** It is a per-request fault — the listener is healthy — so
-/// this closes that connection and waits for the next one. Only a real `accept(2)` failure returns
-/// an error, which is what makes `srv.accept()?` in a serve loop correct.
+/// this closes that connection and waits for the next one. An explicitly configured body-cap
+/// refusal instead returns `AL_INVALID`, closing only the selected connection. The caller must
+/// handle that error if it intends to continue accepting after a refusal.
 ///
 /// **Nor does a transient `accept(2)` errno** ([`AcceptFail`]): the noise errnos go back to the
 /// wait above, and `EMFILE`/`ENFILE` spend one idle parked connection per backoff interval
@@ -25716,6 +25740,7 @@ pub unsafe extern "C" fn align_rt_http_accept(srv: *mut HttpServer, out: *mut *m
         return AL_INVALID;
     }
     let lfd = unsafe { (*srv).fd };
+    let explicit_body_limit = unsafe { (*srv).max_request_body_bytes };
     let park = unsafe { (*srv).park.clone() };
     // Whether this call has already spent a warm connection on descriptor pressure since it last
     // waited — see `http_yield_for_fds`.
@@ -25763,13 +25788,17 @@ pub unsafe extern "C" fn align_rt_http_accept(srv: *mut HttpServer, out: *mut *m
                         }
                     };
                     let Some(pfd) = claimed else { continue };
-                    match unsafe { http_read_request(pfd) } {
+                    match unsafe { http_read_request(pfd, explicit_body_limit) } {
                         Ok(mut ctx) => {
                             ctx.park = Some(park);
                             unsafe { *out = Box::into_raw(Box::new(ctx)) };
                             return 0;
                         }
-                        Err(_) => {
+                        Err(HttpReadRequestError::ExplicitBodyLimit) => {
+                            unsafe { close(pfd) };
+                            return AL_INVALID;
+                        }
+                        Err(HttpReadRequestError::Malformed) => {
                             // EOF (the client is done with the connection) or a malformed follow-up
                             // request: close that connection and look again — a warm connection
                             // dying is not an application-visible event.
@@ -25804,13 +25833,17 @@ pub unsafe extern "C" fn align_rt_http_accept(srv: *mut HttpServer, out: *mut *m
                 }
             }
         };
-        match unsafe { http_read_request(fd) } {
+        match unsafe { http_read_request(fd, explicit_body_limit) } {
             Ok(mut ctx) => {
                 ctx.park = Some(park);
                 unsafe { *out = Box::into_raw(Box::new(ctx)) };
                 return 0;
             }
-            Err(_) => {
+            Err(HttpReadRequestError::ExplicitBodyLimit) => {
+                unsafe { close(fd) };
+                return AL_INVALID;
+            }
+            Err(HttpReadRequestError::Malformed) => {
                 // A malformed / smuggling / truncated request is a PER-REQUEST fault, not a
                 // listener-level one: close that connection and wait for the next, exactly as the
                 // parked path does. Surfacing it would hand every caller a `Result` that kills the
@@ -47613,7 +47646,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             std::thread::sleep(std::time::Duration::from_millis(50));
         });
         let fd = a.into_raw_fd();
-        let ctx = unsafe { http_read_request(fd) }.expect("a framed request reassembles");
+        let ctx = unsafe { http_read_request(fd, Some(body_len)) }.expect("a framed request reassembles at its configured cap");
         writer.join().expect("writer");
 
         assert_eq!(ctx.body_len, body_len, "the whole body arrived");
@@ -47656,10 +47689,21 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             std::thread::sleep(std::time::Duration::from_millis(50));
         });
         let fd = a.into_raw_fd();
-        let ctx = unsafe { http_read_request(fd) }.expect("a split head reassembles");
+        let ctx = unsafe { http_read_request(fd, None) }.expect("a split head reassembles");
         writer.join().expect("writer");
         assert_eq!(&ctx.buf[ctx.target_start..ctx.target_start + ctx.target_len], b"/split");
         assert_eq!(ctx.body_len, 0);
+    }
+
+    #[test]
+    fn http_request_cap_counts_only_the_framed_body_in_a_head_co_read() {
+        use std::io::Write;
+        use std::os::unix::io::IntoRawFd;
+        let (a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+        b.write_all(b"POST /one HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nhelloGET /two HTTP/1.1\r\nHost: h\r\n\r\n").unwrap();
+        let ctx = unsafe { http_read_request(a.into_raw_fd(), Some(5)) }.expect("co-read bytes past the frame are not body bytes");
+        assert_eq!(&ctx.buf[ctx.body_start..], b"hello");
+        assert!(!ctx.keep_alive, "co-read pipelined bytes close after response");
     }
 
     /// The lazy head (http.md item 8 ②) rides the first real `send` in ONE write (head + first
@@ -48815,8 +48859,8 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         unsafe { align_rt_http_server_free(srv) };
     }
 
-    /// A malformed request → `accept` returns `AL_INVALID` (closing that conn) but the LISTENER stays
-    /// alive: a subsequent well-formed client is served.
+    /// A malformed request is skipped (closing that conn); the listener stays alive and serves a
+    /// subsequent well-formed client.
     #[test]
     fn http_server_rejects_malformed_then_keeps_serving() {
         let port = free_loopback_port();
@@ -48840,6 +48884,132 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         let bad_resp = bad.join().unwrap();
         assert!(bad_resp.is_empty(), "the malformed request's connection is closed unanswered: {bad_resp:?}");
         unsafe { align_rt_http_server_free(srv) };
+    }
+
+    #[test]
+    fn http_server_explicit_body_cap_refuses_then_keeps_listener() {
+        let port = free_loopback_port();
+        let (hp, hl) = view_of("127.0.0.1");
+        let mut srv: *mut HttpServer = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_serve(hp, hl, port as i64, &mut srv) }, 0);
+        unsafe { align_rt_http_server_max_request_body_bytes(srv, 5) };
+
+        // The client sends no body: rejection must happen from the declaration, without waiting
+        // for or allocating the six bytes it claims it will send.
+        let oversized = raw_http_client(port, b"POST /large HTTP/1.1\r\nHost: h\r\nContent-Length: 6\r\n\r\n");
+        let mut ctx: *mut HttpRequestCtx = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_accept(srv, &mut ctx) }, AL_INVALID);
+        assert!(ctx.is_null());
+        assert!(oversized.join().unwrap().is_empty());
+
+        let exact = raw_http_client(port, b"POST /exact HTTP/1.1\r\nHost: h\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello");
+        assert_eq!(unsafe { align_rt_http_accept(srv, &mut ctx) }, 0);
+        let body = unsafe { align_rt_http_ctx_body(ctx) };
+        assert_eq!(unsafe { safe_slice(body.ptr, body.len) }, b"hello");
+        assert!(unsafe { (*ctx).buf.capacity() } <= HTTP_HEAD_CHUNK + HTTP_MAX_HEADER_BLOCK + 5);
+        assert_eq!(unsafe { align_rt_http_respond(ctx, align_rt_http_response_new(204)) }, 0);
+        assert!(String::from_utf8_lossy(&exact.join().unwrap()).starts_with("HTTP/1.1 204"));
+
+        unsafe { align_rt_http_server_max_request_body_bytes(srv, 0) };
+        let reset = raw_http_client(port, b"POST /default HTTP/1.1\r\nHost: h\r\nConnection: close\r\nContent-Length: 6\r\n\r\nlonger");
+        ctx = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_accept(srv, &mut ctx) }, 0);
+        let body = unsafe { align_rt_http_ctx_body(ctx) };
+        assert_eq!(unsafe { safe_slice(body.ptr, body.len) }, b"longer");
+        unsafe { align_rt_http_ctx_free(ctx) };
+        assert!(reset.join().unwrap().is_empty());
+        unsafe { align_rt_http_server_free(srv) };
+    }
+
+    #[test]
+    fn http_server_body_cap_refuses_parked_connection() {
+        use std::io::{Read, Write};
+        let port = free_loopback_port();
+        let (hp, hl) = view_of("127.0.0.1");
+        let mut srv: *mut HttpServer = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_serve(hp, hl, port as i64, &mut srv) }, 0);
+        unsafe { align_rt_http_server_max_request_body_bytes(srv, 5) };
+
+        let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        sock.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        sock.write_all(b"GET /first HTTP/1.1\r\nHost: h\r\n\r\n").unwrap();
+        let mut ctx: *mut HttpRequestCtx = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_accept(srv, &mut ctx) }, 0);
+        assert_eq!(unsafe { align_rt_http_respond(ctx, align_rt_http_response_new(204)) }, 0);
+        let mut leftover = Vec::new();
+        assert!(read_framed_response(&mut sock, &mut leftover, false).starts_with("HTTP/1.1 204"));
+
+        // Split the declaration across writes; the parked socket becomes ready before framing
+        // is complete. The final valid head must surface only the explicit cap refusal.
+        sock.write_all(b"POST /large HTTP/1.1\r\nHost: h\r\nContent-Length: ").unwrap();
+        let finisher = std::thread::spawn(move || {
+            sock.write_all(b"6\r\n\r\n").unwrap();
+            let mut tail = Vec::new();
+            sock.read_to_end(&mut tail).unwrap();
+            tail
+        });
+        ctx = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_accept(srv, &mut ctx) }, AL_INVALID);
+        assert!(ctx.is_null());
+        assert!(finisher.join().unwrap().is_empty());
+
+        let good = raw_http_client(port, b"GET /again HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+        assert_eq!(unsafe { align_rt_http_accept(srv, &mut ctx) }, 0);
+        assert_eq!(unsafe { align_rt_http_respond(ctx, align_rt_http_response_new(204)) }, 0);
+        assert!(String::from_utf8_lossy(&good.join().unwrap()).starts_with("HTTP/1.1 204"));
+        unsafe { align_rt_http_server_free(srv) };
+    }
+
+    #[test]
+    #[ignore]
+    fn http_server_body_cap_invalid_setter_probe() {
+        let mode = std::env::var("ALIGN_HTTP_SERVER_CAP_ABORT_MODE").unwrap();
+        if mode == "null" {
+            unsafe { align_rt_http_server_max_request_body_bytes(std::ptr::null_mut(), 5) };
+        }
+        let port = free_loopback_port();
+        let (hp, hl) = view_of("127.0.0.1");
+        let mut srv: *mut HttpServer = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_serve(hp, hl, port as i64, &mut srv) }, 0);
+        unsafe { align_rt_http_server_max_request_body_bytes(srv, 5) };
+        let invalid = match mode.as_str() {
+            "negative" => -1,
+            "too-large" => HTTP_MAX_BODY as i64 + 1,
+            _ => unreachable!(),
+        };
+        unsafe { align_rt_http_server_max_request_body_bytes(srv, invalid) };
+    }
+
+    #[test]
+    fn http_server_body_cap_invalid_setter_aborts() {
+        const NAME: &str = "tests::http_server_body_cap_invalid_setter_probe";
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        for mode in ["null", "negative", "too-large"] {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", NAME, "--test-threads=1"])
+                .env("ALIGN_HTTP_SERVER_CAP_ABORT_MODE", mode)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn().expect("spawn invalid setter probe");
+            let mut child = ChildGuard(child);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = child.0.try_wait().expect("poll invalid setter probe") {
+                    break status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    panic!("{mode} setter probe did not terminate");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            assert!(!status.success(), "{mode} must hard-abort");
+        }
     }
 
     /// `respond` rejects a caller-supplied Content-Length (smuggling guard) — the fd is still closed.

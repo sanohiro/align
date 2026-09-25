@@ -540,6 +540,7 @@ fn runtime_effects(id: RuntimeAbiId) -> RuntimeEffects {
         RuntimeAbiId::Keyed(RuntimeKey::HexEncode) => RuntimeEffects { class: EffectClass::ArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::HtmlEscape) => RuntimeEffects { class: EffectClass::ArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::HttpAccept) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpServerMaxRequestBodyBytes) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::HttpBody) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::HttpClientFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::HttpClientGet) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
@@ -1855,6 +1856,11 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
             symbol: "align_rt_http_accept",
             shape: RuntimeAbiShape::A19,
         },
+        RuntimeKey::HttpServerMaxRequestBodyBytes => RuntimeAbi {
+            key,
+            symbol: "align_rt_http_server_max_request_body_bytes",
+            shape: RuntimeAbiShape::A66,
+        },
         RuntimeKey::HttpBody => RuntimeAbi {
             key,
             symbol: "align_rt_http_body",
@@ -3033,15 +3039,15 @@ fn validate_effects(abi: RuntimeAbi, effects: RuntimeEffects) -> Result<(), Stri
 }
 
 pub(super) fn validate_registry() -> Result<(), String> {
-    if RuntimeKey::ALL.len() != 446 || keyed_runtime_abis().len() != 446 {
+    if RuntimeKey::ALL.len() != 447 || keyed_runtime_abis().len() != 447 {
         return Err("runtime ABI registry invariant: key-count".to_string());
     }
-    if runtime_abis().count() != 464 {
+    if runtime_abis().count() != 465 {
         return Err("runtime ABI registry invariant: base-count".to_string());
     }
 
     let mut keys = HashSet::with_capacity(RuntimeKey::ALL.len());
-    let mut symbols = HashSet::with_capacity(464);
+    let mut symbols = HashSet::with_capacity(465);
     for abi in keyed_runtime_abis() {
         validate_effects(abi, runtime_effects(abi.key))?;
         let key = abi
@@ -4356,17 +4362,17 @@ mod tests {
         );
         validate_registry().unwrap_or_else(|error| panic!("valid runtime registry: {error}"));
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 464);
+        assert_eq!(rows.len(), 465);
         assert_eq!(
             rows.iter().map(|row| row.key).collect::<HashSet<_>>().len(),
-            464
+            465
         );
         assert_eq!(
             rows.iter()
                 .map(|row| row.symbol)
                 .collect::<HashSet<_>>()
                 .len(),
-            464
+            465
         );
         for (key, row) in RuntimeKey::ALL.into_iter().zip(keyed_runtime_abis()) {
             assert_eq!(row.key, RuntimeAbiId::Keyed(key));
@@ -4395,7 +4401,7 @@ mod tests {
     #[test]
     fn runtime_effects_registry_is_total_and_structurally_valid() {
         validate_registry().unwrap();
-        assert_eq!(runtime_abis().map(|abi| runtime_effects(abi.key)).count(), 464);
+        assert_eq!(runtime_abis().map(|abi| runtime_effects(abi.key)).count(), 465);
 
         let expect_rule = |abi, effects, rule: &str| {
             let error = validate_effects(abi, effects).unwrap_err();
@@ -4522,7 +4528,7 @@ mod tests {
     fn runtime_abi_extern_type_matrix_is_exact_for_every_row_and_ordinal() {
         let ctx = inkwell::context::Context::create();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 464);
+        assert_eq!(rows.len(), 465);
 
         for row in rows {
             let symbol = row.symbol;

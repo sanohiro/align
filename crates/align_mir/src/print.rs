@@ -1264,6 +1264,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
             operand_str(port)
         ),
         Rvalue::HttpAccept { server, out } => format!("http_accept({}, -> _{out})", operand_str(server)),
+        Rvalue::HttpServerMaxRequestBodyBytes { server, limit } => format!("http_server_max_request_body_bytes({}, {})", operand_str(server), operand_str(limit)),
         Rvalue::HttpCtxMethod { ctx } => format!("http_ctx_method({})", operand_str(ctx)),
         Rvalue::HttpCtxPath { ctx } => format!("http_ctx_path({})", operand_str(ctx)),
         Rvalue::HttpCtxHeader { ctx, name, out } => format!("http_ctx_header({}, {}, -> _{out})", operand_str(ctx), operand_str(name)),

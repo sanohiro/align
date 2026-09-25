@@ -14056,6 +14056,18 @@ fn hir_body_validator_native() {
         native_result(Ty::HttpRequestCtx, error)
     );
     add!(
+        "native_http_server_max_request_body_bytes",
+        body_test_expr(
+            hir::ExprKind::HttpServerMaxRequestBodyBytes {
+                server: Box::new(native_local(0, Ty::HttpServer)),
+                limit: Box::new(native_i64()),
+            },
+            Ty::Unit,
+        ),
+        vec![body_test_local(0, "server", Ty::HttpServer, false, false)],
+        Ty::Unit
+    );
+    add!(
         "native_http_response_builder",
         body_test_expr(
             hir::ExprKind::HttpResponseBuilder {
@@ -14852,6 +14864,14 @@ fn hir_body_validator_native() {
         body_statement_expression_mut(&mut reject, "native_http_request_max_response_body_bytes");
     let hir::ExprKind::HttpRequestMaxResponseBodyBytes { limit, .. } = &mut expression.kind else {
         panic!("request body-limit fixture lost its discriminator")
+    };
+    limit.ty = Ty::Bool;
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_statement_expression_mut(&mut reject, "native_http_server_max_request_body_bytes");
+    let hir::ExprKind::HttpServerMaxRequestBodyBytes { limit, .. } = &mut expression.kind else {
+        panic!("server body-limit fixture lost its discriminator")
     };
     limit.ty = Ty::Bool;
     assert!(!body_core_metadata_is_valid(&reject));

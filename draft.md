@@ -3922,6 +3922,16 @@ is catastrophic; v1 does not auto-generate nonces (pair with `crypto.random`).
 
 A primitive, not a framework.
 
+An `http_server` owns an optional inbound request-body cap:
+`srv.max_request_body_bytes(limit: i64) -> ()` sets it before a subsequent
+`accept()`. Zero restores the 1 GiB default. A positive value up to 1 GiB bounds
+the framed body before receive growth; invalid values abort before mutation.
+An explicitly over-limit `Content-Length` closes that connection and returns
+`Error.Invalid` from `accept()` while the listener remains usable. The caller
+handles that refusal to continue accepting. Other malformed requests retain
+the server's skip-and-wait behavior. The exact receive and ownership rules are
+in `docs/impl/std-design/http.md`.
+
 The whole-body client has explicit receive limits at both reusable-client and request scope:
 
 ```text

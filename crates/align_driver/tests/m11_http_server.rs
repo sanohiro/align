@@ -68,6 +68,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   c.flag_i64(\"port\", 0)
   p := c.parse(args)?
   srv := http.serve(\"127.0.0.1\", p.get_i64(\"port\"))?
+  srv.max_request_body_bytes(5)
   ctx := srv.accept()?
   rb := http.response(200)
   rb.header(\"X-Method\", ctx.method())
@@ -329,6 +330,7 @@ pub fn main() -> Result<(), Error> {
   ctx := http.serve(\"127.0.0.1\", 8080)?.accept()?
   return Ok(())
 }
+
 ";
     assert!(check_errs("m11-http-srv-unbound", srv), "accept on an unbound http_server must be rejected");
     // `header` on an unbound `response_builder`.
@@ -340,6 +342,28 @@ pub fn main() -> Result<(), Error> {
 }
 ";
     assert!(check_errs("m11-http-rb-unbound", rb), "a method on an unbound response_builder must be rejected");
+}
+
+#[test]
+fn server_request_body_limit_rejects_wrong_arguments() {
+    let arity = "\
+import std.http
+pub fn main() -> Result<(), Error> {
+  srv := http.serve(\"127.0.0.1\", 8080)?
+  srv.max_request_body_bytes()
+  return Ok(())
+}
+";
+    assert!(check_errs("m11-http-server-limit-arity", arity));
+    let ty = "\
+import std.http
+pub fn main() -> Result<(), Error> {
+  srv := http.serve(\"127.0.0.1\", 8080)?
+  srv.max_request_body_bytes(true)
+  return Ok(())
+}
+";
+    assert!(check_errs("m11-http-server-limit-type", ty));
 }
 
 /// `respond` consumes BOTH `ctx` and `rb`: using either after the call is a moved-value compile error.
