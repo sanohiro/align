@@ -32,6 +32,7 @@ array header、builder、allocation を追加しない。named local、parameter
 xs.len()   -> i64        // direct length: str/string, slice, array (fixed = const), soa, buffer
 xs[i]                    // index (bounds-checked abort): scalar elem / chunk slice / struct gather / vec lane
 xs[a..b]   -> slice<T>   // range view of admitted contiguous elements; either bound omittable
+xs.truncate(new_len: i64) -> () // dynamic array のみ; 排他的な先頭部分の保持
 xs[i] = v                // Copy scalar / 借用 str 書き込み。mut local / out slice。owned string / Move は対象外
 arr[i] = structval       // whole-struct element write (POD; Move structs into FIXED arrays only)
 arr[i].f = v             // element-field write, nested paths ok; dynamic arrays: primitive leaf only
@@ -182,6 +183,19 @@ clone は独立した所有文字列になる。
 手書きの `if xs[i] > best { best = xs[i] }` ループはこの形に正規化**しない**。これは別のプログラム
 であり（順序付き比較なので NaN オペランドでは false になり、NaN をスキップする）、書き換えは隠れた
 特別扱いになる。代わりに「ベクタ化される書き方ではない」と明記する（#1082 Part 1）。
+
+## 既存配列の短縮とバイトビュー
+
+`array<T>.truncate(new_len: i64) -> ()` は、安定した可変ローカル、または受理済みの
+排他的な配列・レコードフィールドを対象にし、`0 <= new_len <= old_len` を要求する。
+不正な長さでは Drop や書き込みの前に停止する。除去する所有要素を添字の昇順で Drop してから
+新しい長さを公開する。長さゼロでも先頭部分と外側の割り当てを保持し、確保やコピーは行わない。
+同じ長さへの呼び出しでも、重なるビューや添字付き借用を操作後まで残すことはできない。
+固定配列、slice、SoA は対象外。正確な契約は [plan 66](../../66-array-prefix-and-text-boundary-plan.md)、
+検証対象は `array_truncate.rs`。
+
+書き込み可能なバイト slice の `set_*`/`fill`/`fill_S_E`/`copy_from` と、検査付きの
+ゼロコピー `view_le`/`as_bytes` は [バイト操作リファレンス](string.md) を参照。
 
 ## 明示的なコンストラクタ容量
 

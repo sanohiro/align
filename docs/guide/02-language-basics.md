@@ -52,9 +52,11 @@ fn main() -> i32 {
 The example illustrates two rules:
 
 - **Integer overflow wraps.** It is defined two's-complement behavior — never undefined behavior, never a hidden trap. When you *want* a checked/saturating operation, the spec provides explicit `checked_*` / `saturating_*` / `wrapping_*` forms so the intent is visible in source.
-- **Narrowing is explicit and audited.** `as` truncation is defined behavior, and the compiler flags every lossy `as` with a warning so silent truncation can't hide.
+- **Narrowing is explicit and audited.** `as` truncation is defined behavior, and the compiler warns on potentially lossy `as` conversions unless it can prove the value fits, so silent truncation cannot hide.
 
 Division by zero (and `%` by zero) is a hard runtime error — the program aborts; it is never a silent wrong answer. Out-of-range literals (`x: i8 := 200`) are a compile error.
+
+Floats follow IEEE 754: division by zero can produce infinity or NaN rather than aborting. Use `is_finite()`, `is_nan()`, and `is_infinite()` to classify a scalar float. `f32.to_bits()` returns `u32` and `f64.to_bits()` returns `u64`, preserving the encoding, including signed zero and NaN payloads; an `as` cast instead converts the numeric value. For floating-point math and explicit rounding permissions, see chapter [12](12-simd.md).
 
 ## Everything is an expression
 

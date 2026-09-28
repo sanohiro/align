@@ -41,11 +41,7 @@ pub use csv::*;
 mod xml;
 pub use xml::*;
 
-/// Builtin `print` for integers: write the decimal value + newline to stdout.
-///
-/// M1 widens every integer argument to `i64` in codegen and routes it here. `bool`,
-/// strings, and a no-newline variant arrive with `std.io` (M5). The C ABI (`extern "C"`
-/// + no mangling) is what the generated `call` targets.
+/// Builtin `print` for signed integers, sign-extended to i64: decimal + newline.
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_print_i64(x: i64) {
     use std::io::Write;
@@ -54,6 +50,14 @@ pub extern "C" fn align_rt_print_i64(x: i64) {
     // The generated `main` returns straight to crt0, so std's atexit flush never runs;
     // an explicit flush keeps output from being lost when stdout is block-buffered (a
     // file/pipe redirect). Same for every other `print` variant below.
+    let _ = writeln!(out, "{x}").and_then(|()| out.flush());
+}
+
+/// Builtin `print` for unsigned integers, zero-extended to u64: decimal + newline.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_print_u64(x: u64) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{x}").and_then(|()| out.flush());
 }
 

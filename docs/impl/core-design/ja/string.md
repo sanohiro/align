@@ -87,6 +87,36 @@ Pure（I/O なし）。*アロケーションの可視性* というルールは
 
 `m5.rs`（find / rfind のペア、trim ファミリ、ゼロコピーの bytes ビュー、fuse を含む builder、template、エスケープ、UTF-8 のバイト長、print 型の網羅性チェックを含むメソッド）。`lambda.rs:271/280/287/294`（ラムダ内でのアロケーションの拒否 + ラムダ内での arena の許可）。`hash.rs`（ビューの受け入れ）。`fuzz_fmt.rs`（文字列を多用するソースの formatter 往復テスト）。例として `strings.align`、`template.align`。文字列連結の拒否は reducer、名前付き関数、ラムダの各コンテキストで一貫してカバーされている。SIMD スキャンの固定: #310 differential oracle。
 
+## バイト列の上書きと型付きビュー
+
+次の宣言は既存のストレージを操作し、確保や所有者のコピーは行わない。
+`S` は `u16`、`i16`、`u32`、`i32`、`u64`、`i64`、`f32`、`f64`、`E` は `le` または `be`。
+
+```text
+slice<u8>.set_u8(offset: i64, value: u8) -> ()
+slice<u8>.set_i8(offset: i64, value: i8) -> ()
+slice<u8>.set_S_E(offset: i64, value: S) -> ()
+slice<u8>.fill(value: u8) -> ()
+slice<u8>.fill_S_E(value: S) -> ()
+slice<u8>.copy_from(source: slice<u8>) -> ()
+slice<u8>.view_le<T>() -> Option<slice<T>>
+slice<T>.as_bytes() -> slice<u8>
+```
+
+書き込みには書き込み可能な backing が必要で、長さと容量は維持する。store は値の幅全体を検査し、
+型付き fill は長さが幅の倍数であること、copy は両者の長さが等しいことを要求する。
+検査失敗では書き込み前に停止する。copy は元データを借用し、独立した backing の証明を必要とする。
+重複または不明な backing は拒否する。空の fill/copy は有効で、`fill_u8` という別名はない。
+正確なアクセス・effect・検証規則は [plan 65](../../65-open-issue-batch-plan.md) に従う。
+
+型付きビューは Pure な descriptor 操作で、元データの寿命と読み書き権限を保持する。
+`T` は `S` と同じ 8 型。呼び出しでは `.view_le()` と書き、完全な期待型から `T` を推論し、
+型引数は書かない。長さやアラインメントが不正なら `view_le` は `None` を返し、little-endian
+以外のターゲットはコンパイル時に拒否する。`as_bytes` はネイティブ表現を公開する。
+`mut` ヘッダーだけでは共有・文字列由来の backing に書き込み権限を与えられない。
+自動 SIMD 化は保証しない。正確な契約は [plan 78](../../78-checked-byte-view-plan.md)、検証対象は
+`bytes_ops.rs`、`runway_a2_binary_codec.rs`、`consumer_borrow_boundaries.rs`。
+
 ## 明示的なコンストラクタ容量
 
 `buffer.filled(length: i64, value: u8) -> buffer` は、指定した長さの初期化済み

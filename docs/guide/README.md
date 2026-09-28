@@ -52,3 +52,7 @@ Use `alignc check file.align` to check a program and `alignc run file.align` to 
 - [23 — Packages: vendored source and choosing a library](23-packages.md)
 - [24 — Databases: pkg.db in practice](24-database.md)
 - [25 — Vector search through pkg.db](25-vector-search.md)
+
+## Part VI — Performance
+
+- [26 — Writing fast Align](26-performance.md) — measurement, passes, allocation, layout, SIMD, and parallelism

@@ -76,7 +76,7 @@ fn main() -> i32 {
 }
 ```
 
-The mode is written in the function declaration; the call remains `visit(p)`. A shared borrow cannot move, replace, or drop `p`. A mutable borrow requires a writable place and gives the callee exclusive access for the call. It also invalidates older views into that value: obtain a new view after an update rather than using one saved before it.
+The mode is written in the function declaration; the call remains `visit(p)`. A shared borrow cannot move, replace, or drop `p`. A mutable borrow requires a writable place and gives the callee exclusive access for the call. Older views into storage that the call may replace or invalidate cannot be used afterward: obtain a new view after the update. The compiler distinguishes disjoint record fields, while views that may share backing storage still conflict.
 
 For a function that only needs text or array elements, prefer `str` or `slice<T>` to borrowing the whole record. Shared `borrow` is also useful for large Copy structs: ordinary value passing copies them, while a borrow reads the caller's existing value. `borrow mut` is needed when a Copy struct's field updates should reach the caller.
 
@@ -97,6 +97,31 @@ sequenceDiagram
 ```
 
 These calls return an integer and Unit. A function that returns a view can leave the caller with a reference into `p`; that view remains subject to `p`'s lifetime and mutation rules.
+
+### Replacing owned fields and shortening arrays
+
+An owned field can be replaced on a mutable record or through `borrow mut`:
+
+```align
+fn rename(borrow mut p: Profile, name: str) {
+    p.name = name.clone()
+}
+```
+
+The right-hand side is evaluated first. Its ownership then replaces the old field, whose live value is dropped exactly once; siblings remain intact. This also applies to admitted owned arrays and nested Move records. There is no implicit clone: the example writes one because its input is borrowed text. Replacement must preserve the record's allocation mode.
+
+For an owned dynamic array, keep a prefix in place with `truncate`:
+
+```align
+fn main() -> i32 {
+    mut ids := [10, 20, 30, 40].to_array()
+    ids.truncate(2)
+    print(ids.sum())    // 30
+    return 0
+}
+```
+
+`truncate` requires a mutable owner and `0 <= new_len <= old_len`; an invalid count aborts before mutation. It drops any removed owning elements, preserves the backing allocation, and performs no copy or allocation. It neither grows the array nor returns its unused capacity to the allocator. Fixed arrays and slices cannot be truncated. Finish using views into the old array before truncating it, then obtain fresh views.
 
 ## Arenas — batch allocation by lifetime
 

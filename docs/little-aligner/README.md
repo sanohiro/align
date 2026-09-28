@@ -18,6 +18,8 @@ Some answers are one word. Some questions look identical to the one before — t
 
 After reading the book, choose a program you liked and read it again without running it. Predict its answer. Trace the data and the lifetimes of its values. Count the passes, allocations, and copies. [The final chapter](15-read-it-four-ways.md) practices this way of reading.
 
+To turn those predictions into measurements, continue with [Writing fast Align](../guide/26-performance.md): a practical guide to profiling, storage reuse, data layout, SIMD, and parallelism.
+
 ## Trying the examples
 
 For installation, see [Getting started](../guide/01-getting-started.md). Start a session from your terminal:

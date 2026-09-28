@@ -107,6 +107,8 @@ The guide explains syntax, tools, and libraries through worked examples:
 
 **[The Little Aligner](docs/little-aligner/README.md)** ([Japanese](docs/little-aligner/ja/README.md)) teaches through short questions and answers, in the tradition of *The Little Schemer*. Start here if you want to work out each step yourself: predict a result, follow the data, and reason about ownership and cost. The two books can be read independently or alongside each other.
 
+**[Writing fast Align](docs/guide/26-performance.md)** ([Japanese](docs/guide/ja/26-performance.md)) connects measurement, pipeline fusion, storage reuse, data layout, SIMD, and parallelism in one practical workflow.
+
 ## Layout
 
 - `draft.md` — authoritative language specification

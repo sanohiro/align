@@ -2042,3 +2042,19 @@ best-effort empty read window. `array_builder` capacity overloads reserve storag
 without creating initialized elements, for both heap and explicit region modes.
 They preserve heap transfer and region compaction at freeze. New guaranteed
 materializers use terminal allocation failure, matching core's existing model.
+
+## Mutating existing storage without hidden copies
+
+Plans 65 and 66 complete the existing mutable-storage model. Typed `slice<u8>.set_*` stores
+validate a whole scalar before writing; `fill`/`fill_S_E` and `copy_from` express bulk writes to an
+already-published window. Their access rules remain the ordinary exclusive-backing proof, so an
+overlapping copy is not silently given different semantics. Explicit `buffer.filled` construction
+and `append_filled` growth remain distinct from overwriting existing bytes.
+
+`array.truncate` retains the allocation and prefix while dropping only removed owned elements.
+It avoids the allocation inherent in materializing a prefix, without adding a second array owner
+or permitting an old longer view to survive suffix cleanup. General owning record-field
+replacement uses the existing Drop plan after staging the RHS; it needs no string-only exception
+and admits no new storage types. Disjoint field borrowing proves both place and backing separation:
+the containing record is too coarse an alias identity, but two copied view headers are not evidence
+of independent storage. These are the same ownership and borrowing rules at field precision.

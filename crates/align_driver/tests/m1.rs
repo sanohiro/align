@@ -80,3 +80,34 @@ fn struct_construct_read_and_field_assign() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "3\n10\n");
     assert_eq!(out.status.code(), Some(13), "3 + 10 = 13");
 }
+
+#[test]
+fn integer_print_preserves_signedness_and_matches_interpolation() {
+    if !backend_available() { return; }
+    let source = r#"
+fn display(x: u64) { print(x)
+    print(template "{x}")
+}
+fn main() -> i32 {
+    display(0)
+    display(9223372036854775807)
+    display(9223372036854775808)
+    display(18446744073709551615)
+    signed: i64 := -9223372036854775808
+    print(signed)
+    narrow_signed: i8 := -128
+    narrow_unsigned: u8 := 255
+    print(narrow_signed)
+    print(narrow_unsigned)
+    return 0
+}
+"#;
+    let expected = "0\n0\n9223372036854775807\n9223372036854775807\n9223372036854775808\n9223372036854775808\n18446744073709551615\n18446744073709551615\n-9223372036854775808\n-128\n255\n";
+    let whole = build_and_run("unsigned-print", source);
+    assert_eq!(whole.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&whole.stdout), expected);
+    let built = build_per_unit_multi("unsigned-print-per-unit", &[("main.align", source)], "main.align");
+    let per_unit = built.link_and_run();
+    assert_eq!(per_unit.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&per_unit.stdout), expected);
+}

@@ -65,6 +65,8 @@ fn main() -> i32 {
 }
 ```
 
+Floating `min()` and `max()` use the scalar methods' NaN and signed-zero rules: a NaN propagates, `min` selects `-0.0` from a mixed-zero pair, and `max` selects `+0.0`. They are not “skip NaNs” reducers. Filter unwanted values explicitly, and decide separately how an empty result should be handled.
+
 ## Reordering and splitting
 
 ```align

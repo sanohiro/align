@@ -52,3 +52,7 @@ Align を書くための実践的な入門です。[00 章](00-why-align.md)か�
 - [23 — パッケージ: ソースの配置とライブラリの選び方](23-packages.md)
 - [24 — データベース: pkg.db の実践](24-database.md)
 - [25 — pkg.db を通じたベクトル検索](25-vector-search.md)
+
+## 第 VI 部 —— 性能
+
+- [26 — Align で高速な処理を書く](26-performance.md) — 計測、走査、メモリ確保、データ配置、SIMD、並列化

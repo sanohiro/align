@@ -7405,7 +7405,14 @@ impl<'a, 'd> ConstEval<'a, 'd> {
                     }
                     _ => Ty::Float(FloatTy { bits: 64 }), // unconstrained float defaults to f64
                 };
-                Some((ty, ConstVal::Float(*v)))
+                // ConstVal uses f64 storage, but every f32 literal is rounded before any
+                // enclosing operation or comparison observes it, just as in runtime code.
+                let value = if ty == Ty::Float(FloatTy { bits: 32 }) {
+                    f64::from(*v as f32)
+                } else {
+                    *v
+                };
+                Some((ty, ConstVal::Float(value)))
             }
             K::Bool(b) => self.expect_scalar(Ty::Bool, ConstVal::Bool(*b), expected, e.span),
             K::Char(c) => self.expect_scalar(Ty::Char, ConstVal::Char(*c), expected, e.span),
@@ -7652,17 +7659,28 @@ impl<'a, 'd> ConstEval<'a, 'd> {
                 };
                 Some((lty, ConstVal::Int(wrap_to_int(r, it))))
             }
-            (ConstVal::Float(a), ConstVal::Float(b), Ty::Float(_)) => {
-                let r = match op {
-                    Add => a + b,
-                    Sub => a - b,
-                    Mul => a * b,
-                    Div => a / b,
-                    Rem => a % b,
-                    _ => {
-                        self.diags.error("bitwise and shift operators expect integers".to_string(), span);
-                        return None;
-                    }
+            (ConstVal::Float(a), ConstVal::Float(b), Ty::Float(ft)) => {
+                // Execute in the operand type: rounding only the final initializer (or even
+                // an f64 intermediate) does not implement IEEE f32 arithmetic.
+                macro_rules! arithmetic {
+                    ($a:expr, $b:expr) => {
+                        match op {
+                            Add => $a + $b,
+                            Sub => $a - $b,
+                            Mul => $a * $b,
+                            Div => $a / $b,
+                            Rem => $a % $b,
+                            _ => {
+                                self.diags.error("bitwise and shift operators expect integers".to_string(), span);
+                                return None;
+                            }
+                        }
+                    };
+                }
+                let r = if ft.bits == 32 {
+                    f64::from(arithmetic!(a as f32, b as f32))
+                } else {
+                    arithmetic!(a, b)
                 };
                 Some((lty, ConstVal::Float(r)))
             }
@@ -33237,13 +33255,153 @@ impl BorrowState {
         self.invalidate_matching(how, |root| *root != BorrowRoot::ReadOnly && roots.contains(root));
     }
 
+    /// Roots observed through a completed header, preserving caller-field identities until
+    /// after overlap is decided. Unknown headers retain the conservative root-level match.
+    fn exclusive_header_observations(
+        &self,
+        headers: &ProjectedHeaderFact,
+        roots: &BorrowRoots,
+        target: &ProjectedHeaderFact,
+        include_owner: bool,
+    ) -> BorrowRoots {
+        let target_generations = target.leaves.values()
+            .flat_map(|leaf| leaf.generations.iter().map(|reference| reference.generation.clone()))
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut result = BorrowRoots::new();
+        for leaf in headers.leaves.values() {
+            let selected = ProjectedHeaderFact { leaves: [(Vec::new(), leaf.clone())].into() };
+            let reachable = self.reachable_header_generations(&selected);
+            // The release of an owned header and borrows carried by its contents can flatten
+            // to the same caller root. Keep that root when any reached content may borrow;
+            // subtracting it from a flattened fact would erase both meanings.
+            let contained_borrow_or_unknown = reachable.iter().any(|generation| {
+                let Some(entry) = self.storage.directory.entries.get(generation) else {
+                    return true;
+                };
+                if entry.descriptor.is_none_or(|descriptor| descriptor.kind == StorageHeaderKind::View) {
+                    return true;
+                }
+                let Some(content) = self.storage.contents.entries.get(generation) else {
+                    return true;
+                };
+                !content.non_storage.flatten().is_empty()
+                    || content.headers.leaves.values().any(|nested| {
+                        !nested.known || !nested.fallback_roots.is_empty()
+                    })
+            });
+            let mut observed = self.resolve_headers(&selected).non_storage.live_roots();
+            // Retaining an allocation is not an old borrowed observation of that allocation.
+            // Its contained borrowed dependencies still participate in exclusion.
+            if !include_owner && !contained_borrow_or_unknown
+                && leaf.descriptor.is_some_and(|descriptor| descriptor.kind.owns_storage()) {
+                let owned = self.header_release_roots(&selected);
+                observed.retain(|root| !owned.contains(root));
+            }
+            let unknown = !leaf.known || !leaf.fallback_roots.is_empty()
+                || contained_borrow_or_unknown
+                || reachable.iter().any(|generation| {
+                    self.storage.contents.entries.get(generation).is_some_and(|content| {
+                        content.headers.leaves.values().any(|nested| !nested.known || !nested.fallback_roots.is_empty())
+                            || content.non_storage.live_roots().iter().any(|root| matches!(root, BorrowRoot::ParamStorage(_)))
+                    })
+                });
+            for root in observed.intersection(roots) {
+                if let BorrowRoot::ParamStorage(parameter) = root {
+                    let same_parameter = |generation: &&StorageGeneration| {
+                        matches!(generation, StorageGeneration::CallerStorage { parameter: source, .. } if source == parameter)
+                    };
+                    let targets = target_generations.iter().filter(same_parameter).collect::<Vec<_>>();
+                    let observed = reachable.iter().filter(same_parameter).collect::<Vec<_>>();
+                    // A symbolic caller field names a descriptor place. A view field may point
+                    // into another field's storage, so distinct paths prove separation only
+                    // when both generations denote their own owned storage.
+                    let owned_backing = |generation: &StorageGeneration| {
+                        self.storage.directory.entries.get(generation)
+                            .and_then(|entry| entry.descriptor)
+                            .is_some_and(|descriptor| descriptor.kind.owns_storage())
+                    };
+                    if !unknown && !targets.is_empty() && !observed.is_empty()
+                        && targets.iter().all(|generation| owned_backing(generation))
+                        && observed.iter().all(|generation| owned_backing(generation))
+                        && !observed.iter().any(|generation| targets.contains(generation))
+                    {
+                        continue;
+                    }
+                }
+                result.insert(root.clone());
+            }
+        }
+        result
+    }
+
     fn invalidate_roots_except_local(
         &mut self,
         roots: &BorrowRoots,
         how: BorrowEnd,
         excluded: LocalId,
+        excluded_path: &[BorrowProjection],
+        target: &ProjectedHeaderFact,
     ) {
-        self.invalidate_roots(roots, how);
+        // Keep legacy/header-free observers, but do not flatten an authenticated whole-value
+        // header's distinct caller fields into the same ParamStorage root before matching.
+        fn legacy_observations<K: Copy + Eq + std::hash::Hash>(
+            state: &BorrowState,
+            sources: &HashMap<K, BorrowRoots>,
+            headers: &HashMap<K, ProjectedHeaderFact>,
+            roots: &BorrowRoots,
+            target: &ProjectedHeaderFact,
+            include_owner: bool,
+        ) -> Vec<(K, BorrowRoots)> {
+            sources.iter().map(|(&key, observed)| {
+                let mut matched = observed.intersection(roots).cloned().collect::<BorrowRoots>();
+                if let Some(headers) = headers.get(&key)
+                    && headers.leaves.get(&Vec::new()).is_some_and(|leaf| leaf.known)
+                {
+                    let precise = state.exclusive_header_observations(headers, roots, target, include_owner);
+                    matched.retain(|root| !matches!(root, BorrowRoot::ParamStorage(_)) || precise.contains(root));
+                }
+                (key, matched)
+            }).collect()
+        }
+        let local_roots = legacy_observations(self, &self.sources, &self.headers, roots, target, false);
+        let mut value_roots = legacy_observations(self, &self.value_sources, &self.value_headers, roots, target, true);
+        let mut pipeline_roots = legacy_observations(self, &self.pipeline_sources, &self.pipeline_headers, roots, target, true);
+        value_roots.extend(self.value_headers.iter().map(|(&key, headers)| {
+            (key, self.exclusive_header_observations(headers, roots, target, true))
+        }));
+        pipeline_roots.extend(self.pipeline_headers.iter().map(|(&key, headers)| {
+            (key, self.exclusive_header_observations(headers, roots, target, true))
+        }));
+        for (local, observed) in local_roots {
+            for root in observed {
+                self.invalid.entry(local).or_default().entry(root)
+                    .and_modify(|current| *current = (*current).min(how)).or_insert(how);
+            }
+        }
+        for (key, observed) in value_roots {
+            for root in observed {
+                self.invalid_value_sources.entry(key).or_default().entry(root)
+                    .and_modify(|current| *current = (*current).min(how)).or_insert(how);
+            }
+        }
+        for (key, observed) in pipeline_roots {
+            for root in observed {
+                self.invalid_pipeline_sources.entry(key).or_default().entry(root)
+                    .and_modify(|current| *current = (*current).min(how)).or_insert(how);
+            }
+        }
+        // Record endings on the observing leaf, not the aggregate's flattened root. A record
+        // may own the destination, contain an alias to it, and contain an independent sibling.
+        let mut local_headers = self.headers.clone();
+        for (&local, headers) in &mut local_headers {
+            for (path, leaf) in &mut headers.leaves {
+                if local == excluded && path.starts_with(excluded_path) { continue; }
+                let selected = ProjectedHeaderFact { leaves: [(Vec::new(), leaf.clone())].into() };
+                let observed = self.exclusive_header_observations(&selected, roots, target, false);
+                leaf.fallback_roots.extend(observed.into_iter().map(|root| root.ended(how)));
+            }
+        }
+        self.headers = local_headers;
         if let Some(invalid) = self.invalid.get_mut(&excluded) {
             invalid.retain(|root, _| !roots.contains(root));
             if invalid.is_empty() {
@@ -33846,6 +34004,10 @@ impl<'a> MoveCheck<'a> {
             if let ExprKind::CryptoDigestUpdate { digest, .. } = &expression.kind {
                 arguments.insert(Self::expr_key(digest));
                 places.insert(Self::expr_key(digest));
+            }
+            if let ExprKind::ArrayTruncate { receiver, .. } = &expression.kind {
+                arguments.insert(Self::expr_key(receiver));
+                places.insert(Self::expr_key(receiver));
             }
             if let Some(reader) = Self::reader_action_receiver(expression) {
                 arguments.insert(Self::expr_key(reader));
@@ -35471,15 +35633,17 @@ impl<'a> MoveCheck<'a> {
                     |root| roots.contains(root),
                 );
             }
-            if let Some(owner) = args
+            if let Some(place) = args
                 .get(*index)
                 .and_then(Self::mutable_actual_place)
-                .map(|place| place.root)
             {
+                let path = place.path.iter().copied().map(BorrowProjection::StructField).collect::<Vec<_>>();
                 self.borrows.invalidate_roots_except_local(
                     &roots,
                     BorrowEnd::Consumed,
-                    owner,
+                    place.root,
+                    &path,
+                    &header_argument_facts.get(*index).cloned().unwrap_or_default(),
                 );
             } else {
                 self.borrows
@@ -38075,8 +38239,12 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
-    fn retire_reader_action_input(&mut self, expression: &Expr, children: &mut Vec<usize>) {
-        if let Some(reader) = Self::reader_action_receiver(expression) {
+    fn retire_builtin_action_input(&mut self, expression: &Expr, children: &mut Vec<usize>) {
+        let receiver = match &expression.kind {
+            ExprKind::ArrayTruncate { receiver, .. } => Some(receiver.as_ref()),
+            _ => Self::reader_action_receiver(expression),
+        };
+        if let Some(reader) = receiver {
             let key = Self::expr_key(reader);
             self.clear_value_snapshot(key);
             children.retain(|snapshot| *snapshot != key);
@@ -41954,7 +42122,7 @@ impl<'a> MoveCheck<'a> {
                     self.record_parent_value_snapshot(key);
                 }
             }
-            self.retire_reader_action_input(e, &mut child_snapshots);
+            self.retire_builtin_action_input(e, &mut child_snapshots);
             self.finish_child_staging_frontier(e, &child_snapshots);
             self.record_parent_value_snapshots(&child_snapshots);
         }
@@ -42893,7 +43061,7 @@ impl<'a> MoveCheck<'a> {
                     }
                     let ownership_action = Self::kind_has_ownership_action(&expression.kind);
                     if falls_through {
-                        self.retire_reader_action_input(expression, &mut child_snapshots);
+                        self.retire_builtin_action_input(expression, &mut child_snapshots);
                     }
                     if falls_through && !ownership_action {
                         self.finish_child_staging_frontier(expression, &child_snapshots);
@@ -43479,6 +43647,21 @@ impl<'a> MoveCheck<'a> {
         }
         if let ExprKind::XmlNext { reader } = &expression.kind {
             self.advance_reader_observation(expression, reader);
+            return;
+        }
+        if let ExprKind::ArrayTruncate { root, path, receiver, .. } = &expression.kind {
+            let key = Self::expr_key(receiver);
+            self.validate_value_snapshot(Self::expr_key(expression), key, expression.span);
+            self.borrows.finish_mutable_place_source(key);
+            // Only this array's backing is exclusive: externally owned values merely stored
+            // in its elements, and disjoint record fields, retain their independent lifetimes.
+            let roots = self.borrows.header_release_roots(&self.completed_headers(receiver));
+            let path = path.iter().copied().map(BorrowProjection::StructField).collect::<Vec<_>>();
+            let byte_backing = self.completed_byte_backing(receiver);
+            self.borrows.invalidate_validated_bytes(&byte_backing);
+            let headers = self.completed_headers(receiver);
+            self.borrows.invalidate_roots_except_local(&roots, BorrowEnd::Consumed, *root, &path, &headers);
+            self.invalidate_source_mutation_target(receiver);
             return;
         }
         let Some(action) = Self::source_visible_mutation_action(&expression.kind) else {
@@ -44826,7 +45009,7 @@ impl<'a> MoveCheck<'a> {
                         self.record_parent_value_snapshot(key);
                     }
                 }
-                self.retire_reader_action_input(wrapper, &mut child_snapshots);
+                self.retire_builtin_action_input(wrapper, &mut child_snapshots);
                 self.finish_child_staging_frontier(wrapper, &child_snapshots);
                 self.record_parent_value_snapshots(&child_snapshots);
             }

@@ -49,6 +49,25 @@ fn main() -> i32 {
 
 Recursive structs (`Node { next: Node }`) are rejected — there is no null to terminate them with. A struct with an owning field (say `name: string`) is legal and turns the whole struct into a Move type; that story is chapter [05](05-memory.md).
 
+## Fixed arrays inside records
+
+Use `[T; N]` when the count is part of the data's shape:
+
+```align
+Table { weights: [i64; 4] }
+
+fn main() -> i32 {
+    mut table := Table { weights: [2, 3, 5, 7] }
+    table.weights[1] = 11
+    print(table.weights.sum())    // 25
+    return 0
+}
+```
+
+The four elements live inline in `Table`: no array header or heap allocation. `N` must be a decimal integer literal, not a variable or a const parameter, and the initializer must have exactly that many elements. A Copy-element array is Copy, so passing a large table by value copies its full contents; use `borrow` or a slice when the function only reads it (chapter [05](05-memory.md)). A slice such as `table.weights[1..3]` borrows the table's storage. Bind a returned table before indexing its array field so the storage has a named owner.
+
+`[T; N]` has fixed length. Use `array<T>` for a dynamically sized owned collection. Nested fixed arrays and independently owned scalar elements such as `[string; 4]` are not supported; the complete element rules are in the [specification](../../draft.md#array).
+
 ## Sum types
 
 A sum type lists variants; a variant may carry a payload:
@@ -96,7 +115,30 @@ fn main() -> i32 {
 }
 ```
 
-What `match` deliberately does **not** have: guards (`Circle(r) if r > 10`) and literal patterns (`match n { 0 => ... }`). `match` is for sum types — for numbers, write `if`. One tool per job.
+### Integer, character, and string patterns
+
+`match` also handles integer and `char` literals, inclusive ranges, and exact string literals:
+
+```align
+fn digit(c: char) -> bool = match c {
+    '0'..='9' => true,
+    _         => false,
+}
+
+fn bucket(n: i64) -> i64 = match n {
+    -1 | 0 => 0,
+    1..=9  => 1,
+    _      => 2,
+}
+
+fn command(name: str) -> i64 = match name {
+    "build" | "check" => 1,
+    "run"             => 2,
+    _                 => 0,
+}
+```
+
+An integer match must cover the entire type's domain or include `_`. Character and string matches always require `_`. String matches compare decoded bytes exactly, including embedded NUL; they borrow `str` or `string` without a clone or allocation. Overlapping literal/range patterns are rejected. Guards (`Circle(r) if r > 10`), floating-point patterns, and string ranges are not supported. Use `if` for conditions that compute a predicate.
 
 ## Tuples
 

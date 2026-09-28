@@ -118,6 +118,37 @@ template, escapes, UTF-8 byte lengths, print type coverage); `lambda.rs:271/280/
 `template.align`. String-concat rejection is covered uniformly across reducer, named-function,
 and lambda contexts. SIMD scan pin: #310 differential oracle.
 
+## In-place byte writes and typed views
+
+The following declarations operate on existing storage; they do not allocate or copy owners.
+`S` is one of `u16`, `i16`, `u32`, `i32`, `u64`, `i64`, `f32`, `f64`; `E` is `le` or `be`.
+
+```text
+slice<u8>.set_u8(offset: i64, value: u8) -> ()
+slice<u8>.set_i8(offset: i64, value: i8) -> ()
+slice<u8>.set_S_E(offset: i64, value: S) -> ()
+slice<u8>.fill(value: u8) -> ()
+slice<u8>.fill_S_E(value: S) -> ()
+slice<u8>.copy_from(source: slice<u8>) -> ()
+slice<u8>.view_le<T>() -> Option<slice<T>>
+slice<T>.as_bytes() -> slice<u8>
+```
+
+Writes require writable backing and preserve length/capacity. Stores validate the full width;
+typed fill requires length divisible by width; copy requires equal lengths. Validation failure
+aborts before writing. Copy borrows its source and requires proved independent backing; overlap
+or unknown backing rejects. Empty fill/copy is valid; no `fill_u8` alias exists.
+[Plan 65](../65-open-issue-batch-plan.md) owns exact access/effect and validation rules.
+
+Typed views are Pure, descriptor-only and retain source lifetime and read/write authority.
+`T` is the same eight-type set as `S`; calls write `.view_le()` with `T` inferred from the complete
+expected result, never a written type argument. `view_le` returns `None` for invalid length or
+alignment and rejects a non-little-endian target at compile time. `as_bytes` exposes native
+representation. A `mut` header cannot grant write authority to shared/string-derived backing.
+These views promise no automatic SIMD. [Plan 78](../78-checked-byte-view-plan.md) owns the exact
+contract; `bytes_ops.rs`, `runway_a2_binary_codec.rs` and `consumer_borrow_boundaries.rs` own the
+byte/view checks.
+
 ## Explicit constructor capacity
 
 `buffer.filled(length: i64, value: u8) -> buffer` returns exactly initialized
