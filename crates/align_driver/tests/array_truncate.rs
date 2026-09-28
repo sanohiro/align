@@ -320,6 +320,24 @@ fn truncate_excludes_old_observations_in_both_checking_modes() {
 }
 
 #[test]
+fn truncate_rejects_borrowed_record_view_field_aliases() {
+    // A caller can store a view beside its owner. Distinct symbolic field paths inside the
+    // callee do not prove that the view addresses independent storage.
+    for (name, body) in [
+        ("saved", "old := p.view\n p.data.truncate(1)\n return old[2] as i32"),
+        ("field", "p.data.truncate(1)\n return p.view[2] as i32"),
+        ("eager", "return observe(p.view, { p.data.truncate(1)\n 0 })"),
+    ] {
+        let source = format!("Aliased {{ view: slice<i64>, data: array<i64> }}\nfn observe(v: slice<i64>, n: i64) -> i32 = v[2] as i32\nfn bad(borrow mut p: Aliased) -> i32 {{\n {body}\n}}\nfn main() -> i32 {{\n mut a := [10, 20, 30].to_array()\n v := a[..]\n mut p := Aliased {{ view: v, data: a }}\n return bad(p)\n}}\n");
+        let checked = diff_check_multi(name, &[("main.align", &source)], "main.align");
+        for (failed, diagnostics) in [(checked.whole_errors, checked.whole_diags), (checked.per_unit_errors, checked.per_unit_diags)] {
+            assert!(failed, "{name}: aliased borrowed field unexpectedly accepted");
+            assert!(diagnostics.contains("invalidated borrow") || diagnostics.contains("value snapshot was invalidated"), "{name}: unrelated diagnostic: {diagnostics}");
+        }
+    }
+}
+
+#[test]
 fn truncate_in_imported_helper_excludes_callers_old_view() {
     let library = "module lib\npub fn shorten(borrow mut a: array<i64>) { a.truncate(1) }\n";
     let source = "import lib\nfn main() -> i32 {\n mut a := [1, 2, 3].to_array()\n v := a[..]\n lib.shorten(a)\n return v[0] as i32\n}\n";

@@ -7,7 +7,7 @@ corrected. K1 remains the explicitly unshipped plan 61 capability.
 
 - Driver owners: `array_truncate`, `constants`, `m1`, `borrow_liveness`,
   `borrowed_params`, `disjoint_field_borrows`, and `imported_mutable_retention`
-  passed (150 tests across the seven targets). Ownership negatives are
+  passed (151 tests across the seven targets). Ownership negatives are
   compile-only and compare whole/per-unit checking.
 - `scripts/test-pr.sh`: all 16 bounded-gate binaries passed. The first candidate
   exposed the runtime-key ordering finding below; the corrected gate passed.
@@ -35,6 +35,7 @@ read-only authority remains a separate unshipped capability.
 | Truncate formation and receiver completion | Preserve dynamic-array/mutable-place/i64 validation; reserve the exact completed receiver before the count; diagnose moves, replacement and overlapping writes during later operands. | `array_truncate`: existing formation tests and receiver-reservation cases. |
 | Truncate successful action | End prior overlapping observations, including retained-prefix and same-length views, borrowed strings and records, and eager operand snapshots; permit last-use-before-action and independent sibling storage. Keep the array usable with its new length. | `array_truncate`: compile-only old-view negatives and positive sibling/reborrow controls. |
 | Control flow and calls | Apply the action only on fallthrough; preserve facts through branch/loop joins and early exits; transport the same effect through direct/imported and generic helpers in whole/per-unit checking. | `array_truncate`: parameterized local/imported cases and control-flow cases. |
+| Caller record fields and addressed backing | A symbolic `CallerStorage` field path identifies a descriptor place, not the allocation addressed by a view in that field. Discard a shared caller root for disjoint fields only when both reached generations are authenticated owned-storage headers with distinct identities; a view header, missing directory entry, joined/unknown source or copied descriptor retains the possible alias. Apply this rule to locals and eager argument/result snapshots as well as direct uses. | `array_truncate`: alias stored beside its owner through `borrow mut Aliased` rejects for saved, projected and eager uses in both checking modes; two owned sibling arrays and their derived views stay usable. |
 | Ownership and cleanup | Receiver remains owned; no move-out or source nulling at the action; existing suffix Drop order, outer storage, allocation mode and later replacement/return behavior stay unchanged. | Existing `array_truncate` prefix, repeated, field-path, suffix-string/record and borrow-mut owners. |
 | Constant arithmetic | Round f32 literals and every f32 operation at its own width before memoization, comparison or aggregate construction; preserve f64 and IEEE non-finite behavior. No runtime allocation or ABI change. | `constants`: scalar, comparison, aggregate, overflow, underflow, signed-zero and f64 controls; imported constants and dev/release lowering. |
 | Exported constant source | Capture the complete initializer token span, including leading grouping delimiters, before serializing its existing source field. Re-fold the same expression in importers. No interface record shape changes. | `constants::f32_constants_round_at_each_literal_and_operation`, whole/per-unit and dev/release. |
@@ -86,10 +87,22 @@ The author verified and addressed the complete set together:
 | The new runtime key violated logical-name ordering. | Put `PrintU64` after `PrintStr` and synchronize declaration order. | `runtime_keys_are_complete_unique_and_alphabetical` and the runtime declaration golden. |
 | Two feature-specific ABI counts remained stale. | Record 473 allocation-probe and 470 parallel-probe exports alongside 466 base and 477 maximum exports. | `scripts/test-runtime-abi-exports.sh`. |
 
-This local correction uses the existing storage identities, header facts and
-exclusive-call summaries; it changes no IR shape, interface schema or public
-safety strategy. A second full-diff review is not required by the one-review/
-one-fix policy.
+The committed-candidate review found one further P1: an imported or local
+`borrow mut` record can carry a view field that aliases an owned array field.
+The first correction treated their distinct symbolic `CallerStorage` paths as
+proof of disjoint backing. The witness is accepted in whole and per-unit
+checking, including when the caller stores the alias beside its owner. This
+reopens the caller-field/backing axis above. The revised boundary requires
+producer-owned evidence that each compared generation denotes an owned backing;
+the type of a borrowed view field cannot provide it. The distinct-owned-sibling
+positive owner remains necessary, so a root-wide conservative rejection
+is not a complete repair. An inline fixed-array sibling remains conservative:
+admitting it at this sema seam currently reaches an owned-leaf provenance
+rejection in the MIR producer, so it is outside this correction's proven
+boundary. The review log is bound to `3a759e05`; the correction
+and its owner test belong in one coherent fix commit.
+The saved-view and eager-argument witnesses both pass on the reviewed compiler
+before this fix, then fail with the intended invalidated-observation diagnostic.
 
 ## Scope and evidence
 

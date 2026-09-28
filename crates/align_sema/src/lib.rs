@@ -33292,7 +33292,17 @@ impl BorrowState {
                     };
                     let targets = target_generations.iter().filter(same_parameter).collect::<Vec<_>>();
                     let observed = reachable.iter().filter(same_parameter).collect::<Vec<_>>();
+                    // A symbolic caller field names a descriptor place. A view field may point
+                    // into another field's storage, so distinct paths prove separation only
+                    // when both generations denote their own owned storage.
+                    let owned_backing = |generation: &StorageGeneration| {
+                        self.storage.directory.entries.get(generation)
+                            .and_then(|entry| entry.descriptor)
+                            .is_some_and(|descriptor| descriptor.kind.owns_storage())
+                    };
                     if !unknown && !targets.is_empty() && !observed.is_empty()
+                        && targets.iter().all(|generation| owned_backing(generation))
+                        && observed.iter().all(|generation| owned_backing(generation))
                         && !observed.iter().any(|generation| targets.contains(generation))
                     {
                         continue;
