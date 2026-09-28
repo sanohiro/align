@@ -33270,15 +33270,35 @@ impl BorrowState {
         let mut result = BorrowRoots::new();
         for leaf in headers.leaves.values() {
             let selected = ProjectedHeaderFact { leaves: [(Vec::new(), leaf.clone())].into() };
+            let reachable = self.reachable_header_generations(&selected);
+            // The release of an owned header and borrows carried by its contents can flatten
+            // to the same caller root. Keep that root when any reached content may borrow;
+            // subtracting it from a flattened fact would erase both meanings.
+            let contained_borrow_or_unknown = reachable.iter().any(|generation| {
+                let Some(entry) = self.storage.directory.entries.get(generation) else {
+                    return true;
+                };
+                if entry.descriptor.is_none_or(|descriptor| descriptor.kind == StorageHeaderKind::View) {
+                    return true;
+                }
+                let Some(content) = self.storage.contents.entries.get(generation) else {
+                    return true;
+                };
+                !content.non_storage.flatten().is_empty()
+                    || content.headers.leaves.values().any(|nested| {
+                        !nested.known || !nested.fallback_roots.is_empty()
+                    })
+            });
             let mut observed = self.resolve_headers(&selected).non_storage.live_roots();
             // Retaining an allocation is not an old borrowed observation of that allocation.
             // Its contained borrowed dependencies still participate in exclusion.
-            if !include_owner && leaf.descriptor.is_some_and(|descriptor| descriptor.kind.owns_storage()) {
+            if !include_owner && !contained_borrow_or_unknown
+                && leaf.descriptor.is_some_and(|descriptor| descriptor.kind.owns_storage()) {
                 let owned = self.header_release_roots(&selected);
                 observed.retain(|root| !owned.contains(root));
             }
-            let reachable = self.reachable_header_generations(&selected);
             let unknown = !leaf.known || !leaf.fallback_roots.is_empty()
+                || contained_borrow_or_unknown
                 || reachable.iter().any(|generation| {
                     self.storage.contents.entries.get(generation).is_some_and(|content| {
                         content.headers.leaves.values().any(|nested| !nested.known || !nested.fallback_roots.is_empty())

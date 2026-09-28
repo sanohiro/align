@@ -7,7 +7,7 @@ corrected. K1 remains the explicitly unshipped plan 61 capability.
 
 - Driver owners: `array_truncate`, `constants`, `m1`, `borrow_liveness`,
   `borrowed_params`, `disjoint_field_borrows`, and `imported_mutable_retention`
-  passed (151 tests across the seven targets). Ownership negatives are
+  passed (152 tests across the seven targets). Ownership negatives are
   compile-only and compare whole/per-unit checking.
 - `scripts/test-pr.sh`: all 16 bounded-gate binaries passed. The first candidate
   exposed the runtime-key ordering finding below; the corrected gate passed.
@@ -36,6 +36,7 @@ read-only authority remains a separate unshipped capability.
 | Truncate successful action | End prior overlapping observations, including retained-prefix and same-length views, borrowed strings and records, and eager operand snapshots; permit last-use-before-action and independent sibling storage. Keep the array usable with its new length. | `array_truncate`: compile-only old-view negatives and positive sibling/reborrow controls. |
 | Control flow and calls | Apply the action only on fallthrough; preserve facts through branch/loop joins and early exits; transport the same effect through direct/imported and generic helpers in whole/per-unit checking. | `array_truncate`: parameterized local/imported cases and control-flow cases. |
 | Caller record fields and addressed backing | A symbolic `CallerStorage` field path identifies a descriptor place, not the allocation addressed by a view in that field. Discard a shared caller root for disjoint fields only when both reached generations are authenticated owned-storage headers with distinct identities; a view header, missing directory entry, joined/unknown source or copied descriptor retains the possible alias. Apply this rule to locals and eager argument/result snapshots as well as direct uses. | `array_truncate`: alias stored beside its owner through `borrow mut Aliased` rejects for saved, projected and eager uses in both checking modes; two owned sibling arrays and their derived views stay usable. |
+| Header release versus contained borrows | Resolve an owned header's release root separately from recursively reachable element/content dependencies. A borrowed element, view descriptor, unknown nested header or missing directory/content entry prevents dropping the common caller root merely because it also names the header release. Never use a flattened root set to subtract both meanings at once. Independent owned numeric siblings still pass; an owned array of views into a truncated sibling's owned elements rejects. | `array_truncate`: `borrow mut` record with `array<string>` owner and direct `array<str>` or nested record view elements rejects in whole/per-unit checking; existing independent owned-array sibling stays accepted. |
 | Ownership and cleanup | Receiver remains owned; no move-out or source nulling at the action; existing suffix Drop order, outer storage, allocation mode and later replacement/return behavior stay unchanged. | Existing `array_truncate` prefix, repeated, field-path, suffix-string/record and borrow-mut owners. |
 | Constant arithmetic | Round f32 literals and every f32 operation at its own width before memoization, comparison or aggregate construction; preserve f64 and IEEE non-finite behavior. No runtime allocation or ABI change. | `constants`: scalar, comparison, aggregate, overflow, underflow, signed-zero and f64 controls; imported constants and dev/release lowering. |
 | Exported constant source | Capture the complete initializer token span, including leading grouping delimiters, before serializing its existing source field. Re-fold the same expression in importers. No interface record shape changes. | `constants::f32_constants_round_at_each_literal_and_operation`, whole/per-unit and dev/release. |
@@ -103,6 +104,17 @@ boundary. The review log is bound to `3a759e05`; the correction
 and its owner test belong in one coherent fix commit.
 The saved-view and eager-argument witnesses both pass on the reviewed compiler
 before this fix, then fail with the intended invalidated-observation diagnostic.
+
+The revised-diff review found a second P1 and reopens the header-content axis:
+`array<str>` can own its outer array while its elements borrow strings from a
+sibling `array<string>`. Both the release and contained dependency flatten to
+the caller parameter root. Subtracting the release root from the flattened fact
+also erased the dependency, so truncating the sibling left its old view usable.
+The correction must inspect the generation contents before deciding whether an
+owned header's caller root represents only its release. Missing or unresolved
+content remains conservative; a plain owned numeric sibling still needs to pass.
+Both direct and nested contained-view witnesses pass on the compiler before this
+correction and reject with an invalidated-borrow diagnostic afterward.
 
 ## Scope and evidence
 

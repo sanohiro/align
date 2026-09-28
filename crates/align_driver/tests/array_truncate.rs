@@ -338,6 +338,23 @@ fn truncate_rejects_borrowed_record_view_field_aliases() {
 }
 
 #[test]
+fn truncate_rejects_borrows_inside_an_owned_sibling_array() {
+    // The outer array owns its allocation, but its elements borrow strings from the sibling
+    // array, directly or through a record. Its release root must not mask those dependencies.
+    for (name, declarations, element_ty, element, use_view) in [
+        ("direct", "", "str", "view", "p.views[0].len()"),
+        ("nested", "Item { value: str }\n", "Item", "Item { value: view }", "p.views[0].value.len()"),
+    ] {
+        let source = format!("{declarations}Pair {{ owners: array<string>, views: array<{element_ty}> }}\nfn bad(borrow mut p: Pair) -> i32 {{\n p.owners.truncate(0)\n return {use_view} as i32\n}}\nfn main() -> i32 {{\n mut builder: array_builder<string> := array_builder()\n builder.push(\"alpha\".clone())\n mut owners := builder.build()\n view := owners[0]\n mut views := [{element}].to_array()\n mut pair := Pair {{ owners: owners, views: views }}\n return bad(pair)\n}}\n");
+        let checked = diff_check_multi(name, &[("main.align", &source)], "main.align");
+        for (failed, diagnostics) in [(checked.whole_errors, checked.whole_diags), (checked.per_unit_errors, checked.per_unit_diags)] {
+            assert!(failed, "{name}: borrowed element unexpectedly accepted");
+            assert!(diagnostics.contains("invalidated borrow"), "{name}: unrelated diagnostic: {diagnostics}");
+        }
+    }
+}
+
+#[test]
 fn truncate_in_imported_helper_excludes_callers_old_view() {
     let library = "module lib\npub fn shorten(borrow mut a: array<i64>) { a.truncate(1) }\n";
     let source = "import lib\nfn main() -> i32 {\n mut a := [1, 2, 3].to_array()\n v := a[..]\n lib.shorten(a)\n return v[0] as i32\n}\n";
