@@ -12250,6 +12250,7 @@ fn direct_call_target(func: &str, args: &[hir::Expr]) -> DirectCall {
     let runtime = match func {
         "print" => Some(match args.first().map(|argument| argument.ty) {
             Some(Ty::Str) => RuntimeKey::PrintStr,
+            Some(Ty::Int(IntTy { signed: false, .. })) => RuntimeKey::PrintU64,
             Some(Ty::Bool) => RuntimeKey::PrintBool,
             Some(Ty::Char) => RuntimeKey::PrintChar,
             Some(Ty::Float(FloatTy { bits: 32 })) => RuntimeKey::PrintF32,

@@ -19082,6 +19082,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::Call(
                 DirectCall::Runtime(
                     RuntimeKey::Print
+                    | RuntimeKey::PrintU64
                     | RuntimeKey::PrintStr
                     | RuntimeKey::PrintBool
                     | RuntimeKey::PrintChar
@@ -20718,7 +20719,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 } else {
                     v
                 };
-                let callee = self.runtime(RuntimeKey::Print);
+                let callee = self.runtime(if is_signed(ty) {
+                    RuntimeKey::Print
+                } else {
+                    RuntimeKey::PrintU64
+                });
                 self.builder
                     .build_call(callee, &[wide.into()], "")
                     .map_err(|e| self.err(e))?;
@@ -29077,6 +29082,7 @@ fn main() -> i32 = 0
     fn runtime_abi_legacy_direct_parity_inventory_is_exact() {
         let specialized = [
             RuntimeKey::Print,
+            RuntimeKey::PrintU64,
             RuntimeKey::PrintStr,
             RuntimeKey::PrintBool,
             RuntimeKey::PrintChar,
@@ -29094,7 +29100,7 @@ fn main() -> i32 = 0
             RuntimeKey::Utf8BoundaryFail,
             RuntimeKey::LenMismatchFail,
         ];
-        assert_eq!(specialized.len(), 8);
+        assert_eq!(specialized.len(), 9);
         assert_eq!(deferred.len(), 7);
         assert!(specialized.into_iter().all(|key| {
             runtime_abi::runtime_abi(key).runtime_key() == Some(key)

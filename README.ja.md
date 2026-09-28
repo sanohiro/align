@@ -108,6 +108,8 @@ align> 1 + 2
 
 **[The Little Aligner（日本語）](docs/little-aligner/ja/README.md)**（[English](docs/little-aligner/README.md)）は、*The Little Schemer* にならった短い問答で学ぶ本です。一つずつ自分で考えたい方は、こちらから始めてください。結果を予想し、データの流れを追い、所有権や処理のコストを考えます。どちらからでも読み始められますし、併せて読むこともできます。
 
+**[Align で高速な処理を書く](docs/guide/ja/26-performance.md)**（[English](docs/guide/26-performance.md)）は、計測、パイプラインの融合、領域の再利用、データ配置、SIMD、並列化を一つの実践手順にまとめています。
+
 ## レイアウト
 
 - `draft.md` —— 言語仕様の原本

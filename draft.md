@@ -1049,6 +1049,13 @@ aggregates;
 invalidation may not deliver a dangling peer argument to the callee. This is a structural
 provenance check, never a package/type-name exception.
 
+Stable sibling record fields may supply shared and exclusive arguments together when both their
+field paths and addressed backing are proved disjoint. A common containing root alone does not
+make them alias, and distinct field names alone do not prove independent backing: copied slice
+headers can still address the same storage. Same-field, ancestor/descendant, and unknown-backing
+conflicts remain errors. Mutation or replacement of one field preserves observations of proved
+independent sibling storage. Plan 65 owns the exact path and backing contract.
+
 A borrowed pointee remains caller-owned and receives no callee function-exit cleanup. If
 `borrow mut` replaces an owned value, however, the old value's ordinary Drop plan runs before the
 store and the caller's path-local cleanup bit is updated to the replacement's bit. The unchanged
@@ -1068,10 +1075,13 @@ I/O, and database work remain Impure regardless of parameter mode.
 One aggregate value uses one path-local cleanup bit. Its owned members must therefore use one
 allocation mode: all free-standing or all arena-owned. Mixing the two in one tuple, struct, sum
 value, or owned array is a compile error; keep them separate or construct every owned member in the
-same mode. Replacing an owned field or element must preserve the aggregate's mode. Field replacement
-is additionally limited today: the assigned leaf must be a `string` or an `Option<string>` (the two
-leaves with typed drop-old lowering). Replacing any other owned leaf — a nested Move struct, an
-owned array — is a compile error naming the unsupported type; replace the whole aggregate instead.
+same mode. Replacing an owned field or element must preserve the aggregate's mode. A stable
+writable record field path supports same-type replacement for every already-admitted owning field
+with a complete Drop plan, including owned arrays and nested Move records. The RHS is evaluated
+and retained first, its selected moved sources are cleared, the old live destination is dropped
+once, and the replacement is stored. Siblings and the enclosing owner's lifetime are preserved;
+there is no implicit clone or allocation. This does not admit new field types or generalize
+replacement through an indexed array-element field, whose existing placement gates still apply.
 Borrowed fields do not affect this rule.
 A one-owner aggregate may forward a heap/arena path-dependent runtime bit,
 but its owned fields or elements cannot be mutated until the mode is definite. Direct Move-struct
@@ -1158,6 +1168,18 @@ table: [i64; 32]
 ```
 
 `array<T>` is owned contiguous memory.
+
+`array<T>.truncate(new_len: i64) -> ()` shortens a dynamic array in place. The receiver must be a
+stable mutable local or an admitted exclusive whole-array/record-field place. The count must
+satisfy `0 <= new_len <= old_len`; otherwise the collection-range failure occurs before any Drop
+or header write. Removed owned elements are dropped exactly once in ascending index order, then
+the new length is published. The retained prefix, backing pointer and allocation remain unchanged,
+including when the new length is zero. There is no allocation, copy, compaction or reallocation;
+work is constant for trivially dropped elements and proportional to suffix cleanup otherwise.
+The operation requires exclusive whole-array access: no live overlapping view or indexed borrow
+may survive it, even for a same-length call. Fixed arrays, slices and SoA are not receivers.
+Unlike `xs[..n].to_array()`, truncation retains the existing owner rather than materializing a
+copy. [Plan 66](docs/impl/66-array-prefix-and-text-boundary-plan.md) fixes cleanup and access order.
 
 `[T; N]` is a fixed array: exactly `N` consecutive inline `T` values, with no heap allocation or
 runtime header. The written `;` is required on the same logical line; a newline cannot replace it,
@@ -1446,8 +1468,10 @@ vec16<u8>
 ```
 
 A vector is built from an array literal under the annotation (the annotation picks the SIMD
-representation — no separate constructor), elementwise `+` `-` `*` `/` `%` map to one lane-wise
-hardware instruction each, and `v[i]` reads lane `i` (a constant index). Integer `/` and `%` carry
+representation — no separate constructor), `+` `-` `*` `/` `%` operate lane-wise,
+and `v[i]` reads lane `i` (a constant index). Instruction selection depends on the
+target, lane type and width: an operation may use one or more vector instructions
+or scalar instructions. Integer `/` and `%` carry
 the same defined semantics as their scalar forms, applied per lane: a **zero divisor lane aborts**
 (never a silent poison lane), and a signed `INT_MIN / -1` lane wraps to the two's-complement result.
 Float `%` is the IEEE remainder (`frem`), with no guard.
@@ -1455,16 +1479,16 @@ Float `%` is the IEEE remainder (`frem`), with no guard.
 ```align
 a: vec4<f32> := [1.0, 2.0, 3.0, 4.0]
 b: vec4<f32> := [10.0, 20.0, 30.0, 40.0]
-c := a + b                 // elementwise, one instruction
+c := a + b                 // elementwise addition
 x := c[0]                  // lane 0
 d := dot(a, b)             // reduction to a scalar
-r := a.sqrt()              // elementwise float math: one vector instruction
-f := fma(a, b, c)          // fused a*b + c, one rounding (one vfmadd/fmla)
+r := a.sqrt()              // elementwise float math
+f := fma(a, b, c)          // fused a*b + c, one rounding per lane
 ```
 
 The directly supported unary float math functions — `sqrt`, `abs`, `floor`, `ceil`, `round`,
-`trunc` — apply lane-wise to a float vector (the same names as on a scalar float), each one
-lane-wise hardware instruction. The elementary functions `exp`, `exp2`, `log`, `log2`, and
+`trunc` — apply lane-wise to a float vector (the same names as on a scalar float).
+The elementary functions `exp`, `exp2`, `log`, `log2`, and
 `log10` are also lane-wise, but not every target has a machine-vector implementation: LLVM may
 scalarize them. `emit-llvm --stage optimized` exposes the exact pre-instruction-selection result,
 and `explain-opt` accounts for eliminated or merged operations, retained vector form, and
@@ -1473,7 +1497,7 @@ while verbose output also shows eliminated-or-merged rows. A retained operation 
 warns that instruction selection may still scalarize it. Final machine SIMD is established only by
 emitted-object inspection. The
 element-wise `a.min(b)` / `a.max(b)` of two vectors, and `abs`, also work on integer vectors (`a.min()`
-with no argument is the reduction instead). Each maps to one SIMD instruction; `pow` (a libcall) stays
+with no argument is the reduction instead). Their machine lowering is also target-dependent; `pow` (a libcall) stays
 scalar-only. `fma(a, b, c)` is the fused multiply-add `a*b + c` with a single rounding (a free builtin,
 float scalar or vector) — the kernel of dot products, FIR filters, and Horner-method polynomials.
 
@@ -1906,6 +1930,23 @@ read (`off < 0`, or `off + width > len`) **aborts** — the same fail-closed pol
 a parser checks `.len()` before reading, exactly as it checks a slice's length before indexing. A
 read returns a Copy scalar (it never carries the view's region), so it composes freely; the
 `bytes`/`buffer` themselves stay borrowed (never consumed).
+
+Writable `slice<u8>` views also support in-place binary stores and bulk writes. The declarations
+are `set_u8(offset: i64, value: u8) -> ()`, `set_i8(offset: i64, value: i8) -> ()`, and
+`set_S_E(offset: i64, value: S) -> ()`, where `S` is `u16`, `i16`, `u32`, `i32`, `u64`, `i64`,
+`f32`, or `f64` and `E` is `le` or `be`. Each store checks the entire width before writing any byte;
+an invalid range aborts. `fill(value: u8) -> ()` fills the current slice. Its multi-byte siblings
+`fill_S_E(value: S) -> ()` repeat the exact scalar bits in the named order and require a slice
+length divisible by the scalar width, checked before any write. Empty slices are valid; there is
+no separate `fill_u8` alias.
+
+`slice<u8>.copy_from(source: slice<u8>) -> ()` borrows the source and copies into an equal-length
+destination. A length mismatch aborts before writing. Ordinary alias checking must prove
+independent backing; overlapping or unknown backing is rejected, including same-owner subslices.
+All these operations require writable backing, allocate nothing, and preserve length, capacity
+and ownership. A `mut` header cannot turn shared or string-derived backing writable. Receiver and
+arguments evaluate once in source order, with ordinary access/lifetime and in-memory-write effects.
+Exact declarations and validation rules are in plan 65.
 
 Naturally aligned native-order binary data may instead be viewed without a
 conversion loop:

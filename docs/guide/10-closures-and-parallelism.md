@@ -79,7 +79,7 @@ fn main() -> Result<(), Error> {
 
 `par_map(f)` runs across a persistent worker-thread pool and returns an owned `array<R>`. For an accepted Pure callable, its values and result order match `map(f).to_array()`. This is the complete sequential equivalent: a bare `map(f)` is an unfinished pipeline. Worker completion order does not change the array order, but scheduling overhead and result allocation remain part of the parallel operation.
 
-And you should: **`par_map` earns its keep only when `f` is expensive.** The range kernel still has setup and scheduling overhead, while sequential `map` fuses into a vectorized loop — for cheap arithmetic, plain `map().sum()` is typically *faster*. Measure before reaching for it. Direct-source `par_map` with Copy-capturing closures, and primitive-scalar length-preserving `map` stages before it, use the same range kernel with one immutable call-scoped context; filtered and unsupported forms remain sequential, and Move captures are rejected.
+And you should: **`par_map` earns its keep only when `f` is expensive.** The range kernel still has setup and scheduling overhead, while sequential `map` fuses into a vectorized loop — for cheap arithmetic, plain `map().sum()` is typically *faster*. Measure before reaching for it. Direct-source `par_map` with Copy-capturing closures, supported scalar maps and filters, and supported field/projection forms use range kernels. Filtered forms may evaluate a Pure predicate again during count-and-fill processing. Unsupported forms fall back to sequential execution; Move captures remain rejected. Use `alignc explain-opt` to inspect the selected path.
 
 ## `task_group` — task parallelism
 

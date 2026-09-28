@@ -38,6 +38,8 @@ fn main() -> i32 {
 
 `select(mask, a, b)` chooses each lane from `a` or `b` according to the mask. `v.sum_where(mask)` sums only the selected lanes. A pipeline such as `xs.where(p).sum()` can use the same technique: replace rejected values with the additive identity, zero, to sum without a branch.
 
+Masks may cross scalar types when lane count and lane bit width agree. A `mask4<f32>` can select both `vec4<f32>` scores and `vec4<i32>` indices, or gate either type's `sum_where`. It cannot gate `vec4<i64>` or `vec2<f32>`. The comparison still produces its own `maskN<T>` type; `select` requires its two value vectors to have the same type.
+
 Both value arguments are evaluated before `select` chooses the lanes. It is not a lane-wise `if`: `select(d != 0, n / d, zero)` still divides by zero in any zero-denominator lane. Make the operands safe first, then choose the requested fallback result:
 
 ```align
@@ -79,6 +81,37 @@ fn main() -> i32 {
 `s.load(i)` reads N consecutive elements into a register (N from the annotation); `s.store(i, v)` writes lanes back through an `out` slice. Both are bounds-checked. This pair is how a hand-written kernel walks an array — typically in `chunks(N)` with a scalar tail.
 
 For ten elements and `vec4`, complete non-overlapping loads start at `0` and `4`. A load at `8` would read through index `11` and fail the bounds check. Process indices `8` and `9` as scalars; applying a mask after the load cannot make the out-of-bounds read valid.
+
+### Viewing binary data as typed elements
+
+For aligned little-endian data, a checked view connects byte storage to these same slice kernels:
+
+```align
+fn first_four(raw: slice<u8>) -> Option<f32> {
+    values: slice<f32> := raw.view_le() else { return None }
+    if values.len() < 4 { return None }
+    v: vec4<f32> := values.load(0)
+    return Some(v.sum())
+}
+```
+
+The result annotation supplies the element type; write `raw.view_le()`, without a type argument at the call. It accepts `i16/u16/i32/u32/i64/u64/f32/f64`. Misaligned storage or a byte length that is not a whole number of elements returns `None`. The operation copies no payload and allocates nothing. `values.as_bytes()` exposes the same storage's native bytes. Both views retain their source's lifetime and access authority; a `mut` binding cannot make read-only backing writable. All currently supported targets are little-endian; a big-endian target rejects `view_le`.
+
+Use scalar accessors such as `raw.f32_le(offset)` for unaligned packed data. A typed view alone does not promise automatic vectorization, and a vector `load` still needs enough elements.
+
+## Floating-point math and explicit relaxation
+
+`exp`, `exp2`, `log`, `log2`, and `log10` are zero-argument methods on scalar and vector floats. Vector forms apply lane by lane. They may become scalar library calls when the target has no vector math provider; vector-shaped LLVM IR alone does not prove final machine SIMD. These methods do not promise scalar/vector or cross-target bit identity or a fixed ULP error bound.
+
+Ordinary arithmetic and reductions are ordered and uncontracted by default. When the algorithm permits different rounding, name the permission at its source:
+
+```align
+fn relaxed_total(xs: slice<f64>) -> f64 = float(reassoc) { xs.sum() }
+
+fn fused(a: f64, b: f64, c: f64) -> f64 = float(contract) { a * b + c }
+```
+
+`reassoc` allows additions, subtractions, multiplications, and supported sums/dots to be regrouped. `contract` independently allows an eligible multiply and add/subtract in the scope to fuse into one rounding; `float(reassoc, contract)` permits both. Named functions and lambdas start strict, even when called or written inside a relaxed scope. Put a separate scope inside a lambda to relax its arithmetic. These permissions can change rounding, signed zero, and NaN payloads; they do not assume that NaN or infinity is absent and do not guarantee vectorization.
 
 ## `align(N)` — when the loads should be aligned
 

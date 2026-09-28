@@ -46,7 +46,7 @@ fn main() -> i32 {
 }
 ```
 
-`len` / `contains` / `starts_with` / `ends_with` / `find` / `rfind` / `eq_ignore_ascii_case` / `trim` / `trim_start` / `trim_end` / `clone` — that is the current set. All are byte-oriented, and the searches use SIMD-capable scans; whether and how widely they vectorize depends on the target, profile, and input shape. `find`/`rfind` return `Option<i64>` — a byte index, or `None` — and pair with range slicing, which works on strings too:
+`len` / `bytes` / `is_char_boundary` / `contains` / `starts_with` / `ends_with` / `find` / `rfind` / `eq_ignore_ascii_case` / `trim` / `trim_start` / `trim_end` / `clone` cover common text work. All are byte-oriented, and the searches use SIMD-capable scans; whether and how widely they vectorize depends on the target, profile, and input shape. `find`/`rfind` return `Option<i64>` — a byte index, or `None` — and pair with range slicing, which works on strings too:
 
 ```align
 fn main() -> i32 {
@@ -58,6 +58,19 @@ fn main() -> i32 {
 ```
 
 `path[i]` is not a string operation; use `path.bytes()[i]` when you need an individual UTF-8 byte. There is no `str.split` method. To separate a known delimiter, combine `find` or `rfind` with `[a..b]`; use a parser when the input has a more complex grammar.
+
+A string slice must begin and end at UTF-8 character boundaries. Use `is_char_boundary` when an offset came from byte-oriented input:
+
+```align
+fn prefix(s: str, end: i64) -> Option<str> {
+    if s.is_char_boundary(end) { return Some(s[0..end]) }
+    return None
+}
+```
+
+The predicate returns false for negative or past-end offsets, true for zero and the byte length, and never aborts. Slicing directly at an invalid range or inside a multibyte character still aborts. `starts_with` and `ends_with` need no interior slice; use them directly for prefix/suffix tests.
+
+Text's `.bytes()` is a read-only view, including when the source is an owned `string`. Writing `mut` on the byte-view binding does not make the backing text writable. Copy bytes into writable storage when mutation is needed. After validating mutable bytes as text, an overlapping write invalidates that text observation; validate again before reading it as text.
 
 > **Cost:** Copying a `str` or slicing it is O(1), with no allocation or byte copy. `trim`, `trim_start`, and `trim_end` also return views without allocation or byte copying, but they scan for whitespace and take O(n) time in the worst case. `.clone()` is O(n), makes at most one result allocation, and copies n bytes into an owned `string`. Searches are O(n) in the worst case.
 

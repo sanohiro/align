@@ -35,6 +35,7 @@ element admission remain the literal's existing rules. Exact closure: [plan 73](
 xs.len()   -> i64        // direct length: str/string, slice, array (fixed = const), soa, buffer
 xs[i]                    // index (bounds-checked abort): scalar elem / chunk slice / struct gather / vec lane
 xs[a..b]   -> slice<T>   // range view of admitted contiguous elements; either bound omittable
+xs.truncate(new_len: i64) -> () // dynamic array only; exclusive prefix mutation
 xs[i] = v                // Copy scalar / borrowed str write; mut local or out slice; no owned string/Move
 arr[i] = structval       // whole-struct element write (POD; Move structs into FIXED arrays only)
 arr[i].f = v             // element-field write, nested paths ok; dynamic arrays: primitive leaf only
@@ -232,6 +233,19 @@ A hand-written `if xs[i] > best { best = xs[i] }` loop is deliberately **not** c
 this form. It is a different program — an ordered comparison, false for a NaN operand and therefore
 NaN-skipping — and rewriting it would be a hidden special case. It is documented as not the
 vectorizable spelling instead (#1082 Part 1).
+
+## In-place prefix mutation and byte views
+
+`array<T>.truncate(new_len: i64) -> ()` requires a stable mutable local or admitted exclusive
+array/record-field place and `0 <= new_len <= old_len`. Invalid counts abort before Drop or writes.
+Removed owned elements drop in ascending index order, then the new length is published; the
+prefix and outer allocation remain, including at zero length. No allocation or copy occurs.
+No overlapping view or indexed borrow may survive the action, even for a same-length call.
+Fixed arrays, slices and SoA are excluded. Exact contract: [plan 66](../66-array-prefix-and-text-boundary-plan.md);
+owner: `array_truncate.rs`.
+
+For writable byte-slice `set_*`/`fill`/`fill_S_E`/`copy_from` and checked zero-copy
+`view_le`/`as_bytes`, see [the byte operations reference](string.md#in-place-byte-writes-and-typed-views).
 
 ## Explicit constructor capacity
 

@@ -728,7 +728,12 @@ impl<'a> Parser<'a> {
             None
         };
         self.expect(&TokKind::ColonEq, "':='");
-        let value = self.parse_expr(0)?;
+        let value_start = self.span();
+        let mut value = self.parse_expr(0)?;
+        // Grouping has no AST node, so a compound expression's ordinary span can start
+        // inside its first parentheses. Interfaces export this exact initializer slice;
+        // retain every delimiter consumed by the parser, including outer grouping.
+        value.span = value_start.merge(self.prev_span());
         self.eat_stmt_end();
         let span = start.merge(self.prev_span());
         Some(Item::Const(ConstDecl { vis, name, ty, value, span }))

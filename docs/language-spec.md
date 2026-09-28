@@ -461,9 +461,12 @@ that inner source before an outer return or call takes ownership.
 
 An aggregate has one path-local cleanup bit, so its owned members must all be free-standing or all
 be arena-owned. Mixing allocation modes in one tuple, struct, sum value, or owned array is rejected.
-Replacing an owned field or element must preserve the existing mode, and the replaced leaf must be a
-`string` or `Option<string>` today — replacing any other owned leaf (a nested Move struct, an owned
-array) is a compile error naming the type; replace the whole aggregate instead. A bare
+Replacing an owned field or element must preserve the existing mode. A stable writable record field
+path supports same-type replacement for every already-admitted owning field with a complete Drop
+plan, including owned arrays and nested Move records. Evaluate and retain the RHS, clear its
+selected moved sources, drop the old live destination once, then store the replacement. Siblings
+and the enclosing owner's lifetime remain intact, with no implicit clone or allocation. This does
+not admit new field types or widen indexed array-element-field replacement. A bare
 `array<string>` is a valid ordinary struct field with element-wise Drop, but remains outside the
 shipped borrowed JSON schema. The accepted direct-owned JSON route below admits it only in that
 route's closed flat record. A finite Move struct containing that field retains the existing
@@ -507,6 +510,21 @@ rejected, including distinct holder aggregates. Generation invalidation therefor
 dangling peer argument to the callee. The rule is structural, not package-named. Replacing an owned
 pointee through `borrow mut` drops the old value before the store and updates the caller's cleanup
 bit; an unchanged pointee receives no callee function-exit Drop.
+
+Shared/exclusive calls may use stable sibling record fields when both their paths and addressed
+backing are proved disjoint. A shared root alone does not imply aliasing; different field names
+alone do not prove independent backing. Same-field, ancestor/descendant and unknown-backing
+conflicts still reject. Updating a field preserves observations of proved independent sibling
+storage. Plan 65 owns the detailed access contract.
+
+`array<T>.truncate(new_len: i64) -> ()` shortens an exclusively accessible dynamic array in place.
+It accepts stable mutable locals and admitted exclusive array/record-field places. The count must
+be in `0..=old_len`; invalid counts abort before Drop or mutation. Removed owned elements are
+dropped once in ascending index order, then the new length is published. The retained prefix,
+pointer and outer allocation remain, even at length zero; there is no allocation or copying.
+No overlapping view or indexed borrow may survive the action, even for a no-op count. Fixed arrays,
+slices and SoA are excluded. This avoids the new owner and copy of `xs[..n].to_array()`.
+(`draft.md` §7; plan 66.)
 
 Every recursively Move return carries one dynamic path-selected cleanup bit through direct,
 indirect, and imported ABIs. The caller stores it beside the result. Return borrow/region summaries
@@ -651,8 +669,9 @@ backend and stays a hardware detail. `vecN<T>` / `maskN<T>` (below) are the fixe
 for hand-written register kernels.
 
 The register layer's surface: a vector is built from an array literal under a `vecN<T>` annotation;
-elementwise `+ - * / %` and directly supported unary float math map one-to-one to lane-wise
-instructions. `exp`, `exp2`, `log`, `log2`, and `log10` are zero-argument methods on `f32`, `f64`,
+elementwise `+ - * / %` and directly supported unary float math operate lane-wise.
+The target, lane type and width determine whether an operation uses one or more
+vector instructions or scalar instructions. `exp`, `exp2`, `log`, `log2`, and `log10` are zero-argument methods on `f32`, `f64`,
 and the corresponding `vec2/4/8/16` types. They lower to matching LLVM intrinsics and vector
 semantics are lane-wise, but LLVM may scalarize a vector intrinsic when the selected target has no
 vector math provider. No ULP or scalar/vector/cross-target bit-identity guarantee applies; last
@@ -802,6 +821,16 @@ suffix. The scalar set is `u8`, `i8`, `u16`/`i16`, `u32`/`i32`, `u64`/`i64`, `f3
 (no silent coercion), and an out-of-range read (`off < 0`, or `off + width > len`) **aborts**, the
 same fail-closed policy as `slice[i]` — check `.len()` first. A read returns a Copy scalar carrying
 no region; the `bytes`/`buffer` stay borrowed. (`draft.md` §12.)
+
+Writable `slice<u8>` provides `set_u8(offset: i64, value: u8) -> ()`,
+`set_i8(offset: i64, value: i8) -> ()`, and `set_S_E(offset: i64, value: S) -> ()`
+for the same eight multi-byte scalars and `le`/`be` orders. A full-width range check precedes every
+write. `fill(value: u8) -> ()` fills the slice; `fill_S_E(value: S) -> ()` repeats a scalar's exact
+bits and aborts before writing if length is not divisible by its width. Empty slices are valid;
+there is no `fill_u8` alias. `copy_from(source: slice<u8>) -> ()` borrows and copies an equal-length
+source, rejecting overlapping or unknown backing at compile time and aborting on a length mismatch
+before writing. These operations allocate nothing and preserve length, capacity and owner; they
+require writable backing, which a `mut` header alone cannot grant. (`draft.md` §12; plan 65.)
 
 Naturally aligned little-endian data also has one checked zero-copy view:
 `slice<u8>.view_le<T>() -> Option<slice<T>>`, with `T` inferred from the complete

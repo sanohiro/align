@@ -338,6 +338,7 @@ key|PrintChar|print_char|HostState|declare void @align_rt_print_char(i32) #2
 key|PrintF32|print_f32|HostState|declare void @align_rt_print_f32(float) #2
 key|PrintF64|print_f64|HostState|declare void @align_rt_print_f64(double) #2
 key|PrintStr|print_str|HostState|declare void @align_rt_print_str(ptr, i64) #2
+key|PrintU64|print_u64|HostState|declare void @align_rt_print_u64(i64) #2
 key|ProcessAbort|process_abort|FailNoReturn|declare void @align_rt_process_abort() #1
 key|ProcessCpuCount|process_cpu_count|HostState|declare i64 @align_rt_process_cpu_count() #2
 key|ProcessCurrentImage|process_current_image|HostState|declare i32 @align_rt_process_current_image(ptr) #2

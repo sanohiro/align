@@ -230,6 +230,25 @@ fn visit(borrow mut p: Profile) {
 
 ---
 
+**Q25.** 4要素のフィールドにも、別のヒープ確保が必要ですか？
+
+**A25.** いいえ。固定の要素数を型に書きます。
+
+```align
+Table { weights: [i64; 4] }
+
+fn main() -> i32 {
+    mut table := Table { weights: [2, 3, 5, 7] }
+    table.weights[1] = 11
+    print(table.weights.sum())    // 25
+    return 0
+}
+```
+
+要素はレコードの中にあります。要素が Copy なので `Table` も Copy で、コピーすると4要素すべてをコピーします。`table.weights` のスライスはレコードを借用します。長さを変える必要がある場合は所有する `array<T>` を使い、大きな固定の表を読むだけなら借用します。
+
+---
+
 図で確かめたいときは、ガイドの[メモリの章](../../guide/ja/05-memory.md)を参照してください。Move、借用、arena の文字列をコピーして外へ返す例を図で追えます。
 
 > **第八の戒律**

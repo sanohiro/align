@@ -11451,7 +11451,8 @@ pub fn direct_runtime_key_is_valid(key: RuntimeKey, args: &[Ty], ret: Ty, progra
         signed: true,
     });
     match key {
-        RuntimeKey::Print => args.len() == 1 && matches!(args[0], Ty::Int(_)) && ret == Ty::Unit,
+        RuntimeKey::Print => args.len() == 1 && matches!(args[0], Ty::Int(IntTy { signed: true, .. })) && ret == Ty::Unit,
+        RuntimeKey::PrintU64 => args.len() == 1 && matches!(args[0], Ty::Int(IntTy { signed: false, .. })) && ret == Ty::Unit,
         RuntimeKey::PrintStr => args == [Ty::Str] && ret == Ty::Unit,
         RuntimeKey::PrintBool => args == [Ty::Bool] && ret == Ty::Unit,
         RuntimeKey::PrintChar => args == [Ty::Char] && ret == Ty::Unit,

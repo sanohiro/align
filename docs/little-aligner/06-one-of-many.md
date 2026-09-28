@@ -90,7 +90,17 @@ fn area(s: Shape) -> i64 = match s {
 
 **Q11.** May we match on a number? `match n { 0 => ..., _ => ... }`
 
-**A11.** No. Align's `match` examines variants of a sum type. Use `if` for numeric conditions.
+**A11.** Yes. Integer literals, inclusive ranges, and alternatives work:
+
+```align
+fn bucket(n: i64) -> i64 = match n {
+    -1 | 0 => 0,
+    1..=9  => 1,
+    _      => 2,
+}
+```
+
+`1..=9` includes both endpoints. The arms must cover the integer type's whole domain or use `_`. Character patterns such as `'0'..='9'` also work, but require `_`. For a computed condition, use `if`; match guards are not supported.
 
 ---
 
@@ -203,6 +213,22 @@ Same answer. Prefer `where(...).count()` when the thought is “which elements?�
 **Q20.** What question should we ask before inventing a sum type?
 
 **A20.** “What impossible combination am I trying to make unwriteable?” If the answer is “a reading cannot be Good and Missing at once,” the variants are doing real modeling work. If the states can coexist, they may be fields instead.
+
+---
+
+**Q21.** Can command names be matched too?
+
+**A21.** Yes, with exact string literals:
+
+```align
+fn command(name: str) -> i64 = match name {
+    "build" | "check" => 1,
+    "run"             => 2,
+    _                 => 0,
+}
+```
+
+The wildcard is required: other strings always remain possible. A `string` owner can be matched too; matching borrows its text and does not consume or copy it. String patterns compare bytes, not prefixes or regular expressions.
 
 ---
 

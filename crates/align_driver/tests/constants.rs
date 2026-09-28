@@ -272,3 +272,46 @@ fn a_function_and_a_constant_may_not_share_a_name() {
         "DUP := 1\nfn DUP() -> i32 { return 0 }\nfn main() -> i32 { return 0 }\n",
     ));
 }
+
+#[test]
+fn f32_constants_round_at_each_literal_and_operation() {
+    if !backend_available() { return; }
+    let library = r#"
+module values
+pub ROUNDED: f32 := (16777216.0 + 1.0) - 16777216.0
+pub LITERAL: f32 := 16777217.0
+pub EQUAL := LITERAL == 16777216.0
+pub OVERFLOW: f32 := (1.0e38 * 4.0) / 4.0
+pub UNDERFLOW: f32 := (1.0e-30 * 1.0e-20) * 1.0e30
+pub NEG_ZERO: f32 := -0.0
+pub WIDE: f64 := (16777216.0 + 1.0) - 16777216.0
+pub ELEMENTS: slice<f32> := [(16777216.0 + 1.0) - 16777216.0, 16777217.0]
+"#;
+    let source = r#"
+import values
+fn calculate(x: f32) -> f32 = (x + 1.0) - x
+fn overflow(x: f32) -> f32 = (x * 4.0) / 4.0
+fn underflow(x: f32) -> f32 = (x * 1.0e-20) * 1.0e30
+fn main() -> i32 {
+    if values.ROUNDED != 0.0 { return 1 }
+    if values.ROUNDED != calculate(16777216.0) { return 11 }
+    if values.LITERAL != 16777216.0 || !values.EQUAL { return 2 }
+    if values.OVERFLOW != overflow(1.0e38) || values.OVERFLOW != 1.0 / 0.0 { return 3 }
+    if values.UNDERFLOW != underflow(1.0e-30) || values.UNDERFLOW != 0.0 { return 4 }
+    if values.ELEMENTS[0] != 0.0 || values.ELEMENTS[1] != 16777216.0 { return 5 }
+    if values.WIDE != 1.0 { return 6 }
+    if 1.0 / values.NEG_ZERO != -1.0 / 0.0 { return 7 }
+    return 0
+}
+"#;
+    let files = [("main.align", source), ("values.align", library)];
+    assert_eq!(build_and_run_multi("f32-width", &files, "main.align").status.code(), Some(0));
+    let built = build_per_unit_multi("f32-width-per-unit", &files, "main.align");
+    for profile in [Profile::Dev, Profile::Release] {
+        let objects = built.emit_objects_with(profile, false);
+        let refs = objects.iter().map(|object| object.as_path()).collect::<Vec<_>>();
+        let exe = built.dir.join("float-width");
+        link_objects(&align_driver::CDriver::default(), &refs, &exe, &built.link_libs_union(), profile).expect("link float parity");
+        assert_eq!(std::process::Command::new(&exe).status().expect("run float parity").code(), Some(0), "{profile:?}");
+    }
+}

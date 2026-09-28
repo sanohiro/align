@@ -230,6 +230,25 @@ Declare the caller's record as `mut p`, then call `visit(p)`. The caller still o
 
 ---
 
+**Q25.** Does a four-element field need a separate heap allocation?
+
+**A25.** No. State the fixed size in its type:
+
+```align
+Table { weights: [i64; 4] }
+
+fn main() -> i32 {
+    mut table := Table { weights: [2, 3, 5, 7] }
+    table.weights[1] = 11
+    print(table.weights.sum())    // 25
+    return 0
+}
+```
+
+The elements live inside the record. `Table` is Copy because its elements are Copy; copying it copies all four elements. A slice of `table.weights` borrows the record. Use an owned `array<T>` when the length must vary, and use a borrow when a large fixed table only needs to be read.
+
+---
+
 To see the ownership changes as diagrams, read the guide's [memory chapter](../guide/05-memory.md). It follows Move, borrowing, and a string copied out of an arena.
 
 > **The Eighth Commandment**

@@ -169,6 +169,24 @@ select(m, w, zero)
 
 ---
 
+**Q22.** A float comparison chose the best scores. Can its mask also choose integer indices?
+
+**A22.** Yes, when lane count and bit width agree. A `mask4<f32>` may select `vec4<i32>` indices or gate their `sum_where`, as well as selecting `vec4<f32>` scores. It cannot gate `vec4<i64>`: those lanes are twice as wide.
+
+---
+
+**Q23.** Will a floating-point sum automatically reorder itself to make a faster SIMD reduction?
+
+**A23.** The default keeps its evaluation order. If different rounding is acceptable, write the permission:
+
+```align
+fn total(xs: slice<f64>) -> f64 = float(reassoc) { xs.sum() }
+```
+
+This permits regrouping; it does not guarantee vectorization. `float(contract)` separately permits an eligible multiply and add/subtract to fuse. Functions and lambdas begin strict, so a caller's permission does not silently change a callee. The [SIMD guide](../guide/12-simd.md) explains the numerical limits and checked byte views.
+
+---
+
 > **The Thirteenth Commandment**
 >
 > *Start with a pipeline. Use explicit vectors when the algorithm needs lane operations, and check bounds and operands before using them.*
