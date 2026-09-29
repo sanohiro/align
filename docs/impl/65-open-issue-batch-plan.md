@@ -223,9 +223,50 @@ pointer construction. Direct, indirect, captured, generic and imported calls
 share the same instantiated proof. An empty effect, Pure, LLVM readonly, or a
 missing header is never a no-retention/writable certificate.
 
+### Request 121: resource-only sibling beside owned storage
+
+The first implementation boundary for A is the existing `Pair { device:
+resource, scratch: buffer, second: buffer }` witness. At the first divergent
+stable field, the resource side may contain only resource/resource-ref borrow
+leaves; the other side contains no borrow leaf. A resource's tracked parent can
+only be a `resource_ref<R>`, not a buffer, string, array or plain field. Any
+owned backing on the ordinary side has a separate owner. The common
+containing-record storage root may therefore be excluded from this pair's
+conflict test, while every other root and direct/prefix place overlap remains
+checked. This is a type-graph proof, including nested structs, tuples and sums,
+not an exemption for every field whose type may borrow. Cycles and missing
+aggregate/tagged definitions fail closed; checked HIR already validates nominal
+resource IDs. The existing nonborrowing-sibling rule remains intact.
+
+For a view local, `local_origin_places` is usable only while its descriptor
+still names the same source. Its existing assignment, branch-intersection,
+whole-owner invalidation and `refresh_borrow_mut_place` transitions remove or
+replace the origin when the descriptor might change. In particular a returning
+`borrow mut` or `out` call cannot leave a stale buffer-field certificate. An
+unknown, copied, resource-derived or rebound view without a certified owned
+field origin keeps the coarse alias rejection. `resource.view_from_raw` remains
+rooted in its resource and cannot acquire a buffer-field certificate. Unsafe
+raw pointers passed to `resource.from_raw` remain governed by that intrinsic's
+caller obligations; the checker does not infer a safe buffer lifetime from a
+raw pointer.
+
+This boundary changes call admission only. It adds no source form, HIR/MIR
+variant, serialized summary, ABI record, allocation or benchmark promise. It
+does not claim the general copied-descriptor and dynamic-index A proof, which
+retains the point-state work above. Whole/per-unit compilation must agree.
+
+| Closure cell | Required proof and owner |
+| --- | --- |
+| Type formation and validation | `has_only_resource_borrow_leaves` traverses nested struct/tuple/sum/tagged types and refuses a cycle or missing definition; a slice, str, writer or any other borrow leaf prevents exemption. Existing resource constructor and checked-HIR validation remain unchanged. `resource_ownership::resource_sibling_type_graph_keeps_borrowing_carriers_conservative`, `nested_resource_only_field_is_disjoint_from_owned_buffer_fields` and `tagged_resource_only_fields_keep_sibling_buffer_storage_independent` own the concrete graph cases; existing malformed-HIR owners retain invalid-type rejection. |
+| Construction, move and Drop | Pair owns each buffer and resource independently; whole-record move/return nulls its source and Drop retires each leaf once. No partial resource move or new cleanup path is admitted. `resource_ownership::resource_drop_is_exactly_once_across_moves_returns_and_into_raw`, `borrowed_replacement::borrowed_replacement_reclaims_buffer_storage` and the exact-byte Pair execution owner. |
+| Call order and aliasing | Direct/prefix overlap, same buffer twice, copied slice of the same backing, a resource-derived view, and a view rebound by assignment or mutable call reject. Two fresh sibling buffer views with a non-consuming resource field pass in either argument order. `resource_ownership::independent_buffer_views_can_accompany_a_resource_field`, `resource_sibling_exemption_requires_an_owned_view_origin`, `nested_resource_only_field_is_disjoint_from_owned_buffer_fields`; `disjoint_field_borrows::reject_prefix_overlap_struct_and_field` and `reject_rebound_view_via_call_alias`. |
+| Control and replacement | Branch/loop joins retain an origin only if every reached edge agrees. Replacing the complete owner or either buffer before the call invalidates its old view; early exit and `?` do not publish a stale certificate. Existing `disjoint_field_borrows::reject_rebound_view_via_call_alias`, `borrowed_replacement::borrowed_replacement_reclaims_buffer_storage`, resource ownership generation and branch-join owners retain these conditions. |
+| Generic/imported/per-unit and provenance | `is_disjoint_sibling_fields` reads instantiated field types and subtracts only common parent roots after an authenticated origin/path match; caller-owned parameter storage remains coarse outside that pair. `resource_ownership::generic_resource_sibling_uses_instantiated_borrow_leaves` executes the resource specialization, while `generic_borrowing_sibling_does_not_gain_resource_exemption` rejects the view specialization. The public imported helper runs exact bytes and rejection parity in whole/per-unit mode under `independent_buffer_views_can_accompany_a_resource_field` and its negative companion. No interface/cache field changes; normal body identity invalidates compiled artifacts. |
+
 Implement plan 61 as its complete producer/interface/consumer capability before
-shipping W/M/P or widening A. Its existing plain-slice write and returned-view
-laundering holes must not become the new methods' bypass. This dependency is
+shipping W/M/P or widening A beyond this proved resource/owned sibling case.
+Its existing plain-slice write and returned-view laundering holes must not
+become the new methods' bypass. This dependency is
 substantial: a local method whitelist or name-based caller check is not a
 complete substitute. Reuse plan 61's accepted finite representation and DB/native
 inventory rather than redesigning it in this batch.

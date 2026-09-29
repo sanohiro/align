@@ -36335,6 +36335,97 @@ impl<'a> MoveCheck<'a> {
         Some(current)
     }
 
+    /// A resource can retain another resource, but cannot retain the storage of an ordinary
+    /// owned field through a checked borrow. Walk the complete type graph so a view sibling
+    /// hidden inside a record or sum does not receive the resource-only exemption.
+    fn has_only_resource_borrow_leaves(&self, root: Ty) -> bool {
+        enum Work {
+            Enter(Ty),
+            Exit(Ty),
+        }
+
+        let mut work = vec![Work::Enter(root)];
+        let mut visiting = HashSet::new();
+        while let Some(item) = work.pop() {
+            let ty = match item {
+                Work::Exit(ty) => {
+                    visiting.remove(&ty);
+                    continue;
+                }
+                Work::Enter(ty) => ty,
+            };
+            let children = match ty {
+                Ty::Resource(_) | Ty::ResourceRef(_) => continue,
+                Ty::Param(_) | Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error => return false,
+                Ty::Tagged(id) => match self.tagged_types.get(id as usize) {
+                    Some(hir::TaggedType::Option(payload)) => vec![scalar_to_ty(*payload)],
+                    Some(hir::TaggedType::Result(ok, err)) => {
+                        vec![scalar_to_ty(*ok), scalar_to_ty(*err)]
+                    }
+                    None => return false,
+                },
+                Ty::Struct(id)
+                | Ty::StructArray(id, _)
+                | Ty::DynStructArray(id, _)
+                | Ty::DynFixedStructArray(id, _)
+                | Ty::FixedStructArrayBuilder(id, _) => {
+                    let Some(definition) = self.structs.get(id as usize) else {
+                        return false;
+                    };
+                    definition.fields.iter().map(|field| field.ty).collect()
+                }
+                Ty::Tuple(id) => {
+                    let Some(definition) = self.tuples.get(id as usize) else {
+                        return false;
+                    };
+                    definition.elems.iter().copied().map(scalar_to_ty).collect()
+                }
+                Ty::Enum(id) => {
+                    let Some(definition) = self.enums.get(id as usize) else {
+                        return false;
+                    };
+                    definition
+                        .variants
+                        .iter()
+                        .flat_map(|variant| variant.payload.iter())
+                        .copied()
+                        .map(scalar_to_ty)
+                        .collect()
+                }
+                Ty::Option(payload)
+                | Ty::Array(payload, _)
+                | Ty::DynArray(payload)
+                | Ty::Task(payload)
+                | Ty::Box(payload)
+                | Ty::ArrayBuilder(payload) => {
+                    vec![scalar_to_ty(payload)]
+                }
+                Ty::Result(ok, err) => vec![scalar_to_ty(ok), scalar_to_ty(err)],
+                Ty::DynFixedArray(payload, len) | Ty::FixedArrayBuilder(payload, len) => {
+                    vec![Ty::Array(payload, len)]
+                }
+                Ty::DynVecArray(payload, lanes) | Ty::VecArrayBuilder(payload, lanes) => {
+                    vec![Ty::Vec(payload, lanes)]
+                }
+                Ty::DynMaskArray(payload, lanes) | Ty::MaskArrayBuilder(payload, lanes) => {
+                    vec![Ty::Mask(payload, lanes)]
+                }
+                _ => {
+                    if ty_may_borrow(ty, self.structs, self.tuples, self.enums, self.tagged_types) {
+                        return false;
+                    }
+                    continue;
+                }
+            };
+            if !visiting.insert(ty) {
+                return false;
+            }
+            work.push(Work::Exit(ty));
+            work.extend(children.into_iter().rev().map(Work::Enter));
+        }
+        true
+    }
+
     fn is_disjoint_sibling_fields(
         &self,
         root: LocalId,
@@ -36364,8 +36455,23 @@ impl<'a> MoveCheck<'a> {
         let Some(ty_r) = self.type_at_path(parent_ty, &[field_r]) else {
             return false;
         };
-        !ty_may_borrow(ty_l, self.structs, self.tuples, self.enums, self.tagged_types)
-            && !ty_may_borrow(ty_r, self.structs, self.tuples, self.enums, self.tagged_types)
+        let left_is_plain = !ty_may_borrow(
+            ty_l,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        );
+        let right_is_plain = !ty_may_borrow(
+            ty_r,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        );
+        self.has_only_resource_borrow_leaves(ty_l)
+            && self.has_only_resource_borrow_leaves(ty_r)
+            && (left_is_plain || right_is_plain)
     }
 
     fn check_call_borrow_aliases(

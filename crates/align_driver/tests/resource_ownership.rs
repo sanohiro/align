@@ -1274,6 +1274,177 @@ pub fn touch(borrow mut owner: conn) {}
 }
 
 #[test]
+fn independent_buffer_views_can_accompany_a_resource_field() {
+    let root = "\
+module pkg.db
+import pkg.db.internal.resource
+pub resource conn = pkg.db.internal.resource.drop_conn
+pub fn open() -> conn { unsafe { return resource.from_raw(raw.alloc(8)) } }
+pub Pair { device: conn, scratch: buffer, second: buffer }
+pub fn write(borrow device: conn, borrow mut bytes: slice<u8>, borrow mut other: slice<u8>) {
+  bytes.set_u8(0, 41)
+  other.set_u8(0, 42)
+}
+pub fn update(borrow mut pair: Pair) {
+  mut bytes := pair.scratch.bytes()
+  mut other := pair.second.bytes()
+  write(pair.device, bytes, other)
+}
+";
+    let entry = "\
+module main
+import pkg.db
+fn main() -> i32 {
+  mut pair := pkg.db.Pair {
+    device: pkg.db.open(),
+    scratch: buffer.filled(1, 0),
+    second: buffer.filled(1, 0),
+  }
+  pkg.db.update(pair)
+  if pair.scratch.bytes().u8(0) != 41 { return 1 }
+  if pair.second.bytes().u8(0) != 42 { return 2 }
+  return 0
+}
+";
+    let project = [
+        ("pkg/db/internal/resource.align", INTERNAL),
+        ("pkg/db.align", root),
+        ("main.align", entry),
+    ];
+    let result = diff_check_multi("independent-buffer-resource-siblings", &project, "main.align");
+    assert!(!result.whole_errors, "whole:\n{}", result.whole_diags);
+    assert!(!result.per_unit_errors, "per-unit:\n{}", result.per_unit_diags);
+    if backend_available() {
+        assert_eq!(
+            build_and_run_multi("independent-buffer-resource-whole", &project, "main.align")
+                .status
+                .code(),
+            Some(0),
+        );
+        assert_eq!(
+            build_per_unit_multi("independent-buffer-resource-units", &project, "main.align")
+                .link_and_run()
+                .status
+                .code(),
+            Some(0),
+        );
+    }
+}
+
+#[test]
+fn resource_sibling_exemption_requires_an_owned_view_origin() {
+    let base = "\
+module pkg.db
+import pkg.db.internal.resource
+pub resource conn = pkg.db.internal.resource.drop_conn
+pub Pair { device: conn, scratch: buffer, second: buffer }
+pub fn resource_view(borrow device: conn) -> Option<slice<u8>> {
+  unsafe {
+    reference := resource.borrow(device)
+    return resource.view_from_raw(reference, resource.raw(reference), 8)
+  }
+}
+pub fn redirect(borrow mut dst: slice<u8>, source: slice<u8>) { dst = source }
+pub fn write(borrow device: conn, borrow mut bytes: slice<u8>, borrow mut other: slice<u8>) {}
+";
+    for (name, body) in [
+        ("resource-backed", "mut bytes := pair.scratch.bytes()\n  bytes = resource_view(pair.device) else { return }\n  mut other := pair.second.bytes()\n  write(pair.device, bytes, other)"),
+        ("rebound", "mut bytes := pair.scratch.bytes()\n  mut other := pair.second.bytes()\n  redirect(bytes, other)\n  write(pair.device, bytes, other)"),
+        ("duplicated", "mut bytes := pair.scratch.bytes()\n  mut other := bytes\n  write(pair.device, bytes, other)"),
+    ] {
+        let root = format!("{base}pub fn update(borrow mut pair: Pair) {{\n  {body}\n}}\n");
+        let project = [
+            ("pkg/db/internal/resource.align", INTERNAL),
+            ("pkg/db.align", root.as_str()),
+            ("main.align", "module main\nimport pkg.db\nfn main() {}\n"),
+        ];
+        assert_rejected(name, &project, "aliases argument");
+    }
+}
+
+#[test]
+fn resource_sibling_type_graph_keeps_borrowing_carriers_conservative() {
+    let root = "\
+module pkg.db
+import pkg.db.internal.resource
+pub resource conn = pkg.db.internal.resource.drop_conn
+pub DeviceAndView { device: conn, view: slice<u8> }
+pub Pair { owner: DeviceAndView, scratch: buffer }
+pub fn write(borrow owner: DeviceAndView, borrow mut bytes: slice<u8>) {}
+pub fn update(borrow mut pair: Pair) {
+  mut bytes := pair.scratch.bytes()
+  write(pair.owner, bytes)
+}
+";
+    let project = [
+        ("pkg/db/internal/resource.align", INTERNAL),
+        ("pkg/db.align", root),
+        ("main.align", "module main\nimport pkg.db\nfn main() {}\n"),
+    ];
+    assert_rejected("resource-carrier-with-view", &project, "aliases argument");
+}
+
+#[test]
+fn nested_resource_only_field_is_disjoint_from_owned_buffer_fields() {
+    let root = "\
+module pkg.db
+import pkg.db.internal.resource
+pub resource conn = pkg.db.internal.resource.drop_conn
+pub fn open() -> conn { unsafe { return resource.from_raw(raw.alloc(8)) } }
+pub Device { handle: conn, serial: i64 }
+pub Pair { device: Device, scratch: buffer, second: buffer }
+pub fn write(borrow mut bytes: slice<u8>, borrow device: conn, borrow mut other: slice<u8>) {
+  bytes.set_u8(0, 17)
+  other.set_u8(0, 19)
+}
+
+pub fn update(borrow mut pair: Pair) {
+  mut bytes := pair.scratch.bytes()
+  mut other := pair.second.bytes()
+  write(bytes, pair.device.handle, other)
+}
+";
+    let entry = "\
+module main
+import pkg.db
+fn main() -> i32 {
+  mut pair := pkg.db.Pair {
+    device: pkg.db.Device { handle: pkg.db.open(), serial: 7 },
+    scratch: buffer.filled(1, 0),
+    second: buffer.filled(1, 0),
+  }
+  pkg.db.update(pair)
+  if pair.scratch.bytes().u8(0) != 17 { return 1 }
+  if pair.second.bytes().u8(0) != 19 { return 2 }
+  return 0
+}
+";
+    let project = [
+        ("pkg/db/internal/resource.align", INTERNAL),
+        ("pkg/db.align", root),
+        ("main.align", entry),
+    ];
+    let result = diff_check_multi("nested-resource-owned-buffers", &project, "main.align");
+    assert!(!result.whole_errors, "whole:\n{}", result.whole_diags);
+    assert!(!result.per_unit_errors, "per-unit:\n{}", result.per_unit_diags);
+    if backend_available() {
+        assert_eq!(
+            build_and_run_multi("nested-resource-owned-buffers-whole", &project, "main.align")
+                .status
+                .code(),
+            Some(0),
+        );
+        assert_eq!(
+            build_per_unit_multi("nested-resource-owned-buffers-units", &project, "main.align")
+                .link_and_run()
+                .status
+                .code(),
+            Some(0),
+        );
+    }
+}
+
+#[test]
 fn reachable_return_alternatives_keep_local_storage_rejection() {
     for (name, parameter, value) in [
         ("else", "source: Option<slice<u8>>", "source else { local[0..1] }"),
@@ -1329,4 +1500,142 @@ extern \"C\" fn foreign(owner: conn)
         let project = files(&entry);
         assert_rejected(name, &project, needle);
     }
+}
+
+#[test]
+fn tagged_resource_only_fields_keep_sibling_buffer_storage_independent() {
+    let root = "\
+module pkg.db
+import pkg.db.internal.resource
+pub resource conn = pkg.db.internal.resource.drop_conn
+pub fn open() -> conn { unsafe { return resource.from_raw(raw.alloc(8)) } }
+pub Choice { Device(conn), Empty }
+pub SumPair { device: Choice, scratch: buffer }
+pub OptionPair { device: Option<conn>, scratch: buffer }
+pub fn write_sum(borrow device: Choice, borrow mut bytes: slice<u8>) { bytes.set_u8(0, 23) }
+pub fn write_option(borrow device: Option<conn>, borrow mut bytes: slice<u8>) { bytes.set_u8(0, 29) }
+pub fn update_sum(borrow mut pair: SumPair) {
+  mut bytes := pair.scratch.bytes()
+  write_sum(pair.device, bytes)
+}
+pub fn update_option(borrow mut pair: OptionPair) {
+  mut bytes := pair.scratch.bytes()
+  write_option(pair.device, bytes)
+}
+";
+    let entry = "\
+module main
+import pkg.db
+fn main() -> i32 {
+  mut sum := pkg.db.SumPair {
+    device: pkg.db.Choice.Device(pkg.db.open()),
+    scratch: buffer.filled(1, 0),
+  }
+  mut optional := pkg.db.OptionPair {
+    device: Some(pkg.db.open()),
+    scratch: buffer.filled(1, 0),
+  }
+  pkg.db.update_sum(sum)
+  pkg.db.update_option(optional)
+  if sum.scratch.bytes().u8(0) != 23 { return 1 }
+  if optional.scratch.bytes().u8(0) != 29 { return 2 }
+  return 0
+}
+";
+    let project = [
+        ("pkg/db/internal/resource.align", INTERNAL),
+        ("pkg/db.align", root),
+        ("main.align", entry),
+    ];
+    let result = diff_check_multi("tagged-resource-owned-buffer", &project, "main.align");
+    assert!(!result.whole_errors, "whole:\n{}", result.whole_diags);
+    assert!(!result.per_unit_errors, "per-unit:\n{}", result.per_unit_diags);
+    if backend_available() {
+        assert_eq!(
+            build_and_run_multi("tagged-resource-owned-buffer-whole", &project, "main.align")
+                .status
+                .code(),
+            Some(0),
+        );
+        assert_eq!(
+            build_per_unit_multi("tagged-resource-owned-buffer-units", &project, "main.align")
+                .link_and_run()
+                .status
+                .code(),
+            Some(0),
+        );
+    }
+}
+
+#[test]
+fn generic_resource_sibling_uses_instantiated_borrow_leaves() {
+    let root = "\
+module pkg.db
+import pkg.db.internal.resource
+pub resource conn = pkg.db.internal.resource.drop_conn
+pub fn open() -> conn { unsafe { return resource.from_raw(raw.alloc(8)) } }
+pub Pair<T> { device: T, scratch: buffer }
+pub fn write<T>(borrow device: T, borrow mut bytes: slice<u8>) { bytes.set_u8(0, 37) }
+pub fn update<T>(borrow mut pair: Pair<T>) {
+  mut bytes := pair.scratch.bytes()
+  write(pair.device, bytes)
+}
+";
+    let entry = "\
+module main
+import pkg.db
+fn main() -> i32 {
+  mut pair := pkg.db.Pair { device: pkg.db.open(), scratch: buffer.filled(1, 0) }
+  pkg.db.update(pair)
+  if pair.scratch.bytes().u8(0) != 37 { return 1 }
+  return 0
+}
+";
+    let project = [
+        ("pkg/db/internal/resource.align", INTERNAL),
+        ("pkg/db.align", root),
+        ("main.align", entry),
+    ];
+    let result = diff_check_multi("generic-resource-owned-buffer", &project, "main.align");
+    assert!(!result.whole_errors, "whole:\n{}", result.whole_diags);
+    assert!(!result.per_unit_errors, "per-unit:\n{}", result.per_unit_diags);
+    if backend_available() {
+        assert_eq!(
+            build_and_run_multi("generic-resource-owned-buffer-whole", &project, "main.align")
+                .status
+                .code(),
+            Some(0),
+        );
+        assert_eq!(
+            build_per_unit_multi("generic-resource-owned-buffer-units", &project, "main.align")
+                .link_and_run()
+                .status
+                .code(),
+            Some(0),
+        );
+    }
+}
+
+#[test]
+fn generic_borrowing_sibling_does_not_gain_resource_exemption() {
+    let root = "\
+module pkg.db
+pub Pair<T> { device: T, scratch: buffer }
+pub fn write<T>(borrow device: T, borrow mut bytes: slice<u8>) {}
+pub fn update<T>(borrow mut pair: Pair<T>) {
+  mut bytes := pair.scratch.bytes()
+  write(pair.device, bytes)
+}
+";
+    let entry = "\
+module main
+import pkg.db
+fn main() {
+  mut backing := buffer.filled(1, 0)
+  mut pair := pkg.db.Pair { device: backing.bytes(), scratch: buffer.filled(1, 0) }
+  pkg.db.update(pair)
+}
+";
+    let project = [("pkg/db.align", root), ("main.align", entry)];
+    assert_rejected("generic-borrowing-sibling", &project, "aliases argument");
 }
