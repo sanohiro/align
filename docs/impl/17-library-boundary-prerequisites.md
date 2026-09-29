@@ -334,6 +334,23 @@ returned value and therefore appears in the same parameter-index summary. The `b
 needed to avoid consuming a Move owner or structurally copying stable Copy storage. Ordinary Copy
 arguments remain by value unless the declaration explicitly chooses the no-copy borrow ABI.
 
+#### Caller-resource view return closure (Request 123)
+
+This implementation follows the existing return-root and generation contract. A completed
+fallback that exits before an `else` value is formed contributes no returned storage. The
+source still checks the fallback's own return and cleanup. The owner is
+`resource_ownership::returned_raw_view_can_borrow_caller_resource_generation` and its paired
+rejection owners.
+
+| Cell | Existing authority and completion owner |
+| --- | --- |
+| Formation, type, and validation | `resource.borrow` and `resource.view_from_raw` retain the resource type and current generation; checked HIR and MIR owners reject malformed result/view forms. |
+| Construction and wrapper | Direct `Option` and `Result::Ok` return the same caller-rooted view; an `else` fallback contributes a result only when it reaches its join. Owner compares whole and per-unit forms. |
+| Move, move-out, source nulling, replacement, and Drop | A shared borrowed parameter is not consumed; the caller retains the resource. Caller-side move, mutable borrow, and replacement invalidate a retained view; ordinary Drop remains governed by the existing liveness rule. Existing resource-generation negative owners plus the new returned-view owner close this cell. |
+| Control and early exits | Diverging `else`, `if`, and `match` alternatives do not add return-value provenance at a normal join; reachable alternatives, `?`, `map_err`, loop joins, and explicit returns preserve their selected roots. Escape and return-provenance owners close the applicable forms. |
+| Calls and artifacts | Direct, imported, per-unit and whole-program calls transport the existing return-borrow summary and resource generation. Interface serialization and cache identity are unchanged; generic instantiation and function-value calls retain their existing summary consumers. |
+| Native boundary and allocation | The raw pointer remains under the checked resource view formation and existing `unsafe` obligation. The correction adds no allocation, copy, runtime layout, ABI value or FFI transfer. |
+
 `borrow mut` parameters are already explicit invalidation summaries. No second user annotation or
 name-based effect table is allowed.
 
