@@ -656,6 +656,13 @@ is exactly what makes cross-unit edits invalidate dependents through the interfa
 `array<T>` annotation is therefore rejected, not accepted-and-coerced — the type would be a lie about
 ownership.
 
+**Imported public constants fold through the same definition-time evaluator.** A qualified
+`module.NAME` in an initializer uses the declared import and `pub` visibility, then resolves the
+same fixed type and value as a local reference. This keeps the exported source re-checkable in
+each importing unit and lets transitive interface hashes invalidate consumers when an underlying
+value changes. Private references fail before publication. Aggregate aliases remain excluded
+because each table is rematerialized as private per-unit read-only storage.
+
 **A heap record builder reuses nominal type identity and compile-time Drop, not a runtime record
 descriptor.** Once a consumer needed runtime-sized record arrays, three possible designs existed:
 serialize records through JSON, add a self-describing structural record-builder wire, or extend the

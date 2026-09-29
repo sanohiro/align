@@ -851,6 +851,35 @@ fn gate3b_aggregate_const_element_edit_invalidates_dependents() {
     }
 }
 
+#[test]
+fn imported_constant_alias_tracks_transitive_value_edits() {
+    if !backend() {
+        return;
+    }
+    let base_v1 = "module base\npub VALUE: i64 := 4\n";
+    let base_v2 = "module base\npub VALUE: i64 := 5\n";
+    let middle = "module middle\nimport base\npub ALIAS := base.VALUE\n";
+    let main = "import middle\nfn main() { print(middle.ALIAS) }\n";
+    let proj = Project::new(
+        "const-transitive-edit",
+        &[("base.align", base_v1), ("middle.align", middle), ("main.align", main)],
+        "main.align",
+    );
+    let cache = proj.cache();
+    let cold = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(cold.outcomes.iter().all(|outcome| !outcome.hit));
+    if cc_available() {
+        assert_eq!(cold.run(&proj, Profile::Release), "4\n");
+    }
+
+    proj.write("base.align", base_v2);
+    let rebuilt = emit_all(&proj, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(!rebuilt.outcome("main").hit, "an imported constant alias must re-key its consumer");
+    if cc_available() {
+        assert_eq!(rebuilt.run(&proj, Profile::Release), "5\n");
+    }
+}
+
 // ---- Gate 4: comment-only edit → hit ------------------------------------------------------------
 
 #[test]

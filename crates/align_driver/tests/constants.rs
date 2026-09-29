@@ -3,7 +3,7 @@
 //! aggregate slice, or the exact raw-null sentinel and substituted at every use. Constants are
 //! per-module namespaced like functions/types: `pub` exports one, and an importer names it qualified
 //! (`mod.NAME`). A constant initializer may be a literal, the exact `raw.null()` sentinel, a
-//! unary/binary expression, or a reference to another constant in the same module.
+//! unary/binary expression, or a reference to a local or imported public scalar constant.
 
 mod common;
 use common::*;
@@ -103,6 +103,69 @@ fn a_pub_constant_is_used_qualified_across_modules() {
     );
     let out = build_and_run_multi("const-xmod", &[("cfg.align", cfg), ("main.align", main)], "main.align");
     assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn imported_public_constants_fold_through_transitive_initializers() {
+    if !backend_available() {
+        return;
+    }
+    let base = concat!(
+        "module base\n",
+        "pub LIMIT: i32 := 40\n",
+        "pub READY := true\n",
+        "pub RATE: f32 := 1.5\n",
+        "pub LABEL := \"ok\"\n",
+        "pub NULL: raw := raw.null()\n",
+    );
+    let middle = concat!(
+        "module middle\nimport base\n",
+        "pub MAX_PREFILL := base.LIMIT\n",
+        "pub ANSWER: i32 := MAX_PREFILL + 2\n",
+        "pub READY := base.READY\n",
+        "pub RATE := base.RATE\n",
+        "pub LABEL := base.LABEL\n",
+        "pub NULL: raw := base.NULL\n",
+        "pub TABLE: slice<i32> := [base.LIMIT, base.LIMIT + 2]\n",
+    );
+    let main = concat!(
+        "import middle\n",
+        "fn main() -> i32 {\n",
+        "  unsafe {\n",
+        "    if middle.READY && middle.RATE == 1.5 && middle.LABEL.len() == 2 && middle.NULL.is_null() {\n",
+        "      return middle.ANSWER + middle.TABLE[1] - 42\n",
+        "    }\n",
+        "  }\n",
+        "  return 1\n",
+        "}\n",
+    );
+    let files = [("base.align", base), ("middle.align", middle), ("main.align", main)];
+    let checked = diff_check_multi("const-import-fold", &files, "main.align");
+    assert!(!checked.whole_errors, "{}", checked.whole_diags);
+    assert!(!checked.per_unit_errors, "{}", checked.per_unit_diags);
+    assert_eq!(build_and_run_multi("const-import-fold-whole", &files, "main.align").status.code(), Some(42));
+    assert_eq!(build_per_unit_multi("const-import-fold-unit", &files, "main.align").link_and_run().status.code(), Some(42));
+}
+
+#[test]
+fn imported_constant_initializers_reject_invalid_references_in_both_modes() {
+    let cases = [
+        ("private", "import base\npub ALIAS := base.SECRET\n", "pub LIMIT := 4\nSECRET := 5\n"),
+        ("missing import", "pub ALIAS := base.LIMIT\n", "pub LIMIT := 4\n"),
+        ("missing constant", "import base\npub ALIAS := base.MISSING\n", "pub LIMIT := 4\n"),
+        ("function", "import base\npub ALIAS := base.get\n", "pub fn get() -> i64 = 4\n"),
+        ("aggregate", "import base\npub ALIAS := base.TABLE\n", "pub TABLE := [4]\n"),
+        ("type mismatch", "import base\npub ALIAS: i32 := base.LIMIT\n", "pub LIMIT: i64 := 4\n"),
+    ];
+    for (name, middle_body, base_body) in cases {
+        let base = format!("module base\n{base_body}");
+        let middle = format!("module middle\n{middle_body}");
+        let main = "import middle\nfn main() -> i32 = 0\n";
+        let files = [("base.align", base.as_str()), ("middle.align", middle.as_str()), ("main.align", main)];
+        let result = diff_check_multi(&format!("const-import-{name}"), &files, "main.align");
+        assert!(result.whole_errors, "{name} must reject in whole-program checking");
+        assert!(result.per_unit_errors, "{name} must reject in per-unit checking: {}", result.per_unit_diags);
+    }
 }
 
 #[test]
@@ -249,10 +312,16 @@ fn division_by_zero_in_a_constant_is_an_error() {
 
 #[test]
 fn a_cyclic_constant_is_an_error() {
-    assert!(check_errs(
-        "const-cycle",
-        "A := B\nB := A\nfn main() -> i32 { return 0 }\n",
-    ));
+    let src = "A := B\nB := A\nfn main() -> i32 { return 0 }\n";
+    let diagnostic = || {
+        let mut sources = SourceMap::new();
+        let checked = check(&mut sources, "const-cycle", src);
+        assert!(checked.diags.has_errors());
+        align_driver::format_diagnostics(&sources, &checked.diags)
+    };
+    let first = diagnostic();
+    assert!(first.contains("constant `A` is defined in terms of itself"), "{first}");
+    assert_eq!(first, diagnostic(), "cycle diagnostics must not depend on hash-map order");
 }
 
 #[test]

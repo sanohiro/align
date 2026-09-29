@@ -347,6 +347,10 @@ const_decl = ident (":" type)? ":=" expr END
 A top-level `:=` is a compile-time constant (immutable). `mut` is not allowed. One of the sources feeding the const string pool (`draft.md` §12).
 
 **Const-eval (Pass 0d).** Constants are collected and folded before the checker runs: `ConstEval` (in `align_sema`) evaluates each initializer to a `ConstVal` (memoized, order-independent, with cycle detection) and `ConstTable` maps each `module.NAME` to its `(Ty, ConstVal)`. A use site substitutes the folded value as a literal HIR node via `const_literal` (`check_path` / `check_field_access`), so a *scalar* constant declaration never reaches MIR/codegen.
+An initializer's `module.NAME` resolves only through that module's declared import and a `pub`
+constant. Local and imported references share type and aggregate-alias checks. The existing
+transitive interface reconstruction re-folds the same source against its imported summaries;
+import graph cycles reject before const-eval.
 
 **Raw-null constant (issue 1159).** Const-eval admits one exact call-shaped leaf:
 `NULL: raw := raw.null()` (the annotation may be omitted). It becomes `ConstVal::RawNull`; use-site

@@ -791,8 +791,8 @@ Record: `draft.md` §3, `impl/03-types.md` §2, `examples/cast.align`, `tests/nu
 keyword-less binding form (`NAME := expr` / `NAME: T := expr`), is immutable (`mut` rejected at the
 top level), and is **evaluated at compile time** to a scalar / string value that is substituted as a
 literal at every use — so a constant never reaches MIR/codegen (zero new backend surface). Its value
-is built from literals, unary/binary operators, and references to other constants (cross-module
-references *inside* an initializer are deferred; **scalar/`str`-array aggregate constants landed
+is built from literals, unary/binary operators, and references to local or imported public
+scalar/`str`/raw-null constants (**scalar/`str`-array aggregate constants landed
 2026-07-17 — see the extension below**; struct constants and `as` in a constant stay deferred). A
 constant's type is **fixed at the definition** (unlike a local it does not infer
 from a use site — it must be stable across modules), so an unannotated integer defaults to `i64` /

@@ -177,6 +177,12 @@ and a float to `f64`, so annotate when another width is wanted. `pub` exports a 
 importing modules, where it is named qualified — `mod.NAME` — exactly like a `pub` function or
 type. Division by zero, a cyclic definition, or a type mismatch is a compile-time error.
 
+An initializer may reference an imported module's `pub` scalar, `str`, or exact raw-null
+constant with `module.NAME`. The defining file must import that module. The reference folds at
+compile time with the constant's definition-fixed type, including inside unary/binary expressions
+and array-literal elements. Private or missing constants and import cycles reject. A reference to
+an aggregate constant from another initializer remains invalid; its static table is not aliased.
+
 One deliberately narrow native-boundary sentinel is also a constant value:
 
 ```align
