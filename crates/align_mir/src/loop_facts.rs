@@ -43,6 +43,17 @@ const MAX_ANALYSED_BLOCKS: usize = 1024;
 /// Recursive initializer-source proofs are an optimization only; bound malformed or very deep
 /// SSA/slot chains before they can exhaust the compiler stack.
 const MAX_INIT_PROOF_DEPTH: usize = 256;
+/// One initializer proof may revisit the CFG through nested loads. A depth bound alone does not
+/// cap the resulting tree of fixed-point analyses, so refuse the optimization after this work.
+const MAX_INIT_PROOF_WORK: usize = 16_384;
+
+fn take_init_proof_work(remaining: &mut usize) -> bool {
+    if *remaining == 0 {
+        return false;
+    }
+    *remaining -= 1;
+    true
+}
 
 fn i64_ty() -> Ty {
     Ty::Int(IntTy {
@@ -1563,9 +1574,10 @@ fn initialized_store_source(
     use_block: BlockId,
     use_position: usize,
     active: &mut BTreeSet<InitProofNode>,
+    remaining: &mut usize,
 ) -> bool {
     let InitProofInputs { function, cfg, analysis, .. } = inputs;
-    if operand_ty(function, operand) != Some(expected) {
+    if !take_init_proof_work(remaining) || operand_ty(function, operand) != Some(expected) {
         return false;
     }
     match operand {
@@ -1607,15 +1619,17 @@ fn initialized_store_source(
                     def_block,
                     def_position,
                     active,
+                    remaining,
                 ),
                 Rvalue::Load(slot) => {
                     function.slots.get(*slot as usize) == Some(&expected)
-                        && slot_initialized_at(
+                        && slot_initialized_at_bounded(
                             inputs,
                             *slot,
                             def_block,
                             def_position,
                             active,
+                            remaining,
                         )
                 }
                 Rvalue::SliceLen(view) if expected == i64_ty() => operand_ty(function, view)
@@ -1630,6 +1644,7 @@ fn initialized_store_source(
                             def_block,
                             def_position,
                             active,
+                            remaining,
                         )
                     }),
                 Rvalue::Bin(
@@ -1653,6 +1668,7 @@ fn initialized_store_source(
                         def_block,
                         def_position,
                         active,
+                        remaining,
                     ) && initialized_store_source(
                         inputs,
                         right,
@@ -1660,6 +1676,7 @@ fn initialized_store_source(
                         def_block,
                         def_position,
                         active,
+                        remaining,
                     )
                 }
                 _ => false,
@@ -1686,8 +1703,21 @@ fn slot_initialized_at(
     position: usize,
     active: &mut BTreeSet<InitProofNode>,
 ) -> bool {
+    let mut remaining = MAX_INIT_PROOF_WORK;
+    slot_initialized_at_bounded(inputs, slot, target, position, active, &mut remaining)
+}
+
+fn slot_initialized_at_bounded(
+    inputs: &InitProofInputs<'_, '_, '_>,
+    slot: Slot,
+    target: BlockId,
+    position: usize,
+    active: &mut BTreeSet<InitProofNode>,
+    remaining: &mut usize,
+) -> bool {
     let InitProofInputs { function, cfg, trusted_steps, .. } = inputs;
-    if function.slots.get(slot as usize).is_none()
+    if !take_init_proof_work(remaining)
+        || function.slots.get(slot as usize).is_none()
         || function
             .blocks
             .get(target as usize)
@@ -1713,6 +1743,10 @@ fn slot_initialized_at(
             if !relevant.contains(&block.id) {
                 continue;
             }
+            if !take_init_proof_work(remaining) {
+                active.remove(&InitProofNode::Slot(slot, target, position));
+                return false;
+            }
             let mut initialized = block.id != function.entry
                 && !cfg.preds[block.id as usize].is_empty()
                 && cfg.preds[block.id as usize]
@@ -1720,6 +1754,10 @@ fn slot_initialized_at(
                     .filter(|pred| reachable.contains(pred))
                     .all(|pred| out[*pred as usize]);
             for (stmt_position, stmt) in block.stmts.iter().enumerate() {
+                if !take_init_proof_work(remaining) {
+                    active.remove(&InitProofNode::Slot(slot, target, position));
+                    return false;
+                }
                 match stmt {
                     Stmt::Store(written, value) if *written == slot => {
                         if !trusted_steps.contains(&(slot, block.id, stmt_position)) {
@@ -1730,6 +1768,7 @@ fn slot_initialized_at(
                                 block.id,
                                 stmt_position,
                                 active,
+                                remaining,
                             );
                         } else {
                             initialized = true;
@@ -1761,6 +1800,10 @@ fn slot_initialized_at(
         .iter()
         .enumerate()
     {
+        if !take_init_proof_work(remaining) {
+            active.remove(&InitProofNode::Slot(slot, target, position));
+            return false;
+        }
         match stmt {
             Stmt::Store(written, value) if *written == slot => {
                 if !trusted_steps.contains(&(slot, target, stmt_position)) {
@@ -1771,6 +1814,7 @@ fn slot_initialized_at(
                         target,
                         stmt_position,
                         active,
+                        remaining,
                     );
                 } else {
                     initialized = true;
@@ -3339,6 +3383,53 @@ mod tests {
             trusted_steps: &trusted_steps,
         };
         assert!(slot_initialized_at(&inputs, 0, 0, 1, &mut BTreeSet::new()));
+    }
+
+    #[test]
+    fn nested_slot_load_proof_has_a_total_work_limit() {
+        let mut function = scratch();
+        function.slots = vec![i64_ty(); 24];
+        function.slot_align = vec![None; function.slots.len()];
+        function.value_tys = vec![i64_ty(); function.slots.len() - 1];
+        function.blocks[0].stmts.push(Stmt::Store(0, int(1)));
+        for slot in 1..function.slots.len() {
+            function.blocks[0].stmts.push(Stmt::Let(
+                (slot - 1) as ValueId,
+                Rvalue::Load((slot - 1) as Slot),
+            ));
+            function.blocks[0].stmts.push(Stmt::Store(
+                slot as Slot,
+                Operand::Value((slot - 1) as ValueId),
+            ));
+        }
+        function.blocks[0].term = Term::Return(None);
+        let cfg = Cfg::build(&function).unwrap_or_else(|| panic!("nested-load fixture CFG"));
+        let analysis = Analysis::new(&function, &cfg)
+            .unwrap_or_else(|| panic!("nested-load fixture SSA"));
+        let trusted_steps = BTreeSet::new();
+        let inputs = InitProofInputs {
+            function: &function,
+            cfg: &cfg,
+            analysis: &analysis,
+            trusted_steps: &trusted_steps,
+        };
+        assert!(slot_initialized_at(
+            &inputs,
+            3,
+            0,
+            function.blocks[0].stmts.len(),
+            &mut BTreeSet::new(),
+        ));
+        assert!(
+            !slot_initialized_at(
+                &inputs,
+                23,
+                0,
+                function.blocks[0].stmts.len(),
+                &mut BTreeSet::new(),
+            ),
+            "exponential nested-load proof must fail closed within the shared budget"
+        );
     }
 
     /// The kill set, closed once for the whole `Stmt` inventory rather than by one Align fixture per
