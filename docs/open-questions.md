@@ -4846,9 +4846,12 @@ order are in `impl/17-library-boundary-prerequisites.md` §§2, 4, and 7.
 Library code may declare `borrow x: T` and `borrow mut x: T` parameters. Shared borrow accepts a
 stable bound Copy or Move place: it preserves caller ownership, avoids a by-value aggregate copy,
 and may return a view tied to the caller's exact owner generation. It never makes a temporary
-addressable. Mutable borrow accepts a writable Move or Copy place, updates that caller storage, ends
-the previous generation, invalidates every older view, and returns any new view in the fresh
-generation. Parameter modes and inferred return-borrow summaries are part of the exported
+addressable. Mutable borrow accepts a writable Move or Copy place and updates caller storage.
+An owned replacement ends its displaced generation. A proven Copy-view header rebind or element
+write preserves its addressed allocation; older aliases retain their captured headers and all
+element-owner dependencies not proved overwritten by a whole-element store. An unknown effect retains conservative
+invalidation, and a returned view follows the post-call destination. Parameter modes and inferred
+return-borrow summaries are part of the exported
 interface; `Fn`/`FnTy` also retains every mode and the Move-return cleanup ABI so indirect calls use
 the direct-call ABI. Concrete function values additionally retain inferred
 return-borrow/region parameter and capture-slot summaries. Target-relative capture roots travel with

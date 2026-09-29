@@ -879,6 +879,17 @@ retention.” The memory-model consequences are:
   the existing all-compatible-input fallback. Request 43/49 transports this
   exact fact in interface format 10; function-value representation is unchanged.
 
+Plan 80 extends that transport in interface format 17 with a separate direct
+Copy-view effect. Retained roots alone cannot say whether a mutable call rebound
+the descriptor, wrote an element, wrote through a transient rebind target, or left another element untouched. The caller
+therefore preserves old backing content across a descriptor-only rebind and
+across every unproved partial overwrite. A guaranteed whole-element store through the original
+view can replace content only when the completed backing is authenticated as a
+single cell; a projected field store still preserves sibling content. Sources
+written through transient rebind targets join every compatible completed backing;
+otherwise source roots join while old content remains possible.
+Unknown/import-unavailable effects never authorize that strong replacement.
+
 These rules apply to the shared `AssignIndex`/`AssignElemField`/`AssignElem`
 analysis arm even where the current source classifier admits only a subset of
 region-bearing element shapes. That keeps a later admitted shape from reviving
@@ -939,7 +950,8 @@ projected observers.” Its memory-model consequences are:
   owned dynamic destinations, preserve fixed
   inline storage, and detach/rebind Copy view headers without ending their
   backings, while `out` preserves the destination generation; public return and
-  mutable-retention summaries remain the existing parameter/capture root sets.
+  mutable-retention roots retain their existing parameter/capture meaning, and
+  the separate plan-80 effect records the direct-view mutation kind.
 
 The implementation lands as one boundary because generation transfer without
 projected observers and projected observers without generation transfer are

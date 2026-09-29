@@ -27,7 +27,7 @@ manual close functions through its safe public API.
 Issue 1066's concrete inline-body extension is owned by
 `74-interface-inline-body-plan.md`. It does not weaken this document's generic
 template or imported-header rules. The function-body record introduced by
-interface format 15 and retained by current format 16 gives functions an
+interface format 15 and retained by format 16 gives functions an
 explicit `Absent | GenericTemplate | ConcreteInline` discriminator. Only the
 generic arm enters monomorphization or recomputes public facts. A concrete inline
 body carries exact little-endian u32 policy version 3, is rechecked against every
@@ -5079,9 +5079,17 @@ unchanged-destination transition. An empty set selects the borrow-free replaceme
 transition. Other sets select the existing source-substitution transition. `out`
 never uses the unchanged sentinel. Adding or removing a self root can change the
 transition and is not authorized as a conservative normalization. Every exclusive
-call still invalidates pre-call dependent views and checks live resource dependents,
-including the unchanged transition. The record neither guarantees that a write
-executes nor supplies a return-value borrow summary.
+call checks live resource dependents and keeps pre-call invalidation unless the
+plan-80 direct-view effect proves a change; the unchanged transition still
+invalidates old observations. The record neither guarantees that a write
+executes nor supplies a return-value borrow summary. Plan 80 adds a separate
+format-17 effect for an eligible direct Copy-view `borrow mut` destination:
+retention roots alone cannot distinguish a descriptor rebind, an original or
+transient-target element write, or a partial overwrite. A proved change can preserve the addressed allocation
+and its old aliases, while their old element-owner dependencies remain until a
+complete whole-element overwrite is proved. Sources written through a transient
+rebind target remain in compatible backing candidates even after another rebind. An unavailable effect keeps this paragraph's
+conservative invalidation; live dependent resources still block the action.
 
 Conditional unchanged/fresh replacement is a mandatory safety cell: whole-program,
 imported, and replay checking must reject returning a view of possible fresh local

@@ -398,6 +398,12 @@ ownership model. Replacement through `borrow mut` uses the ordinary old-value Dr
 storing a new value, while an unchanged pointee remains caller-owned. Raw ownership transfer is
 limited to a standalone resource root, avoiding hidden per-field cleanup state.
 
+For a mutable Copy view, the header and its backing allocation are distinct: rebinding the header
+does not release the backing, while an element write updates that backing's shared content fact.
+Old aliases retain their captured header and any element-owner roots not proved overwritten
+by a whole-element store; transient rebind targets retain sources written through them;
+unknown call effects keep the existing conservative invalidation.
+
 Shared borrow also accepts stable Copy storage. Copy does not need borrow to preserve ownership,
 but it needs the same explicit pointer-to-caller-storage mode when a large structural value or a
 producer-generated typed callback must avoid a hidden by-value copy. This is one general ABI rule,
