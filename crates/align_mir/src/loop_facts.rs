@@ -3403,8 +3403,9 @@ mod tests {
             ));
         }
         function.blocks[0].term = Term::Return(None);
-        let cfg = Cfg::build(&function).expect("well-shaped fixture CFG");
-        let analysis = Analysis::new(&function, &cfg).expect("well-shaped fixture SSA");
+        let cfg = Cfg::build(&function).unwrap_or_else(|| panic!("nested-load fixture CFG"));
+        let analysis = Analysis::new(&function, &cfg)
+            .unwrap_or_else(|| panic!("nested-load fixture SSA"));
         let trusted_steps = BTreeSet::new();
         let inputs = InitProofInputs {
             function: &function,
