@@ -231,6 +231,67 @@ impl MutableRetentionRoot {
 /// `None` is unavailable; `Some` has one entry for every logical parameter.
 pub type MutableRetentionSummary = Option<Vec<Vec<MutableRetentionRoot>>>;
 
+/// Effects of an eligible direct Copy-view `borrow mut` parameter. The source lists are
+/// parameter-relative and retain transient writes even when the final header is rebound.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct MutableViewEffect {
+    pub may_write_original: bool,
+    pub must_write_original_element: bool,
+    pub may_rebind: bool,
+    pub must_rebind: bool,
+    pub write_roots: Vec<MutableRetentionRoot>,
+    pub rebind_roots: Vec<MutableRetentionRoot>,
+}
+
+/// `None` means unavailable. A present record has one optional effect per logical parameter.
+pub type MutableViewEffectSummary = Option<Vec<Option<MutableViewEffect>>>;
+
+/// Canonical shape shared by producer HIR, interface decoding, and imported HIR.
+/// `eligible` is computed from each consumer's resolved type graph.
+pub fn validate_mutable_view_effect(
+    summary: &MutableViewEffectSummary,
+    eligible: &[bool],
+    generic: bool,
+) -> Result<(), &'static str> {
+    let Some(effects) = summary else {
+        return Ok(());
+    };
+    if generic || effects.len() != eligible.len() {
+        return Err("mutable-view-effect count");
+    }
+    let parameter_count = eligible.len();
+    for (effect, is_eligible) in effects.iter().zip(eligible) {
+        if effect.is_some() != *is_eligible {
+            return Err("mutable-view-effect eligibility");
+        }
+        let Some(effect) = effect else {
+            continue;
+        };
+        if (effect.must_write_original_element && !effect.may_write_original)
+            || (effect.must_rebind && !effect.may_rebind)
+        {
+            return Err("mutable-view-effect flags");
+        }
+        if (!effect.may_rebind && !effect.rebind_roots.is_empty())
+            || effect.write_roots.windows(2).any(|pair| pair[0] >= pair[1])
+            || effect
+                .rebind_roots
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || effect
+                .write_roots
+                .iter()
+                .chain(&effect.rebind_roots)
+                .any(|root| {
+                    usize::try_from(root.index()).map_or(true, |index| index >= parameter_count)
+                })
+        {
+            return Err("mutable-view-effect roots");
+        }
+    }
+    Ok(())
+}
+
 /// Shared shape authority for interface decoding, in-memory imports, and checked HIR.
 pub fn validate_mutable_retention(
     summary: &MutableRetentionSummary,
@@ -296,6 +357,7 @@ pub struct ImportedFn {
     /// imported body. This validation-only interface fact is stripped before MIR construction.
     pub parallel_transfer_params: Vec<u32>,
     pub mutable_retention: MutableRetentionSummary,
+    pub mutable_view_effect: MutableViewEffectSummary,
 }
 
 /// Whether a callable can change the cleanup state carried by one parameter.
@@ -551,6 +613,7 @@ pub struct Fn {
     pub parallel_transfer: ReturnBorrowSummary,
     /// Re-inferred from the checked body; imported interfaces consume this exact result.
     pub mutable_retention: MutableRetentionSummary,
+    pub mutable_view_effect: MutableViewEffectSummary,
     /// All locals (params + `let` bindings), indexed by [`LocalId`]. Each is a slot.
     pub locals: Vec<Local>,
     pub body: Block,

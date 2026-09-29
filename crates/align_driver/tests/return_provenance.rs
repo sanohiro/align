@@ -6,6 +6,226 @@ use common::*;
 use align_interface::{ReturnBorrowSummary, ReturnRegionSummary};
 
 #[test]
+fn mutable_copy_view_effect_matrix() {
+    let cases = [
+        ("whole-one-cell", "dst[0] = \"static\"", "[view]", 0, true),
+        ("whole-two-cell", "dst[0] = \"static\"", "[\"first\", view]", 1, false),
+        ("no-op", "_ := dst.len()", "[view]", 0, false),
+        ("rebind", "dst = []", "[view]", 0, false),
+        ("write-then-rebind", "dst[0] = \"static\"\n  dst = []", "[view]", 0, true),
+        ("conditional-write", "if flag { dst[0] = \"static\" }", "[view]", 0, false),
+        (
+            "both-branches-write",
+            "if flag { dst[0] = \"static\" } else { dst[0] = \"other\" }",
+            "[view]",
+            0,
+            true,
+        ),
+        ("early-return", "if flag { return }\n  dst[0] = \"static\"", "[view]", 0, false),
+        ("loop-write", "loop { dst[0] = \"static\"; break }", "[view]", 0, true),
+        (
+            "loop-early-break",
+            "loop { if flag { break }; dst[0] = \"static\"; break }",
+            "[view]",
+            0,
+            false,
+        ),
+        (
+            "match-write",
+            "_ := match Some(flag) { Some(_) => { dst[0] = \"static\" } None => { dst[0] = \"static\" } }",
+            "[view]",
+            0,
+            true,
+        ),
+    ];
+    for (name, body, cells, observed, valid) in cases {
+        let source = format!(
+            "fn update(borrow mut dst: slice<str>, flag: bool) {{ {body} }}\nfn main() -> i32 {{\n  mut owner := \"old\".clone()\n  view: str := owner\n  mut cells := {cells}\n  mut dst: slice<str> := cells\n  alias := dst\n  update(dst, true)\n  owner = \"new\".clone()\n  return alias[{observed}].len() as i32\n}}\n"
+        );
+        let diagnostics = check_diagnostics(&format!("mutable-copy-view-matrix-{name}"), &source);
+        assert_eq!(
+            diagnostics.contains("source 'owner'"),
+            !valid,
+            "{name} must preserve exactly the observed old backing dependency:\n{diagnostics}"
+        );
+    }
+}
+
+#[test]
+fn mutable_copy_view_call_preserves_unwritten_old_alias_dependencies() {
+    let cases = [
+        (
+            "descriptor-rebind",
+            "fn reset(borrow mut destination: slice<str>) { destination = [] }\nfn main() -> i32 {\n  mut owner := \"old\".clone()\n  view: str := owner\n  mut values := [view]\n  mut destination: slice<str> := values\n  alias := destination\n  reset(destination)\n  owner = \"new\".clone()\n  _ := alias[0].len()\n  return 0\n}\n",
+        ),
+        (
+            "partial-element-write",
+            "fn reset(borrow mut destination: slice<str>) { destination[0] = \"static\" }\nfn main() -> i32 {\n  mut owner := \"old\".clone()\n  view: str := owner\n  mut values := [\"first\", view]\n  mut destination: slice<str> := values\n  alias := destination\n  reset(destination)\n  owner = \"new\".clone()\n  _ := alias[1].len()\n  return 0\n}\n",
+        ),
+    ];
+    for (name, source) in cases {
+        let diagnostics = check_diagnostics(&format!("mutable-copy-view-{name}"), source);
+        assert!(
+            diagnostics.contains("use of invalidated borrow 'alias'")
+                && diagnostics.contains("source 'owner'"),
+            "{name} must retain the old backing's untouched owner:\n{diagnostics}"
+        );
+    }
+}
+
+#[test]
+fn mutable_copy_view_transient_rebind_write_retains_the_temporary_target() {
+    let source = r#"
+fn transient(borrow mut dst: slice<str>, borrow mut target: slice<str>, value: str) {
+  dst = target
+  dst[0] = value
+  dst = []
+}
+fn main() -> i32 {
+  mut outer := ["original"]
+  mut dummy := ["dummy"]
+  mut dst: slice<str> := dummy
+  mut target: slice<str> := outer
+  arena {
+    n := 42
+    short := template "short={n}"
+    transient(dst, target, short)
+  }
+  return outer[0].len()
+}
+"#;
+    let diagnostics = check_diagnostics("mutable-copy-view-transient-rebind-write", source);
+    assert!(
+        diagnostics.contains("cannot retain a shorter-lived view"),
+        "a transient header must publish its write into the target backing:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn mutable_copy_view_one_row_soa_requires_a_whole_element_write() {
+    for (name, body, valid) in [
+        (
+            "whole",
+            "rows[0] = Row { left: \"new\", right: \"new\" }",
+            true,
+        ),
+        ("field", "rows[0].left = \"new\"", false),
+    ] {
+        let source = format!(
+            r#"
+Row {{ left: str, right: str }}
+fn update(borrow mut rows: soa<Row>) {{ {body} }}
+fn main() -> i32 {{
+  arena {{
+  mut owner := "old".clone()
+  view: str := owner
+  mut data := [Row {{ left: "first", right: view }}].to_soa()
+  mut rows: soa<Row> := data
+  alias := rows
+  update(rows)
+  owner = "later".clone()
+  return alias[0].right.len() as i32
+  }}
+}}
+"#
+        );
+        let diagnostics = check_diagnostics(&format!("mutable-view-soa-{name}"), &source);
+        assert_eq!(
+            diagnostics.contains("source 'owner'"),
+            !valid,
+            "{name} must distinguish a full element from a field store:\n{diagnostics}"
+        );
+    }
+}
+
+#[test]
+fn mutable_copy_view_rebind_to_fresh_region_keeps_its_header_root() {
+    let source = r#"
+fn install(borrow mut dst: slice<u8>, source: slice<u8>, out: region) {
+  dst = source.clone_in(out)
+}
+fn main() -> i32 {
+  mut values := [0 as u8]
+  mut dst: slice<u8> := values
+  arena short {
+    install(dst, "new".bytes(), short)
+  }
+  return dst[0] as i32
+}
+"#;
+    let diagnostics = check_diagnostics("mutable-view-fresh-region-header", source);
+    assert!(
+        diagnostics.contains("shorter-lived") || diagnostics.contains("invalidated borrow"),
+        "a fresh region-backed descriptor must not be treated as empty:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn mutable_copy_view_projected_header_writes_preserve_call_effects() {
+    let retargeted = r#"
+Holder { slot: slice<str> }
+fn write(borrow mut dst: slice<str>, target: slice<str>, value: str) {
+  mut holder := Holder { slot: dst }
+  holder.slot = target
+  mut selected := holder.slot
+  selected[0] = value
+}
+fn main() -> i32 {
+  mut original := ["old"]
+  mut target := ["old"]
+  mut dst: slice<str> := original
+  target_view: slice<str> := target
+  arena short {
+    n := 42
+    value := template "short={n}"
+    write(dst, target_view, value)
+  }
+  return target[0].len() as i32
+}
+"#;
+    let diagnostics = check_diagnostics("mutable-view-projected-retargeted", retargeted);
+    assert!(
+        diagnostics.contains("cannot retain a shorter-lived view"),
+        "a retargeted field must publish its write into the target backing:\n{diagnostics}"
+    );
+
+    let copied_local = retargeted.replace(
+        "mut holder := Holder { slot: dst }\n  holder.slot = target\n  mut selected := holder.slot",
+        "mut selected := dst\n  selected = target",
+    );
+    let diagnostics = check_diagnostics("mutable-view-copied-local-retargeted", &copied_local);
+    assert!(
+        diagnostics.contains("cannot retain a shorter-lived view"),
+        "a retargeted local copy must retain its original destination flow:\n{diagnostics}"
+    );
+
+    let full_write = r#"
+Holder { slot: slice<str> }
+fn write(borrow mut dst: slice<str>) {
+  mut holder := Holder { slot: [] }
+  holder.slot = dst
+  mut selected := holder.slot
+  selected[0] = "static"
+}
+fn main() -> i32 {
+  mut owner := "old".clone()
+  view: str := owner
+  mut values := [view]
+  mut dst: slice<str> := values
+  alias := dst
+  write(dst)
+  owner = "new".clone()
+  return alias[0].len() as i32
+}
+"#;
+    let diagnostics = check_diagnostics("mutable-view-projected-full-write", full_write);
+    assert!(
+        !diagnostics.contains("source 'owner'") && !diagnostics.contains("error:"),
+        "a guaranteed projected whole-element write must replace the one old cell:\n{diagnostics}"
+    );
+}
+
+#[test]
 fn materialized_string_chunks_retain_views_across_modules() {
     let files = [
         ("views.align", r#"module views

@@ -1700,6 +1700,7 @@ mod tests {
                 return_cleanup: hir::ReturnCleanupAbi::None,
                 parallel_transfer: hir::ReturnBorrowSummary::None,
                 mutable_retention: Some(vec![vec![]; 0]),
+                mutable_view_effect: None,
                 locals: Vec::new(),
                 body: Block {
                     stmts: Vec::new(),
@@ -1762,6 +1763,7 @@ mod tests {
                 return_cleanup: hir::ReturnCleanupAbi::DynamicBit,
                 parallel_transfer: hir::ReturnBorrowSummary::None,
                 mutable_retention: Some(vec![vec![]; 1]),
+                mutable_view_effect: None,
                 locals: vec![hir::Local {
                     id: 0,
                     name: "value".to_string(),
@@ -1834,6 +1836,7 @@ mod tests {
                 return_cleanup: hir::ReturnCleanupAbi::DynamicBit,
                 parallel_transfer: hir::ReturnBorrowSummary::None,
                 mutable_retention: Some(vec![vec![]; 1]),
+                mutable_view_effect: None,
                 locals: vec![hir::Local {
                     id: 0,
                     name: "value".to_string(),
@@ -1912,6 +1915,7 @@ mod tests {
                 },
                 parallel_transfer: hir::ReturnBorrowSummary::None,
                 mutable_retention: Some(vec![vec![]; 1]),
+                mutable_view_effect: None,
                 locals: vec![hir::Local {
                     id: 0,
                     name: "value".to_string(),
@@ -2360,6 +2364,7 @@ mod tests {
                 },
                 parallel_transfer: hir::ReturnBorrowSummary::None,
                 mutable_retention: Some(vec![vec![]; 1]),
+                mutable_view_effect: None,
                 locals: vec![hir::Local {
                     id: 0,
                     name: "value".to_string(),
@@ -2531,6 +2536,7 @@ mod tests {
                     let named_return_borrow = std::collections::HashMap::new();
                     let named_param_modes = std::collections::HashMap::new();
                     let named_borrow_mut_retention = std::collections::HashMap::new();
+                    let named_view_effect = std::collections::HashMap::new();
                     let callable_targets =
                         vec![crate::CallableTargetSet::new(); move_program.fn_types.len()];
                     let callable_target_ids = std::collections::HashMap::new();
@@ -2542,6 +2548,7 @@ mod tests {
                         named_parallel_transfer: &named_return_borrow,
                         named_param_modes: &named_param_modes,
                         named_borrow_mut_retention: &named_borrow_mut_retention,
+                        named_view_effect: &named_view_effect,
                         summary_dependencies: None,
                         tuples: &move_program.tuples,
                         structs: &move_program.structs,
@@ -2574,6 +2581,7 @@ mod tests {
                             crate::BorrowRoots::new();
                             move_program.fns[0].params.len()
                         ],
+                        view_effect_exits: None,
                         non_fallthrough: std::collections::HashSet::new(),
                         borrow_fact_cache: std::cell::RefCell::new(None),
                         collecting_move_children: false,
@@ -2591,6 +2599,8 @@ mod tests {
                 let named_return_region = std::collections::HashMap::new();
                 let named_param_modes = std::collections::HashMap::new();
                 let named_borrow_mut_retention = std::collections::HashMap::new();
+                let named_view_effect = std::collections::HashMap::new();
+                let callable_target_ids = std::collections::HashMap::new();
                 {
                     let function = &program.fns[0];
                     let mut escape = crate::EscapeCheck {
@@ -2599,7 +2609,9 @@ mod tests {
                         named_return_region: &named_return_region,
                         named_param_modes: &named_param_modes,
                         named_borrow_mut_retention: &named_borrow_mut_retention,
+                        named_view_effect: &named_view_effect,
                         callable_targets: &[],
+                        callable_target_ids: &callable_target_ids,
                         fn_types: &program.fn_types,
                         tuples: &program.tuples,
                         structs: &program.structs,

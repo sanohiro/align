@@ -154,7 +154,7 @@ Owner              align_interface owns selection input, format 15, canonical
                   reconstruction, external fact/extern closure injection,
                   cache identity, object/link parity and acceptance evidence.
 
-Artifact/cache     Current interface format 16 retains the function-body record
+Artifact/cache     Current interface format 17 retains the function-body record
                   introduced by format 15. The body kind is encoded after
                   `resource_hook_body`: u8 `0`
                   absent; u8 `1`, then the existing u32-length UTF-8 source for

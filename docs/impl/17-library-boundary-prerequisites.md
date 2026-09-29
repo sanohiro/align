@@ -27,7 +27,7 @@ manual close functions through its safe public API.
 Issue 1066's concrete inline-body extension is owned by
 `74-interface-inline-body-plan.md`. It does not weaken this document's generic
 template or imported-header rules. The function-body record introduced by
-interface format 15 and retained by format 16 gives functions an
+interface format 15 and retained through format 17 gives functions an
 explicit `Absent | GenericTemplate | ConcreteInline` discriminator. Only the
 generic arm enters monomorphization or recomputes public facts. A concrete inline
 body carries exact little-endian u32 policy version 3, is rechecked against every

@@ -205,6 +205,7 @@ pub struct IFnSig {
     /// Canonical parameter roots whose contained views may be transferred to parallel workers.
     pub parallel_transfer_params: Vec<u32>,
     pub mutable_retention: align_sema::hir::MutableRetentionSummary,
+    pub mutable_view_effect: align_sema::hir::MutableViewEffectSummary,
     /// Whether the producer source has the exact top-level `unsafe {}` body shape required of a
     /// resource Drop hook. This is semantic validation metadata, not an importable hook path.
     pub resource_hook_body: bool,
@@ -592,6 +593,17 @@ pub fn build_summaries_with_effects(
         .map(|function| (function.name.as_str(), function.mutable_retention.clone()))
         .chain(program.imported_fns.iter().map(|function| (function.name.as_str(), function.mutable_retention.clone())))
         .collect();
+    let mutable_view_effect: HashMap<&str, _> = program
+        .fns
+        .iter()
+        .map(|function| (function.name.as_str(), function.mutable_view_effect.clone()))
+        .chain(
+            program
+                .imported_fns
+                .iter()
+                .map(|function| (function.name.as_str(), function.mutable_view_effect.clone())),
+        )
+        .collect();
     let caps_by_unit = partition_capabilities(modules, mir);
     let impl_hash_by_unit = partition_impl_hashes(modules, mir);
     let resource_hooks = program
@@ -835,6 +847,14 @@ pub fn build_summaries_with_effects(
                             mutable_retention: if is_generic { None } else {
                                 mutable_retention.get(canonical.as_str()).cloned().flatten()
                             },
+                            mutable_view_effect: if is_generic {
+                                None
+                            } else {
+                                mutable_view_effect
+                                    .get(canonical.as_str())
+                                    .cloned()
+                                    .flatten()
+                            },
                             resource_hook_body,
                             body,
                         });
@@ -1012,6 +1032,11 @@ pub fn build_summaries_with_effects(
             interface_hash: Hash128 { lo: 0, hi: 0 },
             impl_hash: Hash128 { lo: 0, hi: 0 },
         };
+        for function in &summary.fns {
+            validate_mutable_view_effect_signature(function).map_err(|message| {
+                format!("unit '{}' function '{}': {message}", m.path, function.name)
+            })?;
+        }
         summary.interface_hash = Hash128::of(&codec::encode_interface_surface(&summary));
         // Legacy whole-program summary hash: attribute stable-printed function MIR to each source
         // unit. The per-unit driver replaces this value with `codegen_impl_hash` over the exact
@@ -1309,6 +1334,7 @@ pub enum ImportCompatibilityError {
     ReturnSummaryGenerativeCapabilityGraph,
     ParallelTransferRootsNonCanonical,
     InvalidMutableRetention(&'static str),
+    InvalidMutableViewEffect(&'static str),
     ReturnCleanupMismatch,
     DropStateEffectMismatch,
 }
@@ -1432,6 +1458,7 @@ impl std::fmt::Display for ImportCompatibilityError {
                 )
             }
             ImportCompatibilityError::InvalidMutableRetention(message) => write!(f, "{message}"),
+            ImportCompatibilityError::InvalidMutableViewEffect(message) => write!(f, "{message}"),
             ImportCompatibilityError::ParallelTransferRootsNonCanonical => {
                 write!(f, "interface parallel-transfer roots are not strictly increasing")
             }
@@ -2858,6 +2885,38 @@ fn validate_return_cleanup_metadata(
     Ok(())
 }
 
+/// Resolve direct-view eligibility after the complete interface type graph has been decoded.
+fn validate_mutable_view_effect_signature(function: &IFnSig) -> Result<(), &'static str> {
+    if function.mutable_view_effect.is_some()
+        && function.producer_certification != ProducerCertification::ValidatedBody
+    {
+        return Err("mutable-view-effect eligibility");
+    }
+    let eligible = function
+        .params
+        .iter()
+        .map(|parameter| {
+            parameter.mode == ParamMode::BorrowMut
+                && matches!(&parameter.ty, IType::Named { path, args }
+                if matches!(path.as_str(), "slice" | "soa") && args.len() == 1)
+        })
+        .collect::<Vec<_>>();
+    align_sema::hir::validate_mutable_view_effect(
+        &function.mutable_view_effect,
+        &eligible,
+        !function.type_params.is_empty(),
+    )
+}
+
+pub(crate) fn validate_mutable_view_effects(
+    summary: &InterfaceSummary,
+) -> Result<(), &'static str> {
+    for function in &summary.fns {
+        validate_mutable_view_effect_signature(function)?;
+    }
+    Ok(())
+}
+
 /// Validate that a decoded interface uses the enabled semantic subset. Codec validation has
 /// already proved canonical return summaries; this gate proves ownership-dependent mode facts
 /// before reconstructing imported source.
@@ -2904,6 +2963,8 @@ pub fn validate_for_import(
             matches!(function.body, IFnBody::GenericTemplate(_)),
         )
         .map_err(ImportCompatibilityError::InvalidMutableRetention)?;
+        validate_mutable_view_effect_signature(function)
+            .map_err(ImportCompatibilityError::InvalidMutableViewEffect)?;
         if function.params.iter().any(|parameter| {
             matches!(parameter.mode, ParamMode::Borrow | ParamMode::BorrowMut)
                 && matches!(&parameter.ty, IType::Named { path, args }
@@ -3285,6 +3346,7 @@ pub fn summary_return_provenance(
                     }
                     IFnBody::Absent | IFnBody::GenericTemplate(_) => None,
                 },
+                function.mutable_view_effect.clone(),
             ),
         );
     }
@@ -3433,6 +3495,7 @@ mod builtin_spelling_tests {
                 effect: Effect::Pure,
                 parallel_transfer_params: Vec::new(),
                 mutable_retention: None,
+                mutable_view_effect: None,
                 resource_hook_body: false,
                 body: IFnBody::Absent,
             }],
