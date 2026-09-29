@@ -117,27 +117,45 @@ fn spawn_watch_args(
 }
 
 fn wait_for(rx: &Receiver<String>, needle: &str) -> Vec<String> {
+    wait_for_matching(rx, needle, |line| line.contains(needle))
+}
+
+fn wait_for_ready_at_least(rx: &Receiver<String>, minimum_revision: u64) -> Vec<String> {
+    let expected = format!("revision {minimum_revision} or later ready");
+    wait_for_matching(rx, &expected, |line| {
+        line.strip_prefix("alignc: watch: revision ")
+            .and_then(|revision| revision.strip_suffix(" ready"))
+            .and_then(|revision| revision.parse::<u64>().ok())
+            .is_some_and(|revision| revision >= minimum_revision)
+    })
+}
+
+fn wait_for_matching(
+    rx: &Receiver<String>,
+    expected: &str,
+    matches: impl Fn(&str) -> bool,
+) -> Vec<String> {
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut lines = Vec::new();
     loop {
         let timeout = deadline.saturating_duration_since(Instant::now());
         assert!(
             !timeout.is_zero(),
-            "timed out waiting for {needle:?}; lines={lines:#?}"
+            "timed out waiting for {expected:?}; lines={lines:#?}"
         );
         match rx.recv_timeout(timeout) {
             Ok(line) => {
-                let found = line.contains(needle);
+                let found = matches(&line);
                 lines.push(line);
                 if found {
                     return lines;
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
-                panic!("timed out waiting for {needle:?}; lines={lines:#?}")
+                panic!("timed out waiting for {expected:?}; lines={lines:#?}")
             }
             Err(RecvTimeoutError::Disconnected) => {
-                panic!("watch process closed before {needle:?}; lines={lines:#?}")
+                panic!("watch process closed before {expected:?}; lines={lines:#?}")
             }
         }
     }
@@ -217,7 +235,9 @@ fn one_process_builds_edit_and_revert_then_stops_cleanly() {
     std::fs::write(&entry, source(2)).expect("edit source");
     wait_for(&lines, "revision 2 ready");
     std::fs::write(&entry, source(1)).expect("revert source");
-    wait_for(&lines, "revision 3 ready");
+    // A normal file write may be observed between truncation and completion. The watcher then
+    // retries that unstable revision and publishes the next one once the reverted bytes settle.
+    wait_for_ready_at_least(&lines, 3);
     let (status, stdout) = stop(child);
     assert_eq!(status.code(), Some(143));
     assert!(
