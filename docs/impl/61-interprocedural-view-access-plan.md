@@ -589,9 +589,9 @@ use while its generated runtime behavior remains unchanged.
 
 This record closes the observation part of source event semantics; the
 checked-HIR placement inventory below fixes its evaluation boundaries. Keep one
-MIR statement variant containing a closed event enum. Its logical cases
-are below; canonical bundle tags belong to the unified wire record, not a second
-independently versioned source-event codec.
+source-only stream positioned among initial MIR statements with a closed event
+enum. Its logical cases are below; canonical bundle tags belong to the unified
+wire record, not a second independently versioned source-event codec.
 
 | Event | Fields | Transfer |
 | --- | --- | --- |
@@ -698,7 +698,7 @@ The policy record is a total structural function after checked-HIR validation:
 | --- | --- |
 | `value_snapshot` | BorrowedIndex, a registered mutable actual root, array-builder type, any storage header/carrier, expanded DynArray/DynStructArray type, or `ty_may_borrow`. These are OR alternatives. |
 | `completion_snapshot` | `value_snapshot` OR membership in the mutable-call argument registry. |
-| `defer_child_check` | Block, Arena, NamedArena, TaskGroup, Unsafe, If, Match, ElseUnwrap, Loop, or Binary And/Or. All other variants are false. |
+| `defer_child_check` | Block, FloatScope, Arena, NamedArena, TaskGroup, Unsafe, If, Match, ElseUnwrap, Loop, or Binary And/Or. All other variants are false. |
 | `ownership_action` | Call, CallFnValue, DbBridgeCall, StructLit, Tuple, ArrayLit, OptionSome, ResultOk, ResultErr, EnumValue, LogNew, XmlParse or Closure. All other variants are false. |
 | `drop_child_byte_observations` | `!value_snapshot` OR StrBytes. This removes byte-validation obligations only; it does not release a retained lifetime or runtime owner. |
 | `intentional_destinations` | Exact BorrowMut argument expressions in argument order for Call/CallFnValue; otherwise the exact destinations of the closed source-visible mutation record, in its declared input order. No match produces an empty vector. |
