@@ -1880,7 +1880,8 @@ fn clone_function(function: &hir::Fn, erase_spans: bool) -> Option<(hir::Fn, Vec
         return_cleanup: function.return_cleanup,
         parallel_transfer: function.parallel_transfer.clone(),
         mutable_retention: function.mutable_retention.clone(),
-        locals: function.locals.clone(),
+            mutable_view_effect: function.mutable_view_effect.clone(),
+            locals: function.locals.clone(),
         body,
         span: if erase_spans {
                 align_span::Span::new(0, 0, 0)
@@ -2000,6 +2001,7 @@ fn drop_functions(fns: Vec<hir::Fn>) {
                     return_cleanup,
                     parallel_transfer,
                     mutable_retention,
+                    mutable_view_effect,
                     locals,
                     body,
                     span,
@@ -2018,6 +2020,7 @@ fn drop_functions(fns: Vec<hir::Fn>) {
                     return_cleanup,
                     parallel_transfer,
                     mutable_retention,
+                    mutable_view_effect,
                     locals,
                     span,
                     drop_locals,
@@ -3132,6 +3135,7 @@ mod tests {
                 return_cleanup: hir::ReturnCleanupAbi::None,
                 parallel_transfer: hir::ReturnBorrowSummary::None,
                 mutable_retention: Some(vec![vec![]; 0]),
+                mutable_view_effect: None,
                 locals: Vec::new(),
                 body,
                 span: Span::new(0, 0, 0),

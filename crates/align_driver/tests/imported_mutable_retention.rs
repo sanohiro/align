@@ -3,6 +3,85 @@ mod common;
 use common::*;
 
 #[test]
+fn mutable_copy_view_effect_transport() {
+    let helper = r#"module helper
+pub fn write(borrow mut dst: slice<str>, value: str) { dst[0] = value }
+pub fn reset(borrow mut dst: slice<str>) { dst = [] }
+pub fn rebind<T>(borrow mut dst: T, value: T) { dst = value }
+"#;
+    for (name, call, cells, observed, valid) in [
+        (
+            "one-cell-write",
+            "helper.write(dst, \"static\")",
+            "[view]",
+            0,
+            true,
+        ),
+        (
+            "indirect-one-cell-write",
+            "f := helper.write; f(dst, \"static\")",
+            "[view]",
+            0,
+            true,
+        ),
+        (
+            "two-cell-write",
+            "helper.write(dst, \"static\")",
+            "[\"first\", view]",
+            1,
+            false,
+        ),
+        ("header-rebind", "helper.reset(dst)", "[view]", 0, false),
+        (
+            "generic-header-rebind",
+            "empty: slice<str> := []; helper.rebind(dst, empty)",
+            "[view]",
+            0,
+            false,
+        ),
+    ] {
+        let main = format!(
+            r#"module main
+import helper
+fn main() -> i32 {{
+  mut owner := "old".clone()
+  view: str := owner
+  mut values := {cells}
+  mut dst: slice<str> := values
+  alias := dst
+  {call}
+  owner = "new".clone()
+  return alias[{observed}].len() as i32
+}}
+"#
+        );
+        let checked = diff_check_multi(
+            &format!("mutable-copy-view-transport-{name}"),
+            &[("helper.align", helper), ("main.align", &main)],
+            "main.align",
+        );
+        assert_eq!(
+            checked.whole_errors, !valid,
+            "{name} whole: {}",
+            checked.whole_diags
+        );
+        assert_eq!(
+            checked.per_unit_errors, !valid,
+            "{name} per-unit: {}",
+            checked.per_unit_diags
+        );
+        if !valid {
+            for diagnostics in [&checked.whole_diags, &checked.per_unit_diags] {
+                assert!(
+                    diagnostics.contains("source 'owner'"),
+                    "{name}: {diagnostics}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn independent_outputs_and_cloned_local_operands_cross_modules() {
     let helper = r#"module helper
 pub Cols { count: i64, ids: array<i64> }

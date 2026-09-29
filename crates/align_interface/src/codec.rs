@@ -19,7 +19,7 @@ use crate::{
 /// The interface-artifact format version. Bump on ANY encoding change; a bump invalidates every
 /// cached summary (an old version fails closed on read) and changes `interface_hash` (the version is
 /// part of the hashed surface).
-pub const FORMAT_VERSION: u32 = 16;
+pub const FORMAT_VERSION: u32 = 17;
 
 const MAX_TYPE_DEPTH: u32 = 128;
 
@@ -239,6 +239,131 @@ fn read_mutable_retention(
     Ok(summary)
 }
 
+fn write_mutable_view_effect(w: &mut Writer, summary: &align_sema::hir::MutableViewEffectSummary) {
+    use align_sema::hir::MutableRetentionRoot;
+    let write_roots = |w: &mut Writer, roots: &[MutableRetentionRoot]| {
+        w.seq(roots, |w, root| {
+            w.u8(match root {
+                MutableRetentionRoot::Contained(_) => 0,
+                MutableRetentionRoot::Storage(_) => 1,
+            });
+            w.u32(root.index());
+        });
+    };
+    match summary {
+        None => w.u8(0),
+        Some(effects) => {
+            w.u8(1);
+            w.seq(effects, |w, effect| match effect {
+                None => w.u8(0),
+                Some(effect) => {
+                    w.u8(1);
+                    w.u8(u8::from(effect.may_write_original)
+                        | (u8::from(effect.must_write_original_element) << 1)
+                        | (u8::from(effect.may_rebind) << 2)
+                        | (u8::from(effect.must_rebind) << 3));
+                    write_roots(w, &effect.write_roots);
+                    write_roots(w, &effect.rebind_roots);
+                }
+            });
+        }
+    }
+}
+
+fn read_mutable_view_effect(
+    r: &mut Reader<'_>,
+    parameter_count: usize,
+    generic: bool,
+) -> Result<align_sema::hir::MutableViewEffectSummary, DecodeError> {
+    use align_sema::hir::{MutableRetentionRoot, MutableViewEffect};
+    let read_roots = |r: &mut Reader<'_>| -> Result<Vec<MutableRetentionRoot>, DecodeError> {
+        let count = usize::try_from(r.u32()?)
+            .map_err(|_| DecodeError::InvalidSummary("mutable-view-effect count"))?;
+        if count > parameter_count.saturating_mul(2) {
+            return Err(DecodeError::InvalidSummary("mutable-view-effect count"));
+        }
+        let mut roots = Vec::with_capacity(count);
+        for _ in 0..count {
+            let tag = r.u8()?;
+            let ordinal = match tag {
+                0 | 1 => r.u32()?,
+                tag => {
+                    return Err(DecodeError::BadTag {
+                        what: "mutable-view-effect root",
+                        tag,
+                    });
+                }
+            };
+            if usize::try_from(ordinal).map_or(true, |ordinal| ordinal >= parameter_count) {
+                return Err(DecodeError::InvalidSummary("mutable-view-effect roots"));
+            }
+            let root = if tag == 0 {
+                MutableRetentionRoot::Contained(ordinal)
+            } else {
+                MutableRetentionRoot::Storage(ordinal)
+            };
+            if roots.last().is_some_and(|previous| *previous >= root) {
+                return Err(DecodeError::InvalidSummary("mutable-view-effect roots"));
+            }
+            roots.push(root);
+        }
+        Ok(roots)
+    };
+    let summary = match r.u8()? {
+        0 => return Ok(None),
+        1 => {
+            let count = usize::try_from(r.u32()?)
+                .map_err(|_| DecodeError::InvalidSummary("mutable-view-effect count"))?;
+            if generic || count != parameter_count {
+                return Err(DecodeError::InvalidSummary("mutable-view-effect count"));
+            }
+            let mut effects = Vec::with_capacity(count);
+            for _ in 0..count {
+                let effect = match r.u8()? {
+                    0 => None,
+                    1 => {
+                        let flags = r.u8()?;
+                        if flags & 0xf0 != 0
+                            || (flags & 0x02 != 0 && flags & 0x01 == 0)
+                            || (flags & 0x08 != 0 && flags & 0x04 == 0)
+                        {
+                            return Err(DecodeError::InvalidSummary("mutable-view-effect flags"));
+                        }
+                        let write_roots = read_roots(r)?;
+                        let rebind_roots = read_roots(r)?;
+                        if flags & 0x04 == 0 && !rebind_roots.is_empty() {
+                            return Err(DecodeError::InvalidSummary("mutable-view-effect roots"));
+                        }
+                        Some(MutableViewEffect {
+                            may_write_original: flags & 0x01 != 0,
+                            must_write_original_element: flags & 0x02 != 0,
+                            may_rebind: flags & 0x04 != 0,
+                            must_rebind: flags & 0x08 != 0,
+                            write_roots,
+                            rebind_roots,
+                        })
+                    }
+                    tag => {
+                        return Err(DecodeError::BadTag {
+                            what: "mutable-view-effect option",
+                            tag,
+                        });
+                    }
+                };
+                effects.push(effect);
+            }
+            Some(effects)
+        }
+        tag => {
+            return Err(DecodeError::BadTag {
+                what: "mutable-view-effect option",
+                tag,
+            });
+        }
+    };
+    Ok(summary)
+}
+
 fn write_fn(w: &mut Writer, f: &IFnSig) {
     w.str(&f.name);
     write_type_params(w, &f.type_params);
@@ -252,6 +377,7 @@ fn write_fn(w: &mut Writer, f: &IFnSig) {
     write_effect(w, f.effect);
     w.seq(&f.parallel_transfer_params, |w, root| w.u32(*root));
     write_mutable_retention(w, &f.mutable_retention);
+    write_mutable_view_effect(w, &f.mutable_view_effect);
     w.bool(f.resource_hook_body);
     write_fn_body(w, &f.body);
 }
@@ -697,6 +823,7 @@ fn read_fn(r: &mut Reader<'_>) -> Result<IFnSig, DecodeError> {
     let parallel_transfer_params = r.seq(|r| r.u32())?;
     validate_transfer_roots(&parallel_transfer_params, params.len())?;
     let mutable_retention = read_mutable_retention(r, &params, !type_params.is_empty())?;
+    let mutable_view_effect = read_mutable_view_effect(r, params.len(), !type_params.is_empty())?;
     let resource_hook_body = r.bool()?;
     let body = read_fn_body(r)?;
     let certification_matches_body = match producer_certification {
@@ -725,6 +852,7 @@ fn read_fn(r: &mut Reader<'_>) -> Result<IFnSig, DecodeError> {
         effect,
         parallel_transfer_params,
         mutable_retention,
+        mutable_view_effect,
         resource_hook_body,
         body,
     })
@@ -895,6 +1023,7 @@ fn deserialize_impl(
     if Hash128::of(&bytes[..surface_len]) != summary.interface_hash {
         return Err(DecodeError::InterfaceHashMismatch);
     }
+    crate::validate_mutable_view_effects(&summary).map_err(DecodeError::InvalidSummary)?;
     if matches!(
         crate::validate_for_import(&summary),
         Err(crate::ImportCompatibilityError::DropStateEffectMismatch)
@@ -1073,6 +1202,236 @@ mod tests {
         let bad_root = [1, 2, 0, 0, 0, 1, 0, 0, 0, 2];
         assert!(matches!(read_mutable_retention(&mut Reader::new(&bad_root), &params, false), Err(DecodeError::BadTag { what: "mutable-retention root", tag: 2 })));
         assert!(read_mutable_retention(&mut Reader::new(&[1, 0, 0, 0, 0]), &[], true).is_err());
+    }
+
+    #[test]
+    fn mutable_view_effect_has_independent_byte_goldens_and_rejects_malformed_records() {
+        use align_sema::hir::{MutableRetentionRoot::Contained, MutableViewEffect};
+        let effect = |flags: u8, rebind_roots| MutableViewEffect {
+            may_write_original: flags & 1 != 0,
+            must_write_original_element: flags & 2 != 0,
+            may_rebind: flags & 4 != 0,
+            must_rebind: flags & 8 != 0,
+            write_roots: Vec::new(),
+            rebind_roots,
+        };
+        let cases = [
+            (None, vec![0], 0),
+            (Some(vec![None]), vec![1, 1, 0, 0, 0, 0], 1),
+            (
+                Some(vec![Some(effect(0, vec![]))]),
+                vec![1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                1,
+            ),
+            (
+                Some(vec![Some(effect(3, vec![]))]),
+                vec![1, 1, 0, 0, 0, 1, 3, 0, 0, 0, 0, 0, 0, 0, 0],
+                1,
+            ),
+            (
+                Some(vec![Some(effect(12, vec![Contained(1)])), None]),
+                vec![
+                    1, 2, 0, 0, 0, 1, 12, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+                ],
+                2,
+            ),
+        ];
+        for (record, literal, parameter_count) in cases {
+            let mut writer = Writer::new();
+            write_mutable_view_effect(&mut writer, &record);
+            assert_eq!(writer.buf, literal, "semantic-to-byte vector");
+            let mut reader = Reader::new(&literal);
+            assert_eq!(
+                read_mutable_view_effect(&mut reader, parameter_count, false),
+                Ok(record),
+                "byte-to-semantic vector"
+            );
+            assert_eq!(reader.finish(), Ok(()));
+            for end in 0..literal.len() {
+                assert!(
+                    read_mutable_view_effect(
+                        &mut Reader::new(&literal[..end]),
+                        parameter_count,
+                        false
+                    )
+                    .is_err()
+                );
+            }
+        }
+        assert_eq!(
+            read_mutable_view_effect(&mut Reader::new(&[2]), 0, false),
+            Err(DecodeError::BadTag {
+                what: "mutable-view-effect option",
+                tag: 2
+            })
+        );
+        assert_eq!(
+            read_mutable_view_effect(&mut Reader::new(&[1, 2, 0, 0, 0]), 1, false),
+            Err(DecodeError::InvalidSummary("mutable-view-effect count"))
+        );
+        assert_eq!(
+            read_mutable_view_effect(&mut Reader::new(&[1, 1, 0, 0, 0, 1, 0x10]), 1, false),
+            Err(DecodeError::InvalidSummary("mutable-view-effect flags"))
+        );
+        assert_eq!(
+            read_mutable_view_effect(&mut Reader::new(&[1, 1, 0, 0, 0, 1, 2]), 1, false),
+            Err(DecodeError::InvalidSummary("mutable-view-effect flags"))
+        );
+        let malformed = |flags: u8, write_roots: &[(u8, u32)], rebind_roots: &[(u8, u32)]| {
+            let mut bytes = vec![1, 2, 0, 0, 0, 1, flags];
+            bytes.extend_from_slice(&(write_roots.len() as u32).to_le_bytes());
+            for &(tag, ordinal) in write_roots {
+                bytes.push(tag);
+                bytes.extend_from_slice(&ordinal.to_le_bytes());
+            }
+            bytes.extend_from_slice(&(rebind_roots.len() as u32).to_le_bytes());
+            for &(tag, ordinal) in rebind_roots {
+                bytes.push(tag);
+                bytes.extend_from_slice(&ordinal.to_le_bytes());
+            }
+            bytes.push(0);
+            bytes
+        };
+        for (bytes, expected) in [
+            (
+                malformed(4, &[(2, 0)], &[]),
+                DecodeError::BadTag {
+                    what: "mutable-view-effect root",
+                    tag: 2,
+                },
+            ),
+            (
+                malformed(4, &[(0, 2)], &[]),
+                DecodeError::InvalidSummary("mutable-view-effect roots"),
+            ),
+            (
+                malformed(4, &[(0, 1), (0, 1)], &[]),
+                DecodeError::InvalidSummary("mutable-view-effect roots"),
+            ),
+            (
+                malformed(4, &[(1, 0), (0, 1)], &[]),
+                DecodeError::InvalidSummary("mutable-view-effect roots"),
+            ),
+            (
+                malformed(0, &[], &[(0, 1)]),
+                DecodeError::InvalidSummary("mutable-view-effect roots"),
+            ),
+            (
+                malformed(0x10, &[(2, 0)], &[]),
+                DecodeError::InvalidSummary("mutable-view-effect flags"),
+            ),
+            (
+                malformed(8, &[], &[(2, 0)]),
+                DecodeError::InvalidSummary("mutable-view-effect flags"),
+            ),
+        ] {
+            assert_eq!(
+                read_mutable_view_effect(&mut Reader::new(&bytes), 2, false),
+                Err(expected)
+            );
+        }
+        let mut oversized = malformed(4, &[], &[]);
+        oversized[7..11].copy_from_slice(&5_u32.to_le_bytes());
+        assert_eq!(
+            read_mutable_view_effect(&mut Reader::new(&oversized), 2, false),
+            Err(DecodeError::InvalidSummary("mutable-view-effect count"))
+        );
+        assert_eq!(
+            read_mutable_view_effect(&mut Reader::new(&[1, 0, 0, 0, 0]), 0, true),
+            Err(DecodeError::InvalidSummary("mutable-view-effect count"))
+        );
+    }
+
+    #[test]
+    fn mutable_view_effect_semantic_rejection_follows_trailing_and_hash_checks() {
+        use crate::ProducerCertification;
+        use align_sema::hir::{MutableViewEffect, ReturnCleanupAbi};
+        let named = |path: &str, args: Vec<IType>| IType::Named {
+            path: path.to_owned(),
+            args,
+        };
+        let mut summary = InterfaceSummary {
+            unit: "views".to_owned(),
+            fns: vec![IFnSig {
+                name: "update".to_owned(),
+                type_params: Vec::new(),
+                params: vec![IParam {
+                    mode: ParamMode::BorrowMut,
+                    ty: named("slice", vec![named("str", Vec::new())]),
+                }],
+                ret: named("()", Vec::new()),
+                return_borrow: ReturnBorrowSummary::None,
+                return_region: ReturnRegionSummary::None,
+                return_cleanup: ReturnCleanupAbi::None,
+                drop_state_effects: vec![align_sema::hir::DropStateEffect::NotApplicable],
+                producer_certification: ProducerCertification::ValidatedBody,
+                effect: Effect::Impure,
+                parallel_transfer_params: Vec::new(),
+                mutable_retention: Some(vec![Vec::new()]),
+                mutable_view_effect: Some(vec![Some(MutableViewEffect::default())]),
+                resource_hook_body: false,
+                body: IFnBody::Absent,
+            }],
+            structs: Vec::new(),
+            owned_json_graphs: Vec::new(),
+            enums: Vec::new(),
+            resources: Vec::new(),
+            consts: Vec::new(),
+            capabilities: Vec::new(),
+            interface_hash: Hash128 { lo: 0, hi: 0 },
+            impl_hash: Hash128 { lo: 0, hi: 0 },
+        };
+        summary.interface_hash = Hash128::of(&encode_interface_surface(&summary));
+        let valid = serialize(&summary);
+        assert_eq!(deserialize(&valid), Ok(summary.clone()));
+        let original_hash = summary.interface_hash;
+        summary.fns[0].mutable_view_effect.as_mut().unwrap()[0]
+            .as_mut()
+            .unwrap()
+            .may_write_original = true;
+        assert_ne!(
+            Hash128::of(&encode_interface_surface(&summary)),
+            original_hash
+        );
+        summary.fns[0].mutable_view_effect.as_mut().unwrap()[0]
+            .as_mut()
+            .unwrap()
+            .may_write_original = false;
+        assert_eq!(
+            Hash128::of(&encode_interface_surface(&summary)),
+            original_hash
+        );
+        let mut trailing = valid.clone();
+        trailing.push(0xff);
+        assert_eq!(deserialize(&trailing), Err(DecodeError::TrailingBytes));
+        let mut old_version = valid.clone();
+        old_version[..4].copy_from_slice(&16_u32.to_le_bytes());
+        assert_eq!(
+            deserialize(&old_version),
+            Err(DecodeError::UnknownVersion(16))
+        );
+
+        summary.fns[0].params[0].mode = ParamMode::ByValue;
+        assert_eq!(
+            deserialize(&serialize(&summary)),
+            Err(DecodeError::InterfaceHashMismatch)
+        );
+        summary.interface_hash = Hash128::of(&encode_interface_surface(&summary));
+        assert_eq!(
+            deserialize(&serialize(&summary)),
+            Err(DecodeError::InvalidSummary(
+                "mutable-view-effect eligibility"
+            ))
+        );
+        summary.fns[0].params[0].mode = ParamMode::BorrowMut;
+        summary.fns[0].producer_certification = ProducerCertification::RevalidateGenericBody;
+        summary.interface_hash = Hash128::of(&encode_interface_surface(&summary));
+        assert_eq!(
+            deserialize(&serialize(&summary)),
+            Err(DecodeError::InvalidSummary(
+                "producer certification disagrees with function body presence"
+            ))
+        );
     }
 
     #[test]

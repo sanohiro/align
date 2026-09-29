@@ -7884,6 +7884,7 @@ pub type ExternalReturnProvenance = std::collections::HashMap<
         hir::MutableRetentionSummary,
         Vec<hir::DropStateEffect>,
         Option<Vec<String>>,
+        hir::MutableViewEffectSummary,
     ),
 >;
 
@@ -10336,7 +10337,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
     // Synthesized interface source cannot spell compiler-owned provenance facts. Restore those
     // facts after signature collection. The driver supplies the complete transitive fact map, so
     // entries outside the modules visible to this check are intentionally ignored.
-    for (name, (return_borrow, return_region, return_cleanup, _, _, _, _, _)) in
+    for (name, (return_borrow, return_region, return_cleanup, _, _, _, _, _, _)) in
         external_return_provenance
     {
         if let Some(sig) = sigs.get_mut(name) {
@@ -10700,7 +10701,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
             let concrete_inline = !is_generic
                 && external_return_provenance
                     .get(&mangled)
-                    .is_some_and(|(_, _, _, _, _, _, _, externs)| externs.is_some());
+                    .is_some_and(|(_, _, _, _, _, _, _, externs, _)| externs.is_some());
             if !is_generic
                 && !concrete_inline
                 && matches!(f.vis, ast::Vis::Pub)
@@ -10723,14 +10724,14 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                         external_return_provenance.contains_key(&mangled);
                     let producer_certified = external_return_provenance
                         .get(&mangled)
-                        .is_some_and(|(_, _, _, _, certified, _, _, _)| *certified);
+                        .is_some_and(|(_, _, _, _, certified, _, _, _, _)| *certified);
                     let effect = external_effects
                         .get(&mangled)
                         .copied()
                         .unwrap_or(FnEffect::Impure);
                     let parallel_transfer_params = external_return_provenance
                         .get(&mangled)
-                        .map(|(_, _, _, roots, _, _, _, _)| roots.clone())
+                        .map(|(_, _, _, roots, _, _, _, _, _)| roots.clone())
                         .unwrap_or_else(|| {
                             sig.params
                                 .iter()
@@ -10753,10 +10754,13 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                         });
                     let mutable_retention = external_return_provenance
                         .get(&mangled)
-                        .and_then(|(_, _, _, _, _, summary, _, _)| summary.clone());
+                        .and_then(|(_, _, _, _, _, summary, _, _, _)| summary.clone());
+                let mutable_view_effect = external_return_provenance
+                    .get(&mangled)
+                    .and_then(|(_, _, _, _, _, _, _, _, summary)| summary.clone());
                     let drop_state_effects = external_return_provenance
                         .get(&mangled)
-                        .map(|(_, _, _, _, _, _, effects, _)| effects.clone())
+                        .map(|(_, _, _, _, _, _, effects, _, _)| effects.clone())
                         .unwrap_or_else(|| {
                             sig.params
                                 .iter()
@@ -10784,7 +10788,33 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                     if let Err(message) = hir::validate_mutable_retention(&mutable_retention, &sig.param_modes, false) {
                         diags.error(message.to_string(), f.span);
                     }
-                    imported_fns.push(hir::ImportedFn {
+                if mutable_view_effect.is_some() && !producer_certified {
+                    diags.error(
+                        "mutable-view-effect summary requires producer certification".to_string(),
+                        f.span,
+                    );
+                }
+                let view_context = StorageTypeContext {
+                    structs: &structs,
+                    tuples: &tuples,
+                    enums: &enums,
+                    tagged_types: &tagged_types,
+                };
+                let eligible = sig
+                    .params
+                    .iter()
+                    .zip(&sig.param_modes)
+                    .map(|(&ty, mode)| {
+                        *mode == ast::ParamMode::BorrowMut
+                            && mutable_view_effect_eligible(ty, view_context)
+                    })
+                    .collect::<Vec<_>>();
+                if let Err(message) =
+                    hir::validate_mutable_view_effect(&mutable_view_effect, &eligible, false)
+                {
+                    diags.error(message.to_string(), f.span);
+                }
+                imported_fns.push(hir::ImportedFn {
                         name: mangled,
                         params: sig.params.clone(),
                         param_modes: sig.param_modes.clone(),
@@ -10798,7 +10828,8 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                         effect,
                         parallel_transfer_params,
                         mutable_retention,
-                    });
+                    mutable_view_effect,
+                });
             }
             if !concrete_inline {
                 continue;
@@ -11132,7 +11163,9 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
             .collect::<std::collections::HashSet<_>>();
         let expected = external_return_provenance.get(&function.name);
         let exact_facts = expected.is_some_and(
-            |(borrow, region, cleanup, transfer, certified, retention, effects, externs)| {
+            |(borrow, region, cleanup, transfer, certified, retention, effects, externs,
+                view_effect,
+            )| {
                 *certified
                     && borrow == &function.return_borrow
                     && region == &function.return_region
@@ -11143,6 +11176,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                             hir::ReturnBorrowSummary::Roots { params, .. } => params.as_slice(),
                         }
                     && retention == &function.mutable_retention
+                    && view_effect == &function.mutable_view_effect
                     && effects
                         .iter()
                         .all(|effect| *effect == hir::DropStateEffect::NotApplicable)
@@ -11957,6 +11991,21 @@ fn run_body_analysis_passes(
             (function.name.clone(), summary)
         }))
         .collect::<std::collections::HashMap<_, _>>();
+    let named_view_effect = program
+        .fns
+        .iter()
+        .map(|function| (function.name.clone(), function.mutable_view_effect.clone()))
+        .chain(program.imported_fns.iter().map(|function| {
+            (
+                function.name.clone(),
+                if function.producer_certified {
+                    function.mutable_view_effect.clone()
+                } else {
+                    None
+                },
+            )
+        }))
+        .collect::<MutableViewEffectMap>();
     let callable = infer_fn_value_return_provenance(program, &named_return_borrow);
     let callable_parallel_targets = callable
         .target_ids
@@ -11994,6 +12043,7 @@ fn run_body_analysis_passes(
             named_parallel_transfer: &named_parallel_transfer,
             named_param_modes: &named_param_modes,
             named_borrow_mut_retention: borrow_mut_retention,
+            named_view_effect: &named_view_effect,
             summary_dependencies: None,
             tuples,
             structs,
@@ -12025,6 +12075,7 @@ fn run_body_analysis_passes(
             return_roots: BorrowRoots::new(),
             parallel_transfer_roots: BorrowRoots::new(),
             borrow_mut_retention: vec![BorrowRoots::new(); f.params.len()],
+            view_effect_exits: None,
             non_fallthrough: std::collections::HashSet::new(),
             borrow_fact_cache: std::cell::RefCell::new(None),
             collecting_move_children: false,
@@ -12039,7 +12090,9 @@ fn run_body_analysis_passes(
                 named_return_region: &named_return_region,
                 named_param_modes: &named_param_modes,
                 named_borrow_mut_retention: borrow_mut_retention,
+                named_view_effect: &named_view_effect,
                 callable_targets: &callable.targets_by_type,
+                callable_target_ids: &callable.target_ids,
                 fn_types,
                 tuples,
                 structs,
@@ -13032,6 +13085,50 @@ fn checked_hir_body_facts_are_valid_impl(program: &hir::Program) -> bool {
     if !borrowed_element_metadata_is_valid(program) {
         return false;
     }
+    let view_context = StorageTypeContext {
+        structs: &program.structs,
+        tuples: &program.tuples,
+        enums: &program.enums,
+        tagged_types: &program.tagged_types,
+    };
+    for function in &program.imported_fns {
+        if function.mutable_view_effect.is_some() && !function.producer_certified {
+            return false;
+        }
+        let eligible = function
+            .params
+            .iter()
+            .zip(&function.param_modes)
+            .map(|(&ty, mode)| {
+                *mode == ast::ParamMode::BorrowMut && mutable_view_effect_eligible(ty, view_context)
+            })
+            .collect::<Vec<_>>();
+        if hir::validate_mutable_view_effect(&function.mutable_view_effect, &eligible, false)
+            .is_err()
+        {
+            return false;
+        }
+    }
+    for function in &program.fns {
+        let eligible = function
+            .params
+            .iter()
+            .enumerate()
+            .map(|(index, &local)| {
+                function.param_modes.get(index) == Some(&ast::ParamMode::BorrowMut)
+                    && function
+                        .locals
+                        .get(local as usize)
+                        .is_some_and(|local| mutable_view_effect_eligible(local.ty, view_context))
+            })
+            .collect::<Vec<_>>();
+        if function.mutable_view_effect.is_none()
+            || hir::validate_mutable_view_effect(&function.mutable_view_effect, &eligible, false)
+                .is_err()
+        {
+            return false;
+        }
+    }
     let Some(mut replay) = replay_clone::clone_program(program) else {
         return false;
     };
@@ -13071,6 +13168,7 @@ fn reset_body_analysis_facts(program: &mut Program) {
         function.return_region = hir::ReturnRegionSummary::None;
         function.parallel_transfer = hir::ReturnBorrowSummary::None;
         function.mutable_retention = None;
+        function.mutable_view_effect = None;
         function.drop_locals.clear();
         function.drop_individual_locals.clear();
         function.drop_individual_exprs.clear();
@@ -13143,6 +13241,7 @@ fn body_analysis_facts_equal(expected: &hir::Program, actual: &Program) -> bool 
             || expected.return_region != actual.return_region
             || expected.return_cleanup != actual.return_cleanup
             || expected.mutable_retention != actual.mutable_retention
+            || expected.mutable_view_effect != actual.mutable_view_effect
             || expected.parallel_transfer != actual.parallel_transfer
             || expected.drop_locals != actual.drop_locals
             || expected.drop_individual_locals != actual.drop_individual_locals
@@ -13809,6 +13908,25 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
     let mut queued = vec![true; function_count];
     let mut worklist: std::collections::VecDeque<usize> =
         (0..function_count).collect();
+    let indirect_view_callers = program
+        .fns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, function)| {
+            hir_depth::body_events(&function.body)
+                .into_iter()
+                .any(|event| {
+                    matches!(
+                        event,
+                        hir_depth::BodyEvent::ExprEnter(Expr {
+                            kind: ExprKind::CallFnValue { .. },
+                            ..
+                        })
+                    )
+                })
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
     let named_param_modes = program
         .fns
         .iter()
@@ -13841,6 +13959,32 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
             }).collect()))
         }))
         .collect::<BorrowMutRetentionMap>();
+    let view_type_context = StorageTypeContext {
+        structs: &program.structs,
+        tuples: &program.tuples,
+        enums: &program.enums,
+        tagged_types: &program.tagged_types,
+    };
+    let mut named_view_effect = program
+        .fns
+        .iter()
+        .map(|function| {
+            (
+                function.name.clone(),
+                initial_mutable_view_effect(function, view_type_context),
+            )
+        })
+        .chain(program.imported_fns.iter().map(|function| {
+            (
+                function.name.clone(),
+                if function.producer_certified {
+                    function.mutable_view_effect.clone()
+                } else {
+                    None
+                },
+            )
+        }))
+        .collect::<MutableViewEffectMap>();
     let mut callable = infer_fn_value_return_provenance(program, &named);
     loop {
         let mut indirect_parallel_changed = false;
@@ -13869,7 +14013,8 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
                 named_parallel_transfer: &named_parallel,
             named_param_modes: &named_param_modes,
             named_borrow_mut_retention: &named_borrow_mut_retention,
-            summary_dependencies: collect_dependencies,
+                named_view_effect: &named_view_effect,
+                summary_dependencies: collect_dependencies,
             tuples: &program.tuples,
             structs: &program.structs,
             enums: &program.enums,
@@ -13900,7 +14045,8 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
             return_roots: BorrowRoots::new(),
                 parallel_transfer_roots: BorrowRoots::new(),
             borrow_mut_retention: vec![BorrowRoots::new(); function.params.len()],
-            non_fallthrough: std::collections::HashSet::new(),
+                view_effect_exits: None,
+                non_fallthrough: std::collections::HashSet::new(),
             borrow_fact_cache: std::cell::RefCell::new(None),
             collecting_move_children: false,
             move_children: Vec::new(),
@@ -13943,7 +14089,9 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
             let parallel_changed = named_parallel.get(&function.name) != Some(&parallel_summary);
             let retention_changed = named_borrow_mut_retention.get(&function.name)
                 != Some(&result.borrow_mut_retention);
-            if !return_changed && !retention_changed && !parallel_changed {
+            let view_changed =
+                named_view_effect.get(&function.name) != Some(&result.mutable_view_effect);
+            if !return_changed && !retention_changed && !parallel_changed && !view_changed {
                 continue;
             }
             named.insert(function.name.clone(), summary);
@@ -13951,8 +14099,17 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
             named_parallel.insert(function.name.clone(), parallel_summary);
             named_borrow_mut_retention
                 .insert(function.name.clone(), result.borrow_mut_retention);
+            named_view_effect.insert(function.name.clone(), result.mutable_view_effect);
             if let Some(callers) = reverse_callers.get(&function.name) {
                 for &caller in callers {
+                    if !queued[caller] {
+                        queued[caller] = true;
+                        worklist.push_back(caller);
+                    }
+                }
+            }
+            if view_changed {
+                for &caller in &indirect_view_callers {
                     if !queued[caller] {
                         queued[caller] = true;
                         worklist.push_back(caller);
@@ -13996,6 +14153,7 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
                     _ => None,
                 }).collect::<Option<Vec<_>>>().map(|mut roots| { roots.sort(); roots })
             }).collect::<Option<Vec<_>>>());
+        function.mutable_view_effect = named_view_effect.get(&function.name).cloned().flatten();
         function.return_region = borrow_to_region_summary(&summary);
         function.return_borrow = summary;
         function.parallel_transfer = named_parallel
@@ -19406,6 +19564,7 @@ enum EscapeFlowOp<'a> {
         call: usize,
         args: &'a [Expr],
         destinations: Vec<(usize, ast::ParamMode, Vec<BorrowMutRetentionSource>)>,
+        view_effect: hir::MutableViewEffectSummary,
         depth: u32,
     },
     /// Region-backed builders may cross a call boundary only through `borrow mut`; a shared or out
@@ -19543,8 +19702,10 @@ struct EscapeCheck<'a> {
     /// Exact same-program mutable-retention roots. Missing callees keep the conservative
     /// all-compatible-input call-site check.
     named_borrow_mut_retention: &'a BorrowMutRetentionMap,
+    named_view_effect: &'a MutableViewEffectMap,
     /// Analysis-only target availability, shared with borrow and storage inference.
     callable_targets: &'a [CallableTargetSet],
+    callable_target_ids: &'a std::collections::HashMap<String, u32>,
     /// Settled function-value signatures. Parameter roots select call arguments; capture roots are
     /// resolved through `EscapeState::callable_capture_region`.
     fn_types: &'a [hir::FnTy],
@@ -22390,8 +22551,9 @@ impl<'a> EscapeCheck<'a> {
                 call,
                 args,
                 destinations,
+                view_effect,
                 depth,
-            } => self.apply_mutable_calls(call, args, &destinations, depth),
+            } => self.apply_mutable_calls(call, args, &destinations, view_effect.as_ref(), depth),
             EscapeFlowOp::RegionBuilderNonMutBorrow { builder, depth } => {
                 if !self.drop_is_individual(builder, depth) {
                     self.diags.error(
@@ -25912,6 +26074,7 @@ impl<'a> EscapeCheck<'a> {
                                     args,
                                     &modes,
                                     summary.as_ref(),
+                                    self.named_view_effect.get(func).cloned().flatten(),
                                     depth,
                                 );
                             }
@@ -25931,6 +26094,13 @@ impl<'a> EscapeCheck<'a> {
                                     args,
                                     &modes,
                                     None,
+                                    indirect_mutable_view_effect(
+                                        callee,
+                                        args.len(),
+                                        self.named_view_effect,
+                                        self.callable_targets,
+                                        self.callable_target_ids,
+                                    ),
                                     depth,
                                 );
                             }
@@ -26998,6 +27168,7 @@ impl<'a> EscapeCheck<'a> {
         call: usize,
         args: &[Expr],
         destinations: &[(usize, ast::ParamMode, Vec<BorrowMutRetentionSource>)],
+        view_effect: Option<&Vec<Option<hir::MutableViewEffect>>>,
         depth: u32,
     ) {
         struct DestinationSnapshot<'e> {
@@ -27048,6 +27219,65 @@ impl<'a> EscapeCheck<'a> {
                 .and_then(Option::as_ref)
                 .cloned()
                 .unwrap_or_else(EscapeArgumentSnapshot::fail_closed);
+            if *mode == ast::ParamMode::BorrowMut
+                && mutable_view_effect_eligible(destination.ty, self.storage_type_context())
+            {
+                let fallback = conservative_mutable_view_effect(args.len());
+                let effect = view_effect
+                    .and_then(|effects| effects.get(*destination_index))
+                    .and_then(Option::as_ref)
+                    .unwrap_or(&fallback);
+                let mut candidate_backing = completion.mutable_backing.clone();
+                for (source, argument) in args.iter().enumerate() {
+                    if mutable_replacement_backing_compatible(
+                        destination.ty,
+                        argument.ty,
+                        self.tagged_types,
+                    ) && let Some(snapshot) =
+                        argument_snapshots.get(source).and_then(Option::as_ref)
+                    {
+                        candidate_backing = candidate_backing.join(&snapshot.mutable_backing);
+                    }
+                }
+                for root in &effect.write_roots {
+                    let source = root.index() as usize;
+                    let captured = argument_snapshots.get(source).and_then(Option::as_ref);
+                    let region = captured.map(|snapshot| match root {
+                        hir::MutableRetentionRoot::Contained(_) => {
+                            snapshot.retained_contained_region
+                        }
+                        hir::MutableRetentionRoot::Storage(_) => snapshot.retained_storage_region,
+                    });
+                    if (region.is_none_or(|region| !region.outlives(candidate_backing.region))
+                        || (!candidate_backing.known && region != Some(Region::Static)))
+                        && let Some(argument) = args.get(source)
+                    {
+                        self.diags.error(
+                            "cannot retain a shorter-lived view through this mutable borrow; copy it into the destination region first"
+                                .to_string(), argument.span,
+                        );
+                    }
+                }
+                let place_region = self.mutable_destination_storage_region(destination, depth);
+                for root in &effect.rebind_roots {
+                    let source = root.index() as usize;
+                    let captured = argument_snapshots.get(source).and_then(Option::as_ref);
+                    let region = captured.map(|snapshot| match root {
+                        hir::MutableRetentionRoot::Contained(_) => {
+                            snapshot.retained_contained_region
+                        }
+                        hir::MutableRetentionRoot::Storage(_) => snapshot.retained_storage_region,
+                    });
+                    if region.is_none_or(|region| !region.outlives(place_region))
+                        && let Some(argument) = args.get(source)
+                    {
+                        self.diags.error(
+                            "cannot retain a shorter-lived view through this mutable borrow; copy it into the destination region first"
+                                .to_string(), argument.span,
+                        );
+                    }
+                }
+            }
             let destination_root = self.mutable_destination_root(destination);
             let replacement = (*mode == ast::ParamMode::BorrowMut
                 && self.indexed_backing_type(destination.ty))
@@ -27343,6 +27573,7 @@ impl<'a> EscapeCheck<'a> {
         args: &'a [Expr],
         modes: &[ast::ParamMode],
         summary: Option<&BorrowMutRetentionSummary>,
+        view_effect: hir::MutableViewEffectSummary,
         depth: u32,
     ) {
         let mut destinations = Vec::new();
@@ -27375,6 +27606,7 @@ impl<'a> EscapeCheck<'a> {
                 call,
                 args,
                 destinations,
+                view_effect,
                 depth,
             });
         }
@@ -29722,6 +29954,7 @@ struct MoveCheck<'a> {
     /// destinations. Absence means the callee body is unavailable and therefore selects the
     /// conservative all-compatible-input fallback.
     named_borrow_mut_retention: &'a BorrowMutRetentionMap,
+    named_view_effect: &'a MutableViewEffectMap,
     /// Direct named calls observed by the exhaustive expression walk. Present only while building
     /// the reverse worklist for named-return inference.
     summary_dependencies: Option<&'a mut std::collections::HashSet<String>>,
@@ -29823,6 +30056,7 @@ struct MoveCheck<'a> {
     /// Union of the exact parameter roots stored in every `borrow mut`/`out` destination at each
     /// returning function edge. Entries are indexed by this function's parameter positions.
     borrow_mut_retention: BorrowMutRetentionSummary,
+    view_effect_exits: Option<Vec<Option<ViewEffectFlow>>>,
     /// Expressions proven not to reach their result edge during this exact source-order walk.
     /// Provenance queries use this to exclude diverging alternatives and unreachable block tails.
     non_fallthrough: std::collections::HashSet<Span>,
@@ -29921,6 +30155,145 @@ type BorrowRoots = std::collections::BTreeSet<BorrowRoot>;
 type BorrowMutRetentionSummary = Vec<BorrowRoots>;
 type BorrowMutRetentionMap =
     std::collections::HashMap<String, BorrowMutRetentionSummary>;
+type MutableViewEffectMap = std::collections::HashMap<String, hir::MutableViewEffectSummary>;
+
+fn mutable_view_effect_eligible(ty: Ty, context: StorageTypeContext<'_>) -> bool {
+    let paths = storage_type_paths(ty, context);
+    paths.valid
+        && paths.carriers.is_empty()
+        && paths.headers.len() == 1
+        && paths.headers[0].path.is_empty()
+        && paths.headers[0].kind == StorageHeaderKind::View
+}
+
+fn initial_mutable_view_effect(
+    function: &hir::Fn,
+    context: StorageTypeContext<'_>,
+) -> hir::MutableViewEffectSummary {
+    Some(
+        function
+            .params
+            .iter()
+            .enumerate()
+            .map(|(position, &local)| {
+                (function.param_modes.get(position) == Some(&ast::ParamMode::BorrowMut)
+                    && function
+                        .locals
+                        .get(local as usize)
+                        .is_some_and(|local| mutable_view_effect_eligible(local.ty, context)))
+                .then_some(hir::MutableViewEffect::default())
+            })
+            .collect(),
+    )
+}
+
+fn conservative_mutable_view_effect(argument_count: usize) -> hir::MutableViewEffect {
+    let roots: Vec<_> = (0..argument_count)
+        .filter_map(|index| u32::try_from(index).ok())
+        .flat_map(|index| {
+            [
+                hir::MutableRetentionRoot::Contained(index),
+                hir::MutableRetentionRoot::Storage(index),
+            ]
+        })
+        .collect();
+    hir::MutableViewEffect {
+        may_write_original: true,
+        must_write_original_element: false,
+        may_rebind: true,
+        must_rebind: false,
+        write_roots: roots.clone(),
+        rebind_roots: roots,
+    }
+}
+
+fn join_mutable_view_effects(
+    left: &hir::MutableViewEffectSummary,
+    right: &hir::MutableViewEffectSummary,
+) -> hir::MutableViewEffectSummary {
+    let (Some(left), Some(right)) = (left, right) else {
+        return None;
+    };
+    if left.len() != right.len() {
+        return None;
+    }
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| match (left, right) {
+            (None, None) => Some(None),
+            (Some(left), Some(right)) => {
+                let mut write_roots = left
+                    .write_roots
+                    .iter()
+                    .chain(&right.write_roots)
+                    .copied()
+                    .collect::<Vec<_>>();
+                write_roots.sort();
+                write_roots.dedup();
+                let mut rebind_roots = left
+                    .rebind_roots
+                    .iter()
+                    .chain(&right.rebind_roots)
+                    .copied()
+                    .collect::<Vec<_>>();
+                rebind_roots.sort();
+                rebind_roots.dedup();
+                Some(Some(hir::MutableViewEffect {
+                    may_write_original: left.may_write_original || right.may_write_original,
+                    must_write_original_element: left.must_write_original_element
+                        && right.must_write_original_element,
+                    may_rebind: left.may_rebind || right.may_rebind,
+                    must_rebind: left.must_rebind && right.must_rebind,
+                    write_roots,
+                    rebind_roots,
+                }))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn indirect_mutable_view_effect(
+    callee: &Expr,
+    argument_count: usize,
+    named_view_effect: &MutableViewEffectMap,
+    callable_targets: &[CallableTargetSet],
+    callable_target_ids: &std::collections::HashMap<String, u32>,
+) -> hir::MutableViewEffectSummary {
+    let Ty::Fn(id) = callee.ty else {
+        return None;
+    };
+    let Some(targets) = callable_targets.get(id as usize) else {
+        return None;
+    };
+    if targets.unavailable || targets.is_empty() {
+        return None;
+    }
+    let mut combined: Option<hir::MutableViewEffectSummary> = None;
+    for target in targets.keys() {
+        let Some(name) = callable_target_ids
+            .iter()
+            .find_map(|(name, id)| (id == target).then_some(name))
+        else {
+            return None;
+        };
+        let Some(summary) = named_view_effect.get(name) else {
+            return None;
+        };
+        if summary
+            .as_ref()
+            .is_none_or(|effects| effects.len() != argument_count)
+        {
+            // Captures need frozen environment substitution; unavailable effects stay conservative.
+            return None;
+        }
+        combined = Some(match combined {
+            Some(current) => join_mutable_view_effects(&current, summary),
+            None => summary.clone(),
+        });
+    }
+    combined.flatten()
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BorrowMutRetentionSource {
@@ -29982,6 +30355,7 @@ struct MoveCheckResult {
     return_roots: BorrowRoots,
     borrow_mut_retention: BorrowMutRetentionSummary,
     parallel_transfer_roots: BorrowRoots,
+    mutable_view_effect: hir::MutableViewEffectSummary,
 }
 
 impl BorrowRoot {
@@ -32307,6 +32681,8 @@ struct MoveGenerationEntry {
     /// Exact header shape represented by this generation. `None` is a sticky fail-closed join of
     /// incompatible descriptors; consumers must then avoid selecting the generation by type.
     descriptor: Option<StorageHeaderDescriptor>,
+    /// Exact row count for a materialized SoA buffer when its fixed source shape proves it.
+    exact_cell_count: Option<u32>,
     releases: std::collections::BTreeSet<MoveReleasePlace>,
     /// Every source-visible root that has released this stable generation. A local-to-local Move
     /// changes `releases` but scalar views completed before that action retain the old root; a
@@ -32330,6 +32706,7 @@ impl MoveGenerationEntry {
         Self {
             byte_validation: None,
             descriptor,
+            exact_cell_count: None,
             releases,
             historical_release_roots,
             caller_origins: match generation {
@@ -32356,6 +32733,9 @@ impl MoveGenerationEntry {
             },
             descriptor: (self.descriptor == other.descriptor)
                 .then_some(self.descriptor)
+                .flatten(),
+            exact_cell_count: (self.exact_cell_count == other.exact_cell_count)
+                .then_some(self.exact_cell_count)
                 .flatten(),
             releases,
             historical_release_roots,
@@ -32467,6 +32847,30 @@ impl MutableBackingFact {
 #[derive(Clone, Default, PartialEq, Eq)]
 struct BorrowState(Box<BorrowStateData>);
 
+#[derive(Clone, Default, PartialEq, Eq)]
+struct ViewEffectFlow {
+    may_write_original: bool,
+    must_write_original_element: bool,
+    may_rebind: bool,
+    must_rebind: bool,
+    write_roots: BorrowRoots,
+    rebind_roots: BorrowRoots,
+}
+
+impl ViewEffectFlow {
+    fn join(&self, other: &Self) -> Self {
+        Self {
+            may_write_original: self.may_write_original || other.may_write_original,
+            must_write_original_element: self.must_write_original_element
+                && other.must_write_original_element,
+            may_rebind: self.may_rebind || other.may_rebind,
+            must_rebind: self.must_rebind && other.must_rebind,
+            write_roots: &self.write_roots | &other.write_roots,
+            rebind_roots: &self.rebind_roots | &other.rebind_roots,
+        }
+    }
+}
+
 /// Heap-owned so adding another flow fact cannot silently consume the checked-HIR native-stack
 /// depth budget. Cloning this state already clones its map allocations; the one enclosing box
 /// keeps every recursive control walker frame at a stable pointer-sized footprint.
@@ -32498,6 +32902,10 @@ struct BorrowStateData {
     /// after an actual mutation an empty root set means a proven borrow-free replacement, not a
     /// no-op call. Control joins union this may-unmodified fact.
     unmodified_borrow_mut_params: std::collections::BTreeSet<u32>,
+    /// Parameter identities whose view headers flowed into each current local header.
+    view_flows: std::collections::HashMap<LocalId, std::collections::BTreeSet<u32>>,
+    /// Path-sensitive effects; control joins union may facts and intersect must facts.
+    view_effects: Vec<Option<ViewEffectFlow>>,
     /// Path-sensitive origin places (root local and field path) tracked for locals initialized from
     /// place projections or view-producing operations on places (e.g. `state.slot.bytes()`).
     local_origin_places: std::collections::HashMap<LocalId, (LocalId, Vec<u32>)>,
@@ -33572,6 +33980,16 @@ impl BorrowState {
     /// that result is installed into a local.
     fn join_prepruned(a: &Self, b: &Self) -> Self {
         let mut out = a.clone();
+        for (local, flows) in &b.view_flows {
+            out.view_flows.entry(*local).or_default().extend(flows);
+        }
+        for (into, other) in out.view_effects.iter_mut().zip(&b.view_effects) {
+            match (into.as_mut(), other) {
+                (Some(current), Some(other)) => *current = current.join(other),
+                (None, Some(other)) => *into = Some(other.clone()),
+                _ => {}
+            }
+        }
         out.unmodified_borrow_mut_params
             .extend(b.unmodified_borrow_mut_params.iter().copied());
         out.active_sum.retain(|local, active| {
@@ -34364,6 +34782,19 @@ impl<'a> MoveCheck<'a> {
 
     fn check(mut self) -> MoveCheckResult {
         self.prepare_mutable_call_snapshots();
+        self.borrows.view_effects = self
+            .f
+            .params
+            .iter()
+            .enumerate()
+            .map(|(position, &local)| {
+                let eligible = self.f.param_modes.get(position) == Some(&ast::ParamMode::BorrowMut)
+                    && self.f.locals.get(local as usize).is_some_and(|local| {
+                        mutable_view_effect_eligible(local.ty, self.storage_type_context())
+                    });
+                eligible.then_some(ViewEffectFlow::default())
+            })
+            .collect();
         for (position, &local) in self.f.params.iter().enumerate() {
             let mode = self
                 .f
@@ -34375,6 +34806,16 @@ impl<'a> MoveCheck<'a> {
                 self.borrows
                     .unmodified_borrow_mut_params
                     .insert(position as u32);
+            }
+            if self
+                .borrows
+                .view_effects
+                .get(position)
+                .is_some_and(Option::is_some)
+            {
+                self.borrows
+                    .view_flows
+                    .insert(local, [position as u32].into());
             }
             self.seed_parameter_storage(position as u32, local, mode);
             if self
@@ -34427,10 +34868,259 @@ impl<'a> MoveCheck<'a> {
         if falls_through {
             self.collect_borrow_mut_exit_roots();
         }
+        let exit_effects = self.view_effect_exits.take().unwrap_or_else(|| {
+            self.borrows
+                .view_effects
+                .iter()
+                .map(|state| state.as_ref().map(|_| ViewEffectFlow::default()))
+                .collect()
+        });
         MoveCheckResult {
             return_roots: self.return_roots,
             borrow_mut_retention: self.borrow_mut_retention,
             parallel_transfer_roots: self.parallel_transfer_roots,
+            mutable_view_effect: Self::public_view_effect(&exit_effects),
+        }
+    }
+
+    fn public_view_effect(states: &[Option<ViewEffectFlow>]) -> hir::MutableViewEffectSummary {
+        fn roots(roots: &BorrowRoots) -> Option<Vec<hir::MutableRetentionRoot>> {
+            roots
+                .iter()
+                .filter(|root| **root != BorrowRoot::ReadOnly)
+                .map(|root| match root {
+                    BorrowRoot::Param(index) => Some(hir::MutableRetentionRoot::Contained(*index)),
+                    BorrowRoot::ParamStorage(index) => {
+                        Some(hir::MutableRetentionRoot::Storage(*index))
+                    }
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+                .map(|mut roots| {
+                    roots.sort();
+                    roots.dedup();
+                    roots
+                })
+        }
+        Some(
+            states
+                .iter()
+                .map(|state| match state {
+                    None => None,
+                    Some(state) => match (roots(&state.write_roots), roots(&state.rebind_roots)) {
+                        (Some(write_roots), Some(rebind_roots)) => Some(hir::MutableViewEffect {
+                            may_write_original: state.may_write_original,
+                            must_write_original_element: state.must_write_original_element,
+                            may_rebind: state.may_rebind,
+                            must_rebind: state.must_rebind,
+                            write_roots,
+                            rebind_roots,
+                        }),
+                        _ => Some(conservative_mutable_view_effect(states.len())),
+                    },
+                })
+                .collect(),
+        )
+    }
+
+    fn view_flows_of_expr(&self, value: &Expr) -> std::collections::BTreeSet<u32> {
+        let mut flows = match value.kind {
+            ExprKind::Local(local) => self
+                .borrows
+                .view_flows
+                .get(&local)
+                .cloned()
+                .unwrap_or_default(),
+            _ => std::collections::BTreeSet::new(),
+        };
+        for leaf in self.completed_headers(value).leaves.values() {
+            for reference in &leaf.generations {
+                if let StorageGeneration::CallerStorage { parameter, .. } = reference.generation
+                    && self
+                        .borrows
+                        .view_effects
+                        .get(parameter as usize)
+                        .is_some_and(Option::is_some)
+                {
+                    flows.insert(parameter);
+                }
+            }
+        }
+        flows
+    }
+
+    fn install_view_flow(&mut self, local: LocalId, mut flows: std::collections::BTreeSet<u32>) {
+        if let Some(position) = self
+            .f
+            .params
+            .iter()
+            .position(|parameter| *parameter == local)
+            && self
+                .borrows
+                .view_effects
+                .get(position)
+                .is_some_and(Option::is_some)
+        {
+            flows.insert(position as u32);
+        }
+        if flows.is_empty() {
+            self.borrows.view_flows.remove(&local);
+        } else {
+            self.borrows.view_flows.insert(local, flows);
+        }
+    }
+
+    fn view_effect_source_roots(&self, value: &Expr) -> BorrowRoots {
+        self.parameterize_view_roots(self.borrows.summary_roots(self.borrow_sources(value)))
+    }
+
+    fn parameterize_view_roots(&self, roots: BorrowRoots) -> BorrowRoots {
+        roots
+            .into_iter()
+            .map(|root| match root {
+                BorrowRoot::Local(local) => self
+                    .f
+                    .params
+                    .iter()
+                    .position(|parameter| *parameter == local)
+                    .and_then(|position| u32::try_from(position).ok())
+                    .map_or(BorrowRoot::Local(local), BorrowRoot::Param),
+                BorrowRoot::StorageLocal(_, local, _) => self
+                    .f
+                    .params
+                    .iter()
+                    .position(|parameter| *parameter == local)
+                    .and_then(|position| u32::try_from(position).ok())
+                    .map_or_else(|| root.clone(), BorrowRoot::ParamStorage),
+                _ => root,
+            })
+            .collect()
+    }
+
+    fn record_nested_view_call_effects(
+        &mut self,
+        args: &[Expr],
+        modes: &[ast::ParamMode],
+        summary: Option<&hir::MutableViewEffectSummary>,
+    ) {
+        for (destination, argument) in args.iter().enumerate() {
+            if modes.get(destination) != Some(&ast::ParamMode::BorrowMut) {
+                continue;
+            }
+            let flows = self.view_flows_of_expr(argument);
+            if flows.is_empty() {
+                continue;
+            }
+            let fallback = conservative_mutable_view_effect(args.len());
+            let effect = summary
+                .and_then(Option::as_ref)
+                .and_then(|effects| effects.get(destination))
+                .and_then(Option::as_ref)
+                .unwrap_or(&fallback);
+            let selected_roots = |sources: &[hir::MutableRetentionRoot]| {
+                sources
+                    .iter()
+                    .filter_map(|source| {
+                        args.get(source.index() as usize)
+                            .map(|argument| match source {
+                                hir::MutableRetentionRoot::Contained(_) => {
+                                    self.view_effect_source_roots(argument)
+                                }
+                                hir::MutableRetentionRoot::Storage(_) => self
+                                    .parameterize_view_roots(self.borrows.summary_roots(
+                                        self.completed_storage_fact(argument).live_roots(),
+                                    )),
+                            })
+                    })
+                    .fold(BorrowRoots::new(), |mut roots, source| {
+                        roots.extend(source);
+                        roots
+                    })
+            };
+            let write_roots = selected_roots(&effect.write_roots);
+            let rebind_roots = selected_roots(&effect.rebind_roots);
+            let headers = self.completed_headers(argument);
+            for position in flows {
+                let original = StorageGeneration::caller_storage(position, &[]);
+                let may_original = headers.leaves.values().any(|leaf| {
+                    !leaf.known
+                        || leaf
+                            .generations
+                            .iter()
+                            .any(|reference| reference.generation == original)
+                });
+                let exact_original = headers.leaves.len() == 1
+                    && headers.leaves.values().all(|leaf| {
+                        leaf.known
+                            && leaf.generations.len() == 1
+                            && leaf.generations.iter().all(|reference| {
+                                reference.generation == original
+                                    && reference.content_path.is_empty()
+                            })
+                    });
+                let rebinding_parameter = matches!(argument.kind, ExprKind::Local(local)
+                    if self.f.params.get(position as usize) == Some(&local));
+                if let Some(Some(current)) = self.borrows.view_effects.get_mut(position as usize) {
+                    current.write_roots.extend(write_roots.iter().cloned());
+                    current.may_write_original |= may_original && effect.may_write_original;
+                    current.must_write_original_element |=
+                        exact_original && effect.must_write_original_element;
+                    if rebinding_parameter {
+                        current.may_rebind |= effect.may_rebind;
+                        current.must_rebind |= effect.must_rebind;
+                        if effect.may_rebind {
+                            current.rebind_roots.extend(rebind_roots.iter().cloned());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn record_view_rebind(&mut self, local: LocalId, value: &Expr) {
+        let Some(position) = self
+            .f
+            .params
+            .iter()
+            .position(|parameter| *parameter == local)
+        else {
+            return;
+        };
+        let roots = self.view_effect_source_roots(value);
+        if let Some(Some(effect)) = self.borrows.view_effects.get_mut(position) {
+            effect.may_rebind = true;
+            effect.must_rebind = true;
+            effect.rebind_roots = roots;
+        }
+    }
+
+    fn record_view_element_store(&mut self, base: LocalId, value: &Expr, whole_element: bool) {
+        let Some(flows) = self.borrows.view_flows.get(&base).cloned() else {
+            return;
+        };
+        let headers = self.local_headers(base);
+        let roots = self.view_effect_source_roots(value);
+        for position in flows {
+            let original = StorageGeneration::caller_storage(position, &[]);
+            let mut may_original = false;
+            let mut exact_original = headers.leaves.len() == 1;
+            for leaf in headers.leaves.values() {
+                may_original |= !leaf.known
+                    || leaf
+                        .generations
+                        .iter()
+                        .any(|reference| reference.generation == original);
+                exact_original &= leaf.known
+                    && leaf.generations.len() == 1
+                    && leaf.generations.iter().all(|reference| {
+                        reference.generation == original && reference.content_path.is_empty()
+                    });
+            }
+            if let Some(Some(effect)) = self.borrows.view_effects.get_mut(position as usize) {
+                effect.write_roots.extend(roots.iter().cloned());
+                effect.may_write_original |= may_original;
+                effect.must_write_original_element |= whole_element && exact_original;
+            }
         }
     }
 
@@ -34439,6 +35129,18 @@ impl<'a> MoveCheck<'a> {
     /// `borrow mut` and `out` share this one summary: their caller transitions differ, not the
     /// callee-side question of which roots may remain stored in a destination.
     fn collect_borrow_mut_exit_roots(&mut self) {
+        match &mut self.view_effect_exits {
+            None => self.view_effect_exits = Some(self.borrows.view_effects.clone()),
+            Some(exits) => {
+                for (exit, current) in exits.iter_mut().zip(&self.borrows.view_effects) {
+                    match (exit.as_mut(), current) {
+                        (Some(exit), Some(current)) => *exit = exit.join(current),
+                        (None, Some(current)) => *exit = Some(current.clone()),
+                        _ => {}
+                    }
+                }
+            }
+        }
         for (destination, (&local, mode)) in self
             .f
             .params
@@ -35323,7 +36025,11 @@ impl<'a> MoveCheck<'a> {
             return;
         };
         let summary = self.named_borrow_mut_retention.get(function).cloned();
-        self.apply_mutable_call_effects(action, args, &modes, summary.as_ref(), moved);
+        let view_summary = self.named_view_effect.get(function).cloned();
+        self.apply_mutable_call_effects(action, args, &modes, summary.as_ref(),
+            view_summary.as_ref(),
+            moved,
+        );
     }
 
     /// Apply one returning call as an atomic mutable-place transition. Argument evaluation has
@@ -35337,6 +36043,7 @@ impl<'a> MoveCheck<'a> {
         args: &[Expr],
         modes: &[ast::ParamMode],
         summary: Option<&BorrowMutRetentionSummary>,
+        view_summary: Option<&hir::MutableViewEffectSummary>,
         moved: &MovedSet,
     ) {
         let action_key = Self::expr_key(action);
@@ -35367,6 +36074,7 @@ impl<'a> MoveCheck<'a> {
                 self.reject_readonly_view_write(argument);
             }
         }
+        self.record_nested_view_call_effects(args, modes, view_summary);
         let value_argument_facts = args
             .iter()
             .map(|argument| self.completed_value_fact(argument))
@@ -35653,6 +36361,30 @@ impl<'a> MoveCheck<'a> {
                 .iter()
                 .all(|header| header.kind == StorageHeaderKind::View);
             if view_only {
+                if typed.headers.len() == 1
+                    && typed.headers[0].path.is_empty()
+                    && typed.carriers.is_empty()
+                {
+                    let fallback = conservative_mutable_view_effect(args.len());
+                    let effect = view_summary
+                        .and_then(Option::as_ref)
+                        .and_then(|effects| effects.get(*index))
+                        .and_then(Option::as_ref)
+                        .unwrap_or(&fallback);
+                    self.apply_exact_view_call_effect(
+                        *index,
+                        place.root,
+                        &place_path,
+                        typed.headers[0].ty,
+                        effect,
+                        args,
+                        &header_argument_facts,
+                        &whole_argument_facts,
+                        &element_argument_facts,
+                        &storage_argument_facts,
+                    );
+                    continue;
+                }
                 if sources.is_empty() {
                     // With no retained root the callee proved that the post-call elements are
                     // borrow-free. The passed view still names its captured backing, so clear that
@@ -35770,6 +36502,22 @@ impl<'a> MoveCheck<'a> {
             }
         }
         for (index, _, roots) in &exclusive_roots {
+            let proved_view_change = view_summary
+                .and_then(Option::as_ref)
+                .and_then(|effects| effects.get(*index))
+                .and_then(Option::as_ref)
+                .is_some_and(|effect| effect.must_write_original_element || effect.must_rebind)
+                && args.get(*index).is_some_and(|argument| {
+                    matches!(
+                        expand_tagged_ty(argument.ty, self.tagged_types),
+                        Ty::Slice(_) | Ty::Soa(_) | Ty::SoaParam(_)
+                    )
+                });
+            if proved_view_change {
+                // A Copy view neither releases the old allocation nor invalidates an alias that
+                // captured its header. The content table above carries the actual write effect.
+                continue;
+            }
             let roots = roots.iter().filter(|root| {
                 !matches!(root, BorrowRoot::Observation(generation) if !generation.is_byte_validation())
                     || destinations.iter().any(|(destination, ..)| destination == index)
@@ -35828,7 +36576,7 @@ impl<'a> MoveCheck<'a> {
 
         for (index, mode, _, backing, replacement, observers, retains_contents, sources) in destinations {
             if let Some(argument) = args.get(index) {
-                let incoming = self.mutable_retention_fact(
+                let mut incoming = self.mutable_retention_fact(
                     &whole_argument_facts,
                     &element_argument_facts,
                     &storage_argument_facts,
@@ -35836,6 +36584,25 @@ impl<'a> MoveCheck<'a> {
                     mode,
                     &sources,
                 );
+                if mode == ast::ParamMode::BorrowMut
+                    && mutable_view_effect_eligible(argument.ty, self.storage_type_context())
+                    && let Some(place) = Self::mutable_actual_place(argument)
+                {
+                    // The view effect has already updated the generation table. The legacy
+                    // observer lane must read that post-call content; an indirect call's old
+                    // retention fallback may still include pre-call roots that a proved
+                    // one-cell write removed.
+                    let path = place
+                        .path
+                        .iter()
+                        .copied()
+                        .map(BorrowProjection::StructField)
+                        .collect::<Vec<_>>();
+                    incoming = self
+                        .borrows
+                        .resolve_headers(&self.local_headers(place.root).project_path(&path))
+                        .non_storage;
+                }
                 match mode {
                     ast::ParamMode::BorrowMut => {
                         // Preserve the historical strong header/place replacement, then publish
@@ -35904,6 +36671,153 @@ impl<'a> MoveCheck<'a> {
     /// Select the roots one returning mutable callee may have installed. An `out` destination's
     /// self-source denotes old elements; every other contained source denotes a copied whole value,
     /// including its backing. Facts are captured before any destination generation is invalidated.
+    fn apply_exact_view_call_effect(
+        &mut self,
+        destination_index: usize,
+        destination_local: LocalId,
+        destination_path: &[BorrowProjection],
+        view_ty: Ty,
+        effect: &hir::MutableViewEffect,
+        args: &[Expr],
+        header_argument_facts: &[ProjectedHeaderFact],
+        whole_argument_facts: &[BorrowFact],
+        element_argument_facts: &[BorrowFact],
+        storage_argument_facts: &[BorrowFact],
+    ) {
+        let descriptor = StorageHeaderDescriptor {
+            ty: view_ty,
+            kind: StorageHeaderKind::View,
+        };
+        let to_source = |root: &hir::MutableRetentionRoot| match root {
+            hir::MutableRetentionRoot::Contained(index) => {
+                BorrowMutRetentionSource::Contained(*index as usize)
+            }
+            hir::MutableRetentionRoot::Storage(index) => {
+                BorrowMutRetentionSource::Storage(*index as usize)
+            }
+        };
+        let write_sources = effect.write_roots.iter().map(to_source).collect::<Vec<_>>();
+        let write_fact = self.mutable_retention_fact(
+            whole_argument_facts,
+            element_argument_facts,
+            storage_argument_facts,
+            destination_index,
+            ast::ParamMode::BorrowMut,
+            &write_sources,
+        );
+        let mut write_headers = ProjectedHeaderFact::default();
+        for source in &write_sources {
+            if let Some(headers) = header_argument_facts.get(source.index()) {
+                write_headers = write_headers.join(headers);
+            }
+        }
+        let written = MoveValueFact {
+            non_storage: write_fact,
+            headers: write_headers,
+        };
+        let original = header_argument_facts.get(destination_index);
+        let strong_generation = original.and_then(|headers| {
+            let leaf = (headers.leaves.len() == 1).then(|| headers.leaves.values().next())??;
+            if !leaf.known || leaf.generations.len() != 1 {
+                return None;
+            }
+            let reference = leaf.generations.iter().next()?;
+            if !reference.content_path.is_empty() {
+                return None;
+            }
+            let entry = self
+                .borrows
+                .storage
+                .directory
+                .entries
+                .get(&reference.generation)?;
+            let single_cell = entry.descriptor.is_some_and(|descriptor| {
+                matches!(descriptor.ty, Ty::Array(_, 1) | Ty::StructArray(_, 1))
+                    || (matches!(descriptor.ty, Ty::Soa(_) | Ty::SoaParam(_))
+                        && entry.exact_cell_count == Some(1))
+            });
+            single_cell.then(|| reference.generation.clone())
+        });
+        // An intermediate rebind target may be absent from the exit descriptor. Every compatible
+        // completed argument can supply that target, so publish written roots to all candidates.
+        let mut candidates = std::collections::BTreeSet::new();
+        for (argument, headers) in args.iter().zip(header_argument_facts) {
+            if !mutable_replacement_backing_compatible(view_ty, argument.ty, self.tagged_types) {
+                continue;
+            }
+            if let Some(leaf) = self.compatible_header_union(headers, descriptor) {
+                candidates.extend(leaf.generations);
+            }
+        }
+        if let Some(headers) = original {
+            for leaf in headers.leaves.values() {
+                candidates.extend(leaf.generations.iter().cloned());
+            }
+        }
+        for reference in candidates {
+            let Some(content) = self
+                .borrows
+                .storage
+                .contents
+                .entries
+                .get_mut(&reference.generation)
+            else {
+                continue;
+            };
+            let selected = reference
+                .content_path
+                .iter()
+                .rev()
+                .copied()
+                .fold(written.clone(), |fact, projection| {
+                    fact.prefixed(projection)
+                });
+            if effect.must_write_original_element
+                && strong_generation.as_ref() == Some(&reference.generation)
+                && reference.content_path.is_empty()
+            {
+                *content = selected;
+            } else {
+                *content = content.join(&selected);
+            }
+        }
+        if effect.may_rebind {
+            let mut sources = ProjectedHeaderFact::default();
+            let mut fallback_roots = BorrowRoots::new();
+            for root in &effect.rebind_roots {
+                let index = root.index() as usize;
+                if let Some(headers) = header_argument_facts.get(index) {
+                    sources = sources.join(headers);
+                }
+                let fact = match root {
+                    hir::MutableRetentionRoot::Contained(_) => whole_argument_facts.get(index),
+                    hir::MutableRetentionRoot::Storage(_) => storage_argument_facts.get(index),
+                };
+                if let Some(fact) = fact {
+                    fallback_roots.extend(fact.live_roots());
+                }
+            }
+            let mut replacement = ProjectedHeaderFact::default();
+            if let Some(mut leaf) = self.compatible_header_union(&sources, descriptor) {
+                leaf.descriptor = Some(descriptor);
+                replacement.leaves.insert(Vec::new(), leaf);
+            } else if !effect.rebind_roots.is_empty() {
+                replacement.leaves.insert(
+                    Vec::new(),
+                    StorageHeaderLeaf::unknown_typed(fallback_roots, descriptor),
+                );
+            }
+            let mut destination = self.local_headers(destination_local);
+            if !effect.must_rebind {
+                replacement = destination
+                    .project_path(destination_path)
+                    .join(&replacement);
+            }
+            destination.replace_path(destination_path, replacement);
+            self.borrows.headers.insert(destination_local, destination);
+        }
+    }
+
     fn mutable_retention_fact(
         &self,
         whole_argument_facts: &[BorrowFact],
@@ -38095,13 +39009,21 @@ impl<'a> MoveCheck<'a> {
             formations.push(StorageHeaderFormation {
                 path: result.path.clone(),
                 generation: generation.clone(),
-                directory: Some(MoveGenerationEntry::new(
+                directory: Some({
+                    let mut entry = MoveGenerationEntry::new(
                     &generation,
                     result.header_ty.zip(result.header_kind).map(|(ty, kind)| {
                         StorageHeaderDescriptor { ty, kind }
                     }),
                     releases,
-                )),
+                );
+                    if let ExprKind::ArrayToSoa { source, .. } = &expression.kind
+                        && let Ty::StructArray(_, count) = source.ty
+                    {
+                        entry.exact_cell_count = Some(count);
+                    }
+                    entry
+                }),
                 content: Some(MoveValueFact {
                     non_storage: if result.header_kind == Some(StorageHeaderKind::OwnedOpaque) {
                         BorrowFact::default()
@@ -41713,16 +42635,22 @@ impl<'a> MoveCheck<'a> {
             match s {
                 Stmt::Let { local, init } => {
                     move_expr!(self, init, moved, true, true);
+                    let view_flows = self.view_flows_of_expr(init);
                     self.install_storage(*local, init, false);
                     self.assign_borrow(*local, init);
                     self.assign_active_sum(*local, init);
                     self.assign_mutable_backing(*local, init);
                     self.assign_local_origin_place(*local, init);
+                    self.install_view_flow(*local, view_flows);
                     clear_moved(moved, *local);
                     self.clear_expression_value_snapshots(init);
                 }
                 Stmt::Assign { local, value, drop_old, .. } => {
                     move_expr!(self, value, moved, true, true);
+                    let view_flows = self.view_flows_of_expr(value);
+                    if !matches!(value.kind, ExprKind::Local(source) if source == *local) {
+                        self.record_view_rebind(*local, value);
+                    }
                     // A may-moved join cannot decide whether the old destination is live on this
                     // path. MIR captures and clears the RHS source before testing its cleanup bit.
                     drop_old.set(self.is_move(*local));
@@ -41741,6 +42669,7 @@ impl<'a> MoveCheck<'a> {
                     self.assign_active_sum(*local, value);
                     self.assign_mutable_backing(*local, value);
                     self.assign_local_origin_place(*local, value);
+                    self.install_view_flow(*local, view_flows);
                     clear_moved(moved, *local);
                     self.clear_expression_value_snapshots(value);
                 }
@@ -41819,6 +42748,9 @@ impl<'a> MoveCheck<'a> {
                     }
                     move_expr!(self, index, moved, false, false);
                     move_expr!(self, value, moved, false, false);
+                    if path.is_empty() {
+                        self.record_view_element_store(*base, value, true);
+                    }
                     self.update_mutable_collection_contents(*base, path, index, &[], value);
                     self.clear_expression_value_snapshots(index);
                     self.clear_expression_value_snapshots(value);
@@ -41841,6 +42773,7 @@ impl<'a> MoveCheck<'a> {
                     }
                     move_expr!(self, index, moved, false, false);
                     move_expr!(self, value, moved, true, true);
+                    self.record_view_element_store(*base, value, false);
                     if self.is_move_ty(value.ty) {
                         self.invalidate_collection_content_owner(*base);
                     }
@@ -41856,6 +42789,7 @@ impl<'a> MoveCheck<'a> {
                     }
                     move_expr!(self, index, moved, false, false);
                     move_expr!(self, value, moved, true, true);
+                    self.record_view_element_store(*base, value, true);
                     if let ExprKind::Int(value) = index.kind
                         && value >= 0
                         && let Ok(index) = u32::try_from(value)
@@ -43597,7 +44531,17 @@ impl<'a> MoveCheck<'a> {
                     _ => None,
                 };
                 if let Some(modes) = modes {
-                    self.apply_mutable_call_effects(expression, args, &modes, None, moved);
+                    let view_summary = indirect_mutable_view_effect(
+                        callee,
+                        args.len(),
+                        self.named_view_effect,
+                        self.callable_targets,
+                        self.callable_target_ids,
+                    );
+                    self.apply_mutable_call_effects(expression, args, &modes, None,
+                        Some(&view_summary),
+                        moved,
+                    );
                 }
                 let modes = match callee.ty {
                     Ty::Fn(id) => self.fn_types.get(id as usize).map(|function| {
@@ -48182,6 +49126,7 @@ impl<'a, 't> Checker<'a, 't> {
             return_cleanup: hir::ReturnCleanupAbi::None,
             parallel_transfer: hir::ReturnBorrowSummary::None,
             mutable_retention: None,
+            mutable_view_effect: None,
             locals,
             body,
             span: f.span,
@@ -57728,6 +58673,7 @@ impl<'a, 't> Checker<'a, 't> {
             return_cleanup: hir::ReturnCleanupAbi::None,
             parallel_transfer: hir::ReturnBorrowSummary::None,
             mutable_retention: None,
+            mutable_view_effect: None,
             locals,
             body: body_fin,
             span,
@@ -76278,6 +77224,7 @@ fn main() -> i32 = 0
         .collect();
         let named_modes = std::collections::HashMap::new();
         let named_borrow_mut_retention = std::collections::HashMap::new();
+        let named_view_effect = std::collections::HashMap::new();
         let callable_targets = vec![CallableTargetSet::new(); program.fn_types.len()];
         let callable_target_ids = std::collections::HashMap::new();
         let parallel_targets = CallableTransferSet::new();
@@ -76291,6 +77238,7 @@ fn main() -> i32 = 0
                     named_parallel_transfer: &named,
                     named_param_modes: &named_modes,
                     named_borrow_mut_retention: &named_borrow_mut_retention,
+                    named_view_effect: &named_view_effect,
                     summary_dependencies: None,
                     tuples: &program.tuples,
                     structs: &program.structs,
@@ -76322,6 +77270,7 @@ fn main() -> i32 = 0
                     return_roots: BorrowRoots::new(),
                     parallel_transfer_roots: BorrowRoots::new(),
                     borrow_mut_retention: vec![BorrowRoots::new(); function.params.len()],
+                    view_effect_exits: None,
                     non_fallthrough: std::collections::HashSet::new(),
                     borrow_fact_cache: std::cell::RefCell::new(None),
                     collecting_move_children: false,
@@ -79519,6 +80468,146 @@ fn main() {}
     }
 
     #[test]
+    fn mutable_copy_view_direct_effects_distinguish_header_and_whole_element() {
+        let (program, diagnostics) = check(
+            r#"
+fn reset(borrow mut dst: slice<str>) { dst = [] }
+fn write(borrow mut dst: slice<str>, source: str) { dst[0] = source }
+fn main() -> i32 = 0
+"#,
+        );
+        assert!(
+            !diagnostics.has_errors(),
+            "{:?}",
+            diagnostics
+                .iter()
+                .map(|item| &item.message)
+                .collect::<Vec<_>>()
+        );
+        let reset = program
+            .fns
+            .iter()
+            .find(|function| function.name == "reset")
+            .unwrap();
+        let write = program
+            .fns
+            .iter()
+            .find(|function| function.name == "write")
+            .unwrap();
+        let reset_effect = reset.mutable_view_effect.as_ref().unwrap()[0]
+            .as_ref()
+            .unwrap();
+        assert!(reset_effect.may_rebind && reset_effect.must_rebind);
+        assert!(!reset_effect.may_write_original && !reset_effect.must_write_original_element);
+        assert!(reset_effect.rebind_roots.is_empty());
+        let write_effect = write.mutable_view_effect.as_ref().unwrap()[0]
+            .as_ref()
+            .unwrap();
+        assert!(write_effect.may_write_original && write_effect.must_write_original_element);
+        assert!(!write_effect.may_rebind && !write_effect.must_rebind);
+        assert_eq!(
+            write_effect.write_roots,
+            vec![hir::MutableRetentionRoot::Contained(1)]
+        );
+    }
+
+    #[test]
+    fn mutable_copy_view_nested_effects_forward_sources_and_guarantees() {
+        let (program, diagnostics) = check(
+            r#"
+fn forward_write(borrow mut dst: slice<str>, source: str) { write(dst, source) }
+fn forward_reset(borrow mut dst: slice<str>) { reset(dst) }
+fn via_value(borrow mut dst: slice<str>, source: str) { f := write; f(dst, source) }
+fn write(borrow mut dst: slice<str>, source: str) { dst[0] = source }
+fn reset(borrow mut dst: slice<str>) { dst = [] }
+fn main() -> i32 = 0
+"#,
+        );
+        assert!(
+            !diagnostics.has_errors(),
+            "{:?}",
+            diagnostics
+                .iter()
+                .map(|item| &item.message)
+                .collect::<Vec<_>>()
+        );
+        let effect = |name: &str| {
+            program
+                .fns
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap()
+                .mutable_view_effect
+                .as_ref()
+                .unwrap()[0]
+                .as_ref()
+                .unwrap()
+                .clone()
+        };
+        let write = effect("forward_write");
+        assert!(
+            write.may_write_original && write.must_write_original_element,
+            "{write:?}"
+        );
+        assert_eq!(
+            write.write_roots,
+            vec![hir::MutableRetentionRoot::Contained(1)]
+        );
+        let indirect = effect("via_value");
+        assert!(
+            indirect.may_write_original && indirect.must_write_original_element,
+            "{indirect:?}"
+        );
+        assert_eq!(
+            indirect.write_roots,
+            vec![hir::MutableRetentionRoot::Contained(1)]
+        );
+        let reset = effect("forward_reset");
+        assert!(reset.may_rebind && reset.must_rebind, "{reset:?}");
+        assert!(reset.rebind_roots.is_empty());
+    }
+
+    #[test]
+    fn mutable_view_effect_replay_rejects_stale_facts() {
+        let (program, diagnostics) = check(
+            r#"
+fn write(borrow mut dst: slice<str>, source: str) { dst[0] = source }
+fn main() -> i32 = 0
+"#,
+        );
+        assert!(!diagnostics.has_errors());
+        assert!(checked_hir_body_facts_are_valid(&program));
+        let write = program
+            .fns
+            .iter()
+            .position(|function| function.name == "write")
+            .unwrap();
+        for mutation in 0..6 {
+            let mut forged = program.clone();
+            let summary = &mut forged.fns[write].mutable_view_effect;
+            let effect = summary.as_mut().unwrap()[0].as_mut().unwrap();
+            match mutation {
+                0 => effect.may_write_original = false,
+                1 => effect.must_write_original_element = false,
+                2 => effect.may_rebind = true,
+                3 => effect.must_rebind = true,
+                4 => effect.write_roots.clear(),
+                5 => effect
+                    .write_roots
+                    .push(hir::MutableRetentionRoot::Storage(1)),
+                _ => unreachable!(),
+            }
+            assert!(
+                !checked_hir_body_facts_are_valid(&forged),
+                "forgery {mutation}"
+            );
+        }
+        let mut missing = program.clone();
+        missing.fns[write].mutable_view_effect = None;
+        assert!(!checked_hir_body_facts_are_valid(&missing));
+    }
+
+    #[test]
     fn storage_generation_joins_keep_source_and_destination_lifetimes_separate() {
         let descriptor = StorageHeaderDescriptor {
             ty: Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })),
@@ -80337,6 +81426,7 @@ fn main() -> i32 = 0
         let named = std::collections::HashMap::new();
         let named_modes = std::collections::HashMap::new();
         let named_borrow_mut_retention = std::collections::HashMap::new();
+        let named_view_effect = std::collections::HashMap::new();
         let callable_targets = vec![CallableTargetSet::new(); program.fn_types.len()];
         let callable_target_ids = std::collections::HashMap::new();
         let parallel_targets = CallableTransferSet::new();
@@ -80348,6 +81438,7 @@ fn main() -> i32 = 0
             named_parallel_transfer: &named,
             named_param_modes: &named_modes,
             named_borrow_mut_retention: &named_borrow_mut_retention,
+            named_view_effect: &named_view_effect,
             summary_dependencies: None,
             tuples: &program.tuples,
             structs: &program.structs,
@@ -80379,6 +81470,7 @@ fn main() -> i32 = 0
             return_roots: BorrowRoots::new(),
             parallel_transfer_roots: BorrowRoots::new(),
             borrow_mut_retention: vec![BorrowRoots::new(); function.params.len()],
+            view_effect_exits: None,
             non_fallthrough: std::collections::HashSet::new(),
             borrow_fact_cache: std::cell::RefCell::new(None),
             collecting_move_children: false,
@@ -80673,6 +81765,7 @@ fn main() -> i32 = 0
             .map(|function| (function.name.clone(), function.param_modes.clone()))
             .collect();
         let named_borrow_mut_retention = std::collections::HashMap::new();
+        let named_view_effect = std::collections::HashMap::new();
         let callable_targets = vec![CallableTargetSet::new(); program.fn_types.len()];
         let callable_target_ids = std::collections::HashMap::new();
         let parallel_targets = CallableTransferSet::new();
@@ -80684,6 +81777,7 @@ fn main() -> i32 = 0
             named_parallel_transfer: &named,
             named_param_modes: &named_modes,
             named_borrow_mut_retention: &named_borrow_mut_retention,
+            named_view_effect: &named_view_effect,
             summary_dependencies: None,
             tuples: &program.tuples,
             structs: &program.structs,
@@ -80715,6 +81809,7 @@ fn main() -> i32 = 0
             return_roots: BorrowRoots::new(),
             parallel_transfer_roots: BorrowRoots::new(),
             borrow_mut_retention: vec![BorrowRoots::new(); function.params.len()],
+            view_effect_exits: None,
             non_fallthrough: std::collections::HashSet::new(),
             borrow_fact_cache: std::cell::RefCell::new(None),
             collecting_move_children: false,
