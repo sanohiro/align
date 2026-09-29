@@ -30263,23 +30263,17 @@ fn indirect_mutable_view_effect(
     let Ty::Fn(id) = callee.ty else {
         return None;
     };
-    let Some(targets) = callable_targets.get(id as usize) else {
-        return None;
-    };
+    let targets = callable_targets.get(id as usize)?;
     if targets.unavailable || targets.is_empty() {
         return None;
     }
     let mut combined: Option<hir::MutableViewEffectSummary> = None;
     for target in targets.keys() {
-        let Some(name) = callable_target_ids
+        let name = callable_target_ids
             .iter()
             .find_map(|(name, id)| (id == target).then_some(name))
-        else {
-            return None;
-        };
-        let Some(summary) = named_view_effect.get(name) else {
-            return None;
-        };
+            ?;
+        let summary = named_view_effect.get(name)?;
         if summary
             .as_ref()
             .is_none_or(|effects| effects.len() != argument_count)
@@ -34931,6 +34925,12 @@ impl<'a> MoveCheck<'a> {
                 .get(&local)
                 .cloned()
                 .unwrap_or_default(),
+            ExprKind::Field { root, .. } => self
+                .borrows
+                .view_flows
+                .get(&root)
+                .cloned()
+                .unwrap_or_default(),
             _ => std::collections::BTreeSet::new(),
         };
         for leaf in self.completed_headers(value).leaves.values() {
@@ -34950,6 +34950,11 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn install_view_flow(&mut self, local: LocalId, mut flows: std::collections::BTreeSet<u32>) {
+        // A copied view may be retargeted before a later store. Retain its historical entry
+        // header flow so the public effect still covers writes into that transient target.
+        if let Some(previous) = self.borrows.view_flows.get(&local) {
+            flows.extend(previous.iter().copied());
+        }
         if let Some(position) = self
             .f
             .params
@@ -36671,6 +36676,7 @@ impl<'a> MoveCheck<'a> {
     /// Select the roots one returning mutable callee may have installed. An `out` destination's
     /// self-source denotes old elements; every other contained source denotes a copied whole value,
     /// including its backing. Facts are captured before any destination generation is invalidated.
+    #[allow(clippy::too_many_arguments)]
     fn apply_exact_view_call_effect(
         &mut self,
         destination_index: usize,
@@ -41369,6 +41375,7 @@ impl<'a> MoveCheck<'a> {
         let headers = self.completed_headers(init);
         let completed_storage_roots = self.completed_storage_fact(init).live_roots();
         let source = self.direct_storage_move_source(init);
+        let view_flows = self.view_flows_of_expr(init);
         for (index, local) in locals.iter().enumerate() {
             let Some(local) = local else { continue };
             let selector = [BorrowProjection::TupleElement(index as u32)];
@@ -41409,6 +41416,7 @@ impl<'a> MoveCheck<'a> {
                 let backing = self.destructured_mutable_backing(*local);
                 self.borrows.mutable_backing.insert(*local, backing);
             }
+            self.install_view_flow(*local, view_flows.clone());
             clear_moved(moved, *local);
         }
     }
@@ -42712,6 +42720,12 @@ impl<'a> MoveCheck<'a> {
                     if !self_assign {
                         self.mark_borrow_mut_modified(*root);
                         self.invalidate_mutable_place(*root, path);
+                        let view_flows = self.view_flows_of_expr(value);
+                        self.borrows
+                            .view_flows
+                            .entry(*root)
+                            .or_default()
+                            .extend(view_flows);
                         let projections = path
                             .iter()
                             .copied()
@@ -45838,11 +45852,13 @@ impl<'a> MoveCheck<'a> {
                 }
                 Post::BlockLet { local, init } => {
                     if falls_through {
+                        let view_flows = self.view_flows_of_expr(init);
                         self.install_storage(local, init, false);
                         self.assign_borrow(local, init);
                         self.assign_active_sum(local, init);
                         self.assign_mutable_backing(local, init);
                         self.assign_local_origin_place(local, init);
+                        self.install_view_flow(local, view_flows);
                         clear_moved(moved, local);
                         self.clear_expression_value_snapshots(init);
                     }
@@ -45854,6 +45870,10 @@ impl<'a> MoveCheck<'a> {
                     drop_old,
                 } => {
                     if falls_through {
+                        let view_flows = self.view_flows_of_expr(value);
+                        if !matches!(value.kind, ExprKind::Local(source) if source == local) {
+                            self.record_view_rebind(local, value);
+                        }
                         drop_old.set(self.is_move(local));
                         if !matches!(value.kind, ExprKind::Local(source) if source == local) {
                             self.mark_borrow_mut_modified(local);
@@ -45870,6 +45890,7 @@ impl<'a> MoveCheck<'a> {
                         self.assign_active_sum(local, value);
                         self.assign_mutable_backing(local, value);
                         self.assign_local_origin_place(local, value);
+                        self.install_view_flow(local, view_flows);
                         clear_moved(moved, local);
                         self.clear_expression_value_snapshots(value);
                     }
@@ -45956,6 +45977,12 @@ impl<'a> MoveCheck<'a> {
                         if !self_assign {
                             self.mark_borrow_mut_modified(root);
                             self.invalidate_mutable_place(root, path);
+                            let view_flows = self.view_flows_of_expr(value);
+                            self.borrows
+                                .view_flows
+                                .entry(root)
+                                .or_default()
+                                .extend(view_flows);
                             let projections = path
                                 .iter()
                                 .copied()
@@ -46003,6 +46030,9 @@ impl<'a> MoveCheck<'a> {
                             value_consuming,
                         );
                         if falls_through {
+                            if collection_path.is_empty() {
+                                self.record_view_element_store(base, value, element_path.is_empty());
+                            }
                             if invalidates_owner
                                 && self.is_move_ty(value.ty)
                             {
@@ -46032,6 +46062,9 @@ impl<'a> MoveCheck<'a> {
                     ..
                 } => {
                     if index_complete && falls_through {
+                        if collection_path.is_empty() {
+                            self.record_view_element_store(base, value, element_path.is_empty());
+                        }
                         if invalidates_owner
                             && self.is_move_ty(value.ty)
                         {
@@ -80509,6 +80542,72 @@ fn main() -> i32 = 0
             write_effect.write_roots,
             vec![hir::MutableRetentionRoot::Contained(1)]
         );
+    }
+
+    #[test]
+    fn mutable_copy_view_match_and_loop_join_guaranteed_writes() {
+        let (program, diagnostics) = check(
+            r#"
+fn matched(borrow mut dst: slice<str>, flag: bool) {
+  _ := match Some(flag) {
+    Some(_) => { dst[0] = "left" }
+    None => { dst[0] = "right" }
+  }
+}
+fn looped(borrow mut dst: slice<str>) { loop { dst[0] = "static"; break } }
+fn unwrapped(borrow mut dst: slice<str>, choice: Option<bool>) {
+  _ := choice else { dst[0] = "static"; return }
+  dst[0] = "static"
+}
+fn main() -> i32 = 0
+"#,
+        );
+        assert!(
+            !diagnostics.has_errors(),
+            "{:?}",
+            diagnostics.iter().map(|item| &item.message).collect::<Vec<_>>()
+        );
+        for name in ["matched", "looped", "unwrapped"] {
+            let function = program.fns.iter().find(|function| function.name == name).unwrap();
+            let effect = function.mutable_view_effect.as_ref().unwrap()[0].as_ref().unwrap();
+            assert!(effect.must_write_original_element, "{name}: {effect:?}");
+        }
+    }
+
+    #[test]
+    fn mutable_copy_view_try_and_map_err_keep_error_return_edges() {
+        let (program, diagnostics) = check(
+            r#"
+fn keep(error: str) -> str = error
+fn maybe(flag: bool) -> Result<(), str> {
+  if flag { return Err("early") }
+  return Ok(())
+}
+fn tried(borrow mut dst: slice<str>, flag: bool) -> Result<(), str> {
+  maybe(flag)?
+  dst[0] = "static"
+  return Ok(())
+}
+fn mapped(borrow mut dst: slice<str>, flag: bool) -> Result<(), str> {
+  result := maybe(flag).map_err(keep)
+  result?
+  dst[0] = "static"
+  return Ok(())
+}
+fn main() -> i32 = 0
+"#,
+        );
+        assert!(
+            !diagnostics.has_errors(),
+            "{:?}",
+            diagnostics.iter().map(|item| &item.message).collect::<Vec<_>>()
+        );
+        for name in ["tried", "mapped"] {
+            let function = program.fns.iter().find(|function| function.name == name).unwrap();
+            let effect = function.mutable_view_effect.as_ref().unwrap()[0].as_ref().unwrap();
+            assert!(effect.may_write_original, "{name}: {effect:?}");
+            assert!(!effect.must_write_original_element, "{name}: {effect:?}");
+        }
     }
 
     #[test]

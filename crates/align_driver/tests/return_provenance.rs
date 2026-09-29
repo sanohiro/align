@@ -22,6 +22,21 @@ fn mutable_copy_view_effect_matrix() {
             true,
         ),
         ("early-return", "if flag { return }\n  dst[0] = \"static\"", "[view]", 0, false),
+        ("loop-write", "loop { dst[0] = \"static\"; break }", "[view]", 0, true),
+        (
+            "loop-early-break",
+            "loop { if flag { break }; dst[0] = \"static\"; break }",
+            "[view]",
+            0,
+            false,
+        ),
+        (
+            "match-write",
+            "_ := match Some(flag) { Some(_) => { dst[0] = \"static\" } None => { dst[0] = \"static\" } }",
+            "[view]",
+            0,
+            true,
+        ),
     ];
     for (name, body, cells, observed, valid) in cases {
         let source = format!(
@@ -142,6 +157,71 @@ fn main() -> i32 {
     assert!(
         diagnostics.contains("shorter-lived") || diagnostics.contains("invalidated borrow"),
         "a fresh region-backed descriptor must not be treated as empty:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn mutable_copy_view_projected_header_writes_preserve_call_effects() {
+    let retargeted = r#"
+Holder { slot: slice<str> }
+fn write(borrow mut dst: slice<str>, target: slice<str>, value: str) {
+  mut holder := Holder { slot: dst }
+  holder.slot = target
+  mut selected := holder.slot
+  selected[0] = value
+}
+fn main() -> i32 {
+  mut original := ["old"]
+  mut target := ["old"]
+  mut dst: slice<str> := original
+  target_view: slice<str> := target
+  arena short {
+    n := 42
+    value := template "short={n}"
+    write(dst, target_view, value)
+  }
+  return target[0].len() as i32
+}
+"#;
+    let diagnostics = check_diagnostics("mutable-view-projected-retargeted", retargeted);
+    assert!(
+        diagnostics.contains("cannot retain a shorter-lived view"),
+        "a retargeted field must publish its write into the target backing:\n{diagnostics}"
+    );
+
+    let copied_local = retargeted.replace(
+        "mut holder := Holder { slot: dst }\n  holder.slot = target\n  mut selected := holder.slot",
+        "mut selected := dst\n  selected = target",
+    );
+    let diagnostics = check_diagnostics("mutable-view-copied-local-retargeted", &copied_local);
+    assert!(
+        diagnostics.contains("cannot retain a shorter-lived view"),
+        "a retargeted local copy must retain its original destination flow:\n{diagnostics}"
+    );
+
+    let full_write = r#"
+Holder { slot: slice<str> }
+fn write(borrow mut dst: slice<str>) {
+  mut holder := Holder { slot: [] }
+  holder.slot = dst
+  mut selected := holder.slot
+  selected[0] = "static"
+}
+fn main() -> i32 {
+  mut owner := "old".clone()
+  view: str := owner
+  mut values := [view]
+  mut dst: slice<str> := values
+  alias := dst
+  write(dst)
+  owner = "new".clone()
+  return alias[0].len() as i32
+}
+"#;
+    let diagnostics = check_diagnostics("mutable-view-projected-full-write", full_write);
+    assert!(
+        !diagnostics.contains("source 'owner'") && !diagnostics.contains("error:"),
+        "a guaranteed projected whole-element write must replace the one old cell:\n{diagnostics}"
     );
 }
 
