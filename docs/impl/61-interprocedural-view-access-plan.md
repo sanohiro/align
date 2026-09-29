@@ -147,6 +147,15 @@ immutable: no context-global content table may inject later descriptors or live
 validation observations backwards into it. Collection permission remains separate
 from contained profiles and unrelated siblings.
 
+Truncation changes the selected dynamic array's length and performs its native
+suffix cleanup, but a weak content cell does not name element positions. A
+positive surviving prefix retains every old row alternative. Only a proven
+zero-length result may clear founded rows; if zero and positive are both
+possible, keep them as separate guarded alternatives. A later append on the
+zero arm inserts into an empty row domain. No truncation transfer removes one
+permission/backing pair from a mixed positive prefix by guessing that it was
+confined to the removed suffix.
+
 An empty content cell means no founded element descriptor is known, not a writable
 descriptor. A known empty collection can return without reading an element.
 Scalar zero/nonzero facts and descriptor lengths preserve the empty/absent branch;
@@ -233,6 +242,13 @@ row alternatives with the inserted complete row before removing temporary old
 storage coordinates. This is a weak element operation; a whole-element update
 uses the same conservative content rule unless an exact singleton indexed place
 has independently been proved.
+
+Truncation is not an exact singleton indexed replacement. Its positive-length
+image keeps old row alternatives and can retain only uniform certificates that
+held before truncation. Its zero-length image has no founded row and the
+existing empty-collection guard; joining those images cannot certify a new
+uniform writable element in a possibly nonempty result. This loses some
+prefix-only precision but cannot manufacture write authority.
 
 When coexisting heap cells merge, combine their complete row alternatives in
 that world; a resulting field is uniform only when every nonempty input is
@@ -3951,6 +3967,7 @@ Owner names below designate the tests to implement, not completed evidence.
 | Construction and copying | `view_access_transfer_matrix`: literals/constants/mapped/static descriptor origins; fixed value copies versus slot slices; shallow versus deep owned copies; disjoint siblings in both field orders. |
 | Replacement and joins | `view_access_control_matrix`: direct and selected-place replacement; both branches, match, else, Try/map_err, loop backedges, value-carrying breaks and early returns. Writes before replacement remain observable. |
 | Aliased heap contents | `view_access_alias_matrix`: aliases before and after calls, returned aliases, mutable descriptor outputs, collection elements, builders, recursive allocation and summary-location weak updates. |
+| Dynamic array truncation | `view_access_truncate_matrix`: heterogeneous writable/read-only rows in both insertion orders, known-zero versus positive/unknown new length, subsequent append and indexed read/write, returned/aliased prefix views, and suffix owned-resource cleanup. A mixed weak summary cannot drop the read-only alternative or synthesize a uniform writable flag after a positive truncation; a known-zero arm has no founded row, and later append starts from that empty state. An originally homogeneous writable collection remains writable after positive truncation. Check invalid length before suffix Drop or header write and preserve whole/per-unit parity. |
 | Source timing and completion | `view_access_source_event_matrix`: the identical-MIR receiver/index pair, live-only capture, ended-child rebind, scalar/owned/byte cutoff, exact-destination effects, branch consolidation and loop-local release. `view_access_event_validation_matrix`: typed subjects, malformed ordinals, undefined/duplicate snapshots, merge agreement, terminating paths and remapping. Full HIR placement inventory remains required. |
 | Byte validation across calls | `view_access_byte_observation_matrix`: UTF-8 and codec kinds, hidden by-value writes, callee-created validation, observation dependency closure, disjoint and raw-byte controls, eager operand order, text derivatives, owned copies, repeat-site revalidation and recursive observation recency and unknown-backing transport. |
 | Calls and captures | `view_access_call_matrix`: direct/imported/generic and indirect calls, target-relative captures, reader/writer twins, unavailable alternatives, recursive readers, nonreturning callees and completed operands. |
@@ -4494,7 +4511,8 @@ not authorize a separate implementation or an early format bump.
 | `HttpServerMaxRequestBodyBytes` | Read the i64 limit and mutate the selected HttpServer configuration handle. No caller byte view, fresh backing or implicit validation result is published. Preserve the native owner/status and limit checks. | `view_access_native_matrix`, HTTP server owner. |
 | `MakeFieldSlice` | Select the validated fixed-array field path and constant extent. Publish a descriptor into that same field backing with its existing authority and observation dependencies; an outer mutable header does not upgrade a read-only leaf. | `view_access_transfer_matrix`, `view_access_alias_matrix`, fixed-array field owner. |
 | `ArrayBuilderNew.capacity` | Read capacity after the optional region operand and before builder allocation. Publish the same fresh builder kind as the zero-capacity form, with an empty initialized prefix; no element profile exists yet. | `view_access_native_matrix`, plan 65 builder-capacity owner. |
-| `DropFlagMoveOut`, `DropField`, `ArrayTruncate` | Apply the exact selected nulling, nested cleanup or suffix cleanup rules in the statement inventory below. Preserve aliases and sibling profiles until their own reached actions. | `view_access_control_matrix`, `view_access_alias_matrix`, plans 66 and 71 ownership owners. |
+| `DropFlagMoveOut`, `DropField` | Apply exact selected slot nulling or nested cleanup. Preserve aliases and sibling profiles until their own reached actions. | `view_access_control_matrix`, `view_access_alias_matrix`, plan 71 ownership owners. |
+| `ArrayTruncate` | Validate the exclusive Place and i64 count before a write. On reached success, interpret feasible suffix Drop hooks in increasing index order before shortening the logical length; their access effects cannot be skipped because element profiles are weak. A definitely zero new length then clears founded row contents in that arm. A positive or unknown new length retains every old weak row alternative and any guarded uniform certificate; it cannot delete a candidate merely because it might have belonged to the removed suffix. A nonuniform collection cannot become uniform without a separate exact positional proof. | `view_access_truncate_matrix` and plan 66 ownership owners. |
 | `StrMatch` | Read the scrutinee at the terminator and traverse each feasible case/otherwise edge in canonical source order. Its branch does not consume, allocate or validate new text. | `view_access_control_matrix`, plan 72 string-match owner. |
 
 The owner matrix also compares whole-program and per-unit replay for every new
@@ -5475,8 +5493,14 @@ Store records the false ownership state. It cannot erase an alias's observation.
 DropField follows the existing validated nested cleanup plan on the selected path and preserves
 siblings. ArrayTruncate checks the exclusive Place destination, applies suffix
 element cleanup in increasing index order on reached success, then publishes
-the shorter logical length. It preserves surviving element/backing profiles;
-no removed owned leaf may remain reachable through the truncated array.
+the shorter logical length. The runtime cannot read a removed leaf through that
+array. Its access summary keeps all old weak row alternatives when the new
+length may be positive: the summary has no positional certificate that could
+identify which alternative belonged only to the removed suffix. Thus a safe
+prefix operation can remain unproved in a heterogeneous array. A definitely
+zero new length clears founded row contents on that arm; a later append starts
+from the known-empty collection. Neither case upgrades an alias's permission
+or retains a usable borrowed view beyond its source lifetime.
 Dropping a local root does not erase observations retained by another live root.
 TgEnd, like TgWait, must apply retained task bodies before dropping the group.
 RawFree/RawStore follow the conditional unsafe transfer above and grant no safe
