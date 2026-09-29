@@ -2477,8 +2477,9 @@ shipped frontend-cache capability. Distinguish reuse of a previously admitted
 compiler-produced artifact from new native emission.
 
 Keep the existing unit manifest shape and key comparison/digest/trailing-byte
-validation order. The interface-format version is already a unit-key component. Changing it from
-12 to 13 invalidates older frontend entries for this access contract. A miss may
+validation order. The interface-format version is already the unit key's
+`frontend_schema` component. Changing it from 17 to 18 invalidates older
+frontend entries for this access contract. A miss may
 publish a clean descriptor-free UnitEntry only after complete source admission
 and canonical interface-bundle construction. The separate object cache publishes
 only after actual native validation/emission. A hit therefore requires both
