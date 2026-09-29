@@ -21014,13 +21014,24 @@ impl<'a> EscapeCheck<'a> {
                 let success = success_projection.map_or_else(EscapeValueFact::default, |path| {
                     self.completed_escape_value(opt).project_path(&[path])
                 });
-                success.join(&self.completed_escape_value(fallback))
+                // A terminating fallback is checked at its own exit; it never supplies this
+                // expression's result and must not lend it frame-local storage.
+                if hir_expr_diverges(fallback) {
+                    success
+                } else {
+                    success.join(&self.completed_escape_value(fallback))
+                }
             }
             ExprKind::If { then, els, .. } => Self::join_escape_value_facts(
-                [then, els].into_iter().map(|block| self.block_escape_value(block)),
+                [then, els]
+                    .into_iter()
+                    .filter(|block| !hir_block_diverges(block))
+                    .map(|block| self.block_escape_value(block)),
             ),
             ExprKind::Match { arms, .. } => Self::join_escape_value_facts(
-                arms.iter().map(|arm| self.completed_escape_value(&arm.body)),
+                arms.iter()
+                    .filter(|arm| !hir_expr_diverges(&arm.body))
+                    .map(|arm| self.completed_escape_value(&arm.body)),
             ),
             ExprKind::Block(block)
             | ExprKind::FloatScope { block, .. }
@@ -23706,10 +23717,14 @@ impl<'a> EscapeCheck<'a> {
                         &[projection],
                     )
                 });
-                Self::join_callable_region_fact(
-                    success,
-                    self.callable_region_fact(fallback, depth),
-                )
+                if hir_expr_diverges(fallback) {
+                    success
+                } else {
+                    Self::join_callable_region_fact(
+                        success,
+                        self.callable_region_fact(fallback, depth),
+                    )
+                }
             }
             ExprKind::Block(block)
             | ExprKind::FloatScope { block, .. }
@@ -23722,6 +23737,7 @@ impl<'a> EscapeCheck<'a> {
             ),
             ExprKind::If { then, els, .. } => [then, els]
                 .into_iter()
+                .filter(|block| !hir_block_diverges(block))
                 .filter_map(|block| block.value.as_deref())
                 .fold(CallableRegionFact::new(), |fact, value| {
                     Self::join_callable_region_fact(
@@ -23729,15 +23745,15 @@ impl<'a> EscapeCheck<'a> {
                         self.callable_region_fact(value, depth),
                     )
                 }),
-            ExprKind::Match { arms, .. } => arms.iter().fold(
-                CallableRegionFact::new(),
-                |fact, arm| {
+            ExprKind::Match { arms, .. } => arms
+                .iter()
+                .filter(|arm| !hir_expr_diverges(&arm.body))
+                .fold(CallableRegionFact::new(), |fact, arm| {
                     Self::join_callable_region_fact(
                         fact,
                         self.callable_region_fact(&arm.body, depth),
                     )
-                },
-            ),
+                }),
             _ => CallableRegionFact::new(),
         }
     }
@@ -24361,12 +24377,14 @@ impl<'a> EscapeCheck<'a> {
                     depth,
                 )),
             ),
-            // `opt else fb` yields one of two values, so it lives only as long as the shorter.
-            ExprKind::ElseUnwrap { opt, fallback } => push_fold(
-                &mut work,
-                Region::Static,
-                vec![(opt, depth, None), (fallback, depth, None)],
-            ),
+            // `opt else fb` yields a success value or a fallback that reaches the join.
+            ExprKind::ElseUnwrap { opt, fallback } => {
+                let mut children = vec![(opt.as_ref(), depth, None)];
+                if !hir_expr_diverges(fallback) {
+                    children.push((fallback, depth, None));
+                }
+                push_fold(&mut work, Region::Static, children);
+            }
             // A `str` borrow of an owned `string` (slice 7b) views storage owned by *this* frame
             // (the `string` is `Drop`-freed at frame exit), so the view is `Frame`-regioned — it
             // must not escape the frame. This feeds `region_of(Call)`: passing a borrowed string
@@ -24633,6 +24651,7 @@ impl<'a> EscapeCheck<'a> {
                     Region::Static,
                     [then, els]
                         .into_iter()
+                        .filter(|block| !hir_block_diverges(block))
                         .filter_map(|block| {
                             block
                                 .value
@@ -24651,6 +24670,7 @@ impl<'a> EscapeCheck<'a> {
                 Region::Static,
                 arms
                     .iter()
+                    .filter(|arm| !hir_expr_diverges(&arm.body))
                     .map(|arm| (&arm.body, depth, None))
                     .collect(),
             ),
@@ -25138,8 +25158,12 @@ impl<'a> EscapeCheck<'a> {
                 work.extend(b.value.as_deref())
             }
             ExprKind::If { then, els, .. } => {
-                work.extend(els.value.as_deref());
-                work.extend(then.value.as_deref());
+                if !hir_block_diverges(els) {
+                    work.extend(els.value.as_deref());
+                }
+                if !hir_block_diverges(then) {
+                    work.extend(then.value.as_deref());
+                }
             }
             // A range slice `recv[a..b]` borrows the receiver's storage, so it is frame-local iff
             // the receiver is (a sub-slice of a local array is still a view of that stack array).
@@ -25152,13 +25176,20 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::CodecBatchBools { batch, .. }
             | ExprKind::CodecBatchStrs { batch, .. } => work.push(batch),
             ExprKind::CodecColumnAt { column, .. } => work.push(column),
-            // A `match`/`else` yields one of its arms, so it is frame-local if any arm is (like the
-            // `if`/`else` arm above — a local-backed slice must not escape through either).
+            // A `match`/`else` yields one of its reaching arms, so a local-backed alternative
+            // cannot escape while a branch that exits before the join cannot taint the result.
             ExprKind::Match { arms, .. } => {
-                work.extend(arms.iter().rev().map(|arm| &arm.body));
+                work.extend(
+                    arms.iter()
+                        .rev()
+                        .filter(|arm| !hir_expr_diverges(&arm.body))
+                        .map(|arm| &arm.body),
+                );
             }
             ExprKind::ElseUnwrap { opt, fallback } => {
-                work.push(fallback);
+                if !hir_expr_diverges(fallback) {
+                    work.push(fallback);
+                }
                 work.push(opt);
             }
             // An `arena` / `unsafe` / `task_group` block yields its block value, which is frame-local

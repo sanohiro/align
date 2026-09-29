@@ -1158,6 +1158,141 @@ pub fn bad() -> str {
 }
 
 #[test]
+fn returned_raw_view_can_borrow_caller_resource_generation() {
+    let root = "\
+module pkg.db
+import pkg.db.internal.resource
+pub resource conn = pkg.db.internal.resource.drop_conn
+pub fn open() -> conn {
+  unsafe {
+    pointer := raw.alloc(8)
+    raw.store(pointer, 0, 42 as u8)
+    return resource.from_raw(pointer)
+  }
+}
+pub fn view(borrow owner: conn) -> Result<slice<u8>, Error> {
+  unsafe {
+    reference := resource.borrow(owner)
+    bytes: slice<u8> := resource.view_from_raw(reference, resource.raw(reference), 8) else {
+      return Err(Error.Invalid)
+    }
+    chosen := if true { bytes } else { return Err(Error.Invalid) }
+    selected := match Some(chosen) {
+      Some(view) => view
+      None => { return Err(Error.Invalid) }
+    }
+    return Ok(selected)
+  }
+}
+pub fn view_option(borrow owner: conn) -> Option<slice<u8>> {
+  unsafe {
+    reference := resource.borrow(owner)
+    return resource.view_from_raw(reference, resource.raw(reference), 8)
+  }
+}
+pub fn view_forward(borrow owner: conn) -> Result<slice<u8>, Error> = Ok(view(owner)?)
+";
+    let entry = "\
+module main
+import pkg.db
+fn main() -> i32 {
+  owner := pkg.db.open()
+  first: slice<u8> := pkg.db.view_option(owner) else { return 1 }
+  if first[0] != 42 { return 2 }
+  bytes: slice<u8> := pkg.db.view_forward(owner) else { return 3 }
+  return bytes[0] as i32
+}
+";
+    let project = [
+        ("pkg/db/internal/resource.align", INTERNAL),
+        ("pkg/db.align", root),
+        ("main.align", entry),
+    ];
+    let differential = diff_check_multi("resource-view-return-borrow", &project, "main.align");
+    assert!(!differential.whole_errors, "{}", differential.whole_diags);
+    assert!(!differential.per_unit_errors, "{}", differential.per_unit_diags);
+    if backend_available() {
+        assert_eq!(
+            build_and_run_multi("resource-view-return-borrow-whole", &project, "main.align")
+                .status
+                .code(),
+            Some(42),
+        );
+        assert_eq!(
+            build_per_unit_multi("resource-view-return-borrow-units", &project, "main.align")
+                .link_and_run()
+                .status
+                .code(),
+            Some(42),
+        );
+    }
+}
+
+#[test]
+fn returned_raw_view_keeps_caller_resource_generation_live() {
+    let root = "\
+module pkg.db
+import pkg.db.internal.resource
+pub resource conn = pkg.db.internal.resource.drop_conn
+pub fn open() -> conn { unsafe { return resource.from_raw(raw.alloc(8)) } }
+pub fn view(borrow owner: conn) -> Result<slice<u8>, Error> {
+  unsafe {
+    reference := resource.borrow(owner)
+    bytes: slice<u8> := resource.view_from_raw(reference, resource.raw(reference), 8) else {
+      return Err(Error.Invalid)
+    }
+    return Ok(bytes)
+  }
+}
+pub fn touch(borrow mut owner: conn) {}
+";
+    for (name, body, needle) in [
+        (
+            "move",
+            "owner := pkg.db.open(); bytes := pkg.db.view(owner) else { return 1 }; moved := owner; return bytes[0] as i32",
+            "use of invalidated borrow 'bytes'",
+        ),
+        (
+            "mutable-call",
+            "mut owner := pkg.db.open(); bytes := pkg.db.view(owner) else { return 1 }; pkg.db.touch(owner); return bytes[0] as i32",
+            "use of invalidated borrow 'bytes'",
+        ),
+        (
+            "replacement",
+            "mut owner := pkg.db.open(); bytes := pkg.db.view(owner) else { return 1 }; owner = pkg.db.open(); return bytes[0] as i32",
+            "use of invalidated borrow 'bytes'",
+        ),
+    ] {
+        let entry = format!("module main\nimport pkg.db\nfn main() -> i32 {{ {body} }}\n");
+        let project = [
+            ("pkg/db/internal/resource.align", INTERNAL),
+            ("pkg/db.align", root),
+            ("main.align", entry.as_str()),
+        ];
+        assert_rejected(name, &project, needle);
+    }
+}
+
+#[test]
+fn reachable_return_alternatives_keep_local_storage_rejection() {
+    for (name, parameter, value) in [
+        ("else", "source: Option<slice<u8>>", "source else { local[0..1] }"),
+        ("if", "source: slice<u8>", "if true { source } else { local[0..1] }"),
+        (
+            "match",
+            "source: Option<slice<u8>>",
+            "match source { Some(view) => view, None => local[0..1] }",
+        ),
+    ] {
+        let entry = format!(
+            "fn bad({parameter}) -> slice<u8> {{ local := [42 as u8]; return {value} }}\nfn main() -> i32 = 0\n"
+        );
+        let project = [("main.align", entry.as_str())];
+        assert_rejected(name, &project, "views a local array");
+    }
+}
+
+#[test]
 fn resources_are_rejected_at_ffi_display_equality_and_dynamic_collection_boundaries() {
     let ffi_root = "\
 module pkg.db
