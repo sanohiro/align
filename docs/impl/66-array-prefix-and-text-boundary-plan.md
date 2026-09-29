@@ -57,9 +57,9 @@ plan 61 statement schema; no independent serializer or opaque raw-call escape.
 Plan 61 reserves AccessInstruction tag 28 for T, followed by its Place subject
 and i64 operand in that order; all nested tags, little-endian widths and sequence
 rules come from that one codec. U expands to existing MIR records and adds no
-access-wire tag. T extends the still-unpublished interface-13 schema; do not
-introduce a separately published version-13 placeholder. If the actual base
-changes before implementation, reconcile the entire bundle/version/golden set.
+access-wire tag. T enters the still-unpublished access bundle in interface
+format 18, based on the current format 17. No earlier placeholder format is
+published. The bundle/version/golden set is reconciled in plan 61.
 For T at root slot 3 with `new_len = Value(7)`, the statement-only golden is
 `1c0103000000000000000107000000` (15 bytes). It contains no optional fields.
 The independent author encoder/reader checks both directions, every proper

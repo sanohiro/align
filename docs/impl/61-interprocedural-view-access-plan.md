@@ -147,6 +147,15 @@ immutable: no context-global content table may inject later descriptors or live
 validation observations backwards into it. Collection permission remains separate
 from contained profiles and unrelated siblings.
 
+Truncation changes the selected dynamic array's length and performs its native
+suffix cleanup, but a weak content cell does not name element positions. A
+positive surviving prefix retains every old row alternative. Only a proven
+zero-length result may clear founded rows; if zero and positive are both
+possible, keep them as separate guarded alternatives. A later append on the
+zero arm inserts into an empty row domain. No truncation transfer removes one
+permission/backing pair from a mixed positive prefix by guessing that it was
+confined to the removed suffix.
+
 An empty content cell means no founded element descriptor is known, not a writable
 descriptor. A known empty collection can return without reading an element.
 Scalar zero/nonzero facts and descriptor lengths preserve the empty/absent branch;
@@ -233,6 +242,13 @@ row alternatives with the inserted complete row before removing temporary old
 storage coordinates. This is a weak element operation; a whole-element update
 uses the same conservative content rule unless an exact singleton indexed place
 has independently been proved.
+
+Truncation is not an exact singleton indexed replacement. Its positive-length
+image keeps old row alternatives and can retain only uniform certificates that
+held before truncation. Its zero-length image has no founded row and the
+existing empty-collection guard; joining those images cannot certify a new
+uniform writable element in a possibly nonempty result. This loses some
+prefix-only precision but cannot manufacture write authority.
 
 When coexisting heap cells merge, combine their complete row alternatives in
 that world; a resulting field is uniform only when every nonempty input is
@@ -2297,7 +2313,7 @@ entry classes. Source permission is not inferred from an LLVM pointer type.
 
 ## Interface integration decisions
 
-The current interface format is 12. This capability changes it once to 13 and
+The current interface format is 17. This capability changes it once to 18 and
 adds one length-prefixed canonical access bundle after the constant records in
 `write_surface`. The complete bundle participates in `interface_hash`; existing
 capabilities and hash trailers retain their ordering and exclusion rules. No
@@ -2405,9 +2421,9 @@ metadata describes an independently forged object file. This capability must
 not claim that stronger property.
 
 The exact bundle/instruction tags, sequence order, validation precedence and
-full-record golden vectors below define this integration. Format 14 is the
-single implementation transition; the current compiler writes format 13 after
-plan 71's drop-state effect addition.
+full-record golden vectors below define this integration. Format 18 is the
+single implementation transition from the current format 17. Earlier format
+transitions in plans 71, 74, 77 and 78 do not provide an access bundle.
 
 ### Cache contract and source-of-truth closure
 
@@ -2461,8 +2477,9 @@ shipped frontend-cache capability. Distinguish reuse of a previously admitted
 compiler-produced artifact from new native emission.
 
 Keep the existing unit manifest shape and key comparison/digest/trailing-byte
-validation order. The interface-format version is already a unit-key component. Changing it from
-12 to 13 invalidates older frontend entries for this access contract. A miss may
+validation order. The interface-format version is already the unit key's
+`frontend_schema` component. Changing it from 17 to 18 invalidates older
+frontend entries for this access contract. A miss may
 publish a clean descriptor-free UnitEntry only after complete source admission
 and canonical interface-bundle construction. The separate object cache publishes
 only after actual native validation/emission. A hit therefore requires both
@@ -2754,7 +2771,7 @@ No allocation is sized directly from an unvalidated claimed count.
 
 | Record | Fields in exact wire order | Canonical constraints |
 | --- | --- | --- |
-| AccessBundle | `types: sequence<byte_string>`, `abis: sequence<byte_string>`, `imports: sequence<AccessImport>`, `programs: sequence<AccessFunction>`, `entries: sequence<AccessEntry>`, `drops: sequence<AccessDropBinding>` | Types and ABIs are strictly byte-sorted, duplicate-free records from the access projection through the existing canonical codecs. Imports and entries follow the key order below; programs follow rooted discovery order; drops are strictly increasing by resource TypeRef. No separate bundle version: interface format 13 owns this schema. |
+| AccessBundle | `types: sequence<byte_string>`, `abis: sequence<byte_string>`, `imports: sequence<AccessImport>`, `programs: sequence<AccessFunction>`, `entries: sequence<AccessEntry>`, `drops: sequence<AccessDropBinding>` | Types and ABIs are strictly byte-sorted, duplicate-free records from the access projection through the existing canonical codecs. Imports and entries follow the key order below; programs follow rooted discovery order; drops are strictly increasing by resource TypeRef. No separate bundle version: interface format 18 owns this schema. |
 | AccessFunction | `abi: u32`, `params: sequence<u32>`, `slots: sequence<u32>`, `values: sequence<u32>`, `snapshot_count: u32`, `entry: u32`, `blocks: sequence<AccessBlock>` | ABI references the bundle ABI table. Param ordinals select distinct function slots in physical parameter order; slot/value entries reference type records. Slot types/modes/return agree with the ABI. Block ordinals are sequence positions; entry is zero. No private function name is serialized. |
 | AccessBlock | `instructions: sequence<AccessInstruction>`, `terminator: AccessTerminator` | Instruction order is evaluation order. Rvalue payloads use the closed schemas below; no arbitrary executable bytecode or native symbol is accepted. |
 | AccessEntryKey | `tag:u8`, `name:byte_string` | Tag 0 is an ordinary concrete exported logical function name; tag 1 is a declaration-owned resource Drop thunk. Other tags reject. Order by tag, then unsigned name bytes (not the encoded length prefix). |
@@ -2798,7 +2815,8 @@ names and process-local ordinals are excluded by the following traversal.
 Validate the complete actual input first, including structurally malformed
 unreachable blocks. For the published projection, walk each function's CFG in
 breadth-first order starting at its entry: Goto adds its target, Branch adds then
-followed by else, and terminal returns/Unreachable add nothing. Add a block only
+followed by else, StrMatch adds its case targets in source order then its otherwise
+target, and terminal returns/Unreachable add nothing. Add a block only
 at its first discovery; discard unreachable blocks from the projection. Do not
 fold a constant condition or drop a called nonreturning block's syntactic tail
 as part of identity normalization. Those remain the interpreter's semantics.
@@ -2986,6 +3004,7 @@ after decoding and structural validation, without changing the canonical bytes.
 | 2 Return | `value: optional<AccessOperand>` |
 | 3 ReturnWithCleanup | `value: AccessOperand`, `cleanup: AccessOperand` |
 | 4 Unreachable | No payload. |
+| 5 StrMatch | `scrutinee:AccessOperand`, `cases:sequence<(utf8_data, target:u32)>`, `otherwise:u32` |
 
 There is exactly one terminator per block. Branch condition type, target bounds,
 return type, return-cleanup shape, value availability and producer foundations
@@ -2993,6 +3012,26 @@ retain their existing validated-MIR requirements. Then and else remain ordered;
 equal targets are permitted and do not invent two different side effects.
 Unreachable has no normal return. A nonreturning called program likewise produces
 no continuation even when an enclosing block has a syntactic terminator.
+StrMatch reads a live `str` or `string` operand without consuming it. Its nonempty
+case sequence preserves source order, contains unique decoded UTF-8 strings
+(embedded NUL permitted), and requires valid targets; the otherwise target is
+mandatory. Interpretation selects an exact length-and-byte match or otherwise.
+All case strings and targets are validated before reachability or interpretation.
+
+The added records have independent record-level semantic-to-byte and
+byte-to-semantic controls (the enclosing function supplies their slot/value
+types and valid targets):
+
+| Record | Canonical hex | Decoded value |
+| --- | --- | --- |
+| `BytesCopyFrom` Rvalue | `520101010000000102000000` | Tag 338, destination Value(1), source Value(2). |
+| `DropField` instruction | `1e03000000020000000100000000000000` | Tag 30, slot 3, path `[1, 0]`. |
+| `StrMatch` terminator | `0501070000000100000001000000610200000003000000` | Tag 5, scrutinee Value(7), one case `"a"` to block 2, otherwise block 3. |
+
+Each reader rejects every proper prefix, an unknown tag, a trailing byte and
+out-of-range references in the specified Wire/Consumption/References order.
+Full-bundle owners additionally check duplicate StrMatch case bytes, missing
+cases, wrong scrutinee type, malformed UTF-8, and invalid case/otherwise targets.
 
 ### Instruction statement wire records
 
@@ -3036,6 +3075,8 @@ process-local MIR `struct_id` and must decode to the required nominal struct.
 | 26 DropValue | `value:AccessOperand` |
 | 27 SourceEvent | `event:AccessSourceEvent` |
 | 28 ArrayTruncate (plan 66 extension) | `destination:AccessSubject` (Place only), `new_len:AccessOperand` (i64) |
+| 29 DropFlagMoveOut | `slot:u32`, `flag:u32` |
+| 30 DropField | `slot:u32`, `path:sequence<u32>` |
 
 `AccessConstElement` uses tags `0 Integer` with 16 little-endian two's-complement
 bytes, `1 Float` with eight little-endian MIR `f64` bits, `2 Character` with a
@@ -3912,7 +3953,7 @@ PostgreSQL parameter naming and canonical type rules. These request bytes do not
 replace source formation, artifact construction or database service tests.
 
 The schemas specify seven operand alternatives, five scalar constant
-alternatives and five terminators. The full vectors are representative examples;
+alternatives and six terminators. The full vectors are representative examples;
 they do not claim every operation combination was executed in the compiler. Compound Rvalue records and exact transfer
 recipes follow below; neither a catch-all operand nor an opaque unchecked
 instruction byte string is permitted.
@@ -3927,6 +3968,7 @@ Owner names below designate the tests to implement, not completed evidence.
 | Construction and copying | `view_access_transfer_matrix`: literals/constants/mapped/static descriptor origins; fixed value copies versus slot slices; shallow versus deep owned copies; disjoint siblings in both field orders. |
 | Replacement and joins | `view_access_control_matrix`: direct and selected-place replacement; both branches, match, else, Try/map_err, loop backedges, value-carrying breaks and early returns. Writes before replacement remain observable. |
 | Aliased heap contents | `view_access_alias_matrix`: aliases before and after calls, returned aliases, mutable descriptor outputs, collection elements, builders, recursive allocation and summary-location weak updates. |
+| Dynamic array truncation | `view_access_truncate_matrix`: heterogeneous writable/read-only rows in both insertion orders, known-zero versus positive/unknown new length, subsequent append and indexed read/write, returned/aliased prefix views, and suffix owned-resource cleanup. A mixed weak summary cannot drop the read-only alternative or synthesize a uniform writable flag after a positive truncation; a known-zero arm has no founded row, and later append starts from that empty state. An originally homogeneous writable collection remains writable after positive truncation. Check invalid length before suffix Drop or header write and preserve whole/per-unit parity. |
 | Source timing and completion | `view_access_source_event_matrix`: the identical-MIR receiver/index pair, live-only capture, ended-child rebind, scalar/owned/byte cutoff, exact-destination effects, branch consolidation and loop-local release. `view_access_event_validation_matrix`: typed subjects, malformed ordinals, undefined/duplicate snapshots, merge agreement, terminating paths and remapping. Full HIR placement inventory remains required. |
 | Byte validation across calls | `view_access_byte_observation_matrix`: UTF-8 and codec kinds, hidden by-value writes, callee-created validation, observation dependency closure, disjoint and raw-byte controls, eager operand order, text derivatives, owned copies, repeat-site revalidation and recursive observation recency and unknown-backing transport. |
 | Calls and captures | `view_access_call_matrix`: direct/imported/generic and indirect calls, target-relative captures, reader/writer twins, unavailable alternatives, recursive readers, nonreturning callees and completed operands. |
@@ -3999,7 +4041,7 @@ permission rule.
 
 `NativeOwnerMirContract`, `xml_written_slots` and the existing exhaustive MIR
 variant list provide the shape and output inventory. They do not supply the
-missing view-origin semantics. The current inventory contains 335 Rvalue variants;
+missing view-origin semantics. The current inventory contains 345 Rvalue variants;
 every variant and every relevant operation-kind discriminator needs an explicit
 transfer classification before the author pass can claim closure.
 
@@ -4057,9 +4099,14 @@ and cleanup must agree; a caller cannot replace only the signature facts while
 retaining a conflicting type list. Lifted targets separately check their trailing
 capture ABI as described above.
 
-The baseline inventory accounts for all 335 variants and 793 direct fields without
+The investigation-baseline table accounts for 335 variants and 793 direct fields without
 a default mapping. StaticData and the four ColumnBatch variants have explicit native-only exclusions;
 the inventory is not permission to copy every native field into the public wire.
+The current MIR adds ten variants and four direct fields on existing variants:
+`ArrayBuilderNew.capacity` and the three vector reduction `mode` fields. The
+extension table below closes their wire records; the current source inventory
+is 345 MIR variants, plus two planned DB semantic records. All frozen baseline
+tags retain their values.
 The two parallel Rvalues omit `work_weight` from the source record: initial
 lowering sets it to `PAR_MAP_DEFAULT_WORK_WEIGHT`, and `annotate_par_map_work`
 computes the native cost hint after source admission and event erasure. Access
@@ -4076,7 +4123,7 @@ a native operation returns or invalidates.
 | 1 | `ArenaBegin` | None |
 | 2 | `ArrayBuilderAppend` | `builder:AccessOperand, data:AccessOperand` |
 | 3 | `ArrayBuilderBuild` | `builder:AccessOperand` |
-| 4 | `ArrayBuilderNew` | `elem:TypeRef, region:optional<AccessOperand>` |
+| 4 | `ArrayBuilderNew` | `elem:TypeRef, region:optional<AccessOperand>, capacity:AccessOperand` |
 | 5 | `ArrayBuilderPush` | `builder:AccessOperand, value:AccessOperand, scalar:TypeRef` |
 | 6 | `ArrayBuilderPushStr` | `builder:AccessOperand, value:AccessOperand` |
 | 7 | `Bin` | `arg0:BinOpTag, arg1:AccessOperand, arg2:AccessOperand` |
@@ -4386,13 +4433,13 @@ a native operation returns or invalidates.
 | 311 | `Un` | `arg0:UnOpTag, arg1:AccessOperand` |
 | 312 | `Use` | `arg0:AccessOperand` |
 | 313 | `Utf8Valid` | `data:AccessOperand` |
-| 314 | `VecDot` | `a:AccessOperand, b:AccessOperand, elem:TypeRef, n:u32` |
+| 314 | `VecDot` | `a:AccessOperand, b:AccessOperand, elem:TypeRef, n:u32, mode:FloatModeBits` |
 | 315 | `VecExtract` | `vec:AccessOperand, lane:u32, elem:TypeRef` |
 | 316 | `VecInsert` | `vec:AccessOperand, value:AccessOperand, lane:u32` |
 | 317 | `VecLoad` | `slice:AccessOperand, index:AccessOperand, elem:TypeRef, n:u32, align:optional<u32>` |
 | 318 | `VecMinMax` | `vec:AccessOperand, elem:TypeRef, n:u32, max:bool` |
-| 319 | `VecSum` | `vec:AccessOperand, elem:TypeRef, n:u32` |
-| 320 | `VecSumWhere` | `vec:AccessOperand, mask:AccessOperand, elem:TypeRef, n:u32` |
+| 319 | `VecSum` | `vec:AccessOperand, elem:TypeRef, n:u32, mode:FloatModeBits` |
+| 320 | `VecSumWhere` | `vec:AccessOperand, mask:AccessOperand, elem:TypeRef, n:u32, mode:FloatModeBits` |
 | 321 | `WriterCreate` | `path:AccessOperand, out:SlotRef` |
 | 322 | `WriterCreateExclusive` | `path:AccessOperand, out:SlotRef` |
 | 323 | `WriterCreateExclusiveBeneath` | `root:AccessOperand, relative:AccessOperand, out:SlotRef` |
@@ -4414,13 +4461,66 @@ Each compound record uses the envelope's scalar, sequence, optional and referenc
 encodings. Box indirection in the Rust representation adds no wire field. Fields
 are listed in exact wire order.
 
-The two source-semantic Rvalue extensions use `u16` tags after the unchanged
-baseline inventory. Native tags remain reserved and reject in the source codec.
+The two DB source-semantic records and ten current-MIR additions use `u16` tags
+after the frozen investigation-baseline inventory. Native-only tags remain
+reserved and reject in the source codec.
 
 | Extension tag | Record | Exact payload order |
 | --- | --- | --- |
 | 335 | `DbDescriptor` | `witness:AccessDbBridgeWitness` (Query or Command only), `driver:DbDriverTag`, `options:sequence<AccessDbStaticOption>` |
 | 336 | `DbBridgeCall` | `bridge:AccessDbBridgeRecord`, `callee:AccessOperand`, `args:sequence<AccessOperand>`, `param_tys:sequence<TypeRef>`, `ret_ty:TypeRef`, `signature:AbiRef` |
+| 337 | `BufferAppendFilled` | `buffer:AccessOperand, length:AccessOperand, value:AccessOperand` |
+| 338 | `BytesCopyFrom` | `dst:AccessOperand, src:AccessOperand` |
+| 339 | `BytesFill` | `bytes:AccessOperand, value:AccessOperand, scalar:TypeRef, be:bool` |
+| 340 | `BytesSet` | `bytes:AccessOperand, offset:AccessOperand, value:AccessOperand, scalar:TypeRef, be:bool` |
+| 341 | `BytesView` | `bytes:AccessOperand, elem:TypeRef` |
+| 342 | `FloatBin` | `op:BinOpTag, a:AccessOperand, b:AccessOperand, mode:FloatModeBits` |
+| 343 | `FloatFma` | `ty:TypeRef, a:AccessOperand, b:AccessOperand, c:AccessOperand, mode:FloatModeBits` |
+| 344 | `HttpServerMaxRequestBodyBytes` | `server:AccessOperand, limit:AccessOperand` |
+| 345 | `MakeFieldSlice` | `slot:u32, path:sequence<u32>, length:i128le` |
+| 346 | `SliceAsBytes` | `slice:AccessOperand, elem:TypeRef` |
+
+These ten tags extend the fixed investigation-baseline table without renumbering
+its 335 tags or the two DB bridge tags. The source codec admits only operations
+that pass the actual MIR producer checks; an enum name or wire tag alone grants
+neither a valid type nor a byte permission. `FloatModeBits` is one byte with bit
+0 `reassoc` and bit 1 `contract`; values 4 through 255 reject at Wire. The
+effective mode on `FloatBin`, `FloatFma`, `VecDot`, `VecSum`, and `VecSumWhere`
+must equal the source-authenticated MIR mode. Integer vector reductions require
+zero bits. The two bit values alter arithmetic/reduction order or contraction,
+never descriptor provenance, ownership, byte validity or source effects.
+`ArrayBuilderNew.capacity` is an `i64` operand; a negative or overflowing
+request reaches the existing terminal allocation-size failure before storage
+acquisition. `MakeFieldSlice.length` preserves the MIR `i128` bit pattern as
+16 little-endian two's-complement bytes and retains its validated fixed-array
+extent and field path. These fields participate in canonical identity; none is
+a native cost hint.
+
+### Current-MIR access extension ledger
+
+The following rules close the added variants against the same state relation,
+source timing, and native producer checks as the baseline inventory. They do
+not authorize a separate implementation or an early format bump.
+
+| Record | Source transfer and boundary | Acceptance owner |
+| --- | --- | --- |
+| `BufferAppendFilled` | Read the i64 count and u8 fill value after the mutable Buffer receiver; zero count changes nothing. On reached success, grow and initialize that Buffer owner's backing. Existing view lifetime and native growth checks govern any aliases; this operation cannot preserve a stale pointer across reallocation by assertion. Negative/overflow aborts before any write. | `view_access_native_matrix` with `bytes_ops` append-filled controls. |
+| `BytesCopyFrom` | Read source bytes before destination write. Require the existing exact equal-length and proven nonoverlap conditions; otherwise reject or terminally fail as prescribed by plan 65. A reached copy invalidates overlapping destination observations, never the source's. No new owner is created. | `view_access_sink_matrix`, `view_access_byte_observation_matrix`, `bytes_ops`. |
+| `BytesFill`, `BytesSet` | Check the receiver's writable backing, scalar type and endian flag. Preserve the established range/divisibility terminal checks before the first write. On reached success invalidate overlapping byte observations; preserve owner, descriptor length, capacity and disjoint observations. | `view_access_sink_matrix`, `view_access_byte_observation_matrix`, `bytes_ops`. |
+| `BytesView`, `SliceAsBytes` | Descriptor-only conversions preserve the exact receiver backing, generation, authority and validation dependencies. `BytesView` returns None on its specified runtime alignment/length failure and otherwise a same-pointer typed view; `SliceAsBytes` scales length with the existing checked representability prerequisite. Neither allocates, copies, consumes, validates payload text, or grants raw-memory authority. | `view_access_transfer_matrix`, `view_access_whole_unit_parity`, plan 78 view owners. |
+| `FloatBin`, `FloatFma`, vector reduction `mode` fields | Source-authenticated mode and operands determine finite scalar/control results. Keep IEEE NaN/signed-zero behavior and the existing contraction/reassociation permission. No byte descriptor or write is produced. A type/mode mismatch rejects before interpretation. | `view_access_control_matrix`, plan 77 floating owners. |
+| `HttpServerMaxRequestBodyBytes` | Read the i64 limit and mutate the selected HttpServer configuration handle. No caller byte view, fresh backing or implicit validation result is published. Preserve the native owner/status and limit checks. | `view_access_native_matrix`, HTTP server owner. |
+| `MakeFieldSlice` | Select the validated fixed-array field path and constant extent. Publish a descriptor into that same field backing with its existing authority and observation dependencies; an outer mutable header does not upgrade a read-only leaf. | `view_access_transfer_matrix`, `view_access_alias_matrix`, fixed-array field owner. |
+| `ArrayBuilderNew.capacity` | Read capacity after the optional region operand and before builder allocation. Publish the same fresh builder kind as the zero-capacity form, with an empty initialized prefix; no element profile exists yet. | `view_access_native_matrix`, plan 65 builder-capacity owner. |
+| `DropFlagMoveOut`, `DropField` | Apply exact selected slot nulling or nested cleanup. Preserve aliases and sibling profiles until their own reached actions. | `view_access_control_matrix`, `view_access_alias_matrix`, plan 71 ownership owners. |
+| `ArrayTruncate` | Validate the exclusive Place and i64 count before a write. On reached success, interpret feasible suffix Drop hooks in increasing index order before shortening the logical length; their access effects cannot be skipped because element profiles are weak. A definitely zero new length then clears founded row contents in that arm. A positive or unknown new length retains every old weak row alternative and any guarded uniform certificate; it cannot delete a candidate merely because it might have belonged to the removed suffix. A nonuniform collection cannot become uniform without a separate exact positional proof. | `view_access_truncate_matrix` and plan 66 ownership owners. |
+| `StrMatch` | Read the scrutinee at the terminator and traverse each feasible case/otherwise edge in canonical source order. Its branch does not consume, allocate or validate new text. | `view_access_control_matrix`, plan 72 string-match owner. |
+
+The owner matrix also compares whole-program and per-unit replay for every new
+record, including malformed type, source mode, ordinal and imported-body
+controls. No row adds a performance promise or benchmark gate. The source
+format remains version 18 only after all producer, codec and consumer rows
+land together.
 
 `AccessDbBridgeRecord` and its witness encoding are the operation/witness
 subrecord fixed above. `DbDriverTag` is one byte: 0 AnySupportedDriver,
@@ -4554,16 +4654,17 @@ transfer recipes.
 
 ## MIR inventory partition
 
-This partition is exhaustive at the investigation baseline: 335 distinct Rvalue
-variants in 25 groups, checked for both omissions and duplicate membership. A
-group identifies the transfer work to close; it is not a blanket rule assigning
+The investigation-baseline partition covered 335 distinct Rvalue variants. The
+current table covers 345 variants in the same 25 groups, with ten additions
+classified exactly once. A group identifies the transfer work to close; it is
+not a blanket rule assigning
 one origin to every result. In particular, regex matches expose byte offsets,
 not borrowed text, and a copied native input does not taint its independent output.
 
 | Transfer family | Exact current variants |
 | --- | --- |
-| local value / place / projection | `Use`, `Load`, `Field`, `Select`, `SoaColumn`, `BoxGet`, `Index`, `IndexField`, `IndexColumn`, `SoaGather`, `MakeTuple`, `TupleIndex`, `MakeSlice`, `SliceLen`, `SlicePtr`, `SliceIndex`, `SliceIndexNoalias`, `SubSlice`, `IndexPtr`, `IndexFieldPtr` |
-| scalar arithmetic / scalar vectors | `Un`, `Cast`, `Bin`, `IntArith`, `MathOp`, `MakeVec`, `VecExtract`, `VecInsert`, `VecSumWhere`, `VecDot`, `VecMinMax`, `VecSum`, `MaskAny`, `VecLoad` |
+| local value / place / projection | `Use`, `Load`, `Field`, `Select`, `SoaColumn`, `BoxGet`, `Index`, `IndexField`, `IndexColumn`, `SoaGather`, `MakeTuple`, `TupleIndex`, `MakeSlice`, `MakeFieldSlice`, `SliceLen`, `SlicePtr`, `SliceIndex`, `SliceIndexNoalias`, `SubSlice`, `IndexPtr`, `IndexFieldPtr` |
+| scalar arithmetic / scalar vectors | `Un`, `Cast`, `Bin`, `FloatBin`, `FloatFma`, `IntArith`, `MathOp`, `MakeVec`, `VecExtract`, `VecInsert`, `VecSumWhere`, `VecDot`, `VecMinMax`, `VecSum`, `MaskAny`, `VecLoad` |
 | active tagged values | `OptionSome`, `OptionNone`, `OptionIsSome`, `OptionUnwrap`, `ResultOk`, `ResultErr`, `ResultIsOk`, `ResultUnwrapOk`, `ResultUnwrapErr`, `MakeEnum`, `MakeError`, `EnumTagEq`, `EnumPayload` |
 | ordinary / indirect calls and closures | `Call`, `CallWithCleanup`, `FnAddr`, `Closure`, `CallIndirect`, `CallIndirectWithCleanup` |
 | static read-only producers | `StrLit`, `ConstArray`, `StaticDescriptorView`, `SqliteCallbackDescriptor` |
@@ -4574,9 +4675,9 @@ not borrowed text, and a copied native input does not taint its independent outp
 | group / dictionary / chunk materialization | `GroupAgg`, `GroupAggStrCols`, `GroupAggStr`, `GroupAggMultiStr`, `DictEncode`, `MakeDictEncoded`, `DictField`, `GatherColumnI64`, `DictLookup`, `Chunks`, `FrameInnerJoin` |
 | synthesized task / parallel applications | `TgBegin`, `SpawnTask`, `TgWaitResult`, `ParMapParallel`, `ParMapReduce` |
 | byte predicates and copied search plan | `StrPredicate`, `StrFinderNew`, `StrFinderFind`, `Utf8Valid`, `CryptoCtEqual` |
-| input-derived byte subviews | `StrTrim`, `BytesAsStr`, `PathComponent` |
+| input-derived byte subviews | `StrTrim`, `BytesAsStr`, `BytesView`, `SliceAsBytes`, `PathComponent` |
 | fresh byte copies / encoding | `StrClone`, `Template`, `JsonEncode`, `PathJoin`, `PathNormalize`, `EncodingEncode`, `EncodingDecode`, `CompressCompress`, `CompressDecompress`, `CryptoHash`, `CryptoHmac`, `CryptoHkdf`, `CryptoAead`, `CryptoArgon2`, `CryptoSign` |
-| owned builder / buffer mutation and views | `BuilderNew`, `BuilderWriteStr`, `BuilderWriteInt`, `BuilderWriteBool`, `BuilderWriteChar`, `BuilderWriteFloat`, `BuilderWriteStrIntStr`, `BuilderToString`, `TemplateHtmlNew`, `TemplateHtmlWrite`, `TemplateHtmlRaw`, `TemplateHtmlToString`, `BufferNew`, `BufferBytes`, `BufferLen`, `BufferCapacity`, `BytesRead`, `BufferPut`, `BufferAppend`, `CryptoRandom` |
+| owned builder / buffer mutation and views | `BuilderNew`, `BuilderWriteStr`, `BuilderWriteInt`, `BuilderWriteBool`, `BuilderWriteChar`, `BuilderWriteFloat`, `BuilderWriteStrIntStr`, `BuilderToString`, `TemplateHtmlNew`, `TemplateHtmlWrite`, `TemplateHtmlRaw`, `TemplateHtmlToString`, `BufferNew`, `BufferBytes`, `BufferLen`, `BufferCapacity`, `BytesRead`, `BytesSet`, `BytesFill`, `BytesCopyFrom`, `BufferPut`, `BufferAppend`, `BufferAppendFilled`, `CryptoRandom` |
 | array-builder retained elements | `ArrayBuilderNew`, `ArrayBuilderPush`, `ArrayBuilderPushStr`, `ArrayBuilderAppend`, `ArrayBuilderBuild` |
 | JSON / CSV input-dependent carriers | `JsonDecode`, `JsonOwnedDecode`, `JsonDecodeArray`, `JsonDecodeScalar`, `JsonDecodeStructArray`, `JsonDecodeSoa`, `CsvDecode`, `JsonDecodeUnion`, `JsonDoc`, `JsonDocKind`, `JsonDocGet`, `JsonDocAt`, `JsonDocAsStr`, `JsonDocAsScalar`, `JsonDocLen`, `JsonDocKey`, `JsonDocElems`, `JsonScanNew`, `JsonScanNext` |
 | XML and codec native carriers | `XmlParse`, `XmlNext`, `XmlName`, `XmlAttributeCount`, `XmlAttributeName`, `XmlAttributeValue`, `XmlText`, `CodecOpen`, `CodecBatchRows`, `CodecBatchColumns`, `CodecBatchName`, `CodecBatchKind`, `CodecBatchFind`, `CodecBatchColumn`, `CodecColumnLen`, `CodecColumnAt`, `CodecEncoderNew`, `CodecEncoderPut`, `CodecEncoderFinish` |
@@ -4587,9 +4688,9 @@ not borrowed text, and a copied native input does not taint its independent outp
 | random source / destination / copy | `RandSeed`, `RandNext`, `RandRange`, `RandShuffle`, `RandSample` |
 | CLI copied native storage | `CliCommand`, `CliFlag`, `CliParse`, `CliGetBool`, `CliGetI64`, `CliGetStr`, `CliUsage` |
 | command copied native storage | `Command`, `CommandCwd`, `CommandTimeout`, `CommandMaxCapture`, `CommandEnv`, `CommandEnvClear`, `CommandRun`, `CommandRunBytes`, `RunOutputView`, `RunBytesView` |
-| HTTP native storage / views / streams | `HttpRequest`, `HttpHeader`, `HttpBody`, `HttpRequestTimeout`, `HttpRequestMaxResponseBodyBytes`, `HttpClientTimeout`, `HttpClientMaxResponseBodyBytes`, `HttpParse`, `HttpRespStatus`, `HttpRespHeader`, `HttpRespBody`, `HttpClient`, `HttpClientGet`, `HttpClientPost`, `HttpClientRequest`, `HttpClientRequestStream`, `HttpReadStreamStatus`, `HttpReadStreamHeader`, `HttpReadStreamRead`, `HttpReadStreamSse`, `HttpSseStreamLastEventId`, `HttpSseStreamRetryMs`, `HttpSseStreamNext`, `HttpGetMany`, `HttpServe`, `HttpAccept`, `HttpCtxMethod`, `HttpCtxPath`, `HttpCtxHeader`, `HttpHeadersCount`, `HttpHeadersTokensValid`, `HttpHeadersContainsToken`, `HttpCtxUpgradeReady`, `HttpCtxBody`, `HttpResponseBuilder`, `HttpRbHeader`, `HttpRbBody`, `HttpRespond`, `HttpRespondStream`, `HttpRespondUpgrade`, `HttpUpgradeReadExact`, `HttpUpgradeWrite`, `HttpUpgradeDeadline`, `HttpUpgradeShutdown`, `HttpStreamSend`, `HttpStreamFinish`, `HttpStreamReject` |
+| HTTP native storage / views / streams | `HttpRequest`, `HttpHeader`, `HttpBody`, `HttpRequestTimeout`, `HttpRequestMaxResponseBodyBytes`, `HttpClientTimeout`, `HttpClientMaxResponseBodyBytes`, `HttpServerMaxRequestBodyBytes`, `HttpParse`, `HttpRespStatus`, `HttpRespHeader`, `HttpRespBody`, `HttpClient`, `HttpClientGet`, `HttpClientPost`, `HttpClientRequest`, `HttpClientRequestStream`, `HttpReadStreamStatus`, `HttpReadStreamHeader`, `HttpReadStreamRead`, `HttpReadStreamSse`, `HttpSseStreamLastEventId`, `HttpSseStreamRetryMs`, `HttpSseStreamNext`, `HttpGetMany`, `HttpServe`, `HttpAccept`, `HttpCtxMethod`, `HttpCtxPath`, `HttpCtxHeader`, `HttpHeadersCount`, `HttpHeadersTokensValid`, `HttpHeadersContainsToken`, `HttpCtxUpgradeReady`, `HttpCtxBody`, `HttpResponseBuilder`, `HttpRbHeader`, `HttpRbBody`, `HttpRespond`, `HttpRespondStream`, `HttpRespondUpgrade`, `HttpUpgradeReadExact`, `HttpUpgradeWrite`, `HttpUpgradeDeadline`, `HttpUpgradeShutdown`, `HttpStreamSend`, `HttpStreamFinish`, `HttpStreamReject` |
 
-The baseline statement inventory has 27 variants; the proposed source-use event
+The current statement inventory has 30 variants; the proposed source-use event
 variant below is not yet implemented. `Let` derives the selected value
 transfer. `Store`, `StoreField`, `StoreIndex`, `StoreElemField`,
 `StoreElemFieldPtr`, `StoreColumn`, `PtrStore`, `PtrStoreNoalias` and `VecStore`
@@ -4598,16 +4699,16 @@ are separate. `StoreConstArray` copies static initializer elements into a local
 fixed-array slot: the destination storage remains writable, and string element
 views retain their read-only bytes. It is not equivalent to `ConstArray`.
 
-`DropFlagInit`, `NullTupleField`, `NullStructField` and `NullElemField` alter
+`DropFlagInit`, `DropFlagMoveOut`, `NullTupleField`, `NullStructField` and `NullElemField` alter
 selected descriptor state without granting new ownership or readable backing.
-`ArenaEnd`, `RawFree`, `ColumnBatchDrop`, `Drop`, `DropElem`, `DropElemField`
-and `DropValue` retain existing lifecycle validation. `ColumnBatchFinish` must
+`ArenaEnd`, `RawFree`, `ColumnBatchDrop`, `Drop`, `DropField`, `DropElem`, `DropElemField`,
+`DropValue` and `ArrayTruncate` retain existing lifecycle validation. `ColumnBatchFinish` must
 preserve the native carrier's exact contained views. `TgWait` and `TgEnd` consume
 the existing task-control contract. `BorrowedElementReservation` remains an inert
 reservation marker. `RawStore` alone is the explicit unsafe raw write action;
 ordinary indexed writes inside an unsafe block do not become RawStore.
 
-All five terminators (`Goto`, `Branch`, `Return`, `ReturnWithCleanup`,
+All six terminators (`Goto`, `Branch`, `StrMatch`, `Return`, `ReturnWithCleanup`,
 `Unreachable`) retain actual control order. Cleanup bits do not confer access
 authority. Runtime targets of `Call`, native operation-kind discriminators and
 parallel stage kinds require closed secondary inventories; this top-level count
@@ -5273,7 +5374,7 @@ snapshots still follow the shared frontier recipe.
 
 ## Secondary discriminator inventory
 
-This author table closes discriminator membership separately from the 335-variant
+This author table closes discriminator membership separately from the 345-variant
 partition. It does not replace the exact native output/observation transfer
 records. The structural producer validates each discriminator, operand schema,
 output type and admitted combination before access derivation.
@@ -5355,22 +5456,27 @@ existing exact scratch initialization schema.
 
 ## Statement and terminator transfer inventory
 
-27 Stmt variants classified exactly once; five Term variants.
+30 current Stmt variants classified exactly once; six Term variants. SourceEvent
+is a planned access-only instruction, not a MIR Stmt.
 
 | Transfer family | Variants |
 | --- | --- |
 | ordered Rvalue evaluation | `Let` |
 | exact local descriptor replacement | `Store`, `StoreField`, `StoreConstArray` |
 | element write / descriptor-content update | `StoreIndex`, `PtrStore`, `PtrStoreNoalias`, `VecStore`, `StoreElemField`, `StoreElemFieldPtr`, `StoreColumn` |
-| existing lifetime/cleanup ending | `ArenaEnd`, `Drop`, `DropElem`, `DropElemField`, `DropValue`, `ColumnBatchFinish`, `ColumnBatchDrop` |
-| selected descriptor nulling | `DropFlagInit`, `NullTupleField`, `NullStructField`, `NullElemField` |
+| existing lifetime/cleanup ending | `ArenaEnd`, `Drop`, `DropField`, `DropElem`, `DropElemField`, `DropValue`, `ColumnBatchFinish`, `ColumnBatchDrop` |
+| selected descriptor nulling | `DropFlagInit`, `DropFlagMoveOut`, `NullTupleField`, `NullStructField`, `NullElemField` |
+| dynamic array suffix cleanup | `ArrayTruncate` |
 | explicit unsafe contract | `RawFree`, `RawStore` |
 | ordered task applications | `TgWait`, `TgEnd` |
 | existing reservation proof | `BorrowedElementReservation` |
 
 Goto retains the state. Branch checks its Boolean operand and selects feasible
-edges from the finite control domain. Return and ReturnWithCleanup consume the
-completed returned value and publish normal-return profiles/anchored effects;
+edges from the finite control domain. StrMatch reads its text operand and
+selects the feasible exact byte-equal cases or the otherwise edge in source
+order; an abstract unknown text value retains all feasible successors. Return
+and ReturnWithCleanup consume the completed returned value and publish
+normal-return profiles/anchored effects;
 the cleanup bit retains its existing ABI prerequisite, not a second access mode.
 Unreachable publishes no return, while earlier write obligations remain recorded.
 
@@ -5383,6 +5489,19 @@ typed producer origin; being represented as an LLVM pointer grants no authority.
 StoreConstArray initializes the local copied array as writable while each
 contained text/static descriptor retains its own read-only origin. Nulling
 replaces only its selected descriptor profile and preserves completed aliases.
+DropFlagMoveOut zeroes the selected slot/profile; the following validated flag
+Store records the false ownership state. It cannot erase an alias's observation.
+DropField follows the existing validated nested cleanup plan on the selected path and preserves
+siblings. ArrayTruncate checks the exclusive Place destination, applies suffix
+element cleanup in increasing index order on reached success, then publishes
+the shorter logical length. The runtime cannot read a removed leaf through that
+array. Its access summary keeps all old weak row alternatives when the new
+length may be positive: the summary has no positional certificate that could
+identify which alternative belonged only to the removed suffix. Thus a safe
+prefix operation can remain unproved in a heterogeneous array. A definitely
+zero new length clears founded row contents on that arm; a later append starts
+from the known-empty collection. Neither case upgrades an alias's permission
+or retains a usable borrowed view beyond its source lifetime.
 Dropping a local root does not erase observations retained by another live root.
 TgEnd, like TgWait, must apply retained task bodies before dropping the group.
 RawFree/RawStore follow the conditional unsafe transfer above and grant no safe
