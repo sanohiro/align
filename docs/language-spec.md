@@ -201,6 +201,9 @@ a `mut` binding or a sub-slice* (a `mut` binding rebinds the view, it does not m
 writable). The same rule covers a string literal's byte view (`"…".bytes()`); copy into an owned
 array to modify. A `pub` constant's value is part of the exported interface (the initializer ships
 and re-folds in importers), so a `pub` constant's initializer may reference only `pub` constants.
+An initializer may use an imported module's `pub` scalar, `str`, or raw-null constant as
+`module.NAME`; the import is required, and its definition-fixed type is preserved. Private and
+missing references, import cycles, and aggregate-constant aliases reject.
 Division by zero, a cyclic definition, and a type mismatch in a constant are compile errors.
 
 Function completion matches the declared return. Unit functions may use bare `return` or reachable

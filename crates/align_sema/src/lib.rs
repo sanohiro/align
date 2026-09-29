@@ -7136,7 +7136,7 @@ impl<'a, 'd> GenericBodyWalker<'a, 'd> {
 // declaration itself never reaches MIR/codegen.
 // Constants are per-module namespaced like functions/types (`pub` exports; a qualified `mod.NAME`
 // reaches an imported module's `pub` constant), and a constant initializer may reference other
-// constants *in the same module* (cross-module references inside an initializer are deferred).
+// constants in the same module or exported constants in imported modules.
 
 /// A folded compile-time constant value (the `Ty` travels alongside it in [`ConstTable::values`]).
 #[derive(Clone, Debug)]
@@ -7197,7 +7197,8 @@ fn hir_is_const_scalar_elem(e: &Expr) -> bool {
 }
 
 /// Producer-side check that a `pub` constant's initializer references only `pub` same-module
-/// constants. A `pub` constant's value is part of the exported interface (its source is shipped in
+/// constants. Imported references are already checked for import and visibility by `ConstEval`.
+/// A `pub` constant's value is part of the exported interface (its source is shipped in
 /// the interface summary and re-folded in every importing unit, where the defining module's PRIVATE
 /// items do not exist), so a reference to a private constant would type-check whole-program yet fail
 /// the per-unit build. `by` is the defining module's `bare → (canonical, is_pub)` const map. Walks
@@ -7331,12 +7332,13 @@ fn peel_neg_literal(operand: &Expr) -> Option<(u32, i128)> {
     }
 }
 
-/// Evaluates top-level constant initializers to folded values, resolving same-module references
-/// on demand (memoized) with cycle detection.
+/// Evaluates top-level constant initializers to folded values, resolving local and imported
+/// public references on demand (memoized) with cycle detection.
 struct ConstEval<'a, 'd> {
     decls: &'a HashMap<String, ConstDeclInfo<'a>>,
     /// module → bare → canonical (for resolving a bare reference inside an initializer).
     by_module: &'a HashMap<String, HashMap<String, (String, bool)>>,
+    module_table: &'a ModuleTable,
     values: HashMap<String, (Ty, ConstVal)>,
     in_progress: std::collections::HashSet<String>,
     diags: &'d mut Diagnostics,
@@ -7432,27 +7434,31 @@ impl<'a, 'd> ConstEval<'a, 'd> {
             K::Binary { op, lhs, rhs } => self.binary(*op, lhs, rhs, expected, module, e.span),
             K::Path(p) => {
                 let Some(name) = single_name(p) else {
-                    self.diags.error("a constant initializer may not be a qualified reference yet".to_string(), e.span);
+                    self.diags.error("a constant initializer must name a constant".to_string(), e.span);
                     return None;
                 };
                 let Some((canonical, _)) = self.by_module.get(module).and_then(|m| m.get(name)).cloned() else {
                     self.diags.error(format!("`{name}` is not a constant (a constant initializer may reference only literals and other constants)"), e.span);
                     return None;
                 };
-                let (ty, val) = self.value(&canonical)?;
-                // An aggregate constant may not be referenced from another constant's initializer
-                // (v1 fail-closed, recorded deferral): neither aliased whole (`B := A`) nor used as an
-                // element (`B := [A, …]`). Each aggregate constant materializes its own per-unit
-                // rodata; composing them needs a shared-storage design not settled for S1.
-                if matches!(val, ConstVal::Array(..)) {
-                    self.diags.error(
-                        format!("aggregate constant `{name}` cannot be referenced from another constant's initializer yet"),
-                        e.span,
-                    );
+                self.reference(&canonical, name, expected, e.span)
+            }
+            K::FieldAccess { recv, field } => {
+                let Some(import) = flatten_module_path(recv).filter(|path| {
+                    self.module_table.get(module).is_some_and(|info| info.user_imports.contains(path))
+                }) else {
+                    self.diags.error("a qualified constant reference requires an imported module".to_string(), e.span);
+                    return None;
+                };
+                let Some((canonical, is_pub)) = self.by_module.get(&import).and_then(|m| m.get(&field.name)).cloned() else {
+                    self.diags.error(format!("`{import}.{}` is not a constant", field.name), e.span);
+                    return None;
+                };
+                if !is_pub {
+                    self.diags.error(format!("constant `{}` is private to module `{import}` (mark it `pub` to export it)", field.name), e.span);
                     return None;
                 }
-                self.check_const_type(ty, expected, e.span)?;
-                Some((ty, val))
+                self.reference(&canonical, &field.name, expected, e.span)
             }
             K::ArrayLit(elems) => self.array(elems, expected, module, e.span),
             _ => {
@@ -7463,6 +7469,21 @@ impl<'a, 'd> ConstEval<'a, 'd> {
                 None
             }
         }
+    }
+
+    fn reference(&mut self, canonical: &str, name: &str, expected: Option<Ty>, span: Span) -> Option<(Ty, ConstVal)> {
+        let (ty, val) = self.value(canonical)?;
+        // Each aggregate constant materializes its own per-unit rodata; composing them needs a
+        // shared-storage design. Local and imported references use the same refusal.
+        if matches!(val, ConstVal::Array(..)) {
+            self.diags.error(
+                format!("aggregate constant `{name}` cannot be referenced from another constant's initializer yet"),
+                span,
+            );
+            return None;
+        }
+        self.check_const_type(ty, expected, span)?;
+        Some((ty, val))
     }
 
     fn expect_scalar(&mut self, ty: Ty, val: ConstVal, expected: Option<Ty>, span: Span) -> Option<(Ty, ConstVal)> {
@@ -9929,12 +9950,14 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         let mut eval = ConstEval {
             decls: &decls,
             by_module: &const_table.by_module,
+            module_table: &mod_table,
             values: HashMap::new(),
             in_progress: std::collections::HashSet::new(),
             diags,
         };
         // Evaluate every constant (memoized; order-independent — a reference folds its target first).
-        let canonicals: Vec<String> = decls.keys().cloned().collect();
+        let mut canonicals: Vec<String> = decls.keys().cloned().collect();
+        canonicals.sort();
         for canonical in &canonicals {
             eval.value(canonical);
         }
@@ -9946,7 +9969,8 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
     // importing unit, where the defining module's PRIVATE constants do not exist. So a `pub` constant
     // may reference only `pub` same-module constants — enforced here at the defining unit so
     // whole-program and per-unit builds reach the same verdict (a `pub A := SECRET` no longer
-    // type-checks whole-program only to fail per-unit with an <interface:…>-located error). Runs for
+    // type-checks whole-program only to fail per-unit with an <interface:…>-located error).
+    // Imported constants have already passed the `ConstEval` import/visibility gate. Runs for
     // every real module in both build paths; interface-only dependencies were checked at their own
     // production time.
     for m in modules {
