@@ -160,6 +160,31 @@ fn source_generation_and_retention() {
 }
 
 #[test]
+fn borrowed_sum_view_snapshot_keeps_disjoint_fields() {
+    let source = local_prefix()
+        + r#"
+Payload { rows: slice<Row>, token: string }
+Container { payload: Option<Payload>, other: i64 }
+fn bump(borrow mut value: i64) -> i64 { value = value + 1; return value }
+fn inspect_container(borrow mut container: Container) -> i64 = match container.payload {
+  Some(payload) => inspect_with(payload.rows[0], bump(container.other))
+  None => 0
+}
+fn main() -> i32 {
+  rows := make()
+  mut container := Container {
+    payload: Some(Payload { rows: rows, token: "alive".clone() }),
+    other: 0
+  }
+  print(inspect_container(container))
+  return 0
+}
+"#;
+    let diagnostics = check_diagnostics("move-slice-sum-disjoint", &source);
+    assert!(diagnostics.is_empty(), "{diagnostics}");
+}
+
+#[test]
 fn control_and_eager_operands() {
     let source = local_prefix()
         + r#"

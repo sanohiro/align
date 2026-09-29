@@ -37097,16 +37097,16 @@ impl<'a> MoveCheck<'a> {
         ) {
             return None;
         }
-        let path = base
-            .path
-            .iter()
-            .skip(1)
-            .map(|segment| match segment {
-                hir::BorrowedPathSegment::StructField(field) => Some(*field),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>()
-            .unwrap_or_default();
+        // A sum payload is not representable in a mutable-place path. Keep the exact struct
+        // prefix so writes to sibling fields remain disjoint; mutations to the containing sum
+        // still overlap and invalidate this selection.
+        let mut path = Vec::new();
+        for segment in base.path.iter().skip(1) {
+            match segment {
+                hir::BorrowedPathSegment::StructField(field) => path.push(*field),
+                _ => break,
+            }
+        }
         Some(MutablePlaceSnapshot {
             root: base.root_local,
             path,
