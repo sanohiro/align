@@ -1,7 +1,7 @@
 # Interface-carried inline bodies
 
-Status: implemented through policy version 2; policy version 3 closes the
-nested terminal-wrapper admission mismatch reported after PR #1163 for
+Status: implemented through policy version 3. PR #1165 closed the nested
+terminal-wrapper admission mismatch reported after PR #1163 for
 [issue 1066](https://github.com/sanohiro/align/issues/1066) and G9 of the
 [vectorization contract](68-vectorization-contract.md). This document is the
 public artifact ledger and implementation closure matrix. The provider

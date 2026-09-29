@@ -1,6 +1,6 @@
 # Session handoff
 
-## Next work (handoff updated 2026-09-23)
+## Next work (handoff updated 2026-09-29)
 
 The align-llm audit issue batch is partly shipped. Merged: #1089 (plan 68),
 #1090, #1091, #1092, #1096, #1099, #1100 (plan 69), #1101, #1110, #1111
@@ -23,9 +23,9 @@ release/fast definitions use `available_externally alwaysinline`; dev and the
 two size profiles retain their established policies. Consumer repinning and a
 fresh call-site census remain align-llm-owned verification.
 The next consumer census exposed one contract-admitted nested
-`unsafe { return ... }` wrapper that policy version 2 still rejects. Policy
-version 3 owns that terminal-wrapper correction; no source surface, body budget,
-effect authority, profile policy or LLVM representation changes.
+`unsafe { return ... }` wrapper. Policy version 3 shipped in #1165 and admits
+that terminal wrapper without changing the source surface, body budget, effect
+authority, profile policy or LLVM representation.
 Every remaining item below starts from `main` with a fresh branch and follows
 the CLAUDE.md review flow.
 
