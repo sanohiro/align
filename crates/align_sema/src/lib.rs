@@ -3275,6 +3275,108 @@ pub fn ty_may_borrow(
     false
 }
 
+/// A resource can retain another resource, but cannot retain the storage of an ordinary
+/// owned field through a checked borrow. Walk the complete type graph so a view sibling
+/// hidden inside a record or sum does not receive the resource-only exemption.
+fn has_only_resource_borrow_leaves(
+    root: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    enum Work {
+        Enter(Ty),
+        Exit(Ty),
+    }
+
+    let mut work = vec![Work::Enter(root)];
+    let mut visiting = HashSet::new();
+    let mut completed = HashSet::new();
+    while let Some(item) = work.pop() {
+        let ty = match item {
+            Work::Exit(ty) => {
+                visiting.remove(&ty);
+                completed.insert(ty);
+                continue;
+            }
+            Work::Enter(ty) => ty,
+        };
+        if completed.contains(&ty) {
+            continue;
+        }
+        let children = match ty {
+            Ty::Resource(_) | Ty::ResourceRef(_) => continue,
+            Ty::Param(_) | Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error => return false,
+            Ty::Tagged(id) => match tagged_types.get(id as usize) {
+                Some(hir::TaggedType::Option(payload)) => vec![scalar_to_ty(*payload)],
+                Some(hir::TaggedType::Result(ok, err)) => {
+                    vec![scalar_to_ty(*ok), scalar_to_ty(*err)]
+                }
+                None => return false,
+            },
+            Ty::Struct(id)
+            | Ty::StructArray(id, _)
+            | Ty::DynStructArray(id, _)
+            | Ty::DynFixedStructArray(id, _)
+            | Ty::FixedStructArrayBuilder(id, _) => {
+                let Some(definition) = structs.get(id as usize) else {
+                    return false;
+                };
+                definition.fields.iter().map(|field| field.ty).collect()
+            }
+            Ty::Tuple(id) => {
+                let Some(definition) = tuples.get(id as usize) else {
+                    return false;
+                };
+                definition.elems.iter().copied().map(scalar_to_ty).collect()
+            }
+            Ty::Enum(id) => {
+                let Some(definition) = enums.get(id as usize) else {
+                    return false;
+                };
+                definition
+                    .variants
+                    .iter()
+                    .flat_map(|variant| variant.payload.iter())
+                    .copied()
+                    .map(scalar_to_ty)
+                    .collect()
+            }
+            Ty::Option(payload)
+            | Ty::Array(payload, _)
+            | Ty::DynArray(payload)
+            | Ty::Task(payload)
+            | Ty::Box(payload)
+            | Ty::ArrayBuilder(payload) => {
+                vec![scalar_to_ty(payload)]
+            }
+            Ty::Result(ok, err) => vec![scalar_to_ty(ok), scalar_to_ty(err)],
+            Ty::DynFixedArray(payload, len) | Ty::FixedArrayBuilder(payload, len) => {
+                vec![Ty::Array(payload, len)]
+            }
+            Ty::DynVecArray(payload, lanes) | Ty::VecArrayBuilder(payload, lanes) => {
+                vec![Ty::Vec(payload, lanes)]
+            }
+            Ty::DynMaskArray(payload, lanes) | Ty::MaskArrayBuilder(payload, lanes) => {
+                vec![Ty::Mask(payload, lanes)]
+            }
+            _ => {
+                if ty_may_borrow(ty, structs, tuples, enums, tagged_types) {
+                    return false;
+                }
+                continue;
+            }
+        };
+        if !visiting.insert(ty) {
+            return false;
+        }
+        work.push(Work::Exit(ty));
+        work.extend(children.into_iter().rev().map(Work::Enter));
+    }
+    true
+}
+
 /// Classification of the dependent HTTP receive-stream storage grammar. `Carrier` is exactly a
 /// bare stream or a finite builtin Option/Result path containing one; `Forbidden` means a stream is
 /// reachable only through another storage edge. `None` contains no dependent stream.
@@ -36364,8 +36466,34 @@ impl<'a> MoveCheck<'a> {
         let Some(ty_r) = self.type_at_path(parent_ty, &[field_r]) else {
             return false;
         };
-        !ty_may_borrow(ty_l, self.structs, self.tuples, self.enums, self.tagged_types)
-            && !ty_may_borrow(ty_r, self.structs, self.tuples, self.enums, self.tagged_types)
+        let left_is_plain = !ty_may_borrow(
+            ty_l,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        );
+        let right_is_plain = !ty_may_borrow(
+            ty_r,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        );
+        has_only_resource_borrow_leaves(
+            ty_l,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        ) && has_only_resource_borrow_leaves(
+            ty_r,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        )
+            && (left_is_plain || right_is_plain)
     }
 
     fn check_call_borrow_aliases(
@@ -85258,6 +85386,53 @@ fn exit_branch(flag: bool) -> i64 {
             drop_plan(Ty::Enum(0), &[], &missing_enum_payload, &[]).needs_drop(),
             "a missing enum payload struct ID must fail closed without panicking"
         );
+    }
+
+    #[test]
+    fn resource_only_borrow_graph_shares_repeated_subgraphs() {
+        let mut structs = vec![StructDef {
+            name: "S0".to_string(),
+            source_name: "S0".to_string(),
+            fields: vec![FieldDef {
+                name: "resource".to_string(),
+                ty: Ty::Resource(0),
+            }],
+            align: None,
+            c_repr: false,
+        }];
+        for depth in 1..40 {
+            let child = (depth - 1) as u32;
+            structs.push(StructDef {
+                name: format!("S{depth}"),
+                source_name: format!("S{depth}"),
+                fields: vec![
+                    FieldDef {
+                        name: "left".to_string(),
+                        ty: Ty::Struct(child),
+                    },
+                    FieldDef {
+                        name: "right".to_string(),
+                        ty: Ty::Struct(child),
+                    },
+                ],
+                align: None,
+                c_repr: false,
+            });
+        }
+        assert!(has_only_resource_borrow_leaves(
+            Ty::Struct(39), &structs, &[], &[], &[],
+        ));
+        structs[0].fields[0].ty = Ty::Str;
+        assert!(!has_only_resource_borrow_leaves(
+            Ty::Struct(39), &structs, &[], &[], &[],
+        ));
+        assert!(!has_only_resource_borrow_leaves(
+            Ty::Struct(40), &structs, &[], &[], &[],
+        ));
+        structs[0].fields[0].ty = Ty::Struct(39);
+        assert!(!has_only_resource_borrow_leaves(
+            Ty::Struct(39), &structs, &[], &[], &[],
+        ));
     }
 
     #[test]
