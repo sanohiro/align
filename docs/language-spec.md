@@ -490,9 +490,14 @@ ownership models. Arbitrary collections of Move elements remain a separate conta
 
 Function parameters may instead be `borrow x: T`; a shared borrow accepts a stable bound Copy or
 Move place, does not consume its owner, avoids a by-value aggregate copy, and may return an inferred
-view of the current generation. It does not make a temporary addressable. `borrow mut x: T` accepts a
-writable Move or Copy place, is exclusive for the call, ends the previous generation, and may
-return a view of the fresh generation. Copy mutable borrow is the in-place state-update form.
+view of the current generation. It does not make a temporary addressable. `borrow mut x: T` accepts
+a writable Move or Copy place and is exclusive for the call. An owned replacement ends the
+displaced generation. A proven Copy-view descriptor rebind or element write preserves its
+addressed allocation: an older alias keeps its captured header and observes shared backing
+updates, with old element-owner dependencies retained unless a complete whole-element
+overwrite is proved.
+Unknown effects remain conservative. A returned view follows the post-call destination fact.
+Copy mutable borrow is the in-place state-update form.
 Parameter modes and inferred return-borrow summaries cross module interfaces; function-value types
 also retain every mode, both return-borrow/region summaries, and the Move-return cleanup ABI, so
 indirect and direct calls use the same ABI and result lifetime. Named summaries record parameter

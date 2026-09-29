@@ -116,6 +116,64 @@ content remains conservative; a plain owned numeric sibling still needs to pass.
 Both direct and nested contained-view witnesses pass on the compiler before this
 correction and reject with an invalidated-borrow diagnostic afterward.
 
+### Nightly follow-up: mutable Copy-view call effects
+
+The first nightly after the A1 repair found four `return_provenance` positives
+that reject after a changed `borrow mut` slice header or element. A candidate
+that simply exempted changed Copy views from exclusive root invalidation made
+both of these source programs check, which is unsound:
+
+```align
+fn reset(borrow mut destination: slice<str>) {
+  destination = []
+}
+fn main() -> i32 {
+  mut owner := "old".clone()
+  view: str := owner
+  mut values := [view]
+  mut destination: slice<str> := values
+  alias := destination
+  reset(destination)
+  owner = "new".clone()
+  _ := alias[0].len()
+  return 0
+}
+```
+
+The same false acceptance occurs when `reset` instead writes
+`destination[0] = "static"`, `values` has a second element rooted in `owner`, and
+the final read uses `alias[1]`. The first program rebinds only the descriptor;
+the second leaves one old element. An empty mutable-retention root set cannot
+distinguish either from a complete content overwrite. The reviewed candidate
+is parked and must not be published.
+
+| Boundary | Closure obligation | Owner evidence |
+| --- | --- | --- |
+| Formation, validation, move and Drop | Keep the existing `borrow mut` place, mode, alias and storage checks. A Copy-view descriptor never owns or frees its addressed allocation; an owned array or resource still ends its displaced generation and runs its existing Drop/nulling plan. Reject malformed effect metadata before a call transition. | Existing `borrowed_params`, `borrow_liveness`, `array_truncate`, `resource_ownership` and malformed-HIR owners; new direct-versus-owned twins. |
+| Descriptor versus content | Distinguish no-op, descriptor-only rebind, original-backing write, temporary-rebind-target write, and their combination on every returning path. Rebinding preserves old backing content for pre-call aliases while the destination selects its post-call backing. Every source written through a transient view remains in all compatible completed backing candidates even if a later rebind removes that view from the exit value. An unknown effect conservatively retains old content. | `return_provenance` no-op, copy-view-rebind, static-reset, sourced-write and rebind-write-rebind twins; imported and function-value parity. |
+| Exact overwrite versus partial write | Remove an old element owner only when every successfully returning path proves its entire observed backing content was overwritten. A write to one element of a two-element backing leaves the other owner's dependency live; an offset/range or unknown backing cannot claim an exact index. A proved single-cell backing may use a guaranteed successful whole-element store as a complete overwrite; a one-row SoA field store cannot erase sibling fields. | Parameterized one/two-element, full/ranged slice, constant/dynamic index, projected-field, no-write and abort/return cases; old-owner replacement plus alias read. |
+| Control and eager action | Apply effects only after every argument falls through. Join `if`, `match`, `else`, `?`, `map_err`, loop, and early-return paths with may-effects by union and must-overwrite by intersection. Preserve source-order snapshots, simultaneous mutable destinations, nested direct calls and action-time overlap exclusion. | Existing argument-completion and multiple-destination owners; new branch/loop/termination and mixed-effect owners. |
+| Generic, imported and indirect calls | Infer direct/concrete generic effects from checked bodies; transport the exact public effect through producer-certified interfaces and validate it on import/replay. Missing, external or unresolved targets use a conservative effect, never known-empty or guaranteed overwrite; malformed records reject before analysis. Whole-program and per-unit checking must agree. | `return_provenance` and `imported_mutable_retention` whole/per-unit matrix; interface semantic/byte and malformed-record owners; generic forwarding and unresolved-target negatives. |
+| Allocation, ABI and cache | Preserve runtime ownership and allocation, MIR/LLVM call ABI and source syntax. If the interface record changes, version and hash its canonical bytes before implementation; no implementation-only summary may be trusted as an imported fact. | Existing allocation/ABI owners, interface hash/edit-revert owner, bounded gate; no benchmark without a new resource promise. |
+
+Before implementation, the owning contract ledger must define the exact effect
+record, its validation and encoding, and the source-level Copy-view alias rule.
+The revised matrix and capability boundary require one fresh adversarial plan
+review. The two false-acceptance cases above remain rejection controls while
+the previous candidate's four nightly positives remain acceptance controls.
+
+The 2026-09-29 independent plan review found two soundness gaps and three
+contract gaps. A temporary rebind target can retain a written source after the
+destination is rebound again, so plan 80 now records writes throughout the
+destination's header flow and joins their sources into all compatible completed
+backings. A one-row SoA field write cannot clear sibling fields, so its must-write
+bit requires a whole-element store. Malformed `Some` records now reject instead
+of using unavailable fallback; resolved nominal eligibility is checked after
+the full interface and hash; and a rebind to a fresh `clone_in(out)` view retains
+an unknown header with the selected region root. The corresponding matrix rows
+above and plan-80 validation, transfer, and owner records close these findings
+before Rust implementation.
+
 ## Scope and evidence
 
 Audited compiler commit `c2f32a2d213fcba6678f7c4dfeca5dac11e308a9` on Darwin arm64.

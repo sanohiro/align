@@ -1036,10 +1036,16 @@ ownership, but an explicit shared borrow also prevents a potentially large aggre
 the typed ABI for producer-generated callbacks. It does not make a temporary addressable. `borrow`
 leaves the argument owned by the caller. The callee cannot move, replace, or drop it; a view returned
 from the call is inferred to borrow the exact caller-side owner generation. `borrow mut`
-accepts a writable Move or Copy place, has exclusive access for the call, and ends the previous
-storage generation. This is required for a Copy state aggregate whose field mutation must update the
-caller rather than a discarded copy. Older views become invalid; a returned view belongs to the
-fresh generation. Parameter modes are part of named-function and function-value signatures, while
+accepts a writable Move or Copy place and has exclusive access for the call. Replacing an owned
+value ends its displaced storage generation; an unknown mutation retains conservative invalidation.
+A Copy view header does not own the allocation it addresses: a proven descriptor rebind or element
+write leaves that allocation live, and an older alias keeps its captured descriptor while
+observing writes to the shared backing. The compiler retains old element-owner dependencies unless
+it proves that every observed element, including every field of an aggregate element,
+was overwritten on every returning path. This is required
+for a Copy state aggregate whose field mutation must update the caller rather than a discarded
+copy. A returned view follows the post-call destination fact. Parameter modes are part of
+named-function and function-value signatures, while
 lifetime roots remain inferred — there are no written lifetime parameters. A concrete function
 value retains inferred return-borrow and return-region parameter/capture sets. Target-relative
 capture roots travel with the selected closure environment; assignment/control-flow joins
