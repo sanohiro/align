@@ -37087,6 +37087,32 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
+    fn borrowed_index_view_place(
+        &self,
+        base: &hir::BorrowedElementBase,
+    ) -> Option<MutablePlaceSnapshot> {
+        if !matches!(
+            expand_tagged_ty(base.array_ty, self.tagged_types),
+            Ty::Slice(_) | Ty::Soa(_) | Ty::SoaParam(_)
+        ) {
+            return None;
+        }
+        // A sum payload is not representable in a mutable-place path. Keep the exact struct
+        // prefix so writes to sibling fields remain disjoint; mutations to the containing sum
+        // still overlap and invalidate this selection.
+        let mut path = Vec::new();
+        for segment in base.path.iter().skip(1) {
+            match segment {
+                hir::BorrowedPathSegment::StructField(field) => path.push(*field),
+                _ => break,
+            }
+        }
+        Some(MutablePlaceSnapshot {
+            root: base.root_local,
+            path,
+        })
+    }
+
     /// Whether the syntactic actual still denotes the header/storage captured when its argument
     /// completed. `out` passes a slice descriptor by value, so a later eager rebind must update the
     /// old backing without attaching the installed owner to the now-unrelated local.
@@ -39174,6 +39200,12 @@ impl<'a> MoveCheck<'a> {
         }
         self.borrows.begin_value_source(key, completion_roots);
         self.borrows.begin_value_headers(key, headers);
+        if let ExprKind::BorrowedIndex { base, .. } = &expression.kind
+            && let Some(place) = self.borrowed_index_view_place(base)
+        {
+            // The element borrow depends on the descriptor that selected its place.
+            self.borrows.begin_mutable_place_source(key, place);
+        }
         if self.borrow_mut_place_snapshots.contains(&key)
             && let Some(place) = Self::mutable_actual_place(expression)
         {
@@ -39312,6 +39344,15 @@ impl<'a> MoveCheck<'a> {
             BorrowEnd::Consumed => "was reassigned or mutated by a later eager operand",
             BorrowEnd::Dropped => "was dropped before the call action",
         };
+        if !self.borrow_mut_place_snapshots.contains(&snapshot) {
+            self.diags.error(
+                format!(
+                    "value snapshot was invalidated before the enclosing operation: source view header '{owner}' {why}"
+                ),
+                span,
+            );
+            return;
+        }
         self.diags.error(
             format!(
                 "borrow mut argument place was invalidated before the call action: '{owner}' {why}"
@@ -47184,6 +47225,12 @@ impl<'a> MoveCheck<'a> {
                     reservation,
                     self.borrowed_element_roots(base.root_local),
                 );
+                if let Some(place) = self.borrowed_index_view_place(base) {
+                    // A Copy view aliases its backing, but the indexed place is selected from
+                    // the header captured before the eager index. Rebinding that exact header
+                    // invalidates this pending selection without ending older copied aliases.
+                    self.borrows.begin_mutable_place_source(reservation, place);
+                }
                 if !self.expr(index, moved, false, false) {
                     self.borrows.finish_value_source(reservation);
                     return false;
