@@ -611,8 +611,9 @@ fn bounded_byte_object_numeric_matrix() {
             else { &[0, 0x8000000000000000, 0x7ff0000000000000, 0xfff0000000000000, 0x7ff8000000001234, 0x7ff0000000001234] };
         for pattern in patterns {
             calls.push_str(&format!(" print(float_{bits}({pattern}))\n"));
-            let printed = i64::from_ne_bytes(pattern.to_ne_bytes());
-            expected.push_str(&format!("{printed}\n"));
+            // The round trip returns u32/u64; print keeps its unsigned decimal value,
+            // including patterns whose high bit is set.
+            expected.push_str(&format!("{pattern}\n"));
         }
     }
     let ir = emit_llvm(&src);
