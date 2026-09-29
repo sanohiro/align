@@ -1639,3 +1639,27 @@ fn main() {
     let project = [("pkg/db.align", root), ("main.align", entry)];
     assert_rejected("generic-borrowing-sibling", &project, "aliases argument");
 }
+
+#[test]
+fn shared_resource_sum_graph_keeps_sibling_proof() {
+    let mut root = String::from("module pkg.db\nimport pkg.db.internal.resource\npub resource conn = pkg.db.internal.resource.drop_conn\n");
+    root.push_str("pub Choice0 { Device(conn), Empty }\n");
+    for depth in 1..=8 {
+        root.push_str(&format!(
+            "pub Choice{depth} {{ Left(Choice{}), Right(Choice{}) }}\n",
+            depth - 1,
+            depth - 1,
+        ));
+    }
+    root.push_str("pub Pair { device: Choice8, scratch: buffer }\n");
+    root.push_str("pub fn write(borrow device: Choice8, borrow mut bytes: slice<u8>) {}\n");
+    root.push_str("pub fn update(borrow mut pair: Pair) { mut bytes := pair.scratch.bytes(); write(pair.device, bytes) }\n");
+    let project = [
+        ("pkg/db/internal/resource.align", INTERNAL),
+        ("pkg/db.align", root.as_str()),
+        ("main.align", "module main\nimport pkg.db\nfn main() {}\n"),
+    ];
+    let result = diff_check_multi("shared-resource-sum-graph", &project, "main.align");
+    assert!(!result.whole_errors, "whole:\n{}", result.whole_diags);
+    assert!(!result.per_unit_errors, "per-unit:\n{}", result.per_unit_diags);
+}
