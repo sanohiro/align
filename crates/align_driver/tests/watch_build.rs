@@ -120,13 +120,25 @@ fn wait_for(rx: &Receiver<String>, needle: &str) -> Vec<String> {
     wait_for_matching(rx, needle, |line| line.contains(needle))
 }
 
-fn wait_for_ready_at_least(rx: &Receiver<String>, minimum_revision: u64) -> Vec<String> {
-    let expected = format!("revision {minimum_revision} or later ready");
+fn wait_for_ready_output(
+    rx: &Receiver<String>,
+    minimum_revision: u64,
+    executable: &Path,
+    expected_code: i32,
+) -> Vec<String> {
+    let expected = format!("revision {minimum_revision} or later ready with exit {expected_code}");
     wait_for_matching(rx, &expected, |line| {
-        line.strip_prefix("alignc: watch: revision ")
+        let ready = line
+            .strip_prefix("alignc: watch: revision ")
             .and_then(|revision| revision.strip_suffix(" ready"))
             .and_then(|revision| revision.parse::<u64>().ok())
-            .is_some_and(|revision| revision >= minimum_revision)
+            .is_some_and(|revision| revision >= minimum_revision);
+        ready
+            && Command::new(executable)
+                .status()
+                .expect("run ready output")
+                .code()
+                == Some(expected_code)
     })
 }
 
@@ -237,7 +249,7 @@ fn one_process_builds_edit_and_revert_then_stops_cleanly() {
     std::fs::write(&entry, source(1)).expect("revert source");
     // A normal file write may be observed between truncation and completion. The watcher then
     // retries that unstable revision and publishes the next one once the reverted bytes settle.
-    wait_for_ready_at_least(&lines, 3);
+    wait_for_ready_output(&lines, 3, &temp.0.join("main"), 1);
     let (status, stdout) = stop(child);
     assert_eq!(status.code(), Some(143));
     assert!(
