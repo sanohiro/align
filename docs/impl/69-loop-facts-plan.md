@@ -1077,9 +1077,11 @@ full stores on their backedges; neither can initialize a missing outside
 entry. Re-derivation recognizes the twin only by the same typed
 load/add/store recurrence inside generated blocks. A load in another source
 requires its own must-init proof at the load statement; cycles in value
-definitions and proof chains deeper than 256 nodes fail closed. A non-`Store`
-write to the index slot clears the
-proof. The merge is intersection over reachable predecessors. The entry starts
+definitions and proof chains deeper than 256 nodes fail closed. Nested load
+proofs share a 16,384-step budget over block, statement and source visits;
+exhaustion also fails closed instead of repeating whole-CFG analyses. A non-`Store`
+write to the index slot clears the proof. The merge is intersection over
+reachable predecessors. The entry starts
 false and all other blocks start true; iteration removes a fact when an actual
 path lacks initialization. Every reachable cycle has a path from entry, so a
 cycle cannot justify its own initial load, while an initialized value survives
@@ -1094,7 +1096,7 @@ is introduced.
 
 | Boundary | Proof and owner |
 |---|---|
-| formation and move | Only an exact `i64` index slot with the existing recurrence is considered. The parameter's real `Store` and other full-width typed/available `Store` values establish initialization; missing parameter stores, wrong-width/undefined/non-dominating sources, cyclic or deeper-than-256 source chains, partial writes, Drop and move-out clear the fact. The existing index-write, escape, and type checks remain. A MIR-level dataflow owner covers each transfer and malformed slot/source. |
+| formation and move | Only an exact `i64` index slot with the existing recurrence is considered. The parameter's real `Store` and other full-width typed/available `Store` values establish initialization; missing parameter stores, wrong-width/undefined/non-dominating sources, cyclic or deeper-than-256 source chains, exhausted nested-load work, partial writes, Drop and move-out clear the fact. The existing index-write, escape, and type checks remain. MIR-level dataflow and nested-load-budget owners cover these transfers and refusals. |
 | control joins | Entry, `if`/`match`/`else`, loop and early-exit joins use intersection of reachable predecessors; unreachable blocks cannot supply a proof, and a reachable cycle inherits its entry path rather than certifying itself. Source owners cover parameter entry, two branch initializers, a negative live value and both enclosing-loop re-entry cases; an isolated MIR owner covers a missing predecessor initialization. |
 | rewrite and return | The original slow copy keeps its guards and trap order. The fast copy reads the current slot at every preheader entry, including after a prior slow-copy run; re-derivation checks the same must-init fact after rewriting. Existing trap-prefix, re-entry, clone and return owners remain applicable. |
 | compilation modes | Generic monomorphization, whole-program, per-unit, function partition, and runtime allocation are unchanged by this MIR-only admission proof. The existing mode and allocation owners remain applicable; no new benchmark or ABI owner is required. |
