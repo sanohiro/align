@@ -1019,13 +1019,15 @@ extern "C" {
   fn align_pg_protocol_ok() -> i32
 }
 
+// This owner must enter the async cancellation/recovery path. Leave setup
+// time before expiry so scheduler load cannot substitute pre-send rejection.
 fn timeout_connection() -> i32 {
   unsafe { align_pg_reset() }
   connection := pkg.db.postgres.connect("postgresql://stub/dynamic", []) else { return 1 }
   timed := pkg.db.dynamic_execute(
     pkg.db.exec_conn(connection), pkg.db.Driver.PostgreSQL,
     "SELECT DYNAMIC_SIMPLE TIMEOUT_WAIT", [],
-    [pkg.db.ExecuteOption.TimeoutNs(2000000)],
+    [pkg.db.ExecuteOption.TimeoutNs(200000000)],
   )
   timeout_ok := match timed { Err(error) => match error { Timeout(_) => true, _ => false }, Ok(_) => false }
   if !timeout_ok { return 2 }
@@ -1046,7 +1048,7 @@ fn timeout_transaction() -> i32 {
   timed := pkg.db.dynamic_execute(
     pkg.db.exec_tx(transaction), pkg.db.Driver.PostgreSQL,
     "SELECT DYNAMIC_SIMPLE TIMEOUT_WAIT", [],
-    [pkg.db.ExecuteOption.TimeoutNs(2000000)],
+    [pkg.db.ExecuteOption.TimeoutNs(200000000)],
   )
   timeout_ok := match timed { Err(error) => match error { Timeout(_) => true, _ => false }, Ok(_) => false }
   if !timeout_ok { return 3 }

@@ -25,7 +25,7 @@ use align_mir::producer::{
     canonical_ty, source_ty_matches, callable_metadata_error, preflight_operand_ty,
     slice_index_physical_element, slice_index_result_matches, validate_slice_index_rvalues,
     validate_str_match_terminators,
-    validate_fixed_element_nulling, validate_checked_byte_views, template_piece_is_type_safe,
+    validate_fixed_element_nulling, validate_partial_field_nulling, validate_checked_byte_views, template_piece_is_type_safe,
     direct_operands_match_modes,
     direct_runtime_key_is_valid
 };
@@ -41,6 +41,8 @@ mod llvm_build_id;
 /// C++ shim's `align_pgo_run_pipeline` entry for `--pgo-instrument` / `--pgo-use`.
 pub mod pgo;
 mod return_transport;
+#[cfg(test)]
+mod tuple_nulling_tests;
 mod runtime_abi;
 /// The resolved target identity: the one place that decides the exact triple (and, on Apple, the
 /// deployment target) every artifact, link, and cache key derives from.
@@ -1110,6 +1112,7 @@ pub fn validate_thin_partition_program(
     validate_slice_index_rvalues(program)?;
     validate_str_match_terminators(program)?;
     validate_fixed_element_nulling(program)?;
+    validate_partial_field_nulling(program)?;
     validate_checked_byte_views(program)?;
     let declarations = callable_declarations(program)?;
     callable_preflight(program, exports, declarations, ModuleScope::Whole)?;
@@ -3519,6 +3522,7 @@ fn validate_module_program(
     validate_slice_index_rvalues(program)?;
     validate_str_match_terminators(program)?;
     validate_fixed_element_nulling(program)?;
+    validate_partial_field_nulling(program)?;
     validate_checked_byte_views(program)?;
     Ok(())
 }
@@ -13321,75 +13325,28 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     self.builder.build_store(self.slots[slot], z).map_err(|e| self.err(e))?;
                 }
                 Stmt::NullTupleField(slot, idx) => {
-                    // Null one owned `{ptr,len}` field of a tuple slot (after a partial field move),
-                    // so the tuple's `Drop` frees null there.
-                    let Ty::Tuple(tid) = self.f.slots[*slot as usize] else {
-                        unreachable!("NullTupleField on a non-tuple slot");
+                    // Null the moved field's own representation. Pointer owners occupy one
+                    // pointer; a pointer/length zero would overwrite the adjacent tuple element.
+                    let Some(Ty::Tuple(tid)) = self.f.slots.get(*slot as usize).copied() else {
+                        return Err(self.err("NullTupleField destination is not a tuple slot"));
                     };
-                    let field_ptr = self
-                        .builder
-                        .build_struct_gep(self.tuple_types[tid as usize], self.slots[slot], *idx, "nulltupfld")
-                        .map_err(|e| self.err(e))?;
-                    self.builder
-                        .build_store(field_ptr, slice_struct_type(self.ctx).const_zero())
-                        .map_err(|e| self.err(e))?;
+                    let scalar = self.tuples.get(tid as usize)
+                        .and_then(|tuple| tuple.elems.get(*idx as usize)).copied()
+                        .ok_or_else(|| self.err("NullTupleField element is out of bounds"))?;
+                    let tuple_ty = self.tuple_types.get(tid as usize).copied()
+                        .ok_or_else(|| self.err("NullTupleField LLVM tuple type is missing"))?;
+                    let storage = self.slots.get(slot).copied()
+                        .ok_or_else(|| self.err("NullTupleField destination has no storage"))?;
+                    let field_ptr = self.builder
+                        .build_struct_gep(tuple_ty, storage, *idx, "nulltupfld")
+                        .map_err(|error| self.err(error))?;
+                    let zero = self.llvm_type(scalar_to_ty(scalar)).const_zero();
+                    self.builder.build_store(field_ptr, zero).map_err(|error| self.err(error))?;
                 }
                 Stmt::NullStructField(slot, idx) => {
-                    // Null one owned field of a struct slot after a partial field move: a `string`
-                    // `{ptr,len}` field (`n := u.name`), or a **Move**-enum field whose payload a
-                    // `match m.content { … }` moved out (J3). Zero the field's own type so the struct's
-                    // recursive `Drop` frees null there — a `{ptr,len}` slice for a `string`, the whole
-                    // `{ tag, payloads }` aggregate for an enum (tag → 0, every payload ptr null → the
-                    // tag-switched `drop_enum` frees null on every arm).
-                    let Ty::Struct(sid) = self.f.slots[*slot as usize] else {
-                        unreachable!("NullStructField on a non-struct slot");
-                    };
-                    let field_ptr = self
-                        .builder
-                        .build_struct_gep(
-                            self.struct_types[sid as usize],
-                            self.slots[slot],
-                            self.pfield(sid, *idx),
-                            "nullstructfld",
-                        )
-                        .map_err(|e| self.err(e))?;
-                    let zero: inkwell::values::BasicValueEnum = match self.structs[sid as usize].fields[*idx as usize].ty {
-                        Ty::Enum(eid) => self.enum_types[eid as usize].const_zero().into(),
-                        Ty::Option(payload) => {
-                            option_struct_type(
-                                self.ctx,
-                                payload,
-                                self.struct_types,
-                                self.enum_types,
-                                self.tagged_types,
-                            )
-                                .const_zero()
-                                .into()
-                        }
-                        ty @ (Ty::Result(..) | Ty::Tagged(_)) => self
-                            .llvm_type(ty)
-                            .into_struct_type()
-                            .const_zero()
-                            .into(),
-                        // A Move **handle** field is a single opaque POINTER, not a `{ptr,len}` —
-                        // zeroing it with a 16-byte slice struct would clobber the next field.
-                        // `handle_free_key` is the same predicate that decides its drop is a pointer
-                        // free, so the two can never disagree about the field's shape.
-                        ty if handle_free_key(ty).is_some() => self
-                            .ctx
-                            .ptr_type(AddressSpace::default())
-                            .const_null()
-                            .into(),
-                        Ty::Resource(_) => self
-                            .ctx
-                            .ptr_type(AddressSpace::default())
-                            .const_null()
-                            .into(),
-                        _ => slice_struct_type(self.ctx).const_zero().into(),
-                        };
-                    self.builder
-                        .build_store(field_ptr, zero)
-                        .map_err(|e| self.err(e))?;
+                    let (field_ptr, field_ty) = self.checked_field_path_ptr_and_ty(*slot, &[*idx])?;
+                    let zero = self.llvm_type(field_ty).const_zero();
+                    self.builder.build_store(field_ptr, zero).map_err(|error| self.err(error))?;
                 }
                 Stmt::NullElemField(slot, index, path) => {
                     let field_ptr = self.elem_field_ptr(*slot, index, path)?;

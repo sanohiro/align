@@ -765,14 +765,13 @@ pub enum Stmt {
     DropFlagInit(Slot),
     /// Move-out source nulling paired with the ownership flag becoming false.
     DropFlagMoveOut { slot: Slot, flag: Slot },
-    /// Null one owned field (`{null, 0}`) of a tuple slot, after a partial field move (`a := t.0`)
-    /// took its buffer — so the tuple's exit `Drop` frees null there, not the buffer now owned by
-    /// the new binding. The other fields are untouched.
+    /// Zero one owned field of a tuple slot using that field's own representation after a partial
+    /// move (`a := t.0`). Pointer owners store one null pointer; owned headers store `{null, 0}`.
+    /// The tuple's exit Drop then consumes null while the other fields remain untouched.
     NullTupleField(Slot, u32),
-    /// Null one owned `string` field (`{null, 0}`) of a struct slot, after a partial field move
-    /// (`n := u.name`) took its buffer — so the struct's recursive `Drop` frees null there, not the
-    /// buffer now owned by the new binding. Depth-1 (a direct field of the slot's struct); the other
-    /// fields are untouched.
+    /// Zero one owned field of a struct slot using its own representation after a partial move
+    /// (`n := u.name`), so the struct's recursive Drop consumes zero while the new binding owns
+    /// the moved value. The path is one direct field; the other fields remain untouched.
     NullStructField(Slot, u32),
     /// Null one resource-pointer leaf of a fixed Move-struct array after an exact element-field
     /// move. The enclosing array remains the owner of every other element and field.
