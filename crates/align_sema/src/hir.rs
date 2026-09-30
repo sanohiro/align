@@ -74,6 +74,40 @@ pub enum MathFn {
 }
 
 impl MathFn {
+    /// Complete concrete MathOp grammar shared by checked-HIR and MIR replay.
+    /// Inference-time source diagnostics retain their receiver-before-arity order.
+    pub fn result_type(self, operands: &[crate::Ty]) -> Option<crate::Ty> {
+        use crate::{Scalar, Ty};
+        let first = *operands.first()?;
+        let integer = |bits| matches!(bits, 8 | 16 | 32 | 64);
+        let float_width = |bits| matches!(bits, 32 | 64);
+        let lanes = |lanes| matches!(lanes, 2 | 4 | 8 | 16);
+        let numeric = match first {
+            Ty::Int(ty) => integer(ty.bits),
+            Ty::Float(ty) => float_width(ty.bits),
+            Ty::Vec(Scalar::Int(ty), count) => integer(ty.bits) && lanes(count),
+            Ty::Vec(Scalar::Float(ty), count) => float_width(ty.bits) && lanes(count),
+            _ => false,
+        };
+        let floating = match first {
+            Ty::Float(ty) => float_width(ty.bits),
+            Ty::Vec(Scalar::Float(ty), count) => float_width(ty.bits) && lanes(count),
+            _ => false,
+        };
+        let exact = |count| operands.len() == count && operands.iter().all(|ty| *ty == first);
+        match self {
+            Self::Abs => (exact(1) && numeric).then_some(first),
+            Self::Min | Self::Max => (exact(2) && numeric).then_some(first),
+            Self::Sqrt | Self::Floor | Self::Ceil | Self::Round | Self::Trunc
+            | Self::Exp | Self::Exp2 | Self::Log | Self::Log2 | Self::Log10 =>
+                (exact(1) && floating).then_some(first),
+            Self::Pow => (exact(2) && matches!(first, Ty::Float(_)) && floating).then_some(first),
+            Self::Fma => (exact(3) && floating).then_some(first),
+            Self::ToBits | Self::IsFinite | Self::IsNan | Self::IsInfinite =>
+                exact(1).then(|| self.float_inspection_result(first)).flatten(),
+        }
+    }
+
     pub fn is_float_inspection(self) -> bool {
         match self {
             Self::ToBits | Self::IsFinite | Self::IsNan | Self::IsInfinite => true,

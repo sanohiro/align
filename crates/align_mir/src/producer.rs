@@ -6323,20 +6323,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 }
             }
             Rvalue::MathOp { fn_, ty, operands } => {
-                let expected = if fn_.is_float_inspection() {
-                    (operands.len() == 1)
-                        .then(|| fn_.float_inspection_result(ty))
-                        .flatten()
-                } else {
-                    Some(ty)
-                };
-                if !path.is_empty()
-                    || Some(result_ty) != expected
-                    || operands.is_empty()
-                    || operands
-                        .iter()
-                        .any(|operand| xml_operand_base_ty(self.graph.function, operand) != Some(ty))
-                {
+                let expected = math_operation_result(self.graph.function, fn_, ty, &operands);
+                if !path.is_empty() || Some(result_ty) != expected {
                     equation.invalid = true;
                 } else {
                     for operand in &operands {
@@ -8485,6 +8473,19 @@ fn validate_resource_rvalues_component(
                 assert_xml_stmt_variant_classified(statement);
                 match statement {
                     Stmt::Let(value, rvalue) => {
+                        // Scalar provenance can be trivially founded, and a dead
+                        // result need not enter the access equation graph. Shape
+                        // validation therefore owns every MathOp here first.
+                        if let Rvalue::MathOp { fn_, ty, operands } = rvalue {
+                            let expected = math_operation_result(function, *fn_, *ty, operands);
+                            let value = usize::try_from(*value)
+                                .map_err(|_| fail(function, "unrepresentable math result"))?;
+                            if expected.is_none()
+                                || expected != function.value_tys.get(value).copied()
+                            {
+                                return Err(fail(function, "invalid math operation signature"));
+                            }
+                        }
                         if let Some(count) = primary_definitions.get_mut(*value as usize) {
                             *count = count.saturating_add(1);
                         }
@@ -11445,6 +11446,22 @@ pub fn direct_operands_match_modes(
         && operands_match_modes(&args[1..], &modes[1..], &types[1..], program)
 }
 
+fn math_operation_result(
+    function: &Function,
+    operation: hir::MathFn,
+    input: Ty,
+    operands: &[Operand],
+) -> Option<Ty> {
+    let types = operands
+        .iter()
+        .map(|operand| xml_operand_base_ty(function, operand))
+        .collect::<Option<Vec<_>>>()?;
+    if types.first() != Some(&input) {
+        return None;
+    }
+    operation.result_type(&types)
+}
+
 pub fn direct_runtime_key_is_valid(key: RuntimeKey, args: &[Ty], ret: Ty, program: &Program) -> bool {
     let i64_ty = Ty::Int(IntTy {
         bits: 64,
@@ -11491,6 +11508,291 @@ pub fn direct_runtime_key_is_valid(key: RuntimeKey, args: &[Ty], ret: Ty, progra
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn math_producers_share_complete_arity_input_and_result_rules() {
+        use hir::MathFn::*;
+        let mut diagnostics = align_diag::Diagnostics::new();
+        let tokens = align_lexer::tokenize(
+            0,
+            "fn calc(a: f64, b: f64, c: f64) -> f64 = fma(a, b, c)\nfn main() -> i32 = 0\n",
+            &mut diagnostics,
+        );
+        let ast = align_parser::parse_file(tokens, &mut diagnostics);
+        let hir = align_sema::check_file(&ast, &mut diagnostics);
+        assert!(!diagnostics.has_errors());
+        let baseline = crate::lower_program(&hir);
+        validate_mir_producers(&baseline).unwrap();
+        let function_index = baseline
+            .fns
+            .iter()
+            .position(|function| function.name.as_str() == "calc")
+            .unwrap();
+        let (block, statement, value, source_operands) = baseline.fns[function_index]
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(block, body)| {
+                body.stmts.iter().enumerate().find_map(|(statement, stmt)| {
+                    if let Stmt::Let(value, Rvalue::MathOp { operands, .. }) = stmt {
+                        Some((block, statement, *value, operands.clone()))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .unwrap();
+        let candidate = |operation, ty, operands, ret| {
+            let mut program = baseline.clone();
+            let function = &mut program.fns[function_index];
+            function.blocks[block].stmts[statement] = Stmt::Let(
+                value,
+                Rvalue::MathOp {
+                    fn_: operation,
+                    ty,
+                    operands,
+                },
+            );
+            function.value_tys[usize::try_from(value).unwrap()] = ret;
+            function.ret = ret;
+            program
+        };
+        let defined = BTreeSet::from([ProgramCall::try_from_logical("calc").unwrap()]);
+        let valid = |program: &Program| {
+            let whole = validate_mir_producers(program);
+            let partition = validate_partition_resource_rvalues(program, &defined);
+            assert_eq!(
+                whole.is_ok(),
+                partition.is_ok(),
+                "whole/partition math validation"
+            );
+            for error in [whole.as_ref().err(), partition.as_ref().err()]
+                .into_iter()
+                .flatten()
+            {
+                let message = error.to_string();
+                assert!(message.contains("function 'calc'"), "{message}");
+                assert!(
+                    message.contains("invalid math operation signature"),
+                    "{message}"
+                );
+            }
+            whole.is_ok()
+        };
+        let f64_ty = Ty::Float(FloatTy { bits: 64 });
+        let u64_ty = Ty::Int(IntTy {
+            bits: 64,
+            signed: false,
+        });
+        let operations = [
+            (Abs, 1),
+            (Min, 2),
+            (Max, 2),
+            (Sqrt, 1),
+            (Floor, 1),
+            (Ceil, 1),
+            (Round, 1),
+            (Trunc, 1),
+            (Pow, 2),
+            (Fma, 3),
+            (Exp, 1),
+            (Exp2, 1),
+            (Log, 1),
+            (Log2, 1),
+            (Log10, 1),
+            (ToBits, 1),
+            (IsFinite, 1),
+            (IsNan, 1),
+            (IsInfinite, 1),
+        ];
+        for (operation, arity) in operations {
+            let ret = match operation {
+                ToBits => u64_ty,
+                IsFinite | IsNan | IsInfinite => Ty::Bool,
+                _ => f64_ty,
+            };
+            let operands = source_operands[..arity].to_vec();
+            assert!(
+                valid(&candidate(operation, f64_ty, operands.clone(), ret)),
+                "{operation:?}"
+            );
+            for count in 0..=4 {
+                if count == arity {
+                    continue;
+                }
+                let wrong = (0..count)
+                    .map(|index| source_operands[index % source_operands.len()].clone())
+                    .collect();
+                assert!(
+                    !valid(&candidate(operation, f64_ty, wrong, ret)),
+                    "{operation:?} arity {count}"
+                );
+            }
+            for wrong_ret in [
+                Ty::Unit,
+                Ty::Raw,
+                Ty::Float(FloatTy { bits: 32 }),
+                Ty::Int(IntTy {
+                    bits: 32,
+                    signed: false,
+                }),
+                Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                }),
+            ] {
+                assert!(
+                    !valid(&candidate(operation, f64_ty, operands.clone(), wrong_ret)),
+                    "{operation:?} result {wrong_ret:?}"
+                );
+            }
+            let mut wrong = operands.clone();
+            wrong[0] = Operand::Const(Const::Int(0, u64_ty));
+            assert!(
+                !valid(&candidate(operation, f64_ty, wrong, ret)),
+                "{operation:?} operand agreement"
+            );
+            for (ty, operand) in [
+                (Ty::Bool, Operand::Const(Const::Bool(false))),
+                (Ty::Char, Operand::Const(Const::Char(0))),
+                (Ty::Unit, Operand::Const(Const::Unit)),
+            ] {
+                assert!(
+                    !valid(&candidate(operation, ty, vec![operand; arity], ty)),
+                    "{operation:?} nonnumeric {ty:?}"
+                );
+            }
+            let i64_ty = Ty::Int(IntTy {
+                bits: 64,
+                signed: true,
+            });
+            let integers = vec![Operand::Const(Const::Int(0, i64_ty)); arity];
+            assert_eq!(
+                valid(&candidate(operation, i64_ty, integers, i64_ty)),
+                matches!(operation, Abs | Min | Max),
+                "{operation:?} integer grammar"
+            );
+        }
+
+        for unreachable in [false, true] {
+            let mut program = baseline.clone();
+            let function = &mut program.fns[function_index];
+            let dead_value = u32::try_from(function.value_tys.len()).unwrap();
+            function.value_tys.push(f64_ty);
+            let dead = Stmt::Let(
+                dead_value,
+                Rvalue::MathOp {
+                    fn_: Abs,
+                    ty: f64_ty,
+                    operands: vec![Operand::Const(Const::Float(0.0, f64_ty))],
+                },
+            );
+            let target_block = if unreachable {
+                let id = u32::try_from(function.blocks.len()).unwrap();
+                function.blocks.push(Block {
+                    id,
+                    stmts: vec![dead],
+                    stmt_lines: vec![],
+                    term: Term::Unreachable,
+                });
+                function.blocks.len() - 1
+            } else {
+                function.blocks[block].stmts.push(dead);
+                block
+            };
+            assert!(
+                valid(&program),
+                "valid unused math, unreachable={unreachable}"
+            );
+            let function = &mut program.fns[function_index];
+            let Stmt::Let(_, Rvalue::MathOp { operands, .. }) =
+                function.blocks[target_block].stmts.last_mut().unwrap()
+            else {
+                panic!("math fixture");
+            };
+            operands.clear();
+            assert!(
+                !valid(&program),
+                "invalid unused math, unreachable={unreachable}"
+            );
+        }
+
+        // Sweep the concrete scalar/vector grammar shared by checked HIR and MIR.
+        for lanes in [2, 4, 8, 16] {
+            for bits in [32, 64] {
+                let scalar = Scalar::Float(FloatTy { bits });
+                let vector = Ty::Vec(scalar, lanes);
+                for operation in [
+                    Abs, Sqrt, Floor, Ceil, Round, Trunc, Exp, Exp2, Log, Log2, Log10,
+                ] {
+                    assert_eq!(operation.result_type(&[vector]), Some(vector));
+                }
+                assert_eq!(Min.result_type(&[vector; 2]), Some(vector));
+                assert_eq!(Max.result_type(&[vector; 2]), Some(vector));
+                assert_eq!(Fma.result_type(&[vector; 3]), Some(vector));
+                assert_eq!(Pow.result_type(&[vector; 2]), None);
+                for operation in [ToBits, IsFinite, IsNan, IsInfinite] {
+                    assert_eq!(operation.result_type(&[vector]), None);
+                }
+                for operation in [Abs, Min, Max, Exp, Fma] {
+                    for invalid in [
+                        Ty::Vec(scalar, 3),
+                        Ty::Vec(Scalar::Float(FloatTy { bits: 16 }), lanes),
+                        Ty::Mask(scalar, lanes),
+                    ] {
+                        assert_eq!(operation.result_type(&[invalid]), None);
+                        assert_eq!(operation.result_type(&[invalid; 2]), None);
+                        assert_eq!(operation.result_type(&[invalid; 3]), None);
+                    }
+                }
+            }
+            for bits in [8, 16, 32, 64] {
+                for signed in [false, true] {
+                    let scalar = Scalar::Int(IntTy { bits, signed });
+                    for ty in [Ty::Int(IntTy { bits, signed }), Ty::Vec(scalar, lanes)] {
+                        assert_eq!(Abs.result_type(&[ty]), Some(ty));
+                        assert_eq!(Min.result_type(&[ty; 2]), Some(ty));
+                        assert_eq!(Max.result_type(&[ty; 2]), Some(ty));
+                        for operation in [Sqrt, Exp, ToBits, IsNan] {
+                            assert_eq!(operation.result_type(&[ty]), None);
+                        }
+                        assert_eq!(Fma.result_type(&[ty; 3]), None);
+                    }
+                }
+            }
+        }
+        for bits in [32, 64] {
+            let ty = Ty::Float(FloatTy { bits });
+            assert_eq!(
+                ToBits.result_type(&[ty]),
+                Some(Ty::Int(IntTy {
+                    bits,
+                    signed: false
+                }))
+            );
+            for operation in [IsFinite, IsNan, IsInfinite] {
+                assert_eq!(operation.result_type(&[ty]), Some(Ty::Bool));
+            }
+        }
+        for invalid in [
+            Ty::Int(IntTy {
+                bits: 24,
+                signed: true,
+            }),
+            Ty::Float(FloatTy { bits: 16 }),
+            Ty::Str,
+            Ty::Raw,
+            Ty::Fn(0),
+        ] {
+            for (operation, arity) in operations {
+                assert_eq!(
+                    operation.result_type(&vec![invalid; arity]),
+                    None,
+                    "{operation:?} {invalid:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn mir_publication_certifies_bodies_without_a_backend() {
