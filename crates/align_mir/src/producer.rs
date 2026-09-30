@@ -11510,7 +11510,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn math_producers_share_complete_arity_input_and_result_rules() {
+    fn math_producers_share_complete_arity_input_and_result_rules()
+    -> Result<(), Box<dyn std::error::Error>> {
         use hir::MathFn::*;
         let mut diagnostics = align_diag::Diagnostics::new();
         let tokens = align_lexer::tokenize(
@@ -11522,12 +11523,12 @@ mod tests {
         let hir = align_sema::check_file(&ast, &mut diagnostics);
         assert!(!diagnostics.has_errors());
         let baseline = crate::lower_program(&hir);
-        validate_mir_producers(&baseline).unwrap();
+        validate_mir_producers(&baseline)?;
         let function_index = baseline
             .fns
             .iter()
             .position(|function| function.name.as_str() == "calc")
-            .unwrap();
+            .ok_or("missing calc fixture")?;
         let (block, statement, value, source_operands) = baseline.fns[function_index]
             .blocks
             .iter()
@@ -11541,7 +11542,8 @@ mod tests {
                     }
                 })
             })
-            .unwrap();
+            .ok_or("missing MathOp fixture")?;
+        let value_index = usize::try_from(value)?;
         let candidate = |operation, ty, operands, ret| {
             let mut program = baseline.clone();
             let function = &mut program.fns[function_index];
@@ -11553,11 +11555,12 @@ mod tests {
                     operands,
                 },
             );
-            function.value_tys[usize::try_from(value).unwrap()] = ret;
+            function.value_tys[value_index] = ret;
             function.ret = ret;
             program
         };
-        let defined = BTreeSet::from([ProgramCall::try_from_logical("calc").unwrap()]);
+        let defined = BTreeSet::from([ProgramCall::try_from_logical("calc")
+            .map_err(|error| format!("invalid calc fixture: {error:?}"))?]);
         let valid = |program: &Program| {
             let whole = validate_mir_producers(program);
             let partition = validate_partition_resource_rvalues(program, &defined);
@@ -11677,7 +11680,7 @@ mod tests {
         for unreachable in [false, true] {
             let mut program = baseline.clone();
             let function = &mut program.fns[function_index];
-            let dead_value = u32::try_from(function.value_tys.len()).unwrap();
+            let dead_value = u32::try_from(function.value_tys.len())?;
             function.value_tys.push(f64_ty);
             let dead = Stmt::Let(
                 dead_value,
@@ -11688,7 +11691,7 @@ mod tests {
                 },
             );
             let target_block = if unreachable {
-                let id = u32::try_from(function.blocks.len()).unwrap();
+                let id = u32::try_from(function.blocks.len())?;
                 function.blocks.push(Block {
                     id,
                     stmts: vec![dead],
@@ -11705,8 +11708,10 @@ mod tests {
                 "valid unused math, unreachable={unreachable}"
             );
             let function = &mut program.fns[function_index];
-            let Stmt::Let(_, Rvalue::MathOp { operands, .. }) =
-                function.blocks[target_block].stmts.last_mut().unwrap()
+            let Stmt::Let(_, Rvalue::MathOp { operands, .. }) = function.blocks[target_block]
+                .stmts
+                .last_mut()
+                .ok_or("missing unused MathOp fixture")?
             else {
                 panic!("math fixture");
             };
@@ -11792,6 +11797,7 @@ mod tests {
                 );
             }
         }
+        Ok(())
     }
 
     #[test]
