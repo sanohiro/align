@@ -8037,6 +8037,7 @@ pub fn validate_mir_producers(program: &Program) -> Result<HashSet<String>, Prod
     validate_slice_index_rvalues(program)?;
     validate_str_match_terminators(program)?;
     validate_fixed_element_nulling(program)?;
+    validate_partial_field_nulling(program)?;
     validate_fixed_field_slices(program)?;
     validate_checked_byte_views(program)?;
     // Publication certifies the typed producer graph, not final native codegen.
@@ -11295,6 +11296,61 @@ pub fn validate_fixed_element_nulling(program: &Program) -> Result<(), ProducerE
                         function.name
                     )));
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn struct_field_nulling_type_is_valid(
+    ty: Ty,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    ty == Ty::String
+        || matches!(ty, Ty::Resource(_))
+        || align_sema::is_move_handle(ty)
+        || (matches!(ty, Ty::Enum(_) | Ty::Option(_) | Ty::Result(..) | Ty::Tagged(_))
+            && align_sema::drop_plan(ty, structs, enums, tagged_types).needs_drop())
+}
+
+/// Authenticate partial source nulling before publication or LLVM construction.
+/// Eligibility follows the source lowering's existing Move scalar/field rules;
+/// the backend derives the zero's width from that exact selected field type.
+pub fn validate_partial_field_nulling(program: &Program) -> Result<(), ProducerError> {
+    for function in &program.fns {
+        for statement in function.blocks.iter().flat_map(|block| &block.stmts) {
+            let valid = match statement {
+                Stmt::NullTupleField(slot, field) => {
+                    let Some(Ty::Tuple(id)) = function.slots.get(*slot as usize).copied() else {
+                        return Err(ProducerError::Lowering(format!(
+                            "partial tuple field nulling in function '{}' has an invalid root slot",
+                            function.name,
+                        )));
+                    };
+                    program.tuples.get(id as usize)
+                        .and_then(|tuple| tuple.elems.get(*field as usize))
+                        .is_some_and(|scalar| scalar.is_move())
+                }
+                Stmt::NullStructField(slot, field) => {
+                    let Some(Ty::Struct(id)) = function.slots.get(*slot as usize).copied() else {
+                        return Err(ProducerError::Lowering(format!(
+                            "partial struct field nulling in function '{}' has an invalid root slot",
+                            function.name,
+                        )));
+                    };
+                    program.structs.get(id as usize)
+                        .and_then(|record| record.fields.get(*field as usize))
+                        .is_some_and(|field| struct_field_nulling_type_is_valid(field.ty, &program.structs, &program.enums, &program.tagged_types))
+                }
+                _ => continue,
+            };
+            if !valid {
+                return Err(ProducerError::Lowering(format!(
+                    "partial field nulling in function '{}' has an invalid field definition or type",
+                    function.name,
+                )));
             }
         }
     }

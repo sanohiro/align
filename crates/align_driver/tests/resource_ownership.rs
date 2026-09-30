@@ -104,9 +104,10 @@ pub fn open() -> conn { unsafe { return resource.from_raw(raw.alloc(8)) } }
 pub fn present(reference: resource_ref<conn>) -> bool {
   unsafe { return !resource.raw(reference).is_null() }
 }
-pub fn move_through(pair: (conn, i64)) -> conn {
-  (owner, _) := pair
-  return owner
+pub fn move_through(pair: (conn, i64)) -> (conn, i64) {
+  owner := pair.0
+  marker := pair.1
+  return (owner, marker)
 }
 pub fn inspect_through(pair: (resource_ref<conn>, i64)) -> bool {
   (reference, _) := pair
@@ -118,7 +119,7 @@ pub fn inspect_through(pair: (resource_ref<conn>, i64)) -> bool {
         ("pkg/db.align", root),
         (
             "main.align",
-            "module main\nimport pkg.db\nfn main() -> i32 { reference_owner := pkg.db.open(); reference := resource.borrow(reference_owner); if !pkg.db.inspect_through((reference, 7)) { return 1 }; move_owner := pkg.db.open(); moved := pkg.db.move_through((move_owner, 9)); if pkg.db.present(resource.borrow(moved)) { return 42 }; return 2 }\n",
+            "module main\nimport pkg.db\nfn main() -> i32 { reference_owner := pkg.db.open(); reference := resource.borrow(reference_owner); if !pkg.db.inspect_through((reference, 7)) { return 1 }; move_owner := pkg.db.open(); (moved, marker) := pkg.db.move_through((move_owner, 9)); if marker != 9 { return 3 }; if pkg.db.present(resource.borrow(moved)) { return 42 }; return 2 }\n",
         ),
     ];
     let differential = diff_check_multi("resource-tuple-annotations", &project, "main.align");

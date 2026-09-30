@@ -460,6 +460,23 @@ Rules:
 `resource.from_raw` on null is an unsafe-precondition violation. Safe driver constructors must test
 the native result and return a structured error before calling it.
 
+#### Partial-move nulling implementation closure
+
+This correction preserves the shipped tuple/resource surface. A moved pointer
+field must be zeroed as one pointer; writing a pointer/length header corrupts
+the adjacent field despite passing LLVM's opaque-pointer verifier. Native
+tuple and struct nulling use the selected field's existing LLVM type, with no
+new allocation, runtime symbol, ownership flag, interface record or ABI.
+
+| Axis | Implementation and owner |
+| --- | --- |
+| Type formation and malformed input | Existing tuple scalar Move and struct partial-move rules; `validate_partial_field_nulling` checks root, definition, field bounds and eligible leaf before producer publication and whole/partition LLVM preparation. `partial_field_nulling_rejects_malformed_metadata_before_emission` covers missing roots/definitions/fields, Copy leaves and unsupported nested owners, including unreachable blocks. |
+| Construction, move-in, replacement and return | Existing construction and ownership-flag rules remain authoritative. Nulling changes only a reached move-out's source field; it does not construct or transfer an owner. |
+| Move-out, source nulling and Drop | `NullTupleField` and `NullStructField` store the selected field type's zero. `tuple_partial_move_nulls_exact_element_layout` sweeps the shared Move-handle inventory and owned headers; the resource tuple owner preserves an adjacent scalar after partial extraction. Existing recursive Drop consumes the same zeroed field. |
+| Branch/loop joins and early exits | Existing path-local move/cleanup scheduling remains authoritative for `if`, `match`, `else`, `?`, `map_err`, joins and exits. No new branch, cleanup edge or flag transition is introduced. |
+| Monomorphization, interface and compilation mode | The field type is derived from the completed definition graph. Producer validation and whole/function-partition preparation share the same check. The resource tuple owner runs whole-program and per-unit compilation. |
+| Runtime ownership and allocation parity | Pointer/header layout and individual/arena ownership remain unchanged. Nulling allocates nothing and performs no native call; a size regression is a correctness failure, with no benchmark claim. |
+
 ### 3.3 Resource references
 
 `resource_ref<R>` is a builtin Copy view:
