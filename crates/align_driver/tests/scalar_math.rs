@@ -8,6 +8,55 @@ mod common;
 use common::*;
 
 #[test]
+fn all_math_discriminators_keep_whole_and_per_unit_results() {
+    if !backend_available() {
+        return;
+    }
+    let source = r#"
+fn display(x: f64, y: f64) {
+    print((x - y).abs())
+    print(x.min(y))
+    print(x.max(y))
+    print((x + y).sqrt())
+    print((x / y).floor())
+    print((x / y).ceil())
+    print((x / y).round())
+    print((x / y).trunc())
+    print(x.pow(y))
+    print(fma(x, y, x))
+    zero := x - x
+    one := x / x
+    print(zero.exp())
+    print(zero.exp2())
+    print(one.log())
+    print(one.log2())
+    print(one.log10())
+    neg_zero: f64 := -0.0
+    print(neg_zero.to_bits())
+    print(x.is_finite())
+    print((zero / zero).is_nan())
+    print((one / zero).is_infinite())
+}
+fn main() -> i32 {
+    display(2.0, 2.0)
+    return 0
+}
+"#;
+    let expected = "0.0\n2.0\n2.0\n2.0\n1.0\n1.0\n1.0\n1.0\n4.0\n6.0\n1.0\n1.0\n0.0\n0.0\n0.0\n9223372036854775808\ntrue\ntrue\ntrue\n";
+    let whole = build_and_run("math-discriminator-whole", source);
+    assert_eq!(whole.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&whole.stdout), expected);
+    let built = build_per_unit_multi(
+        "math-discriminator-per-unit",
+        &[("main.align", source)],
+        "main.align",
+    );
+    let per_unit = built.link_and_run();
+    assert_eq!(per_unit.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&per_unit.stdout), expected);
+}
+
+#[test]
 fn abs_min_max_int() {
     if !backend_available() {
         return;

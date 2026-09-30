@@ -14081,28 +14081,8 @@ fn binary_result(op: align_ast::BinOp, lhs: Ty, rhs: Ty) -> Option<Ty> {
 }
 
 fn math_result(fn_: hir::MathFn, operands: &[BodyFlow]) -> Option<Ty> {
-    let tys: Vec<Ty> = operands.iter().map(|flow| flow.ty).collect();
-    let first = *tys.first()?;
-    let numeric = scalar_numeric(first) || vector_numeric(first).is_some();
-    let float = matches!(first, Ty::Float(_))
-        || matches!(first, Ty::Vec(Scalar::Float(_), _));
-    let exact = |count: usize| tys.len() == count && tys.iter().all(|ty| *ty == first);
-    match fn_ {
-        hir::MathFn::Abs | hir::MathFn::Sqrt | hir::MathFn::Floor | hir::MathFn::Ceil
-        | hir::MathFn::Round | hir::MathFn::Trunc | hir::MathFn::Exp | hir::MathFn::Exp2
-        | hir::MathFn::Log | hir::MathFn::Log2 | hir::MathFn::Log10 => {
-            if !exact(1) || !numeric || (fn_ != hir::MathFn::Abs && !float) {
-                None
-            } else {
-                Some(first)
-            }
-        }
-        hir::MathFn::Min | hir::MathFn::Max => exact(2).then_some(first).filter(|_| numeric),
-        hir::MathFn::Pow => (exact(2) && matches!(first, Ty::Float(_))).then_some(first),
-        hir::MathFn::Fma => (exact(3) && float).then_some(first),
-        hir::MathFn::ToBits | hir::MathFn::IsFinite | hir::MathFn::IsNan
-        | hir::MathFn::IsInfinite => exact(1).then(|| fn_.float_inspection_result(first)).flatten(),
-    }
+    let types: Vec<Ty> = operands.iter().map(|flow| flow.ty).collect();
+    fn_.result_type(&types)
 }
 
 fn builder_write_ty_ok(kind: hir::BuilderWriteKind, ty: Ty) -> bool {
