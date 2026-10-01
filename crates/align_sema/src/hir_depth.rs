@@ -906,7 +906,7 @@ fn walk_body_records<'a>(
                 | ExprKind::CreateExclusive { path: recv }
                 | ExprKind::ReaderBuffered { reader: recv }
                 | ExprKind::BytesAsStr { bytes: recv }
-                | ExprKind::WriterFlush { writer: recv }
+                | ExprKind::WriterFlush { writer: recv } | ExprKind::WriterSync { writer: recv }
                 | ExprKind::LogFlush { logger: recv }
                 | ExprKind::XmlParse { input: recv }
                 | ExprKind::XmlNext { reader: recv }
@@ -923,7 +923,7 @@ fn walk_body_records<'a>(
                 | ExprKind::FileCreateRw { path: recv }
                 | ExprKind::FileOpenRw { path: recv }
                 | ExprKind::FileOpenRo { path: recv } | ExprKind::FileCreateRwExclusive { path: recv }
-                | ExprKind::FileLen { file: recv }
+                | ExprKind::FileLen { file: recv } | ExprKind::FileSync { file: recv }
                 | ExprKind::BufferBytes { buffer: recv }
                 | ExprKind::StrBytes { inner: recv }
                 | ExprKind::BytesView { bytes: recv, .. }

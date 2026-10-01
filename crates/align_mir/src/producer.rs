@@ -1594,6 +1594,14 @@ pub fn native_owner_mir_contract<'a>(
             contract.outputs = vec![(*out, Ty::File)];
             contract.operands = vec![(path, Ty::Str, read)];
         }
+        Rvalue::FileSync(file) => {
+            contract.result = i32_ty;
+            contract.operands = vec![(file, Ty::File, read)];
+        }
+        Rvalue::WriterSync(writer) => {
+            contract.result = i32_ty;
+            contract.operands = vec![(writer, Ty::Writer, read)];
+        }
         Rvalue::StrParseI64 { input, out } => {
             contract.result = i32_ty;
             contract.outputs = vec![(*out, i64_ty)];
@@ -6433,7 +6441,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::BytesAsStr { .. }
             | Rvalue::WriterWrite(..)
             | Rvalue::WriterWriteBuilder(..)
-            | Rvalue::WriterFlush(..)
+            | Rvalue::WriterFlush(..) | Rvalue::WriterSync(..)
             | Rvalue::LogNew(..)
             | Rvalue::LogEnabled(..)
             | Rvalue::LogLine(..)
@@ -6458,7 +6466,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::FileOpenRo { .. } | Rvalue::FileCreateRwExclusive { .. }
             | Rvalue::FilePread { .. }
             | Rvalue::FilePwrite { .. }
-            | Rvalue::FileLen { .. }
+            | Rvalue::FileLen { .. } | Rvalue::FileSync(..)
             | Rvalue::BufferBytes(..)
             | Rvalue::BufferLen(..)
             | Rvalue::BufferCapacity(..)

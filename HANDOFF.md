@@ -2,6 +2,16 @@
 
 ## Next work (handoff updated 2026-10-01)
 
+Request 31's explicit synchronization capability is implemented in plan 86:
+`f.sync()` and `w.sync()` return unit/Error without consuming existing owners.
+Writer flush precedes one Linux fsync or macOS F_FULLFSYNC request; flush errors
+prevent sync, native sync errors have no retry/fallback, and Drop remains cleanup.
+The native operation, error ordering, read-only/empty/repeated use, stable borrowed
+projection and malformed-producer owners cover the boundary. Native completion
+is conditional on support/truthful reporting, without parent-entry durability or
+arbitrary power-loss survival. Consumer KV SAVE adoption remains align-llm-owned.
+Continue independent capabilities with K1 deferred.
+
 Request 30's exclusive positional-output capability is implemented in plan 85:
 `fs.create_rw_exclusive(path: str) -> Result<file, Error>` uses one native
 O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW open, mode 0644 subject to umask.

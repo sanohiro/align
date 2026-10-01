@@ -10866,6 +10866,57 @@ pub unsafe extern "C" fn align_rt_io_writer_flush(w: *mut Writer) -> i32 {
     unsafe { (*w).flush_buf() }
 }
 
+/// The one explicit file synchronization policy; no weaker request is substituted on failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileSyncRequest {
+    #[cfg(target_os = "macos")]
+    FullFsync,
+    #[cfg(not(target_os = "macos"))]
+    Fsync,
+}
+#[cfg(target_os = "macos")]
+const NATIVE_FILE_SYNC_REQUEST: FileSyncRequest = FileSyncRequest::FullFsync;
+#[cfg(not(target_os = "macos"))]
+const NATIVE_FILE_SYNC_REQUEST: FileSyncRequest = FileSyncRequest::Fsync;
+trait FileSyncOps {
+    fn sync(&mut self, fd: i32, request: FileSyncRequest) -> std::io::Result<()>;
+}
+struct NativeFileSyncOps;
+impl FileSyncOps for NativeFileSyncOps {
+    fn sync(&mut self, fd: i32, request: FileSyncRequest) -> std::io::Result<()> {
+        let result = match request {
+            #[cfg(target_os = "macos")]
+            FileSyncRequest::FullFsync => unsafe { libc::fcntl(fd, libc::F_FULLFSYNC) },
+            #[cfg(not(target_os = "macos"))]
+            FileSyncRequest::Fsync => unsafe { libc::fsync(fd) },
+        };
+        if result < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+    }
+}
+fn sync_fd_with_ops(fd: i32, ops: &mut impl FileSyncOps) -> i32 {
+    match ops.sync(fd, NATIVE_FILE_SYNC_REQUEST) {
+        Ok(()) => 0, Err(error) => io_error_to_status(&error)
+    }
+}
+fn writer_sync_with_ops(writer: &mut Writer, ops: &mut impl FileSyncOps) -> i32 {
+    let status = writer.flush_buf();
+    if status != 0 { return status; }
+    sync_fd_with_ops(writer.fd, ops)
+}
+
+/// `w.sync()` — flush the existing accumulator, then request native file/device synchronization.
+/// A flush error skips synchronization. Linux uses fsync; macOS uses F_FULLFSYNC without fallback.
+/// Sync errors leave the owner usable; Drop keeps its existing best-effort flush/close behavior.
+///
+/// # Safety
+/// `w` must be null or a live aligned Writer shell with exclusive operation access.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_writer_sync(w: *mut Writer) -> i32 {
+    if w.is_null() { return AL_INVALID; }
+    writer_sync_with_ops(unsafe { &mut *w }, &mut NativeFileSyncOps)
+}
+const _: unsafe extern "C" fn(*mut Writer) -> i32 = align_rt_io_writer_sync;
+
 /// Free a `writer`, flushing any buffered bytes best-effort first (errors are not observable here —
 /// use an explicit `flush()?` to handle them), then closing the fd iff owned. Null-safe.
 ///
@@ -11410,6 +11461,19 @@ pub unsafe extern "C" fn align_rt_io_file_len(f: *mut RwFile) -> i64 {
         Err(e) => -(io_error_to_status(&e) as i64),
     }
 }
+
+/// `f.sync()` — issue one native synchronization request on the existing descriptor.
+/// No cursor, path, allocation, ownership transfer or implicit Drop synchronization is added.
+///
+/// # Safety
+/// `f` must be null or a live aligned RwFile shell under the existing operation exclusion.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_file_sync(f: *mut RwFile) -> i32 {
+    if f.is_null() { return AL_INVALID; }
+    sync_fd_with_ops(unsafe { (*f).fd }, &mut NativeFileSyncOps)
+}
+const _: unsafe extern "C" fn(*mut RwFile) -> i32 = align_rt_io_file_sync;
+
 
 /// Free a `file`, closing its fd. Null-safe (a never-initialised owned slot drops harmlessly).
 ///
@@ -29182,6 +29246,112 @@ mod tests {
     struct FileTestHandle(*mut RwFile);
     impl Drop for FileTestHandle {
         fn drop(&mut self) { unsafe { align_rt_io_file_free(self.0) }; }
+    }
+
+    struct WriterTestHandle(*mut Writer);
+    impl Drop for WriterTestHandle {
+        fn drop(&mut self) { unsafe { align_rt_io_writer_free(self.0) }; }
+    }
+    struct ScriptFileSync {
+        calls: Vec<(i32, FileSyncRequest)>,
+        errno: Option<i32>,
+        written: Option<std::path::PathBuf>,
+    }
+    impl FileSyncOps for ScriptFileSync {
+        fn sync(&mut self, fd: i32, request: FileSyncRequest) -> std::io::Result<()> {
+            self.calls.push((fd, request));
+            if let Some(path) = &self.written {
+                assert_eq!(std::fs::read(path).unwrap(), b"buffered");
+            }
+            self.errno.map_or(Ok(()), |errno| Err(std::io::Error::from_raw_os_error(errno)))
+        }
+    }
+
+    #[test]
+    fn file_sync_policy_and_writer_error_ordering() {
+        use std::os::fd::AsRawFd;
+        let root = FileFixtureDir::new("sync-policy");
+        let path = root.0.join("buffered");
+        let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+        for errno in [None, Some(libc::EINTR), Some(libc::EIO), Some(libc::ENOTSUP), Some(libc::EINVAL), Some(libc::EPERM)] {
+            let mut ops = ScriptFileSync { calls: Vec::new(), errno, written: Some(path.clone()) };
+            let mut writer = Writer::generic_fd(file.as_raw_fd(), false, true);
+            writer.buf.extend_from_slice(b"buffered");
+            let capacity = writer.buf.capacity();
+            // Each iteration starts at offset zero while retaining the same owned descriptor.
+            assert_eq!(unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_SET) }, 0);
+            let expected = errno.map_or(0, |n| io_error_to_status(&std::io::Error::from_raw_os_error(n)));
+            assert_eq!(writer_sync_with_ops(&mut writer, &mut ops), expected);
+            assert_eq!(ops.calls, vec![(file.as_raw_fd(), NATIVE_FILE_SYNC_REQUEST)]);
+            assert!(writer.buf.is_empty());
+            assert_eq!(writer.buf.capacity(), capacity);
+            assert!(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) } >= 0);
+            ops.written = None;
+            assert_eq!(writer_sync_with_ops(&mut writer, &mut ops), expected);
+            assert_eq!(ops.calls.len(), 2, "even an empty accumulator issues one request");
+        }
+        let mut broken = Writer::generic_fd(-1, false, true);
+        broken.buf.extend_from_slice(b"lost-on-flush-error");
+        let mut ops = ScriptFileSync { calls: Vec::new(), errno: Some(libc::EIO), written: None };
+        assert_eq!(writer_sync_with_ops(&mut broken, &mut ops),
+            io_error_to_status(&std::io::Error::from_raw_os_error(libc::EBADF)));
+        assert!(ops.calls.is_empty(), "flush failure must precede and skip sync");
+        assert!(broken.buf.is_empty(), "keep the existing flush-error buffer semantics");
+    }
+
+    #[test]
+    fn file_sync_native_file_and_buffered_writer_readback() {
+        let root = FileFixtureDir::new("sync-native");
+        let path = root.0.join("positional").to_str().unwrap().to_owned();
+        let mut file = core::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_io_file_create_exclusive(path.as_ptr(), path.len() as i64, &mut file) }, 0);
+        let owner = FileTestHandle(file);
+        let fd = unsafe { (*file).fd };
+        assert_eq!(unsafe { align_rt_io_file_pwrite(file, b"file".as_ptr(), 4, 0) }, 4);
+        assert_eq!(unsafe { align_rt_io_file_sync(file) }, 0);
+        assert_eq!(std::fs::read(&path).unwrap(), b"file");
+        assert_eq!(unsafe { align_rt_io_file_pwrite(file, b"!".as_ptr(), 1, 4) }, 1);
+        assert_eq!(unsafe { align_rt_io_file_sync(file) }, 0);
+        assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
+        let mut ro = core::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_io_file_open_ro(path.as_ptr(), path.len() as i64, &mut ro) }, 0);
+        let ro_owner = FileTestHandle(ro);
+        assert_eq!(unsafe { align_rt_io_file_sync(ro) }, 0);
+        drop(ro_owner);
+        drop(owner);
+
+        let path = root.0.join("writer").to_str().unwrap().to_owned();
+        let mut writer = core::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_io_writer_create_exclusive(path.as_ptr(), path.len() as i64, &mut writer) }, 0);
+        let owner = WriterTestHandle(writer);
+        assert_eq!(unsafe { align_rt_io_writer_write(writer, b"buffered".as_ptr(), 8) }, 0);
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        assert_eq!(unsafe { align_rt_io_writer_sync(writer) }, 0);
+        assert_eq!(std::fs::read(&path).unwrap(), b"buffered");
+        assert_eq!(unsafe { align_rt_io_writer_write(writer, b"!".as_ptr(), 1) }, 0);
+        assert_eq!(unsafe { align_rt_io_writer_sync(writer) }, 0);
+        assert_eq!(std::fs::read(&path).unwrap(), b"buffered!");
+        drop(owner);
+    }
+
+    #[test]
+    fn file_sync_invalid_and_unsupported_descriptors() {
+        assert_eq!(unsafe { align_rt_io_file_sync(core::ptr::null_mut()) }, AL_INVALID);
+        assert_eq!(unsafe { align_rt_io_writer_sync(core::ptr::null_mut()) }, AL_INVALID);
+        let mut file = RwFile { fd: -1 };
+        let mut writer = Writer::generic_fd(-1, false, false);
+        let bad = io_error_to_status(&std::io::Error::from_raw_os_error(libc::EBADF));
+        assert_eq!(unsafe { align_rt_io_file_sync(&mut file) }, bad);
+        assert_eq!(unsafe { align_rt_io_writer_sync(&mut writer) }, bad);
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) }, 0);
+        let first = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let _second = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let native = NativeFileSyncOps.sync(first.as_raw_fd(), NATIVE_FILE_SYNC_REQUEST).unwrap_err();
+        let mut writer = Writer::tcp_socket(first.as_raw_fd());
+        assert_eq!(unsafe { align_rt_io_writer_sync(&mut writer) }, io_error_to_status(&native));
+        assert!(unsafe { libc::fcntl(first.as_raw_fd(), libc::F_GETFD) } >= 0);
     }
 
     /// Release every started creator and join it before fixture cleanup, including partial spawn

@@ -3317,6 +3317,7 @@ bytes.as_str()              -> Result<str, Error>   // validate UTF-8, yield a z
                                                      // UTF-8. The one bytes->text path.
 w.write(x: str | bytes | builder) -> Result<(), Error>
 w.flush()                   -> Result<(), Error>
+w.sync()                    -> Result<(), Error>   // explicit flush, then native file sync
 io.copy(r: reader, w: writer) -> Result<i64, Error>   // returns bytes transferred; memory is always
                                                        // O(buffer), never O(file size)
 f.pread(b: mut buffer, off: i64)  -> Result<i64, Error>   // one positionless read at off into b's
@@ -3324,6 +3325,7 @@ f.pread(b: mut buffer, off: i64)  -> Result<i64, Error>   // one positionless re
 f.pwrite(data: bytes, off: i64)   -> Result<i64, Error>   // writes ALL of data at off (loops to full);
                                                           // returns the full len; past-EOF extends
 f.len()                           -> Result<i64, Error>   // live fstat (not cached)
+f.sync()                          -> Result<(), Error>   // explicit native file sync
 ```
 
 Every native operation that fills a `buffer` (`read`, `read_line`, `pread`, `recv_from`, and
@@ -3339,6 +3341,23 @@ access-mode check. `pwrite` on a read-only descriptor returns `Error.Denied`, in
 the runtime queries the descriptor's access mode rather than storing a second capability flag. `file` is Move (owns its fd, `Drop` closes it) and structurally
 single-threaded (no `par_map`/`spawn` capture); it never rides an aggregate other than its
 constructor's `Result<file, Error>`.
+
+`f.sync() -> Result<(), Error>` and `w.sync() -> Result<(), Error>` are Impure,
+zero-argument, nonconsuming operations on the existing File and writer. Writer sync first
+performs the existing flush; a flush error clears its accumulator as before and prevents the
+sync request. A successful flush leaves the accumulator empty with capacity retained. File has
+no buffer. Both then issue exactly one `fsync(fd)` on Linux or `fcntl(fd, F_FULLFSYNC)` on macOS,
+including read-only File descriptors and empty writers. Native failures use the fixed errno
+table; sync is not retried on EINTR and has no weaker fallback. The owner stays usable after
+success or error. Existing stable receiver, dependent lifetime, Move and Drop rules remain;
+no allocation, retained view, descriptor duplication or implicit Drop sync is added.
+
+Success reports the native filesystem/device completion: Linux synchronizes file data and
+associated metadata; macOS additionally requests a device-cache flush. It depends on native
+support and truthful completion, and promises neither arbitrary power-loss survival nor
+parent-directory entry durability, multi-file atomicity, other handles' buffered bytes,
+later/concurrent writes or remote-filesystem durability. A tmpfs success has no persistent
+backing-store guarantee. No directory sync is performed (plan 86).
 
 `reader`/`writer` are the concrete Move types from "I/O design principles" above. `io.copy`
 dispatches on fd kind internally (a portable fixed-buffer loop is the v1 / reference

@@ -271,6 +271,7 @@ key|IoFileOpen|io_file_open|HostState|declare i32 @align_rt_io_file_open(ptr, i6
 key|IoFileOpenRo|io_file_open_ro|HostState|declare i32 @align_rt_io_file_open_ro(ptr, i64, ptr) #2
 key|IoFilePread|io_file_pread|HostState|declare i64 @align_rt_io_file_pread(ptr, ptr, i64) #2
 key|IoFilePwrite|io_file_pwrite|HostState|declare i64 @align_rt_io_file_pwrite(ptr, ptr, i64, i64) #2
+key|IoFileSync|io_file_sync|HostState|declare i32 @align_rt_io_file_sync(ptr) #2
 key|IoReaderBuffered|io_reader_buffered|HostState|declare ptr @align_rt_io_reader_buffered(ptr) #2
 key|IoReaderFree|io_reader_free|HostState|declare void @align_rt_io_reader_free(ptr) #2
 key|IoReaderOpen|io_reader_open|HostState|declare i32 @align_rt_io_reader_open(ptr, i64, ptr) #2
@@ -286,6 +287,7 @@ key|IoWriterCreateExclusiveBeneath|io_writer_create_exclusive_beneath|HostState|
 key|IoWriterFlush|io_writer_flush|HostState|declare i32 @align_rt_io_writer_flush(ptr) #2
 key|IoWriterFree|io_writer_free|HostState|declare void @align_rt_io_writer_free(ptr) #2
 key|IoWriterStd|io_writer_std|HostState|declare ptr @align_rt_io_writer_std(i32, i32) #2
+key|IoWriterSync|io_writer_sync|HostState|declare i32 @align_rt_io_writer_sync(ptr) #2
 key|IoWriterWrite|io_writer_write|HostState|declare i32 @align_rt_io_writer_write(ptr, ptr, i64) #2
 key|IoWriterWriteBuilder|io_writer_write_builder|HostState|declare i32 @align_rt_io_writer_write_builder(ptr, ptr) #2
 key|JsonBuilderFinish|json_builder_finish|IndirectStorage|declare i32 @align_rt_json_builder_finish(ptr, ptr) #2

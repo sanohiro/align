@@ -13,6 +13,16 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### Explicit File and writer synchronization (SETTLED 2026-10-01)
+
+**Explicit synchronization settled 2026-10-01 (Request 31, plan 86):**
+`f.sync()` and `w.sync()` return `Result<(), Error>` without consuming the owner.
+Writer flush precedes one native sync request and its error prevents that request.
+Linux uses fsync; macOS uses F_FULLFSYNC without weaker fallback or EINTR retry.
+Native success is conditional on filesystem/device support and truthful completion,
+not arbitrary power-loss survival or parent-entry durability. Fixed errors, stable
+borrowed receiver/lifetime rules and cleanup remain; Drop never syncs implicitly.
+
 ### Nameable text builder and borrowed helpers (SETTLED 2026-10-01)
 
 `builder` names the existing opaque Move text accumulator. Direct typed parameters
@@ -4556,6 +4566,7 @@ fast-systems-programming needs that any Align user hits, not engine-specific.
    Ordinary parent resolution, fixed errors, call-scoped path allocation and
    existing File methods/Move/Drop remain authoritative. Partial files require
    explicit cleanup; no confinement, rollback, transaction or durability is added.
+
 5. **`std.http` server slice (Slice 4) + streaming (SSE/chunked) response write** — the
    align-gateway is an OpenAI-compatible SSE-streaming local server; Slice 4's design should be
    written against that requirement. **Slice-4 surface SETTLED 2026-07-10** (two-lens design

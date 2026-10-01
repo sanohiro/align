@@ -988,6 +988,7 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             arg: boxed!(arg),
             builder: *builder,
         },
+        ExprKind::WriterSync { writer } => ExprKind::WriterSync { writer: boxed!(writer) },
         ExprKind::WriterFlush { writer } => ExprKind::WriterFlush {
             writer: boxed!(writer),
         },
@@ -1115,6 +1116,7 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             data: boxed!(data),
             offset: boxed!(offset),
         },
+        ExprKind::FileSync { file } => ExprKind::FileSync { file: boxed!(file) },
         ExprKind::FileLen { file } => ExprKind::FileLen { file: boxed!(file) },
         ExprKind::BufferNew { capacity, fill } => ExprKind::BufferNew {
             capacity: boxed!(capacity),
@@ -2757,7 +2759,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::CreateExclusive { path: recv }
         | ExprKind::ReaderBuffered { reader: recv }
         | ExprKind::BytesAsStr { bytes: recv }
-        | ExprKind::WriterFlush { writer: recv }
+        | ExprKind::WriterFlush { writer: recv } | ExprKind::WriterSync { writer: recv }
         | ExprKind::LogFlush { logger: recv }
         | ExprKind::XmlParse { input: recv }
         | ExprKind::XmlNext { reader: recv }
@@ -2774,7 +2776,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::FileCreateRw { path: recv }
         | ExprKind::FileOpenRw { path: recv }
         | ExprKind::FileOpenRo { path: recv } | ExprKind::FileCreateRwExclusive { path: recv }
-        | ExprKind::FileLen { file: recv }
+        | ExprKind::FileLen { file: recv } | ExprKind::FileSync { file: recv }
         | ExprKind::BufferBytes { buffer: recv }
         | ExprKind::StrBytes { inner: recv }
         | ExprKind::BytesView { bytes: recv, .. }

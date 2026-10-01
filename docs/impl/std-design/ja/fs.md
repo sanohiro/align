@@ -72,6 +72,31 @@ fs.remove_empty_dir(path: str) -> Result<(), Error>
 
 ## 公開契約
 
+### File と writer の明示的な同期
+
+[Plan 86](../../86-file-writer-sync-plan.md) は既存の所有者に次のメソッドを定義する。
+
+```text
+f.sync() -> Result<(), Error>
+w.sync() -> Result<(), Error>
+```
+
+引数はなく、Impure で所有者を消費しない。writer は既存の flush を先に行い、
+失敗すると従来どおり蓄積バッファを空にし、同期 syscall を行わずそのエラーを返す。
+flush の成功後はバッファが空となり容量を保持する。File にバッファはない。
+その後、Linux は fsync(fd)、macOS は fcntl(fd, F_FULLFSYNC) を正確に1回行う。
+読み取り専用 File や空の writer も同じネイティブ要求を行う。失敗は既存の固定 errno
+表に従い、EINTR の再試行や弱い代替操作は行わない。成功・失敗後も所有者は利用できる。
+安定した receiver、接続由来の借用期間、Move、Drop の規則は同じであり、確保、view の保持、
+descriptor の複製、Drop による暗黙の同期は追加しない。
+
+成功は OS とデバイスによる完了報告を表す。Linux はファイルのデータと関連 metadata を同期し、
+macOS はさらにデバイスキャッシュの flush を要求する。ファイルシステムとデバイスの対応、
+正しい完了報告が条件であり、任意の電源断からの生存、親ディレクトリエントリの永続化、
+複数ファイルの原子性、別の handle の未 flush バイト、その後・同時の書き込み、リモート
+ファイルシステムの耐久性は保証しない。tmpfs の成功には永続ストレージの保証がない。
+ディレクトリの同期は行わない。
+
 ### 排他的なランダムアクセス用ファイル作成
 
 [Plan 85](../../85-exclusive-random-file-plan.md) は次の Impure なコンストラクタを定義する。

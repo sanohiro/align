@@ -2015,6 +2015,10 @@ green. **Next: M13** (codegen quality & link hygiene, the pre-LLVM-upgrade wave)
   trigger with the same File, unchanged pread/len/Drop, and runtime Denied writes.
   Request 30 / plan 85 adds `create_rw_exclusive`, the same owned File with native
   exclusive final-entry acquisition, 0644 subject to umask and Code(EEXIST) protection.
+  Request 31 / plan 86 adds explicit `f.sync()` and `w.sync()` with unit/Error,
+  writer flush-before-sync, Linux fsync and macOS F_FULLFSYNC. Native completion
+  is conditional on support/truthful reporting; parent-entry durability and
+  arbitrary power-loss survival are not promised. Existing owners and Drop remain.
   <br>Original settled design (2026-07-11, two-lens review): A new Move type **`file`** = the random-access block-WRITE handle with
   read-back; **no `seek` ever** (a settable cursor is hidden mutable state — every access takes
   an explicit `off`), and **no read-only constructor** (pure random reads stay reader | mmap

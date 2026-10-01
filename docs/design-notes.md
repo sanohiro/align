@@ -2098,6 +2098,17 @@ make pwrite return Denied, including zero-byte writes; no compiler constructor
 history or duplicated stored capability determines permission. Negative offsets
 still abort first. Plan 84 owns the exact path, ownership and ABI contract.
 
+## Why synchronization is explicit on the existing owners
+
+Request 31 separates draining a writer's existing buffer from asking the OS to
+synchronize its descriptor. `sync()` reuses the same File/writer owners and
+Result/Error model: writer flush failure wins before any native sync request.
+Linux fsync and macOS F_FULLFSYNC express each platform's native completion
+request without a silent weaker fallback. Drop remains cleanup rather than a
+persistence promise. Parent-entry synchronization and crash-safe publication
+require a separate protocol; ordinary readback cannot establish power-loss
+survival. Plan 86 owns the exact conditional guarantee and error precedence.
+
 ## Why positional output has an exclusive constructor
 
 An exists-then-create guard cannot protect a competing artifact: the ordinary

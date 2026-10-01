@@ -12161,11 +12161,11 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        // FileCreateRwExclusive, FileOpenRo, StrParseI64, StrCharBoundary, ArrayTruncate, BytesSet, BytesFill, BytesCopyFrom, BufferAppendFilled,
+        // FileSync, WriterSync, FileCreateRwExclusive, FileOpenRo, StrParseI64, StrCharBoundary, ArrayTruncate, BytesSet, BytesFill, BytesCopyFrom, BufferAppendFilled,
         // FloatScope, BytesView, SliceAsBytes, and HttpServerMaxRequestBodyBytes are explicit in
         // validation, source-shape, replay and ownership.
         variants,
-        345,
+        347,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -18473,10 +18473,10 @@ fn valid_hir_global_type_preflight_is_mir_identity() {
 #[test]
 fn borrowed_handle_receiver_hir_rejects_forged_places() -> Result<(), &'static str> {
     let program = checked_source_program(
-        "Holder { data: buffer, sink: writer }\nfn inspect(borrow owner: Holder) -> i64 = owner.data.len()\nfn flush(borrow owner: Holder) -> Result<(), Error> = owner.sink.flush()\nfn main() {}\n",
+        "Holder { data: buffer, sink: writer }\nfn inspect(borrow owner: Holder) -> i64 = owner.data.len()\nfn flush(borrow owner: Holder) -> Result<(), Error> = owner.sink.flush()\nfn sync(borrow owner: Holder) -> Result<(), Error> = owner.sink.sync()\nfn main() {}\n",
     );
     assert!(validate_hir::body_only_metadata_is_valid(&program));
-    for name in ["inspect", "flush"] {
+    for name in ["inspect", "flush", "sync"] {
         for mutation in 0..3 {
             let mut forged = program.clone();
             let function = forged
@@ -18487,7 +18487,7 @@ fn borrowed_handle_receiver_hir_rejects_forged_places() -> Result<(), &'static s
             let value = function.body.value.as_mut().ok_or("receiver expression")?;
             let receiver = match &mut value.kind {
                 hir::ExprKind::BufferLen { buffer } => buffer,
-                hir::ExprKind::WriterFlush { writer } => writer,
+                hir::ExprKind::WriterFlush { writer } | hir::ExprKind::WriterSync { writer } => writer,
                 _ => panic!("receiver operation"),
             };
             let hir::ExprKind::Field { root, path } = &mut receiver.kind else {
@@ -19417,6 +19417,37 @@ fn file_constructors_hir_reject_forged_types_in_every_entrypoint() -> Result<(),
                 _ => expression.ty = Ty::Result(Scalar::File, Scalar::Bool),
             }
             assert_body_entrypoints_empty("file-constructor-forged", &malformed);
+        }
+    }
+    Ok(())
+}
+
+
+#[test]
+fn sync_methods_hir_reject_forged_native_types() -> Result<(), &'static str> {
+    for ty in ["file", "writer"] {
+        let base = checked_source_program(&format!(
+            "fn synchronize(value: {ty}) -> Result<(), Error> = value.sync()\nfn main() {{}}\n"
+        ));
+        assert!(validate_hir::body_only_metadata_is_valid(&base));
+        for mutation in 0..3 {
+            let mut bad = base.clone();
+            let function = bad.fns.iter_mut().find(|f| f.name == "synchronize").ok_or("sync function")?;
+            let value = function.body.value.as_mut().ok_or("sync value")?;
+            let receiver = match &mut value.kind {
+                hir::ExprKind::FileSync { file } => file,
+                hir::ExprKind::WriterSync { writer } => writer,
+                _ => return Err("sync operation"),
+            };
+            match mutation {
+                0 => receiver.ty = Ty::Reader,
+                1 => receiver.kind = hir::ExprKind::Bool(false),
+                _ => {
+                    let Ty::Result(_, error) = value.ty else { return Err("sync Result type"); };
+                    value.ty = Ty::Result(align_sema::Scalar::Int(align_sema::IntTy { bits: 64, signed: true }), error);
+                },
+            }
+            assert_body_entrypoints_empty(&format!("sync-{ty}-{mutation}"), &bad);
         }
     }
     Ok(())

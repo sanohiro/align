@@ -1910,6 +1910,8 @@ pub enum Rvalue {
     WriterWriteBuilder(Operand, Operand),
     /// `w.flush()` — drain a `writer` to the OS, borrowing it. `i32` errno-status (0 = ok).
     WriterFlush(Operand),
+    /// `w.sync()` — flush, then request native file synchronization without consuming the writer.
+    WriterSync(Operand),
     /// `log.new(output, minimum)` — transfer one writer into an owned logger. `minimum` remains the
     /// ordinary `log.level` aggregate; LLVM lowering alone extracts its field-0 tag for the ABI.
     LogNew(Operand, Operand),
@@ -2028,6 +2030,8 @@ pub enum Rvalue {
         data: Operand,
         offset: Operand,
     },
+    /// `f.sync()` — request native file synchronization, borrowing the File; i32 errno status.
+    FileSync(Operand),
     /// `f.len()` — the file's live byte length (a fresh `fstat`), borrowing the file. Yields an
     /// `i64`: the length (`>= 0`) on success, or `-(status)` on error (the [`Self::ReaderRead`] sign
     /// convention). (A4.)
@@ -8140,7 +8144,7 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
             | hir::ExprKind::FileOpenRo { .. } | hir::ExprKind::FileCreateRwExclusive { .. }
             | hir::ExprKind::FilePread { .. }
             | hir::ExprKind::FilePwrite { .. }
-            | hir::ExprKind::FileLen { .. }
+            | hir::ExprKind::FileLen { .. } | hir::ExprKind::FileSync { .. }
             | hir::ExprKind::ReaderBuffered { .. }
             | hir::ExprKind::ReaderReadLine { .. }
             | hir::ExprKind::BytesAsStr { .. }
@@ -8332,7 +8336,7 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         | hir::ExprKind::FileOpenRo { .. } | hir::ExprKind::FileCreateRwExclusive { .. }
         | hir::ExprKind::FilePread { .. }
         | hir::ExprKind::FilePwrite { .. }
-        | hir::ExprKind::FileLen { .. } => lower_file_expr(b, e),
+        | hir::ExprKind::FileLen { .. } | hir::ExprKind::FileSync { .. } => lower_file_expr(b, e),
         hir::ExprKind::ReaderBuffered { .. }
         | hir::ExprKind::ReaderReadLine { .. }
         | hir::ExprKind::BytesAsStr { .. } => lower_reader_line_expr(b, e),
@@ -8853,7 +8857,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             | hir::ExprKind::FileOpenRo { .. } | hir::ExprKind::FileCreateRwExclusive { .. }
             | hir::ExprKind::FilePread { .. }
             | hir::ExprKind::FilePwrite { .. }
-            | hir::ExprKind::FileLen { .. } => lower_file_expr(b, e),
+            | hir::ExprKind::FileLen { .. } | hir::ExprKind::FileSync { .. } => lower_file_expr(b, e),
             hir::ExprKind::ReaderStdin => {
                 let v = b.fresh_value(e.ty);
                 b.push(Stmt::Let(v, Rvalue::ReaderStdin));
@@ -8967,14 +8971,17 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 let code = mk(b);
                 lower_status_result(b, code, e.ty)
             }
-            hir::ExprKind::WriterFlush { writer } => {
+            hir::ExprKind::WriterFlush { writer } | hir::ExprKind::WriterSync { writer } => {
                 lower_required_binding!(
                     b,
                     wop = lower_expr(b, writer),
                     Operand::Const(Const::Unit)
                 );
                 let code = b.fresh_value(status_ty());
-                b.push(Stmt::Let(code, Rvalue::WriterFlush(wop)));
+                let value = if matches!(e.kind, hir::ExprKind::WriterSync { .. }) {
+                    Rvalue::WriterSync(wop)
+                } else { Rvalue::WriterFlush(wop) };
+                b.push(Stmt::Let(code, value));
                 lower_status_result(b, code, e.ty)
             }
             hir::ExprKind::BufferNew { capacity, fill } => {
@@ -20307,6 +20314,12 @@ fn lower_file_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                 },
             ));
             lower_count_or_status_result(b, n, result_ty)
+        }
+        hir::ExprKind::FileSync { file } => {
+            let fop = lower_required!(b, lower_expr(b, file), Operand::Const(Const::Unit));
+            let code = b.fresh_value(status_ty());
+            b.push(Stmt::Let(code, Rvalue::FileSync(fop)));
+            lower_status_result(b, code, result_ty)
         }
         hir::ExprKind::FileLen { file } => {
             let fop = lower_required!(b, lower_expr(b, file), Operand::Const(Const::Unit));
