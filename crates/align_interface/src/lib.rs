@@ -1625,6 +1625,7 @@ const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("Result", 2, BuiltinCapability::Transparent),
     ("box", 1, BuiltinCapability::Opaque),
     ("array_builder", 1, BuiltinCapability::Opaque),
+    ("builder", 0, BuiltinCapability::Opaque),
     ("buffer", 0, BuiltinCapability::Opaque),
     ("xml.reader", 0, BuiltinCapability::Opaque),
     ("codec.encoder", 0, BuiltinCapability::Opaque),

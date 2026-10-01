@@ -4827,6 +4827,7 @@ pub const BUILTIN_SPELLING_TYS: &[(&str, Ty)] = &[
     ("rng", Ty::Rng),
     ("str", Ty::Str),
     ("string", Ty::String),
+    ("builder", Ty::Builder),
     ("json.doc", Ty::JsonDoc),
     ("http_headers", Ty::HttpHeaders),
     ("reader", Ty::Reader),
@@ -4982,8 +4983,8 @@ pub fn soa_plain_ok(id: u32, structs: &[StructDef]) -> bool {
 /// region, which is the escape check's business, not a transparent forward.
 ///
 /// Every consumer of this fact goes through here, so adding a wrapper updates them together.
-/// Two consumers exist: [`may_need_synthetic_owner`] (does MIR mint a hidden owner?) and
-/// `MoveCheck::storage_roots` (which storage does a borrower depend on?). They MUST agree: where the
+/// [`may_need_synthetic_owner`] (does MIR mint a hidden owner?) and `MoveCheck::storage_roots`
+/// (which storage does a borrower depend on?) MUST agree: where the
 /// predicate says "not a temporary" because it saw through a wrapper, `storage_roots` has to reach
 /// the same place, or the wrapper records no root at all and the borrow silently becomes untracked —
 /// which is exactly what `keep = { inner }` did before this was single-sourced.
@@ -4994,6 +4995,33 @@ pub fn borrow_transparent_value(e: &hir::Expr) -> Option<&hir::Expr> {
         | hir::ExprKind::Unsafe(b) => b.value.as_deref(),
         _ => None,
     }
+}
+
+/// Existing bindings selected by a non-consuming text-builder receiver. Scope tails and selected
+/// branch values preserve receiver authority; loop breaks and ordinary calls transfer ownership
+/// through their existing MoveCheck gates. Source admission and checked-HIR replay share this
+/// value-path inventory. Statement operands do not contribute to a scope's returned handle.
+pub fn builder_receiver_sources(expression: &hir::Expr) -> Vec<&hir::Expr> {
+    let mut work = vec![expression];
+    let mut sources = Vec::new();
+    while let Some(expression) = work.pop() {
+        if let Some(inner) = borrow_transparent_value(expression) {
+            work.push(inner);
+            continue;
+        }
+        match &expression.kind {
+            hir::ExprKind::Local(_) => sources.push(expression),
+            hir::ExprKind::TaskGroup(block) | hir::ExprKind::Arena(block)
+            | hir::ExprKind::NamedArena { block, .. } => work.extend(block.value.as_deref()),
+            hir::ExprKind::If { then, els, .. } => {
+                work.extend(els.value.as_deref());
+                work.extend(then.value.as_deref());
+            }
+            hir::ExprKind::Match { arms, .. } => work.extend(arms.iter().rev().map(|arm| &arm.body)),
+            _ => {}
+        }
+    }
+    sources
 }
 
 /// Return the physical place behind a call-boundary view coercion. `str` and `slice<T>` arguments
@@ -38024,6 +38052,9 @@ impl<'a> MoveCheck<'a> {
         let storage_paths = storage_type_paths(e.ty, self.storage_type_context());
         matches!(e.kind, ExprKind::BorrowedIndex { .. })
             || self.borrow_mut_place_snapshots.contains(&Self::expr_key(e))
+            // Append loads this opaque handle before its eager argument. Although it contains no
+            // view, the completed pointer still depends on its owner surviving until the write.
+            || e.ty == Ty::Builder
             || e.ty.is_array_builder()
             || !storage_paths.headers.is_empty()
             || !storage_paths.carriers.is_empty()
@@ -61322,6 +61353,13 @@ impl<'a, 't> Checker<'a, 't> {
                 .error(format!("'.{mname}()' expects {want}, got {}", ty_name(arg.ty)), arg.span);
             return err;
         }
+        // A borrowing receiver can select a caller-owned handle through scope/branch values.
+        // Fresh owned expression receivers keep their established temporary ownership path.
+        for receiver in builder_receiver_sources(&recv_expr) {
+            if !self.require_exclusive_handle_receiver(receiver, "builder", mname, "append to") {
+                return err;
+            }
+        }
         Expr {
             kind: ExprKind::BuilderWrite { builder: Box::new(recv_expr), arg: Box::new(arg), kind },
             ty: Ty::Unit,
@@ -74004,7 +74042,7 @@ fn resolve_type(
         "f32" => Ty::Float(FloatTy { bits: 32 }),
         "f64" => Ty::Float(FloatTy { bits: 64 }),
         "()" => Ty::Unit,
-        // `writer` / `reader` / `buffer` — the std.io / core.buffer Move handles. Surface type names
+        // The std.io and core text/byte builder Move handles. Surface type names
         // so they can be threaded through functions (each is a Move handle; passed by value).
         "writer" => {
             if !args.is_empty() {
@@ -74026,6 +74064,13 @@ fn resolve_type(
                 return Ty::Error;
             }
             Ty::Buffer
+        }
+        "builder" => {
+            if !args.is_empty() {
+                diags.error("builder takes no type arguments".to_string(), span);
+                return Ty::Error;
+            }
+            Ty::Builder
         }
         name @ ("rs256_private_key"
         | "rs256_public_key"

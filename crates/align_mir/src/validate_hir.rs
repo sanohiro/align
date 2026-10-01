@@ -2062,6 +2062,7 @@ impl<'a> PlacementValidator<'a> {
             | Ty::FsDirCursor
             | Ty::ProcessSignalSubscription | Ty::ProcessChildScope | Ty::ProcessMember | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
             | Ty::CodecEncoder
+            | Ty::Builder
             | Ty::Buffer
             | Ty::SignatureKey(_)
             | Ty::Regex
@@ -2092,7 +2093,6 @@ impl<'a> PlacementValidator<'a> {
             Ty::IntVar(_)
             | Ty::FloatVar(_)
             | Ty::Task(_)
-            | Ty::Builder
             | Ty::StrFinder
             | Ty::DictEncoded(..)
             | Ty::Error => false,
@@ -5439,6 +5439,24 @@ impl<'a> BodyValidator<'a> {
         )
     }
 
+    fn builder_receiver_ok(&self, context: &BodyContext, expression: &hir::Expr, consume: bool) -> bool {
+        align_sema::builder_receiver_sources(expression).into_iter().all(|source| {
+            let hir::ExprKind::Local(id) = source.kind else { return false };
+            if !self.local_handle_place(context, source, Ty::Builder) {
+                return false;
+            }
+            let Some(function) = self.program.fns.get(context.function) else { return false };
+            let Some(position) = function.params.iter().position(|parameter| *parameter == id) else {
+                return true;
+            };
+            match function.param_modes.get(position) {
+                Some(align_ast::ParamMode::ByValue) => true,
+                Some(align_ast::ParamMode::BorrowMut) => !consume,
+                _ => false,
+            }
+        })
+    }
+
     fn owned_http_stream_place(
         &self,
         context: &BodyContext,
@@ -8745,6 +8763,9 @@ impl<'a> BodyValidator<'a> {
                 }
             }
             hir::ExprKind::BuilderWrite { builder, arg, kind } => {
+                if !self.builder_receiver_ok(context, builder, false) {
+                    return None;
+                }
                 let builder = self.expr_flow(builder)?;
                 let arg = self.expr_flow(arg)?;
                 if builder.ty != Ty::Builder || !builder_write_ty_ok(*kind, arg.ty) {
@@ -8754,6 +8775,9 @@ impl<'a> BodyValidator<'a> {
                 Some((Ty::Unit, falls, breaks))
             }
             hir::ExprKind::BuilderToString(builder) => {
+                if !self.builder_receiver_ok(context, builder, true) {
+                    return None;
+                }
                 let flow = self.expr_flow(builder)?;
                 (flow.ty == Ty::Builder).then_some((Ty::String, flow.falls, flow.breaks))
             }

@@ -13,6 +13,16 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### Nameable text builder and borrowed helpers (SETTLED 2026-10-01)
+
+`builder` names the existing opaque Move text accumulator. Direct typed parameters
+and results use ordinary ownership; `borrow mut` may append and forward exclusively,
+while shared `borrow` stays read-only through scope and branch receivers. Borrowed
+owners cannot transfer or finish; exclusive whole-owner replacement keeps ordinary
+Drop-before-store semantics. Aggregate placement and function-value formation remain
+excluded. [Plan 82](impl/82-text-builder-parameter-plan.md) owns Request 24's exact
+admission and verification boundary.
+
 ### Safe mutable storage and array prefix truncation (IMPLEMENTED)
 
 Plans [65](impl/65-open-issue-batch-plan.md) and

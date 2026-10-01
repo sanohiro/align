@@ -10508,19 +10508,21 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             hir::ExprKind::BuilderWrite { builder, arg, kind } => {
                 lower_required_binding!(
                     b,
-                    bop = lower_expr(b, builder),
+                    bop = lower_borrowed_owned(b, builder),
                     Operand::Const(Const::Unit)
                 );
                 lower_required_binding!(b, aop = lower_expr(b, arg), Operand::Const(Const::Unit));
                 let v = b.fresh_value(Ty::Unit);
                 let rv = match kind {
-                    hir::BuilderWriteKind::Str => Rvalue::BuilderWriteStr(bop, aop),
-                    hir::BuilderWriteKind::Int => Rvalue::BuilderWriteInt(bop, aop),
-                    hir::BuilderWriteKind::Bool => Rvalue::BuilderWriteBool(bop, aop),
-                    hir::BuilderWriteKind::Char => Rvalue::BuilderWriteChar(bop, aop),
-                    hir::BuilderWriteKind::Float => Rvalue::BuilderWriteFloat(bop, aop),
+                    hir::BuilderWriteKind::Str => Rvalue::BuilderWriteStr(bop.clone(), aop.clone()),
+                    hir::BuilderWriteKind::Int => Rvalue::BuilderWriteInt(bop.clone(), aop.clone()),
+                    hir::BuilderWriteKind::Bool => Rvalue::BuilderWriteBool(bop.clone(), aop.clone()),
+                    hir::BuilderWriteKind::Char => Rvalue::BuilderWriteChar(bop.clone(), aop.clone()),
+                    hir::BuilderWriteKind::Float => Rvalue::BuilderWriteFloat(bop.clone(), aop.clone()),
                 };
                 b.push(Stmt::Let(v, rv));
+                drop_borrow_owners(b, &aop);
+                drop_borrow_owners(b, &bop);
                 Operand::Const(Const::Unit)
             }
             hir::ExprKind::BuilderToString(inner) => {

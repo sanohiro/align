@@ -33,11 +33,25 @@ b := builder()  /  builder(cap)
 b.write(s: str|string)  /  b.write_int(i: i64)
 b.to_string()              -> string     // the finisher (there is no finish()/build())
 
+fn append(borrow mut output: builder, text: str)  // direct helper declaration
+
 template "…{expr}…"        -> str        // holes: int, float, str, bool, char; full expressions
 ```
 
 Receivers auto-borrow: every method above takes `str` or `string` (an owned `string` is viewed,
 not consumed). `hash64`/`hash128` also accept these views ([hash.md](hash.md)).
+
+`builder` is a nameable opaque Move type. Direct by-value parameters and results
+transfer its owner; `borrow mut` permits all append methods and nested exclusive
+forwarding. Shared `borrow` is read-only through scope tails and selected branches.
+The caller supplies a mutable binding and may finish after the helper returns.
+Borrowed builders cannot move, return, capture, or finish; exclusive replacement
+uses ordinary Drop-before-store. Append copies bytes and retains no text view;
+passing the handle allocates nothing. Aggregate placement and function-value
+formation remain excluded. The existing function-type result grammar can spell
+`fn() -> builder`, but forming such a function value remains rejected.
+[Plan 82](../82-text-builder-parameter-plan.md) owns this boundary;
+`text_builder_params.rs` owns source/native and whole-program/per-unit parity.
 
 ## Type & ownership classification
 

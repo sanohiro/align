@@ -820,6 +820,15 @@ SIMD speedup is promised.
 `str + str` is a **hard error** — `+` never concatenates (a hidden allocation, and a second way to
 build a string); the one way is a `builder`. (`draft.md` §7/§12.)
 
+`builder` is a nameable opaque Move type. Direct helper parameters may use
+`borrow mut output: builder` to append through existing `write*` methods; the
+caller supplies a mutable binding and retains the owner. Shared `borrow` is
+read-only, including through scope tails and selected branches. A borrowed
+builder cannot move, return, capture, or finish; exclusive replacement follows
+ordinary Drop-before-store rules. By-value parameters/results transfer ownership.
+Append copies input bytes without retaining a view; passing the handle allocates
+nothing. Aggregate placement and function-value formation remain excluded.
+
 **Binary decode / encode.** Packed binary is read from a `bytes` view and written into a growable
 `buffer`, bounds-checked and **endian-explicit**: every multi-byte read/write names its byte order
 with a `_le` / `_be` suffix (`h.u32_le(0)`, `out.put_u64_be(n)`), and only `u8` / `i8` carry no

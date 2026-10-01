@@ -1048,8 +1048,8 @@ The result formula in every row is followed by the universal
 | `StrTrim` | `env[kind]`; `child[recv]`; `post[recv Str; result Str; view inherits recv roots/region]`. |
 | `StrBorrow` | `env[]`; `child[string]`; `post[string.ty == String; result Str; owned source is borrowed and remains live]`. |
 | `BuilderNew` | `env[capacity presence]`; `child[capacity if present]`; `post[capacity i64; result Builder; one owned builder allocation with current arena/individual fact]`. |
-| `BuilderWrite` | `env[kind]`; `child[builder,arg]`; `post[builder Builder and borrowed mutable handle; arg type exactly matches BuilderWriteKind; result Unit; no argument ownership transfer]`. |
-| `BuilderToString` | `env[]`; `child[builder]`; `post[builder Builder; result String; consume builder once and transfer its buffer without double Drop]`. |
+| `BuilderWrite` | `env[kind]`; `child[builder,arg]`; `post[builder Builder; every existing receiver binding selected through scope tails or if/match values is owned or BorrowMut, never shared Borrow; arg type exactly matches BuilderWriteKind; result Unit; no argument ownership transfer]`. Fresh owned expression receivers retain ordinary temporary ownership. |
+| `BuilderToString` | `env[]`; `child[builder]`; `post[builder Builder; every existing receiver binding selected through scope tails or if/match values is owned, never Borrow or BorrowMut; result String; consume builder once and transfer its buffer without double Drop]`. |
 
 ### am-b1 helper discriminators
 

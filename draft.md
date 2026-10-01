@@ -2023,6 +2023,28 @@ b.write(name)
 msg := b.to_string()
 ```
 
+`builder` is a nameable opaque Move type. A helper parameter such as
+`borrow mut output: builder` may append through all existing `write*` methods;
+the caller supplies a mutable binding and retains ownership after the call.
+Shared `borrow` is read-only, including through scope tails and selected branches.
+A borrowed builder cannot be moved, returned, captured, or consumed by
+`to_string()`. Exclusive whole-owner replacement follows ordinary Drop-before-store
+rules. By-value parameters and results transfer the owner. Append copies text bytes
+and retains no input view; parameter passing itself allocates nothing. Builder
+aggregate placement and function-value formation remain outside the admitted surface.
+
+```align
+fn append_name(borrow mut output: builder, name: str) {
+    output.write("hello ")
+    output.write(name)
+}
+fn greeting(name: str) -> string {
+    mut output: builder := builder()
+    append_name(output, name)
+    return output.to_string()
+}
+```
+
 ### Static String Meta
 
 String literals carry meta at compile time.

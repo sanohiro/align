@@ -2,6 +2,12 @@
 
 ## Next work (handoff updated 2026-09-29)
 
+Request 24's text builder helper boundary is implemented in plan 82: `builder`
+is nameable in direct typed signatures, exclusive helpers append without taking
+ownership, shared receivers remain read-only, and whole-program/per-unit calls
+agree. Aggregate/callable admission remains excluded. Consumer repinning and
+deduplicating align-llm's decode walks remain align-llm-owned verification.
+
 The align-llm audit issue batch is partly shipped. Merged: #1089 (plan 68),
 #1090, #1091, #1092, #1096, #1099, #1100 (plan 69), #1101, #1110, #1111
 (plan 69 PR 1), #1113, #1114 (plan 70 ledger), #1115, #1116 (plan 69 PR 2,
