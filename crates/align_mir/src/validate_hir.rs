@@ -10695,7 +10695,7 @@ impl<'a> BodyValidator<'a> {
                 }
                 let scalar = align_sema::ty_to_scalar(final_elem)?;
                 if final_elem != *elem
-                    || !numeric_body_ty(final_elem)
+                    || !orderable_body_ty(final_elem)
                     || !self.scalar_copy_ok(scalar)
                 {
                     return None;
@@ -10717,7 +10717,7 @@ impl<'a> BodyValidator<'a> {
                 }
                 let scalar = align_sema::ty_to_scalar(final_elem)?;
                 if final_elem != *elem
-                    || align_sema::scalar_to_prim(scalar).is_none()
+                    || (align_sema::scalar_to_prim(scalar).is_none() && scalar != Scalar::Str)
                     || !self.scalar_copy_ok(scalar)
                     || !orderable_body_ty(*key_ty)
                 {

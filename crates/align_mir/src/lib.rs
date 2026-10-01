@@ -18002,8 +18002,8 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         Scalar::Int(_) | Scalar::Char | Scalar::Str | Scalar::Bool => KeyOrder::Total,
         // IEEE 754: not a total order (NaN is unordered) — must keep the merge path.
         Scalar::Float(_) => KeyOrder::PartialFloat,
-        // Fail-closed. These are not valid sort keys today (sema restricts `sort` to numeric
-        // scalars and `sort_by_key` to primitive scalars), but they are enumerated explicitly so a
+        // Fail-closed. These are not valid sort keys today (sema restricts `sort` to
+        // Copy Ord scalars and `sort_by_key` to Copy scalars), but they are enumerated explicitly so a
         // future new `Scalar` variant is a compile error here until it is deliberately triaged into
         // Total or PartialFloat.
         Scalar::Unit
@@ -18198,8 +18198,8 @@ fn sort_copy_step(
 /// `key(arr[j])` recomputation. A `str` key is a borrowed `{ptr,len}` view (Copy), so freeing the
 /// key buffers is a shallow spine `DropValue` that never touches the pointed-to bytes.
 ///
-/// Elements are always Copy scalars (sema restricts `sort` to numeric scalars and `sort_by_key` to
-/// primitive scalars), so no element ever needs a deep move/drop. Reads use `SliceIndex`; writes use
+/// Elements are always Copy scalars, including borrowed `str` headers. The result and scratch
+/// spines never own string bytes, so no element needs a deep move/drop. Reads use `SliceIndex`; writes use
 /// `PtrStore` through a buffer pointer (`SlicePtr`).
 ///
 /// **Adaptive ordered-run fast paths (doc-12 §4.1), total-order keys only** ([`sort_key_order`] ==

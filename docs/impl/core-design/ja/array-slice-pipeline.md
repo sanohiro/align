@@ -14,7 +14,7 @@
 
 ```text
 [a, b, c]        fixed array [T; N] — stack slot, compile-time length, Copy
-array<T>         dynamic array — heap/arena {ptr,len}, Move (deep-dropped for str elements);
+array<T>         dynamic array — heap/arena {ptr,len}, Move (deep-dropped for owned string elements);
                  produced by .to_array(), chunks, json.decode, partition, sort
 slice<T>         borrowed view {ptr,len}, Copy, region = the data it points into
 ```
@@ -91,10 +91,19 @@ storage: field 'f' owns independent heap storage`。設計は
 
 ステージへの関数引数は、名前付きの `fn`、ラムダ式 `fn x { … }` / `fn acc, x { … }`、または `.field` 射影の形式をとる。`reduce` や `scan` は **init-first（初期値が先）** である。末尾に初期値を置く古い形式は完全に廃止された（後方互換性を持たせないルールに従い、別名は一切残していない）。
 
+直接の `.sort()` は Copy な `Ord` 要素、すなわち数値・`char`・`str` を受け入れる。
+`sort_by_key` は従来のプリミティブ Copy 要素と `str` を受け入れる。どちらも配列本体を
+所有するが、`str` のバイト列は元の所有者から借用し、暗黙の clone や所有権移転はない。
+結果は source と stage capture の内容の寿命を引き継ぎ、ローカル文字列からのビューの
+返却や所有者の無効化後の利用を拒否する。既存の保守的な source-generation の借用も維持する。
+バイト列が static でも、束縛済みの元配列を置換・move・再確保すると、生存する結果の
+借用が無効になる場合がある。所有する `string` 要素と comparator overload は
+未対応のままである（plan 88）。
+
 ## Type & ownership classification
 
 - Fixed array は Copy 値である。所有権付きフィールドを持つ source-formed な Move struct 固定配列（`[User{name}]` など）には再帰的な要素 Drop がある。Move 要素全体の読み取りは、下記の明示的な shared-call place に限定される。
-- Dynamic `array<T>` は再帰的な Drop を持つ Move 型である（str 要素の配列は deep-free される。#339 の前例を参照）。
+- Dynamic `array<T>` は再帰的な Drop を持つ Move 型である（所有する string 要素の配列は deep-free される。#339 の前例を参照）。
 - `array_builder<T>` は1つの Move owner である。heap 形式は通常の型付き parameter/return を
   move でき、helper は同じ owner を `borrow mut` 経由で変更できる。builder は aggregate field
   や task/closure capture にはできず、borrowed builder を consume または保持することもできない。
@@ -125,7 +134,7 @@ storage: field 'f' owns independent heap storage`。設計は
 
 ## Regions
 
-`region_of(xs[a..b]) = region_of(xs)`、`region_of(chunks elem) = region_of(source storage)` — これは #297 で導入された storage と element の区別に基づく（str 配列の *要素* は配列の *storage* よりも長生きする可能性がある）。`to_array` / `sort` / `partition` の結果は owned となる（region なし）。`map_into` は呼び出し側の region を介して書き込みを行い、**no-alias を証明する**。呼び出し側の out-disjointness チェックは、#328 の call-laundered-aliasing 修正以降、意図的に保守的なものになっている。その敵対的なケースを再実行せずにチェックを緩めてはならない。
+`region_of(xs[a..b]) = region_of(xs)`、`region_of(chunks elem) = region_of(source storage)` — これは #297 で導入された storage と element の区別に基づく（str 配列の *要素* は配列の *storage* よりも長生きする可能性がある）。`to_array` / `sort` / `partition` の結果は新しい heap/arena の配列本体を所有し、その storage の領域は確保元に従う。借用した `str` の内容は、バイト列の所有者と寿命、および既存の保守的な source-generation の借用を維持する。`map_into` は呼び出し側の region を介して書き込みを行い、**no-alias を証明する**。呼び出し側の out-disjointness チェックは、#328 の call-laundered-aliasing 修正以降、意図的に保守的なものになっている。その敵対的なケースを再実行せずにチェックを緩めてはならない。
 `zip(...).map_into(dst)` では、すべての source と `dst` が重複しないことが証明される。ランタイムの source 読み込みは 1 つの input-vs-output スコープを共有し、source 同士のエイリアスは許可されており、互いに disjoint であるとは宣言されない。
 
 ## 仕様先行（未実装の範囲）

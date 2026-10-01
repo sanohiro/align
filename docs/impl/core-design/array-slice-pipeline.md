@@ -17,7 +17,7 @@ surface + shape rules; the columnar layer is [soa-groupby.md](soa-groupby.md).
 
 ```text
 [a, b, c]        fixed array [T; N] — stack slot, compile-time length, Copy
-array<T>         dynamic array — heap/arena {ptr,len}, Move (deep-dropped for str elements);
+array<T>         dynamic array — heap/arena {ptr,len}, Move (deep-dropped for owned string elements);
                  produced by .to_array(), chunks, json.decode, partition, sort
 slice<T>         borrowed view {ptr,len}, Copy, region = the data it points into
 ```
@@ -97,12 +97,22 @@ Function arguments to stages: named `fn`, lambda `fn x { … }` / `fn acc, x { �
 `.field` projection forms. `reduce`/`scan` are **init-first** — the old trailing-init order was
 removed outright (no alias survives, per the no-backward-compat rule).
 
+Direct `.sort()` accepts Copy `Ord` elements: numbers, `char` and `str`.
+`sort_by_key` accepts primitive Copy elements and `str`. Both return an owned
+array spine; `str` elements retain their byte owners, with no implicit clone or
+byte ownership transfer. Source and stage-capture lifetimes remain attached to
+the result, so local text views cannot escape or survive owner invalidation.
+Existing conservative source-generation loans remain: replacing, moving or
+reallocating a bound source array can invalidate a live result even when its
+copied bytes are static. Owned `string` elements and comparator overloads
+remain unsupported (plan 88).
+
 ## Type & ownership classification
 
 - Fixed arrays are Copy values; source-formed fixed arrays of Move structs (`[User{name}]` with
   owned fields) have recursive element Drop. Whole Move-element reads remain restricted to the
   explicit shared-call places described below.
-- Dynamic `array<T>` is a Move type with recursive Drop (str-element arrays deep-free, #339
+- Dynamic `array<T>` is a Move type with recursive Drop (owned-string arrays deep-free, #339
   precedent).
 - `array_builder<T>` is one Move owner. The heap form may move through an ordinary typed parameter
   or return and a helper may mutate the same owner through `borrow mut`; a builder is never an
@@ -143,8 +153,10 @@ Empty input is an answer, never an error: `sum` 0, `count` 0, `any` false, `all`
 
 `region_of(xs[a..b]) = region_of(xs)`; `region_of(chunks elem) = region_of(source storage)` —
 the storage-vs-element distinction from #297 (a str-array's *elements* may outlive the array
-*storage*). `to_array`/`sort`/`partition` results are owned (no region). `map_into` writes
-through the caller's region and **proves no-alias**: the caller-side out-disjointness check is
+*storage*). `to_array`/`sort`/`partition` results own fresh heap/arena spines whose
+storage follows their allocation provenance. Borrowed `str` content retains its
+byte owners/lifetimes and established conservative source-generation loans.
+`map_into` writes through the caller's region and **proves no-alias**: the caller-side out-disjointness check is
 deliberately conservative after the #328 call-laundered-aliasing fix — do not loosen it without
 re-running that adversarial case.
 For `zip(...).map_into(dst)`, the proof covers **every** source. Runtime source loads share one

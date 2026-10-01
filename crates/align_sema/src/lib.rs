@@ -24314,7 +24314,11 @@ impl<'a> EscapeCheck<'a> {
             // changes their general allocation provenance.
             // (`to_soa` and `json.decode → soa` are handled separately below — a `str`-bearing soa
             // also borrows its source/input, so it needs the shorter of the two regions.)
-            ExprKind::ArrayToArray { source, stages, .. } => {
+            ExprKind::ArrayToArray { source, stages, .. }
+            | ExprKind::ArraySort { source, stages, elem: Ty::Str }
+            | ExprKind::ArraySortBy { source, stages, elem: Ty::Str, .. } => {
+                // Copy string elements still borrow their byte owners. The sorted spine owns no
+                // bytes, so its allocation cannot erase source or stage-capture provenance.
                 let mut children = Vec::with_capacity(1 + stages.len());
                 children.push((source.as_ref(), depth, None));
                 children.extend(
@@ -60551,22 +60555,30 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     /// `source.….sort()` — materialize the surviving elements into an owned `array<T>` and sort
-    /// them ascending. First cut: numeric scalar elements only (an ordering exists), no
-    /// comparator argument (a `sort(cmp)` overload is a follow-up).
+    /// them ascending. Elements are Copy `Ord` scalars: numbers, characters and string views.
+    /// Owned string bytes are never implicitly cloned; comparator arguments remain deferred.
     fn check_array_sort(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
-        if !args.is_empty() {
-            self.diags.error("'sort' takes no arguments yet (a comparator overload is a follow-up)".to_string(), span);
-        }
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let Some((source, stages, elem)) = self.check_pipeline(recv, None, span) else {
             return err;
         };
+        if !args.is_empty() {
+            self.diags.error("'sort' takes no arguments (comparator sorting is not supported)".to_string(), span);
+            return err;
+        }
         if matches!(elem, Ty::Struct(_)) {
             self.diags.error("'sort' over struct elements is not supported yet (project a field first)".to_string(), span);
             return err;
         }
-        if !elem.is_numeric() {
-            self.diags.error(format!("'sort' needs a numeric element type, got {}", ty_name(elem)), span);
+        // Generic bodies are checked symbolically, then rechecked with concrete types at each
+        // instantiation. An Ord bound authorizes ordering here; a Move string instantiation still
+        // fails the concrete Copy restriction below before producing executable HIR.
+        let orderable = match elem {
+            Ty::Param(index) => self.param_bound(index).grants_ord(),
+            _ => Bound::Ord.satisfied_by(elem),
+        };
+        if !orderable || elem == Ty::String {
+            self.diags.error(format!("'sort' needs a Copy Ord element (int/float/char/str), got {}", ty_name(elem)), span);
             return err;
         }
         let Some(scalar) = ty_to_scalar(elem) else {
@@ -60581,8 +60593,8 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     /// `source.….sort_by_key(f)` — materialize the surviving (primitive scalar) elements and sort
-    /// them ascending by `f(element)`. Unlike `sort`, the element need not be numeric (it is ordered
-    /// by the key); the key `f` must return an orderable value (int/float/char, or a `str` compared
+    /// them ascending by `f(element)`. Copy string views are also admitted. The element is ordered
+    /// by the key; the key `f` must return an orderable value (int/float/char, or a `str` compared
     /// byte-lexicographically). `f` may be a named function or a lambda (which may capture).
     fn check_array_sort_by_key(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
@@ -60598,10 +60610,10 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error("'sort_by_key' over struct elements is not supported yet (project a field first)".to_string(), span);
             return err;
         }
-        // The element must materialize into `array<T>`, i.e. be a primitive scalar.
-        let Some(scalar) = ty_to_scalar(elem).filter(|s| scalar_to_prim(*s).is_some()) else {
+        // The result materializes Copy scalar values, including borrowed string headers.
+        let Some(scalar) = ty_to_scalar(elem).filter(|s| scalar_to_prim(*s).is_some() || *s == Scalar::Str) else {
             self.diags.error(
-                format!("'sort_by_key' element must be a primitive scalar (int/float/bool/char), got {}", ty_name(elem)),
+                format!("'sort_by_key' element must be a Copy scalar (int/float/bool/char/str), got {}", ty_name(elem)),
                 span,
             );
             return err;
