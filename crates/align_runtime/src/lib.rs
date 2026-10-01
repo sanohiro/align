@@ -29184,6 +29184,75 @@ mod tests {
         fn drop(&mut self) { unsafe { align_rt_io_file_free(self.0) }; }
     }
 
+    /// Release every started creator and join it before fixture cleanup, including partial spawn
+    /// failure and worker assertion unwind. The gate does not require a fixed successful spawn count.
+    struct FileCreatorGroup {
+        start: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        threads: Vec<std::thread::JoinHandle<(i32, u8)>>,
+    }
+    impl FileCreatorGroup {
+        fn new() -> Self {
+            Self { start: std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())), threads: Vec::new() }
+        }
+        fn spawn(&mut self, body: impl FnOnce() -> (i32, u8) + Send + 'static) -> std::io::Result<()> {
+            let start = std::sync::Arc::clone(&self.start);
+            let thread = std::thread::Builder::new().spawn(move || {
+                let (lock, wake) = &*start;
+                let mut ready = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                while !*ready { ready = wake.wait(ready).unwrap_or_else(std::sync::PoisonError::into_inner); }
+                drop(ready);
+                body()
+            })?;
+            self.threads.push(thread);
+            Ok(())
+        }
+        fn release(&self) {
+            let (lock, wake) = &*self.start;
+            *lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            wake.notify_all();
+        }
+        fn finish(mut self) -> Vec<(i32, u8)> {
+            self.release();
+            let joined: Vec<_> = self.threads.drain(..).map(|thread| thread.join()).collect();
+            // No worker remains live when the first failed result resumes its original panic.
+            joined.into_iter().map(|result| result.unwrap_or_else(|payload| std::panic::resume_unwind(payload))).collect()
+        }
+    }
+    impl Drop for FileCreatorGroup {
+        fn drop(&mut self) {
+            self.release();
+            // During an existing unwind, secondary worker failures must not skip the remaining joins.
+            for thread in self.threads.drain(..) { let _ = thread.join(); }
+        }
+    }
+
+    #[test]
+    fn file_create_exclusive_failed_worker_joins_before_fixture_cleanup() {
+        for finish in [true, false] {
+            let root = FileFixtureDir::new("exclusive-worker-failure");
+            let path = root.0.clone();
+            let peer_path = path.clone();
+            let (send, receive) = std::sync::mpsc::channel();
+            let mut group = FileCreatorGroup::new();
+            group.spawn(|| panic!("injected creator failure")).unwrap();
+            group.spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                send.send(peer_path.is_dir()).unwrap();
+                (0, 0)
+            }).unwrap();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _root = root;
+                let group = group;
+                if finish { group.finish(); }
+                else { panic!("injected partial setup failure"); }
+            }));
+            let peer_saw_live_fixture = receive.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+            assert!(result.is_err());
+            assert!(peer_saw_live_fixture, "fixture cleanup must follow the delayed peer join");
+            assert!(!path.exists());
+        }
+    }
+
     #[test]
     fn file_create_exclusive_occupied_entries_and_flags() {
         use std::os::unix::fs::FileTypeExt;
@@ -29256,15 +29325,13 @@ mod tests {
 
     #[test]
     fn file_create_exclusive_race_has_one_winner() {
-        use std::sync::{Arc, Barrier};
+        use std::sync::Arc;
         let root = FileFixtureDir::new("exclusive-race");
         let path = Arc::new(root.0.join("winner").to_str().unwrap().to_owned());
-        let barrier = Arc::new(Barrier::new(8));
-        let threads: Vec<_> = (0u8..8).map(|byte| {
+        let mut group = FileCreatorGroup::new();
+        for byte in 0u8..8 {
             let path = Arc::clone(&path);
-            let barrier = Arc::clone(&barrier);
-            std::thread::spawn(move || {
-                barrier.wait();
+            group.spawn(move || {
                 let mut out = core::ptr::null_mut();
                 let status = unsafe { align_rt_io_file_create_exclusive(path.as_ptr(), path.len() as i64, &mut out) };
                 let _owner = FileTestHandle(out);
@@ -29273,9 +29340,9 @@ mod tests {
                     assert_eq!(unsafe { align_rt_io_file_pwrite(out, &byte, 1, 0) }, 1);
                 } else { assert!(out.is_null()); }
                 (status, byte)
-            })
-        }).collect();
-        let results: Vec<_> = threads.into_iter().map(|thread| thread.join().expect("exclusive creator")).collect();
+            }).expect("exclusive creator spawn");
+        }
+        let results = group.finish();
         let winners: Vec<_> = results.iter().filter(|(status, _)| *status == 0).collect();
         assert_eq!(winners.len(), 1);
         let occupied = io_error_to_status(&std::io::Error::from_raw_os_error(libc::EEXIST));

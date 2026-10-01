@@ -17,7 +17,7 @@ benchmark is introduced. The expected diff is below 1,000 hand-written lines.
 | --- | --- | --- |
 | `fs.create_rw_exclusive(path: str) -> Result<file, Error>` | Requires `import std.fs` and exactly one positional argument, implicitly borrowing string. One native open uses O_RDWR\|O_CREAT\|O_EXCL\|O_CLOEXEC\|O_NOFOLLOW with mode 0644 subject to umask. An absent final entry creates one regular file; any occupied regular file, directory, live or dangling symlink, FIFO or device fails with Code(native EEXIST) without opening, truncating, replacing, following or removing it. Parents use ordinary resolution, including symlinks and relative paths; no parent creation, stat/exists preflight, normalization, retry or emulation. Missing parent is NotFound, permissions Denied, invalid inputs Invalid, other native errors Code(errno), through the fixed table. Empty, embedded-NUL and invalid UTF-8 reject before filesystem work. No defaults or new ambient configuration. | Impure, same Move File owning one descriptor and native shell. Path is call-scoped and not retained. One ephemeral NUL path copy plus the existing File shell; no buffer or mmap. Drop closes once and never removes the entry, including partial-write/error paths. Existing bound-receiver, aggregate and single-threaded restrictions remain. Driver exclusive-create owner and native occupied-entry/race/flag owners. |
 | Existing File methods | Pread, pwrite, len and negative-offset semantics remain unchanged; new owner is read/write. A full pwrite can extend past EOF and pread returns actual/short/zero EOF counts. | Existing File borrow and buffer requirements, ownership, replacement, Return, try/map_err and Drop paths. Owner writes at planned offsets and reads exact bytes back. |
-| Atomicity and environment | The operation claims only atomic final-entry acquisition on the accepted local ext4/tmpfs Linux and APFS macOS floor, consistent with plan 27. Exactly one competing exclusive creator of one absent path wins. No path stability after acquisition, parent confinement, multi-file transaction, automatic rollback, unlink, flush or crash durability. Native errors are returned without weakening flags. Process umask/current directory follow existing filesystem semantics and are never changed by the operation. | No global state change or restoration protocol. Barrier-controlled native competing-creator owner and existing-entry preservation controls. |
+| Atomicity and environment | The operation claims only atomic final-entry acquisition on the accepted local ext4/tmpfs Linux and APFS macOS floor, consistent with plan 27. Exactly one competing exclusive creator of one absent path wins. No path stability after acquisition, parent confinement, multi-file transaction, automatic rollback, unlink, flush or crash durability. Native errors are returned without weakening flags. Process umask/current directory follow existing filesystem semantics and are never changed by the operation. | No global state change or restoration protocol. Start-gated native competing-creator owner and existing-entry preservation controls. |
 | Artifact/interface identity | New HIR/MIR operation participates in normal structural hashing and compiler-build identity; imported generic templates reparse from source. No new type graph, serialization field/version or fingerprint kind. | Imported generic File return/consume helper in whole-program and per-unit compilation. |
 
 ## Native and compiler ledger
@@ -86,7 +86,7 @@ preserves the reviewed contract and requires no second complete plan review.
 - `owned_temporaries::open_handle_path_owner_releases_after_native_read` sweeps
   all six path-only constructors, retaining the path until native use and dropping
   it before Result formation. The existing 14 other temporary owners remain green.
-- The four native `file_create_exclusive_*` owners close every occupied final
+- The five native `file_create_exclusive_*` owners close every occupied final
   kind, device rejection, exact output/extent/text order, flags, one-winner race
   with winner-byte identity, and child-scoped 000/077 mode masking. Native
   `file_no_fd_leak_across_cycles` now includes 128 exclusive acquisition/Drop cycles.
@@ -105,3 +105,24 @@ normative-prose extraction and Gate 1–6 author checks are retained outside Git
 The creation-mode and one-winner owners were mutation-verified: 0666 and missing
 O_EXCL each fail their named owner; restored code passes. The public contract,
 English/Japanese mirrors and exact 451/469/476/473/469/480 inventory agree.
+
+## Code-review finding closure
+
+The one independent full-diff review of candidate 14e040c2 found one P2 in the
+competing-creator test: joining and immediately unwrapping each worker could
+propagate the first panic while other workers still used the fixture directory.
+The author audited every new worker/process path for the same lifecycle class.
+The child-umask owner already had immediate, bounded child cleanup; the native
+creator race was the only unguarded thread path.
+
+`FileCreatorGroup` now owns each successfully spawned worker immediately. Its
+start gate does not require a fixed successful spawn count. Both finish and Drop
+release and join every started worker before the enclosing fixture can be
+removed; finish resumes a worker panic only after all joins are collected.
+`file_create_exclusive_failed_worker_joins_before_fixture_cleanup` crosses worker
+failure and partial-setup unwind with a delayed peer, asserting that the fixture
+remains live through that peer's completion and is subsequently removed.
+Mutations detaching peers at the first failed join or during group Drop each fail
+that owner; the restored five exclusive native owners pass. This is a test
+cleanup correction against the original finding, with no public-contract,
+production ownership, IR-shape or compiler-strategy change.
