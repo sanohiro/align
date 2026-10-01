@@ -81,6 +81,35 @@ fs.remove_empty_dir(path: str) -> Result<(), Error>
 
 ## Public contract
 
+### Read-only random-access files
+
+[Plan 84](../84-read-only-random-file-plan.md) owns the fired M12 non-mmap
+random-read trigger and this surface:
+
+```text
+fs.open_ro(path: str) -> Result<file, Error>
+```
+
+The Impure call opens an existing ordinary path O_RDONLY|O_CLOEXEC, following
+symlinks and relative resolution like open_rw. It never creates, truncates or
+extends, and adds no regular-file admission policy. UTF-8 and embedded-NUL
+validation precede filesystem work; NUL returns Invalid, empty paths keep OS
+mapping. Missing is NotFound, permissions Denied, invalid inputs Invalid and
+other errors Code(errno) through the existing fixed table. Input is borrowed
+only for the call, including implicit borrowing of string. Native path conversion
+and the existing handle shell allocate; no read buffer or mmap is allocated.
+The result retains no path lifetime.
+
+The result is the same Move file, owning one descriptor that Drop closes, with
+existing bound-receiver, aggregate and single-threaded restrictions. Pread uses
+the caller's mutable buffer window, returns actual/short counts and zero EOF;
+len is live descriptor metadata. Negative offsets abort before permission checks.
+Pwrite queries kernel-owned descriptor mode before reading source bytes and
+returns Denied for a read-only descriptor, including empty data. No stored
+capability flag or constructor-origin inference is added. Existing read/write
+constructors and successful full-write behavior retain their contracts.
+
+
 ### Ordinary-path regular-file admission
 
 `fs.open_regular(path: str) -> Result<reader, Error>` is Impure and supports Linux/macOS.

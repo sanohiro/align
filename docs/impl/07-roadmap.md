@@ -2011,7 +2011,8 @@ green. **Next: M13** (codegen quality & link hygiene, the pre-LLVM-upgrade wave)
   past-EOF-hole/pread-back/len/open_rw-missing-Err/negative-offset-abort + the move/print/==/import
   gates) + `align_runtime` units (pwrite/pread roundtrip, short-read-at-EOF, in-place update,
   fd-leak across N cycles). `cargo test --workspace` green; clippy `-D warnings` clean. Deferred:
-  `copy_range`, `open_ro`, buffering.
+  `copy_range`, buffering. Request 21 / plan 84 implements the recorded `open_ro`
+  trigger with the same File, unchanged pread/len/Drop, and runtime Denied writes.
   <br>Original settled design (2026-07-11, two-lens review): A new Move type **`file`** = the random-access block-WRITE handle with
   read-back; **no `seek` ever** (a settable cursor is hidden mutable state — every access takes
   an explicit `off`), and **no read-only constructor** (pure random reads stay reader | mmap

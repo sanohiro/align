@@ -12161,11 +12161,11 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        // StrParseI64, StrCharBoundary, ArrayTruncate, BytesSet, BytesFill, BytesCopyFrom, BufferAppendFilled,
+        // FileOpenRo, StrParseI64, StrCharBoundary, ArrayTruncate, BytesSet, BytesFill, BytesCopyFrom, BufferAppendFilled,
         // FloatScope, BytesView, SliceAsBytes, and HttpServerMaxRequestBodyBytes are explicit in
         // validation, source-shape, replay and ownership.
         variants,
-        343,
+        344,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -19389,4 +19389,35 @@ fn checked_byte_views_hir_rejects_forged_type_equations_in_every_entrypoint() {
         }
         assert_body_entrypoints_empty("inverse-byte-view-forged", &malformed);
     }
+}
+
+#[test]
+fn file_constructors_hir_reject_forged_types_in_every_entrypoint() -> Result<(), &'static str> {
+    for constructor in ["create_rw", "open_rw", "open_ro"] {
+        let base = checked_source_program(&format!("import std.fs\nfn f(text: str) -> Result<file, Error> {{ value := fs.{constructor}(text); return value }}"));
+        assert!(!is_empty(&lower_program(&base)));
+        for mutation in 0..5 {
+            let mut malformed = base.clone();
+            let expression = body_first_let_init_mut(&mut malformed, "f");
+            let original = expression.ty;
+            let path = match &mut expression.kind {
+                hir::ExprKind::FileCreateRw { path } | hir::ExprKind::FileOpenRw { path }
+                | hir::ExprKind::FileOpenRo { path } => path,
+                _ => return Err("file constructor fixture"),
+            };
+            match mutation {
+                0 => **path = body_test_expr(hir::ExprKind::Bool(true), Ty::Bool),
+                1 => **path = body_test_expr(hir::ExprKind::StrClone(Box::new(
+                    body_test_expr(hir::ExprKind::Str("x".into()), Ty::Str))), Ty::String),
+                2 => expression.ty = Ty::File,
+                3 => {
+                    let Ty::Result(_, error) = original else { return Err("file Result fixture"); };
+                    expression.ty = Ty::Result(Scalar::Bool, error);
+                }
+                _ => expression.ty = Ty::Result(Scalar::File, Scalar::Bool),
+            }
+            assert_body_entrypoints_empty("file-constructor-forged", &malformed);
+        }
+    }
+    Ok(())
 }

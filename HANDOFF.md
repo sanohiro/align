@@ -2,6 +2,13 @@
 
 ## Next work (handoff updated 2026-10-01)
 
+Request 21's recorded read-only random-access trigger is implemented in plan 84:
+`fs.open_ro(path: str) -> Result<file, Error>` opens O_RDONLY|O_CLOEXEC into the
+existing Move File. Pread/len/Drop remain unchanged; read-only pwrite returns
+Denied even for empty data. The read-only permission, path/flag, temporary-owner,
+forged-producer and imported whole/per-unit owners cover the boundary. Consumer
+GGUF/transcript/tokenizer/KV adoption remains align-llm-owned verification.
+
 Request 26's checked decimal conversion is implemented in plan 83:
 `str.parse_i64() -> Result<i64, Error>` accepts whole-input ASCII signed decimal,
 rejects whitespace and out-of-range input with Invalid, borrows owned strings,

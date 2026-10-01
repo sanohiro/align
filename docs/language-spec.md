@@ -1340,9 +1340,16 @@ bytes→text boundary: it validates UTF-8 and returns a zero-copy `str` view reg
 receiver.
 
 `file` is the **random-access** handle: every access carries an explicit offset, so there is no
-cursor and no `seek` (hidden mutable state), and no read-only constructor. `f.pread(b: mut buffer,
-off)` reads one window, `f.pwrite(data: bytes, off)` writes all of `data` (extending past EOF), and
-`f.len()` is a live `fstat`. A **negative** offset is a programmer bug and aborts.
+cursor and no `seek` (hidden mutable state). `fs.create_rw` / `fs.open_rw` grant read+write access;
+`fs.open_ro(path: str) -> Result<file, Error>` opens an existing ordinary path O_RDONLY|O_CLOEXEC
+without creating or truncating it. `f.pread(b: mut buffer, off)` reads one window,
+`f.pwrite(data: bytes, off)` writes all of `data` (extending past EOF), and `f.len()` is a live
+`fstat`. A **negative** offset aborts before access-mode checks. Read-only `pwrite` returns
+`Error.Denied`, including empty data, using the descriptor's kernel-owned mode. Path UTF-8/NUL
+validation precedes filesystem work; empty paths keep OS mapping. The fixed errno table, Move
+fd ownership, Drop and single-threaded rules are unchanged; the result retains no path view.
+The constructor allocates only the existing handle shell and ephemeral native path, with no read
+buffer or mmap (plan 84).
 
 **Line reads** are explicit because they need lookahead: `r.buffered()` upgrades a reader (the read
 dual of the buffered writer), and `read_line` is a **buffered-reader-only** method. It fills `b`

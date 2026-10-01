@@ -1,8 +1,8 @@
 //! M12 Slice A4 — `std.fs`/`std.io` offset-addressed file I/O: a new Move type `file` (an owned
 //! read+write fd; `Drop` closes it), constructed by `fs.create_rw` (`O_RDWR|O_CREAT|O_TRUNC`) /
 //! `fs.open_rw` (`O_RDWR`, must exist), with `f.pread(b: mut buffer, off)` / `f.pwrite(data, off)`
-//! (loops to full; past-EOF extends) / `f.len()` (live fstat). **No cursor / no seek / no read-only
-//! constructor.** Negative offset aborts. The headline drives create_rw → pwrite at offsets (incl. a
+//! (loops to full; past-EOF extends) / `f.len()` (live fstat). `fs.open_ro` supplies the same
+//! File with read-only access; pwrite returns Denied. **No cursor / no seek.** Negative offset aborts. The headline drives create_rw → pwrite at offsets (incl. a
 //! past-EOF hole) → pread back → and verifies the bytes end-to-end, plus the Move/consume guardrails
 //! and the import gate. (`docs/impl/07-roadmap.md` M12 Slice A4; `draft.md` §18.2.)
 
@@ -34,6 +34,36 @@ impl Drop for TempFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+/// Acquire fixture ownership with one exclusive mkdir; cleanup never touches an unowned path.
+struct FileFixtures { dir: PathBuf }
+impl FileFixtures {
+    fn acquire(dir: PathBuf) -> std::io::Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        Ok(Self { dir })
+    }
+    fn new(tag: &str) -> Self {
+        Self::acquire(std::env::temp_dir().join(format!("align-file-{}-{tag}-{}", std::process::id(), thin_nonce())))
+            .expect("exclusive fixture directory")
+    }
+}
+impl Drop for FileFixtures {
+    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.dir); }
+}
+
+#[test]
+fn file_fixture_directory_preserves_existing_entries() {
+    let root = FileFixtures::new("ownership");
+    let occupied = root.dir.join("occupied");
+    std::fs::create_dir(&occupied).unwrap();
+    std::fs::write(occupied.join("marker"), b"untouched").unwrap();
+    assert!(FileFixtures::acquire(occupied.clone()).is_err());
+    let link = root.dir.join("link");
+    std::os::unix::fs::symlink(&occupied, &link).unwrap();
+    assert!(FileFixtures::acquire(link).is_err());
+    assert_eq!(std::fs::read(occupied.join("marker")).unwrap(), b"untouched");
 }
 
 /// The completion condition: `fs.create_rw` a fresh file, `pwrite` at explicit offsets (contiguous
@@ -137,20 +167,17 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 /// never a silent clamp / `Err`. An abort is a signal death, not a normal exit code.
 #[test]
 fn negative_offset_aborts() {
-    if !backend_available() {
-        return;
+    if !backend_available() { return; }
+    let fixtures = FileFixtures::new("negative-offset");
+    let file = fixtures.dir.join("input");
+    std::fs::write(&file, b"content").unwrap();
+    for constructor in ["create_rw", "open_ro"] {
+        for operation in ["f.pwrite(\"x\", -5)", "f.pwrite(\"\", -5)", "f.pread(buf, -5)"] {
+            let source = format!("import std.fs\nfn main(args: array<str>) -> Result<(), Error> {{\n f := fs.{constructor}(args[1])?\n mut buf := buffer(2)\n {operation}?\n return Ok(())\n}}\n");
+            let out = build_and_run_args(&format!("m12-negative-{constructor}-{}", operation.len()), &source, &[file.to_str().unwrap()]);
+            assert_eq!(out.status.code(), None, "negative offset must abort before readonly denial: {}", String::from_utf8_lossy(&out.stderr));
+        }
     }
-    let f = TempFile::out("neg");
-    let prog = "\
-import std.fs
-pub fn main(args: array<str>) -> Result<(), Error> {
-  f := fs.create_rw(args[1])?
-  f.pwrite(\"x\", -5)?
-  return Ok(())
-}
-";
-    let out = build_and_run_args("m12-neg-offset", prog, &[&f.str()]);
-    assert_eq!(out.status.code(), None, "a negative offset must abort (signal death), not exit normally");
 }
 
 /// The Move/consume guardrails, all compile-time rejections (twin-mirror with reader/writer):
@@ -259,4 +286,120 @@ fn file_constructors_require_std_fs_import() {
         "m12-file-bound-ok",
         "import std.fs\nimport std.io\npub fn main(args: array<str>) -> Result<(), Error> {\n  f := fs.create_rw(args[1])?\n  f.pwrite(\"hi\", 0)?\n  mut buf := buffer(2)\n  n := f.pread(buf, 0)?\n  print(f.len()?)\n  return Ok(())\n}\n",
     ), "a bound file's pwrite/pread/len must stay allowed");
+}
+
+/// Read-only admission is observable on the same mode-0444 file that open_rw refuses.
+#[test]
+fn open_ro_permissions_windows_and_write_denial() {
+    if !backend_available() { return; }
+    use std::os::unix::fs::PermissionsExt;
+    let fixtures = FileFixtures::new("open-ro-permissions");
+    let readable = fixtures.dir.join("readable");
+    let denied = fixtures.dir.join("denied");
+    let missing = fixtures.dir.join("missing");
+    std::fs::write(&readable, b"abcdef").unwrap();
+    std::fs::write(&denied, b"secret").unwrap();
+    std::fs::set_permissions(&readable, std::fs::Permissions::from_mode(0o444)).unwrap();
+    std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
+    assert!(std::fs::OpenOptions::new().read(true).write(true).open(&readable).is_err(),
+        "permission owner requires a non-root host where mode 0444 denies write admission");
+    let source = r#"
+import std.fs
+fn main(args: array<str>) -> Result<(), Error> {
+  f := fs.open_ro(args[1])?
+  if f.len()? != 6 { return Err(Error.Invalid) }
+  mut b := buffer(4)
+  if f.pread(b, 2)? != 4 { return Err(Error.Invalid) }
+  text := b.bytes().as_str()?
+  if text != "cdef" { return Err(Error.Invalid) }
+  if f.pread(b, 5)? != 1 { return Err(Error.Invalid) }
+  if f.pread(b, 6)? != 0 { return Err(Error.Invalid) }
+  if b.len() != 0 { return Err(Error.Invalid) }
+  if f.pread(b, 100)? != 0 { return Err(Error.Invalid) }
+  match f.pwrite("XYZ", 20) { Ok(_) => { return Err(Error.Invalid) }, Err(e) => match e { Denied => {}, _ => { return Err(Error.Invalid) } } }
+  match f.pwrite("", 0) { Ok(_) => { return Err(Error.Invalid) }, Err(e) => match e { Denied => {}, _ => { return Err(Error.Invalid) } } }
+  if f.len()? != 6 { return Err(Error.Invalid) }
+  match fs.open_rw(args[1]) { Ok(_) => { return Err(Error.Invalid) }, Err(e) => match e { Denied => {}, _ => { return Err(Error.Invalid) } } }
+  match fs.open_ro(args[2]) { Ok(_) => { return Err(Error.Invalid) }, Err(e) => match e { Denied => {}, _ => { return Err(Error.Invalid) } } }
+  match fs.open_ro(args[3]) { Ok(_) => { return Err(Error.Invalid) }, Err(e) => match e { NotFound => {}, _ => { return Err(Error.Invalid) } } }
+  match fs.open_ro("bad\0path") { Ok(_) => { return Err(Error.Invalid) }, Err(e) => match e { Invalid => {}, _ => { return Err(Error.Invalid) } } }
+  return Ok(())
+}
+"#;
+    let output = build_and_run_args("open-ro-permissions", source, &[
+        readable.to_str().unwrap(), denied.to_str().unwrap(), missing.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(std::fs::read(&readable).unwrap(), b"abcdef");
+    assert!(!missing.exists());
+}
+
+#[test]
+fn open_ro_control_and_imported_generic_parity() {
+    if !backend_available() { return; }
+    let fixtures = FileFixtures::new("open-ro-control");
+    let path = fixtures.dir.join("input");
+    std::fs::write(&path, b"abcdef").unwrap();
+    let library = r#"
+module positional
+import std.fs
+pub fn open<T>(value: T, path: str) -> Result<file, Error> = fs.open_ro(path.clone())
+pub fn read(f: file) -> Result<i64, Error> {
+  mut b := buffer(8)
+  return f.pread(b, 4)
+}
+"#;
+    let source = format!(r#"
+import std.fs
+import positional
+fn path_once(p: str) -> string {{ print(1); return p.clone() }}
+fn early(p: str) -> i64 {{ f := fs.open_ro({{ return 17; p }}); return 0 }}
+fn main() -> Result<(), Error> {{
+  path := "{}".clone()
+  f := positional.open(true, path)?
+  if positional.read(f)? != 2 {{ return Err(Error.Invalid) }}
+  print(path)
+  mut g := fs.open_ro(if true {{ path_once(path) }} else {{ "missing".clone() }})?
+  g = fs.open_ro(match 1 {{ 1 => path.clone(), _ => "missing".clone() }})?
+  if g.len()? != 6 {{ return Err(Error.Invalid) }}
+  h := fs.open_ro(loop {{ break path.clone() }}) else {{ return Err(Error.Invalid) }}
+  if h.len()? != 6 {{ return Err(Error.Invalid) }}
+  a := fs.open_ro(arena {{ path.clone() }})?
+  if a.len()? != 6 {{ return Err(Error.Invalid) }}
+  t := fs.open_ro(task_group {{ path.clone() }})?
+  if t.len()? != 6 {{ return Err(Error.Invalid) }}
+  match fs.open_ro(path).map_err(fn e: Error {{ e }}) {{ Ok(owner) => {{ if owner.len()? != 6 {{ return Err(Error.Invalid) }} }}, Err(e) => {{ return Err(e) }} }}
+  if early(path) != 17 {{ return Err(Error.Invalid) }}
+  rw := fs.open_rw(path)?
+  mut b := buffer(4)
+  if rw.pread(b, 2)? != 4 {{ return Err(Error.Invalid) }}
+  if b.bytes().as_str()? != "cdef" {{ return Err(Error.Invalid) }}
+  return Ok(())
+}}
+"#, path.display());
+    let files = [("positional.align", library), ("main.align", source.as_str())];
+    for output in [build_and_run_multi("open-ro-whole", &files, "main.align"),
+        build_per_unit_multi("open-ro-units", &files, "main.align").link_and_run()] {
+        assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), format!("{}\n1\n", path.display()));
+    }
+}
+
+#[test]
+fn open_ro_formation_and_move_diagnostics() {
+    for source in [
+        "fn main() { f := fs.open_ro(\"x\") }",
+        "import std.fs\nfn main() { f := fs.open_ro() }",
+        "import std.fs\nfn main() { f := fs.open_ro(\"x\", \"y\") }",
+        "import std.fs\nfn main() { f := fs.open_ro(1) }",
+        "import std.fs\nfn main() { f: Result<i64, Error> := fs.open_ro(\"x\") }",
+        "import std.fs\nfn main() -> Result<(), Error> { fs.open_ro(\"x\")?.len()?; return Ok(()) }",
+        "import std.fs\nfn main() -> Result<(), Error> { f := fs.open_ro(\"x\")?; g := f; f.len()?; return Ok(()) }",
+        "import std.fs\nfn main() -> Result<(), Error> { f := fs.open_ro(\"x\")?; print(f); return Ok(()) }",
+        "import std.fs\nfn main() -> Result<(), Error> { f := fs.open_ro(\"x\")?; xs := [1,2].par_map(|n| { f.len(); n }); return Ok(()) }",
+        "import std.fs\nfn main() { xs := [1,2].par_map(|n| { fs.open_ro(\"x\"); n }) }",
+    ] {
+        assert!(check_errs("open-ro-invalid", source), "{source}");
+        let mut sm = SourceMap::new();
+        assert!(check_per_unit(&mut sm, "open-ro-invalid.align", source).diags.has_errors(), "per-unit: {source}");
+    }
 }
