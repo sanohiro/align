@@ -67226,9 +67226,10 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// `w.write(x)` / `w.flush()` on a `writer` ([`Ty::Writer`]), the receiver already evaluated.
+    /// `w.write(x)` / `w.flush()` / `w.sync()` on a writer, the receiver already evaluated.
     /// `write` appends a `str` / owned `string` (auto-borrowed) / `bytes` (`slice<u8>`) / a
-    /// `builder`'s bytes; `flush` drains to the OS. Both yield `Result<(), Error>` and borrow the
+    /// `builder`'s bytes; `flush` drains to the OS and `sync` then requests native completion.
+    /// All yield `Result<(), Error>` and borrow the
     /// writer (never consumed — `Drop`-flushed/closed at scope exit).
     fn check_writer_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
@@ -67634,9 +67635,9 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// `f.pread(b: mut buffer, off)` / `f.pwrite(data, off)` / `f.len()` on a `file` ([`Ty::File`]),
+    /// File pread/pwrite/len/sync methods on an already evaluated `file` ([`Ty::File`]),
     /// the receiver already evaluated. Each **borrows** the file (never consumed — no move-out) and
-    /// yields `Result<i64, Error>` (`pread`/`len` a count, `pwrite` the full byte count written). A
+    /// yields `Result<i64, Error>` for counts/length, or `Result<(), Error>` for sync. A
     /// `file` has no borrowed variant, so — like `check_reader_method` — the receiver must be a bound
     /// local (an unbound owned-file temporary would leak its fd; lifted when Move temporaries drop).
     /// `pread` mirrors `reader.read`'s buffer-window discipline; `pwrite` accepts the same byte-source

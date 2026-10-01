@@ -110,3 +110,14 @@ omitted and when the native request is omitted; the restored three native owners
 pass. The cfg-selected native provider has exactly one F_FULLFSYNC arm on macOS
 and one fsync arm on Linux. Physical crash/device-cache behavior is explicitly
 outside the test's evidence; no stronger persistence conclusion is drawn.
+
+## Preflight review closure
+
+One independent full-diff inspection found two P2s and no production correctness
+or soundness defect. The existing exact sync decision is moved from the historical
+Open item into Settled. Each new sync insertion/rewrite now has separate source
+pattern/result assertions; buffer-only negative cases are explicitly exempt.
+The counted cleanup twins also assert the formed WriterSync count independently
+of relocating their owned path. Omitting any of the three operation rewrites or the independent path rewrite
+fails its named owner at the source assertion before that case is compiled. The focused borrowed consume/escape and success/error cleanup
+owners close this class without changing public contract, IR shape or strategy.

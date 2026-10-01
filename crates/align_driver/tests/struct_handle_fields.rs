@@ -351,8 +351,15 @@ fn change(borrow mut holder: Holder) { holder = Holder { sink: None, data: buffe
                 "fn fill(borrow mut data: buffer) { data.put_u8(0) }\nfn bad(borrow mut holder: Holder) { fill(holder.data) }",
             ),
         ] {
-            let body = body.replace("Some(sink) => {", "Some(sink) => { synchronized := sink.sync();")
-                .replace("sink.flush()", "sink.sync()");
+            let arms = usize::from(matches!(name, "return" | "consume" | "join" | "store" | "capture" | "arg_replace"));
+            assert_eq!(body.matches("Some(sink) => {").count(), arms, "{name}: sync arm witness");
+            let body = body.replace("Some(sink) => {", "Some(sink) => { synchronized := sink.sync();");
+            assert_eq!(body.matches("synchronized := sink.sync();").count(), arms, "{name}: sync insertion");
+            let captures = usize::from(name == "capture");
+            assert_eq!(body.matches("sink.flush()").count(), captures, "{name}: capture witness");
+            let body = body.replace("sink.flush()", "sink.sync()");
+            assert_eq!(body.matches("sink.flush()").count(), 0, "{name}: capture rewrite");
+            assert_eq!(body.matches("sink.sync()").count(), arms + captures, "{name}: sync identity");
             let source = format!("{prelude}\n{body}\nfn main() {{}}\n");
             let source = if mixed {
                 source
@@ -730,8 +737,18 @@ int32_t probe_readonly(int32_t fd) {
     for (per_unit, synchronization) in [(false, false), (true, false), (false, true), (true, true)] {
         let project = handle_project("counted", source);
         let source = if synchronization {
-            source.replace("sink.flush()?", "sink.sync()?")
-                .replace("fs.create(\"/dev/null\")", &format!("fs.create(\"{}\")", project.dir.join("output").display()))
+            assert_eq!(source.matches("sink.flush()?").count(), 1, "flush witness");
+            assert_eq!(source.matches("sink.sync()?").count(), 0, "original operation");
+            let synchronized = source.replace("sink.flush()?", "sink.sync()?");
+            assert_eq!(synchronized.matches("sink.flush()?").count(), 0, "sync rewrite");
+            assert_eq!(synchronized.matches("sink.sync()?").count(), 1, "sync witness");
+            let old_path = "fs.create(\"/dev/null\")";
+            let new_path = format!("fs.create(\"{}\")", project.dir.join("output").display());
+            assert_eq!(synchronized.matches(old_path).count(), 1, "path witness");
+            let relocated = synchronized.replace(old_path, &new_path);
+            assert_eq!(relocated.matches(old_path).count(), 0, "path rewrite");
+            assert_eq!(relocated.matches(&new_path).count(), 1, "owned sync fixture");
+            relocated
         } else { source.to_owned() };
         std::fs::write(project.dir.join("main.align"), &source).expect("write sync cleanup fixture");
         let source = source.as_str();
@@ -759,6 +776,11 @@ int32_t probe_readonly(int32_t fd) {
             );
             vec![lower_to_mir(&checked.hir)]
         };
+        let sync_operations = programs.iter().flat_map(|program| &program.fns)
+            .flat_map(|function| &function.blocks).flat_map(|block| &block.stmts)
+            .filter(|statement| matches!(statement, align_mir::Stmt::Let(_, align_mir::Rvalue::WriterSync(_))))
+            .count();
+        assert_eq!(sync_operations, usize::from(synchronization), "formed sync operation");
         let mut objects = Vec::new();
         for (index, program) in programs.iter().enumerate() {
             let ir = emit_llvm_ir(program, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false).expect("LLVM");
