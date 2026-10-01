@@ -98,3 +98,22 @@ and raw-extent owners exercise success and canonical-zero Invalid failures;
 its allocation-count owner records zero global allocation delta. No input view
 is retained, no new cleanup authority is introduced, and no matrix cell is
 silently delegated to K1 or consumer adoption.
+
+
+## Code review finding closure
+
+The independent full-diff review found one stale exact-count owner: the runtime
+key inventory and compile-time assertion were 449, while the unique/alphabetical
+unit owner still expected 448. The inventory-class sweep checked the key array,
+registry validators, declaration owners, native export counts and current ABI
+ledger; that unit assertion was the only missed live count. It now expects 449.
+`runtime_keys_are_complete_unique_and_alphabetical` is the discriminating owner.
+No public contract, IR shape, ownership or ABI strategy changed in this fix.
+
+
+The local bounded gate also exposed the same inventory class in the two HIR
+cardinality tripwires: both still expected 342 variants instead of 343. Their
+storage/validation policies already handled `StrParseI64` exhaustively. The
+class sweep now includes every HIR and runtime-key cardinality owner; both
+tripwires are updated and run directly before the final gate. These are author
+verification failures, not additional independent-review findings.

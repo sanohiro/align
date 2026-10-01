@@ -76665,14 +76665,14 @@ mod tests {
         // Digest New/Update retain no storage; Finish forms an individually owned array
         // with fresh empty content. FsTree also constructs fresh owners without retained inputs.
         // JsonEncode replaces three variants with one fresh owned Result producer.
-        // StrCharBoundary has a scalar result and retains no storage.
+        // StrCharBoundary and StrParseI64 have Copy results and retain no input storage.
         // BufferAppendFilled mutates an existing owned buffer and produces Unit, so it shares
         // BufferAppend's fresh-missing policy.
         // FloatScope is an explicit forwarding wrapper with no storage of its own.
         // HttpServerMaxRequestBodyBytes mutates a server setting and returns Unit.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 342,
+            variants, 343,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 
