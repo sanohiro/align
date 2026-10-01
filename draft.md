@@ -2834,6 +2834,20 @@ allocation; allocation failure aborts. This is Pure explicit allocation.
 The existing `buffer(capacity)` retains its best-effort empty read-window
 contract. There is no separate zeroed constructor.
 
+`b.capacity() -> i64` is a Pure, zero-argument, nonconsuming query of a
+buffer's usable read-window capacity, independent of initialized `b.len()`.
+The existing stable local/field and borrowed-payload receiver rules apply;
+no allocation or retained view is added. Successful `buffer(n)` reservation
+publishes `n`, while invalid/unreservable requests publish zero. Filled buffers
+have capacity at least length. Puts, appends and successful `read_line` retain
+old capacity or raise it to the new initialized/body length. Short reads, EOF
+and failed line reads retain capacity; decoded/returned buffers publish their
+initialized length as capacity. `read_line` may grow beyond the old window;
+capacity limits bounded fills. Hidden allocator spare bytes do not enlarge
+that window. The result promises neither physical-memory residency nor future
+growth success; existing best-effort construction and terminal growth/OOM
+policies remain (plan 87).
+
 `b.append_filled(length: i64, value: u8) -> ()` is the append member of the same
 bulk-write family: it extends the published window of a `mut buffer` by exactly
 `length` bytes of `value`, in one growth rather than a growth sequence or a call

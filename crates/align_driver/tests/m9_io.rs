@@ -839,3 +839,117 @@ fn io_copy_argument_types_are_checked() {
         "import std.io\npub fn main() -> Result<(), Error> {\n  n := io.copy(io.stdin)?\n  return Ok(())\n}\n",
     ), "the wrong argument count must be rejected");
 }
+
+
+/// Only this exclusively acquired directory owns the new capacity fixture's paths.
+struct CapacityFixture(PathBuf);
+impl CapacityFixture {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!("align-capacity-{}-{}", std::process::id(), thin_nonce()));
+        std::fs::create_dir(&path).expect("exclusive capacity fixture directory");
+        Self(path)
+    }
+}
+impl Drop for CapacityFixture {
+    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+}
+
+#[test]
+fn buffer_capacity_in_imported_helpers_and_read_windows() {
+    if !backend_available() { return; }
+    let fixture = CapacityFixture::new();
+    let path = fixture.0.join("input");
+    std::fs::write(&path, b"abcde").unwrap();
+    let path = path.to_str().unwrap().replace('\\', "\\\\").replace('"', "\\\"");
+    let helper = r#"module windows
+pub Holder<T> { data: buffer, marker: T }
+pub fn window<T>(borrow owner: Holder<T>) -> i64 = owner.data.capacity()
+pub fn query(borrow data: buffer) -> i64 = data.capacity()
+pub fn owned(data: buffer) -> buffer = data
+pub fn after_drop() -> i64 { data := buffer(13); return data.capacity() }
+pub fn optional(borrow data: Option<buffer>) -> i64 = match data {
+  Some(active) => active.capacity(), None => 0,
+}
+pub fn result(borrow data: Result<buffer, i32>) -> i64 = match data {
+  Ok(active) => active.capacity(), Err(_) => 0,
+}
+"#;
+    let source = r#"module main
+import windows
+import std.fs
+fn main() -> Result<(), Error> {
+  print(windows.after_drop())
+  empty := buffer(0)
+  negative := buffer(-1)
+  huge := buffer(9223372036854775807)
+  print(empty.capacity())
+  print(negative.capacity())
+  print(huge.capacity())
+  filled := buffer.filled(3, 65 as u8)
+  print(filled.capacity() >= 3)
+  mut grown := buffer(2)
+  print(grown.capacity()); print(grown.len())
+  grown.put_u8(65)
+  print(grown.capacity()); print(grown.len())
+  grown.append("xyz".bytes())
+  print(grown.capacity()); print(grown.len())
+  grown.append_filled(2, 66 as u8)
+  print(grown.capacity()); print(grown.len())
+  holder := windows.Holder { data: grown, marker: 1 }
+  print(windows.window(holder))
+  optional: Option<buffer> := Some(buffer(5))
+  successful: Result<buffer, i32> := Ok(buffer(7))
+  print(windows.optional(optional)); print(windows.result(successful))
+  selected: Option<i64> := Some(windows.optional(optional))
+  if (selected else 0) != 5 { return Err(Error.Invalid) }
+  mut returned := windows.owned(buffer(7))
+  print(returned.capacity())
+  returned = buffer(9)
+  print(returned.capacity())
+  r := fs.open("INPUT")?
+  mut read_window := buffer(3)
+  print(windows.query(read_window)); print(read_window.len())
+  mut iteration := 0
+  loop {
+    count := r.read(read_window).map_err(fn e: Error { e })?
+    print(count)
+    print(if count == 0 { read_window.capacity() } else { windows.query(read_window) })
+    print(read_window.len())
+    iteration = iteration + 1
+    if count == 0 { break }
+  }
+  print(iteration)
+  return Ok(())
+}
+"#.replace("INPUT", &path);
+    let files = [("main.align", source.as_str()), ("windows.align", helper)];
+    for output in [build_and_run_multi("capacity-windows-whole", &files, "main.align"),
+        build_per_unit_multi("capacity-windows-unit", &files, "main.align").link_and_run()] {
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout),
+            "13\n0\n0\n0\ntrue\n2\n0\n2\n1\n4\n4\n6\n6\n6\n5\n7\n7\n9\n3\n0\n3\n3\n3\n2\n3\n2\n0\n3\n0\n3\n");
+    }
+}
+
+#[test]
+fn buffer_capacity_formation_and_move_diagnostics() {
+    for (name, source, diagnostic) in [
+        ("arity", "fn main() { data := buffer(3); print(data.capacity(1)) }", "takes no arguments"),
+        ("temporary", "fn main() { print(buffer(3).capacity()) }", "bind the buffer to a local"),
+        ("receiver", "fn main() { print(1.capacity()) }", "capacity"),
+        ("result", "fn main() { data := buffer(3); value: bool := data.capacity() }", "i64 vs bool"),
+        ("move", "fn take(data: buffer) {}\nfn main() { data := buffer(3); before := data.capacity(); take(data); print(data.capacity()) }", "moved"),
+        ("borrowed_return", "fn bad(borrow data: buffer) -> buffer { before := data.capacity(); return data }\nfn main() {}", "borrow"),
+        ("borrowed_payload_capture", "fn bad(borrow data: Option<buffer>) { match data { Some(active) => { callback := fn() { active.capacity() } }, None => {} } }\nfn main() {}", "borrow"),
+        ("unresolved_receiver", "fn main() { print(missing.capacity()) }", "undefined"),
+    ] {
+        let files = [("main.align", source)];
+        let checked = diff_check_multi(&format!("capacity-{name}"), &files, "main.align");
+        assert!(checked.whole_errors && checked.per_unit_errors, "{name}: {}\n{}", checked.whole_diags, checked.per_unit_diags);
+        assert!(checked.whole_diags.contains(diagnostic) && checked.per_unit_diags.contains(diagnostic), "{name}: {}\n{}", checked.whole_diags, checked.per_unit_diags);
+        if name == "unresolved_receiver" {
+            assert_eq!(checked.whole_diags.matches("error:").count(), 1, "{}", checked.whole_diags);
+            assert_eq!(checked.per_unit_diags.matches("error:").count(), 1, "{}", checked.per_unit_diags);
+        }
+    }
+}

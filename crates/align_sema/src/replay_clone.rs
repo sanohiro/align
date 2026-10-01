@@ -1139,6 +1139,9 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         ExprKind::BufferLen { buffer } => ExprKind::BufferLen {
             buffer: boxed!(buffer),
         },
+        ExprKind::BufferCapacity { buffer } => ExprKind::BufferCapacity {
+            buffer: boxed!(buffer),
+        },
         ExprKind::BytesRead { bytes, offset, be } => ExprKind::BytesRead {
             bytes: boxed!(bytes),
             offset: boxed!(offset),
@@ -2781,7 +2784,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::StrBytes { inner: recv }
         | ExprKind::BytesView { bytes: recv, .. }
         | ExprKind::SliceAsBytes { slice: recv, .. }
-        | ExprKind::BufferLen { buffer: recv }
+        | ExprKind::BufferLen { buffer: recv } | ExprKind::BufferCapacity { buffer: recv }
         | ExprKind::FsExists { path: recv }
         | ExprKind::FsRemove { path: recv }
         | ExprKind::FsCreateDir { path: recv }

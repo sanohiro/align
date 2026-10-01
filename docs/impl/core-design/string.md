@@ -181,6 +181,20 @@ nonzero length, none for zero; the Move handle may allocate. Initialization is
 O(length). Invalid/overflowing counts abort before allocation; OOM aborts.
 The ordinary `buffer(capacity)` remains a best-effort empty read window.
 
+`b.capacity() -> i64` is a Pure, zero-argument, nonconsuming query of a
+buffer's usable read-window capacity, independent of initialized `b.len()`.
+The existing stable local/field and borrowed-payload receiver rules apply;
+no allocation or retained view is added. Successful `buffer(n)` reservation
+publishes `n`, while invalid/unreservable requests publish zero. Filled buffers
+have capacity at least length. Puts, appends and successful `read_line` retain
+old capacity or raise it to the new initialized/body length. Short reads, EOF
+and failed line reads retain capacity; decoded/returned buffers publish their
+initialized length as capacity. `read_line` may grow beyond the old window;
+capacity limits bounded fills. Hidden allocator spare bytes do not enlarge
+that window. The result promises neither physical-memory residency nor future
+growth success; existing best-effort construction and terminal growth/OOM
+policies remain ([plan 87](../87-buffer-read-capacity-plan.md)).
+
 `b.append_filled(length: i64, value: u8) -> ()` is the family's append member.
 It extends a `mut buffer`'s published window by exactly `length` bytes of
 `value` in one growth, never a growth sequence or a call per byte. Zero length

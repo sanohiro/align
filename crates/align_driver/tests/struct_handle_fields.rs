@@ -410,6 +410,11 @@ pub fn retain(borrow item: Item<buffer>, borrow mut result: View) {
   result = View { data: bytes(item) }
 }
 pub fn identity<T>(borrow item: Item<T>) -> i64 = 1
+pub fn nested_capacity(borrow outer: Outer) -> i64 = outer.inner.data.capacity()
+pub fn tagged_capacity(borrow data: Data) -> i64 = match data {
+  Present(active) => active.data.capacity(), Absent => 0,
+}
+
 "#;
         let helper = if mixed {
             helper_template.to_string()
@@ -440,7 +445,7 @@ pub fn identity<T>(borrow item: Item<T>) -> i64 = 1
             ),
             (
                 "tagged",
-                "mut tagged: views.Data := views.Present(views.Item { data: buffer(8), extra: empty }); view := views.tagged(tagged); tagged = views.Absent; print(view.u8(0))",
+                "mut tagged: views.Data := views.Data.Present(views.Item { data: buffer(8), extra: empty }); view := views.tagged(tagged); tagged = views.Data.Absent; print(view.u8(0))",
             ),
         ] {
             let invalid = format!(
@@ -498,6 +503,11 @@ fn main() -> i32 {
   if kept.data.u8(0) != 66 { return 3 }
   rows := views.Rows { items: None }
   if views.first(rows).len() != 0 { return 4 }
+  nested := views.Outer { inner: views.Item { data: buffer(4), extra: empty } }
+  if views.nested_capacity(nested) != 4 { return 7 }
+  tagged: views.Data := views.Data.Present(views.Item { data: buffer(6), extra: empty })
+  if views.tagged_capacity(tagged) != 6 { return 8 }
+
   return 0
 }
 "#;
@@ -908,7 +918,7 @@ fn borrowed_handle_receiver_cache_replays_and_invalidates_body_edits() {
 fn borrowed_buffer_views_support_parallel_shared_readers() {
     let helper = r#"module shared_buffer
 pub Item { data: buffer }
-pub fn length(borrow item: Item) -> i64 = item.data.bytes().len()
+pub fn length(borrow item: Item) -> i64 = item.data.bytes().len() + item.data.capacity()
 pub fn read(items: slice<Item>) -> i64 {
   return [1, 2].par_map(fn x { x + length(items[0]) }).sum()
 }
@@ -940,7 +950,7 @@ fn main() {
                 "{}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            assert_eq!(String::from_utf8_lossy(&output.stdout), "5\n");
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "21\n");
         }
     }
 }

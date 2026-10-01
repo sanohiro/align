@@ -1314,6 +1314,7 @@ merely because its `Ty` matches.
 | `BufferBytes` | `env[]; child[buffer]`; `Buffer; result bytes; view inherits buffer provenance; Pure`. |
 | `StrBytes` | `env[]; child[inner]`; `Str; result bytes; view inherits string provenance; Pure`. |
 | `BufferLen` | `env[]; child[buffer]`; `Buffer; result i64; borrowed; Pure`. |
+| `BufferCapacity` | `env[]; child[buffer]`; exact stable Buffer receiver and i64 result; borrowed, Pure, no retained view. Observes descriptor read-window capacity, not initialized length or allocator spare (plan 87). |
 | `BytesRead` | `env[be]`; `child[bytes,offset]`; `bytes,i64; result exact stored read scalar in {i8/u8/i16/u16/i32/u32/i64/u64/f32/f64}; be must be false for one-byte widths; borrowed bounds-checked read; Pure`. |
 | `BufferPut` | `env[be]`; `child[buffer,value]`; `SourceMutLocal(Buffer,buffer); value exact supported binary scalar; be false for one-byte widths; result Unit; buffer mutated; Pure`. |
 | `BufferAppend` | `env[]; child[buffer,data]`; `SourceMutLocal(Buffer,buffer),byte-view; result Unit; data borrowed, buffer mutated; Pure`. |
@@ -2124,7 +2125,7 @@ decode in either whole-program or per-unit emission.
 
 ## Request 61 receiver extension
 
-`WriterWrite`/`WriterFlush` and `BufferBytes`/`BufferLen` accept an exact typed
+`WriterWrite`/`WriterFlush` and `BufferBytes`/`BufferLen`/`BufferCapacity` accept an exact typed
 stable local or nonempty struct-field path, including checked borrowed-match
 roots. Expression-flow validation still authenticates every path segment and
 receiver type; `IoCopy` retains its prior local/std-stream gate. Borrowed match
@@ -2132,7 +2133,7 @@ metadata admits the buffer/writer leaves specified by
 [plan 37](37-borrowed-buffer-writer-plan.md), with the same owner/path/type and
 no-independent-cleanup replay checks. View-header fallback roots participate in
 local and eager-snapshot invalidation even when no legacy source-map entry
-exists. There is no new HIR record or serialized representation.
+exists. The Request 61 receiver extension adds no HIR record or serialized representation.
 
 ## Imported mutable-retention records (Request 43/49)
 

@@ -28292,6 +28292,7 @@ fn main() -> i32 = 0
     fn borrowed_handle_receivers_reject_forged_mir_projections() {
         for (payload, observation) in [
             ("buffer", "handle.len()"),
+            ("buffer", "handle.capacity()"),
             ("writer", "{ result := handle.write(\"x\"); 1 }"),
             ("writer", "{ result := handle.sync(); 1 }"),
         ] {
@@ -28308,7 +28309,7 @@ fn main() -> i32 = 0
                     for block in &mut function.blocks {
                         for statement in &mut block.stmts {
                             let operand = match statement {
-                                Stmt::Let(_, Rvalue::BufferLen(buffer)) => buffer,
+                                Stmt::Let(_, Rvalue::BufferLen(buffer) | Rvalue::BufferCapacity(buffer)) => buffer,
                                 Stmt::Let(_, Rvalue::WriterWrite(writer, _) | Rvalue::WriterSync(writer)) => writer,
                                 _ => continue,
                             };
@@ -31533,6 +31534,37 @@ fn main() -> i32 = 0
                 );
             }
         }
+    }
+
+    #[test]
+    fn buffer_capacity_mir_gate_requires_exact_native_receiver() -> Result<(), &'static str> {
+        let base = mir("fn capacity(borrow value: buffer) -> i64 = value.capacity()\nfn main() {}\n");
+        assert!(emit_llvm_ir(&base, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_ok());
+        for mutation in 0..4 {
+            let mut bad = base.clone();
+            let mut changed = false;
+            for function in &mut bad.fns {
+                for block in &mut function.blocks {
+                    for statement in &mut block.stmts {
+                        let Stmt::Let(value, Rvalue::BufferCapacity(receiver)) = statement else { continue; };
+                        changed = true;
+                        match mutation {
+                            0 => *function.value_tys.get_mut(usize::try_from(*value).map_err(|_| "value index")?).ok_or("value type")? =
+                                Ty::Int(IntTy { bits: 32, signed: true }),
+                            1 => *receiver = Operand::Const(Const::Unit),
+                            2 => *receiver = Operand::Value(u32::MAX),
+                            _ => {
+                                let Operand::Value(source) = receiver else { return Err("capacity receiver SSA"); };
+                                *function.value_tys.get_mut(usize::try_from(*source).map_err(|_| "receiver index")?).ok_or("receiver type")? = Ty::Reader;
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(changed, "fixture must contain capacity observation");
+            assert!(emit_llvm_ir(&bad, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_err(), "capacity/{mutation}");
+        }
+        Ok(())
     }
 
     #[test]

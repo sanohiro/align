@@ -17008,7 +17008,7 @@ impl EffectScan<'_> {
             ExprKind::StrBytes { inner } => walk!(inner),
             ExprKind::BytesView { bytes, .. } => walk!(bytes),
             ExprKind::SliceAsBytes { slice, .. } => walk!(slice),
-            ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => walk!(buffer),
+            ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } | ExprKind::BufferCapacity { buffer } => walk!(buffer),
             // Binary decode/encode (A2) are pure in-memory reads/growth (no I/O — a buffer `put`
             // mutates local heap like a `mut` array store, never a syscall). Walk the sub-exprs.
             ExprKind::BytesRead { bytes, offset, .. } => {
@@ -25193,7 +25193,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::FilePwrite { .. }
             | ExprKind::FileLen { .. } | ExprKind::FileSync { .. }
             | ExprKind::BufferNew { .. }
-            | ExprKind::BufferLen { .. }
+            | ExprKind::BufferLen { .. } | ExprKind::BufferCapacity { .. }
             | ExprKind::BytesRead { .. }
             | ExprKind::BytesSet { .. }
             | ExprKind::BytesFill { .. }
@@ -25665,7 +25665,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::FilePwrite { .. }
             | ExprKind::FileLen { .. } | ExprKind::FileSync { .. }
             | ExprKind::BufferNew { .. }
-            | ExprKind::BufferLen { .. }
+            | ExprKind::BufferLen { .. } | ExprKind::BufferCapacity { .. }
             | ExprKind::BytesRead { .. }
             | ExprKind::BytesSet { .. }
             | ExprKind::BytesFill { .. }
@@ -29623,7 +29623,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(writer, depth);
             }
             ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } | ExprKind::FileSync { .. } => self.walk_file_op(&e.kind, depth),
-            ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.walk(buffer, depth),
+            ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } | ExprKind::BufferCapacity { buffer } => self.walk(buffer, depth),
             ExprKind::BytesRead { bytes, offset, .. } => {
                 self.walk(bytes, depth);
                 self.walk(offset, depth);
@@ -31917,7 +31917,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::FilePwrite { .. }
         | ExprKind::FileLen { .. } | ExprKind::FileSync { .. }
         | ExprKind::BufferNew { .. }
-        | ExprKind::BufferLen { .. }
+        | ExprKind::BufferLen { .. } | ExprKind::BufferCapacity { .. }
         | ExprKind::BytesRead { .. }
         | ExprKind::BytesSet { .. }
         | ExprKind::BytesFill { .. }
@@ -40930,7 +40930,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::FrameInnerJoin { .. }
             | ExprKind::IoCopy { .. } | ExprKind::FileCreateRw { .. }
             | ExprKind::FileOpenRw { .. } | ExprKind::FileOpenRo { .. } | ExprKind::FileCreateRwExclusive { .. } | ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. }
-            | ExprKind::FileLen { .. } | ExprKind::FileSync { .. } | ExprKind::BufferNew { .. } | ExprKind::BufferLen { .. }
+            | ExprKind::FileLen { .. } | ExprKind::FileSync { .. } | ExprKind::BufferNew { .. } | ExprKind::BufferLen { .. } | ExprKind::BufferCapacity { .. }
             | ExprKind::BytesRead { .. }
             | ExprKind::BytesSet { .. }
             | ExprKind::BytesFill { .. }
@@ -45744,7 +45744,7 @@ impl<'a> MoveCheck<'a> {
                     ExprKind::StrBytes { inner: child }
                     | ExprKind::StrTrim { recv: child, .. }
                     | ExprKind::BufferBytes { buffer: child }
-                    | ExprKind::BufferLen { buffer: child }
+                    | ExprKind::BufferLen { buffer: child } | ExprKind::BufferCapacity { buffer: child }
                     | ExprKind::BytesAsStr { bytes: child } => {
                         (child.as_ref(), false, false, false, Post::None)
                     }
@@ -47049,7 +47049,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::StrBytes { inner } => move_expr!(self, inner, moved, false, false),
             ExprKind::BytesView { bytes, .. } => move_expr!(self, bytes, moved, false, false),
             ExprKind::SliceAsBytes { slice, .. } => move_expr!(self, slice, moved, false, false),
-            ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => move_expr!(self, buffer, moved, false, false),
+            ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } | ExprKind::BufferCapacity { buffer } => move_expr!(self, buffer, moved, false, false),
             // Binary decode/encode (A2): every operand is borrowed (a read, or a buffer grown in
             // place), never consumed.
             ExprKind::BytesRead { bytes, offset, .. } => {
@@ -55265,6 +55265,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
         }
         match method {
+            "capacity" if recv_ty == Ty::Buffer => self.check_buffer_capacity(recv_expr, args, span),
             // `json.doc` navigation / leaf accessors (J4): `d.kind()` / `d.get(k)` / `d.at(i)` /
             // `d.as_i64()` / `d.as_f64()` / `d.as_bool()`. Type-guarded on the receiver (checked once
             // above), BEFORE the shared `get` (box) arm so the name stays free on other values.
@@ -62875,6 +62876,27 @@ impl<'a, 't> Checker<'a, 't> {
                     }
                 }
             }
+        }
+    }
+
+    /// Observe the usable read window without moving or mutating its stable owner.
+    fn check_buffer_capacity(&mut self, receiver: Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Int(0), ty: Ty::Error, span };
+        if !args.is_empty() {
+            self.diags.error(format!("'.capacity()' takes no arguments, got {}", args.len()), span);
+            return err;
+        }
+        if !matches!(receiver.kind, ExprKind::Local(_) | ExprKind::Field { .. }) {
+            self.diags.error(
+                "bind the buffer to a local first, then call the method (`b := buffer(n)` then `b.capacity()`) — a temporary buffer handle is not dropped yet".to_string(),
+                span,
+            );
+            return err;
+        }
+        Expr {
+            kind: ExprKind::BufferCapacity { buffer: Box::new(receiver) },
+            ty: Ty::Int(IntTy { bits: 64, signed: true }),
+            span,
         }
     }
 
@@ -70614,7 +70636,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(writer);
             }
             k @ (ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } | ExprKind::FileSync { .. }) => self.finalize_file_op(k),
-            ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.finalize_expr(buffer),
+            ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } | ExprKind::BufferCapacity { buffer } => self.finalize_expr(buffer),
             ExprKind::BytesRead { bytes, offset, .. } => {
                 self.finalize_expr(bytes);
                 self.finalize_expr(offset);
@@ -76691,9 +76713,10 @@ mod tests {
         // FloatScope is an explicit forwarding wrapper with no storage of its own.
         // HttpServerMaxRequestBodyBytes mutates a server setting and returns Unit.
         // FileSync and WriterSync borrow native owners and return unit/Error.
+        // BufferCapacity is a non-retaining scalar observation of a borrowed owner.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 347,
+            variants, 348,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

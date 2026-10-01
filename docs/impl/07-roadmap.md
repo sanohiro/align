@@ -1446,6 +1446,8 @@ required `import` — the `core.json` pattern, not yet Align-over-FFI library co
   str|bytes|builder)` / `w.flush()`, all `Result<_, Error>`. `core.buffer`'s build (deferred in
   `open-questions.md` "`bytes`/`buffer`" until a consumer) landed here as the minimal owned growable
   `Ty::Buffer` (`buffer(cap)` / `.bytes()` → `slice<u8>` / `.len()`), the sink `reader.read` fills.
+  Plan 87 adds Pure `.capacity() -> i64`, exposing the existing usable read window
+  independently of current length, without changing best-effort allocation policy.
   The **errno→`Error` fixed table** (`draft.md` §18.2) is one runtime helper (`io_error_to_status`)
   + one MIR decode (`make_error_from_status`, branchless), shared by `fs.read_file`/`fs.open`/
   `fs.create`/read/write/flush. **Completion condition met:** an Align program byte-exact-copies a

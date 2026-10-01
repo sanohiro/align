@@ -263,7 +263,7 @@ operation is added.
 
 Stable `buffer` and `writer` fields, including nested fields and checked borrowed
 match projections, support their existing non-consuming receivers: buffer
-`.bytes()`/`.len()` and writer `.write(...)`/`.flush()`. The original owner keeps
+`.bytes()`/`.len()`/`.capacity()` and writer `.write(...)`/`.flush()`. The original owner keeps
 the handle and its only cleanup; byte views retain that owner’s generation and
 lifetime. Plain field assignment still moves, and exclusive partial-Move-field
 arguments remain excluded. [Request 61’s contract](impl/37-borrowed-buffer-writer-plan.md) owns receiver validation and closure.
@@ -875,6 +875,20 @@ length, including zero, with capacity at least length. Nonempty construction
 acquires one payload; initialization is O(length). The handle may allocate.
 Negative/overflowing counts abort before allocation and OOM aborts. The existing
 `buffer(capacity)` remains a best-effort empty read window.
+
+`b.capacity() -> i64` is a Pure, zero-argument, nonconsuming query of a
+buffer's usable read-window capacity, independent of initialized `b.len()`.
+The existing stable local/field and borrowed-payload receiver rules apply;
+no allocation or retained view is added. Successful `buffer(n)` reservation
+publishes `n`, while invalid/unreservable requests publish zero. Filled buffers
+have capacity at least length. Puts, appends and successful `read_line` retain
+old capacity or raise it to the new initialized/body length. Short reads, EOF
+and failed line reads retain capacity; decoded/returned buffers publish their
+initialized length as capacity. `read_line` may grow beyond the old window;
+capacity limits bounded fills. Hidden allocator spare bytes do not enlarge
+that window. The result promises neither physical-memory residency nor future
+growth success; existing best-effort construction and terminal growth/OOM
+policies remain (plan 87).
 
 `b.append_filled(length: i64, value: u8) -> ()` is that family's append member:
 it extends a `mut buffer`'s published window by exactly `length` bytes of
