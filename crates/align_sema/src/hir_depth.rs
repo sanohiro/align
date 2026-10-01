@@ -922,6 +922,7 @@ fn walk_body_records<'a>(
         | ExprKind::CryptoDigestFinish { digest: recv }
                 | ExprKind::FileCreateRw { path: recv }
                 | ExprKind::FileOpenRw { path: recv }
+                | ExprKind::FileOpenRo { path: recv }
                 | ExprKind::FileLen { file: recv }
                 | ExprKind::BufferBytes { buffer: recv }
                 | ExprKind::StrBytes { inner: recv }

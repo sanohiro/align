@@ -17064,7 +17064,7 @@ impl EffectScan<'_> {
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path }
             | ExprKind::FsCreateDir { path } | ExprKind::FsIsDir { path } | ExprKind::FsRemoveEmptyDir { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
-            | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } => {
+            | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } | ExprKind::FileOpenRo { path } => {
                 walk!(path);
                 self.impure_direct = true;
             }
@@ -25188,6 +25188,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::IoCopy { .. }
             | ExprKind::FileCreateRw { .. }
             | ExprKind::FileOpenRw { .. }
+            | ExprKind::FileOpenRo { .. }
             | ExprKind::FilePread { .. }
             | ExprKind::FilePwrite { .. }
             | ExprKind::FileLen { .. }
@@ -25659,6 +25660,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::IoCopy { .. }
             | ExprKind::FileCreateRw { .. }
             | ExprKind::FileOpenRw { .. }
+            | ExprKind::FileOpenRo { .. }
             | ExprKind::FilePread { .. }
             | ExprKind::FilePwrite { .. }
             | ExprKind::FileLen { .. }
@@ -29124,7 +29126,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path }
             | ExprKind::FsCreateDir { path } | ExprKind::FsIsDir { path } | ExprKind::FsRemoveEmptyDir { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
-            | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } => self.walk(path, depth),
+            | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } | ExprKind::FileOpenRo { path } => self.walk(path, depth),
             ExprKind::RenameNoReplace { source, destination } => {
                 self.walk(source, depth);
                 self.walk(destination, depth);
@@ -31910,6 +31912,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::IoCopy { .. }
         | ExprKind::FileCreateRw { .. }
         | ExprKind::FileOpenRw { .. }
+        | ExprKind::FileOpenRo { .. }
         | ExprKind::FilePread { .. }
         | ExprKind::FilePwrite { .. }
         | ExprKind::FileLen { .. }
@@ -40926,7 +40929,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::CodecEncoderPut { .. } | ExprKind::CodecEncoderFinish { .. }
             | ExprKind::FrameInnerJoin { .. }
             | ExprKind::IoCopy { .. } | ExprKind::FileCreateRw { .. }
-            | ExprKind::FileOpenRw { .. } | ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. }
+            | ExprKind::FileOpenRw { .. } | ExprKind::FileOpenRo { .. } | ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. }
             | ExprKind::FileLen { .. } | ExprKind::BufferNew { .. } | ExprKind::BufferLen { .. }
             | ExprKind::BytesRead { .. }
             | ExprKind::BytesSet { .. }
@@ -47679,7 +47682,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path }
             | ExprKind::FsCreateDir { path } | ExprKind::FsIsDir { path } | ExprKind::FsRemoveEmptyDir { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
-            | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } => move_expr!(self, path, moved, false, false),
+            | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } | ExprKind::FileOpenRo { path } => move_expr!(self, path, moved, false, false),
             ExprKind::RenameNoReplace { source, destination } => {
                 move_expr!(self, source, moved, false, false);
                 move_expr!(self, destination, moved, false, false);
@@ -54276,11 +54279,11 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.fs", &format!("fs.{method}"), span);
                 return self.check_fs_beneath(method, args, span);
             }
-            // `fs.create_rw(path)` (O_RDWR|O_CREAT|O_TRUNC) / `fs.open_rw(path)` (O_RDWR, must exist)
+            // File constructors: create_rw (O_RDWR|O_CREAT|O_TRUNC), open_rw (O_RDWR), open_ro (O_RDONLY).
             // -> Result<file, Error> — the offset-addressed block I/O handle (A4).
-            if module == "fs" && (method == "create_rw" || method == "open_rw") {
+            if module == "fs" && matches!(method, "create_rw" | "open_rw" | "open_ro") {
                 self.require_import("std.fs", &format!("fs.{method}"), span);
-                return self.check_fs_create_open_rw(method == "create_rw", args, span);
+                return self.check_fs_create_open_rw(method, args, span);
             }
             // `fs.write_file(path, data)` -> Result<(), Error> (data: str | bytes | builder).
             if module == "fs" && method == "write_file" {
@@ -63425,22 +63428,22 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// `fs.create_rw(path)` (`O_RDWR|O_CREAT|O_TRUNC`) / `fs.open_rw(path)` (`O_RDWR`, must exist) ->
-    /// `Result<file, Error>` (A4). The offset-addressed block read+write handle; the `file` owns its
+    /// `fs.create_rw(path)` / `fs.open_rw(path)` / `fs.open_ro(path)` ->
+    /// `Result<file, Error>`. The offset-addressed handle; the `file` owns its
     /// fd (closed on `Drop`). Mirrors [`Self::check_fs_open_create`]; the path is a `str` (owned
     /// `string` auto-borrowed).
-    fn check_fs_create_open_rw(&mut self, create: bool, args: &[ast::Expr], span: Span) -> Expr {
-        let name = if create { "fs.create_rw" } else { "fs.open_rw" };
+    fn check_fs_create_open_rw(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let name = format!("fs.{method}");
         if args.len() != 1 {
             self.diags
                 .error(format!("'{name}' expects 1 argument (the path), got {}", args.len()), span);
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         }
         let path = self.check_str_init(&args[0]);
-        let kind = if create {
-            ExprKind::FileCreateRw { path: Box::new(path) }
-        } else {
-            ExprKind::FileOpenRw { path: Box::new(path) }
+        let kind = match method {
+            "create_rw" => ExprKind::FileCreateRw { path: Box::new(path) },
+            "open_ro" => ExprKind::FileOpenRo { path: Box::new(path) },
+            _ => ExprKind::FileOpenRw { path: Box::new(path) },
         };
         Expr {
             kind,
@@ -70143,7 +70146,7 @@ impl<'a, 't> Checker<'a, 't> {
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path }
             | ExprKind::FsCreateDir { path } | ExprKind::FsIsDir { path } | ExprKind::FsRemoveEmptyDir { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
-            | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } => self.finalize_expr(path),
+            | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } | ExprKind::FileOpenRo { path } => self.finalize_expr(path),
             ExprKind::RenameNoReplace { source, destination } => {
                 self.finalize_expr(source);
                 self.finalize_expr(destination);
@@ -76672,7 +76675,7 @@ mod tests {
         // HttpServerMaxRequestBodyBytes mutates a server setting and returns Unit.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 343,
+            variants, 344,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

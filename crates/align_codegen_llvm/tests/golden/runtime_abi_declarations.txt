@@ -267,6 +267,7 @@ key|IoFileCreate|io_file_create|HostState|declare i32 @align_rt_io_file_create(p
 key|IoFileFree|io_file_free|HostState|declare void @align_rt_io_file_free(ptr) #2
 key|IoFileLen|io_file_len|HostState|declare i64 @align_rt_io_file_len(ptr) #2
 key|IoFileOpen|io_file_open|HostState|declare i32 @align_rt_io_file_open(ptr, i64, ptr) #2
+key|IoFileOpenRo|io_file_open_ro|HostState|declare i32 @align_rt_io_file_open_ro(ptr, i64, ptr) #2
 key|IoFilePread|io_file_pread|HostState|declare i64 @align_rt_io_file_pread(ptr, ptr, i64) #2
 key|IoFilePwrite|io_file_pwrite|HostState|declare i64 @align_rt_io_file_pwrite(ptr, ptr, i64, i64) #2
 key|IoReaderBuffered|io_reader_buffered|HostState|declare ptr @align_rt_io_reader_buffered(ptr) #2

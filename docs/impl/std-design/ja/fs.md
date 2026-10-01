@@ -72,6 +72,32 @@ fs.remove_empty_dir(path: str) -> Result<(), Error>
 
 ## 公開契約
 
+### 読み取り専用ランダムアクセスファイル
+
+[Plan 84](../../84-read-only-random-file-plan.md) は、M12 で保留した非 mmap
+ランダム読み取りの実需と次の公開 API を定義する。
+
+```text
+fs.open_ro(path: str) -> Result<file, Error>
+```
+
+Impure な呼び出しは既存の通常パスを O_RDONLY|O_CLOEXEC で開く。open_rw と同じく
+相対パスと symlink を通常どおり解決し、作成、切り詰め、拡張を行わない。通常ファイル
+限定の検査も追加しない。UTF-8 と埋め込み NUL の検査はファイルシステム操作に先行し、
+NUL は Invalid、空パスは通常の OS エラー変換となる。不在は NotFound、権限は Denied、
+不正入力は Invalid、その他は既存の固定表による Code(errno)。string の暗黙の借用を
+含め、パスは呼び出し中だけ借用する。ネイティブパス変換と既存ハンドル本体は割り当てを
+伴うが、読み取りバッファや mmap は割り当てない。結果はパスの寿命を保持しない。
+
+結果は同じ Move の file で、所有する descriptor を Drop が閉じる。束縛済み receiver、
+集約への格納、単一スレッドの制限も同じ。pread は呼び出し側の mutable buffer の窓を
+使い、実際の読み取り数、短い読み取り、EOF の 0 を返す。len は descriptor の最新の
+メタデータを取得する。負のオフセットは権限検査より先に abort する。pwrite は入力
+バイトを読む前にカーネルが保持する descriptor のモードを調べ、読み取り専用の場合は
+空データも Denied にする。保存する capability flag やコンストラクタ履歴の推論を追加
+しない。既存の読み書きコンストラクタと全量書き込み成功の契約は同じ。
+
+
 ### `create_exclusive`
 
 `create_exclusive` は、受理する Unix ターゲットで

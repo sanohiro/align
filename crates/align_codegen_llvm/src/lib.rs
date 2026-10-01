@@ -16587,7 +16587,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // `#[inline(never)]` helper, so `gen_rvalue` gains a single tiny arm rather than five inline
             // bodies — `gen_rvalue` is depth-recursive (via operand materialization), so keeping its
             // frame flat preserves the expr-depth budget (the #296 lesson, mirroring MIR's dispatcher).
-            Rvalue::FileCreateRw { .. } | Rvalue::FileOpenRw { .. }
+            Rvalue::FileCreateRw { .. } | Rvalue::FileOpenRw { .. } | Rvalue::FileOpenRo { .. }
             | Rvalue::FilePread { .. } | Rvalue::FilePwrite { .. } | Rvalue::FileLen { .. } => self.gen_file_rvalue(rv)?,
             Rvalue::ReaderStdin => self
                 .builder
@@ -23587,6 +23587,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         Ok(match rv {
             Rvalue::FileCreateRw { path, out } => self.gen_open_handle(RuntimeKey::IoFileCreate, path, *out)?,
             Rvalue::FileOpenRw { path, out } => self.gen_open_handle(RuntimeKey::IoFileOpen, path, *out)?,
+            Rvalue::FileOpenRo { path, out } => self.gen_open_handle(RuntimeKey::IoFileOpenRo, path, *out)?,
             // f.pread(b, off) — the runtime fills the buffer window at `off`, returns i64 count-or-status.
             Rvalue::FilePread { file, buffer, offset } => {
                 let fp = self.operand(file)?.into();
@@ -23625,18 +23626,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// is a null-safe no-op), then call the runtime opener (`func`) with the path `{ptr,len}` and the
     /// out slot. Returns the i32 errno-status (0 = ok).
     fn gen_open_handle(&mut self, key: RuntimeKey, path: &Operand, out: Slot) -> Result<BasicValueEnum<'c>, CodegenError> {
-        let out_ptr = self.slots[&out];
+        let out_ptr = *self.slots.get(&out).ok_or_else(|| self.err("missing open-handle output slot"))?;
         self.builder
             .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
             .map_err(|e| self.err(e))?;
-        let agg = self.operand(path)?.into_struct_value();
+        let agg = match self.operand_by_value(path)? {
+            BasicValueEnum::StructValue(agg) => agg,
+            _ => return Err(self.err("open path must be a text view")),
+        };
         let p_ptr = self.builder.build_extract_value(agg, 0, "path_p").map_err(|e| self.err(e))?;
         let p_len = self.builder.build_extract_value(agg, 1, "path_l").map_err(|e| self.err(e))?;
         let cs = self
             .builder
             .build_call(self.runtime(key), &[p_ptr.into(), p_len.into(), out_ptr.into()], "open")
             .map_err(|e| self.err(e))?;
-        Ok(cs.try_as_basic_value().basic().expect("open returns i32 status"))
+        Ok(cs.try_as_basic_value().basic().ok_or_else(|| self.err("open must return i32 status"))?)
     }
 
     /// Descriptor-relative two-path constructor. Evaluate and unpack root before relative, then
@@ -31517,6 +31521,36 @@ fn main() -> i32 = 0
                 );
             }
         }
+    }
+
+    #[test]
+    fn file_constructors_mir_gate_requires_exact_native_slots() -> Result<(), &'static str> {
+        for constructor in ["create_rw", "open_rw", "open_ro"] {
+            let base = mir(&format!("import std.fs\nfn f(path: str, spare: file) -> Result<file, Error> = fs.{constructor}(path)\nfn main() -> i32 = 0\n"));
+            assert!(validate_resource_rvalues(&base).is_ok());
+            let index = xml_test_function(&base, "f");
+            let (value, out) = base.fns[index].blocks.iter().flat_map(|b| &b.stmts).find_map(|s| match s {
+                Stmt::Let(value, Rvalue::FileCreateRw { out, .. } | Rvalue::FileOpenRw { out, .. }
+                    | Rvalue::FileOpenRo { out, .. }) => Some((*value, *out)), _ => None,
+            }).ok_or("file native fixture")?;
+            for mutation in 0..5 {
+                let mut wrong = base.clone();
+                let spare = *wrong.fns[index].params.get(1).ok_or("file spare parameter")?;
+                let (path, output) = wrong.fns[index].blocks.iter_mut().flat_map(|b| &mut b.stmts).find_map(|s| match s {
+                    Stmt::Let(_, Rvalue::FileCreateRw { path, out } | Rvalue::FileOpenRw { path, out }
+                        | Rvalue::FileOpenRo { path, out }) => Some((path, out)), _ => None,
+                }).ok_or("file mutable fixture")?;
+                match mutation {
+                    0 => *path = Operand::Const(Const::Bool(true)),
+                    1 => *output = u32::MAX,
+                    2 => *output = spare,
+                    3 => wrong.fns[index].slots[out as usize] = Ty::Bool,
+                    _ => wrong.fns[index].value_tys[value as usize] = Ty::Int(IntTy { bits: 64, signed: true }),
+                }
+                assert_xml_producer_rejected(&wrong, "file exact signature/private output");
+            }
+        }
+        Ok(())
     }
 
     #[test]

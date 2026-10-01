@@ -3331,11 +3331,12 @@ Every native operation that fills a `buffer` (`read`, `read_line`, `pread`, `rec
 an immutable local or an expression directly is rejected before the operation is formed. This keeps
 the mutation, address stability, and ownership boundary explicit.
 
-`file` is the offset-addressed block read+write handle (`fs.create_rw` / `fs.open_rw`, below). Every
-access carries an explicit `off` — there is **no cursor and no `seek`** (a settable cursor is hidden
-mutable state), and there is **no read-only constructor** (pure random reads stay `reader` or the
-`fs.read_bytes_view` mmap view — a third read path would break "one way"). A **negative** offset is a
-programmer bug and **aborts**. `file` is Move (owns its fd, `Drop` closes it) and structurally
+`file` is the offset-addressed handle: `fs.create_rw` / `fs.open_rw` grant read+write access;
+`fs.open_ro` opens an existing path read-only for bounded random reads without a whole-file mmap.
+Every access carries an explicit `off` — there is **no cursor and no `seek`** (a settable cursor is
+hidden mutable state). A **negative** offset is a programmer bug and **aborts**, before any
+access-mode check. `pwrite` on a read-only descriptor returns `Error.Denied`, including empty data;
+the runtime queries the descriptor's access mode rather than storing a second capability flag. `file` is Move (owns its fd, `Drop` closes it) and structurally
 single-threaded (no `par_map`/`spawn` capture); it never rides an aggregate other than its
 constructor's `Result<file, Error>`.
 
@@ -3406,12 +3407,22 @@ fs.create_private_temp_dir(prefix: str) -> Result<string, Error>
 fs.remove_empty_dir(path: str) -> Result<(), Error>
 fs.create_rw(path: str) -> Result<file, Error>   // O_RDWR|O_CREAT|O_TRUNC — a fresh random-access file
 fs.open_rw(path: str)   -> Result<file, Error>   // O_RDWR, must exist — in-place update (see std.io `file`)
+fs.open_ro(path: str)   -> Result<file, Error>   // O_RDONLY|O_CLOEXEC, must exist — bounded random reads
 fs.create_dir(path: str) -> Result<(), Error>
 fs.is_dir(path: str) -> Result<bool, Error>
 fs.exists(path: str) -> bool
 fs.remove(path: str) -> Result<(), Error>
 fs.read_dir(path: str) -> Result<array<string>, Error>   // v1: owned strings
 ```
+
+`fs.open_ro` uses ordinary path resolution, including symlinks and relative paths. It never
+creates, truncates or extends. The call borrows UTF-8 path bytes only until open completes; an
+embedded NUL returns `Error.Invalid` before filesystem work. Empty paths keep the ordinary OS
+mapping. Missing paths return NotFound, permission failures Denied, invalid paths Invalid, and
+other failures Code(errno) through the fixed table. It allocates the existing native handle shell
+and ephemeral NUL-terminated native path, with no read buffer or mapping. The result is the same
+owned `file` and retains no path lifetime. The M12 deferred non-mmap random-read trigger is met by
+align-llm's read-only model, transcript and KV inputs (plan 84).
 
 `fs.create_exclusive` creates one new regular file entry with the native
 exclusive-create operation (`O_CREAT|O_EXCL`, plus close-on-exec and final

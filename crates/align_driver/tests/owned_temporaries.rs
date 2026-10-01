@@ -595,3 +595,21 @@ fn codec_dispatch_diagnoses_an_invalid_receiver_once() {
         assert!(diagnostics.contains("missing"), "{diagnostics}");
     }
 }
+
+#[test]
+fn open_handle_path_owner_releases_after_native_read() {
+    for (constructor, native) in [("open", "fs_open("), ("create", "fs_create("),
+        ("create_rw", "fs_create_rw"), ("open_rw", "fs_open_rw"), ("open_ro", "fs_open_ro")] {
+        let source = format!("import std.fs\nfn probe(path: str) -> Result<(), Error> {{ owner := fs.{constructor}(path.clone())?; return Ok(()) }}\nfn main() -> i32 = 0\n");
+        let text = mir_text(&source);
+        let body = function(&text, "probe");
+        let native_position = body.find(native).unwrap_or_else(|| panic!("missing native {native}: {body}"));
+        let first_drop = body.find("drop _").unwrap_or_else(|| panic!("missing path Drop: {body}"));
+        assert!(native_position < first_drop, "path owner must survive the native read: {body}");
+        // The shared helper must clear the temporary's flag before constructing the Result.
+        let following = &body[native_position..];
+        let drop_position = following.find("drop _").unwrap();
+        let result_position = following.find("Ok(").unwrap_or_else(|| panic!("missing handle Result: {body}"));
+        assert!(drop_position < result_position, "path owner must release after its final read: {body}");
+    }
+}

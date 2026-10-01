@@ -4542,9 +4542,12 @@ fast-systems-programming needs that any Align user hits, not engine-specific.
    **Design SETTLED 2026-07-11 (two-lens review; full record = roadmap M12 Slice A4):** a Move
    `file` = the random-access WRITE handle (`fs.create_rw`/`fs.open_rw`, O_CLOEXEC) with
    `pread(mut buffer, off)` read-back (actual count, 0 = EOF) / `pwrite(bytes, off)`
-   (loops-to-full) / `len()`; **no `seek`** (hidden cursor state) and **no read-only
-   constructor** (reads stay reader | mmap; `fs.open_ro` = the deferred-with-trigger escape
-   hatch); negative offset aborts; `copy_range` deferred.
+   (loops-to-full) / `len()`; **no `seek`** (hidden cursor state); negative offset aborts;
+   `copy_range` deferred. **Read-only trigger met 2026-10-01 (Request 21, plan 84):** bounded
+   model/transcript/KV readers need non-mmap access on read-only inputs. `fs.open_ro(path: str)
+   -> Result<file, Error>` opens O_RDONLY|O_CLOEXEC into the same owned file. Pread/len/Drop
+   remain unchanged; pwrite returns Denied even for empty data, after negative-offset abort.
+   Runtime descriptor-mode checking adds no stored capability flag or constructor-origin inference.
 5. **`std.http` server slice (Slice 4) + streaming (SSE/chunked) response write** — the
    align-gateway is an OpenAI-compatible SSE-streaming local server; Slice 4's design should be
    written against that requirement. **Slice-4 surface SETTLED 2026-07-10** (two-lens design

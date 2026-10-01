@@ -2085,3 +2085,15 @@ replacement uses the existing Drop plan after staging the RHS; it needs no strin
 and admits no new storage types. Disjoint field borrowing proves both place and backing separation:
 the containing record is too coarse an alias identity, but two copied view headers are not evidence
 of independent storage. These are the same ownership and borrowing rules at field precision.
+
+## Why bounded random reads have a read-only File constructor
+
+M12 A4 recorded `fs.open_ro` as a deferred escape hatch for a real non-mmap
+random-read consumer. Request 21 supplies that consumer: model, transcript and
+KV readers inspect bounded windows without changing their read-only inputs.
+Sequential readers cannot express offsets and whole-file mmap reserves a large
+address range. The same File with an O_RDONLY descriptor closes this gap without
+a cursor, buffer policy or second handle family. Native descriptor-mode checks
+make pwrite return Denied, including zero-byte writes; no compiler constructor
+history or duplicated stored capability determines permission. Negative offsets
+still abort first. Plan 84 owns the exact path, ownership and ABI contract.

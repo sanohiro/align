@@ -1303,6 +1303,7 @@ merely because its `Ty` matches.
 | `IoCopy` | `env[]; child[reader,writer]`; `Reader,Writer; result ERR(i64); both borrowed; Impure`. |
 | `FileCreateRw` | `env[]; child[path]`; `Str; result ERR(File); new owned fd; Impure`. |
 | `FileOpenRw` | `env[]; child[path]`; `Str; result ERR(File); new owned fd; Impure`. |
+| `FileOpenRo` | `env[]; child[path]`; `Str; result ERR(File); new owned fd; Impure`. |
 | `FilePread` | `env[]; child[file,buffer,offset]`; `LocalHandle(File,file), SourceMutLocal(Buffer,buffer), i64; result ERR(i64); handles borrowed, buffer mutated; Impure`. |
 | `FilePwrite` | `env[]; child[file,data,offset]`; `File, byte-view, i64; result ERR(i64); borrowed; Impure`. |
 | `FileLen` | `env[]; child[file]`; `File; result ERR(i64); borrowed; Impure`. |
