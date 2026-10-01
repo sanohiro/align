@@ -1588,6 +1588,10 @@ pub fn native_owner_mir_contract<'a>(
         access: XmlAccessProvenance::Owned,
     };
     match value {
+        Rvalue::BufferCapacity(buffer) => {
+            contract.result = i64_ty;
+            contract.operands = vec![(buffer, Ty::Buffer, read)];
+        }
         Rvalue::FileCreateRw { path, out } | Rvalue::FileOpenRw { path, out }
         | Rvalue::FileOpenRo { path, out } | Rvalue::FileCreateRwExclusive { path, out } => {
             contract.result = i32_ty;

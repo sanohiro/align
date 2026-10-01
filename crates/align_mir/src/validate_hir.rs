@@ -4770,7 +4770,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::StrBytes { .. }
             | hir::ExprKind::BytesView { .. }
             | hir::ExprKind::SliceAsBytes { .. }
-            | hir::ExprKind::BufferLen { .. }
+            | hir::ExprKind::BufferLen { .. } | hir::ExprKind::BufferCapacity { .. }
             | hir::ExprKind::BytesRead { .. }
             | hir::ExprKind::BytesSet { .. }
             | hir::ExprKind::BytesFill { .. }
@@ -5168,7 +5168,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::BufferNew { .. }
             | hir::ExprKind::BufferBytes { .. }
             | hir::ExprKind::StrBytes { .. }
-            | hir::ExprKind::BufferLen { .. }
+            | hir::ExprKind::BufferLen { .. } | hir::ExprKind::BufferCapacity { .. }
             | hir::ExprKind::BufferAppend { .. }
             | hir::ExprKind::BufferAppendFilled { .. }
             | hir::ExprKind::ArrayBuilderAppend { .. }
@@ -9298,7 +9298,7 @@ impl<'a> BodyValidator<'a> {
                 }
                 strict(Ty::Slice(u8_scalar), &[slice])
             }
-            hir::ExprKind::BufferLen { buffer } => {
+            hir::ExprKind::BufferLen { buffer } | hir::ExprKind::BufferCapacity { buffer } => {
                 (self.handle_receiver_place(buffer, context, Ty::Buffer) && buffer.ty == Ty::Buffer)
                     .then(|| strict(i64, &[buffer]))?
             }

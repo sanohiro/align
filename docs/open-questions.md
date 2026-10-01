@@ -13,6 +13,23 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### Observable buffer read-window capacity (Request 35)
+
+`b.capacity() -> i64` is a Pure, zero-argument, nonconsuming query of a
+buffer's usable read-window capacity, independent of initialized `b.len()`.
+The existing stable local/field and borrowed-payload receiver rules apply;
+no allocation or retained view is added. Successful `buffer(n)` reservation
+publishes `n`, while invalid/unreservable requests publish zero. Filled buffers
+have capacity at least length. Puts, appends and successful `read_line` retain
+old capacity or raise it to the new initialized/body length. Short reads, EOF
+and failed line reads retain capacity; decoded/returned buffers publish their
+initialized length as capacity. `read_line` may grow beyond the old window;
+capacity limits bounded fills. Hidden allocator spare bytes do not enlarge
+that window. The result promises neither physical-memory residency nor future
+growth success; existing best-effort construction and terminal growth/OOM
+policies remain (plan 87).
+
+
 ### Explicit File and writer synchronization (SETTLED 2026-10-01)
 
 **Explicit synchronization settled 2026-10-01 (Request 31, plan 86):**

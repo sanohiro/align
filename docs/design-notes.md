@@ -2070,6 +2070,16 @@ without creating initialized elements, for both heap and explicit region modes.
 They preserve heap transfer and region compaction at freeze. New guaranteed
 materializers use terminal allocation failure, matching core's existing model.
 
+## Observable buffer read-window capacity
+
+Plan 87 exposes the existing descriptor's usable capacity through `b.capacity()`.
+A caller can check a best-effort reservation before a bounded read without
+inferring failure from the read's byte count. Reporting hidden allocator spare
+would silently widen existing native read windows. The Pure scalar query instead
+preserves descriptor authority, including growth by `read_line`, and changes no
+allocation failure policy or owner lifetime. Capacity is not physical-memory
+admission or a guarantee that future growth succeeds.
+
 ## Mutating existing storage without hidden copies
 
 Plans 65 and 66 complete the existing mutable-storage model. Typed `slice<u8>.set_*` stores

@@ -1,6 +1,15 @@
 # Session handoff
 
-## Next work (handoff updated 2026-10-01)
+## Next work (handoff updated 2026-10-02)
+
+Request 35's capacity-accessor trigger is implemented in plan 87:
+`b.capacity() -> i64` is Pure and nonconsuming and reports the existing usable
+read window independently of initialized length. Stable local/nested/borrowed
+payload receivers, constructor/growth/line/returned-buffer transitions and
+forged HIR/MIR owners cover the boundary in whole/per-unit compilation. Existing
+best-effort construction and terminal growth/OOM policies remain; fallible
+construction and consumer adoption are pending. Continue independent capabilities
+with K1 deferred.
 
 Request 31's explicit synchronization capability is implemented in plan 86:
 `f.sync()` and `w.sync()` return unit/Error without consuming existing owners.

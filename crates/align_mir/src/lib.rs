@@ -9018,6 +9018,16 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 b.push(Stmt::Let(v, Rvalue::BufferLen(bop)));
                 Operand::Value(v)
             }
+            hir::ExprKind::BufferCapacity { buffer } => {
+                lower_required_binding!(
+                    b,
+                    bop = lower_expr(b, buffer),
+                    Operand::Const(Const::Unit)
+                );
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(v, Rvalue::BufferCapacity(bop)));
+                Operand::Value(v)
+            }
             hir::ExprKind::BytesView { bytes, elem } => {
                 lower_required_binding!(
                     b,

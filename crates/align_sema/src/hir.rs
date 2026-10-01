@@ -1647,6 +1647,8 @@ pub enum ExprKind {
     SliceAsBytes { slice: Box<Expr>, elem: crate::Scalar },
     /// `b.len()` — the buffer's current byte count (an `i64`). Pure.
     BufferLen { buffer: Box<Expr> },
+    /// `b.capacity()` — the usable read-window capacity, independent of length. Pure.
+    BufferCapacity { buffer: Box<Expr> },
     /// `bytes.<scalar>_<le|be>(off)` — a bounds-checked binary scalar **read** from a `bytes`
     /// (`slice<u8>`) view at byte offset `off`. The `ty` is the read scalar (`u8`/`i8`/…/`f64`);
     /// its width (1/2/4/8 bytes) comes from `ty`. `be` selects big-endian byte order (single-byte

@@ -11593,7 +11593,8 @@ pub unsafe extern "C" fn align_rt_buffer_len(b: *mut Buffer) -> i64 {
     unsafe { (*b).len as i64 }
 }
 
-/// `buffer`'s fixed caller-selected read window. This differs from `buffer.len()`: a newly created
+/// `b.capacity()` — the current usable read window, excluding hidden allocator spare. This differs
+/// from `buffer.len()`: a newly created
 /// or freshly cleared buffer has length zero while retaining the capacity future reads may fill.
 /// Null-safe so checked lowering can use the same zero test as the direct ABI validation path.
 ///
@@ -29248,6 +29249,15 @@ mod tests {
         fn drop(&mut self) { unsafe { align_rt_io_file_free(self.0) }; }
     }
 
+    struct BufferTestHandle(*mut Buffer);
+    impl Drop for BufferTestHandle {
+        fn drop(&mut self) { unsafe { align_rt_buffer_free(self.0) }; }
+    }
+    struct ReaderTestHandle(*mut Reader);
+    impl Drop for ReaderTestHandle {
+        fn drop(&mut self) { unsafe { align_rt_io_reader_free(self.0) }; }
+    }
+
     struct WriterTestHandle(*mut Writer);
     impl Drop for WriterTestHandle {
         fn drop(&mut self) { unsafe { align_rt_io_writer_free(self.0) }; }
@@ -29819,12 +29829,82 @@ mod tests {
     }
 
     #[test]
+    fn buffer_capacity_tracks_read_window_not_allocator_spare() {
+        assert_eq!(unsafe { align_rt_buffer_capacity(core::ptr::null_mut()) }, 0);
+        for requested in [0, -5, 3, 17] {
+            let b = BufferTestHandle(align_rt_buffer_new(requested));
+            assert_eq!(unsafe { align_rt_buffer_capacity(b.0) }, if (0..=17).contains(&requested) { requested } else { 0 });
+            assert_eq!(unsafe { align_rt_buffer_len(b.0) }, 0);
+        }
+        let b = BufferTestHandle(align_rt_buffer_new(3));
+        unsafe {
+            // A valid window may be smaller than its allocator's spare storage. Querying must
+            // preserve that native-fill bound rather than reveal/reclassify the spare bytes.
+            (*b.0).data.with_mut(|data| data.reserve_exact(64));
+            assert!((*b.0).data.capacity() > 3);
+            let pointer = (*b.0).data.writable_ptr();
+            align_rt_buffer_put(b.0, 0x41, 1, 0);
+            assert_eq!(align_rt_buffer_capacity(b.0), 3);
+            assert_eq!(align_rt_buffer_len(b.0), 1);
+            align_rt_buffer_put(b.0, 0x4243, 2, 0);
+            assert_eq!(align_rt_buffer_capacity(b.0), 3);
+            align_rt_buffer_put(b.0, 0x44, 1, 0);
+            assert_eq!(align_rt_buffer_capacity(b.0), 4);
+            align_rt_buffer_append(b.0, b"xyz".as_ptr(), 3);
+            assert_eq!(align_rt_buffer_capacity(b.0), 7);
+            align_rt_buffer_append_filled(b.0, 2, 0x45);
+            assert_eq!(align_rt_buffer_capacity(b.0), 9);
+            assert_eq!(align_rt_buffer_len(b.0), 9);
+            assert_eq!((*b.0).data.writable_ptr(), pointer);
+        }
+        for length in [0, 1, 17] {
+            let b = BufferTestHandle(align_rt_buffer_filled(length, 0xa5));
+            assert!(unsafe { align_rt_buffer_capacity(b.0) } >= length);
+            assert_eq!(unsafe { align_rt_buffer_len(b.0) }, length);
+        }
+        let mut decoded = Vec::with_capacity(64);
+        decoded.extend_from_slice(b"abc");
+        let decoded = BufferTestHandle(buffer_from_vec(decoded));
+        assert_eq!(unsafe { align_rt_buffer_capacity(decoded.0) }, 3);
+        assert_eq!(unsafe { align_rt_buffer_len(decoded.0) }, 3);
+        assert!(unsafe { (*decoded.0).data.capacity() } > 3);
+    }
+
+    #[test]
+    fn buffer_capacity_tracks_growing_lines_and_retains_window_on_eof_or_error() {
+        use std::os::fd::IntoRawFd;
+        let root = FileFixtureDir::new("capacity-lines");
+        let path = root.0.join("input");
+        std::fs::write(&path, b"abcdef\r\n\nxy").unwrap();
+        let reader = ReaderTestHandle(Box::into_raw(Box::new(Reader::unbuffered(std::fs::File::open(&path).unwrap().into_raw_fd(), true))));
+        let b = BufferTestHandle(align_rt_buffer_new(2));
+        for (consumed, length, capacity) in [(8, 6, 6), (1, 0, 6), (2, 2, 6), (0, 0, 6)] {
+            assert_eq!(unsafe { align_rt_io_reader_read_line(reader.0, b.0) }, consumed);
+            assert_eq!(unsafe { align_rt_buffer_len(b.0) }, length);
+            assert_eq!(unsafe { align_rt_buffer_capacity(b.0) }, capacity);
+        }
+        // Invalid descriptor error clears the prior body without lowering the window.
+        unsafe { align_rt_buffer_append(b.0, b"old".as_ptr(), 3) };
+        let invalid = ReaderTestHandle(Box::into_raw(Box::new(Reader::unbuffered(-1, false))));
+        assert!(unsafe { align_rt_io_reader_read_line(invalid.0, b.0) } < 0);
+        assert_eq!(unsafe { align_rt_buffer_len(b.0) }, 0);
+        assert_eq!(unsafe { align_rt_buffer_capacity(b.0) }, 6);
+        let path = root.0.join("unterminated");
+        std::fs::write(&path, b"abcdefgh").unwrap();
+        let reader = ReaderTestHandle(Box::into_raw(Box::new(Reader::unbuffered(std::fs::File::open(path).unwrap().into_raw_fd(), true))));
+        assert_eq!(unsafe { align_rt_io_reader_read_line(reader.0, b.0) }, 8);
+        assert_eq!(unsafe { align_rt_buffer_capacity(b.0) }, 8);
+        assert_eq!(unsafe { align_rt_buffer_len(b.0) }, 8);
+    }
+
+    #[test]
     fn buffer_huge_capacity_degrades_to_empty_window_not_abort() {
         // A pathological capacity must fail softly (an empty read window), never abort the process
         // on an infallible allocation. `read` into it then yields 0 (nothing to fill).
         let b = align_rt_buffer_new(i64::MAX);
         let bref = unsafe { &*b };
         assert_eq!(bref.cap, 0, "an unreservable capacity degrades to a 0-byte window");
+        assert_eq!(unsafe { align_rt_buffer_capacity(b) }, 0);
         assert_eq!(unsafe { align_rt_buffer_len(b) }, 0);
         unsafe { align_rt_buffer_free(b) };
         // A negative capacity is also an empty window (never a wrapping `as usize`).

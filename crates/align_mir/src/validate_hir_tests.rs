@@ -12161,11 +12161,11 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        // FileSync, WriterSync, FileCreateRwExclusive, FileOpenRo, StrParseI64, StrCharBoundary, ArrayTruncate, BytesSet, BytesFill, BytesCopyFrom, BufferAppendFilled,
+        // BufferCapacity, FileSync, WriterSync, FileCreateRwExclusive, FileOpenRo, StrParseI64, StrCharBoundary, ArrayTruncate, BytesSet, BytesFill, BytesCopyFrom, BufferAppendFilled,
         // FloatScope, BytesView, SliceAsBytes, and HttpServerMaxRequestBodyBytes are explicit in
         // validation, source-shape, replay and ownership.
         variants,
-        347,
+        348,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -12599,6 +12599,17 @@ fn hir_body_validator_native() {
         "native_buffer_len",
         body_test_expr(
             hir::ExprKind::BufferLen {
+                buffer: Box::new(native_local(0, Ty::Buffer)),
+            },
+            i64_ty,
+        ),
+        vec![body_test_local(0, "buffer", Ty::Buffer, false, false)],
+        i64_ty
+    );
+    add!(
+        "native_buffer_capacity",
+        body_test_expr(
+            hir::ExprKind::BufferCapacity {
                 buffer: Box::new(native_local(0, Ty::Buffer)),
             },
             i64_ty,
@@ -18473,10 +18484,10 @@ fn valid_hir_global_type_preflight_is_mir_identity() {
 #[test]
 fn borrowed_handle_receiver_hir_rejects_forged_places() -> Result<(), &'static str> {
     let program = checked_source_program(
-        "Holder { data: buffer, sink: writer }\nfn inspect(borrow owner: Holder) -> i64 = owner.data.len()\nfn flush(borrow owner: Holder) -> Result<(), Error> = owner.sink.flush()\nfn sync(borrow owner: Holder) -> Result<(), Error> = owner.sink.sync()\nfn main() {}\n",
+        "Holder { data: buffer, sink: writer }\nfn inspect(borrow owner: Holder) -> i64 = owner.data.len()\nfn capacity(borrow owner: Holder) -> i64 = owner.data.capacity()\nfn flush(borrow owner: Holder) -> Result<(), Error> = owner.sink.flush()\nfn sync(borrow owner: Holder) -> Result<(), Error> = owner.sink.sync()\nfn main() {}\n",
     );
     assert!(validate_hir::body_only_metadata_is_valid(&program));
-    for name in ["inspect", "flush", "sync"] {
+    for name in ["inspect", "capacity", "flush", "sync"] {
         for mutation in 0..3 {
             let mut forged = program.clone();
             let function = forged
@@ -18486,7 +18497,7 @@ fn borrowed_handle_receiver_hir_rejects_forged_places() -> Result<(), &'static s
                 .ok_or("receiver function")?;
             let value = function.body.value.as_mut().ok_or("receiver expression")?;
             let receiver = match &mut value.kind {
-                hir::ExprKind::BufferLen { buffer } => buffer,
+                hir::ExprKind::BufferLen { buffer } | hir::ExprKind::BufferCapacity { buffer } => buffer,
                 hir::ExprKind::WriterFlush { writer } | hir::ExprKind::WriterSync { writer } => writer,
                 _ => panic!("receiver operation"),
             };
@@ -19449,6 +19460,26 @@ fn sync_methods_hir_reject_forged_native_types() -> Result<(), &'static str> {
             }
             assert_body_entrypoints_empty(&format!("sync-{ty}-{mutation}"), &bad);
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn buffer_capacity_hir_rejects_forged_native_types() -> Result<(), &'static str> {
+    let base = checked_source_program("fn capacity(borrow value: buffer) -> i64 = value.capacity()\nfn main() {}\n");
+    assert!(validate_hir::body_only_metadata_is_valid(&base));
+    for mutation in 0..4 {
+        let mut bad = base.clone();
+        let function = bad.fns.iter_mut().find(|f| f.name == "capacity").ok_or("capacity function")?;
+        let value = function.body.value.as_mut().ok_or("capacity value")?;
+        let hir::ExprKind::BufferCapacity { buffer } = &mut value.kind else { return Err("capacity operation"); };
+        match mutation {
+            0 => buffer.ty = Ty::Reader,
+            1 => buffer.kind = hir::ExprKind::Bool(false),
+            2 => buffer.kind = hir::ExprKind::Local(u32::MAX),
+            _ => value.ty = Ty::Int(align_sema::IntTy { bits: 32, signed: true }),
+        }
+        assert_body_entrypoints_empty(&format!("capacity-{mutation}"), &bad);
     }
     Ok(())
 }
