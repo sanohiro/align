@@ -2129,3 +2129,16 @@ One O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW open with mode 0644 subject to um
 makes the winner explicit without a second error, ownership or cleanup model.
 Code(native EEXIST) protects occupied entries; partial outputs remain caller-owned
 for explicit removal. Plan 85 adds no confinement, rollback or durability promise.
+
+### Copy string sorting (Request 27, plan 88)
+
+Direct sorting completes the existing Copy scalar `Ord` domain instead of
+introducing a string-only ordering API. Characters and borrowed string headers
+use the stable MIR sort already used by numbers and recorded keys. String
+materialization owns only a result spine; keeping content-region and owner
+generation facts avoids an implicit clone and prevents the fresh allocation
+from laundering a local byte borrow. Keyed string elements use the same rule.
+Move strings and general comparators require separate ownership/callable work.
+Existing conservative bound-source generation loans remain the shared collector
+rule. Precision beyond those loans is separate work; allocating a new spine
+does not make replacing a live source binding admissible.

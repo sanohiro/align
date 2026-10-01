@@ -196,6 +196,55 @@ fn checked_source_program(source: &str) -> hir::Program {
     program
 }
 
+#[test]
+fn copy_string_sort_hir_rejects_forged_metadata() {
+    let mut bool_element = checked_source_program("fn f(xs: slice<bool>) -> array<bool> { value := xs.sort_by_key(fn b: bool { 1 }); return value }");
+    let expression = body_first_let_init_mut(&mut bool_element, "f");
+    let hir::ExprKind::ArraySortBy { source, stages, elem, .. } = expression.kind.clone() else {
+        panic!("boolean sort fixture")
+    };
+    expression.kind = hir::ExprKind::ArraySort { source, stages, elem };
+    assert_body_entrypoints_empty("copy-sort-unordered-bool", &bool_element);
+    for source in [
+        "fn f(xs: slice<str>) -> array<str> { value := xs.sort(); return value }",
+        "fn f(xs: slice<str>) -> array<str> { value := xs.sort_by_key(fn s: str { s.len() }); return value }",
+        "fn f(xs: slice<char>) -> array<char> { value := xs.sort(); return value }",
+    ] {
+        let base = checked_source_program(source);
+        assert!(body_core_metadata_is_valid(&base));
+        assert!(!is_empty(&lower_program(&base)));
+        for mutation in 0..5 {
+            let mut malformed = base.clone();
+            let expression = body_first_let_init_mut(&mut malformed, "f");
+            if mutation == 0 {
+                expression.ty = Ty::DynArray(Scalar::Bool);
+            } else {
+                let (source, elem) = match &mut expression.kind {
+                    hir::ExprKind::ArraySort { source, elem, .. }
+                    | hir::ExprKind::ArraySortBy { source, elem, .. } => (source, elem),
+                    _ => panic!("string-sort fixture"),
+                };
+                match mutation {
+                    1 => *elem = Ty::Bool,
+                    2 => source.ty = Ty::Slice(Scalar::String),
+                    3 => source.kind = hir::ExprKind::Local(u32::MAX),
+                    _ => *elem = Ty::String,
+                }
+            }
+            assert_body_entrypoints_empty("copy-string-sort-forged", &malformed);
+        }
+    }
+    let mut move_key = checked_source_program("fn owned(s: str) -> string = s.clone()\nfn f(xs: slice<str>) -> array<str> { value := xs.sort_by_key(fn s: str { s.len() }); return value }");
+    let expression = body_first_let_init_mut(&mut move_key, "f");
+    let hir::ExprKind::ArraySortBy { key_func, key_ty, .. } = &mut expression.kind else {
+        panic!("string-key fixture")
+    };
+    *key_func = "owned".to_string();
+    *key_ty = Ty::String;
+    assert!(!body_core_metadata_is_valid(&move_key), "buffered Move key must fail the body gate itself");
+    assert_body_entrypoints_empty("copy-string-sort-move-key", &move_key);
+}
+
 fn float_scope_parts(
     program: &mut hir::Program,
 ) -> Option<(&mut hir::FloatMode, &mut align_ast::BinOp, &mut hir::FloatMode)> {

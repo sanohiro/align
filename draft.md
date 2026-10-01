@@ -720,6 +720,16 @@ it satisfies `Ord`, but the checker rejects it because the fused sort path has n
 borrowed `str`.
 Aggregates have no order, exactly as they have no `==`.
 
+Direct `.sort()` accepts Copy `Ord` elements: numbers, `char` and `str`.
+`sort_by_key` accepts primitive Copy elements and `str`. Both return an owned
+array spine; `str` elements retain their byte owners, with no implicit clone or
+byte ownership transfer. Source and stage-capture lifetimes remain attached to
+the result, so local text views cannot escape or survive owner invalidation.
+Existing conservative source-generation loans remain: replacing, moving or
+reallocating a bound source array can invalidate a live result even when its
+copied bytes are static. Owned `string` elements and comparator overloads
+remain unsupported (plan 88).
+
 The operator and builtin-bound paths compare owned `string` values through a non-consuming,
 zero-cost `str` borrow. Mixed `string`/`str` operands use the same path; comparison neither moves
 nor allocates.

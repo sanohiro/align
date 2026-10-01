@@ -330,7 +330,19 @@ integer division aborts. `str`/`string` are `Ord` (byte-lexicographic; locale co
 library concern), so strings sort and compare. A `sort_by_key` key is a **Copy** `Ord` value — a
 number, a `char`, or a borrowed `str`; the checker rejects an owned `string` key because the fused
 sort path has no per-key Drop (see `docs/impl/19-hir-validation-ledger.md`). Return a Copy key or a
-borrowed `str`. `else` works on `Result` as
+borrowed `str`.
+
+Direct `.sort()` accepts Copy `Ord` elements: numbers, `char` and `str`.
+`sort_by_key` accepts primitive Copy elements and `str`. Both return an owned
+array spine; `str` elements retain their byte owners, with no implicit clone or
+byte ownership transfer. Source and stage-capture lifetimes remain attached to
+the result, so local text views cannot escape or survive owner invalidation.
+Existing conservative source-generation loans remain: replacing, moving or
+reallocating a bound source array can invalidate a live result even when its
+copied bytes are static. Owned `string` elements and comparator overloads
+remain unsupported (plan 88).
+
+`else` works on `Result` as
 well as `Option` — the intent triangle is `?` propagates / `else` falls back / `match` inspects.
 Details: `draft.md` §4 (display, equality, ordering, floats) and §12 (literals and escapes).
 

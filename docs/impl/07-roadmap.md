@@ -588,6 +588,12 @@ Completion condition (met): data allocated inside `arena {}` is freed at block e
 - [designed, plan 73] nameable fixed arrays `[T; N]` in every type position, including inline
   record fields. Stable field places use the existing fixed-array operations and ownership model;
   no header or allocation is added. Implementation is tracked by issue #1065.
+- [done] **Copy string sorting (plan 88)** — direct `sort()` accepts numeric,
+  character and borrowed string elements; `sort_by_key` also accepts borrowed
+  string elements. Stable results own their spines and retain byte-owner
+  lifetime/generation facts. Whole/per-unit imported generic, algorithm-exit,
+  effect-order, invalidation and forged-producer owners cover the capability.
+  Move strings and general comparators remain deferred.
 - [done] **`sort_by_key(f)`** — materialize the surviving (primitive scalar) elements and sort
   ascending by `f(element)` (an orderable scalar key: int/float/char). Reuses the MIR insertion
   sort (`lower_array_sort` gained an optional `SortKey`), comparing `key(a) > key(b)` instead of

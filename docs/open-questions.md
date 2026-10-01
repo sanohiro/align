@@ -3699,6 +3699,12 @@ freedom that blocks optimization, no complexity, no soundness breaks; inconvenie
    `sort_by_key` `str`-key comparator — `str_eq` keeps its own length-fast-path for `==`/`!=`).
    Owned `string` uses the same runtime comparison through an implicit non-consuming `str` borrow;
    direct, mixed-view, and generic `Ord` comparisons are implemented.
+   Direct `.sort()` accepts the Copy `Ord` domain (numbers, `char`, `str`), and
+   `.sort_by_key` accepts primitive Copy elements and `str`. Result spines own
+   no borrowed string bytes and retain source/stage content lifetimes. Move
+   string elements/keys and comparator overloads remain deferred (plan 88).
+   Existing conservative bound-source generation loans remain; fresh result
+   storage does not promise release of a live source loan.
 2. **`else` works on `Result`** (`draft.md` §5 Result; guide ch04 rewritten): `v := f() else
    fallback` yields `Ok`'s value or deliberately discards the error — visible handling, so the
    unhandled-`Result` error never fires on it; no error binding (needing the error *is* the
