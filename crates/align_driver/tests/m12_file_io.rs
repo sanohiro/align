@@ -386,6 +386,7 @@ fn main() -> Result<(), Error> {{
 
 #[test]
 fn open_ro_formation_and_move_diagnostics() {
+    for constructor in ["open_ro", "create_rw_exclusive"] {
     for source in [
         "fn main() { f := fs.open_ro(\"x\") }",
         "import std.fs\nfn main() { f := fs.open_ro() }",
@@ -398,8 +399,108 @@ fn open_ro_formation_and_move_diagnostics() {
         "import std.fs\nfn main() -> Result<(), Error> { f := fs.open_ro(\"x\")?; xs := [1,2].par_map(|n| { f.len(); n }); return Ok(()) }",
         "import std.fs\nfn main() { xs := [1,2].par_map(|n| { fs.open_ro(\"x\"); n }) }",
     ] {
-        assert!(check_errs("open-ro-invalid", source), "{source}");
+        let source = source.replace("open_ro", constructor);
+        assert!(check_errs("file-constructor-invalid", &source), "{source}");
         let mut sm = SourceMap::new();
-        assert!(check_per_unit(&mut sm, "open-ro-invalid.align", source).diags.has_errors(), "per-unit: {source}");
+        assert!(check_per_unit(&mut sm, "file-constructor-invalid.align", &source).diags.has_errors(), "per-unit: {source}");
+    }
+    }
+}
+
+#[test]
+fn create_rw_exclusive_preserves_existing_entries_and_reads_offsets() {
+    if !backend_available() { return; }
+    let root = FileFixtures::new("exclusive-driver");
+    let existing = root.dir.join("existing");
+    std::fs::write(&existing, b"preserved").unwrap();
+    let directory = root.dir.join("directory");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::write(directory.join("marker"), b"marker").unwrap();
+    let symlink = root.dir.join("symlink");
+    std::os::unix::fs::symlink(&existing, &symlink).unwrap();
+    for mode in ["whole", "units"] {
+        let fresh = root.dir.join(mode);
+        let source = format!(r#"
+import std.fs
+fn occupied(p: str) -> bool {{
+  match fs.create_rw_exclusive(p) {{ Ok(f) => {{ return false }}, Err(e) => {{ match e {{ Code(n) => {{ return n > 0 }}, _ => {{ return false }} }} }} }}
+}}
+fn path_error(p: str) -> i64 {{
+  match fs.create_rw_exclusive(p) {{ Ok(f) => {{ return 0 }}, Err(e) => {{ match e {{ NotFound => {{ return 1 }}, Invalid => {{ return 2 }}, _ => {{ return 3 }} }} }} }}
+}}
+fn main() -> Result<(), Error> {{
+  f := fs.create_rw_exclusive("{}")?
+  if f.pwrite("ab", 0)? != 2 {{ return Err(Error.Invalid) }}
+  if f.pwrite("xy", 4)? != 2 {{ return Err(Error.Invalid) }}
+  if f.len()? != 6 {{ return Err(Error.Invalid) }}
+  mut b := buffer(8)
+  if f.pread(b, 4)? != 2 {{ return Err(Error.Invalid) }}
+  if b.bytes().as_str()? != "xy" {{ return Err(Error.Invalid) }}
+  if f.pread(b, 6)? != 0 {{ return Err(Error.Invalid) }}
+  if !occupied("{}") || !occupied("{}") || !occupied("{}") || !occupied("{}") {{ return Err(Error.Invalid) }}
+  if path_error("{}") != 1 || path_error("") != 2 || path_error("bad\0path") != 2 {{ return Err(Error.Invalid) }}
+  return Ok(())
+}}
+"#, fresh.display(), fresh.display(), existing.display(), directory.display(), symlink.display(), root.dir.join("absent-parent/file").display());
+        let files = [("main.align", source.as_str())];
+        let output = if mode == "whole" { build_and_run_multi("exclusive-whole", &files, "main.align") }
+            else { build_per_unit_multi("exclusive-units", &files, "main.align").link_and_run() };
+        assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(std::fs::read(fresh).unwrap(), b"ab\0\0xy");
+    }
+    assert_eq!(std::fs::read(&existing).unwrap(), b"preserved");
+    assert_eq!(std::fs::read(directory.join("marker")).unwrap(), b"marker");
+    assert_eq!(std::fs::read_link(symlink).unwrap(), existing);
+}
+
+#[test]
+fn create_rw_exclusive_control_and_imported_generic_parity() {
+    if !backend_available() { return; }
+    let root = FileFixtures::new("exclusive-control");
+    let library = r#"
+module exclusive
+import std.fs
+pub fn create<T>(value: T, path: str) -> Result<file, Error> = fs.create_rw_exclusive(path.clone())
+pub fn write(f: file) -> Result<(), Error> { f.pwrite("owned", 0)?; return Ok(()) }
+"#;
+    for mode in ["whole", "units"] {
+        let dir = root.dir.join(mode);
+        std::fs::create_dir(&dir).unwrap();
+        let source = format!(r#"
+import std.fs
+import exclusive
+fn once(p: str) -> string {{ print(1); return p.clone() }}
+fn early(p: str) -> i64 {{ f := fs.create_rw_exclusive({{ return 17; p }}); return 0 }}
+fn fail(p: str) -> Result<(), Error> {{ f := fs.create_rw_exclusive(p)?; f.pwrite("partial", 0)?; return Err(Error.Invalid) }}
+fn main() -> Result<(), Error> {{
+  path := "{0}/helper".clone()
+  f := exclusive.create(true, path)?
+  exclusive.write(f)?
+  print(path)
+  mut g := fs.create_rw_exclusive(if true {{ once("{0}/if") }} else {{ "missing".clone() }})?
+  g = fs.create_rw_exclusive(match 1 {{ 1 => "{0}/match".clone(), _ => "missing".clone() }})?
+  if g.len()? != 0 {{ return Err(Error.Invalid) }}
+  h := fs.create_rw_exclusive(loop {{ break "{0}/loop".clone() }}) else {{ return Err(Error.Invalid) }}
+  if h.len()? != 0 {{ return Err(Error.Invalid) }}
+  a := fs.create_rw_exclusive(arena {{ "{0}/arena".clone() }})?
+  if a.len()? != 0 {{ return Err(Error.Invalid) }}
+  t := fs.create_rw_exclusive(task_group {{ "{0}/task".clone() }})?
+  if t.len()? != 0 {{ return Err(Error.Invalid) }}
+  match fs.create_rw_exclusive("{0}/map").map_err(fn e: Error {{ e }}) {{ Ok(owner) => {{ owner.pwrite("map", 0)? }}, Err(e) => {{ return Err(e) }} }}
+  if early("{0}/never") != 17 {{ return Err(Error.Invalid) }}
+  match fail("{0}/failure") {{ Err(e) => {{ match e {{ Invalid => {{}}, _ => {{ return Err(Error.Invalid) }} }} }}, _ => {{ return Err(Error.Invalid) }} }}
+  return Ok(())
+}}
+"#, dir.display());
+        let files = [("exclusive.align", library), ("main.align", source.as_str())];
+        let output = if mode == "whole" { build_and_run_multi("exclusive-control-whole", &files, "main.align") }
+            else { build_per_unit_multi("exclusive-control-units", &files, "main.align").link_and_run() };
+        assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), format!("{}\n1\n", dir.join("helper").display()));
+        assert_eq!(std::fs::read(dir.join("helper")).unwrap(), b"owned");
+        assert_eq!(std::fs::read(dir.join("map")).unwrap(), b"map");
+        assert_eq!(std::fs::read(dir.join("failure")).unwrap(), b"partial");
+        for name in ["if", "match", "loop", "arena", "task"] { assert_eq!(std::fs::metadata(dir.join(name)).unwrap().len(), 0); }
+        assert!(!dir.join("never").exists());
     }
 }

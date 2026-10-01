@@ -1351,6 +1351,17 @@ fd ownership, Drop and single-threaded rules are unchanged; the result retains n
 The constructor allocates only the existing handle shell and ephemeral native path, with no read
 buffer or mmap (plan 84).
 
+`fs.create_rw_exclusive(path: str) -> Result<file, Error>` creates a regular file with one
+O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW open, mode 0644 subject to umask. Every occupied
+final entry, including live/dangling symlinks and special files, returns Code(native EEXIST)
+without opening, following, truncating, replacing or removing it. Parents use ordinary
+resolution; no exists/stat preflight, parent creation or fallback is added. Empty, invalid
+UTF-8 and NUL paths are Invalid before filesystem work; other failures use the fixed errno
+table. The Impure call borrows the path only during acquisition and allocates only the
+native path copy and existing Move File shell. Methods/Drop are unchanged; Drop closes
+without removing partial output. The local ext4/tmpfs Linux and APFS macOS acceptance floor
+has one competing-creator winner; no confinement, rollback or durability is promised (plan 85).
+
 **Line reads** are explicit because they need lookahead: `r.buffered()` upgrades a reader (the read
 dual of the buffered writer), and `read_line` is a **buffered-reader-only** method. It fills `b`
 with the line body, exactly one `\r?\n` already stripped, and returns the bytes consumed including
@@ -1367,8 +1378,8 @@ require the buffer argument to be a bare local declared with `mut`; temporaries 
 are rejected before the operation is formed.
 
 `std.fs`: `read_file`/`write_file`/`open`/`create`/
-`create_exclusive`/`rename_no_replace`/`open_beneath`/`open_beneath_single_link`/`create_exclusive_beneath`/`create_private_temp_dir`/`remove_empty_dir`/`exists`/`remove`/`read_dir`, plus `create_rw` / `open_rw`
-(the `file` constructors — `O_RDWR` fresh or must-exist), `read_file_view` (a `str` mmap view — requires an enclosing
+`create_exclusive`/`rename_no_replace`/`open_beneath`/`open_beneath_single_link`/`create_exclusive_beneath`/`create_private_temp_dir`/`remove_empty_dir`/`exists`/`remove`/`read_dir`, plus `create_rw` / `create_rw_exclusive` / `open_rw` / `open_ro`
+(the positional `file` constructors), `read_file_view` (a `str` mmap view — requires an enclosing
 arena, escapes via `.clone()`) and `read_bytes_view` (its binary sibling — the same arena mmap
 without UTF-8 validation, returning a `bytes` view so a GGUF/binary asset maps zero-copy).
 `read_dir` returns owned strings and **excludes** any entry whose name is not valid UTF-8, so a

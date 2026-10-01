@@ -599,7 +599,7 @@ fn codec_dispatch_diagnoses_an_invalid_receiver_once() {
 #[test]
 fn open_handle_path_owner_releases_after_native_read() {
     for (constructor, native) in [("open", "fs_open("), ("create", "fs_create("),
-        ("create_rw", "fs_create_rw"), ("open_rw", "fs_open_rw"), ("open_ro", "fs_open_ro")] {
+        ("create_rw", "fs_create_rw("), ("create_rw_exclusive", "fs_create_rw_exclusive"), ("open_rw", "fs_open_rw"), ("open_ro", "fs_open_ro")] {
         let source = format!("import std.fs\nfn probe(path: str) -> Result<(), Error> {{ owner := fs.{constructor}(path.clone())?; return Ok(()) }}\nfn main() -> i32 = 0\n");
         let text = mir_text(&source);
         let body = function(&text, "probe");

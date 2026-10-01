@@ -2097,3 +2097,14 @@ a cursor, buffer policy or second handle family. Native descriptor-mode checks
 make pwrite return Denied, including zero-byte writes; no compiler constructor
 history or duplicated stored capability determines permission. Negative offsets
 still abort first. Plan 84 owns the exact path, ownership and ABI contract.
+
+## Why positional output has an exclusive constructor
+
+An exists-then-create guard cannot protect a competing artifact: the ordinary
+truncating constructor can destroy an entry created between those operations.
+Request 30 supplies the same native final-entry exclusive acquisition already
+used by sequential writers, returning the existing positional File instead.
+One O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW open with mode 0644 subject to umask
+makes the winner explicit without a second error, ownership or cleanup model.
+Code(native EEXIST) protects occupied entries; partial outputs remain caller-owned
+for explicit removal. Plan 85 adds no confinement, rollback or durability promise.

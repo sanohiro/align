@@ -1100,6 +1100,7 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         ExprKind::FileCreateRw { path } => ExprKind::FileCreateRw { path: boxed!(path) },
         ExprKind::FileOpenRw { path } => ExprKind::FileOpenRw { path: boxed!(path) },
         ExprKind::FileOpenRo { path } => ExprKind::FileOpenRo { path: boxed!(path) },
+        ExprKind::FileCreateRwExclusive { path } => ExprKind::FileCreateRwExclusive { path: boxed!(path) },
         ExprKind::FilePread {
             file,
             buffer,
@@ -2772,7 +2773,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::CryptoDigestFinish { digest: recv }
         | ExprKind::FileCreateRw { path: recv }
         | ExprKind::FileOpenRw { path: recv }
-        | ExprKind::FileOpenRo { path: recv }
+        | ExprKind::FileOpenRo { path: recv } | ExprKind::FileCreateRwExclusive { path: recv }
         | ExprKind::FileLen { file: recv }
         | ExprKind::BufferBytes { buffer: recv }
         | ExprKind::StrBytes { inner: recv }

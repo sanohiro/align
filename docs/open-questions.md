@@ -4548,6 +4548,14 @@ fast-systems-programming needs that any Align user hits, not engine-specific.
    -> Result<file, Error>` opens O_RDONLY|O_CLOEXEC into the same owned file. Pread/len/Drop
    remain unchanged; pwrite returns Denied even for empty data, after negative-offset abort.
    Runtime descriptor-mode checking adds no stored capability flag or constructor-origin inference.
+   **Exclusive positional create settled 2026-10-01 (Request 30, plan 85):**
+   `fs.create_rw_exclusive(path: str) -> Result<file, Error>` uses one native
+   O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW open with mode 0644 subject to umask.
+   Every occupied final entry returns Code(native EEXIST) without following,
+   opening or modifying it. Empty/UTF-8/NUL validation precedes filesystem work.
+   Ordinary parent resolution, fixed errors, call-scoped path allocation and
+   existing File methods/Move/Drop remain authoritative. Partial files require
+   explicit cleanup; no confinement, rollback, transaction or durability is added.
 5. **`std.http` server slice (Slice 4) + streaming (SSE/chunked) response write** — the
    align-gateway is an OpenAI-compatible SSE-streaming local server; Slice 4's design should be
    written against that requirement. **Slice-4 surface SETTLED 2026-07-10** (two-lens design

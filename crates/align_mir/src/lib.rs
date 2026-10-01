@@ -2010,6 +2010,8 @@ pub enum Rvalue {
     },
     /// `fs.open_ro(path)`: O_RDONLY|O_CLOEXEC, same private File output and i32 status.
     FileOpenRo { path: Operand, out: Slot },
+    /// Exclusive final-entry creation with the existing read/write File owner.
+    FileCreateRwExclusive { path: Operand, out: Slot },
     /// `f.pread(b, off)` — one positionless read at file offset `off` into the `buffer` `b`,
     /// borrowing both. Yields an `i64`: actual bytes read (`0` = EOF) on success, or `-(status)` on
     /// error (the [`Self::ReaderRead`] sign convention). A negative `off` aborts in the runtime. (A4.)
@@ -8135,7 +8137,7 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
             | hir::ExprKind::JsonEncode { plan: align_sema::hir::JsonEncodePlan::Owned(_), max_bytes: Some(_), .. }
             | hir::ExprKind::FileCreateRw { .. }
             | hir::ExprKind::FileOpenRw { .. }
-            | hir::ExprKind::FileOpenRo { .. }
+            | hir::ExprKind::FileOpenRo { .. } | hir::ExprKind::FileCreateRwExclusive { .. }
             | hir::ExprKind::FilePread { .. }
             | hir::ExprKind::FilePwrite { .. }
             | hir::ExprKind::FileLen { .. }
@@ -8327,7 +8329,7 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::JsonEncode { base, plan, max_bytes } => lower_json_encode(b, *base, plan, max_bytes.as_deref(), e.ty),
         hir::ExprKind::FileCreateRw { .. }
         | hir::ExprKind::FileOpenRw { .. }
-        | hir::ExprKind::FileOpenRo { .. }
+        | hir::ExprKind::FileOpenRo { .. } | hir::ExprKind::FileCreateRwExclusive { .. }
         | hir::ExprKind::FilePread { .. }
         | hir::ExprKind::FilePwrite { .. }
         | hir::ExprKind::FileLen { .. } => lower_file_expr(b, e),
@@ -8848,7 +8850,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             // is depth-multiplied, so keeping it flat matters).
             hir::ExprKind::FileCreateRw { .. }
             | hir::ExprKind::FileOpenRw { .. }
-            | hir::ExprKind::FileOpenRo { .. }
+            | hir::ExprKind::FileOpenRo { .. } | hir::ExprKind::FileCreateRwExclusive { .. }
             | hir::ExprKind::FilePread { .. }
             | hir::ExprKind::FilePwrite { .. }
             | hir::ExprKind::FileLen { .. } => lower_file_expr(b, e),
@@ -20268,6 +20270,9 @@ fn lower_file_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
         hir::ExprKind::FileOpenRo { path } => {
             lower_open_handle(b, path, Ty::File, result_ty, |path, out| Rvalue::FileOpenRo { path, out })
+        }
+        hir::ExprKind::FileCreateRwExclusive { path } => {
+            lower_open_handle(b, path, Ty::File, result_ty, |path, out| Rvalue::FileCreateRwExclusive { path, out })
         }
         hir::ExprKind::FilePread {
             file,

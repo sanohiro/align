@@ -9009,13 +9009,13 @@ unsafe fn abi_exclusive_path(ptr: *const u8, len: i64) -> Result<std::ffi::CStri
     if n == 0 || ptr.is_null() {
         return Err(AL_INVALID);
     }
+    n.checked_add(1)
+        .filter(|capacity| *capacity <= isize::MAX.unsigned_abs())
+        .ok_or(AL_INVALID)?;
     let bytes = unsafe { std::slice::from_raw_parts(ptr, n) };
     if std::str::from_utf8(bytes).is_err() || bytes.contains(&0) {
         return Err(AL_INVALID);
     }
-    n.checked_add(1)
-        .filter(|capacity| *capacity <= isize::MAX.unsigned_abs())
-        .ok_or(AL_INVALID)?;
     // The checks above prove that `CString::new` cannot reject the bytes. Keep the conversion
     // fail-closed anyway; its allocation remains intentionally infallible under the locked OOM
     // policy.
@@ -11179,7 +11179,7 @@ pub unsafe extern "C" fn align_rt_io_copy(r: *mut Reader, w: *mut Writer) -> i64
 
 /// A `file` (`std.fs`/`std.io`) — a Move handle owning a read-only or read+write file descriptor for
 /// positionless (`pread`/`pwrite`) block I/O. Unlike `Reader`/`Writer` it has no borrowed variant
-/// (`fs.create_rw`/`fs.open_rw`/`fs.open_ro` always own the fd) and no cursor (every access carries its own
+/// (all File constructors own the fd) and no cursor (every access carries its own
 /// explicit offset). `Drop` (`align_rt_io_file_free`) closes the fd.
 pub struct RwFile {
     fd: i32,
@@ -11263,6 +11263,31 @@ pub unsafe extern "C" fn align_rt_io_file_open_ro(path: *const u8, path_len: i64
     }
 }
 const _: unsafe extern "C" fn(*const u8, i64, *mut *mut RwFile) -> i32 = align_rt_io_file_open_ro;
+
+/// `fs.create_rw_exclusive(path)` — one read/write exclusive native create, mode 0644 subject
+/// to umask. An occupied final entry is never followed, opened, truncated, replaced or removed.
+/// Drop owns only descriptor closure; a partial file remains for explicit application cleanup.
+///
+/// # Safety
+/// Positive non-null input must be live immutable readable bytes; out must be aligned writable
+/// pointer storage disjoint from input. Success transfers an owned File for exactly-once free.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_file_create_exclusive(path: *const u8, path_len: i64, out: *mut *mut RwFile) -> i32 {
+    if out.is_null() { return AL_INVALID; }
+    unsafe { *out = core::ptr::null_mut() };
+    let path = match unsafe { abi_exclusive_path(path, path_len) } {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+    let fd = unsafe {
+        libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_EXCL
+            | libc::O_CLOEXEC | libc::O_NOFOLLOW, 0o644)
+    };
+    if fd < 0 { return io_error_to_status(&std::io::Error::last_os_error()); }
+    unsafe { *out = Box::into_raw(Box::new(RwFile { fd })) };
+    0
+}
+const _: unsafe extern "C" fn(*const u8, i64, *mut *mut RwFile) -> i32 = align_rt_io_file_create_exclusive;
 
 /// Borrow a `std::fs::File` over an owned raw fd **without** taking ownership of it — the returned
 /// [`ManuallyDrop`] is never dropped, so the fd stays owned by the caller's `RwFile` (its `Drop`
@@ -29159,6 +29184,227 @@ mod tests {
         fn drop(&mut self) { unsafe { align_rt_io_file_free(self.0) }; }
     }
 
+    /// Release every started creator and join it before fixture cleanup, including partial spawn
+    /// failure and worker assertion unwind. The gate does not require a fixed successful spawn count.
+    struct FileCreatorGroup {
+        start: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        threads: Vec<std::thread::JoinHandle<(i32, u8)>>,
+    }
+    impl FileCreatorGroup {
+        fn new() -> Self {
+            Self { start: std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())), threads: Vec::new() }
+        }
+        fn spawn(&mut self, body: impl FnOnce() -> (i32, u8) + Send + 'static) -> std::io::Result<()> {
+            let start = std::sync::Arc::clone(&self.start);
+            let thread = std::thread::Builder::new().spawn(move || {
+                let (lock, wake) = &*start;
+                let mut ready = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                while !*ready { ready = wake.wait(ready).unwrap_or_else(std::sync::PoisonError::into_inner); }
+                drop(ready);
+                body()
+            })?;
+            self.threads.push(thread);
+            Ok(())
+        }
+        fn release(&self) {
+            let (lock, wake) = &*self.start;
+            *lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            wake.notify_all();
+        }
+        fn finish(mut self) -> Vec<(i32, u8)> {
+            self.release();
+            let joined: Vec<_> = self.threads.drain(..).map(|thread| thread.join()).collect();
+            // No worker remains live when the first failed result resumes its original panic.
+            joined.into_iter().map(|result| result.unwrap_or_else(|payload| std::panic::resume_unwind(payload))).collect()
+        }
+    }
+    impl Drop for FileCreatorGroup {
+        fn drop(&mut self) {
+            self.release();
+            // During an existing unwind, secondary worker failures must not skip the remaining joins.
+            for thread in self.threads.drain(..) { let _ = thread.join(); }
+        }
+    }
+
+    #[test]
+    fn file_create_exclusive_failed_worker_joins_before_fixture_cleanup() {
+        for finish in [true, false] {
+            let root = FileFixtureDir::new("exclusive-worker-failure");
+            let path = root.0.clone();
+            let peer_path = path.clone();
+            let (send, receive) = std::sync::mpsc::channel();
+            let mut group = FileCreatorGroup::new();
+            group.spawn(|| panic!("injected creator failure")).unwrap();
+            group.spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                send.send(peer_path.is_dir()).unwrap();
+                (0, 0)
+            }).unwrap();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _root = root;
+                let group = group;
+                if finish { group.finish(); }
+                else { panic!("injected partial setup failure"); }
+            }));
+            let peer_saw_live_fixture = receive.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+            assert!(result.is_err());
+            assert!(peer_saw_live_fixture, "fixture cleanup must follow the delayed peer join");
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn file_create_exclusive_occupied_entries_and_flags() {
+        use std::os::unix::fs::FileTypeExt;
+        let root = FileFixtureDir::new("exclusive-entries");
+        let fresh = root.0.join("fresh");
+        let text = fresh.to_str().unwrap();
+        let mut out = core::ptr::null_mut();
+        let status = unsafe { align_rt_io_file_create_exclusive(text.as_ptr(), text.len() as i64, &mut out) };
+        let owner = FileTestHandle(out);
+        assert_eq!(status, 0);
+        assert!(!out.is_null());
+        let fd = unsafe { (*out).fd };
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_ACCMODE, libc::O_RDWR);
+        assert!(fd_is_cloexec(fd));
+        assert_eq!(unsafe { align_rt_io_file_pwrite(out, core::ptr::null(), 0, 0) }, 0);
+        assert_eq!(unsafe { align_rt_io_file_pwrite(out, b"abc".as_ptr(), 3, 5) }, 3);
+        assert_eq!(unsafe { align_rt_io_file_len(out) }, 8);
+        drop(owner);
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"\0\0\0\0\0abc");
+
+        let directory = root.0.join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("marker"), b"unchanged").unwrap();
+        let live = root.0.join("live");
+        let dangling = root.0.join("dangling");
+        let absent = root.0.join("absent");
+        std::os::unix::fs::symlink(&fresh, &live).unwrap();
+        std::os::unix::fs::symlink(&absent, &dangling).unwrap();
+        let fifo = root.0.join("fifo");
+        let fifo_c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        for path in [&fresh, &directory, &live, &dangling, &fifo, std::path::Path::new("/dev/null")] {
+            let text = path.to_str().unwrap();
+            let mut out = core::ptr::null_mut();
+            let status = unsafe { align_rt_io_file_create_exclusive(text.as_ptr(), text.len() as i64, &mut out) };
+            let _owner = FileTestHandle(out);
+            assert_eq!(status, io_error_to_status(&std::io::Error::from_raw_os_error(libc::EEXIST)), "{path:?}");
+            assert!(out.is_null());
+        }
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"\0\0\0\0\0abc");
+        assert_eq!(std::fs::read(directory.join("marker")).unwrap(), b"unchanged");
+        assert_eq!(std::fs::read_link(live).unwrap(), fresh);
+        assert_eq!(std::fs::read_link(dangling).unwrap(), absent);
+        assert!(!absent.exists());
+        assert!(std::fs::symlink_metadata(fifo).unwrap().file_type().is_fifo());
+    }
+
+    #[test]
+    fn file_create_exclusive_invalid_paths() {
+        let root = FileFixtureDir::new("exclusive-invalid");
+        let missing = root.0.join("missing-parent").join("file");
+        let missing = missing.to_str().unwrap();
+        let bad_utf8 = [0xff];
+        let bad_nul = b"bad\0path";
+        for (ptr, len, expected) in [
+            (core::ptr::null(), 0, AL_INVALID), (core::ptr::null(), 1, AL_INVALID),
+            (b"x".as_ptr(), -1, AL_INVALID), (core::ptr::dangling(), i64::MAX, AL_INVALID),
+            (bad_utf8.as_ptr(), 1, AL_INVALID), (bad_nul.as_ptr(), 8, AL_INVALID),
+            (missing.as_ptr(), missing.len() as i64, AL_NOT_FOUND),
+        ] {
+            let mut out = core::ptr::dangling_mut();
+            assert_eq!(unsafe { align_rt_io_file_create_exclusive(ptr, len, &mut out) }, expected);
+            assert!(out.is_null());
+            assert_eq!(unsafe { align_rt_io_file_create_exclusive(ptr, len, core::ptr::null_mut()) }, AL_INVALID);
+        }
+        // Shared exclusive-publication callers must also reject capacity before a raw-slice read.
+        assert!(matches!(unsafe { abi_exclusive_path(core::ptr::dangling(), i64::MAX) }, Err(AL_INVALID)));
+        assert_eq!(std::fs::read_dir(&root.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn file_create_exclusive_race_has_one_winner() {
+        use std::sync::Arc;
+        let root = FileFixtureDir::new("exclusive-race");
+        let path = Arc::new(root.0.join("winner").to_str().unwrap().to_owned());
+        let mut group = FileCreatorGroup::new();
+        for byte in 0u8..8 {
+            let path = Arc::clone(&path);
+            group.spawn(move || {
+                let mut out = core::ptr::null_mut();
+                let status = unsafe { align_rt_io_file_create_exclusive(path.as_ptr(), path.len() as i64, &mut out) };
+                let _owner = FileTestHandle(out);
+                if status == 0 {
+                    assert!(!out.is_null());
+                    assert_eq!(unsafe { align_rt_io_file_pwrite(out, &byte, 1, 0) }, 1);
+                } else { assert!(out.is_null()); }
+                (status, byte)
+            }).expect("exclusive creator spawn");
+        }
+        let results = group.finish();
+        let winners: Vec<_> = results.iter().filter(|(status, _)| *status == 0).collect();
+        assert_eq!(winners.len(), 1);
+        let occupied = io_error_to_status(&std::io::Error::from_raw_os_error(libc::EEXIST));
+        assert!(results.iter().filter(|(status, _)| *status != 0).all(|(status, _)| *status == occupied));
+        assert_eq!(std::fs::read(path.as_str()).unwrap(), [winners[0].1]);
+    }
+
+    #[test]
+    fn file_create_exclusive_mode_respects_child_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        const MODE: &str = "ALIGN_FILE_EXCLUSIVE_UMASK_CHILD";
+        if let Some(mode) = std::env::var_os(MODE) {
+            let mask = match mode.to_str() { Some("000") => 0, Some("077") => 0o077, _ => panic!("invalid child umask") };
+            // The exact-filter child has no other test; the parent process never changes umask.
+            unsafe { libc::umask(mask) };
+            let root = FileFixtureDir::new("exclusive-mode");
+            let path = root.0.join("created");
+            let text = path.to_str().unwrap();
+            let mut out = core::ptr::null_mut();
+            let status = unsafe { align_rt_io_file_create_exclusive(text.as_ptr(), text.len() as i64, &mut out) };
+            let _owner = FileTestHandle(out);
+            assert_eq!(status, 0);
+            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o644 & !u32::from(mask));
+            return;
+        }
+        struct ChildOwner { child: Option<std::process::Child>, deadline: std::time::Instant }
+        impl Drop for ChildOwner {
+            fn drop(&mut self) {
+                let Some(child) = self.child.as_mut() else { return; };
+                let _ = child.kill();
+                while std::time::Instant::now() < self.deadline {
+                    match child.try_wait() {
+                        Ok(Some(_)) => return,
+                        Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {},
+                        Err(_) => return,
+                    }
+                }
+                eprintln!("exclusive mode child could not be reaped before deadline");
+            }
+        }
+        for mode in ["000", "077"] {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let execution = deadline - std::time::Duration::from_secs(5);
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::file_create_exclusive_mode_respects_child_umask", "--test-threads=1", "--nocapture"])
+                .env(MODE, mode).spawn().expect("isolated mode child");
+            let mut owner = ChildOwner { child: Some(child), deadline };
+            let status = loop {
+                assert!(std::time::Instant::now() < execution, "exclusive mode child timed out");
+                match owner.child.as_mut().unwrap().try_wait() {
+                    Ok(Some(status)) => break status,
+                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {},
+                    Err(error) => panic!("poll exclusive mode child: {error}"),
+                }
+            };
+            owner.child.take();
+            assert!(status.success(), "umask {mode} child: {status}");
+        }
+    }
+
     #[test]
     fn file_fixture_directory_preserves_existing_entries() {
         let root = FileFixtureDir::new("ownership");
@@ -29349,7 +29595,7 @@ mod tests {
 
         const N: usize = 128;
         let before = count_fds();
-        for _ in 0..N {
+        for cycle in 0..N {
             let mut f: *mut RwFile = std::ptr::null_mut();
             assert_eq!(unsafe { align_rt_io_file_create(pb.as_ptr(), pb.len() as i64, &mut f) }, 0);
             let owner = FileTestHandle(f);
@@ -29363,6 +29609,14 @@ mod tests {
             let ro_owner = FileTestHandle(ro);
             assert_eq!(unsafe { align_rt_io_file_len(ro) }, 7);
             drop(ro_owner);
+            let exclusive = fixture.0.join(format!("exclusive-{cycle}"));
+            let text = exclusive.to_str().unwrap();
+            let mut f = core::ptr::null_mut();
+            let status = unsafe { align_rt_io_file_create_exclusive(text.as_ptr(), text.len() as i64, &mut f) };
+            let owner = FileTestHandle(f);
+            assert_eq!(status, 0);
+            assert_eq!(unsafe { align_rt_io_file_pwrite(f, b"x".as_ptr(), 1, 0) }, 1);
+            drop(owner);
         }
         if let (Some(before), Some(after)) = (before, count_fds()) {
             assert!(

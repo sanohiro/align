@@ -4761,7 +4761,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::IoCopy { .. }
             | hir::ExprKind::FileCreateRw { .. }
             | hir::ExprKind::FileOpenRw { .. }
-            | hir::ExprKind::FileOpenRo { .. }
+            | hir::ExprKind::FileOpenRo { .. } | hir::ExprKind::FileCreateRwExclusive { .. }
             | hir::ExprKind::FilePread { .. }
             | hir::ExprKind::FilePwrite { .. }
             | hir::ExprKind::FileLen { .. }
@@ -5161,7 +5161,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::IoCopy { .. }
             | hir::ExprKind::FileCreateRw { .. }
             | hir::ExprKind::FileOpenRw { .. }
-            | hir::ExprKind::FileOpenRo { .. }
+            | hir::ExprKind::FileOpenRo { .. } | hir::ExprKind::FileCreateRwExclusive { .. }
             | hir::ExprKind::FilePread { .. }
             | hir::ExprKind::FilePwrite { .. }
             | hir::ExprKind::FileLen { .. }
@@ -9231,7 +9231,7 @@ impl<'a> BodyValidator<'a> {
                 }
                 result(Ty::Int(align_sema::IntTy { bits: 64, signed: true }), &[reader, writer])
             }
-            hir::ExprKind::FileCreateRw { path } | hir::ExprKind::FileOpenRw { path } | hir::ExprKind::FileOpenRo { path } => {
+            hir::ExprKind::FileCreateRw { path } | hir::ExprKind::FileOpenRw { path } | hir::ExprKind::FileOpenRo { path } | hir::ExprKind::FileCreateRwExclusive { path } => {
                 (path.ty == Ty::Str).then(|| result(Ty::File, &[path]))?
             }
             hir::ExprKind::FilePread { file, buffer, offset } => {

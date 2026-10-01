@@ -1612,6 +1612,8 @@ pub enum ExprKind {
     FileOpenRw { path: Box<Expr> },
     /// `fs.open_ro(path)` — O_RDONLY|O_CLOEXEC, existing path, same owned File and Drop. Impure.
     FileOpenRo { path: Box<Expr> },
+    /// `fs.create_rw_exclusive(path)` — exclusive final entry, read/write owned File. Impure.
+    FileCreateRwExclusive { path: Box<Expr> },
     /// `f.pread(b: mut buffer, off)` — one positionless read at file offset `off` into `b`
     /// (overwriting its length), borrowing both `file` and `buffer` (neither consumed). The `ty` is
     /// `Result<i64, Error>` (actual bytes read; `0` = EOF). Impure. A negative `off` aborts. (A4.)
