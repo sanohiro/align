@@ -1580,6 +1580,8 @@ pub enum Rvalue {
     /// `s.contains(n)` / `s.starts_with(p)` / `s.ends_with(s)` — a byte-oriented `str` predicate,
     /// yielding `bool` (`i1`). Both operands are `str` `{ptr,len}` views; backed by a runtime
     /// `memchr`-class scan. Pure read, no allocation.
+    /// Checked decimal scanner: i32 status and an exact i64 output slot.
+    StrParseI64 { input: Operand, out: Slot },
     StrPredicate {
         kind: hir::StrPredKind,
         haystack: Operand,
@@ -10421,6 +10423,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 b.push(Stmt::Let(v, Rvalue::CloneIn { value: src, handle }));
                 Operand::Value(v)
             }
+            hir::ExprKind::StrParseI64 { input } => lower_str_parse_i64(b, input, e.ty),
             hir::ExprKind::StrCharBoundary { receiver, index } => {
                 lower_required_binding!(b, h = lower_expr(b, receiver), Operand::Const(Const::Unit));
                 lower_required_binding!(b, i = lower_expr(b, index), Operand::Const(Const::Unit));
@@ -19235,6 +19238,65 @@ fn lower_json_decode_array(b: &mut Builder, elem: Ty, input: &hir::Expr, result_
     b.push(Stmt::Let(r, Rvalue::Load(rslot)));
     Operand::Value(r)
 }
+
+/// Checked decimal parsing borrows bytes only until the native scanner completes.
+fn lower_str_parse_i64(
+    b: &mut Builder,
+    input: &hir::Expr,
+    result_ty: Ty,
+) -> Operand {
+    let scalar = Ty::Int(IntTy { bits: 64, signed: true });
+    let out = b.new_slot(scalar);
+    let inp = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(
+        code,
+        Rvalue::StrParseI64 {
+            input: inp.clone(),
+            out,
+        },
+    ));
+
+    drop_borrow_owners(b, &inp);
+
+    let isok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
+
+    // Ok: load the parsed scalar and wrap it.
+    b.cur = ok_bb;
+    let s = b.fresh_value(scalar);
+    b.push(Stmt::Let(s, Rvalue::Load(out)));
+    let okv = b.fresh_value(result_ty);
+    b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Value(s))));
+    b.push(Stmt::Store(rslot, Operand::Value(okv)));
+    b.terminate(Term::Goto(join));
+
+    // Err: wrap the status code (the out slot is unused on failure).
+    b.cur = err_bb;
+    let errv = b.fresh_value(result_ty);
+    let ec = make_error_from_status(b, code, result_ty);
+    b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
+    b.push(Stmt::Store(rslot, Operand::Value(errv)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let r = b.fresh_value(result_ty);
+    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
+    Operand::Value(r)
+}
+
 
 /// `json.decode(input)` into a bare **scalar** (JSON completeness T1b) → parse the whole input as one
 /// JSON number / bool into an out scalar slot via the runtime parser (status `i32`), then branch into

@@ -1043,6 +1043,7 @@ The result formula in every row is followed by the universal
 | `BoxGet` | `env[]`; `child[box]`; `post[box.ty == Box(S), S is Copy; result scalar_to_ty(S); box borrowed]`. |
 | `BoxClone` | `env[]`; `child[box]`; `post[box.ty == Box(S), S is Copy; result same Box(S); inside arena; source borrowed and destination newly arena-owned]`. |
 | `StrClone` | `env[]`; `child[text]`; `post[text.ty is Str or String; result String; source borrowed without transfer; a fresh owned receiver is kept live only through the copy; result individually owned unless current arena captures it]`. |
+| `StrParseI64` | `child[input]`; `post[input exact Str; result exact Result<i64, builtin Error>; borrowed input; strict child completion; no result borrow roots; Pure]`. Whole-input ASCII signed decimal grammar and Invalid failures are owned by plan 83; independent validation derives the canonical Error enum identity. |
 | `StrCharBoundary` | `child[receiver,index]`; `post[receiver Str; index exact signed i64; result Bool; receiver borrowed; strict child completion]`. |
 | `StrPredicate` | `env[kind]`; `child[haystack,needle]`; `post[both Str; Contains/StartsWith/EndsWith/EqIgnoreCase result Bool; Find/Rfind result Option<i64>; both borrowed]`. |
 | `StrTrim` | `env[kind]`; `child[recv]`; `post[recv Str; result Str; view inherits recv roots/region]`. |

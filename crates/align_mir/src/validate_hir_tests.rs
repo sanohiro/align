@@ -12161,11 +12161,11 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        // StrCharBoundary, ArrayTruncate, BytesSet, BytesFill, BytesCopyFrom, BufferAppendFilled,
+        // StrParseI64, StrCharBoundary, ArrayTruncate, BytesSet, BytesFill, BytesCopyFrom, BufferAppendFilled,
         // FloatScope, BytesView, SliceAsBytes, and HttpServerMaxRequestBodyBytes are explicit in
         // validation, source-shape, replay and ownership.
         variants,
-        342,
+        343,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -19247,6 +19247,33 @@ fn text_boundary_hir_rejects_forged_types_in_every_entrypoint() {
         }
         assert_body_entrypoints_empty("text-boundary-forged", &malformed);
     }
+}
+
+#[test]
+fn str_parse_i64_hir_rejects_forged_types_in_every_entrypoint() -> Result<(), &'static str> {
+    let base = checked_source_program("fn f(text: str) -> Result<i64, Error> { value := text.parse_i64(); return value }");
+    assert!(!is_empty(&lower_program(&base)));
+    for mutation in 0..5 {
+        let mut malformed = base.clone();
+        let expression = body_first_let_init_mut(&mut malformed, "f");
+        let original = expression.ty;
+        let hir::ExprKind::StrParseI64 { input } = &mut expression.kind else { return Err("parse fixture"); };
+        match mutation {
+            0 => **input = body_test_expr(hir::ExprKind::Bool(true), Ty::Bool),
+            1 => **input = body_test_expr(
+                hir::ExprKind::StrClone(Box::new(body_test_expr(hir::ExprKind::Str("1".into()), Ty::Str))),
+                Ty::String,
+            ),
+            2 => expression.ty = Ty::Int(IntTy { bits: 64, signed: true }),
+            3 => {
+                let Ty::Result(_, error) = original else { return Err("result fixture"); };
+                expression.ty = Ty::Result(Scalar::Int(IntTy { bits: 32, signed: true }), error);
+            }
+            _ => expression.ty = Ty::Result(Scalar::Int(IntTy { bits: 64, signed: true }), Scalar::Bool),
+        }
+        assert_body_entrypoints_empty("str-parse-i64-forged", &malformed);
+    }
+    Ok(())
 }
 
 #[test]

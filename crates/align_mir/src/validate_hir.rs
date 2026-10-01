@@ -4421,6 +4421,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::BoxClone(_)
             | hir::ExprKind::StrClone(_)
             | hir::ExprKind::CloneIn { .. }
+            | hir::ExprKind::StrParseI64 { .. }
             | hir::ExprKind::StrCharBoundary { .. } | hir::ExprKind::StrPredicate { .. }
             | hir::ExprKind::StrTrim { .. }
             | hir::ExprKind::StrBorrow(_)
@@ -7105,6 +7106,7 @@ impl<'a> BodyValidator<'a> {
                 hir::ExprKind::JsonDecode { input, .. }
                 | hir::ExprKind::JsonOwnedDecode { input, .. }
                 | hir::ExprKind::JsonDecodeArray { input, .. }
+                | hir::ExprKind::StrParseI64 { input }
                 | hir::ExprKind::JsonDecodeScalar { input, .. }
                 | hir::ExprKind::JsonDecodeStructArray { input, .. }
                 | hir::ExprKind::JsonDecodeSoa { input, .. }
@@ -8711,6 +8713,13 @@ impl<'a> BodyValidator<'a> {
                 let ty = value.ty;
                 let (falls, breaks) = strict_flow(&[value, region]);
                 Some((ty, falls, breaks))
+            }
+            hir::ExprKind::StrParseI64 { input } => {
+                let flow = self.expr_flow(input)?;
+                if flow.ty != Ty::Str { return None; }
+                let error = self.error_id()?;
+                let (falls, breaks) = strict_flow(&[flow]);
+                Some((Ty::Result(Scalar::Int(align_sema::IntTy { bits: 64, signed: true }), Scalar::Enum(error)), falls, breaks))
             }
             hir::ExprKind::StrCharBoundary { receiver, index } => {
                 let left = self.expr_flow(receiver)?;

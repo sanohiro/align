@@ -16176,6 +16176,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .basic()
                     .expect("str trim returns a {ptr,len}")
             }
+            Rvalue::StrParseI64 { input, out } => {
+                let out_ptr = self.slots.get(out).copied().ok_or_else(|| self.err("missing parse_i64 output slot"))?;
+                let (ptr, len) = self.split_str(input)?;
+                self.builder.build_call(self.runtime(RuntimeKey::StrParseI64), &[ptr.into(), len.into(), out_ptr.into()], "parse_i64")
+                    .map_err(|e| self.err(e))?.try_as_basic_value().basic()
+                    .ok_or_else(|| self.err("parse_i64 must return i32"))?
+            }
             Rvalue::StrPredicate { kind, haystack, needle } => {
                 use align_sema::hir::StrPredKind;
                 // Extract both `{ptr,len}` views; the runtime call + result shaping differ per kind.
@@ -31510,6 +31517,47 @@ fn main() -> i32 = 0
                 );
             }
         }
+    }
+
+    #[test]
+    fn str_parse_i64_mir_gate_requires_exact_native_slots() -> Result<(), &'static str> {
+        let base = mir("fn f(text: str, spare: i64) -> Result<i64, Error> = text.parse_i64()\nfn main() -> i32 = 0\n");
+        assert!(validate_resource_rvalues(&base).is_ok());
+        let index = xml_test_function(&base, "f");
+        let function = &base.fns[index];
+        let (value, out) = function.blocks.iter().flat_map(|block| &block.stmts).find_map(|statement| {
+            match statement {
+                Stmt::Let(value, Rvalue::StrParseI64 { out, .. }) => Some((*value, *out)),
+                _ => None,
+            }
+        }).ok_or("parse native fixture")?;
+        for ty in [Ty::Bool, Ty::Int(IntTy { bits: 64, signed: true }), Ty::Int(IntTy { bits: 32, signed: false })] {
+            let mut wrong = base.clone();
+            wrong.fns[index].value_tys[value as usize] = ty;
+            assert_xml_producer_rejected(&wrong, "parse status exact i32");
+        }
+        for ty in [Ty::Bool, Ty::Int(IntTy { bits: 64, signed: false }), Ty::Int(IntTy { bits: 32, signed: true })] {
+            let mut wrong = base.clone();
+            wrong.fns[index].slots[out as usize] = ty;
+            assert_xml_producer_rejected(&wrong, "parse output exact i64");
+        }
+        for mutation in 0..3 {
+            let mut wrong = base.clone();
+            let spare = *wrong.fns[index].params.get(1).ok_or("spare parameter")?;
+            let operation = wrong.fns[index].blocks.iter_mut().flat_map(|block| &mut block.stmts).find_map(|statement| {
+                match statement {
+                    Stmt::Let(_, Rvalue::StrParseI64 { input, out }) => Some((input, out)),
+                    _ => None,
+                }
+            }).ok_or("parse mutable fixture")?;
+            match mutation {
+                0 => *operation.0 = Operand::Const(Const::Bool(true)),
+                1 => *operation.1 = u32::MAX,
+                _ => *operation.1 = spare,
+            }
+            assert_xml_producer_rejected(&wrong, "parse operand and private scratch identity");
+        }
+        Ok(())
     }
 
     #[test]

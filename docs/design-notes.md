@@ -50,6 +50,12 @@ path. This preserves the `match` = alternatives / `if` = conditions boundary
 without a hash contract, hidden copy, or pattern-specific allocation. [Plan
 72](impl/72-string-literal-match-plan.md) owns the exact records and closure.
 
+Checked `str.parse_i64()` makes decimal conversion independent of JSON and
+private parsers. Whole-input ASCII grammar, explicit trimming and one Invalid
+error keep protocol/CLI parsing deterministic. Checked conversion preserves the
+ordinary wrapping arithmetic rule: conversion rejects unrepresentable text.
+Borrowing bytes and returning a scalar avoids hidden allocation or retained views.
+
 UTF-8 byte offsets can be queried with `str.is_char_boundary(i64)` before slicing.
 The total predicate shares MIR boundary logic with ordinary slicing, while
 slicing retains its terminal failure contract. Prefix/suffix comparison already

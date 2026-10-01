@@ -317,6 +317,15 @@ fn borrowed_control_flow_temporaries_lower_exactly_once() {
             branches,
             "{cell}: the borrowed control flow must be lowered exactly once:\n{probe}"
         );
+        let parsed = src.replace(".trim().len()", ".trim().parse_i64() else 3");
+        let parsed_mir = mir_text(&parsed);
+        let parsed_probe = function(&parsed_mir, "probe");
+        assert_eq!(parsed_probe.matches("str_parse_i64(").count(), 1, "{cell}: scanner evaluated once");
+        assert_eq!(parsed_probe.matches("branch ").count(), branches + 2, "{cell}: receiver, status and else branches");
+        if backend_available() {
+            assert_eq!(build_and_run(&format!("parsed-temp-{cell}"), &parsed).status.code(), Some(6));
+        }
+
         if backend_available() {
             assert_eq!(
                 build_and_run(&format!("owned-temp-{cell}"), &src).status.code(),
@@ -350,6 +359,7 @@ fn borrowed_scope_temporaries_lower_their_scope_exactly_once() {
     ];
     for (mode, prelude, tail) in [
         ("string-borrow", "", "\" tmp \".clone()\n  }).trim().len()"),
+        ("string-parse", "", "\"3\".clone()\n  }).parse_i64() else 0"),
         (
             "string-index",
             "fn strings() -> array<string> { mut b: array_builder<string> := array_builder(); b.push(\"tmp\".clone()); return b.build() }\n",

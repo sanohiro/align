@@ -16,6 +16,7 @@
 "lit"                      -> str        // single-line only; \n \t \" escapes; UTF-8
 'A' / 'あ'                 -> char       // one Unicode scalar
 s.is_char_boundary(index: i64) -> bool  // 全域的なバイト境界判定; アロケーションなし
+s.parse_i64() -> Result<i64, Error>  // ASCII 十進数の検査付き変換; アロケーションなし
 s.len()                    -> i64        // BYTE length ("あ".len() == 3)
 s.contains(n) / s.starts_with(n) / s.ends_with(n)      -> bool
 s.eq_ignore_ascii_case(t)  -> bool       // ASCII fold only, not Unicode
@@ -62,7 +63,15 @@ Pure（I/O なし）。*アロケーションの可視性* というルールは
 
 ## Errors & aborts
 
-この領域では `Result` は使用されない。`s[a..b]` における範囲外アクセス（out of bounds）は abort を引き起こす。非 UTF-8 な *入力* のエラー処理は `std` 境界での関心事である（`fs.read_file` → `Error.Invalid`）。core の文字列操作は不変条件が満たされている前提でバイト指向を保つ。範囲の部分ビュー作成（range lowering）は、仕様どおり O(1) で両端の UTF-8 スカラー境界チェックを行い、違反時は abort する（audit 13 §3.1、2026-07-13 修正済み）。
+整数変換は `Result<i64, Error>` を返し、不正な形式や範囲外の入力は `Error.Invalid` となる。`s[a..b]` における範囲外アクセス（out of bounds）は abort を引き起こす。非 UTF-8 な *入力* のエラー処理は `std` 境界での関心事である（`fs.read_file` → `Error.Invalid`）。core の文字列操作は不変条件が満たされている前提でバイト指向を保つ。範囲の部分ビュー作成（range lowering）は、仕様どおり O(1) で両端の UTF-8 スカラー境界チェックを行い、違反時は abort する（audit 13 §3.1、2026-07-13 修正済み）。
+
+`s.parse_i64() -> Result<i64, Error>` は入力全体を ASCII の
+`[+-]?[0-9]+` として変換する。先頭の符号は一つまでで、先頭のゼロと符号付きゼロを
+許容する。空白は拒否し、必要なら明示的に `.trim()` を呼ぶ。空文字、符号のみ、
+非 ASCII 数字、埋め込み NUL、区切り、基数接頭辞、小数、指数、i64 の範囲外は
+ラップや停止をせず `Err(Error.Invalid)` を返す。所有 `string` を含む受信側を一度だけ
+評価して借用し、Copy な結果はビューを保持しない。Pure で、ヒープ確保も入力のコピーも
+行わず、ロケール状態を参照しない。
 
 `s.is_char_boundary(index: i64) -> bool` は UTF-8 のバイト境界を判定する。
 負の位置とバイト長を超える位置は false、0 と末尾は true、それ以外は
