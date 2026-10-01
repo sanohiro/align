@@ -29,6 +29,23 @@ receiver は共有借用、入力の借用は呼び出し中だけ。実 UID/GID
 > single-link open も実装済みであり、align-llm 側の adoption は外部作業として残る。Request 56 の
 > private temporary-directory lifecycle は実装済みであり、release と align-llm 側 adoption が残る。
 
+## 既存バッファへの範囲指定読み込み
+
+`f.pread_into(b, destination_offset, length, file_offset) -> Result<i64, Error>`
+は既存のバッファへ直接読み込みます。File は束縛済みのローカル、`b` は
+排他的ヘルパー引数を含む裸の可変ローカルです。3 個の整数は i64 で、既定値はありません。
+負の引数、初期化済み長を超える開始位置、公開容量を超える要求範囲は、
+長さゼロや EOF でも I/O 前に Invalid を返します。未初期化の隙間は公開しません。
+成功後の長さは max(以前の長さ, 開始位置 + 実際の読み込み数) です。
+実際に書き込まれた範囲の前後は保持します。短い読み込みと EOF は実際の数を返し、
+EOF とエラーは初期化済み長を保持します。検証済みの長さゼロでは syscall を行いません。
+EINTR のみ再試行し、他のネイティブエラーは既存の errno 表に従います。
+容量とペイロードのアドレスは変わらず、割り当て・reserve・resize・clone・
+暗黙のゼロ埋めは行いません。所有者は呼び出し中のみ借用され、ゼロやエラーでも
+バッファ全体の既存の世代無効化が適用されます。後続の eager 引数は先に評価済みの
+File/Buffer を move・置換できません。予約はスカラー操作の完了時に終了します。
+任意の位置を初期化済みにする場合は明示的な `buffer.filled` を使います（plan 89）。
+
 ## R65 の封印済みストレージ契約
 
 設計・レビュー指摘の反映を完了した [plan 50](../../50-r65-process-capability-handoff.md) が、明示的な
@@ -142,7 +159,7 @@ NUL は Invalid、空パスは通常の OS エラー変換となる。不在は 
 結果は同じ Move の file で、所有する descriptor を Drop が閉じる。束縛済み receiver、
 集約への格納、単一スレッドの制限も同じ。pread は呼び出し側の mutable buffer の窓を
 使い、実際の読み取り数、短い読み取り、EOF の 0 を返す。len は descriptor の最新の
-メタデータを取得する。負のオフセットは権限検査より先に abort する。pwrite は入力
+メタデータを取得する。pread/pwrite の負のオフセットは権限検査より先に abort する。pwrite は入力
 バイトを読む前にカーネルが保持する descriptor のモードを調べ、読み取り専用の場合は
 空データも Denied にする。保存する capability flag やコンストラクタ履歴の推論を追加
 しない。既存の読み書きコンストラクタと全量書き込み成功の契約は同じ。

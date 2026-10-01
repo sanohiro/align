@@ -2022,6 +2022,8 @@ pub enum Rvalue {
         buffer: Operand,
         offset: Operand,
     },
+    /// Bounded one-read operation preserving initialized prefix, payload address and capacity.
+    FilePreadInto { file: Operand, buffer: Operand, destination_offset: Operand, length: Operand, offset: Operand },
     /// `f.pwrite(data, off)` — write **all** of the `data` (`bytes`) operand at file offset `off`,
     /// borrowing the file. Yields an `i64`: the full byte count on success, or `-(status)` on error
     /// (the [`Self::ReaderRead`] sign convention). A negative `off` aborts in the runtime. (A4.)
@@ -8142,7 +8144,7 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
             | hir::ExprKind::FileCreateRw { .. }
             | hir::ExprKind::FileOpenRw { .. }
             | hir::ExprKind::FileOpenRo { .. } | hir::ExprKind::FileCreateRwExclusive { .. }
-            | hir::ExprKind::FilePread { .. }
+            | hir::ExprKind::FilePread { .. } | hir::ExprKind::FilePreadInto { .. }
             | hir::ExprKind::FilePwrite { .. }
             | hir::ExprKind::FileLen { .. } | hir::ExprKind::FileSync { .. }
             | hir::ExprKind::ReaderBuffered { .. }
@@ -8334,7 +8336,7 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::FileCreateRw { .. }
         | hir::ExprKind::FileOpenRw { .. }
         | hir::ExprKind::FileOpenRo { .. } | hir::ExprKind::FileCreateRwExclusive { .. }
-        | hir::ExprKind::FilePread { .. }
+        | hir::ExprKind::FilePread { .. } | hir::ExprKind::FilePreadInto { .. }
         | hir::ExprKind::FilePwrite { .. }
         | hir::ExprKind::FileLen { .. } | hir::ExprKind::FileSync { .. } => lower_file_expr(b, e),
         hir::ExprKind::ReaderBuffered { .. }
@@ -8855,7 +8857,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             hir::ExprKind::FileCreateRw { .. }
             | hir::ExprKind::FileOpenRw { .. }
             | hir::ExprKind::FileOpenRo { .. } | hir::ExprKind::FileCreateRwExclusive { .. }
-            | hir::ExprKind::FilePread { .. }
+            | hir::ExprKind::FilePread { .. } | hir::ExprKind::FilePreadInto { .. }
             | hir::ExprKind::FilePwrite { .. }
             | hir::ExprKind::FileLen { .. } | hir::ExprKind::FileSync { .. } => lower_file_expr(b, e),
             hir::ExprKind::ReaderStdin => {
@@ -20309,6 +20311,16 @@ fn lower_file_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                 },
             ));
             lower_count_or_status_result(b, n, result_ty)
+        }
+        hir::ExprKind::FilePreadInto { file, buffer, destination_offset, length, offset } => {
+            let file = lower_required!(b, lower_expr(b, file), Operand::Const(Const::Unit));
+            let buffer = lower_required!(b, lower_expr(b, buffer), Operand::Const(Const::Unit));
+            let destination_offset = lower_required!(b, lower_expr(b, destination_offset), Operand::Const(Const::Unit));
+            let length = lower_required!(b, lower_expr(b, length), Operand::Const(Const::Unit));
+            let offset = lower_required!(b, lower_expr(b, offset), Operand::Const(Const::Unit));
+            let count = b.fresh_value(i64_ty());
+            b.push(Stmt::Let(count, Rvalue::FilePreadInto { file, buffer, destination_offset, length, offset }));
+            lower_count_or_status_result(b, count, result_ty)
         }
         hir::ExprKind::FilePwrite { file, data, offset } => {
             let fop = lower_required!(b, lower_expr(b, file), Operand::Const(Const::Unit));

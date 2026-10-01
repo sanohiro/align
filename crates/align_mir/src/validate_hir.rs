@@ -4762,7 +4762,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::FileCreateRw { .. }
             | hir::ExprKind::FileOpenRw { .. }
             | hir::ExprKind::FileOpenRo { .. } | hir::ExprKind::FileCreateRwExclusive { .. }
-            | hir::ExprKind::FilePread { .. }
+            | hir::ExprKind::FilePread { .. } | hir::ExprKind::FilePreadInto { .. }
             | hir::ExprKind::FilePwrite { .. }
             | hir::ExprKind::FileLen { .. } | hir::ExprKind::FileSync { .. }
             | hir::ExprKind::BufferNew { .. }
@@ -5162,7 +5162,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::FileCreateRw { .. }
             | hir::ExprKind::FileOpenRw { .. }
             | hir::ExprKind::FileOpenRo { .. } | hir::ExprKind::FileCreateRwExclusive { .. }
-            | hir::ExprKind::FilePread { .. }
+            | hir::ExprKind::FilePread { .. } | hir::ExprKind::FilePreadInto { .. }
             | hir::ExprKind::FilePwrite { .. }
             | hir::ExprKind::FileLen { .. } | hir::ExprKind::FileSync { .. }
             | hir::ExprKind::BufferNew { .. }
@@ -5485,13 +5485,23 @@ impl<'a> BodyValidator<'a> {
         let hir::ExprKind::Local(id) = expression.kind else {
             return false;
         };
-        self.local_type(context, id) == Some(ty)
-            && self
-                .program
-                .fns
-                .get(context.function)
-                .and_then(|function| function.locals.get(id as usize))
-                .is_some_and(|local| local.id == id && local.is_mut)
+        let Some(function) = self.program.fns.get(context.function) else {
+            return false;
+        };
+        if self.local_type(context, id) != Some(ty)
+            || !function.locals.get(id as usize).is_some_and(|local| local.id == id && local.is_mut)
+        {
+            return false;
+        }
+        let Some(position) = function.params.iter().position(|parameter| *parameter == id) else {
+            return true;
+        };
+        // A forged mutable binding flag does not authorize writes through a shared parameter.
+        // Out slices retain their established writable authority; opaque outputs require ownership
+        // or BorrowMut because declaration validation excludes Out for those types.
+        matches!(function.param_modes.get(position), Some(
+            align_ast::ParamMode::ByValue | align_ast::ParamMode::BorrowMut | align_ast::ParamMode::Out
+        ))
     }
 
     fn writable_slice_local(&self, context: &BodyContext, expression: &hir::Expr) -> bool {
@@ -9244,6 +9254,14 @@ impl<'a> BodyValidator<'a> {
                     return None;
                 }
                 result(Ty::Int(align_sema::IntTy { bits: 64, signed: true }), &[file, buffer, offset])
+            }
+            hir::ExprKind::FilePreadInto { file, buffer, destination_offset, length, offset } => {
+                if !local(file, Ty::File) || !mutable_local(buffer, Ty::Buffer)
+                    || file.ty != Ty::File || buffer.ty != Ty::Buffer
+                    || destination_offset.ty != i64 || length.ty != i64 || offset.ty != i64 {
+                    return None;
+                }
+                result(i64, &[file, buffer, destination_offset, length, offset])
             }
             hir::ExprKind::FilePwrite { file, data, offset } => {
                 if !local(file, Ty::File)

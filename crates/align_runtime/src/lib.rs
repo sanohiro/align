@@ -11394,6 +11394,76 @@ pub unsafe extern "C" fn align_rt_io_file_pread(f: *mut RwFile, b: *mut Buffer, 
     }
 }
 
+/// Execute one bounded positional read without clearing, reserving or moving storage.
+/// The successful prefix may extend initialized length, but never leaves an uninitialized hole.
+///
+/// # Safety
+/// A successful callback count within the requested bound must prove that many destination
+/// bytes were initialized. The callback must not write outside the requested range.
+unsafe fn file_pread_into_with(
+    fd: i32, buffer: &mut Buffer, destination_offset: i64, length: i64, offset: i64,
+    mut read: impl FnMut(i32, *mut u8, usize, i64) -> std::io::Result<usize>,
+) -> i64 {
+    let invalid = -i64::from(AL_INVALID);
+    let (Ok(start), Ok(requested)) = (safe_len(destination_offset), safe_len(length)) else { return invalid; };
+    if offset < 0 || fd < 0
+        || buffer.data.len() != buffer.len
+        || buffer.len > buffer.cap || buffer.cap > buffer.data.capacity()
+        || i64::try_from(buffer.cap).is_err() || isize::try_from(buffer.cap).is_err()
+        || start > buffer.len || requested > buffer.cap - start {
+        return invalid;
+    }
+    // All metadata and declared-window checks precede even this no-I/O fast path.
+    if requested == 0 { return 0; }
+    let old_len = buffer.len;
+    let outcome = buffer.data.with_mut(|data| {
+        // start <= initialized length <= capacity; positive requested proves start < capacity.
+        let destination = unsafe { data.as_mut_ptr().add(start) };
+        loop {
+            match read(fd, destination, requested, offset) {
+                Ok(count) => {
+                    if count > requested { return Err(AL_INVALID); }
+                    let Ok(signed_count) = i64::try_from(count) else { return Err(AL_INVALID); };
+                    let Some(end) = start.checked_add(count) else { return Err(AL_INVALID); };
+                    let initialized = old_len.max(end);
+                    // The syscall initialized [start,end), contiguous with the old valid prefix.
+                    // declared-window validation proves initialized <= the existing allocation.
+                    unsafe { data.set_len(initialized) };
+                    return Ok((signed_count, initialized));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(io_error_to_status(&error)),
+            }
+        }
+    });
+    match outcome {
+        Ok((count, initialized)) => { buffer.len = initialized; count }
+        Err(status) => -i64::from(status),
+    }
+}
+
+/// `f.pread_into(b, destination_offset, length, file_offset)` — bounded direct buffer-window I/O.
+/// Invalid scalars/windows/metadata return negative Invalid before I/O, including zero length.
+/// Successful short counts preserve surrounding bytes and extend only a contiguous initialized
+/// prefix. Capacity/address never change; EOF/error preserve length. EINTR alone is retried.
+///
+/// # Safety
+/// Non-null shells must be aligned live File/Buffer storage, with a valid Vec allocation and
+/// exclusive buffer byte access. The owners must remain disjoint and live through the call.
+/// Invalid/dangling allocations or non-null pointers are not recoverable validation inputs.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_file_pread_into(
+    file: *mut RwFile, buffer: *mut Buffer, destination_offset: i64, length: i64, offset: i64,
+) -> i64 {
+    if file.is_null() || buffer.is_null() { return -i64::from(AL_INVALID); }
+    unsafe { file_pread_into_with((*file).fd, &mut *buffer, destination_offset, length, offset,
+        |fd, destination, requested, offset| {
+            let count = pread(fd, destination.cast(), requested, offset);
+            usize::try_from(count).map_err(|_| std::io::Error::last_os_error())
+        }) }
+}
+const _: unsafe extern "C" fn(*mut RwFile, *mut Buffer, i64, i64, i64) -> i64 = align_rt_io_file_pread_into;
+
 /// `f.pwrite(data, off)` — write **all** of `data` at file offset `off`, looping over partial
 /// `pwrite(2)`s internally (each partial write advances the target offset; a write past EOF extends
 /// the file per POSIX) and retrying `EINTR` — the `write_all` precedent: a relayout must never
@@ -11493,7 +11563,8 @@ pub unsafe extern "C" fn align_rt_io_file_free(f: *mut RwFile) {
 
 /// A `buffer` (`core.buffer`) — an owned, growable byte container (the byte analog of `Vec<u8>`),
 /// the caller-owned sink a `reader.read` fills. `cap` is the read window; `len` is how many bytes
-/// the last read produced (`.bytes()` views `data[..len]`). A Move type, `Drop`-freed.
+/// are initialized (`.bytes()` views `data[..len]`). Replacing reads reset this prefix;
+/// bounded `pread_into` can preserve or extend it. A Move type, `Drop`-freed.
 pub struct Buffer {
     data: BufferStorage,
     cap: usize,
@@ -29647,6 +29718,121 @@ mod tests {
             assert_eq!(unsafe { align_rt_io_file_open_ro(ptr, len, &mut file) }, AL_NOT_FOUND);
             assert!(file.is_null());
         }
+    }
+
+    #[test]
+    fn file_pread_into_window_preserves_storage_and_initialized_prefix() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::fd::AsRawFd;
+        let snapshot = |ptr: *mut Buffer| unsafe { ((*ptr).data.as_slice().to_vec(), (*ptr).len, (*ptr).cap, (*ptr).data.writable_ptr()) };
+        let fixture = FileFixtureDir::new("pread-into");
+        let path = fixture.0.join("input");
+        let source = b"0123456789ABCDEF";
+        std::fs::write(&path, source)?;
+        let file = std::fs::File::open(&path)?;
+        let mut handle = RwFile { fd: file.as_raw_fd() };
+        for (start, requested, offset) in [(0, 2, 0), (2, 4, 4), (4, 5, 13), (4, 12, 0), (4, 0, 0), (4, 5, 16)] {
+            let ptr = align_rt_buffer_new(16);
+            let _owner = BufferTestHandle(ptr);
+            unsafe { align_rt_buffer_append(ptr, b"----".as_ptr(), 4); }
+            let (_, _, capacity, address) = snapshot(ptr);
+            let count = unsafe { align_rt_io_file_pread_into(&mut handle, ptr, start, requested, offset) };
+            let actual = usize::try_from(requested)?.min(source.len() - usize::try_from(offset)?);
+            assert_eq!(count, i64::try_from(actual)?);
+            let end = usize::try_from(start)? + actual;
+            let mut expected = b"----".to_vec();
+            expected.resize(expected.len().max(end), 0);
+            expected[usize::try_from(start)?..end].copy_from_slice(&source[usize::try_from(offset)?..usize::try_from(offset)?+actual]);
+            let state = snapshot(ptr);
+            assert_eq!(state.0, expected);
+            assert_eq!(state.1, expected.len());
+            assert_eq!((state.2, state.3), (capacity, address));
+        }
+        // A reserve-only buffer extends from zero without publishing gaps; an initialized buffer
+        // can fill disjoint positions while preserving its other bytes and exact logical length.
+        for filled in [false, true] {
+            let ptr = if filled { align_rt_buffer_filled(16, b'-') } else { align_rt_buffer_new(16) };
+            let _owner = BufferTestHandle(ptr);
+            let address = unsafe { (*ptr).data.writable_ptr() };
+            let capacity = unsafe { (*ptr).cap };
+            assert_eq!(unsafe { align_rt_io_file_pread_into(&mut handle, ptr, 0, 4, 8) }, 4);
+            assert_eq!(unsafe { align_rt_io_file_pread_into(&mut handle, ptr, 4, 4, 0) }, 4);
+            let expected: &[u8] = if filled { b"89AB0123--------" } else { b"89AB0123" };
+            assert_eq!(unsafe { (*ptr).data.as_slice() }, expected);
+            assert_eq!(unsafe { (*ptr).cap }, capacity);
+            assert_eq!(unsafe { (*ptr).data.writable_ptr() }, address);
+        }
+        let ptr = align_rt_buffer_new(16);
+        let _owner = BufferTestHandle(ptr);
+        unsafe { align_rt_buffer_append(ptr, b"----".as_ptr(), 4); }
+        let original = snapshot(ptr);
+        for (start, requested, offset) in [(-1, 0, 0), (0, -1, 0), (0, 0, -1), (5, 0, 16), (5, 1, 0), (4, 13, 0), (i64::MAX, 0, 0), (0, i64::MAX, 0)] {
+            assert_eq!(unsafe { align_rt_io_file_pread_into(&mut handle, ptr, start, requested, offset) }, -i64::from(AL_INVALID));
+            assert_eq!(snapshot(ptr), original);
+        }
+        let original_cap = original.2;
+        for requested in [0, 1] {
+            for malformed in 0..4 {
+                unsafe { match malformed {
+                    0 => (*ptr).len = 5,
+                    1 => (*ptr).cap = 3,
+                    2 => (*ptr).cap = (*ptr).data.capacity().checked_add(1).ok_or("capacity overflow")?,
+                    _ => (*ptr).cap = usize::MAX,
+                } }
+                let before = snapshot(ptr);
+                assert_eq!(unsafe { align_rt_io_file_pread_into(&mut handle, ptr, 0, requested, 0) }, -i64::from(AL_INVALID));
+                assert_eq!(snapshot(ptr), before);
+                unsafe { (*ptr).len = 4; (*ptr).cap = original_cap; }
+            }
+            let mut invalid_file = RwFile { fd: -1 };
+            assert_eq!(unsafe { align_rt_io_file_pread_into(&mut invalid_file, ptr, 0, requested, 0) }, -i64::from(AL_INVALID));
+            assert_eq!(unsafe { align_rt_io_file_pread_into(core::ptr::null_mut(), ptr, 0, requested, 0) }, -i64::from(AL_INVALID));
+            assert_eq!(unsafe { align_rt_io_file_pread_into(&mut handle, core::ptr::null_mut(), 0, requested, 0) }, -i64::from(AL_INVALID));
+        }
+        let write_only = std::fs::OpenOptions::new().write(true).open(&path)?;
+        let mut write_handle = RwFile { fd: write_only.as_raw_fd() };
+        assert_eq!(unsafe { align_rt_io_file_pread_into(&mut write_handle, ptr, 0, 0, 0) }, 0, "zero count has no native read");
+        assert_eq!(unsafe { align_rt_io_file_pread_into(&mut write_handle, ptr, 0, 1, 0) }, -i64::from(io_error_to_status(&std::io::Error::from_raw_os_error(libc::EBADF))));
+        assert_eq!(snapshot(ptr), original);
+        Ok(())
+    }
+
+    #[test]
+    fn file_pread_into_native_attempt_transitions() {
+        let ptr = align_rt_buffer_new(8);
+        let _owner = BufferTestHandle(ptr);
+        unsafe { align_rt_buffer_append(ptr, b"AB".as_ptr(), 2); }
+        let buffer = unsafe { &mut *ptr };
+        let (capacity, address) = (buffer.cap, buffer.data.writable_ptr());
+        let mut calls = 0;
+        assert_eq!(unsafe { file_pread_into_with(7, buffer, 2, 4, 11, |fd, dst, requested, offset| {
+            assert_eq!((fd, requested, offset), (7, 4, 11));
+            calls += 1;
+            if calls == 1 { return Err(std::io::Error::from_raw_os_error(libc::EINTR)); }
+            core::ptr::copy_nonoverlapping(b"XY".as_ptr(), dst, 2);
+            Ok(2)
+        }) }, 2);
+        assert_eq!(calls, 2, "short count returns without an implicit fill loop");
+        assert_eq!(buffer.data.as_slice(), b"ABXY");
+        assert_eq!(buffer.len, 4);
+        assert_eq!((buffer.cap, buffer.data.writable_ptr()), (capacity, address));
+        for outcome in [Ok(0), Err(libc::EIO), Ok(5)] {
+            let mut attempts = 0;
+            let count = unsafe { file_pread_into_with(7, buffer, 1, 4, 9, |_, _, _, _| {
+                attempts += 1;
+                outcome.map_err(std::io::Error::from_raw_os_error)
+            }) };
+            let expected = match outcome {
+                Ok(0) => 0,
+                Ok(_) => -i64::from(AL_INVALID),
+                Err(errno) => -i64::from(io_error_to_status(&std::io::Error::from_raw_os_error(errno))),
+            };
+            assert_eq!(count, expected);
+            assert_eq!(attempts, 1);
+            assert_eq!(buffer.data.as_slice(), b"ABXY");
+            assert_eq!(buffer.len, 4);
+            assert_eq!((buffer.cap, buffer.data.writable_ptr()), (capacity, address));
+        }
+        assert_eq!(unsafe { file_pread_into_with(7, buffer, 4, 0, 9, |_, _, _, _| panic!("zero read called native operation")) }, 0);
     }
 
     #[test]

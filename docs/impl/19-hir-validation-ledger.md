@@ -1266,7 +1266,7 @@ predicate, not type equality alone:
   producer's writable `Slice(T)` local: `is_mut == true`, not read-only, and
   admitted primitive element `T`. Am-v adds the same
   `SourceMutLocal(Buffer,...)` predicate to the five native output operands
-  `ReaderRead.buffer`, `ReaderReadLine.buffer`, `FilePread.buffer`,
+  `ReaderRead.buffer`, `ReaderReadLine.buffer`, `FilePread.buffer`, `FilePreadInto.buffer`,
   `UdpRecvFrom.buffer`, and `CryptoRandom.out`. No other native-handle row
   inspects `Local.is_mut`: mutation of a Command, CliCommand, HttpRequest,
   HttpClient, ResponseBuilder, HttpStream, Reader, Writer, File, socket, or
@@ -1307,6 +1307,7 @@ merely because its `Ty` matches.
 | `FileOpenRw` | `env[]; child[path]`; `Str; result ERR(File); new owned fd; Impure`. |
 | `FileOpenRo` | `env[]; child[path]`; `Str; result ERR(File); new owned fd; Impure`. |
 | `FilePread` | `env[]; child[file,buffer,offset]`; `LocalHandle(File,file), SourceMutLocal(Buffer,buffer), i64; result ERR(i64); handles borrowed, buffer mutated; Impure`. |
+| `FilePreadInto` | `env[]; child[file,buffer,destination_offset,length,offset]`; `LocalHandle(File,file), SourceMutLocal(Buffer,buffer), i64 × 3; result ERR(i64); both handles borrowed, buffer exclusively mutated; Impure`. |
 | `FilePwrite` | `env[]; child[file,data,offset]`; `File, byte-view, i64; result ERR(i64); borrowed; Impure`. |
 | `FileLen` | `env[]; child[file]`; `File; result ERR(i64); borrowed; Impure`. |
 | `FileSync` | `env[]; child[file]`; `LocalHandle(File,file); result ERR(Unit); borrowed; Impure`. |

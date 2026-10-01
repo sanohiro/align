@@ -16588,7 +16588,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // bodies — `gen_rvalue` is depth-recursive (via operand materialization), so keeping its
             // frame flat preserves the expr-depth budget (the #296 lesson, mirroring MIR's dispatcher).
             Rvalue::FileCreateRw { .. } | Rvalue::FileOpenRw { .. } | Rvalue::FileOpenRo { .. } | Rvalue::FileCreateRwExclusive { .. }
-            | Rvalue::FilePread { .. } | Rvalue::FilePwrite { .. } | Rvalue::FileLen { .. } | Rvalue::FileSync(..) => self.gen_file_rvalue(rv)?,
+            | Rvalue::FilePread { .. } | Rvalue::FilePreadInto { .. } | Rvalue::FilePwrite { .. } | Rvalue::FileLen { .. } | Rvalue::FileSync(..) => self.gen_file_rvalue(rv)?,
             Rvalue::ReaderStdin => self
                 .builder
                 .build_call(self.runtime(RuntimeKey::IoReaderStdin), &[], "stdin")
@@ -23600,6 +23600,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.runtime(RuntimeKey::IoFilePread), &[fp, bp, off], "pread")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("io_file_pread returns i64")
+            }
+            Rvalue::FilePreadInto { file, buffer, destination_offset, length, offset } => {
+                let arguments = [self.operand(file)?.into(), self.operand(buffer)?.into(),
+                    self.operand(destination_offset)?.into(), self.operand(length)?.into(), self.operand(offset)?.into()];
+                self.builder.build_call(self.runtime(RuntimeKey::IoFilePreadInto), &arguments, "pread_into")
+                    .map_err(|e| self.err(e))?.try_as_basic_value().basic()
+                    .ok_or_else(|| self.err("io_file_pread_into must return i64"))?
             }
             // f.pwrite(data, off) — split the `bytes` operand into ptr+len, return i64 count-or-status.
             Rvalue::FilePwrite { file, data, offset } => {
@@ -31563,6 +31570,41 @@ fn main() -> i32 = 0
             }
             assert!(changed, "fixture must contain capacity observation");
             assert!(emit_llvm_ir(&bad, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_err(), "capacity/{mutation}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn file_pread_into_mir_gate_requires_exact_native_operands() -> Result<(), &'static str> {
+        let base = mir("fn fill(borrow f: file, borrow mut b: buffer) -> Result<i64, Error> = f.pread_into(b, 1, 2, 3)\nfn main() {}\n");
+        let ir = emit_llvm_ir(&base, &BuildTarget::Baseline, Profile::Release, false, &[], None).map_err(|_| "valid pread_into LLVM")?;
+        assert!(ir.contains("@align_rt_io_file_pread_into("));
+        for mutation in 0..8 {
+            let mut bad = base.clone();
+            let mut changed = false;
+            for function in &mut bad.fns {
+                for block in &mut function.blocks {
+                    for statement in &mut block.stmts {
+                        let Stmt::Let(value, Rvalue::FilePreadInto { file, buffer, destination_offset, length, offset }) = statement else { continue; };
+                        changed = true;
+                        match mutation {
+                            0 => *function.value_tys.get_mut(usize::try_from(*value).map_err(|_| "value index")?).ok_or("result type")? = Ty::Bool,
+                            1 => *file = Operand::Const(Const::Unit),
+                            2 => *buffer = Operand::Const(Const::Unit),
+                            3 => *destination_offset = Operand::Const(Const::Bool(false)),
+                            4 => *length = Operand::Const(Const::Bool(false)),
+                            5 => *offset = Operand::Const(Const::Bool(false)),
+                            6 => *buffer = Operand::Value(u32::MAX),
+                            _ => {
+                                let Operand::Value(source) = file else { return Err("file SSA receiver"); };
+                                *function.value_tys.get_mut(usize::try_from(*source).map_err(|_| "file index")?).ok_or("file type")? = Ty::Reader;
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(changed);
+            assert!(emit_llvm_ir(&bad, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_err(), "pread_into/{mutation}");
         }
         Ok(())
     }

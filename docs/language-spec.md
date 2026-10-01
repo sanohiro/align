@@ -1370,12 +1370,30 @@ cursor and no `seek` (hidden mutable state). `fs.create_rw` / `fs.open_rw` grant
 `fs.open_ro(path: str) -> Result<file, Error>` opens an existing ordinary path O_RDONLY|O_CLOEXEC
 without creating or truncating it. `f.pread(b: mut buffer, off)` reads one window,
 `f.pwrite(data: bytes, off)` writes all of `data` (extending past EOF), and `f.len()` is a live
-`fstat`. A **negative** offset aborts before access-mode checks. Read-only `pwrite` returns
+`fstat`. A **negative** `pread`/`pwrite` offset aborts before access-mode checks. Read-only `pwrite` returns
 `Error.Denied`, including empty data, using the descriptor's kernel-owned mode. Path UTF-8/NUL
 validation precedes filesystem work; empty paths keep OS mapping. The fixed errno table, Move
 fd ownership, Drop and single-threaded rules are unchanged; the result retains no path view.
 The constructor allocates only the existing handle shell and ephemeral native path, with no read
 buffer or mmap (plan 84).
+
+`f.pread_into(b, destination_offset, length, file_offset) -> Result<i64, Error>`
+reads directly into a selected range of the existing buffer. The receiver is a
+bound File and `b` a bare mutable local, including an exclusive helper parameter.
+All three scalar arguments are i64 with no defaults. Negative arguments,
+a destination beyond initialized length, or a requested range beyond published
+capacity return Invalid before I/O, even for zero length or EOF. No hole is
+published: successful length is max(old length, destination offset + actual
+count). Bytes outside the actual written range survive; short counts and zero
+EOF return directly, and EOF/error preserve initialized length. A validated zero
+request performs no syscall. EINTR alone is retried; other native failures use
+the fixed errno table. Capacity and payload address stay unchanged, with no
+allocation, reserve, resize, clone or implicit zero fill. Both owners are borrowed
+only for the call. Existing whole-buffer generation invalidation applies even
+to zero/error paths. Later eager operands cannot move or replace already loaded
+File/Buffer inputs; their reservations end at the completed scalar operation.
+Use explicit `buffer.filled` for initialized random-write positions (plan 89).
+
 
 `fs.create_rw_exclusive(path: str) -> Result<file, Error>` creates a regular file with one
 O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW open, mode 0644 subject to umask. Every occupied

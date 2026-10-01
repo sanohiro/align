@@ -1454,6 +1454,11 @@ required `import` — the `core.json` pattern, not yet Align-over-FFI library co
   `Ty::Buffer` (`buffer(cap)` / `.bytes()` → `slice<u8>` / `.len()`), the sink `reader.read` fills.
   Plan 87 adds Pure `.capacity() -> i64`, exposing the existing usable read window
   independently of current length, without changing best-effort allocation policy.
+  Plan 89 adds `f.pread_into(b, destination_offset, length, file_offset)` for
+  bounded direct reads into the existing allocation. It preserves surrounding
+  bytes, forbids uninitialized holes, and retains capacity/address; one native
+  short/EOF count returns without an implicit fill loop. Whole/per-unit, native
+  Linux/macOS and malformed HIR/MIR owners cover the capability.
   The **errno→`Error` fixed table** (`draft.md` §18.2) is one runtime helper (`io_error_to_status`)
   + one MIR decode (`make_error_from_status`, branchless), shared by `fs.read_file`/`fs.open`/
   `fs.create`/read/write/flush. **Completion condition met:** an Align program byte-exact-copies a

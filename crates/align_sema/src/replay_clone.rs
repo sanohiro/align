@@ -1111,6 +1111,10 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             buffer: boxed!(buffer),
             offset: boxed!(offset),
         },
+        ExprKind::FilePreadInto { file, buffer, destination_offset, length, offset } => ExprKind::FilePreadInto {
+            file: boxed!(file), buffer: boxed!(buffer), destination_offset: boxed!(destination_offset),
+            length: boxed!(length), offset: boxed!(offset),
+        },
         ExprKind::FilePwrite { file, data, offset } => ExprKind::FilePwrite {
             file: boxed!(file),
             data: boxed!(data),
@@ -2960,6 +2964,9 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::JsonDocKey { doc, index: key } => {
             one!(doc);
             one!(key);
+        }
+        ExprKind::FilePreadInto { file, buffer, destination_offset, length, offset } => {
+            one!(file); one!(buffer); one!(destination_offset); one!(length); one!(offset);
         }
         ExprKind::FilePread {
             file,

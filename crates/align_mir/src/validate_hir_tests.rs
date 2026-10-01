@@ -12214,7 +12214,7 @@ fn request11_expr_kind_inventory_tripwire() {
         // FloatScope, BytesView, SliceAsBytes, and HttpServerMaxRequestBodyBytes are explicit in
         // validation, source-shape, replay and ownership.
         variants,
-        348,
+        349,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -19529,6 +19529,62 @@ fn buffer_capacity_hir_rejects_forged_native_types() -> Result<(), &'static str>
             _ => value.ty = Ty::Int(align_sema::IntTy { bits: 32, signed: true }),
         }
         assert_body_entrypoints_empty(&format!("capacity-{mutation}"), &bad);
+    }
+    Ok(())
+}
+
+#[test]
+fn file_pread_into_hir_rejects_forged_native_types() -> Result<(), &'static str> {
+    let base = checked_source_program("fn fill(borrow f: file, borrow mut b: buffer) -> Result<i64, Error> = f.pread_into(b, 1, 2, 3)\n");
+    assert!(!is_empty(&lower_program(&base)));
+    for mutation in 0..9 {
+        let mut malformed = base.clone();
+        let expression = body_value_expression_mut(&mut malformed, "fill");
+        let hir::ExprKind::FilePreadInto { file, buffer, destination_offset, length, offset } = &mut expression.kind else { return Err("pread_into fixture"); };
+        match mutation {
+            0 => expression.ty = Ty::Bool,
+            1 => file.ty = Ty::Reader,
+            2 => buffer.ty = Ty::File,
+            3 => buffer.kind = hir::ExprKind::Bool(false),
+            4 => file.kind = hir::ExprKind::Local(u32::MAX),
+            5 => destination_offset.ty = Ty::Int(align_sema::IntTy { bits: 64, signed: false }),
+            6 => **length = body_test_expr(hir::ExprKind::Bool(false), Ty::Bool),
+            7 => offset.ty = Ty::Int(align_sema::IntTy { bits: 32, signed: true }),
+            _ => buffer.kind = hir::ExprKind::Local(u32::MAX),
+        }
+        assert_body_entrypoints_empty(&format!("pread-into-{mutation}"), &malformed);
+    }
+    for mode in [align_ast::ParamMode::ByValue, align_ast::ParamMode::Borrow] {
+        let mut malformed = base.clone();
+        let function = malformed.fns.iter_mut().find(|function| function.name == "fill").ok_or("fill function")?;
+        *function.param_modes.get_mut(1).ok_or("buffer parameter mode")? = mode;
+        let local = *function.params.get(1).ok_or("buffer parameter")?;
+        function.locals.get_mut(usize::try_from(local).map_err(|_| "buffer local index")?).ok_or("buffer local")?.is_mut = false;
+        assert_body_entrypoints_empty("pread-into-shared-or-immutable", &malformed);
+    }
+    Ok(())
+}
+
+#[test]
+fn native_output_hir_rejects_shared_mode_with_mutable_local_flag() -> Result<(), &'static str> {
+    for (label, source, buffer_parameter) in [
+        ("pread_into", "fn fill(borrow f: file, borrow mut b: buffer) -> Result<i64, Error> = f.pread_into(b, 0, 1, 0)\n", 1usize),
+        ("pread", "fn fill(borrow f: file, borrow mut b: buffer) -> Result<i64, Error> = f.pread(b, 0)\n", 1),
+        ("read", "fn fill(borrow r: reader, borrow mut b: buffer) -> Result<i64, Error> = r.read(b)\n", 1),
+        ("read_line", "fn fill(r: reader, borrow mut b: buffer) -> Result<i64, Error> { br := r.buffered(); return br.read_line(b) }\n", 1),
+        ("append", "fn fill(borrow mut b: buffer) { b.append(\"x\") }\n", 0),
+        ("append_filled", "fn fill(borrow mut b: buffer) { b.append_filled(1, 0) }\n", 0),
+    ] {
+        let mut malformed = checked_source_program(source);
+        assert!(!is_empty(&lower_program(&malformed)), "valid {label}");
+        let function = malformed.fns.iter_mut().find(|function| function.name == "fill").ok_or("fill function")?;
+        let local = *function.params.get(buffer_parameter).ok_or("output parameter")?;
+        assert!(function.locals.get(usize::try_from(local).map_err(|_| "local index")?).ok_or("output local")?.is_mut);
+        *function.param_modes.get_mut(buffer_parameter).ok_or("output mode")? = align_ast::ParamMode::Borrow;
+        if let Some(summary) = &mut function.mutable_retention {
+            summary.get_mut(buffer_parameter).ok_or("output summary")?.clear();
+        }
+        assert_body_entrypoints_empty(label, &malformed);
     }
     Ok(())
 }

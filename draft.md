@@ -3346,13 +3346,31 @@ io.copy(r: reader, w: writer) -> Result<i64, Error>   // returns bytes transferr
                                                        // O(buffer), never O(file size)
 f.pread(b: mut buffer, off: i64)  -> Result<i64, Error>   // one positionless read at off into b's
                                                           // window; returns the actual count, 0 = EOF
+f.pread_into(b: mut buffer, destination_offset: i64, length: i64, file_offset: i64) -> Result<i64, Error>
 f.pwrite(data: bytes, off: i64)   -> Result<i64, Error>   // writes ALL of data at off (loops to full);
                                                           // returns the full len; past-EOF extends
 f.len()                           -> Result<i64, Error>   // live fstat (not cached)
 f.sync()                          -> Result<(), Error>   // explicit native file sync
 ```
 
-Every native operation that fills a `buffer` (`read`, `read_line`, `pread`, `recv_from`, and
+`f.pread_into(b, destination_offset, length, file_offset) -> Result<i64, Error>`
+reads directly into a selected range of the existing buffer. The receiver is a
+bound File and `b` a bare mutable local, including an exclusive helper parameter.
+All three scalar arguments are i64 with no defaults. Negative arguments,
+a destination beyond initialized length, or a requested range beyond published
+capacity return Invalid before I/O, even for zero length or EOF. No hole is
+published: successful length is max(old length, destination offset + actual
+count). Bytes outside the actual written range survive; short counts and zero
+EOF return directly, and EOF/error preserve initialized length. A validated zero
+request performs no syscall. EINTR alone is retried; other native failures use
+the fixed errno table. Capacity and payload address stay unchanged, with no
+allocation, reserve, resize, clone or implicit zero fill. Both owners are borrowed
+only for the call. Existing whole-buffer generation invalidation applies even
+to zero/error paths. Later eager operands cannot move or replace already loaded
+File/Buffer inputs; their reservations end at the completed scalar operation.
+Use explicit `buffer.filled` for initialized random-write positions (plan 89).
+
+Every native operation that fills a `buffer` (`read`, `read_line`, `pread`, `pread_into`, `recv_from`, and
 `crypto.random`) requires a bare source local declared with `mut`. Bind a temporary first; passing
 an immutable local or an expression directly is rejected before the operation is formed. This keeps
 the mutation, address stability, and ownership boundary explicit.
@@ -3360,7 +3378,7 @@ the mutation, address stability, and ownership boundary explicit.
 `file` is the offset-addressed handle: `fs.create_rw` / `fs.open_rw` grant read+write access;
 `fs.open_ro` opens an existing path read-only for bounded random reads without a whole-file mmap.
 Every access carries an explicit `off` — there is **no cursor and no `seek`** (a settable cursor is
-hidden mutable state). A **negative** offset is a programmer bug and **aborts**, before any
+hidden mutable state). A **negative** offset in `pread`/`pwrite` is a programmer bug and **aborts**, before any
 access-mode check. `pwrite` on a read-only descriptor returns `Error.Denied`, including empty data;
 the runtime queries the descriptor's access mode rather than storing a second capability flag. `file` is Move (owns its fd, `Drop` closes it) and structurally
 single-threaded (no `par_map`/`spawn` capture); it never rides an aggregate other than its
