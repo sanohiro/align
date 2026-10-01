@@ -38052,6 +38052,9 @@ impl<'a> MoveCheck<'a> {
         let storage_paths = storage_type_paths(e.ty, self.storage_type_context());
         matches!(e.kind, ExprKind::BorrowedIndex { .. })
             || self.borrow_mut_place_snapshots.contains(&Self::expr_key(e))
+            // Append loads this opaque handle before its eager argument. Although it contains no
+            // view, the completed pointer still depends on its owner surviving until the write.
+            || e.ty == Ty::Builder
             || e.ty.is_array_builder()
             || !storage_paths.headers.is_empty()
             || !storage_paths.carriers.is_empty()

@@ -42,6 +42,8 @@ No new source authority or provenance representation is introduced.
 | Move-in, move-out, source nulling, return | Existing BuilderToString and by-value call/return lowering | `text_builder_params::owned_transfer` and moved-source negative twins |
 | Borrowed consumption, return, local retention | Existing MoveCheck and non-scalar placement checks | `text_builder_params::borrowed_owner_cannot_escape` |
 | Exclusive whole-owner replacement | Existing borrowed-place assignment and Drop-before-store lowering | `text_builder_params::imported_builder_helpers_match_whole_program`; shared replacement negative |
+| Caller header allocation across borrowed calls | Existing fail-closed stack-header escape proof rejects every place operand passed to a call; caller and callee retain the boxed ABI for a possibly replaced header | `align_codegen_llvm::borrowed_builder_calls_retain_boxed_headers`, isolated text/array and shared/exclusive cases; `text_builder_params::isolated_borrowed_replacement` native heap/arena caller cases |
+| Completed receiver before a later eager argument | Text builder values participate in the existing completion snapshot frontier; replacement, move, or exclusive call through a later argument invalidates the completed receiver before append | `text_builder_params::receiver_argument_invalidation_matrix`, all five writes with direct/scope/selected receivers, owning and borrowed parameters, replacement/consumption negatives, shared-read and distinct-owner positives |
 | Drop, normal and early exit | Existing builder Drop and borrowed-parameter cleanup exclusion | `text_builder_params::borrowed_append_control_flow`; existing `m5` builder owners |
 | Borrowing receiver joins / fresh temporary cleanup | `BuilderWrite` uses existing `lower_borrowed_owned`, preserving bound branch sources and dropping a fresh receiver only after the append; required-argument termination keeps the registered owner under ordinary exit cleanup | `text_builder_params::borrowed_receiver_values_preserve_owner`, including both selected arms and fallible argument termination; existing `owned_temporaries::borrowed_control_flow_temporaries_lower_exactly_once` |
 | `if`, `match`, loop joins, return | Existing control-flow lowering and borrow lifetimes | `text_builder_params::borrowed_append_control_flow` |
@@ -81,3 +83,20 @@ lowering and temporary cleanup strategy, with native bound/fresh and terminating
 argument twins. No new ownership representation or cleanup strategy is required.
 Consumer adoption stays in align-llm; Align records its
 provider result in the external request register without modifying consumer code.
+
+## Code review finding closure
+
+The first full-diff review found two missing cells: a borrowed call was invisible
+to the stack-header escape proof, and the header-free text builder did not enter
+the eager completion frontier. Compile-only probes confirmed both: an isolated
+reset emitted stack initialization followed by boxed callee Drop, and a write
+whose argument replaced its receiver checked successfully. Neither unsafe probe
+was executed. The matrix above now names both axes. The fixes reuse the existing
+boxed-call boundary and completion invalidation strategy; they add no new IR,
+ABI, ownership authority, or public contract. The owner tests keep the isolated
+allocation case separate from returned-builder and generic import cases.
+
+| Verified finding | Fix / class sweep | Discriminating owner |
+| --- | --- | --- |
+| Borrowed call exposes a stack header to boxed Drop | `stack_header_plan::reject_header_operand` exhaustively handles all Operand forms and rejects borrowed-place roots across every existing call consumer; both text and array headers retain the boxed ABI | `borrowed_builder_calls_retain_boxed_headers` fails before the fix and passes afterward for shared/exclusive text/array calls; isolated replacement executes successfully after the fix |
+| Later eager argument invalidates a completed builder receiver | `MoveCheck::value_snapshot_needed` includes `Ty::Builder`, using existing local/parameter roots and the shared source-ordered completion frontier | `receiver_argument_invalidation_matrix` fails before the fix and passes afterward for all five methods, three invalidation actions, direct/scope/selected receivers, and borrowed parameters; stable-owner positives remain accepted |

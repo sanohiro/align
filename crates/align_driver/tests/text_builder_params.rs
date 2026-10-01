@@ -15,6 +15,83 @@ fn assert_checked(name: &str, source: &str) {
 }
 
 #[test]
+fn receiver_argument_invalidation_matrix() {
+    for (method, argument, ret) in [
+        ("write", "\"x\"", "str"),
+        ("write_int", "1", "i64"),
+        ("write_bool", "true", "bool"),
+        ("write_char", "'x'", "char"),
+        ("write_float", "1.5", "f64"),
+    ] {
+        for receiver in [
+            "output",
+            "({ output })",
+            "(task_group { output })",
+            "(if true { output } else { builder() })",
+            "(match 0 { 0 => output, _ => builder() })",
+        ] {
+            for action in [
+                "reset(output)".to_owned(),
+                "consume(output)".to_owned(),
+                format!("({{ output = builder(); {argument} }})"),
+            ] {
+                let source = format!(
+                    "fn create() -> builder = builder()\n\
+                     fn reset(borrow mut output: builder) -> {ret} {{ output = builder(); return {argument} }}\n\
+                     fn consume(output: builder) -> {ret} {{ text := output.to_string(); return {argument} }}\n\
+                     fn main() -> i32 {{ mut output := create(); {receiver}.{method}({action}); return 0 }}\n"
+                );
+                let diagnostics = check_diagnostics("text-builder-receiver-invalidation", &source);
+                assert!(
+                    diagnostics.contains("value snapshot was invalidated"),
+                    "{receiver}.{method}({action}): {diagnostics}"
+                );
+            }
+        }
+        let borrowed = format!(
+            "fn reset(borrow mut output: builder) -> {ret} {{ output = builder(); return {argument} }}\n\
+             fn append(borrow mut output: builder) {{ output.{method}(reset(output)) }}\n\
+             fn main() -> i32 = 0\n"
+        );
+        let diagnostics =
+            check_diagnostics("text-builder-borrowed-receiver-invalidation", &borrowed);
+        assert!(
+            diagnostics.contains("value snapshot was invalidated"),
+            "{diagnostics}"
+        );
+        let positive = format!(
+            "fn read(borrow output: builder) -> {ret} = {argument}\n\
+             fn reset(borrow mut output: builder) -> {ret} {{ output = builder(); return {argument} }}\n\
+             fn main() -> i32 {{ mut output := builder(); mut other := builder();\n\
+               output.{method}(read(output)); output.{method}(reset(other));\n\
+               builder().{method}(reset(output)); return 0 }}\n"
+        );
+        assert_checked("text-builder-stable-receiver", &positive);
+    }
+}
+
+#[test]
+fn isolated_borrowed_replacement() {
+    for body in [
+        "mut output := builder(); reset(output); print(output.to_string())",
+        "arena { mut output := builder(); reset(output); print(output.to_string()) }",
+    ] {
+        // Keep this independent of owned-return helpers: those conservatively disable stack
+        // headers in the caller and would mask a borrowed-place escape from the stack proof.
+        let source = format!(
+            "fn reset(borrow mut output: builder) {{ output = builder(); output.write(\"reset\") }}\n\
+             fn main() -> i32 {{ {body}; return 0 }}\n"
+        );
+        assert_checked("text-builder-isolated-replacement", &source);
+        if backend_available() {
+            let output = build_and_run("text-builder-isolated-replacement", &source);
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "reset\n");
+        }
+    }
+}
+
+#[test]
 fn borrowed_append_all_methods() {
     let source = r#"
 fn append(borrow mut output: builder, text: str) {

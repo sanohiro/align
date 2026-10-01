@@ -10008,13 +10008,21 @@ fn stack_header_plan(f: &Function) -> StackHeaderPlan {
         new_owner: &HashMap<ValueId, Slot>,
         bad: &mut HashSet<Slot>,
     ) {
-        if let Operand::Value(v) = op {
-            if let Some(slot) = load_defs.get(v) {
-                bad.insert(*slot);
+        match op {
+            Operand::Value(v) => {
+                if let Some(slot) = load_defs.get(v) {
+                    bad.insert(*slot);
+                }
+                if let Some(slot) = new_owner.get(v) {
+                    bad.insert(*slot);
+                }
             }
-            if let Some(slot) = new_owner.get(v) {
-                bad.insert(*slot);
-            }
+            // Calls may replace a borrowed owner and Drop its old header through the boxed ABI.
+            // A place operand exposes that header without ever producing a tracked Load value.
+            Operand::BorrowedPlace(place) => { bad.insert(place.slot); }
+            Operand::BorrowedElementPlace(place) => { bad.insert(place.base.slot); }
+            Operand::BorrowedFixedElementPlace(place) => { bad.insert(place.base); }
+            Operand::Const(_) | Operand::Arg(_) | Operand::BorrowedCleanupArg(_) => {}
         }
     }
     fn allow_loaded(
@@ -38948,6 +38956,25 @@ fn main() -> i32 = 0
             available_externally: false,
         };
         assert!(stack_header_plan(&f).slots.is_empty(), "an unaudited wrapper must retain the boxed ABI");
+    }
+
+    #[test]
+    fn borrowed_builder_calls_retain_boxed_headers() {
+        for (ty, constructor, finish, runtime) in [
+            ("builder", "builder()", "to_string", "builder"),
+            ("array_builder<i64>", "array_builder()", "build", "array_builder"),
+        ] {
+            for mode in ["borrow", "borrow mut"] {
+                let out = ir(&format!(
+                    "fn observe({mode} output: {ty}) {{}}\n\
+                     fn main() -> i32 {{ mut output: {ty} := {constructor}; observe(output);\n\
+                       result := output.{finish}(); return result.len() as i32 }}\n"
+                ));
+                let main = function_body(&out, "main");
+                assert!(main.contains(&format!("call ptr @align_rt_{runtime}_new(")), "{mode} {ty} must use the boxed call ABI:\n{main}");
+                assert!(!main.contains(&format!("call ptr @align_rt_{runtime}_init_stack(")), "{mode} {ty} must not expose stack header storage:\n{main}");
+            }
+        }
     }
 
     #[test]

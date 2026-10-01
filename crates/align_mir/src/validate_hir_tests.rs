@@ -2546,7 +2546,7 @@ fn valid_header_does_not_consume_body_facts() {
 }
 
 #[test]
-fn text_builder_parameter_modes_are_revalidated() {
+fn text_builder_parameter_modes_are_revalidated() -> Result<(), &'static str> {
     for receiver in [
         "output",
         "({ output })",
@@ -2569,7 +2569,7 @@ fn text_builder_parameter_modes_are_revalidated() {
             let mut program = checked_source_program(&source);
             assert!(validate_hir::declaration_header_metadata_is_valid(&program));
             assert!(validate_hir::body_only_metadata_is_valid(&program), "{receiver}.{method}: positive");
-            let function = program.fns.iter_mut().find(|function| function.name == "append").expect("append fixture");
+            let function = program.fns.iter_mut().find(|function| function.name == "append").ok_or("append fixture missing")?;
             function.param_modes[0] = align_ast::ParamMode::Borrow;
             function.locals[function.params[0] as usize].is_mut = false;
             assert!(validate_hir::declaration_header_metadata_is_valid(&program));
@@ -2586,7 +2586,7 @@ fn text_builder_parameter_modes_are_revalidated() {
         assert!(validate_hir::body_only_metadata_is_valid(&base));
         for mode in [align_ast::ParamMode::Borrow, align_ast::ParamMode::BorrowMut] {
             let mut program = base.clone();
-            let function = program.fns.iter_mut().find(|function| function.name == "finish").expect("finish fixture");
+            let function = program.fns.iter_mut().find(|function| function.name == "finish").ok_or("finish fixture missing")?;
             function.param_modes[0] = mode;
             function.locals[function.params[0] as usize].is_mut = mode == align_ast::ParamMode::BorrowMut;
             function.drop_locals.clear();
@@ -2595,6 +2595,7 @@ fn text_builder_parameter_modes_are_revalidated() {
             assert!(!validate_hir::body_only_metadata_is_valid(&program), "{receiver}: forged borrowed finish");
         }
     }
+    Ok(())
 }
 
 fn csv_validation_program() -> hir::Program {
