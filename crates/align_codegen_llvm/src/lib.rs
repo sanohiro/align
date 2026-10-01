@@ -16588,7 +16588,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // bodies — `gen_rvalue` is depth-recursive (via operand materialization), so keeping its
             // frame flat preserves the expr-depth budget (the #296 lesson, mirroring MIR's dispatcher).
             Rvalue::FileCreateRw { .. } | Rvalue::FileOpenRw { .. } | Rvalue::FileOpenRo { .. } | Rvalue::FileCreateRwExclusive { .. }
-            | Rvalue::FilePread { .. } | Rvalue::FilePwrite { .. } | Rvalue::FileLen { .. } => self.gen_file_rvalue(rv)?,
+            | Rvalue::FilePread { .. } | Rvalue::FilePwrite { .. } | Rvalue::FileLen { .. } | Rvalue::FileSync(..) => self.gen_file_rvalue(rv)?,
             Rvalue::ReaderStdin => self
                 .builder
                 .build_call(self.runtime(RuntimeKey::IoReaderStdin), &[], "stdin")
@@ -16671,12 +16671,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("io_writer_write_builder returns i32")
             }
-            Rvalue::WriterFlush(w) => {
+            Rvalue::WriterFlush(w) | Rvalue::WriterSync(w) => {
+                let key = if matches!(rv, Rvalue::WriterSync(..)) { RuntimeKey::IoWriterSync }
+                    else { RuntimeKey::IoWriterFlush };
                 let wp = self.operand(w)?.into();
                 self.builder
-                    .build_call(self.runtime(RuntimeKey::IoWriterFlush), &[wp], "wflush")
+                    .build_call(self.runtime(key), &[wp], "writer_status")
                     .map_err(|e| self.err(e))?
-                    .try_as_basic_value().basic().expect("io_writer_flush returns i32")
+                    .try_as_basic_value().basic().expect("writer operation returns i32")
             }
             Rvalue::BufferNew { capacity, fill } => {
                 let mut args = vec![self.operand(capacity)?.into()];
@@ -23611,6 +23613,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("io_file_pwrite returns i64")
             }
+            // f.sync() — one native request, returning the unit/Error status.
+            Rvalue::FileSync(file) => {
+                let fp = self.operand(file)?.into();
+                self.builder
+                    .build_call(self.runtime(RuntimeKey::IoFileSync), &[fp], "fsync")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().ok_or_else(|| self.err("io_file_sync must return i32"))?
+            }
             // f.len() — a live fstat, returns i64 length-or-status.
             Rvalue::FileLen { file } => {
                 let fp = self.operand(file)?.into();
@@ -28283,6 +28293,7 @@ fn main() -> i32 = 0
         for (payload, observation) in [
             ("buffer", "handle.len()"),
             ("writer", "{ result := handle.write(\"x\"); 1 }"),
+            ("writer", "{ result := handle.sync(); 1 }"),
         ] {
             let source = format!(
                 "fn inspect(borrow value: Option<{payload}>) -> i64 = match value {{ Some(handle) => {observation}, None => 0 }}\nfn main() {{}}\n"
@@ -28298,7 +28309,7 @@ fn main() -> i32 = 0
                         for statement in &mut block.stmts {
                             let operand = match statement {
                                 Stmt::Let(_, Rvalue::BufferLen(buffer)) => buffer,
-                                Stmt::Let(_, Rvalue::WriterWrite(writer, _)) => writer,
+                                Stmt::Let(_, Rvalue::WriterWrite(writer, _) | Rvalue::WriterSync(writer)) => writer,
                                 _ => continue,
                             };
                             let Operand::BorrowedPlace(place) = operand else {
@@ -31522,6 +31533,43 @@ fn main() -> i32 = 0
                 );
             }
         }
+    }
+
+    #[test]
+    fn sync_methods_mir_gate_requires_exact_native_receiver() -> Result<(), &'static str> {
+        for ty in ["file", "writer"] {
+            let base = mir(&format!("fn synchronize(value: {ty}) -> Result<(), Error> = value.sync()\nfn main() {{}}\n"));
+            assert!(emit_llvm_ir(&base, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_ok());
+            for mutation in 0..4 {
+                let mut bad = base.clone();
+                let mut changed = false;
+                for function in &mut bad.fns {
+                    for block in &mut function.blocks {
+                        for statement in &mut block.stmts {
+                            let Stmt::Let(value, rvalue) = statement else { continue; };
+                            let receiver = match rvalue {
+                                Rvalue::FileSync(file) | Rvalue::WriterSync(file) => file,
+                                _ => continue,
+                            };
+                            changed = true;
+                            match mutation {
+                                0 => *function.value_tys.get_mut(usize::try_from(*value).map_err(|_| "value index")?).ok_or("value type")? =
+                                    Ty::Int(IntTy { bits: 64, signed: true }),
+                                1 => *receiver = Operand::Const(Const::Unit),
+                                2 => *receiver = Operand::Value(u32::MAX),
+                                _ => {
+                                    let Operand::Value(source) = receiver else { return Err("sync receiver SSA value"); };
+                                    *function.value_tys.get_mut(usize::try_from(*source).map_err(|_| "receiver index")?).ok_or("receiver type")? = Ty::Reader;
+                                }
+                            }
+                        }
+                    }
+                }
+                assert!(changed);
+                assert!(emit_llvm_ir(&bad, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_err(), "{ty}/{mutation}");
+            }
+        }
+        Ok(())
     }
 
     #[test]

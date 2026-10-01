@@ -1519,6 +1519,7 @@ pub enum ExprKind {
     /// `w.flush()` — flush a `writer`'s buffered bytes to the OS, borrowing it. The `ty` is
     /// `Result<(), Error>`. Impure.
     WriterFlush { writer: Box<Expr> },
+    WriterSync { writer: Box<Expr> },
     /// `log.new(output, minimum)` — consume one writer and preserve its exact region in a new
     /// `log.logger` Move handle. Pure: allocation only, no writer I/O.
     LogNew { output: Box<Expr>, minimum: Box<Expr> },
@@ -1625,6 +1626,7 @@ pub enum ExprKind {
     /// `f.len()` — the file's live byte length (a fresh `fstat`), borrowing `file`. The `ty` is
     /// `Result<i64, Error>`. Impure (a syscall — the length is not cached). (A4.)
     FileLen { file: Box<Expr> },
+    FileSync { file: Box<Expr> },
     /// `buffer(cap)` — open an owned growable byte buffer with read window `cap` (a `str`-less byte
     /// sink for `reader.read`). The `ty` is [`crate::Ty::Buffer`] (an owned Move handle, `Drop`-freed).
     /// Pure (allocation only), like `BuilderNew`.

@@ -351,6 +351,8 @@ fn change(borrow mut holder: Holder) { holder = Holder { sink: None, data: buffe
                 "fn fill(borrow mut data: buffer) { data.put_u8(0) }\nfn bad(borrow mut holder: Holder) { fill(holder.data) }",
             ),
         ] {
+            let body = body.replace("Some(sink) => {", "Some(sink) => { synchronized := sink.sync();")
+                .replace("sink.flush()", "sink.sync()");
             let source = format!("{prelude}\n{body}\nfn main() {{}}\n");
             let source = if mixed {
                 source
@@ -725,8 +727,14 @@ int32_t probe_readonly(int32_t fd) {
     // Redirect only the generated program's free calls through counting delegates. The actual
     // runtime implementations, handle layouts, I/O and error paths remain the linked production
     // runtime. Counting non-null calls detects duplicate frees without invoking allocator UB.
-    for per_unit in [false, true] {
+    for (per_unit, synchronization) in [(false, false), (true, false), (false, true), (true, true)] {
         let project = handle_project("counted", source);
+        let source = if synchronization {
+            source.replace("sink.flush()?", "sink.sync()?")
+                .replace("fs.create(\"/dev/null\")", &format!("fs.create(\"{}\")", project.dir.join("output").display()))
+        } else { source.to_owned() };
+        std::fs::write(project.dir.join("main.align"), &source).expect("write sync cleanup fixture");
+        let source = source.as_str();
         let entry = project.dir.join("main.align");
         let name = entry.to_str().expect("UTF-8 fixture path");
         let mut sm = SourceMap::new();
@@ -912,5 +920,63 @@ fn main() {
             );
             assert_eq!(String::from_utf8_lossy(&output.stdout), "5\n");
         }
+    }
+}
+
+
+#[test]
+fn borrowed_writer_sync_preserves_nested_and_optional_owners() {
+    if !backend_available() { return; }
+    let fixture = handle_project("writer-sync-fields", "fn main() {}");
+    let helper = r#"
+module synchronized_handles
+pub Inner { data: buffer, sink: Option<writer> }
+pub Outer { inner: Inner }
+pub Direct { sink: writer }
+pub fn emit(borrow owner: Outer) -> Result<(), Error> {
+  match owner.inner.sink { Some(sink) => { sink.write(owner.inner.data.bytes())?; sink.sync()? }, None => {} }
+  return Ok(())
+}
+pub fn optional(borrow output: Option<writer>) -> Result<(), Error> {
+  match output { Some(sink) => { sink.write("?")?; sink.sync()? }, None => {} }
+  return Ok(())
+}
+pub fn fallible(borrow output: Result<writer, Error>) -> Result<(), Error> {
+  match output { Ok(sink) => { sink.write("!")?; sink.sync()? }, Err(error) => { return Err(error) } }
+  return Ok(())
+}
+pub fn direct(borrow output: Direct) -> Result<(), Error> = output.sink.sync()
+"#;
+    let source = format!(r#"
+import std.fs
+import synchronized_handles
+fn main() -> Result<(), Error> {{
+  mut data := buffer(8)
+  data.put_u8(65)
+  sink := fs.create("{0}/nested")?
+  owner := synchronized_handles.Outer {{ inner: synchronized_handles.Inner {{ data: data, sink: Some(sink) }} }}
+  synchronized_handles.emit(owner)?
+  synchronized_handles.emit(owner)?
+  synchronized_handles.optional(owner.inner.sink)?
+  print(fs.read_file("{0}/nested")?)
+  output := fs.create("{0}/result")
+  synchronized_handles.fallible(output)?
+  print(fs.read_file("{0}/result")?)
+  direct := synchronized_handles.Direct {{ sink: fs.create("{0}/direct")? }}
+  direct.sink.write("D")?
+  synchronized_handles.direct(direct)?
+  print(fs.read_file("{0}/direct")?)
+  bad := synchronized_handles.Direct {{ sink: fs.create("/dev/null")? }}
+  match synchronized_handles.direct(bad) {{ Ok(_) => {{ return Err(Error.Invalid) }}, Err(_) => {{}} }}
+  bad.sink.write("still usable")?
+  bad.sink.flush()?
+  return Ok(())
+}}
+"#, fixture.dir.display());
+    let files = [("main.align", source.as_str()), ("synchronized_handles.align", helper)];
+    for output in [build_and_run_multi("writer-sync-fields-whole", &files, "main.align"),
+        build_per_unit_multi("writer-sync-fields-unit", &files, "main.align").link_and_run()] {
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(output.stdout, b"AA?\n!\nD\n");
     }
 }

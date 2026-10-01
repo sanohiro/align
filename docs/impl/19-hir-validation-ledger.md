@@ -1245,7 +1245,7 @@ predicate, not type equality alone:
   it consumes any producer-valid Reader expression and transfers the fd, so a
   temporary does not leak.
 - `WriterPlace(e)` is `LocalHandle(Writer,e)` or
-  `WriterStd { buffered: false, fd: 1|2 }`. `WriterWrite`, `WriterFlush`, and
+  `WriterStd { buffered: false, fd: 1|2 }`. `WriterWrite`, `WriterFlush`, `WriterSync`, and
   the writer operand of `IoCopy` use it. A buffered `WriterStd` must first be a
   local because unwritten bytes are released only by Flush/Drop.
 - `HttpResponsePlace(e)` is `LocalHandle(HttpResponse,e)` or an `Index` whose
@@ -1300,6 +1300,7 @@ merely because its `Ty` matches.
 | `BytesAsStr` | `env[]; child[bytes]`; `bytes; result ERR(Str); success view inherits bytes provenance; Pure`. |
 | `WriterWrite` | `env[builder]`; `child[writer,arg]`; `Writer borrowed; builder=false requires byte-view, true requires Builder; result ERR(Unit); arg borrowed; Impure`. |
 | `WriterFlush` | `env[]; child[writer]`; `Writer; result ERR(Unit); borrowed; Impure`. |
+| `WriterSync` | `env[]; child[writer]`; `WriterPlace(writer); result ERR(Unit); borrowed without consuming its containing/dependent owner; Impure`. |
 | `IoCopy` | `env[]; child[reader,writer]`; `Reader,Writer; result ERR(i64); both borrowed; Impure`. |
 | `FileCreateRw` | `env[]; child[path]`; `Str; result ERR(File); new owned fd; Impure`. |
 | `FileCreateRwExclusive` | `env[]; child[path]`; `Str; result ERR(File); new exclusive read/write owned fd; Impure`. |
@@ -1308,6 +1309,7 @@ merely because its `Ty` matches.
 | `FilePread` | `env[]; child[file,buffer,offset]`; `LocalHandle(File,file), SourceMutLocal(Buffer,buffer), i64; result ERR(i64); handles borrowed, buffer mutated; Impure`. |
 | `FilePwrite` | `env[]; child[file,data,offset]`; `File, byte-view, i64; result ERR(i64); borrowed; Impure`. |
 | `FileLen` | `env[]; child[file]`; `File; result ERR(i64); borrowed; Impure`. |
+| `FileSync` | `env[]; child[file]`; `LocalHandle(File,file); result ERR(Unit); borrowed; Impure`. |
 | `BufferNew` | `env[fill presence]; child[capacity,fill?]`; capacity is i64; present fill is u8. Result Buffer; fresh owned allocation; Pure. Absent fill retains the empty read window; present fill guarantees initialized length.. |
 | `BufferBytes` | `env[]; child[buffer]`; `Buffer; result bytes; view inherits buffer provenance; Pure`. |
 | `StrBytes` | `env[]; child[inner]`; `Str; result bytes; view inherits string provenance; Pure`. |

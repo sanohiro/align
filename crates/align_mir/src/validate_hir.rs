@@ -4731,7 +4731,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::ReaderReadLine { .. }
             | hir::ExprKind::BytesAsStr { .. }
             | hir::ExprKind::WriterWrite { .. }
-            | hir::ExprKind::WriterFlush { .. }
+            | hir::ExprKind::WriterFlush { .. } | hir::ExprKind::WriterSync { .. }
             | hir::ExprKind::LogNew { .. }
             | hir::ExprKind::LogEnabled { .. }
             | hir::ExprKind::LogLine { .. }
@@ -4764,7 +4764,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::FileOpenRo { .. } | hir::ExprKind::FileCreateRwExclusive { .. }
             | hir::ExprKind::FilePread { .. }
             | hir::ExprKind::FilePwrite { .. }
-            | hir::ExprKind::FileLen { .. }
+            | hir::ExprKind::FileLen { .. } | hir::ExprKind::FileSync { .. }
             | hir::ExprKind::BufferNew { .. }
             | hir::ExprKind::BufferBytes { .. }
             | hir::ExprKind::StrBytes { .. }
@@ -5131,7 +5131,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::ReaderBuffered { .. }
             | hir::ExprKind::ReaderReadLine { .. }
             | hir::ExprKind::BytesAsStr { .. }
-            | hir::ExprKind::WriterFlush { .. }
+            | hir::ExprKind::WriterFlush { .. } | hir::ExprKind::WriterSync { .. }
             | hir::ExprKind::LogNew { .. }
             | hir::ExprKind::LogEnabled { .. }
             | hir::ExprKind::LogLine { .. }
@@ -5164,7 +5164,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::FileOpenRo { .. } | hir::ExprKind::FileCreateRwExclusive { .. }
             | hir::ExprKind::FilePread { .. }
             | hir::ExprKind::FilePwrite { .. }
-            | hir::ExprKind::FileLen { .. }
+            | hir::ExprKind::FileLen { .. } | hir::ExprKind::FileSync { .. }
             | hir::ExprKind::BufferNew { .. }
             | hir::ExprKind::BufferBytes { .. }
             | hir::ExprKind::StrBytes { .. }
@@ -9069,7 +9069,7 @@ impl<'a> BodyValidator<'a> {
                 }
                 result(Ty::Unit, &[writer, arg])
             }
-            hir::ExprKind::WriterFlush { writer } => {
+            hir::ExprKind::WriterFlush { writer } | hir::ExprKind::WriterSync { writer } => {
                 ((self.writer_place(writer, context)
                     || self.handle_receiver_place(writer, context, Ty::Writer))
                     && writer.ty == Ty::Writer)
@@ -9254,6 +9254,10 @@ impl<'a> BodyValidator<'a> {
                     return None;
                 }
                 result(Ty::Int(align_sema::IntTy { bits: 64, signed: true }), &[file, data, offset])
+            }
+            hir::ExprKind::FileSync { file } => {
+                (local(file, Ty::File) && file.ty == Ty::File)
+                    .then(|| result(Ty::Unit, &[file]))?
             }
             hir::ExprKind::FileLen { file } => {
                 (local(file, Ty::File) && file.ty == Ty::File)

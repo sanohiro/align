@@ -504,3 +504,96 @@ fn main() -> Result<(), Error> {{
         assert!(!dir.join("never").exists());
     }
 }
+
+
+#[test]
+fn sync_file_and_buffered_writer_in_imported_helpers() {
+    if !backend_available() { return; }
+    let fixtures = FileFixtures::new("sync");
+    let file_path = fixtures.dir.join("file");
+    let writer_path = fixtures.dir.join("writer");
+    let library = r#"
+module synchronization
+pub fn file_owner<T>(tag: T, f: file) -> Result<file, Error> { f.sync()?; return Ok(f) }
+pub fn writer_owner<T>(tag: T, w: writer) -> Result<writer, Error> { w.sync()?; return Ok(w) }
+"#;
+    let source = format!(r#"
+import std.fs
+import synchronization
+fn main() -> Result<(), Error> {{
+  file_path := "{}"
+  writer_path := "{}"
+  f := fs.create_rw(file_path)?
+  f.pwrite("file", 0)?
+  mut g := synchronization.file_owner(true, f)?
+  g.pwrite("!", 4)?
+  match g.sync().map_err(fn e: Error {{ e }}) {{ Ok(value) => {{}}, Err(e) => {{ return Err(e) }} }}
+  mut n := 0
+  loop {{ if n == 2 {{ break }}; g.sync()?; n = n + 1 }}
+  g.sync() else {{ return Err(Error.Invalid) }}
+  g = fs.open_rw(file_path)?
+  g.sync()?
+  ro := fs.open_ro(file_path)?
+  ro.sync()?
+  print(fs.read_file(file_path)?)
+  w := fs.create(writer_path)?
+  w.write("buffered")?
+  if fs.read_file(writer_path)? != "" {{ return Err(Error.Invalid) }}
+  mut v := synchronization.writer_owner(1, w)?
+  if fs.read_file(writer_path)? != "buffered" {{ return Err(Error.Invalid) }}
+  v.write("!")?
+  match v.sync().map_err(fn e: Error {{ e }}) {{ Ok(value) => {{}}, Err(e) => {{ return Err(e) }} }}
+  n = 0
+  loop {{ if n == 2 {{ break }}; v.sync()?; n = n + 1 }}
+  v.sync() else {{ return Err(Error.Invalid) }}
+  print(fs.read_file(writer_path)?)
+  v = fs.create(writer_path)?
+  v.sync()?
+  return Ok(())
+}}
+"#, file_path.display(), writer_path.display());
+    let files = [("synchronization.align", library), ("main.align", source.as_str())];
+    for output in [build_and_run_multi("sync-whole", &files, "main.align"),
+        build_per_unit_multi("sync-units", &files, "main.align").link_and_run()] {
+        assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(output.stdout, b"file!\nbuffered!\n");
+    }
+}
+
+#[test]
+fn sync_formation_effect_and_move_diagnostics() {
+    for (ty, constructor) in [("file", "fs.create_rw(\"x\")"), ("writer", "fs.create(\"x\")")] {
+        let bind = format!("owner := {constructor}?");
+        for body in [
+            format!("{bind}; owner.sync(1)?"),
+            format!("{bind}; wrong: Result<i64, Error> := owner.sync()"),
+            format!("{constructor}?.sync()?"),
+            format!("{bind}; moved := owner; owner.sync()?"),
+            format!("{bind}; owner.sync()"),
+            format!("{bind}; xs := [1,2].par_map(|n| {{ owner.sync(); n }})"),
+        ] {
+            let source = format!("import std.fs\nfn main() -> Result<(), Error> {{ {body}; return Ok(()) }}\n");
+            assert!(check_errs(&format!("sync-invalid-{ty}"), &source), "{source}");
+            let files = [("main.align", source.as_str())];
+            assert!(check_per_unit_multi(&format!("sync-invalid-unit-{ty}"), &files, "main.align").diags.has_errors(), "{source}");
+        }
+    }
+}
+
+#[test]
+fn sync_preserves_connection_writer_lifetime() {
+    let valid = "import std.net\nfn operation() -> Result<(), Error> { conn := tcp.connect(\"127.0.0.1\", 80)?; w := conn.writer(); w.sync()?; w.write(\"still borrowed\")?; return Ok(()) }\nfn main() {}\n";
+    assert!(!check_errs("sync-connection-valid", valid));
+    let valid_files = [("main.align", valid)];
+    assert!(!check_per_unit_multi("sync-connection-valid-unit", &valid_files, "main.align").diags.has_errors());
+    for body in [
+        "fn escape() -> Result<writer, Error> { conn := tcp.connect(\"127.0.0.1\", 80)?; w := conn.writer(); w.sync()?; return Ok(w) }",
+        "fn retire(conn: tcp_conn) {}\nfn operation() -> Result<(), Error> { conn := tcp.connect(\"127.0.0.1\", 80)?; w := conn.writer(); w.sync()?; retire(conn); w.sync()?; return Ok(()) }",
+        "fn operation() -> Result<(), Error> { conn := tcp.connect(\"127.0.0.1\", 80)?; w := conn.writer(); w.sync()?; xs := [1,2].par_map(|n| { w.sync(); n }); return Ok(()) }",
+    ] {
+        let source = format!("import std.net\n{body}\nfn main() {{}}\n");
+        assert!(check_errs("sync-connection-invalid", &source), "{source}");
+        let files = [("main.align", source.as_str())];
+        assert!(check_per_unit_multi("sync-connection-invalid-unit", &files, "main.align").diags.has_errors(), "{source}");
+    }
+}

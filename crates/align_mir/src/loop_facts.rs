@@ -291,7 +291,7 @@ macro_rules! unmodelled_rvalues {
         Rvalue::WriterCreateExclusiveBeneath { .. } | Rvalue::ReaderStdin { .. } | Rvalue::WriterStd { .. } |
         Rvalue::ReaderRead { .. } | Rvalue::ReaderBuffered { .. } | Rvalue::ReaderReadLine { .. } |
         Rvalue::BytesAsStr { .. } | Rvalue::WriterWrite { .. } | Rvalue::WriterWriteBuilder { .. } |
-        Rvalue::WriterFlush { .. } | Rvalue::LogNew { .. } | Rvalue::LogEnabled { .. } |
+        Rvalue::WriterFlush { .. } | Rvalue::WriterSync { .. } | Rvalue::LogNew { .. } | Rvalue::LogEnabled { .. } |
         Rvalue::LogLine { .. } | Rvalue::LogLineBuilder { .. } | Rvalue::LogFlush { .. } |
         Rvalue::XmlParse { .. } | Rvalue::XmlNext { .. } | Rvalue::XmlName { .. } |
         Rvalue::XmlAttributeCount { .. } | Rvalue::XmlAttributeName { .. } | Rvalue::XmlAttributeValue { .. } |
@@ -302,7 +302,7 @@ macro_rules! unmodelled_rvalues {
         Rvalue::CodecEncoderFinish { .. } | Rvalue::CryptoDigestNew { .. } | Rvalue::CryptoDigestUpdate { .. } |
         Rvalue::CryptoDigestFinish { .. } | Rvalue::FrameInnerJoin { .. } | Rvalue::IoCopy { .. } |
         Rvalue::FileCreateRw { .. } | Rvalue::FileOpenRw { .. } | Rvalue::FileOpenRo { .. } | Rvalue::FileCreateRwExclusive { .. } | Rvalue::FilePread { .. } |
-        Rvalue::FilePwrite { .. } | Rvalue::FileLen { .. } | Rvalue::BufferNew { .. } |
+        Rvalue::FilePwrite { .. } | Rvalue::FileLen { .. } | Rvalue::FileSync(..) | Rvalue::BufferNew { .. } |
         Rvalue::BufferBytes { .. } | Rvalue::BufferLen { .. } | Rvalue::BufferCapacity { .. } |
         Rvalue::BytesSet { .. } | Rvalue::BytesFill { .. } |
         Rvalue::BytesCopyFrom { .. } | Rvalue::BufferPut { .. } | Rvalue::BufferAppend { .. } |

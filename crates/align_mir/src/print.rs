@@ -834,6 +834,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::IoCopy(r, w) => format!("io_copy({}, {})", operand_str(r), operand_str(w)),
         Rvalue::WriterWrite(w, s) => format!("io_write({}, {})", operand_str(w), operand_str(s)),
         Rvalue::WriterWriteBuilder(w, b) => format!("io_write_builder({}, {})", operand_str(w), operand_str(b)),
+        Rvalue::WriterSync(w) => format!("io_sync({})", operand_str(w)),
         Rvalue::WriterFlush(w) => format!("io_flush({})", operand_str(w)),
         Rvalue::LogNew(w, level) => format!("log_new({}, {})", operand_str(w), operand_str(level)),
         Rvalue::LogEnabled(logger, level) => format!("log_enabled({}, {})", operand_str(logger), operand_str(level)),
@@ -936,6 +937,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::FileCreateRwExclusive { path, out } => format!("fs_create_rw_exclusive({}, -> _{out})", operand_str(path)),
         Rvalue::FilePread { file, buffer, offset } => format!("file_pread({}, {}, {})", operand_str(file), operand_str(buffer), operand_str(offset)),
         Rvalue::FilePwrite { file, data, offset } => format!("file_pwrite({}, {}, {})", operand_str(file), operand_str(data), operand_str(offset)),
+        Rvalue::FileSync(file) => format!("file_sync({})", operand_str(file)),
         Rvalue::FileLen { file } => format!("file_len({})", operand_str(file)),
         Rvalue::BufferNew { capacity, fill } => match fill {
             Some(value) => format!("buffer_filled({}, {})", operand_str(capacity), operand_str(value)),

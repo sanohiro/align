@@ -9,7 +9,7 @@ handle ownership or admit exclusive calls on arbitrary partial Move fields.
 | Surface | Exact input and result | Ownership, lifetime, errors and allocation | Owner and acceptance |
 |---|---|---|---|
 | Stable buffer receiver | `owner.path.data.bytes() -> slice<u8>` and `owner.path.data.len() -> i64`, where the final field is `buffer` and the complete root is a stable local, shared/exclusive parameter, or checked borrowed payload binding. No new arguments/defaults. | Non-consuming load of the existing handle. The view retains the original owner, generation and contained lifetime; no new owner, nulling, independent cleanup or allocation. Existing byte-view mutation rules apply. Temporary receivers remain rejected. | Sema, checked HIR, MIR borrowed load, resource validation and LLVM pure lowering. Direct/nested receiver, borrowed owner, view escape/invalidation and exact-byte execution owners. |
-| Stable writer receiver | `owner.path.sink.write(value) -> Result<(), Error>` and `.flush() -> Result<(), Error>`. `value` is the existing `str`, `string`, `slice<u8>` or `builder` argument. Stable roots as above; existing local/std-stream receivers remain. | Existing writer methods take a non-consuming shared handle receiver; I/O remains impure and native errors unchanged. Borrowing does not transfer the writer, its descriptor, buffered bytes or backing connection. Failure/early exit leaves cleanup with the owner. No added allocation or implicit flush. | Same stages; repeated write/flush, failed write, eager-argument owner replacement, one close/free and exact bytes. |
+| Stable writer receiver | `owner.path.sink.write(value) -> Result<(), Error>` and `.flush() -> Result<(), Error>`; plan 86 adds `.sync() -> Result<(), Error>` under the same stable-place and dependent-owner rules. `value` is the existing `str`, `string`, `slice<u8>` or `builder` argument. Stable roots as above; existing local/std-stream receivers remain. | Existing writer methods take a non-consuming shared handle receiver; I/O remains impure and native errors unchanged. Borrowing does not transfer the writer, its descriptor, buffered bytes or backing connection. Failure/early exit leaves cleanup with the owner. No added allocation or implicit flush. | Same stages; repeated write/flush, failed write, eager-argument owner replacement, one close/free and exact bytes. |
 | Borrowed sum payload | Add `buffer` and `writer` leaves to plan 28's closed finite recursive grammar. Existing `match` over a borrowed complete `Option`, `Result`, user-sum or field may bind them or records containing them as checked borrowed projections. | Existing static payload type and projection metadata; active tag/path/authenticated owner only. No independent drop bit, extraction or source nulling. Consumption, storage, return of the handle, capture, exclusive passing and nested borrowed matches remain rejected by existing rules. Ordinary owning match still consumes. | Shared classifier and variant sweep, checked-HIR replay, exact MIR place/type/provenance, negative consumption/escape and owning-match twins. |
 
 A plain `alias := owner.handle` remains an ordinary Move expression; this
@@ -270,3 +270,12 @@ native HTTP read/SSE success, EOF, malformed framing, capacity and timeout owner
 exercise the same Buffer path. These owners close initialization and publication
 alongside pointer permission; the changed private Rust output signatures are the
 compile-time check against passing uninitialized storage as ordinary byte slices.
+
+## Explicit synchronization follow-up (Request 31)
+
+Plan 86 adds WriterSync under this stable-place/dependent-owner contract. Its
+nested field and borrowed Option/Result execution owners preserve parent cleanup
+on success and error; consumption/escape, connection retirement/capture, and
+forged checked-HIR/MIR projection owners bind the new operation itself. The
+original capability above did not add a variant or symbol; the two sync variants
+and A03 symbols belong to plan 86.

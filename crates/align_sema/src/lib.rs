@@ -16912,7 +16912,7 @@ impl EffectScan<'_> {
                 walk!(arg);
                 self.impure_direct = true;
             }
-            ExprKind::WriterFlush { writer } => {
+            ExprKind::WriterFlush { writer } | ExprKind::WriterSync { writer } => {
                 walk!(writer);
                 self.impure_direct = true;
             }
@@ -16999,8 +16999,8 @@ impl EffectScan<'_> {
                 walk!(writer);
                 self.impure_direct = true;
             }
-            // `f.pread` / `f.pwrite` / `f.len` are syscalls (I/O / fstat) — Impure, like `reader.read`.
-            ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } => {
+            // File pread/pwrite/len/sync are syscalls (I/O / fstat / synchronization) — Impure, like `reader.read`.
+            ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } | ExprKind::FileSync { .. } => {
                 self.impure_direct = true;
             }
             // `.bytes()` re-views string/buffer memory and `.len()` reads it — pure (no I/O), like
@@ -25173,7 +25173,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ReaderRead { .. }
             | ExprKind::ReaderReadLine { .. }
             | ExprKind::WriterWrite { .. }
-            | ExprKind::WriterFlush { .. }
+            | ExprKind::WriterFlush { .. } | ExprKind::WriterSync { .. }
             | ExprKind::LogEnabled { .. }
             | ExprKind::LogLine { .. }
             | ExprKind::LogFlush { .. }
@@ -25191,7 +25191,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::FileOpenRo { .. } | ExprKind::FileCreateRwExclusive { .. }
             | ExprKind::FilePread { .. }
             | ExprKind::FilePwrite { .. }
-            | ExprKind::FileLen { .. }
+            | ExprKind::FileLen { .. } | ExprKind::FileSync { .. }
             | ExprKind::BufferNew { .. }
             | ExprKind::BufferLen { .. }
             | ExprKind::BytesRead { .. }
@@ -25643,7 +25643,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ReaderReadLine { .. }
             | ExprKind::BytesAsStr { .. }
             | ExprKind::WriterWrite { .. }
-            | ExprKind::WriterFlush { .. }
+            | ExprKind::WriterFlush { .. } | ExprKind::WriterSync { .. }
             | ExprKind::LogNew { .. }
             | ExprKind::LogEnabled { .. }
             | ExprKind::LogLine { .. }
@@ -25663,7 +25663,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::FileOpenRo { .. } | ExprKind::FileCreateRwExclusive { .. }
             | ExprKind::FilePread { .. }
             | ExprKind::FilePwrite { .. }
-            | ExprKind::FileLen { .. }
+            | ExprKind::FileLen { .. } | ExprKind::FileSync { .. }
             | ExprKind::BufferNew { .. }
             | ExprKind::BufferLen { .. }
             | ExprKind::BytesRead { .. }
@@ -28797,7 +28797,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(data, depth);
                 self.walk(offset, depth);
             }
-            ExprKind::FileLen { file } => self.walk(file, depth),
+            ExprKind::FileLen { file } | ExprKind::FileSync { file } => self.walk(file, depth),
             _ => unreachable!("walk_file_op on a non-file op"),
         }
     }
@@ -29548,7 +29548,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(writer, depth);
                 self.walk(arg, depth);
             }
-            ExprKind::WriterFlush { writer } => self.walk(writer, depth),
+            ExprKind::WriterFlush { writer } | ExprKind::WriterSync { writer } => self.walk(writer, depth),
             ExprKind::LogNew { output, minimum }
             | ExprKind::LogEnabled { logger: output, level: minimum } => {
                 self.walk(output, depth);
@@ -29622,7 +29622,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(reader, depth);
                 self.walk(writer, depth);
             }
-            ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } => self.walk_file_op(&e.kind, depth),
+            ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } | ExprKind::FileSync { .. } => self.walk_file_op(&e.kind, depth),
             ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.walk(buffer, depth),
             ExprKind::BytesRead { bytes, offset, .. } => {
                 self.walk(bytes, depth);
@@ -31892,7 +31892,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::ReaderReadLine { .. }
         | ExprKind::BytesAsStr { .. }
         | ExprKind::WriterWrite { .. }
-        | ExprKind::WriterFlush { .. }
+        | ExprKind::WriterFlush { .. } | ExprKind::WriterSync { .. }
         | ExprKind::LogNew { .. }
         | ExprKind::LogEnabled { .. }
         | ExprKind::LogLine { .. }
@@ -31915,7 +31915,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::FileOpenRo { .. } | ExprKind::FileCreateRwExclusive { .. }
         | ExprKind::FilePread { .. }
         | ExprKind::FilePwrite { .. }
-        | ExprKind::FileLen { .. }
+        | ExprKind::FileLen { .. } | ExprKind::FileSync { .. }
         | ExprKind::BufferNew { .. }
         | ExprKind::BufferLen { .. }
         | ExprKind::BytesRead { .. }
@@ -40920,7 +40920,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::JsonDocAsScalar { .. } | ExprKind::JsonDocLen { .. } | ExprKind::FsReadFile { .. }
             | ExprKind::FsCreatePrivateTempDir { .. }
             | ExprKind::ReaderRead { .. } | ExprKind::ReaderReadLine { .. } | ExprKind::WriterWrite { .. }
-            | ExprKind::WriterFlush { .. } | ExprKind::LogEnabled { .. } | ExprKind::LogLine { .. }
+            | ExprKind::WriterFlush { .. } | ExprKind::WriterSync { .. } | ExprKind::LogEnabled { .. } | ExprKind::LogLine { .. }
             | ExprKind::LogFlush { .. }
             | ExprKind::CodecBatchRows { .. } | ExprKind::CodecBatchColumns { .. }
             | ExprKind::CodecBatchKind { .. } | ExprKind::CodecBatchFind { .. }
@@ -40930,7 +40930,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::FrameInnerJoin { .. }
             | ExprKind::IoCopy { .. } | ExprKind::FileCreateRw { .. }
             | ExprKind::FileOpenRw { .. } | ExprKind::FileOpenRo { .. } | ExprKind::FileCreateRwExclusive { .. } | ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. }
-            | ExprKind::FileLen { .. } | ExprKind::BufferNew { .. } | ExprKind::BufferLen { .. }
+            | ExprKind::FileLen { .. } | ExprKind::FileSync { .. } | ExprKind::BufferNew { .. } | ExprKind::BufferLen { .. }
             | ExprKind::BytesRead { .. }
             | ExprKind::BytesSet { .. }
             | ExprKind::BytesFill { .. }
@@ -42999,7 +42999,7 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, data, moved, false, false);
                 move_expr!(self, offset, moved, false, false);
             }
-            ExprKind::FileLen { file } => {
+            ExprKind::FileLen { file } | ExprKind::FileSync { file } => {
                 move_expr!(self, file, moved, false, false);
             }
             _ => unreachable!("move_file_op on a non-file op"),
@@ -46945,7 +46945,7 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, writer, moved, false, false);
                 move_expr!(self, arg, moved, false, false);
             }
-            ExprKind::WriterFlush { writer } => move_expr!(self, writer, moved, false, false),
+            ExprKind::WriterFlush { writer } | ExprKind::WriterSync { writer } => move_expr!(self, writer, moved, false, false),
             // `log.new` transfers the sole writer ownership after both operands type-check. Logger
             // methods borrow the logger, level, and message; the logger remains usable afterward.
             ExprKind::LogNew { output, minimum } => {
@@ -47041,7 +47041,7 @@ impl<'a> MoveCheck<'a> {
             // Split out `#[inline(never)]` so its arm locals stay out of this recursive frame (#296).
             ExprKind::FilePread { .. }
             | ExprKind::FilePwrite { .. }
-            | ExprKind::FileLen { .. } => {
+            | ExprKind::FileLen { .. } | ExprKind::FileSync { .. } => {
                 if !self.move_file_op(&e.kind, moved) {
                     return false;
                 }
@@ -54999,14 +54999,18 @@ impl<'a, 't> Checker<'a, 't> {
         // `std.fs`/`std.io` offset-addressed file I/O on a `file`: `f.pread(b, off)` / `f.pwrite(data,
         // off)` (A4). Dispatched on the receiver type so the names stay free on other values. (`f.len()`
         // dispatches through `check_len` like the other `.len()` receivers.)
-        if matches!(method, "pread" | "pwrite") {
+        if matches!(method, "pread" | "pwrite" | "sync") {
             let recv_expr = self.check_expr(recv, None);
             if recv_expr.ty == Ty::File {
                 return self.check_file_method(recv_expr, method, args, span);
             }
+            if method == "sync" && recv_expr.ty == Ty::Writer {
+                return self.check_writer_method(recv_expr, method, args, span);
+            }
             if recv_expr.ty != Ty::Error {
                 self.diags
-                    .error(format!("'.{method}()' is not a method on {} (it is a `file` method)", ty_name(recv_expr.ty)), span);
+                    .error(format!("'.{method}()' is not a method on {} ({})", ty_name(recv_expr.ty),
+                        if method == "sync" { "it synchronizes a file or writer" } else { "it is a `file` method" }), span);
             }
             return err;
         }
@@ -67248,13 +67252,16 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         match method {
-            "flush" => {
+            "flush" | "sync" => {
                 if !args.is_empty() {
                     self.diags
-                        .error(format!("'.flush()' takes no arguments, got {}", args.len()), span);
+                        .error(format!("'.{method}()' takes no arguments, got {}", args.len()), span);
                     return err;
                 }
-                Expr { kind: ExprKind::WriterFlush { writer: Box::new(recv_expr) }, ty: result_ty, span }
+                let writer = Box::new(recv_expr);
+                let kind = if method == "sync" { ExprKind::WriterSync { writer } }
+                    else { ExprKind::WriterFlush { writer } };
+                Expr { kind, ty: result_ty, span }
             }
             "write" => {
                 if args.len() != 1 {
@@ -67294,7 +67301,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
             _ => {
                 self.diags
-                    .error(format!("'.{method}()' is not a method on a writer (try write / flush)"), span);
+                    .error(format!("'.{method}()' is not a method on a writer (try write / flush / sync)"), span);
                 err
             }
         }
@@ -67647,6 +67654,14 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         match method {
+            "sync" => {
+                if !args.is_empty() {
+                    self.diags.error(format!("'.sync()' takes no arguments, got {}", args.len()), span);
+                    return err;
+                }
+                Expr { kind: ExprKind::FileSync { file: Box::new(recv_expr) },
+                    ty: Ty::Result(Scalar::Unit, Scalar::Enum(self.error_enum_id)), span }
+            }
             "len" => {
                 if !args.is_empty() {
                     self.diags.error(format!("'.len()' takes no arguments, got {}", args.len()), span);
@@ -67723,7 +67738,7 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
             _ => {
-                self.diags.error(format!("'.{method}()' is not a method on a file (try pread / pwrite / len)"), span);
+                self.diags.error(format!("'.{method}()' is not a method on a file (try pread / pwrite / len / sync)"), span);
                 err
             }
         }
@@ -69619,7 +69634,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(data);
                 self.finalize_expr(offset);
             }
-            ExprKind::FileLen { file } => self.finalize_expr(file),
+            ExprKind::FileLen { file } | ExprKind::FileSync { file } => self.finalize_expr(file),
             _ => unreachable!("finalize_file_op on a non-file op"),
         }
     }
@@ -70523,7 +70538,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(writer);
                 self.finalize_expr(arg);
             }
-            ExprKind::WriterFlush { writer } => self.finalize_expr(writer),
+            ExprKind::WriterFlush { writer } | ExprKind::WriterSync { writer } => self.finalize_expr(writer),
             ExprKind::LogNew { output, minimum } => {
                 self.finalize_expr(output);
                 self.finalize_expr(minimum);
@@ -70597,7 +70612,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(reader);
                 self.finalize_expr(writer);
             }
-            k @ (ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. }) => self.finalize_file_op(k),
+            k @ (ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } | ExprKind::FileSync { .. }) => self.finalize_file_op(k),
             ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } => self.finalize_expr(buffer),
             ExprKind::BytesRead { bytes, offset, .. } => {
                 self.finalize_expr(bytes);
@@ -76674,9 +76689,10 @@ mod tests {
         // BufferAppend's fresh-missing policy.
         // FloatScope is an explicit forwarding wrapper with no storage of its own.
         // HttpServerMaxRequestBodyBytes mutates a server setting and returns Unit.
+        // FileSync and WriterSync borrow native owners and return unit/Error.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 345,
+            variants, 347,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 
