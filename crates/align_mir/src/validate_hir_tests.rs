@@ -19564,3 +19564,27 @@ fn file_pread_into_hir_rejects_forged_native_types() -> Result<(), &'static str>
     }
     Ok(())
 }
+
+#[test]
+fn native_output_hir_rejects_shared_mode_with_mutable_local_flag() -> Result<(), &'static str> {
+    for (label, source, buffer_parameter) in [
+        ("pread_into", "fn fill(borrow f: file, borrow mut b: buffer) -> Result<i64, Error> = f.pread_into(b, 0, 1, 0)\n", 1usize),
+        ("pread", "fn fill(borrow f: file, borrow mut b: buffer) -> Result<i64, Error> = f.pread(b, 0)\n", 1),
+        ("read", "fn fill(borrow r: reader, borrow mut b: buffer) -> Result<i64, Error> = r.read(b)\n", 1),
+        ("read_line", "fn fill(r: reader, borrow mut b: buffer) -> Result<i64, Error> { br := r.buffered(); return br.read_line(b) }\n", 1),
+        ("append", "fn fill(borrow mut b: buffer) { b.append(\"x\") }\n", 0),
+        ("append_filled", "fn fill(borrow mut b: buffer) { b.append_filled(1, 0) }\n", 0),
+    ] {
+        let mut malformed = checked_source_program(source);
+        assert!(!is_empty(&lower_program(&malformed)), "valid {label}");
+        let function = malformed.fns.iter_mut().find(|function| function.name == "fill").ok_or("fill function")?;
+        let local = *function.params.get(buffer_parameter).ok_or("output parameter")?;
+        assert!(function.locals.get(usize::try_from(local).map_err(|_| "local index")?).ok_or("output local")?.is_mut);
+        *function.param_modes.get_mut(buffer_parameter).ok_or("output mode")? = align_ast::ParamMode::Borrow;
+        if let Some(summary) = &mut function.mutable_retention {
+            summary.get_mut(buffer_parameter).ok_or("output summary")?.clear();
+        }
+        assert_body_entrypoints_empty(label, &malformed);
+    }
+    Ok(())
+}

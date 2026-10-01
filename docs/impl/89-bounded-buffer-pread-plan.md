@@ -77,3 +77,17 @@ their own reservations. The same root class is closed for
 existing pread/pwrite, with parameterized later-operand moves and replacement
 controls. This preserves the existing source-order/liveness contract and does
 not change the borrow strategy, lifetime precision or K1 boundary.
+
+## Independent code review closure
+
+One fresh full-diff review found one P2: native mutable-local validation trusted
+`Local.is_mut` without independently authenticating its parameter mode. A
+coherent forged Borrow-mode record with a mutable local flag and a shared-mode
+retention summary passed the checked-HIR body boundary. The shared source
+predicate now requires ByValue, BorrowMut or an existing Out slice authority,
+covering every native output sibling instead of special-casing this method.
+`native_output_hir_rejects_shared_mode_with_mutable_local_flag` retains the
+mutable flag and checks pread_into, pread, reader read/read_line and buffer
+append/append_filled in all four lowering entrypoints. Its pre-fix witness fails;
+the corrected authority also retains the existing owning, exclusive and Out
+positive paths. No public contract, IR shape or ownership strategy changed.
