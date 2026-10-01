@@ -280,7 +280,7 @@ macro_rules! unmodelled_rvalues {
         Rvalue::BuilderToString { .. } | Rvalue::TemplateHtmlNew { .. } | Rvalue::TemplateHtmlWrite { .. } |
         Rvalue::TemplateHtmlRaw { .. } | Rvalue::TemplateHtmlToString { .. } | Rvalue::Template { .. } |
         Rvalue::JsonEncode { .. } | Rvalue::JsonDecode { .. } | Rvalue::JsonOwnedDecode { .. } |
-        Rvalue::JsonDecodeArray { .. } | Rvalue::JsonDecodeScalar { .. } | Rvalue::JsonDecodeStructArray { .. } |
+        Rvalue::StrParseI64 { .. } | Rvalue::JsonDecodeArray { .. } | Rvalue::JsonDecodeScalar { .. } | Rvalue::JsonDecodeStructArray { .. } |
         Rvalue::JsonDecodeSoa { .. } | Rvalue::CsvDecode { .. } | Rvalue::JsonDecodeUnion { .. } |
         Rvalue::JsonDoc { .. } | Rvalue::JsonDocKind { .. } | Rvalue::JsonDocGet { .. } |
         Rvalue::JsonDocAt { .. } | Rvalue::JsonDocAsStr { .. } | Rvalue::JsonDocAsScalar { .. } |

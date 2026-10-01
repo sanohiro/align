@@ -19,6 +19,7 @@ arena, an owner, or a builder; allocation inside pipeline lambdas is a compile e
 "lit"                      -> str        // single-line only; \n \t \" escapes; UTF-8
 'A' / 'あ'                 -> char       // one Unicode scalar
 s.is_char_boundary(index: i64) -> bool  // total byte-boundary query; no allocation
+s.parse_i64()              -> Result<i64, Error>  // checked ASCII decimal; no allocation
 s.len()                    -> i64        // BYTE length ("あ".len() == 3)
 s.contains(n) / s.starts_with(n) / s.ends_with(n)      -> bool
 s.eq_ignore_ascii_case(t)  -> bool       // ASCII fold only, not Unicode
@@ -74,10 +75,19 @@ fixed 2026-07-15).
 
 ## Errors & aborts
 
-No `Result` in this area. `s[a..b]` out of bounds aborts. Non-UTF-8 *input* is a `std` boundary
+Checked integer conversion returns `Result<i64, Error>`; malformed or out-of-range text is `Error.Invalid`. `s[a..b]` out of bounds aborts. Non-UTF-8 *input* is a `std` boundary
 concern (`fs.read_file` → `Error.Invalid`); core string ops assume the invariant and stay
 byte-oriented. Range lowering now enforces the promised O(1) UTF-8-scalar-boundary abort at both
 endpoints (audit 13 §3.1; fixed 2026-07-13).
+
+`s.parse_i64() -> Result<i64, Error>` parses the entire input as ASCII
+`[+-]?[0-9]+`. One optional leading sign, leading zeros and signed zero are
+accepted. Whitespace is rejected; trimming is explicit. Empty/sign-only input,
+non-ASCII digits, embedded NUL, separators, radix prefixes, fractions, exponents,
+and values outside the inclusive i64 range return `Err(Error.Invalid)` without
+wrapping or aborting. The receiver is evaluated once and borrowed, including an
+owned `string`; the Copy result retains no view. The operation is Pure, performs
+no heap allocation or input copy, and does not use locale state.
 
 `s.is_char_boundary(index: i64) -> bool` queries a UTF-8 byte boundary without
 allocation. It returns false for negative indices or indices greater than the byte

@@ -1097,6 +1097,8 @@ pub enum ExprKind {
     /// auto-borrowed via [`ExprKind::StrBorrow`]); the comparison reads bytes only, so neither is
     /// moved. Backed by the runtime's `memchr`-class scans.
     StrPredicate { kind: StrPredKind, haystack: Box<Expr>, needle: Box<Expr> },
+    /// Checked whole-input ASCII decimal conversion; borrows text and returns Result<i64, Error>.
+    StrParseI64 { input: Box<Expr> },
     /// Total UTF-8 boundary inspection; the index is an exact i64 byte offset.
     StrCharBoundary { receiver: Box<Expr>, index: Box<Expr> },
     /// In-place dynamic array length truncation (`arr.truncate(new_len)`).

@@ -17985,7 +17985,8 @@ impl EffectScan<'_> {
             }
             ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Owned(_), max_bytes: None, .. } => {}
             ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Owned(_), max_bytes: Some(max_bytes), .. } => walk!(max_bytes),
-            ExprKind::JsonDecode { input, .. } | ExprKind::JsonOwnedDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. }
+            ExprKind::JsonDecode { input, .. } | ExprKind::JsonOwnedDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::StrParseI64 { input }
+            | ExprKind::JsonDecodeScalar { input, .. }
             | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. }
             // `json.scan(input)` is Pure (build a streaming scanner — no I/O); walk the input (J5).
             | ExprKind::JsonScan { input, .. } => walk!(input),
@@ -25153,7 +25154,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ArrayMapInto { .. }
             | ExprKind::Len(..)
             | ExprKind::JsonDecodeArray { .. }
-            | ExprKind::JsonDecodeScalar { .. }
+            | ExprKind::StrParseI64 { .. } | ExprKind::JsonDecodeScalar { .. }
             // `d.kind()` is a Copy `json.kind` tag; `d.as_i64/f64/bool()` copy the scalar out — neither
             // borrows the doc, so both are `Static` (freely returnable), unlike the view accessors.
             | ExprKind::JsonDocKind { .. }
@@ -25598,7 +25599,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::JsonDecode { .. }
             | ExprKind::JsonOwnedDecode { .. }
             | ExprKind::JsonDecodeArray { .. }
-            | ExprKind::JsonDecodeScalar { .. }
+            | ExprKind::StrParseI64 { .. } | ExprKind::JsonDecodeScalar { .. }
             | ExprKind::JsonDecodeStructArray { .. }
             | ExprKind::JsonDecodeSoa { .. }
             | ExprKind::CsvDecode { .. }
@@ -29086,7 +29087,8 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Owned(_), max_bytes: None, .. } => {}
             ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Owned(_), max_bytes: Some(max_bytes), .. } => self.walk(max_bytes, depth),
-            ExprKind::JsonDecode { input, .. } | ExprKind::JsonOwnedDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.walk(input, depth),
+            ExprKind::JsonDecode { input, .. } | ExprKind::JsonOwnedDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::StrParseI64 { input }
+            | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.walk(input, depth),
             ExprKind::CsvDecode {
                 input,
                 arena,
@@ -31863,7 +31865,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::Len(_)
         | ExprKind::Template(_)
         | ExprKind::JsonEncode { .. }
-        | ExprKind::JsonDecodeScalar { .. }
+        | ExprKind::StrParseI64 { .. } | ExprKind::JsonDecodeScalar { .. }
         | ExprKind::JsonDoc { .. }
         | ExprKind::JsonDocKind { .. }
         | ExprKind::JsonDocGet { .. }
@@ -40911,7 +40913,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::VecLoad { .. } | ExprKind::VecStore { .. } | ExprKind::VecLit { .. }
             | ExprKind::ArraySum { .. } | ExprKind::ArrayCount { .. } | ExprKind::ArrayAnyAll { .. }
             | ExprKind::ArrayMinMax { .. } | ExprKind::ArrayDot { .. } | ExprKind::ArrayMapInto { .. }
-            | ExprKind::Len(..) | ExprKind::JsonDecodeScalar { .. } | ExprKind::JsonDocKind { .. }
+            | ExprKind::Len(..) | ExprKind::StrParseI64 { .. } | ExprKind::JsonDecodeScalar { .. } | ExprKind::JsonDocKind { .. }
             | ExprKind::JsonDocAsScalar { .. } | ExprKind::JsonDocLen { .. } | ExprKind::FsReadFile { .. }
             | ExprKind::FsCreatePrivateTempDir { .. }
             | ExprKind::ReaderRead { .. } | ExprKind::ReaderReadLine { .. } | ExprKind::WriterWrite { .. }
@@ -47630,6 +47632,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::JsonDecode { input, .. }
             | ExprKind::JsonOwnedDecode { input, .. }
             | ExprKind::JsonDecodeArray { input, .. }
+            | ExprKind::StrParseI64 { input }
             | ExprKind::JsonDecodeScalar { input, .. }
             | ExprKind::JsonDecodeStructArray { input, .. }
             | ExprKind::JsonDecodeSoa { input, .. }
@@ -55296,6 +55299,9 @@ impl<'a, 't> Checker<'a, 't> {
             "get" if recv_ty != Ty::HttpClient => self.check_box_get(recv_expr, recv_ty, args, span),
             "clone" => self.check_box_clone(recv_expr, recv_ty, args, span),
             "clone_in" => self.check_clone_in(recv_expr, recv_ty, args, span),
+            "parse_i64" if matches!(recv_ty, Ty::Str | Ty::String) => {
+                self.check_str_parse_i64(recv_expr, args, span)
+            }
             "is_char_boundary" if matches!(recv_ty, Ty::Str | Ty::String) => {
                 self.check_str_char_boundary(recv_expr, args, span)
             }
@@ -60864,6 +60870,22 @@ impl<'a, 't> Checker<'a, 't> {
         Expr {
             kind: ExprKind::CloneIn { value: Box::new(value), region: Box::new(region) },
             ty,
+            span,
+        }
+    }
+
+    fn check_str_parse_i64(&mut self, recv: Expr, args: &[ast::Expr], span: Span) -> Expr {
+        if !args.is_empty() {
+            self.diags.error("'.parse_i64()' takes no arguments", span);
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        }
+        let input = if recv.ty == Ty::String {
+            let span = recv.span;
+            Expr { kind: ExprKind::StrBorrow(Box::new(recv)), ty: Ty::Str, span }
+        } else { recv };
+        Expr {
+            kind: ExprKind::StrParseI64 { input: Box::new(input) },
+            ty: Ty::Result(Scalar::Int(IntTy { bits: 64, signed: true }), Scalar::Enum(self.error_enum_id)),
             span,
         }
     }
@@ -70081,6 +70103,7 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::JsonDecode { input, .. }
             | ExprKind::JsonOwnedDecode { input, .. }
             | ExprKind::JsonDecodeArray { input, .. }
+            | ExprKind::StrParseI64 { input }
             | ExprKind::JsonDecodeScalar { input, .. }
             | ExprKind::JsonDecodeStructArray { input, .. }
             | ExprKind::JsonDecodeSoa { input, .. }

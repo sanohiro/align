@@ -1588,6 +1588,11 @@ pub fn native_owner_mir_contract<'a>(
         access: XmlAccessProvenance::Owned,
     };
     match value {
+        Rvalue::StrParseI64 { input, out } => {
+            contract.result = i32_ty;
+            contract.outputs = vec![(*out, i64_ty)];
+            contract.operands = vec![(input, Ty::Str, read)];
+        }
         Rvalue::ProcessLive { kind, args, out } => {
             contract.result = if kind.fallible() { i32_ty } else if out.is_some() { Ty::Unit }
                 else if matches!(kind,align_sema::process_live::ProcessLiveKind::ScopeId | align_sema::process_live::ProcessLiveKind::ScopeOwnerId | align_sema::process_live::ProcessLiveKind::ChildId | align_sema::process_live::ProcessLiveKind::SignalNumber | align_sema::process_live::ProcessLiveKind::SealedLen | align_sema::process_live::ProcessLiveKind::ImageLen) { i64_ty } else { Ty::Unit };
@@ -1821,6 +1826,7 @@ fn xml_written_slots(rvalue: &Rvalue) -> Vec<(Slot, XmlAccessProvenance)> {
         Rvalue::JsonEncode { out, .. }
         | Rvalue::JsonOwnedDecode { out, .. }
         | Rvalue::JsonDecodeArray { out, .. }
+        | Rvalue::StrParseI64 { out, .. }
         | Rvalue::JsonDecodeScalar { out, .. }
         | Rvalue::JsonDocAsScalar { out, .. }
         | Rvalue::FsReadFile { out, .. }
@@ -1909,6 +1915,7 @@ fn xml_out_producer_operands(rvalue: &Rvalue) -> Vec<&Operand> {
         }
         Rvalue::JsonOwnedDecode { input, .. }
         | Rvalue::JsonDecodeArray { input, .. }
+        | Rvalue::StrParseI64 { input, .. }
         | Rvalue::JsonDecodeScalar { input, .. }
         | Rvalue::FsReadFile { path: input, .. }
         | Rvalue::FsCreatePrivateTempDir { prefix: input, .. }
@@ -6387,6 +6394,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::JsonDecode { .. }
             | Rvalue::JsonOwnedDecode { .. }
             | Rvalue::JsonDecodeArray { .. }
+            | Rvalue::StrParseI64 { .. }
             | Rvalue::JsonDecodeScalar { .. }
             | Rvalue::JsonDecodeStructArray { .. }
             | Rvalue::JsonDecodeSoa { .. }

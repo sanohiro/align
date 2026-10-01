@@ -73,6 +73,18 @@ lifetime remain the existing singular rules. Arbitrary temporary receivers,
 nested fixed-array elements and independently owned scalar elements remain
 excluded. Record: draft §7, language digest and [plan 73](impl/73-fixed-array-field-plan.md).
 
+### Checked decimal text conversion (SETTLED 2026-10-01)
+
+`str.parse_i64() -> Result<i64, Error>` accepts the complete ASCII grammar
+`[+-]?[0-9]+`, including leading zeros and signed zero. Whitespace is rejected
+unless explicitly trimmed. Empty/sign-only text, non-ASCII digits, embedded NUL,
+other grammar and i64 overflow produce `Error.Invalid`; conversion never wraps
+or aborts for these errors. The receiver is evaluated once and borrowed,
+including owned strings. The result is Copy and retains no view; the operation
+is Pure with no heap allocation, input copy, or locale state. Radix and float
+parsing are outside this capability. Record: draft §12, language digest, core
+string design and [plan 83](impl/83-checked-text-integer-plan.md).
+
 ### Total UTF-8 boundary inspection (SETTLED 2026-09-15)
 
 `str.is_char_boundary(index: i64) -> bool` borrows its text receiver (including

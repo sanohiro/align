@@ -887,6 +887,7 @@ fn walk_body_records<'a>(
                 | ExprKind::JsonDecode { input: recv, .. }
                 | ExprKind::JsonOwnedDecode { input: recv, .. }
                 | ExprKind::JsonDecodeArray { input: recv, .. }
+                | ExprKind::StrParseI64 { input: recv }
                 | ExprKind::JsonDecodeScalar { input: recv, .. }
                 | ExprKind::JsonDecodeStructArray { input: recv, .. }
                 | ExprKind::JsonDecodeSoa { input: recv, .. }

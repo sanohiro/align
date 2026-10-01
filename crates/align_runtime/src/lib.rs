@@ -14433,6 +14433,40 @@ pub unsafe extern "C" fn align_rt_str_contains(hptr: *const u8, hlen: i64, nptr:
     memchr::memmem::find(hay, needle).is_some() as i32
 }
 
+/// Checked whole-input ASCII decimal conversion. Status 0 publishes an i64; status 2
+/// leaves the output zero. No allocation or retained input address.
+///
+/// # Safety
+/// A non-null `out` must be aligned and writable for one i64. A positive admitted
+/// length must describe live readable bytes disjoint from `out` for this call.
+/// Null output, negative/unrepresentable length, and null input are rejected.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_str_parse_i64(data: *const u8, len: i64, out: *mut i64) -> i32 {
+    if out.is_null() { return AL_INVALID; }
+    unsafe { out.write(0); }
+    let Ok(len) = usize::try_from(len) else { return AL_INVALID; };
+    if len == 0 || len > isize::MAX.unsigned_abs() || data.is_null() { return AL_INVALID; }
+    let bytes = unsafe { core::slice::from_raw_parts(data, len) };
+    let (negative, digits) = match bytes[0] {
+        b'-' => (true, &bytes[1..]),
+        b'+' => (false, &bytes[1..]),
+        _ => (false, bytes),
+    };
+    if digits.is_empty() { return AL_INVALID; }
+    let mut value = 0_i64;
+    for &byte in digits {
+        if !byte.is_ascii_digit() { return AL_INVALID; }
+        let digit = i64::from(byte - b'0');
+        let next = value.checked_mul(10).and_then(|value| {
+            if negative { value.checked_sub(digit) } else { value.checked_add(digit) }
+        });
+        let Some(next) = next else { return AL_INVALID; };
+        value = next;
+    }
+    unsafe { out.write(value); }
+    0
+}
+
 /// `s.find(needle)` (M5, `core.string`) — the byte index of `needle`'s first occurrence in `s`, or
 /// `-1` if absent (codegen turns the sentinel into `Option<i64>`: `None` for `-1`, else `Some(i)`).
 /// An empty needle is found at index 0. Backed by `memchr::memmem`.
@@ -27369,6 +27403,7 @@ const _: extern "C" fn(f32) -> i64 = align_rt_f32_text_len;
 const _: extern "C" fn(f64) -> i64 = align_rt_f64_text_len;
 const _: unsafe extern "C" fn(f32, *mut u8, i64) -> i64 = align_rt_f32_text_write;
 const _: unsafe extern "C" fn(f64, *mut u8, i64) -> i64 = align_rt_f64_text_write;
+const _: unsafe extern "C" fn(*const u8, i64, *mut i64) -> i32 = align_rt_str_parse_i64;
 const _: unsafe extern "C" fn(i32, *mut u32) -> i32 = align_rt_test_launch_recv_v1;
 const _: extern "C" fn(i32) -> i32 = align_rt_test_fd_cloexec_v1;
 const _: extern "C" fn(i32, u32) -> i32 = align_rt_test_ack_v1;
@@ -27377,6 +27412,66 @@ const _: extern "C" fn(i32, u8, u8, i32, u32) -> i32 = align_rt_test_report_v1;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn str_parse_i64_grammar_range_and_raw_extents() {
+        let parse = |text: &[u8]| {
+            let mut out = 123_i64;
+            let len = i64::try_from(text.len()).unwrap_or(i64::MAX);
+            let status = unsafe { align_rt_str_parse_i64(text.as_ptr(), len, &mut out) };
+            (status, out)
+        };
+        for (text, expected) in [
+            (b"0".as_slice(), 0), (b"-0", 0), (b"+0", 0), (b"00042", 42),
+            (b"-0012", -12), (b"+0012", 12),
+            (b"9223372036854775807", i64::MAX),
+            (b"+9223372036854775807", i64::MAX),
+            (b"-9223372036854775808", i64::MIN),
+            (b"00000000000000000000000000001", 1),
+        ] { assert_eq!(parse(text), (0, expected), "{text:?}"); }
+        for text in [
+            b"".as_slice(), b"+", b"-", b" 1", b"1 ", b"\t1", b"1\n", b"1\0", b"\xff",
+            "١".as_bytes(), "１２".as_bytes(), b"--1", b"++1", b"+-1", b"1-2",
+            b"0x10", b"1_000", b"1.0", b"1e2", b"9223372036854775808",
+            b"-9223372036854775809", b"+9223372036854775808", b"9999999999999999999999999",
+        ] { assert_eq!(parse(text), (AL_INVALID, 0), "{text:?}"); }
+        // Every byte at every position, against an independent UTF-8/i64 oracle.
+        for byte in u8::MIN..=u8::MAX {
+            for text in [[byte, b'1', b'2'], [b'1', byte, b'2'], [b'1', b'2', byte]] {
+                let expected = core::str::from_utf8(&text).ok().and_then(|text| text.parse::<i64>().ok());
+                assert_eq!(parse(&text), expected.map_or((AL_INVALID, 0), |value| (0, value)), "{text:?}");
+            }
+        }
+        let mut out = 0_i64;
+        for (data, len) in [
+            (core::ptr::null(), 0), (core::ptr::null(), 1),
+            (b"1".as_ptr(), -1), (b"1".as_ptr(), i64::MIN),
+        ] {
+            out = 123;
+            assert_eq!(unsafe { align_rt_str_parse_i64(data, len, &mut out) }, AL_INVALID);
+            assert_eq!(out, 0);
+        }
+        // Only a rejected extent may accompany this one-byte allocation.
+        if let Some(oversized) = i64::try_from(isize::MAX.unsigned_abs()).ok().and_then(|len| len.checked_add(1)) {
+            assert_eq!(unsafe { align_rt_str_parse_i64(b"1".as_ptr(), oversized, &mut out) }, AL_INVALID);
+            assert_eq!(out, 0);
+        }
+        assert_eq!(unsafe { align_rt_str_parse_i64(core::ptr::null(), -1, core::ptr::null_mut()) }, AL_INVALID);
+    }
+
+    #[cfg(feature = "alloc-count")]
+    #[test]
+    fn str_parse_i64_allocates_nothing() {
+        let mut out = 0_i64;
+        let before = global_alloc_count();
+        for text in [b"42".as_slice(), b"-9223372036854775808", b"bad", b"9223372036854775808"] {
+            let len = i64::try_from(text.len()).unwrap_or(i64::MAX);
+            for _ in 0..100 {
+                std::hint::black_box(unsafe { align_rt_str_parse_i64(text.as_ptr(), len, &mut out) });
+            }
+        }
+        assert_eq!(global_alloc_count(), before);
+    }
 
     /// Every `.rs` path under `root`, relative to `root`, with `/`-separated components regardless
     /// of host path separator.

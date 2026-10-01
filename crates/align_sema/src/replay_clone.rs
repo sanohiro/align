@@ -558,6 +558,9 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             value: boxed!(value),
             region: boxed!(region),
         },
+        ExprKind::StrParseI64 { input } => ExprKind::StrParseI64 {
+            input: boxed!(input),
+        },
         ExprKind::StrCharBoundary { receiver, index } => ExprKind::StrCharBoundary {
             receiver: boxed!(receiver), index: boxed!(index),
         },
@@ -2733,6 +2736,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::JsonDecode { input: recv, .. }
         | ExprKind::JsonOwnedDecode { input: recv, .. }
         | ExprKind::JsonDecodeArray { input: recv, .. }
+        | ExprKind::StrParseI64 { input: recv }
         | ExprKind::JsonDecodeScalar { input: recv, .. }
         | ExprKind::JsonDecodeStructArray { input: recv, .. }
         | ExprKind::JsonDecodeSoa { input: recv, .. }

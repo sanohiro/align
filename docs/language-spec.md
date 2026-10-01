@@ -803,6 +803,15 @@ whitespace (space, `\t`, `\n`, `\x0c`, `\r`; not vertical tab); Unicode-whitespa
 trimming is deliberately package-level, out of core. A `str`/`string` is **always valid
 UTF-8** (a type invariant): a range slice `s[a..b]` uses byte offsets and aborts if a bound
 splits a scalar, so arbitrary-byte work goes through `s.bytes()` (→ `bytes`, no UTF-8 obligation).
+`s.parse_i64() -> Result<i64, Error>` parses the entire input as ASCII
+`[+-]?[0-9]+`. One optional leading sign, leading zeros and signed zero are
+accepted. Whitespace is rejected; trimming is explicit. Empty/sign-only input,
+non-ASCII digits, embedded NUL, separators, radix prefixes, fractions, exponents,
+and values outside the inclusive i64 range return `Err(Error.Invalid)` without
+wrapping or aborting. The receiver is evaluated once and borrowed, including an
+owned `string`; the Copy result retains no view. The operation is Pure, performs
+no heap allocation or input copy, and does not use locale state.
+
 `s.is_char_boundary(index: i64) -> bool` queries a UTF-8 byte boundary without
 allocation. It returns false for negative indices or indices greater than the byte
 length, true at zero and the end, and otherwise tests that the byte is not a

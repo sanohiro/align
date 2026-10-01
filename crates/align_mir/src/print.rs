@@ -624,6 +624,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::CloneIn { value, handle } => {
             format!("clone_in({}, {})", operand_str(value), operand_str(handle))
         }
+        Rvalue::StrParseI64 { input, out } => format!("str_parse_i64({}, _{})", operand_str(input), out),
         Rvalue::StrPredicate { kind, haystack, needle } => {
             let name = match kind {
                 align_sema::hir::StrPredKind::Contains => "str_contains",

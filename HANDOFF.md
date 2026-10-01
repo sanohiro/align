@@ -1,6 +1,14 @@
 # Session handoff
 
-## Next work (handoff updated 2026-09-29)
+## Next work (handoff updated 2026-10-01)
+
+Request 26's checked decimal conversion is implemented in plan 83:
+`str.parse_i64() -> Result<i64, Error>` accepts whole-input ASCII signed decimal,
+rejects whitespace and out-of-range input with Invalid, borrows owned strings,
+and allocates nothing. Scalar Result control paths, Pure readers, and imported
+whole-program/per-unit execution agree. Consumer parser replacement remains
+align-llm-owned verification. Continue independent request capabilities while
+K1 remains deferred.
 
 Request 24's text builder helper boundary is implemented in plan 82: `builder`
 is nameable in direct typed signatures, exclusive helpers append without taking
