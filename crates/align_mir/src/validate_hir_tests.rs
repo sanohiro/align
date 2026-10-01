@@ -2545,6 +2545,58 @@ fn valid_header_does_not_consume_body_facts() {
     assert!(validate_hir::declaration_header_metadata_is_valid(&body_local_type));
 }
 
+#[test]
+fn text_builder_parameter_modes_are_revalidated() {
+    for receiver in [
+        "output",
+        "({ output })",
+        "({ 0; output })",
+        "(unsafe { output })",
+        "(float(reassoc) { output })",
+        "(task_group { output })",
+        "(arena out { output })",
+        "(if true { output } else { builder() })",
+        "(match 0 { 0 => output, _ => builder() })",
+    ] {
+        for (method, argument) in [
+            ("write", "\"x\""),
+            ("write_int", "1"),
+            ("write_bool", "true"),
+            ("write_char", "'x'"),
+            ("write_float", "1.5"),
+        ] {
+            let source = format!("fn append(borrow mut output: builder) {{ {receiver}.{method}({argument}) }}\nfn main() -> i32 = 0\n");
+            let mut program = checked_source_program(&source);
+            assert!(validate_hir::declaration_header_metadata_is_valid(&program));
+            assert!(validate_hir::body_only_metadata_is_valid(&program), "{receiver}.{method}: positive");
+            let function = program.fns.iter_mut().find(|function| function.name == "append").expect("append fixture");
+            function.param_modes[0] = align_ast::ParamMode::Borrow;
+            function.locals[function.params[0] as usize].is_mut = false;
+            assert!(validate_hir::declaration_header_metadata_is_valid(&program));
+            assert!(!validate_hir::body_only_metadata_is_valid(&program), "{receiver}.{method}: forged shared write");
+            assert!(lower_program_checked(&program, false, None).is_err());
+            assert!(lower_program_checked(&program, true, None).is_err());
+        }
+    }
+
+    for receiver in ["output", "({ output })", "(if true { output } else { builder() })"] {
+        let source = format!("fn finish(output: builder) -> string = {receiver}.to_string()\nfn main() -> i32 = 0\n");
+        let base = checked_source_program(&source);
+        assert!(validate_hir::declaration_header_metadata_is_valid(&base));
+        assert!(validate_hir::body_only_metadata_is_valid(&base));
+        for mode in [align_ast::ParamMode::Borrow, align_ast::ParamMode::BorrowMut] {
+            let mut program = base.clone();
+            let function = program.fns.iter_mut().find(|function| function.name == "finish").expect("finish fixture");
+            function.param_modes[0] = mode;
+            function.locals[function.params[0] as usize].is_mut = mode == align_ast::ParamMode::BorrowMut;
+            function.drop_locals.clear();
+            function.drop_individual_locals.clear();
+            assert!(validate_hir::declaration_header_metadata_is_valid(&program));
+            assert!(!validate_hir::body_only_metadata_is_valid(&program), "{receiver}: forged borrowed finish");
+        }
+    }
+}
+
 fn csv_validation_program() -> hir::Program {
     let mut program = baseline_program();
     let header = program.enums.len() as u32;

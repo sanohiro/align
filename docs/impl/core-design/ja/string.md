@@ -30,10 +30,24 @@ b := builder()  /  builder(cap)
 b.write(s: str|string)  /  b.write_int(i: i64)
 b.to_string()              -> string     // the finisher (there is no finish()/build())
 
+fn append(borrow mut output: builder, text: str)  // 直接呼び出す helper の宣言
+
 template "…{expr}…"        -> str        // holes: int, float, str, bool, char; full expressions
 ```
 
 レシーバは自動で借用される — 上記のどのメソッドも `str` または `string` を受け取る（所有権を持つ `string` は消費されず、ビューとして扱われる）。`hash64` / `hash128` もこれらのビューを受け取る（[hash.md](hash.md) を参照）。
+
+`builder` は型名として記述できる opaque な Move 型である。直接呼び出す関数の
+値渡し引数と戻り値は所有権を移す。`borrow mut` はすべての追記メソッドと
+排他的 borrow の転送を許す。共有 `borrow` はスコープ末尾や分岐を経ても読み取り専用である。
+caller は mutable な binding を渡し、helper の終了後に finish できる。
+借りた builder は move・返却・capture・finish できない。排他的な置換は通常の
+Drop-before-store に従う。追記はバイトをコピーし、入力のビューを保持しない。
+handle の引数渡し自体はアロケーションしない。aggregate への配置と関数値の生成は
+対象外のままである。既存の関数型の戻り値構文では `fn() -> builder` を記述できるが、
+その関数値の生成は引き続き拒否される。
+[Plan 82](../../82-text-builder-parameter-plan.md) がこの境界を定め、
+`text_builder_params.rs` がソース・native 実行・whole-program/per-unit の一致を検証する。
 
 ## Type & ownership classification
 

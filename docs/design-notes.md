@@ -930,11 +930,19 @@ small-`malloc` churn SSO targets — so it trades "predictable performance" + "n
 for a marginal win. (Settled in `open-questions.md`.)
 
 **Output writes into a `builder` sink, not a returned string.** The library convention is
-`write_json(out: mut builder, …)` over `to_json() -> string`: serialization/formatting append
+`write_json(borrow mut out: builder, …)` over `to_json() -> string`: serialization/formatting append
 into a caller-provided buffer (often arena-backed), so complex output costs zero heap
 allocations. Paired with read-oriented `std` APIs returning views (`str`/`slice`/`bytes`)
 rather than owned copies, this makes zero-allocation pipelines the default. (A std design
 rule — `open-questions.md` Future "Library architecture principle".)
+
+Naming the existing text builder lets a direct helper share one accumulation
+walk. The type remains one opaque Move owner: exclusive borrowing permits append,
+shared borrowing permits observation, and only an owned receiver may finish.
+Ordinary exclusive replacement keeps its existing Drop-before-store semantics.
+No aggregate or callable admission, runtime representation, or hidden allocation
+is needed for this factoring boundary. [Plan 82](impl/82-text-builder-parameter-plan.md)
+records the source and imported-call closure.
 
 ---
 
