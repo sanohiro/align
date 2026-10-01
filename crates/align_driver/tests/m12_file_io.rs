@@ -36,6 +36,36 @@ impl Drop for TempFile {
     }
 }
 
+/// Acquire fixture ownership with one exclusive mkdir; cleanup never touches an unowned path.
+struct FileFixtures { dir: PathBuf }
+impl FileFixtures {
+    fn acquire(dir: PathBuf) -> std::io::Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        Ok(Self { dir })
+    }
+    fn new(tag: &str) -> Self {
+        Self::acquire(std::env::temp_dir().join(format!("align-file-{}-{tag}-{}", std::process::id(), thin_nonce())))
+            .expect("exclusive fixture directory")
+    }
+}
+impl Drop for FileFixtures {
+    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.dir); }
+}
+
+#[test]
+fn file_fixture_directory_preserves_existing_entries() {
+    let root = FileFixtures::new("ownership");
+    let occupied = root.dir.join("occupied");
+    std::fs::create_dir(&occupied).unwrap();
+    std::fs::write(occupied.join("marker"), b"untouched").unwrap();
+    assert!(FileFixtures::acquire(occupied.clone()).is_err());
+    let link = root.dir.join("link");
+    std::os::unix::fs::symlink(&occupied, &link).unwrap();
+    assert!(FileFixtures::acquire(link).is_err());
+    assert_eq!(std::fs::read(occupied.join("marker")).unwrap(), b"untouched");
+}
+
 /// The completion condition: `fs.create_rw` a fresh file, `pwrite` at explicit offsets (contiguous
 /// then a hole past EOF), `pread` a region back, and verify both the read-back bytes (via stdout)
 /// and the on-disk contents (via the Rust side). Exercises create_rw / pwrite (incl. past-EOF
@@ -138,11 +168,13 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 #[test]
 fn negative_offset_aborts() {
     if !backend_available() { return; }
-    let f = TempFile::with("neg", b"content");
+    let fixtures = FileFixtures::new("negative-offset");
+    let file = fixtures.dir.join("input");
+    std::fs::write(&file, b"content").unwrap();
     for constructor in ["create_rw", "open_ro"] {
         for operation in ["f.pwrite(\"x\", -5)", "f.pwrite(\"\", -5)", "f.pread(buf, -5)"] {
             let source = format!("import std.fs\nfn main(args: array<str>) -> Result<(), Error> {{\n f := fs.{constructor}(args[1])?\n mut buf := buffer(2)\n {operation}?\n return Ok(())\n}}\n");
-            let out = build_and_run_args(&format!("m12-negative-{constructor}-{}", operation.len()), &source, &[&f.str()]);
+            let out = build_and_run_args(&format!("m12-negative-{constructor}-{}", operation.len()), &source, &[file.to_str().unwrap()]);
             assert_eq!(out.status.code(), None, "negative offset must abort before readonly denial: {}", String::from_utf8_lossy(&out.stderr));
         }
     }
@@ -261,7 +293,7 @@ fn file_constructors_require_std_fs_import() {
 fn open_ro_permissions_windows_and_write_denial() {
     if !backend_available() { return; }
     use std::os::unix::fs::PermissionsExt;
-    let fixtures = Proj::new("open-ro-permissions", &[], "unused.align");
+    let fixtures = FileFixtures::new("open-ro-permissions");
     let readable = fixtures.dir.join("readable");
     let denied = fixtures.dir.join("denied");
     let missing = fixtures.dir.join("missing");
@@ -304,7 +336,7 @@ fn main(args: array<str>) -> Result<(), Error> {
 #[test]
 fn open_ro_control_and_imported_generic_parity() {
     if !backend_available() { return; }
-    let fixtures = Proj::new("open-ro-control", &[], "unused.align");
+    let fixtures = FileFixtures::new("open-ro-control");
     let path = fixtures.dir.join("input");
     std::fs::write(&path, b"abcdef").unwrap();
     let library = r#"

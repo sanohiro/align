@@ -29137,14 +29137,51 @@ mod tests {
 
     // --- file (offset-addressed read/write, A4) ------------------------------------------------
 
+    struct FileFixtureDir(std::path::PathBuf);
+    impl FileFixtureDir {
+        fn acquire(path: std::path::PathBuf) -> std::io::Result<Self> {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new().mode(0o700).create(&path)?;
+            Ok(Self(path))
+        }
+        fn new(tag: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let nonce = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Self::acquire(std::env::temp_dir().join(format!("align-rt-file-{}-{tag}-{nonce}", std::process::id())))
+                .expect("exclusive file fixture directory")
+        }
+    }
+    impl Drop for FileFixtureDir {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+    struct FileTestHandle(*mut RwFile);
+    impl Drop for FileTestHandle {
+        fn drop(&mut self) { unsafe { align_rt_io_file_free(self.0) }; }
+    }
+
+    #[test]
+    fn file_fixture_directory_preserves_existing_entries() {
+        let root = FileFixtureDir::new("ownership");
+        let occupied = root.0.join("occupied");
+        std::fs::create_dir(&occupied).unwrap();
+        std::fs::write(occupied.join("marker"), b"untouched").unwrap();
+        assert!(FileFixtureDir::acquire(occupied.clone()).is_err());
+        let link = root.0.join("link");
+        std::os::unix::fs::symlink(&occupied, &link).unwrap();
+        assert!(FileFixtureDir::acquire(link).is_err());
+        assert_eq!(std::fs::read(occupied.join("marker")).unwrap(), b"untouched");
+    }
+
     #[test]
     fn file_open_ro_path_flags_read_write_and_drop_contract() {
         use std::os::unix::fs::FileExt;
-        let path = tmp_path("open-ro-contract");
+        let fixture = FileFixtureDir::new("open-ro-contract");
+        let path = fixture.0.join("input");
         std::fs::write(&path, b"abcdef").unwrap();
         let text = path.to_str().unwrap();
         let mut file = core::ptr::null_mut();
         assert_eq!(unsafe { align_rt_io_file_open_ro(text.as_ptr(), text.len() as i64, &mut file) }, 0);
+        let _owner = FileTestHandle(file);
         let fd = unsafe { (*file).fd };
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
@@ -29164,8 +29201,8 @@ mod tests {
         assert_eq!(unsafe { align_rt_io_file_len(file) }, 8, "read-only len uses live metadata");
         assert_eq!(unsafe { align_rt_io_file_pread(file, buffer, 6) }, 2);
         assert_eq!(unsafe { &*buffer }.data.as_slice(), b"xy");
-        unsafe { align_rt_buffer_free(buffer); align_rt_io_file_free(file); }
-        std::fs::remove_file(path).unwrap();
+        unsafe { align_rt_buffer_free(buffer); }
+
     }
 
     #[test]
@@ -29306,8 +29343,8 @@ mod tests {
         // parallel noise approaches.
         let _fd_guard = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let count_fds = || -> Option<usize> { std::fs::read_dir("/proc/self/fd").ok().map(|d| d.count()) };
-        let mut path = std::env::temp_dir();
-        path.push(format!("align_rt_file_leak_{}", std::process::id()));
+        let fixture = FileFixtureDir::new("fd-cycles");
+        let path = fixture.0.join("input");
         let pb = path.to_str().unwrap().as_bytes();
 
         const N: usize = 128;
@@ -29315,15 +29352,17 @@ mod tests {
         for _ in 0..N {
             let mut f: *mut RwFile = std::ptr::null_mut();
             assert_eq!(unsafe { align_rt_io_file_create(pb.as_ptr(), pb.len() as i64, &mut f) }, 0);
+            let owner = FileTestHandle(f);
             assert_eq!(unsafe { align_rt_io_file_pwrite(f, b"payload".as_ptr(), 7, 0) }, 7);
             let b = align_rt_buffer_new(7);
             assert_eq!(unsafe { align_rt_io_file_pread(f, b, 0) }, 7);
             unsafe { align_rt_buffer_free(b) };
-            unsafe { align_rt_io_file_free(f) };
+            drop(owner);
             let mut ro = core::ptr::null_mut();
             assert_eq!(unsafe { align_rt_io_file_open_ro(pb.as_ptr(), pb.len() as i64, &mut ro) }, 0);
+            let ro_owner = FileTestHandle(ro);
             assert_eq!(unsafe { align_rt_io_file_len(ro) }, 7);
-            unsafe { align_rt_io_file_free(ro) };
+            drop(ro_owner);
         }
         if let (Some(before), Some(after)) = (before, count_fds()) {
             assert!(
@@ -29331,7 +29370,6 @@ mod tests {
                 "create_rw/free cycles must not leak fds: before={before} after={after} (N={N}); a real leak would be ~+{N}"
             );
         }
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

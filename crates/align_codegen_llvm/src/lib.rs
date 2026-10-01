@@ -23640,7 +23640,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .builder
             .build_call(self.runtime(key), &[p_ptr.into(), p_len.into(), out_ptr.into()], "open")
             .map_err(|e| self.err(e))?;
-        Ok(cs.try_as_basic_value().basic().ok_or_else(|| self.err("open must return i32 status"))?)
+        cs.try_as_basic_value().basic().ok_or_else(|| self.err("open must return i32 status"))
     }
 
     /// Descriptor-relative two-path constructor. Evaluate and unpack root before relative, then

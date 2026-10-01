@@ -108,3 +108,15 @@ requires a benchmark. The mechanical added-prose obligation extraction is retain
 with the worktree Git logs; source English and Japanese contracts agree. Existing
 M12 original-history wording remains marked historical, with the fired trigger and
 current surface recorded separately. K1 and external adoption remain deferred.
+
+## Code review finding closure
+
+The fresh full-diff review found one P2 fixture-ownership class. Runtime flags,
+the expanded native fd-cycle owner, driver permissions/control and the expanded
+negative-offset owner now acquire mode-0700 directories with exclusive mkdir
+and arm RAII cleanup immediately. They never remove or follow an existing entry.
+Both native and driver collision/symlink negative controls prove pre-existing
+markers survive failed acquisition. New native handle guards also close acquired
+fds on assertion unwind. Shared legacy harness machinery remains outside this
+local fix. The production contract, IR and safety strategy are unchanged; the
+fix closes against these owner targets without a second full-diff review.
