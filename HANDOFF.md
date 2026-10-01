@@ -2,6 +2,15 @@
 
 ## Next work (handoff updated 2026-10-02)
 
+Request 38's direct bounded positional reads are implemented in plan 89:
+`f.pread_into(b, destination_offset, length, file_offset)` reads one bounded
+chunk into the existing allocation, preserves surrounding initialized bytes,
+and extends length only contiguously. Capacity/address stay unchanged; invalid
+ranges return Invalid before I/O even at zero/EOF. Native Linux/macOS window,
+short/error/EINTR, imported whole/per-unit, source-order and forged-producer
+owners cover the boundary. Reset/truncate, in-memory positional writes and
+consumer adoption remain deferred. Continue independent capabilities with K1 deferred.
+
 Request 27's Copy string-sorting boundary is implemented in plan 88:
 `.sort()` accepts numbers, char and str; `.sort_by_key` also accepts str elements.
 Results own their array spine and retain borrowed byte-owner lifetimes, with no

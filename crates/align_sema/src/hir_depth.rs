@@ -1199,6 +1199,11 @@ fn walk_body_records<'a>(
                 ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Owned(_), max_bytes: Some(max_bytes), .. } => {
                     work.push((BodyRecord::Expr(max_bytes), child_depth));
                 }
+                ExprKind::FilePreadInto { file, buffer, destination_offset, length, offset } => {
+                    for child in [file, buffer, destination_offset, length, offset] {
+                        work.push((BodyRecord::Expr(child), child_depth));
+                    }
+                }
                 ExprKind::FilePread {
                     file,
                     buffer,

@@ -4762,7 +4762,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::FileCreateRw { .. }
             | hir::ExprKind::FileOpenRw { .. }
             | hir::ExprKind::FileOpenRo { .. } | hir::ExprKind::FileCreateRwExclusive { .. }
-            | hir::ExprKind::FilePread { .. }
+            | hir::ExprKind::FilePread { .. } | hir::ExprKind::FilePreadInto { .. }
             | hir::ExprKind::FilePwrite { .. }
             | hir::ExprKind::FileLen { .. } | hir::ExprKind::FileSync { .. }
             | hir::ExprKind::BufferNew { .. }
@@ -5162,7 +5162,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::FileCreateRw { .. }
             | hir::ExprKind::FileOpenRw { .. }
             | hir::ExprKind::FileOpenRo { .. } | hir::ExprKind::FileCreateRwExclusive { .. }
-            | hir::ExprKind::FilePread { .. }
+            | hir::ExprKind::FilePread { .. } | hir::ExprKind::FilePreadInto { .. }
             | hir::ExprKind::FilePwrite { .. }
             | hir::ExprKind::FileLen { .. } | hir::ExprKind::FileSync { .. }
             | hir::ExprKind::BufferNew { .. }
@@ -9244,6 +9244,14 @@ impl<'a> BodyValidator<'a> {
                     return None;
                 }
                 result(Ty::Int(align_sema::IntTy { bits: 64, signed: true }), &[file, buffer, offset])
+            }
+            hir::ExprKind::FilePreadInto { file, buffer, destination_offset, length, offset } => {
+                if !local(file, Ty::File) || !mutable_local(buffer, Ty::Buffer)
+                    || file.ty != Ty::File || buffer.ty != Ty::Buffer
+                    || destination_offset.ty != i64 || length.ty != i64 || offset.ty != i64 {
+                    return None;
+                }
+                result(i64, &[file, buffer, destination_offset, length, offset])
             }
             hir::ExprKind::FilePwrite { file, data, offset } => {
                 if !local(file, Ty::File)

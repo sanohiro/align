@@ -2142,3 +2142,15 @@ Move strings and general comparators require separate ownership/callable work.
 Existing conservative bound-source generation loans remain the shared collector
 rule. Precision beyond those loans is separate work; allocating a new spine
 does not make replacing a live source binding admissible.
+
+### Direct bounded reads preserve caller-selected storage (Request 38)
+
+`file.pread_into` exposes destination offset, requested length and file offset
+without a transient copy or implicit buffer acquisition. A start at or before
+initialized length permits contiguous extension; refusing holes prevents spare
+bytes from becoming observable. Actual short counts preserve surrounding bytes
+and only raise initialized length when necessary. Empty/EOF/error paths retain
+that length; no-fill-loop behavior leaves chunking explicit. Published capacity,
+not allocator spare, is the accepted range. Existing native-owner reservations
+protect eagerly loaded File/Buffer inputs and end at the scalar call boundary.
+Plan 89 owns the exact error, ownership, ABI and acceptance matrix.

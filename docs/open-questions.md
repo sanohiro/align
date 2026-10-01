@@ -13,6 +13,26 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### Direct bounded buffer-window reads (SETTLED 2026-10-02)
+
+`f.pread_into(b, destination_offset, length, file_offset) -> Result<i64, Error>`
+reads directly into a selected range of the existing buffer. The receiver is a
+bound File and `b` a bare mutable local, including an exclusive helper parameter.
+All three scalar arguments are i64 with no defaults. Negative arguments,
+a destination beyond initialized length, or a requested range beyond published
+capacity return Invalid before I/O, even for zero length or EOF. No hole is
+published: successful length is max(old length, destination offset + actual
+count). Bytes outside the actual written range survive; short counts and zero
+EOF return directly, and EOF/error preserve initialized length. A validated zero
+request performs no syscall. EINTR alone is retried; other native failures use
+the fixed errno table. Capacity and payload address stay unchanged, with no
+allocation, reserve, resize, clone or implicit zero fill. Both owners are borrowed
+only for the call. Existing whole-buffer generation invalidation applies even
+to zero/error paths. Later eager operands cannot move or replace already loaded
+File/Buffer inputs; their reservations end at the completed scalar operation.
+Use explicit `buffer.filled` for initialized random-write positions (plan 89).
+
+
 ### Observable buffer read-window capacity (Request 35)
 
 `b.capacity() -> i64` is a Pure, zero-argument, nonconsuming query of a

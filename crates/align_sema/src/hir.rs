@@ -1619,6 +1619,8 @@ pub enum ExprKind {
     /// (overwriting its length), borrowing both `file` and `buffer` (neither consumed). The `ty` is
     /// `Result<i64, Error>` (actual bytes read; `0` = EOF). Impure. A negative `off` aborts. (A4.)
     FilePread { file: Box<Expr>, buffer: Box<Expr>, offset: Box<Expr> },
+    /// Bounded positional read into a contiguous existing buffer window, without allocation.
+    FilePreadInto { file: Box<Expr>, buffer: Box<Expr>, destination_offset: Box<Expr>, length: Box<Expr>, offset: Box<Expr> },
     /// `f.pwrite(data, off)` — write **all** of `data` (a `bytes` view) at file offset `off`,
     /// borrowing `file` (not consumed). The `ty` is `Result<i64, Error>` (the full byte count).
     /// Impure. A negative `off` aborts; a write past EOF extends the file. (A4.)

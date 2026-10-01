@@ -17000,7 +17000,7 @@ impl EffectScan<'_> {
                 self.impure_direct = true;
             }
             // File pread/pwrite/len/sync are syscalls (I/O / fstat / synchronization) — Impure, like `reader.read`.
-            ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } | ExprKind::FileSync { .. } => {
+            ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } | ExprKind::FileSync { .. } => {
                 self.impure_direct = true;
             }
             // `.bytes()` re-views string/buffer memory and `.len()` reads it — pure (no I/O), like
@@ -25193,7 +25193,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::FileCreateRw { .. }
             | ExprKind::FileOpenRw { .. }
             | ExprKind::FileOpenRo { .. } | ExprKind::FileCreateRwExclusive { .. }
-            | ExprKind::FilePread { .. }
+            | ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. }
             | ExprKind::FilePwrite { .. }
             | ExprKind::FileLen { .. } | ExprKind::FileSync { .. }
             | ExprKind::BufferNew { .. }
@@ -25665,7 +25665,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::FileCreateRw { .. }
             | ExprKind::FileOpenRw { .. }
             | ExprKind::FileOpenRo { .. } | ExprKind::FileCreateRwExclusive { .. }
-            | ExprKind::FilePread { .. }
+            | ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. }
             | ExprKind::FilePwrite { .. }
             | ExprKind::FileLen { .. } | ExprKind::FileSync { .. }
             | ExprKind::BufferNew { .. }
@@ -28796,6 +28796,13 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(buffer, depth);
                 self.walk(offset, depth);
             }
+            ExprKind::FilePreadInto { file, buffer, destination_offset, length, offset } => {
+                self.walk(file, depth);
+                self.walk(buffer, depth);
+                self.walk(destination_offset, depth);
+                self.walk(length, depth);
+                self.walk(offset, depth);
+            }
             ExprKind::FilePwrite { file, data, offset } => {
                 self.walk(file, depth);
                 self.walk(data, depth);
@@ -29626,7 +29633,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(reader, depth);
                 self.walk(writer, depth);
             }
-            ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } | ExprKind::FileSync { .. } => self.walk_file_op(&e.kind, depth),
+            ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } | ExprKind::FileSync { .. } => self.walk_file_op(&e.kind, depth),
             ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } | ExprKind::BufferCapacity { buffer } => self.walk(buffer, depth),
             ExprKind::BytesRead { bytes, offset, .. } => {
                 self.walk(bytes, depth);
@@ -31917,7 +31924,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::FileCreateRw { .. }
         | ExprKind::FileOpenRw { .. }
         | ExprKind::FileOpenRo { .. } | ExprKind::FileCreateRwExclusive { .. }
-        | ExprKind::FilePread { .. }
+        | ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. }
         | ExprKind::FilePwrite { .. }
         | ExprKind::FileLen { .. } | ExprKind::FileSync { .. }
         | ExprKind::BufferNew { .. }
@@ -34605,6 +34612,12 @@ impl<'a> MoveCheck<'a> {
                         arguments.insert(Self::expr_key(argument));
                         places.insert(Self::expr_key(argument));
                     }
+                }
+            }
+            if let Some((file, buffer)) = Self::file_action_inputs(&expression.kind) {
+                for receiver in std::iter::once(file).chain(buffer) {
+                    arguments.insert(Self::expr_key(receiver));
+                    places.insert(Self::expr_key(receiver));
                 }
             }
             if let ExprKind::CryptoDigestUpdate { digest, .. } = &expression.kind {
@@ -39421,6 +39434,16 @@ impl<'a> MoveCheck<'a> {
         )
     }
 
+    /// Native File operands are loaded before eager scalar arguments; reserve their source places
+    /// using the existing owning-handle machinery until the complete operation starts.
+    fn file_action_inputs(kind: &ExprKind) -> Option<(&Expr, Option<&Expr>)> {
+        match kind {
+            ExprKind::FilePread { file, buffer, .. } | ExprKind::FilePreadInto { file, buffer, .. } => Some((file, Some(buffer))),
+            ExprKind::FilePwrite { file, .. } | ExprKind::FileLen { file } | ExprKind::FileSync { file } => Some((file, None)),
+            _ => None,
+        }
+    }
+
     fn reader_action_receiver(expression: &Expr) -> Option<&Expr> {
         match &expression.kind {
             ExprKind::XmlNext { reader } | ExprKind::XmlName { reader }
@@ -39432,6 +39455,16 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn retire_builtin_action_input(&mut self, expression: &Expr, children: &mut Vec<usize>) {
+        if let Some((file, buffer)) = Self::file_action_inputs(&expression.kind) {
+            // File methods return scalars/unit, so their call-scoped owner reservations end here.
+            // Other eager operands and independently retained byte views keep their own snapshots.
+            for receiver in std::iter::once(file).chain(buffer) {
+                let key = Self::expr_key(receiver);
+                self.clear_value_snapshot(key);
+                children.retain(|snapshot| *snapshot != key);
+            }
+            return;
+        }
         let receiver = match &expression.kind {
             ExprKind::ArrayTruncate { receiver, .. } => Some(receiver.as_ref()),
             _ => Self::reader_action_receiver(expression),
@@ -40933,7 +40966,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::CodecEncoderPut { .. } | ExprKind::CodecEncoderFinish { .. }
             | ExprKind::FrameInnerJoin { .. }
             | ExprKind::IoCopy { .. } | ExprKind::FileCreateRw { .. }
-            | ExprKind::FileOpenRw { .. } | ExprKind::FileOpenRo { .. } | ExprKind::FileCreateRwExclusive { .. } | ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. }
+            | ExprKind::FileOpenRw { .. } | ExprKind::FileOpenRo { .. } | ExprKind::FileCreateRwExclusive { .. } | ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. } | ExprKind::FilePwrite { .. }
             | ExprKind::FileLen { .. } | ExprKind::FileSync { .. } | ExprKind::BufferNew { .. } | ExprKind::BufferLen { .. } | ExprKind::BufferCapacity { .. }
             | ExprKind::BytesRead { .. }
             | ExprKind::BytesSet { .. }
@@ -42998,6 +43031,13 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, buffer, moved, false, false);
                 move_expr!(self, offset, moved, false, false);
             }
+            ExprKind::FilePreadInto { file, buffer, destination_offset, length, offset } => {
+                move_expr!(self, file, moved, false, false);
+                move_expr!(self, buffer, moved, false, false);
+                move_expr!(self, destination_offset, moved, false, false);
+                move_expr!(self, length, moved, false, false);
+                move_expr!(self, offset, moved, false, false);
+            }
             ExprKind::FilePwrite { file, data, offset } => {
                 move_expr!(self, file, moved, false, false);
                 move_expr!(self, data, moved, false, false);
@@ -44778,6 +44818,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ReaderReadLine { buffer, .. }
             | ExprKind::HttpReadStreamRead { buffer, .. }
             | ExprKind::FilePread { buffer, .. }
+            | ExprKind::FilePreadInto { buffer, .. }
             | ExprKind::UdpRecvFrom { buffer, .. }
             | ExprKind::CryptoRandom { out: buffer }
             | ExprKind::BufferPut { buffer, .. }
@@ -44858,6 +44899,13 @@ impl<'a> MoveCheck<'a> {
     /// Opaque handle interiors are deliberately absent: only operations that replace a visible
     /// source place or write a caller-visible collection backing end a place reservation.
     fn apply_builtin_mutation_action(&mut self, expression: &Expr) {
+        if let Some((file, buffer)) = Self::file_action_inputs(&expression.kind) {
+            for receiver in std::iter::once(file).chain(buffer) {
+                let key = Self::expr_key(receiver);
+                self.validate_value_snapshot(Self::expr_key(expression), key, expression.span);
+                self.borrows.finish_mutable_place_source(key);
+            }
+        }
         if let ExprKind::ProcessLive { kind, args } = &expression.kind {
             for (input, argument) in kind.inputs().iter().zip(args) {
                 if matches!(input, process_live::Input::OutBytes) {
@@ -47043,7 +47091,7 @@ impl<'a> MoveCheck<'a> {
             // `f.pread(b, off)` / `f.pwrite(data, off)` / `f.len()` all **borrow** the file (never
             // consumed — no move-out); the buffer is filled in place and the data/offset are read.
             // Split out `#[inline(never)]` so its arm locals stay out of this recursive frame (#296).
-            ExprKind::FilePread { .. }
+            ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. }
             | ExprKind::FilePwrite { .. }
             | ExprKind::FileLen { .. } | ExprKind::FileSync { .. } => {
                 if !self.move_file_op(&e.kind, moved) {
@@ -55003,7 +55051,7 @@ impl<'a, 't> Checker<'a, 't> {
         // `std.fs`/`std.io` offset-addressed file I/O on a `file`: `f.pread(b, off)` / `f.pwrite(data,
         // off)` (A4). Dispatched on the receiver type so the names stay free on other values. (`f.len()`
         // dispatches through `check_len` like the other `.len()` receivers.)
-        if matches!(method, "pread" | "pwrite" | "sync") {
+        if matches!(method, "pread" | "pread_into" | "pwrite" | "sync") {
             let recv_expr = self.check_expr(recv, None);
             if recv_expr.ty == Ty::File {
                 return self.check_file_method(recv_expr, method, args, span);
@@ -67733,6 +67781,33 @@ impl<'a, 't> Checker<'a, 't> {
                     span,
                 }
             }
+            "pread_into" => {
+                let [buf_arg, destination_arg, length_arg, off_arg] = args else {
+                    self.diags.error(format!("'.pread_into()' takes 4 arguments (a mut buffer, destination offset, length, and file offset), got {}", args.len()), span);
+                    return err;
+                };
+                let buffer = self.check_expr(buf_arg, Some(Ty::Buffer));
+                if buffer.ty == Ty::Error { return err; }
+                if buffer.ty != Ty::Buffer {
+                    self.diags.error(format!("'.pread_into()' fills a buffer, got {}", ty_name(buffer.ty)), buf_arg.span);
+                    return err;
+                }
+                let mut scalars = Vec::new();
+                for (argument, label) in [(destination_arg, "destination offset"), (length_arg, "length"), (off_arg, "file offset")] {
+                    let value = self.check_expr(argument, Some(Ty::Int(IntTy { bits: 64, signed: true })));
+                    if value.ty == Ty::Error { return err; }
+                    if !self.require_i64_arg(value.ty, argument.span, &format!("'.pread_into()' {label}")) { return err; }
+                    scalars.push(value);
+                }
+                if !self.require_mut_buffer_local(buf_arg, ".pread_into()") { return err; }
+                let mut scalars = scalars.into_iter();
+                let (Some(destination_offset), Some(length), Some(offset)) = (scalars.next(), scalars.next(), scalars.next()) else { return err; };
+                Expr {
+                    kind: ExprKind::FilePreadInto { file: Box::new(recv_expr), buffer: Box::new(buffer),
+                        destination_offset: Box::new(destination_offset), length: Box::new(length), offset: Box::new(offset) },
+                    ty: i64_result, span,
+                }
+            }
             "pwrite" => {
                 let [data_arg, off_arg] = args else {
                     self.diags.error(format!("'.pwrite()' takes 2 arguments (bytes and an offset), got {}", args.len()), span);
@@ -67773,7 +67848,7 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
             _ => {
-                self.diags.error(format!("'.{method}()' is not a method on a file (try pread / pwrite / len / sync)"), span);
+                self.diags.error(format!("'.{method}()' is not a method on a file (try pread / pread_into / pwrite / len / sync)"), span);
                 err
             }
         }
@@ -69664,6 +69739,13 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(buffer);
                 self.finalize_expr(offset);
             }
+            ExprKind::FilePreadInto { file, buffer, destination_offset, length, offset } => {
+                self.finalize_expr(file);
+                self.finalize_expr(buffer);
+                self.finalize_expr(destination_offset);
+                self.finalize_expr(length);
+                self.finalize_expr(offset);
+            }
             ExprKind::FilePwrite { file, data, offset } => {
                 self.finalize_expr(file);
                 self.finalize_expr(data);
@@ -70647,7 +70729,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(reader);
                 self.finalize_expr(writer);
             }
-            k @ (ExprKind::FilePread { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } | ExprKind::FileSync { .. }) => self.finalize_file_op(k),
+            k @ (ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } | ExprKind::FileSync { .. }) => self.finalize_file_op(k),
             ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } | ExprKind::BufferCapacity { buffer } => self.finalize_expr(buffer),
             ExprKind::BytesRead { bytes, offset, .. } => {
                 self.finalize_expr(bytes);
@@ -76728,7 +76810,7 @@ mod tests {
         // BufferCapacity is a non-retaining scalar observation of a borrowed owner.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 348,
+            variants, 349,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

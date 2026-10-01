@@ -1598,6 +1598,11 @@ pub fn native_owner_mir_contract<'a>(
             contract.outputs = vec![(*out, Ty::File)];
             contract.operands = vec![(path, Ty::Str, read)];
         }
+        Rvalue::FilePreadInto { file, buffer, destination_offset, length, offset } => {
+            contract.result = i64_ty;
+            contract.operands = vec![(file, Ty::File, read), (buffer, Ty::Buffer, write),
+                (destination_offset, i64_ty, read), (length, i64_ty, read), (offset, i64_ty, read)];
+        }
         Rvalue::FileSync(file) => {
             contract.result = i32_ty;
             contract.operands = vec![(file, Ty::File, read)];
@@ -6468,7 +6473,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::FileCreateRw { .. }
             | Rvalue::FileOpenRw { .. }
             | Rvalue::FileOpenRo { .. } | Rvalue::FileCreateRwExclusive { .. }
-            | Rvalue::FilePread { .. }
+            | Rvalue::FilePread { .. } | Rvalue::FilePreadInto { .. }
             | Rvalue::FilePwrite { .. }
             | Rvalue::FileLen { .. } | Rvalue::FileSync(..)
             | Rvalue::BufferBytes(..)
