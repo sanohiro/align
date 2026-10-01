@@ -1589,7 +1589,7 @@ pub fn native_owner_mir_contract<'a>(
     };
     match value {
         Rvalue::FileCreateRw { path, out } | Rvalue::FileOpenRw { path, out }
-        | Rvalue::FileOpenRo { path, out } => {
+        | Rvalue::FileOpenRo { path, out } | Rvalue::FileCreateRwExclusive { path, out } => {
             contract.result = i32_ty;
             contract.outputs = vec![(*out, Ty::File)];
             contract.operands = vec![(path, Ty::Str, read)];
@@ -1850,7 +1850,7 @@ fn xml_written_slots(rvalue: &Rvalue) -> Vec<(Slot, XmlAccessProvenance)> {
         | Rvalue::FrameInnerJoin { out, .. }
         | Rvalue::FileCreateRw { out, .. }
         | Rvalue::FileOpenRw { out, .. }
-        | Rvalue::FileOpenRo { out, .. }
+        | Rvalue::FileOpenRo { out, .. } | Rvalue::FileCreateRwExclusive { out, .. }
         | Rvalue::FsReadDir { out, .. }
         | Rvalue::DnsResolve { out, .. }
         | Rvalue::TcpConnect { out, .. }
@@ -1931,7 +1931,7 @@ fn xml_out_producer_operands(rvalue: &Rvalue) -> Vec<&Operand> {
         | Rvalue::WriterCreateExclusive { path: input, .. }
         | Rvalue::FileCreateRw { path: input, .. }
         | Rvalue::FileOpenRw { path: input, .. }
-        | Rvalue::FileOpenRo { path: input, .. }
+        | Rvalue::FileOpenRo { path: input, .. } | Rvalue::FileCreateRwExclusive { path: input, .. }
         | Rvalue::FsReadDir { path: input, .. }
         | Rvalue::DnsResolve { host: input, .. }
         | Rvalue::BytesAsStr { bytes: input, .. }
@@ -6455,7 +6455,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::IoCopy(..)
             | Rvalue::FileCreateRw { .. }
             | Rvalue::FileOpenRw { .. }
-            | Rvalue::FileOpenRo { .. }
+            | Rvalue::FileOpenRo { .. } | Rvalue::FileCreateRwExclusive { .. }
             | Rvalue::FilePread { .. }
             | Rvalue::FilePwrite { .. }
             | Rvalue::FileLen { .. }

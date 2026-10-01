@@ -2,6 +2,14 @@
 
 ## Next work (handoff updated 2026-10-01)
 
+Request 30's exclusive positional-output capability is implemented in plan 85:
+`fs.create_rw_exclusive(path: str) -> Result<file, Error>` uses one native
+O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW open, mode 0644 subject to umask.
+Occupied entries return Code(EEXIST) without modification; existing File methods,
+ownership and Drop remain. Native entry/race/mode/flag/cycle, forged producer and
+whole/per-unit control owners cover the boundary. Consumer alignpack/KV adoption
+remains align-llm-owned verification. Continue independent capabilities with K1 deferred.
+
 Request 21's recorded read-only random-access trigger is implemented in plan 84:
 `fs.open_ro(path: str) -> Result<file, Error>` opens O_RDONLY|O_CLOEXEC into the
 existing Move File. Pread/len/Drop remain unchanged; read-only pwrite returns

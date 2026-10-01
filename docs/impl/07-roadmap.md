@@ -2013,6 +2013,8 @@ green. **Next: M13** (codegen quality & link hygiene, the pre-LLVM-upgrade wave)
   fd-leak across N cycles). `cargo test --workspace` green; clippy `-D warnings` clean. Deferred:
   `copy_range`, buffering. Request 21 / plan 84 implements the recorded `open_ro`
   trigger with the same File, unchanged pread/len/Drop, and runtime Denied writes.
+  Request 30 / plan 85 adds `create_rw_exclusive`, the same owned File with native
+  exclusive final-entry acquisition, 0644 subject to umask and Code(EEXIST) protection.
   <br>Original settled design (2026-07-11, two-lens review): A new Move type **`file`** = the random-access block-WRITE handle with
   read-back; **no `seek` ever** (a settable cursor is hidden mutable state — every access takes
   an explicit `off`), and **no read-only constructor** (pure random reads stay reader | mmap

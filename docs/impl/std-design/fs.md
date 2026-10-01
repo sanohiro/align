@@ -81,6 +81,31 @@ fs.remove_empty_dir(path: str) -> Result<(), Error>
 
 ## Public contract
 
+### Exclusive random-access creation
+
+[Plan 85](../85-exclusive-random-file-plan.md) fixes this Impure constructor:
+
+```text
+fs.create_rw_exclusive(path: str) -> Result<file, Error>
+```
+
+One native O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW open creates a regular file
+with mode 0644 subject to umask. Every occupied final entry, including a directory,
+live or dangling symlink, FIFO or device, returns Code(native EEXIST) without
+opening, following, truncating, replacing or removing it. Parents use ordinary
+resolution, including symlinks and relative paths. No exists/stat preflight,
+parent creation, normalization or fallback is added. Empty, invalid UTF-8 and
+embedded-NUL paths return Invalid before filesystem work; missing parents are
+NotFound, permission failures Denied and other failures use the fixed errno table.
+
+The path is borrowed only during the call, including implicit string borrowing.
+The ephemeral native path copy and existing File shell allocate; no buffer or
+mmap does. The same Move File retains no path view and uses unchanged positional
+methods, ownership and Drop. Drop closes once without removing the entry; partial
+output remains for explicit cleanup. The existing local ext4/tmpfs Linux and APFS
+macOS acceptance floor has one competing-creator winner. No parent confinement,
+path stability, rollback, multi-file transaction or durability is promised.
+
 ### Read-only random-access files
 
 [Plan 84](../84-read-only-random-file-plan.md) owns the fired M12 non-mmap

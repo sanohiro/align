@@ -1302,6 +1302,7 @@ merely because its `Ty` matches.
 | `WriterFlush` | `env[]; child[writer]`; `Writer; result ERR(Unit); borrowed; Impure`. |
 | `IoCopy` | `env[]; child[reader,writer]`; `Reader,Writer; result ERR(i64); both borrowed; Impure`. |
 | `FileCreateRw` | `env[]; child[path]`; `Str; result ERR(File); new owned fd; Impure`. |
+| `FileCreateRwExclusive` | `env[]; child[path]`; `Str; result ERR(File); new exclusive read/write owned fd; Impure`. |
 | `FileOpenRw` | `env[]; child[path]`; `Str; result ERR(File); new owned fd; Impure`. |
 | `FileOpenRo` | `env[]; child[path]`; `Str; result ERR(File); new owned fd; Impure`. |
 | `FilePread` | `env[]; child[file,buffer,offset]`; `LocalHandle(File,file), SourceMutLocal(Buffer,buffer), i64; result ERR(i64); handles borrowed, buffer mutated; Impure`. |

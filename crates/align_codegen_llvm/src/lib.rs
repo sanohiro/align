@@ -16583,11 +16583,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 relative,
                 *out,
             )?,
-            // All A4 `file` rvalues (create_rw/open_rw + pread/pwrite/len) go through ONE
+            // All positional File constructors and methods go through ONE
             // `#[inline(never)]` helper, so `gen_rvalue` gains a single tiny arm rather than five inline
             // bodies — `gen_rvalue` is depth-recursive (via operand materialization), so keeping its
             // frame flat preserves the expr-depth budget (the #296 lesson, mirroring MIR's dispatcher).
-            Rvalue::FileCreateRw { .. } | Rvalue::FileOpenRw { .. } | Rvalue::FileOpenRo { .. }
+            Rvalue::FileCreateRw { .. } | Rvalue::FileOpenRw { .. } | Rvalue::FileOpenRo { .. } | Rvalue::FileCreateRwExclusive { .. }
             | Rvalue::FilePread { .. } | Rvalue::FilePwrite { .. } | Rvalue::FileLen { .. } => self.gen_file_rvalue(rv)?,
             Rvalue::ReaderStdin => self
                 .builder
@@ -23588,6 +23588,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::FileCreateRw { path, out } => self.gen_open_handle(RuntimeKey::IoFileCreate, path, *out)?,
             Rvalue::FileOpenRw { path, out } => self.gen_open_handle(RuntimeKey::IoFileOpen, path, *out)?,
             Rvalue::FileOpenRo { path, out } => self.gen_open_handle(RuntimeKey::IoFileOpenRo, path, *out)?,
+            Rvalue::FileCreateRwExclusive { path, out } => self.gen_open_handle(RuntimeKey::IoFileCreateExclusive, path, *out)?,
             // f.pread(b, off) — the runtime fills the buffer window at `off`, returns i64 count-or-status.
             Rvalue::FilePread { file, buffer, offset } => {
                 let fp = self.operand(file)?.into();
@@ -31525,20 +31526,20 @@ fn main() -> i32 = 0
 
     #[test]
     fn file_constructors_mir_gate_requires_exact_native_slots() -> Result<(), &'static str> {
-        for constructor in ["create_rw", "open_rw", "open_ro"] {
+        for constructor in ["create_rw", "open_rw", "open_ro", "create_rw_exclusive"] {
             let base = mir(&format!("import std.fs\nfn f(path: str, spare: file) -> Result<file, Error> = fs.{constructor}(path)\nfn main() -> i32 = 0\n"));
             assert!(validate_resource_rvalues(&base).is_ok());
             let index = xml_test_function(&base, "f");
             let (value, out) = base.fns[index].blocks.iter().flat_map(|b| &b.stmts).find_map(|s| match s {
                 Stmt::Let(value, Rvalue::FileCreateRw { out, .. } | Rvalue::FileOpenRw { out, .. }
-                    | Rvalue::FileOpenRo { out, .. }) => Some((*value, *out)), _ => None,
+                    | Rvalue::FileOpenRo { out, .. } | Rvalue::FileCreateRwExclusive { out, .. }) => Some((*value, *out)), _ => None,
             }).ok_or("file native fixture")?;
             for mutation in 0..5 {
                 let mut wrong = base.clone();
                 let spare = *wrong.fns[index].params.get(1).ok_or("file spare parameter")?;
                 let (path, output) = wrong.fns[index].blocks.iter_mut().flat_map(|b| &mut b.stmts).find_map(|s| match s {
                     Stmt::Let(_, Rvalue::FileCreateRw { path, out } | Rvalue::FileOpenRw { path, out }
-                        | Rvalue::FileOpenRo { path, out }) => Some((path, out)), _ => None,
+                        | Rvalue::FileOpenRo { path, out } | Rvalue::FileCreateRwExclusive { path, out }) => Some((path, out)), _ => None,
                 }).ok_or("file mutable fixture")?;
                 match mutation {
                     0 => *path = Operand::Const(Const::Bool(true)),

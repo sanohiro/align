@@ -3406,6 +3406,7 @@ fs.create_exclusive_beneath(root: str, relative: str) -> Result<writer, Error>
 fs.create_private_temp_dir(prefix: str) -> Result<string, Error>
 fs.remove_empty_dir(path: str) -> Result<(), Error>
 fs.create_rw(path: str) -> Result<file, Error>   // O_RDWR|O_CREAT|O_TRUNC — a fresh random-access file
+fs.create_rw_exclusive(path: str) -> Result<file, Error>   // atomic exclusive random-access create
 fs.open_rw(path: str)   -> Result<file, Error>   // O_RDWR, must exist — in-place update (see std.io `file`)
 fs.open_ro(path: str)   -> Result<file, Error>   // O_RDONLY|O_CLOEXEC, must exist — bounded random reads
 fs.create_dir(path: str) -> Result<(), Error>
@@ -3414,6 +3415,21 @@ fs.exists(path: str) -> bool
 fs.remove(path: str) -> Result<(), Error>
 fs.read_dir(path: str) -> Result<array<string>, Error>   // v1: owned strings
 ```
+
+`fs.create_rw_exclusive` performs one native O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW
+open with mode 0644 subject to umask. Any occupied final entry, including a directory,
+live or dangling symlink, FIFO or device, returns Code(native EEXIST) without opening,
+following, truncating, replacing or removing it. Parent resolution is ordinary, with no
+exists/stat preflight, parent creation or emulation. Empty, invalid UTF-8 and embedded-NUL
+paths return Invalid before filesystem work; missing parents return NotFound, permission
+failures Denied, and remaining failures use the fixed errno table. The path is borrowed
+only during the call, including implicit string borrowing. An ephemeral native path copy
+and the existing File shell allocate; no buffer or mmap does. The Impure result is the
+same Move file with unchanged methods, ownership and Drop. Drop closes without removing
+the created entry; partial files remain for explicit cleanup. On the existing local
+ext4/tmpfs Linux and APFS macOS acceptance floor, competing exclusive creators have one
+winner. No parent confinement, path stability, rollback, transaction or durability is
+added (plan 85).
 
 `fs.open_ro` uses ordinary path resolution, including symlinks and relative paths. It never
 creates, truncates or extends. The call borrows UTF-8 path bytes only until open completes; an

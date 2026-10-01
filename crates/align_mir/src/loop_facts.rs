@@ -301,7 +301,7 @@ macro_rules! unmodelled_rvalues {
         Rvalue::CodecColumnAt { .. } | Rvalue::CodecEncoderNew { .. } | Rvalue::CodecEncoderPut { .. } |
         Rvalue::CodecEncoderFinish { .. } | Rvalue::CryptoDigestNew { .. } | Rvalue::CryptoDigestUpdate { .. } |
         Rvalue::CryptoDigestFinish { .. } | Rvalue::FrameInnerJoin { .. } | Rvalue::IoCopy { .. } |
-        Rvalue::FileCreateRw { .. } | Rvalue::FileOpenRw { .. } | Rvalue::FileOpenRo { .. } | Rvalue::FilePread { .. } |
+        Rvalue::FileCreateRw { .. } | Rvalue::FileOpenRw { .. } | Rvalue::FileOpenRo { .. } | Rvalue::FileCreateRwExclusive { .. } | Rvalue::FilePread { .. } |
         Rvalue::FilePwrite { .. } | Rvalue::FileLen { .. } | Rvalue::BufferNew { .. } |
         Rvalue::BufferBytes { .. } | Rvalue::BufferLen { .. } | Rvalue::BufferCapacity { .. } |
         Rvalue::BytesSet { .. } | Rvalue::BytesFill { .. } |

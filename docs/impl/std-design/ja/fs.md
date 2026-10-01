@@ -72,6 +72,31 @@ fs.remove_empty_dir(path: str) -> Result<(), Error>
 
 ## 公開契約
 
+### 排他的なランダムアクセス用ファイル作成
+
+[Plan 85](../../85-exclusive-random-file-plan.md) は次の Impure なコンストラクタを定義する。
+
+```text
+fs.create_rw_exclusive(path: str) -> Result<file, Error>
+```
+
+O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW を指定したネイティブ open を1回行い、
+umask を適用したモード 0644 の通常ファイルを作成する。末尾にディレクトリ、生きた
+symlink、リンク先が不在の symlink、FIFO、デバイスなどのエントリがある場合は
+Code(native EEXIST) を返し、開く、追跡する、切り詰める、置換する、削除する操作をしない。
+親要素は相対パスと symlink を含む通常の解決に従う。exists/stat による事前検査、
+親の作成、正規化、代替実装は追加しない。空パス、不正 UTF-8、埋め込み NUL は
+ファイルシステム操作より先に Invalid となる。親の不在は NotFound、権限は Denied、
+その他は既存の固定 errno 表を用いる。
+
+string の暗黙の借用を含め、パスは呼び出し中だけ借用する。一時的なネイティブパスの
+コピーと既存の File 本体は割り当てを伴うが、バッファや mmap は割り当てない。
+同じ Move の File を返し、パスの view は保持しない。位置指定のメソッド、所有権、
+Drop は同じで、Drop は descriptor を1回閉じてエントリを削除しない。部分的な出力は
+明示的な cleanup のために残る。既存の Linux のローカル ext4/tmpfs と macOS の APFS
+という受け入れ範囲では、競合する作成の成功は1件だけとなる。親への閉じ込め、パスの
+安定性、rollback、複数ファイルの transaction、耐久性は保証しない。
+
 ### 読み取り専用ランダムアクセスファイル
 
 [Plan 84](../../84-read-only-random-file-plan.md) は、M12 で保留した非 mmap

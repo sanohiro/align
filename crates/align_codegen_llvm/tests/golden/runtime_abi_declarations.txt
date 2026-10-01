@@ -264,6 +264,7 @@ key|HttpUpgradeShutdown|http_upgrade_shutdown|HostState|declare i32 @align_rt_ht
 key|HttpUpgradeWrite|http_upgrade_write|HostState|declare i32 @align_rt_http_upgrade_write(ptr, ptr, i64) #2
 key|IoCopy|io_copy|HostState|declare i64 @align_rt_io_copy(ptr, ptr) #2
 key|IoFileCreate|io_file_create|HostState|declare i32 @align_rt_io_file_create(ptr, i64, ptr) #2
+key|IoFileCreateExclusive|io_file_create_exclusive|HostState|declare i32 @align_rt_io_file_create_exclusive(ptr, i64, ptr) #2
 key|IoFileFree|io_file_free|HostState|declare void @align_rt_io_file_free(ptr) #2
 key|IoFileLen|io_file_len|HostState|declare i64 @align_rt_io_file_len(ptr) #2
 key|IoFileOpen|io_file_open|HostState|declare i32 @align_rt_io_file_open(ptr, i64, ptr) #2
