@@ -1355,14 +1355,20 @@ work remains deferred.
 
 ### 8.5 P2 — remove or diagnose redundant materialization only with the right proof
 
-The explicit shape `xs.map(f).to_array().sum()` currently allocates, writes, rereads, and frees an
-array. The best source-level answer is the existing fused spelling `xs.map(f).sum()`. Add a structural
-rewrite lint so the allocation is visible and repairable even before ownership-based materialization
-elision exists:
+The explicit shape `xs.map(f).to_array().sum()` requests intermediate array
+storage before a scalar sum. The existing fused spelling is `xs.map(f).sum()`.
+The structural check-time warning makes that source choice visible:
 
 ```text
-redundant materialization before `sum`; use `xs.map(f).sum()`
+intermediate array before sum: consider removing `.to_array()` when only the sum is needed
 ```
+
+The direct numeric source shape is implemented by
+[plan98](98-immediate-materialization-lint.md): an empty-stage sum over a direct
+array materializer emits structural advice at that materializer's span, with
+exact text/span deduplication. Named/reused arrays and other terminal shapes
+remain silent. The message offers a considered source edit, not an automatic
+rewrite or a claim that an allocation survives storage donation/optimization.
 
 A later MIR rewrite may remove an unobserved temporary, but only when ownership/drop/trap order is
 identical. Do not silently erase a named or aliased materialization. This complements, rather than

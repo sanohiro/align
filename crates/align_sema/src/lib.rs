@@ -4402,6 +4402,19 @@ const HUGE_STRUCT_BYTES: u64 = 128;
 /// lint prefers silence to noise and fires only where the default plausibly costs real bandwidth.
 const DEFAULT_ELEM_LITERAL_ARRAY_LEN: u32 = 64;
 
+const INTERMEDIATE_ARRAY_SUM_WARNING: &str =
+    "intermediate array before sum: consider removing `.to_array()` when only the sum is needed";
+
+fn warn_intermediate_array_sum(diags: &mut Diagnostics, span: Span) {
+    if !diags.iter().any(|diagnostic| {
+        diagnostic.severity == align_diag::Severity::Warning
+            && diagnostic.span == Some(span)
+            && diagnostic.message == INTERMEDIATE_ARRAY_SUM_WARNING
+    }) {
+        diags.push(align_diag::Diagnostic::warning(INTERMEDIATE_ARRAY_SUM_WARNING, span));
+    }
+}
+
 /// Natural-alignment `(size, align)` of a struct as codegen lays it out (the dual of
 /// [`struct_is_move`]). The shared type-layout engine is iterative, memoized, cycle-safe, and is the
 /// single semantic dual of LLVM's struct/enum/option/result layout. `visiting` remains in this
@@ -70166,8 +70179,17 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(value);
                 self.finalize_expr(region);
             }
-            ExprKind::ArraySum { source, stages, .. }
-            | ExprKind::ArrayCount { source, stages }
+            ExprKind::ArraySum { source, stages, .. } => {
+                self.finalize_expr(source);
+                self.finalize_pipeline_stages(stages);
+                if cur_ty.is_numeric()
+                    && stages.is_empty()
+                    && matches!(source.kind, ExprKind::ArrayToArray { .. })
+                {
+                    warn_intermediate_array_sum(self.diags, source.span);
+                }
+            }
+            ExprKind::ArrayCount { source, stages }
             | ExprKind::ArrayMinMax { source, stages, .. }
             | ExprKind::ArrayToArray { source, stages, .. }
             | ExprKind::ArraySort { source, stages, .. } => {
@@ -82836,6 +82858,89 @@ fn main() -> i32 = 0
                 .contains("unnecessary heap allocation")),
             "finalization/lints must still traverse dead checked HIR"
         );
+    }
+
+    #[test]
+    fn immediate_materialization_sum_lint_shape_matrix() -> Result<(), String> {
+        let prefix = "fn identity(x: i64) -> i64 = x\nfn keep(x: i64) -> bool = x > 0\nfn materialize(xs: slice<i64>) -> array<i64> = xs.to_array()\nfn forward(xs: slice<i64>) -> i64 = xs.sum()\n";
+        for (body, materialized) in [
+            ("xs.to_array().sum()", Some("xs.to_array()")),
+            ("xs.map(identity).to_array().sum()", Some("xs.map(identity).to_array()")),
+            ("xs.where(keep).map(identity).to_array().sum()", Some("xs.where(keep).map(identity).to_array()")),
+            ("(xs.to_array()).sum()", Some("xs.to_array()")),
+            ("xs.sum()", None),
+            ("xs.map(identity).sum()", None),
+            ("xs.to_array().map(identity).sum()", None),
+            ("xs.to_array().where(keep).sum()", None),
+            ("{ values := xs.to_array(); values.sum() }", None),
+            ("{ values := xs.to_array(); values.sum() + values.sum() }", None),
+            ("materialize(xs).sum()", None),
+            ("forward(xs.to_array())", None),
+            ("xs.to_array().len()", None),
+            ("xs.to_array().count()", None),
+        ] {
+            let source = format!("{prefix}fn total(xs: slice<i64>) -> i64 = {body}\nfn main() -> i32 = 0\n");
+            let (_, diags) = check(&source);
+            let messages: Vec<_> = diags.iter().map(|d| d.message.as_str()).collect();
+            assert!(!diags.has_errors(), "{source}\n{messages:?}");
+            let warnings: Vec<_> = diags.iter().filter(|d| d.message == INTERMEDIATE_ARRAY_SUM_WARNING).collect();
+            assert_eq!(warnings.len(), usize::from(materialized.is_some()), "{source}\n{messages:?}");
+            if let Some(materialized) = materialized {
+                let start = source.rfind(materialized).ok_or("missing materialization")?;
+                let end = start + materialized.len();
+                let expected = Span::new(
+                    0,
+                    u32::try_from(start).map_err(|e| e.to_string())?,
+                    u32::try_from(end).map_err(|e| e.to_string())?,
+                );
+                assert_eq!(warnings[0].severity, align_diag::Severity::Warning);
+                assert_eq!(warnings[0].span, Some(expected), "{source}");
+            }
+        }
+        for ty in ["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64"] {
+            let source = format!("fn total(xs: slice<{ty}>) -> {ty} = xs.to_array().sum()\nfn main() -> i32 = 0\n");
+            let (_, diags) = check(&source);
+            assert!(!diags.has_errors(), "{source}");
+            assert_eq!(diags.iter().filter(|d| d.message == INTERMEDIATE_ARRAY_SUM_WARNING).count(), 1, "{source}");
+        }
+        for ty in ["bool", "str"] {
+            let source = format!("fn total(xs: slice<{ty}>) -> i64 = xs.to_array().sum()\nfn main() -> i32 = 0\n");
+            let (_, diags) = check(&source);
+            assert!(diags.has_errors(), "{source}");
+            assert_eq!(diags.iter().filter(|d| d.message == INTERMEDIATE_ARRAY_SUM_WARNING).count(), 0, "{source}");
+        }
+        for (terminal, expected) in [(".to_array().sum()", 1), (".sum()", 0)] {
+            let source = format!("fn loud(x: i64) -> i64 {{ print(x); return x }}\nfn total(xs: slice<i64>) -> i64 = xs.map(loud){terminal}\nfn main() -> i32 = 0\n");
+            let (_, diags) = check(&source);
+            assert!(!diags.has_errors(), "{source}");
+            assert_eq!(diags.iter().filter(|d| d.message == INTERMEDIATE_ARRAY_SUM_WARNING).count(), expected, "{source}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn immediate_materialization_sum_lint_repetition_and_generic_instances() {
+        let mut diags = Diagnostics::new();
+        let first = Span::new(9, 10, 20);
+        let second = Span::new(10, 10, 20);
+        warn_intermediate_array_sum(&mut diags, first);
+        warn_intermediate_array_sum(&mut diags, first);
+        warn_intermediate_array_sum(&mut diags, second);
+        assert_eq!(diags.len(), 2);
+        assert_eq!(diags.iter().map(|d| d.span).collect::<Vec<_>>(), [Some(first), Some(second)]);
+
+        let source = "fn total<T>(value: T) -> i64 = [1, 2].to_array().sum()\nfn main() -> i32 { print(total(1)); print(total(1.0)); return 0 }\n";
+        let (_, diags) = check(source);
+        let messages: Vec<_> = diags.iter().map(|d| d.message.as_str()).collect();
+        assert!(!diags.has_errors(), "{messages:?}");
+        assert_eq!(diags.iter().filter(|d| d.message == INTERMEDIATE_ARRAY_SUM_WARNING).count(), 1, "{messages:?}");
+
+        let source = "fn first(xs: slice<i64>) -> i64 = xs.to_array().sum()\nfn second(xs: slice<i64>) -> i64 = xs.to_array().sum()\nfn main() -> i32 = 0\n";
+        let (_, diags) = check(source);
+        let warnings: Vec<_> = diags.iter().filter(|d| d.message == INTERMEDIATE_ARRAY_SUM_WARNING).collect();
+        assert!(!diags.has_errors());
+        assert_eq!(warnings.len(), 2);
+        assert_ne!(warnings[0].span, warnings[1].span);
     }
 
     #[test]

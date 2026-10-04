@@ -812,6 +812,16 @@ lints. `loop` also finally gives the deferred frequency-dependent lints
 
 ---
 
+## Immediate materialization advice
+
+A direct `.to_array().sum()` requests an intermediate collection when the
+existing fused sum may be sufficient. A structural check-time warning makes
+that choice visible without removing allocation, changing callable execution
+or guessing hotness. Named/reused arrays remain ordinary intentional storage.
+The advice says "consider": storage donation or optimization may already remove
+an allocation, and a manual edit must retain intended types and stage boundaries.
+[Plan98](impl/98-immediate-materialization-lint.md) owns the finite typed shape.
+
 ## The SIMD philosophy
 
 Align does not try to make developers write SIMD.

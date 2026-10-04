@@ -13,6 +13,17 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### Immediate array materialization before sum (SETTLED 2026-10-05)
+
+The standard lint set includes structural advice for a finalized numeric sum
+whose direct source is array materialization and whose intervening stage list
+is empty. Anchor at the materializing source's existing span; deduplicate exact
+warning text/span within one diagnostics owner. Named/indirect sources and
+other terminals stay silent. This introduces no rewrite, profiling requirement,
+execution rule, library API, runtime allocation strategy or K1 dependency.
+[Plan98](impl/98-immediate-materialization-lint.md) fixes the exact warning and
+acceptance contract; plan12 §8.5 owns the original proposal.
+
 ### HTTP complete-request acquisition budgets (SETTLED 2026-10-04)
 
 `srv.accept_timeout_ns(timeout_ns: i64) -> Result<(), Error>` is an Impure,
