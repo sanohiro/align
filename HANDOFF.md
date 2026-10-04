@@ -17,6 +17,16 @@ outside the active worktree so they do not obstruct unrelated checks or pulls.
 
 ## Next work (handoff updated 2026-10-04)
 
+The owner resumed independent std/library improvements on 2026-10-04, with
+existing-module usability first, useful bounded transport/library capabilities
+next, and measured execution/storage/startup improvements. Complex uncompleted
+compiler items have lower priority; K1 retains the explicit deferral above.
+Plan51's process assessment selected the plan92 reap-scratch improvement without
+a new process API or supervisor. Continue with one real retained-directory
+workflow for the filesystem assessment. Real voice/media engine integration and
+GPU qualification belong to their consumers, which request demonstrated Align
+gaps; they are not the next provider implementation queue.
+
 [Plan 90](docs/impl/90-multimodal-library-foundation-plan.md) assesses voice/media
 workloads as ordinary Align library consumers. H1 implements one borrowed-byte
 vectored writer for existing HTTP binary and SSE sends, with no payload copy or
