@@ -182,6 +182,48 @@ fn linux_pipeline_control_and_lease_lifetimes() {
     // Exercise the actual control reply's budget with a socket-filling fixture payload.
     // Ordinary bounded status JSON can fit the kernel buffer even when the peer never reads.
     transport.1 = transport.1.replace(budget, "  stream.write_timeout_ns(50000000)?\n  if stalled {\n    payload := buffer.filled(4096, 120)\n    mut index := 0\n    loop { if index == 2048 { break }; stream.send(payload.bytes())?; index = index + 1 }\n  }");
+    let post_header = "  request.header(\"X-Observer-Slot\", slot_value)";
+    assert_eq!(transport.1.matches(post_header).count(), 1);
+    transport.1 = transport.1.replace(post_header, "  request.header(\"X-Observer-Slot\", slot_value)\n  if slot == 1 && match path.find(\"/lease/\") { Some(_) => true, None => false } { request.header(\"X-Owner-Bad-Grant\", \"yes\") }");
+    let controller = files
+        .iter_mut()
+        .find(|(name, _)| name == "controller.align")
+        .unwrap();
+    let encoded_grant = "    body := json.encode_bounded(grant, 32768)?";
+    assert_eq!(controller.1.matches(encoded_grant).count(), 1);
+    controller.1 = controller.1.replace(encoded_grant, "    body := json.encode_bounded(grant, 32768)?\n    if (ctx.headers().get(\"X-Owner-Bad-Grant\") else { \"\" }) == \"yes\" { return transport.reply(ctx, 200, \"application/json\", \"{}\".bytes()) }");
+    let observer = files
+        .iter_mut()
+        .find(|(name, _)| name == "observer.align")
+        .unwrap();
+    let cursor = "  mut cursor := job_model.canonical_id";
+    assert_eq!(observer.1.matches(cursor).count(), 1);
+    observer.1 = observer.1.replace(cursor, "  forced_late := (ctx.headers().get(\"X-Owner-Late\") else { \"\" }) == \"yes\"\n  mut native_snapshot_count := 0\n  mut cursor := job_model.canonical_id");
+    let fetched = "    snapshot_response := transport.private_get(client, control, token, path)?";
+    assert_eq!(observer.1.matches(fetched).count(), 1);
+    observer.1 = observer.1.replace(fetched, "    snapshot_response := transport.private_get(client, control, token, path)?\n    native_snapshot_count = native_snapshot_count + 1\n    snapshot_status := if forced_late && native_snapshot_count > 1 { 404 } else { snapshot_response.status() }");
+    assert_eq!(
+        observer
+            .1
+            .matches("snapshot_response.status() != 200")
+            .count(),
+        1
+    );
+    observer.1 = observer.1.replace(
+        "snapshot_response.status() != 200",
+        "snapshot_status != 200",
+    );
+    assert_eq!(
+        observer
+            .1
+            .matches("http.response(snapshot_response.status())")
+            .count(),
+        1
+    );
+    observer.1 = observer.1.replace(
+        "http.response(snapshot_response.status())",
+        "http.response(snapshot_status)",
+    );
     let built = build_per_unit_multi("multimodal-native", &refs(&files), "main.align");
     let objects = built.emit_objects(false);
     let object_refs: Vec<&Path> = objects.iter().map(PathBuf::as_path).collect();
@@ -202,8 +244,41 @@ fn linux_pipeline_control_and_lease_lifetimes() {
     assert!(output.contains("reference-integration-ok"), "{output}");
 }
 const NATIVE_OWNER: &str = r###"
-import json, os, pathlib, shutil, signal, socket, subprocess, sys, tempfile, time, urllib.request, urllib.error
+import ctypes, http.client, json, os, pathlib, shutil, signal, socket, subprocess, sys, tempfile, time, urllib.request, urllib.error
 exe=sys.argv[1]
+# This dedicated single-thread Python child owns every fixture process family.
+libc=ctypes.CDLL(None,use_errno=True)
+libc.prctl.argtypes=[ctypes.c_int,ctypes.c_ulong,ctypes.c_ulong,ctypes.c_ulong,ctypes.c_ulong]
+libc.prctl.restype=ctypes.c_int
+prior_subreaper=ctypes.c_int()
+assert libc.prctl(37,ctypes.addressof(prior_subreaper),0,0,0)==0
+prior_sigchld=signal.signal(signal.SIGCHLD,signal.SIG_DFL)
+assert libc.prctl(36,1,0,0,0)==0
+
+def reap_owned():
+ end=time.monotonic()+4;total=0
+ while True:
+  # Unreaped direct children cannot have their PIDs recycled. No other reaper runs.
+  with pathlib.Path(f'/proc/self/task/{os.getpid()}/children').open() as listing:raw=listing.read(65537)
+  assert len(raw)<=65536,'fixture child-table byte bound'
+  children=[int(value) for value in raw.split()]
+  if not children:return total
+  assert len(children)<=4096 and time.monotonic()<end,'fixture descendant cleanup bound'
+  handles=[]
+  try:
+   for pid in children:
+    descriptor=os.pidfd_open(pid);handles.append((pid,descriptor))
+    try:signal.pidfd_send_signal(descriptor,signal.SIGKILL)
+    except ProcessLookupError:pass
+   for pid,descriptor in handles:
+    while True:
+     waited,status=os.waitpid(pid,os.WNOHANG)
+     if waited==pid:total+=1;break
+     assert time.monotonic()<end,'fixture descendant reap budget'
+     time.sleep(.001)
+  finally:
+   for pid,descriptor in handles:os.close(descriptor)
+
 sandbox=pathlib.Path(tempfile.mkdtemp(prefix='align-reference-native-'))
 root=sandbox/'artifacts';root.mkdir(mode=0o700)
 def port():
@@ -213,7 +288,7 @@ assert len({control,observation,observation_second})==3
 token="fixture-private-control-token"
 log=sandbox/'server.log'
 handle=log.open('wb')
-server=subprocess.Popen([exe,'serve',str(root),str(control),str(observation),str(observation_second),'/usr/bin/ffmpeg'],stderr=handle,start_new_session=True)
+server=None
 deadline=time.monotonic()+60
 native_reader=None
 first=second=None
@@ -223,7 +298,7 @@ signal.alarm(75)
 
 def request(method,path,data=None,observer=False,private=False,slot=0,headers=None):
  payload=None if data is None else data if isinstance(data,bytes) else json.dumps(data).encode()
- req=urllib.request.Request(f'http://127.0.0.1:{observation if observer else control}'+path,data=payload,method=method)
+ req=urllib.request.Request(f'http://127.0.0.1:{[control,observation,observation_second][observer]}'+path,data=payload,method=method)
  for name,value in (headers or {}).items():req.add_header(name,value)
  if private:
   req.add_header("X-Reference-Control",token)
@@ -240,12 +315,18 @@ def request(method,path,data=None,observer=False,private=False,slot=0,headers=No
 def get_json(path):
  code,body=request('GET',path); assert code==200,(code,body);return json.loads(body)
 try:
+ server=subprocess.Popen([exe,'serve',str(root),str(control),str(observation),str(observation_second),'/usr/bin/ffmpeg'],stderr=handle,start_new_session=True)
  while True:
   try:
    health=get_json('/health'); break
   except Exception:
    if server.poll() is not None or time.monotonic()>deadline:raise AssertionError(log.read_text())
    time.sleep(.02)
+ code,body=request('POST','/v1/jobs/00000000000000000000000000000000/999');assert code==405
+ code,body=request('GET',f"/v1/jobs/{health['epoch']}/999/cancel");assert code==405
+ code,body=request('GET',f"/internal/jobs/{health['epoch']}/999/lease/audio",private=True);assert code==405
+ code,body=request('GET','/internal/slots/0/release/1',private=True);assert code==405
+ code,body=request('POST',f"/v1/jobs/{health['epoch']}/-1/events",observer=True);assert code==400
  code,body=request('GET','/internal/health');assert code==403
  code,body=request('POST','/v1/jobs/audio',b'{"input":"x","input":"y","delay_ns":0}');assert code==400
  code,body=request('POST','/v1/jobs/audio',b'{"input":"\xff","delay_ns":0}');assert code==400
@@ -278,6 +359,15 @@ try:
  assert code==200 and b'id: ' in body and b'"state":"succeeded"' in body,body
  code,body=request('GET','/v1/live/pcm',observer=True)
  assert code==200 and len(body)==16000 and set(body)=={0}
+ code,body=request('POST','/v1/jobs/text',{'input':'late snapshot','delay_ns':1000000000});assert code==202
+ late=json.loads(body);late_base=f"/v1/jobs/{late['epoch']}/{late['id']}"
+ late_request=urllib.request.Request(f'http://127.0.0.1:{observation}'+late_base+'/events',headers={'X-Owner-Late':'yes'})
+ with urllib.request.urlopen(late_request,timeout=2) as response:
+  try:late_body=response.read()
+  except http.client.IncompleteRead as error:late_body=error.partial
+ assert b'id: ' in late_body
+ code,body=request('GET','/v1/live/text',observer=True);assert code==200
+ code,body=request('POST',late_base+'/cancel');assert code==200
  # Two held SSE connections must leave controller requests available.
  code,body=request('POST','/v1/jobs/text',{'input':'hold','delay_ns':1000000000});assert code==202
  held=json.loads(body);held_base=f"/v1/jobs/{held['epoch']}/{held['id']}"
@@ -312,6 +402,7 @@ try:
  code,body=request('POST',private_base+'/lease/audio',private=True);assert code==200,(code,body)
  grant=json.loads(body)
  code,repeat=request('POST',private_base+'/lease/audio',private=True);assert json.loads(repeat)==grant
+ code,discarded=request('POST',private_base+'/lease/audio',private=True);assert code==200
  native_reader=open(root/grant['relative_name'],'rb')
  assert get_json('/health')['active_leases']==1
  latest=None
@@ -322,6 +413,9 @@ try:
   while get_json(latest_base)['state']!='succeeded':
    assert time.monotonic()<deadline;time.sleep(.02)
  code,body=request('GET',lease_base);assert code==404
+ code,replay=request('POST',private_base+'/lease/audio',private=True);assert code==200 and json.loads(replay)==grant
+ code,body=request('POST',private_base+'/lease/audio',private=True,slot=1);assert code==404
+ assert get_json('/health')['active_leases']==1
  assert (root/grant['relative_name']).exists() and native_reader.read(4)==b'RIFF'
  native_reader.close()
  release_path=f"/internal/slots/0/release/{grant['lease_id']}"
@@ -358,7 +452,7 @@ try:
  assert list(root.iterdir())==[],list(root.iterdir())
  # Invalid, crashed, oversized and descendant-retaining muxers exercise the same controller.
  tool=sandbox/'mux-fixture';mode_file=sandbox/'mode'
- tool.write_text("#!/usr/bin/python3\nimport os,pathlib,sys,time\nmode=pathlib.Path(__file__).with_name('mode').read_text()\nif mode=='crash':sys.exit(7)\nif mode=='stderr':\n sys.stderr.buffer.write(b'x'*4097);sys.stderr.buffer.flush();sys.stdout.buffer.write(b'\\x00\\x00\\x00\\x0cftypmock');sys.exit(0)\nif mode=='orphan':\n child=os.fork()\n if child==0:\n  os.close(1);os.close(2);time.sleep(60);os._exit(0)\n pathlib.Path(__file__).with_name('descendant').write_text(str(child))\n sys.stdout.buffer.write(b'\\x00\\x00\\x00\\x0cftypmock');sys.stdout.buffer.flush();sys.exit(0)\nif mode=='overflow':\n sys.stdout.buffer.write(b'\\x00\\x00\\x00\\x0cftyp'+b'x'*1048576);sys.stdout.buffer.flush()\nelse:sys.stdout.buffer.write(b'invalid media framing')\n")
+ tool.write_text("#!/usr/bin/python3\nimport os,pathlib,signal,sys,time\nmode=pathlib.Path(__file__).with_name('mode').read_text()\nif mode=='crash':sys.exit(7)\nif mode=='stderr':\n sys.stderr.buffer.write(b'x'*4097);sys.stderr.buffer.flush();sys.stdout.buffer.write(b'\\x00\\x00\\x00\\x0cftypmock');sys.exit(0)\nif mode=='orphan':\n child=os.fork()\n if child==0:\n  signal.signal(signal.SIGTERM,signal.SIG_IGN)\n  os.close(1);os.close(2);time.sleep(60);os._exit(0)\n pathlib.Path(__file__).with_name('descendant').write_text(str(child))\n sys.stdout.buffer.write(b'\\x00\\x00\\x00\\x0cftypmock');sys.stdout.buffer.flush();sys.exit(0)\nif mode=='overflow':\n sys.stdout.buffer.write(b'\\x00\\x00\\x00\\x0cftyp'+b'x'*1048576);sys.stdout.buffer.flush()\nelse:sys.stdout.buffer.write(b'invalid media framing')\n")
  tool.chmod(0o700)
  for mode in ('invalid','crash','overflow','stderr','orphan'):
   mode_file.write_text(mode)
@@ -397,20 +491,55 @@ try:
   server.wait(timeout=5);assert server.returncode==0,log.read_text()
   assert list(root.iterdir())==[]
   print('mux-failure-control',mode,flush=True)
+ server=subprocess.Popen([exe,'serve',str(root),str(control),str(observation),str(observation_second),'/usr/bin/ffmpeg'],stderr=handle,start_new_session=True)
+ while True:
+  try:health=get_json('/health');break
+  except Exception:
+   assert server.poll() is None and time.monotonic()<deadline;time.sleep(.02)
+ code,body=request('POST','/v1/jobs/audio',{'input':'ambiguous','delay_ns':0});assert code==202
+ receipt=json.loads(body);bad_base=f"/v1/jobs/{receipt['epoch']}/{receipt['id']}"
+ while get_json(bad_base)['state']!='succeeded':
+  assert time.monotonic()<deadline;time.sleep(.01)
+ try:request('GET',bad_base+'/artifacts/audio',observer=2);raise AssertionError('malformed applied grant accepted')
+ except (urllib.error.URLError,ConnectionError,http.client.RemoteDisconnected):pass
+ assert get_json('/health')['active_leases']==1
+ request('POST','/shutdown');server.wait(timeout=5)
+ assert server.returncode!=0 and list(root.iterdir())==[]
+ print('ambiguous-grant-join-ok',flush=True)
+ # A forced server death exercises the harness authority across the workers' setsid boundary.
+ mode_file.write_text('orphan');(sandbox/'descendant').unlink(missing_ok=True)
+ server=subprocess.Popen([exe,'serve',str(root),str(control),str(observation),str(observation_second),str(tool)],stderr=handle,start_new_session=True)
+ while True:
+  try:get_json('/health');break
+  except Exception:
+   assert server.poll() is None and time.monotonic()<deadline;time.sleep(.02)
+ code,body=request('POST','/v1/jobs/pipeline',{'input':'fallback','delay_ns':0});assert code==202
+ while not (sandbox/'descendant').exists():
+  assert time.monotonic()<deadline;time.sleep(.01)
+ os.killpg(server.pid,signal.SIGKILL);server.wait(timeout=2)
+ assert (root/'controller.lock').is_file()
+ reaped=reap_owned();assert reaped>0
+ print('forced-descendant-reap-ok',reaped,flush=True)
+ # Only the external harness's completed child reap permits manual fixture reconciliation.
+ for entry in root.iterdir():entry.unlink()
  print('reference-integration-ok',flush=True)
 finally:
  signal.alarm(0)
  for stream in (first,second):
   if stream is not None:stream.close()
  if native_reader is not None:native_reader.close()
- if server.poll() is None:
+ if server is not None and server.poll() is None:
   try:
    request('POST','/shutdown');server.wait(timeout=3)
   except Exception:
    os.killpg(server.pid,signal.SIGKILL);server.wait(timeout=2)
+ recovered=reap_owned()
+ assert recovered==0,'unexpected native leftovers after owner execution'
+ assert libc.prctl(36,prior_subreaper.value,0,0,0)==0
+ signal.signal(signal.SIGCHLD,prior_sigchld)
  handle.close()
  print(log.read_text(),flush=True)
- if server.returncode==0 and list(root.iterdir())==[]:
+ if list(root.iterdir())==[]:
   shutil.rmtree(sandbox)
  else:print('unclean fixture preserved at',sandbox,flush=True)
 "###;

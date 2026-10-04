@@ -163,6 +163,13 @@ fn retire_completed(root: str, epoch: str, borrow mut state: Table) -> Result<()
   }
   return Ok(())
 }
+fn grant_action(job: job_model.Job, lease: job_model.Lease, phase: i64, accepting: bool) -> i64 {
+  // Replay does not create another lease or reader lifetime.
+  if lease.id > 0 { return if lease.job == job.id && lease.phase == phase { 200 } else { 409 } }
+  if !accepting { return 409 }
+  if job.retired || job.state != job_model.SUCCEEDED || job_model.artifact_length(job, phase) <= 0 { return 404 }
+  return 201
+}
 fn find_any(borrow value: Table, id: i64) -> Option<i64> {
   mut index := 0
   loop { if index == 8 { break None }; if value.job_id[index] == id && id > 0 { break Some(index) }; index = index + 1 }
@@ -273,8 +280,11 @@ fn handle(ctx: http_request_ctx, root: str, epoch: str, token: str, borrow mut s
   if private && (ctx.headers().get("X-Reference-Control") else { "" }) != token { return transport.message(ctx, 403, "forbidden\n") }
   route := match transport.route(ctx.path()) { Ok(value) => value, Err(error) => match error { Invalid => { return transport.message(ctx, 400, "invalid route\n") }, _ => { return transport.message(ctx, 404, "unknown route\n") } } }
   method := ctx.method()
+  served := route.kind == 1 || route.kind == 2 || route.kind == 3 || route.kind == 11 || route.kind == 12 || route.kind == 13 || route.kind == 21 || route.kind == 22 || route.kind == 30
+  if !served { return transport.message(ctx, 404, "unknown route\n") }
+  expected := if route.kind == 2 || route.kind == 11 || route.kind == 13 || route.kind == 22 || route.kind == 30 { "POST" } else { "GET" }
+  if method != expected { return transport.message(ctx, 405, "method\n") }
   if route.kind == 1 || route.kind == 3 || route.kind == 2 {
-    if (route.kind == 2 && method != "POST") || (route.kind != 2 && method != "GET") { return transport.message(ctx, 405, "method\n") }
     if route.kind == 2 {
       if ctx.body().len() != 0 { return transport.message(ctx, 400, "empty body required\n") }
       state.accepting = false
@@ -294,12 +304,11 @@ fn handle(ctx: http_request_ctx, root: str, epoch: str, token: str, borrow mut s
     return transport.reply(ctx, if route.kind == 2 { 202 } else { 200 }, "application/json", body.bytes())
   }
   if route.kind == 11 {
-    if method != "POST" { return transport.message(ctx, 405, "method\n") }
     kind := job_model.parse_kind(route.phase) else { return transport.message(ctx, 404, "unknown type\n") }
     return submit(ctx, root, epoch, kind, state)
   }
   if route.kind == 30 {
-    if !private || method != "POST" || ctx.body().len() != 0 { return transport.message(ctx, 400, "release request\n") }
+    if !private || ctx.body().len() != 0 { return transport.message(ctx, 400, "release request\n") }
     sender := job_model.canonical_id(ctx.headers().get("X-Observer-Slot") else { "" }) else { return transport.message(ctx, 400, "observer slot\n") }
     if sender != route.slot { return transport.message(ctx, 400, "observer slot mismatch\n") }
     mut lease := get_lease(state, route.slot)
@@ -318,15 +327,13 @@ fn handle(ctx: http_request_ctx, root: str, epoch: str, token: str, borrow mut s
   }
   if !job_model.valid_epoch(route.epoch) { return transport.message(ctx, 400, "invalid epoch\n") }
   if route.epoch != epoch { return transport.message(ctx, 410, "expired epoch\n") }
-  slot := find(state, route.id) else { return transport.message(ctx, 404, "unknown job\n") }
+  slot := (if route.kind == 22 { find_any(state, route.id) } else { find(state, route.id) }) else { return transport.message(ctx, 404, "unknown job\n") }
   if route.kind == 12 || route.kind == 21 {
-    if method != "GET" || (route.kind == 21 && !private) { return transport.message(ctx, 405, "method\n") }
     if route.cursor > state.job_sequence[slot] { return transport.message(ctx, 400, "future cursor\n") }
     body := status_body(root, epoch, state, slot, route.cursor)?
     return transport.reply(ctx, 200, "application/json", body.bytes())
   }
   if route.kind == 13 {
-    if method != "POST" { return transport.message(ctx, 405, "method\n") }
     if ctx.body().len() != 0 { return transport.message(ctx, 400, "empty body required\n") }
     mut job := get(state, slot)
     if !job_model.terminal(job.state) {
@@ -341,16 +348,15 @@ fn handle(ctx: http_request_ctx, root: str, epoch: str, token: str, borrow mut s
     return transport.reply(ctx, 200, "application/json", body.bytes())
   }
   if route.kind == 22 {
-    if !private || method != "POST" || ctx.body().len() != 0 { return transport.message(ctx, 400, "lease request\n") }
-    if !state.accepting { return transport.message(ctx, 409, "stopping\n") }
+    if !private || ctx.body().len() != 0 { return transport.message(ctx, 400, "lease request\n") }
     observer := job_model.canonical_id(ctx.headers().get("X-Observer-Slot") else { "" }) else { return transport.message(ctx, 400, "observer slot\n") }
     if observer > 1 { return transport.message(ctx, 400, "observer slot\n") }
     phase := job_model.parse_phase(route.phase) else { return transport.message(ctx, 404, "artifact\n") }
     job := get(state, slot)
-    if job.state != job_model.SUCCEEDED || job_model.artifact_length(job, phase) == 0 { return transport.message(ctx, 404, "artifact unavailable\n") }
     mut lease := get_lease(state, observer)
-    if lease.id > 0 && (lease.job != job.id || lease.phase != phase) { return transport.message(ctx, 409, "observer already owns a lease\n") }
-    if lease.id == 0 {
+    action := grant_action(job, lease, phase, state.accepting)
+    if action != 200 && action != 201 { return transport.message(ctx, action, "artifact unavailable or slot occupied\n") }
+    if action == 201 {
       next := state.next_lease.checked_add(1) else { return transport.message(ctx, 429, "lease ids exhausted\n") }
       lease.id = state.next_lease
       lease.job = job.id
@@ -528,6 +534,27 @@ pub fn selftest() -> Result<(), Error> {
   known.total = 29
   if (execution.admit_output(known, 0, 29) else { -1 }) != 29 { return Err(Error.Invalid) }
   if match execution.admit_output(known, 0, 30) { Some(_) => true, None => false } { return Err(Error.Invalid) }
+  mut replay_job := job_model.empty()
+  replay_job.id = 10
+  replay_job.state = job_model.SUCCEEDED
+  replay_job.audio_bytes = 16044
+  matching := job_model.Lease { id: 2, job: 10, phase: job_model.AUDIO, last_released: 1 }
+  mut retired := 0
+  loop {
+    if retired == 2 { break }
+    replay_job.retired = retired == 1
+    mut stopped := 0
+    loop {
+      if stopped == 2 { break }
+      accepting := stopped == 0
+      if grant_action(replay_job, matching, job_model.AUDIO, accepting) != 200 { return Err(Error.Invalid) }
+      if grant_action(replay_job, matching, job_model.TEXT, accepting) != 409 { return Err(Error.Invalid) }
+      expected := if !accepting { 409 } else { if replay_job.retired { 404 } else { 201 } }
+      if grant_action(replay_job, job_model.empty_lease(), job_model.AUDIO, accepting) != expected { return Err(Error.Invalid) }
+      stopped = stopped + 1
+    }
+    retired = retired + 1
+  }
   print("controller-model-ok")
   return Ok(())
 }
