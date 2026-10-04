@@ -37,6 +37,12 @@ fn main() -> i32 {
 
 The filter, multiplication, and sum form one pass with no intermediate array. Writing `.to_array()` before `.sum()` would request storage for the selected squares and a second pass to sum them. Materialization is useful when later work needs the collection or reuses an expensive transformation; it is a cost to choose deliberately.
 
+The checker warns about an immediate `.to_array().sum()` with no intervening
+stages and suggests considering the fused sum. The warning points to the
+materialization; named or reused arrays stay silent. It performs no automatic
+edit and makes no promise that a runtime allocation survives optimization.
+Keep intended types and floating-point stage boundaries when making a manual edit.
+
 | Shape | Work and storage to account for |
 | --- | --- |
 | `xs.map(f).where(p).sum()` | One fused traversal; no intermediate collection. |

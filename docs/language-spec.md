@@ -1230,11 +1230,17 @@ The official formatter is **mandatory**. It normalizes only meaningless variatio
 placement, trailing commas, alignment — and deliberately does not force the one-line versus
 multi-line choice.
 
-The standard lint set is eleven checks: allocation in loop, huge struct copy, unnecessary clone,
-unnecessary heap, unhandled `Result`, branch in hot loop, string re-scan, implicit copy, lossy
+The standard lint set is twelve checks: allocation in loop, huge struct copy, unnecessary clone,
+unnecessary heap, intermediate array before sum, unhandled `Result`, branch in hot loop, string re-scan, implicit copy, lossy
 conversion (narrowing / float→int / wide-int→float / `char`-narrowing `as`), wasteful default type
 (a large literal array left at the `i64`/`f64` default), and index-walk in loop (walking an array by
 index inside a `loop` instead of writing a pipeline). (`draft.md` §16.)
+
+An immediate numeric `.to_array().sum()` without intervening stages emits
+structural advice at the materializing source expression. Named/indirect arrays
+and other terminals stay silent; identical text/span pairs appear once per
+diagnostics owner. It changes no execution and performs no automatic rewrite.
+[Plan98](impl/98-immediate-materialization-lint.md) fixes the exact contract.
 
 ## Core library
 

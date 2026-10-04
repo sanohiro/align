@@ -6,6 +6,24 @@ mod common;
 use common::*;
 
 #[test]
+fn immediate_materialization_sum_lint_imported_source_provenance() {
+    let helper = "module numbers\npub fn total(xs: slice<i64>) -> i64 = xs.to_array().sum()\n";
+    let main = "module main\nimport numbers\nfn main() -> i32 { print(numbers.total([1, 2])); return 0 }\n";
+    let result = diff_check_multi(
+        "immediate-materialization-sum-lint",
+        &[("numbers.align", helper), ("main.align", main)],
+        "main.align",
+    );
+    assert!(!result.whole_errors, "{}", result.whole_diags);
+    assert!(!result.per_unit_errors, "{}", result.per_unit_diags);
+    let warning = "intermediate array before sum: consider removing `.to_array()` when only the sum is needed";
+    for diagnostics in [&result.whole_diags, &result.per_unit_diags] {
+        assert_eq!(diagnostics.matches(warning).count(), 1, "{diagnostics}");
+        assert!(diagnostics.contains("numbers.align:2:"), "{diagnostics}");
+    }
+}
+
+#[test]
 fn to_array_map_where_then_sum() {
     if !backend_available() {
         return;

@@ -2554,6 +2554,7 @@ allocation in loop
 huge struct copy
 unnecessary clone
 unnecessary heap
+intermediate array before sum
 unhandled Result
 branch in hot loop
 string re-scan
@@ -2567,6 +2568,15 @@ An integer cast warning is suppressed when finalized expression-local known
 bits prove that every possible source value fits the destination interval.
 Masks, bitwise operations and constant shifts may supply these facts. Unknown
 facts retain the warning; this rule never changes cast execution.
+
+An immediate numeric `.to_array().sum()` with no intervening pipeline stages
+warns at the materializing source expression. The message suggests considering
+the fused sum when only the sum is needed. Named or indirect array sources and
+other terminals stay silent. Identical warning text/span pairs are emitted once
+per diagnostics owner. This is structural advice, independent of profiling;
+it changes no execution or allocation strategy and offers no automatic rewrite.
+The exact admission, provenance and repetition contract is
+[plan98](docs/impl/98-immediate-materialization-lint.md).
 
 
 ### Convergence Over Expression

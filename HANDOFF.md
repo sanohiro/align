@@ -36,6 +36,10 @@ macOS SIGPIPE writer probe remains deferred. Plan97 adds a general binary GET
 example through existing std.cli/http/io, with a reused 64KiB window, explicit
 decoded-body cap and per-operation timeout. It writes incrementally to stdout;
 late errors may leave a prefix. No new library API or native mechanism is needed.
+Plan98 adds structural advice for a direct numeric `.to_array().sum()` with no
+intervening stages. It anchors one warning at the materialization's source span;
+named or reused arrays stay silent. Existing inference and compiled execution
+remain unchanged; source, generic and whole/per-unit diagnostic owners cover it.
 Continue bounded library/transport improvements and measured
 execution/storage/startup work against demonstrated consumers.
 Real voice/media engine integration and GPU qualification belong to their
