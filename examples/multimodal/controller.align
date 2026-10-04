@@ -1,0 +1,560 @@
+module controller
+import std.http
+import std.fs
+import std.io
+import core.json
+import job_model
+import execution
+import transport
+
+pub Table {
+  job_id: [i64; 8],
+  job_kind: [i64; 8],
+  job_state: [i64; 8],
+  job_phase: [i64; 8],
+  job_delay_ns: [i64; 8],
+  job_completed: [i64; 8],
+  job_total: [i64; 8],
+  job_sequence: [i64; 8],
+  job_input_bytes: [i64; 8],
+  job_text_bytes: [i64; 8],
+  job_audio_bytes: [i64; 8],
+  job_batch_bytes: [i64; 8],
+  job_mux_bytes: [i64; 8],
+  job_pins: [i64; 8],
+  job_error_code: [i64; 8],
+  job_reserved: [i64; 8],
+  job_retired: [bool; 8],
+  lease_id: [i64; 2],
+  lease_job: [i64; 2],
+  lease_phase: [i64; 2],
+  lease_last_released: [i64; 2],
+  history: job_model.History, next_id: i64, next_lease: i64, accepting: bool, faulted: bool,
+}
+pub fn table() -> Table = Table {
+  job_id: [0, 0, 0, 0, 0, 0, 0, 0],
+  job_kind: [0, 0, 0, 0, 0, 0, 0, 0],
+  job_state: [0, 0, 0, 0, 0, 0, 0, 0],
+  job_phase: [0, 0, 0, 0, 0, 0, 0, 0],
+  job_delay_ns: [0, 0, 0, 0, 0, 0, 0, 0],
+  job_completed: [0, 0, 0, 0, 0, 0, 0, 0],
+  job_total: [-1, -1, -1, -1, -1, -1, -1, -1],
+  job_sequence: [0, 0, 0, 0, 0, 0, 0, 0],
+  job_input_bytes: [0, 0, 0, 0, 0, 0, 0, 0],
+  job_text_bytes: [0, 0, 0, 0, 0, 0, 0, 0],
+  job_audio_bytes: [0, 0, 0, 0, 0, 0, 0, 0],
+  job_batch_bytes: [0, 0, 0, 0, 0, 0, 0, 0],
+  job_mux_bytes: [0, 0, 0, 0, 0, 0, 0, 0],
+  job_pins: [0, 0, 0, 0, 0, 0, 0, 0],
+  job_error_code: [0, 0, 0, 0, 0, 0, 0, 0],
+  job_reserved: [0, 0, 0, 0, 0, 0, 0, 0],
+  job_retired: [false, false, false, false, false, false, false, false],
+  lease_id: [0, 0],
+  lease_job: [0, 0],
+  lease_phase: [0, 0],
+  lease_last_released: [0, 0],
+  history: job_model.history(), next_id: 1, next_lease: 1, accepting: true, faulted: false,
+}
+fn get(borrow value: Table, slot: i64) -> job_model.Job = job_model.Job {
+  id: value.job_id[slot],
+  kind: value.job_kind[slot],
+  state: value.job_state[slot],
+  phase: value.job_phase[slot],
+  delay_ns: value.job_delay_ns[slot],
+  completed: value.job_completed[slot],
+  total: value.job_total[slot],
+  sequence: value.job_sequence[slot],
+  input_bytes: value.job_input_bytes[slot],
+  text_bytes: value.job_text_bytes[slot],
+  audio_bytes: value.job_audio_bytes[slot],
+  batch_bytes: value.job_batch_bytes[slot],
+  mux_bytes: value.job_mux_bytes[slot],
+  pins: value.job_pins[slot],
+  error_code: value.job_error_code[slot],
+  retired: value.job_retired[slot],
+}
+fn set(borrow mut value: Table, slot: i64, job: job_model.Job) {
+  value.job_id[slot] = job.id
+  value.job_kind[slot] = job.kind
+  value.job_state[slot] = job.state
+  value.job_phase[slot] = job.phase
+  value.job_delay_ns[slot] = job.delay_ns
+  value.job_completed[slot] = job.completed
+  value.job_total[slot] = job.total
+  value.job_sequence[slot] = job.sequence
+  value.job_input_bytes[slot] = job.input_bytes
+  value.job_text_bytes[slot] = job.text_bytes
+  value.job_audio_bytes[slot] = job.audio_bytes
+  value.job_batch_bytes[slot] = job.batch_bytes
+  value.job_mux_bytes[slot] = job.mux_bytes
+  value.job_pins[slot] = job.pins
+  value.job_error_code[slot] = job.error_code
+  value.job_retired[slot] = job.retired
+}
+fn set_state(borrow mut value: Table, slot: i64, changed: i64) { value.job_state[slot] = changed }
+fn set_phase(borrow mut value: Table, slot: i64, changed: i64) { value.job_phase[slot] = changed }
+fn set_completed(borrow mut value: Table, slot: i64, changed: i64) { value.job_completed[slot] = changed }
+fn set_total(borrow mut value: Table, slot: i64, changed: i64) { value.job_total[slot] = changed }
+fn set_text_bytes(borrow mut value: Table, slot: i64, changed: i64) { value.job_text_bytes[slot] = changed }
+fn set_audio_bytes(borrow mut value: Table, slot: i64, changed: i64) { value.job_audio_bytes[slot] = changed }
+fn set_batch_bytes(borrow mut value: Table, slot: i64, changed: i64) { value.job_batch_bytes[slot] = changed }
+fn set_mux_bytes(borrow mut value: Table, slot: i64, changed: i64) { value.job_mux_bytes[slot] = changed }
+fn set_pins(borrow mut value: Table, slot: i64, changed: i64) { value.job_pins[slot] = changed }
+fn get_lease(borrow value: Table, slot: i64) -> job_model.Lease = job_model.Lease { id: value.lease_id[slot], job: value.lease_job[slot], phase: value.lease_phase[slot], last_released: value.lease_last_released[slot] }
+fn set_lease(borrow mut value: Table, slot: i64, lease: job_model.Lease) {
+  value.lease_id[slot] = lease.id
+  value.lease_job[slot] = lease.job
+  value.lease_phase[slot] = lease.phase
+  value.lease_last_released[slot] = lease.last_released
+}
+fn jobs(borrow value: Table) -> [job_model.Job; 8] { rows := [get(value, 0), get(value, 1), get(value, 2), get(value, 3), get(value, 4), get(value, 5), get(value, 6), get(value, 7)]; return rows }
+fn find(borrow value: Table, id: i64) -> Option<i64> { rows := jobs(value); return job_model.find(rows, id) }
+fn queued(borrow value: Table) -> i64 { rows := jobs(value); return job_model.queued(rows) }
+Admission { slot: i64, retire: i64 }
+fn admission(borrow value: Table) -> Option<Admission> {
+  if queued(value) >= 4 { return None }
+  mut free := -1
+  mut oldest := -1
+  mut reusable := -1
+  mut count := 0
+  mut index := 0
+  loop {
+    if index == 8 { break }
+    if value.job_id[index] == 0 { free = index }
+    if value.job_id[index] > 0 && job_model.terminal(value.job_state[index]) && !value.job_retired[index] {
+      count = count + 1
+      if oldest < 0 || value.job_id[index] < value.job_id[oldest] { oldest = index }
+      if value.job_pins[index] == 0 && (reusable < 0 || value.job_id[index] < value.job_id[reusable]) { reusable = index }
+    }
+    index = index + 1
+  }
+  if count >= 3 {
+    if reusable >= 0 { return Some(Admission { slot: reusable, retire: if oldest != reusable { oldest } else { -1 } }) }
+    if free >= 0 { return Some(Admission { slot: free, retire: oldest }) }
+    return None
+  }
+  if free >= 0 { return Some(Admission { slot: free, retire: -1 }) }
+  return None
+}
+fn retirement(borrow value: Table) -> Option<i64> {
+  mut count := 0
+  mut oldest := -1
+  mut index := 0
+  loop {
+    if index == 8 { break }
+    if value.job_id[index] > 0 && job_model.terminal(value.job_state[index]) && !value.job_retired[index] {
+      count = count + 1
+      if oldest < 0 || value.job_id[index] < value.job_id[oldest] { oldest = index }
+    }
+    index = index + 1
+  }
+  return if count > 3 { Some(oldest) } else { None }
+}
+fn retire_completed(root: str, epoch: str, borrow mut state: Table) -> Result<(), Error> {
+  loop {
+    slot := retirement(state) else { break }
+    // Logical retirement never revokes an already granted reader lifetime.
+    state.job_retired[slot] = true
+    if state.job_pins[slot] == 0 {
+      remove_job(root, epoch, get(state, slot))?
+      set(state, slot, job_model.empty())
+      state.job_reserved[slot] = 0
+    }
+  }
+  return Ok(())
+}
+fn grant_action(job: job_model.Job, lease: job_model.Lease, phase: i64, accepting: bool) -> i64 {
+  // Replay does not create another lease or reader lifetime.
+  if lease.id > 0 { return if lease.job == job.id && lease.phase == phase { 200 } else { 409 } }
+  if !accepting { return 409 }
+  if job.retired || job.state != job_model.SUCCEEDED || job_model.artifact_length(job, phase) <= 0 { return 404 }
+  return 201
+}
+fn find_any(borrow value: Table, id: i64) -> Option<i64> {
+  mut index := 0
+  loop { if index == 8 { break None }; if value.job_id[index] == id && id > 0 { break Some(index) }; index = index + 1 }
+}
+fn next_queued(borrow value: Table) -> Option<i64> { rows := jobs(value); return job_model.next_queued(rows) }
+fn no_running(borrow value: Table) -> bool { mut index := 0; loop { if index == 8 { break true }; if value.job_id[index] > 0 && (value.job_state[index] == job_model.RUNNING || value.job_state[index] == job_model.CANCELLING) { break false }; index = index + 1 } }
+fn event(borrow mut state: Table, slot: i64) -> Result<(), Error> {
+  mut job := get(state, slot)
+  job_model.record(job, slot, state.history)?
+  set(state, slot, job)
+  return Ok(())
+}
+fn remove_if_present(borrow directory: fs.directory, name: str) -> Result<(), Error> {
+  match directory.remove_file(name.bytes()) { Ok(_) => Ok(()), Err(error) => match error { NotFound => Ok(()), _ => Err(error) } }
+}
+fn remove_job(root: str, epoch: str, job: job_model.Job) -> Result<(), Error> {
+  if job.id == 0 { return Ok(()) }
+  directory := fs.open_directory(root)?
+  phases := ["input", "staging", "text", "audio", "batch", "mux"]
+  mut index := 0
+  loop {
+    if index == phases.len() { break }
+    relative := job_model.name(epoch, job.id, phases[index])
+    remove_if_present(directory, relative)?
+    index = index + 1
+  }
+  return Ok(())
+}
+fn health(epoch: str, borrow state: Table) -> job_model.Health {
+  mut running: Option<i64> := None
+  mut reservations := 0
+  mut pins := 0
+  mut cancelling := false
+  mut index := 0
+  loop {
+    if index == 8 { break }
+    job := get(state, index)
+    if job.id > 0 {
+      reservations = reservations + state.job_reserved[index]
+      pins = pins + job.pins
+      if job.state == job_model.RUNNING || job.state == job_model.CANCELLING { running = Some(job.id); cancelling = job.state == job_model.CANCELLING }
+    }
+    index = index + 1
+  }
+  return job_model.Health { epoch: epoch.clone(), accepting: state.accepting, device_state: if state.faulted { "faulted".clone() } else { if cancelling { "cancelling".clone() } else { if match running { Some(_) => true, None => false } { "running".clone() } else { "idle".clone() } } }, queued: queued(state), running: running, reserved_artifact_bytes: reservations, active_leases: pins }
+}
+fn status_body(root: str, epoch: str, borrow state: Table, slot: i64, after: i64) -> Result<string, Error> {
+  job := get(state, slot)
+  relative := job_model.name(epoch, job.id, "input")
+  mut input := buffer(512)
+  if job.state == job_model.SUCCEEDED && job.audio_bytes > 0 {
+    directory := fs.open_directory(root)?
+    reader := directory.open_read_single_link(relative.bytes())?
+    metadata := reader.metadata()?
+    if metadata.size != job.input_bytes || reader.read(input)? != job.input_bytes { return Err(Error.Invalid) }
+  }
+  transcript := input.bytes().as_str()?
+  snapshot := job_model.snapshot(epoch, job, slot, state.history, after, transcript)?
+  return json.encode_bounded(snapshot, 32768)
+}
+fn parse_submit(text: str) -> Result<job_model.Submit, Error> { value: job_model.Submit := json.decode(text)?; return Ok(value) }
+fn validate_submit(borrow value: job_model.Submit) -> Result<(), Error> {
+  if value.input.len() > 512 || match value.input.find("\0") { Some(_) => true, None => false } { return Err(Error.Invalid) }
+  if value.delay_ns < 0 || value.delay_ns > 1000000000 { return Err(Error.Invalid) }
+  return Ok(())
+}
+fn submit(ctx: http_request_ctx, root: str, epoch: str, kind: i64, borrow mut state: Table) -> Result<(), Error> {
+  value: job_model.Submit := match ctx.body().as_str() {
+    Ok(text) => match parse_submit(text) { Ok(parsed) => parsed, Err(_) => { return transport.message(ctx, 400, "invalid JSON\n") } },
+    Err(_) => { return transport.message(ctx, 400, "invalid UTF-8\n") }
+  }
+  if match validate_submit(value) { Ok(_) => false, Err(_) => true } { return transport.message(ctx, 400, "invalid input or delay\n") }
+  if !state.accepting || state.faulted { return transport.message(ctx, 429, "admission stopped\n") }
+  proposal := admission(state) else { return transport.message(ctx, 429, "capacity exhausted\n") }
+  slot := proposal.slot
+  next := state.next_id.checked_add(1) else { return transport.message(ctx, 429, "id exhausted\n") }
+  prior := get(state, slot)
+  remove_job(root, epoch, prior)?
+  relative := job_model.name(epoch, state.next_id, "input")
+  directory := fs.open_directory(root)?
+  mut job := job_model.empty()
+  job.id = state.next_id
+  job.kind = kind
+  job.delay_ns = value.delay_ns
+  job.input_bytes = value.input.len()
+  state.job_reserved[slot] = 1048576
+  set(state, slot, job)
+  state.next_id = next
+  if proposal.retire >= 0 { state.job_retired[proposal.retire] = true }
+  // Charge the owned basename before any fallible create/write. Failed retention never queues work.
+  writer := directory.create_new(relative.bytes()) else {
+    state.job_state[slot] = job_model.FAILED
+    event(state, slot)?
+    return transport.message(ctx, 500, "input create failed\n")
+  }
+  if match writer.write(value.input) { Ok(_) => match writer.flush() { Ok(_) => false, Err(_) => true }, Err(_) => true } {
+    state.job_state[slot] = job_model.FAILED
+    event(state, slot)?
+    return transport.message(ctx, 500, "input write failed\n")
+  }
+  event(state, slot)?
+  receipt := job_model.Receipt { epoch: epoch.clone(), id: job.id, status: "queued".clone() }
+  body := json.encode_bounded(receipt, 32768)?
+  return transport.reply(ctx, 202, "application/json", body.bytes())
+}
+fn handle(ctx: http_request_ctx, root: str, epoch: str, token: str, borrow mut state: Table) -> Result<(), Error> {
+  private := ctx.path().starts_with("/internal/")
+  if private && (ctx.headers().get("X-Reference-Control") else { "" }) != token { return transport.message(ctx, 403, "forbidden\n") }
+  route := match transport.route(ctx.path()) { Ok(value) => value, Err(error) => match error { Invalid => { return transport.message(ctx, 400, "invalid route\n") }, _ => { return transport.message(ctx, 404, "unknown route\n") } } }
+  method := ctx.method()
+  served := route.kind == 1 || route.kind == 2 || route.kind == 3 || route.kind == 11 || route.kind == 12 || route.kind == 13 || route.kind == 21 || route.kind == 22 || route.kind == 30
+  if !served { return transport.message(ctx, 404, "unknown route\n") }
+  expected := if route.kind == 2 || route.kind == 11 || route.kind == 13 || route.kind == 22 || route.kind == 30 { "POST" } else { "GET" }
+  if method != expected { return transport.message(ctx, 405, "method\n") }
+  if route.kind == 1 || route.kind == 3 || route.kind == 2 {
+    if route.kind == 2 {
+      if ctx.body().len() != 0 { return transport.message(ctx, 400, "empty body required\n") }
+      state.accepting = false
+      mut index := 0
+      loop {
+        if index == 8 { break }
+        mut job := get(state, index)
+        job_model.cancel(job)
+        job.error_code = 2
+        set(state, index, job)
+        if job.id > 0 && !job_model.terminal(job.state) { event(state, index)? }
+        index = index + 1
+      }
+    }
+    health_value := health(epoch, state)
+    body := json.encode_bounded(health_value, 32768)?
+    return transport.reply(ctx, if route.kind == 2 { 202 } else { 200 }, "application/json", body.bytes())
+  }
+  if route.kind == 11 {
+    kind := job_model.parse_kind(route.phase) else { return transport.message(ctx, 404, "unknown type\n") }
+    return submit(ctx, root, epoch, kind, state)
+  }
+  if route.kind == 30 {
+    if !private || ctx.body().len() != 0 { return transport.message(ctx, 400, "release request\n") }
+    sender := job_model.canonical_id(ctx.headers().get("X-Observer-Slot") else { "" }) else { return transport.message(ctx, 400, "observer slot\n") }
+    if sender != route.slot { return transport.message(ctx, 400, "observer slot mismatch\n") }
+    mut lease := get_lease(state, route.slot)
+    prior_job := lease.job
+    already_released := route.lease == lease.last_released
+    if match job_model.release(lease, route.lease) { Ok(_) => false, Err(_) => true } { return transport.message(ctx, 409, "lease mismatch\n") }
+    set_lease(state, route.slot, lease)
+    if !already_released {
+      slot := find_any(state, prior_job) else { return transport.message(ctx, 500, "lease owner missing\n") }
+      set_pins(state, slot, state.job_pins[slot] - 1)
+      if state.job_pins[slot] == 0 && state.job_retired[slot] { remove_job(root, epoch, get(state, slot))?; set(state, slot, job_model.empty()) }
+    }
+    acknowledgement := job_model.ReleaseAck { released: true }
+    body := json.encode_bounded(acknowledgement, 32768)?
+    return transport.reply(ctx, 200, "application/json", body.bytes())
+  }
+  if !job_model.valid_epoch(route.epoch) { return transport.message(ctx, 400, "invalid epoch\n") }
+  if route.epoch != epoch { return transport.message(ctx, 410, "expired epoch\n") }
+  slot := (if route.kind == 22 { find_any(state, route.id) } else { find(state, route.id) }) else { return transport.message(ctx, 404, "unknown job\n") }
+  if route.kind == 12 || route.kind == 21 {
+    if route.cursor > state.job_sequence[slot] { return transport.message(ctx, 400, "future cursor\n") }
+    body := status_body(root, epoch, state, slot, route.cursor)?
+    return transport.reply(ctx, 200, "application/json", body.bytes())
+  }
+  if route.kind == 13 {
+    if ctx.body().len() != 0 { return transport.message(ctx, 400, "empty body required\n") }
+    mut job := get(state, slot)
+    if !job_model.terminal(job.state) {
+      queued_cancel := job.state == job_model.QUEUED
+      job_model.cancel(job)
+      job.error_code = 2
+      set(state, slot, job)
+      event(state, slot)?
+      if queued_cancel { remove_job(root, epoch, job)?; state.job_reserved[slot] = 0; state.job_input_bytes[slot] = 0 }
+    }
+    body := status_body(root, epoch, state, slot, 0)?
+    return transport.reply(ctx, 200, "application/json", body.bytes())
+  }
+  if route.kind == 22 {
+    if !private || ctx.body().len() != 0 { return transport.message(ctx, 400, "lease request\n") }
+    observer := job_model.canonical_id(ctx.headers().get("X-Observer-Slot") else { "" }) else { return transport.message(ctx, 400, "observer slot\n") }
+    if observer > 1 { return transport.message(ctx, 400, "observer slot\n") }
+    phase := job_model.parse_phase(route.phase) else { return transport.message(ctx, 404, "artifact\n") }
+    job := get(state, slot)
+    mut lease := get_lease(state, observer)
+    action := grant_action(job, lease, phase, state.accepting)
+    if action != 200 && action != 201 { return transport.message(ctx, action, "artifact unavailable or slot occupied\n") }
+    if action == 201 {
+      next := state.next_lease.checked_add(1) else { return transport.message(ctx, 429, "lease ids exhausted\n") }
+      lease.id = state.next_lease
+      lease.job = job.id
+      lease.phase = phase
+      state.next_lease = next
+      set_pins(state, slot, state.job_pins[slot] + 1)
+      set_lease(state, observer, lease)
+    }
+    grant := job_model.LeaseGrant { lease_id: lease.id, artifact_id: job_model.name(epoch, job.id, route.phase), relative_name: job_model.name(epoch, job.id, route.phase), media_type: job_model.media_type(phase).clone(), byte_length: job_model.artifact_length(job, phase) }
+    body := json.encode_bounded(grant, 32768)?
+    return transport.reply(ctx, 200, "application/json", body.bytes())
+  }
+  return transport.message(ctx, 404, "unknown route\n")
+}
+fn cleanup_record(root: str, epoch: str, borrow state: Table) -> Result<(), Error> {
+  mut names: array_builder<string> := array_builder(48)
+  phases := ["input", "staging", "text", "audio", "batch", "mux"]
+  mut index := 0
+  loop {
+    if index == 8 { break }
+    job := get(state, index)
+    if job.id > 0 {
+      mut phase_index := 0
+      loop {
+        if phase_index == 6 { break }
+        names.push(job_model.name(epoch, job.id, phases[phase_index]))
+        phase_index = phase_index + 1
+      }
+    }
+    index = index + 1
+  }
+  record := job_model.Cleanup { epoch: epoch.clone(), names: names.build() }
+  body := json.encode_bounded(record, 8192)?
+  directory := fs.open_directory(root)?
+  writer := directory.create_new("cleanup.json".bytes())?
+  writer.write(body)?
+  return writer.flush()
+}
+fn report(error: Error) {
+  output := io.stderr
+  output.write("control request failed: ") else {}
+  message := match error { Code(number) => { text := builder(); text.write_int(number); text.to_string() }, Invalid => "Invalid".clone(), Timeout => "Timeout".clone(), NotFound => "NotFound".clone(), _ => "native error".clone() }
+  output.write(message) else {}
+  output.write("\n") else {}
+}
+pub fn run(root: str, epoch: str, token: str, binary: str, ffmpeg: str, port: i64) -> Result<(), Error> {
+  mut state := table()
+  mut output := buffer.filled(4096, 0)
+  mut diagnostics := buffer.filled(4096, 0)
+  mut output_view := output.bytes()
+  mut diagnostic_view := diagnostics.bytes()
+  server := http.serve("127.0.0.1", port)?
+  server.accept_timeout_ns(20000000)?
+  server.max_request_body_bytes(1024)
+  loop {
+    retire_completed(root, epoch, state)?
+    match server.accept() { Ok(ctx) => { match handle(ctx, root, epoch, token, state) { Ok(_) => {}, Err(error) => { report(error) } } }, Err(error) => match error { Timeout => {}, Invalid => {}, _ => { state.accepting = false } } }
+    if state.accepting && !state.faulted {
+      match next_queued(state) {
+        None => {}
+        Some(slot) => {
+          set_state(state, slot, job_model.RUNNING)
+          set_phase(state, slot, job_model.first_phase(state.job_kind[slot]))
+          loop {
+            set_total(state, slot, job_model.known_total(state.job_phase[slot]))
+            set_completed(state, slot, 0)
+            event(state, slot)?
+            launched := execution.start(root, epoch, binary, ffmpeg, get(state, slot), slot) else {
+              set_state(state, slot, job_model.FAILED)
+              event(state, slot)?
+              break
+            }
+            mut metadata := launched.meta
+            mut scope := launched.scope
+            sink := launched.sink
+            loop {
+              retire_completed(root, epoch, state)?
+              match server.accept() { Ok(peer) => { match handle(peer, root, epoch, token, state) { Ok(_) => {}, Err(error) => { report(error) } } }, Err(_) => {} }
+              execution.tick(scope, sink, metadata, get(state, slot), output_view, diagnostic_view)
+              prior := state.job_completed[slot]
+              set_completed(state, slot, metadata.bytes)
+              if prior != metadata.bytes { event(state, slot)? }
+              if metadata.failure && !metadata.released { set_state(state, slot, job_model.CANCELLING); state.faulted = true }
+              if metadata.released { break }
+            }
+            state.faulted = false
+            if state.job_state[slot] == job_model.CANCELLING || metadata.failure {
+              set_state(state, slot, if state.job_error_code[slot] == 2 { job_model.CANCELLED } else { job_model.FAILED })
+              event(state, slot)?
+              break
+            }
+            phase := state.job_phase[slot]
+            length := execution.publish(sink, metadata, root, epoch, state.job_id[slot], phase) else {
+              set_state(state, slot, job_model.FAILED)
+              event(state, slot)?
+              break
+            }
+            if phase == job_model.TEXT { set_text_bytes(state, slot, length) }
+            if phase == job_model.AUDIO { set_audio_bytes(state, slot, length) }
+            if phase == job_model.BATCH { set_batch_bytes(state, slot, length) }
+            if phase == job_model.MUX { set_mux_bytes(state, slot, length) }
+            next := job_model.next_phase(state.job_kind[slot], phase)
+            if next == job_model.EMPTY {
+              set_state(state, slot, job_model.SUCCEEDED)
+              event(state, slot)?
+              break
+            }
+            set_phase(state, slot, next)
+          }
+        }
+      }
+    }
+    retire_completed(root, epoch, state)?
+    if !state.accepting { break }
+  }
+  cleanup_record(root, epoch, state)?
+  return Ok(())
+}
+
+pub fn selftest() -> Result<(), Error> {
+  mut state := table()
+  mut index := 0
+  loop {
+    if index == 4 { break }
+    state.job_id[index] = 4 - index
+    state.job_state[index] = job_model.QUEUED
+    index = index + 1
+  }
+  if match admission(state) { Some(_) => true, None => false } { return Err(Error.Invalid) }
+  if (next_queued(state) else { -1 }) != 3 { return Err(Error.Invalid) }
+  state.job_state[0] = job_model.SUCCEEDED
+  state.job_state[1] = job_model.SUCCEEDED
+  state.job_state[2] = job_model.SUCCEEDED
+  state.job_pins[2] = 1
+  proposal := admission(state) else { return Err(Error.Invalid) }
+  if proposal.retire != 2 || proposal.slot != 1 { return Err(Error.Invalid) }
+  state.job_id[7] = 10
+  state.job_total[7] = 100
+  index = 0
+  loop {
+    if index == 20 { break }
+    state.job_completed[7] = index
+    event(state, 7)?
+    index = index + 1
+  }
+  value := job_model.snapshot("0123456789abcdef0123456789abcdef", get(state, 7), 7, state.history, 1, "")?
+  if !value.gap || value.oldest_sequence != 5 || value.events.len() != 16 || value.events[0].sequence != 5 || value.events[15].sequence != 20 { return Err(Error.Invalid) }
+  cap_job := job_model.empty()
+  if (execution.admit_output(cap_job, 0, 1028096) else { -1 }) != 1028096 { return Err(Error.Invalid) }
+  if match execution.admit_output(cap_job, 0, 1028097) { Some(_) => true, None => false } { return Err(Error.Invalid) }
+  if match execution.admit_output(cap_job, 9223372036854775807, 1) { Some(_) => true, None => false } { return Err(Error.Invalid) }
+  state = table()
+  index = 0
+  loop {
+    if index == 4 { break }
+    state.job_id[index] = index + 1
+    state.job_state[index] = job_model.CANCELLED
+    index = index + 1
+  }
+  state.job_pins[0] = 1
+  if (retirement(state) else { -1 }) != 0 { return Err(Error.Invalid) }
+  state.job_retired[0] = true
+  if match retirement(state) { Some(_) => true, None => false } { return Err(Error.Invalid) }
+  state = table()
+  index = 0
+  loop {
+    if index == 8 { break }
+    state.job_id[index] = index + 1
+    state.job_state[index] = job_model.SUCCEEDED
+    state.job_pins[index] = 1
+    index = index + 1
+  }
+  if match admission(state) { Some(_) => true, None => false } { return Err(Error.Invalid) }
+  mut known := job_model.empty()
+  known.total = 29
+  if (execution.admit_output(known, 0, 29) else { -1 }) != 29 { return Err(Error.Invalid) }
+  if match execution.admit_output(known, 0, 30) { Some(_) => true, None => false } { return Err(Error.Invalid) }
+  mut replay_job := job_model.empty()
+  replay_job.id = 10
+  replay_job.state = job_model.SUCCEEDED
+  replay_job.audio_bytes = 16044
+  matching := job_model.Lease { id: 2, job: 10, phase: job_model.AUDIO, last_released: 1 }
+  mut retired := 0
+  loop {
+    if retired == 2 { break }
+    replay_job.retired = retired == 1
+    mut stopped := 0
+    loop {
+      if stopped == 2 { break }
+      accepting := stopped == 0
+      if grant_action(replay_job, matching, job_model.AUDIO, accepting) != 200 { return Err(Error.Invalid) }
+      if grant_action(replay_job, matching, job_model.TEXT, accepting) != 409 { return Err(Error.Invalid) }
+      expected := if !accepting { 409 } else { if replay_job.retired { 404 } else { 201 } }
+      if grant_action(replay_job, job_model.empty_lease(), job_model.AUDIO, accepting) != expected { return Err(Error.Invalid) }
+      stopped = stopped + 1
+    }
+    retired = retired + 1
+  }
+  print("controller-model-ok")
+  return Ok(())
+}

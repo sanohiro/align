@@ -56,3 +56,5 @@ Use `alignc check file.align` to check a program and `alignc run file.align` to 
 ## Part VI — Performance
 
 - [26 — Writing fast Align](26-performance.md) — measurement, passes, allocation, layout, SIMD, and parallelism
+
+- [27 — A bounded multimodal reference](27-multimodal-reference.md)

@@ -1,0 +1,52 @@
+module worker
+import std.io
+import std.process
+import std.time
+
+// These deterministic CPU producers exercise transport and release, not model quality.
+pub fn run(phase: str, delay_ns: i64) -> Result<(), Error> {
+  if delay_ns < 0 || delay_ns > 1000000000 { return Err(Error.Invalid) }
+  mut subscription := process.signals(process.signal_set { hangup: false, interrupt: false, quit: false, terminate: true })?
+  started := time.instant()
+  loop {
+    if match subscription.next()? { Some(_) => true, None => false } { return Ok(()) }
+    if time.instant() - started >= delay_ns { break }
+    time.sleep(1000000)
+  }
+  output := io.stdout
+  if phase == "text" { output.write("Align reference mock script.\n")?; return Ok(()) }
+  if phase == "audio" {
+    mut header := buffer.filled(44, 0)
+    mut bytes := header.bytes()
+    bytes.set_u32_be(0, 1380533830)
+    bytes.set_u32_le(4, 16036)
+    bytes.set_u32_be(8, 1463899717)
+    bytes.set_u32_be(12, 1718449184)
+    bytes.set_u32_le(16, 16)
+    bytes.set_u16_le(20, 1)
+    bytes.set_u16_le(22, 1)
+    bytes.set_u32_le(24, 8000)
+    bytes.set_u32_le(28, 16000)
+    bytes.set_u16_le(32, 2)
+    bytes.set_u16_le(34, 16)
+    bytes.set_u32_be(36, 1684108385)
+    bytes.set_u32_le(40, 16000)
+    output.write(bytes)?
+    silence := buffer.filled(1000, 0)
+    mut index := 0
+    loop {
+      if index == 16 { break }
+      if match subscription.next()? { Some(_) => true, None => false } { return Ok(()) }
+      output.write(silence.bytes())?
+      index = index + 1
+    }
+    return Ok(())
+  }
+  if phase == "batch" {
+    output.write("P6\n16 16\n255\n")?
+    pixels := buffer.filled(768, 32)
+    output.write(pixels.bytes())?
+    return Ok(())
+  }
+  return Err(Error.Invalid)
+}

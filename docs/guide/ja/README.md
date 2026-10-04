@@ -56,3 +56,5 @@ Align を書くための実践的な入門です。[00 章](00-why-align.md)か�
 ## 第 VI 部 —— 性能
 
 - [26 — Align で高速な処理を書く](26-performance.md) — 計測、走査、メモリ確保、データ配置、SIMD、並列化
+
+- [27 — 上限を明示したマルチモーダル参照実装](27-multimodal-reference.md)

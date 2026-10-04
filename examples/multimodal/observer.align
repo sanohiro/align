@@ -1,0 +1,220 @@
+module observer
+import std.http
+import std.fs
+import std.time
+import core.json
+import job_model
+import transport
+
+fn health(borrow client: http_client, control: i64, token: str) -> Result<bool, Error> {
+  response := transport.private_get(client, control, token, "/internal/health")?
+  if response.status() != 200 { return Err(Error.Invalid) }
+  value: job_model.Health := json.decode(response.body().as_str()?)?
+  return Ok(value.accepting)
+}
+fn accepting(borrow client: http_client, control: i64, token: str) -> Result<bool, Error> {
+  mut attempt := 0
+  loop {
+    match health(client, control, token) { Ok(value) => { return Ok(value) }, Err(_) => {} }
+    attempt = attempt + 1
+    if attempt == 3 { return Err(Error.Timeout) }
+  }
+}
+fn request_path(epoch: str, id: i64, suffix: str) -> string {
+  output := builder()
+  output.write("/internal/jobs/")
+  output.write(epoch)
+  output.write("/")
+  output.write_int(id)
+  output.write(suffix)
+  return output.to_string()
+}
+fn status_error(code: i64) -> Error = match code {
+  400 => Error.Code(400), 403 => Error.Code(403), 404 => Error.NotFound,
+  405 => Error.Code(405), 409 => Error.Code(409), 410 => Error.Code(410),
+  429 => Error.Code(429), _ => Error.Code(500),
+}
+fn lease(borrow client: http_client, control: i64, token: str, route: transport.Route, slot: i64) -> Result<job_model.LeaseGrant, Error> {
+  suffix := builder()
+  suffix.write("/lease/")
+  suffix.write(route.phase)
+  action := suffix.to_string()
+  path := request_path(route.epoch, route.id, action)
+  mut attempt := 0
+  mut ambiguous := false
+  loop {
+    match transport.private_post(client, control, token, path, slot) {
+      Ok(response) => {
+        if response.status() != 200 {
+          status := response.status()
+          safe_rejection := status == 400 || status == 403 || status == 404 || status == 405 || status == 409 || status == 410 || status == 429
+          if ambiguous || !safe_rejection { return Err(Error.Invalid) }
+          return Err(status_error(response.status()))
+        }
+        grant: job_model.LeaseGrant := json.decode(response.body().as_str()?)?
+        expected := job_model.name(route.epoch, route.id, route.phase)
+        phase := job_model.parse_phase(route.phase) else { return Err(Error.Invalid) }
+        if grant.lease_id <= 0 || grant.byte_length <= 0 || grant.byte_length > 1048576 || grant.artifact_id != expected || grant.relative_name != expected || grant.media_type != job_model.media_type(phase) { return Err(Error.Invalid) }
+        return Ok(grant)
+      }
+      Err(_) => { ambiguous = true }
+    }
+    attempt = attempt + 1
+    if attempt == 3 { return Err(Error.Timeout) }
+  }
+}
+fn release(borrow client: http_client, control: i64, token: str, slot: i64, id: i64) -> Result<(), Error> {
+  output := builder()
+  output.write("/internal/slots/")
+  output.write_int(slot)
+  output.write("/release/")
+  output.write_int(id)
+  path := output.to_string()
+  mut attempt := 0
+  loop {
+    match transport.private_post(client, control, token, path, slot) {
+      Ok(response) => {
+        if response.status() != 200 { return Err(Error.Invalid) }
+        acknowledgement: job_model.ReleaseAck := json.decode(response.body().as_str()?)?
+        if !acknowledgement.released { return Err(Error.Invalid) }
+        return Ok(())
+      }
+      Err(_) => {}
+    }
+    attempt = attempt + 1
+    if attempt == 3 { return Err(Error.Timeout) }
+  }
+}
+fn transfer(ctx: http_request_ctx, borrow directory: fs.directory, borrow grant: job_model.LeaseGrant) -> Result<(), Error> {
+  reader := directory.open_read_single_link(grant.relative_name.bytes())?
+  metadata := reader.metadata()?
+  if metadata.size != grant.byte_length { return Err(Error.Invalid) }
+  response := http.response(200)
+  response.header("Content-Type", grant.media_type)
+  stream := ctx.respond_stream(response)?
+  stream.write_timeout_ns(50000000)?
+  mut scratch := buffer(4096)
+  mut total := 0
+  loop {
+    count := reader.read(scratch)?
+    if count == 0 { break }
+    total = total + count
+    if total > grant.byte_length { return Err(Error.Invalid) }
+    stream.send(scratch.bytes())?
+  }
+  if total != grant.byte_length { return Err(Error.Invalid) }
+  return stream.finish()
+}
+fn events(ctx: http_request_ctx, borrow client: http_client, control: i64, token: str, route: transport.Route) -> Result<(), Error> {
+  mut cursor := job_model.canonical_id(ctx.headers().get("Last-Event-ID") else { "0" }) else { return transport.message(ctx, 400, "invalid cursor\n") }
+  response := http.response(200)
+  response.header("Content-Type", "text/event-stream")
+  stream := ctx.respond_stream(response)?
+  stream.write_timeout_ns(50000000)?
+  mut committed := false
+  loop {
+    if !(accepting(client, control, token) else { false }) { break }
+    suffix := builder()
+    suffix.write("/events?after=")
+    suffix.write_int(cursor)
+    action := suffix.to_string()
+    path := request_path(route.epoch, route.id, action)
+    snapshot_response := transport.private_get(client, control, token, path)?
+    if snapshot_response.status() != 200 {
+      if committed { return Ok(()) }
+      replacement := http.response(snapshot_response.status())
+      replacement.header("Content-Type", "text/plain")
+      replacement.body("event request rejected\n")
+      return stream.reject(replacement)
+    }
+    snapshot: job_model.Snapshot := json.decode(snapshot_response.body().as_str()?)?
+    if snapshot.gap {
+      body := json.encode_bounded(snapshot, 32768)?
+      committed = true
+      stream.send("event: gap\n") else { return Ok(()) }
+      stream.send_event(body) else { return Ok(()) }
+    }
+    mut index := 0
+    loop {
+      if index == snapshot.events.len() { break }
+      // Rebuild the owned wire row explicitly; indexing a Move row never transfers it.
+      row := job_model.EventRow { sequence: snapshot.events[index].sequence, state: snapshot.events[index].state.clone(), phase: snapshot.events[index].phase.clone(), completed: snapshot.events[index].completed, total: snapshot.events[index].total, progress_percent: snapshot.events[index].progress_percent }
+      body := json.encode_bounded(row, 32768)?
+      prefix := builder()
+      prefix.write("id: ")
+      prefix.write_int(row.sequence)
+      prefix.write("\n")
+      id_line := prefix.to_string()
+      committed = true
+      stream.send(id_line) else { return Ok(()) }
+      stream.send_event(body) else { return Ok(()) }
+      cursor = row.sequence
+      index = index + 1
+    }
+    if snapshot.state == "succeeded" || snapshot.state == "failed" || snapshot.state == "cancelled" { break }
+    time.sleep(10000000)
+  }
+  stream.finish() else {}
+  return Ok(())
+}
+fn live(ctx: http_request_ctx, pcm: bool) -> Result<(), Error> {
+  response := http.response(200)
+  response.header("Content-Type", if pcm { "application/octet-stream" } else { "text/event-stream" })
+  if pcm {
+    response.header("X-Audio-Format", "s16le")
+    response.header("X-Sample-Rate", "8000")
+    response.header("X-Channels", "1")
+    response.header("X-Sample-Frames", "8000")
+  }
+  stream := ctx.respond_stream(response)?
+  stream.write_timeout_ns(50000000)?
+  silence := buffer.filled(1000, 0)
+  mut index := 0
+  loop {
+    if index == 16 { break }
+    if pcm { stream.send(silence.bytes()) else { return Ok(()) } } else { stream.send_event("mock token") else { return Ok(()) } }
+    index = index + 1
+  }
+  stream.finish() else {}
+  return Ok(())
+}
+fn handle(ctx: http_request_ctx, borrow directory: fs.directory, borrow client: http_client, control: i64, token: str, slot: i64) -> Result<(), Error> {
+  route := match transport.route(ctx.path()) { Ok(value) => value, Err(error) => match error { Invalid => { return transport.message(ctx, 400, "invalid route\n") }, _ => { return transport.message(ctx, 404, "unknown route\n") } } }
+  if route.kind != 4 && route.kind != 5 && route.kind != 14 && route.kind != 15 { return transport.message(ctx, 404, "unknown route\n") }
+  if ctx.method() != "GET" { return transport.message(ctx, 405, "method\n") }
+  if route.kind == 4 || route.kind == 5 { return live(ctx, route.kind == 5) }
+  if route.kind == 14 { return events(ctx, client, control, token, route) }
+  if route.kind == 15 {
+    grant := match lease(client, control, token, route, slot) {
+      Ok(value) => value,
+      Err(error) => match error { NotFound => { return transport.message(ctx, 404, "artifact unavailable\n") }, Code(status) => { return transport.message(ctx, status as i64, "artifact request rejected\n") }, _ => { return Err(error) } }
+    }
+    // The function returns only after both native read/stream owners have closed.
+    transfer(ctx, directory, grant) else {}
+    return release(client, control, token, slot, grant.lease_id)
+  }
+  return transport.message(ctx, 404, "unknown route\n")
+}
+pub fn run(root: str, control: i64, port: i64, token: str, slot: i64) -> Result<(), Error> {
+  directory := fs.open_directory(root)?
+  client := http.client()
+  client.max_response_body_bytes(32768)
+  mut attempt := 0
+  loop {
+    if health(client, control, token) else { false } { break }
+    attempt = attempt + 1
+    if attempt == 3 { return Err(Error.Timeout) }
+    time.sleep(20000000)
+  }
+  server := http.serve("127.0.0.1", port)?
+  server.accept_timeout_ns(20000000)?
+  server.max_request_body_bytes(1024)
+  loop {
+    if !(accepting(client, control, token) else { false }) { break }
+    match server.accept() {
+      Ok(ctx) => { handle(ctx, directory, client, control, token, slot)? }
+      Err(error) => match error { Timeout => {}, Invalid => {}, _ => { return Err(error) } }
+    }
+  }
+  return Ok(())
+}

@@ -1,0 +1,148 @@
+module main
+import std.fs
+import std.io
+import std.crypto
+import std.process
+import std.time
+import core.json
+import job_model
+import controller
+import observer
+import worker
+
+fn nonce() -> string {
+  mut random := buffer(16)
+  crypto.random(random)
+  bytes := random.bytes()
+  output := builder()
+  digits := "0123456789abcdef"
+  mut index := 0
+  loop {
+    if index == 16 { break }
+    value := bytes[index] as i64
+    output.write(digits[(value / 16)..(value / 16 + 1)])
+    output.write(digits[(value % 16)..(value % 16 + 1)])
+    index = index + 1
+  }
+  return output.to_string()
+}
+fn probe(binary: str) -> Result<(), Error> {
+  command := process.command(binary, [binary, "worker", "text", "0"])
+  mut scope := command.start_scope()?
+  started := time.instant()
+  loop {
+    scope.kill(process.signal_number(process.signal.Kill)) else {}
+    scope.reap(32)?
+    if scope.release()? { break }
+    if time.instant() - started >= 5000000000 { return Err(Error.Timeout) }
+    time.sleep(1000000)
+  }
+  return Ok(())
+}
+fn owned_name(epoch: str, name: str) -> bool {
+  if !name.starts_with(epoch) || name.len() < 35 || name[32..33] != "-" { return false }
+  tail := name[33..]
+  dash := tail.find("-") else { return false }
+  id := job_model.canonical_id(tail[..dash]) else { return false }
+  if id == 0 { return false }
+  phase := tail[dash+1..]
+  return phase == "input" || phase == "staging" || phase == "text" || phase == "audio" || phase == "batch" || phase == "mux"
+}
+fn cleanup(root: str, epoch: str) -> Result<(), Error> {
+  directory := fs.open_directory(root)?
+  reader := directory.open_read_single_link("cleanup.json".bytes())?
+  metadata := reader.metadata()?
+  if metadata.size < 1 || metadata.size > 8192 { return Err(Error.Invalid) }
+  mut input := buffer(8192)
+  if reader.read(input)? != metadata.size { return Err(Error.Invalid) }
+  record: job_model.Cleanup := json.decode(input.bytes().as_str()?)?
+  if record.epoch != epoch || record.names.len() > 48 { return Err(Error.Invalid) }
+  mut index := 0
+  loop {
+    if index == record.names.len() { break }
+    if !owned_name(epoch, record.names[index]) { return Err(Error.Invalid) }
+    index = index + 1
+  }
+  // Validate the whole cleanup set before deleting an entry.
+  mut cursor := directory.cursor()?
+  loop {
+    entry := cursor.next()? else { break }
+    raw_name: slice<u8> := entry.name
+    name := raw_name.as_str()?
+    if name != "controller.lock" && name != "cleanup.json" {
+      mut found := false
+      mut search := 0
+      loop {
+        if search == record.names.len() { break }
+        if name == record.names[search] { found = true }
+        search = search + 1
+      }
+      if !found { return Err(Error.Invalid) }
+    }
+  }
+  index = 0
+  loop {
+    if index == record.names.len() { break }
+    match directory.remove_file(record.names[index].bytes()) { Ok(_) => {}, Err(error) => match error { NotFound => {}, _ => { return Err(error) } } }
+    index = index + 1
+  }
+  directory.remove_file("cleanup.json".bytes())?
+  return directory.remove_file("controller.lock".bytes())
+}
+fn controller_task(root: str, epoch: str, token: str, binary: str, ffmpeg: str, port: i64) -> i64 {
+  return match controller.run(root, epoch, token, binary, ffmpeg, port) {
+    Ok(_) => 0,
+    Err(_) => { output := io.stderr; output.write("controller failed; fence retained\n") else {}; 1 }
+  }
+}
+fn observer_task(root: str, control: i64, port: i64, token: str, slot: i64) -> i64 {
+  return match observer.run(root, control, port, token, slot) {
+    Ok(_) => 0,
+    Err(_) => { output := io.stderr; output.write("observer failed; its lease remains charged until join\n") else {}; 1 }
+  }
+}
+pub fn main(args: array<str>) -> Result<(), Error> {
+  if args.len() == 2 && args[1] == "selftest" { controller.selftest()?; return job_model.selftest() }
+  if args.len() == 4 && args[1] == "worker" {
+    delay := job_model.canonical_id(args[3])?
+    return worker.run(args[2], delay)
+  }
+  if args.len() != 7 || args[1] != "serve" { return Err(Error.Invalid) }
+  root := args[2]
+  control := job_model.canonical_id(args[3])?
+  port := job_model.canonical_id(args[4])?
+  second_port := job_model.canonical_id(args[5])?
+  ffmpeg := args[6]
+  binary := args[0]
+  if !root.starts_with("/") || !ffmpeg.starts_with("/") || !binary.starts_with("/") || control < 1 || control > 65535 || port < 1 || port > 65535 || second_port < 1 || second_port > 65535 || port == control || second_port == control || second_port == port || process.cpu_count() < 2 { return Err(Error.Invalid) }
+  directory := fs.open_directory(root)?
+  metadata := directory.metadata()?
+  if metadata.mode != 448 { return Err(Error.Denied) }
+  mut cursor := directory.cursor()?
+  if match cursor.next()? { Some(_) => true, None => false } { return Err(Error.Invalid) }
+  fence := directory.create_new("controller.lock".bytes())?
+  fence.set_mode(384)?
+  epoch := nonce()
+  token := nonce()
+  fence.write(epoch)?
+  fence.flush()?
+  // A constructor error publishes no process owner. No observer starts before this probe.
+  match probe(binary) {
+    Ok(_) => {},
+    Err(error) => { return Err(error) }
+  }
+  epoch_view: str := epoch
+  token_view: str := token
+  results := task_group {
+    a := spawn(fn { controller_task(root, epoch_view, token_view, binary, ffmpeg, control) })
+    b := spawn(fn { observer_task(root, control, port, token_view, 0) })
+    c := spawn(fn { observer_task(root, control, second_port, token_view, 1) })
+    wait()
+    (a.get(), b.get(), c.get())
+  }
+  // Joining proves all observer readers closed; only controller success certifies scope release.
+  if results.0 != 0 { return Err(Error.Invalid) }
+  cleanup(root, epoch)?
+  if results.1 != 0 || results.2 != 0 { return Err(Error.Invalid) }
+  return Ok(())
+}
