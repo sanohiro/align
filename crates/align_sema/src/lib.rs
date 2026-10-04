@@ -76903,11 +76903,17 @@ mod tests {
         // FileSync and WriterSync borrow native owners and return unit/Error.
         // BufferCapacity is a non-retaining scalar observation of a borrowed owner.
         // HTTP timeout setters borrow an existing owner and return unit/Error.
+        // OsMemory observes only Copy counts and retains no storage.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 351,
+            variants, 352,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
+
+        for available in [false, true] {
+            assert_eq!(storage_variant_policy(&ExprKind::OsMemory { available }),
+                StorageVariantPolicy::Fresh(StorageContentInitializer::Missing));
+        }
 
         let u8_ = IntTy {
             bits: 8,

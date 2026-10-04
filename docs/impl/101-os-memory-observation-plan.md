@@ -109,7 +109,11 @@ Its independent IR owner pins i32 calls to eight-byte alignment-eight output;
 its cold/hit object owner proves cached compilation preserves the callable
 surface. Forged checked-HIR Result/error/width and MIR status/output owners
 reject before lowering. Existing host/identity owners, declaration/effect
-and native source/export inventories cover surrounding behavior. Guide examples
+and native source/export inventories cover surrounding behavior. The existing
+RuntimeKey complete/unique/alphabetical owner fixes the canonical iterator
+order, which the declaration golden and documented effect inventory preserve.
+Both existing ExprKind-count tripwires acknowledge the new family; the
+storage policy owner and native body owner cover both static selectors. Guide examples
 and both language/library mirrors use the same public signatures and limits.
 
 The public source ledgers agree with this record. Native allocation counts

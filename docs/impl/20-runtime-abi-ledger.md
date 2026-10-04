@@ -462,10 +462,10 @@ declaration golden owns the emitted declaration and the class token together.
 | `LogLine` | `align_rt_log_line` | `HostState` |
 | `LogLineBuilder` | `align_rt_log_line_builder` | `HostState` |
 | `LogNew` | `align_rt_log_new` | `AllocNew` |
+| `OsAvailableMemory` | `align_rt_os_available_memory` | `HostState` |
 | `OsHost` | `align_rt_os_host` | `HostState` |
 | `OsIdentity` | `align_rt_os_identity` | `HostState` |
 | `OsPhysicalMemory` | `align_rt_os_physical_memory` | `HostState` |
-| `OsAvailableMemory` | `align_rt_os_available_memory` | `HostState` |
 | `ParMap` | `align_rt_par_map` | `Callback` |
 | `ParMapFilter` | `align_rt_par_map_filter` | `Callback` |
 | `ParMapReduce` | `align_rt_par_map_reduce` | `Callback` |

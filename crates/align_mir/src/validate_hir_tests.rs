@@ -12212,9 +12212,10 @@ fn request11_expr_kind_inventory_tripwire() {
     assert_eq!(
         // BufferCapacity, FileSync, WriterSync, FileCreateRwExclusive, FileOpenRo, StrParseI64, StrCharBoundary, ArrayTruncate, BytesSet, BytesFill, BytesCopyFrom, BufferAppendFilled,
         // FloatScope, BytesView, SliceAsBytes, and HttpServerMaxRequestBodyBytes are explicit in
-        // validation, source-shape, replay and ownership.
+        // validation, source-shape, replay and ownership. OsMemory adds one nullary
+        // Copy Result family with explicit checked-HIR validation and no retained storage.
         variants,
-        351,
+        352,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -13212,6 +13213,10 @@ fn hir_body_validator_native() {
         Vec::new(),
         result_unit
     );
+    for (name, available) in [("native_os_physical_memory", false), ("native_os_available_memory", true)] {
+        let ret = native_result(i64_ty, error);
+        add!(name, body_test_expr(hir::ExprKind::OsMemory { available }, ret), Vec::new(), ret);
+    }
     for (name, kind, ret) in [
         ("native_time_now", hir::ExprKind::TimeNow, i64_ty),
         ("native_time_instant", hir::ExprKind::TimeInstant, i64_ty),
