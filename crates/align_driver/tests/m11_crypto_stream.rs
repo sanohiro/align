@@ -121,7 +121,7 @@ impl DigestExample {
         input: &[u8],
         args: &[&str],
         readonly_stdout: bool,
-    ) -> (std::process::ExitStatus, Vec<u8>) {
+    ) -> (std::process::ExitStatus, Vec<u8>, Vec<u8>) {
         let input_path = self.stage.path().join("input.bin");
         let output_path = self.stage.path().join("stdout");
         std::fs::write(&input_path, input).unwrap();
@@ -144,8 +144,35 @@ impl DigestExample {
             input,
             "input must remain unchanged"
         );
-        (status, std::fs::read(output_path).unwrap())
+        (
+            status,
+            std::fs::read(output_path).unwrap(),
+            std::fs::read(self.stage.path().join("stderr")).unwrap(),
+        )
     }
+}
+
+fn assert_digest_example_error(
+    status: &std::process::ExitStatus,
+    stdout: &[u8],
+    stderr: &[u8],
+    code: i32,
+) {
+    assert_eq!(
+        status.code(),
+        Some(code.clamp(1, 255)),
+        "normal error exit required: {}",
+        String::from_utf8_lossy(stderr)
+    );
+    assert!(
+        stdout.is_empty(),
+        "input/output refusal must publish no digest"
+    );
+    assert_eq!(
+        stderr,
+        format!("error: code {code}\n").as_bytes(),
+        "wrong error class/report"
+    );
 }
 
 #[test]
@@ -216,7 +243,7 @@ fn bounded_file_sha256_example_binary_cli_and_errors() {
             if file {
                 args.extend(["--file", "input.bin"]);
             }
-            let (status, stdout) = example.run(&input, &args, false);
+            let (status, stdout, stderr) = example.run(&input, &args, false);
             assert!(
                 status.success(),
                 "size={}, file={file}: {}",
@@ -224,58 +251,58 @@ fn bounded_file_sha256_example_binary_cli_and_errors() {
                 std::fs::read_to_string(example.stage.path().join("stderr")).unwrap()
             );
             assert_eq!(stdout, format!("{expected}\n").as_bytes());
+            assert!(stderr.is_empty());
             if !input.is_empty() {
                 let short = (input.len() - 1).to_string();
                 let mut short_args = vec!["--max-input-bytes", short.as_str()];
                 if file {
                     short_args.extend(["--file", "input.bin"]);
                 }
-                let (status, stdout) = example.run(&input, &short_args, false);
-                assert!(!status.success());
-                assert!(stdout.is_empty(), "cap rejection must publish no digest");
+                let (status, stdout, stderr) = example.run(&input, &short_args, false);
+                assert_digest_example_error(&status, &stdout, &stderr, -1);
             }
         }
     }
     let fifo =
         std::ffi::CString::new(example.stage.path().join("blocked").to_str().unwrap()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-    for args in [
-        vec!["--file", "blocked", "--max-input-bytes", "-1"],
-        vec![
-            "--file",
-            "blocked",
-            "--max-input-bytes",
-            "2305843009213693952",
-        ],
-        vec!["--file", "blocked", "--unknown"],
-        vec!["--file", "absent"],
-        vec!["--file", "."],
+    for (args, code) in [
+        (vec!["--file", "blocked", "--max-input-bytes", "-1"], 2),
+        (
+            vec![
+                "--file",
+                "blocked",
+                "--max-input-bytes",
+                "2305843009213693952",
+            ],
+            2,
+        ),
+        (vec!["--file", "blocked", "--unknown"], 2),
+        (vec!["--file", "absent"], 1),
+        (vec!["--file", "."], libc::EISDIR),
     ] {
-        let (status, stdout) = example.run(b"abc", &args, false);
-        assert!(!status.success(), "{args:?}");
-        assert!(stdout.is_empty());
+        let (status, stdout, stderr) = example.run(b"abc", &args, false);
+        assert_digest_example_error(&status, &stdout, &stderr, code);
     }
-    let (status, usage) = example.run(
+    let (status, usage, stderr) = example.run(
         b"abc",
         &["--help", "--file", "blocked", "--max-input-bytes", "-1"],
         false,
     );
     assert!(status.success());
+    assert!(stderr.is_empty());
     let usage = String::from_utf8(usage).unwrap();
     assert!(usage.contains("file") && usage.contains("max-input-bytes"));
-    let (status, stdout) =
+    let (status, stdout, stderr) =
         example.run(b"abc", &["--max-input-bytes", "2305843009213693951"], false);
     assert!(status.success());
+    assert!(stderr.is_empty());
     assert_eq!(
         stdout,
         b"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n"
     );
-    let (status, stdout) = example.run(b"abc", &[], true);
-    assert!(
-        !status.success(),
-        "readonly stdout must propagate its write failure"
-    );
-    assert!(stdout.is_empty());
+    let (status, stdout, stderr) = example.run(b"abc", &[], true);
+    assert_digest_example_error(&status, &stdout, &stderr, libc::EBADF);
 }
 
 #[test]

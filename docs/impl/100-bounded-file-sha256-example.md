@@ -28,6 +28,9 @@ invalid caps and unknown flags before a blocking FIFO open, help without input,
 missing-file and directory-read errors, and a read-only stdout refusal. Independent
 Python hashlib vectors own exact SHA-256 output. File-backed streams, exclusive
 ArtifactStage cleanup and the immediate bounded child guard own fixture lifecycle.
+All negative cases require the expected normal exit and exact standard error report,
+so incorrect error reports and signal termination cannot satisfy the owner.
+The cap-to-Invalid mutation is rejected by that owner.
 
 The owner passes on macOS ARM64 and Linux ARM64. There is no native/compiler change
 or performance benchmark. The runnable program's byte cap does not bound input
