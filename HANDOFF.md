@@ -63,6 +63,11 @@ reused caller buffer and bound stdout writer, explicit event/body/count limits,
 per-operation timeout and no reconnect policy. Actual-source incremental/count,
 cap/error/late-prefix owners and existing stream lifetime/interface owners
 qualify Linux/macOS. No language or native API changes.
+Plan104 uses the existing 32KiB scratch for fixed/close-delimited SSE payload
+receives while feeding and charging one source byte at a time. Post-head native
+owners qualify bulk reads, next-event boundaries, the exact work guard and fixed
+residual pooling; raw and chunked receive policies remain. Local byte/state and
+receive-call measurements qualify the refinement without a public speed guarantee.
 Continue bounded library/transport improvements and measured
 execution/storage/startup work against demonstrated consumers.
 Real voice/media engine integration and GPU qualification belong to their

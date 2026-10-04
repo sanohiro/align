@@ -21461,6 +21461,18 @@ impl HttpResponseDecoder {
         limit.min(HTTP_CLIENT_READ_CHUNK)
     }
 
+    /// SSE feeds one byte at a time, but payload-only framing may receive the remaining
+    /// source allowance into the already-owned scratch. Chunk framing keeps its existing
+    /// receive policy so ahead-of-payload framing/error observation is unchanged.
+    fn stream_sse_read_limit(&self, source_remaining: usize) -> usize {
+        match self.state {
+            HttpDecodeState::Fixed { .. } | HttpDecodeState::CloseDelimited => {
+                self.stream_read_limit(source_remaining)
+            }
+            _ => self.stream_read_limit(1),
+        }
+    }
+
     fn stream_charge_payload(&mut self, count: usize) -> Result<(), HttpParseErr> {
         let next = self
             .streamed_body_len
@@ -22154,6 +22166,34 @@ enum ConnRead {
     Err(i32),
 }
 
+#[cfg(test)]
+thread_local! {
+    static HTTP_READ_WINDOW: core::cell::Cell<Option<(usize, usize)>> = const {
+        core::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+struct HttpReadWindowTrace(Option<(usize, usize)>);
+
+#[cfg(test)]
+impl HttpReadWindowTrace {
+    fn new() -> Self {
+        Self(HTTP_READ_WINDOW.with(|window| window.replace(Some((0, 0)))))
+    }
+
+    fn observed(&self) -> (usize, usize) {
+        HTTP_READ_WINDOW.with(|window| window.get().expect("read window trace is active"))
+    }
+}
+
+#[cfg(test)]
+impl Drop for HttpReadWindowTrace {
+    fn drop(&mut self) {
+        HTTP_READ_WINDOW.with(|window| window.set(self.0));
+    }
+}
+
 impl Conn {
     /// Reconstruct a conn from pooled parts: a null `ssl` is a plaintext conn, else a TLS conn (its
     /// live handshaken `SSL*` reused with no re-handshake — http.md Slice 5).
@@ -22198,7 +22238,18 @@ impl Conn {
     /// # Safety
     /// The conn must be live.
     unsafe fn read(&mut self, buf: &mut [u8], has_deadline: bool) -> ConnRead {
-        unsafe { self.read_raw(buf.as_mut_ptr(), buf.len(), has_deadline) }
+        let result = unsafe { self.read_raw(buf.as_mut_ptr(), buf.len(), has_deadline) };
+        #[cfg(test)]
+        HTTP_READ_WINDOW.with(|window| {
+            if let Some((maximum, received)) = window.get() {
+                let count = match &result {
+                    ConnRead::Data(count) => *count,
+                    _ => 0,
+                };
+                window.set(Some((maximum.max(buf.len()), received + count)));
+            }
+        });
+        result
     }
 
     /// Observe whether one application byte or EOF is available without consuming the byte. This
@@ -23741,6 +23792,7 @@ impl HttpReadStream {
         output: &mut [core::mem::MaybeUninit<u8>],
         max_wire_read: usize,
         defer_payload_completion: bool,
+        sse_source_remaining: Option<usize>,
     ) -> Result<HttpBodyStep, i32> {
         match self.state {
             HttpReadStreamState::Complete => return Ok(HttpBodyStep::Complete),
@@ -23802,10 +23854,11 @@ impl HttpReadStream {
             if output.is_empty() && self.decoder_needs_payload() {
                 return Ok(HttpBodyStep::NeedPayload);
             }
-            let limit = self
-                .decoder
-                .stream_read_limit(output.len())
-                .min(max_wire_read);
+            let limit = match sse_source_remaining {
+                Some(remaining) => self.decoder.stream_sse_read_limit(remaining),
+                None => self.decoder.stream_read_limit(output.len()),
+            }
+            .min(max_wire_read);
             if limit == 0 {
                 return Err(self.fail(AL_INVALID));
             }
@@ -23836,7 +23889,7 @@ impl HttpReadStream {
             HttpReadStreamState::Active => {}
         }
         self.decoder.reset_stream_framing_allowance();
-        match self.read_body_step(output, usize::MAX, false)? {
+        match self.read_body_step(output, usize::MAX, false, None)? {
             HttpBodyStep::Payload(written) => Ok(written),
             HttpBodyStep::Complete => Ok(0),
             HttpBodyStep::NeedPayload => Err(self.fail(AL_INVALID)),
@@ -23848,7 +23901,7 @@ impl HttpReadStream {
     /// knows whether payload remains, and co-read close-delimited bytes remain visible in scratch;
     /// only an empty scratch plus a live close-delimited conn needs the transport peek.
     fn probe_sse_boundary(&mut self) -> Result<HttpBodyStep, i32> {
-        let step = self.read_body_step(&mut [], 1, true)?;
+        let step = self.read_body_step(&mut [], 1, true, None)?;
         if !matches!(step, HttpBodyStep::NeedPayload)
             || !matches!(self.decoder.state, HttpDecodeState::CloseDelimited)
             || self.scratch_start < self.scratch_end
@@ -23913,7 +23966,7 @@ impl HttpReadStream {
             }
 
             let mut byte = [core::mem::MaybeUninit::<u8>::uninit(); 1];
-            match self.read_body_step(&mut byte, usize::MAX, true) {
+            match self.read_body_step(&mut byte, usize::MAX, true, Some(allowance - processed)) {
                 Ok(HttpBodyStep::Payload(1)) => {
                     processed += 1;
                     let feed = self.sse.as_mut().ok_or(AL_INVALID)?.feed_source_byte(
@@ -45669,6 +45722,221 @@ event: first\nevent:\ndata: x\n\n";
         unsafe { align_rt_http_read_stream_free(stream) };
         unsafe { align_rt_http_client_free(client) };
         let _ = server.join().unwrap();
+    }
+
+    struct HttpClientTestHandle(*mut HttpClient);
+    impl Drop for HttpClientTestHandle {
+        fn drop(&mut self) { unsafe { align_rt_http_client_free(self.0) }; }
+    }
+
+    struct HttpReadStreamTestHandle(*mut HttpReadStream);
+    impl Drop for HttpReadStreamTestHandle {
+        fn drop(&mut self) { unsafe { align_rt_http_read_stream_free(self.0) }; }
+    }
+
+    struct SseReadWindowPeer {
+        release: Option<std::sync::mpsc::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    }
+    impl SseReadWindowPeer {
+        fn release_body(&mut self) {
+            if let Some(release) = self.release.take() {
+                release.send(()).expect("release post-head body");
+            }
+        }
+
+        fn finish(mut self) {
+            self.release_body();
+            self.thread.take().unwrap().join().unwrap().unwrap();
+        }
+    }
+    impl Drop for SseReadWindowPeer {
+        fn drop(&mut self) {
+            if let Some(release) = self.release.take() { let _ = release.send(()); }
+            if let Some(thread) = self.thread.take() { let _ = thread.join(); }
+        }
+    }
+
+    fn sse_read_window_peer(body: Vec<u8>, framing: &'static str) -> (String, SseReadWindowPeer) {
+        let mut head = b"HTTP/1.1 200 OK\r\nConnection: close\r\n".to_vec();
+        match framing {
+            "fixed" => head.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes()),
+            "chunked" => head.extend_from_slice(b"Transfer-Encoding: chunked\r\n"),
+            "close" => {}
+            _ => unreachable!(),
+        }
+        head.extend_from_slice(b"\r\n");
+        let wire = if framing == "chunked" {
+            let mut wire = format!("{:x}\r\n", body.len()).into_bytes();
+            wire.extend_from_slice(&body);
+            wire.extend_from_slice(b"\r\n0\r\n\r\n");
+            wire
+        } else { body };
+        read_window_peer(head, wire)
+    }
+
+    fn read_window_peer(head: Vec<u8>, wire: Vec<u8>) -> (String, SseReadWindowPeer) {
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (release, wait) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || -> std::io::Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "accept deadline"));
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+            socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+            let mut request = Vec::new();
+            let mut bytes = [0u8; 512];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = socket.read(&mut bytes)?;
+                if count == 0 || request.len() + count > 8192 {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "request head"));
+                }
+                request.extend_from_slice(&bytes[..count]);
+            }
+            socket.write_all(&head)?;
+            wait.recv_timeout(Duration::from_secs(2)).map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, error)
+            })?;
+            match socket.write_all(&wire) {
+                Err(error) if matches!(error.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset) => Ok(()),
+                result => result,
+            }
+        });
+        (format!("http://127.0.0.1:{port}/events"), SseReadWindowPeer {
+            release: Some(release), thread: Some(thread),
+        })
+    }
+
+    fn guarded_read_window_stream(client: &HttpClientTestHandle, url: &str) -> HttpReadStreamTestHandle {
+        let request = unsafe { align_rt_http_request_new(b"GET".as_ptr(), 3, url.as_ptr(), url.len() as i64) };
+        let mut stream = HttpReadStreamTestHandle(core::ptr::null_mut());
+        let status = unsafe { align_rt_http_client_request_stream(client.0, request, &mut stream.0) };
+        assert_eq!(status, 0);
+        assert!(!stream.0.is_null());
+        stream
+    }
+
+    #[test]
+    fn http_sse_receive_window_batches_payload_and_preserves_raw_and_event_boundaries() {
+        for framing in ["fixed", "chunked", "close"] {
+            let mut body = b"data:".to_vec();
+            body.extend(std::iter::repeat_n(b'x', HTTP_CLIENT_READ_CHUNK));
+            body.extend_from_slice(b"\n\ndata:y\n\n");
+            let first_end = HTTP_CLIENT_READ_CHUNK + 7;
+            let (url, mut peer) = sse_read_window_peer(body, framing);
+            let client = HttpClientTestHandle(align_rt_http_client_new());
+            unsafe { align_rt_http_client_timeout(client.0, 1_000_000_000) };
+            let stream = guarded_read_window_stream(&client, &url);
+            assert_eq!(unsafe { align_rt_http_read_stream_sse(stream.0) }, stream.0);
+            let output = BufferTestHandle(align_rt_buffer_new((HTTP_CLIENT_READ_CHUNK + 7) as i64));
+            let trace = HttpReadWindowTrace::new();
+            peer.release_body();
+            let (status, event, name, data, id) = http_sse_next_owned(stream.0, output.0);
+            assert_eq!(status, 0, "{framing}");
+            assert_eq!(event.present, 1);
+            assert_eq!(name, b"message");
+            assert_eq!(data, vec![b'x'; HTTP_CLIENT_READ_CHUNK]);
+            assert!(id.is_empty());
+            assert_eq!(trace.observed().0, HTTP_CLIENT_READ_CHUNK, "{framing}: actual receive fills the existing window");
+            assert_eq!(unsafe { &*stream.0 }.decoder.streamed_body_len, first_end as u64);
+            let (status, event, _, data, _) = http_sse_next_owned(stream.0, output.0);
+            assert_eq!(status, 0);
+            assert_eq!(event.present, 1);
+            assert_eq!(data, b"y");
+            let (status, event, _, _, _) = http_sse_next_owned(stream.0, output.0);
+            assert_eq!(status, 0);
+            assert_eq!(event.present, 0);
+            drop(trace);
+            peer.finish();
+        }
+        for residual in [false, true] {
+            let body = b"data:x\n\n";
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+            let mut wire = body.to_vec();
+            if residual { wire.push(b'!'); }
+            let expected_received = wire.len();
+            let (url, mut peer) = read_window_peer(head, wire);
+            let client = HttpClientTestHandle(align_rt_http_client_new());
+            unsafe { align_rt_http_client_timeout(client.0, 1_000_000_000) };
+            let stream = guarded_read_window_stream(&client, &url);
+            assert_eq!(unsafe { align_rt_http_read_stream_sse(stream.0) }, stream.0);
+            let output = BufferTestHandle(align_rt_buffer_new(8));
+            let trace = HttpReadWindowTrace::new();
+            peer.release_body();
+            let (status, event, _, data, _) = http_sse_next_owned(stream.0, output.0);
+            assert_eq!(status, 0);
+            assert_eq!(event.present, 1);
+            assert_eq!(data, b"x");
+            let (maximum, received) = trace.observed();
+            assert_eq!(maximum, body.len() + 1);
+            assert!(received >= body.len() && received <= expected_received);
+            let co_read_residual = received > body.len();
+            let idle = unsafe { &*client.0 }.take_idle(HttpScheme::Http, "127.0.0.1", unsafe { &*stream.0 }.port);
+            let was_pooled = idle.is_some();
+            if let Some((fd, ssl)) = idle {
+                // Return the acquired native ownership before any assertion can unwind.
+                unsafe { Conn::from_parts(fd, ssl).close() };
+            }
+            assert_eq!(was_pooled, !co_read_residual, "residual {residual}: only co-read residual excludes pooling");
+            drop(trace);
+            peer.finish();
+        }
+        for framing in ["fixed", "close"] {
+            let (url, mut peer) = sse_read_window_peer(vec![b'x'; 128], framing);
+            let client = HttpClientTestHandle(align_rt_http_client_new());
+            unsafe { align_rt_http_client_timeout(client.0, 1_000_000_000) };
+            let stream = guarded_read_window_stream(&client, &url);
+            let output = BufferTestHandle(align_rt_buffer_new(8));
+            let trace = HttpReadWindowTrace::new();
+            peer.release_body();
+            let mut count = -1;
+            assert_eq!(unsafe { align_rt_http_read_stream_read(stream.0, output.0, &mut count) }, 0);
+            assert!(count > 0 && count <= 8);
+            assert_eq!(trace.observed(), (8, usize::try_from(count).unwrap()), "{framing}: raw output remains caller bounded");
+            drop(trace);
+            drop(stream);
+            peer.finish();
+        }
+    }
+
+    #[test]
+    fn http_sse_receive_window_never_reads_the_over_guard_payload() {
+        let allowance = HTTP_MAX_SSE_METADATA + 8;
+        for framing in ["fixed", "close"] {
+            let mut body = vec![b'x'; allowance + 1];
+            body[0] = b':';
+            let (url, mut peer) = sse_read_window_peer(body, framing);
+            let client = HttpClientTestHandle(align_rt_http_client_new());
+            unsafe { align_rt_http_client_timeout(client.0, 1_000_000_000) };
+            let stream = guarded_read_window_stream(&client, &url);
+            assert_eq!(unsafe { align_rt_http_read_stream_sse(stream.0) }, stream.0);
+            let output = BufferTestHandle(align_rt_buffer_new(8));
+            let trace = HttpReadWindowTrace::new();
+            peer.release_body();
+            for attempt in 0..2 {
+                let (status, event, _, _, _) = http_sse_next_owned(stream.0, output.0);
+                assert_eq!(status, AL_INVALID, "{framing} attempt {attempt}");
+                assert_eq!(event.present, 0);
+                assert_eq!(unsafe { align_rt_buffer_len(output.0) }, 0);
+                assert_eq!(trace.observed().1, allowance, "{framing}: rejected next payload remains unread");
+            }
+            drop(trace);
+            peer.finish();
+        }
     }
 
     #[test]
