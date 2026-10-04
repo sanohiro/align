@@ -32,8 +32,12 @@ source, cache or artifact work. Plan96 restores the macOS core.test consumer
 through typed unsigned-byte native C ABI attributes, peer-close classification,
 bounded terminal observation and proven-empty-group cleanup. Linux/macOS native,
 compiler and execution owners cover the shared boundary; the independent baseline
-macOS SIGPIPE writer probe remains deferred. Continue bounded library/transport
-improvements and measured execution/storage/startup work against demonstrated consumers.
+macOS SIGPIPE writer probe remains deferred. Plan97 adds a general binary GET
+example through existing std.cli/http/io, with a reused 64KiB window, explicit
+decoded-body cap and per-operation timeout. It writes incrementally to stdout;
+late errors may leave a prefix. No new library API or native mechanism is needed.
+Continue bounded library/transport improvements and measured
+execution/storage/startup work against demonstrated consumers.
 Real voice/media engine integration and GPU qualification belong to their
 consumers, which request demonstrated Align
 gaps; they are not the next provider implementation queue.

@@ -7,6 +7,389 @@ use common::*;
 
 use std::io::{Read, Write};
 
+// The runnable example owns its artifacts and child independently of the older protocol fixtures.
+struct FetchExample {
+    stage: align_driver::ArtifactStage,
+    exe: std::path::PathBuf,
+}
+
+struct FetchChild {
+    child: Option<std::process::Child>,
+    deadline: std::time::Instant,
+}
+
+impl FetchChild {
+    fn spawn(command: &mut std::process::Command) -> Self {
+        use std::os::unix::process::CommandExt;
+        let child = command
+            .process_group(0)
+            .spawn()
+            .expect("spawn HTTP example owner");
+        Self {
+            child: Some(child),
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
+        }
+    }
+
+    fn remaining(&self) -> std::time::Duration {
+        self.deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|remaining| *remaining > std::time::Duration::from_secs(5))
+            .expect("HTTP example exceeded its work deadline")
+    }
+
+    fn wait(&mut self) -> std::process::ExitStatus {
+        loop {
+            self.remaining();
+            match self.child.as_mut().expect("live child").try_wait() {
+                Ok(Some(status)) => {
+                    self.child.take();
+                    return status;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("poll HTTP example: {error}"),
+            }
+        }
+    }
+}
+
+impl Drop for FetchChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            if let Ok(pid) = i32::try_from(child.id()) {
+                // SAFETY: this owned child leads a fresh process group.
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+            }
+            let _ = child.kill();
+            // Reserve cleanup time within the deadline established at spawn.
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                }
+                if std::time::Instant::now() >= self.deadline {
+                    eprintln!("HTTP example kill/reap exceeded its owner deadline");
+                    break;
+                }
+            }
+        }
+    }
+}
+
+impl FetchExample {
+    fn build(label: &str) -> Self {
+        let stage = align_driver::ArtifactStage::temp(label).expect("acquire HTTP example fixture");
+        let source = fixture("examples/http_fetch.align");
+        std::fs::write(stage.path().join("http_fetch.align"), source).expect("write example");
+        let mut build = std::process::Command::new(env!("CARGO_BIN_EXE_alignc"));
+        build
+            .args(["build", "http_fetch.align", "--profile", "dev"])
+            .current_dir(stage.path())
+            .env("ALIGNC_CACHE", "off")
+            .env("TMPDIR", stage.path())
+            .stdout(std::fs::File::create(stage.path().join("build.stdout")).expect("build stdout"))
+            .stderr(
+                std::fs::File::create(stage.path().join("build.stderr")).expect("build stderr"),
+            );
+        let status = FetchChild::spawn(&mut build).wait();
+        assert!(
+            status.success(),
+            "{}",
+            std::fs::read_to_string(stage.path().join("build.stderr")).expect("build evidence")
+        );
+        let exe = stage
+            .path()
+            .join(format!("http_fetch{}", std::env::consts::EXE_SUFFIX));
+        Self { stage, exe }
+    }
+
+    fn start(&self, args: &[&str], reject_stdout: bool) -> FetchChild {
+        let stdout = if reject_stdout {
+            // Inherit an actual read-only descriptor: both supported platforms reject its write.
+            std::fs::File::open(self.stage.path().join("http_fetch.align"))
+                .expect("readonly stdout")
+        } else {
+            std::fs::File::create(self.stage.path().join("stdout")).expect("capture stdout")
+        };
+        let mut command = std::process::Command::new(&self.exe);
+        command
+            .args(args)
+            .current_dir(self.stage.path())
+            .stdout(stdout)
+            .stderr(
+                std::fs::File::create(self.stage.path().join("stderr")).expect("capture stderr"),
+            );
+        FetchChild::spawn(&mut command)
+    }
+
+    fn stdout(&self) -> Vec<u8> {
+        std::fs::read(self.stage.path().join("stdout")).expect("stdout evidence")
+    }
+}
+
+fn fetch_listener() -> std::net::TcpListener {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind example fixture");
+    listener.set_nonblocking(true).expect("bound accept");
+    listener
+}
+
+fn fetch_peer(listener: &std::net::TcpListener, child: &FetchChild) -> std::net::TcpStream {
+    let mut socket = loop {
+        child.remaining();
+        match listener.accept() {
+            Ok((socket, _)) => break socket,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => panic!("accept HTTP example: {error}"),
+        }
+    };
+    socket
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .expect("bound fixture read");
+    socket
+        .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+        .expect("bound fixture write");
+    let mut request = Vec::new();
+    loop {
+        child.remaining();
+        let mut byte = [0];
+        assert_eq!(socket.read(&mut byte).expect("request byte"), 1);
+        request.push(byte[0]);
+        if request.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        assert!(
+            request.len() < 8192,
+            "example request head exceeded fixture cap"
+        );
+    }
+    assert!(request.starts_with(b"GET /binary HTTP/1.1\r\n"));
+    socket
+}
+
+#[test]
+fn bounded_fetch_example_preserves_binary_framing_and_emits_before_completion() {
+    if !backend_available() {
+        return;
+    }
+    let example = FetchExample::build("http-fetch-binary");
+    let payload: Vec<u8> = (0..=255).cycle().take(131073).collect();
+    for framing in ["fixed", "chunked", "close", "interim"] {
+        let listener = fetch_listener();
+        let url = format!(
+            "http://127.0.0.1:{}/binary",
+            listener.local_addr().unwrap().port()
+        );
+        let args = if framing == "fixed" {
+            vec!["--url", &url]
+        } else {
+            vec!["--url", &url, "--max-body-bytes", "131073"]
+        };
+        let mut child = example.start(&args, false);
+        let mut socket = fetch_peer(&listener, &child);
+        if framing == "interim" {
+            socket
+                .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+                .expect("interim");
+        }
+        let head = match framing {
+            "chunked" => "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_owned(),
+            "close" => "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_owned(),
+            _ => format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                payload.len()
+            ),
+        };
+        socket.write_all(head.as_bytes()).expect("head");
+        for part in [&payload[..257], &payload[257..]] {
+            if framing == "chunked" {
+                socket
+                    .write_all(format!("{:x};test=1\r\n", part.len()).as_bytes())
+                    .expect("chunk");
+            }
+            socket.write_all(part).expect("payload");
+            if framing == "chunked" {
+                socket.write_all(b"\r\n").expect("chunk end");
+            }
+            if part.len() == 257 {
+                loop {
+                    child.remaining();
+                    let observed = example.stdout();
+                    assert!(observed.len() <= part.len());
+                    if observed.len() == part.len() {
+                        assert_eq!(observed, part);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }
+        if framing == "chunked" {
+            socket
+                .write_all(b"0\r\nX-Trailer: hidden\r\n\r\n")
+                .expect("terminal chunk");
+        }
+        drop(socket);
+        assert!(child.wait().success(), "{framing}");
+        assert_eq!(example.stdout(), payload, "{framing}");
+    }
+}
+
+#[test]
+fn bounded_fetch_example_validates_cli_before_network_or_output() {
+    if !backend_available() {
+        return;
+    }
+    let example = FetchExample::build("http-fetch-cli");
+    let listener = fetch_listener();
+    let url = format!(
+        "http://127.0.0.1:{}/binary",
+        listener.local_addr().unwrap().port()
+    );
+    for invalid in [
+        vec!["--url", ""],
+        vec!["--max-body-bytes", "0"],
+        vec!["--max-body-bytes", "-1"],
+        vec!["--max-body-bytes", "1073741825"],
+        vec!["--timeout-ns", "0"],
+        vec!["--timeout-ns", "-1"],
+        vec!["--max-body-bytes", "bad"],
+        vec!["--unknown"],
+        vec!["--url"],
+    ] {
+        let mut args = vec!["--url", &url];
+        args.extend(invalid);
+        assert!(!example.start(&args, false).wait().success(), "{args:?}");
+        assert!(example.stdout().is_empty());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+    for args in [
+        vec![],
+        vec![
+            "--help",
+            "--url",
+            &url,
+            "--max-body-bytes=0",
+            "--timeout-ns=-1",
+        ],
+    ] {
+        let help = !args.is_empty();
+        assert_eq!(example.start(&args, false).wait().success(), help);
+        if help {
+            let output = String::from_utf8(example.stdout()).expect("help text");
+            for flag in ["--url", "--max-body-bytes", "--timeout-ns", "--help"] {
+                assert!(output.contains(flag), "{output}");
+            }
+        } else {
+            assert!(example.stdout().is_empty());
+        }
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+}
+
+#[test]
+fn bounded_fetch_example_propagates_cap_protocol_timeout_and_output_failures() {
+    if !backend_available() {
+        return;
+    }
+    let example = FetchExample::build("http-fetch-errors");
+    // None keeps the accepted peer open without writing; incomplete responses keep it open too.
+    for (response, keep_open, reject_stdout, expected) in [
+        (
+            Some(&b"HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\n\r\nerr"[..]),
+            false,
+            false,
+            &b""[..],
+        ),
+        (
+            Some(&b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabcde"[..]),
+            false,
+            false,
+            &b""[..],
+        ),
+        (
+            Some(
+                &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nabcde\r\n0\r\n\r\n"[..],
+            ),
+            false,
+            false,
+            &b""[..],
+        ),
+        (
+            Some(&b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabcde"[..]),
+            false,
+            false,
+            &b""[..],
+        ),
+        (
+            Some(&b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab"[..]),
+            false,
+            false,
+            &b"ab"[..],
+        ),
+        (Some(&b"HTTP/1.1 200 OK\r\n"[..]), false, false, &b""[..]),
+        (None, true, false, &b""[..]),
+        (
+            Some(&b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n"[..]),
+            true,
+            false,
+            &b""[..],
+        ),
+        (
+            Some(&b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata"[..]),
+            false,
+            true,
+            &b""[..],
+        ),
+    ] {
+        let listener = fetch_listener();
+        let url = format!(
+            "http://127.0.0.1:{}/binary",
+            listener.local_addr().unwrap().port()
+        );
+        let mut child = example.start(
+            &[
+                "--url",
+                &url,
+                "--max-body-bytes=4",
+                "--timeout-ns=2000000000",
+            ],
+            reject_stdout,
+        );
+        let mut socket = Some(fetch_peer(&listener, &child));
+        if let Some(response) = response {
+            socket
+                .as_mut()
+                .unwrap()
+                .write_all(response)
+                .expect("fault response");
+        }
+        if !keep_open {
+            drop(socket.take());
+        }
+        assert!(!child.wait().success(), "response {response:?}");
+        assert!(
+            !std::fs::read(example.stage.path().join("stderr"))
+                .unwrap()
+                .is_empty()
+        );
+        if !reject_stdout {
+            assert_eq!(example.stdout(), expected, "response {response:?}");
+        }
+    }
+}
+
 fn spawn_response(response: Vec<u8>) -> (u16, std::thread::JoinHandle<Vec<u8>>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stream fixture");
     let port = listener.local_addr().unwrap().port();
