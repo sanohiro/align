@@ -24,7 +24,9 @@ compiler items have lower priority; K1 retains the explicit deferral above.
 Plan51's process assessment selected the plan92 reap-scratch improvement without
 a new process API or supervisor. The filesystem assessment in plan93 supplies a
 bounded byte-name tree summary example through existing std.fs; no new traversal
-API is needed. Continue with demonstrated CLI composition gaps. Real voice/media engine integration and
+API is needed. Plan94 removes the extra component-offset allocation from its
+retained-path operations while preserving admission and cleanup; measured walk
+latency remains within baseline spread. Continue with demonstrated CLI composition gaps. Real voice/media engine integration and
 GPU qualification belong to their consumers, which request demonstrated Align
 gaps; they are not the next provider implementation queue.
 

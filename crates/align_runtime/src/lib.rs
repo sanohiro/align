@@ -9026,22 +9026,25 @@ unsafe fn abi_exclusive_path(ptr: *const u8, len: i64) -> Result<std::ffi::CStri
 }
 
 /// One validated, private, NUL-delimited path copy for the retained-root filesystem boundary.
-/// `components` contains byte offsets into `bytes`; after complete grammar validation every `/`
-/// separator in the private copy is replaced by NUL, so each offset is directly usable by
-/// `fstatat`/`openat`. Caller storage is never modified.
+/// After complete grammar validation every `/` separator in the private copy is replaced by NUL.
+/// Components borrow those terminated pieces directly; no offset table is allocated.
+/// Caller storage is never modified.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct BeneathPath {
     bytes: Vec<u8>,
-    components: Vec<usize>,
+    component_start: usize,
     absolute: bool,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl BeneathPath {
-    fn component_ptr(&self, index: usize) -> *const libc::c_char {
-        // Every recorded offset is inside `bytes`, and grammar validation plus the trailing NUL
-        // guarantees a terminator before the allocation ends.
-        unsafe { self.bytes.as_ptr().add(self.components[index]).cast() }
+    fn components(&self) -> impl DoubleEndedIterator<Item = *const libc::c_char> + '_ {
+        // The parser proves start <= the trailing NUL's index. Inclusive splitting preserves
+        // each piece's terminator; the special roots contain only that terminator in this suffix.
+        self.bytes[self.component_start..]
+            .split_inclusive(|byte| *byte == 0)
+            .filter(|component| component.len() > 1)
+            .map(|component| component.as_ptr().cast())
     }
 }
 
@@ -9077,14 +9080,14 @@ unsafe fn abi_beneath_path_impl(ptr: *const u8, len: i64, root: bool, utf8: bool
     if root && source == b"." {
         return Ok(BeneathPath {
             bytes,
-            components: Vec::new(),
+            component_start: n,
             absolute: false,
         });
     }
     if root && source == b"/" {
         return Ok(BeneathPath {
             bytes,
-            components: Vec::new(),
+            component_start: n,
             absolute: true,
         });
     }
@@ -9093,8 +9096,8 @@ unsafe fn abi_beneath_path_impl(ptr: *const u8, len: i64, root: bool, utf8: bool
     if (!root && source[0] == b'/') || source[n - 1] == b'/' {
         return Err(AL_INVALID);
     }
-    let mut start = usize::from(absolute);
-    let mut components = Vec::new();
+    let component_start = usize::from(absolute);
+    let mut start = component_start;
     while start < n {
         let end = source[start..]
             .iter()
@@ -9104,13 +9107,12 @@ unsafe fn abi_beneath_path_impl(ptr: *const u8, len: i64, root: bool, utf8: bool
         if component.is_empty() || component == b"." || component == b".." {
             return Err(AL_INVALID);
         }
-        components.push(start);
         if end == n {
             break;
         }
         start = end + 1;
     }
-    if components.is_empty() {
+    if component_start >= n {
         return Err(AL_INVALID);
     }
     for byte in &mut bytes[..n] {
@@ -9120,7 +9122,7 @@ unsafe fn abi_beneath_path_impl(ptr: *const u8, len: i64, root: bool, utf8: bool
     }
     Ok(BeneathPath {
         bytes,
-        components,
+        component_start,
         absolute,
     })
 }
@@ -9446,13 +9448,14 @@ unsafe fn native_open_beneath(
     let relative = unsafe { abi_beneath_path(relative_ptr, relative_len, false) }?;
 
     let mut parent = beneath_open_start(root.absolute)?;
-    for index in 0..root.components.len() {
-        parent = beneath_open_directory(parent.0, root.component_ptr(index))?;
+    for component in root.components() {
+        parent = beneath_open_directory(parent.0, component)?;
     }
-    for index in 0..relative.components.len() - 1 {
-        parent = beneath_open_directory(parent.0, relative.component_ptr(index))?;
+    let mut components = relative.components();
+    let final_name = components.next_back().ok_or(AL_INVALID)?;
+    for component in components {
+        parent = beneath_open_directory(parent.0, component)?;
     }
-    let final_name = relative.component_ptr(relative.components.len() - 1);
     match operation {
         BeneathOperation::OpenRegular => beneath_open_regular(parent.0, final_name, false),
         BeneathOperation::OpenRegularSingleLink => {
@@ -9641,8 +9644,8 @@ fn create_private_temp_dir_with(
         return Err(AL_INVALID);
     }
     let mut root_fd = beneath_open_start(true)?;
-    for index in 0..root.components.len() {
-        root_fd = beneath_open_directory(root_fd.0, root.component_ptr(index))?;
+    for component in root.components() {
+        root_fd = beneath_open_directory(root_fd.0, component)?;
     }
 
     let separator = usize::from(root_bytes != b"/");
@@ -9708,14 +9711,15 @@ fn remove_post_observation_error(error: &std::io::Error) -> i32 {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 unsafe fn native_remove_empty_dir(path_ptr: *const u8, path_len: i64) -> Result<(), i32> {
     let path = unsafe { abi_beneath_path(path_ptr, path_len, true) }?;
-    if !path.absolute || path.components.is_empty() {
+    let mut components = path.components();
+    let name = components.next_back().ok_or(AL_INVALID)?;
+    if !path.absolute {
         return Err(AL_INVALID);
     }
     let mut parent = beneath_open_start(true)?;
-    for index in 0..path.components.len() - 1 {
-        parent = beneath_open_directory(parent.0, path.component_ptr(index))?;
+    for component in components {
+        parent = beneath_open_directory(parent.0, component)?;
     }
-    let name = path.component_ptr(path.components.len() - 1);
     #[cfg(test)]
     if beneath_test_fail(BeneathTestFailpoint::FinalObserve) {
         return Err(AL_CODE + libc::EIO);
@@ -37801,6 +37805,66 @@ mod tests {
         let _ = std::fs::remove_file(&rename_destination);
         for source in rename_sources {
             let _ = std::fs::remove_file(source);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn fs_beneath_component_storage() {
+        for (source, root, utf8, absolute, expected) in [
+            (b".".as_slice(), true, true, false, Vec::<&[u8]>::new()),
+            (b"/".as_slice(), true, true, true, vec![]),
+            (b"artifact.wav".as_slice(), false, false, false, vec![b"artifact.wav".as_slice()]),
+            (b"a/b/c".as_slice(), false, true, false, vec![b"a".as_slice(), b"b", b"c"]),
+            (b"/a/b/c".as_slice(), true, true, true, vec![b"a".as_slice(), b"b", b"c"]),
+            (b"raw-\xff/next".as_slice(), false, false, false, vec![b"raw-\xff".as_slice(), b"next"]),
+        ] {
+            let before = source.to_vec();
+            #[cfg(feature = "alloc-count")]
+            let allocations_before = global_alloc_count();
+            let path = unsafe { abi_beneath_path_impl(source.as_ptr(), i64::try_from(source.len()).unwrap(), root, utf8) }.expect("valid path");
+            #[cfg(feature = "alloc-count")]
+            assert_eq!(global_alloc_count() - allocations_before, 1, "only the private byte copy allocates");
+            assert_eq!(path.absolute, absolute);
+            #[cfg(feature = "alloc-count")]
+            {
+                let allocations_before_iteration = global_alloc_count();
+                assert_eq!(path.components().count(), expected.len());
+                assert_eq!(global_alloc_count(), allocations_before_iteration, "component iteration allocates nothing");
+            }
+            let pointers: Vec<_> = path.components().collect();
+            let names: Vec<_> = pointers.iter().map(|&pointer| {
+                assert!(pointer.addr() >= path.bytes.as_ptr().addr());
+                assert!(pointer.addr() < path.bytes.as_ptr().addr() + path.bytes.len());
+                // SAFETY: the validated private component lies inside the live terminated copy.
+                unsafe { std::ffi::CStr::from_ptr(pointer) }.to_bytes()
+            }).collect();
+            assert_eq!(names, expected);
+            let mut components = path.components();
+            let mut front = 0;
+            let mut back = expected.len();
+            while front < back {
+                let pointer = if front % 2 == 0 {
+                    let pointer = components.next().expect("front component");
+                    assert_eq!(unsafe { std::ffi::CStr::from_ptr(pointer) }.to_bytes(), expected[front]);
+                    front += 1;
+                    pointer
+                } else {
+                    back -= 1;
+                    let pointer = components.next_back().expect("back component");
+                    assert_eq!(unsafe { std::ffi::CStr::from_ptr(pointer) }.to_bytes(), expected[back]);
+                    pointer
+                };
+                assert!(pointers.contains(&pointer));
+            }
+            assert!(components.next().is_none() && components.next_back().is_none());
+            assert_eq!(source, before);
+            if std::env::var_os("ALIGN_PATH_STORAGE_MEASURE").is_some() {
+                println!("path_components={} path_bytes={} offset_bytes={} shell_bytes={}", expected.len(), path.bytes.capacity(), 0, core::mem::size_of::<BeneathPath>());
+            }
+        }
+        for source in [b"".as_slice(), b"/", b"a/", b"a//b", b".", b"..", b"a/../b", b"a/./b", b"a\0b", b"\xff"] {
+            assert!(matches!(unsafe { abi_beneath_path_impl(source.as_ptr(), i64::try_from(source.len()).unwrap(), false, true) }, Err(AL_INVALID)));
         }
     }
 

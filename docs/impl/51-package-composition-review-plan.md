@@ -6,7 +6,9 @@ capabilities through PR and merge. [Plan 92](92-process-composition-and-reap-sto
 records the process disposition and bounded reap-scratch improvement.
 [Plan 93](93-retained-tree-composition.md) records the existing filesystem
 composition and bounded tree summary example. This assessment selects no new
-process/traversal API, exec, tree or CLI package.
+process/traversal API, exec, tree or CLI package. [Plan 94](94-retained-path-component-storage.md)
+removes the repeated native path-offset allocation exposed by that walk without
+changing the retained filesystem contract.
 
 ## Direction
 
