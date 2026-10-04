@@ -43,6 +43,36 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 
 HTTP status is data: a 404 is a successful HTTP response, not an `Err`. Transport, TLS, and malformed-message failures are errors. `cl.get_many(urls, degree)` performs bounded blocking-I/O overlap while preserving input order. Server primitives are deliberately below framework level: `http.serve`, `accept`, request views, `http.response`, and `respond`. For SSE or another streaming body, `respond_stream` yields an `http_stream` while the request context stays readable (borrowed, spent); call `send` for each chunk and `finish` for the sole clean terminator — or, before the first `send`, `reject(rb)` to answer with a normal error response instead.
 
+### Receive binary bodies without retaining the whole response
+
+The runnable [http_fetch example](../../examples/http_fetch.align) composes
+`std.cli`, `std.http` and `std.io`. Build it from the repository root:
+
+```bash
+./target/debug/alignc build examples/http_fetch.align
+./http_fetch --url http://127.0.0.1:8082/v1/jobs/EPOCH/ID/artifacts/mux > scene.mp4
+```
+
+Replace the URL with your endpoint. The [multimodal reference](27-multimodal-reference.md)
+supplies that artifact route after a job completes. Only a zero exit status means
+the body was complete and every stdout write succeeded; an error may leave a
+partial file. Redirecting stdout does not publish a file atomically.
+
+The example accepts only final status 200 and preserves all body bytes. It uses
+one 64 KiB buffer: `stream.read(out)` overwrites that buffer, and
+`io.stdout.write(out.bytes())` consumes its borrowed byte view before the next
+read. A zero count means completion. Chunk framing is removed by the stream;
+the application performs no UTF-8 conversion or whole-body accumulation.
+
+`--max-body-bytes` defaults to 64 MiB and accepts 1..1073741824 decoded bytes.
+`--timeout-ns` defaults to 30 seconds and must be positive. Both limits are
+validated before network I/O. The HTTP timeout applies independently to each
+connect, send and transport receive; it does not bound DNS, stdout writes or
+the total download. A peer making progress can take longer than one timeout.
+Use `--help` separately to print usage. Empty URL, invalid limits and non-200
+status return `Error.Invalid`; exceeding the body cap is `Error.Code(-1)`. Transport,
+framing, timeout and output errors propagate through `?`.
+
 ## `std.process`
 
 ```align

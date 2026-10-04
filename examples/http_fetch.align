@@ -1,0 +1,40 @@
+module main
+
+import std.cli
+import std.http
+import std.io
+
+// Binary stdout may contain a prefix on failure; only success means complete output.
+pub fn main(args: array<str>) -> Result<(), Error> {
+  command := cli.command("http_fetch")
+  command.flag_str("url", "")
+  command.flag_i64("max-body-bytes", 67108864)
+  command.flag_i64("timeout-ns", 30000000000)
+  command.flag_bool("help")
+  parsed := command.parse(args)?
+  if parsed.get_bool("help") {
+    print(command.usage())
+    return Ok(())
+  }
+  url := parsed.get_str("url")
+  if url.len() == 0 { return Err(Error.Invalid) }
+  maximum := parsed.get_i64("max-body-bytes")
+  if maximum < 1 || maximum > 1073741824 { return Err(Error.Invalid) }
+  timeout := parsed.get_i64("timeout-ns")
+  if timeout < 1 { return Err(Error.Invalid) }
+
+  client := http.client()
+  client.timeout(timeout)
+  client.max_response_body_bytes(maximum)
+  request := http.request("GET", url)
+  stream := client.request_stream(request)?
+  if stream.status() != 200 { return Err(Error.Invalid) }
+
+  mut out := buffer(65536)
+  loop {
+    count := stream.read(out)?
+    if count == 0 { break }
+    io.stdout.write(out.bytes())?
+  }
+  return Ok(())
+}
