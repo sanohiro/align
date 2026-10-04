@@ -15,7 +15,15 @@ independent improvements from current `main`: completing, reviewing, or adopting
 the parked work is not a prerequisite. Keep its source and evidence archived
 outside the active worktree so they do not obstruct unrelated checks or pulls.
 
-## Next work (handoff updated 2026-10-02)
+## Next work (handoff updated 2026-10-04)
+
+[Plan 90](docs/impl/90-multimodal-library-foundation-plan.md) assesses voice/media
+workloads as ordinary Align library consumers. It proposes removing HTTP stream
+payload copies, explicit stream-write and complete-request budgets, then a bounded
+process/job/artifact reference composition. Model lifetimes use existing opaque
+resources and process owners; no new language concurrency model or tensor system
+is proposed. Linux/WSL2 is the GPU qualification target. This is design only;
+implementation and measurements are pending, independently of deferred K1.
 
 Request 38's direct bounded positional reads are implemented in plan 89:
 `f.pread_into(b, destination_offset, length, file_offset)` reads one bounded
