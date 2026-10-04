@@ -12214,7 +12214,7 @@ fn request11_expr_kind_inventory_tripwire() {
         // FloatScope, BytesView, SliceAsBytes, and HttpServerMaxRequestBodyBytes are explicit in
         // validation, source-shape, replay and ownership.
         variants,
-        349,
+        350,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
