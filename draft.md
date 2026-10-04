@@ -3344,7 +3344,7 @@ r.buffered()                -> reader   // upgrade a reader to carry a lookahead
 r.read_line(b: mut buffer)  -> Result<i64, Error>   // (buffered reader only) fills b with the next line
                                                      // BODY, terminator already stripped (b.len() = body
                                                      // length); returns bytes consumed incl. terminator,
-                                                     // 0 = EOF. b GROWS as needed (up to a 64 MiB line
+                                                     // 0 = EOF. b GROWS as needed (up to a 64 MiB body
                                                      // cap -> Error.Invalid).
 bytes.as_str()              -> Result<str, Error>   // validate UTF-8, yield a zero-copy str VIEW of the
                                                      // same bytes (region-bound); Error.Invalid on bad
@@ -3440,8 +3440,11 @@ transformation, so `json.decode` fails on line 1 if a BOM is present and strippi
 call), so `b.len()` is the body length and the return is the bytes consumed including the terminator (`0`
 = EOF, an empty line returns `1` with body length `0`, a final unterminated line returns its bare
 length). **Growth asymmetry:** unlike `r.read`, which caps at the buffer's capacity, `read_line`
-**grows** `b` as needed — a line has no caller-chosen bound — up to a 64 MiB line cap (`Error.Invalid`
-beyond it, so a terminator-free/binary input can't grow the buffer without bound). The canonical loop
+**grows** `b` as needed — a line has no caller-chosen bound — up to an inclusive 64 MiB stripped-body cap (`Error.Invalid`
+beyond it). Admission precedes each output append. One possible CR terminator is held without
+allocation across refills, so exact-cap CRLF lines are independent of refill boundaries. Existing
+larger reservations and allocator spare are retained; the cap bounds body length, not total
+reserved memory (plan 102). The canonical loop
 starts with `mut buf := buffer(4096)` and is `loop { n := r.read_line(buf)?; if n == 0 { break };
 line := buf.bytes().as_str()?; … }`. The output must be that bare `mut` local. **Warning:** the
 per-iteration line view (`buf.bytes()` / its `as_str`) must **not** be hoisted across iterations — the

@@ -1432,8 +1432,10 @@ backing-store guarantee. No directory sync is performed (plan 86).
 **Line reads** are explicit because they need lookahead: `r.buffered()` upgrades a reader (the read
 dual of the buffered writer), and `read_line` is a **buffered-reader-only** method. It fills `b`
 with the line body, exactly one `\r?\n` already stripped, and returns the bytes consumed including
-the terminator (0 = EOF). Unlike `read`, it **grows** `b` as needed, up to a 64 MiB line cap
-(`Error.Invalid` beyond it). The per-iteration line view (`buf.bytes()` / its `as_str()`) must not
+the terminator (0 = EOF). Unlike `read`, it **grows** `b` as needed, up to an inclusive 64 MiB stripped-body cap
+(`Error.Invalid` beyond it), checked before each output append. A possible CR terminator is held
+without allocation across refills, so exact-cap CRLF is independent of refill boundaries. Existing
+larger reservations and allocator spare are retained; this is a body-length bound (plan 102). The per-iteration line view (`buf.bytes()` / its `as_str()`) must not
 be hoisted across iterations — the next `read_line` overwrites `buf` — so `.clone()` a line you keep.
 
 **A v1 restriction:** an owned handle (`reader`/`writer`/`file`/`buffer`, and a buffered

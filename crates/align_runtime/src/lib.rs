@@ -10492,8 +10492,9 @@ pub unsafe extern "C" fn align_rt_io_reader_buffered(r: *mut Reader) -> *mut Rea
 /// the terminator, or `0` at EOF; `< 0` (`-(status)`) on error. An empty line returns `1` with body
 /// length `0`; a final unterminated line yields its body as-is and returns its bare length. Exactly
 /// one `\r?\n` is stripped (a lone `\r` is not a terminator; a BOM is never stripped). The buffer
-/// **grows** as needed — unlike `read`, a line has no caller-chosen bound — up to a 64 MiB line cap
-/// ([`READ_LINE_CAP`]) → `Error.Invalid`. One memcpy per line (from the lookahead into `b`); the
+/// **grows** as needed — unlike `read`, a line has no caller-chosen bound — up to a 64 MiB body cap
+/// ([`READ_LINE_CAP`]) → `Error.Invalid`, checked before each body append. A possible CR terminator
+/// is held without allocation across refills. One memcpy per admitted lookahead span; the
 /// refill `read`s retry `EINTR`; I/O errors are errno-mapped.
 ///
 /// Requires a buffered reader (sema-enforced); defensively upgrades one in place if reached
@@ -10506,9 +10507,31 @@ pub unsafe extern "C" fn align_rt_io_reader_read_line(r: *mut Reader, b: *mut Bu
     if r.is_null() || b.is_null() {
         return -(AL_INVALID as i64);
     }
-    let r = unsafe { &mut *r };
-    let b = unsafe { &mut *b };
-    // Defensive lookahead init (sema guarantees `buffered`, but never trust the caller).
+    read_line_with_cap(unsafe { &mut *r }, unsafe { &mut *b }, READ_LINE_CAP)
+}
+
+const _: unsafe extern "C" fn(*mut Reader, *mut Buffer) -> i64 = align_rt_io_reader_read_line;
+
+/// Admit the entire proven-body append before either copying or growing storage.
+fn append_line_body(b: &mut Buffer, pending_cr: bool, span: &[u8], cap: usize) -> bool {
+    let length = b.data.len().checked_add(usize::from(pending_cr))
+        .and_then(|length| length.checked_add(span.len()));
+    if length.is_none_or(|length| length > cap) {
+        return false;
+    }
+    b.data.with_mut(|data| {
+        if pending_cr { data.push(b'\r'); }
+        data.extend_from_slice(span);
+    });
+    true
+}
+
+/// Production and small-cap native owners share this loop. A trailing CR stays
+/// unresolved until LF, another body byte or EOF; it never grows output merely
+/// to be removed as a terminator. Ordinary refills preserve accumulated body.
+fn read_line_with_cap(r: &mut Reader, b: &mut Buffer, cap: usize) -> i64 {
+    debug_assert!(cap <= READ_LINE_CAP);
+    // Defensive lookahead init (sema guarantees `buffered`).
     if !r.buffered || r.buf.is_empty() {
         r.buffered = true;
         if r.buf.is_empty() {
@@ -10517,60 +10540,53 @@ pub unsafe extern "C" fn align_rt_io_reader_read_line(r: *mut Reader, b: *mut Bu
             r.filled = 0;
         }
     }
-    // `b` is the output sink: reset it to the line body we accumulate (one memcpy per refill span).
     b.data.with_mut(|data| data.clear());
     b.len = 0;
-    // Bytes consumed from the stream, INCLUDING the terminator — the return value.
     let mut consumed: i64 = 0;
+    let mut pending_cr = false;
     loop {
-        // Scan the lookahead for the `\n` terminator (rides `memchr`'s AVX2/NEON/scalar dispatch —
-        // never a byte-at-a-time loop, #310).
         let hay = &r.buf[r.start..r.filled];
         if let Some(rel) = memchr::memchr(b'\n', hay) {
-            // Line body is `buf[start..start+rel]` (everything before the `\n`).
-            b.data.with_mut(|data| data.extend_from_slice(&r.buf[r.start..r.start + rel]));
-            // Strip exactly one trailing `\r` (CRLF). Checking the *accumulated* output (not just
-            // this span) handles a `\r` that landed in a previous refill with the `\n` at a span
-            // boundary. A lone `\r` mid-body, or a `\r` not immediately before the `\n`, is kept.
-            if b.data.last() == Some(&b'\r') {
-                b.data.with_mut(|data| data.pop());
-            }
-            consumed += rel as i64 + 1; // body span + the `\n` (the stripped `\r`, if any, is inside `rel`)
+            let span = &hay[..rel];
+            let body = span.strip_suffix(b"\r").unwrap_or(span);
+            // An empty span makes the held CR part of CRLF. Otherwise it is
+            // ordinary body, even when this span itself ends in another CR.
+            let admitted = append_line_body(b, pending_cr && !span.is_empty(), body, cap);
+            consumed += rel as i64 + 1;
             r.start += rel + 1;
-            if b.data.len() > READ_LINE_CAP {
+            if !admitted {
                 b.data.with_mut(|data| data.clear());
-                b.len = 0;
                 return -(AL_INVALID as i64);
             }
             b.len = b.data.len();
             b.cap = b.cap.max(b.len);
             return consumed;
         }
-        // No `\n` in the lookahead: take all of it into the body, then refill.
-        b.data.with_mut(|data| data.extend_from_slice(hay));
-        consumed += hay.len() as i64;
-        r.start = r.filled; // fully consumed
-        if b.data.len() > READ_LINE_CAP {
-            b.data.with_mut(|data| data.clear());
-            b.len = 0;
-            return -(AL_INVALID as i64);
+        if !hay.is_empty() {
+            let body = hay.strip_suffix(b"\r").unwrap_or(hay);
+            let admitted = append_line_body(b, pending_cr, body, cap);
+            pending_cr = hay.last() == Some(&b'\r');
+            consumed += hay.len() as i64;
+            r.start = r.filled;
+            if !admitted {
+                b.data.with_mut(|data| data.clear());
+                return -(AL_INVALID as i64);
+            }
         }
         match r.refill() {
             Ok(0) => {
-                // EOF. No bytes at all → true end (return 0). Otherwise a final unterminated line:
-                // its body as-is, returning the bare body length (no terminator was consumed).
-                if consumed == 0 {
-                    b.len = 0;
-                    return 0;
+                // With no LF, a held CR is ordinary body, not a terminator.
+                if pending_cr && !append_line_body(b, true, &[], cap) {
+                    b.data.with_mut(|data| data.clear());
+                    return -(AL_INVALID as i64);
                 }
                 b.len = b.data.len();
-                b.cap = b.cap.max(b.len);
+                if consumed != 0 { b.cap = b.cap.max(b.len); }
                 return consumed;
             }
-            Ok(_) => {} // lookahead refilled (`start = 0`, `filled = n`); loop and rescan
+            Ok(_) => {}
             Err(status) => {
                 b.data.with_mut(|data| data.clear());
-                b.len = 0;
                 return -(status as i64);
             }
         }
@@ -29597,15 +29613,176 @@ mod tests {
     /// `Error.Invalid` (`-(AL_INVALID)`), bounding the caller's buffer growth. (One heavy test.)
     #[test]
     fn read_line_over_cap_is_invalid() {
+        use std::os::fd::IntoRawFd;
+        let root = FileFixtureDir::new("line-cap");
         // Just over the cap, no newline anywhere.
         let content = vec![b'z'; READ_LINE_CAP + 4096];
-        let (r, path) = buffered_reader_over("cap", &content);
-        let b = align_rt_buffer_new(16);
-        let n = unsafe { align_rt_io_reader_read_line(r, b) };
+        let path = root.0.join("cap");
+        std::fs::write(&path, &content).unwrap();
+        let r = ReaderTestHandle(Box::into_raw(Box::new(Reader::unbuffered(std::fs::File::open(&path).unwrap().into_raw_fd(), true))));
+        unsafe { align_rt_io_reader_buffered(r.0); }
+        let b = BufferTestHandle(align_rt_buffer_new(16));
+        let n = unsafe { align_rt_io_reader_read_line(r.0, b.0) };
+        let backing_capacity = unsafe { (*b.0).data.with_mut(|data| data.capacity()) };
+        drop(b);
+        drop(r);
         assert_eq!(n, -(AL_INVALID as i64), "a line past the 64 MiB cap → Error.Invalid");
-        unsafe { align_rt_buffer_free(b) };
-        unsafe { align_rt_io_reader_free(r) };
-        let _ = std::fs::remove_file(&path);
+        assert!(backing_capacity <= READ_LINE_CAP,
+            "reject before growing for an over-cap span: backing capacity {backing_capacity}");
+        println!("rejected line backing bytes: {backing_capacity}");
+
+        // The public constant also admits an exact-cap body with CRLF. Its
+        // terminator must not trigger another allocation merely to be popped.
+        let mut exact = vec![b'z'; READ_LINE_CAP];
+        exact.extend_from_slice(b"\r\n");
+        let path = root.0.join("cap-crlf");
+        std::fs::write(&path, &exact).unwrap();
+        let r = ReaderTestHandle(Box::into_raw(Box::new(Reader::unbuffered(std::fs::File::open(&path).unwrap().into_raw_fd(), true))));
+        unsafe { align_rt_io_reader_buffered(r.0); }
+        let b = BufferTestHandle(align_rt_buffer_new(16));
+        let n = unsafe { align_rt_io_reader_read_line(r.0, b.0) };
+        let body_length = unsafe { &*b.0 }.data.len();
+        let body_matches = unsafe { &*b.0 }.data.iter().all(|byte| *byte == b'z');
+        let backing_capacity = unsafe { &*b.0 }.data.capacity();
+        let published_capacity = unsafe { align_rt_buffer_capacity(b.0) };
+        drop(b);
+        drop(r);
+        assert_eq!(n, READ_LINE_CAP as i64 + 2);
+        assert_eq!(body_length, READ_LINE_CAP);
+        assert!(body_matches);
+        assert_eq!(published_capacity, READ_LINE_CAP as i64);
+        assert!(backing_capacity <= READ_LINE_CAP, "CRLF is not appended before stripping");
+        println!("exact-cap CRLF backing bytes: {backing_capacity}");
+    }
+
+    /// The independent oracle uses complete byte records, never the assembly
+    /// loop's pending-CR state. Every prefix split forces that exact boundary.
+    #[test]
+    fn read_line_body_cap_split_oracle() {
+        use std::os::fd::IntoRawFd;
+        let root = FileFixtureDir::new("line-splits");
+        let path = root.0.join("input");
+        let cases: &[&[u8]] = &[
+            b"", b"\nT", b"\r\nT", b"a\nT", b"ab\r\nT", b"abc\r\nT",
+            b"abcd\nT", b"ab\r", b"abc\r", b"a\r\r\nT", b"ab\0\nT", b"a\rX\nT",
+        ];
+        for &input in cases {
+            let newline = input.iter().position(|byte| *byte == b'\n');
+            let consumed = newline.map_or(input.len(), |index| index + 1);
+            let mut body = &input[..newline.unwrap_or(input.len())];
+            if newline.is_some() && body.last() == Some(&b'\r') { body = &body[..body.len() - 1]; }
+            for cap in 0..=4 {
+                for split in 0..=input.len() {
+                    std::fs::write(&path, &input[split..]).unwrap();
+                    let r = ReaderTestHandle(Box::into_raw(Box::new(Reader::unbuffered(std::fs::File::open(&path).unwrap().into_raw_fd(), true))));
+                    unsafe { align_rt_io_reader_buffered(r.0); }
+                    let b = BufferTestHandle(align_rt_buffer_new(32));
+                    let reader = unsafe { &mut *r.0 };
+                    reader.buf.clear();
+                    reader.buf.extend_from_slice(&input[..split]);
+                    reader.start = 0;
+                    reader.filled = split;
+                    let buffer = unsafe { &mut *b.0 };
+                    let status = read_line_with_cap(reader, buffer, cap);
+                    assert_eq!(buffer.cap, 32, "retains existing larger window");
+                    assert_eq!(buffer.data.writable_ptr().cast_const(), buffer.data.as_ptr());
+                    if body.len() > cap {
+                        assert_eq!(status, -(AL_INVALID as i64), "{input:?}, cap {cap}, split {split}");
+                        assert_eq!(buffer.len, 0);
+                        assert!(buffer.data.is_empty());
+                        continue;
+                    }
+                    assert_eq!(status, consumed as i64, "{input:?}, cap {cap}, split {split}");
+                    assert_eq!(buffer.len, body.len());
+                    assert_eq!(buffer.data.as_slice(), body);
+                    // Both retained lookahead and fd-fresh suffix are still observable.
+                    let mut remaining = Vec::new();
+                    loop {
+                        let count = unsafe { align_rt_io_reader_read(r.0, b.0) };
+                        assert!(count >= 0);
+                        if count == 0 { break; }
+                        remaining.extend_from_slice(unsafe { &*b.0 }.data.as_slice());
+                    }
+                    assert_eq!(remaining, &input[consumed..]);
+                }
+            }
+        }
+    }
+
+    /// Oversized reservations hide reallocations: sentinels discriminate a
+    /// rejected copy from append-then-clear, using fresh current provenance.
+    #[test]
+    fn read_line_body_cap_rejected_spans_leave_backing_untouched() {
+        for input in [b"abcde".as_slice(), b"abcd\nTAIL".as_slice()] {
+            let mut reader = Reader { fd: -1, owns_fd: false, buffered: true,
+                buf: input.to_vec(), start: 0, filled: input.len() };
+            let mut buffer = Buffer { data: vec![0xa5; 32].into(), cap: 32, len: 32 };
+            let before = buffer.data.as_ptr();
+            assert_eq!(read_line_with_cap(&mut reader, &mut buffer, 3), -(AL_INVALID as i64));
+            assert_eq!(buffer.len, 0);
+            assert!(buffer.data.is_empty());
+            assert_eq!(buffer.cap, 32);
+            assert_eq!(buffer.data.as_ptr(), before);
+            // All 32 bytes were initialized before the call. clear() drops u8
+            // values without invalidating backing; obtain its current pointer.
+            let backing = unsafe { core::slice::from_raw_parts(buffer.data.as_ptr(), 32) };
+            assert!(backing.iter().all(|byte| *byte == 0xa5), "rejected span was copied");
+            let consumed = input.iter().position(|byte| *byte == b'\n').map_or(input.len(), |index| index + 1);
+            assert_eq!(reader.start, consumed);
+            assert_eq!(&reader.buf[reader.start..reader.filled], &input[consumed..]);
+        }
+    }
+
+    #[test]
+    fn read_line_body_cap_pending_cr_error_order_and_capacity() {
+        use std::os::fd::IntoRawFd;
+        for (input, expected) in [
+            (b"abcde".as_slice(), -(AL_INVALID as i64)),
+            (b"abc\r".as_slice(), -(io_error_to_status(&std::io::Error::from_raw_os_error(libc::EBADF)) as i64)),
+        ] {
+            let mut reader = Reader { fd: -1, owns_fd: false, buffered: true,
+                buf: input.to_vec(), start: 0, filled: input.len() };
+            let mut buffer = Buffer { data: Vec::new().into(), cap: 0, len: 0 };
+            assert_eq!(read_line_with_cap(&mut reader, &mut buffer, 3), expected);
+            assert_eq!(buffer.len, 0);
+            assert!(buffer.data.is_empty());
+            assert_eq!(buffer.cap, 0, "failure never publishes a grown window");
+            assert_eq!(reader.start, reader.filled);
+        }
+        // Successful growth publishes body capacity; a subsequent EOF retains it.
+        let root = FileFixtureDir::new("line-growth");
+        let path = root.0.join("input");
+        std::fs::write(&path, b"abc\r\n").unwrap();
+        let r = ReaderTestHandle(Box::into_raw(Box::new(Reader::unbuffered(std::fs::File::open(&path).unwrap().into_raw_fd(), true))));
+        unsafe { align_rt_io_reader_buffered(r.0); }
+        let b = BufferTestHandle(align_rt_buffer_new(0));
+        assert_eq!(read_line_with_cap(unsafe { &mut *r.0 }, unsafe { &mut *b.0 }, 3), 5);
+        assert_eq!(unsafe { &*b.0 }.data.as_slice(), b"abc");
+        assert_eq!(unsafe { align_rt_buffer_capacity(b.0) }, 3);
+        assert_eq!(unsafe { align_rt_io_reader_read_line(r.0, b.0) }, 0);
+        assert_eq!(unsafe { align_rt_buffer_capacity(b.0) }, 3);
+        assert_eq!(unsafe { align_rt_io_reader_read_line(core::ptr::null_mut(), core::ptr::null_mut()) }, -(AL_INVALID as i64));
+    }
+
+    #[cfg(feature = "alloc-count")]
+    #[test]
+    fn read_line_body_cap_rejected_allocation_parity() {
+        let before = global_alloc_count();
+        let positive = Box::new(9_u64);
+        std::hint::black_box(&positive);
+        assert!(global_alloc_count() > before, "counter observes actual Rust allocations");
+        for input in [b"abcde".as_slice(), b"abcd\nTAIL".as_slice()] {
+            for reserved in [3, 32] {
+                let mut reader = Reader { fd: -1, owns_fd: false, buffered: true,
+                    buf: input.to_vec(), start: 0, filled: input.len() };
+                let mut buffer = Buffer { data: Vec::with_capacity(reserved).into(), cap: reserved, len: 0 };
+                let before = global_alloc_count();
+                let status = read_line_with_cap(&mut reader, &mut buffer, 3);
+                let allocations = global_alloc_count() - before;
+                assert_eq!(status, -(AL_INVALID as i64));
+                assert_eq!(allocations, 0, "known over-cap append never grows output");
+            }
+        }
     }
 
     /// `bytes.as_str()`: valid UTF-8 round-trips the same view; invalid UTF-8 is `AL_INVALID`; the
