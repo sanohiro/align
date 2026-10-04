@@ -1,6 +1,7 @@
 # Multimodal workloads through ordinary Align libraries
 
-Status: proposed implementation plan. No implementation or new shipped API is claimed.
+Status: H1 implemented; H2/H3 and the reference composition remain pending.
+H1 adds no source API. Concrete engine packages still require consumer evidence.
 Baseline: `5b76f1b3ecf1ec006d4df86fb99ac4f9df74a942` (2026-10-04).
 
 ## Authoritative public-contract ledger
@@ -56,7 +57,7 @@ K1 remains deferred. These changes read call-scoped bytes and mutate existing
 opaque I/O owners; they neither depend on nor claim to repair cross-call view
 authority. A newly reproduced compiler defect gets its own bounded request.
 
-## Audit of the shipped baseline
+## Audit at the plan baseline
 
 | Evidence | Consequence |
 | --- | --- |
@@ -432,6 +433,26 @@ and malformed byte vectors under the existing codec contract before publication.
 Neither a new persisted format nor source-callable native symbol ships in this
 design-only change.
 
+### H1 implementation closure
+
+`http_stream_bytes` validates the native extent before slice formation and head
+transfer. `http_stream_send_parts_with` coalesces only fixed framing bytes on
+stack and retains the borrowed caller payload in at most four vectors;
+`http_stream_write_parts` advances exact accepted prefixes. Linux uses sendmsg
+with MSG_NOSIGNAL; macOS blocking output uses writev on the accepted socket with
+checked SO_NOSIGPIPE. There is one geometry and poison policy for text and binary.
+
+`crates/align_runtime/src/http_stream_tests.rs` owns every partial prefix,
+source-pointer and allocation parity, zero/error/impossible-count refusal,
+pre-commit extent rejection, arbitrary native octets and caller buffer reuse.
+Existing runtime lazy-head/finish/reject tests and the driver `m12_http_stream`
+and `apps_web_stream` targets own the unchanged language/framework path.
+No IR shape, ownership summary, native symbol or interface format changes.
+The H2/H3/C1 rows are explicitly deferred to their complete capabilities.
+The writer, discriminating native owners and standalone performance/resource
+harness are one proof boundary: splitting the harness would publish the copy
+claim before its token regression and allocation controls exist.
+
 ## Performance acceptance
 
 H1 must preserve the existing text/SSE route and use the same implementation
@@ -456,6 +477,23 @@ Provider mock fixtures protect wire bytes and transport costs. Actual align-llm
 token latency and voice first-audio latency need later consumer-side measurements;
 this task neither runs nor modifies those repositories' code.
 
+H1 measured on native Apple Silicon with Rust 1.96.1, the default release profile
+and identical locked dependencies against the plan baseline. The first candidate
+regressed some token rows; fixed framing coalescing and the macOS blocking writev
+operation closed that result. The final idle-host run used ten balanced baseline
+repeatability pairs and ten balanced baseline/candidate pairs. No token metric
+regressed outside its premeasured envelope. Token p50 ratios ranged 0.945–1.037;
+256 KiB p50 ratios ranged 0.692–0.816, with wire throughput ratios 1.012–1.049.
+These are local transport measurements, not model inference or first-audio claims.
+Separate counting binaries observed one allocation per nonempty baseline send
+and zero candidate send allocations, including empty SSE events. Pointer owners
+prove that caller payloads are not copied; scripted owners count actual native
+attempts and every partial prefix. Real kernel syscall counts require OS tracing.
+Raw CSVs and binary hashes are retained under the session's
+`align-http-stream-timing-20261004-idle` evidence directory; the resource CSVs
+remain in `align-http-stream-timing-20261004-v2`. `bench/http_stream/compare.py`
+can summarize completed runs without repeating their measurements.
+
 ## Delivery and file map
 
 | Capability | Concrete files expected to change | Useful completion boundary |
@@ -473,11 +511,10 @@ boundary before coding; do not split IR producers from consumers to meet a line
 target. Run only the applicable owners and normal repository preflight. No DB
 service gate or GPU benchmark is required for an unrelated HTTP change.
 
-This design change updates no shipped language behavior. Consequently the
-current specification, library English/Japanese mirrors and ABI inventory remain
-the shipped truth. The ledger explicitly lists the documents each future
-implementation must change atomically; it must not present these APIs as already
-available. The external align-llm register receives only a design/status answer,
+H1 preserves source behavior and updates the HTTP and pkg.web English/Japanese
+writer resource records. The language specification and ABI inventory retain
+their existing operations. H2/H3 remain proposals; the ledger lists their full
+implementation-time documentation set. The external align-llm register receives an answer,
 left uncommitted; consumer code, fixtures, branches and adoption stay untouched.
 
 ## External evidence and limits
@@ -501,8 +538,9 @@ compiler/interface closure and implementation-time documentation set. No new
 canonical wire/cache format or executable Align example is introduced here;
 table signatures describe proposed operations, not presently compilable calls.
 The reference composition deliberately leaves application schemas and package
-APIs to their concrete consumers. Implementation, performance measurements and
-real GPU qualification remain pending.
+APIs to their concrete consumers. H1 implementation and local transport/resource
+measurements are recorded above; the remaining capabilities and real GPU
+qualification are pending.
 
 One independent inspection-only design review completed on 2026-10-04. Its two
 P2 findings and one P3 clarification are closed in this document: every control

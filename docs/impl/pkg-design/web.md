@@ -447,7 +447,8 @@ changed shape with concurrency, exactly as this note predicted.
 5. **pkg.web wiring — DONE (2026-07-21).** `Handler` (`Respond`/`Stream`) + `Route.stream_type` in
    `types.align`; `web.stream` / `web.sse` constructors; `serve`'s stream arm exactly as the
    pseudocode above; and `s.send_event(data)` as the std.http method (WHATWG `data: {data}\n\n`,
-   ONE write sharing the lazy head's buffer — head + framing + event in a single `send`; an empty
+   one vectored write borrowing the payload — head + framing + event in a single native attempt
+   when writable, without payload copies or send-framing allocation; an empty
    event is a real frame, unlike `send("")`'s no-op; runtime `align_rt_http_stream_send_event` over
    the shared `http_stream_send_parts`). En route, fixed a **MoveCheck false positive**: a
    match-arm binding consumed inside a `loop` body poisoned the back-edge fixpoint (arm bindings

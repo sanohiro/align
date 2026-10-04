@@ -18,12 +18,16 @@ outside the active worktree so they do not obstruct unrelated checks or pulls.
 ## Next work (handoff updated 2026-10-04)
 
 [Plan 90](docs/impl/90-multimodal-library-foundation-plan.md) assesses voice/media
-workloads as ordinary Align library consumers. It proposes removing HTTP stream
-payload copies, explicit stream-write and complete-request budgets, then a bounded
-process/job/artifact reference composition. Model lifetimes use existing opaque
-resources and process owners; no new language concurrency model or tensor system
-is proposed. Linux/WSL2 is the GPU qualification target. This is design only;
-implementation and measurements are pending, independently of deferred K1.
+workloads as ordinary Align library consumers. H1 implements one borrowed-byte
+vectored writer for existing HTTP binary and SSE sends, with no payload copy or
+send-time framing allocation. Native partial-write/pointer/allocation owners and
+the existing language/framework stream owners cover its unchanged behavior. Local
+paired token measurements stay within premeasured baseline repeatability. Explicit
+stream-write and complete-request budgets (H2/H3), then the bounded process/job/
+artifact reference composition (C1), remain next. Model lifetimes use existing
+opaque resources and process owners; no new language concurrency model or tensor
+system is proposed. Linux/WSL2 is the GPU qualification target. This work proceeds
+independently of deferred K1.
 
 Request 38's direct bounded positional reads are implemented in plan 89:
 `f.pread_into(b, destination_offset, length, file_offset)` reads one bounded
