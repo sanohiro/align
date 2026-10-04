@@ -687,12 +687,26 @@ fn signal_child(pid: i32, verified_group: bool, signal: i32) -> SignalDispatch {
     }
 }
 
-fn target_signal_error(attempt: TargetSignals, terminal: bool) -> Option<io::Error> {
+fn target_signal_error(
+    attempt: TargetSignals,
+    terminal: bool,
+    group_empty: bool,
+) -> Option<io::Error> {
     let direct_sent = matches!(attempt.direct, TargetSignal::Sent);
     let group_error = match attempt.group {
         TargetSignal::Sent => None,
         TargetSignal::Missing if terminal || direct_sent => None,
         TargetSignal::Missing => Some(io::Error::from_raw_os_error(libc::ESRCH)),
+        // Darwin reports EPERM for a group containing only its unreaped zombie leader.
+        // The same-child terminal observation and later reap/group-absence proof are both needed.
+        TargetSignal::Failed(error)
+            if cfg!(target_os = "macos")
+                && terminal
+                && group_empty
+                && error.raw_os_error() == Some(libc::EPERM) =>
+        {
+            None
+        }
         TargetSignal::Failed(error) => Some(error),
     };
     let direct_error = match attempt.direct {
@@ -704,9 +718,14 @@ fn target_signal_error(attempt: TargetSignals, terminal: bool) -> Option<io::Err
     group_error.or(direct_error)
 }
 
-fn signal_dispatch_error(attempt: SignalDispatch, terminal: bool) -> Option<io::Error> {
+
+fn signal_dispatch_error(
+    attempt: SignalDispatch,
+    terminal: bool,
+    group_empty: bool,
+) -> Option<io::Error> {
     match attempt {
-        SignalDispatch::Verified(attempt) => target_signal_error(attempt, terminal),
+        SignalDispatch::Verified(attempt) => target_signal_error(attempt, terminal, group_empty),
         SignalDispatch::Direct(TargetSignal::Sent) => None,
         SignalDispatch::Direct(TargetSignal::Missing) if terminal => None,
         SignalDispatch::Direct(TargetSignal::Missing) => {
@@ -715,6 +734,7 @@ fn signal_dispatch_error(attempt: SignalDispatch, terminal: bool) -> Option<io::
         SignalDispatch::Direct(TargetSignal::Failed(error)) => Some(error),
     }
 }
+
 
 fn kill_direct(pid: i32, deadline: Instant) -> io::Result<()> {
     match send_signal(pid, libc::SIGKILL) {
@@ -837,7 +857,7 @@ impl ChildGuard {
         if self.verified_group {
             let attempt = signal_verified_targets(self.pid, libc::SIGKILL);
             let terminal = child_is_terminal_until(self.pid, deadline)?;
-            target_signal_error(attempt, terminal).map_or(Ok(()), Err)
+            target_signal_error(attempt, terminal, false).map_or(Ok(()), Err)
         } else {
             kill_direct(self.pid, deadline)
         }
@@ -1168,11 +1188,15 @@ fn spawn_child(
 
 fn drain_control(
     control: &UnixDatagram,
+    control_eof: &mut bool,
     ordinal: u32,
     acknowledged: &mut bool,
     completion: &mut Option<Completion>,
     record_detail: &mut Option<&'static str>,
 ) -> io::Result<()> {
+    if *control_eof {
+        return Ok(());
+    }
     loop {
         let mut record = [0u8; 21];
         match control.recv(&mut record) {
@@ -1205,6 +1229,13 @@ fn drain_control(
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            #[cfg(target_os = "macos")]
+            Err(error) if error.raw_os_error() == Some(libc::ECONNRESET) => {
+                // Darwin drains queued Unix datagrams before reporting the closed peer.
+                // EOF does not prove child termination or complete the protocol.
+                *control_eof = true;
+                return Ok(());
+            }
             Err(error) => return Err(error),
         }
     }
@@ -1264,11 +1295,33 @@ fn remember_cleanup_error(
     }
 }
 
+fn select_cleanup_error(
+    terminal_error: Option<RunnerError>,
+    graceful_attempt: Option<SignalDispatch>,
+    kill_attempt: SignalDispatch,
+    terminal: bool,
+    group_empty: bool,
+    later_error: Option<RunnerError>,
+) -> Option<RunnerError> {
+    let mut first = terminal_error;
+    if let Some(attempt) = graceful_attempt
+        && let Some(error) = signal_dispatch_error(attempt, terminal, group_empty)
+    {
+        remember_cleanup_error(&mut first, "kill", error);
+    }
+    if let Some(error) = signal_dispatch_error(kill_attempt, terminal, group_empty) {
+        remember_cleanup_error(&mut first, "kill", error);
+    }
+    first.or(later_error)
+}
+
+
 #[allow(clippy::too_many_arguments)]
 fn quiesce_child(
     controller: &mut SignalController,
     child_guard: &mut ChildGuard,
     parent_control: UnixDatagram,
+    control_eof: &mut bool,
     mut stdout: File,
     mut stderr: File,
     ordinal: u32,
@@ -1319,7 +1372,11 @@ fn quiesce_child(
                     .min(cleanup_deadline);
                 if let Err(error) = poll_row(
                     controller.descriptor(),
-                    parent_control.as_raw_fd(),
+                    if *control_eof {
+                        -1
+                    } else {
+                        parent_control.as_raw_fd()
+                    },
                     if *stdout_eof || *stdout_exceeded {
                         -1
                     } else {
@@ -1343,20 +1400,16 @@ fn quiesce_child(
         }
     };
 
-    if let Some(attempt) = graceful_attempt
-        && let Some(error) = signal_dispatch_error(attempt, terminal)
-    {
-        remember_cleanup_error(&mut cleanup_error, "kill", error);
-    }
-    if let Some(error) = signal_dispatch_error(kill_attempt, terminal) {
-        remember_cleanup_error(&mut cleanup_error, "kill", error);
-    }
+    // Terminal observation errors precede signalling errors; later drain/close/reap errors follow.
+    // Keep these apart until the original dispatches can use the final group-absence proof.
+    let terminal_error = cleanup_error.take();
 
     if let Err(error) = controller.drain() {
         remember_cleanup_error(&mut cleanup_error, "poll", error);
     }
     if let Err(error) = drain_control(
         &parent_control,
+        control_eof,
         ordinal,
         acknowledged,
         completion,
@@ -1384,6 +1437,7 @@ fn quiesce_child(
     }
     if let Err(error) = drain_control(
         &parent_control,
+        control_eof,
         ordinal,
         acknowledged,
         completion,
@@ -1401,13 +1455,15 @@ fn quiesce_child(
             remember_cleanup_error(&mut cleanup_error, "close", error);
         }
     }
+    let mut group_empty = false;
     let status = if terminal {
         match child_guard.reap(cleanup_deadline) {
             Ok(status) => {
-                if verified_group
-                    && let Err(error) = wait_process_group_empty(child_guard.pid, cleanup_deadline)
-                {
-                    remember_cleanup_error(&mut cleanup_error, "process group", error);
+                if verified_group {
+                    match wait_process_group_empty(child_guard.pid, cleanup_deadline) {
+                        Ok(()) => group_empty = true,
+                        Err(error) => remember_cleanup_error(&mut cleanup_error, "process group", error),
+                    }
                 }
                 Some(status)
             }
@@ -1426,7 +1482,9 @@ fn quiesce_child(
     }
     Quiesced {
         status,
-        cleanup_error,
+        cleanup_error: select_cleanup_error(
+            terminal_error, graceful_attempt, kill_attempt, terminal, group_empty, cleanup_error,
+        ),
         interrupted,
     }
 }
@@ -1467,6 +1525,7 @@ fn run_row(
     let mut child_guard = ChildGuard::new(pid);
     let mut stdout = child.stdout;
     let mut stderr = child.stderr;
+    let mut control_eof = false;
     let mut acknowledged = false;
     let mut completion = None;
     let mut record_detail = None;
@@ -1560,6 +1619,7 @@ fn run_row(
             stderr_exceeded |= exceeded;
             if let Err(error) = drain_control(
                 &parent_control,
+                &mut control_eof,
                 ordinal,
                 &mut acknowledged,
                 &mut completion,
@@ -1571,6 +1631,7 @@ fn run_row(
         } else {
             if let Err(error) = drain_control(
                 &parent_control,
+                &mut control_eof,
                 ordinal,
                 &mut acknowledged,
                 &mut completion,
@@ -1617,13 +1678,25 @@ fn run_row(
                 break;
             }
         }
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        if now >= deadline {
             timed_out = true;
             break;
         }
+        // Both pipes can close just before waitid observes the child as terminal.
+        // Without a remaining capture wakeup, retain bounded child observation.
+        let wake = if stdout_eof && stderr_eof {
+            now.checked_add(Duration::from_millis(10)).unwrap_or(deadline).min(deadline)
+        } else {
+            deadline
+        };
         if let Err(error) = poll_row(
             controller.descriptor(),
-            parent_control.as_raw_fd(),
+            if control_eof {
+                -1
+            } else {
+                parent_control.as_raw_fd()
+            },
             if stdout_eof || stdout_exceeded {
                 -1
             } else {
@@ -1634,7 +1707,7 @@ fn run_row(
             } else {
                 stderr.as_raw_fd()
             },
-            deadline,
+            wake,
         ) {
             event_error = Some(infrastructure("poll", &error));
             break;
@@ -1645,6 +1718,7 @@ fn run_row(
         controller,
         &mut child_guard,
         parent_control,
+        &mut control_eof,
         stdout,
         stderr,
         ordinal,
@@ -2197,6 +2271,7 @@ mod tests {
             .expect("nonblocking control");
         let stdout = File::open("/dev/null").expect("open null stdout");
         let stderr = File::open("/dev/null").expect("open null stderr");
+        let mut control_eof = false;
         let mut acknowledged = true;
         let mut completion = None;
         let mut record_detail = None;
@@ -2212,6 +2287,7 @@ mod tests {
             &mut controller,
             &mut child_guard,
             parent_control,
+            &mut control_eof,
             stdout,
             stderr,
             0,
@@ -2290,8 +2366,15 @@ mod tests {
         let mut acknowledged = false;
         let mut completion = None;
         let mut detail = None;
-        drain_control(&parent, 7, &mut acknowledged, &mut completion, &mut detail)
-            .expect("control drain");
+        drain_control(
+            &parent,
+            &mut false,
+            7,
+            &mut acknowledged,
+            &mut completion,
+            &mut detail,
+        )
+        .expect("control drain");
         assert!(acknowledged);
         assert_eq!(completion, Some(Completion::Ok));
         assert_eq!(detail, Some("order"));
@@ -2305,14 +2388,257 @@ mod tests {
         let mut acknowledged = false;
         let mut completion = None;
         let mut detail = None;
-        drain_control(&parent, 7, &mut acknowledged, &mut completion, &mut detail)
-            .expect("malformed pre-ack drain");
+        drain_control(
+            &parent,
+            &mut false,
+            7,
+            &mut acknowledged,
+            &mut completion,
+            &mut detail,
+        )
+        .expect("malformed pre-ack drain");
         assert!(
             !acknowledged,
             "a later acknowledgement cannot erase a launch error"
         );
         assert_eq!(completion, None);
         assert_eq!(detail, Some("order"));
+    }
+
+    #[test]
+    fn terminal_group_errors_require_exact_absence_proof_and_preserve_precedence() {
+        fn target(code: i32) -> TargetSignal {
+            match code {
+                0 => TargetSignal::Sent,
+                libc::ESRCH => TargetSignal::Missing,
+                code => TargetSignal::Failed(io::Error::from_raw_os_error(code)),
+            }
+        }
+        fn dispatch(group: i32, direct: i32) -> SignalDispatch {
+            SignalDispatch::Verified(TargetSignals {
+                group: target(group),
+                direct: target(direct),
+            })
+        }
+        for terminal in [false, true] {
+            for empty in [false, true] {
+                for group in [0, libc::ESRCH, libc::EPERM, libc::EIO] {
+                    for direct in [0, libc::ESRCH, libc::EPERM, libc::EIO] {
+                        let group_error = match group {
+                            0 => None,
+                            libc::ESRCH if terminal || direct == 0 => None,
+                            libc::EPERM if cfg!(target_os = "macos") && terminal && empty => None,
+                            code => Some(code),
+                        };
+                        let direct_error = match direct {
+                            0 => None,
+                            libc::ESRCH if terminal => None,
+                            code => Some(code),
+                        };
+                        assert_eq!(
+                            signal_dispatch_error(dispatch(group, direct), terminal, empty)
+                                .and_then(|error| error.raw_os_error()),
+                            group_error.or(direct_error),
+                            "terminal={terminal} empty={empty} group={group} direct={direct}"
+                        );
+                        assert_eq!(
+                            signal_dispatch_error(
+                                SignalDispatch::Direct(target(direct)),
+                                terminal,
+                                empty
+                            )
+                            .and_then(|error| error.raw_os_error()),
+                            direct_error
+                        );
+                    }
+                }
+            }
+        }
+        for terminal_error in [false, true] {
+            for graceful_error in [false, true] {
+                for forced_error in [false, true] {
+                    for later_error in [false, true] {
+                        let early = terminal_error.then_some(RunnerError::Infrastructure {
+                            operation: "wait",
+                            code: 101,
+                        });
+                        let later = later_error.then_some(RunnerError::Infrastructure {
+                            operation: "close",
+                            code: 104,
+                        });
+                        let graceful = graceful_error.then(|| dispatch(102, 0));
+                        let forced = dispatch(if forced_error { 103 } else { 0 }, 0);
+                        let selected = select_cleanup_error(early, graceful, forced, true, true, later);
+                        let expected = if terminal_error {
+                            Some(("wait", 101))
+                        } else if graceful_error {
+                            Some(("kill", 102))
+                        } else if forced_error {
+                            Some(("kill", 103))
+                        } else if later_error {
+                            Some(("close", 104))
+                        } else {
+                            None
+                        };
+                        let actual = selected.map(|error| match error {
+                            RunnerError::Infrastructure { operation, code } => (operation, code),
+                            _ => panic!("unexpected cleanup classification"),
+                        });
+                        assert_eq!(actual, expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn control_peer_close_preserves_every_received_protocol_state() {
+        let ack = b"ALTESTA\x01\x07\0\0\0\0\0\0\0".as_slice();
+        let ok = b"ALTEST\0\x01\0\xff\0\0\0\0\0\0\x07\0\0\0".as_slice();
+        let error = b"ALTEST\0\x01\x01\x04\0\0\xf7\xff\xff\xff\x07\0\0\0".as_slice();
+        let wrong_ordinal = b"ALTEST\0\x01\0\xff\0\0\0\0\0\0\x08\0\0\0".as_slice();
+        let long = b"ALTEST\0\x01\0\xff\0\0\0\0\0\0\x07\0\0\0x".as_slice();
+        let cases = [
+            ("empty", &[] as &[&[u8]], false, None, None),
+            ("ack-only", &[ack], true, None, None),
+            ("ok", &[ack, ok], true, Some(Completion::Ok), None),
+            (
+                "error",
+                &[ack, error],
+                true,
+                Some(Completion::Error { tag: 4, code: -9 }),
+                None,
+            ),
+            (
+                "bad-ack",
+                &[b"invalid".as_slice(), ack],
+                false,
+                None,
+                Some("order"),
+            ),
+            (
+                "empty-datagram",
+                &[ack, b"".as_slice()],
+                true,
+                None,
+                Some("length"),
+            ),
+            (
+                "bad-ordinal",
+                &[ack, wrong_ordinal],
+                true,
+                None,
+                Some("ordinal"),
+            ),
+            (
+                "repeated",
+                &[ack, ok, ok],
+                true,
+                Some(Completion::Ok),
+                Some("repetition"),
+            ),
+            (
+                "long-extra",
+                &[ack, ok, long],
+                true,
+                Some(Completion::Ok),
+                Some("order"),
+            ),
+        ];
+        for close_before_drain in [false, true] {
+            for (name, records, expected_ack, expected_completion, expected_detail) in &cases {
+                let (parent, child) = UnixDatagram::pair().expect("control pair");
+                parent.set_nonblocking(true).expect("nonblocking parent");
+                for record in *records {
+                    child.send(record).expect("queue control record");
+                }
+                let peer = if close_before_drain {
+                    drop(child);
+                    None
+                } else {
+                    Some(child)
+                };
+                let mut eof = false;
+                let mut acknowledged = false;
+                let mut completion = None;
+                let mut detail = None;
+                let close_deadline = Instant::now() + Duration::from_secs(1);
+                loop {
+                    drain_control(
+                        &parent,
+                        &mut eof,
+                        7,
+                        &mut acknowledged,
+                        &mut completion,
+                        &mut detail,
+                    )
+                    .unwrap_or_else(|error| panic!("{name}, closed={close_before_drain}: {error}"));
+                    if !cfg!(target_os = "macos") || !close_before_drain || eof {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < close_deadline,
+                        "{name}: closed peer retained"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert_eq!(acknowledged, *expected_ack, "{name}");
+                assert_eq!(&completion, expected_completion, "{name}");
+                assert_eq!(detail, *expected_detail, "{name}");
+                assert_eq!(
+                    eof,
+                    cfg!(target_os = "macos") && close_before_drain,
+                    "{name}"
+                );
+                drop(peer);
+                let close_deadline = Instant::now() + Duration::from_secs(1);
+                for _ in 0..2 {
+                    // A concurrent spawn may transiently retain an inherited socket reference.
+                    // Observe eventual kernel EOF rather than assuming immediate local-drop EOF.
+                    loop {
+                        drain_control(
+                            &parent,
+                            &mut eof,
+                            7,
+                            &mut acknowledged,
+                            &mut completion,
+                            &mut detail,
+                        )
+                        .unwrap_or_else(|error| panic!("{name}, repeated closed drain: {error}"));
+                        if !cfg!(target_os = "macos") || eof {
+                            break;
+                        }
+                        assert!(
+                            Instant::now() < close_deadline,
+                            "{name}: closed peer retained"
+                        );
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    assert_eq!(eof, cfg!(target_os = "macos"), "{name}");
+                    assert_eq!(acknowledged, *expected_ack, "{name}");
+                    assert_eq!(&completion, expected_completion, "{name}");
+                    assert_eq!(detail, *expected_detail, "{name}");
+                }
+            }
+        }
+        // OwnedFd conversion is safe; recv on the wrong descriptor kind must retain its errno.
+        let file: std::os::fd::OwnedFd = File::open("/dev/null").expect("open null file").into();
+        let non_socket = UnixDatagram::from(file);
+        let mut eof = false;
+        let mut acknowledged = false;
+        let mut completion = None;
+        let mut detail = None;
+        let error = drain_control(
+            &non_socket,
+            &mut eof,
+            7,
+            &mut acknowledged,
+            &mut completion,
+            &mut detail,
+        )
+        .expect_err("non-socket receive is an infrastructure error");
+        assert_eq!(error.raw_os_error(), Some(libc::ENOTSOCK));
+        assert!(!eof && !acknowledged && completion.is_none() && detail.is_none());
     }
 
     #[test]

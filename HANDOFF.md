@@ -28,8 +28,12 @@ API is needed. Plan94 removes the extra component-offset allocation from its
 retained-path operations while preserving admission and cleanup; measured walk
 latency remains within baseline spread. Plan95 closes the CLI assessment through
 existing std.cli and rejects unsupported residual compiler arguments before native,
-source, cache or artifact work. Continue bounded library/transport improvements
-and measured execution/storage/startup work against demonstrated consumers.
+source, cache or artifact work. Plan96 restores the macOS core.test consumer
+through typed unsigned-byte native C ABI attributes, peer-close classification,
+bounded terminal observation and proven-empty-group cleanup. Linux/macOS native,
+compiler and execution owners cover the shared boundary; the independent baseline
+macOS SIGPIPE writer probe remains deferred. Continue bounded library/transport
+improvements and measured execution/storage/startup work against demonstrated consumers.
 Real voice/media engine integration and GPU qualification belong to their
 consumers, which request demonstrated Align
 gaps; they are not the next provider implementation queue.
