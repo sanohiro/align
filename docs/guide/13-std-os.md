@@ -85,6 +85,34 @@ linked file returns `Error.Invalid`; removing the extra link allows a later call
 operation exposes no metadata and does not prevent a new hard link or content mutation after it
 returns.
 
+## Retained directories and bounded traversal
+
+For raw filenames and repeated operations relative to one opened directory, use
+`fs.open_directory(path)`. Its independent `cursor()` returns owned byte names
+through `next()`: `Some(entry)` carries `entry.name: array<u8>`, and `None` means
+EOF. A native read error stays an error. Only `.` and `..` are omitted.
+
+Pass a name directly to `directory.metadata_at(name)` or `directory.open_dir(name)`;
+decoding it as UTF-8 would reject valid Linux names. Metadata does not follow the
+final symlink. Opening a child directory admits and retains it without following
+symlinks. Directory and cursor owners close on scope exit, including `?` exits.
+
+The complete [tree summary example](../../examples/tree_summary.align) composes
+these operations with ordinary recursion and a Copy count record:
+
+```bash
+alignc run examples/tree_summary.align -- --root assets --max-depth 16 --max-entries 8192
+```
+
+It counts the root and every observed entry, classifies directories, regular
+files, symlinks and other entries, and sums regular-file logical sizes. Symlinks
+and special entries are counted without opening them; hard-linked names count
+separately. The explicit depth and entry limits reject excess work, and failures
+print no partial summary. Names are processed one at a time rather than collected
+into a full-tree array. Native operations can still block; limits are not deadlines.
+Concurrent mutation can change observations or cause an error, so the summary is
+not a filesystem snapshot or a disk-usage measurement.
+
 ## Zero-copy reads: `read_file_view`
 
 ```align
