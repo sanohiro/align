@@ -218,15 +218,14 @@ fn parent(
 ) -> Result<(Option<BeneathFd>, i32, *const libc::c_char), i32> {
     let mut retained = None;
     let mut fd = directory.fd.0;
-    let Some(last) = path.components.len().checked_sub(1) else {
-        return Err(AL_INVALID);
-    };
-    for index in 0..last {
-        let next = beneath_open_directory(fd, path.component_ptr(index))?;
+    let mut components = path.components();
+    let final_name = components.next_back().ok_or(AL_INVALID)?;
+    for component in components {
+        let next = beneath_open_directory(fd, component)?;
         fd = next.0;
         retained = Some(next);
     }
-    Ok((retained, fd, path.component_ptr(last)))
+    Ok((retained, fd, final_name))
 }
 
 /// # Safety
@@ -243,8 +242,8 @@ pub unsafe extern "C" fn align_rt_fs_directory_open(
         }
         let path = unsafe { abi_beneath_path_impl(path, len, true, true)? };
         let mut fd = beneath_open_start(path.absolute)?;
-        for index in 0..path.components.len() {
-            fd = beneath_open_directory(fd.0, path.component_ptr(index))?;
+        for component in path.components() {
+            fd = beneath_open_directory(fd.0, component)?;
         }
         unsafe {
             out.write(Box::into_raw(Box::new(Directory { fd })).cast());
@@ -770,16 +769,15 @@ fn relative_access(_directory: &Directory, _path: &BeneathPath, _mode: i32) -> R
 fn relative_access(directory: &Directory, path: &BeneathPath, mode: i32) -> Result<bool,i32> {
     let mut retained = None;
     let mut fd = directory.fd.0;
-    let last = path.components.len().checked_sub(1).ok_or(AL_INVALID)?;
-    for index in 0..=last {
+    let mut components = path.components();
+    let name = components.next_back().ok_or(AL_INVALID)?;
+    for component in components {
         if !native_access(fd,c".",libc::X_OK,0)? { return Ok(false); }
-        if index != last {
-            let next = beneath_open_directory(fd,path.component_ptr(index))?;
-            fd = next.0;
-            retained = Some(next);
-        }
+        let next = beneath_open_directory(fd,component)?;
+        fd = next.0;
+        retained = Some(next);
     }
-    let name = path.component_ptr(last);
+    if !native_access(fd,c".",libc::X_OK,0)? { return Ok(false); }
     let result = {
         let raw = unsafe { libc::openat(fd,name,libc::O_PATH|libc::O_NOFOLLOW|libc::O_CLOEXEC) };
         if raw < 0 { return Err(io_error_to_status(&std::io::Error::last_os_error())); }
