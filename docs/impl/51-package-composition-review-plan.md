@@ -1,9 +1,10 @@
 # Standard-library and package responsibility review
 
-Status: **PLANNED — future assessment; implementation is not scheduled.**
-Owner direction: 2026-09-11. Record the plan now; do not start implementation.
-This document selects an assessment sequence, not public APIs or new language
-semantics. No new exec, tree or CLI package is selected.
+Status: **OWNER-RESUMED 2026-10-04 — process assessment complete; filesystem
+and CLI assessment remain pending.** The owner approved continuing independent
+capabilities through PR and merge. [Plan 92](92-process-composition-and-reap-storage.md)
+records the process disposition and bounded reap-scratch improvement. This
+assessment selects no new process API, exec, tree or CLI package.
 
 ## Direction
 

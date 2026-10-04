@@ -49,6 +49,15 @@ fn capacity<T>(count: i64) -> Result<usize, i32> {
     Ok(count)
 }
 #[cfg(target_os = "linux")]
+fn reserve_reap_slot(rows: &mut Vec<Reaped>, limit: usize) {
+    if rows.len() == rows.capacity() {
+        // The caller has validated the stride and keeps len < limit. Reserve before wait4
+        // consumes a status, so publishing the next row cannot allocate after that effect.
+        let next = rows.capacity().saturating_mul(2).max(1).min(limit);
+        rows.reserve_exact(next - rows.len());
+    }
+}
+#[cfg(target_os = "linux")]
 fn disposition() -> Result<bool, i32> {
     let mut action = unsafe { core::mem::zeroed::<libc::sigaction>() };
     if unsafe { libc::sigaction(libc::SIGCHLD, core::ptr::null(), &mut action) } != 0 {
@@ -293,8 +302,9 @@ impl Scope {
         #[cfg(target_os = "linux")]
         {
             self.valid()?;
-            let mut rows = Vec::with_capacity(limit);
+            let mut rows = Vec::new();
             while rows.len() < limit {
+                reserve_reap_slot(&mut rows, limit);
                 #[cfg(test)]
                 if FAIL_REAP_AT.with(|fail| {
                     let value = fail.get();
@@ -660,6 +670,32 @@ pub unsafe extern "C" fn align_rt_process_member_free(owner: *mut Member) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reap_storage_growth_reserves_before_each_event() {
+        for limit in [1, 2, 3, 5, 16, 17, 32, 33, 127, 4096] {
+            let mut rows = Vec::new();
+            let mut growths = 0;
+            for reached in 0..limit {
+                let previous = rows.capacity();
+                reserve_reap_slot(&mut rows, limit);
+                assert!(rows.capacity() > reached, "no slot before event {reached}");
+                assert!(rows.capacity() <= limit, "reservation exceeds event budget");
+                if previous > reached {
+                    assert_eq!(rows.capacity(), previous, "spare capacity was reallocated");
+                } else {
+                    growths += 1;
+                }
+                let reserved = rows.capacity();
+                rows.push(Reaped {
+                    pid: 1,
+                    status: WaitResult::default(),
+                });
+                assert_eq!(rows.capacity(), reserved, "event publication allocated");
+            }
+            assert!(growths <= usize::BITS, "dense batches grew one row at a time");
+        }
+    }
     #[test]
     fn native_layout_and_ranges() {
         assert_eq!(core::mem::offset_of!(Scope, root), 0);
@@ -786,6 +822,64 @@ mod tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::yield_now();
         }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sparse_reap_storage() {
+        if isolated(
+            "process_scope::tests::sparse_reap_storage",
+            "ALIGN_SCOPE_SPARSE_REAP",
+        ) {
+            return;
+        }
+        let command = crate::process_launch::tests::command("exec sleep 30");
+        let mut scope = start(&command).unwrap();
+        let measure = std::env::var_os("ALIGN_SCOPE_REAP_MEASURE").is_some();
+        for limit in [1, 32, 4096, 1_048_576] {
+            let rows = scope.reap(limit).unwrap();
+            assert!(rows.is_empty());
+            assert_eq!(rows.capacity(), 1, "pending reap reserved the event budget");
+            if measure {
+                eprintln!(
+                    "reap-storage pending limit={limit} rows={} capacity={} scratch_bytes={}",
+                    rows.len(), rows.capacity(), rows.capacity() * core::mem::size_of::<Reaped>()
+                );
+            }
+        }
+        scope.root.signal(i64::from(libc::SIGKILL), false).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while scope.root.status().unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let rows = scope.reap(4096).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows.capacity(), 2,
+            "one terminal event reserved the event budget"
+        );
+        assert_eq!(rows[0].pid, i64::from(scope.root.pid));
+        assert_eq!(rows[0].status.termination.value, i64::from(libc::SIGKILL));
+        assert_eq!(
+            scope.root.wait().unwrap().termination.value,
+            i64::from(libc::SIGKILL)
+        );
+        if measure {
+            eprintln!(
+                "reap-storage terminal limit=4096 rows={} capacity={} scratch_bytes={}",
+                rows.len(), rows.capacity(), rows.capacity() * core::mem::size_of::<Reaped>()
+            );
+        }
+        let empty = scope.reap(1_048_576).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(empty.capacity(), 1, "ECHILD reserved the event budget");
+        if measure {
+            eprintln!(
+                "reap-storage empty limit=1048576 rows={} capacity={} scratch_bytes={}",
+                empty.len(), empty.capacity(), empty.capacity() * core::mem::size_of::<Reaped>()
+            );
+        }
+        assert_eq!(scope.release(), Ok(true));
     }
     #[cfg(target_os = "linux")]
     #[test]
