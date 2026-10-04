@@ -1565,3 +1565,38 @@ ABI は `void align_rt_http_server_max_request_body_bytes(ptr, i64)`（A66）。
 | fresh/parked の拒否、fd close、listener 再利用 | `http_read_request` と `align_rt_http_accept` | `http_server_explicit_body_cap_refuses_then_keeps_listener`、`http_server_body_cap_refuses_parked_connection` |
 | 分割受信、先読み、ctx cleanup | `http_read_into` と `HttpRequestCtx::drop` | `http_read_request_reassembles_a_body_larger_than_one_read`、`http_request_cap_counts_only_the_framed_body_in_a_head_co_read`、既存 `http_keepalive_` と malformed-request owner |
 | native symbol・署名・件数 | runtime key、A66 宣言/effect、export inventory | `runtime_abi_registry_matches_checked_in_declaration_golden`、`scripts/test-runtime-abi-exports.sh` |
+
+## ストリーム書き込みの明示的な時間予算（plan 90 H2）
+
+```text
+s.write_timeout_ns(timeout_ns: i64) -> Result<(), Error>
+```
+
+レシーバーは束縛済みローカルの排他的借用であり、消費しない。setter は Impure で、
+スカラー1個だけを保存し、割り当ても I/O も行わない。既定値 `0` は無制限、
+`1..=i64::MAX` ナノ秒は有効。負の引数、続いて null・使用済み・poisoned 状態を
+検証し、変更前に Invalid を返す。失敗時は前の値を保持する。引数はソース順に1回評価する。
+
+空でない send、すべての event（空データを含む）、finish/reject の出力は、
+操作全体で1つの単調時計の時間予算を使う。ヘッド、フレーミング、部分書き込み、
+EINTR、EAGAIN・readiness 再試行も同じ予算を共有する。設定・書き込み・待機の
+前後で確認し、同時に観測したネイティブ成功・エラーより期限切れを優先する。
+poll は正の残りナノ秒をミリ秒に切り上げ、i32::MAX で飽和させる。起床後に
+再計算し、期限後のゼロ時間プローブを行わない。send の期限切れは Timeout を
+返して poison し、後の空でない出力は Invalid。空 send は時計を読まずヘッドも
+確定せず Ok。finish/reject は Timeout でも1回消費して閉じる。poisoned finish は
+Invalid。ヘッド送信済み HTTP/1.0 finish は書き込みも時計もなく、閉じて成功する。
+Drop は flush しない。生成・キャンセルの期限は呼び出し側の方針であり、
+ハードリアルタイムのスケジューリング保証ではない。
+
+Linux の有限出力は MSG_DONTWAIT・MSG_NOSIGNAL 付き sendmsg を使い、fd モードを
+変えない。macOS ではストリームだけが fd を所有する。ctx.fd は -1 になり、fd の
+別名は公開せず、接続を pool/context に戻さない。最初の有限出力で F_GETFL/F_SETFL
+を検証し O_NONBLOCK を固定する。検証済み SO_NOSIGPIPE と H1 の writev 構造は維持する。
+設定成功は、その後の Timeout 判定より先に記録する。F_SETFL は失敗でもネイティブ
+モードを変え得るため、poison して後の I/O を行わず、復元せず Drop/消費で閉じる。
+未設定の zero は元の blocking writer。固定後の zero は追加の時計・フラグ変更なく
+poll(-1) で無期限に再試行する。空 send・閉じるだけの raw finish はモードを設定しない。
+
+ABI は A04 `i32 align_rt_http_stream_write_timeout_ns(ptr, i64)`。既存の status/result、
+型タグ、interface format 17 は維持する。公開契約と検証行列は plan 90 に記録する。

@@ -1617,3 +1617,41 @@ Closure matrix: formation is a bound `http_server` receiver plus one checked `i6
 | Fresh/parked refusal, fd close and listener reuse | `http_read_request`, `align_rt_http_accept` | `http_server_explicit_body_cap_refuses_then_keeps_listener`, `http_server_body_cap_refuses_parked_connection` |
 | Incremental receive, co-read boundary and cleanup | `http_read_into`, `HttpRequestCtx::drop` | `http_read_request_reassembles_a_body_larger_than_one_read`, `http_request_cap_counts_only_the_framed_body_in_a_head_co_read`, existing `http_keepalive_` and malformed-request owners |
 | Native symbol/type/count | runtime key, A66 declaration/effects and export inventory | `runtime_abi_registry_matches_checked_in_declaration_golden`, `scripts/test-runtime-abi-exports.sh` |
+
+## Explicit stream write budget (plan 90 H2)
+
+```text
+s.write_timeout_ns(timeout_ns: i64) -> Result<(), Error>
+```
+
+The receiver is an exclusively borrowed bound local, never consumed. The setter
+is Impure, stores one scalar, and allocates/performs I/O nowhere. Default `0`
+disables the bound; `1..=i64::MAX` nanoseconds are valid. Validate a negative
+argument first, then null/spent/poisoned state, returning Invalid before mutation.
+Failure preserves the previous scalar. Evaluate arguments once in source order.
+
+Every nonempty send, every event (including empty data), and finish/reject output
+snapshots one monotonic total budget. Head, framing, partial writes, EINTR and
+EAGAIN/readiness retries share it. Check before and after each setup/write/wait;
+expiration takes precedence over a simultaneous native success/error. Remaining
+poll time rounds positive nanoseconds up and saturates at i32::MAX milliseconds;
+recompute after wakeup and never issue a zero-time probe after expiry. Send timeout
+returns Timeout and poisons, so later nonempty output is Invalid. Empty send stays
+Ok without clocks or head commitment. Finish/reject consumes and closes once even
+on Timeout; poisoned finish is Invalid. Committed HTTP/1.0 finish writes nothing
+and succeeds by closing without a clock. Drop never flushes. Generation/cancellation
+budgets remain caller policy; this is no hard real-time scheduling guarantee.
+
+Linux timed output uses sendmsg with MSG_DONTWAIT and MSG_NOSIGNAL without fd-mode
+mutation. macOS owns the stream fd alone: ctx.fd becomes -1, no fd alias is
+published, and the connection never returns to a pool/context. First timed output
+checks F_GETFL/F_SETFL to latch O_NONBLOCK, retaining checked SO_NOSIGPIPE and H1's
+writev geometry. Record successful latching before selecting post-setup Timeout.
+F_SETFL failure may change native mode: poison, perform no more I/O and close on
+Drop/consumption without restoration. Never-configured zero uses the original
+blocking writer; zero after latching retries via indefinite poll(-1) without
+clock reads or another flag change. Empty send/raw close-only finish does not latch.
+
+The ABI is A04 `i32 align_rt_http_stream_write_timeout_ns(ptr, i64)`. Existing
+status/result, type tags and interface format 17 remain. The public-contract
+ledger and discriminating owner matrix are in plan 90.

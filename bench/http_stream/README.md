@@ -40,3 +40,10 @@ paired metric deltas against the maximum absolute baseline-pair delta measured
 before candidate comparisons. Zero-nanosecond clock-quantized rows use additive
 deltas rather than an undefined ratio. `compare.py --summarize DIRECTORY`
 reprocesses completed raw rows without launching a benchmark again.
+
+The `write-budget` feature configures an explicit one-second total budget before
+the first measured send. First-write mode setup and all deadline observations stay
+inside the measured operation. Default builds retain an unconfigured zero budget.
+Compare default baseline/candidate binaries for the unchanged fast-path claim;
+retain a separate configured run to report the cost of the requested bounded path.
+Neither setter setup nor clock operations allocate on the send path.

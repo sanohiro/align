@@ -27291,6 +27291,10 @@ pub struct HttpStream {
     /// attempt takes it (committed even if that write then fails — bytes may be on the wire);
     /// `reject` is legal exactly while this is `Some`.
     pending_head: Option<Vec<u8>>,
+    /// Zero keeps blocking output; positive values bound each complete write.
+    write_timeout_ns: i64,
+    /// macOS first timed write latches the sole owned fd until close.
+    nonblocking: bool,
 }
 
 impl Drop for HttpStream {
@@ -27391,7 +27395,7 @@ pub unsafe extern "C" fn align_rt_http_respond_stream(
     // ctx keeps its parse buffer alive for the caller's views). The head is stored, not written.
     let fd = c.fd;
     c.fd = -1;
-    unsafe { *out = Box::into_raw(Box::new(HttpStream { fd, framed, poisoned: false, pending_head: Some(head) })) };
+    unsafe { *out = Box::into_raw(Box::new(HttpStream { fd, framed, poisoned: false, pending_head: Some(head), write_timeout_ns: 0, nonblocking: false, })) };
     0
 }
 
@@ -27470,7 +27474,38 @@ unsafe fn http_stream_bytes<'a>(ptr: *const u8, len: i64) -> Result<&'a [u8], i3
 
 /// One statically dispatched native operation, also used by partial-write and pointer owners.
 trait HttpStreamWriteOps {
+    fn requires_nonblocking_mode(&self) -> bool {
+        cfg!(any(target_os = "macos", target_os = "ios"))
+    }
+
+    fn get_flags(&mut self, fd: i32) -> SocketCallOutcome {
+        let result = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        let errno = if result < 0 { std::io::Error::last_os_error().raw_os_error().unwrap_or(0) } else { 0 };
+        SocketCallOutcome { result: isize::try_from(result).unwrap_or(-1), errno }
+    }
+
+    fn set_flags(&mut self, fd: i32, flags: i32) -> SocketCallOutcome {
+        let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+        let errno = if result < 0 { std::io::Error::last_os_error().raw_os_error().unwrap_or(0) } else { 0 };
+        SocketCallOutcome { result: isize::try_from(result).unwrap_or(-1), errno }
+    }
+
     fn send_parts(&mut self, fd: i32, parts: &[libc::iovec], flags: i32) -> SocketCallOutcome;
+
+    fn start_budget(&mut self, timeout_ns: i64) -> Option<MonotonicTimeoutBudget> {
+        MonotonicTimeoutBudget::from_positive_ns(timeout_ns)
+    }
+
+    fn remaining(&mut self, budget: &MonotonicTimeoutBudget) -> Option<std::time::Duration> {
+        budget.remaining()
+    }
+
+    fn wait_writable(&mut self, fd: i32, timeout_ms: i32) -> SocketCallOutcome {
+        let mut descriptor = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+        let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+        let errno = if result < 0 { std::io::Error::last_os_error().raw_os_error().unwrap_or(0) } else { 0 };
+        SocketCallOutcome { result: isize::try_from(result).unwrap_or(-1), errno }
+    }
 }
 
 struct NativeHttpStreamWriteOps;
@@ -27479,15 +27514,12 @@ impl HttpStreamWriteOps for NativeHttpStreamWriteOps {
     fn send_parts(&mut self, fd: i32, parts: &[libc::iovec], flags: i32) -> SocketCallOutcome {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         let result = {
-            // Accepted sockets already have checked SO_NOSIGPIPE. writev avoids an unneeded
-            // msghdr on this blocking path; positive-budget writes will use per-call flags.
-            let _ = flags;
+            let _ = flags; // Checked owner-local mode, not MSG_DONTWAIT, bounds Darwin writes.
             let Ok(count) = i32::try_from(parts.len()) else { return SocketCallOutcome { result: -1, errno: libc::EINVAL } };
             unsafe { libc::writev(fd, parts.as_ptr(), count) }
         };
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         let result = {
-            // All-zero fields denote no address or ancillary data; Linux needs MSG_NOSIGNAL.
             let mut message: libc::msghdr = unsafe { core::mem::zeroed() };
             message.msg_iov = parts.as_ptr().cast_mut();
             #[cfg(target_os = "linux")]
@@ -27504,15 +27536,63 @@ impl HttpStreamWriteOps for NativeHttpStreamWriteOps {
     }
 }
 
+fn http_stream_arm_nonblocking<O: HttpStreamWriteOps>(st: &mut HttpStream, budget: &MonotonicTimeoutBudget, ops: &mut O) -> i32 {
+    if !ops.requires_nonblocking_mode() || st.nonblocking { return 0; }
+    if ops.remaining(budget).is_none() { return AL_TIMEOUT; }
+    let got = ops.get_flags(st.fd);
+    let flags = i32::try_from(got.result).ok().filter(|_| got.result >= 0);
+    if flags.is_some_and(|flags| flags & libc::O_NONBLOCK != 0) { st.nonblocking = true; }
+    if ops.remaining(budget).is_none() { return AL_TIMEOUT; }
+    let Some(flags) = flags else {
+        return io_read_write_status(&std::io::Error::from_raw_os_error(got.errno));
+    };
+    if st.nonblocking { return 0; }
+    if ops.remaining(budget).is_none() { return AL_TIMEOUT; }
+    let set = ops.set_flags(st.fd, flags | libc::O_NONBLOCK);
+    if set.result == 0 { st.nonblocking = true; }
+    if ops.remaining(budget).is_none() { return AL_TIMEOUT; }
+    if set.result != 0 {
+        // F_SETFL can mutate native mode before an ioctl error; the poisoned owner only closes.
+        return io_read_write_status(&std::io::Error::from_raw_os_error(set.errno));
+    }
+    0
+}
+
 /// Advance only the accepted prefix; pointers retain their original backing allocations.
-fn http_stream_write_parts<O: HttpStreamWriteOps>(fd: i32, parts: &mut [libc::iovec], mut remaining: usize, ops: &mut O) -> i32 {
+fn http_stream_write_parts<O: HttpStreamWriteOps>(fd: i32, parts: &mut [libc::iovec], mut remaining: usize, budget: Option<MonotonicTimeoutBudget>, nonblocking: bool, ops: &mut O) -> i32 {
     #[cfg(target_os = "linux")]
     let flags = MSG_NOSIGNAL;
     #[cfg(not(target_os = "linux"))]
     let flags = 0;
+    #[cfg(target_os = "linux")]
+    let flags = flags | if budget.is_some() { libc::MSG_DONTWAIT } else { 0 };
     let mut first = 0;
     while remaining > 0 {
-        match socket_write_attempt(ops.send_parts(fd, &parts[first..], flags)) {
+        if budget.as_ref().is_some_and(|budget| ops.remaining(budget).is_none()) {
+            return AL_TIMEOUT;
+        }
+        let outcome = ops.send_parts(fd, &parts[first..], flags);
+        if budget.as_ref().is_some_and(|budget| ops.remaining(budget).is_none()) {
+            return AL_TIMEOUT; // Expiration wins over any simultaneous native result.
+        }
+        if (budget.is_some() || nonblocking) && outcome.result < 0
+            && (outcome.errno == libc::EAGAIN || outcome.errno == libc::EWOULDBLOCK)
+        {
+            loop {
+                let timeout_ms = if let Some(budget) = budget.as_ref() {
+                    let Some(timeout_ms) = ops.remaining(budget).and_then(poll_timeout_ms) else { return AL_TIMEOUT };
+                    timeout_ms
+                } else { -1 };
+                let waited = ops.wait_writable(fd, timeout_ms);
+                if budget.as_ref().is_some_and(|budget| ops.remaining(budget).is_none()) { return AL_TIMEOUT; }
+                if waited.result >= 0 { break; }
+                if waited.errno != libc::EINTR {
+                    return io_read_write_status(&std::io::Error::from_raw_os_error(waited.errno));
+                }
+            }
+            continue;
+        }
+        match socket_write_attempt(outcome) {
             SocketWriteAttempt::Sent(count) if count <= remaining => {
                 remaining -= count;
                 let mut accepted = count;
@@ -27580,7 +27660,12 @@ fn http_stream_send_parts_with<O: HttpStreamWriteOps>(st: &mut HttpStream, data:
     let after_len = suffix.len() + if st.framed { 2 } else { 0 };
     if st.framed { after[suffix.len()..after_len].copy_from_slice(b"\r\n"); }
     let after = &after[..after_len];
+    let budget = ops.start_budget(st.write_timeout_ns);
     let head = st.pending_head.take();
+    if let Some(budget) = budget.as_ref() {
+        let status = http_stream_arm_nonblocking(st, budget, ops);
+        if status != 0 { st.poisoned = true; return status; }
+    }
     let mut parts = [libc::iovec { iov_base: core::ptr::null_mut(), iov_len: 0 }; 4];
     let mut count = 0;
     for bytes in [head.as_deref().unwrap_or_default(), before, data, after] {
@@ -27589,11 +27674,35 @@ fn http_stream_send_parts_with<O: HttpStreamWriteOps>(st: &mut HttpStream, data:
             count += 1;
         }
     }
-    let rc = http_stream_write_parts(st.fd, &mut parts[..count], wire_len, ops);
+    let rc = http_stream_write_parts(st.fd, &mut parts[..count], wire_len, budget, st.nonblocking, ops);
     if rc != 0 {
         st.poisoned = true; // a broken stream — `finish` will skip the terminator and return Err
     }
     rc
+}
+
+/// Replace one stream's per-operation write budget without allocation or socket mutation.
+///
+/// # Safety
+/// `s` must be null or an aligned live stream owner.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_stream_write_timeout_ns(s: *mut HttpStream, timeout_ns: i64) -> i32 {
+    if timeout_ns < 0 || !abi_ptr_is_aligned(s) { return AL_INVALID; }
+    let stream = unsafe { &mut *s };
+    if stream.fd < 0 || stream.poisoned { return AL_INVALID; }
+    stream.write_timeout_ns = timeout_ns;
+    0
+}
+
+fn http_stream_write_bytes<O: HttpStreamWriteOps>(st: &mut HttpStream, bytes: &[u8], ops: &mut O) -> i32 {
+    if bytes.is_empty() { return 0; }
+    let budget = ops.start_budget(st.write_timeout_ns);
+    if let Some(budget) = budget.as_ref() {
+        let status = http_stream_arm_nonblocking(st, budget, ops);
+        if status != 0 { st.poisoned = true; return status; }
+    }
+    let mut parts = [libc::iovec { iov_base: bytes.as_ptr().cast_mut().cast(), iov_len: bytes.len() }];
+    http_stream_write_parts(st.fd, &mut parts, bytes.len(), budget, st.nonblocking, ops)
 }
 
 /// `s.finish()` — the SOLE clean terminator. **Consumes** `s` (the language moved it in, nulling the
@@ -27611,7 +27720,11 @@ pub unsafe extern "C" fn align_rt_http_stream_finish(s: *mut HttpStream) -> i32 
     if s.is_null() {
         return AL_INVALID;
     }
-    let mut st = unsafe { Box::from_raw(s) }; // consumed — `Drop` closes the fd at scope end
+    let st = unsafe { Box::from_raw(s) }; // consumed — `Drop` closes the fd at scope end
+    http_stream_finish_with(st, &mut NativeHttpStreamWriteOps)
+}
+
+fn http_stream_finish_with<O: HttpStreamWriteOps>(mut st: Box<HttpStream>, ops: &mut O) -> i32 {
     if st.poisoned {
         return AL_INVALID; // a failed `send` already broke the stream — skip the terminator, close, Err
     }
@@ -27626,7 +27739,7 @@ pub unsafe extern "C" fn align_rt_http_stream_finish(s: *mut HttpStream) -> i32 
     if buf.is_empty() {
         0 // raw mode, head already written: close (via `Drop`) IS the terminator
     } else {
-        unsafe { http_send_all(st.fd, &buf) }
+        http_stream_write_bytes(&mut st, &buf, ops)
     }
 }
 
@@ -27648,9 +27761,14 @@ pub unsafe extern "C" fn align_rt_http_stream_reject(s: *mut HttpStream, rb: *mu
     // the fd; the builder's `Drop` frees its buffers).
     let s_owned = if s.is_null() { None } else { Some(unsafe { Box::from_raw(s) }) };
     let rb_owned = if rb.is_null() { None } else { Some(unsafe { Box::from_raw(rb) }) };
-    let (Some(mut st), Some(r)) = (s_owned, rb_owned) else {
+    let (Some(st), Some(r)) = (s_owned, rb_owned) else {
         return AL_INVALID; // a null handle — the non-null one `Drop`s here
     };
+    http_stream_reject_with(st, r, &mut NativeHttpStreamWriteOps)
+}
+
+fn http_stream_reject_with<O: HttpStreamWriteOps>(mut st: Box<HttpStream>, r: Box<ResponseBuilder>, ops: &mut O) -> i32 {
+    if st.poisoned { return AL_INVALID; }
     // The head is already committed (a first `send` took it — even a failed one may have put bytes
     // on the wire): a normal response can no longer be written. Close only, `Err`.
     if st.pending_head.take().is_none() {
@@ -27660,7 +27778,7 @@ pub unsafe extern "C" fn align_rt_http_stream_reject(s: *mut HttpStream, rb: *mu
         Ok(b) => b,
         Err(code) => return code, // `st` drops → the fd closes, nothing was written
     };
-    unsafe { http_send_all(st.fd, &bytes) } // `st` drops → close right after the one write
+    http_stream_write_bytes(&mut st, &bytes, ops) // `st` drops → close after the write
 }
 
 /// Free a `http_stream`, closing its socket fd (via `Drop`, close-only — NO terminal write). Null-safe.
@@ -48608,7 +48726,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         // A stream whose `poisoned` flag is set returns Err from finish and does not write `0\r\n\r\n`.
         let (a, _b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
         let fd = a.into_raw_fd();
-        let s = Box::into_raw(Box::new(HttpStream { fd, framed: true, poisoned: true, pending_head: None }));
+        let s = Box::into_raw(Box::new(HttpStream { fd, framed: true, poisoned: true, pending_head: None, write_timeout_ns: 0, nonblocking: false, }));
         assert_eq!(unsafe { align_rt_http_stream_finish(s) }, AL_INVALID, "poisoned finish returns Err");
         // `fd` was closed by finish's Drop; a second close must fail (already closed → no leak).
         assert_eq!(unsafe { close(fd) }, -1, "the stream's fd was closed by finish");
@@ -48628,8 +48746,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             fd,
             framed: true,
             poisoned: false,
-            pending_head: Some(b"HTTP/1.1 200 OK\r\n\r\n".to_vec()),
-        }));
+            pending_head: Some(b"HTTP/1.1 200 OK\r\n\r\n".to_vec()), write_timeout_ns: 0, nonblocking: false, }));
         assert_eq!(unsafe { align_rt_http_stream_send(s, b"".as_ptr(), 0) }, 0, "empty send is Ok");
         assert!(!unsafe { &*s }.poisoned, "empty send never wrote, so never poisoned");
         assert!(unsafe { &*s }.pending_head.is_some(), "empty send does not flush the lazy head (reject window stays open)");
@@ -48746,8 +48863,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             fd,
             framed: true,
             poisoned: false,
-            pending_head: Some(b"HEAD\r\n\r\n".to_vec()),
-        }));
+            pending_head: Some(b"HEAD\r\n\r\n".to_vec()), write_timeout_ns: 0, nonblocking: false, }));
         assert_eq!(unsafe { align_rt_http_stream_send(s, b"hi".as_ptr(), 2) }, 0);
         assert!(unsafe { &*s }.pending_head.is_none(), "first send committed the head");
         assert_eq!(unsafe { align_rt_http_stream_finish(s) }, 0);
@@ -48761,8 +48877,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             fd: fd2,
             framed: true,
             poisoned: false,
-            pending_head: Some(b"HEAD\r\n\r\n".to_vec()),
-        }));
+            pending_head: Some(b"HEAD\r\n\r\n".to_vec()), write_timeout_ns: 0, nonblocking: false, }));
         assert_eq!(unsafe { align_rt_http_stream_finish(s2) }, 0);
         let mut got2 = Vec::new();
         b2.read_to_end(&mut got2).expect("read");
@@ -48784,8 +48899,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             fd,
             framed: true,
             poisoned: false,
-            pending_head: Some(b"HEAD\r\n\r\n".to_vec()),
-        }));
+            pending_head: Some(b"HEAD\r\n\r\n".to_vec()), write_timeout_ns: 0, nonblocking: false, }));
         assert_eq!(unsafe { align_rt_http_stream_send_event(s, b"tick".as_ptr(), 4) }, 0);
         assert!(unsafe { &*s }.pending_head.is_none(), "the first send_event committed the head");
         assert_eq!(unsafe { align_rt_http_stream_send_event(s, b"".as_ptr(), 0) }, 0, "an empty event is a real frame, not a no-op");
@@ -48800,8 +48914,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             fd: fd2,
             framed: false,
             poisoned: false,
-            pending_head: Some(b"HEAD10\r\n\r\n".to_vec()),
-        }));
+            pending_head: Some(b"HEAD10\r\n\r\n".to_vec()), write_timeout_ns: 0, nonblocking: false, }));
         assert_eq!(unsafe { align_rt_http_stream_send_event(s2, b"x".as_ptr(), 1) }, 0);
         assert_eq!(unsafe { align_rt_http_stream_finish(s2) }, 0);
         let mut got2 = Vec::new();
@@ -48823,8 +48936,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             fd,
             framed: true,
             poisoned: false,
-            pending_head: Some(b"STREAMHEAD\r\n\r\n".to_vec()),
-        }));
+            pending_head: Some(b"STREAMHEAD\r\n\r\n".to_vec()), write_timeout_ns: 0, nonblocking: false, }));
         let rb = Box::into_raw(Box::new(ResponseBuilder {
             status: 400,
             headers: Vec::new(),
@@ -48841,7 +48953,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         // Post-commit (head taken by a send): reject is Err, closes, writes nothing more.
         let (a2, mut b2) = std::os::unix::net::UnixStream::pair().expect("socketpair");
         let fd2 = a2.into_raw_fd();
-        let s2 = Box::into_raw(Box::new(HttpStream { fd: fd2, framed: false, poisoned: false, pending_head: None }));
+        let s2 = Box::into_raw(Box::new(HttpStream { fd: fd2, framed: false, poisoned: false, pending_head: None, write_timeout_ns: 0, nonblocking: false, }));
         let rb2 = Box::into_raw(Box::new(ResponseBuilder { status: 400, headers: Vec::new(), body: None }));
         assert_eq!(unsafe { align_rt_http_stream_reject(s2, rb2) }, AL_INVALID);
         assert_eq!(unsafe { close(fd2) }, -1, "reject consumed the stream even on Err");

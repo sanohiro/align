@@ -14525,6 +14525,18 @@ fn hir_body_validator_native() {
         result_unit
     );
     add!(
+        "native_http_stream_write_timeout_ns",
+        body_test_expr(
+            hir::ExprKind::HttpStreamWriteTimeoutNs {
+                stream: Box::new(native_local(0, Ty::HttpStream)),
+                timeout_ns: Box::new(native_i64()),
+            },
+            result_unit,
+        ),
+        vec![body_test_local(0, "stream", Ty::HttpStream, false, false)],
+        result_unit
+    );
+    add!(
         "native_http_stream_send",
         body_test_expr(
             hir::ExprKind::HttpStreamSend {
@@ -14673,6 +14685,34 @@ fn hir_body_validator_native() {
         "native nominal metadata"
     );
     assert!(body_core_metadata_is_valid(&program), "native body metadata");
+
+    for fault in 0..4 {
+        let mut reject = program.clone();
+        let expression = body_value_expression_mut(&mut reject, "native_http_stream_write_timeout_ns");
+        let hir::ExprKind::HttpStreamWriteTimeoutNs { stream, timeout_ns } = &mut expression.kind else {
+            panic!("stream budget fixture discriminator");
+        };
+        match fault {
+            0 => stream.ty = Ty::Bool,
+            1 => **stream = body_test_expr(hir::ExprKind::Block(hir::Block {
+                stmts: Vec::new(), value: Some(Box::new(native_local(0, Ty::HttpStream))),
+            }), Ty::HttpStream),
+            2 => timeout_ns.ty = Ty::Bool,
+            _ => expression.ty = Ty::Bool,
+        }
+        assert!(!body_core_metadata_is_valid(&reject), "stream budget forged field {fault}");
+    }
+    for mode in [align_ast::ParamMode::ByValue, align_ast::ParamMode::BorrowMut, align_ast::ParamMode::Borrow] {
+        let mut owned = program.clone();
+        let Some(function) = owned.fns.iter_mut().find(|function| function.name == "native_http_stream_write_timeout_ns") else {
+            panic!("stream budget fixture missing");
+        };
+        function.params = vec![0];
+        function.param_modes = vec![mode];
+        function.locals[0].is_param = true;
+        function.locals[0].is_mut = mode == align_ast::ParamMode::BorrowMut;
+        assert_eq!(body_core_metadata_is_valid(&owned), mode != align_ast::ParamMode::Borrow, "stream budget exclusive authority");
+    }
 
     for name in [
         "native_http_client_request_stream",

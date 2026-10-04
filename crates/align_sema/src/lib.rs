@@ -17465,7 +17465,7 @@ impl EffectScan<'_> {
             ExprKind::HttpUpgradeDeadline {
                 upgrade,
                 timeout_ns,
-            } => {
+            } | ExprKind::HttpStreamWriteTimeoutNs { stream: upgrade, timeout_ns } => {
                 walk!(upgrade);
                 walk!(timeout_ns);
                 self.impure_direct = true;
@@ -25311,6 +25311,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpUpgradeReadExact { .. }
             | ExprKind::HttpUpgradeWrite { .. }
             | ExprKind::HttpUpgradeDeadline { .. }
+            | ExprKind::HttpStreamWriteTimeoutNs { .. }
             | ExprKind::HttpUpgradeShutdown { .. }
             | ExprKind::HttpStreamSend { .. }
             | ExprKind::HttpStreamFinish { .. }
@@ -25806,6 +25807,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpUpgradeReadExact { .. }
             | ExprKind::HttpUpgradeWrite { .. }
             | ExprKind::HttpUpgradeDeadline { .. }
+            | ExprKind::HttpStreamWriteTimeoutNs { .. }
             | ExprKind::HttpUpgradeShutdown { .. }
             | ExprKind::HttpStreamSend { .. }
             | ExprKind::HttpStreamFinish { .. }
@@ -29451,7 +29453,7 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::HttpUpgradeDeadline {
                 upgrade,
                 timeout_ns,
-            } => {
+            } | ExprKind::HttpStreamWriteTimeoutNs { stream: upgrade, timeout_ns } => {
                 self.walk(upgrade, depth);
                 self.walk(timeout_ns, depth);
             }
@@ -32054,6 +32056,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::HttpUpgradeReadExact { .. }
         | ExprKind::HttpUpgradeWrite { .. }
         | ExprKind::HttpUpgradeDeadline { .. }
+        | ExprKind::HttpStreamWriteTimeoutNs { .. }
         | ExprKind::HttpUpgradeShutdown { .. }
         | ExprKind::HttpStreamSend { .. }
         | ExprKind::HttpStreamFinish { .. }
@@ -41017,6 +41020,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::HttpHeadersContainsToken { .. } | ExprKind::HttpCtxUpgradeReady { .. }
             | ExprKind::HttpRespondUpgrade { .. } | ExprKind::HttpUpgradeReadExact { .. }
             | ExprKind::HttpUpgradeWrite { .. } | ExprKind::HttpUpgradeDeadline { .. }
+            | ExprKind::HttpStreamWriteTimeoutNs { .. }
             | ExprKind::HttpUpgradeShutdown { .. }
             | ExprKind::HttpStreamFinish { .. } | ExprKind::HttpStreamReject { .. } | ExprKind::CryptoCtEqual { .. }
             | ExprKind::CryptoRandom { .. } | ExprKind::CryptoDigestNew | ExprKind::CryptoDigestUpdate { .. } | ExprKind::CryptoDigestFinish { .. }
@@ -48094,7 +48098,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::HttpUpgradeDeadline {
                 upgrade,
                 timeout_ns,
-            } => {
+            } | ExprKind::HttpStreamWriteTimeoutNs { stream: upgrade, timeout_ns } => {
                 move_expr!(self, upgrade, moved, false, false);
                 move_expr!(self, timeout_ns, moved, false, false);
             }
@@ -55083,6 +55087,9 @@ impl<'a, 't> Checker<'a, 't> {
         }
         if matches!(method, "read_timeout_ns" | "write_timeout_ns") {
             let recv_expr = self.check_expr(recv, None);
+            if method == "write_timeout_ns" && recv_expr.ty == Ty::HttpStream {
+                return self.check_http_stream_method(recv_expr, method, args, span);
+            }
             if recv_expr.ty == Ty::TcpConn {
                 return self.check_conn_timeout(recv_expr, method, args, span);
             }
@@ -66630,6 +66637,22 @@ impl<'a, 't> Checker<'a, 't> {
         }
         let result_ty = Ty::Result(Scalar::Unit, Scalar::Enum(self.error_enum_id));
         match method {
+            "write_timeout_ns" => {
+                if args.len() != 1 {
+                    self.diags.error(format!("'.write_timeout_ns()' takes 1 timeout_ns argument, got {}", args.len()), span);
+                    return err;
+                }
+                let timeout_ns = self.check_expr(&args[0], Some(Ty::Int(IntTy { bits: 64, signed: true })));
+                let operand_ok = timeout_ns.ty != Ty::Error
+                    && self.require_i64_arg(timeout_ns.ty, args[0].span, "'.write_timeout_ns()' timeout_ns");
+                let receiver_ok = self.require_exclusive_handle_receiver(&recv_expr, "http_stream", method, "mutate");
+                if !operand_ok || !receiver_ok { return err; }
+                Expr {
+                    kind: ExprKind::HttpStreamWriteTimeoutNs { stream: Box::new(recv_expr), timeout_ns: Box::new(timeout_ns) },
+                    ty: result_ty,
+                    span,
+                }
+            }
             "send" | "send_event" => {
                 let event = method == "send_event";
                 if args.len() != 1 {
@@ -66669,7 +66692,7 @@ impl<'a, 't> Checker<'a, 't> {
                 Expr { kind: ExprKind::HttpStreamReject { stream: Box::new(recv_expr), rb: Box::new(rb) }, ty: result_ty, span }
             }
             _ => {
-                self.diags.error(format!("'.{method}()' is not a method on an http stream (try send / send_event / finish / reject)"), span);
+                self.diags.error(format!("'.{method}()' is not a method on an http stream (try write_timeout_ns / send / send_event / finish / reject)"), span);
                 err
             }
         }
@@ -70560,7 +70583,7 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::HttpUpgradeDeadline {
                 upgrade,
                 timeout_ns,
-            } => {
+            } | ExprKind::HttpStreamWriteTimeoutNs { stream: upgrade, timeout_ns } => {
                 self.finalize_expr(upgrade);
                 self.finalize_expr(timeout_ns);
             }
@@ -76808,9 +76831,10 @@ mod tests {
         // HttpServerMaxRequestBodyBytes mutates a server setting and returns Unit.
         // FileSync and WriterSync borrow native owners and return unit/Error.
         // BufferCapacity is a non-retaining scalar observation of a borrowed owner.
+        // HTTP timeout setters borrow an existing owner and return unit/Error.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 349,
+            variants, 350,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

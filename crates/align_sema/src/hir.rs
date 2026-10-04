@@ -2262,6 +2262,8 @@ pub enum ExprKind {
     HttpUpgradeWrite { upgrade: Box<Expr>, data: Box<Expr> },
     /// Replace the transport's retained cumulative monotonic deadline.
     HttpUpgradeDeadline { upgrade: Box<Expr>, timeout_ns: Box<Expr> },
+    /// Replace the per-operation write budget, without moving the stream.
+    HttpStreamWriteTimeoutNs { stream: Box<Expr>, timeout_ns: Box<Expr> },
     /// Terminal full-duplex shutdown, retaining one spent handle for ordinary Drop.
     HttpUpgradeShutdown { upgrade: Box<Expr> },
     /// `s.send(chunk)` / `s.send_event(data)` — write one streamed chunk (one chunk frame in

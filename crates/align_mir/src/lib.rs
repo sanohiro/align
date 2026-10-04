@@ -2970,6 +2970,11 @@ pub enum Rvalue {
         upgrade: Operand,
         timeout_ns: Operand,
     },
+    /// Store a per-operation HTTP stream write budget; returns an i32 status.
+    HttpStreamWriteTimeoutNs {
+        stream: Operand,
+        timeout_ns: Operand,
+    },
     HttpUpgradeShutdown {
         upgrade: Operand,
     },
@@ -8224,6 +8229,7 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
             | hir::ExprKind::HttpUpgradeReadExact { .. }
             | hir::ExprKind::HttpUpgradeWrite { .. }
             | hir::ExprKind::HttpUpgradeDeadline { .. }
+            | hir::ExprKind::HttpStreamWriteTimeoutNs { .. }
             | hir::ExprKind::HttpUpgradeShutdown { .. }
             | hir::ExprKind::HttpStreamReject { .. }
             | hir::ExprKind::HttpStreamSend { .. }
@@ -8421,6 +8427,7 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         | hir::ExprKind::HttpUpgradeReadExact { .. }
         | hir::ExprKind::HttpUpgradeWrite { .. }
         | hir::ExprKind::HttpUpgradeDeadline { .. }
+        | hir::ExprKind::HttpStreamWriteTimeoutNs { .. }
         | hir::ExprKind::HttpUpgradeShutdown { .. }
         | hir::ExprKind::HttpStreamReject { .. }
         | hir::ExprKind::HttpStreamSend { .. }
@@ -9773,6 +9780,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             | hir::ExprKind::HttpUpgradeReadExact { .. }
             | hir::ExprKind::HttpUpgradeWrite { .. }
             | hir::ExprKind::HttpUpgradeDeadline { .. }
+            | hir::ExprKind::HttpStreamWriteTimeoutNs { .. }
             | hir::ExprKind::HttpUpgradeShutdown { .. }
             | hir::ExprKind::HttpStreamReject { .. }
             | hir::ExprKind::HttpStreamSend { .. }
@@ -22328,6 +22336,13 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
                     timeout_ns,
                 },
             ));
+            lower_status_result(b, code, e.ty)
+        }
+        hir::ExprKind::HttpStreamWriteTimeoutNs { stream, timeout_ns } => {
+            let stream = lower_required!(b, lower_expr(b, stream), Operand::Const(Const::Unit));
+            let timeout_ns = lower_required!(b, lower_expr(b, timeout_ns), Operand::Const(Const::Unit));
+            let code = b.fresh_value(status_ty());
+            b.push(Stmt::Let(code, Rvalue::HttpStreamWriteTimeoutNs { stream, timeout_ns }));
             lower_status_result(b, code, e.ty)
         }
         hir::ExprKind::HttpUpgradeShutdown { upgrade } => {
