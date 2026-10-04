@@ -28,6 +28,7 @@ pub use str_prims::*;
 mod crypto_asymmetric;
 mod crypto_digest;
 mod os_host;
+mod os_memory;
 mod process_live;
 mod process_signal;
 mod process_verified;

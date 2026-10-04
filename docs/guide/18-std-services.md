@@ -1,8 +1,31 @@
-# std services: network, HTTP, processes, compression, crypto
+# std services: RAM, network, HTTP, processes, compression, crypto
 
 > 🌐 **English** · [Japanese](./ja/18-std-services.md)
 
-This chapter covers networking, HTTP, processes, compression, and cryptography. The same boundary rules apply: imports name capabilities, operating-system and engine failures return `Result`, and sockets, children, clients, responses, and streams that own resources are Move values.
+This chapter covers RAM observation, networking, HTTP, processes, compression, and cryptography. The same boundary rules apply: imports name capabilities, operating-system and engine failures return `Result`, and sockets, children, clients, responses, and streams that own resources are Move values.
+
+## `std.os`: observe RAM
+
+The two Impure nullary queries return ordinary `Result<i64, Error>` byte counts:
+
+```align
+import std.os
+
+fn main() -> Result<(), Error> {
+    total := os.physical_memory()?
+    available := os.available_memory()?
+    print(total)
+    print(available)
+    return Ok(())
+}
+```
+
+Linux/WSL2 reports its current kernel/VM's MemTotal and MemAvailable. macOS
+reports hw.memsize and Align's `(free_count + inactive_count) * host_page_size`
+advisory estimate. Calls allocate no Align/Rust heap storage, retain no native
+resource and sample independently. These values neither reserve RAM nor report
+VRAM; container/address-space limits can be lower. Keep application caps and
+allocation checks. See the exact [std.os contract](../impl/std-design/os.md).
 
 ## `std.net`
 

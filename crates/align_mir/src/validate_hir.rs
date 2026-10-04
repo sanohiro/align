@@ -4811,6 +4811,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::TimeInstant
             | hir::ExprKind::OsHost
             | hir::ExprKind::OsIdentity
+        | hir::ExprKind::OsMemory { .. }
             | hir::ExprKind::ProcessCpuCount
             | hir::ExprKind::TimeSleep { .. }
             | hir::ExprKind::ProcessExit { .. }
@@ -5202,6 +5203,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::TimeInstant
             | hir::ExprKind::OsHost
             | hir::ExprKind::OsIdentity
+        | hir::ExprKind::OsMemory { .. }
             | hir::ExprKind::ProcessCpuCount
             | hir::ExprKind::TimeSleep { .. }
             | hir::ExprKind::ProcessExit { .. }
@@ -9601,6 +9603,7 @@ impl<'a> BodyValidator<'a> {
                 (name.ty == Ty::Str && value.ty == Ty::Str)
                     .then(|| result(Ty::Unit, &[name, value]))?
             }
+            hir::ExprKind::OsMemory { .. } => result(i64, &[]),
             hir::ExprKind::OsIdentity => {
                 let id = self.program.structs.iter().position(align_sema::identity_info_schema_valid)?;
                 result(Ty::Struct(u32::try_from(id).ok()?), &[])

@@ -1,5 +1,30 @@
 # std.os
 
+**実装済みのメモリ観測：** 独立設計レビュー済みの plan 101 に従う。
+
+`os.physical_memory() -> Result<i64, Error>` と
+`os.available_memory() -> Result<i64, Error>` は `import std.os` が必要な
+引数なしの Impure な観測である。成功値はバイト数。総量は正、利用可能量は
+非負で、その操作内で問い合わせた総量以下となる。結果は通常の Copy 値で、
+所有者・借用ビュー・ヒープ領域は返さない。
+
+Linux/WSL2 は最大 8192 バイトの `/proc/meminfo` を読み、MemTotal の
+カーネルで利用可能な RAM 総量と、MemAvailable の推定値を使う。これは
+現在のカーネル／VM の値であり、cgroup やアドレス空間の制限は反映しない。
+macOS は総量に hw.memsize、利用可能量に明示的な
+`(free_count + inactive_count) * host_page_size` の参考推定値を使う。
+speculative ページは free_count に含まれるため追加しない。フォールバック・
+子プロセス・環境設定・キャッシュはない。未対応・不正・表現不能な観測は
+Invalid、POSIX エラーは既存の対応規則で返す。固定のネイティブ作業領域を
+使い、成功した結果は Align/Rust のヒープを確保しない。
+
+観測はメモリの予約でも、後続の確保成功の保証でもない。VRAM やモデル別の
+使用量は報告しない。各呼び出しは独立で、原子的スナップショットは保証しない。
+アプリケーションは確保結果の検査と明示的な上限を維持する。コンテナ制限は
+観測総量より小さくなる場合がある。取得・解放順、上限、ABI、検証の正確な
+契約は [OS memory observation](../../101-os-memory-observation-plan.md) にある。
+
+
 **実装済みの identity 観測:**
 `os.identity() -> Result<os.identity_info, Error>` は getuid/getgid の順で現在の実 UID/GID を観測する。
 std.os を必要とする Impure 操作で、メモリ確保も資格情報の変更もない。

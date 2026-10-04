@@ -2197,3 +2197,11 @@ before publication to preserve existing response/Upgrade semantics. Zero after
 latching uses indefinite readiness waits without deadline clocks. Timeout discards
 partial input without consuming the listener; streaming uploads and event reactors
 remain separate consumer requirements. Plan 90 owns the closure matrix.
+
+### RAM observations remain OS facts
+
+The nullary physical/available memory queries in [plan 101](impl/101-os-memory-observation-plan.md)
+serve the resident-weight consumer without turning Align into a model/GPU manager.
+The supported OS view and macOS estimate are explicit; cgroup admission, placement
+and allocation success remain separate. Primitive Copy results need no new owner
+or lifetime rule. Native queries use bounded scratch and no observation cache.

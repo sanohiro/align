@@ -33,10 +33,15 @@ fn host_formation() {
         "import std.os\nfn bad(h: host_info) {}\nfn main() {}",
         "fn bad(h: os.host_info) {}\nfn main() {}",
         "import std.os\nfn main() { h := os.host() else { return }; moved := h.system; print(h.system) }",
-        "import std.os\nfn main() { xs := [1,2]; ys := xs.par_map(|x| { h := os.host() else { return x }; x }) }",
+        "import std.os\nfn main() { xs := [1,2]; ys := xs.par_map(fn x { h := os.host() else { return x }; x }) }",
     ] {
         let checked = diff_check_multi("host-invalid", &[("main.align", source)], "main.align");
         assert!(checked.whole_errors && checked.per_unit_errors, "accepted: {source}");
+        if source.contains("par_map") {
+            for diagnostics in [&checked.whole_diags, &checked.per_unit_diags] {
+                assert!(diagnostics.contains("requires a Pure function"), "{diagnostics}");
+            }
+        }
     }
 }
 

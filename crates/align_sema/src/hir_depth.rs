@@ -362,6 +362,7 @@ fn walk_body_records<'a>(
                 | ExprKind::TimeInstant
                 | ExprKind::OsHost
         | ExprKind::OsIdentity
+        | ExprKind::OsMemory { .. }
                 | ExprKind::ProcessCpuCount
                 | ExprKind::ProcessAbort
                 | ExprKind::RandSeed

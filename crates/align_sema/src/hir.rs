@@ -1837,6 +1837,8 @@ pub enum ExprKind {
     OsHost,
     /// Current real UID/GID as the ordinary qualified Copy record.
     OsIdentity,
+    /// Advisory RAM observation; ordinary Copy Result<i64, Error>.
+    OsMemory { available: bool },
     ProcessCpuCount,
     /// `time.sleep(ns)` — suspend the calling thread for `ns` nanoseconds (the `ty` is
     /// [`crate::Ty::Unit`]). A negative `ns` is a no-op; `EINTR` resumes for the remaining time.

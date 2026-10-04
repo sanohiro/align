@@ -1666,6 +1666,10 @@ pub fn native_owner_mir_contract<'a>(
             contract.outputs = fs_tree_output_slots(*output).into_iter().map(|slot|
                 (slot, function.slots.get(slot as usize).copied().unwrap_or(Ty::Error))).collect();
         }
+        Rvalue::OsMemory { out, .. } => {
+            contract.result = i32_ty;
+            contract.outputs = vec![(*out, i64_ty)];
+        }
         Rvalue::OsHost { out } | Rvalue::OsIdentity { out } => {
             // Exact nominal schema is independently certified by validate_host_mir.
             contract.result = i32_ty;
@@ -1864,6 +1868,7 @@ fn xml_written_slots(rvalue: &Rvalue) -> Vec<(Slot, XmlAccessProvenance)> {
         | Rvalue::FsIsDir { out, .. }
         | Rvalue::OsHost { out }
         | Rvalue::OsIdentity { out }
+        | Rvalue::OsMemory { out, .. }
         | Rvalue::FrameInnerJoin { out, .. }
         | Rvalue::FileCreateRw { out, .. }
         | Rvalue::FileOpenRw { out, .. }
@@ -6468,6 +6473,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::CodecEncoderFinish(..)
             | Rvalue::OsHost { .. }
             | Rvalue::OsIdentity { .. }
+            | Rvalue::OsMemory { .. }
             | Rvalue::FrameInnerJoin { .. }
             | Rvalue::IoCopy(..)
             | Rvalue::FileCreateRw { .. }

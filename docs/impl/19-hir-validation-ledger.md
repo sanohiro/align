@@ -2303,3 +2303,16 @@ rechecking imported body source. The positive product covers `ArraySum`,
 identifiers; the first unknown in source order outranks every duplicate, and only an all-known list
 reports the first duplicate's second occurrence. Plan 77 owns the parameterized
 formation, control-flow, interface and whole/per-unit acceptance matrix.
+
+
+## Advisory OS RAM observation
+
+The nullary `OsMemory { available }` family requires exact
+`Result<i64, Error>` for both static selectors. Its Copy result has no storage
+header, native owner or region carrier. Explicit purity, replay, depth and
+storage sweeps retain its impurity without assigning allocation provenance.
+Checked-HIR ingress rejects wrong success/error identity or scalar width;
+MIR producer validation authenticates i32 status and exclusive i64 scratch
+before LLVM. [Plan 101](101-os-memory-observation-plan.md) owns native queries,
+cleanup, source transport, cache parity and the implementation closure matrix.
+No Ty/Scalar or serialized leaf tag is added.

@@ -12212,9 +12212,10 @@ fn request11_expr_kind_inventory_tripwire() {
     assert_eq!(
         // BufferCapacity, FileSync, WriterSync, FileCreateRwExclusive, FileOpenRo, StrParseI64, StrCharBoundary, ArrayTruncate, BytesSet, BytesFill, BytesCopyFrom, BufferAppendFilled,
         // FloatScope, BytesView, SliceAsBytes, and HttpServerMaxRequestBodyBytes are explicit in
-        // validation, source-shape, replay and ownership.
+        // validation, source-shape, replay and ownership. OsMemory adds one nullary
+        // Copy Result family with explicit checked-HIR validation and no retained storage.
         variants,
-        351,
+        352,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -13212,6 +13213,10 @@ fn hir_body_validator_native() {
         Vec::new(),
         result_unit
     );
+    for (name, available) in [("native_os_physical_memory", false), ("native_os_available_memory", true)] {
+        let ret = native_result(i64_ty, error);
+        add!(name, body_test_expr(hir::ExprKind::OsMemory { available }, ret), Vec::new(), ret);
+    }
     for (name, kind, ret) in [
         ("native_time_now", hir::ExprKind::TimeNow, i64_ty),
         ("native_time_instant", hir::ExprKind::TimeInstant, i64_ty),
@@ -19666,6 +19671,31 @@ fn native_output_hir_rejects_shared_mode_with_mutable_local_flag() -> Result<(),
             summary.get_mut(buffer_parameter).ok_or("output summary")?.clear();
         }
         assert_body_entrypoints_empty(label, &malformed);
+    }
+    Ok(())
+}
+
+#[test]
+fn os_memory_hir_rejects_forged_result_in_every_entrypoint() -> Result<(), &'static str> {
+    for method in ["physical_memory", "available_memory"] {
+        let base = checked_source_program(&format!("import std.os\nfn observe() -> Result<i64, Error> = os.{method}()\nfn main() {{}}\n"));
+        assert!(!is_empty(&lower_program(&base)));
+        for ty in [Ty::Bool, Ty::Int(align_sema::IntTy { bits: 64, signed: true }),
+            Ty::Result(Scalar::Bool, Scalar::Bool),
+            Ty::Result(Scalar::Int(align_sema::IntTy { bits: 32, signed: true }), Scalar::Bool)] {
+            let mut bad = base.clone();
+            body_value_expression_mut(&mut bad, "observe").ty = ty;
+            assert_body_entrypoints_empty("memory-forged-result", &bad);
+        }
+        let mut bad = base.clone();
+        let expression = body_value_expression_mut(&mut bad, "observe");
+        let Ty::Result(ok, error) = expression.ty else { return Err("memory Result"); };
+        for ty in [Ty::Result(Scalar::Bool, error), Ty::Result(ok, Scalar::Bool), Ty::Result(ok, Scalar::Enum(u32::MAX)),
+            Ty::Result(Scalar::Int(align_sema::IntTy { bits: 64, signed: false }), error)] {
+            let mut bad = base.clone();
+            body_value_expression_mut(&mut bad, "observe").ty = ty;
+            assert_body_entrypoints_empty("memory-forged-result-arm", &bad);
+        }
     }
     Ok(())
 }

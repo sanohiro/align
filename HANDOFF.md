@@ -47,6 +47,13 @@ state remain unchanged; native cursor/buffering parity and actual allocation
 counters qualify the refinement. No throughput or RSS improvement is claimed.
 Plan100 provides a bounded binary SHA-256 CLI example through existing crypto,
 reader/writer and CLI operations, with checked output and file/stdin parity.
+Plan101 adds the two std.os RAM observations requested by R50 as ordinary
+Copy Result<i64,Error> values. Linux/WSL2 uses its kernel/VM MemTotal and
+MemAvailable; macOS uses hw.memsize and an explicit free-plus-inactive advisory
+estimate. Queries use fixed native scratch, allocate no Align/Rust heap storage,
+and retain no descriptor/right. Compiler/ABI/native and whole/per-unit/cache
+owners qualify the boundary. Budget admission, cgroup adjustment, VRAM and
+consumer adoption remain application-owned.
 Continue bounded library/transport improvements and measured
 execution/storage/startup work against demonstrated consumers.
 Real voice/media engine integration and GPU qualification belong to their
