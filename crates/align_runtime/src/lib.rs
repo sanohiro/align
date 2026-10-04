@@ -25995,7 +25995,10 @@ fn http_yield_for_fds(park: &std::sync::Arc<std::sync::Mutex<ParkSlot>>, polled:
 /// The `accept(2)` errno policy in one decision ([`accept_errno_is_noise`]'s half is shared with the
 /// net rail).
 fn classify_accept_error(e: &std::io::Error) -> AcceptFail {
-    if accept_errno_is_noise(e) {
+    if accept_errno_is_noise(e)
+        || e.raw_os_error().is_some_and(|errno| errno == libc::EAGAIN || errno == libc::EWOULDBLOCK)
+    {
+        // A nonblocking listener may lose readiness before accept; select again.
         return AcceptFail::Again;
     }
     match e.raw_os_error() {

@@ -294,6 +294,33 @@ fn http_server_accept_budget_retry_readiness_malformed_and_body_cap_keep_one_bud
 }
 
 #[test]
+fn http_server_accept_budget_unexpired_accept_race_repolls_positive_and_latched_zero() {
+    for ns in [1, 0] {
+        for errno in [libc::EAGAIN, libc::EWOULDBLOCK] {
+            let mut srv = server(ns);
+            let (mut ops, _peer, _) = scripted_peer(b"GET / HTTP/1.1\r\n\r\n");
+            if ns == 0 {
+                srv.listener_mode = HttpListenerMode::Nonblocking;
+                ops.effective.insert(srv.fd, true);
+                ops.flags.insert(srv.fd, libc::O_NONBLOCK);
+            }
+            ops.accepted.push_front(Err(errno));
+            let (status, ctx) = run(&mut srv, &mut ops);
+            assert_eq!(status, 0, "ns={ns}, errno={errno}");
+            assert!(!ctx.is_null());
+            assert_eq!(ops.accepts, 2);
+            assert!(ops.waits.len() >= 2, "readiness race returns to selection");
+            assert_eq!(ops.starts, 1); // Zero constructs no budget and reads no clock.
+            if ns == 0 {
+                assert_eq!(ops.clocks, 0);
+                assert!(ops.waits.iter().all(|wait| *wait == -1));
+            }
+            unsafe { align_rt_http_ctx_free(ctx) };
+        }
+    }
+}
+
+#[test]
 fn http_server_accept_budget_pressure_caps_backoff_and_expiry_wins_over_native_errors() {
     let mut srv = server(1);
     let mut ops = AcceptScript {
