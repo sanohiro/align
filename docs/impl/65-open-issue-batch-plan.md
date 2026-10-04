@@ -8,6 +8,12 @@ disjoint record field borrows) implemented. Initial audit: 2026-09-15, baseline
 1055 and 1057 against `61b2de79`, bringing the current inventory to 11 open issues.
 It owns their exact additional public ledger and revised delivery sequence.
 
+Execution status (2026-10-04): the plan 61 dependency and capabilities that
+require it remain deferred under [plan 61's status](61-interprocedural-view-access-plan.md).
+Its implementation/reuse orders below are historical, not an active work queue.
+Shipped capabilities retain their existing contracts. Independently useful
+improvements that do not require K1 continue from current `main`.
+
 This document owns the proposed batch, exact proposed public ledger and closure
 matrix. Existing shipped contracts remain authoritative until implementation.
 It does not reopen the settled loop syntax, nominal types, inferred purity,
