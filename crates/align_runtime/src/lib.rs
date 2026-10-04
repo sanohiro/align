@@ -10516,7 +10516,7 @@ const _: unsafe extern "C" fn(*mut Reader, *mut Buffer) -> i64 = align_rt_io_rea
 fn append_line_body(b: &mut Buffer, pending_cr: bool, span: &[u8], cap: usize) -> bool {
     let length = b.data.len().checked_add(usize::from(pending_cr))
         .and_then(|length| length.checked_add(span.len()));
-    if !length.is_some_and(|length| length <= cap) {
+    if length.is_none_or(|length| length > cap) {
         return false;
     }
     b.data.with_mut(|data| {
@@ -29613,15 +29613,19 @@ mod tests {
     /// `Error.Invalid` (`-(AL_INVALID)`), bounding the caller's buffer growth. (One heavy test.)
     #[test]
     fn read_line_over_cap_is_invalid() {
+        use std::os::fd::IntoRawFd;
+        let root = FileFixtureDir::new("line-cap");
         // Just over the cap, no newline anywhere.
         let content = vec![b'z'; READ_LINE_CAP + 4096];
-        let (r, path) = buffered_reader_over("cap", &content);
-        let b = align_rt_buffer_new(16);
-        let n = unsafe { align_rt_io_reader_read_line(r, b) };
-        let backing_capacity = unsafe { (*b).data.with_mut(|data| data.capacity()) };
-        unsafe { align_rt_buffer_free(b) };
-        unsafe { align_rt_io_reader_free(r) };
-        let _ = std::fs::remove_file(&path);
+        let path = root.0.join("cap");
+        std::fs::write(&path, &content).unwrap();
+        let r = ReaderTestHandle(Box::into_raw(Box::new(Reader::unbuffered(std::fs::File::open(&path).unwrap().into_raw_fd(), true))));
+        unsafe { align_rt_io_reader_buffered(r.0); }
+        let b = BufferTestHandle(align_rt_buffer_new(16));
+        let n = unsafe { align_rt_io_reader_read_line(r.0, b.0) };
+        let backing_capacity = unsafe { (*b.0).data.with_mut(|data| data.capacity()) };
+        drop(b);
+        drop(r);
         assert_eq!(n, -(AL_INVALID as i64), "a line past the 64 MiB cap → Error.Invalid");
         assert!(backing_capacity <= READ_LINE_CAP,
             "reject before growing for an over-cap span: backing capacity {backing_capacity}");
@@ -29631,15 +29635,18 @@ mod tests {
         // terminator must not trigger another allocation merely to be popped.
         let mut exact = vec![b'z'; READ_LINE_CAP];
         exact.extend_from_slice(b"\r\n");
-        let (r, path) = buffered_reader_over("cap-crlf", &exact);
-        let b = align_rt_buffer_new(16);
-        let n = unsafe { align_rt_io_reader_read_line(r, b) };
-        let body_length = unsafe { &*b }.data.len();
-        let body_matches = unsafe { &*b }.data.iter().all(|byte| *byte == b'z');
-        let backing_capacity = unsafe { &*b }.data.capacity();
-        let published_capacity = unsafe { align_rt_buffer_capacity(b) };
-        unsafe { align_rt_buffer_free(b); align_rt_io_reader_free(r); }
-        let _ = std::fs::remove_file(&path);
+        let path = root.0.join("cap-crlf");
+        std::fs::write(&path, &exact).unwrap();
+        let r = ReaderTestHandle(Box::into_raw(Box::new(Reader::unbuffered(std::fs::File::open(&path).unwrap().into_raw_fd(), true))));
+        unsafe { align_rt_io_reader_buffered(r.0); }
+        let b = BufferTestHandle(align_rt_buffer_new(16));
+        let n = unsafe { align_rt_io_reader_read_line(r.0, b.0) };
+        let body_length = unsafe { &*b.0 }.data.len();
+        let body_matches = unsafe { &*b.0 }.data.iter().all(|byte| *byte == b'z');
+        let backing_capacity = unsafe { &*b.0 }.data.capacity();
+        let published_capacity = unsafe { align_rt_buffer_capacity(b.0) };
+        drop(b);
+        drop(r);
         assert_eq!(n, READ_LINE_CAP as i64 + 2);
         assert_eq!(body_length, READ_LINE_CAP);
         assert!(body_matches);
@@ -29652,13 +29659,9 @@ mod tests {
     /// loop's pending-CR state. Every prefix split forces that exact boundary.
     #[test]
     fn read_line_body_cap_split_oracle() {
-        struct Owner(*mut Reader, *mut Buffer, std::path::PathBuf);
-        impl Drop for Owner {
-            fn drop(&mut self) {
-                unsafe { align_rt_buffer_free(self.1); align_rt_io_reader_free(self.0); }
-                let _ = std::fs::remove_file(&self.2);
-            }
-        }
+        use std::os::fd::IntoRawFd;
+        let root = FileFixtureDir::new("line-splits");
+        let path = root.0.join("input");
         let cases: &[&[u8]] = &[
             b"", b"\nT", b"\r\nT", b"a\nT", b"ab\r\nT", b"abc\r\nT",
             b"abcd\nT", b"ab\r", b"abc\r", b"a\r\r\nT", b"ab\0\nT", b"a\rX\nT",
@@ -29670,14 +29673,16 @@ mod tests {
             if newline.is_some() && body.last() == Some(&b'\r') { body = &body[..body.len() - 1]; }
             for cap in 0..=4 {
                 for split in 0..=input.len() {
-                    let (r, path) = buffered_reader_over("body-cap-split", &input[split..]);
-                    let owner = Owner(r, align_rt_buffer_new(32), path);
-                    let reader = unsafe { &mut *owner.0 };
+                    std::fs::write(&path, &input[split..]).unwrap();
+                    let r = ReaderTestHandle(Box::into_raw(Box::new(Reader::unbuffered(std::fs::File::open(&path).unwrap().into_raw_fd(), true))));
+                    unsafe { align_rt_io_reader_buffered(r.0); }
+                    let b = BufferTestHandle(align_rt_buffer_new(32));
+                    let reader = unsafe { &mut *r.0 };
                     reader.buf.clear();
                     reader.buf.extend_from_slice(&input[..split]);
                     reader.start = 0;
                     reader.filled = split;
-                    let buffer = unsafe { &mut *owner.1 };
+                    let buffer = unsafe { &mut *b.0 };
                     let status = read_line_with_cap(reader, buffer, cap);
                     assert_eq!(buffer.cap, 32, "retains existing larger window");
                     assert_eq!(buffer.data.writable_ptr().cast_const(), buffer.data.as_ptr());
@@ -29693,10 +29698,10 @@ mod tests {
                     // Both retained lookahead and fd-fresh suffix are still observable.
                     let mut remaining = Vec::new();
                     loop {
-                        let count = unsafe { align_rt_io_reader_read(owner.0, owner.1) };
+                        let count = unsafe { align_rt_io_reader_read(r.0, b.0) };
                         assert!(count >= 0);
                         if count == 0 { break; }
-                        remaining.extend_from_slice(unsafe { &*owner.1 }.data.as_slice());
+                        remaining.extend_from_slice(unsafe { &*b.0 }.data.as_slice());
                     }
                     assert_eq!(remaining, &input[consumed..]);
                 }
@@ -29730,6 +29735,7 @@ mod tests {
 
     #[test]
     fn read_line_body_cap_pending_cr_error_order_and_capacity() {
+        use std::os::fd::IntoRawFd;
         for (input, expected) in [
             (b"abcde".as_slice(), -(AL_INVALID as i64)),
             (b"abc\r".as_slice(), -(io_error_to_status(&std::io::Error::from_raw_os_error(libc::EBADF)) as i64)),
@@ -29744,15 +29750,17 @@ mod tests {
             assert_eq!(reader.start, reader.filled);
         }
         // Successful growth publishes body capacity; a subsequent EOF retains it.
-        let (r, path) = buffered_reader_over("body-cap-growth", b"abc\r\n");
-        let b = align_rt_buffer_new(0);
-        assert_eq!(read_line_with_cap(unsafe { &mut *r }, unsafe { &mut *b }, 3), 5);
-        assert_eq!(unsafe { &*b }.data.as_slice(), b"abc");
-        assert_eq!(unsafe { align_rt_buffer_capacity(b) }, 3);
-        assert_eq!(unsafe { align_rt_io_reader_read_line(r, b) }, 0);
-        assert_eq!(unsafe { align_rt_buffer_capacity(b) }, 3);
-        unsafe { align_rt_buffer_free(b); align_rt_io_reader_free(r); }
-        let _ = std::fs::remove_file(&path);
+        let root = FileFixtureDir::new("line-growth");
+        let path = root.0.join("input");
+        std::fs::write(&path, b"abc\r\n").unwrap();
+        let r = ReaderTestHandle(Box::into_raw(Box::new(Reader::unbuffered(std::fs::File::open(&path).unwrap().into_raw_fd(), true))));
+        unsafe { align_rt_io_reader_buffered(r.0); }
+        let b = BufferTestHandle(align_rt_buffer_new(0));
+        assert_eq!(read_line_with_cap(unsafe { &mut *r.0 }, unsafe { &mut *b.0 }, 3), 5);
+        assert_eq!(unsafe { &*b.0 }.data.as_slice(), b"abc");
+        assert_eq!(unsafe { align_rt_buffer_capacity(b.0) }, 3);
+        assert_eq!(unsafe { align_rt_io_reader_read_line(r.0, b.0) }, 0);
+        assert_eq!(unsafe { align_rt_buffer_capacity(b.0) }, 3);
         assert_eq!(unsafe { align_rt_io_reader_read_line(core::ptr::null_mut(), core::ptr::null_mut()) }, -(AL_INVALID as i64));
     }
 
