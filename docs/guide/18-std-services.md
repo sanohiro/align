@@ -143,13 +143,26 @@ and output errors propagate. A late failure may leave a stdout prefix.
 import std.process
 
 pub fn main(args: array<str>) -> Result<(), Error> {
+    if args.len() < 2 { return Err(Error.Invalid) }
     ch := process.spawn(args[1], args[1..])?
-    print(ch.wait()?)
+    result := ch.wait()?
+    match result.termination {
+        Exited(code) => {
+            print("exited")
+            print(code)
+        }
+        Signaled(signal) => {
+            print("signaled")
+            print(signal)
+        }
+    }
     return Ok(())
 }
 ```
 
-The argv slice includes `argv[0]`. A `child` is a Move handle and Drop reaps an unwaited child, so it cannot silently become a zombie. `process.exec` replaces the image and runs no cleanup on success. `process.exit` performs the current cleanup path first; `process.abort` is the explicit immediate `_exit` path and skips cleanup.
+The argv slice includes `argv[0]`. `wait()` returns the Copy record `process.wait_result`: `termination` distinguishes `Exited(code)` from `Signaled(signal)`. A child's nonzero exit is result data, not an I/O error. This example prints the kind and value, then returns `Ok(())`; it does not forward the child's exit code. `max_rss_bytes: Option<i64>` carries the child's native maximum resident memory observation in bytes when available.
+
+A `child` is a Move handle and Drop reaps an unwaited direct child, so it cannot silently become a zombie. Drop may block and does not certify descendant termination. `process.exec` replaces the image and runs no cleanup on success. `process.exit` performs the current cleanup path first; `process.abort` is the explicit immediate `_exit` path and skips cleanup.
 
 ## `std.compress` and `std.crypto`
 

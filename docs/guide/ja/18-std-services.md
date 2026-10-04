@@ -126,13 +126,26 @@ URL は利用するエンドポイントに置き換えてください。
 import std.process
 
 pub fn main(args: array<str>) -> Result<(), Error> {
+    if args.len() < 2 { return Err(Error.Invalid) }
     ch := process.spawn(args[1], args[1..])?
-    print(ch.wait()?)
+    result := ch.wait()?
+    match result.termination {
+        Exited(code) => {
+            print("exited")
+            print(code)
+        }
+        Signaled(signal) => {
+            print("signaled")
+            print(signal)
+        }
+    }
     return Ok(())
 }
 ```
 
-引数のスライスには `argv[0]` も含めます。`child` は Move ハンドルです。`wait` せずに drop しても、後始末で子プロセスを回収するため、ゾンビプロセスが残りません。
+引数のスライスには `argv[0]` も含めます。`wait()` は Copy レコードの `process.wait_result` を返します。`termination` の `Exited(code)` は通常の終了、`Signaled(signal)` はシグナルによる終了です。子プロセスの非ゼロ終了は結果のデータであり、I/O エラーではありません。この例は終了の種類と値を表示して `Ok(())` を返し、子プロセスの終了コードを自身の終了コードには使いません。`max_rss_bytes: Option<i64>` は、取得できた場合の子プロセスの最大常駐メモリをバイト数で表します。
+
+`child` は Move ハンドルです。`wait` せずに drop しても、後始末で直接の子プロセスを回収するため、ゾンビプロセスが残りません。Drop は待機でブロックすることがあり、子孫プロセスの終了は保証しません。
 
 `process.exec` は現在のプロセスイメージを置き換え、成功時には後始末を行いません。`process.exit` は現在のクリーンアップ処理を実行してから終了します。`process.abort` は `_exit` に相当し、後始末をせず即座に終了します。
 
