@@ -1,6 +1,6 @@
 # Multimodal workloads through ordinary Align libraries
 
-Status: H1/H2 implemented; H3 and the reference composition remain pending.
+Status: H1/H2/H3 and the bounded C1 reference composition are implemented. C1's concrete contract and closure are in plan91.
 H1 adds no source API. Concrete engine packages still require consumer evidence.
 Baseline: `5b76f1b3ecf1ec006d4df86fb99ac4f9df74a942` (2026-10-04).
 
@@ -457,7 +457,8 @@ pre-commit extent rejection, arbitrary native octets and caller buffer reuse.
 Existing runtime lazy-head/finish/reject tests and the driver `m12_http_stream`
 and `apps_web_stream` targets own the unchanged language/framework path.
 No IR shape, ownership summary, native symbol or interface format changes.
-The H3/C1 rows are explicitly deferred to their complete capabilities.
+H2/H3 native/compiler closure is recorded below; C1 application closure is in
+`91-multimodal-reference-composition.md`.
 The writer, discriminating native owners and standalone performance/resource
 harness are one proof boundary: splitting the harness would publish the copy
 claim before its token regression and allocation controls exist.
@@ -585,8 +586,10 @@ socket-effective mode divergence after failed F_SETFL; the ledger now requires
 successful reassertion, and the owner models both states independently. Primary
 operation evidence: Apple's
 [`kern_descrip.c`](https://raw.githubusercontent.com/apple-oss-distributions/xnu/main/bsd/kern/kern_descrip.c)
-and [`sys_socket.c`](https://raw.githubusercontent.com/apple-oss-distributions/xnu/main/bsd/kern/sys_socket.c). H3's full code review remains its one
-preflight review.
+and [`sys_socket.c`](https://raw.githubusercontent.com/apple-oss-distributions/xnu/main/bsd/kern/sys_socket.c). H3's one full code review found unexpired accept
+EAGAIN was treated as fatal; the shared classifier now repolls. Positive and
+latched-zero native controls discriminate that branch, and final local/platform
+gates closed the capability.
 
 
 ### H2/H3 eager receiver reservation repair
@@ -671,7 +674,7 @@ is `align-http-write-budget-allocations-configured.csv`.
 | 1. H1 borrowed vectored stream output | `crates/align_runtime/src/lib.rs`; `crates/align_driver/tests/m12_http_stream.rs`, `apps_web_stream.rs`; a focused benchmark under `bench/`; the H1 source documents in the ledger | Existing binary and SSE callers get the complete copy/allocation improvement together. No dormant producer or new public source operation. |
 | 2. H2 bounded stream writes | `crates/align_sema/src/lib.rs`, `hir.rs`, `hir_depth.rs`, `replay_clone.rs`; `crates/align_mir/src/lib.rs`, `validate_hir.rs`, `producer.rs`, `runtime_key.rs`, `print.rs`; unchanged format-17 imported-source owner; `crates/align_codegen_llvm/src/lib.rs`, `runtime_abi.rs`, ABI golden; runtime and stream owners; ledger-listed normative documents/mirrors | A slow reader can no longer hold a caller indefinitely once that caller explicitly configures the budget. All source/interface/native consumers land together. |
 | 3. H3 bounded complete-request acquisition | The same setter/codec/ABI owner files, runtime accept/read/poll owners, `m11_http_server.rs`, native timeout owners; ledger-listed normative documents/mirrors | A controller can perform finite accept/supervision cycles and remain responsive to failed or partial requests. Useful without an inference engine. |
-| 4. C1 reference composition | Planned `examples/jobs/` or a focused `apps/` example with mock worker sources, one driver owner and English/Japanese usage guide | Runnable bounded submit/observe/cancel/artifact flow with explicit process ownership; separate text, live binary and batch fixtures. Final example paths are selected before that capability starts. |
+| 4. C1 reference composition | `examples/multimodal/` (seven ordinary Align modules), `crates/align_driver/tests/multimodal_reference.rs`, plan91 and English/Japanese guide27 | Runnable bounded submit/observe/cancel/artifact flow with explicit process ownership; separate text, live binary and batch fixtures. The exact three-port CLI, wire records and bounded resources are fixed in plan91. |
 | 5. Concrete engine / media packages | Package design and native wrapper files chosen from actual voice/media consumers; no speculative compiler edits | Each wrapper carries complete ownership, supported formats/cancellation/release and a real consumer. Add a shared jobs or media API only when this evidence justifies it. |
 
 Capabilities 2 and 3 isolate different failure domains and each has a useful
@@ -711,8 +714,8 @@ canonical wire/cache format or executable Align example is introduced here;
 table signatures describe proposed operations, not presently compilable calls.
 The reference composition deliberately leaves application schemas and package
 APIs to their concrete consumers. H1 implementation and local transport/resource
-measurements are recorded above; the remaining capabilities and real GPU
-qualification are pending.
+measurements are recorded above; H2/H3 are implemented and the runnable C1 closure is recorded in plan91. Real GPU
+qualification remains consumer-owned.
 
 One independent inspection-only design review completed on 2026-10-04. Its two
 P2 findings and one P3 clarification are closed in this document: every control

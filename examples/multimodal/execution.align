@@ -1,0 +1,151 @@
+module execution
+import std.process
+import std.fs
+import std.time
+import job_model
+
+pub Run { scope: process.child_scope, sink: writer, meta: Meta }
+pub Meta { slot: i64,
+  started: i64, cancelling_since: i64, stdout_done: bool, stderr_done: bool,
+  bytes: i64, stderr_bytes: i64, failure: bool, released: bool,
+}
+pub fn start(root: str, epoch: str, binary: str, ffmpeg: str, job: job_model.Job, slot: i64) -> Result<Run, Error> {
+  relative := job_model.name(epoch, job.id, "staging")
+  directory := fs.open_directory(root)?
+  sink := directory.create_new(relative.bytes())?
+  delay := builder()
+  delay.write_int(job.delay_ns)
+  delay_text := delay.to_string()
+  audio_name := job_model.name(epoch, job.id, "audio")
+  image_name := job_model.name(epoch, job.id, "batch")
+  audio_path := job_model.path(root, audio_name)
+  image_path := job_model.path(root, image_name)
+  audio_view: str := audio_path
+  image_view: str := image_path
+  delay_view: str := delay_text
+  scope := if job.phase == job_model.MUX {
+    command := process.command(ffmpeg, [ffmpeg, "-nostdin", "-v", "error", "-loop", "1", "-framerate", "24", "-i", image_view, "-i", audio_view, "-t", "1", "-c:v", "mpeg4", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "frag_keyframe+empty_moov", "-f", "mp4", "pipe:1"])
+    command.new_session(true)
+    command.start_scope()?
+  } else {
+    command := process.command(binary, [binary, "worker", job_model.phase_name(job.phase), delay_view])
+    command.new_session(true)
+    command.start_scope()?
+  }
+  return Ok(Run { scope: scope, sink: sink, meta: Meta { slot: slot, started: time.instant(), cancelling_since: 0,
+    stdout_done: false, stderr_done: false, bytes: 0, stderr_bytes: 0, failure: false, released: false } })
+}
+fn write(borrow sink: writer, data: slice<u8>) -> Result<(), Error> = sink.write(data)
+fn flush(borrow sink: writer) -> Result<(), Error> = sink.flush()
+fn read_output(borrow mut scope: process.child_scope, out scratch: slice<u8>) -> Result<Option<i64>, Error> = scope.read_stdout(scratch)
+fn read_error(borrow mut scope: process.child_scope, out scratch: slice<u8>) -> Result<Option<i64>, Error> = scope.read_stderr(scratch)
+fn status(borrow mut scope: process.child_scope) -> Result<Option<process.termination>, Error> = scope.status()
+fn reap(borrow mut scope: process.child_scope) -> Result<(), Error> { scope.reap(32)?; return Ok(()) }
+fn release(borrow mut scope: process.child_scope) -> Result<bool, Error> = scope.release()
+fn kill_member(borrow member: process.member, sig: i64) { member.kill(sig) else {} }
+fn kill_entry(borrow entry: process.member_info, sig: i64) { kill_member(entry.handle, sig) }
+fn stop(borrow mut scope: process.child_scope, sig: i64) -> Result<(), Error> {
+  // Root authority remains authenticated before any reap; adopted descendants use pidfds.
+  scope.kill(sig) else {}
+  members := scope.children(4096)?
+  mut index := 0
+  loop {
+    if index == members.len() { break }
+    kill_entry(members[index], sig)
+    index = index + 1
+  }
+  return Ok(())
+}
+pub fn tick(borrow mut scope: process.child_scope, borrow sink: writer, borrow mut meta: Meta, job: job_model.Job, out output: slice<u8>, out diagnostics: slice<u8>) {
+  if meta.released { return }
+  if !meta.stdout_done {
+    match read_output(scope, output) {
+      Ok(part) => {
+        match part {
+        Some(count) => {
+        if count == 0 { meta.stdout_done = true } else {
+          match admit_output(job, meta.bytes, count) {
+            Some(next) => match write(sink, output[..count]) { Ok(_) => { meta.bytes = next }, Err(_) => { meta.failure = true } },
+            None => { meta.failure = true }
+          }
+        }
+      }
+        None => {}
+        }
+      }
+      Err(_) => { meta.failure = true }
+    }
+  }
+  if !meta.stderr_done {
+    match read_error(scope, diagnostics) {
+      Ok(part) => {
+        match part {
+        Some(count) => {
+        if count == 0 { meta.stderr_done = true } else {
+          if meta.stderr_bytes + count > 4096 { meta.failure = true } else { meta.stderr_bytes = meta.stderr_bytes + count }
+        }
+      }
+        None => {}
+        }
+      }
+      Err(_) => { meta.failure = true }
+    }
+  }
+  if time.instant() - meta.started >= 5000000000 { meta.failure = true }
+  if job.state == job_model.CANCELLING || meta.failure {
+    if meta.cancelling_since == 0 { meta.cancelling_since = time.instant() }
+    requested := if time.instant() - meta.cancelling_since >= 250000000 { process.signal.Kill } else { process.signal.Terminate }
+    stop(scope, process.signal_number(requested)) else { meta.failure = true }
+  }
+  mut root_done := false
+  observed := status(scope) else { meta.failure = true; None }
+  match observed {
+    Some(termination) => {
+      root_done = true
+      match termination { Exited(code) => { if code != 0 { meta.failure = true } }, Signaled(_) => { meta.failure = true } }
+    }
+    None => {}
+  }
+  if root_done { reap(scope) else { meta.failure = true } }
+  if root_done && meta.stdout_done && meta.stderr_done {
+    match release(scope) { Ok(gone) => { meta.released = gone }, Err(_) => { meta.failure = true } }
+  }
+}
+pub fn publish(borrow sink: writer, metadata: Meta, root: str, epoch: str, id: i64, phase: i64) -> Result<i64, Error> {
+  if !metadata.released || metadata.failure { return Err(Error.Invalid) }
+  flush(sink)?
+  expected := job_model.known_total(phase)
+  if expected >= 0 && expected != metadata.bytes { return Err(Error.Invalid) }
+  stage_name := job_model.name(epoch, id, "staging")
+  final_name := job_model.name(epoch, id, job_model.phase_name(phase))
+  stage_path := job_model.path(root, stage_name)
+  final_path := job_model.path(root, final_name)
+  // Validate completed container framing before publication; FFmpeg/ffprobe qualification is in the owner.
+  directory := fs.open_directory(root)?
+  reader := directory.open_read_single_link(stage_name.bytes())?
+  mut header := buffer(44)
+  count := reader.read(header)?
+  data := header.bytes()
+  if phase == job_model.AUDIO && (count < 44 || data[..4].as_str()? != "RIFF" || data[8..12].as_str()? != "WAVE" || data.u32_le(40) != 16000) { return Err(Error.Invalid) }
+  if phase == job_model.BATCH && (count < 13 || data[..13].as_str()? != "P6\n16 16\n255\n") { return Err(Error.Invalid) }
+  if phase == job_model.MUX && (count < 12 || data[4..8].as_str()? != "ftyp") { return Err(Error.Invalid) }
+  fs.rename_no_replace(stage_path, final_path)?
+  return Ok(metadata.bytes)
+}
+
+pub fn admit_output(job: job_model.Job, current: i64, count: i64) -> Option<i64> {
+  if current < 0 || count < 0 { return None }
+  next := current.checked_add(count) else { return None }
+  mut used := 20480
+  amounts := [job.input_bytes, job.text_bytes, job.audio_bytes, job.batch_bytes, job.mux_bytes]
+  mut index := 0
+  loop {
+    if index == amounts.len() { break }
+    amount := amounts[index]
+    if amount < 0 { return None }
+    used = used.checked_add(amount) else { return None }
+    index = index + 1
+  }
+  if used > 1048576 || next > 1048576 - used || (job.total >= 0 && next > job.total) { return None }
+  return Some(next)
+}

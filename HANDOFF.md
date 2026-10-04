@@ -32,7 +32,12 @@ TCP/Unix stall, configured-zero drain and ABI/export owners close the boundary.
 Complete-request budgets (H3) now cover finite selection, admission and full
 headers/body, with checked listener-mode recovery and exactly-once selected-input
 cleanup. Source/forged-HIR, checkpoint and real partial-peer owners close the
-boundary. The bounded process/job/artifact reference composition (C1) remains next. Model lifetimes use existing
+boundary. The bounded process/job/artifact reference composition (C1) is implemented in
+`examples/multimodal/` against plan91: controller-only admission, two explicit
+observer ports, serial Linux child_scope workers, capped artifacts, exact-id
+read leases, sample-frame metadata and real FFmpeg assembly. Native mock/failure
+owners qualify this application; real engine adapters and GPU release remain
+consumer-owned. Model lifetimes use existing
 opaque resources and process owners; no new language concurrency model or tensor
 system is proposed. Linux/WSL2 is the GPU qualification target. This work proceeds
 independently of deferred K1.

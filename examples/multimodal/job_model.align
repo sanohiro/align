@@ -1,0 +1,359 @@
+module job_model
+import core.json
+
+pub QUEUED := 0
+pub RUNNING := 1
+pub CANCELLING := 2
+pub SUCCEEDED := 3
+pub FAILED := 4
+pub CANCELLED := 5
+pub EMPTY := 0
+pub TEXT := 1
+pub AUDIO := 2
+pub BATCH := 3
+pub MUX := 4
+pub PIPELINE := 4
+pub Job {
+  id: i64, kind: i64, state: i64, phase: i64,
+  delay_ns: i64, completed: i64, total: i64, sequence: i64,
+  input_bytes: i64, text_bytes: i64, audio_bytes: i64, batch_bytes: i64, mux_bytes: i64,
+  pins: i64, error_code: i64, retired: bool,
+}
+pub History { sequence: [i64; 128], state: [i64; 128], phase: [i64; 128], completed: [i64; 128], total: [i64; 128] }
+pub Lease { id: i64, job: i64, phase: i64, last_released: i64 }
+pub Submit { input: string, delay_ns: i64 }
+pub Receipt { epoch: string, id: i64, status: string }
+pub EventRow { sequence: i64, state: string, phase: string, completed: i64, total: Option<i64>, progress_percent: Option<i64> }
+pub ArtifactRow { artifact_id: string, media_type: string, byte_length: i64, integrity: Option<string> }
+pub TextSpan { start: i64, end: i64 }
+pub AlignmentEntry { ordinal: i64, track: i64, kind: string, label: string, start_frame: i64, end_frame: i64, text_span: Option<TextSpan> }
+pub AudioAlignment { artifact_id: string, transcript: string, sample_rate: i64, channels: i64, sample_frames: i64, producer: string, entries: Option<array<AlignmentEntry>> }
+pub Snapshot {
+  epoch: string, id: i64, state: string, phase: string, completed: i64,
+  total: Option<i64>, progress_percent: Option<i64>, sequence: i64, oldest_sequence: i64, gap: bool,
+  events: array<EventRow>, artifacts: array<ArtifactRow>, alignment: Option<AudioAlignment>, error: Option<string>,
+}
+pub Health { epoch: string, accepting: bool, device_state: string, queued: i64, running: Option<i64>, reserved_artifact_bytes: i64, active_leases: i64 }
+pub LeaseGrant { lease_id: i64, artifact_id: string, relative_name: string, media_type: string, byte_length: i64 }
+pub ReleaseAck { released: bool }
+pub Cleanup { epoch: string, names: array<string> }
+pub VideoTime { numerator: i64, denominator: i64, pts: i64 }
+
+pub fn empty() -> Job = Job {
+  id: 0, kind: TEXT, state: QUEUED, phase: EMPTY, delay_ns: 0,
+  completed: 0, total: -1, sequence: 0, input_bytes: 0,
+  text_bytes: 0, audio_bytes: 0, batch_bytes: 0, mux_bytes: 0,
+  pins: 0, error_code: 0, retired: false,
+}
+pub fn history() -> History = History {
+  sequence: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+  state: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+  phase: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+  completed: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+  total: [-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
+}
+pub fn empty_lease() -> Lease = Lease { id: 0, job: 0, phase: EMPTY, last_released: 0 }
+pub fn state_name(value: i64) -> str = match value {
+  0 => "queued", 1 => "running", 2 => "cancelling",
+  3 => "succeeded", 4 => "failed", 5 => "cancelled", _ => "invalid",
+}
+pub fn phase_name(value: i64) -> str = match value { 0 => "", 1 => "text", 2 => "audio", 3 => "batch", 4 => "mux", _ => "invalid" }
+pub fn kind_name(value: i64) -> str = match value { 1 => "text", 2 => "audio", 3 => "batch", 4 => "pipeline", _ => "invalid" }
+pub fn parse_kind(value: str) -> Option<i64> = match value { "text" => Some(TEXT), "audio" => Some(AUDIO), "batch" => Some(BATCH), "pipeline" => Some(PIPELINE), _ => None }
+pub fn parse_phase(value: str) -> Option<i64> = match value { "text" => Some(TEXT), "audio" => Some(AUDIO), "batch" => Some(BATCH), "mux" => Some(MUX), _ => None }
+pub fn terminal(value: i64) -> bool = match value { 3 => true, 4 => true, 5 => true, _ => false }
+pub fn first_phase(value: i64) -> i64 = match value { 1 => TEXT, 2 => AUDIO, 3 => BATCH, 4 => TEXT, _ => EMPTY }
+pub fn next_phase(value: i64, phase: i64) -> i64 {
+  if value != PIPELINE { return EMPTY }
+  return match phase { 1 => AUDIO, 2 => BATCH, 3 => MUX, _ => EMPTY }
+}
+pub fn known_total(phase: i64) -> i64 = match phase { 1 => 29, 2 => 16044, 3 => 781, _ => -1 }
+pub fn optional_total(value: i64) -> Option<i64> = if value < 0 { None } else { Some(value) }
+pub fn media_type(phase: i64) -> str = match phase { 1 => "text/plain; charset=utf-8", 2 => "audio/wav", 3 => "image/x-portable-pixmap", 4 => "video/mp4", _ => "application/octet-stream" }
+pub fn artifact_length(job: Job, phase: i64) -> i64 = match phase { 1 => job.text_bytes, 2 => job.audio_bytes, 3 => job.batch_bytes, 4 => job.mux_bytes, _ => 0 }
+pub fn used_bytes(job: Job) -> i64 = job.input_bytes + job.text_bytes + job.audio_bytes + job.batch_bytes + job.mux_bytes + 16384 + 4096
+pub fn name(epoch: str, id: i64, phase: str) -> string {
+  output := builder()
+  output.write(epoch)
+  output.write("-")
+  output.write_int(id)
+  output.write("-")
+  output.write(phase)
+  return output.to_string()
+}
+pub fn path(root: str, relative: str) -> string {
+  output := builder()
+  output.write(root)
+  output.write("/")
+  output.write(relative)
+  return output.to_string()
+}
+pub fn canonical_id(text: str) -> Result<i64, Error> {
+  value := text.parse_i64() else { return Err(Error.Invalid) }
+  if value < 0 { return Err(Error.Invalid) }
+  output := builder()
+  output.write_int(value)
+  canonical := output.to_string()
+  if text != canonical { return Err(Error.Invalid) }
+  return Ok(value)
+}
+pub fn percent(completed: i64, total: Option<i64>) -> Result<Option<i64>, Error> {
+  if completed < 0 { return Err(Error.Invalid) }
+  amount := total else { return Ok(None) }
+  if amount < 0 || completed > amount { return Err(Error.Invalid) }
+  if amount == 0 { return Ok(None) }
+  // Quotient/remainder avoids overflowing completed*100.
+  whole := (completed / amount).checked_mul(100) else { return Err(Error.Invalid) }
+  tail := (completed % amount).checked_mul(100) else { return Err(Error.Invalid) }
+  result := whole.checked_add(tail / amount) else { return Err(Error.Invalid) }
+  return Ok(Some(result))
+}
+pub fn frames_ms(frame: i64, rate: i64) -> Result<i64, Error> {
+  if frame < 0 || rate <= 0 { return Err(Error.Invalid) }
+  whole := (frame / rate).checked_mul(1000) else { return Err(Error.Invalid) }
+  remainder := (frame % rate).checked_mul(1000) else { return Err(Error.Invalid) }
+  result := whole.checked_add(remainder / rate) else { return Err(Error.Invalid) }
+  return Ok(result)
+}
+pub fn video_ms(value: VideoTime) -> Result<i64, Error> {
+  if value.numerator <= 0 || value.denominator <= 0 || value.pts < 0 { return Err(Error.Invalid) }
+  scaled := value.pts.checked_mul(value.numerator) else { return Err(Error.Invalid) }
+  return frames_ms(scaled, value.denominator)
+}
+pub fn validate_alignment(value: AudioAlignment) -> Result<(), Error> {
+  if value.sample_rate <= 0 || value.channels <= 0 || value.sample_frames < 0 { return Err(Error.Invalid) }
+  entries := value.entries else { return Ok(()) }
+  if entries.len() > 16 { return Err(Error.Invalid) }
+  mut previous := [0, 0, 0, 0]
+  mut index := 0
+  loop {
+    if index == entries.len() { break }
+    if entries[index].ordinal != index || entries[index].track < 0 || entries[index].track > 3 || entries[index].label.len() > 64 { return Err(Error.Invalid) }
+    if entries[index].kind != "word" && entries[index].kind != "phoneme" && entries[index].kind != "breath" && entries[index].kind != "silence" { return Err(Error.Invalid) }
+    if entries[index].start_frame < previous[entries[index].track] || entries[index].end_frame < entries[index].start_frame || entries[index].end_frame > value.sample_frames { return Err(Error.Invalid) }
+    previous[entries[index].track] = entries[index].start_frame
+    match entries[index].text_span {
+      Some(span) => {
+        if span.start < 0 || span.end < span.start || span.end > value.transcript.len() { return Err(Error.Invalid) }
+        if !value.transcript.is_char_boundary(span.start) || !value.transcript.is_char_boundary(span.end) { return Err(Error.Invalid) }
+      }
+      None => {}
+    }
+    index = index + 1
+  }
+  return Ok(())
+}
+pub fn find(jobs: slice<Job>, id: i64) -> Option<i64> {
+  mut index := 0
+  loop {
+    if index == jobs.len() { break None }
+    if jobs[index].id == id && id > 0 && !jobs[index].retired { break Some(index) }
+    index = index + 1
+  }
+}
+pub fn queued(jobs: slice<Job>) -> i64 {
+  mut count := 0
+  mut index := 0
+  loop {
+    if index == jobs.len() { break count }
+    if jobs[index].id > 0 && jobs[index].state == QUEUED { count = count + 1 }
+    index = index + 1
+  }
+}
+pub fn admission_slot(jobs: slice<Job>) -> Option<i64> {
+  if queued(jobs) >= 4 { return None }
+  mut free: Option<i64> := None
+  mut oldest: Option<i64> := None
+  mut terminals := 0
+  mut index := 0
+  loop {
+    if index == jobs.len() { break }
+    candidate := jobs[index]
+    if candidate.id == 0 { free = Some(index) }
+    if candidate.id > 0 && terminal(candidate.state) {
+      terminals = terminals + 1
+      if candidate.pins == 0 {
+        if match oldest { None => true, Some(prior) => candidate.id < jobs[prior].id } { oldest = Some(index) }
+      }
+    }
+    index = index + 1
+  }
+  if terminals >= 3 { return oldest }
+  return free
+}
+pub fn next_queued(jobs: slice<Job>) -> Option<i64> {
+  mut selected: Option<i64> := None
+  mut index := 0
+  loop {
+    if index == jobs.len() { break selected }
+    if jobs[index].id > 0 && jobs[index].state == QUEUED {
+      if match selected { None => true, Some(prior) => jobs[index].id < jobs[prior].id } { selected = Some(index) }
+    }
+    index = index + 1
+  }
+}
+pub fn record(borrow mut job: Job, slot: i64, borrow mut history: History) -> Result<(), Error> {
+  sequence := job.sequence.checked_add(1) else { return Err(Error.Invalid) }
+  position := slot * 16 + ((sequence - 1) % 16)
+  history.sequence[position] = sequence
+  history.state[position] = job.state
+  history.phase[position] = job.phase
+  history.completed[position] = job.completed
+  history.total[position] = job.total
+  job.sequence = sequence
+  return Ok(())
+}
+pub fn cancel(borrow mut job: Job) {
+  if terminal(job.state) { return }
+  job.state = if job.state == QUEUED { CANCELLED } else { CANCELLING }
+}
+pub fn release(borrow mut lease: Lease, id: i64) -> Result<(), Error> {
+  if id <= 0 { return Err(Error.Invalid) }
+  if id == lease.last_released { return Ok(()) }
+  if id != lease.id { return Err(Error.Invalid) }
+  lease.last_released = id
+  lease.id = 0
+  lease.job = 0
+  lease.phase = EMPTY
+  return Ok(())
+}
+pub fn snapshot(epoch: str, job: Job, slot: i64, borrow history: History, after: i64, transcript: str) -> Result<Snapshot, Error> {
+  if after < 0 || after > job.sequence { return Err(Error.Invalid) }
+  oldest := if job.sequence > 16 { job.sequence - 15 } else { 1 }
+  mut rows: array_builder<EventRow> := array_builder(16)
+  mut sequence := oldest
+  loop {
+    if sequence > job.sequence { break }
+    position := slot * 16 + ((sequence - 1) % 16)
+    if sequence > after {
+      rows.push(EventRow { sequence: sequence, state: state_name(history.state[position]).clone(), phase: phase_name(history.phase[position]).clone(), completed: history.completed[position], total: optional_total(history.total[position]), progress_percent: percent(history.completed[position], optional_total(history.total[position]))? })
+    }
+    if sequence == job.sequence { break }
+    sequence = sequence + 1
+  }
+  mut artifacts: array_builder<ArtifactRow> := array_builder(4)
+  if job.state == SUCCEEDED {
+    phases := [TEXT, AUDIO, BATCH, MUX]
+    mut phase_index := 0
+    loop {
+      if phase_index == 4 { break }
+      phase := phases[phase_index]
+      length := artifact_length(job, phase)
+      if length > 0 { artifacts.push(ArtifactRow { artifact_id: name(epoch, job.id, phase_name(phase)), media_type: media_type(phase).clone(), byte_length: length, integrity: None }) }
+      phase_index = phase_index + 1
+    }
+  }
+  mut alignment: Option<AudioAlignment> := None
+  if job.state == SUCCEEDED && job.audio_bytes > 0 {
+    mut entries: array_builder<AlignmentEntry> := array_builder(1)
+    entries.push(AlignmentEntry { ordinal: 0, track: 0, kind: "silence".clone(), label: "".clone(), start_frame: 0, end_frame: 8000, text_span: None })
+    alignment = Some(AudioAlignment { artifact_id: name(epoch, job.id, "audio"), transcript: transcript.clone(), sample_rate: 8000, channels: 1, sample_frames: 8000, producer: "align-reference-silence".clone(), entries: Some(entries.build()) })
+  }
+  return Ok(Snapshot {
+    epoch: epoch.clone(), id: job.id, state: state_name(job.state).clone(), phase: phase_name(job.phase).clone(), completed: job.completed,
+    total: optional_total(job.total), progress_percent: percent(job.completed, optional_total(job.total))?, sequence: job.sequence, oldest_sequence: oldest,
+    gap: after > 0 && after < oldest - 1, events: rows.build(), artifacts: artifacts.build(), alignment: alignment,
+    error: if job.state == FAILED { Some("worker or output validation failed".clone()) } else { None },
+  })
+}
+pub fn selftest() -> Result<(), Error> {
+  if frames_ms(7999, 8000)? != 999 || video_ms(VideoTime { numerator: 1, denominator: 24, pts: 25 })? != 1041 { return Err(Error.Invalid) }
+  if match frames_ms(9223372036854775807, 1) { Ok(_) => true, Err(_) => false } { return Err(Error.Invalid) }
+  if match frames_ms(-1, 8000) { Ok(_) => true, Err(_) => false } { return Err(Error.Invalid) }
+  if frames_ms(0, 8000)? != 0 || frames_ms(9223372036854775, 1)? != 9223372036854775000 { return Err(Error.Invalid) }
+  if match video_ms(VideoTime { numerator: 2, denominator: 1, pts: 9223372036854775807 }) { Ok(_) => true, Err(_) => false } { return Err(Error.Invalid) }
+  if match video_ms(VideoTime { numerator: 1, denominator: 0, pts: 0 }) { Ok(_) => true, Err(_) => false } { return Err(Error.Invalid) }
+  if match percent(1, Some(0)) { Ok(_) => true, Err(_) => false } { return Err(Error.Invalid) }
+  golden := "{\"entries\":[{\"label\":\"€\",\"kind\":\"word\",\"ordinal\":0,\"track\":0,\"start_frame\":400,\"end_frame\":800,\"text_span\":{\"end\":3,\"start\":0}}],\"producer\":\"fixture\",\"sample_frames\":8000,\"channels\":1,\"sample_rate\":8000,\"transcript\":\"€a\",\"artifact_id\":\"opaque\"}"
+  valid: AudioAlignment := json.decode(golden)?
+  validate_alignment(valid)?
+  roundtrip: AudioAlignment := json.decode(golden)?
+  serialized := json.encode_bounded(roundtrip, 32768)?
+  print(serialized)
+  unsupported: AudioAlignment := json.decode("{\"artifact_id\":\"opaque\",\"transcript\":\"\",\"sample_rate\":8000,\"channels\":1,\"sample_frames\":0,\"producer\":\"fixture\"}")?
+  encoded_unsupported := json.encode_bounded(unsupported, 32768)?
+  print(encoded_unsupported)
+  validate_alignment(unsupported)?
+  // Each invalid field crosses the same owned JSON -> validation boundary.
+  invalid_entries := [
+    "{\"ordinal\":1,\"track\":0,\"kind\":\"word\",\"label\":\"\",\"start_frame\":0,\"end_frame\":1}",
+    "{\"ordinal\":0,\"track\":4,\"kind\":\"word\",\"label\":\"\",\"start_frame\":0,\"end_frame\":1}",
+    "{\"ordinal\":0,\"track\":0,\"kind\":\"unknown\",\"label\":\"\",\"start_frame\":0,\"end_frame\":1}",
+    "{\"ordinal\":0,\"track\":0,\"kind\":\"word\",\"label\":\"\",\"start_frame\":-1,\"end_frame\":1}",
+    "{\"ordinal\":0,\"track\":0,\"kind\":\"word\",\"label\":\"\",\"start_frame\":2,\"end_frame\":1}",
+    "{\"ordinal\":0,\"track\":0,\"kind\":\"word\",\"label\":\"\",\"start_frame\":0,\"end_frame\":8001}",
+    "{\"ordinal\":0,\"track\":0,\"kind\":\"word\",\"label\":\"\",\"start_frame\":0,\"end_frame\":1,\"text_span\":{\"start\":1,\"end\":3}}",
+    "{\"ordinal\":0,\"track\":0,\"kind\":\"word\",\"label\":\"\",\"start_frame\":0,\"end_frame\":1,\"text_span\":{\"start\":0,\"end\":5}}",
+    "{\"ordinal\":0,\"track\":0,\"kind\":\"word\",\"label\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"start_frame\":0,\"end_frame\":1}",
+    "{\"ordinal\":0,\"track\":0,\"kind\":\"word\",\"label\":\"\",\"start_frame\":2,\"end_frame\":3},{\"ordinal\":1,\"track\":0,\"kind\":\"word\",\"label\":\"\",\"start_frame\":1,\"end_frame\":2}",
+  ]
+  mut invalid_index := 0
+  loop {
+    if invalid_index == invalid_entries.len() { break }
+    input := builder()
+    input.write("{\"artifact_id\":\"opaque\",\"transcript\":\"€a\",\"sample_rate\":8000,\"channels\":1,\"sample_frames\":8000,\"producer\":\"fixture\",\"entries\":[")
+    input.write(invalid_entries[invalid_index])
+    input.write("]}")
+    text := input.to_string()
+    invalid: AudioAlignment := json.decode(text)?
+    if match validate_alignment(invalid) { Ok(_) => true, Err(_) => false } { return Err(Error.Invalid) }
+    invalid_index = invalid_index + 1
+  }
+  mut entry_limit := 16
+  loop {
+    if entry_limit == 18 { break }
+    mut entries: array_builder<AlignmentEntry> := array_builder(entry_limit)
+    mut ordinal := 0
+    loop {
+      if ordinal == entry_limit { break }
+      entries.push(AlignmentEntry { ordinal: ordinal, track: 0, kind: "silence".clone(), label: "".clone(), start_frame: 0, end_frame: 0, text_span: None })
+      ordinal = ordinal + 1
+    }
+    bounded := AudioAlignment { artifact_id: "opaque".clone(), transcript: "".clone(), sample_rate: 8000, channels: 1, sample_frames: 0, producer: "fixture".clone(), entries: Some(entries.build()) }
+    accepted := match validate_alignment(bounded) { Ok(_) => true, Err(_) => false }
+    if accepted != (entry_limit == 16) { return Err(Error.Invalid) }
+    entry_limit = entry_limit + 1
+  }
+  mut domain := 0
+  loop {
+    if domain == 3 { break }
+    invalid := AudioAlignment { artifact_id: "opaque".clone(), transcript: "".clone(), sample_rate: if domain == 0 { 0 } else { 8000 }, channels: if domain == 1 { 0 } else { 1 }, sample_frames: if domain == 2 { -1 } else { 0 }, producer: "fixture".clone(), entries: None }
+    if match validate_alignment(invalid) { Ok(_) => true, Err(_) => false } { return Err(Error.Invalid) }
+    domain = domain + 1
+  }
+  mut lease := Lease { id: 1, job: 10, phase: AUDIO, last_released: 0 }
+  release(lease, 1)?
+  lease.id = 2
+  lease.job = 11
+  release(lease, 1)?
+  if lease.id != 2 || lease.job != 11 { return Err(Error.Invalid) }
+  if match release(lease, 3) { Ok(_) => true, Err(_) => false } { return Err(Error.Invalid) }
+  mut job := empty()
+  job.id = 1
+  mut records := history()
+  record(job, 7, records)?
+  status := snapshot("0123456789abcdef0123456789abcdef", job, 7, records, 0, "")?
+  encoded := json.encode_bounded(status, 32768)?
+  print(encoded)
+  decoded: Snapshot := json.decode(encoded)?
+  if decoded.id != 1 || decoded.events.len() != 1 || decoded.artifacts.len() != 0 { return Err(Error.Invalid) }
+  job.sequence = 9223372036854775806
+  record(job, 7, records)?
+  last := snapshot("0123456789abcdef0123456789abcdef", job, 7, records, 9223372036854775806, "")?
+  if last.events.len() != 1 || last.events[0].sequence != 9223372036854775807 { return Err(Error.Invalid) }
+  if match record(job, 7, records) { Ok(_) => true, Err(_) => false } { return Err(Error.Invalid) }
+  print("model-ok")
+  return Ok(())
+}
+
+pub fn valid_epoch(value: str) -> bool {
+  if value.len() != 32 { return false }
+  bytes := value.bytes()
+  mut index := 0
+  loop {
+    if index == 32 { break true }
+    digit := bytes[index]
+    if !((digit >= 48 && digit <= 57) || (digit >= 97 && digit <= 102)) { break false }
+    index = index + 1
+  }
+}

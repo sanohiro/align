@@ -1,0 +1,86 @@
+module transport
+import std.http
+import job_model
+
+pub Route { kind: i64, epoch: str, id: i64, phase: str, cursor: i64, slot: i64, lease: i64 }
+pub fn reply(ctx: http_request_ctx, status: i64, media: str, data: slice<u8>) -> Result<(), Error> {
+  response := http.response(status)
+  response.header("Content-Type", media)
+  stream := ctx.respond_stream(response)?
+  stream.write_timeout_ns(50000000)?
+  stream.send(data)?
+  return stream.finish()
+}
+pub fn message(ctx: http_request_ctx, status: i64, text: str) -> Result<(), Error> = reply(ctx, status, "text/plain; charset=utf-8", text.bytes())
+pub fn route(path: str) -> Result<Route, Error> {
+  mut kind := 0
+  mut tail := ""
+  if path == "/health" { kind = 1 }
+  if path == "/shutdown" { kind = 2 }
+  if path == "/internal/health" { kind = 3 }
+  if path == "/v1/live/text" { kind = 4 }
+  if path == "/v1/live/pcm" { kind = 5 }
+  if kind > 0 { return Ok(Route { kind: kind, epoch: "", id: 0, phase: "", cursor: 0, slot: 0, lease: 0 }) }
+  if path.starts_with("/v1/jobs/") { kind = 10; tail = path[9..] }
+  if path.starts_with("/internal/jobs/") { kind = 20; tail = path[15..] }
+  if path.starts_with("/internal/slots/") {
+    rest := path[16..]
+    slash := rest.find("/") else { return Err(Error.Invalid) }
+    slot := job_model.canonical_id(rest[..slash])?
+    remaining := rest[slash..]
+    if !remaining.starts_with("/release/") { return Err(Error.Invalid) }
+    lease := job_model.canonical_id(remaining[9..])?
+    if slot > 1 || lease == 0 { return Err(Error.Invalid) }
+    return Ok(Route { kind: 30, epoch: "", id: 0, phase: "", cursor: 0, slot: slot, lease: lease })
+  }
+  if kind == 0 { return Err(Error.NotFound) }
+  first := tail.find("/") else {
+    if kind == 10 { return Ok(Route { kind: 11, epoch: "", id: 0, phase: tail, cursor: 0, slot: 0, lease: 0 }) }
+    return Err(Error.Invalid)
+  }
+  epoch := tail[..first]
+  remainder := tail[first+1..]
+  second := remainder.find("/") else { remainder.len() }
+  id := job_model.canonical_id(remainder[..second])?
+  if id == 0 { return Err(Error.Invalid) }
+  action := remainder[second..]
+  mut phase := ""
+  mut cursor := 0
+  if action == "" { kind = 12 }
+  if action == "/cancel" { kind = 13 }
+  if action == "/events" { kind = 14 }
+  if action.starts_with("/events?after=") { kind = 21; cursor = job_model.canonical_id(action[14..])? }
+  if action.starts_with("/artifacts/") { kind = 15; phase = action[11..] }
+  if action.starts_with("/lease/") { kind = 22; phase = action[7..] }
+  if kind == 10 || kind == 20 { return Err(Error.NotFound) }
+  return Ok(Route { kind: kind, epoch: epoch, id: id, phase: phase, cursor: cursor, slot: 0, lease: 0 })
+}
+pub fn private_get(borrow client: http_client, control_port: i64, token: str, path: str) -> Result<http_response, Error> {
+  url := builder()
+  url.write("http://127.0.0.1:")
+  url.write_int(control_port)
+  url.write(path)
+  address := url.to_string()
+  request := http.request("GET", address)
+  request.header("X-Reference-Control", token)
+  request.timeout(100000000)
+  request.max_response_body_bytes(32768)
+  return client.request(request)
+}
+pub fn private_post(borrow client: http_client, control_port: i64, token: str, path: str, slot: i64) -> Result<http_response, Error> {
+  url := builder()
+  url.write("http://127.0.0.1:")
+  url.write_int(control_port)
+  url.write(path)
+  address := url.to_string()
+  slot_text := builder()
+  slot_text.write_int(slot)
+  slot_value := slot_text.to_string()
+  request := http.request("POST", address)
+  request.header("X-Reference-Control", token)
+  request.header("X-Observer-Slot", slot_value)
+  request.body("")
+  request.timeout(100000000)
+  request.max_response_body_bytes(32768)
+  return client.request(request)
+}
