@@ -40,6 +40,11 @@ Plan98 adds structural advice for a direct numeric `.to_array().sum()` with no
 intervening stages. It anchors one warning at the materialization's source span;
 named or reused arrays stay silent. Existing inference and compiled execution
 remain unchanged; source, generic and whole/per-unit diagnostic owners cover it.
+Plan99 reuses a buffered reader's reserved 64KiB window during io.copy, removing
+one separate transfer allocation. Unbuffered/small-capacity readers retain fixed
+scratch storage. The shared writer, error precedence and subsequent reader/writer
+state remain unchanged; native cursor/buffering parity and actual allocation
+counters qualify the refinement. No throughput or RSS improvement is claimed.
 Continue bounded library/transport improvements and measured
 execution/storage/startup work against demonstrated consumers.
 Real voice/media engine integration and GPU qualification belong to their

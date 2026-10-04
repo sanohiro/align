@@ -365,9 +365,11 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 }
 ```
 
-`align_rt_io_copy` now goes through the shared `align_rt_io_reader_read` path for every chunk. That
-path drains `buf[start..filled]` first, advances `start`, and only then reads fresh fd bytes; the
-shared writer path and returned byte total are unchanged. The regression test uses `AB\nCDEFG`,
+`align_rt_io_copy` drains `buf[start..filled]` first, advances `start`, and only then reads fresh fd
+bytes. Plan99 reuses a buffered reader's already-reserved 64KiB lookahead through `Reader::refill`;
+other readers retain the fixed scratch buffer and `align_rt_io_reader_read`. Both producers consume
+the initialized chunk before the shared writer call, including write failure. The writer path and
+returned byte total are unchanged. The regression test uses `AB\nCDEFG`,
 consumes the first line, then proves that copy returns `5` and writes exactly `CDEFG`. Any future
 sendfile/splice path must retain the same precondition: it may start only after lookahead is empty.
 
@@ -1141,7 +1143,7 @@ whose chunk-vector growth may free old metadata.
 | `fs.read_file_view` / bytes view | any nonzero regular file may mmap; zero/special/failure falls back to arena copy | same arena-scoped mmap path; no payload copy | **GOOD** copy avoidance, not nonblocking I/O: string view immediately UTF-8-scans/faults pages; bytes view may fault later |
 | buffered `writer` | accumulates into 64 KiB, amortizing syscalls | flushes then writes a chunk >=64 KiB directly, avoiding double copy | **GOOD** for both sizes; `print` remains the deliberately slow debug rail |
 | buffered `reader.read_line` | `memchr` finds newline; one payload append per lookahead span | 64 KiB lookahead; long lines may append several spans and reallocate while growing | **GOOD** baseline; scoped zero-copy line callback is already planned if copying dominates |
-| `io.copy` | one raw-capacity 64 KiB allocation per call; final short write may enter writer buffer | portable fixed 64 KiB shared-reader/shared-writer loop | Memory-bounded, no pre-read zero-fill, and **byte-correct after buffered lookahead** (fixed §3.6) |
+| `io.copy` | reuses an eligible buffered reader's reserved 64 KiB window; other readers allocate one fixed scratch payload; final short write may enter writer buffer | portable fixed 64 KiB reader/refill and shared-writer loop | Memory-bounded, no pre-read zero-fill, and **byte-correct after buffered lookahead** (fixed §3.6); plan99 removes eligible copies' separate scratch allocation without changing error cursors |
 | `file.pread/pwrite` | one synchronous positional syscall/loop | caller-selected buffer size; pwrite handles partial writes | Correct, but blocks the calling OS thread; no batch/vectored surface today |
 | `http.get_many` | prebuilt immutable requests copy each URL once | bounded dedicated blocking threads overlap latency; input-order slots | **GOOD**; redundant per-worker URL clone removed 2026-07-16 |
 
