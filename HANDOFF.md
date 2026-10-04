@@ -58,6 +58,11 @@ Plan102 admits line bodies before output growth, avoiding the extra allocation
 for over-cap input. One pending CR scalar makes the inclusive 64MiB stripped-
 body cap independent of refill boundaries; binary/count/surplus, native-error,
 backing-sentinel and actual-allocation owners qualify it. No API or ABI changes.
+Plan103 adds a bounded SSE client example through existing cli/http/io: one
+reused caller buffer and bound stdout writer, explicit event/body/count limits,
+per-operation timeout and no reconnect policy. Actual-source incremental/count,
+cap/error/late-prefix owners and existing stream lifetime/interface owners
+qualify Linux/macOS. No language or native API changes.
 Continue bounded library/transport improvements and measured
 execution/storage/startup work against demonstrated consumers.
 Real voice/media engine integration and GPU qualification belong to their
