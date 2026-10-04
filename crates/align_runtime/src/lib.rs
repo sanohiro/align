@@ -27490,8 +27490,13 @@ impl HttpStreamWriteOps for NativeHttpStreamWriteOps {
             // All-zero fields denote no address or ancillary data; Linux needs MSG_NOSIGNAL.
             let mut message: libc::msghdr = unsafe { core::mem::zeroed() };
             message.msg_iov = parts.as_ptr().cast_mut();
-            let Ok(count) = parts.len().try_into() else { return SocketCallOutcome { result: -1, errno: libc::EINVAL } };
-            message.msg_iovlen = count;
+            #[cfg(target_os = "linux")]
+            { message.msg_iovlen = parts.len(); }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let Ok(count) = i32::try_from(parts.len()) else { return SocketCallOutcome { result: -1, errno: libc::EINVAL } };
+                message.msg_iovlen = count;
+            }
             unsafe { libc::sendmsg(fd, &message, flags) }
         };
         let errno = if result < 0 { std::io::Error::last_os_error().raw_os_error().unwrap_or(0) } else { 0 };
