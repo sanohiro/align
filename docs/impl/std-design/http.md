@@ -77,6 +77,7 @@ srv := http.serve_shared(host: str, port: i64) -> Result<http_server, Error>
 srv.accept() -> Result<http_request_ctx, Error>   // one request; caller writes the response.
                                              // Yields the next request off a KEPT-ALIVE connection
                                              // before accepting a new one (item 9 ②) — same surface
+srv.accept_timeout_ns(timeout_ns: i64) -> Result<(), Error> // 0 disables the complete-request bound
 srv.max_request_body_bytes(limit: i64)        // 0 restores the 1 GiB default; positive sets an
                                              // inbound decoded-body cap before the next accept
 ctx.method() -> str                          // view into ctx (region-bound)
@@ -1655,3 +1656,50 @@ clock reads or another flag change. Empty send/raw close-only finish does not la
 The ABI is A04 `i32 align_rt_http_stream_write_timeout_ns(ptr, i64)`. Existing
 status/result, type tags and interface format 17 remain. The public-contract
 ledger and discriminating owner matrix are in plan 90.
+
+## Explicit complete-request acquisition budget (plan 90 H3)
+
+```text
+srv.accept_timeout_ns(timeout_ns: i64) -> Result<(), Error>
+```
+
+The receiver is an exclusively borrowed bound local, not consumed. The Impure
+setter stores one scalar with no allocation, clock or I/O. Zero is the default
+unbounded mode; 1..=i64::MAX nanoseconds are valid. Reject negative input first,
+then null/misaligned/closed native state as Invalid before mutation; failure keeps
+the previous value. Evaluate receiver and argument once in source order. Reject
+argument-side consumption/replacement of the loaded receiver; its exact owner
+reservation ends at this setter action. The unit/Error result retains no handle.
+HttpServer remains inferred-only in source; no type spelling is added.
+
+At accept entry snapshot timeout and body cap. One monotonic budget covers
+listener/park selection, admission, complete header/body reads, malformed retries,
+transient accept errors and fd-pressure backoff. Check before/after each native
+setup/I/O/wait and before context publication. Expiry wins over simultaneous native
+success/error, returns Timeout with null output and releases selected incomplete
+input. Preserve the listener and unselected parked peers; existing explicit
+pressure reclamation can already have evicted idle peers. Partial input is not
+resumed by a later accept. A body-cap refusal recognized before expiry is Invalid;
+other malformed requests close/retry under the original budget. Retain errno
+mapping. Poll rounds positive remaining time up and saturates, recomputes after
+wakeups and never issues a zero probe after expiry. No hard real-time guarantee.
+
+First positive accept uses checked F_GETFL/F_SETFL to latch O_NONBLOCK on the
+sole-owned listener, preserving other flags. Record success before post-call
+expiry. Failed F_SETFL records Unknown, since file flags do not prove socket-
+effective mode. Later accepts, including zero, preserve other flags and always
+reassert O_NONBLOCK through successful F_SETFL before I/O. Failure keeps Unknown
+without closing/restoring the listener or publishing a context. Never-configured
+zero keeps the blocking path; latched/recovered zero uses indefinite readiness
+waits and per-call nonblocking recv without deadline clocks. Shared servers own
+distinct SO_REUSEPORT listeners. Guard a selected fd before post-call checks;
+always perform checked blocking restoration on fresh connections before publishing
+them, even when the flag bit already appears clear. Failure closes that fd once.
+Retain checked SIGPIPE behavior; Drop closes owners without mode restoration.
+
+Complete request ownership and response/Upgrade behavior remain. This budget does
+not bound ordinary ctx.respond output; a supervisor configures a stream for its
+replies. No reactor, streaming-upload API or automatic pkg.web timeout is added.
+The ABI is A04 `i32 align_rt_http_server_accept_timeout_ns(ptr, i64)`; interface
+format 17 remains. [Plan 90](../90-multimodal-library-foundation-plan.md) owns the
+public ledger and source/native/platform acceptance matrix.

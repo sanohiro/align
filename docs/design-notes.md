@@ -2170,3 +2170,20 @@ returned to the context/pool. A failed mode change is indeterminate and terminal
 Drop only closes. Configured-zero after latching uses indefinite readiness waits
 without clocks. The default H1 blocking path remains for unlatched streams.
 Plan 90 owns the complete source/native and platform closure.
+
+## Bounded complete-request acquisition
+
+A serial supervisor needs to return from accept when a peer never connects or
+sends only part of a request. A finite readiness poll followed by blocking
+accept/read does not provide that bound. One monotonic operation budget follows
+selection, admission, parser input, malformed retries and pressure backoff;
+selected descriptors are guarded before post-call expiration checks.
+
+The sole-owned listener retains checked nonblocking mode once configured. Failed
+F_SETFL can leave file flags and socket-effective mode inconsistent on macOS, so
+Unknown recovery requires a successful mode reassertion even when flags already
+show the requested bit. Fresh connections undergo checked blocking restoration
+before publication to preserve existing response/Upgrade semantics. Zero after
+latching uses indefinite readiness waits without deadline clocks. Timeout discards
+partial input without consuming the listener; streaming uploads and event reactors
+remain separate consumer requirements. Plan 90 owns the closure matrix.

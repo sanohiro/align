@@ -2082,3 +2082,21 @@ The default and optional export inventories each gain exactly one base/keyed row
 No new type tag, interface byte encoding or probe export ships. The existing
 registry/golden/export owners cover this row alongside every current native row;
 plan 90 owns its compiler and native timeout/mode closure.
+
+## Plan 90 H3: complete-request acquisition budget
+
+`HttpServerAcceptTimeoutNs` maps one-to-one to
+`i32 @align_rt_http_server_accept_timeout_ns(ptr, i64)` (A04). The server pointer
+is exclusively borrowed and not released; the nonnegative signed scalar replaces
+its next-acquisition budget. Native validation rejects a negative value first,
+then null/misaligned/closed state, preserving the old value on failure. The
+setter allocates nothing and performs no socket operation. Its conservative
+HostState record uses argmem Unstated, no parameter attributes, escapes `[0]`,
+releases None, returns_fresh false and diverges false. Existing status/Result
+construction, handle representation and interface format 17 remain.
+
+Every ordinary/optional export inventory gains exactly one keyed/base row.
+Complete-request acquisition itself keeps its existing native signature; one
+internal budget and selected-fd guard connect listener/park selection, admission,
+parser and final publication. Plan 90 owns listener Unknown-mode recovery,
+blocking connected-fd restoration, timeout precedence and cleanup owners.

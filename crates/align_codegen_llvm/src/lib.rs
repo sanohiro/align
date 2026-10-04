@@ -18780,6 +18780,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 ).map_err(|error| self.err(error))?.try_as_basic_value().basic()
                     .ok_or_else(|| self.err("http_stream_write_timeout_ns returned no value"))?
             }
+            Rvalue::HttpServerAcceptTimeoutNs { server, timeout_ns } => {
+                let server = self.operand(server)?.into_pointer_value();
+                let timeout_ns = self.operand(timeout_ns)?;
+                self.builder.build_call(self.runtime(RuntimeKey::HttpServerAcceptTimeoutNs),
+                    &[server.into(), timeout_ns.into()], "httpserveraccepttimeoutns")
+                    .map_err(|error| self.err(error))?.try_as_basic_value().basic()
+                    .ok_or_else(|| self.err("http_server_accept_timeout_ns returned no value"))?
+            }
             Rvalue::HttpUpgradeShutdown { upgrade } => {
                 let upgrade = self.operand(upgrade)?.into_pointer_value();
                 self.builder

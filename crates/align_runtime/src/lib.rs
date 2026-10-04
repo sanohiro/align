@@ -17,6 +17,8 @@
 mod buffer_storage;
 #[cfg(test)]
 mod http_stream_tests;
+#[cfg(test)]
+mod http_accept_budget_tests;
 use buffer_storage::BufferStorage;
 mod json_number;
 mod time_formats;
@@ -8831,7 +8833,6 @@ struct SocketCallOutcome {
     errno: i32,
 }
 
-#[cfg(any(test, not(any(target_os = "macos", target_os = "ios"))))]
 impl SocketCallOutcome {
     #[cfg(test)]
     const fn returned(result: isize) -> Self {
@@ -25024,8 +25025,8 @@ pub unsafe extern "C" fn align_rt_http_client_request(
 // CR/LF/NUL/SP guards mirrored inbound. The Incomplete/Invalid streaming split, the header-block scan,
 // and the caps (256 KiB head / 128 headers / 1 GiB body) ARE reused. **All server ops are Impure**
 // (network syscalls). **v1 security caveat (http.md):** the blocking single accept loop is unsafe on
-// untrusted networks (a slow-loris client stalls the whole server) — the recorded trust assumption is a
-// localhost / trusted-network gateway.
+// untrusted networks without explicit accept/output budgets (a slow peer can stall its worker).
+// The default remains unbounded; configured acquisition covers the complete request.
 // ---------------------------------------------------------------------------------------------
 
 /// The `poll(2)` descriptor — `struct pollfd` (identical layout on Linux and macOS/BSD: `int fd;
@@ -25082,6 +25083,9 @@ enum ParkSlot {
     Dead,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HttpListenerMode { Blocking, Nonblocking, Unknown }
+
 /// A `http_server` (`std.http`) — a Move handle owning the listening TCP socket fd from `http.serve`.
 /// `Drop` closes the fd (so `align_rt_http_server_free` is just `Box::from_raw` + drop). The fd was
 /// lifted out of a net `TcpListener` (which has no `Drop`), so the pool/listen bookkeeping is entirely
@@ -25092,6 +25096,8 @@ enum ParkSlot {
 /// one.
 pub struct HttpServer {
     fd: i32,
+    accept_timeout_ns: i64,
+    listener_mode: HttpListenerMode,
     max_request_body_bytes: Option<usize>,
     park: std::sync::Arc<std::sync::Mutex<ParkSlot>>,
     /// Scratch for `accept`'s `poll` array, reused across calls (it is rebuilt every request, and at
@@ -25223,6 +25229,8 @@ unsafe fn http_serve_impl(host_ptr: *const u8, host_len: i64, port: i64, out: *m
         *out = Box::into_raw(Box::new(HttpServer {
             fd,
             max_request_body_bytes: None,
+            accept_timeout_ns: 0,
+            listener_mode: HttpListenerMode::Blocking,
             park: std::sync::Arc::new(std::sync::Mutex::new(ParkSlot::Live(Vec::new()))),
             poll_buf: Vec::new(),
             poll_cursor: 0,
@@ -25573,6 +25581,59 @@ const HTTP_HEAD_CHUNK: usize = 2 * 1024;
 /// obey the framed end, even when the buffer already has more spare capacity.
 const HTTP_READ_CHUNK: usize = 16 * 1024;
 
+// Statically dispatched acquisition seam; the production implementation uses native syscalls.
+trait HttpAcceptOps {
+    fn start_budget(&mut self, ns: i64) -> Option<MonotonicTimeoutBudget> {
+        MonotonicTimeoutBudget::from_positive_ns(ns)
+    }
+    fn remaining(&mut self, budget: &MonotonicTimeoutBudget) -> Option<std::time::Duration> { budget.remaining() }
+    fn get_flags(&mut self, fd: i32) -> SocketCallOutcome { NativeHttpStreamWriteOps.get_flags(fd) }
+    fn set_flags(&mut self, fd: i32, flags: i32) -> SocketCallOutcome { NativeHttpStreamWriteOps.set_flags(fd, flags) }
+    fn accept(&mut self, fd: i32) -> SocketCallOutcome {
+        let result = unsafe { cloexec_accept(fd) };
+        let errno = if result < 0 { std::io::Error::last_os_error().raw_os_error().unwrap_or(0) } else { 0 };
+        SocketCallOutcome { result: isize::try_from(result).unwrap_or(-1), errno }
+    }
+    // The caller proves this destination is spare capacity and commits only the returned prefix.
+    unsafe fn read(&mut self, fd: i32, ptr: *mut u8, len: usize, nonblocking: bool) -> SocketCallOutcome {
+        let result = if nonblocking {
+            unsafe { libc::recv(fd, ptr.cast(), len, libc::MSG_DONTWAIT) }
+        } else { unsafe { libc::read(fd, ptr.cast(), len) } };
+        let errno = if result < 0 { std::io::Error::last_os_error().raw_os_error().unwrap_or(0) } else { 0 };
+        SocketCallOutcome { result, errno }
+    }
+    fn poll(&mut self, fds: &mut [PollFd], timeout_ms: i32) -> SocketCallOutcome {
+        let Ok(count) = libc::nfds_t::try_from(fds.len()) else { return SocketCallOutcome::failed(libc::EINVAL) };
+        let result = unsafe { libc::poll(fds.as_mut_ptr().cast(), count, timeout_ms) };
+        let errno = if result < 0 { std::io::Error::last_os_error().raw_os_error().unwrap_or(0) } else { 0 };
+        SocketCallOutcome { result: isize::try_from(result).unwrap_or(-1), errno }
+    }
+    fn set_option(&mut self, fd: i32, level: i32, option: i32) -> SocketCallOutcome {
+        let on: libc::c_int = 1;
+        let Ok(size) = libc::socklen_t::try_from(core::mem::size_of_val(&on)) else { return SocketCallOutcome::failed(libc::EINVAL) };
+        let result = unsafe { libc::setsockopt(fd, level, option, (&on as *const libc::c_int).cast(), size) };
+        let errno = if result < 0 { std::io::Error::last_os_error().raw_os_error().unwrap_or(0) } else { 0 };
+        SocketCallOutcome { result: isize::try_from(result).unwrap_or(-1), errno }
+    }
+    fn install_nosigpipe(&mut self, fd: i32) -> SocketCallOutcome { NativeSocketWriteOps.install_nosigpipe(fd) }
+    fn backoff(&mut self, duration: std::time::Duration) { std::thread::sleep(duration); }
+}
+struct NativeHttpAcceptOps;
+impl HttpAcceptOps for NativeHttpAcceptOps {}
+
+fn http_accept_checkpoint<O: HttpAcceptOps>(budget: Option<&MonotonicTimeoutBudget>, ops: &mut O) -> Result<(), i32> {
+    if budget.is_some_and(|budget| ops.remaining(budget).is_none()) { Err(AL_TIMEOUT) } else { Ok(()) }
+}
+fn http_accept_poll<O: HttpAcceptOps>(fds: &mut [PollFd], budget: Option<&MonotonicTimeoutBudget>, ops: &mut O) -> Result<SocketCallOutcome, i32> {
+    let timeout_ms = if let Some(budget) = budget {
+        ops.remaining(budget).and_then(poll_timeout_ms).ok_or(AL_TIMEOUT)?
+    } else { -1 };
+    let result = ops.poll(fds, timeout_ms);
+    http_accept_checkpoint(budget, ops)?;
+    Ok(result)
+}
+
+
 /// One `read(2)` **directly into `buf`'s uninitialised spare capacity**, appending what arrives.
 /// `want` is the framed remainder — `Some(n)` once the head is parsed, `None` while it is not, which
 /// is the difference between "grow and read at most what is left" and "grow the way any buffer of
@@ -25594,7 +25655,7 @@ const HTTP_READ_CHUNK: usize = 16 * 1024;
 /// # Safety
 /// `fd` must be a readable descriptor. The `set_len` below is sound because the kernel initialised
 /// exactly the `n` bytes reported, and `n` is bounded by the spare capacity passed to `read`.
-unsafe fn http_read_into(fd: i32, buf: &mut Vec<u8>, want: Option<usize>) -> Result<usize, i32> {
+unsafe fn http_read_into<O: HttpAcceptOps>(fd: i32, buf: &mut Vec<u8>, want: Option<usize>, budget: Option<&MonotonicTimeoutBudget>, nonblocking: bool, ops: &mut O) -> Result<usize, i32> {
     let len_now = buf.len();
     match want {
         // The head is not framed yet, so the final size is unknown: grow the way any such buffer
@@ -25625,32 +25686,37 @@ unsafe fn http_read_into(fd: i32, buf: &mut Vec<u8>, want: Option<usize>) -> Res
     let spare = (buf.capacity() - len).min(want.unwrap_or(usize::MAX));
     debug_assert!(spare > 0, "reserve guarantees spare capacity");
     loop {
-        let r = unsafe { read(fd, buf.as_mut_ptr().add(len) as *mut core::ffi::c_void, spare) };
-        if r >= 0 {
-            let n = r as usize;
-            // The kernel cannot write more than the count it was given, so this never fires. It is
-            // a hard check rather than a clamp on purpose: if it ever did, the overflow already
-            // happened in the kernel and quietly clamping `set_len` would hide the corruption.
-            if n > spare {
-                return Err(AL_INVALID);
-            }
-            // `len + n <= capacity`, and every byte up to it was written by the kernel.
+        http_accept_checkpoint(budget, ops)?;
+        let outcome = unsafe { ops.read(fd, buf.as_mut_ptr().add(len), spare, nonblocking) };
+        http_accept_checkpoint(budget, ops)?;
+        if outcome.result >= 0 {
+            let n = usize::try_from(outcome.result).map_err(|_| AL_INVALID)?;
+            if n > spare { return Err(AL_INVALID); }
+            // The native operation initialized exactly this bounded prefix of the spare tail.
             unsafe { buf.set_len(len + n) };
             return Ok(n);
         }
-        let e = std::io::Error::last_os_error();
-        if e.kind() == std::io::ErrorKind::Interrupted {
+        if outcome.errno == libc::EINTR { continue; }
+        if nonblocking && (outcome.errno == libc::EAGAIN || outcome.errno == libc::EWOULDBLOCK) {
+            let mut descriptor = [PollFd { fd, events: POLLIN, revents: 0 }];
+            loop {
+                let waited = http_accept_poll(&mut descriptor, budget, ops)?;
+                if waited.result >= 0 { break; }
+                if waited.errno != libc::EINTR {
+                    return Err(io_error_to_status(&std::io::Error::from_raw_os_error(waited.errno)));
+                }
+            }
             continue;
         }
-        return Err(io_error_to_status(&e));
+        return Err(io_error_to_status(&std::io::Error::from_raw_os_error(outcome.errno)));
     }
 }
 
 /// Read + parse one inbound request over the accepted socket `fd`: stream reads (never per-line —
 /// http.md R4) to the head's end via [`http_parse_request_head`], then frame the body by Content-Length
 /// (a request without CL has no body). Returns the built [`HttpRequestCtx`] (owning `fd` + the buffer +
-/// the offset table), or a mapped status (`AL_INVALID` for a malformed / smuggling / truncated request,
-/// an errno for a transport failure). On `Ok` the ctx owns `fd`; on `Err` the caller closes it.
+/// the offset table), or a classified error. The selected fd is owned on entry: success transfers
+/// it to the ctx; every error closes it and releases the incomplete buffer before returning.
 ///
 /// # Safety
 /// `fd` must be a valid connected socket.
@@ -25658,9 +25724,11 @@ unsafe fn http_read_into(fd: i32, buf: &mut Vec<u8>, want: Option<usize>) -> Res
 enum HttpReadRequestError {
     Malformed,
     ExplicitBodyLimit,
+    Timeout,
 }
 
-unsafe fn http_read_request(fd: i32, explicit_body_limit: Option<usize>) -> Result<HttpRequestCtx, HttpReadRequestError> {
+fn http_read_request_with<O: HttpAcceptOps>(fd: std::os::fd::OwnedFd, explicit_body_limit: Option<usize>, budget: Option<&MonotonicTimeoutBudget>, nonblocking: bool, ops: &mut O) -> Result<HttpRequestCtx, HttpReadRequestError> {
+    use std::os::fd::{AsRawFd, IntoRawFd};
     // Sized so an ordinary request head lands in ONE read with no growth. This is capacity, not
     // initialised bytes: the read below writes straight into the spare tail (see `http_read_into`),
     // so nothing here is zeroed or copied.
@@ -25672,9 +25740,12 @@ unsafe fn http_read_request(fd: i32, explicit_body_limit: Option<usize>) -> Resu
     // [`HttpRequestHeadScan`].
     let mut scan = HttpRequestHeadScan::new();
     loop {
+        http_accept_checkpoint(budget, ops).map_err(|_| HttpReadRequestError::Timeout)?;
         // Parse the head once (framing decided once), then just read to the framed length.
         if head.is_none() {
-            match scan.advance(&buf) {
+            let parsed = scan.advance(&buf);
+            http_accept_checkpoint(budget, ops).map_err(|_| HttpReadRequestError::Timeout)?;
+            match parsed {
                 Ok(h) => head = Some(h),
                 Err(HttpParseErr::Incomplete) => {
                     if buf.len() > HTTP_MAX_HEADER_BLOCK {
@@ -25724,8 +25795,9 @@ unsafe fn http_read_request(fd: i32, explicit_body_limit: Option<usize>) -> Resu
             let keep_alive = h.http11 && !residual && !http_request_wants_close(&buf, &h.headers);
             buf.truncate(need); // drop any pipelined bytes — the eligibility check above saw them
             let body_len = need - h.body_start;
+            http_accept_checkpoint(budget, ops).map_err(|_| HttpReadRequestError::Timeout)?;
             return Ok(HttpRequestCtx {
-                fd,
+                fd: fd.into_raw_fd(),
                 buf,
                 method_start: h.method_start,
                 method_len: h.method_len,
@@ -25745,7 +25817,8 @@ unsafe fn http_read_request(fd: i32, explicit_body_limit: Option<usize>) -> Resu
         // subtraction cannot underflow: control only reaches here when `buf.len() < need`, and
         // `need` was bounded by the `HTTP_MAX_BODY` + `checked_add` gate just above.
         let want = framed_need.map(|need| need - buf.len());
-        let n = unsafe { http_read_into(fd, &mut buf, want) }.map_err(|_| HttpReadRequestError::Malformed)?;
+        let n = unsafe { http_read_into(fd.as_raw_fd(), &mut buf, want, budget, nonblocking, ops) }
+            .map_err(|status| if status == AL_TIMEOUT { HttpReadRequestError::Timeout } else { HttpReadRequestError::Malformed })?;
         if n == 0 {
             // EOF before a complete request (client closed / truncated head or body) → malformed.
             return Err(HttpReadRequestError::Malformed);
@@ -25755,6 +25828,12 @@ unsafe fn http_read_request(fd: i32, explicit_body_limit: Option<usize>) -> Resu
             return Err(HttpReadRequestError::Malformed);
         }
     }
+}
+
+#[cfg(test)]
+unsafe fn http_read_request(fd: i32, limit: Option<usize>) -> Result<HttpRequestCtx, HttpReadRequestError> {
+    use std::os::fd::FromRawFd;
+    http_read_request_with(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }, limit, None, false, &mut NativeHttpAcceptOps)
 }
 
 /// Which side of the keep-alive wait became ready — the decision [`align_rt_http_accept`] makes when
@@ -25781,21 +25860,21 @@ enum ParkedWait {
 ///
 /// # Safety
 /// `parked` and `listener` must be open fds.
-unsafe fn http_wait_parked_or_listener(fds: &mut Vec<PollFd>, listener: i32, cursor: &mut usize) -> ParkedWait {
+fn http_wait_parked_or_listener<O: HttpAcceptOps>(fds: &mut Vec<PollFd>, listener: i32, cursor: &mut usize, budget: Option<&MonotonicTimeoutBudget>, nonblocking: bool, ops: &mut O) -> Result<ParkedWait, i32> {
     const READY: i16 = POLLIN | POLLHUP | POLLERR | POLLNVAL;
     let parked_n = fds.len();
     fds.push(PollFd { fd: listener, events: POLLIN, revents: 0 });
     let n = fds.len(); // parked + the listener
     loop {
-        let rc = unsafe { poll(fds.as_mut_ptr(), fds.len() as _, -1) };
-        if rc < 0 {
-            let e = std::io::Error::last_os_error();
+        let outcome = http_accept_poll(fds, budget, ops)?;
+        if outcome.result < 0 {
+            let e = std::io::Error::from_raw_os_error(outcome.errno);
             if e.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-            return ParkedWait::Failed;
+            return if nonblocking { Err(io_error_to_status(&e)) } else { Ok(ParkedWait::Failed) };
         }
-        if rc == 0 {
+        if outcome.result == 0 {
             continue; // no timeout was requested — spurious; keep waiting
         }
         // Scan from a ROTATING start. A plain "parked first" scan starves the listener: once enough
@@ -25812,7 +25891,7 @@ unsafe fn http_wait_parked_or_listener(fds: &mut Vec<PollFd>, listener: i32, cur
             }
             // A parked connection's hangup/error resolves to a read error in the caller, which
             // closes it and looks again.
-            return if i < parked_n { ParkedWait::Parked(fds[i].fd) } else { ParkedWait::Listener };
+            return Ok(if i < parked_n { ParkedWait::Parked(fds[i].fd) } else { ParkedWait::Listener });
         }
     }
 }
@@ -25842,6 +25921,7 @@ enum AcceptFail {
 
 /// Complete the platform SIGPIPE prerequisite for one newly accepted socket. This helper owns the
 /// fd on entry: an install failure closes it exactly once and returns no publishable descriptor.
+#[cfg(test)]
 fn http_prepare_accepted_fd<O: SocketWriteOps>(
     fd: i32,
     policy: SocketSigpipePolicy,
@@ -25894,19 +25974,31 @@ fn http_relieve_fd_pressure(park: &std::sync::Arc<std::sync::Mutex<ParkSlot>>, p
 ///
 /// `spent` is the caller's per-call state: `true` means a connection was already given up since the
 /// last time we waited.
-fn http_yield_for_fds(park: &std::sync::Arc<std::sync::Mutex<ParkSlot>>, polled: &[PollFd], spent: &mut bool) {
+fn http_yield_for_fds_with<O: HttpAcceptOps>(park: &std::sync::Arc<std::sync::Mutex<ParkSlot>>, polled: &[PollFd], spent: &mut bool, budget: Option<&MonotonicTimeoutBudget>, ops: &mut O) -> Result<(), i32> {
+    http_accept_checkpoint(budget, ops)?;
     if !*spent && http_relieve_fd_pressure(park, polled) {
         *spent = true;
     } else {
-        std::thread::sleep(HTTP_ACCEPT_NO_FDS_BACKOFF);
+        let duration = if let Some(budget) = budget {
+            ops.remaining(budget).ok_or(AL_TIMEOUT)?.min(HTTP_ACCEPT_NO_FDS_BACKOFF)
+        } else { HTTP_ACCEPT_NO_FDS_BACKOFF };
+        ops.backoff(duration);
         *spent = false;
     }
+    http_accept_checkpoint(budget, ops)
+}
+#[cfg(test)]
+fn http_yield_for_fds(park: &std::sync::Arc<std::sync::Mutex<ParkSlot>>, polled: &[PollFd], spent: &mut bool) {
+    let _ = http_yield_for_fds_with(park, polled, spent, None, &mut NativeHttpAcceptOps);
 }
 
 /// The `accept(2)` errno policy in one decision ([`accept_errno_is_noise`]'s half is shared with the
 /// net rail).
 fn classify_accept_error(e: &std::io::Error) -> AcceptFail {
-    if accept_errno_is_noise(e) {
+    if accept_errno_is_noise(e)
+        || e.raw_os_error().is_some_and(|errno| errno == libc::EAGAIN || errno == libc::EWOULDBLOCK)
+    {
+        // A nonblocking listener may lose readiness before accept; select again.
         return AcceptFail::Again;
     }
     match e.raw_os_error() {
@@ -25922,37 +26014,83 @@ fn classify_accept_error(e: &std::io::Error) -> AcceptFail {
 ///
 /// # Safety
 /// `lfd` must be a valid listening socket.
-unsafe fn http_accept_conn(lfd: i32) -> Result<i32, AcceptFail> {
-    let fd = unsafe { cloexec_accept(lfd) };
-    if fd < 0 {
-        return Err(classify_accept_error(&std::io::Error::last_os_error()));
+fn http_accept_conn<O: HttpAcceptOps>(lfd: i32, nonblocking: bool, budget: Option<&MonotonicTimeoutBudget>, ops: &mut O) -> Result<std::os::fd::OwnedFd, AcceptFail> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    http_accept_checkpoint(budget, ops).map_err(AcceptFail::Fatal)?;
+    let outcome = ops.accept(lfd);
+    // Acquire cleanup before the post-result timeout observation.
+    let fd = i32::try_from(outcome.result).ok().filter(|fd| *fd >= 0)
+        .map(|fd| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+    http_accept_checkpoint(budget, ops).map_err(AcceptFail::Fatal)?;
+    let Some(fd) = fd else {
+        if outcome.result >= 0 { return Err(AcceptFail::Fatal(AL_INVALID)); }
+        return Err(classify_accept_error(&std::io::Error::from_raw_os_error(outcome.errno)));
+    };
+    if nonblocking {
+        http_accept_checkpoint(budget, ops).map_err(AcceptFail::Fatal)?;
+        let got = ops.get_flags(fd.as_raw_fd());
+        http_accept_checkpoint(budget, ops).map_err(AcceptFail::Fatal)?;
+        let flags = i32::try_from(got.result).ok().filter(|flags| *flags >= 0)
+            .ok_or_else(|| AcceptFail::Fatal(io_error_to_status(&std::io::Error::from_raw_os_error(got.errno))))?;
+        http_accept_checkpoint(budget, ops).map_err(AcceptFail::Fatal)?;
+        // Reassert even if the file flag is already clear: it is not socket-effective evidence.
+        let set = ops.set_flags(fd.as_raw_fd(), flags & !libc::O_NONBLOCK);
+        http_accept_checkpoint(budget, ops).map_err(AcceptFail::Fatal)?;
+        if set.result != 0 { return Err(AcceptFail::Fatal(io_error_to_status(&std::io::Error::from_raw_os_error(set.errno)))); }
     }
-    // Disable Nagle so the response tail is sent immediately (http.md R4); best-effort.
-    let on: i32 = 1;
-    unsafe {
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on as *const i32 as *const core::ffi::c_void, core::mem::size_of::<i32>() as u32);
+    for (level, option) in [(IPPROTO_TCP, TCP_NODELAY), (SOL_SOCKET, SO_KEEPALIVE)] {
+        http_accept_checkpoint(budget, ops).map_err(AcceptFail::Fatal)?;
+        let _ = ops.set_option(fd.as_raw_fd(), level, option); // Existing best-effort policy.
+        http_accept_checkpoint(budget, ops).map_err(AcceptFail::Fatal)?;
     }
-    // TCP keepalive — parity with the net rail's `accept`, and the ONLY thing that ever reaps a
-    // parked connection whose peer vanished WITHOUT a FIN (a NAT timeout, a powered-off client).
-    // Such a connection is silent, so `poll` never reports it and no eviction path is reached while
-    // traffic stays one-shot; the kernel's probes eventually turn it into a hangup this loop closes.
-    // Slow (hours, by the system default) but bounded — and it costs nothing on a live connection.
-    unsafe {
-        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on as *const i32 as *const core::ffi::c_void, core::mem::size_of::<i32>() as u32);
+    if NATIVE_SOCKET_SIGPIPE_POLICY == SocketSigpipePolicy::InstallSocketOption {
+        http_accept_checkpoint(budget, ops).map_err(AcceptFail::Fatal)?;
+        let outcome = ops.install_nosigpipe(fd.as_raw_fd());
+        http_accept_checkpoint(budget, ops).map_err(AcceptFail::Fatal)?;
+        socket_option_status(outcome).map_err(AcceptFail::Fatal)?;
     }
-    // macOS/BSD: suppress SIGPIPE per-socket before the fd can enter a request context. Linux's
-    // MSG_NOSIGNAL policy needs no socket option. A failed install closes instead of publishing.
-    http_prepare_accepted_fd(fd, NATIVE_SOCKET_SIGPIPE_POLICY, &mut NativeSocketWriteOps)
+    Ok(fd)
+}
+
+fn http_listener_nonblocking<O: HttpAcceptOps>(server: &mut HttpServer, budget: Option<&MonotonicTimeoutBudget>, ops: &mut O) -> Result<(), i32> {
+    if server.listener_mode == HttpListenerMode::Nonblocking
+        || (server.listener_mode == HttpListenerMode::Blocking && budget.is_none()) { return Ok(()); }
+    http_accept_checkpoint(budget, ops)?;
+    let got = ops.get_flags(server.fd);
+    http_accept_checkpoint(budget, ops)?;
+    let flags = i32::try_from(got.result).ok().filter(|flags| *flags >= 0)
+        .ok_or_else(|| io_error_to_status(&std::io::Error::from_raw_os_error(got.errno)))?;
+    http_accept_checkpoint(budget, ops)?;
+    server.listener_mode = HttpListenerMode::Unknown;
+    // File flags may already contain the bit while the socket-effective mode still differs.
+    let set = ops.set_flags(server.fd, flags | libc::O_NONBLOCK);
+    if set.result == 0 { server.listener_mode = HttpListenerMode::Nonblocking; }
+    http_accept_checkpoint(budget, ops)?;
+    if set.result != 0 { return Err(io_error_to_status(&std::io::Error::from_raw_os_error(set.errno))); }
+    Ok(())
+}
+
+/// Replace one server's total complete-request budget; no allocation or socket mutation.
+/// # Safety
+/// `srv` must be null or an aligned live server owner.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_server_accept_timeout_ns(srv: *mut HttpServer, timeout_ns: i64) -> i32 {
+    if timeout_ns < 0 || !abi_ptr_is_aligned(srv) { return AL_INVALID; }
+    let server = unsafe { &mut *srv };
+    if server.fd < 0 { return AL_INVALID; }
+    server.accept_timeout_ns = timeout_ns;
+    0
 }
 
 /// `srv.accept()` — yield the next inbound request, read + parsed, as an owned `http_request_ctx`
 /// written to `*out` (returning `0`); else a mapped status leaving `*out` null. A malformed /
-/// smuggling request closes the accepted fd and returns `AL_INVALID` — the **listener stays alive**,
-/// so the caller's accept loop keeps serving. An `EINTR`-interrupted accept is retried (the
+/// smuggling request closes only the selected fd and retries under the same acquisition budget;
+/// the listener stays alive. An `EINTR`-interrupted accept is retried (the
 /// server-loop shape; parity with `align_rt_tcp_accept`).
 ///
 /// **Keep-alive (http.md item 9 ②) rides entirely inside here and `respond` — the caller's loop is
-/// unchanged.** With nothing parked this is a plain blocking `accept(2)`, exactly as before.
+/// unchanged.** A never-configured server with nothing parked uses plain blocking `accept(2)`.
+/// Configured or latched listeners use readiness and nonblocking admission.
 /// Otherwise it waits on {…parked, listener} with a rotating preference (warm connections usually
 /// win; the listener still gets its turn, so it cannot be starved), and a new connection leaves the
 /// parked set alone — the set is bounded at the end where it grows, in `respond`. A parked
@@ -25971,29 +26109,29 @@ unsafe fn http_accept_conn(lfd: i32) -> Result<i32, AcceptFail> {
 ///
 /// # Safety
 /// `srv` must be a valid `HttpServer` (or null); `out` must point to a writable `*mut HttpRequestCtx`
-/// slot.
+/// slot. A positive configured budget bounds acquisition of the complete request; Timeout closes
+/// only selected unpublished input and preserves the listener and unselected parked peers.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_http_accept(srv: *mut HttpServer, out: *mut *mut HttpRequestCtx) -> i32 {
-    if out.is_null() {
-        return AL_INVALID;
-    }
+    if !abi_ptr_is_aligned(out) { return AL_INVALID; }
     unsafe { *out = core::ptr::null_mut() };
-    if srv.is_null() {
-        return AL_INVALID;
-    }
-    let lfd = unsafe { (*srv).fd };
-    let explicit_body_limit = unsafe { (*srv).max_request_body_bytes };
-    let park = unsafe { (*srv).park.clone() };
-    // Whether this call has already spent a warm connection on descriptor pressure since it last
-    // waited — see `http_yield_for_fds`.
+    if !abi_ptr_is_aligned(srv) { return AL_INVALID; }
+    unsafe { http_accept_with(&mut *srv, out, &mut NativeHttpAcceptOps) }
+}
+
+unsafe fn http_accept_with<O: HttpAcceptOps>(server: &mut HttpServer, out: *mut *mut HttpRequestCtx, ops: &mut O) -> i32 {
+    use std::os::fd::FromRawFd;
+    unsafe { *out = core::ptr::null_mut() };
+    if server.fd < 0 { return AL_INVALID; }
+    let limit = server.max_request_body_bytes;
+    let budget = ops.start_budget(server.accept_timeout_ns);
+    if let Err(status) = http_listener_nonblocking(server, budget.as_ref(), ops) { return status; }
+    let nonblocking = server.listener_mode == HttpListenerMode::Nonblocking;
+    let park = server.park.clone();
     let mut spent_for_fds = false;
     loop {
-        // Build the poll set IN PLACE, reusing the server's scratch buffer: at capacity this runs
-        // once per request on the hot path, and a fresh `Vec` per call (twice — one clone of the
-        // parked fds, one array) is a measurable per-request constant that grows as keep-alive
-        // succeeds. The parked fds stay PARKED while polling; only the one chosen is taken out
-        // (below), so nothing dangles if this call returns early.
-        let scratch = unsafe { &mut (*srv).poll_buf };
+        if let Err(status) = http_accept_checkpoint(budget.as_ref(), ops) { return status; }
+        let scratch = &mut server.poll_buf;
         scratch.clear();
         {
             let slot = park.lock().unwrap_or_else(|e| e.into_inner());
@@ -26002,99 +26140,46 @@ pub unsafe extern "C" fn align_rt_http_accept(srv: *mut HttpServer, out: *mut *m
             }
         }
         let parked_n = scratch.len();
-        let fd = if parked_n == 0 {
-            match unsafe { http_accept_conn(lfd) } {
-                Ok(fd) => fd,
-                Err(AcceptFail::Fatal(status)) => return status,
-                // Nothing is parked, so "wait again" is simply another blocking `accept`.
-                Err(AcceptFail::Again) => continue,
-                Err(AcceptFail::NoFds) => {
-                    // The set looked empty when this iteration built its poll array, but a ctx on
-                    // another thread may have parked since — so try to reclaim either way, and only
-                    // wait when there is genuinely nothing of ours to give back.
-                    http_yield_for_fds(&park, &[], &mut spent_for_fds);
-                    continue;
-                }
+        let selection = if parked_n == 0 && !nonblocking { ParkedWait::Listener } else {
+            match http_wait_parked_or_listener(scratch, server.fd, &mut server.poll_cursor, budget.as_ref(), nonblocking, ops) {
+                Ok(selection) => selection, Err(status) => return status,
             }
-        } else {
-            let start = unsafe { &mut (*srv).poll_cursor };
-            match unsafe { http_wait_parked_or_listener(scratch, lfd, start) } {
-                ParkedWait::Parked(pfd) => {
-                    // Claim it: remove it from the set before reading, so it is owned by exactly one
-                    // path. If it is already gone (a concurrent free), start over.
-                    let claimed = {
-                        let mut slot = park.lock().unwrap_or_else(|e| e.into_inner());
-                        match &mut *slot {
-                            ParkSlot::Live(fds) => fds.iter().position(|&f| f == pfd).map(|i| fds.remove(i)),
-                            ParkSlot::Dead => None,
-                        }
-                    };
-                    let Some(pfd) = claimed else { continue };
-                    match unsafe { http_read_request(pfd, explicit_body_limit) } {
-                        Ok(mut ctx) => {
-                            ctx.park = Some(park);
-                            unsafe { *out = Box::into_raw(Box::new(ctx)) };
-                            return 0;
-                        }
-                        Err(HttpReadRequestError::ExplicitBodyLimit) => {
-                            unsafe { close(pfd) };
-                            return AL_INVALID;
-                        }
-                        Err(HttpReadRequestError::Malformed) => {
-                            // EOF (the client is done with the connection) or a malformed follow-up
-                            // request: close that connection and look again — a warm connection
-                            // dying is not an application-visible event.
-                            unsafe { close(pfd) };
-                            continue;
-                        }
+        };
+        if let Err(status) = http_accept_checkpoint(budget.as_ref(), ops) { return status; }
+        let fd = match selection {
+            ParkedWait::Parked(pfd) => {
+                let claimed = {
+                    let mut slot = park.lock().unwrap_or_else(|e| e.into_inner());
+                    match &mut *slot {
+                        ParkSlot::Live(fds) => fds.iter().position(|&fd| fd == pfd).map(|i| fds.remove(i)),
+                        ParkSlot::Dead => None,
                     }
-                }
-                // A new connection, or a `poll` failure to fall back from. **The parked set is left
-                // alone**: a new client never costs a warm one its connection here. The set is
-                // bounded where it GROWS — `respond` evicts the coldest when it parks into a full
-                // set — so accept needs no valve of its own, and one here could only ever fire for
-                // a connection that will not join the set at all (a `Connection: close` request, a
-                // malformed one, a client that vanishes after the handshake), permanently shrinking
-                // the warm set for nothing. Real descriptor pressure has its own answer below:
-                // `NoFds` spends an idle connection only when `accept` actually ran out of fds.
-                ParkedWait::Listener | ParkedWait::Failed => {
-                    match unsafe { http_accept_conn(lfd) } {
-                        Ok(fd) => fd,
-                        Err(AcceptFail::Fatal(status)) => return status,
-                        // Back to the `poll` — the connection this wait promised is gone, but a
-                        // parked client's next request may be waiting right now. Re-`accept`ing in
-                        // place would block on the listener and starve exactly those.
-                        Err(AcceptFail::Again) => continue,
-                        Err(AcceptFail::NoFds) => {
-                            // Out of descriptors with connections parked: one of them is the
-                            // descriptor to spend. This wait's `revents` say which are idle.
-                            http_yield_for_fds(&park, &scratch[..parked_n], &mut spent_for_fds);
-                            continue;
-                        }
+                };
+                let Some(pfd) = claimed else { continue };
+                unsafe { std::os::fd::OwnedFd::from_raw_fd(pfd) }
+            }
+            ParkedWait::Listener | ParkedWait::Failed => {
+                match http_accept_conn(server.fd, nonblocking, budget.as_ref(), ops) {
+                    Ok(fd) => fd,
+                    Err(AcceptFail::Fatal(status)) => return status,
+                    Err(AcceptFail::Again) => continue,
+                    Err(AcceptFail::NoFds) => {
+                        if let Err(status) = http_yield_for_fds_with(&park, &scratch[..parked_n], &mut spent_for_fds, budget.as_ref(), ops) { return status; }
+                        continue;
                     }
                 }
             }
         };
-        match unsafe { http_read_request(fd, explicit_body_limit) } {
+        match http_read_request_with(fd, limit, budget.as_ref(), nonblocking, ops) {
             Ok(mut ctx) => {
+                if let Err(status) = http_accept_checkpoint(budget.as_ref(), ops) { return status; }
                 ctx.park = Some(park);
                 unsafe { *out = Box::into_raw(Box::new(ctx)) };
                 return 0;
             }
-            Err(HttpReadRequestError::ExplicitBodyLimit) => {
-                unsafe { close(fd) };
-                return AL_INVALID;
-            }
-            Err(HttpReadRequestError::Malformed) => {
-                // A malformed / smuggling / truncated request is a PER-REQUEST fault, not a
-                // listener-level one: close that connection and wait for the next, exactly as the
-                // parked path does. Surfacing it would hand every caller a `Result` that kills the
-                // accept loop (`srv.accept()?`) the first time a scanner, a TLS ClientHello, or a
-                // bare-LF request arrives — while the listener is perfectly healthy. Only a real
-                // `accept(2)` failure returns from here.
-                unsafe { close(fd) };
-                continue;
-            }
+            Err(HttpReadRequestError::ExplicitBodyLimit) => return AL_INVALID,
+            Err(HttpReadRequestError::Timeout) => return AL_TIMEOUT,
+            Err(HttpReadRequestError::Malformed) => continue,
         }
     }
 }

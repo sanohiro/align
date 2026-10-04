@@ -75,6 +75,7 @@ srv := http.serve_shared(host: str, port: i64) -> Result<http_server, Error>
 srv.accept() -> Result<http_request_ctx, Error>   // one request; caller writes the response.
                                              // Yields the next request off a KEPT-ALIVE connection
                                              // before accepting a new one (item 9 ②) — same surface
+srv.accept_timeout_ns(timeout_ns: i64) -> Result<(), Error> // 0 で完全要求の時間制限を無効化
 srv.max_request_body_bytes(limit: i64)        // 0 は 1 GiB の既定値に戻す。
                                              // 正値は次の accept の受信本文を制限する
 ctx.method() -> str                          // view into ctx (region-bound)
@@ -1600,3 +1601,44 @@ poll(-1) で無期限に再試行する。空 send・閉じるだけの raw fini
 
 ABI は A04 `i32 align_rt_http_stream_write_timeout_ns(ptr, i64)`。既存の status/result、
 型タグ、interface format 17 は維持する。公開契約と検証行列は plan 90 に記録する。
+
+## 完全な要求の受信に使う明示的な時間予算（plan 90 H3）
+
+```text
+srv.accept_timeout_ns(timeout_ns: i64) -> Result<(), Error>
+```
+
+レシーバーは束縛済みローカルの排他的借用で、消費しない。Impure な setter は
+スカラー1個だけを保存し、割り当て・時計・I/O を行わない。既定の zero は無制限、
+1..=i64::MAX ナノ秒は有効。負の入力を最初に、次に null・不整列・閉じた状態を
+Invalid として変更前に拒否する。失敗時は前の値を保持する。レシーバーと引数を
+ソース順に1回評価する。引数中の所有者の消費・置換を拒否し、この予約は setter の
+action で終わる。unit/Error の結果にハンドルを保持しない。HttpServer は推論のみで、
+ソースの型名を追加しない。
+
+accept の入口で timeout と body cap を保存する。listener/park の選択、接続の準備、
+完全なヘッダー・本文、不正 peer の再試行、一時的 accept エラー、fd 不足時の待機まで
+1つの単調時計の予算を共有する。native 設定・I/O・待機の前後と ctx 公開前に確認し、
+同時の成功・エラーより期限切れを優先する。Timeout は出力 null とし、選択済みの
+未完成入力を解放する。listener と未選択 parked peer は保持するが、既存の明示的な
+fd 不足対策が idle peer を先に解放する場合はある。部分入力を次の accept で再開しない。
+期限前に認識した body cap 超過は Invalid、その他の不正要求は同じ予算で閉じて再試行する。
+errno 対応を維持する。poll の正の残り時間を切り上げ・飽和し、起床後に再計算する。
+期限後のゼロ時間プローブを行わず、ハードリアルタイム保証ではない。
+
+最初の正の accept で F_GETFL/F_SETFL を検証し、単独所有 listener の O_NONBLOCK を
+他のフラグを保持して固定する。成功は期限判定より先に記録する。F_SETFL の失敗は
+Unknown とする。ファイルフラグだけではソケットの有効モードを証明できないため、
+以後は zero でも必ず成功する F_SETFL で O_NONBLOCK を再設定してから I/O を行う。
+失敗時は Unknown を保持し、listener を閉じたり復元したりせず ctx を公開しない。
+未設定 zero は blocking 経路、固定・回復後の zero は時計なしの無期限 readiness 待機と
+per-call nonblocking recv。shared server は別々の SO_REUSEPORT listener を所有する。
+選択 fd の cleanup を時計確認前に確保し、新規接続はフラグのビットにかかわらず
+検証済み blocking 設定後に公開する。失敗時はその fd だけを1回閉じる。
+検証済み SIGPIPE 方針を維持し、Drop はモードを復元せず所有者を閉じる。
+
+完全な要求の所有権と response/Upgrade は維持する。通常の ctx.respond の出力を
+制限しないため、supervisor は期限を設定した stream で返信する。reactor、streaming
+upload API、pkg.web の自動 timeout は追加しない。ABI は A04
+`i32 align_rt_http_server_accept_timeout_ns(ptr, i64)`、interface format 17 を維持する。
+公開契約・source/native/platform 検証行列は plan 90 が管理する。

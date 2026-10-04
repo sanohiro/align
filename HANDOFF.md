@@ -29,8 +29,10 @@ partial progress and readiness waits; Timeout poisons output and consuming
 cleanup closes exactly once. Linux uses per-call nonblocking sends, while macOS
 latches mode only on the sole stream-owned fd. Source, forged-HIR, native
 TCP/Unix stall, configured-zero drain and ABI/export owners close the boundary.
-Complete-request budgets (H3), then the bounded process/job/artifact reference
-composition (C1), remain next. Model lifetimes use existing
+Complete-request budgets (H3) now cover finite selection, admission and full
+headers/body, with checked listener-mode recovery and exactly-once selected-input
+cleanup. Source/forged-HIR, checkpoint and real partial-peer owners close the
+boundary. The bounded process/job/artifact reference composition (C1) remains next. Model lifetimes use existing
 opaque resources and process owners; no new language concurrency model or tensor
 system is proposed. Linux/WSL2 is the GPU qualification target. This work proceeds
 independently of deferred K1.

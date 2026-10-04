@@ -4207,6 +4207,19 @@ s.reject(rb: response_builder) -> Result<(), Error> // consumes s + rb; pre-firs
                                                     //   discard the head, answer normally, close
 ```
 
+An exclusively borrowed bound server accepts
+`srv.accept_timeout_ns(timeout_ns: i64) -> Result<(), Error>` (Impure). Zero is
+unbounded by default; negative input returns Invalid without changing the stored
+value. One monotonic budget covers the next complete request acquisition,
+including selection, admission, header/body reads, malformed-peer retries and
+fd-pressure backoff. Expiry returns Timeout, drops selected incomplete input,
+and preserves the listener and unselected parked peers. No partial context is
+published. Native mode changes are checked and owner-local; a latched listener
+later reset to zero uses clock-free indefinite readiness waits. Ordinary response
+writes are separate and require an explicit stream write budget when bounded
+output is needed. The exact platform and error contract is in
+`docs/impl/std-design/http.md`.
+
 An exclusively borrowed bound stream accepts `s.write_timeout_ns(timeout_ns: i64)`
 with `Result<(), Error>` and Impure effect. The default is zero (unbounded).
 Negative input returns Invalid before state inspection/mutation; failure preserves

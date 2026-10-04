@@ -17465,7 +17465,8 @@ impl EffectScan<'_> {
             ExprKind::HttpUpgradeDeadline {
                 upgrade,
                 timeout_ns,
-            } | ExprKind::HttpStreamWriteTimeoutNs { stream: upgrade, timeout_ns } => {
+            } | ExprKind::HttpStreamWriteTimeoutNs { stream: upgrade, timeout_ns }
+            | ExprKind::HttpServerAcceptTimeoutNs { server: upgrade, timeout_ns } => {
                 walk!(upgrade);
                 walk!(timeout_ns);
                 self.impure_direct = true;
@@ -25312,6 +25313,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpUpgradeWrite { .. }
             | ExprKind::HttpUpgradeDeadline { .. }
             | ExprKind::HttpStreamWriteTimeoutNs { .. }
+            | ExprKind::HttpServerAcceptTimeoutNs { .. }
             | ExprKind::HttpUpgradeShutdown { .. }
             | ExprKind::HttpStreamSend { .. }
             | ExprKind::HttpStreamFinish { .. }
@@ -25808,6 +25810,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpUpgradeWrite { .. }
             | ExprKind::HttpUpgradeDeadline { .. }
             | ExprKind::HttpStreamWriteTimeoutNs { .. }
+            | ExprKind::HttpServerAcceptTimeoutNs { .. }
             | ExprKind::HttpUpgradeShutdown { .. }
             | ExprKind::HttpStreamSend { .. }
             | ExprKind::HttpStreamFinish { .. }
@@ -29453,7 +29456,8 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::HttpUpgradeDeadline {
                 upgrade,
                 timeout_ns,
-            } | ExprKind::HttpStreamWriteTimeoutNs { stream: upgrade, timeout_ns } => {
+            } | ExprKind::HttpStreamWriteTimeoutNs { stream: upgrade, timeout_ns }
+            | ExprKind::HttpServerAcceptTimeoutNs { server: upgrade, timeout_ns } => {
                 self.walk(upgrade, depth);
                 self.walk(timeout_ns, depth);
             }
@@ -32057,6 +32061,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::HttpUpgradeWrite { .. }
         | ExprKind::HttpUpgradeDeadline { .. }
         | ExprKind::HttpStreamWriteTimeoutNs { .. }
+            | ExprKind::HttpServerAcceptTimeoutNs { .. }
         | ExprKind::HttpUpgradeShutdown { .. }
         | ExprKind::HttpStreamSend { .. }
         | ExprKind::HttpStreamFinish { .. }
@@ -39456,6 +39461,7 @@ impl<'a> MoveCheck<'a> {
     fn http_timeout_action_receiver(kind: &ExprKind) -> Option<&Expr> {
         match kind {
             ExprKind::HttpStreamWriteTimeoutNs { stream, .. } => Some(stream.as_ref()),
+            ExprKind::HttpServerAcceptTimeoutNs { server, .. } => Some(server.as_ref()),
             _ => None,
         }
     }
@@ -41035,6 +41041,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::HttpRespondUpgrade { .. } | ExprKind::HttpUpgradeReadExact { .. }
             | ExprKind::HttpUpgradeWrite { .. } | ExprKind::HttpUpgradeDeadline { .. }
             | ExprKind::HttpStreamWriteTimeoutNs { .. }
+            | ExprKind::HttpServerAcceptTimeoutNs { .. }
             | ExprKind::HttpUpgradeShutdown { .. }
             | ExprKind::HttpStreamFinish { .. } | ExprKind::HttpStreamReject { .. } | ExprKind::CryptoCtEqual { .. }
             | ExprKind::CryptoRandom { .. } | ExprKind::CryptoDigestNew | ExprKind::CryptoDigestUpdate { .. } | ExprKind::CryptoDigestFinish { .. }
@@ -48112,7 +48119,8 @@ impl<'a> MoveCheck<'a> {
             ExprKind::HttpUpgradeDeadline {
                 upgrade,
                 timeout_ns,
-            } | ExprKind::HttpStreamWriteTimeoutNs { stream: upgrade, timeout_ns } => {
+            } | ExprKind::HttpStreamWriteTimeoutNs { stream: upgrade, timeout_ns }
+            | ExprKind::HttpServerAcceptTimeoutNs { server: upgrade, timeout_ns } => {
                 move_expr!(self, upgrade, moved, false, false);
                 move_expr!(self, timeout_ns, moved, false, false);
             }
@@ -55435,7 +55443,7 @@ impl<'a, 't> Checker<'a, 't> {
             "code" | "stdout" | "stderr" if recv_ty == Ty::RunBytes => {
                 self.check_run_bytes_method(recv_expr, method, args, span)
             }
-            "max_request_body_bytes" if recv_ty == Ty::HttpServer => {
+            "max_request_body_bytes" | "accept_timeout_ns" if recv_ty == Ty::HttpServer => {
                 self.check_http_server_method(recv_expr, method, args, span)
             }
             // `std.http` request methods on an `http request`: `r.header(name, value)` /
@@ -66370,6 +66378,22 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         match method {
+            "accept_timeout_ns" => {
+                if args.len() != 1 {
+                    self.diags.error(format!("'.accept_timeout_ns()' takes 1 timeout_ns argument, got {}", args.len()), span);
+                    return err;
+                }
+                let timeout_ns = self.check_expr(&args[0], Some(Ty::Int(IntTy { bits: 64, signed: true })));
+                let operand_ok = timeout_ns.ty != Ty::Error
+                    && self.require_i64_arg(timeout_ns.ty, args[0].span, "'.accept_timeout_ns()' timeout_ns");
+                let receiver_ok = self.require_exclusive_handle_receiver(&recv_expr, "http_server", method, "configure");
+                if !operand_ok || !receiver_ok { return err; }
+                Expr {
+                    kind: ExprKind::HttpServerAcceptTimeoutNs { server: Box::new(recv_expr), timeout_ns: Box::new(timeout_ns) },
+                    ty: Ty::Result(Scalar::Unit, Scalar::Enum(self.error_enum_id)),
+                    span,
+                }
+            }
             "accept" => {
                 if !args.is_empty() {
                     self.diags.error(format!("'.accept()' takes no arguments, got {}", args.len()), span);
@@ -66396,7 +66420,7 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
             _ => {
-                self.diags.error(format!("'.{method}()' is not a method on an http server (try accept / max_request_body_bytes)"), span);
+                self.diags.error(format!("'.{method}()' is not a method on an http server (try accept / accept_timeout_ns / max_request_body_bytes)"), span);
                 err
             }
         }
@@ -70597,7 +70621,8 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::HttpUpgradeDeadline {
                 upgrade,
                 timeout_ns,
-            } | ExprKind::HttpStreamWriteTimeoutNs { stream: upgrade, timeout_ns } => {
+            } | ExprKind::HttpStreamWriteTimeoutNs { stream: upgrade, timeout_ns }
+            | ExprKind::HttpServerAcceptTimeoutNs { server: upgrade, timeout_ns } => {
                 self.finalize_expr(upgrade);
                 self.finalize_expr(timeout_ns);
             }
@@ -76848,7 +76873,7 @@ mod tests {
         // HTTP timeout setters borrow an existing owner and return unit/Error.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 350,
+            variants, 351,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 
