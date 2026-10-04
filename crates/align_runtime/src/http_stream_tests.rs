@@ -23,8 +23,8 @@ impl HttpStreamWriteOps for ScriptedWrite {
         );
         self.calls += 1;
         for part in parts {
-            let base = part.iov_base as usize;
-            let payload = self.payload as usize;
+            let base = part.iov_base.addr();
+            let payload = self.payload.addr();
             if self.payload_len > 0 && base >= payload && base < payload + self.payload_len {
                 assert!(part.iov_len <= payload + self.payload_len - base);
                 self.saw_payload = true;

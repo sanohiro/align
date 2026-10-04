@@ -27396,11 +27396,11 @@ pub unsafe extern "C" fn align_rt_http_respond_stream(
 }
 
 /// `s.send(chunk)` — write one streamed chunk, **flushing the lazy head first** if this is the
-/// stream's first write (head + first chunk assembled in the SAME buffer — still one write; the
-/// head is committed by the attempt even if the write fails, closing the `reject` window).
-/// **Framed** (1.1): one chunk frame (lowercase-hex length, CRLF, payload, CRLF) assembled in ONE
-/// buffer and sent in ONE `http_send_all` write. **Raw** (1.0): the payload bytes unframed, one
-/// write. **`send("")` (an empty chunk) is a no-op returning `0`** — a zero-length chunk is the
+/// stream's first write. The head, fixed framing and borrowed payload share one vectored writer;
+/// the head is committed by the attempt even if it fails, closing the `reject` window.
+/// **Framed** (1.1): one chunk frame (lowercase-hex length, CRLF, payload, CRLF).
+/// **Raw** (1.0): unframed payload bytes. Native short writes advance the accepted prefix without
+/// copying the payload. **`send("")` (an empty chunk) is a no-op returning `0`** — a zero-length chunk is the
 /// protocol TERMINATOR, and an empty output step is foreseeable gateway data (a multi-byte
 /// codepoint split across tokens detokenizes to zero bytes), not a bug; it does NOT flush the head
 /// (nothing to write), so the `reject` window stays open. On a write error the stream is
@@ -27462,7 +27462,7 @@ unsafe fn http_stream_bytes<'a>(ptr: *const u8, len: i64) -> Result<&'a [u8], i3
         return Ok(&[]);
     }
     let length = usize::try_from(len).map_err(|_| AL_INVALID)?;
-    if length > isize::MAX as usize || (ptr as usize).checked_add(length).is_none() {
+    if length > isize::MAX.unsigned_abs() || ptr.addr().checked_add(length).is_none() {
         return Err(AL_INVALID);
     }
     Ok(unsafe { core::slice::from_raw_parts(ptr, length) })
@@ -27563,7 +27563,7 @@ fn http_stream_send_parts_with<O: HttpStreamWriteOps>(st: &mut HttpStream, data:
     }
     let head_len = st.pending_head.as_ref().map_or(0, Vec::len);
     let framing_len = if st.framed { framing.len() - framing_start + 2 } else { 0 };
-    let Some(wire_len) = head_len.checked_add(payload_len).and_then(|n| n.checked_add(framing_len)).filter(|&n| n <= isize::MAX as usize) else { return AL_INVALID };
+    let Some(wire_len) = head_len.checked_add(payload_len).and_then(|n| n.checked_add(framing_len)).filter(|&n| n <= isize::MAX.unsigned_abs()) else { return AL_INVALID };
     // Only fixed framing bytes are coalesced; the caller's payload never moves.
     let mut before = [0_u8; core::mem::size_of::<usize>() * 2 + 8];
     let line = &framing[framing_start..];
