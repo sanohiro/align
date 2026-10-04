@@ -1,0 +1,58 @@
+module main
+
+import std.cli
+import std.http
+import std.io
+
+// Print selected SSE data fields; an error may leave a prefix on stdout.
+pub fn main(args: array<str>) -> Result<(), Error> {
+  command := cli.command("http_sse_watch")
+  command.flag_str("url", "")
+  command.flag_i64("max-events", 1024)
+  command.flag_i64("event-bytes", 65536)
+  command.flag_i64("max-body-bytes", 67108864)
+  command.flag_i64("timeout-ns", 30000000000)
+  command.flag_bool("help")
+  parsed := command.parse(args)?
+  if parsed.get_bool("help") {
+    print(command.usage())
+    return Ok(())
+  }
+  url := parsed.get_str("url")
+  if url.len() == 0 { return Err(Error.Invalid) }
+  maximum_events := parsed.get_i64("max-events")
+  if maximum_events < 1 || maximum_events > 1048576 { return Err(Error.Invalid) }
+  event_bytes := parsed.get_i64("event-bytes")
+  if event_bytes < 1 || event_bytes > 1048576 { return Err(Error.Invalid) }
+  maximum_body := parsed.get_i64("max-body-bytes")
+  if maximum_body < 1 || maximum_body > 1073741824 { return Err(Error.Invalid) }
+  timeout := parsed.get_i64("timeout-ns")
+  if timeout < 1 { return Err(Error.Invalid) }
+  mut out := buffer(event_bytes)
+  if out.capacity() != event_bytes { return Err(Error.Invalid) }
+
+  client := http.client()
+  client.timeout(timeout)
+  client.max_response_body_bytes(maximum_body)
+  request := http.request("GET", url)
+  request.header("Accept", "text/event-stream")
+  raw := client.request_stream(request)?
+  if raw.status() != 200 { return Err(Error.Invalid) }
+  events := raw.sse()
+  output := io.stdout
+
+  mut emitted := 0
+  loop {
+    if emitted >= maximum_events { break }
+    next := events.next(out)?
+    match next {
+      Some(event) => {
+        output.write(event.data)?
+        output.write("\n")?
+        emitted = emitted + 1
+      },
+      None => { break },
+    }
+  }
+  return Ok(())
+}

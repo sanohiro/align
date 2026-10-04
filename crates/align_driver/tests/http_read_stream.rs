@@ -8,17 +8,17 @@ use common::*;
 use std::io::{Read, Write};
 
 // The runnable example owns its artifacts and child independently of the older protocol fixtures.
-struct FetchExample {
+struct ReceiveExample {
     stage: align_driver::ArtifactStage,
     exe: std::path::PathBuf,
 }
 
-struct FetchChild {
+struct ReceiveChild {
     child: Option<std::process::Child>,
     deadline: std::time::Instant,
 }
 
-impl FetchChild {
+impl ReceiveChild {
     fn spawn(command: &mut std::process::Command) -> Self {
         use std::os::unix::process::CommandExt;
         let child = command
@@ -54,7 +54,7 @@ impl FetchChild {
     }
 }
 
-impl Drop for FetchChild {
+impl Drop for ReceiveChild {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
             if let Ok(pid) = i32::try_from(child.id()) {
@@ -79,14 +79,17 @@ impl Drop for FetchChild {
     }
 }
 
-impl FetchExample {
-    fn build(label: &str) -> Self {
+impl ReceiveExample {
+    fn build(label: &str, example: &str) -> Self {
+        Self::build_source(label, &fixture(&format!("examples/{example}.align")))
+    }
+
+    fn build_source(label: &str, source: &str) -> Self {
         let stage = align_driver::ArtifactStage::temp(label).expect("acquire HTTP example fixture");
-        let source = fixture("examples/http_fetch.align");
-        std::fs::write(stage.path().join("http_fetch.align"), source).expect("write example");
+        std::fs::write(stage.path().join("main.align"), source).expect("write example");
         let mut build = std::process::Command::new(env!("CARGO_BIN_EXE_alignc"));
         build
-            .args(["build", "http_fetch.align", "--profile", "dev"])
+            .args(["build", "main.align", "--profile", "dev"])
             .current_dir(stage.path())
             .env("ALIGNC_CACHE", "off")
             .env("TMPDIR", stage.path())
@@ -94,7 +97,7 @@ impl FetchExample {
             .stderr(
                 std::fs::File::create(stage.path().join("build.stderr")).expect("build stderr"),
             );
-        let status = FetchChild::spawn(&mut build).wait();
+        let status = ReceiveChild::spawn(&mut build).wait();
         assert!(
             status.success(),
             "{}",
@@ -102,15 +105,14 @@ impl FetchExample {
         );
         let exe = stage
             .path()
-            .join(format!("http_fetch{}", std::env::consts::EXE_SUFFIX));
+            .join(format!("main{}", std::env::consts::EXE_SUFFIX));
         Self { stage, exe }
     }
 
-    fn start(&self, args: &[&str], reject_stdout: bool) -> FetchChild {
+    fn start(&self, args: &[&str], reject_stdout: bool) -> ReceiveChild {
         let stdout = if reject_stdout {
             // Inherit an actual read-only descriptor: both supported platforms reject its write.
-            std::fs::File::open(self.stage.path().join("http_fetch.align"))
-                .expect("readonly stdout")
+            std::fs::File::open(self.stage.path().join("main.align")).expect("readonly stdout")
         } else {
             std::fs::File::create(self.stage.path().join("stdout")).expect("capture stdout")
         };
@@ -122,7 +124,37 @@ impl FetchExample {
             .stderr(
                 std::fs::File::create(self.stage.path().join("stderr")).expect("capture stderr"),
             );
-        FetchChild::spawn(&mut command)
+        ReceiveChild::spawn(&mut command)
+    }
+
+    fn wait_for_stdout(&self, child: &ReceiveChild, expected: &[u8]) {
+        loop {
+            child.remaining();
+            let output = self.stdout();
+            assert!(
+                expected.starts_with(&output),
+                "unexpected incremental output: {output:?}"
+            );
+            if output == expected {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn assert_exit(&self, status: std::process::ExitStatus, error: Option<i32>) {
+        let stderr = std::fs::read(self.stage.path().join("stderr")).expect("stderr evidence");
+        let code = error.map_or(0, |code| code.clamp(1, 255));
+        assert_eq!(
+            status.code(),
+            Some(code),
+            "normal exit required: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+        let expected = error.map_or_else(Vec::new, |code| {
+            format!("error: code {code}\n").into_bytes()
+        });
+        assert_eq!(stderr, expected, "exact error class/report");
     }
 
     fn stdout(&self) -> Vec<u8> {
@@ -130,13 +162,17 @@ impl FetchExample {
     }
 }
 
-fn fetch_listener() -> std::net::TcpListener {
+fn receive_listener() -> std::net::TcpListener {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind example fixture");
     listener.set_nonblocking(true).expect("bound accept");
     listener
 }
 
-fn fetch_peer(listener: &std::net::TcpListener, child: &FetchChild) -> std::net::TcpStream {
+fn receive_peer(
+    listener: &std::net::TcpListener,
+    child: &ReceiveChild,
+    expected_header: Option<&[u8]>,
+) -> std::net::TcpStream {
     let mut socket = loop {
         child.remaining();
         match listener.accept() {
@@ -169,6 +205,13 @@ fn fetch_peer(listener: &std::net::TcpListener, child: &FetchChild) -> std::net:
         );
     }
     assert!(request.starts_with(b"GET /binary HTTP/1.1\r\n"));
+    if let Some(header) = expected_header {
+        assert!(
+            request
+                .windows(header.len())
+                .any(|window| window.eq_ignore_ascii_case(header))
+        );
+    }
     socket
 }
 
@@ -177,10 +220,10 @@ fn bounded_fetch_example_preserves_binary_framing_and_emits_before_completion() 
     if !backend_available() {
         return;
     }
-    let example = FetchExample::build("http-fetch-binary");
+    let example = ReceiveExample::build("http-fetch-binary", "http_fetch");
     let payload: Vec<u8> = (0..=255).cycle().take(131073).collect();
     for framing in ["fixed", "chunked", "close", "interim"] {
-        let listener = fetch_listener();
+        let listener = receive_listener();
         let url = format!(
             "http://127.0.0.1:{}/binary",
             listener.local_addr().unwrap().port()
@@ -191,7 +234,7 @@ fn bounded_fetch_example_preserves_binary_framing_and_emits_before_completion() 
             vec!["--url", &url, "--max-body-bytes", "131073"]
         };
         let mut child = example.start(&args, false);
-        let mut socket = fetch_peer(&listener, &child);
+        let mut socket = receive_peer(&listener, &child, None);
         if framing == "interim" {
             socket
                 .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
@@ -245,8 +288,8 @@ fn bounded_fetch_example_validates_cli_before_network_or_output() {
     if !backend_available() {
         return;
     }
-    let example = FetchExample::build("http-fetch-cli");
-    let listener = fetch_listener();
+    let example = ReceiveExample::build("http-fetch-cli", "http_fetch");
+    let listener = receive_listener();
     let url = format!(
         "http://127.0.0.1:{}/binary",
         listener.local_addr().unwrap().port()
@@ -303,7 +346,7 @@ fn bounded_fetch_example_propagates_cap_protocol_timeout_and_output_failures() {
     if !backend_available() {
         return;
     }
-    let example = FetchExample::build("http-fetch-errors");
+    let example = ReceiveExample::build("http-fetch-errors", "http_fetch");
     // None keeps the accepted peer open without writing; incomplete responses keep it open too.
     for (response, keep_open, reject_stdout, expected) in [
         (
@@ -353,7 +396,7 @@ fn bounded_fetch_example_propagates_cap_protocol_timeout_and_output_failures() {
             &b""[..],
         ),
     ] {
-        let listener = fetch_listener();
+        let listener = receive_listener();
         let url = format!(
             "http://127.0.0.1:{}/binary",
             listener.local_addr().unwrap().port()
@@ -367,7 +410,7 @@ fn bounded_fetch_example_propagates_cap_protocol_timeout_and_output_failures() {
             ],
             reject_stdout,
         );
-        let mut socket = Some(fetch_peer(&listener, &child));
+        let mut socket = Some(receive_peer(&listener, &child, None));
         if let Some(response) = response {
             socket
                 .as_mut()
@@ -388,6 +431,357 @@ fn bounded_fetch_example_propagates_cap_protocol_timeout_and_output_failures() {
             assert_eq!(example.stdout(), expected, "response {response:?}");
         }
     }
+}
+
+#[test]
+fn bounded_sse_watch_example_streams_data_and_stops_at_the_requested_count() {
+    if !backend_available() {
+        return;
+    }
+    let example = ReceiveExample::build("sse-watch-data", "http_sse_watch");
+    let first = b"data: first\n\n";
+    let rest = b": heartbeat\r\nid: 7\r\nevent: progress\r\ndata: one\r\ndata: two\r\n\r\ndata:\n\nid: 9\nretry: 1000\n\ndata: h\xc3\xa9\n\ndata: unfinished";
+    for framing in ["fixed", "chunked", "close", "count"] {
+        let listener = receive_listener();
+        let url = format!(
+            "http://127.0.0.1:{}/binary",
+            listener.local_addr().unwrap().port()
+        );
+        let maximum = if framing == "count" { "1" } else { "1024" };
+        let body_cap = (first.len() + rest.len()).to_string();
+        let mut child = example.start(
+            &[
+                "--url",
+                &url,
+                "--max-events",
+                maximum,
+                "--max-body-bytes",
+                &body_cap,
+            ],
+            false,
+        );
+        let mut socket = receive_peer(&listener, &child, Some(b"Accept: text/event-stream\r\n"));
+        let head = match framing {
+            "chunked" | "count" => "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n".to_owned(),
+            "close" => "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n".to_owned(),
+            _ => format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n", first.len() + rest.len()),
+        };
+        socket.write_all(head.as_bytes()).expect("SSE head");
+        if framing == "chunked" || framing == "count" {
+            socket
+                .write_all(format!("{:x}\r\n", first.len()).as_bytes())
+                .expect("first chunk");
+        }
+        socket.write_all(first).expect("first event");
+        if framing == "chunked" || framing == "count" {
+            socket.write_all(b"\r\n").expect("chunk end");
+        }
+        example.wait_for_stdout(&child, b"first\n");
+        if framing == "count" {
+            // No terminal chunk and the peer stays open: success must not read another event.
+            example.assert_exit(child.wait(), None);
+            assert_eq!(example.stdout(), b"first\n");
+            continue;
+        }
+        if framing == "chunked" {
+            socket
+                .write_all(format!("{:x}\r\n", rest.len()).as_bytes())
+                .expect("remaining chunk");
+        }
+        socket.write_all(rest).expect("remaining events");
+        if framing == "chunked" {
+            socket.write_all(b"\r\n0\r\n\r\n").expect("terminal chunk");
+        }
+        drop(socket);
+        example.assert_exit(child.wait(), None);
+        assert_eq!(
+            example.stdout(),
+            "first\none\ntwo\n\nhé\n".as_bytes(),
+            "{framing}"
+        );
+    }
+}
+
+#[test]
+fn bounded_sse_watch_example_validates_cli_before_connecting() {
+    if !backend_available() {
+        return;
+    }
+    let example = ReceiveExample::build("sse-watch-cli", "http_sse_watch");
+    let listener = receive_listener();
+    let url = format!(
+        "http://127.0.0.1:{}/binary",
+        listener.local_addr().unwrap().port()
+    );
+    let invalid = [
+        vec!["--url", ""],
+        vec!["--max-events=0"],
+        vec!["--max-events=-1"],
+        vec!["--max-events=1048577"],
+        vec!["--event-bytes=0"],
+        vec!["--event-bytes=-1"],
+        vec!["--event-bytes=1048577"],
+        vec!["--max-body-bytes=0"],
+        vec!["--max-body-bytes=-1"],
+        vec!["--max-body-bytes=1073741825"],
+        vec!["--timeout-ns=0"],
+        vec!["--timeout-ns=-1"],
+        vec!["--event-bytes=bad"],
+        vec!["--unknown"],
+        vec!["--url"],
+        vec!["--help", "--event-bytes=bad"],
+    ];
+    for invalid in invalid {
+        let mut args = vec!["--url", &url];
+        args.extend(invalid);
+        example.assert_exit(example.start(&args, false).wait(), Some(2));
+        assert!(
+            example.stdout().is_empty(),
+            "validation produces no event data"
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+    example.assert_exit(example.start(&[], false).wait(), Some(2));
+    example.assert_exit(
+        example
+            .start(
+                &[
+                    "--help",
+                    "--url",
+                    &url,
+                    "--max-events=0",
+                    "--event-bytes=0",
+                    "--max-body-bytes=0",
+                    "--timeout-ns=-1",
+                ],
+                false,
+            )
+            .wait(),
+        None,
+    );
+    let usage = String::from_utf8(example.stdout()).expect("usage text");
+    for flag in [
+        "--url",
+        "--max-events",
+        "--event-bytes",
+        "--max-body-bytes",
+        "--timeout-ns",
+        "--help",
+    ] {
+        assert!(usage.contains(flag));
+    }
+    for default in ["1024", "65536", "67108864", "30000000000"] {
+        assert!(usage.contains(default));
+    }
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn bounded_sse_watch_example_owns_caps_and_failures() {
+    if !backend_available() {
+        return;
+    }
+    let example = ReceiveExample::build("sse-watch-errors", "http_sse_watch");
+    // The default event name contributes seven bytes to the caller-window bound.
+    let cases: &[(&[u8], &[&str], bool, bool, Option<i32>, &[u8])] = &[
+        (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ndata:x\n\n",
+            &["--event-bytes=8", "--max-body-bytes=8"],
+            false,
+            false,
+            None,
+            b"x\n",
+        ),
+        (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ndata:x\n\n",
+            &["--event-bytes=7"],
+            false,
+            false,
+            Some(-1),
+            b"",
+        ),
+        (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\n\r\nid: q\ndata:x\n\n",
+            &["--event-bytes=8"],
+            false,
+            false,
+            Some(-1),
+            b"",
+        ),
+        (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ndata:x\n\n",
+            &["--max-body-bytes=7"],
+            false,
+            false,
+            Some(-1),
+            b"",
+        ),
+        (
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n8\r\ndata:x\n\n\r\n0\r\n\r\n",
+            &["--max-body-bytes=8"],
+            false,
+            false,
+            None,
+            b"x\n",
+        ),
+        (
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n8\r\ndata:x\n\n\r\n0\r\n\r\n",
+            &["--max-body-bytes=7"],
+            false,
+            false,
+            Some(-1),
+            b"",
+        ),
+        (
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 8\r\n\r\ndata:x\n\n",
+            &[],
+            false,
+            false,
+            Some(2),
+            b"",
+        ),
+        (
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nZ\r\n",
+            &[],
+            false,
+            false,
+            Some(2),
+            b"",
+        ),
+        (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\ndata:x",
+            &[],
+            false,
+            false,
+            Some(2),
+            b"",
+        ),
+        (b"HTTP/1.1 200 OK\r\n", &[], true, false, Some(4), b""),
+        (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\ndata:x",
+            &[],
+            true,
+            false,
+            Some(4),
+            b"",
+        ),
+        (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ndata:x\n\n",
+            &[],
+            false,
+            true,
+            Some(libc::EBADF),
+            b"",
+        ),
+    ];
+    for &(response, extra, keep_open, reject_stdout, error, expected) in cases {
+        let listener = receive_listener();
+        let url = format!(
+            "http://127.0.0.1:{}/binary",
+            listener.local_addr().unwrap().port()
+        );
+        let mut args = vec!["--url", &url, "--timeout-ns=500000000"];
+        args.extend_from_slice(extra);
+        let mut child = example.start(&args, reject_stdout);
+        let mut socket = Some(receive_peer(
+            &listener,
+            &child,
+            Some(b"Accept: text/event-stream\r\n"),
+        ));
+        socket
+            .as_mut()
+            .unwrap()
+            .write_all(response)
+            .expect("SSE fault response");
+        if !keep_open {
+            drop(socket.take());
+        }
+        example.assert_exit(child.wait(), error);
+        assert_eq!(
+            example.stdout(),
+            expected,
+            "response {response:?}, flags {extra:?}"
+        );
+    }
+    // First event is observed before releasing any later error: co-reading cannot hide it.
+    for (late, extra, keep_open, code) in [
+        (b"".as_slice(), &[][..], false, 2),
+        (b"".as_slice(), &[][..], true, 4),
+        (
+            b"9\r\ndata:xx\n\n\r\n".as_slice(),
+            &["--event-bytes=8"][..],
+            false,
+            -1,
+        ),
+        (
+            b"9\r\ndata:xx\n\n\r\n".as_slice(),
+            &["--max-body-bytes=16"][..],
+            false,
+            -1,
+        ),
+        (b"Z\r\n".as_slice(), &[][..], false, 2),
+    ] {
+        let listener = receive_listener();
+        let url = format!(
+            "http://127.0.0.1:{}/binary",
+            listener.local_addr().unwrap().port()
+        );
+        let mut args = vec!["--url", &url, "--timeout-ns=500000000"];
+        args.extend_from_slice(extra);
+        let mut child = example.start(&args, false);
+        let mut socket = Some(receive_peer(
+            &listener,
+            &child,
+            Some(b"Accept: text/event-stream\r\n"),
+        ));
+        socket
+            .as_mut()
+            .unwrap()
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n8\r\ndata:x\n\n\r\n")
+            .expect("first event before failure");
+        example.wait_for_stdout(&child, b"x\n");
+        socket
+            .as_mut()
+            .unwrap()
+            .write_all(late)
+            .expect("late fault");
+        if !keep_open {
+            drop(socket.take());
+        }
+        example.assert_exit(child.wait(), Some(code));
+        assert_eq!(
+            example.stdout(),
+            b"x\n",
+            "late failure preserves only the previous event"
+        );
+    }
+    // A constructor returning no usable window exercises admission independently of host OOM.
+    let source = fixture("examples/http_sse_watch.align");
+    assert_eq!(source.matches("buffer(event_bytes)").count(), 1);
+    let source = source.replace("buffer(event_bytes)", "buffer(0)");
+    let degraded = ReceiveExample::build_source("sse-watch-degraded-window", &source);
+    let listener = receive_listener();
+    let url = format!(
+        "http://127.0.0.1:{}/binary",
+        listener.local_addr().unwrap().port()
+    );
+    degraded.assert_exit(
+        degraded
+            .start(&["--url", &url, "--timeout-ns=100000000"], false)
+            .wait(),
+        Some(2),
+    );
+    assert!(degraded.stdout().is_empty());
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
 }
 
 fn spawn_response(response: Vec<u8>) -> (u16, std::thread::JoinHandle<Vec<u8>>) {
@@ -517,7 +911,10 @@ pub fn main(args: array<str>) -> Result<(), Error> {
         .output()
         .expect("run zero-capacity client");
     let _ = server.join().unwrap();
-    assert!(!output.status.success(), "a zero-capacity stream read must abort");
+    assert!(
+        !output.status.success(),
+        "a zero-capacity stream read must abort"
+    );
 }
 
 #[test]
@@ -745,7 +1142,10 @@ fn main() -> Result<(), Error> {
             &format!("  moved := {client}\n  print(selected.status())"),
         );
         assert!(
-            check_errs(&format!("http-read-stream-client-join-move-{index}"), &rejected),
+            check_errs(
+                &format!("http-read-stream-client-join-move-{index}"),
+                &rejected
+            ),
             "moving possible client root {client} compiled",
         );
     }
@@ -787,7 +1187,12 @@ fn main() -> i32 {
     let per_unit = build_per_unit_multi("http-read-stream-per-unit", files, "main.align");
     assert_eq!(per_unit.link_and_run().status.code(), Some(0));
     assert!(
-        per_unit.unit("streams").mir.link_libs.iter().any(|library| library == "ssl"),
+        per_unit
+            .unit("streams")
+            .mir
+            .link_libs
+            .iter()
+            .any(|library| library == "ssl"),
         "a unit that only moves/drops http_read_stream still needs its TLS-aware free ABI",
     );
 }

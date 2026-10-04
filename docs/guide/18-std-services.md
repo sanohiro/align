@@ -96,6 +96,47 @@ Use `--help` separately to print usage. Empty URL, invalid limits and non-200
 status return `Error.Invalid`; exceeding the body cap is `Error.Code(-1)`. Transport,
 framing, timeout and output errors propagate through `?`.
 
+### Read SSE progress through a bounded client
+
+The runnable [http_sse_watch example](../../examples/http_sse_watch.align)
+prints SSE data fields as they arrive through the existing receiver:
+
+```bash
+./target/debug/alignc build examples/http_sse_watch.align
+./http_sse_watch --url http://127.0.0.1:8081/v1/jobs/EPOCH/ID/events --max-events 32
+```
+
+Use your job's epoch/id and observer port from the
+[multimodal reference](27-multimodal-reference.md), or another SSE endpoint.
+The example asks for `text/event-stream` and, after request admission, accepts
+only status 200. It does not validate the response content type or decode an
+application schema. Each dispatched event contributes its data text followed
+by one LF; multiline data stays multiline, and an empty-data event prints a
+blank line. Event names, IDs and retry values are omitted. The output is data
+text, rather than a JSONL or event-record format.
+
+`--max-events` defaults to 1024 and accepts 1..1048576. Reaching that count is
+successful bounded observation: the stream closes immediately, even if the peer
+is still sending. Clean stream EOF also succeeds; comments and control-only
+blocks do not count, and the existing SSE parser discards an incomplete final
+block. There is no automatic reconnect or retry.
+
+`--event-bytes` defaults to 65536 and accepts 1..1048576. One explicit buffer is
+reused for every event. Its capacity bounds the combined event name, data and
+last ID, including fields omitted from stdout. A degraded buffer reservation
+returns Invalid before connecting. Event views are written before the next
+`next(out)` invalidates them; nothing accumulates the full event history.
+
+`--max-body-bytes` defaults to 67108864 and accepts 1..1073741824 decoded bytes,
+including comments and control fields. `--timeout-ns` defaults to 30000000000
+and must be positive; configure a longer interval for a quiet producer. The
+existing timeout bounds individual connect/send/transport-receive operations,
+not DNS, stdout writes or total watch duration. CLI limits are validated before
+network I/O, and `--help` reports usage separately. Output-window and body-cap
+refusals remain Code(-1); SSE source-work overflow is Invalid, with the body cap
+taking precedence at the same source boundary. Other transport, parser, timeout
+and output errors propagate. A late failure may leave a stdout prefix.
+
 ## `std.process`
 
 ```align
