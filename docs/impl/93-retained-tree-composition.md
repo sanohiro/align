@@ -29,8 +29,8 @@ The CLI uses the existing `std.cli`: `--root` defaults to `.`, `--max-depth` to
 after successful parsing, before numeric validation or filesystem access.
 Otherwise validate depth in 0..64 and entries in 1..1048576 before opening the
 root. Root spelling and errors use unchanged `fs.open_directory` admission.
-The root counts as one entry and one directory at depth zero. A child directory
-at the selected maximum depth is an error, including an empty child. Exactly
+The root counts as one entry and one directory at depth zero. A directory
+beyond the selected maximum depth is an error, including an empty directory. Exactly
 the selected entry limit succeeds; a further entry fails before its metadata
 query. Native errors propagate. Invalid limits, negative regular-file sizes,
 checked byte-sum overflow and observed/opened child identity disagreement are

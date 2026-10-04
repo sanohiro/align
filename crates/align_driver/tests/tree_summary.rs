@@ -4,7 +4,9 @@ use common::*;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
-const SOURCE: &str = include_str!("../../../examples/tree_summary.align");
+fn source() -> &'static str {
+    fixture("examples/tree_summary.align")
+}
 
 struct Fixture {
     directory: PathBuf,
@@ -89,7 +91,7 @@ fn byte_names_kinds_and_logical_sizes() {
     }
     let fixture = Fixture::new("kinds");
     let (files, bytes) = fixture.populated();
-    let executable = build_exe("tree-summary-kinds", SOURCE);
+    let executable = build_exe("tree-summary-kinds", source());
     let defaults = std::process::Command::new(&executable.exe)
         .current_dir(&fixture.root)
         .output()
@@ -129,7 +131,7 @@ fn exact_limits_and_pre_io_validation() {
         return;
     }
     let fixture = Fixture::new("limits");
-    let executable = build_exe("tree-summary-limits", SOURCE);
+    let executable = build_exe("tree-summary-limits", source());
     let empty = std::process::Command::new(&executable.exe)
         .args([
             "--root",
@@ -197,7 +199,7 @@ fn exact_limits_and_pre_io_validation() {
 fn probe_source(main: &str) -> String {
     format!(
         "{}\n{main}",
-        SOURCE.replace("pub fn main(", "fn example_main(")
+        source().replace("pub fn main(", "fn example_main(")
     )
 }
 
@@ -205,7 +207,7 @@ fn probe_source(main: &str) -> String {
 fn source_formation_and_native_per_unit_walk() {
     let checked = diff_check_multi(
         "tree-summary-formation",
-        &[("main.align", SOURCE)],
+        &[("main.align", source())],
         "main.align",
     );
     assert!(
