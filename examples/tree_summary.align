@@ -1,0 +1,91 @@
+module main
+
+import std.cli
+import std.fs
+
+// Read-only, byte-name traversal. Limits include the root; no full-tree array is built.
+// Symlinks and special entries are counted but never opened. Logical sizes count each name,
+// including hard links; observations are not a snapshot or a disk-usage measurement.
+Counts {
+  entries: i64,
+  directories: i64,
+  regular_files: i64,
+  symlinks: i64,
+  other: i64,
+  logical_bytes: i64,
+}
+
+fn add_size(current: i64, size: i64) -> Result<i64, Error> {
+  if size < 0 { return Err(Error.Invalid) }
+  return Ok(current.checked_add(size) else { return Err(Error.Invalid) })
+}
+
+fn walk(
+  borrow directory: fs.directory,
+  remaining_depth: i64,
+  maximum_entries: i64,
+  initial: Counts,
+) -> Result<Counts, Error> {
+  cursor := directory.cursor()?
+  mut counts := initial
+  loop {
+    entry := cursor.next()? else { break }
+    if counts.entries == maximum_entries { return Err(Error.Invalid) }
+    name: slice<u8> := entry.name
+    observed := directory.metadata_at(name)?
+    counts.entries = counts.entries + 1
+    match observed.kind {
+      Directory => {
+        if remaining_depth == 0 { return Err(Error.Invalid) }
+        child := directory.open_dir(name)?
+        actual := child.metadata()?
+        if actual.device != observed.device || actual.inode != observed.inode {
+          return Err(Error.Invalid)
+        }
+        counts.directories = counts.directories + 1
+        counts = walk(child, remaining_depth - 1, maximum_entries, counts)?
+      },
+      Regular => {
+        counts.logical_bytes = add_size(counts.logical_bytes, observed.size)?
+        counts.regular_files = counts.regular_files + 1
+      },
+      Symlink => { counts.symlinks = counts.symlinks + 1 },
+      Other => { counts.other = counts.other + 1 },
+    }
+  }
+  return Ok(counts)
+}
+
+pub fn main(args: array<str>) -> Result<(), Error> {
+  command := cli.command("tree_summary")
+  command.flag_str("root", ".")
+  command.flag_i64("max-depth", 32)
+  command.flag_i64("max-entries", 8192)
+  command.flag_bool("help")
+  parsed := command.parse(args)?
+  if parsed.get_bool("help") {
+    print(command.usage())
+    return Ok(())
+  }
+  depth := parsed.get_i64("max-depth")
+  entries := parsed.get_i64("max-entries")
+  if depth < 0 || depth > 64 || entries < 1 || entries > 1048576 {
+    return Err(Error.Invalid)
+  }
+  directory := fs.open_directory(parsed.get_str("root"))?
+  initial := Counts { entries: 1, directories: 1, regular_files: 0, symlinks: 0, other: 0, logical_bytes: 0 }
+  counts := walk(directory, depth, entries, initial)?
+  print("entries")
+  print(counts.entries)
+  print("directories")
+  print(counts.directories)
+  print("regular_files")
+  print(counts.regular_files)
+  print("symlinks")
+  print(counts.symlinks)
+  print("other")
+  print(counts.other)
+  print("logical_bytes")
+  print(counts.logical_bytes)
+  return Ok(())
+}

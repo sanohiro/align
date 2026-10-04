@@ -22,8 +22,9 @@ existing-module usability first, useful bounded transport/library capabilities
 next, and measured execution/storage/startup improvements. Complex uncompleted
 compiler items have lower priority; K1 retains the explicit deferral above.
 Plan51's process assessment selected the plan92 reap-scratch improvement without
-a new process API or supervisor. Continue with one real retained-directory
-workflow for the filesystem assessment. Real voice/media engine integration and
+a new process API or supervisor. The filesystem assessment in plan93 supplies a
+bounded byte-name tree summary example through existing std.fs; no new traversal
+API is needed. Continue with demonstrated CLI composition gaps. Real voice/media engine integration and
 GPU qualification belong to their consumers, which request demonstrated Align
 gaps; they are not the next provider implementation queue.
 
@@ -442,10 +443,11 @@ the final symlink itself; the earlier macOS strategy was incorrect. Self
 `access` remains supported on Linux/macOS. Useful macOS R72 relative observations
 are deferred; consumer adoption remains external. The combined implementation is merged. Consumer adoption remains external.
 
-**Future std/pkg review (planned, no implementation scheduled):**
+**Resumed std/pkg assessment:**
 [Plan 51](docs/impl/51-package-composition-review-plan.md) records the overlap
 assessment and existing-module priority: std.process, std.fs, then demonstrated
-std.cli gaps. No new exec/tree/CLI package is selected. Reuse and responsibility
+std.cli gaps. Process and filesystem dispositions are in plans 92 and 93; CLI
+assessment is next. No new exec/tree/CLI package is selected. Reuse and responsibility
 review precede additions; this is separate from completed R65 delivery.
 
 `std.fs` retained raw tree access (R64) is implemented under

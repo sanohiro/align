@@ -1,10 +1,12 @@
 # Standard-library and package responsibility review
 
-Status: **OWNER-RESUMED 2026-10-04 — process assessment complete; filesystem
-and CLI assessment remain pending.** The owner approved continuing independent
+Status: **OWNER-RESUMED 2026-10-04 — process and filesystem assessments complete;
+CLI assessment remains pending.** The owner approved continuing independent
 capabilities through PR and merge. [Plan 92](92-process-composition-and-reap-storage.md)
-records the process disposition and bounded reap-scratch improvement. This
-assessment selects no new process API, exec, tree or CLI package.
+records the process disposition and bounded reap-scratch improvement.
+[Plan 93](93-retained-tree-composition.md) records the existing filesystem
+composition and bounded tree summary example. This assessment selects no new
+process/traversal API, exec, tree or CLI package.
 
 ## Direction
 
