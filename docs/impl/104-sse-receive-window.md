@@ -47,4 +47,3 @@ The two native macOS HTTPS/SSE fixtures fail during request_stream on unchanged
 main and the candidate, before SSE body receive. Their baseline logs are retained;
 they are not claimed as locally qualified or repaired. Linux closes the common
 TLS body path; no unrelated TLS strategy is added to this refinement.
-
