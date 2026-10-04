@@ -94,8 +94,13 @@ fn parse_stat(pid: i32, bytes: &[u8]) -> Result<Observation, i32> {
         return Err(AL_INVALID);
     }
     let tail = std::str::from_utf8(&bytes[close + 1..]).map_err(|_| AL_INVALID)?;
-    let fields: Vec<_> = tail.split_ascii_whitespace().collect();
-    let number = |index: usize| fields.get(index).and_then(|text| text.parse::<i128>().ok());
+    // Only this prefix supplies observed fields; later tokens still passed full UTF-8 validation.
+    let mut fields = [None; 22];
+    for (slot, text) in fields.iter_mut().zip(tail.split_ascii_whitespace()) {
+        *slot = Some(text);
+    }
+    let number = |index: usize| fields.get(index).copied().flatten()
+        .and_then(|text| text.parse::<i128>().ok());
     let parent = number(1)
         .and_then(|n| i64::try_from(n).ok())
         .filter(|n| *n >= 0)
@@ -396,6 +401,56 @@ mod tests {
             assert!(candidates(1).is_err());
         }
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stat_prefix_missing_fields_and_ignored_tail_preserve_admission() {
+        let mut fields = ["0"; 22];
+        fields[0] = "S";
+        fields[1] = "1";
+        fields[11] = "3";
+        fields[12] = "4";
+        fields[17] = "2";
+        fields[21] = "5";
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        for count in 0..=fields.len() {
+            let raw = format!("123 (a)\nb) {}", fields[..count].join("\t "));
+            let observed = parse_stat(123, raw.as_bytes());
+            if count < 3 {
+                assert!(matches!(observed, Err(AL_INVALID)), "count={count}");
+                continue;
+            }
+            let observed = observed.unwrap();
+            assert_eq!((observed.row.parent_pid, observed.group), (1, 0));
+            let expected = |present: bool, value: i128| {
+                if present { OptionalCount::from_nonnegative(value) }
+                else { OptionalCount::default() }
+            };
+            assert_eq!(observed.row.threads, expected(count > 17, 2));
+            assert_eq!(observed.row.rss_bytes, expected(count > 21 && page > 0, i128::from(page) * 5));
+            let cpu = if ticks > 0 { 7_000_000_000 / i128::from(ticks) } else { 0 };
+            assert_eq!(observed.row.cpu_ns, expected(count > 12 && ticks > 0, cpu));
+        }
+        let prefix = format!("123 (x) {}", fields.join(" "));
+        for tail in ["".to_owned(), " irrelevant -999 NaN".to_owned(), " x".repeat(32_000)] {
+            let raw = prefix.clone() + &tail;
+            let observed = parse_stat(123, raw.as_bytes()).unwrap();
+            assert_eq!((observed.row.pid, observed.row.parent_pid, observed.group), (123, 1, 0));
+            assert_eq!(observed.row.threads, OptionalCount::from_nonnegative(2));
+        }
+        let mut invalid_utf8 = prefix.clone().into_bytes();
+        invalid_utf8.extend_from_slice(b" ignored \xff");
+        assert!(matches!(parse_stat(123, &invalid_utf8), Err(AL_INVALID)));
+        for invalid in ["-1", "bad", "170141183460469231731687303715884105728"] {
+            for index in [1, 2] {
+                let mut malformed = fields;
+                malformed[index] = invalid;
+                let raw = format!("123 (x) {} ignored", malformed.join(" "));
+                assert!(matches!(parse_stat(123, raw.as_bytes()), Err(AL_INVALID)));
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn stat_identity_and_optional_counters() {

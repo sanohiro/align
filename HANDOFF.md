@@ -68,6 +68,11 @@ receives while feeding and charging one source byte at a time. Post-head native
 owners qualify bulk reads, next-event boundaries, the exact work guard and fixed
 residual pooling; raw and chunked receive policies remain. Local byte/state and
 receive-call measurements qualify the refinement without a public speed guarantee.
+Plan105 retains 22 borrowed Linux stat-field slots in fixed local storage,
+removing the per-observation token Vec without changing essential/optional
+field admission, native queries or table/group output. Native prefix/tail and
+actual-source owners qualify it; parser-only allocation measurements distinguish
+this scratch from the unchanged input and returned-row storage.
 Continue bounded library/transport improvements and measured
 execution/storage/startup work against demonstrated consumers.
 Real voice/media engine integration and GPU qualification belong to their
