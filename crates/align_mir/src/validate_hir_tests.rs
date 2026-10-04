@@ -12214,7 +12214,7 @@ fn request11_expr_kind_inventory_tripwire() {
         // FloatScope, BytesView, SliceAsBytes, and HttpServerMaxRequestBodyBytes are explicit in
         // validation, source-shape, replay and ownership.
         variants,
-        350,
+        351,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -14537,6 +14537,18 @@ fn hir_body_validator_native() {
         result_unit
     );
     add!(
+        "native_http_server_accept_timeout_ns",
+        body_test_expr(
+            hir::ExprKind::HttpServerAcceptTimeoutNs {
+                server: Box::new(native_local(0, Ty::HttpServer)),
+                timeout_ns: Box::new(native_i64()),
+            },
+            result_unit,
+        ),
+        vec![body_test_local(0, "server", Ty::HttpServer, false, false)],
+        result_unit
+    );
+    add!(
         "native_http_stream_send",
         body_test_expr(
             hir::ExprKind::HttpStreamSend {
@@ -14712,6 +14724,35 @@ fn hir_body_validator_native() {
         function.locals[0].is_param = true;
         function.locals[0].is_mut = mode == align_ast::ParamMode::BorrowMut;
         assert_eq!(body_core_metadata_is_valid(&owned), mode != align_ast::ParamMode::Borrow, "stream budget exclusive authority");
+    }
+    for fault in 0..4 {
+        let mut reject = program.clone();
+        let expression = body_value_expression_mut(&mut reject, "native_http_server_accept_timeout_ns");
+        let hir::ExprKind::HttpServerAcceptTimeoutNs { server: stream, timeout_ns } = &mut expression.kind else {
+            panic!("server budget fixture discriminator");
+        };
+        match fault {
+            0 => stream.ty = Ty::Bool,
+            1 => **stream = body_test_expr(hir::ExprKind::Block(hir::Block {
+                stmts: Vec::new(), value: Some(Box::new(native_local(0, Ty::HttpServer))),
+            }), Ty::HttpServer),
+            2 => timeout_ns.ty = Ty::Bool,
+            _ => expression.ty = Ty::Bool,
+        }
+        assert!(!body_core_metadata_is_valid(&reject), "server budget forged field {fault}");
+    }
+    // HttpServer remains inferred-only: the owned local baseline is valid, while
+    // forged typed borrow signatures must fail the existing placement boundary.
+    for mode in [align_ast::ParamMode::BorrowMut, align_ast::ParamMode::Borrow] {
+        let mut owned = program.clone();
+        let Some(function) = owned.fns.iter_mut().find(|function| function.name == "native_http_server_accept_timeout_ns") else {
+            panic!("server budget fixture missing");
+        };
+        function.params = vec![0];
+        function.param_modes = vec![mode];
+        function.locals[0].is_param = true;
+        function.locals[0].is_mut = mode == align_ast::ParamMode::BorrowMut;
+        assert!(!body_core_metadata_is_valid(&owned), "unnamed server is not admitted in a forged borrowed signature");
     }
 
     for name in [

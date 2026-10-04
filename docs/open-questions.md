@@ -13,6 +13,20 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### HTTP complete-request acquisition budgets (SETTLED 2026-10-04)
+
+`srv.accept_timeout_ns(timeout_ns: i64) -> Result<(), Error>` is an Impure,
+exclusive, nonconsuming bound-local setter. Default zero is unbounded; negative
+values return Invalid before mutation. The next accept snapshots one monotonic
+budget through complete headers/body, malformed retries and descriptor pressure.
+Timeout releases selected incomplete input while preserving the listener and
+unselected parked peers. Checked owner-local nonblocking listener setup is
+latched; failed setup is Unknown and requires successful reassertion before later
+I/O, including after zero reset. Zero uses no deadline clocks. No partial-request
+API, server type spelling, global reactor or implicit response budget is added.
+[Plan 90](impl/90-multimodal-library-foundation-plan.md) and
+[HTTP design](impl/std-design/http.md) own the exact contract.
+
 ### HTTP stream total write budgets (SETTLED 2026-10-04)
 
 `s.write_timeout_ns(timeout_ns: i64) -> Result<(), Error>` is an Impure,

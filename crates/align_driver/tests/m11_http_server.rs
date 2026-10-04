@@ -69,6 +69,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   p := c.parse(args)?
   srv := http.serve(\"127.0.0.1\", p.get_i64(\"port\"))?
   srv.max_request_body_bytes(5)
+  srv.accept_timeout_ns(1000000000)?
   ctx := srv.accept()?
   rb := http.response(200)
   rb.header(\"X-Method\", ctx.method())

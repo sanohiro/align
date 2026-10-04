@@ -352,7 +352,7 @@ macro_rules! unmodelled_rvalues {
         Rvalue::HttpCtxBody { .. } | Rvalue::HttpResponseBuilder { .. } | Rvalue::HttpRbHeader { .. } |
         Rvalue::HttpRbBody { .. } | Rvalue::HttpRespond { .. } | Rvalue::HttpRespondStream { .. } |
         Rvalue::HttpRespondUpgrade { .. } | Rvalue::HttpUpgradeReadExact { .. } | Rvalue::HttpUpgradeWrite { .. } |
-        Rvalue::HttpUpgradeDeadline { .. } | Rvalue::HttpStreamWriteTimeoutNs { .. } | Rvalue::HttpUpgradeShutdown { .. } | Rvalue::HttpStreamSend { .. } |
+        Rvalue::HttpUpgradeDeadline { .. } | Rvalue::HttpStreamWriteTimeoutNs { .. } | Rvalue::HttpServerAcceptTimeoutNs { .. } | Rvalue::HttpUpgradeShutdown { .. } | Rvalue::HttpStreamSend { .. } |
         Rvalue::HttpStreamFinish { .. } | Rvalue::HttpStreamReject { .. }
     };
 }

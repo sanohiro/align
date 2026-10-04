@@ -4907,6 +4907,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::HttpUpgradeWrite { .. }
             | hir::ExprKind::HttpUpgradeDeadline { .. }
             | hir::ExprKind::HttpStreamWriteTimeoutNs { .. }
+            | hir::ExprKind::HttpServerAcceptTimeoutNs { .. }
             | hir::ExprKind::HttpUpgradeShutdown { .. }
             | hir::ExprKind::HttpStreamSend { .. }
             | hir::ExprKind::HttpStreamFinish { .. }
@@ -5285,6 +5286,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::HttpUpgradeWrite { .. }
             | hir::ExprKind::HttpUpgradeDeadline { .. }
             | hir::ExprKind::HttpStreamWriteTimeoutNs { .. }
+            | hir::ExprKind::HttpServerAcceptTimeoutNs { .. }
             | hir::ExprKind::HttpUpgradeShutdown { .. }
             | hir::ExprKind::HttpStreamFinish { .. }
             | hir::ExprKind::HttpStreamReject { .. }
@@ -10132,6 +10134,10 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::HttpStreamWriteTimeoutNs { stream, timeout_ns } => {
                 (self.exclusive_handle_place(context, stream, Ty::HttpStream) && stream.ty == Ty::HttpStream && timeout_ns.ty == i64)
                     .then(|| result(Ty::Unit, &[stream, timeout_ns]))?
+            }
+            hir::ExprKind::HttpServerAcceptTimeoutNs { server, timeout_ns } => {
+                (self.exclusive_handle_place(context, server, Ty::HttpServer) && server.ty == Ty::HttpServer && timeout_ns.ty == i64)
+                    .then(|| result(Ty::Unit, &[server, timeout_ns]))?
             }
             hir::ExprKind::HttpUpgradeShutdown { upgrade } => {
                 (local(upgrade, Ty::HttpUpgrade) && upgrade.ty == Ty::HttpUpgrade)

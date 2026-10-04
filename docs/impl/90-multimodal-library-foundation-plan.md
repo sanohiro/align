@@ -17,7 +17,7 @@ new source type: `slice<u8>`, `str`, and owned text admitted by the current chec
 | --- | --- | --- | --- | --- | --- |
 | H1 | Existing `s.send(chunk: bytes) -> Result<(), Error>` and `s.send_event(data: bytes) -> Result<(), Error>` | Call-scoped readonly input; exclusive bound stream receiver; Impure. Remove payload-sized framing allocation/copy. Existing empty-send, lazy-head, rejection, poison, finish and Drop behavior remains. No retained input, encoding conversion or implicit queue. | Runtime stream writer; existing HIR/MIR, symbols and public type identity. Runtime artifact identity changes normally; no interface schema change. Existing HTTP stream is the only prerequisite. | Arbitrary binary octets, exact SSE bytes, partial vectored writes, EINTR, disconnect and ownership owners; allocation/copy counters and paired token/bulk benchmarks. | `std-design/http.md` + `ja/http.md`, `pkg-design/web.md` + `ja/web.md`, plan 15's performance record; wording in `draft.md` / `language-spec.md` only where it describes writer behavior. |
 | H2 | `s.write_timeout_ns(timeout_ns: i64) -> Result<(), Error>` on `http_stream`; default `0`, meaning no bound; nonnegative values accepted | Exclusive nonconsuming receiver; Impure. Stores one scalar, no allocation/I/O. Each later send/send_event/finish/reject that writes bytes snapshots one monotonic total write budget; partial progress and EINTR do not reset it. Empty send and close-only raw finish remain clock-free. Invalid argument/state is Invalid. A timed-out write poisons the stream and returns Timeout; consuming operations still close exactly once. | Sema, HIR/MIR validation/lowering, rechecked interface source bodies, runtime key/ABI, runtime. No new type or interface-format change (format 17). H1 is a shared writer prerequisite. | Deadline/partial-write/state Cartesian owner, both native platforms, whole/per-unit and forged-HIR owners. No new speed claim; H1 regression measurement includes default and configured modes. | `draft.md`, `language-spec.md`, `design-notes.md`, `open-questions.md`, std HTTP English/Japanese, runtime ABI ledger and relevant implementation plan. |
-| H3 | Proposed `srv.accept_timeout_ns(timeout_ns: i64) -> Result<(), Error>` on `http_server`; default `0`, meaning no bound; nonnegative values accepted | Exclusive nonconsuming receiver; Impure. Stores one scalar, no allocation/I/O. `accept()` snapshots one monotonic budget covering selection and complete request acquisition. Timeout closes a selected incomplete request, preserves the listener and other parked connections, and returns Timeout. No incomplete request escapes. | Same compiler/runtime owners as H2; existing request cap and keep-alive owners. New operation identity, no new type or request-body model. Independent of GPU libraries and K1. | Idle/partial/malformed/fresh/parked request and timeout-order owners; resource bounds, repeated timeout then success, whole/per-unit and forged-HIR owners. No performance promise. | Same specification/HTTP/ABI set as H2; pkg.web docs only if a package-level configuration surface is separately adopted. |
+| H3 | `srv.accept_timeout_ns(timeout_ns: i64) -> Result<(), Error>` on `http_server`; default `0`, meaning no bound; nonnegative values accepted | Exclusive nonconsuming receiver; Impure. Stores one scalar, no allocation/I/O. `accept()` snapshots one monotonic budget covering selection and complete request acquisition. Timeout closes a selected incomplete request, preserves the listener and other parked connections, and returns Timeout. No incomplete request escapes. | Same compiler/runtime owners as H2; existing request cap and keep-alive owners. New operation identity, no new type or request-body model. Independent of GPU libraries and K1. | Idle/partial/malformed/fresh/parked request and timeout-order owners; resource bounds, repeated timeout then success, whole/per-unit and forged-HIR owners. No performance promise. | Same specification/HTTP/ABI set as H2; pkg.web docs only if a package-level configuration surface is separately adopted. |
 | R1 | Existing opaque `resource`, explicit `borrow` / `borrow mut`, `resource_ref`, and native FFI | Package-owned model/session handles; existing Move and exactly-once Drop rules. Model allocations and copies remain explicit operations. All native errors use Result; absent observations use Option. No Backend trait, hidden GPU allocation or compiler-known model kind. | Existing library-boundary plan 17; concrete engine package owns its native dependencies and interface identity. | A real wrapper must demonstrate constructor failure, partial load rollback, borrowed-output lifetime, explicit release failure, and Drop before claiming readiness. | Existing sources remain unchanged unless a reproduced language/library gap is found. |
 | P1 | Existing `process.command`, `start` / `start_scope`, `poll`, reads, status, signalling, reap and release | Explicit child owner; caller-provided byte scratch; bounded waits and cleanup steps. Linux child_scope can certify managed descendant absence; a root exit or group scan cannot. No hidden supervisor/thread. | Plans 49/50. Linux/WSL2 production; native macOS supports the common child subset, not Linux-only scope acquisition. | Mock worker completion/cancellation/crash/descendant controls; real GPU release is a separate engine acceptance. | Existing process contracts reused, not redefined. |
 | C1 | Ordinary single-owner job state, artifact records and sample/frame time records | Arrays/records/sums and existing Result/Option. Application supplies bounds, persistence and engine policy. Every controller reply uses H2; a parent-owned capped pipe-to-file sink enforces reference artifact output, accounting for staging, retained and retired-but-open files. HTTP connections borrow/read snapshots; job lifetime is owned independently. No new async language model. | Reference composition using H2/H3 and existing HTTP/process/fs/JSON. No new canonical persisted format, scheduler ABI or model cache identity is introduced by this plan. | Complete mock text/audio/batch pipeline, bounded queue/event/output storage, cancellation, disconnect and failed-release controls; stalled control reader, oversized output and retirement during live download; metadata arithmetic/round-trip controls. | One reference guide/example after the necessary provider capabilities; extract a pkg API only from demonstrated common consumers. |
@@ -180,7 +180,13 @@ checking expiration; a later zero budget uses indefinite readiness waits,
 without deadline clock reads. Never-configured servers retain the original
 blocking-listener path. A setup error returns the mapped native error (or
 Timeout if the budget has expired) without publishing a context. A failed
-F_SETFL does not update the recorded mode. The listener is not closed on Timeout.
+F_SETFL leaves mode indeterminate (the native call may have mutated it). Record
+Unknown before selecting error/Timeout. A later accept, including zero-budget
+accept, performs checked F_GETFL to preserve other flags, then always reasserts
+O_NONBLOCK through checked F_SETFL before recording Nonblocking. F_GETFL alone
+cannot prove the socket-effective mode after failed mutation. No accept/read
+follows failed recovery; Unknown remains. Zero recovery uses no deadline clock
+and adopts the clock-free indefinite-readiness policy. The listener stays owned and is not closed on Timeout or setup failure.
 
 This is owner-local state: `serve_shared` creates a separate SO_REUSEPORT socket
 per server, not duplicated descriptors for one open file description. The
@@ -422,7 +428,7 @@ memory. No model/download/driver change is part of this design task.
 | H1 segment geometry | One parameterized native owner crosses HTTP 1.0/1.1, head pending/committed, plain/event, empty/nonempty and partial transfer at every segment boundary; verify actual payload pointers and allocator counters, not merely concatenated output. |
 | H2 budgets and poison | Controlled clock/syscall owner crosses zero/positive/max budget, before/after partial progress, EINTR/EAGAIN/hard error, first/later send, empty send/event and finish/reject. Check Timeout precedence, poison, no final zero probe and clock-free close-only raw finish. Real stalled-reader and disconnected-peer controls on Linux/macOS. |
 | H3 budgets and request ownership | Fresh/parked/no peer, header/body split, exact/over body cap, malformed floods, transient accept errors, readiness races and fd-pressure backoff. Timeout before/after selection and before publication preserves unselected fds and releases all unpublished storage. Real partial client then healthy client proves continued use. |
-| Generic/interface/whole and per-unit | New operations participate in type/effect validation, all IR walks, cloning, producer checks and codec rejection. Existing generic/imported helper patterns cover both setters and borrowed stream payload. Interface edit/revert and native declarations agree; no new type tag. |
+| Generic/interface/whole and per-unit | New operations participate in type/effect validation, all IR walks, cloning, producer checks and codec rejection. Existing generic/imported helper patterns cover H2 and borrowed stream payload. H3 uses inferred server locals within imported generic bodies; HttpServer has no source type spelling, and independently forged HIR owns borrowed-authority negatives. Interface edit/revert and native declarations agree; no new type tag. |
 | Runtime provenance / allocation | Borrow caller bytes only for the send; no opaque-owner mutability exemption and no K1 dependency. H1 allocator/pointer assertions and ordinary/alloc-count runtime ABI/export parity; H2/H3 scalar fields introduce no additional owner. |
 | Native ABI and backend lowering | Two proposed keys `HttpStreamWriteTimeoutNs` / `HttpServerAcceptTimeoutNs`, symbols `align_rt_http_stream_write_timeout_ns` / `align_rt_http_server_accept_timeout_ns`, both A04 `i32(ptr, i64)`. Conservative HostState effect records; no purity/capture attribute inferred from the name. Exact declarations and export owner. |
 | OS state and overlap | Deadline state is per owner, not global. Checked latched listener-mode setup, timeout immediately after successful setup, later zero mode, accepted-fd blocking setup and failure cleanup are native owners. Linux per-call send and timed recv flags never mutate shared state; macOS stream setup mutates only its sole owned connection. SO_REUSEPORT servers have distinct listeners. Existing child_scope exclusivity and signal/reap semantics are reused by the reference, not modified. |
@@ -522,6 +528,66 @@ this changed matrix before implementation, not a reopening of the source API.
 | Terminal paths | Timed send failure poisons; finish/reject consumes exactly once. Empty send and raw committed finish avoid setup, poll and clocks. Drop closes the sole fd without restoration. |
 | Platform native acceptance | Real stalled TCP/Unix reader times out on macOS/Linux; macOS configured-zero sends complete with a draining peer; default token regression comparisons remain required. |
 
+### H3 implementation boundary
+
+H3 adds `ExprKind::HttpServerAcceptTimeoutNs { server, timeout_ns }`, its MIR
+rvalue, `HttpServerAcceptTimeoutNs` runtime key and A04
+`align_rt_http_server_accept_timeout_ns` status call. As H2, it uses exclusive
+nonconsuming bound-local authority, source-ordered eager operands, existing
+unit/Error and source-body reconstruction under interface format 17. Every
+operand walk/classifier and independent HIR validator gains an explicit case.
+The native server stores one i64 budget and a closed three-state listener mode
+(Blocking, Nonblocking, Unknown), initialized to zero/Blocking. No new handle
+or language model is introduced.
+
+One statically dispatched acquisition seam supplies clock, flags, accept, recv,
+poll and bounded backoff operations. The parser keeps its existing incremental
+scan and body-cap policy; the budget is passed through selection, admission,
+readiness and spare-tail reads, not restarted inside any helper. A selected fd
+is guarded immediately after acquisition/park removal. Context construction
+transfers that owner once; every pre-publication error/expiry closes it and drops
+its incomplete buffer. The complete-context publication checkpoint is last.
+Never-configured zero retains the existing blocking fast path. A latched zero
+uses indefinite readiness waits and nonblocking recv without any clock reads.
+
+Darwin's failed F_SETFL can change flags; H3 cannot poison/close the listener
+like a terminal output stream, because Timeout must leave it usable. Unknown
+is therefore a recovery state, not an assertion of Blocking. Recovery reads
+flags only to preserve unrelated bits, then requires successful F_SETFL to
+reassert O_NONBLOCK before I/O, even when the requested budget was reset to zero.
+F_GETFL may reflect updated file flags while the socket-effective SS_NBIO still
+differs; its bit is not effect evidence. Zero recovery keeps clock-free waits. Successful nonblocking setup records Nonblocking before the
+post-call expiry checkpoint; failed setup records Unknown before that checkpoint.
+Fresh connected fds undergo checked blocking-mode restoration before exposure;
+restoration always performs checked F_SETFL (even if F_GETFL reports the desired
+bit clear); failure closes only that selected fd. No restoration is deferred to
+Drop and no native alias is published by the server.
+
+| H3 closure cell | Implementation and discriminating owner |
+| --- | --- |
+| Formation/effects/authority | Full H2-style variant sweep and exact A04/golden; source arity/type negatives on inferred locals, forged shared-authority negatives, eager exit, imported generic bodies with inferred servers and whole/per-unit reconstruction and forged receiver/argument/result/effect. |
+| Listener acquisition/mode | Sole listener from serve/shared; controlled F_GETFL and mutation-then-error F_SETFL with distinct file flags/socket-effective mode; Unknown positive/zero recovery requires successful reassertion even when flags already show O_NONBLOCK; success before expiry, no I/O after failed recovery. |
+| Selection | One poll scratch/cursor policy for listener plus parked peers; before/after poll/accept expiry, EINTR, readiness race/EAGAIN, invalid readiness; unselected parked fds remain owned. |
+| Complete input | Existing incremental parser and capped spare tail; nonblocking recv before/after checks, split header/body, no CL/zero/exact/over cap, malformed/EOF then next peer under the original budget. |
+| Native admission | Immediate selected-fd guard; checked blocking setup and SIGPIPE policy; mode/setup failure or expiry closes once with output null, no incomplete ctx reaches a caller. |
+| Pressure/backoff | Preserve existing idle-fd reclamation policy; sleep at most remaining budget, check before/after, no retry or zero probe after expiry. |
+| Publication/cleanup | Final checkpoint before Box publication; one fd/buffer transfer on success, immediate release on timeout/error, repeated timeout then healthy request; parked selected timeout preserves unrelated peers. |
+| Zero/default/native platforms | Clock-free unconfigured zero and recovered/latched zero; real Linux/macOS idle/header/body/malformed controls plus healthy success and blocking connected-fd flags. |
+| Accounting/joins/Drop | No new allocation owner or retained view; existing server/context/park Drop owners plus Result/loop exits and whole/per-unit tests. |
+
+This is one useful complete-request capability, expected to exceed 1,000
+handwritten lines with discriminating owners and synchronized prose. Splitting
+setter, bounded listener and bounded reads would publish an unusable chain: a
+finite poll followed by blocking acquisition still violates the promised bound.
+The changed Unknown-mode recovery strategy receives one fresh scoped adversarial
+design review before implementation. Its valid P2 identified file flags versus
+socket-effective mode divergence after failed F_SETFL; the ledger now requires
+successful reassertion, and the owner models both states independently. Primary
+operation evidence: Apple's
+[`kern_descrip.c`](https://raw.githubusercontent.com/apple-oss-distributions/xnu/main/bsd/kern/kern_descrip.c)
+and [`sys_socket.c`](https://raw.githubusercontent.com/apple-oss-distributions/xnu/main/bsd/kern/sys_socket.c). H3's full code review remains its one
+preflight review.
+
 
 ### H2/H3 eager receiver reservation repair
 
@@ -618,8 +684,9 @@ service gate or GPU benchmark is required for an unrelated HTTP change.
 H1 preserves source behavior and updates the HTTP and pkg.web English/Japanese
 writer resource records. The language specification and ABI inventory retain
 their existing operations. H2 adds its explicit setter and runtime ABI row across
-the ledger-listed specification set. H3 retains its proposed implementation-time
-documentation set. The external align-llm register receives an answer,
+the ledger-listed specification set. H3 adds its setter, acquisition ownership/mode policy and ABI row across
+the same specification set. Its server remains inferred-only; imported generic
+bodies create inferred locals rather than introducing typed server helpers. The external align-llm register receives an answer,
 left uncommitted; consumer code, fixtures, branches and adoption stay untouched.
 
 ## External evidence and limits

@@ -1622,6 +1622,9 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             stream: boxed!(stream),
             timeout_ns: boxed!(timeout_ns),
         },
+        ExprKind::HttpServerAcceptTimeoutNs { server, timeout_ns } => ExprKind::HttpServerAcceptTimeoutNs {
+            server: boxed!(server), timeout_ns: boxed!(timeout_ns),
+        },
         ExprKind::HttpUpgradeShutdown { upgrade } => ExprKind::HttpUpgradeShutdown {
             upgrade: boxed!(upgrade),
         },
@@ -2570,6 +2573,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             timeout_ns: rhs,
         }
         | ExprKind::HttpStreamWriteTimeoutNs { stream: lhs, timeout_ns: rhs }
+        | ExprKind::HttpServerAcceptTimeoutNs { server: lhs, timeout_ns: rhs }
         | ExprKind::HttpStreamSend {
             stream: lhs,
             chunk: rhs,

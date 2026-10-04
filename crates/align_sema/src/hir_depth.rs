@@ -733,6 +733,7 @@ fn walk_body_records<'a>(
                     timeout_ns: rhs,
                 }
                 | ExprKind::HttpStreamWriteTimeoutNs { stream: lhs, timeout_ns: rhs }
+                | ExprKind::HttpServerAcceptTimeoutNs { server: lhs, timeout_ns: rhs }
                 | ExprKind::HttpStreamSend {
                     stream: lhs,
                     chunk: rhs,
