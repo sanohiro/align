@@ -42,6 +42,11 @@ copies, zero per-request heap allocation, O(segments) radix dispatch, zero-copy 
 startup-total validation) is the framework's existence claim, bench-pinned in W5 and externally
 compared against Go Fiber in W7 (target: competitive-or-better on plaintext + JSON echo).
 
+Plan 90 H1 closes the plaintext streaming output boundary: `send` / `send_event`
+borrow caller payloads without copies or framing allocation after construction.
+The native writer and token/bulk harness are shared by SSE and binary routes;
+builder body copies and application/kernel/IPC/device work remain separate.
+
 **D-D — surface decisions settled by the restored Fiber reference** (no open forks): per-method
 constructors (`web.get/post/...`), `:name` + `*name` pattern syntax (Fiber/httprouter lineage,
 static > param > wildcard priority), one-ctx handlers (`fn(c: web.Ctx) -> Result<(), Error>`) with

@@ -15,6 +15,8 @@
 // here. `pub use` re-exports `safe_slice` (used by `str_cmp`/`str_contains`/… below) and the four
 // `align_rt_str_*` symbols.
 mod buffer_storage;
+#[cfg(test)]
+mod http_stream_tests;
 use buffer_storage::BufferStorage;
 mod json_number;
 mod time_formats;
@@ -26589,7 +26591,7 @@ fn http_head_len(rb: &ResponseBuilder, persistent: bool) -> usize {
 }
 
 /// Append a decimal integer — the `Content-Length` value. Sibling of
-/// [`http_push_chunk_size_hex`]: a stack render + one `extend_from_slice`, so the framing header
+/// [`http_chunk_size_line`]: a stack render, so the framing header
 /// costs no `String` allocation on the serialize path. [`http_decimal_len`] is its length.
 fn http_push_decimal(buf: &mut Vec<u8>, mut n: usize) {
     let mut tmp = [0u8; 20]; // the widest `usize` decimal (`u64::MAX` = 20 digits)
@@ -27301,24 +27303,20 @@ impl Drop for HttpStream {
     }
 }
 
-/// Append `n` as a lowercase, `0x`-free, minimal-width hex chunk-size to `buf` (RFC 9112 §7.1
-/// `chunk-size`). Allocation-free (a 16-byte stack scratch covers a 64-bit length). `n == 0` is never
+/// Render `n` as a lowercase, `0x`-free, minimal-width hex chunk-size plus CRLF (RFC 9112 §7.1
+/// `chunk-size`), returning its start in fixed stack scratch. `n == 0` is never
 /// framed by `send` (a zero-length chunk is the terminator), but the encoder still renders `"0"`
 /// defensively so the table is total.
-fn http_push_chunk_size_hex(buf: &mut Vec<u8>, mut n: usize) {
-    if n == 0 {
-        buf.push(b'0');
-        return;
-    }
-    let mut tmp = [0u8; 2 * core::mem::size_of::<usize>()]; // max hex digits for a usize, target-independent
-    let mut i = tmp.len();
-    while n > 0 {
+fn http_chunk_size_line(mut n: usize, tmp: &mut [u8; 2 * core::mem::size_of::<usize>() + 2]) -> usize {
+    let mut i = tmp.len() - 2;
+    tmp[i..].copy_from_slice(b"\r\n");
+    loop {
         i -= 1;
-        let d = (n & 0xf) as u8;
-        tmp[i] = if d < 10 { b'0' + d } else { b'a' + (d - 10) };
+        tmp[i] = b"0123456789abcdef"[n & 15];
         n >>= 4;
+        if n == 0 { break }
     }
-    buf.extend_from_slice(&tmp[i..]);
+    i
 }
 
 /// `ctx.respond_stream(rb)` — begin a streaming response: validate + serialize `rb`'s head (shared
@@ -27417,19 +27415,22 @@ pub unsafe extern "C" fn align_rt_http_stream_send(s: *mut HttpStream, ptr: *con
         return AL_INVALID;
     }
     let st = unsafe { &mut *s };
-    let chunk = unsafe { bytes_view(ptr, len) };
+    let chunk = match unsafe { http_stream_bytes(ptr, len) } {
+        Ok(chunk) => chunk,
+        Err(status) => return status,
+    };
     // A zero-length chunk is the chunked terminator — never frame it; an empty output step is honest
     // "no bytes this step" data, so writing nothing and returning Ok is the correct semantics.
     // Placed BEFORE the poison check so `send("")` stays an unconditional Ok(0).
     if chunk.is_empty() {
         return 0;
     }
-    unsafe { http_stream_send_parts(st, b"", chunk, b"") }
+    unsafe { http_stream_send_parts(st, chunk, false) }
 }
 
 /// `s.send_event(data)` — write `data` as ONE WHATWG SSE event frame, `data: {data}\n\n`, in ONE
-/// write (the prefix/suffix are assembled into the same buffer as the chunk framing and the lazy
-/// head, so head + framing + event go out together). Empty `data` is a **legal empty event**
+/// vectored write (head, framing, prefix, borrowed data and suffix go out together, without a
+/// payload copy or framing allocation). Empty `data` is a **legal empty event**
 /// (`data: \n\n`, 8 payload bytes) — unlike `send`, it is never the chunked terminator, so there is
 /// no empty no-op and the first `send_event` always commits the head (closing the `reject` window).
 /// Multi-line `data` is the CALLER's responsibility in v1 (a bare `\n` inside `data` changes the
@@ -27444,13 +27445,96 @@ pub unsafe extern "C" fn align_rt_http_stream_send_event(s: *mut HttpStream, ptr
         return AL_INVALID;
     }
     let st = unsafe { &mut *s };
-    let data = unsafe { bytes_view(ptr, len) };
-    unsafe { http_stream_send_parts(st, b"data: ", data, b"\n\n") }
+    let data = match unsafe { http_stream_bytes(ptr, len) } {
+        Ok(data) => data,
+        Err(status) => return status,
+    };
+    unsafe { http_stream_send_parts(st, data, true) }
 }
 
-/// The shared writer behind `s.send(chunk)` and `s.send_event(data)`: assemble the lazy head (if
-/// still pending) plus ONE chunk whose payload is `prefix + data + suffix` into a single buffer,
-/// and write it with ONE `http_send_all` call. **Framed** (1.1): one chunk frame (lowercase-hex
+/// Admit the existing empty sentinel before forming a nonempty Rust slice. Allocation validity
+/// remains the foreign caller's obligation; address/length arithmetic is checked here.
+///
+/// # Safety
+/// A nonempty representable range must be readable for this call.
+unsafe fn http_stream_bytes<'a>(ptr: *const u8, len: i64) -> Result<&'a [u8], i32> {
+    if ptr.is_null() || len <= 0 {
+        return Ok(&[]);
+    }
+    let length = usize::try_from(len).map_err(|_| AL_INVALID)?;
+    if length > isize::MAX as usize || (ptr as usize).checked_add(length).is_none() {
+        return Err(AL_INVALID);
+    }
+    Ok(unsafe { core::slice::from_raw_parts(ptr, length) })
+}
+
+/// One statically dispatched native operation, also used by partial-write and pointer owners.
+trait HttpStreamWriteOps {
+    fn send_parts(&mut self, fd: i32, parts: &[libc::iovec], flags: i32) -> SocketCallOutcome;
+}
+
+struct NativeHttpStreamWriteOps;
+
+impl HttpStreamWriteOps for NativeHttpStreamWriteOps {
+    fn send_parts(&mut self, fd: i32, parts: &[libc::iovec], flags: i32) -> SocketCallOutcome {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let result = {
+            // Accepted sockets already have checked SO_NOSIGPIPE. writev avoids an unneeded
+            // msghdr on this blocking path; positive-budget writes will use per-call flags.
+            let _ = flags;
+            let Ok(count) = i32::try_from(parts.len()) else { return SocketCallOutcome { result: -1, errno: libc::EINVAL } };
+            unsafe { libc::writev(fd, parts.as_ptr(), count) }
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let result = {
+            // All-zero fields denote no address or ancillary data; Linux needs MSG_NOSIGNAL.
+            let mut message: libc::msghdr = unsafe { core::mem::zeroed() };
+            message.msg_iov = parts.as_ptr().cast_mut();
+            let Ok(count) = parts.len().try_into() else { return SocketCallOutcome { result: -1, errno: libc::EINVAL } };
+            message.msg_iovlen = count;
+            unsafe { libc::sendmsg(fd, &message, flags) }
+        };
+        let errno = if result < 0 { std::io::Error::last_os_error().raw_os_error().unwrap_or(0) } else { 0 };
+        SocketCallOutcome { result, errno }
+    }
+}
+
+/// Advance only the accepted prefix; pointers retain their original backing allocations.
+fn http_stream_write_parts<O: HttpStreamWriteOps>(fd: i32, parts: &mut [libc::iovec], mut remaining: usize, ops: &mut O) -> i32 {
+    #[cfg(target_os = "linux")]
+    let flags = MSG_NOSIGNAL;
+    #[cfg(not(target_os = "linux"))]
+    let flags = 0;
+    let mut first = 0;
+    while remaining > 0 {
+        match socket_write_attempt(ops.send_parts(fd, &parts[first..], flags)) {
+            SocketWriteAttempt::Sent(count) if count <= remaining => {
+                remaining -= count;
+                let mut accepted = count;
+                while accepted > 0 {
+                    let Some(part) = parts.get_mut(first) else { return AL_INVALID };
+                    if accepted < part.iov_len {
+                        // Each original vector is a validated live slice, and accepted is inside it.
+                        part.iov_base = unsafe { part.iov_base.cast::<u8>().add(accepted) }.cast();
+                        part.iov_len -= accepted;
+                        accepted = 0;
+                    } else {
+                        accepted -= part.iov_len;
+                        first += 1;
+                    }
+                }
+            }
+            SocketWriteAttempt::Interrupted => {}
+            SocketWriteAttempt::Zero => return AL_CODE,
+            SocketWriteAttempt::Failed(status) => return status,
+            SocketWriteAttempt::Sent(_) => return AL_INVALID,
+        }
+    }
+    0
+}
+
+/// The shared writer behind `s.send(chunk)` and `s.send_event(data)`: keep the lazy head and
+/// borrowed payload in at most four stack vectors. Fixed framing bytes are coalesced on stack. **Framed** (1.1): one chunk frame (lowercase-hex
 /// length of the COMBINED payload, CRLF, payload, CRLF). **Raw** (1.0): the combined payload bytes
 /// unframed. The combined payload must be non-empty (a zero-length chunk is the protocol
 /// terminator — `send`'s empty no-op short-circuits in its caller; an SSE frame is never empty).
@@ -27460,31 +27544,47 @@ pub unsafe extern "C" fn align_rt_http_stream_send_event(s: *mut HttpStream, ptr
 ///
 /// # Safety
 /// `st` must point into a live `HttpStream` whose fd is the stream's (owned) socket.
-unsafe fn http_stream_send_parts(st: &mut HttpStream, prefix: &[u8], data: &[u8], suffix: &[u8]) -> i32 {
+unsafe fn http_stream_send_parts(st: &mut HttpStream, data: &[u8], event: bool) -> i32 {
+    http_stream_send_parts_with(st, data, event, &mut NativeHttpStreamWriteOps)
+}
+
+fn http_stream_send_parts_with<O: HttpStreamWriteOps>(st: &mut HttpStream, data: &[u8], event: bool, ops: &mut O) -> i32 {
+    let prefix = if event { b"data: ".as_slice() } else { &[] };
+    let suffix = if event { b"\n\n".as_slice() } else { &[] };
     if st.poisoned {
         return AL_INVALID;
     }
-    let payload_len = prefix.len() + data.len() + suffix.len();
-    debug_assert!(payload_len > 0, "a zero-length chunk is the terminator, never written here");
-    let head = st.pending_head.take();
-    let head_len = head.as_ref().map_or(0, Vec::len);
-    let mut buf: Vec<u8> = Vec::with_capacity(head_len + payload_len + 20);
-    if let Some(h) = head {
-        buf.extend_from_slice(&h);
-    }
+    let Some(payload_len) = prefix.len().checked_add(data.len()).and_then(|n| n.checked_add(suffix.len())) else { return AL_INVALID };
+    if payload_len == 0 { return AL_INVALID }
+    let mut framing = [0_u8; core::mem::size_of::<usize>() * 2 + 2];
+    let mut framing_start = framing.len();
     if st.framed {
-        http_push_chunk_size_hex(&mut buf, payload_len);
-        buf.extend_from_slice(b"\r\n");
-        buf.extend_from_slice(prefix);
-        buf.extend_from_slice(data);
-        buf.extend_from_slice(suffix);
-        buf.extend_from_slice(b"\r\n");
-    } else {
-        buf.extend_from_slice(prefix);
-        buf.extend_from_slice(data);
-        buf.extend_from_slice(suffix);
+        framing_start = http_chunk_size_line(payload_len, &mut framing);
     }
-    let rc = unsafe { http_send_all(st.fd, &buf) };
+    let head_len = st.pending_head.as_ref().map_or(0, Vec::len);
+    let framing_len = if st.framed { framing.len() - framing_start + 2 } else { 0 };
+    let Some(wire_len) = head_len.checked_add(payload_len).and_then(|n| n.checked_add(framing_len)).filter(|&n| n <= isize::MAX as usize) else { return AL_INVALID };
+    // Only fixed framing bytes are coalesced; the caller's payload never moves.
+    let mut before = [0_u8; core::mem::size_of::<usize>() * 2 + 8];
+    let line = &framing[framing_start..];
+    before[..line.len()].copy_from_slice(line);
+    before[line.len()..line.len() + prefix.len()].copy_from_slice(prefix);
+    let before = &before[..line.len() + prefix.len()];
+    let mut after = [0_u8; 4];
+    after[..suffix.len()].copy_from_slice(suffix);
+    let after_len = suffix.len() + if st.framed { 2 } else { 0 };
+    if st.framed { after[suffix.len()..after_len].copy_from_slice(b"\r\n"); }
+    let after = &after[..after_len];
+    let head = st.pending_head.take();
+    let mut parts = [libc::iovec { iov_base: core::ptr::null_mut(), iov_len: 0 }; 4];
+    let mut count = 0;
+    for bytes in [head.as_deref().unwrap_or_default(), before, data, after] {
+        if !bytes.is_empty() {
+            parts[count] = libc::iovec { iov_base: bytes.as_ptr().cast_mut().cast(), iov_len: bytes.len() };
+            count += 1;
+        }
+    }
+    let rc = http_stream_write_parts(st.fd, &mut parts[..count], wire_len, ops);
     if rc != 0 {
         st.poisoned = true; // a broken stream — `finish` will skip the terminator and return Err
     }
@@ -48321,15 +48421,16 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         assert!(!gh.http11, "HTTP/1.0 request threads http11 = false");
     }
 
-    /// The chunk-size hex encoder (`http_push_chunk_size_hex`): lowercase, `0x`-free, minimal-width,
+    /// The chunk-size hex encoder (`http_chunk_size_line`): lowercase, `0x`-free, minimal-width,
     /// across the byte-count boundaries a chunk length crosses (15/16, 255/256), 1 byte, and a large
     /// length. A zero renders `"0"` defensively (never used — `send("")` is a no-op that frames nothing).
     #[test]
     fn http_chunk_size_hex_table() {
         let enc = |n: usize| -> String {
-            let mut b = Vec::new();
-            http_push_chunk_size_hex(&mut b, n);
-            String::from_utf8(b).unwrap()
+            let mut b = [0_u8; 2 * core::mem::size_of::<usize>() + 2];
+            let start = http_chunk_size_line(n, &mut b);
+            assert_eq!(&b[b.len() - 2..], b"\r\n");
+            String::from_utf8(b[start..b.len() - 2].to_vec()).unwrap()
         };
         assert_eq!(enc(0), "0");
         assert_eq!(enc(1), "1");

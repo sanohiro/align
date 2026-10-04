@@ -493,7 +493,7 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
    - **`http_stream`**（Move。ctx から持ち上げた fd を所有する。free-standing — ctx から何も借用せず
      region 束縛もない。Move ハンドルの標準的な除外規則に従う）。`s.send(chunk: bytes) ->
      Result<(), Error>` — 1 つのチャンクフレーム（小文字 hex の長さ、`0x` なし、CRLF ペイロード CRLF）を
-     1 つのバッファで組み立て、`http_send_all` で **1 回の write**（MSG_NOSIGNAL/EINTR/部分書き込みの
+     借用したスライスと固定長スタック上のフレームから vectored socket write で書く（MSG_NOSIGNAL/EINTR/部分書き込みの
      規律。EPIPE → Error）。**`send("")` は Ok を返す no-op である** — 空チャンクはプロトコルの
      **終端子**であり、かつ空の出力ステップは予見できる gateway のデータ（トークンをまたいで分割された
      マルチバイト UTF-8 コードポイントは 0 バイトにデトークナイズされる）であってプログラマのバグでは
@@ -514,6 +514,15 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
      いうだけでなく、設計上の荷重を負っている。
    - Request 4 が後に元の client 非対称性を除去した。Align 自身の whole-body client は streaming
      server response を de-chunk し、decoded payload を公開する。
+   - **借用した出力の resource 境界（plan 90 H1）。** `send` / `send_event` は return まで
+     caller の byte を借用し、stream 構築後の本文コピー、UTF-8 scan、送信フレーム用 allocation を
+     行わない。保留中の head、hex 行、prefix、本文、suffix、CRLF を最大六つの stack vector に
+     置く。部分書き込みは受け付けた prefix だけ進め、EINTR は残りを retry、進捗ゼロは error。
+     native extent / wire-size rejection は head commit より前。write failure は従来どおり
+     head を commit して stream を poison する。empty send、reject、finish、close-only Drop
+     の動作は従来どおり。head 構築、application encoding、file / IPC / device transfer、
+     kernel / TLS buffering は、この plaintext HTTP の保証範囲に含まれない。
+
 8. **`respond_stream` の作り直し（pkg.web stream ルート向け）— 2026-07-21 設計、同日出荷。**
    pkg.web のストリーミング設計（`docs/impl/pkg-design/web.md` → 「ストリーミング」）が消費者である。
    stream ハンドラの実行中も framework がリクエストコンテキストを所有し続けること、および head 確定前の
@@ -546,8 +555,8 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
    - **④ `s.send_event(data) -> Result<(), Error>` — 2026-07-21 出荷**（pkg.web ストリーミングの
      enabler 5、その最初の消費者と共に — 確約済みの「最初のストリーミング消費者が着地したときの SSE
      イベントフレーミング（WHATWG）」床項目）。`data` を 1 つのイベントフレーム `data: {data}\n\n` として
-     包み、チャンクフレーミングと（まだ保留かもしれない）遅延 head と**同じバッファ内**で組み立てる —
-     head + チャンクフレーミング + イベントを 1 回の `http_send_all` write で; raw（1.0）モードはイベン
+     包み、借用したデータ、チャンクフレーミング、保留中の遅延 head を別々の領域から渡す —
+     ソケットがフレーム全体を受け付ける場合は 1 回の vectored write。raw（1.0）モードはイベン
      トバイトを非フレームで書く。**`send_event("")` は合法な空イベント**（`data: \n\n`、8 ペイロード
      バイト — チャンク終端とは決して被らない）なので、`send("")` と違い実際の write であり head を確定
      する。複数行 `data` は v1 では caller の責務（裸の `\n` はイベントのフィールド構造を変える — 分割は

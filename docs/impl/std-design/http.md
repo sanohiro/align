@@ -505,7 +505,7 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
    - **`http_stream`** (Move, owns the fd lifted out of ctx; free-standing — borrows nothing
      from ctx, no region binding; standard Move-handle exclusions). `s.send(chunk: bytes) ->
      Result<(), Error>` — one chunk frame (lowercase hex length, no `0x`, CRLF payload CRLF)
-     assembled in one buffer, ONE write via `http_send_all` (MSG_NOSIGNAL/EINTR/partial-write
+     written from borrowed slices and fixed stack framing with a vectored socket write (MSG_NOSIGNAL/EINTR/partial-write
      discipline; EPIPE → Error). **`send("")` is a no-op returning Ok** — an empty chunk is
      the protocol TERMINATOR, and empty output steps are foreseeable gateway data (a multi-byte
      UTF-8 codepoint split across tokens detokenizes to zero bytes), not a programmer bug;
@@ -526,6 +526,17 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
      not just an attack caveat.
    - Request 4 later removed the original client asymmetry: Align's own whole-body client now
      de-chunks the streaming server response and exposes the decoded payload.
+
+   - **Borrowed output resource boundary (plan 90 H1).** `send` and `send_event`
+     retain caller bytes only until return, with no payload copy, UTF-8 scan or
+     framing allocation after stream construction. Pending head, hex line,
+     prefix, payload, suffix and CRLF form at most six stack vectors. Partial
+     writes advance only the accepted prefix; EINTR retries the remainder;
+     zero progress fails. Native extent/wire-size rejection precedes head commit.
+     A failed write still commits the lazy head and poisons the stream. Empty
+     send, reject, finish and close-only Drop retain their existing behavior.
+     Head construction, application encoding, file/IPC/device transfers and
+     kernel/TLS buffering are outside this plaintext HTTP promise.
 
 8. **`respond_stream` rework for pkg.web stream routes — DESIGNED + SHIPPED 2026-07-21.**
    pkg.web's streaming design (`docs/impl/pkg-design/web.md` → "Streaming") is the consumer; it
@@ -563,8 +574,8 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
    - **④ `s.send_event(data) -> Result<(), Error>` — SHIPPED 2026-07-21** (with pkg.web streaming
      enabler 5, its first consumer — the committed "SSE event framing (WHATWG) when the first
      streaming consumer lands" floor item). Wraps `data` as ONE event frame `data: {data}\n\n`
-     assembled INSIDE the same buffer as the chunk framing and the (possibly still pending) lazy
-     head — head + chunk framing + event in one `http_send_all` write; raw (1.0) mode writes the
+     written from separate borrowed segments alongside the chunk framing and the pending lazy
+     head — one vectored write when the socket accepts the full frame; raw (1.0) mode writes the
      event bytes unframed. **`send_event("")` is a legal EMPTY event** (`data: \n\n`, 8 payload
      bytes — never the chunked terminator), so unlike `send("")` it is a real write and commits
      the head. Multi-line `data` is the caller's problem in v1 (a bare `\n` changes the event's

@@ -419,7 +419,8 @@ serve を続けるので、ゲートは可視のサイジング判断（`workers
 5. **pkg.web の配線 — 完了（2026-07-21）。** `types.align` の `Handler`（`Respond`/`Stream`）+
    `Route.stream_type`; `web.stream` / `web.sse` コンストラクタ; 上の擬似コードそのままの `serve` の
    stream 腕; そして std.http メソッドとしての `s.send_event(data)`（WHATWG `data: {data}\n\n`、遅延
-   head のバッファを共有する 1 回の write — head + フレーミング + イベントを単一の `send` で; 空イベ
+   head + フレーミング + 借用したイベントを vectored write で送り、本文コピーや送信フレーム用
+   allocation を行わない。ソケットが全体を受け付ける場合は 1 回の native attempt。空イベ
    ントは `send("")` の no-op と違い実フレーム; 共有 `http_stream_send_parts` の上のランタイム
    `align_rt_http_stream_send_event`）。途上で **MoveCheck の偽陽性**を修正: `loop` 本体内で消費され
    る match 腕バインディングが back-edge の不動点を汚染していた（腕バインディングは `Let` と違い
