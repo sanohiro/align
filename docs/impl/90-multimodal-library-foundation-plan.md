@@ -522,6 +522,30 @@ this changed matrix before implementation, not a reopening of the source API.
 | Terminal paths | Timed send failure poisons; finish/reject consumes exactly once. Empty send and raw committed finish avoid setup, poll and clocks. Drop closes the sole fd without restoration. |
 | Platform native acceptance | Real stalled TCP/Unix reader times out on macOS/Linux; macOS configured-zero sends complete with a draining peer; default token regression comparisons remain required. |
 
+
+### H2/H3 eager receiver reservation repair
+
+The H2 independent code review found that loading a non-borrow-bearing native
+handle before its scalar argument does not by itself preserve that handle.
+An argument can consume or replace the bound owner before the native action.
+This is a finite, call-local repair for the two new setters, not an expansion
+of the deferred K1 interprocedural view work.
+
+| Changed cell | Exact strategy and owner |
+| --- | --- |
+| Receiver completion | Register only the receiver expression of `HttpStreamWriteTimeoutNs` and `HttpServerAcceptTimeoutNs` in `prepare_mutable_call_snapshots`, in both the argument and mutable-place sets. The existing completion path records its exact local place despite having no storage header or borrowed leaves. No type-wide snapshot rule is added. |
+| Later eager invalidation | Existing move, Drop and assignment invalidation marks that reservation; validation at the enclosing setter rejects consumption and replacement before MIR/native execution. Source-order evaluation stays unchanged. Whole/per-unit owners cross direct move, direct replacement, nested expression, branch and loop joins. |
+| Successful action and retirement | Reuse a dedicated exact receiver selector in preparation and `retire_builtin_action_input`. Validate children first, then retire only that setter receiver's snapshot after the successful action boundary. A different enclosing operation's reservation remains live. The setter result is unit/Error and retains no handle. |
+| Noninvalidating work | Ordinary scalar work, mutation of the same owner's deadline field, independent-owner destruction and a setter followed by consumption remain valid. Whole/per-unit positive controls distinguish call-scoped protection from a permanent borrow. |
+| Terminating argument | Return, propagated error or loop exit that prevents the setter action does not validate an action that never occurs. Cleanup may consume the owner on that terminal path. MIR owners verify that no setter call is emitted for unconditional termination; branch owners validate only paths that reach it. |
+| Interfaces and runtime | Existing source reconstruction rechecks these reservations in whole/per-unit compilation. No new HIR variant, native ABI, runtime state, ownership summary, allocation or interface format is introduced by this repair. |
+
+A fresh inspection-only independent review of this changed safety strategy
+and its receiver lifetime boundaries completed clean before implementation. After the
+P1 repair, review the revised complete H2 candidate once under the repository's
+P1 redesign rule. H3 applies the same explicit receiver registration and owners
+before its first complete candidate review.
+
 ## Performance acceptance
 
 H1 must preserve the existing text/SSE route and use the same implementation

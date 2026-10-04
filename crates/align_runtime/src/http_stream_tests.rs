@@ -545,6 +545,8 @@ fn http_stream_budget_native_stalled_reader_and_setter_preservation() {
             &mut NativeSocketWriteOps,
         )
         .unwrap_or_else(|_| panic!("SIGPIPE setup"));
+        let mut stream = timed_stream(false, true, 0);
+        stream.fd = fd;
         let send_buffer: libc::c_int = 4096;
         assert_eq!(
             unsafe {
@@ -558,8 +560,6 @@ fn http_stream_budget_native_stalled_reader_and_setter_preservation() {
             },
             0
         );
-        let mut stream = timed_stream(false, true, 0);
-        stream.fd = fd;
         let original_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         assert!(original_flags >= 0);
         for ns in [1, i64::MAX, 0, 5_000_000] {

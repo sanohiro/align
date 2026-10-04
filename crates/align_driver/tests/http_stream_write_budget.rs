@@ -63,10 +63,87 @@ fn stream_write_budget_imported_generic_and_result_exits_agree() {
         return;
     }
     let whole = build_exe_multi("stream-budget-import-whole", &files, "main.align");
-    assert!(std::process::Command::new(&whole.exe)
-        .status()
-        .unwrap()
-        .success());
+    assert!(
+        std::process::Command::new(&whole.exe)
+            .status()
+            .unwrap()
+            .success()
+    );
     let units = build_per_unit_multi("stream-budget-import-unit", &files, "main.align");
     assert!(units.link_and_run().status.success());
+}
+
+#[test]
+fn stream_write_budget_reserves_receiver_until_its_action() {
+    for (name, argument) in [
+        ("finish", "{ stream.finish() else {}; 0 }"),
+        ("move", "{ taken := stream; 0 }"),
+        ("replace", "{ stream = other; 0 }"),
+        ("nested", "0 + { stream.finish() else {}; 0 }"),
+        ("if", "{ if flag { stream = other }; 0 }"),
+        (
+            "match",
+            "{ match if flag { 1 } else { 0 } { 1 => { stream = other }, _ => {} }; 0 }",
+        ),
+        ("loop", "loop { stream = other; break 0 }"),
+    ] {
+        let source = format!(
+            "import std.http\npub fn configure(s: http_stream, t: http_stream, flag: bool) -> Result<(), Error> {{\n  mut stream := s\n  other := t\n  stream.write_timeout_ns({argument})\n}}\nfn main() -> i32 = 0\n"
+        );
+        let files = [("main.align", source.as_str())];
+        let verdict = assert_same_verdict(
+            &format!("stream-budget-reserve-{name}"),
+            &files,
+            "main.align",
+        );
+        assert!(verdict.diags.has_errors(), "{name} admitted");
+        let diagnostics = check_multi_diagnostics("stream-budget-reserve", &files, "main.align");
+        assert!(
+            diagnostics.contains("invalidated before"),
+            "{name}: {diagnostics}"
+        );
+    }
+}
+
+#[test]
+fn stream_write_budget_reservations_are_call_scoped() {
+    let source = r#"import std.http
+pub fn nested(s: http_stream, t: http_stream) -> Result<(), Error> {
+    s.write_timeout_ns({ s.write_timeout_ns(7) else {}; t.finish() else {}; 0 })?
+    s.write_timeout_ns(loop { break 1 })?
+    s.finish()
+}
+pub fn terminal(s: http_stream, flag: bool) -> Result<(), Error> {
+    s.write_timeout_ns(if flag { return s.finish() } else { 0 })?
+    s.finish()
+}
+pub fn ended(s: http_stream) -> Result<(), Error> {
+    s.write_timeout_ns({ return s.finish() })?
+    return Ok(())
+}
+fn main() -> i32 = 0
+"#;
+    let files = [("main.align", source)];
+    let verdict = assert_same_verdict("stream-budget-scoped", &files, "main.align");
+    assert!(
+        !verdict.diags.has_errors(),
+        "{}",
+        check_multi_diagnostics("stream-budget-scoped", &files, "main.align")
+    );
+    if backend_available() {
+        assert!(
+            std::process::Command::new(
+                build_exe_multi("stream-budget-scoped", &files, "main.align").exe
+            )
+            .status()
+            .unwrap()
+            .success()
+        );
+        assert!(
+            build_per_unit_multi("stream-budget-scoped-unit", &files, "main.align")
+                .link_and_run()
+                .status
+                .success()
+        );
+    }
 }

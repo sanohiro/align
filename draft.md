@@ -4207,7 +4207,7 @@ s.reject(rb: response_builder) -> Result<(), Error> // consumes s + rb; pre-firs
                                                     //   discard the head, answer normally, close
 ```
 
-An exclusively borrowed bound stream accepts `s.write_timeout_ns(timeout_ns: i64)
+An exclusively borrowed bound stream accepts `s.write_timeout_ns(timeout_ns: i64)`
 with `Result<(), Error>` and Impure effect. The default is zero (unbounded).
 Negative input returns Invalid before state inspection/mutation; failure preserves
 the stored value. Each later complete send/event/finish/reject write snapshots

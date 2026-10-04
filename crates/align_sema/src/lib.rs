@@ -34631,6 +34631,10 @@ impl<'a> MoveCheck<'a> {
                 arguments.insert(Self::expr_key(receiver));
                 places.insert(Self::expr_key(receiver));
             }
+            if let Some(receiver) = Self::http_timeout_action_receiver(&expression.kind) {
+                arguments.insert(Self::expr_key(receiver));
+                places.insert(Self::expr_key(receiver));
+            }
             if let Some(reader) = Self::reader_action_receiver(expression) {
                 arguments.insert(Self::expr_key(reader));
                 places.insert(Self::expr_key(reader));
@@ -39447,6 +39451,15 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
+    /// Timeout setters load their opaque owner before eager scalar operands. Reserve the exact
+    /// place until the action completes, without treating every native handle as borrow-bearing.
+    fn http_timeout_action_receiver(kind: &ExprKind) -> Option<&Expr> {
+        match kind {
+            ExprKind::HttpStreamWriteTimeoutNs { stream, .. } => Some(stream.as_ref()),
+            _ => None,
+        }
+    }
+
     fn reader_action_receiver(expression: &Expr) -> Option<&Expr> {
         match &expression.kind {
             ExprKind::XmlNext { reader } | ExprKind::XmlName { reader }
@@ -39470,7 +39483,8 @@ impl<'a> MoveCheck<'a> {
         }
         let receiver = match &expression.kind {
             ExprKind::ArrayTruncate { receiver, .. } => Some(receiver.as_ref()),
-            _ => Self::reader_action_receiver(expression),
+            _ => Self::http_timeout_action_receiver(&expression.kind)
+                .or_else(|| Self::reader_action_receiver(expression)),
         };
         if let Some(reader) = receiver {
             let key = Self::expr_key(reader);

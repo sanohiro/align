@@ -1519,7 +1519,7 @@ closes its connection and returns `Error.Invalid` from `accept()` while the
 listener remains usable. Other malformed requests are skipped. The full
 contract is in `docs/impl/std-design/http.md`.
 
-An exclusively borrowed bound stream accepts `s.write_timeout_ns(timeout_ns: i64)
+An exclusively borrowed bound stream accepts `s.write_timeout_ns(timeout_ns: i64)`
 with `Result<(), Error>` and Impure effect. The default is zero (unbounded).
 Negative input returns Invalid before state inspection/mutation; failure preserves
 the stored value. Each later complete send/event/finish/reject write snapshots
