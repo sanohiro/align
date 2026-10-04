@@ -98,6 +98,12 @@ alignc db repair      --entry file.align  dirty な 1 件をチェックサム�
 alignc --version                          compiler version を表示
 ```
 
+未対応の末尾のコンパイラ引数は、ソースの読み込みや成果物の作成前にエラーになります。
+たとえば `alignc build file.align -o output` は失敗します。`build` は通常の名前で実行ファイルを作り、
+`emit-obj file.align output.o` ではオブジェクトの出力先を指定できます。出力名が `-` で始まる場合は、`./` を付けてください。
+`run` の末尾のプログラム引数はそのまま渡されます。`--profile` などをプログラムへ渡す場合は、
+`--` の後に置いてください。
+
 `db` グループは `pkg.db` を使うプロジェクト向けです（[23 章](23-packages.md)）。日常の開発では、編集中の確認に `check`、実行に `run`、宣言したテストの実行に `test` を使います。テストの書き方は第 [16](16-toolchain.md#coretest-でテストを書く) 章で説明します。生成されるコードを調べたいときは `emit-llvm` で LLVM IR を確認できます。
 
 ## コンパイルエラーを読む

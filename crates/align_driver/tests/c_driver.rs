@@ -359,3 +359,238 @@ fn selection_retains_symlink_spelling_and_never_recovers_a_vanished_driver() {
     assert!(!root.join("selected.log").exists());
     assert!(!root.join("never-published").exists());
 }
+
+mod residual_arguments {
+    use super::*;
+
+    const SOURCE: &str = "fn  main() { print(1) }\n";
+
+    fn fixture() -> align_driver::ArtifactStage {
+        let stage = align_driver::ArtifactStage::temp("cli-residual").expect("acquire fixture");
+        fs::write(stage.path().join("sample.align"), SOURCE).unwrap();
+        fs::create_dir_all(stage.path().join("cache/actions")).unwrap();
+        fs::write(stage.path().join("cache/actions/marker"), b"retained").unwrap();
+        stage
+    }
+
+    fn run_fixture(stage: &align_driver::ArtifactStage, args: &[&str]) -> std::process::Output {
+        let root = stage.path();
+        let status = Process::spawn(
+            command(root)
+                .args(args)
+                .env("PATH", "/usr/bin:/bin")
+                .env("ALIGNC_CACHE", root.join("cache")),
+        )
+        .wait();
+        std::process::Output {
+            status,
+            stdout: fs::read(root.join("stdout")).unwrap(),
+            stderr: fs::read(root.join("stderr")).unwrap(),
+        }
+    }
+
+    fn invalid(stage: &align_driver::ArtifactStage, args: &[&str], error: &str) {
+        let root = stage.path();
+        let output = run_fixture(stage, args);
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{args:?}: {output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!("alignc: {error}\n"),
+            "{args:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("sample.align")).unwrap(),
+            SOURCE
+        );
+        assert_eq!(
+            fs::read(root.join("cache/actions/marker")).unwrap(),
+            b"retained"
+        );
+        for artifact in ["sample", "sample.o", "chosen.o", "desired-output"] {
+            assert!(
+                !root.join(artifact).exists(),
+                "unexpected artifact {artifact}"
+            );
+        }
+    }
+    #[test]
+    fn residual_errors_precede_native_source_and_artifact_work() {
+        let fixture = fixture();
+        for verb in [
+            "check",
+            "check-per-unit",
+            "emit-interface",
+            "emit-mir",
+            "build",
+            "size",
+            "fmt",
+            "explain-opt",
+            "emit-obj",
+            "emit-llvm",
+        ] {
+            for source in ["sample.align", "missing.align"] {
+                invalid(
+                    &fixture,
+                    &[verb, source, "--misspelled"],
+                    &format!("unexpected argument '--misspelled' for '{verb}'"),
+                );
+            }
+        }
+        for (args, error) in [
+            (
+                vec!["build", "sample.align", "-o", "desired-output"],
+                "unexpected argument '-o' for 'build'",
+            ),
+            (
+                vec!["build", "sample.align", "--watch", "--misspelled"],
+                "unexpected argument '--misspelled' for 'build'",
+            ),
+            (
+                vec!["build", "--help", "--misspelled"],
+                "unexpected argument '--misspelled' for 'build'",
+            ),
+            (
+                vec![
+                    "build",
+                    "sample.align",
+                    "--cc",
+                    "/missing/compiler",
+                    "--misspelled",
+                ],
+                "unexpected argument '--misspelled' for 'build'",
+            ),
+            (
+                vec!["fmt", "sample.align", "--write", "--misspelled"],
+                "unexpected argument '--misspelled' for 'fmt'",
+            ),
+            (
+                vec!["cache", "clear", "--misspelled"],
+                "unexpected argument '--misspelled' for 'cache'",
+            ),
+            (
+                vec!["cache", "unknown", "--misspelled"],
+                "unknown `cache` subcommand `unknown` (expected: clear)",
+            ),
+            (
+                vec!["emit-obj", "sample.align", "chosen.o", "extra.o"],
+                "unexpected argument 'extra.o' for 'emit-obj'",
+            ),
+            (
+                vec!["test", "sample.align", "extra.align"],
+                "test accepts exactly one entry path",
+            ),
+            (vec!["test"], "test accepts exactly one entry path"),
+            (
+                vec!["check", "sample.align", "unexpected\nargument"],
+                "unexpected argument 'unexpected\nargument' for 'check'",
+            ),
+            (
+                vec!["emit-llvm", "missing.align", "--misspelled", "--stage=bad"],
+                "unexpected argument '--misspelled' for 'emit-llvm'",
+            ),
+            (
+                vec!["emit-llvm", "missing.align", "--stage=bad", "--misspelled"],
+                "unknown --stage 'bad' (expected `raw` or `optimized`)",
+            ),
+            (
+                vec!["emit-llvm", "missing.align", "--stage"],
+                "unknown --stage '' (expected `raw` or `optimized`)",
+            ),
+            (
+                vec!["emit-llvm", "missing.align", "--stage=bad\nstage"],
+                "unknown --stage 'bad\nstage' (expected `raw` or `optimized`)",
+            ),
+            (
+                vec!["check", "sample.align", "--profile=bad", "--misspelled"],
+                "unknown --profile 'bad' (expected one of: dev, release, fast, small, tiny)",
+            ),
+            (
+                vec!["build", "sample.align", "--", "--misspelled"],
+                "program argument delimiter -- is only valid for `run`",
+            ),
+        ] {
+            invalid(&fixture, &args, error);
+        }
+    }
+
+    #[test]
+    fn legal_local_options_and_program_arguments_remain_usable() {
+        let fixture = fixture();
+        for args in [
+            vec!["check", "sample.align"],
+            vec!["build", "--help"],
+            vec!["fmt", "sample.align"],
+            vec!["fmt", "sample.align", "-w", "--write"],
+        ] {
+            let output = run_fixture(&fixture, &args);
+            assert!(output.status.success(), "{args:?}: {output:?}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(fixture.path().join("sample.align")).unwrap(),
+            "fn main() { print(1) }\n"
+        );
+        if align_driver::backend_available() {
+            let raw = run_fixture(&fixture, &["emit-llvm", "sample.align"]);
+            assert!(raw.status.success(), "{raw:?}");
+            let optimized = run_fixture(
+                &fixture,
+                &["emit-llvm", "sample.align", "--stage=optimized"],
+            );
+            assert!(optimized.status.success(), "{optimized:?}");
+            assert_ne!(raw.stdout, optimized.stdout, "stage must change emitted IR");
+            for (args, expected) in [
+                (
+                    vec![
+                        "emit-llvm",
+                        "sample.align",
+                        "--stage=optimized",
+                        "--stage",
+                        "raw",
+                    ],
+                    &raw.stdout,
+                ),
+                (
+                    vec![
+                        "emit-llvm",
+                        "sample.align",
+                        "--stage",
+                        "raw",
+                        "--stage=optimized",
+                    ],
+                    &optimized.stdout,
+                ),
+            ] {
+                let output = run_fixture(&fixture, &args);
+                assert!(output.status.success(), "{args:?}: {output:?}");
+                assert_eq!(&output.stdout, expected, "last stage wins: {args:?}");
+            }
+            for args in [
+                vec!["explain-opt", "sample.align", "-v", "--verbose"],
+                vec!["emit-obj", "sample.align", "chosen.o"],
+            ] {
+                let output = run_fixture(&fixture, &args);
+                assert!(output.status.success(), "{args:?}: {output:?}");
+            }
+            assert!(fixture.path().join("chosen.o").is_file());
+            std::fs::write(fixture.path().join("argv.align"),
+            "fn main(args: array<str>) -> Result<(), Error> { print(args[1]); print(args[2]); return Ok(()) }\n").unwrap();
+            for args in [
+                vec!["run", "argv.align", "--misspelled", "value"],
+                vec!["run", "argv.align", "--", "--profile", "fast"],
+            ] {
+                let output = run_fixture(&fixture, &args);
+                assert!(output.status.success(), "{args:?}: {output:?}");
+                let expected = if args.contains(&"--") {
+                    b"--profile\nfast\n".as_slice()
+                } else {
+                    b"--misspelled\nvalue\n".as_slice()
+                };
+                assert_eq!(output.stdout, expected);
+            }
+        }
+        let output = run_fixture(&fixture, &["cache", "clear"]);
+        assert!(output.status.success(), "{output:?}");
+        assert!(!fixture.path().join("cache/actions/marker").exists());
+    }
+}
