@@ -132,9 +132,10 @@ including comments and control fields. `--timeout-ns` defaults to 30000000000
 and must be positive; configure a longer interval for a quiet producer. The
 existing timeout bounds individual connect/send/transport-receive operations,
 not DNS, stdout writes or total watch duration. CLI limits are validated before
-network I/O, and `--help` reports usage separately. Output/window/source-work
-and body-cap refusals remain Code(-1); other transport/parser/timeout/output
-errors propagate. A late failure may leave a stdout prefix.
+network I/O, and `--help` reports usage separately. Output-window and body-cap
+refusals remain Code(-1); SSE source-work overflow is Invalid, with the body cap
+taking precedence at the same source boundary. Other transport, parser, timeout
+and output errors propagate. A late failure may leave a stdout prefix.
 
 ## `std.process`
 
