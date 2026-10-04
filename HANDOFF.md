@@ -1,5 +1,20 @@
 # Session handoff
 
+## Deferred K1
+
+Full K1 and adoption of the parked [plan 61 implementation](docs/impl/61-interprocedural-view-access-plan.md)
+are deferred by user decision (2026-10-01, reaffirmed 2026-10-04). The work did
+not deliver an accepted end-to-end compiler repair. The narrower HIR reuse
+candidate also lacks an established finite abstraction for recursive selected
+view origins; whole-parameter lifetime roots lose independent field authority.
+The known interprocedural write-authority and temporal-validation gaps remain.
+
+Do not resume either approach without a new explicit user request. Older
+implementation and continuation instructions for K1 are inactive. Continue
+independent improvements from current `main`: completing, reviewing, or adopting
+the parked work is not a prerequisite. Keep its source and evidence archived
+outside the active worktree so they do not obstruct unrelated checks or pulls.
+
 ## Next work (handoff updated 2026-10-02)
 
 Request 38's direct bounded positional reads are implemented in plan 89:

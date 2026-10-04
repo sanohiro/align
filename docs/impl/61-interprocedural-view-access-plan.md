@@ -1,6 +1,24 @@
 # Interprocedural view access
 
-Status: consolidated implementation design. Compiler implementation is not yet shipped.
+Status: deferred by user decision (2026-10-01, reaffirmed 2026-10-04). Compiler implementation is not shipped.
+
+The parked implementation did not deliver an accepted end-to-end
+producer/interface/caller/validation repair, and its adoption is withheld.
+The narrower candidate using existing HIR provenance and call effects is also
+deferred: whole-parameter lifetime roots lose selected-field independence,
+while exact paths grow through admitted recursive slice graphs without an
+established finite abstraction. This is a feasibility limit of that candidate,
+not a claim that every HIR repair is impossible. Full interprocedural temporal
+UTF-8/codec validation remains unresolved.
+
+The design below is historical reference. Its imperative instructions,
+fixed-strategy declarations, and remaining-work lists do not authorize
+implementation, PRs, or merges. A new explicit user request is required before
+either approach resumes. Independent capabilities continue from current `main`
+without completing, reviewing, or adopting this work first. Preserve the parked
+source and evidence outside the active worktree.
+See [the current handoff](../../HANDOFF.md#deferred-k1).
+
 This is boundary 2 of [plan 52](52-readonly-view-provenance-plan.md).
 The producer-validation owner established by [plan 55](55-mir-producer-validation-plan.md)
 is a prerequisite, not this capability's implementation.
