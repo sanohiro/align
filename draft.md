@@ -3631,6 +3631,31 @@ the normal hard-error policy. Errors use the existing errno mapping, including
 Code(EEXIST). No new owner, type tag or Error variant is added. The exact contract
 and closure are in [ordinary directory operations](docs/impl/43-ordinary-directory-plan.md).
 
+### std.os memory observation
+
+`os.physical_memory() -> Result<i64, Error>` and
+`os.available_memory() -> Result<i64, Error>` are Impure nullary observations
+requiring `import std.os`. Success reports bytes: total is positive; available
+is nonnegative and bounded by the total queried in that operation. Values are
+ordinary Copy results; no memory owner, borrowed view or allocation is returned.
+
+Linux/WSL2 reads bounded `/proc/meminfo`: MemTotal supplies kernel-usable RAM
+and MemAvailable supplies its estimate. These are the current kernel/VM view,
+without cgroup or address-space-limit adjustment. macOS uses hw.memsize for total
+and the explicit `(free_count + inactive_count) * host_page_size` advisory estimate
+for available bytes. Speculative pages are already included in free_count.
+No fallback, subprocess, environment setting or observation cache exists.
+Unsupported, malformed or unrepresentable observations return Invalid; native
+POSIX errors use the existing mapping. Native scratch is fixed; successful
+results allocate no Align/Rust heap storage.
+
+These observations neither reserve memory nor guarantee a later allocation.
+They do not report VRAM or per-model usage. Calls are independent and do not
+certify an atomic snapshot. Applications retain allocation checks and explicit
+caps; container limits can be lower than the observed total. The exact native
+query/cleanup order, bounds, ABI and owners are in
+[OS memory observation](docs/impl/101-os-memory-observation-plan.md).
+
 ### std.os host observation
 
 `os.host() -> Result<os.host_info, Error>` requires `import std.os` and is Impure.

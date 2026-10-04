@@ -48,5 +48,10 @@ fn identity_formation_and_effect() {
     ] {
         let checked=diff_check_multi("identity-invalid",&[("main.align",source)],"main.align");
         assert!(checked.whole_errors && checked.per_unit_errors,"accepted: {source}");
+        if source.contains("par_map") {
+            for diagnostics in [&checked.whole_diags, &checked.per_unit_diags] {
+                assert!(diagnostics.contains("requires a Pure function"), "{diagnostics}");
+            }
+        }
     }
 }

@@ -17158,7 +17158,7 @@ impl EffectScan<'_> {
                 walk!(value);
                 self.impure_direct = true;
             }
-            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::ProcessCpuCount => self.impure_direct = true,
+            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::OsMemory { .. } | ExprKind::ProcessCpuCount => self.impure_direct = true,
             ExprKind::TimeSleep { ns } => {
                 walk!(ns);
                 self.impure_direct = true;
@@ -25239,7 +25239,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::EnvGet { .. }
             | ExprKind::EnvSet { .. }
             | ExprKind::TimeNow
-            | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::ProcessCpuCount
+            | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::OsMemory { .. } | ExprKind::ProcessCpuCount
             | ExprKind::TimeInstant
             | ExprKind::TimeSleep { .. }
             | ExprKind::ProcessExit { .. }
@@ -25720,7 +25720,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::EnvGet { .. }
             | ExprKind::EnvSet { .. }
             | ExprKind::TimeNow
-            | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::ProcessCpuCount
+            | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::OsMemory { .. } | ExprKind::ProcessCpuCount
             | ExprKind::TimeInstant
             | ExprKind::TimeSleep { .. }
             | ExprKind::ProcessExit { .. }
@@ -29205,7 +29205,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(name, depth);
                 self.walk(value, depth);
             }
-            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::ProcessCpuCount => {}
+            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::OsMemory { .. } | ExprKind::ProcessCpuCount => {}
             ExprKind::TimeSleep { ns } => self.walk(ns, depth),
             // `process.exit` diverges and its `code` is a scalar `i64` (nothing escapes); `abort`
             // has no operand.
@@ -31838,6 +31838,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         }
 
         ExprKind::Unit
+        | ExprKind::OsMemory { .. }
         | ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Char(_)
@@ -41019,7 +41020,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::TcpAccept { .. } | ExprKind::UdpBind { .. } | ExprKind::UdpSendTo { .. }
             | ExprKind::UdpRecvFrom { .. } | ExprKind::PathJoin { .. } | ExprKind::PathNormalize { .. }
             | ExprKind::EnvGet { .. } | ExprKind::EnvSet { .. } | ExprKind::TimeNow | ExprKind::TimeInstant
-            | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::ProcessCpuCount | ExprKind::TimeSleep { .. } | ExprKind::ProcessExit { .. }
+            | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::OsMemory { .. } | ExprKind::ProcessCpuCount | ExprKind::TimeSleep { .. } | ExprKind::ProcessExit { .. }
             | ExprKind::ProcessAbort | ExprKind::ProcessSpawn { .. } | ExprKind::ChildWait { .. }
             | ExprKind::ChildKill { .. } | ExprKind::ProcessExec { .. }
             // `process.command` (owns the handle) / `c.cwd` (`()`) / `c.run` (owns its `Result`) /
@@ -47835,7 +47836,7 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, name, moved, false, false);
                 move_expr!(self, value, moved, false, false);
             }
-            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::ProcessCpuCount => {}
+            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::OsMemory { .. } | ExprKind::ProcessCpuCount => {}
             ExprKind::TimeSleep { ns } => move_expr!(self, ns, moved, false, false),
             // `process.exit(code)` reads a scalar `i64` (never consumed); `abort` reads nothing.
             ExprKind::ProcessExit { code } => {
@@ -54435,6 +54436,15 @@ impl<'a, 't> Checker<'a, 't> {
             if module == "process" && matches!(method, "exit" | "abort") {
                 self.require_import("std.process", &format!("process.{method}"), span);
                 return self.check_process_op(method, args, span);
+            }
+            if module == "os" && matches!(method, "physical_memory" | "available_memory") {
+                self.require_import("std.os", &format!("os.{method}"), span);
+                if !args.is_empty() {
+                    self.diags.error(format!("'os.{method}' takes no arguments"), span);
+                    return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+                }
+                return Expr { kind: ExprKind::OsMemory { available: method == "available_memory" },
+                    ty: Ty::Result(Scalar::Int(IntTy { bits: 64, signed: true }), Scalar::Enum(self.error_enum_id)), span };
             }
             if module == "os" && matches!(method, "host" | "identity") {
                 self.require_import("std.os", &format!("os.{method}"), span);
@@ -70412,7 +70422,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(name);
                 self.finalize_expr(value);
             }
-            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::ProcessCpuCount => {}
+            ExprKind::TimeNow | ExprKind::TimeInstant | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::OsMemory { .. } | ExprKind::ProcessCpuCount => {}
             ExprKind::TimeSleep { ns } => self.finalize_expr(ns),
             ExprKind::ProcessExit { code } => self.finalize_expr(code),
             ExprKind::ProcessAbort => {}

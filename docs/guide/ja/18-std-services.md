@@ -1,8 +1,33 @@
-# std: ネットワーク、HTTP、プロセス、圧縮、暗号
+# std: RAM、ネットワーク、HTTP、プロセス、圧縮、暗号
 
 > 🌐 [English](../18-std-services.md) · **日本語**
 
-本章ではネットワーク、HTTP、プロセス、圧縮、暗号を扱います。これまでと同じく、使う機能をインポートで明示し、OS やライブラリの失敗は `Result` で返します。リソースを所有するソケット、子プロセス、クライアント、レスポンス、ストリームは Move 値です。
+本章では RAM の観測、ネットワーク、HTTP、プロセス、圧縮、暗号を扱います。これまでと同じく、使う機能をインポートで明示し、OS やライブラリの失敗は `Result` で返します。リソースを所有するソケット、子プロセス、クライアント、レスポンス、ストリームは Move 値です。
+
+## `std.os`: RAM を観測する
+
+二つの非純粋な引数なし関数は、バイト数を通常の `Result<i64, Error>` で返します。
+
+```align
+import std.os
+
+fn main() -> Result<(), Error> {
+    total := os.physical_memory()?
+    available := os.available_memory()?
+    print(total)
+    print(available)
+    return Ok(())
+}
+```
+
+Linux/WSL2 は現在のカーネル・仮想マシンの MemTotal と MemAvailable を返します。
+macOS は hw.memsize と、Align が定めた
+`(free_count + inactive_count) * host_page_size` の参考値を返します。
+Align/Rust のヒープ領域を確保せず、ネイティブ資源を保持しません。
+それぞれ独立した時点で観測します。RAM の予約や VRAM の測定は行わず、
+コンテナやアドレス空間の上限は観測値より低い場合があります。
+アプリケーションの上限と割り当ての確認を併用してください。
+正確な [std.os の契約](../../impl/std-design/ja/os.md) も参照してください。
 
 ## `std.net`
 

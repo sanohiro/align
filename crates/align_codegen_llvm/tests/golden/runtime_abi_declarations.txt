@@ -328,6 +328,8 @@ key|LogLineBuilder|log_line_builder|HostState|declare i32 @align_rt_log_line_bui
 key|LogNew|log_new|AllocNew|declare noalias ptr @align_rt_log_new(ptr, i32) #0
 key|OsHost|os_host|HostState|declare i32 @align_rt_os_host(ptr) #2
 key|OsIdentity|os_identity|HostState|declare i32 @align_rt_os_identity(ptr) #2
+key|OsPhysicalMemory|os_physical_memory|HostState|declare i32 @align_rt_os_physical_memory(ptr captures(none)) #2
+key|OsAvailableMemory|os_available_memory|HostState|declare i32 @align_rt_os_available_memory(ptr captures(none)) #2
 key|ParMap|par_map|Callback|declare noalias ptr @align_rt_par_map(ptr, ptr, i64, i64, i64, i64, ptr) #2
 key|ParMapFilter|par_map_filter|Callback|declare { ptr, i64 } @align_rt_par_map_filter(ptr, ptr, i64, i64, i64, i64, ptr, ptr) #2
 key|ParMapReduce|par_map_reduce|Callback|declare i64 @align_rt_par_map_reduce(ptr, ptr, i64, i64, i64, i64, ptr) #2

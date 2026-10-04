@@ -19669,3 +19669,28 @@ fn native_output_hir_rejects_shared_mode_with_mutable_local_flag() -> Result<(),
     }
     Ok(())
 }
+
+#[test]
+fn os_memory_hir_rejects_forged_result_in_every_entrypoint() -> Result<(), &'static str> {
+    for method in ["physical_memory", "available_memory"] {
+        let base = checked_source_program(&format!("import std.os\nfn observe() -> Result<i64, Error> = os.{method}()\nfn main() {{}}\n"));
+        assert!(!is_empty(&lower_program(&base)));
+        for ty in [Ty::Bool, Ty::Int(align_sema::IntTy { bits: 64, signed: true }),
+            Ty::Result(Scalar::Bool, Scalar::Bool),
+            Ty::Result(Scalar::Int(align_sema::IntTy { bits: 32, signed: true }), Scalar::Bool)] {
+            let mut bad = base.clone();
+            body_value_expression_mut(&mut bad, "observe").ty = ty;
+            assert_body_entrypoints_empty("memory-forged-result", &bad);
+        }
+        let mut bad = base.clone();
+        let expression = body_value_expression_mut(&mut bad, "observe");
+        let Ty::Result(ok, error) = expression.ty else { return Err("memory Result"); };
+        for ty in [Ty::Result(Scalar::Bool, error), Ty::Result(ok, Scalar::Bool), Ty::Result(ok, Scalar::Enum(u32::MAX)),
+            Ty::Result(Scalar::Int(align_sema::IntTy { bits: 64, signed: false }), error)] {
+            let mut bad = base.clone();
+            body_value_expression_mut(&mut bad, "observe").ty = ty;
+            assert_body_entrypoints_empty("memory-forged-result-arm", &bad);
+        }
+    }
+    Ok(())
+}

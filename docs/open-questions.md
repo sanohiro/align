@@ -282,6 +282,15 @@ local before/after evidence under the plan, not an unmeasured speed claim.
   online CPU facts. No inferred CPU description, ambient configuration, or authenticated
   identity promise. [Plan 42](impl/42-host-observation-plan.md) owns the schema and validation.
 
+### RAM observation (Settled, 2026-10-05)
+
+Plan 101 selects `os.physical_memory()` and `os.available_memory()`, both
+Impure nullary `Result<i64, Error>` calls. Linux/WSL2 reports bounded kernel/VM
+meminfo facts; macOS uses hw.memsize and a defined free-plus-inactive estimate.
+No memory reservation, cgroup admission, GPU control or allocator model is added.
+[Plan 101](impl/101-os-memory-observation-plan.md) owns the exact contract and
+closure; independent design/matrix review passed before implementation.
+
 ### Incremental SHA-256 (Settled, 2026-09-10)
 
 R29 admits one qualified `crypto.digest` Move owner with `sha256_stream`,

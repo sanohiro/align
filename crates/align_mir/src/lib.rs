@@ -2356,6 +2356,7 @@ pub enum Rvalue {
     OsHost { out: Slot },
     /// Native Copy real-credential observation; scratch is the exact identity_info record.
     OsIdentity { out: Slot },
+    OsMemory { available: bool, out: Slot },
     /// `process.cpu_count()` — the parallelism available to this process, an `i64` (>= 1). Impure.
     ProcessCpuCount,
     /// `time.instant()` — monotonic-clock nanoseconds (`CLOCK_MONOTONIC`), an `i64`. Impure.
@@ -6306,6 +6307,8 @@ fn field_path_leaf_ty(structs: &[hir::StructDef], struct_id: u32, path: &[u32]) 
 /// covers every free-standing owner; arena-regioned `box<T>` has no individual Drop.
 fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
     match &e.kind {
+        // The nullary RAM observation has only Copy scalar/error payloads.
+        hir::ExprKind::OsMemory { .. } => {},
         hir::ExprKind::Local(id) => {
             let moved = match b.slots.get(*id as usize) {
                 // Share the exact sema/MIR ownership predicate. A handwritten type list previously
@@ -9340,6 +9343,13 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 let out = b.new_slot(ty);
                 let status = b.fresh_value(status_ty());
                 b.push(Stmt::Let(status, if matches!(e.kind, hir::ExprKind::OsIdentity) { Rvalue::OsIdentity { out } } else { Rvalue::OsHost { out } }));
+                emit_open_handle_result(b, status, out, ty, e.ty)
+            }
+            hir::ExprKind::OsMemory { available } => {
+                let ty = Ty::Int(IntTy { bits: 64, signed: true });
+                let out = b.new_slot(ty);
+                let status = b.fresh_value(status_ty());
+                b.push(Stmt::Let(status, Rvalue::OsMemory { available: *available, out }));
                 emit_open_handle_result(b, status, out, ty, e.ty)
             }
             hir::ExprKind::ProcessCpuCount => {

@@ -347,6 +347,7 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         | ExprKind::TimeInstant
         | ExprKind::OsHost
         | ExprKind::OsIdentity
+        | ExprKind::OsMemory { .. }
                 | ExprKind::ProcessCpuCount
         | ExprKind::ProcessAbort
         | ExprKind::RandSeed
@@ -2254,6 +2255,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::TimeInstant
         | ExprKind::OsHost
         | ExprKind::OsIdentity
+        | ExprKind::OsMemory { .. }
                 | ExprKind::ProcessCpuCount
         | ExprKind::ProcessAbort
         | ExprKind::RandSeed

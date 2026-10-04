@@ -18888,6 +18888,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder.build_call(self.runtime(RuntimeKey::OsHost), &[pointer.into()], "host")
                     .map_err(|e| self.err(e))?.try_as_basic_value().basic().ok_or_else(|| self.err("host ABI result"))?
             }
+            Rvalue::OsMemory { available, out } => {
+                let pointer = *self.slots.get(out).ok_or_else(|| self.err("missing memory output slot"))?;
+                let key = if *available { RuntimeKey::OsAvailableMemory } else { RuntimeKey::OsPhysicalMemory };
+                self.builder.build_call(self.runtime(key), &[pointer.into()], "memory")
+                    .map_err(|e| self.err(e))?.try_as_basic_value().basic().ok_or_else(|| self.err("memory ABI result"))?
+            }
             Rvalue::OsIdentity { out } => {
                 let pointer = *self.slots.get(out).ok_or_else(|| self.err("missing identity output slot"))?;
                 self.builder.build_call(self.runtime(RuntimeKey::OsIdentity), &[pointer.into()], "identity")
@@ -40481,6 +40487,34 @@ fn main() -> i32 = 0
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn os_memory_mir_gate_rejects_forged_status_and_output() -> Result<(), &'static str> {
+        let source = "import std.os\nfn total() -> Result<i64, Error> = os.physical_memory()\nfn available() -> Result<i64, Error> = os.available_memory()\nfn main() {}\n";
+        let base = mir(source);
+        assert!(validate_mir_producers(&base).is_ok());
+        let mut found = 0;
+        for (index, function) in base.fns.iter().enumerate() {
+            for statement in function.blocks.iter().flat_map(|block| &block.stmts) {
+                if let Stmt::Let(value, Rvalue::OsMemory { out, .. }) = statement {
+                    found += 1;
+                    for ty in [Ty::Bool, Ty::Int(align_sema::IntTy { bits: 64, signed: true }), Ty::Raw] {
+                        let mut bad = base.clone();
+                        bad.fns[index].value_tys[*value as usize] = ty;
+                        assert_xml_producer_rejected(&bad, "memory status");
+                    }
+                    for ty in [Ty::Bool, Ty::Int(align_sema::IntTy { bits: 32, signed: true }),
+                        Ty::Int(align_sema::IntTy { bits: 64, signed: false }), Ty::Raw, Ty::String, Ty::Unit] {
+                        let mut bad = base.clone();
+                        bad.fns[index].slots[*out as usize] = ty;
+                        assert_xml_producer_rejected(&bad, "memory output");
+                    }
+                }
+            }
+        }
+        assert_eq!(found, 2);
         Ok(())
     }
 

@@ -1,5 +1,31 @@
 # std.os
 
+**Implemented memory observation:**
+The two nullary RAM queries below follow the independently reviewed plan 101.
+
+`os.physical_memory() -> Result<i64, Error>` and
+`os.available_memory() -> Result<i64, Error>` are Impure nullary observations
+requiring `import std.os`. Success reports bytes: total is positive; available
+is nonnegative and bounded by the total queried in that operation. Values are
+ordinary Copy results; no memory owner, borrowed view or allocation is returned.
+
+Linux/WSL2 reads at most 8192 bytes of `/proc/meminfo`: MemTotal supplies kernel-usable RAM
+and MemAvailable supplies its estimate. These are the current kernel/VM view,
+without cgroup or address-space-limit adjustment. macOS uses hw.memsize for total
+and the explicit `(free_count + inactive_count) * host_page_size` advisory estimate
+for available bytes. Speculative pages are already included in free_count.
+No fallback, subprocess, environment setting or observation cache exists.
+Unsupported, malformed or unrepresentable observations return Invalid; native
+POSIX errors use the existing mapping. Native scratch is fixed; successful
+results allocate no Align/Rust heap storage.
+
+These observations neither reserve memory nor guarantee a later allocation.
+They do not report VRAM or per-model usage. Calls are independent and do not
+certify an atomic snapshot. Applications retain allocation checks and explicit
+caps; container limits can be lower than the observed total. The exact native
+query/cleanup order, bounds, ABI and owners are in
+[OS memory observation](../101-os-memory-observation-plan.md).
+
 **Implemented identity observation:**
 `os.identity() -> Result<os.identity_info, Error>` observes current real UID/GID,
 in that order, through native getuid/getgid. It is Impure, requires std.os,

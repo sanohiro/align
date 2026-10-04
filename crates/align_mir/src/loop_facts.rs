@@ -319,7 +319,7 @@ macro_rules! unmodelled_rvalues {
         Rvalue::ChildKill { .. } | Rvalue::ProcessExec { .. } | Rvalue::FsReadFileView { .. } |
         Rvalue::FsReadBytesView { .. } | Rvalue::PathJoin { .. } | Rvalue::PathComponent { .. } |
         Rvalue::PathNormalize { .. } | Rvalue::EnvGet { .. } | Rvalue::EnvSet { .. } |
-        Rvalue::TimeNow { .. } | Rvalue::OsHost { .. } | Rvalue::OsIdentity { .. } |
+        Rvalue::TimeNow { .. } | Rvalue::OsHost { .. } | Rvalue::OsIdentity { .. } | Rvalue::OsMemory { .. } |
         Rvalue::ProcessCpuCount { .. } | Rvalue::TimeInstant { .. } | Rvalue::TimeSleep { .. } |
         Rvalue::TimeFormat { .. } | Rvalue::TimeParse { .. } | Rvalue::EncodingEncode { .. } |
         Rvalue::RegexCompile { .. } | Rvalue::RegexIsMatch { .. } | Rvalue::RegexFind { .. } |
