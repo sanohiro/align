@@ -6608,6 +6608,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::HttpUpgradeReadExact { .. }
             | Rvalue::HttpUpgradeWrite { .. }
             | Rvalue::HttpUpgradeDeadline { .. }
+            | Rvalue::HttpStreamWriteTimeoutNs { .. }
             | Rvalue::HttpUpgradeShutdown { .. }
             | Rvalue::HttpStreamSend { .. }
             | Rvalue::HttpStreamFinish { .. }

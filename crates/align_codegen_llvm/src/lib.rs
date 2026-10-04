@@ -18771,6 +18771,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .basic()
                     .ok_or_else(|| self.err("http_upgrade_deadline returned no value"))?
             }
+            Rvalue::HttpStreamWriteTimeoutNs { stream, timeout_ns } => {
+                let stream = self.operand(stream)?.into_pointer_value();
+                let timeout_ns = self.operand(timeout_ns)?;
+                self.builder.build_call(
+                    self.runtime(RuntimeKey::HttpStreamWriteTimeoutNs),
+                    &[stream.into(), timeout_ns.into()], "httpstreamwritetimeoutns",
+                ).map_err(|error| self.err(error))?.try_as_basic_value().basic()
+                    .ok_or_else(|| self.err("http_stream_write_timeout_ns returned no value"))?
+            }
             Rvalue::HttpUpgradeShutdown { upgrade } => {
                 let upgrade = self.operand(upgrade)?.into_pointer_value();
                 self.builder

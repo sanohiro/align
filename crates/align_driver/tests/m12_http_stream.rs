@@ -103,6 +103,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   rb := http.response(200)
   rb.header(\"X-Kind\", \"stream\")
   s := ctx.respond_stream(rb)?
+  s.write_timeout_ns(1000000000)?
   s.send(\"data: one\\n\\n\")?
   s.send(\"\")?
   s.send(ctx.path())?

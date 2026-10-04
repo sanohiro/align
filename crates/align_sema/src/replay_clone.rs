@@ -1618,6 +1618,10 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             upgrade: boxed!(upgrade),
             timeout_ns: boxed!(timeout_ns),
         },
+        ExprKind::HttpStreamWriteTimeoutNs { stream, timeout_ns } => ExprKind::HttpStreamWriteTimeoutNs {
+            stream: boxed!(stream),
+            timeout_ns: boxed!(timeout_ns),
+        },
         ExprKind::HttpUpgradeShutdown { upgrade } => ExprKind::HttpUpgradeShutdown {
             upgrade: boxed!(upgrade),
         },
@@ -2565,6 +2569,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             upgrade: lhs,
             timeout_ns: rhs,
         }
+        | ExprKind::HttpStreamWriteTimeoutNs { stream: lhs, timeout_ns: rhs }
         | ExprKind::HttpStreamSend {
             stream: lhs,
             chunk: rhs,

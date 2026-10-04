@@ -595,6 +595,7 @@ fn runtime_effects(id: RuntimeAbiId) -> RuntimeEffects {
         RuntimeAbiId::Keyed(RuntimeKey::HttpStreamSend) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::HttpStreamSendEvent) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::HttpTimeout) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpStreamWriteTimeoutNs) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::HttpUpgradeDeadline) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::HttpUpgradeFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::HttpUpgradeReadExact) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
@@ -2134,6 +2135,11 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
             symbol: "align_rt_http_timeout",
             shape: RuntimeAbiShape::A66,
         },
+        RuntimeKey::HttpStreamWriteTimeoutNs => RuntimeAbi {
+            key,
+            symbol: "align_rt_http_stream_write_timeout_ns",
+            shape: RuntimeAbiShape::A04,
+        },
         RuntimeKey::HttpUpgradeDeadline => RuntimeAbi {
             key,
             symbol: "align_rt_http_upgrade_deadline",
@@ -3066,15 +3072,15 @@ fn validate_effects(abi: RuntimeAbi, effects: RuntimeEffects) -> Result<(), Stri
 }
 
 pub(super) fn validate_registry() -> Result<(), String> {
-    if RuntimeKey::ALL.len() != 454 || keyed_runtime_abis().len() != 454 {
+    if RuntimeKey::ALL.len() != 455 || keyed_runtime_abis().len() != 455 {
         return Err("runtime ABI registry invariant: key-count".to_string());
     }
-    if runtime_abis().count() != 472 {
+    if runtime_abis().count() != 473 {
         return Err("runtime ABI registry invariant: base-count".to_string());
     }
 
     let mut keys = HashSet::with_capacity(RuntimeKey::ALL.len());
-    let mut symbols = HashSet::with_capacity(472);
+    let mut symbols = HashSet::with_capacity(473);
     for abi in keyed_runtime_abis() {
         validate_effects(abi, runtime_effects(abi.key))?;
         let key = abi
@@ -4391,17 +4397,17 @@ mod tests {
         );
         validate_registry().unwrap_or_else(|error| panic!("valid runtime registry: {error}"));
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 472);
+        assert_eq!(rows.len(), 473);
         assert_eq!(
             rows.iter().map(|row| row.key).collect::<HashSet<_>>().len(),
-            472
+            473
         );
         assert_eq!(
             rows.iter()
                 .map(|row| row.symbol)
                 .collect::<HashSet<_>>()
                 .len(),
-            472
+            473
         );
         for (key, row) in RuntimeKey::ALL.into_iter().zip(keyed_runtime_abis()) {
             assert_eq!(row.key, RuntimeAbiId::Keyed(key));
@@ -4430,7 +4436,7 @@ mod tests {
     #[test]
     fn runtime_effects_registry_is_total_and_structurally_valid() {
         validate_registry().unwrap();
-        assert_eq!(runtime_abis().map(|abi| runtime_effects(abi.key)).count(), 472);
+        assert_eq!(runtime_abis().map(|abi| runtime_effects(abi.key)).count(), 473);
 
         let expect_rule = |abi, effects, rule: &str| {
             let error = validate_effects(abi, effects).unwrap_err();
@@ -4557,7 +4563,7 @@ mod tests {
     fn runtime_abi_extern_type_matrix_is_exact_for_every_row_and_ordinal() {
         let ctx = inkwell::context::Context::create();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 472);
+        assert_eq!(rows.len(), 473);
 
         for row in rows {
             let symbol = row.symbol;

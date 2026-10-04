@@ -13,6 +13,18 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### HTTP stream total write budgets (SETTLED 2026-10-04)
+
+`s.write_timeout_ns(timeout_ns: i64) -> Result<(), Error>` is an Impure,
+exclusive, nonconsuming bound-local setter. Zero is the default/unbounded mode;
+negative values return Invalid without mutation. One monotonic budget covers each
+complete later write; expiry returns Timeout and send poisons. Consuming output
+still closes exactly once; empty send and committed raw finish stay clock-free.
+Linux per-call nonblocking flags and macOS sole-owner mode latching are platform
+implementations of that policy, not another concurrency or ownership model.
+[Plan 90](impl/90-multimodal-library-foundation-plan.md) and
+[HTTP design](impl/std-design/http.md) own the exact contract.
+
 ### Direct bounded buffer-window reads (SETTLED 2026-10-02)
 
 `f.pread_into(b, destination_offset, length, file_offset) -> Result<i64, Error>`

@@ -23,8 +23,14 @@ vectored writer for existing HTTP binary and SSE sends, with no payload copy or
 send-time framing allocation. Native partial-write/pointer/allocation owners and
 the existing language/framework stream owners cover its unchanged behavior. Local
 paired token measurements stay within premeasured baseline repeatability. Explicit
-stream-write and complete-request budgets (H2/H3), then the bounded process/job/
-artifact reference composition (C1), remain next. Model lifetimes use existing
+stream-write budgets (H2) are implemented with `s.write_timeout_ns(ns)`: default
+zero remains clock-free; positive budgets cover complete writes, including
+partial progress and readiness waits; Timeout poisons output and consuming
+cleanup closes exactly once. Linux uses per-call nonblocking sends, while macOS
+latches mode only on the sole stream-owned fd. Source, forged-HIR, native
+TCP/Unix stall, configured-zero drain and ABI/export owners close the boundary.
+Complete-request budgets (H3), then the bounded process/job/artifact reference
+composition (C1), remain next. Model lifetimes use existing
 opaque resources and process owners; no new language concurrency model or tensor
 system is proposed. Linux/WSL2 is the GPU qualification target. This work proceeds
 independently of deferred K1.

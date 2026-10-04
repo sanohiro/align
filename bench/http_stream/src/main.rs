@@ -135,6 +135,11 @@ fn run_case(framed: bool, event: bool, payload: &[u8], iterations: usize) {
         0
     );
     let mut stream = Stream(stream);
+    #[cfg(feature = "write-budget")]
+    assert_eq!(
+        unsafe { align_rt_http_stream_write_timeout_ns(stream.0, 1_000_000_000) },
+        0
+    );
     let wire_payload = payload.len() + if event { 8 } else { 0 };
     let framing_len = if framed && wire_payload > 0 {
         format!("{wire_payload:x}").len() + 4

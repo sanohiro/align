@@ -1294,6 +1294,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::HttpUpgradeReadExact { upgrade, out, count } => format!("http_upgrade_read_exact({}, {}, {})", operand_str(upgrade), operand_str(out), operand_str(count)),
         Rvalue::HttpUpgradeWrite { upgrade, data } => format!("http_upgrade_write({}, {})", operand_str(upgrade), operand_str(data)),
         Rvalue::HttpUpgradeDeadline { upgrade, timeout_ns } => format!("http_upgrade_deadline({}, {})", operand_str(upgrade), operand_str(timeout_ns)),
+        Rvalue::HttpStreamWriteTimeoutNs { stream, timeout_ns } => format!("http_stream_write_timeout_ns({}, {})", operand_str(stream), operand_str(timeout_ns)),
         Rvalue::HttpUpgradeShutdown { upgrade } => format!("http_upgrade_shutdown({})", operand_str(upgrade)),
         Rvalue::HttpStreamSend { stream, chunk, event } => {
             let f = if *event { "http_stream_send_event" } else { "http_stream_send" };

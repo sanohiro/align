@@ -4200,11 +4200,22 @@ signal).
 
 ```text
 ctx.respond_stream(rb: response_builder) -> Result<http_stream, Error>  // consumes rb; borrows ctx (spent)
+s.write_timeout_ns(timeout_ns: i64) -> Result<(), Error> // borrows s; 0 disables the per-write bound
 s.send(chunk: bytes) -> Result<(), Error>       // one chunk frame, one write; send("") = no-op
 s.finish() -> Result<(), Error>                 // consumes s; writes 0\r\n\r\n (framed) + closes
 s.reject(rb: response_builder) -> Result<(), Error> // consumes s + rb; pre-first-send only:
                                                     //   discard the head, answer normally, close
 ```
+
+An exclusively borrowed bound stream accepts `s.write_timeout_ns(timeout_ns: i64)`
+with `Result<(), Error>` and Impure effect. The default is zero (unbounded).
+Negative input returns Invalid before state inspection/mutation; failure preserves
+the stored value. Each later complete send/event/finish/reject write snapshots
+one monotonic total budget, including head/framing, partial progress and retries.
+Expiry wins over a native result observed at that deadline and returns Timeout.
+Send timeout poisons; consuming finish/reject still closes once. Empty send and
+committed raw HTTP/1.0 finish remain clock-free. The budget does not cover content
+generation. The full platform/mode contract is in `docs/impl/std-design/http.md`.
 
 ---
 

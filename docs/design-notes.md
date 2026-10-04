@@ -2154,3 +2154,19 @@ that length; no-fill-loop behavior leaves chunking explicit. Published capacity,
 not allocator spare, is the accepted range. Existing native-owner reservations
 protect eagerly loaded File/Buffer inputs and end at the scalar call boundary.
 Plan 89 owns the exact error, ownership, ABI and acceptance matrix.
+
+## Explicit HTTP stream write budgets
+
+A caller chooses a total budget for each complete output operation; partial writes,
+EINTR and readiness wakeups do not extend it. Zero remains unbounded and performs
+no deadline clock reads. The setter stores policy without I/O or allocation, uses
+the existing Result/Error model and requires exclusive handle authority. A timeout
+may follow a visible wire prefix, so send poisons while finish/reject consumes.
+
+Linux uses per-call nonblocking send flags. macOS MSG_DONTWAIT did not bound a
+full-buffer send in a native reproduction; first timed output therefore latches
+checked O_NONBLOCK on the stream's sole owned fd. That fd is never published or
+returned to the context/pool. A failed mode change is indeterminate and terminal;
+Drop only closes. Configured-zero after latching uses indefinite readiness waits
+without clocks. The default H1 blocking path remains for unlatched streams.
+Plan 90 owns the complete source/native and platform closure.

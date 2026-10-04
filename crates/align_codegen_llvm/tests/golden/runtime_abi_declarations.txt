@@ -256,6 +256,7 @@ key|HttpStreamFree|http_stream_free|HostState|declare void @align_rt_http_stream
 key|HttpStreamReject|http_stream_reject|HostState|declare i32 @align_rt_http_stream_reject(ptr, ptr) #2
 key|HttpStreamSend|http_stream_send|HostState|declare i32 @align_rt_http_stream_send(ptr, ptr, i64) #2
 key|HttpStreamSendEvent|http_stream_send_event|HostState|declare i32 @align_rt_http_stream_send_event(ptr, ptr, i64) #2
+key|HttpStreamWriteTimeoutNs|http_stream_write_timeout_ns|HostState|declare i32 @align_rt_http_stream_write_timeout_ns(ptr, i64) #2
 key|HttpTimeout|http_timeout|HostState|declare void @align_rt_http_timeout(ptr, i64) #2
 key|HttpUpgradeDeadline|http_upgrade_deadline|HostState|declare i32 @align_rt_http_upgrade_deadline(ptr, i64) #2
 key|HttpUpgradeFree|http_upgrade_free|HostState|declare void @align_rt_http_upgrade_free(ptr) #2

@@ -8,6 +8,7 @@ publish = false
 
 [features]
 count-alloc = []
+write-budget = []
 
 [dependencies]
 align_runtime = { path = "../../crates/align_runtime" }

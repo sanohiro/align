@@ -1,6 +1,6 @@
 # Multimodal workloads through ordinary Align libraries
 
-Status: H1 implemented; H2/H3 and the reference composition remain pending.
+Status: H1/H2 implemented; H3 and the reference composition remain pending.
 H1 adds no source API. Concrete engine packages still require consumer evidence.
 Baseline: `5b76f1b3ecf1ec006d4df86fb99ac4f9df74a942` (2026-10-04).
 
@@ -16,7 +16,7 @@ new source type: `slice<u8>`, `str`, and owned text admitted by the current chec
 | ID | Surface and exact inputs/defaults | Ownership, allocation, effects and errors | Owner, identity and prerequisite | Acceptance and required measurement | Sources to synchronize when implemented |
 | --- | --- | --- | --- | --- | --- |
 | H1 | Existing `s.send(chunk: bytes) -> Result<(), Error>` and `s.send_event(data: bytes) -> Result<(), Error>` | Call-scoped readonly input; exclusive bound stream receiver; Impure. Remove payload-sized framing allocation/copy. Existing empty-send, lazy-head, rejection, poison, finish and Drop behavior remains. No retained input, encoding conversion or implicit queue. | Runtime stream writer; existing HIR/MIR, symbols and public type identity. Runtime artifact identity changes normally; no interface schema change. Existing HTTP stream is the only prerequisite. | Arbitrary binary octets, exact SSE bytes, partial vectored writes, EINTR, disconnect and ownership owners; allocation/copy counters and paired token/bulk benchmarks. | `std-design/http.md` + `ja/http.md`, `pkg-design/web.md` + `ja/web.md`, plan 15's performance record; wording in `draft.md` / `language-spec.md` only where it describes writer behavior. |
-| H2 | Proposed `s.write_timeout_ns(timeout_ns: i64) -> Result<(), Error>` on `http_stream`; default `0`, meaning no bound; nonnegative values accepted | Exclusive nonconsuming receiver; Impure. Stores one scalar, no allocation/I/O. Each later send/send_event/finish/reject that writes bytes snapshots one monotonic total write budget; partial progress and EINTR do not reset it. Empty send and close-only raw finish remain clock-free. Invalid argument/state is Invalid. A timed-out write poisons the stream and returns Timeout; consuming operations still close exactly once. | Sema, HIR/MIR validation/lowering, interface codec, runtime key/ABI, runtime. No new type. New operation identity follows the interface-format policy. H1 is a shared writer prerequisite. | Deadline/partial-write/state Cartesian owner, both native platforms, whole/per-unit and forged-HIR owners. No new speed claim; H1 regression measurement includes default and configured modes. | `draft.md`, `language-spec.md`, `design-notes.md`, `open-questions.md`, std HTTP English/Japanese, runtime ABI ledger and relevant implementation plan. |
+| H2 | `s.write_timeout_ns(timeout_ns: i64) -> Result<(), Error>` on `http_stream`; default `0`, meaning no bound; nonnegative values accepted | Exclusive nonconsuming receiver; Impure. Stores one scalar, no allocation/I/O. Each later send/send_event/finish/reject that writes bytes snapshots one monotonic total write budget; partial progress and EINTR do not reset it. Empty send and close-only raw finish remain clock-free. Invalid argument/state is Invalid. A timed-out write poisons the stream and returns Timeout; consuming operations still close exactly once. | Sema, HIR/MIR validation/lowering, rechecked interface source bodies, runtime key/ABI, runtime. No new type or interface-format change (format 17). H1 is a shared writer prerequisite. | Deadline/partial-write/state Cartesian owner, both native platforms, whole/per-unit and forged-HIR owners. No new speed claim; H1 regression measurement includes default and configured modes. | `draft.md`, `language-spec.md`, `design-notes.md`, `open-questions.md`, std HTTP English/Japanese, runtime ABI ledger and relevant implementation plan. |
 | H3 | Proposed `srv.accept_timeout_ns(timeout_ns: i64) -> Result<(), Error>` on `http_server`; default `0`, meaning no bound; nonnegative values accepted | Exclusive nonconsuming receiver; Impure. Stores one scalar, no allocation/I/O. `accept()` snapshots one monotonic budget covering selection and complete request acquisition. Timeout closes a selected incomplete request, preserves the listener and other parked connections, and returns Timeout. No incomplete request escapes. | Same compiler/runtime owners as H2; existing request cap and keep-alive owners. New operation identity, no new type or request-body model. Independent of GPU libraries and K1. | Idle/partial/malformed/fresh/parked request and timeout-order owners; resource bounds, repeated timeout then success, whole/per-unit and forged-HIR owners. No performance promise. | Same specification/HTTP/ABI set as H2; pkg.web docs only if a package-level configuration surface is separately adopted. |
 | R1 | Existing opaque `resource`, explicit `borrow` / `borrow mut`, `resource_ref`, and native FFI | Package-owned model/session handles; existing Move and exactly-once Drop rules. Model allocations and copies remain explicit operations. All native errors use Result; absent observations use Option. No Backend trait, hidden GPU allocation or compiler-known model kind. | Existing library-boundary plan 17; concrete engine package owns its native dependencies and interface identity. | A real wrapper must demonstrate constructor failure, partial load rollback, borrowed-output lifetime, explicit release failure, and Drop before claiming readiness. | Existing sources remain unchanged unless a reproduced language/library gap is found. |
 | P1 | Existing `process.command`, `start` / `start_scope`, `poll`, reads, status, signalling, reap and release | Explicit child owner; caller-provided byte scratch; bounded waits and cleanup steps. Linux child_scope can certify managed descendant absence; a root exit or group scan cannot. No hidden supervisor/thread. | Plans 49/50. Linux/WSL2 production; native macOS supports the common child subset, not Linux-only scope acquisition. | Mock worker completion/cancellation/crash/descendant controls; real GPU release is a separate engine acceptance. | Existing process contracts reused, not redefined. |
@@ -137,10 +137,14 @@ wait policy, not a hard real-time guarantee.
 ### Stream writes
 
 For positive mode, validate inputs, snapshot the budget, then commit the lazy
-head at the same valid first-write attempt as H1. Use per-call nonblocking
-`sendmsg` flags and readiness waits so no individual write can bypass the
-budget; do not toggle the socket's shared open-file-description flags. Retain
-the platform SIGPIPE policy. Zero mode keeps ordinary blocking writes. Check the
+head at the same valid first-write attempt as H1. Linux uses per-call nonblocking
+`sendmsg` flags. macOS uses a checked, once-latched O_NONBLOCK setup on the
+stream's exclusively owned socket, with no descriptor alias published by Align.
+Both paths use readiness waits so no individual write can bypass the budget.
+Retain the platform SIGPIPE policy. A never-configured stream keeps H1's ordinary
+blocking operation. A latched macOS stream later reset to zero uses indefinite
+readiness waits without deadline clocks; Drop closes it without restoring a
+socket that cannot return to another owner. Check the
 remaining budget before every I/O/wait and after its return before accepting
 the native result; expiration wins at that observation point, including over
 simultaneous native success/error. EINTR, EAGAIN and short writes use the same
@@ -421,17 +425,16 @@ memory. No model/download/driver change is part of this design task.
 | Generic/interface/whole and per-unit | New operations participate in type/effect validation, all IR walks, cloning, producer checks and codec rejection. Existing generic/imported helper patterns cover both setters and borrowed stream payload. Interface edit/revert and native declarations agree; no new type tag. |
 | Runtime provenance / allocation | Borrow caller bytes only for the send; no opaque-owner mutability exemption and no K1 dependency. H1 allocator/pointer assertions and ordinary/alloc-count runtime ABI/export parity; H2/H3 scalar fields introduce no additional owner. |
 | Native ABI and backend lowering | Two proposed keys `HttpStreamWriteTimeoutNs` / `HttpServerAcceptTimeoutNs`, symbols `align_rt_http_stream_write_timeout_ns` / `align_rt_http_server_accept_timeout_ns`, both A04 `i32(ptr, i64)`. Conservative HostState effect records; no purity/capture attribute inferred from the name. Exact declarations and export owner. |
-| OS state and overlap | Deadline state is per owner, not global. Checked latched listener-mode setup, timeout immediately after successful setup, later zero mode, accepted-fd blocking setup and failure cleanup are native owners. Per-call send/recv flags never mutate shared state; SO_REUSEPORT servers have distinct listeners. Existing child_scope exclusivity and signal/reap semantics are reused by the reference, not modified. |
+| OS state and overlap | Deadline state is per owner, not global. Checked latched listener-mode setup, timeout immediately after successful setup, later zero mode, accepted-fd blocking setup and failure cleanup are native owners. Linux per-call send and timed recv flags never mutate shared state; macOS stream setup mutates only its sole owned connection. SO_REUSEPORT servers have distinct listeners. Existing child_scope exclusivity and signal/reap semantics are reused by the reference, not modified. |
 | Application composition | Mock text/audio/batch workers, one device-admission witness, delayed/failed release, cancel-before/after completion, full queue, subscriber gaps/disconnect, stalled control reader, oversized pipe output, retired-but-open download accounting, invalid artifact path and restart epoch. Model-quality/real GPU tests remain external adapter acceptance. |
 | Resource/performance promise | Only H1 promises reduced copy/allocation work. The benchmark below and structural owners close it; other rows have correctness/finite-bound owners, not speculative speed claims. |
 
 H2/H3 are new operations across compiler layers. Follow the existing exhaustive
-variant machinery rather than adding catch-all arms. The interface codec must
-allocate its actual tags and version at implementation time against that HEAD;
-do not reserve guessed bytes now. That implementation records complete semantic
-and malformed byte vectors under the existing codec contract before publication.
-Neither a new persisted format nor source-callable native symbol ships in this
-design-only change.
+variant machinery rather than adding catch-all arms. Inspect the actual interface
+representation before assigning tags or changing its version. These operations
+are reconstructed from rechecked source bodies under format 17, so their runtime
+keys add no encoded HIR tags or new canonical layout. Existing malformed-codec
+owners and imported whole/per-unit source owners cover that unchanged boundary.
 
 ### H1 implementation closure
 
@@ -448,10 +451,100 @@ pre-commit extent rejection, arbitrary native octets and caller buffer reuse.
 Existing runtime lazy-head/finish/reject tests and the driver `m12_http_stream`
 and `apps_web_stream` targets own the unchanged language/framework path.
 No IR shape, ownership summary, native symbol or interface format changes.
-The H2/H3/C1 rows are explicitly deferred to their complete capabilities.
+The H3/C1 rows are explicitly deferred to their complete capabilities.
 The writer, discriminating native owners and standalone performance/resource
 harness are one proof boundary: splitting the harness would publish the copy
 claim before its token regression and allocation controls exist.
+
+### H2 implementation boundary
+
+H2 adds `ExprKind::HttpStreamWriteTimeoutNs { stream, timeout_ns }` and the
+matching MIR rvalue, runtime key and A04 status call. The receiver remains a
+bound exclusive local; argument evaluation completes once before mutation.
+Every depth/clone/effect/escape/move/provenance walk must follow both operands,
+and checked HIR must independently check the receiver, signed i64 argument,
+unit/Error result and Impure effect. Setter success/failure never nulls a source.
+Existing finish/reject cleanup still consumes once on every Result exit.
+
+The interface carries rechecked source bodies and existing signature/effect
+records, not encoded HIR operation tags. H2 therefore allocates no type tag,
+changes no canonical byte layout, and keeps interface format 17. Imported and
+generic whole/per-unit owners exercise source-body reconstruction and malformed
+interface rejection under that unchanged codec. The runtime ABI ledger and
+native declaration/export goldens gain exactly one A04 operation.
+
+The runtime stores `write_timeout_ns: i64` (initially zero). One statically
+dispatched writer seam supplies send, poll and remaining-budget observations.
+Linux timed sends use per-call MSG_DONTWAIT. macOS first latches O_NONBLOCK
+with checked F_GETFL/F_SETFL on its sole owned connection; subsequent writes use
+writev and readiness waits. Setup is part of the same budget: check before/after,
+record successful mutation before selecting Timeout, and poison on setup failure.
+A failed F_SETFL is not assumed atomic: no later I/O occurs and the sole owned
+fd closes through Drop/consuming cleanup; no fallible restoration is attempted.
+No fd alias is published by the stream, and it never returns to the context/pool.
+Zero on an unlatched stream retains H1 blocking output with no clock observation;
+zero after macOS latching retries EAGAIN via poll(-1), including EINTR, with no
+budget/clock and no flag restoration. Close-only finish and empty send do not
+latch or poll. The production test uses a TCP peer, with an additional Unix-socket
+native control for the same platform mode transition.
+Finish/reject pass their complete serialized bytes through the same bounded
+writer. Native parameterized owners close the budget/result/partial/wait cross
+product, setter preservation and consuming cleanup; source owners close argument
+order, Result control exits, borrowed receiver rejection and whole/per-unit parity.
+Owner commands: `scripts/cargo.sh test -p align_runtime --features alloc-count
+--lib http_stream_`; `scripts/cargo.sh test -p align_driver --test
+http_stream_write_budget --test m12_http_stream`; `scripts/cargo.sh test -p
+align_mir --lib hir_body_validator_native`; `scripts/cargo.sh test -p
+align_codegen_llvm --lib runtime_abi`; `scripts/test-runtime-abi-exports.sh`.
+The native mode/result cross product supplies negative and multi-invalid
+precedence evidence, including F_SETFL mutation followed by failure.
+
+This is one complete source-to-native capability, likely over 1,000 handwritten
+lines once discriminating owners and synchronized public prose are included.
+Splitting compiler producers, native consumers or the finite-write acceptance
+would leave a dormant chain and duplicate its ownership/ABI proof. No new handle,
+parallel model or default finite timeout is introduced.
+
+H2 platform correction (2026-10-04): the first local macOS stalled-peer owner
+blocked inside sendmsg despite MSG_DONTWAIT. A bounded Python syscall reproduction
+confirmed both TCP and Unix-stream behavior, and the process sample is retained
+outside the worktree. Apple's public kernel `sosendcheck` checks MSG_NBIO for a
+full send buffer; that private flag is not adopted as a user-space contract.
+The owner-local latch above replaces the invalid per-call assumption. This is a
+platform implementation strategy change, requiring a fresh independent review of
+this changed matrix before implementation, not a reopening of the source API.
+
+| Changed H2 cell | Required owner |
+| --- | --- |
+| Sole fd authority | respond_stream transfers ctx.fd to -1; stream never parks, returns or publishes its fd. Existing ctx/view and consuming stream owners; explicit source ownership prose. |
+| Setup before/after expiry | Inject F_GETFL/F_SETFL failure and success followed by expiry; success latches before Timeout, failure leaves native mode indeterminate and poisons, no send follows failure/expiry. |
+| Subsequent positive/zero | One successful setup across repeated sends; zero reset uses indefinitely blocking poll, retries EINTR/EAGAIN, observes no clock, and keeps SIGPIPE policy. Never-configured zero remains H1 path. |
+| Terminal paths | Timed send failure poisons; finish/reject consumes exactly once. Empty send and raw committed finish avoid setup, poll and clocks. Drop closes the sole fd without restoration. |
+| Platform native acceptance | Real stalled TCP/Unix reader times out on macOS/Linux; macOS configured-zero sends complete with a draining peer; default token regression comparisons remain required. |
+
+
+### H2/H3 eager receiver reservation repair
+
+The H2 independent code review found that loading a non-borrow-bearing native
+handle before its scalar argument does not by itself preserve that handle.
+An argument can consume or replace the bound owner before the native action.
+This is a finite, call-local repair for the two new setters, not an expansion
+of the deferred K1 interprocedural view work.
+
+| Changed cell | Exact strategy and owner |
+| --- | --- |
+| Receiver completion | Register only the receiver expression of `HttpStreamWriteTimeoutNs` and `HttpServerAcceptTimeoutNs` in `prepare_mutable_call_snapshots`, in both the argument and mutable-place sets. The existing completion path records its exact local place despite having no storage header or borrowed leaves. No type-wide snapshot rule is added. |
+| Later eager invalidation | Existing move, Drop and assignment invalidation marks that reservation; validation at the enclosing setter rejects consumption and replacement before MIR/native execution. Source-order evaluation stays unchanged. Whole/per-unit owners cross direct move, direct replacement, nested expression, branch and loop joins. |
+| Successful action and retirement | Reuse a dedicated exact receiver selector in preparation and `retire_builtin_action_input`. Validate children first, then retire only that setter receiver's snapshot after the successful action boundary. A different enclosing operation's reservation remains live. The setter result is unit/Error and retains no handle. |
+| Noninvalidating work | Ordinary scalar work, mutation of the same owner's deadline field, independent-owner destruction and a setter followed by consumption remain valid. Whole/per-unit positive controls distinguish call-scoped protection from a permanent borrow. |
+| Terminating argument | Return, propagated error or loop exit that prevents the setter action does not validate an action that never occurs. Cleanup may consume the owner on that terminal path. MIR owners verify that no setter call is emitted for unconditional termination; branch owners validate only paths that reach it. |
+| Interfaces and runtime | Existing source reconstruction rechecks these reservations in whole/per-unit compilation. No new HIR variant, native ABI, runtime state, ownership summary, allocation or interface format is introduced by this repair. |
+
+A fresh inspection-only independent review of this changed safety strategy
+and its receiver lifetime boundaries completed clean before implementation. After the
+P1 repair, review the revised complete H2 candidate once under the repository's
+P1 redesign rule. H3 applies the same explicit receiver registration and owners
+before its first complete candidate review.
 
 ## Performance acceptance
 
@@ -494,12 +587,23 @@ Raw CSVs and binary hashes are retained under the session's
 remain in `align-http-stream-timing-20261004-v2`. `bench/http_stream/compare.py`
 can summarize completed runs without repeating their measurements.
 
+H2 default-zero transport comparison against H1 used the same native release
+harness and paired procedure. No token metric fell outside the independently
+measured baseline envelope; token p50 ratios ranged 0.992–1.008. Separate
+configured-budget allocation measurement observed zero send allocations in all
+20 cases. Configured timing includes the first owner-local mode transition and
+every deadline checkpoint; its raw results are retained separately, without
+claiming that an explicitly bounded write has no clock/setup overhead. Evidence
+directories are `align-http-write-budget-timing-20261004-default` and
+`align-http-write-budget-timing-20261004-configured`; the separate allocation CSV
+is `align-http-write-budget-allocations-configured.csv`.
+
 ## Delivery and file map
 
 | Capability | Concrete files expected to change | Useful completion boundary |
 | --- | --- | --- |
 | 1. H1 borrowed vectored stream output | `crates/align_runtime/src/lib.rs`; `crates/align_driver/tests/m12_http_stream.rs`, `apps_web_stream.rs`; a focused benchmark under `bench/`; the H1 source documents in the ledger | Existing binary and SSE callers get the complete copy/allocation improvement together. No dormant producer or new public source operation. |
-| 2. H2 bounded stream writes | `crates/align_sema/src/lib.rs`, `hir.rs`, `hir_depth.rs`, `replay_clone.rs`; `crates/align_mir/src/lib.rs`, `validate_hir.rs`, `producer.rs`, `runtime_key.rs`, `print.rs`; `crates/align_interface/src/codec.rs` and format owner; `crates/align_codegen_llvm/src/lib.rs`, `runtime_abi.rs`, ABI golden; runtime and stream owners; ledger-listed normative documents/mirrors | A slow reader can no longer hold a caller indefinitely once that caller explicitly configures the budget. All source/interface/native consumers land together. |
+| 2. H2 bounded stream writes | `crates/align_sema/src/lib.rs`, `hir.rs`, `hir_depth.rs`, `replay_clone.rs`; `crates/align_mir/src/lib.rs`, `validate_hir.rs`, `producer.rs`, `runtime_key.rs`, `print.rs`; unchanged format-17 imported-source owner; `crates/align_codegen_llvm/src/lib.rs`, `runtime_abi.rs`, ABI golden; runtime and stream owners; ledger-listed normative documents/mirrors | A slow reader can no longer hold a caller indefinitely once that caller explicitly configures the budget. All source/interface/native consumers land together. |
 | 3. H3 bounded complete-request acquisition | The same setter/codec/ABI owner files, runtime accept/read/poll owners, `m11_http_server.rs`, native timeout owners; ledger-listed normative documents/mirrors | A controller can perform finite accept/supervision cycles and remain responsive to failed or partial requests. Useful without an inference engine. |
 | 4. C1 reference composition | Planned `examples/jobs/` or a focused `apps/` example with mock worker sources, one driver owner and English/Japanese usage guide | Runnable bounded submit/observe/cancel/artifact flow with explicit process ownership; separate text, live binary and batch fixtures. Final example paths are selected before that capability starts. |
 | 5. Concrete engine / media packages | Package design and native wrapper files chosen from actual voice/media consumers; no speculative compiler edits | Each wrapper carries complete ownership, supported formats/cancellation/release and a real consumer. Add a shared jobs or media API only when this evidence justifies it. |
@@ -513,8 +617,9 @@ service gate or GPU benchmark is required for an unrelated HTTP change.
 
 H1 preserves source behavior and updates the HTTP and pkg.web English/Japanese
 writer resource records. The language specification and ABI inventory retain
-their existing operations. H2/H3 remain proposals; the ledger lists their full
-implementation-time documentation set. The external align-llm register receives an answer,
+their existing operations. H2 adds its explicit setter and runtime ABI row across
+the ledger-listed specification set. H3 retains its proposed implementation-time
+documentation set. The external align-llm register receives an answer,
 left uncommitted; consumer code, fixtures, branches and adoption stay untouched.
 
 ## External evidence and limits
