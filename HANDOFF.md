@@ -54,6 +54,10 @@ estimate. Queries use fixed native scratch, allocate no Align/Rust heap storage,
 and retain no descriptor/right. Compiler/ABI/native and whole/per-unit/cache
 owners qualify the boundary. Budget admission, cgroup adjustment, VRAM and
 consumer adoption remain application-owned.
+Plan102 admits line bodies before output growth, avoiding the extra allocation
+for over-cap input. One pending CR scalar makes the inclusive 64MiB stripped-
+body cap independent of refill boundaries; binary/count/surplus, native-error,
+backing-sentinel and actual-allocation owners qualify it. No API or ABI changes.
 Continue bounded library/transport improvements and measured
 execution/storage/startup work against demonstrated consumers.
 Real voice/media engine integration and GPU qualification belong to their

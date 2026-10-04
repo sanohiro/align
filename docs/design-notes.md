@@ -2090,6 +2090,15 @@ preserves descriptor authority, including growth by `read_line`, and changes no
 allocation failure policy or owner lifetime. Capacity is not physical-memory
 admission or a guarantee that future growth succeeds.
 
+## Admitting line bodies before growth
+
+Plan 102 checks the existing inclusive 64 MiB stripped-body limit before an
+output append. Append-then-reject can double backing storage for a rejected
+span even when the published read window stays unchanged. A possible trailing
+CR needs only one scalar until LF, another byte or EOF classifies it; an exact-
+cap CRLF line therefore does not depend on native refill segmentation. Existing
+larger reservations remain valid; this is not a total heap or RSS ceiling.
+
 ## Mutating existing storage without hidden copies
 
 Plans 65 and 66 complete the existing mutable-storage model. Typed `slice<u8>.set_*` stores

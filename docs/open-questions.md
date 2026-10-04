@@ -4709,7 +4709,8 @@ fast-systems-programming needs that any Align user hits, not engine-specific.
    Slice A7):** the buffered READER (`r.buffered()`, the read dual of the buffered writer;
    lookahead is explicitly constructed, drain-before-fd interleaving contract) +
    `r.read_line(mut buffer)` (body-with-terminator-stripped into the buffer, returns
-   consumed-incl-terminator, 0 = EOF; grows to a 64 MiB line cap) + the generic
+   consumed-incl-terminator, 0 = EOF; grows to an inclusive 64 MiB stripped-body
+   cap, admitted before append independently of refill boundaries; plan 102) + the generic
    `bytes.as_str()` validating view (the view sibling of `bytes.to_string()`). Zero-copy
    views into the lookahead and a bespoke buffer `line()` op were both rejected. Perf
    follow-up recorded: json.decode's redundant re-validation of invariant str input.

@@ -190,7 +190,9 @@ have capacity at least length. Puts, appends and successful `read_line` retain
 old capacity or raise it to the new initialized/body length. Short reads, EOF
 and failed line reads retain capacity; decoded/returned buffers publish their
 initialized length as capacity. `read_line` may grow beyond the old window;
-capacity limits bounded fills. Hidden allocator spare bytes do not enlarge
+its inclusive 64 MiB stripped-body cap is checked before append, independently
+of refill boundaries (plan 102). Existing larger reservations remain. Capacity
+limits bounded fills. Hidden allocator spare bytes do not enlarge
 that window. The result promises neither physical-memory residency nor future
 growth success; existing best-effort construction and terminal growth/OOM
 policies remain ([plan 87](../87-buffer-read-capacity-plan.md)).
