@@ -45,6 +45,8 @@ one separate transfer allocation. Unbuffered/small-capacity readers retain fixed
 scratch storage. The shared writer, error precedence and subsequent reader/writer
 state remain unchanged; native cursor/buffering parity and actual allocation
 counters qualify the refinement. No throughput or RSS improvement is claimed.
+Plan100 provides a bounded binary SHA-256 CLI example through existing crypto,
+reader/writer and CLI operations, with checked output and file/stdin parity.
 Continue bounded library/transport improvements and measured
 execution/storage/startup work against demonstrated consumers.
 Real voice/media engine integration and GPU qualification belong to their

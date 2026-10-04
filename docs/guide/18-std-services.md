@@ -145,6 +145,25 @@ certifying a stable filesystem snapshot. See the
 [incremental SHA-256 contract](../impl/std-design/crypto.md#incremental-sha-256)
 for the ownership and provider-failure rules.
 
+The runnable [file_sha256 example](../../examples/file_sha256.align) adds CLI
+selection, an input byte cap and checked stdout writes:
+
+```bash
+./target/debug/alignc build examples/file_sha256.align
+./file_sha256 --file scene.mp4 --max-input-bytes 4294967296
+./file_sha256 < scene.mp4
+```
+
+An omitted or empty `--file` reads stdin. `--max-input-bytes` defaults to 1 GiB
+and accepts 0..2305843009213693951; zero admits only empty input. Parsing and cap
+validation precede opening a file or reading stdin. Use `--help` for usage.
+The example reuses one 64 KiB window and emits one lowercase 64-character digest
+plus newline only after EOF. A cap violation returns `Error.Code(-1)` before
+updating the digest, but the read may already have consumed one window past the
+cap. Input errors emit no digest. A stdout error propagates and may leave a
+digest prefix; the byte cap does not bound blocking input time. Existing crypto
+provider/allocation failures remain hard errors as specified above.
+
 ## `std.log`
 
 A logger owns the writer you give it and uses an explicit minimum level. This program writes `[INFO] ready` to stderr and suppresses the debug record:
