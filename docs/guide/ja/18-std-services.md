@@ -115,6 +115,45 @@ pub fn main() -> Result<(), Error> {
 
 Argon2id には OpenSSL 3.2 で追加されたプロバイダが必要で、古い環境では出力を生成せず `Error.Code` を返します。AEAD の復号では、認証に失敗すると平文を一切返しません。`constant_time_equal` は同じ長さの入力に対し、内容によらず一定時間で比較します。長さ自体は公開情報として扱います。BLAKE3 は、適切な監査済みのシステムエンジンが利用できるまで提供しません。
 
+### ファイルを少しずつハッシュする
+
+大きな成果物は、ファイル全体を保持せず、同じバイトバッファを再利用して
+`crypto.sha256_stream()` に渡せます。次のプログラムは `artifact.bin` をハッシュします。
+
+```align
+import std.crypto
+import std.encoding
+import std.fs
+
+fn sha256_reader(input: reader) -> Result<string, Error> {
+    digest := crypto.sha256_stream()
+    mut chunk := buffer(65536)
+    loop {
+        n := input.read(chunk)?
+        if n == 0 { break }
+        digest.update(chunk.bytes())
+    }
+    result := digest.finish()
+    return Ok(encoding.hex_encode(result[..]))
+}
+
+pub fn main() -> Result<(), Error> {
+    input := fs.open("artifact.bin")?
+    print(sha256_reader(input)?)
+    return Ok(())
+}
+```
+
+読み取りのたびに、バッファの初期化済みバイト列を置き換えます。Update がその
+バイト列を借用するのは呼び出し中だけなので、次の読み取りで同じ領域を使えます。
+入力はバイナリで、NUL や UTF-8 でないバイトを変換する必要はありません。
+`finish()` はダイジェストを消費し、所有権のある32バイトの結果を返します。
+16進エンコードも所有権のある文字列を作ります。`?` はファイルを開く際や
+読み取る際のエラーを伝播し、通常の Drop が reader と未完了のダイジェストを
+解放します。ハッシュの対象は実際に読み取ったバイト列であり、ファイルシステムの
+安定したスナップショットを保証しません。所有権とプロバイダ失敗時の規則は
+[増分 SHA-256 の契約](../../impl/std-design/ja/crypto.md#増分-sha-256)を参照してください。
+
 ## `std.log`
 
 ロガーには、出力先の writer と出力する最低レベルを渡します。次のプログラムは標準エラーに `[INFO] ready` を書き、Debug の行は出力しません。

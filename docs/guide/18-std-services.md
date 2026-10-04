@@ -106,6 +106,45 @@ pub fn main() -> Result<(), Error> {
 
 `std.crypto` provides OS random bytes, SHA-256/512, HMAC-SHA256, HKDF-SHA256, Argon2id, AES-256-GCM, ChaCha20-Poly1305, and constant-time equality. It wraps OpenSSL instead of inventing cryptography. Argon2id requires the provider added in OpenSSL 3.2; on an older engine that operation returns `Error.Code` without producing output. AEAD open is all-or-nothing: authentication failure releases no plaintext. `constant_time_equal` is constant-time over equal-length contents; input length is public. BLAKE3 is not exposed until a suitable audited system engine exists.
 
+### Hash a file incrementally
+
+For a large artifact, feed a reused byte buffer into `crypto.sha256_stream()`
+instead of retaining the whole file. This program hashes `artifact.bin`:
+
+```align
+import std.crypto
+import std.encoding
+import std.fs
+
+fn sha256_reader(input: reader) -> Result<string, Error> {
+    digest := crypto.sha256_stream()
+    mut chunk := buffer(65536)
+    loop {
+        n := input.read(chunk)?
+        if n == 0 { break }
+        digest.update(chunk.bytes())
+    }
+    result := digest.finish()
+    return Ok(encoding.hex_encode(result[..]))
+}
+
+pub fn main() -> Result<(), Error> {
+    input := fs.open("artifact.bin")?
+    print(sha256_reader(input)?)
+    return Ok(())
+}
+```
+
+Each read replaces the buffer's initialized bytes. Update borrows those bytes
+only for the call; the next read can reuse the same storage. Input is binary,
+so NUL and non-UTF-8 bytes need no conversion. `finish()` consumes the digest
+and produces an owned 32-byte result; hex encoding produces an owned string.
+`?` propagates file/read errors and ordinary Drop releases the reader and any
+unfinished digest. A digest describes the bytes actually read, rather than
+certifying a stable filesystem snapshot. See the
+[incremental SHA-256 contract](../impl/std-design/crypto.md#incremental-sha-256)
+for the ownership and provider-failure rules.
+
 ## `std.log`
 
 A logger owns the writer you give it and uses an explicit minimum level. This program writes `[INFO] ready` to stderr and suppresses the debug record:
