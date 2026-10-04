@@ -477,7 +477,7 @@ fn timeout_kills_the_row_and_reports_only_bounded_evidence() {
             "}\n",
         ),
     );
-    let output = scratch.run(&["test", "main.align", "--timeout-ns=50000000"]);
+    let output = scratch.run(&["test", "main.align", "--timeout-ns=2000000000"]);
     assert_eq!(
         output.status.code(),
         Some(1),
@@ -487,7 +487,7 @@ fn timeout_kills_the_row_and_reports_only_bounded_evidence() {
         output.stdout,
         concat!(
             "FAIL timeout_test::slow\n",
-            "reason: timed out after 50000000 ns\n",
+            "reason: timed out after 2000000000 ns\n",
             "test result: FAILED. 0 passed; 1 failed\n",
         )
         .as_bytes(),
@@ -517,13 +517,13 @@ fn timeout_removes_group_descendants_before_reporting() {
             "}\n",
         ),
     );
-    let output = scratch.run(&["test", "main.align", "--timeout-ns=500000000"]);
+    let output = scratch.run(&["test", "main.align", "--timeout-ns=2000000000"]);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(
         output.stdout,
         concat!(
             "FAIL descendant_timeout::tree\n",
-            "reason: timed out after 500000000 ns\n",
+            "reason: timed out after 2000000000 ns\n",
             "test result: FAILED. 0 passed; 1 failed\n",
         )
         .as_bytes()

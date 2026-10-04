@@ -22,10 +22,10 @@ key|Base64urlDecode|base64url_decode|IndirectStorage|declare i32 @align_rt_base6
 key|Base64urlEncode|base64url_encode|ArgRead|declare { ptr, i64 } @align_rt_base64url_encode(ptr readonly captures(none), i64) #3
 key|BoundsFail|bounds_fail|FailNoReturn|declare void @align_rt_bounds_fail(i64, i64) #1
 key|BufferAppend|buffer_append|IndirectStorage|declare void @align_rt_buffer_append(ptr, ptr, i64) #2
-key|BufferAppendFilled|buffer_append_filled|IndirectStorage|declare void @align_rt_buffer_append_filled(ptr, i64, i8) #2
+key|BufferAppendFilled|buffer_append_filled|IndirectStorage|declare void @align_rt_buffer_append_filled(ptr, i64, i8 zeroext) #2
 key|BufferBytes|buffer_bytes|IndirectStorage|declare void @align_rt_buffer_bytes(ptr, ptr) #2
 key|BufferCapacity|buffer_capacity|IndirectStorage|declare i64 @align_rt_buffer_capacity(ptr) #2
-key|BufferFilled|buffer_filled|AllocNew|declare noalias ptr @align_rt_buffer_filled(i64, i8) #0
+key|BufferFilled|buffer_filled|AllocNew|declare noalias ptr @align_rt_buffer_filled(i64, i8 zeroext) #0
 key|BufferFree|buffer_free|IndirectStorage|declare void @align_rt_buffer_free(ptr) #2
 key|BufferLen|buffer_len|IndirectStorage|declare i64 @align_rt_buffer_len(ptr) #2
 key|BufferNew|buffer_new|AllocNew|declare noalias ptr @align_rt_buffer_new(i64) #0
@@ -89,7 +89,7 @@ key|CommandInheritFile|command_inherit_file|HostState|declare i32 @align_rt_comm
 key|CommandInheritNamespace|command_inherit_namespace|HostState|declare i32 @align_rt_command_inherit_namespace(ptr, ptr, i64) #2
 key|CommandMaxCapture|command_max_capture|HostState|declare void @align_rt_command_max_capture(ptr, i64) #2
 key|CommandNew|command_new|IndirectStorage|declare noalias ptr @align_rt_command_new(ptr, i64, ptr, i64) #2
-key|CommandNewSession|command_new_session|HostState|declare void @align_rt_command_new_session(ptr, i8) #2
+key|CommandNewSession|command_new_session|HostState|declare void @align_rt_command_new_session(ptr, i8 zeroext) #2
 key|CommandRun|command_run|HostState|declare i32 @align_rt_command_run(ptr, ptr) #2
 key|CommandRunBytes|command_run_bytes|HostState|declare i32 @align_rt_command_run_bytes(ptr, ptr) #2
 key|CommandStart|command_start|HostState|declare i32 @align_rt_command_start(ptr, ptr) #2
@@ -141,8 +141,8 @@ key|FsCreateDir|fs_create_dir|HostState|declare i32 @align_rt_fs_create_dir(ptr,
 key|FsCreatePrivateTempDir|fs_create_private_temp_dir|HostState|declare i32 @align_rt_fs_create_private_temp_dir(ptr, i64, ptr) #2
 key|FsCursorFree|fs_cursor_free|HostState|declare void @align_rt_fs_cursor_free(ptr) #2
 key|FsCursorNext|fs_cursor_next|HostState|declare i32 @align_rt_fs_cursor_next(ptr, ptr, ptr) #2
-key|FsDirectoryAccess|fs_directory_access|HostState|declare i32 @align_rt_fs_directory_access(ptr, i8, i8, i8, ptr) #2
-key|FsDirectoryAccessAt|fs_directory_access_at|HostState|declare i32 @align_rt_fs_directory_access_at(ptr, ptr, i64, i8, i8, i8, ptr) #2
+key|FsDirectoryAccess|fs_directory_access|HostState|declare i32 @align_rt_fs_directory_access(ptr, i8 zeroext, i8 zeroext, i8 zeroext, ptr) #2
+key|FsDirectoryAccessAt|fs_directory_access_at|HostState|declare i32 @align_rt_fs_directory_access_at(ptr, ptr, i64, i8 zeroext, i8 zeroext, i8 zeroext, ptr) #2
 key|FsDirectoryCreateDir|fs_directory_create_dir|HostState|declare i32 @align_rt_fs_directory_create_dir(ptr, ptr, i64, i32) #2
 key|FsDirectoryCreateNew|fs_directory_create_new|HostState|declare i32 @align_rt_fs_directory_create_new(ptr, ptr, i64, ptr) #2
 key|FsDirectoryCreateSymlink|fs_directory_create_symlink|HostState|declare i32 @align_rt_fs_directory_create_symlink(ptr, ptr, i64, ptr, i64) #2
@@ -470,7 +470,7 @@ unkeyed|F64TextWrite|IndirectStorage|declare i64 @align_rt_f64_text_write(double
 unkeyed|TestLaunchRecvV1|IndirectStorage|declare i32 @align_rt_test_launch_recv_v1(i32, ptr) #2
 unkeyed|TestFdCloexecV1|IndirectStorage|declare i32 @align_rt_test_fd_cloexec_v1(i32) #2
 unkeyed|TestAckV1|IndirectStorage|declare i32 @align_rt_test_ack_v1(i32, i32) #2
-unkeyed|TestReportV1|IndirectStorage|declare i32 @align_rt_test_report_v1(i32, i8, i8, i32, i32) #2
+unkeyed|TestReportV1|IndirectStorage|declare i32 @align_rt_test_report_v1(i32, i8 zeroext, i8 zeroext, i32, i32) #2
 unkeyed|TcpConnSetIoTimeout|HostState|declare i32 @align_rt_tcp_conn_set_io_timeout(ptr, i64) #2
 rt-lto-guarded|align_rt_str_ends_with,align_rt_str_eq,align_rt_str_eq_ignore_case,align_rt_str_starts_with
 attributes #0 = { nofree nounwind memory(inaccessiblemem: readwrite) }

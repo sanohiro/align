@@ -360,6 +360,71 @@ fn selection_retains_symlink_spelling_and_never_recovers_a_vanished_driver() {
     assert!(!root.join("never-published").exists());
 }
 
+#[test]
+fn test_control_eof_does_not_end_a_live_row() {
+    for (script, reason) in [
+        (
+            "echo $$ > exec.pid; echo retained-output; echo retained-error >&2; exec /bin/sleep 30",
+            "timed out after 2000000000 ns",
+        ),
+        (
+            "echo $$ > exec.pid; echo retained-output; echo retained-error >&2; exec 1>&-; exec 2>&-; /bin/sleep 0.1; exit 0",
+            "exited with status 0; completion record: length",
+        ),
+    ] {
+        let stage = align_driver::ArtifactStage::temp("cc-control-eof").unwrap();
+        let root = stage.path();
+        let cc = driver(root);
+        fs::write(root.join("main.align"), format!(
+            "module control_eof\nimport std.process\ntest \"live\" {{\n  process.exec(\"/bin/sh\", [\"/bin/sh\", \"-c\", \"{script}\"][0..3])?\n}}\n",
+        )).unwrap();
+        let status = Process::spawn(
+            command(root)
+                .args(["test", "main.align", "--cc", &cc, "--timeout-ns=2000000000"])
+                .env("ALIGNC_CACHE", "off"),
+        )
+        .wait();
+        let stdout = fs::read_to_string(root.join("stdout")).unwrap();
+        let stderr = fs::read_to_string(root.join("stderr")).unwrap();
+        assert_eq!(status.code(), Some(1), "{stdout}\n{stderr}");
+        assert_eq!(
+            stdout,
+            format!(
+                "FAIL control_eof::live\nreason: {reason}\n--- stdout ---\nretained-output\n--- stderr ---\nretained-error\ntest result: FAILED. 0 passed; 1 failed\n",
+            ),
+            "live-row report: {stdout}\n{stderr}"
+        );
+        assert!(stderr.is_empty(), "{stderr}");
+        let pid = fs::read_to_string(root.join("exec.pid"))
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .expect("exec process publishes its pid");
+        // Observation only: the runner owns signalling and reap of the row.
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "row survived its terminal report"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        for entry in fs::read_dir(root).unwrap() {
+            let entry = entry.unwrap();
+            assert!(
+                !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".align-test-"),
+                "test stage survived the terminal report: {:?}",
+                entry.path()
+            );
+        }
+    }
+}
+
+
 mod residual_arguments {
     use super::*;
 

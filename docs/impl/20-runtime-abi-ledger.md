@@ -28,6 +28,35 @@ Historical vectors/version transitions and current shipped ABI inventories below
 remain baseline records, not alternate implementation contracts. In particular,
 plan 47 records the replacement ABI counts and rows.
 
+## Unsigned-byte C ABI arguments
+
+The typed registry records its narrow native arguments as unsigned bytes, matching
+Rust `u8`. LLVM uses `i8 zeroext` on both declarations and calls for x86_64 and
+Apple arm64/aarch64; Linux AArch64 uses plain `i8` on both. The already-resolved
+module triple selects this C ABI rule. It does not reuse Align-owned scalar
+boundary conventions or copy memory-effect optimization attributes to calls.
+No native row has a signed-byte argument or a narrow integer return.
+
+| Symbol | Zero-based unsigned-byte parameter ordinals |
+| --- | --- |
+| `align_rt_buffer_filled` | 1 |
+| `align_rt_buffer_append_filled` | 2 |
+| `align_rt_command_new_session` | 1 |
+| `align_rt_fs_directory_access` | 1, 2, 3 |
+| `align_rt_fs_directory_access_at` | 3, 4, 5 |
+| `align_rt_test_report_v1` | 1, 2 |
+
+All six rows remain outside the measured `--rt-lto` string-primitive subset.
+The checked-in declaration golden pins x86_64 Linux; the parameterized owner
+checks both declaration and call inventories on all four supported targets and
+Apple's `arm64` alias. The private test-control fingerprint is v3 and includes
+the unsigned-byte type, declaration/call scope and four-target policy results.
+The resolved target and compiler binary continue to bind normal codegen caches.
+Private test-control symbols remain forbidden source extern declarations.
+[Plan 96](96-test-control-peer-close.md) owns this correction and its runner
+peer-close consumer boundary. Public native symbols, widths and wire records do
+not change.
+
 ## Status and authority
 
 This is the exact native symbol/type/attribute appendix for L2b-a2-am-r and

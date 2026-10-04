@@ -725,7 +725,7 @@ pub fn emit_test_harness_object(
     let native = |key| {
         let abi = runtime_abi::unkeyed_runtime_abi(key);
         let function = abi.declare(&ctx, &module);
-        abi.apply_attributes(&ctx, function);
+        abi.apply_attributes(&ctx, function, &module.get_triple().as_str().to_string_lossy());
         function
     };
     let launch_recv = native(runtime_abi::UnkeyedRuntimeKey::TestLaunchRecvV1);
@@ -959,7 +959,7 @@ pub fn emit_test_harness_object(
         (&i32_ty.const_zero(), error_category_end),
         (&i32_ty.const_zero(), result_ok_end),
     ]);
-    let report_status = builder
+    let report_call = builder
         .build_call(
             report,
             &[
@@ -971,7 +971,10 @@ pub fn emit_test_harness_object(
             ],
             "report.status",
         )
-        .map_err(lower)?
+        .map_err(lower)?;
+    runtime_abi::unkeyed_runtime_abi(runtime_abi::UnkeyedRuntimeKey::TestReportV1)
+        .apply_call_attributes(&ctx, report_call, &module.get_triple().as_str().to_string_lossy());
+    let report_status = report_call
         .try_as_basic_value()
         .basic()
         .ok_or_else(|| CodegenError::Lowering("test completion report returned void".to_owned()))?
@@ -4171,7 +4174,7 @@ fn lower_prepared_module<'c>(
             abi.declare(ctx, module)
         };
         if !(rt_lto_skip_guarded && abi.is_rt_lto_guarded()) {
-            abi.apply_attributes(ctx, function);
+            abi.apply_attributes(ctx, function, &module.get_triple().as_str().to_string_lossy());
         }
         runtime_funcs.insert(key, function);
         runtime_physical_names.insert(
@@ -9050,7 +9053,7 @@ fn restore_rt_lto_guarded_attributes<'c>(
                 "--rt-lto: typed guarded runtime declaration {physical} is missing",
             ))
         })?;
-        abi.apply_attributes(ctx, function);
+        abi.apply_attributes(ctx, function, &module.get_triple().as_str().to_string_lossy());
     }
     Ok(())
 }
@@ -10208,6 +10211,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
 
     fn runtime(&self, key: RuntimeKey) -> FunctionValue<'c> {
         self.runtime_funcs[&key]
+    }
+
+    fn apply_native_call_attributes(&self, key: RuntimeKey, call: CallSiteValue<'c>) {
+        runtime_abi::runtime_abi(key).apply_call_attributes(
+            self.ctx, call, &self.module.get_triple().as_str().to_string_lossy(),
+        );
     }
 
     fn enum_union_shape(&self, enum_id: u32) -> Result<UnionShape<'c>, CodegenError> {
@@ -16686,10 +16695,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     args.push(self.operand(fill)?.into());
                     RuntimeKey::BufferFilled
                 } else { RuntimeKey::BufferNew };
-                self.builder
+                let call = self.builder
                     .build_call(self.runtime(key), &args, "buf")
-                    .map_err(|e| self.err(e))?
-                    .try_as_basic_value().basic().expect("buffer_new returns a pointer")
+                    .map_err(|e| self.err(e))?;
+                self.apply_native_call_attributes(key, call);
+                call.try_as_basic_value().basic().expect("buffer_new returns a pointer")
             }
             Rvalue::BufferBytes(buf) => {
                 // The runtime writes the `{ptr,len}` view into a stack slot; load it back.
@@ -16907,9 +16917,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let bp = self.operand(buffer)?.into();
                 let len = self.operand(length)?.into();
                 let byte = self.operand(value)?.into();
-                self.builder
+                let call = self.builder
                     .build_call(self.runtime(RuntimeKey::BufferAppendFilled), &[bp, len, byte], "")
                     .map_err(|e| self.err(e))?;
+                self.apply_native_call_attributes(RuntimeKey::BufferAppendFilled, call);
                 return Ok(None);
             }
             Rvalue::BytesSet { bytes, offset, value, scalar, be } => {
@@ -17213,6 +17224,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
 
                 };
                 let call = self.builder.build_call(self.runtime(key),&native_args,"process.live").map_err(|e|self.err(e))?;
+                self.apply_native_call_attributes(key, call);
                 if !kind.fallible() && (kind.scratch() || *kind==ProcessLiveKind::CommandNewSession) {
                     self.ctx.i8_type().const_zero().into()
                 } else { call.try_as_basic_value().basic().ok_or_else(||self.err("live process ABI result"))? }
@@ -17266,8 +17278,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     FsTreeKind::WriterSetMode => RuntimeKey::FsWriterSetMode,
                     FsTreeKind::FileSetMode => RuntimeKey::FsFileSetMode,
                 };
-                self.builder.build_call(self.runtime(key), &native_args, "fs_tree")
-                    .map_err(|error| self.err(error))?.try_as_basic_value().basic()
+                let call = self.builder.build_call(self.runtime(key), &native_args, "fs_tree")
+                    .map_err(|error| self.err(error))?;
+                self.apply_native_call_attributes(key, call);
+                call.try_as_basic_value().basic()
                     .ok_or_else(|| self.err("filesystem ABI result"))?
             }
             Rvalue::FsCreateDir { path } => {
@@ -19099,6 +19113,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .builder
                     .build_call(self.runtime(*key), &argv, "call")
                     .map_err(|error| self.err(error))?;
+                self.apply_native_call_attributes(*key, call);
                 return Ok(call.try_as_basic_value().basic());
             }
             Rvalue::Call(DirectCall::Program(name), args) => {
@@ -19175,6 +19190,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .builder
                     .build_call(callee, &argv, "call")
                     .map_err(|e| self.err(e))?;
+                if self.extern_abi.contains_key(name)
+                    && let Some(id) = runtime_abi::runtime_abi_for_symbol(name.as_str())
+                {
+                    runtime_abi::runtime_abi_by_id(id).apply_call_attributes(
+                        self.ctx, cs, &self.module.get_triple().as_str().to_string_lossy(),
+                    );
+                }
                 if !self.extern_abi.contains_key(name) {
                     add_scalar_call_facts(
                         self.ctx,
@@ -38704,6 +38726,77 @@ fn main() -> i32 = 0
     }
 
     #[test]
+    fn native_unsigned_byte_calls_cover_dedicated_and_compatible_extern_consumers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = concat!(
+            "import std.process\nimport std.fs\n",
+            "fn bytes(value: u8) -> u8 { mut b := buffer.filled(1, value)\n",
+            " b.append_filled(1, value)\n return b.bytes()[1] }\n",
+            "fn session(enabled: bool) { c := process.command(\"/bin/true\", [\"true\"])\n c.new_session(enabled) }\n",
+            "fn access(d: fs.directory, m: fs.access_mode) -> Result<bool, Error> = d.access(m)\n",
+            "fn relative(d: fs.directory, m: fs.access_mode) -> Result<bool, Error> = d.access_at(\"x\", m)\n",
+            "extern \"C\" fn align_rt_command_new_session(command: raw, enabled: u8)\n",
+            "fn native(command: raw, enabled: u8) { unsafe { align_rt_command_new_session(command, enabled) } }\n",
+            "fn main() {}\n",
+        );
+        let program = mir(source);
+        let ir = emit_llvm_ir(
+            &program,
+            &BuildTarget::Baseline,
+            Profile::Dev,
+            false,
+            &[],
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+        let triple = ir
+            .lines()
+            .find(|line| line.starts_with("target triple = "))
+            .ok_or("target triple missing from emitted IR")?;
+        let extends = triple.contains("x86_64") || triple.contains("apple");
+        for (symbol, ordinals, expected_calls) in [
+            ("align_rt_buffer_filled", vec![1], 1),
+            ("align_rt_buffer_append_filled", vec![2], 1),
+            ("align_rt_command_new_session", vec![1], 2),
+            ("align_rt_fs_directory_access", vec![1, 2, 3], 1),
+            ("align_rt_fs_directory_access_at", vec![3, 4, 5], 1),
+        ] {
+            let needle = format!("@{symbol}(");
+            let calls: Vec<_> = ir
+                .lines()
+                .filter(|line| line.contains("call ") && line.contains(&needle))
+                .collect();
+            assert_eq!(
+                calls.len(),
+                expected_calls,
+                "{symbol} producers missing: {ir}"
+            );
+            let declaration = ir
+                .lines()
+                .find(|line| line.starts_with("declare ") && line.contains(&needle))
+                .ok_or_else(|| format!("missing declaration: {symbol}"))?;
+            for line in calls.into_iter().chain([declaration]) {
+                let arguments = line
+                    .split_once(&needle)
+                    .ok_or("native argument list missing")?
+                    .1
+                    .split(')')
+                    .next()
+                    .ok_or("native argument list end missing")?;
+                for (ordinal, argument) in arguments.split(',').enumerate() {
+                    assert_eq!(
+                        argument.contains("zeroext"),
+                        extends && ordinals.contains(&ordinal),
+                        "native byte convention: {line}"
+                    );
+                    assert!(!argument.contains("signext"), "signed native byte: {line}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn scalar_boundary_facts_cover_direct_indirect_task_and_per_unit_calls() {
         let source = "Choice { A, B }\n\
             fn bool_id(value: bool) -> bool = value\n\
@@ -39478,7 +39571,7 @@ fn main() -> i32 = 0
             runtime_abi::UnkeyedRuntimeKey::F32ToBits,
         );
         let scalar_function = scalar.declare(&scalar_ctx, &scalar_module);
-        scalar.apply_attributes(&scalar_ctx, scalar_function);
+        scalar.apply_attributes(&scalar_ctx, scalar_function, "x86_64-unknown-linux-gnu");
         let scalar_ir = scalar_module.print_to_string().to_string();
         assert!(
             attr_group_of(&scalar_ir, "align_rt_f32_to_bits").contains("memory(none)"),

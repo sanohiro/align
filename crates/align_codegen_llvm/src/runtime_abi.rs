@@ -4,12 +4,12 @@ use align_mir::RuntimeKey;
 use inkwell::context::Context;
 use inkwell::module::Module;
 use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FunctionType};
-use inkwell::values::FunctionValue;
+use inkwell::values::{CallSiteValue, FunctionValue};
 use std::collections::HashSet;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeType {
-    I8,
+    U8,
     I32,
     I64,
     F32,
@@ -813,6 +813,24 @@ fn runtime_effects(id: RuntimeAbiId) -> RuntimeEffects {
     }
 }
 
+/// C unsigned-byte arguments are caller-extended on x86_64 and Apple ARM64.
+/// AAPCS64 on Linux instead lets the callee consume the low byte. Keep this separate
+/// from Align-owned scalar boundary facts and memory-effect optimization promises.
+fn native_u8_zeroext(triple: &str) -> bool {
+    let mut fields = triple.split('-');
+    matches!(
+        (fields.next(), fields.next()),
+        (Some("x86_64"), _) | (Some("aarch64" | "arm64"), Some("apple"))
+    )
+}
+
+const NATIVE_U8_ABI_TARGETS: [&str; 4] = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-macosx11.0",
+    "aarch64-apple-macosx11.0",
+];
+
 impl RuntimeAbi {
     pub(super) fn function_type<'c>(self, ctx: &'c Context) -> FunctionType<'c> {
         let spec = shape_spec(self.shape);
@@ -831,7 +849,24 @@ impl RuntimeAbi {
         module.add_function(self.symbol, self.function_type(ctx), None)
     }
 
-    pub(super) fn apply_attributes<'c>(self, ctx: &'c Context, function: FunctionValue<'c>) {
+    pub(super) fn apply_attributes<'c>(
+        self,
+        ctx: &'c Context,
+        function: FunctionValue<'c>,
+        triple: &str,
+    ) {
+        if native_u8_zeroext(triple) {
+            for (ordinal, ty) in shape_spec(self.shape).params.iter().enumerate() {
+                if *ty == NativeType::U8 {
+                    super::add_enum_attr(
+                        ctx,
+                        function,
+                        inkwell::attributes::AttributeLoc::Param(ordinal as u32),
+                        "zeroext",
+                    );
+                }
+            }
+        }
         let effects = runtime_effects(self.key);
         if effects.returns_fresh {
             super::add_enum_attr(
@@ -875,6 +910,20 @@ impl RuntimeAbi {
                     "captures",
                     super::CAPTURES_NONE,
                 );
+            }
+        }
+    }
+
+    /// Only ABI facts belong on the call: memory effects remain declaration promises.
+    pub(super) fn apply_call_attributes(self, ctx: &Context, call: CallSiteValue<'_>, triple: &str) {
+        if native_u8_zeroext(triple) {
+            for (ordinal, ty) in shape_spec(self.shape).params.iter().enumerate() {
+                if *ty == NativeType::U8 {
+                    call.add_attribute(
+                        inkwell::attributes::AttributeLoc::Param(ordinal as u32),
+                        ctx.create_enum_attribute(super::enum_kind_id("zeroext"), 0),
+                    );
+                }
             }
         }
     }
@@ -3244,7 +3293,7 @@ pub(super) fn unkeyed_runtime_abi(key: UnkeyedRuntimeKey) -> RuntimeAbi {
 pub(super) fn test_control_fingerprint() -> Vec<u8> {
     fn native_type_tag(value: NativeType) -> u8 {
         match value {
-            NativeType::I8 => 0,
+            NativeType::U8 => 6,
             NativeType::I32 => 1,
             NativeType::I64 => 2,
             NativeType::F32 => 3,
@@ -3309,7 +3358,13 @@ pub(super) fn test_control_fingerprint() -> Vec<u8> {
         }
     }
 
-    let mut bytes = b"align-test-control-runtime-abi-v2\0".to_vec();
+    let mut bytes = b"align-test-control-runtime-abi-v3\0".to_vec();
+    bytes.extend_from_slice(b"declaration-and-call-u8-extension\0");
+    for triple in NATIVE_U8_ABI_TARGETS {
+        bytes.extend_from_slice(&(triple.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(triple.as_bytes());
+        bytes.push(u8::from(native_u8_zeroext(triple)));
+    }
     for key in [
         UnkeyedRuntimeKey::TestLaunchRecvV1,
         UnkeyedRuntimeKey::TestFdCloexecV1,
@@ -3392,7 +3447,7 @@ pub(super) fn native_extern_abi_matches<'c>(
 
 fn native_type<'c>(ctx: &'c Context, ty: NativeType) -> BasicTypeEnum<'c> {
     match ty {
-        NativeType::I8 => ctx.i8_type().into(),
+        NativeType::U8 => ctx.i8_type().into(),
         NativeType::I32 => ctx.i32_type().into(),
         NativeType::I64 => ctx.i64_type().into(),
         NativeType::F32 => ctx.f32_type().into(),
@@ -3810,11 +3865,11 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
         },
         RuntimeAbiShape::BufferAppendFilled => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
-            params: &[NativeType::Ptr, NativeType::I64, NativeType::I8],
+            params: &[NativeType::Ptr, NativeType::I64, NativeType::U8],
         },
         RuntimeAbiShape::BufferFilled => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,
-            params: &[NativeType::I64, NativeType::I8],
+            params: &[NativeType::I64, NativeType::U8],
         },
         RuntimeAbiShape::A49 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,
@@ -4225,8 +4280,8 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
             params: &[
                 NativeType::I32,
-                NativeType::I8,
-                NativeType::I8,
+                NativeType::U8,
+                NativeType::U8,
                 NativeType::I32,
                 NativeType::I32,
             ],
@@ -4302,17 +4357,17 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr, params: &[NativeType::Ptr, NativeType::I32, NativeType::I64],
         },
         RuntimeAbiShape::A131 => RuntimeAbiShapeSpec {
-            ret: NativeReturn::Void, params: &[NativeType::Ptr, NativeType::I8],
+            ret: NativeReturn::Void, params: &[NativeType::Ptr, NativeType::U8],
         },
         RuntimeAbiShape::A132 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32, params: &[NativeType::Ptr, NativeType::I32, NativeType::I64, NativeType::Ptr],
         },
         RuntimeAbiShape::A136 => RuntimeAbiShapeSpec {
-            ret: NativeReturn::I32, params: &[NativeType::Ptr, NativeType::I8, NativeType::I8, NativeType::I8, NativeType::Ptr],
+            ret: NativeReturn::I32, params: &[NativeType::Ptr, NativeType::U8, NativeType::U8, NativeType::U8, NativeType::Ptr],
         },
         RuntimeAbiShape::A138 => RuntimeAbiShapeSpec { ret: NativeReturn::I64, params: &[NativeType::Ptr, NativeType::Ptr, NativeType::I64, NativeType::I64, NativeType::I64] },
         RuntimeAbiShape::A137 => RuntimeAbiShapeSpec {
-            ret: NativeReturn::I32, params: &[NativeType::Ptr, NativeType::Ptr, NativeType::I64, NativeType::I8, NativeType::I8, NativeType::I8, NativeType::Ptr],
+            ret: NativeReturn::I32, params: &[NativeType::Ptr, NativeType::Ptr, NativeType::I64, NativeType::U8, NativeType::U8, NativeType::U8, NativeType::Ptr],
         },
         RuntimeAbiShape::A135 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32, params: &[NativeType::I32,NativeType::I64,NativeType::Ptr],
@@ -4613,12 +4668,139 @@ mod tests {
     }
 
     #[test]
+    fn native_unsigned_byte_abi_matches_declarations_calls_and_cache_policy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use inkwell::attributes::AttributeLoc;
+        use inkwell::values::BasicMetadataValueEnum;
+        let rows = [
+            ("align_rt_buffer_append_filled", vec![2]),
+            ("align_rt_buffer_filled", vec![1]),
+            ("align_rt_command_new_session", vec![1]),
+            ("align_rt_fs_directory_access", vec![1, 2, 3]),
+            ("align_rt_fs_directory_access_at", vec![3, 4, 5]),
+            ("align_rt_test_report_v1", vec![1, 2]),
+        ];
+        let actual: Vec<_> = runtime_abis()
+            .filter_map(|abi| {
+                let ordinals: Vec<_> = super::shape_spec(abi.shape)
+                    .params
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, ty)| (*ty == super::NativeType::U8).then_some(i))
+                    .collect();
+                (!ordinals.is_empty()).then_some((abi.symbol, ordinals))
+            })
+            .collect();
+        assert_eq!(actual, rows);
+        for (triple, extends) in [
+            ("x86_64-unknown-linux-gnu", true),
+            ("aarch64-unknown-linux-gnu", false),
+            ("x86_64-apple-macosx11.0", true),
+            ("aarch64-apple-macosx11.0", true),
+            ("arm64-apple-macosx26.0", true),
+        ] {
+            let ctx = inkwell::context::Context::create();
+            let module = ctx.create_module("native_unsigned_bytes");
+            module.set_triple(&inkwell::targets::TargetTriple::create(triple));
+            let caller = module.add_function("caller", ctx.void_type().fn_type(&[], false), None);
+            let builder = ctx.create_builder();
+            builder.position_at_end(ctx.append_basic_block(caller, "entry"));
+            for abi in runtime_abis() {
+                let function = abi.declare(&ctx, &module);
+                abi.apply_attributes(&ctx, function, triple);
+                let args: Vec<BasicMetadataValueEnum<'_>> = function
+                    .get_type()
+                    .get_param_types()
+                    .iter()
+                    .map(|ty| match ty {
+                        BasicMetadataTypeEnum::IntType(ty) => ty.const_all_ones().into(),
+                        BasicMetadataTypeEnum::FloatType(ty) => ty.const_zero().into(),
+                        BasicMetadataTypeEnum::PointerType(ty) => ty.const_null().into(),
+                        _ => panic!("unexpected native parameter type: {ty:?}"),
+                    })
+                    .collect();
+                let call = builder.build_call(function, &args, "")?;
+                abi.apply_call_attributes(&ctx, call, triple);
+                let expected = rows
+                    .iter()
+                    .find(|(symbol, _)| *symbol == abi.symbol)
+                    .map(|(_, ordinals)| ordinals.as_slice())
+                    .unwrap_or(&[]);
+                for ordinal in 0..function.count_params() {
+                    let location = AttributeLoc::Param(ordinal);
+                    let want = extends && expected.contains(&(ordinal as usize));
+                    for name in ["zeroext", "signext"] {
+                        let kind = crate::enum_kind_id(name);
+                        let want = want && name == "zeroext";
+                        assert_eq!(
+                            function.get_enum_attribute(location, kind).is_some(),
+                            want,
+                            "declaration {triple} {} parameter {ordinal} {name}",
+                            abi.symbol
+                        );
+                        assert_eq!(
+                            call.get_enum_attribute(location, kind).is_some(),
+                            want,
+                            "call {triple} {} parameter {ordinal} {name}",
+                            abi.symbol
+                        );
+                    }
+                    assert_eq!(
+                        call.count_attributes(location),
+                        u32::from(want),
+                        "native call acquired optimization facts: {}",
+                        abi.symbol
+                    );
+                }
+                assert_eq!(call.count_attributes(AttributeLoc::Return), 0);
+                assert_eq!(call.count_attributes(AttributeLoc::Function), 0);
+                if !expected.is_empty() {
+                    assert!(!abi.is_rt_lto_guarded());
+                }
+            }
+            builder.build_return(None)?;
+            module.verify().map_err(|error| error.to_string())?;
+        }
+        let bytes = super::test_control_fingerprint();
+        let mut prefix =
+            b"align-test-control-runtime-abi-v3\0declaration-and-call-u8-extension\0".to_vec();
+        for (triple, extends) in [
+            ("x86_64-unknown-linux-gnu", 1),
+            ("aarch64-unknown-linux-gnu", 0),
+            ("x86_64-apple-macosx11.0", 1),
+            ("aarch64-apple-macosx11.0", 1),
+        ] {
+            prefix.extend_from_slice(&(triple.len() as u32).to_le_bytes());
+            prefix.extend_from_slice(triple.as_bytes());
+            prefix.push(extends);
+        }
+        assert!(
+            bytes.starts_with(&prefix),
+            "private cache ABI policy drifted"
+        );
+        let symbol = b"align_rt_test_report_v1";
+        let row = bytes
+            .windows(symbol.len())
+            .position(|candidate| candidate == symbol)
+            .ok_or("report ABI symbol missing from fingerprint")?
+            + symbol.len();
+        assert_eq!(
+            &bytes[row..row + 10],
+            &[1, 5, 0, 0, 0, 1, 6, 6, 1, 1],
+            "report fingerprint must retain both unsigned-byte parameters"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn runtime_abi_registry_matches_checked_in_declaration_golden() {
         let ctx = inkwell::context::Context::create();
         let module = ctx.create_module("runtime_abi_golden");
+        let triple = "x86_64-unknown-linux-gnu";
+        module.set_triple(&inkwell::targets::TargetTriple::create(triple));
         for abi in runtime_abis() {
             let function = abi.declare(&ctx, &module);
-            abi.apply_attributes(&ctx, function);
+            abi.apply_attributes(&ctx, function, triple);
         }
 
         let ir = module.print_to_string().to_string();
