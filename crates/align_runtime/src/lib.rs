@@ -11172,7 +11172,37 @@ const _: unsafe extern "C" fn(*mut Logger, i32, *mut Builder) -> i32 = align_rt_
 const _: unsafe extern "C" fn(*mut Logger) -> i32 = align_rt_log_flush;
 const _: unsafe extern "C" fn(*mut Logger) = align_rt_log_free;
 
-/// `io.copy(r, w)` — stream all of `r` into `w` through a fixed 64 KiB buffer (memory is
+// Both producers must retain the portable pump's write boundaries and error cursor semantics.
+const _: () = assert!(READ_LINE_CHUNK == BUF_WRITER_CAP);
+
+/// Produce one initialized copy window. Eligible readers lend their existing lookahead until the
+/// synchronous writer returns; other readers overwrite the portable scratch buffer as before.
+fn io_copy_window<'a>(
+    reader: &'a mut Reader,
+    scratch: Option<&'a mut Buffer>,
+) -> Result<&'a [u8], i64> {
+    let invalid = -i64::from(AL_INVALID);
+    if let Some(buffer) = scratch {
+        buffer.len = 0;
+        let n = unsafe { align_rt_io_reader_read(reader, buffer) };
+        if n < 0 {
+            return Err(n);
+        }
+        let count = usize::try_from(n).map_err(|_| invalid)?;
+        return buffer.data.get(..count).ok_or(invalid);
+    }
+    if reader.start == reader.filled {
+        reader.refill().map_err(|status| -i64::from(status))?;
+    }
+    let count = reader.filled.checked_sub(reader.start).ok_or(invalid)?.min(READ_LINE_CHUNK);
+    let end = reader.start.checked_add(count).ok_or(invalid)?;
+    let bytes = reader.buf.get(reader.start..end).ok_or(invalid)?;
+    // The reference read consumes this chunk before writer_write, even if that write fails.
+    reader.start = end;
+    Ok(bytes)
+}
+
+/// `io.copy(r, w)` — stream all of `r` into `w` through a fixed 64 KiB window (memory is
 /// O(buffer), never O(file size)), returning the number of bytes transferred, or `-(status)` on
 /// error (the errno mapped through [`io_error_to_status`], sign-encoded like
 /// [`align_rt_io_reader_read`]). Both handles are **borrowed** — neither fd is closed here, so the
@@ -11181,10 +11211,9 @@ const _: unsafe extern "C" fn(*mut Logger) = align_rt_log_free;
 /// left in `w` flush on its `flush()` / `Drop`, like any other `w.write` (this does not force a
 /// flush — that stays the caller's one way, `w.flush()`).
 ///
-/// v1 is this portable fixed-buffer loop (the reference implementation). A Linux `sendfile` /
-/// `splice` fast path (file → pipe/socket) would dispatch on the fd kinds at the marked point
-/// below — post-M9 (`docs/open-questions.md` "Transparent zero-copy I/O"), validated against this
-/// loop and without changing the signature.
+/// A buffered reader lends its already-reserved lookahead; other readers use fallible scratch
+/// storage. Kernel-transfer dispatch remains deferred: it must preserve this portable loop's
+/// lookahead, buffering and cursor behavior on both success and error.
 ///
 /// # Safety
 /// `r` must be a valid `Reader` pointer and `w` a valid `Writer` pointer for the call.
@@ -11193,38 +11222,32 @@ pub unsafe extern "C" fn align_rt_io_copy(r: *mut Reader, w: *mut Writer) -> i64
     if r.is_null() || w.is_null() {
         return -(AL_INVALID as i64);
     }
-    // A fixed 64 KiB transfer buffer (matches `BUF_WRITER_CAP`) — the point is O(buffer) memory,
-    // independent of the file size. `try_reserve` so a hostile/OOM environment fails softly
-    // (EINVAL) instead of aborting the process.
-    let mut data: Vec<u8> = Vec::new();
-    if data.try_reserve_exact(BUF_WRITER_CAP).is_err() {
-        return -(AL_INVALID as i64);
-    }
-    let mut buf = Buffer { data: data.into(), cap: BUF_WRITER_CAP, len: 0 };
+    let reader = unsafe { &mut *r };
+    // Refill cannot reserve once this private capacity invariant holds. Neither producer lends
+    // its uninitialized tail, and the returned borrow ends before the next read/refill.
+    let mut scratch = if reader.buffered && reader.buf.capacity() >= READ_LINE_CHUNK {
+        None
+    } else {
+        let mut data: Vec<u8> = Vec::new();
+        if data.try_reserve_exact(BUF_WRITER_CAP).is_err() {
+            return -i64::from(AL_INVALID);
+        }
+        Some(Buffer { data: data.into(), cap: BUF_WRITER_CAP, len: 0 })
+    };
 
-    // Fast-path dispatch site (post-M9): on Linux, if `rfd` is a regular file and `w`'s fd is a
-    // pipe/socket, a `sendfile`/`splice` loop would replace the read+write below — same result,
-    // same O(buffer) bound, no signature change. v1 always takes the portable loop.
     let mut total: i64 = 0;
     loop {
-        // `reader_read` appends into the supplied Buffer. Reuse this allocation as a fresh transfer
-        // chunk each time; otherwise later reads grow the buffer and `writer_write` keeps sending
-        // bytes from its beginning instead of the newly appended chunk.
-        buf.len = 0;
-        // Go through the reader's one read path rather than reading its fd directly. In particular,
-        // a buffered reader may hold bytes that a preceding `read_line` fetched past its terminator;
-        // those lookahead bytes are logically next in the stream and must be copied before fd-fresh
-        // bytes (or before reporting EOF).
-        let n = unsafe { align_rt_io_reader_read(r, &mut buf) };
-        if n < 0 {
-            return n; // already encoded as `-(status)` by the shared reader path
-        }
-        if n == 0 {
+        let bytes = match io_copy_window(reader, scratch.as_mut()) {
+            Ok(bytes) => bytes,
+            Err(status) => return status,
+        };
+        if bytes.is_empty() {
             break; // EOF
         }
+        let Ok(n) = i64::try_from(bytes.len()) else { return -i64::from(AL_INVALID) };
         // Route the chunk through the writer so buffering + partial-write + EINTR handling is the
         // one shared implementation.
-        let s = unsafe { align_rt_io_writer_write(w, buf.data.as_ptr(), n) };
+        let s = unsafe { align_rt_io_writer_write(w, bytes.as_ptr(), n) };
         if s != 0 {
             return -(s as i64);
         }
@@ -31826,6 +31849,221 @@ mod tests {
     #[test]
     fn io_copy_null_handles_are_invalid_not_a_crash() {
         assert_eq!(unsafe { align_rt_io_copy(std::ptr::null_mut(), std::ptr::null_mut()) }, -(AL_INVALID as i64));
+    }
+
+    // Frozen portable pump from 36524f2a, used only as the state/allocation oracle. Keep the native
+    // read/write authorities shared; no production dispatch reaches this reference.
+    unsafe fn io_copy_portable_reference(r: *mut Reader, w: *mut Writer) -> i64 {
+        let mut data = Vec::new();
+        if data.try_reserve_exact(BUF_WRITER_CAP).is_err() {
+            return -i64::from(AL_INVALID);
+        }
+        let mut buffer = Buffer { data: data.into(), cap: BUF_WRITER_CAP, len: 0 };
+        let mut total = 0_i64;
+        loop {
+            buffer.len = 0;
+            let n = unsafe { align_rt_io_reader_read(r, &mut buffer) };
+            if n <= 0 { return if n < 0 { n } else { total }; }
+            let status = unsafe { align_rt_io_writer_write(w, buffer.data.as_ptr(), n) };
+            if status != 0 { return -i64::from(status); }
+            total = total.saturating_add(n);
+        }
+    }
+
+    struct CopyWindowFixture {
+        // Native shells borrow the Rust-owned descriptors; declaration order frees shells first.
+        reader: ReaderTestHandle,
+        writer: WriterTestHandle,
+        source: std::fs::File,
+        _destination: std::fs::File,
+        destination_path: std::path::PathBuf,
+        _root: FileFixtureDir,
+    }
+    impl CopyWindowFixture {
+        // Modes: 0 unbuffered, 1 reserved, 2 prior read_line lookahead, 3 small private capacity.
+        fn new(content: &[u8], mode: u8, buffered_writer: bool, read_error: bool, write_error: bool) -> Self {
+            use std::os::fd::AsRawFd;
+            let root = FileFixtureDir::new("copy-window");
+            let source_path = root.0.join("source");
+            let destination_path = root.0.join("destination");
+            std::fs::write(&source_path, content).unwrap();
+            std::fs::write(&destination_path, b"").unwrap();
+            let source = std::fs::OpenOptions::new().read(!read_error).write(read_error).open(&source_path).unwrap();
+            let destination = std::fs::OpenOptions::new().read(write_error).write(!write_error).open(&destination_path).unwrap();
+            let reader = ReaderTestHandle(Box::into_raw(Box::new(Reader::unbuffered(source.as_raw_fd(), false))));
+            let writer = WriterTestHandle(Box::into_raw(Box::new(Writer::generic_fd(destination.as_raw_fd(), false, buffered_writer))));
+            if mode == 3 {
+                let r = unsafe { &mut *reader.0 };
+                r.buffered = true;
+                r.buf = Vec::with_capacity(16);
+            } else if mode != 0 {
+                assert_eq!(unsafe { align_rt_io_reader_buffered(reader.0) }, reader.0);
+                if mode == 2 {
+                    let line = BufferTestHandle(align_rt_buffer_new(16));
+                    assert_eq!(unsafe { align_rt_io_reader_read_line(reader.0, line.0) }, 3);
+                    let line = unsafe { &*line.0 };
+                    assert_eq!(&line.data[..line.len], b"AB");
+                }
+            }
+            Self { reader, writer, source, _destination: destination, destination_path, _root: root }
+        }
+        fn cursor(&self) -> (i64, i64) {
+            use std::os::fd::AsRawFd;
+            let physical = unsafe { libc::lseek(self.source.as_raw_fd(), 0, libc::SEEK_CUR) };
+            assert!(physical >= 0);
+            let r = unsafe { &*self.reader.0 };
+            let pending = i64::try_from(r.filled - r.start).unwrap();
+            (physical - pending, physical)
+        }
+    }
+
+    #[test]
+    fn buffered_io_copy_windows_and_cursors() {
+        for size in [0, 1, BUF_WRITER_CAP - 1, BUF_WRITER_CAP, BUF_WRITER_CAP + 1, BUF_WRITER_CAP * 2 + 17] {
+            let body: Vec<u8> = (0..size).map(|n| u8::try_from(n % 256).unwrap()).collect();
+            for mode in 0..4 {
+                let content = if mode == 2 { [b"AB\n".as_slice(), body.as_slice()].concat() } else { body.clone() };
+                for buffered_writer in [false, true] {
+                    let fixture = CopyWindowFixture::new(&content, mode, buffered_writer, false, false);
+                    let reader = unsafe { &*fixture.reader.0 };
+                    let pointer = reader.buf.as_ptr();
+                    let capacity = reader.buf.capacity();
+                    assert_eq!(unsafe { align_rt_io_copy(fixture.reader.0, fixture.writer.0) }, i64::try_from(size).unwrap());
+                    assert_eq!(fixture.cursor(), (i64::try_from(content.len()).unwrap(), i64::try_from(content.len()).unwrap()));
+                    let reader = unsafe { &*fixture.reader.0 };
+                    assert_eq!(reader.buf.as_ptr(), pointer, "mode {mode}, size {size}");
+                    assert_eq!(reader.buf.capacity(), capacity);
+                    let probe = BufferTestHandle(align_rt_buffer_new(1));
+                    assert_eq!(unsafe { align_rt_io_reader_read(fixture.reader.0, probe.0) }, 0);
+                    assert_eq!(unsafe { align_rt_io_writer_write(fixture.writer.0, b"!".as_ptr(), 1) }, 0);
+                    assert_eq!(unsafe { align_rt_io_writer_flush(fixture.writer.0) }, 0);
+                    assert_eq!(std::fs::read(&fixture.destination_path).unwrap(), [body.as_slice(), b"!"].concat());
+                }
+            }
+        }
+        // Observe the borrowed window itself, including a consumed lookahead suffix and refills.
+        let content = [b"AB\n".as_slice(), &vec![0xff; BUF_WRITER_CAP * 2 + 17]].concat();
+        let fixture = CopyWindowFixture::new(&content, 2, false, false, false);
+        // Reject either single null handle while unread lookahead remains, before any native read.
+        let cursor = fixture.cursor();
+        assert_eq!(unsafe { align_rt_io_copy(fixture.reader.0, core::ptr::null_mut()) }, -i64::from(AL_INVALID));
+        assert_eq!(unsafe { align_rt_io_copy(core::ptr::null_mut(), fixture.writer.0) }, -i64::from(AL_INVALID));
+        assert_eq!(fixture.cursor(), cursor);
+        let reader = unsafe { &mut *fixture.reader.0 };
+        let base = reader.buf.as_ptr();
+        let capacity = reader.buf.capacity();
+        for (offset, expected) in [(3, BUF_WRITER_CAP - 3), (0, BUF_WRITER_CAP), (0, 20), (0, 0)] {
+            let bytes = io_copy_window(reader, None).unwrap();
+            assert_eq!(bytes.as_ptr(), base.wrapping_add(offset));
+            assert_eq!(bytes.len(), expected);
+            assert!(bytes.iter().all(|byte| *byte == 0xff));
+            assert_eq!(reader.buf.capacity(), capacity);
+        }
+    }
+
+    #[test]
+    fn buffered_io_copy_error_cursor_parity() {
+        let bad = -i64::from(io_error_to_status(&std::io::Error::from_raw_os_error(libc::EBADF)));
+        // Empty buffered writer accepts an exact window; overflow consumes the next window before
+        // flushing. A prefilled accumulator fails while flushing its prefix on the first chunk.
+        for (size, mode, buffered_writer, read_error, write_error, prefix, expected) in [
+            (BUF_WRITER_CAP * 2 + 17, 1, false, true, false, false, bad),
+            (BUF_WRITER_CAP * 2 + 17, 1, true, true, true, true, bad),
+            (BUF_WRITER_CAP * 2 + 17, 1, false, false, true, false, bad),
+            (BUF_WRITER_CAP * 2 + 17, 2, false, false, true, false, bad),
+            (BUF_WRITER_CAP, 1, true, false, true, false, i64::try_from(BUF_WRITER_CAP).unwrap()),
+            (BUF_WRITER_CAP + 17, 1, true, false, true, false, bad),
+            (BUF_WRITER_CAP * 2 + 17, 1, true, false, true, true, bad),
+            (BUF_WRITER_CAP * 2 + 17, 2, true, false, true, true, bad),
+        ] {
+            let body: Vec<u8> = (0..size).map(|n| u8::try_from(n / BUF_WRITER_CAP + 1).unwrap()).collect();
+            let content = if mode == 2 { [b"AB\n".as_slice(), body.as_slice()].concat() } else { body };
+            let mut observations = Vec::new();
+            for reference in [true, false] {
+                let fixture = CopyWindowFixture::new(&content, mode, buffered_writer, read_error, write_error);
+                if prefix { unsafe { (*fixture.writer.0).buf.extend_from_slice(b"prefix") }; }
+                let status = unsafe {
+                    if reference { io_copy_portable_reference(fixture.reader.0, fixture.writer.0) }
+                    else { align_rt_io_copy(fixture.reader.0, fixture.writer.0) }
+                };
+                assert_eq!(status, expected);
+                let cursor = fixture.cursor();
+                let before_flush = unsafe { (*fixture.writer.0).buf.clone() };
+                let probe = BufferTestHandle(align_rt_buffer_new(32));
+                let next = unsafe { align_rt_io_reader_read(fixture.reader.0, probe.0) };
+                let probe_bytes = unsafe { &*probe.0 };
+                let next_bytes = probe_bytes.data[..probe_bytes.len].to_vec();
+                let flush = unsafe { align_rt_io_writer_flush(fixture.writer.0) };
+                let after_flush = unsafe { (*fixture.writer.0).buf.clone() };
+                observations.push((status, cursor, before_flush, next, next_bytes, flush, after_flush,
+                    std::fs::read(&fixture.destination_path).unwrap()));
+            }
+            assert_eq!(observations[0], observations[1], "size={size} mode={mode} buffered={buffered_writer} prefix={prefix}");
+            let observed = &observations[1];
+            assert!(observed.6.is_empty());
+            if read_error {
+                assert_eq!(observed.1, (0, 0));
+                assert_eq!(observed.2.as_slice(), if prefix { b"prefix".as_slice() } else { b"".as_slice() });
+                assert_eq!(observed.3, bad);
+            } else if expected >= 0 {
+                assert_eq!(observed.2.len(), BUF_WRITER_CAP);
+                assert_eq!(i64::from(observed.5), -bad, "failure is deferred until explicit flush");
+                assert_eq!(observed.3, 0);
+            } else {
+                assert!(observed.2.is_empty(), "failed overflow flush clears its previous bytes");
+                let consumed = if mode == 2 { BUF_WRITER_CAP } else if buffered_writer && !prefix { size } else { BUF_WRITER_CAP };
+                assert_eq!(observed.1.0, i64::try_from(consumed).unwrap());
+            }
+        }
+    }
+
+    #[cfg(feature = "alloc-count")]
+    #[test]
+    fn buffered_io_copy_allocation_parity() {
+        let body = vec![0xff; BUF_WRITER_CAP * 2 + 17];
+        for mode in 0..4 {
+            let content = if mode == 2 { [b"AB\n".as_slice(), body.as_slice()].concat() } else { body.clone() };
+            for buffered_writer in [false, true] {
+                let fixture = CopyWindowFixture::new(&content, mode, buffered_writer, false, false);
+                let before = global_alloc_count();
+                let result = unsafe { align_rt_io_copy(fixture.reader.0, fixture.writer.0) };
+                let allocations = global_alloc_count() - before;
+                assert_eq!(result, i64::try_from(body.len()).unwrap());
+                assert_eq!(allocations, u64::from(mode == 0 || mode == 3), "mode={mode}, buffered={buffered_writer}");
+            }
+        }
+    }
+
+    /// Requested scratch storage only; no timing/RSS/general zero-copy claim. Fixture preparation,
+    /// reader/writer construction and native-provider allocation are outside the measured call.
+    #[cfg(feature = "alloc-count")]
+    #[test]
+    #[ignore]
+    fn buffered_io_copy_storage_probe() {
+        let body = vec![0xff; BUF_WRITER_CAP * 2 + 17];
+        for mode in [1, 2] {
+            let content = if mode == 2 { [b"AB\n".as_slice(), body.as_slice()].concat() } else { body.clone() };
+            for reference in [true, false] {
+                let fixture = CopyWindowFixture::new(&content, mode, false, false, false);
+                let reader = unsafe { &*fixture.reader.0 };
+                let pointer = reader.buf.as_ptr();
+                let capacity = reader.buf.capacity();
+                let before = global_alloc_count();
+                let result = unsafe {
+                    if reference { io_copy_portable_reference(fixture.reader.0, fixture.writer.0) }
+                    else { align_rt_io_copy(fixture.reader.0, fixture.writer.0) }
+                };
+                let allocations = global_alloc_count() - before;
+                let reader = unsafe { &*fixture.reader.0 };
+                assert_eq!(result, i64::try_from(body.len()).unwrap());
+                assert_eq!(allocations, u64::from(reference));
+                assert_eq!(reader.buf.as_ptr(), pointer);
+                assert_eq!(reader.buf.capacity(), capacity);
+                assert_eq!(std::fs::read(&fixture.destination_path).unwrap(), body);
+                eprintln!("mode={mode} reference={reference} allocations={allocations} scratch_requested_bytes={} retained_capacity={capacity} retained_pointer={pointer:p}",
+                    if reference { BUF_WRITER_CAP } else { 0 });
+            }
+        }
     }
 
     /// Allocation-inclusive model of the first read into a fresh 64 KiB buffer. The simulated
