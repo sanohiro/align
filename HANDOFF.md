@@ -26,8 +26,12 @@ a new process API or supervisor. The filesystem assessment in plan93 supplies a
 bounded byte-name tree summary example through existing std.fs; no new traversal
 API is needed. Plan94 removes the extra component-offset allocation from its
 retained-path operations while preserving admission and cleanup; measured walk
-latency remains within baseline spread. Continue with demonstrated CLI composition gaps. Real voice/media engine integration and
-GPU qualification belong to their consumers, which request demonstrated Align
+latency remains within baseline spread. Plan95 closes the CLI assessment through
+existing std.cli and rejects unsupported residual compiler arguments before native,
+source, cache or artifact work. Continue bounded library/transport improvements
+and measured execution/storage/startup work against demonstrated consumers.
+Real voice/media engine integration and GPU qualification belong to their
+consumers, which request demonstrated Align
 gaps; they are not the next provider implementation queue.
 
 [Plan 90](docs/impl/90-multimodal-library-foundation-plan.md) assesses voice/media
@@ -448,8 +452,8 @@ are deferred; consumer adoption remains external. The combined implementation is
 **Resumed std/pkg assessment:**
 [Plan 51](docs/impl/51-package-composition-review-plan.md) records the overlap
 assessment and existing-module priority: std.process, std.fs, then demonstrated
-std.cli gaps. Process and filesystem dispositions are in plans 92 and 93; CLI
-assessment is next. No new exec/tree/CLI package is selected. Reuse and responsibility
+std.cli gaps. Process, filesystem and CLI dispositions are in plans 92, 93 and 95.
+No new exec/tree/CLI package is selected. Reuse and responsibility
 review precede additions; this is separate from completed R65 delivery.
 
 `std.fs` retained raw tree access (R64) is implemented under

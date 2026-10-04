@@ -1,7 +1,7 @@
 # Standard-library and package responsibility review
 
-Status: **OWNER-RESUMED 2026-10-04 — process and filesystem assessments complete;
-CLI assessment remains pending.** The owner approved continuing independent
+Status: **OWNER-RESUMED 2026-10-04 — process, filesystem and CLI assessments complete.**
+The owner approved continuing independent
 capabilities through PR and merge. [Plan 92](92-process-composition-and-reap-storage.md)
 records the process disposition and bounded reap-scratch improvement.
 [Plan 93](93-retained-tree-composition.md) records the existing filesystem
@@ -9,6 +9,9 @@ composition and bounded tree summary example. This assessment selects no new
 process/traversal API, exec, tree or CLI package. [Plan 94](94-retained-path-component-storage.md)
 removes the repeated native path-offset allocation exposed by that walk without
 changing the retained filesystem contract.
+[Plan 95](95-cli-composition-and-argument-admission.md) closes the CLI assessment
+without a new library API and selects strict compiler argument admission for
+demonstrated silently ignored options.
 
 ## Direction
 

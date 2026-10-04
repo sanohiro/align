@@ -229,6 +229,14 @@ fn main() -> ExitCode {
     let cmd = args.get(1).map(String::as_str);
     let path = args.get(2);
 
+    let llvm_optimized = match validate_verb_arguments(&args) {
+        Ok(optimized) => optimized,
+        Err(error) => {
+            eprintln!("alignc: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let cc = match cc_path {
         Some(path) => {
             if !matches!(cmd, Some("build" | "run" | "size" | "test")) {
@@ -443,7 +451,7 @@ fn main() -> ExitCode {
         (Some("check-per-unit"), Some(p)) => run_check_per_unit(p),
         (Some("emit-interface"), Some(p)) => run_emit_interface(p),
         (Some("emit-mir"), Some(p)) => run_emit_mir(p),
-        (Some("emit-llvm"), Some(p)) => run_emit_llvm(p, args.get(3..).unwrap_or(&[]), target, profile,
+        (Some("emit-llvm"), Some(p)) => run_emit_llvm(p, llvm_optimized, target, profile,
             &exports, rt_lto),
         // `emit-obj <file> [out.o]` — codegen to an object file, no linking and no `main` required
         // (a library / benchmark kernel). Default output is `<stem>.o`.
@@ -507,6 +515,33 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Validate residual compiler arguments before native setup or source/artifact work.
+/// Returns the selected LLVM stage; other verbs return false. Run retains its program arguments.
+fn validate_verb_arguments(args: &[String]) -> Result<bool, String> {
+    let verb = args.get(1).map(String::as_str).unwrap_or("");
+    let rest = args.get(3..).unwrap_or(&[]);
+    if verb == "emit-llvm" {
+        return parse_stage(rest);
+    }
+    if verb == "test" && !rest.is_empty() {
+        return Err("test accepts exactly one entry path".to_string());
+    }
+    let invalid = match verb {
+        "check" | "check-per-unit" | "emit-interface" | "emit-mir" | "build" | "size" => rest.first(),
+        "cache" if args.get(2).is_some_and(|sub| sub == "clear") => rest.first(),
+        "fmt" => rest.iter().find(|arg| !matches!(arg.as_str(), "--write" | "-w")),
+        "explain-opt" => rest.iter().find(|arg| !matches!(arg.as_str(), "--verbose" | "-v")),
+        "emit-obj" => rest.iter().enumerate()
+            .find(|(index, arg)| *index != 0 || arg.starts_with('-'))
+            .map(|(_, arg)| arg),
+        _ => None,
+    };
+    if let Some(argument) = invalid {
+        return Err(format!("unexpected argument '{argument}' for '{verb}'"));
+    }
+    Ok(false)
 }
 
 #[derive(Clone, Copy)]
@@ -1980,18 +2015,9 @@ fn run_emit_mir(path: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_emit_llvm(path: &str, rest: &[String], target: BuildTarget, profile: Profile,
+fn run_emit_llvm(path: &str, optimized: bool, target: BuildTarget, profile: Profile,
     exports: &[String], rt_lto: bool) -> ExitCode {
-    // `--stage raw|optimized` picks the lens (default `raw` = today's semantics, the pre-opt IR
-    // codegen emitted). `optimized` runs the selected profile first (what LLVM did: inlined, fused,
-    // vectorized). Any other value is a hard argument error, not a panic.
-    let optimized = match parse_stage(rest) {
-        Ok(v) => v,
-        Err(bad) => {
-            eprintln!("alignc: unknown --stage '{bad}' (expected `raw` or `optimized`)");
-            return ExitCode::FAILURE;
-        }
-    };
+    // The early argument gate has already selected the raw/optimized lens.
     let Some(mut walk) = walk_or_report(path) else {
         return ExitCode::FAILURE;
     };
@@ -2033,30 +2059,27 @@ fn run_emit_llvm(path: &str, rest: &[String], target: BuildTarget, profile: Prof
 }
 
 /// Parse `--stage raw|optimized` (or `--stage=…`) out of the trailing `emit-llvm` args. Returns
-/// `Ok(true)` for `optimized`, `Ok(false)` for `raw` or when absent (the default lens), or
-/// `Err(bad_value)` for any other `--stage` value. A missing value after a bare `--stage` reads as
-/// the empty string, which is rejected like any other unknown value.
+/// `Ok(true)` for `optimized`, `Ok(false)` for `raw` or when absent (the default lens).
+/// A malformed/missing stage or unrecognized residual argument returns its complete diagnostic.
 fn parse_stage(rest: &[String]) -> Result<bool, String> {
     let mut i = 0;
     let mut optimized = false;
     while i < rest.len() {
         let a = &rest[i];
         let value = if let Some(v) = a.strip_prefix("--stage=") {
-            Some(v.to_string())
+            v
         } else if a == "--stage" {
             let v = rest.get(i + 1).map(String::as_str).unwrap_or("");
             i += 1;
-            Some(v.to_string())
+            v
         } else {
-            None
+            return Err(format!("unexpected argument '{a}' for 'emit-llvm'"));
         };
-        if let Some(v) = value {
-            optimized = match v.as_str() {
-                "raw" => false,
-                "optimized" => true,
-                other => return Err(other.to_string()),
-            };
-        }
+        optimized = match value {
+            "raw" => false,
+            "optimized" => true,
+            other => return Err(format!("unknown --stage '{other}' (expected `raw` or `optimized`)")),
+        };
         i += 1;
     }
     Ok(optimized)

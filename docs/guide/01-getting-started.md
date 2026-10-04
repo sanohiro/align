@@ -101,6 +101,13 @@ alignc db repair      --entry file.align  checksum-bound repair of one dirty mig
 alignc --version                          print the compiler version
 ```
 
+Unsupported trailing compiler arguments are errors before source or artifact
+work. For example, `alignc build file.align -o output` fails: `build` writes its
+normal executable name, while `emit-obj file.align output.o` accepts an explicit
+object path; use `./` for an output filename beginning with `-`.
+`run` keeps its trailing program arguments; use `--` to pass tokens
+such as `--profile` to your program.
+
 The `db` group only concerns projects that use the `pkg.db` package (chapter [23](23-packages.md)). The everyday loop is `check` while editing, `run` to try it, and `test` to run the tests you have declared. Chapter [16](16-toolchain.md#tests-with-coretest) shows how to write them. `emit-llvm` is worth knowing early: Align's design promises that ordinary code lowers to tight machine code, and `emit-llvm` is how you check that promise yourself.
 
 ## Reading a compile error
