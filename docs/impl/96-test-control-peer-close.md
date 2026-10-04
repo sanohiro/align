@@ -198,3 +198,15 @@ restores an actually usable macOS test consumer and closes the unsigned-byte
 native sibling class. EOF suppression, terminal wakeup and group cleanup share
 one row state and the same execution owners; separating their producer/consumer
 chain would duplicate that proof and leave intermediate consumers unusable.
+
+The final local owner gate exposed the same zombie-group class in the post-reap
+probe: a descendant's other parent may not have reaped it yet. On macOS,
+wait_process_group_empty now treats raw EPERM as a still-present group and
+retries within its unchanged deadline; only ESRCH proves absence. If EPERM
+persists at expiry it retains that exact error. Other errors and Linux behavior
+are unchanged. The existing cleanup_waits_honor_deadlines owner now creates a
+private group, keeps its killed direct child unreaped, proves the group cannot
+be reported absent or fail early, then reaps and proves absence. Its immediate
+ChildGuard also protects fixture failure cleanup. The real descendant-timeout
+owner closes the delayed other-parent consumer. This is the same local cleanup
+finding class and does not change the terminal/empty-group proof strategy.

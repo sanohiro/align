@@ -818,11 +818,10 @@ fn runtime_effects(id: RuntimeAbiId) -> RuntimeEffects {
 /// from Align-owned scalar boundary facts and memory-effect optimization promises.
 fn native_u8_zeroext(triple: &str) -> bool {
     let mut fields = triple.split('-');
-    match (fields.next(), fields.next()) {
-        (Some("x86_64"), _) => true,
-        (Some("aarch64" | "arm64"), Some("apple")) => true,
-        _ => false,
-    }
+    matches!(
+        (fields.next(), fields.next()),
+        (Some("x86_64"), _) | (Some("aarch64" | "arm64"), Some("apple"))
+    )
 }
 
 const NATIVE_U8_ABI_TARGETS: [&str; 4] = [

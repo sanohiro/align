@@ -817,22 +817,29 @@ fn reap_child(pid: i32, deadline: Instant) -> io::Result<ExitStatus> {
 
 fn wait_process_group_empty(pid: i32, deadline: Instant) -> io::Result<()> {
     loop {
-        match send_signal(-pid, 0) {
+        let permission_error = match send_signal(-pid, 0) {
             TargetSignal::Missing => return Ok(()),
-            TargetSignal::Sent => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(cleanup_timed_out());
-                }
-                // The leader is reaped immediately before this check. Keep the observation window
-                // finite so a persistent zombie or a subsequently reused PGID fails the row closed
-                // instead of hanging the runner or being followed into the next catalog row.
-                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+            TargetSignal::Sent => None,
+            // Darwin can retain an all-zombie group until its other parent reaps the last member.
+            // EPERM is never absence: wait for ESRCH within the same original deadline.
+            TargetSignal::Failed(error)
+                if cfg!(target_os = "macos") && error.raw_os_error() == Some(libc::EPERM) =>
+            {
+                Some(error)
             }
             TargetSignal::Failed(error) => return Err(error),
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(permission_error.unwrap_or_else(cleanup_timed_out));
         }
+        // The leader is reaped immediately before this check. Keep the observation window
+        // finite so a persistent zombie or a subsequently reused PGID fails the row closed
+        // instead of hanging the runner or being followed into the next catalog row.
+        std::thread::sleep(remaining.min(Duration::from_millis(1)));
     }
 }
+
 
 struct ChildGuard {
     pid: i32,
@@ -2233,18 +2240,62 @@ mod tests {
 
     #[test]
     fn cleanup_waits_honor_deadlines() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("5")
-            .spawn()
-            .expect("spawn cleanup probe");
-        let child_pid = i32::try_from(child.id()).expect("child pid fits i32");
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("5");
+        // This test owns a private group, so a zombie-only probe cannot include unrelated members.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            });
+        }
+        let mut child = command.spawn().expect("spawn cleanup probe");
+        // Unix Child::id comes from a positive pid_t; this native identity cannot exceed i32.
+        let child_pid = child.id() as i32;
+        let mut child_guard = ChildGuard::new(child_pid);
+        let fixture_deadline = cleanup_deadline();
         let child_deadline = Instant::now()
             .checked_add(Duration::from_millis(10))
             .expect("child deadline");
         let error = reap_child(child_pid, child_deadline).expect_err("live child reaped");
         assert_eq!(error.raw_os_error(), Some(libc::ETIMEDOUT));
         child.kill().expect("kill cleanup probe");
-        reap_child(child_pid, cleanup_deadline()).expect("reap cleanup probe");
+        loop {
+            if child_is_terminal_until(child_pid, fixture_deadline).expect("observe killed probe") {
+                break;
+            }
+            assert!(
+                Instant::now() < fixture_deadline,
+                "killed probe did not become terminal"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let zombie_deadline = Instant::now()
+            .checked_add(Duration::from_millis(10))
+            .expect("zombie group deadline")
+            .min(fixture_deadline);
+        let error = wait_process_group_empty(child_pid, zombie_deadline)
+            .expect_err("unreaped zombie group was classified as absent");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(if cfg!(target_os = "macos") {
+                libc::EPERM
+            } else {
+                libc::ETIMEDOUT
+            })
+        );
+        assert!(
+            Instant::now() >= zombie_deadline,
+            "zombie-only group did not wait within its deadline"
+        );
+        child_guard
+            .reap(fixture_deadline)
+            .expect("reap cleanup probe");
+        wait_process_group_empty(child_pid, fixture_deadline).expect("reaped private group is absent");
 
         let group = unsafe { libc::getpgrp() };
         let group_deadline = Instant::now()
