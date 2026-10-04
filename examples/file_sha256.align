@@ -1,0 +1,44 @@
+module main
+
+import std.cli
+import std.crypto
+import std.encoding
+import std.fs
+import std.io
+
+fn sha256_reader(input: reader, maximum: i64) -> Result<string, Error> {
+  digest := crypto.sha256_stream()
+  mut chunk := buffer(65536)
+  mut seen: i64 := 0
+  loop {
+    count := input.read(chunk)?
+    if count == 0 { break }
+    if count > maximum - seen { return Err(Error.Code(-1)) }
+    seen = seen + count
+    digest.update(chunk.bytes())
+  }
+  bytes := digest.finish()
+  return Ok(encoding.hex_encode(bytes[..]))
+}
+
+// Hash observed binary bytes, with no digest output until the complete input is admitted.
+pub fn main(args: array<str>) -> Result<(), Error> {
+  command := cli.command("file_sha256")
+  command.flag_str("file", "")
+  command.flag_i64("max-input-bytes", 1073741824)
+  command.flag_bool("help")
+  parsed := command.parse(args)?
+  if parsed.get_bool("help") {
+    print(command.usage())
+    return Ok(())
+  }
+  maximum := parsed.get_i64("max-input-bytes")
+  if maximum < 0 || maximum > 2305843009213693951 { return Err(Error.Invalid) }
+  path := parsed.get_str("file")
+  input := if path.len() == 0 { io.stdin } else { fs.open(path)? }
+  hex := sha256_reader(input, maximum)?
+  output := io.stdout
+  output.write(hex)?
+  output.write("\n")?
+  return Ok(())
+}

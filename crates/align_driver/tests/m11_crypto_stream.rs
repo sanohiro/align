@@ -3,6 +3,308 @@
 mod common;
 use common::*;
 
+// File-backed streams avoid pipe-pressure deadlocks. The child guard is armed immediately after
+// spawn, and one deadline includes execution, interrupted probes and kill/reap on failure.
+struct DigestExampleChild {
+    child: Option<std::process::Child>,
+    deadline: std::time::Instant,
+}
+impl DigestExampleChild {
+    fn spawn(command: &mut std::process::Command) -> Self {
+        use std::os::unix::process::CommandExt;
+        let child = command
+            .process_group(0)
+            .spawn()
+            .expect("spawn digest example owner");
+        Self {
+            child: Some(child),
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+        }
+    }
+    fn wait(mut self) -> std::process::ExitStatus {
+        let work_deadline = self.deadline - std::time::Duration::from_secs(5);
+        loop {
+            assert!(
+                std::time::Instant::now() < work_deadline,
+                "digest example work deadline"
+            );
+            match self.child.as_mut().expect("live owned child").try_wait() {
+                Ok(Some(status)) => {
+                    self.child.take();
+                    return status;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("poll digest example: {error}"),
+            }
+        }
+    }
+}
+impl Drop for DigestExampleChild {
+    fn drop(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        if let Ok(pid) = i32::try_from(child.id()) {
+            loop {
+                // This child owns its fresh process group, including compiler/linker descendants.
+                if unsafe { libc::kill(-pid, libc::SIGKILL) } == 0 {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted
+                    || std::time::Instant::now() >= self.deadline
+                {
+                    break;
+                }
+            }
+        }
+        loop {
+            match child.kill() {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::Interrupted
+                        && std::time::Instant::now() < self.deadline => {}
+                _ => break,
+            }
+        }
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    eprintln!("digest example cleanup probe failed: {error}");
+                    break;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+            if std::time::Instant::now() >= self.deadline {
+                eprintln!("digest example kill/reap deadline exceeded");
+                break;
+            }
+        }
+    }
+}
+
+struct DigestExample {
+    stage: align_driver::ArtifactStage,
+    exe: std::path::PathBuf,
+}
+impl DigestExample {
+    fn build(source: &str) -> Self {
+        let stage =
+            align_driver::ArtifactStage::temp("file-sha256").expect("acquire digest fixture");
+        std::fs::write(stage.path().join("file_sha256.align"), source)
+            .expect("write digest source");
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_alignc"));
+        command
+            .args(["build", "file_sha256.align", "--profile", "dev"])
+            .current_dir(stage.path())
+            .env("ALIGNC_CACHE", "off")
+            .env("TMPDIR", stage.path())
+            .stdout(std::fs::File::create(stage.path().join("build.stdout")).expect("build stdout"))
+            .stderr(
+                std::fs::File::create(stage.path().join("build.stderr")).expect("build stderr"),
+            );
+        let status = DigestExampleChild::spawn(&mut command).wait();
+        assert!(
+            status.success(),
+            "{}",
+            std::fs::read_to_string(stage.path().join("build.stderr")).unwrap()
+        );
+        let exe = stage
+            .path()
+            .join(format!("file_sha256{}", std::env::consts::EXE_SUFFIX));
+        Self { stage, exe }
+    }
+    fn run(
+        &self,
+        input: &[u8],
+        args: &[&str],
+        readonly_stdout: bool,
+    ) -> (std::process::ExitStatus, Vec<u8>, Vec<u8>) {
+        let input_path = self.stage.path().join("input.bin");
+        let output_path = self.stage.path().join("stdout");
+        std::fs::write(&input_path, input).unwrap();
+        std::fs::write(&output_path, b"").unwrap();
+        let stdout = if readonly_stdout {
+            std::fs::File::open(&input_path).unwrap()
+        } else {
+            std::fs::File::create(&output_path).unwrap()
+        };
+        let mut command = std::process::Command::new(&self.exe);
+        command
+            .args(args)
+            .current_dir(self.stage.path())
+            .stdin(std::fs::File::open(&input_path).unwrap())
+            .stdout(stdout)
+            .stderr(std::fs::File::create(self.stage.path().join("stderr")).unwrap());
+        let status = DigestExampleChild::spawn(&mut command).wait();
+        assert_eq!(
+            std::fs::read(input_path).unwrap(),
+            input,
+            "input must remain unchanged"
+        );
+        (
+            status,
+            std::fs::read(output_path).unwrap(),
+            std::fs::read(self.stage.path().join("stderr")).unwrap(),
+        )
+    }
+}
+
+fn assert_digest_example_error(
+    status: &std::process::ExitStatus,
+    stdout: &[u8],
+    stderr: &[u8],
+    code: i32,
+) {
+    assert_eq!(
+        status.code(),
+        Some(code.clamp(1, 255)),
+        "normal error exit required: {}",
+        String::from_utf8_lossy(stderr)
+    );
+    assert!(
+        stdout.is_empty(),
+        "input/output refusal must publish no digest"
+    );
+    assert_eq!(
+        stderr,
+        format!("error: code {code}\n").as_bytes(),
+        "wrong error class/report"
+    );
+}
+
+#[test]
+fn bounded_file_sha256_example_binary_cli_and_errors() {
+    assert!(
+        backend_available(),
+        "digest example requires native backend qualification"
+    );
+    let source = fixture("examples/file_sha256.align");
+    let checked = diff_check_multi(
+        "file-sha256-example",
+        &[("main.align", source)],
+        "main.align",
+    );
+    assert!(
+        !checked.whole_errors && !checked.per_unit_errors,
+        "whole: {}\nunit: {}",
+        checked.whole_diags,
+        checked.per_unit_diags
+    );
+    let example = DigestExample::build(source);
+    // Independently generated Python hashlib SHA-256 vectors, including every window boundary.
+    let mut vectors = vec![
+        (
+            Vec::new(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+        (
+            b"abc".to_vec(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        ),
+        (
+            vec![0xff],
+            "a8100ae6aa1940d0b663bb31cd466142ebbdbd5187131b92d93818987832eb89",
+        ),
+        (
+            vec![0, 0xff, 0, b'A'],
+            "daf505a07aad0a2b8dae061126f3fe0bcc7f39668af36385e48da5a43067987f",
+        ),
+    ];
+    for (size, digest) in [
+        (
+            65535,
+            "5f1bf999bcba5e05d4c34a13710d2e4bff005877874dcce49ac87af61076231e",
+        ),
+        (
+            65536,
+            "7daca2095d0438260fa849183dfc67faa459fdf4936e1bc91eec6b281b27e4c2",
+        ),
+        (
+            65537,
+            "2deb0bd2129a9d3aed91e3cff58b3993752be549642890a3e853ec1065f9b617",
+        ),
+        (
+            131089,
+            "b4935a6cd264749cf4ad8533daaafb8c8d7e4fdd23d9f43a3ec1b91d462bc554",
+        ),
+    ] {
+        vectors.push((
+            (0..size).map(|n| u8::try_from(n % 256).unwrap()).collect(),
+            digest,
+        ));
+    }
+    for (input, expected) in vectors {
+        let limit = input.len().to_string();
+        for file in [false, true] {
+            let mut args = vec!["--max-input-bytes", limit.as_str()];
+            if file {
+                args.extend(["--file", "input.bin"]);
+            }
+            let (status, stdout, stderr) = example.run(&input, &args, false);
+            assert!(
+                status.success(),
+                "size={}, file={file}: {}",
+                input.len(),
+                std::fs::read_to_string(example.stage.path().join("stderr")).unwrap()
+            );
+            assert_eq!(stdout, format!("{expected}\n").as_bytes());
+            assert!(stderr.is_empty());
+            if !input.is_empty() {
+                let short = (input.len() - 1).to_string();
+                let mut short_args = vec!["--max-input-bytes", short.as_str()];
+                if file {
+                    short_args.extend(["--file", "input.bin"]);
+                }
+                let (status, stdout, stderr) = example.run(&input, &short_args, false);
+                assert_digest_example_error(&status, &stdout, &stderr, -1);
+            }
+        }
+    }
+    let fifo =
+        std::ffi::CString::new(example.stage.path().join("blocked").to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    for (args, code) in [
+        (vec!["--file", "blocked", "--max-input-bytes", "-1"], 2),
+        (
+            vec![
+                "--file",
+                "blocked",
+                "--max-input-bytes",
+                "2305843009213693952",
+            ],
+            2,
+        ),
+        (vec!["--file", "blocked", "--unknown"], 2),
+        (vec!["--file", "absent"], 1),
+        (vec!["--file", "."], libc::EISDIR),
+    ] {
+        let (status, stdout, stderr) = example.run(b"abc", &args, false);
+        assert_digest_example_error(&status, &stdout, &stderr, code);
+    }
+    let (status, usage, stderr) = example.run(
+        b"abc",
+        &["--help", "--file", "blocked", "--max-input-bytes", "-1"],
+        false,
+    );
+    assert!(status.success());
+    assert!(stderr.is_empty());
+    let usage = String::from_utf8(usage).unwrap();
+    assert!(usage.contains("file") && usage.contains("max-input-bytes"));
+    let (status, stdout, stderr) =
+        example.run(b"abc", &["--max-input-bytes", "2305843009213693951"], false);
+    assert!(status.success());
+    assert!(stderr.is_empty());
+    assert_eq!(
+        stdout,
+        b"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n"
+    );
+    let (status, stdout, stderr) = example.run(b"abc", &[], true);
+    assert_digest_example_error(&status, &stdout, &stderr, libc::EBADF);
+}
+
 #[test]
 fn stream_vectors_and_partitions() {
     let source = r#"import std.crypto
