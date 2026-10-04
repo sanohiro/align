@@ -68,12 +68,8 @@ fn meminfo_with(
             if total.replace(field).is_some() {
                 total_duplicate = true;
             }
-        } else if available {
-            if let Some(field) = line.strip_prefix(b"MemAvailable:") {
-                if spare.replace(field).is_some() {
-                    spare_duplicate = true;
-                }
-            }
+        } else if available && let Some(field) = line.strip_prefix(b"MemAvailable:") {
+            spare_duplicate |= spare.replace(field).is_some();
         }
     }
     if total_duplicate {
