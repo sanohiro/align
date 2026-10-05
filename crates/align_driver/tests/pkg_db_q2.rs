@@ -1527,10 +1527,88 @@ fn main(args: array<str>) -> Result<(), Error> {
 }
 "#;
     let files = package_files(main).module("app/float_text_query.align", QUERY);
-    expect_checks_clean("pkg-db-q2-float-text", &files);
-    let output = build_and_run_multi_with_static_descriptors_args_with_env(
-        "pkg-db-q2-float-text", &files.files(), "main.align", &[url.as_str()], &[],
-    );
+    // Keep every fixture below one exclusively acquired, immediately guarded directory.
+    let stage = align_driver::ArtifactStage::temp("pkg-db-q2-float-text")
+        .expect("acquire float Text fixture");
+    for (name, source) in files.files() {
+        let path = stage.path().join(name);
+        std::fs::create_dir_all(path.parent().expect("module parent")).expect("module directory");
+        std::fs::write(path, source).expect("write module");
+    }
+    let entry = stage.path().join("main.align").display().to_string();
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, &entry, main);
+    assert!(!checked.diags.has_errors(), "{}",
+        align_driver::format_diagnostics(&sm, &checked.diags));
+    let mut unit_sm = SourceMap::new();
+    let per_unit = check_per_unit(&mut unit_sm, &entry, main);
+    assert!(!per_unit.diags.has_errors(), "{}",
+        align_driver::format_diagnostics(&unit_sm, &per_unit.diags));
+    let mir = lower_to_mir_with_static_descriptors(&checked, &mut sm, stage.path())
+        .expect("install static descriptors");
+    let object = stage.path().join("main.o");
+    let executable = stage.path().join(format!("main{}", std::env::consts::EXE_SUFFIX));
+    emit_object_file(&mir, &object, BuildTarget::Baseline, Profile::Release, &[], false)
+        .expect("codegen float Text owner");
+    link_executable(&align_driver::CDriver::default(), &object, &executable,
+        &mir.link_libs, Profile::Release).expect("link float Text owner");
+
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+    struct ChildOwner {
+        child: Option<std::process::Child>,
+        deadline: Instant,
+    }
+    impl Drop for ChildOwner {
+        fn drop(&mut self) {
+            if let Some(child) = self.child.as_mut() {
+                if let Ok(pid) = i32::try_from(child.id()) {
+                    // SAFETY: the owned child leads its own process group.
+                    unsafe { libc::kill(-pid, libc::SIGKILL) };
+                }
+                let _ = child.kill();
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => break,
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
+                        Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+                    }
+                    if Instant::now() >= self.deadline {
+                        eprintln!("float Text child kill/reap exceeded its owner deadline");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let stdout = stage.path().join("stdout");
+    let stderr = stage.path().join("stderr");
+    let mut command = std::process::Command::new(executable);
+    command.arg(&url).process_group(0)
+        .stdout(std::fs::File::create(&stdout).expect("stdout capture"))
+        .stderr(std::fs::File::create(&stderr).expect("stderr capture"));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut owner = ChildOwner {
+        child: Some(command.spawn().expect("spawn float Text owner")),
+        deadline,
+    };
+    let status = loop {
+        assert!(Instant::now() + Duration::from_secs(5) < owner.deadline,
+            "float Text child exceeded its work deadline");
+        match owner.child.as_mut().expect("armed child").try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => panic!("poll float Text child: {error}"),
+        }
+    };
+    owner.child.take();
+    let output = std::process::Output {
+        status,
+        stdout: std::fs::read(stdout).expect("stdout evidence"),
+        stderr: std::fs::read(stderr).expect("stderr evidence"),
+    };
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_eq!(output.stdout, b"42\n", "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");
