@@ -82,9 +82,10 @@ the body was complete and every stdout write succeeded; an error may leave a
 partial file. Redirecting stdout does not publish a file atomically.
 
 The example accepts only final status 200 and preserves all body bytes. It uses
-one 64 KiB buffer: `stream.read(out)` overwrites that buffer, and
-`io.stdout.write(out.bytes())` consumes its borrowed byte view before the next
-read. A zero count means completion. Chunk framing is removed by the stream;
+one 64 KiB buffer and one unbuffered stdout writer, bound before the loop:
+`stream.read(out)` overwrites the buffer, and `output.write(out.bytes())`
+consumes its borrowed byte view before the next read. A zero count means
+completion. Chunk framing is removed by the stream;
 the application performs no UTF-8 conversion or whole-body accumulation.
 
 `--max-body-bytes` defaults to 64 MiB and accepts 1..1073741824 decoded bytes.

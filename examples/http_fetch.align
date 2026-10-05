@@ -31,10 +31,11 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   if stream.status() != 200 { return Err(Error.Invalid) }
 
   mut out := buffer(65536)
+  output := io.stdout
   loop {
     count := stream.read(out)?
     if count == 0 { break }
-    io.stdout.write(out.bytes())?
+    output.write(out.bytes())?
   }
   return Ok(())
 }

@@ -22,9 +22,10 @@ the request. Accept only final status 200; another status returns
 content-type restriction, decoding, authentication or URL discovery in the example.
 Existing constructor and transport errors propagate.
 
-Allocate one explicit 65536-byte output buffer after successful status admission.
-Repeated `stream.read(out)` overwrites it without growth; a positive result is
-written through `io.stdout.write(out.bytes())` before the next read. Zero means
+Allocate one explicit 65536-byte output buffer and bind one unbuffered stdout
+writer after successful status admission. Repeated `stream.read(out)` overwrites
+the buffer without growth; a positive result is written through
+`output.write(out.bytes())` before the next read. Zero means
 exact HTTP body completion. Preserve every binary octet and expose no chunk
 framing or UTF-8 conversion. Body-cap errors remain `Error.Code(-1)`; framing,
 timeout and output errors retain the existing error model.
@@ -36,9 +37,11 @@ independently to connect/send/each transport receive; it does not bound DNS,
 stdout writes, or total execution. A slowly progressing peer can take longer
 than one timeout. The body cap limits decoded payload, not all wire metadata.
 
-Named parsed/client/request/stream/buffer owners preserve existing view lifetimes,
+Named parsed/client/request/stream/buffer/writer owners preserve existing view lifetimes,
 request consumption and ordinary cleanup on success, status refusal and `?`.
-The buffer is reused, and the application never accumulates the complete body.
+The buffer and writer are reused, and the application never accumulates the complete body.
+The writer shell is created once before the first read, including empty bodies;
+its Drop never closes stdout. Writes remain unbuffered and checked individually.
 The existing stream owns its separately bounded head and transport scratch.
 This is neither an end-to-end zero-copy claim nor a new latency/RSS promise.
 There is no new artifact/cache identity or prerequisite milestone.
