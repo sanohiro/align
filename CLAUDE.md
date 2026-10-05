@@ -478,6 +478,34 @@ work already produced, imply a clean result, or justify rerunning the same broad
 scope from the beginning. Narrow a continuation only to unreviewed,
 contradictory, or changed areas.
 
+## Local artifacts and disk space
+
+Cleanup is part of completing Align work. The owner has authorized routine
+deletion of agent-created, no-longer-needed artifacts without another request
+or confirmation. Perform it before the final handoff, including after a merge
+or an abandoned experiment; do not wait for a low-disk-space complaint.
+
+- Check disk usage before a large build or measurement. Reuse compatible build
+  caches across worktrees instead of creating a full cache per task. Keep the
+  required Clippy target separate from build/test fingerprints.
+- Collect traces, profiles, IR dumps and verbose logs only for a concrete
+  investigation or required check. Bound their scope and retention; do not
+  accumulate them speculatively.
+- Remove obsolete per-task build directories, benchmark binaries, temporary
+  toolchains, generated dumps, raw traces, superseded logs and scratch copies
+  when their purpose is complete. Moving them to another cache, backup or Trash
+  is not disk cleanup. Verify and report the resulting disk usage.
+- Retain artifacts with a concrete continuing use: current shared caches,
+  required review/attestation evidence, compact reproducible measurement results,
+  and explicitly parked source/evidence archives. Preserve only what that use
+  requires; a completed review does not justify keeping its build tree or every
+  intermediate trace.
+- Before deletion, verify ownership and check active processes, container mounts,
+  symlink consumers and Git state. Do not delete source, uncommitted work,
+  unrelated project data or conversation history as if it were a cache. Remove
+  a worktree only after proving its work is preserved and it has no active
+  consumer. Existing limits on the external align-llm repository still apply.
+
 ## Review before merging
 
 Verification is proportional to blast radius. `scripts/pre-pr.sh` classifies
