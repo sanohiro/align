@@ -19,6 +19,8 @@ mod buffer_storage;
 mod http_stream_tests;
 #[cfg(test)]
 mod http_accept_budget_tests;
+#[cfg(test)]
+mod net_service_tests;
 use buffer_storage::BufferStorage;
 mod json_number;
 mod time_formats;
@@ -1257,6 +1259,34 @@ unsafe fn tcp_connect_fd_with<O: TcpConnectOps>(
     result
 }
 
+/// A numeric resolver service owns at most five decimal digits and its NUL terminator.
+/// Borrow its pointer only after construction/movement, through the synchronous resolver call.
+struct NumericService {
+    bytes: [u8; 6],
+    start: usize,
+}
+
+impl NumericService {
+    fn new(port: i64) -> Option<Self> {
+        let mut value = u16::try_from(port).ok()?;
+        if value == 0 {
+            return None;
+        }
+        let mut service = Self { bytes: [0; 6], start: 5 };
+        // A positive u16 has at most five digits, so the initialized final NUL stays untouched.
+        while value != 0 {
+            service.start -= 1;
+            service.bytes[service.start] = b"0123456789"[usize::from(value % 10)];
+            value /= 10;
+        }
+        Some(service)
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.bytes[self.start..].as_ptr()
+    }
+}
+
 /// Validate the raw TCP ABI inputs, clear the publication slot, build transient resolver strings,
 /// and return one connected blocking fd. The caller alone performs keepalive setup and publication.
 ///
@@ -1275,16 +1305,13 @@ unsafe fn tcp_connect_validated_fd_with<O: TcpConnectOps>(
         return Err(AL_INVALID);
     }
     unsafe { *out = core::ptr::null_mut() };
-    if !(1..=65535).contains(&port) {
+    let Some(c_service) = NumericService::new(port) else {
         return Err(AL_INVALID);
-    }
+    };
     let Some(c_host) = (unsafe { abi_c_string(host, host_len) }) else {
         return Err(AL_INVALID);
     };
-    let Ok(c_service) = std::ffi::CString::new(port.to_string()) else {
-        return Err(AL_INVALID);
-    };
-    unsafe { tcp_connect_fd_with(ops, c_host.as_ptr().cast(), c_service.as_ptr().cast(), timeout_ns) }
+    unsafe { tcp_connect_fd_with(ops, c_host.as_ptr().cast(), c_service.as_ptr(), timeout_ns) }
 }
 
 /// `tcp.connect(host, port)` — resolve `host` via `getaddrinfo` (AF_UNSPEC — both IPv4 and IPv6,
@@ -1614,9 +1641,9 @@ unsafe fn tcp_listen_impl(host: *const u8, host_len: i64, port: i64, out: *mut *
     // A TCP port is 1..=65535 — reject out-of-range (0, negative, > 65535). Port 0 (kernel-assigned)
     // is deliberately rejected in v1 (see the doc comment) rather than silently binding a port the
     // caller cannot read back.
-    if !(1..=65535).contains(&port) {
+    let Some(c_service) = NumericService::new(port) else {
         return AL_INVALID;
-    }
+    };
     // Borrow just long enough to distinguish the allocation-free wildcard case. A non-empty host
     // is then copied directly into getaddrinfo's NUL-terminated representation.
     let Some(host_str) = (unsafe { abi_str_view(host, host_len) }) else {
@@ -1630,12 +1657,6 @@ unsafe fn tcp_listen_impl(host: *const u8, host_len: i64, port: i64, out: *mut *
         };
         Some(host)
     };
-    // The port as a numeric service string — `getaddrinfo` fills the correct `sin_port`/`sin6_port`
-    // per family. `port` is in `1..=65535`, so the decimal string never contains an interior NUL.
-    let Ok(c_service) = std::ffi::CString::new(port.to_string()) else {
-        return AL_INVALID;
-    };
-
     // hints: AF_UNSPEC (both A and AAAA), SOCK_STREAM (TCP), AI_PASSIVE (wildcard when node is null).
     let mut hints: AddrInfo = unsafe { core::mem::zeroed() };
     hints.ai_flags = AI_PASSIVE;
@@ -1644,7 +1665,7 @@ unsafe fn tcp_listen_impl(host: *const u8, host_len: i64, port: i64, out: *mut *
 
     let node = c_host.as_ref().map_or(core::ptr::null(), |h| h.as_ptr().cast());
     let mut res: *mut AddrInfo = core::ptr::null_mut();
-    let rc = unsafe { getaddrinfo(node, c_service.as_ptr().cast(), &hints, &mut res) };
+    let rc = unsafe { getaddrinfo(node, c_service.as_ptr(), &hints, &mut res) };
     if rc != 0 {
         return eai_to_status(rc);
     }
@@ -1847,9 +1868,9 @@ pub unsafe extern "C" fn align_rt_udp_bind(host: *const u8, host_len: i64, port:
     unsafe { *out = core::ptr::null_mut() };
     // A UDP port is 1..=65535 — reject out-of-range (0, negative, > 65535). Port 0 (kernel-assigned)
     // is deliberately rejected in v1 (see the doc comment), the `tcp.listen` deferral.
-    if !(1..=65535).contains(&port) {
+    let Some(c_service) = NumericService::new(port) else {
         return AL_INVALID;
-    }
+    };
     // Borrow just long enough to distinguish the allocation-free wildcard case. A non-empty host
     // is then copied directly into getaddrinfo's NUL-terminated representation.
     let Some(host_str) = (unsafe { abi_str_view(host, host_len) }) else {
@@ -1863,12 +1884,6 @@ pub unsafe extern "C" fn align_rt_udp_bind(host: *const u8, host_len: i64, port:
         };
         Some(host)
     };
-    // The port as a numeric service string — `getaddrinfo` fills the correct `sin_port`/`sin6_port`
-    // per family. `port` is in `1..=65535`, so the decimal string never contains an interior NUL.
-    let Ok(c_service) = std::ffi::CString::new(port.to_string()) else {
-        return AL_INVALID;
-    };
-
     // hints: AF_UNSPEC (both A and AAAA), SOCK_DGRAM (UDP), AI_PASSIVE (wildcard when node is null).
     let mut hints: AddrInfo = unsafe { core::mem::zeroed() };
     hints.ai_flags = AI_PASSIVE;
@@ -1877,7 +1892,7 @@ pub unsafe extern "C" fn align_rt_udp_bind(host: *const u8, host_len: i64, port:
 
     let node = c_host.as_ref().map_or(core::ptr::null(), |h| h.as_ptr().cast());
     let mut res: *mut AddrInfo = core::ptr::null_mut();
-    let rc = unsafe { getaddrinfo(node, c_service.as_ptr().cast(), &hints, &mut res) };
+    let rc = unsafe { getaddrinfo(node, c_service.as_ptr(), &hints, &mut res) };
     if rc != 0 {
         return eai_to_status(rc);
     }
@@ -1946,9 +1961,9 @@ pub unsafe extern "C" fn align_rt_udp_send_to(sock: *mut UdpSocket, data: *const
     if sock.is_null() {
         return -(AL_INVALID as i64);
     }
-    if !(1..=65535).contains(&port) {
+    let Some(c_service) = NumericService::new(port) else {
         return -(AL_INVALID as i64);
-    }
+    };
     let fd = unsafe { (*sock).fd };
     let payload = unsafe { bytes_view(data, data_len) };
     // Resolve the destination host/port (numeric service). A non-UTF-8 / interior-NUL host is a bad
@@ -1962,16 +1977,12 @@ pub unsafe extern "C" fn align_rt_udp_send_to(sock: *mut UdpSocket, data: *const
     let Ok(c_host) = std::ffi::CString::new(host_str.as_bytes()) else {
         return -(AL_INVALID as i64);
     };
-    let Ok(c_service) = std::ffi::CString::new(port.to_string()) else {
-        return -(AL_INVALID as i64);
-    };
-
     let mut hints: AddrInfo = unsafe { core::mem::zeroed() };
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_DGRAM;
 
     let mut res: *mut AddrInfo = core::ptr::null_mut();
-    let rc = unsafe { getaddrinfo(c_host.as_ptr().cast(), c_service.as_ptr().cast(), &hints, &mut res) };
+    let rc = unsafe { getaddrinfo(c_host.as_ptr().cast(), c_service.as_ptr(), &hints, &mut res) };
     if rc != 0 {
         return -(eai_to_status(rc) as i64);
     }
