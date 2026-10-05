@@ -1439,6 +1439,103 @@ fn main(args: array<str>) -> Result<(), Error> {
     );
 }
 
+#[test]
+fn postgres_required_float_text_preserves_finite_extremes() {
+    if !backend_available() {
+        return;
+    }
+    let Some(url) = live_postgres_url("PostgreSQL canonical float Text parameters") else {
+        return;
+    };
+    const QUERY: &str = r#"module app.float_text_query
+import pkg.db
+import pkg.db.postgres
+
+pub Params { value: f64 }
+pub Row { bits: str }
+pub fn query() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
+  "SELECT encode(float8send(CAST(:value AS float8)), 'hex') AS bits", [],
+  [pkg.db.postgres.QueryOption.ParameterType("value", "float8")],
+)
+"#;
+    let main = r#"module main
+import pkg.db
+import pkg.db.postgres
+import app.float_text_query
+
+extern "C" fn align_rt_f64_from_bits(bits: u64) -> f64
+
+fn row_matches(borrow mut rows: pkg.db.rows<app.float_text_query.Row>, expected: str) -> bool {
+  available := pkg.db.next(rows) else { return false }
+  row := available else { return false }
+  if row.bits != expected { return false }
+  match pkg.db.next(rows) else { return false } {
+    Some(_) => false
+    None => true
+  }
+}
+
+fn direct(borrow connection: pkg.db.conn, value: f64, expected: str) -> bool {
+  mut rows := pkg.db.postgres.rows_native(
+    pkg.db.exec_conn(connection), app.float_text_query.query(),
+    app.float_text_query.Params { value: value }, [],
+    [pkg.db.postgres.ExecuteOption.ParameterFormat("value", pkg.db.postgres.Format.Text)],
+  ) else { return false }
+  return row_matches(rows, expected)
+}
+
+fn prepared(
+  borrow mut statement: pkg.db.stmt<app.float_text_query.Params, app.float_text_query.Row>,
+  value: f64, expected: str,
+) -> bool {
+  mut rows := pkg.db.postgres.rows_stmt_native(
+    statement, app.float_text_query.Params { value: value }, [],
+    [pkg.db.postgres.ExecuteOption.ParameterFormat("value", pkg.db.postgres.Format.Text)],
+  ) else { return false }
+  return row_matches(rows, expected)
+}
+
+fn run(url: str) -> i32 {
+  connection := pkg.db.postgres.connect(url, []) else { return 1 }
+  mut statement := pkg.db.prepare(
+    pkg.db.exec_conn(connection), app.float_text_query.query(), [],
+  ) else { return 2 }
+  bits: [u64; 8] := [
+    0x16687e92154ef7ac, 0x6974e718d7d7625a,
+    0x7fefffffffffffff, 0xffefffffffffffff,
+    0x0010000000000000, 0x0000000000000001,
+    0x8000000000000001, 0x8000000000000000,
+  ]
+  expected := [
+    "16687e92154ef7ac", "6974e718d7d7625a", "7fefffffffffffff", "ffefffffffffffff",
+    "0010000000000000", "0000000000000001", "8000000000000001", "8000000000000000",
+  ]
+  mut index := 0
+  loop {
+    if index == bits.len() { break }
+    value := unsafe { align_rt_f64_from_bits(bits[index]) }
+    if !direct(connection, value, expected[index]) { return 10 + (index as i32) }
+    if !prepared(statement, value, expected[index]) { return 20 + (index as i32) }
+    index = index + 1
+  }
+  return 42
+}
+
+fn main(args: array<str>) -> Result<(), Error> {
+  print(run(args[1]))
+  return Ok(())
+}
+"#;
+    let files = package_files(main).module("app/float_text_query.align", QUERY);
+    expect_checks_clean("pkg-db-q2-float-text", &files);
+    let output = build_and_run_multi_with_static_descriptors_args_with_env(
+        "pkg-db-q2-float-text", &files.files(), "main.align", &[url.as_str()], &[],
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.stdout, b"42\n", "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
 /// The Layer-1 migration's forward guard for this suite.
 ///
 /// Regenerate ONLY with a reviewed reason, from the panic message this emits.

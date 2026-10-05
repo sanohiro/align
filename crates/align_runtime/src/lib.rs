@@ -125,8 +125,14 @@ impl FloatWrite for Vec<u8> {
     }
 }
 
+// Shortest f64 Display has at most 17 significant digits and a first-digit
+// decimal exponent in -324..=308. Expanded fractional text needs at most
+// 1 sign + 2 ("0.") + 323 zeros + 17 digits = 343 bytes; integer text plus
+// the canonical ".0" needs at most 312. f32 and special values are shorter.
+const FLOAT_TEXT_CAPACITY: usize = 384;
+
 struct FixedFloatBuf {
-    bytes: [u8; 128],
+    bytes: [u8; FLOAT_TEXT_CAPACITY],
     len: usize,
 }
 
@@ -219,7 +225,7 @@ pub extern "C" fn align_rt_f64_from_bits(bits: u64) -> f64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_f32_text_len(value: f32) -> i64 {
     let mut output = FixedFloatBuf {
-        bytes: [0; 128],
+        bytes: [0; FLOAT_TEXT_CAPACITY],
         len: 0,
     };
     push_float(&mut output, value);
@@ -229,7 +235,7 @@ pub extern "C" fn align_rt_f32_text_len(value: f32) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_f64_text_len(value: f64) -> i64 {
     let mut output = FixedFloatBuf {
-        bytes: [0; 128],
+        bytes: [0; FLOAT_TEXT_CAPACITY],
         len: 0,
     };
     push_float(&mut output, value);
@@ -241,7 +247,7 @@ unsafe fn write_fixed_float<T: std::fmt::Display>(value: T, output: *mut u8, cap
         return -1;
     };
     let mut rendered = FixedFloatBuf {
-        bytes: [0; 128],
+        bytes: [0; FLOAT_TEXT_CAPACITY],
         len: 0,
     };
     push_float(&mut rendered, value);
@@ -28586,58 +28592,77 @@ mod tests {
 
     #[test]
     fn package_float_helpers_preserve_bits_and_measure_canonical_text() {
-        for bits in [
-            0_u32,
-            0x8000_0000,
-            f32::INFINITY.to_bits(),
-            f32::NEG_INFINITY.to_bits(),
-            0x7fc0_1234,
-        ] {
-            let value = align_rt_f32_from_bits(bits);
-            assert_eq!(align_rt_f32_to_bits(value), bits);
+        fn check<T: Copy + std::fmt::Display>(
+            value: T,
+            measure: impl Fn(T) -> i64,
+            write: impl Fn(T, *mut u8, i64) -> i64,
+        ) {
+            // Independent canonical oracle: do not reuse push_float or its scratch.
+            let mut expected = value.to_string();
+            if !expected.bytes().any(|byte| {
+                matches!(byte, b'.' | b'e' | b'E') || byte.is_ascii_alphabetic()
+            }) {
+                expected.push_str(".0");
+            }
+            let length = i64::try_from(expected.len()).expect("bounded float text");
+            let mut actual = [0xa5_u8; 386];
+            assert!(expected.len() <= actual.len() - 2);
+            let destination = actual[1..].as_mut_ptr();
+            #[cfg(feature = "alloc-count")]
+            let before = global_alloc_count();
+            let measured = measure(value);
+            let written = write(value, destination, length);
+            #[cfg(feature = "alloc-count")]
+            let after = global_alloc_count();
+            assert_eq!(measured, length, "canonical text: {expected}");
+            assert_eq!(written, length, "canonical text: {expected}");
+            #[cfg(feature = "alloc-count")]
+            assert_eq!(after, before, "float text helpers allocated");
+            assert_eq!(&actual[1..1 + expected.len()], expected.as_bytes());
+            assert_eq!(actual[0], 0xa5);
+            assert!(actual[1 + expected.len()..].iter().all(|&byte| byte == 0xa5));
 
-            let mut expected = Vec::new();
-            push_float(&mut expected, value);
-            assert_eq!(align_rt_f32_text_len(value), expected.len() as i64);
-            let mut actual = [0_u8; 128];
-            let written =
-                unsafe { align_rt_f32_text_write(value, actual.as_mut_ptr(), actual.len() as i64) };
-            assert_eq!(written, expected.len() as i64);
-            let written = usize::try_from(written)
-                .unwrap_or_else(|_| panic!("successful f32 text length is nonnegative"));
-            assert_eq!(&actual[..written], expected.as_slice());
+            for capacity in [-1, 0, length - 1] {
+                actual.fill(0xa5);
+                assert_eq!(write(value, actual[1..].as_mut_ptr(), capacity), -1);
+                assert!(actual.iter().all(|&byte| byte == 0xa5));
+            }
+            assert_eq!(write(value, std::ptr::null_mut(), length), -1);
         }
 
-        for bits in [
-            0_u64,
-            0x8000_0000_0000_0000,
-            f64::INFINITY.to_bits(),
-            f64::NEG_INFINITY.to_bits(),
-            0x7ff8_0000_0000_1234,
-        ] {
-            let value = align_rt_f64_from_bits(bits);
-            assert_eq!(align_rt_f64_to_bits(value), bits);
-
-            let mut expected = Vec::new();
-            push_float(&mut expected, value);
-            assert_eq!(align_rt_f64_text_len(value), expected.len() as i64);
-            let mut actual = [0_u8; 128];
-            let written =
-                unsafe { align_rt_f64_text_write(value, actual.as_mut_ptr(), actual.len() as i64) };
-            assert_eq!(written, expected.len() as i64);
-            let written = usize::try_from(written)
-                .unwrap_or_else(|_| panic!("successful f64 text length is nonnegative"));
-            assert_eq!(&actual[..written], expected.as_slice());
+        #[cfg(feature = "alloc-count")]
+        {
+            let before = global_alloc_count();
+            let witness = std::hint::black_box(vec![std::hint::black_box(7_u8); 32]);
+            assert!(global_alloc_count() > before, "allocation counter must be active");
+            drop(witness);
         }
-
-        assert_eq!(
-            unsafe { align_rt_f32_text_write(1.0, std::ptr::null_mut(), 3) },
-            -1
-        );
-        assert_eq!(
-            unsafe { align_rt_f64_text_write(1.0, std::ptr::null_mut(), -1) },
-            -1
-        );
+        // Every exponent, both signs, and zero/low/middle/high mantissas include
+        // finite extrema, subnormals, signed zero, infinities and NaN payloads.
+        for exponent in 0..=255_u32 {
+            for mantissa in [0, 1, 1 << 22, (1 << 23) - 1] {
+                for sign in [0, 1 << 31] {
+                    let bits = sign | (exponent << 23) | mantissa;
+                    let value = align_rt_f32_from_bits(bits);
+                    assert_eq!(align_rt_f32_to_bits(value), bits);
+                    check(value, |v| align_rt_f32_text_len(v), |v, p, n| unsafe {
+                        align_rt_f32_text_write(v, p, n)
+                    });
+                }
+            }
+        }
+        for exponent in 0..=2047_u64 {
+            for mantissa in [0, 1, 1 << 51, (1 << 52) - 1] {
+                for sign in [0, 1 << 63] {
+                    let bits = sign | (exponent << 52) | mantissa;
+                    let value = align_rt_f64_from_bits(bits);
+                    assert_eq!(align_rt_f64_to_bits(value), bits);
+                    check(value, |v| align_rt_f64_text_len(v), |v, p, n| unsafe {
+                        align_rt_f64_text_write(v, p, n)
+                    });
+                }
+            }
+        }
     }
 
     /// Matches the opaque storage envelope reserved by codegen for nonescaping builder headers.
