@@ -52,7 +52,8 @@ fn candidates(maximum: usize) -> Result<Vec<i32>, i32> {
 }
 #[cfg(target_os = "linux")]
 fn observe(pid: i32, scratch: &mut ObservationScratch) -> Result<Option<Observation>, i32> {
-    let file = match std::fs::File::open(format!("/proc/{pid}/stat")) {
+    let mut path_bytes = [0; 22];
+    let file = match std::fs::File::open(stat_path(pid, &mut path_bytes)?) {
         Ok(file) => file,
         Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
             return Ok(None);
@@ -63,6 +64,16 @@ fn observe(pid: i32, scratch: &mut ObservationScratch) -> Result<Option<Observat
         return Ok(None);
     };
     parse_stat(pid, bytes).map(Some)
+}
+#[cfg(any(test, target_os = "linux"))]
+fn stat_path(pid: i32, bytes: &mut [u8; 22]) -> Result<&std::ffi::OsStr, i32> {
+    use std::os::unix::ffi::OsStrExt;
+    // /proc/ + the longest signed i32 (-2147483648) + /stat fits exactly.
+    let mut remaining = &mut bytes[..];
+    std::io::Write::write_fmt(&mut remaining, format_args!("/proc/{pid}/stat"))
+        .map_err(|_| AL_INVALID)?;
+    let length = 22 - remaining.len();
+    Ok(std::ffi::OsStr::from_bytes(&bytes[..length]))
 }
 #[cfg(any(test, target_os = "linux"))]
 fn observation_bytes(reader: impl std::io::Read, bytes: &mut Vec<u8>) -> Result<Option<&[u8]>, i32> {
@@ -360,6 +371,42 @@ pub unsafe extern "C" fn align_rt_child_group_members(
 mod tests {
     use super::*;
 
+    #[test]
+    fn stat_path_spelling_and_storage() {
+        use std::os::unix::ffi::OsStrExt;
+        #[cfg(feature = "alloc-count")]
+        {
+            let before = super::super::global_alloc_count();
+            let witness = std::hint::black_box(vec![std::hint::black_box(7_u8); 32]);
+            assert!(super::super::global_alloc_count() > before, "allocation counter must be active");
+            drop(witness);
+        }
+        let mut pids = vec![i32::MAX, 0, i32::MIN, 1, -1, i32::MAX - 1, i32::MIN + 1];
+        for width in [1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000] {
+            for delta in [-1, 0, 1] {
+                pids.push(width + delta);
+                pids.push(-width + delta);
+            }
+        }
+        let mut bits = 0x127a_d309_u32;
+        for _ in 0..1024 {
+            bits = bits.wrapping_mul(1664525).wrapping_add(1013904223);
+            pids.push(i32::from_ne_bytes(bits.to_ne_bytes()));
+        }
+        let mut scratch = [b'!'; 22];
+        for pid in pids {
+            let expected = format!("/proc/{pid}/stat");
+            let original = scratch;
+            #[cfg(feature = "alloc-count")]
+            let before = super::super::global_alloc_count();
+            let actual = stat_path(pid, &mut scratch).unwrap();
+            #[cfg(feature = "alloc-count")]
+            assert_eq!(super::super::global_alloc_count() - before, 0);
+            assert_eq!(actual.as_bytes(), expected.as_bytes());
+            assert_eq!(&scratch[expected.len()..], &original[expected.len()..]);
+        }
+    }
+
     struct ChunkedInput<'a> {
         remaining: &'a [u8],
         consumed: usize,
@@ -475,9 +522,9 @@ mod tests {
             assert_eq!((current.pid, current.parent_pid), (first.pid, first.parent_pid));
         }
         eprintln!("native process observation Rust allocations: cold={cold}, warm={warm:?}");
-        // One unchanged /proc/PID/stat pathname allocation remains per observe call.
+        // Input capacity is retained, and the pathname now uses only fixed stack storage.
         assert!(cold > 1, "cold read must demonstrate input storage growth");
-        assert_eq!(warm, [1; 32]);
+        assert_eq!(warm, [0; 32]);
     }
 
     #[test]
