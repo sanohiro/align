@@ -21,6 +21,8 @@ mod http_stream_tests;
 mod http_accept_budget_tests;
 #[cfg(test)]
 mod net_service_tests;
+#[cfg(test)]
+mod http_pool_storage_tests;
 use buffer_storage::BufferStorage;
 mod json_number;
 mod time_formats;
@@ -23012,18 +23014,11 @@ pub unsafe extern "C" fn align_rt_http_client_free(c: *mut HttpClient) {
         return;
     }
     let client = unsafe { Box::from_raw(c) };
-    // Drain the pool under the lock, then tear conns down AFTER releasing it: a TLS `close_tls` can
-    // WRITE a close_notify and block on a dead socket, so it must not run under the pool lock (keeps
-    // the no-I/O-under-lock property uniform across every close_tls caller).
-    let conns: Vec<(i32, *mut c_void)> = {
-        let mut map = client.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.drain()
-            .flat_map(|(_host, endpoints)| endpoints.into_values())
-            .flat_map(|bucket| bucket.into_iter().map(|c| (c.fd, c.ssl)))
-            .collect()
-    };
-    for (fd, ssl) in conns {
-        unsafe { close_tls(ssl, fd) }; // TLS-aware (ssl null → just close the fd)
+    // Free owns the client exclusively, so consume the mutex and its existing map directly.
+    // TLS teardown can block; no lock is held and no temporary connection collection is needed.
+    let conns = client.idle.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+    for connection in conns.into_values().flat_map(|endpoints| endpoints.into_values()).flatten() {
+        unsafe { close_tls(connection.ssl, connection.fd) }; // TLS-aware (null → just close the fd)
     }
 }
 
