@@ -14,6 +14,11 @@ struct Observation {
     row: Snapshot,
     group: i64,
 }
+#[derive(Default)]
+struct ObservationScratch {
+    #[cfg(target_os = "linux")]
+    bytes: Vec<u8>,
+}
 fn budget(value: i64) -> Result<usize, i32> {
     if !(1..=536870910).contains(&value) {
         return Err(AL_INVALID);
@@ -46,7 +51,7 @@ fn candidates(maximum: usize) -> Result<Vec<i32>, i32> {
     Ok(pids)
 }
 #[cfg(target_os = "linux")]
-fn observe(pid: i32) -> Result<Option<Observation>, i32> {
+fn observe(pid: i32, scratch: &mut ObservationScratch) -> Result<Option<Observation>, i32> {
     let file = match std::fs::File::open(format!("/proc/{pid}/stat")) {
         Ok(file) => file,
         Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
@@ -54,16 +59,16 @@ fn observe(pid: i32) -> Result<Option<Observation>, i32> {
         }
         Err(error) => return Err(io_error_to_status(&error)),
     };
-    let Some(bytes) = observation_bytes(file)? else {
+    let Some(bytes) = observation_bytes(file, &mut scratch.bytes)? else {
         return Ok(None);
     };
-    parse_stat(pid, &bytes).map(Some)
+    parse_stat(pid, bytes).map(Some)
 }
 #[cfg(any(test, target_os = "linux"))]
-fn observation_bytes(reader: impl std::io::Read) -> Result<Option<Vec<u8>>, i32> {
+fn observation_bytes(reader: impl std::io::Read, bytes: &mut Vec<u8>) -> Result<Option<&[u8]>, i32> {
     use std::io::Read;
-    let mut bytes = Vec::new();
-    match reader.take(65537).read_to_end(&mut bytes) {
+    bytes.clear();
+    match reader.take(65537).read_to_end(bytes) {
         Ok(_) => {}
         Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
             return Ok(None);
@@ -73,7 +78,7 @@ fn observation_bytes(reader: impl std::io::Read) -> Result<Option<Vec<u8>>, i32>
     if bytes.len() > 65536 {
         return Err(AL_INVALID);
     }
-    Ok(Some(bytes))
+    Ok(Some(bytes.as_slice()))
 }
 #[cfg(target_os = "linux")]
 fn parse_stat(pid: i32, bytes: &[u8]) -> Result<Observation, i32> {
@@ -185,7 +190,7 @@ fn decode_pid_list(
 }
 #[cfg(target_os = "macos")]
 #[allow(deprecated)] // libc exposes the stable native Mach timebase ABI.
-fn observe(pid: i32) -> Result<Option<Observation>, i32> {
+fn observe(pid: i32, _scratch: &mut ObservationScratch) -> Result<Option<Observation>, i32> {
     #[repr(C)]
     struct ShortBsd {
         pid: u32,
@@ -288,8 +293,9 @@ pub unsafe extern "C" fn align_rt_process_table(max_scan: i64, out: *mut AlignSt
     let run = || {
         let pids = candidates(budget(max_scan)?)?;
         let mut rows = Vec::with_capacity(pids.len());
+        let mut scratch = ObservationScratch::default();
         for pid in pids {
-            if let Some(observation) = observe(pid)? {
+            if let Some(observation) = observe(pid, &mut scratch)? {
                 rows.push(observation.row);
             }
         }
@@ -329,8 +335,9 @@ pub unsafe extern "C" fn align_rt_child_group_members(
             return Err(AL_INVALID);
         }
         let mut rows = Vec::new();
+        let mut scratch = ObservationScratch::default();
         for pid in candidates(maximum)? {
-            if let Some(observation) = observe(pid)?
+            if let Some(observation) = observe(pid, &mut scratch)?
                 && observation.group == i64::from(child.pid)
             {
                 rows.push(i64::from(pid));
@@ -352,6 +359,127 @@ pub unsafe extern "C" fn align_rt_child_group_members(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ChunkedInput<'a> {
+        remaining: &'a [u8],
+        consumed: usize,
+        interrupt_at: Option<usize>,
+        terminal_error: Option<i32>,
+    }
+    impl std::io::Read for ChunkedInput<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.interrupt_at.is_some_and(|at| self.consumed >= at) {
+                self.interrupt_at = None;
+                return Err(std::io::Error::from_raw_os_error(libc::EINTR));
+            }
+            if self.remaining.is_empty() {
+                return match self.terminal_error {
+                    Some(error) => Err(std::io::Error::from_raw_os_error(error)),
+                    None => Ok(0),
+                };
+            }
+            let count = out.len().min(self.remaining.len()).min(7);
+            out[..count].copy_from_slice(&self.remaining[..count]);
+            self.remaining = &self.remaining[count..];
+            self.consumed += count;
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn observation_input_reuse_and_failures() {
+        let long = [b'x'; 1024];
+        let mut scratch = Vec::new();
+        for bytes in [&long[..], &b"short\0\xff"[..], &b""[..]] {
+            let mut input = ChunkedInput {
+                remaining: bytes, consumed: 0, interrupt_at: Some(7), terminal_error: None,
+            };
+            assert_eq!(observation_bytes(&mut input, &mut scratch), Ok(Some(bytes)));
+            assert_eq!(input.consumed, bytes.len());
+        }
+        for error in [libc::ENOENT, libc::ESRCH, libc::EIO, libc::EACCES] {
+            let input = ChunkedInput {
+                remaining: b"partial", consumed: 0, interrupt_at: Some(7), terminal_error: Some(error),
+            };
+            let expected = if matches!(error, libc::ENOENT | libc::ESRCH) {
+                Ok(None)
+            } else {
+                Err(io_error_to_status(&std::io::Error::from_raw_os_error(error)))
+            };
+            assert_eq!(observation_bytes(input, &mut scratch), expected);
+            assert_eq!(observation_bytes(&b"new"[..], &mut scratch), Ok(Some(&b"new"[..])));
+        }
+    }
+
+    #[test]
+    fn observation_input_cap_and_read_error_order() {
+        let bytes = [b'x'; 65538];
+        let mut scratch = Vec::new();
+        for len in [65536, 65537, 65538] {
+            for terminal_error in [None, Some(libc::ENOENT), Some(libc::ESRCH), Some(libc::EIO)] {
+                let mut input = ChunkedInput {
+                    remaining: &bytes[..len], consumed: 0, interrupt_at: Some(65534), terminal_error,
+                };
+                let actual = observation_bytes(&mut input, &mut scratch);
+                let expected = match (len, terminal_error) {
+                    (65536, None) => Ok(Some(&bytes[..len])),
+                    (65536, Some(libc::ENOENT | libc::ESRCH)) => Ok(None),
+                    (65536, Some(error)) => Err(io_error_to_status(&std::io::Error::from_raw_os_error(error))),
+                    _ => Err(AL_INVALID),
+                };
+                assert_eq!(actual, expected, "len={len}, error={terminal_error:?}");
+                assert_eq!(input.consumed, len.min(65537));
+                assert_eq!(observation_bytes(&b"ok"[..], &mut scratch), Ok(Some(&b"ok"[..])));
+            }
+        }
+    }
+
+    #[cfg(feature = "alloc-count")]
+    #[test]
+    fn observation_input_reuse_allocations() {
+        use super::super::global_alloc_count;
+        let witness_before = global_alloc_count();
+        let witness = std::hint::black_box(vec![std::hint::black_box(7_u8); 32]);
+        assert!(global_alloc_count() > witness_before, "allocation counter must be active");
+        drop(witness);
+
+        let bytes = [b'x'; 1024];
+        let mut scratch = Vec::new();
+        observation_bytes(&bytes[..], &mut scratch).unwrap().unwrap();
+        for len in [1024, 0, 1, 127, 1024, 31] {
+            let input = ChunkedInput {
+                remaining: &bytes[..len], consumed: 0, interrupt_at: Some(7), terminal_error: None,
+            };
+            let before = global_alloc_count();
+            let result = observation_bytes(input, &mut scratch);
+            let allocations = global_alloc_count() - before;
+            assert_eq!(result, Ok(Some(&bytes[..len])));
+            assert_eq!(allocations, 0, "warmed input len={len}");
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "alloc-count"))]
+    #[test]
+    fn observation_native_reuse_allocations() {
+        use super::super::global_alloc_count;
+        let pid = i32::try_from(std::process::id()).unwrap();
+        let mut scratch = ObservationScratch::default();
+        let before = global_alloc_count();
+        let first = observe(pid, &mut scratch).unwrap().unwrap().row;
+        let cold = global_alloc_count() - before;
+        let mut warm = [0_u64; 32];
+        for count in &mut warm {
+            let before = global_alloc_count();
+            let current = observe(pid, &mut scratch).unwrap().unwrap().row;
+            *count = global_alloc_count() - before;
+            assert_eq!((current.pid, current.parent_pid), (first.pid, first.parent_pid));
+        }
+        eprintln!("native process observation Rust allocations: cold={cold}, warm={warm:?}");
+        // One unchanged /proc/PID/stat pathname allocation remains per observe call.
+        assert!(cold > 1, "cold read must demonstrate input storage growth");
+        assert_eq!(warm, [1; 32]);
+    }
+
     #[test]
     fn native_scan_failures_are_not_empty_observations() {
         for native_error in [libc::EACCES, libc::EIO] {
@@ -373,13 +501,14 @@ mod tests {
                 Err(std::io::Error::from_raw_os_error(self.0))
             }
         }
+        let mut scratch = Vec::new();
         for vanished in [libc::ENOENT, libc::ESRCH] {
-            assert_eq!(observation_bytes(Failure(vanished)), Ok(None));
+            assert_eq!(observation_bytes(Failure(vanished), &mut scratch), Ok(None));
         }
-        assert!(observation_bytes(Failure(libc::EIO)).is_err());
+        assert!(observation_bytes(Failure(libc::EIO), &mut scratch).is_err());
         assert_eq!(
-            observation_bytes(&b"record"[..]),
-            Ok(Some(b"record".to_vec()))
+            observation_bytes(&b"record"[..], &mut scratch),
+            Ok(Some(&b"record"[..]))
         );
     }
     #[test]
@@ -393,7 +522,7 @@ mod tests {
         assert!(pids.windows(2).all(|pair| pair[0] < pair[1]));
         let pid = i32::try_from(std::process::id()).unwrap();
         assert!(pids.contains(&pid));
-        let observation = observe(pid).unwrap().unwrap();
+        let observation = observe(pid, &mut ObservationScratch::default()).unwrap().unwrap();
         assert_eq!(observation.row.pid, i64::from(pid));
         assert!(observation.row.parent_pid >= 0);
         assert!(matches!(observation.row.threads,OptionalCount { tag:1,value,.. } if value>=1));
