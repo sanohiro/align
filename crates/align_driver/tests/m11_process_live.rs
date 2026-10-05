@@ -2,6 +2,274 @@
 mod common;
 use common::*;
 
+// Exclusive artifacts and file-backed outputs keep setup and capture free of pipe pressure.
+// The fresh group is owned until wait succeeds; all probes and failure cleanup share one budget.
+struct ProcessOutputChild {
+    child: Option<std::process::Child>,
+    deadline: std::time::Instant,
+}
+impl ProcessOutputChild {
+    fn spawn(command: &mut std::process::Command) -> Self {
+        use std::os::unix::process::CommandExt;
+        let child = command
+            .process_group(0)
+            .spawn()
+            .expect("spawn process output owner");
+        Self {
+            child: Some(child),
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+        }
+    }
+    fn check_work_deadline(&self) {
+        assert!(
+            std::time::Instant::now() < self.deadline - std::time::Duration::from_secs(5),
+            "process output owner work deadline"
+        );
+    }
+    fn wait(mut self) -> std::process::ExitStatus {
+        loop {
+            self.check_work_deadline();
+            match self.child.as_mut().expect("owned child").try_wait() {
+                Ok(Some(status)) => {
+                    self.child.take();
+                    return status;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("wait process output example: {error}"),
+            }
+        }
+    }
+}
+impl Drop for ProcessOutputChild {
+    fn drop(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        if let Ok(pid) = i32::try_from(child.id()) {
+            loop {
+                // The fixture never detaches; this group includes its producer and sleep children.
+                if unsafe { libc::kill(-pid, libc::SIGKILL) } == 0 {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted
+                    || std::time::Instant::now() >= self.deadline
+                {
+                    break;
+                }
+            }
+        }
+        loop {
+            match child.kill() {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::Interrupted
+                        && std::time::Instant::now() < self.deadline => {}
+                _ => break,
+            }
+        }
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    eprintln!("process output cleanup probe failed: {error}");
+                    break;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+            if std::time::Instant::now() >= self.deadline {
+                eprintln!("process output kill/reap deadline exceeded");
+                break;
+            }
+        }
+    }
+}
+
+struct ProcessOutputExample {
+    stage: align_driver::ArtifactStage,
+    exe: std::path::PathBuf,
+}
+impl ProcessOutputExample {
+    fn build(source: &str) -> Self {
+        let stage = align_driver::ArtifactStage::temp("process-output")
+            .expect("acquire process output fixture");
+        std::fs::write(stage.path().join("process_output.align"), source).unwrap();
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_alignc"));
+        command
+            .args(["build", "process_output.align", "--profile", "dev"])
+            .current_dir(stage.path())
+            .env("ALIGNC_CACHE", "off")
+            .env("TMPDIR", stage.path())
+            .stdout(std::fs::File::create(stage.path().join("build.stdout")).unwrap())
+            .stderr(std::fs::File::create(stage.path().join("build.stderr")).unwrap());
+        let status = ProcessOutputChild::spawn(&mut command).wait();
+        assert!(
+            status.success(),
+            "{}",
+            std::fs::read_to_string(stage.path().join("build.stderr")).unwrap()
+        );
+        let exe = stage
+            .path()
+            .join(format!("process_output{}", std::env::consts::EXE_SUFFIX));
+        Self { stage, exe }
+    }
+    fn start(&self, args: &[&str], readonly_stdout: bool) -> ProcessOutputChild {
+        let stdout = self.stage.path().join("stdout");
+        std::fs::write(&stdout, b"").unwrap();
+        let output = if readonly_stdout {
+            std::fs::File::open(&stdout).unwrap()
+        } else {
+            std::fs::File::create(&stdout).unwrap()
+        };
+        let mut command = std::process::Command::new(&self.exe);
+        command
+            .args(args)
+            .current_dir(self.stage.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(output)
+            .stderr(std::fs::File::create(self.stage.path().join("stderr")).unwrap());
+        ProcessOutputChild::spawn(&mut command)
+    }
+    fn wait_for_bytes(&self, child: &ProcessOutputChild, name: &str, expected: &[u8]) {
+        loop {
+            child.check_work_deadline();
+            let output = std::fs::read(self.stage.path().join(name)).unwrap();
+            assert!(
+                expected.starts_with(&output),
+                "unexpected {name} prefix: {} bytes",
+                output.len()
+            );
+            if output == expected {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    fn wait_for_marker(&self, child: &ProcessOutputChild, name: &str) {
+        loop {
+            child.check_work_deadline();
+            if self.stage.path().join(name).try_exists().unwrap() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    fn release(&self, name: &str) {
+        std::fs::write(self.stage.path().join(name), b"").unwrap();
+    }
+    fn assert_error(&self, args: &[&str], readonly_stdout: bool, code: i32) {
+        let status = self.start(args, readonly_stdout).wait();
+        assert_eq!(status.code(), Some(code));
+        assert_eq!(
+            std::fs::read(self.stage.path().join("stdout")).unwrap(),
+            b""
+        );
+        assert_eq!(
+            std::fs::read(self.stage.path().join("stderr")).unwrap(),
+            format!("error: code {code}\n").as_bytes()
+        );
+    }
+}
+
+#[test]
+fn incremental_process_output_example() {
+    let source = fixture("examples/process_output.align");
+    let checked = diff_check_multi(
+        "process-output-source",
+        &[("main.align", &source)],
+        "main.align",
+    );
+    assert!(
+        !checked.whole_errors && !checked.per_unit_errors,
+        "{}\n{}",
+        checked.whole_diags,
+        checked.per_unit_diags
+    );
+    if !backend_available() {
+        return;
+    }
+    let example = ProcessOutputExample::build(&source);
+    let payload: Vec<u8> = (0_u8..=255).cycle().take(3 * 65536 + 17).collect();
+    std::fs::write(example.stage.path().join("payload.bin"), &payload).unwrap();
+    // Both orders exceed pipe/window size. The worker cannot exit until both binary outputs
+    // have been observed, and it closes the first pipe before it produces the other stream.
+    std::fs::write(
+        example.stage.path().join("worker.sh"),
+        r#"set -eu
+if [ "$1" = stdout ]; then
+    cat payload.bin
+    exec 1>&-
+else
+    cat payload.bin >&2
+    exec 2>&-
+fi
+: > first.closed
+while [ ! -f release.other ]; do sleep 0.01; done
+if [ "$1" = stdout ]; then
+    cat payload.bin >&2
+    exec 2>&-
+else
+    cat payload.bin
+    exec 1>&-
+fi
+: > both.closed
+while [ ! -f release.exit ]; do sleep 0.01; done
+exit 0
+"#,
+    )
+    .unwrap();
+    for (first, other) in [("stdout", "stderr"), ("stderr", "stdout")] {
+        for name in [
+            "first.closed",
+            "both.closed",
+            "release.other",
+            "release.exit",
+        ] {
+            let path = example.stage.path().join(name);
+            if path.try_exists().unwrap() {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        let child = example.start(&["/bin/sh", "worker.sh", first], false);
+        example.wait_for_bytes(&child, first, &payload);
+        example.wait_for_marker(&child, "first.closed");
+        assert_eq!(
+            std::fs::read(example.stage.path().join(other)).unwrap(),
+            b""
+        );
+        assert!(!example
+            .stage
+            .path()
+            .join("release.other")
+            .try_exists()
+            .unwrap());
+        example.release("release.other");
+        example.wait_for_bytes(&child, other, &payload);
+        example.wait_for_marker(&child, "both.closed");
+        assert!(!example
+            .stage
+            .path()
+            .join("release.exit")
+            .try_exists()
+            .unwrap());
+        example.release("release.exit");
+        assert!(child.wait().success());
+        assert_eq!(
+            std::fs::read(example.stage.path().join(first)).unwrap(),
+            payload
+        );
+        assert_eq!(
+            std::fs::read(example.stage.path().join(other)).unwrap(),
+            payload
+        );
+    }
+    example.assert_error(&[], false, 2);
+    example.assert_error(&["/bin/sh", "-c", "exit 7"], false, 2);
+    example.assert_error(&["/bin/sh", "-c", "kill -TERM $$"], false, 2);
+    example.assert_error(&["/bin/sh", "-c", "printf x"], true, libc::EBADF);
+}
+
 #[test]
 fn typed_wait_and_cached_result() {
     let source = r#"import std.process

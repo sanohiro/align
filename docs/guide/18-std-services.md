@@ -162,6 +162,10 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 
 The argv slice includes `argv[0]`. `wait()` returns the Copy record `process.wait_result`: `termination` distinguishes `Exited(code)` from `Signaled(signal)`. A child's nonzero exit is result data, not an I/O error. This example prints the kind and value, then returns `Ok(())`; it does not forward the child's exit code. `max_rss_bytes: Option<i64>` carries the child's native maximum resident memory observation in bytes when available.
 
+For live binary output, see [`examples/process_output.align`](../../examples/process_output.align). Build it with `alignc build examples/process_output.align`, then run `./examples/process_output /usr/bin/printf 'align\n'`, or pass another executable and its arguments. `command.start()` uses `/dev/null` for stdin and captures both output pipes. The example drains both through one explicitly initialized 64KiB writable array and writes each received prefix to the corresponding output without text decoding. `Some(n)` supplies bytes, `Some(0)` marks EOF, and `None` means pending or interrupted; both pipes must reach EOF before the final `wait()`. It maps nonzero exits and signals to `Error.Invalid`, rather than forwarding the child status.
+
+Each `poll` waits at most one second; this is not a whole-command deadline. Output writes, final wait and child Drop may block. A read or write error can leave an already-written prefix, and this example does not forward stdin or cap output.
+
 A `child` is a Move handle and Drop reaps an unwaited direct child, so it cannot silently become a zombie. Drop may block and does not certify descendant termination. `process.exec` replaces the image and runs no cleanup on success. `process.exit` performs the current cleanup path first; `process.abort` is the explicit immediate `_exit` path and skips cleanup.
 
 ## `std.compress` and `std.crypto`

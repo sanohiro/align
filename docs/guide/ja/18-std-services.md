@@ -145,6 +145,10 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 
 引数のスライスには `argv[0]` も含めます。`wait()` は Copy レコードの `process.wait_result` を返します。`termination` の `Exited(code)` は通常の終了、`Signaled(signal)` はシグナルによる終了です。子プロセスの非ゼロ終了は結果のデータであり、I/O エラーではありません。この例は終了の種類と値を表示して `Ok(())` を返し、子プロセスの終了コードを自身の終了コードには使いません。`max_rss_bytes: Option<i64>` は、取得できた場合の子プロセスの最大常駐メモリをバイト数で表します。
 
+終了前のバイナリ出力を読む例は [`examples/process_output.align`](../../../examples/process_output.align) です。`alignc build examples/process_output.align` でビルドし、`./examples/process_output /usr/bin/printf 'align\n'` を実行するか、別の実行ファイルと引数を渡します。`command.start()` は標準入力に `/dev/null` を使い、標準出力と標準エラーを別々のパイプで捕捉します。この例は明示的に初期化した 64KiB の書き換え可能な配列を再利用し、受信した範囲だけを対応する出力へ書き込みます。テキストへの変換は行いません。`Some(n)` は受信したバイト数、`Some(0)` は EOF、`None` は待機中または割り込みがあった状態です。両方の EOF を確認してから最後の `wait()` を呼びます。非ゼロ終了とシグナル終了は、子プロセスの終了状態をそのまま返す代わりに `Error.Invalid` にします。
+
+各 `poll` の待機は最大 1 秒ですが、コマンド全体の期限ではありません。出力への書き込み、最後の wait、子プロセスの Drop はブロックすることがあります。読み書きのエラーが起きると、書き込み済みの出力が残ることがあります。この例は標準入力の転送や出力量の制限を行いません。
+
 `child` は Move ハンドルです。`wait` せずに drop しても、後始末で直接の子プロセスを回収するため、ゾンビプロセスが残りません。Drop は待機でブロックすることがあり、子孫プロセスの終了は保証しません。
 
 `process.exec` は現在のプロセスイメージを置き換え、成功時には後始末を行いません。`process.exit` は現在のクリーンアップ処理を実行してから終了します。`process.abort` は `_exit` に相当し、後始末をせず即座に終了します。
