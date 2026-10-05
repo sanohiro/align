@@ -178,22 +178,28 @@ fn push_float<T: std::fmt::Display>(buf: &mut impl FloatWrite, x: T) {
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_print_f64(x: f64) {
     use std::io::Write;
-    let mut line = Vec::with_capacity(32);
+    let mut line = FixedFloatBuf {
+        bytes: [0; FLOAT_TEXT_CAPACITY],
+        len: 0,
+    };
     push_float(&mut line, x);
-    line.push(b'\n');
+    line.append(b"\n");
     let mut out = std::io::stdout().lock();
-    let _ = out.write_all(&line).and_then(|()| out.flush());
+    let _ = out.write_all(line.bytes()).and_then(|()| out.flush());
 }
 
 /// Builtin `print` for `f32`: shortest round-trip decimal + a newline.
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_print_f32(x: f32) {
     use std::io::Write;
-    let mut line = Vec::with_capacity(32);
+    let mut line = FixedFloatBuf {
+        bytes: [0; FLOAT_TEXT_CAPACITY],
+        len: 0,
+    };
     push_float(&mut line, x);
-    line.push(b'\n');
+    line.append(b"\n");
     let mut out = std::io::stdout().lock();
-    let _ = out.write_all(&line).and_then(|()| out.flush());
+    let _ = out.write_all(line.bytes()).and_then(|()| out.flush());
 }
 
 /// Package-internal bit-preserving float conversion for native binary codecs.
@@ -28588,6 +28594,43 @@ mod tests {
                 libc::close(fds[1]);
             }
         }
+    }
+
+    #[cfg(feature = "alloc-count")]
+    #[test]
+    fn float_print_uses_fixed_rendering_scratch() {
+        let witness_before = global_alloc_count();
+        let witness = std::hint::black_box(vec![std::hint::black_box(7_u8); 32]);
+        assert!(global_alloc_count() > witness_before, "allocation counter must be active");
+        drop(witness);
+        // Warm stdout before counting the rendering operation. Do not redirect
+        // process-global output or count only Align's explicit malloc helpers.
+        align_rt_print_f32(0.0);
+        align_rt_print_f64(0.0);
+        let f32_bits = [
+            0, 0x8000_0000, 0x3fa0_0000, 0x7f7f_ffff, 0xff7f_ffff,
+            0x0080_0000, 1, 0x8000_0001, 0x7f80_0000, 0xff80_0000, 0x7fc0_1234,
+        ];
+        let f64_bits = [
+            0, 0x8000_0000_0000_0000, 0x3ff4_0000_0000_0000,
+            0x7fef_ffff_ffff_ffff, 0xffef_ffff_ffff_ffff,
+            0x0010_0000_0000_0000, 1, 0x8000_0000_0000_0001,
+            0x7ff0_0000_0000_0000, 0xfff0_0000_0000_0000, 0x7ff8_0000_0000_1234,
+        ];
+        let mut counts = [[0_u64; 11]; 2];
+        for (index, bits) in f32_bits.into_iter().enumerate() {
+            let value = std::hint::black_box(f32::from_bits(bits));
+            let before = global_alloc_count();
+            align_rt_print_f32(value);
+            counts[0][index] = global_alloc_count() - before;
+        }
+        for (index, bits) in f64_bits.into_iter().enumerate() {
+            let value = std::hint::black_box(f64::from_bits(bits));
+            let before = global_alloc_count();
+            align_rt_print_f64(value);
+            counts[1][index] = global_alloc_count() - before;
+        }
+        assert_eq!(counts, [[0; 11]; 2], "temporary float rendering allocated");
     }
 
     #[test]
