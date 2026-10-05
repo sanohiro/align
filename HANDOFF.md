@@ -73,6 +73,10 @@ removing the per-observation token Vec without changing essential/optional
 field admission, native queries or table/group output. Native prefix/tail and
 actual-source owners qualify it; parser-only allocation measurements distinguish
 this scratch from the unchanged input and returned-row storage.
+Plan107 forms PATH-search scratch only for searched executable names. Direct
+paths and retained images preserve their final environment and native ownership
+while avoiding one unused search copy. Native preparation and actual-allocation
+owners qualify the refinement; no whole-launch speed or RSS promise is made.
 Continue bounded library/transport improvements and measured
 execution/storage/startup work against demonstrated consumers.
 Real voice/media engine integration and GPU qualification belong to their

@@ -165,25 +165,31 @@ impl Prepared {
                 variables.push((key, value));
             }
         }
-        let search = variables
-            .iter()
-            .find(|(key, _)| key == "PATH")
-            .map(|(_, value)| value.as_bytes().to_vec());
-        let search = match search {
-            _ if matches!(command.target, super::CommandTarget::Image(_)) || command.target.direct_path() => Vec::new(),
-            Some(value) => value,
-            None => {
-                let size = unsafe { libc::confstr(libc::_CS_PATH, core::ptr::null_mut(), 0) };
-                if size == 0 {
-                    return Err(error());
+        // Direct paths and retained images do not need PATH-search scratch.
+        let search = if matches!(command.target, super::CommandTarget::Image(_))
+            || command.target.direct_path()
+        {
+            Vec::new()
+        } else {
+            match variables
+                .iter()
+                .find(|(key, _)| key == "PATH")
+                .map(|(_, value)| value.as_bytes().to_vec())
+            {
+                Some(value) => value,
+                None => {
+                    let size = unsafe { libc::confstr(libc::_CS_PATH, core::ptr::null_mut(), 0) };
+                    if size == 0 {
+                        return Err(error());
+                    }
+                    let mut bytes = vec![0u8; size];
+                    if unsafe { libc::confstr(libc::_CS_PATH, bytes.as_mut_ptr().cast(), size) } != size
+                    {
+                        return Err(AL_INVALID);
+                    }
+                    bytes.pop();
+                    bytes
                 }
-                let mut bytes = vec![0u8; size];
-                if unsafe { libc::confstr(libc::_CS_PATH, bytes.as_mut_ptr().cast(), size) } != size
-                {
-                    return Err(AL_INVALID);
-                }
-                bytes.pop();
-                bytes
             }
         };
         let environment = variables
@@ -915,6 +921,91 @@ pub(crate) mod tests {
             new_session: false,
             stdout_binding: None,
             stderr_binding: None,
+        }
+    }
+    #[test]
+    fn prepared_target_search_and_environment() {
+        for (target, path, expected) in [
+            ("/bin/sh", "a::/b", vec!["/bin/sh"]),
+            ("./tool", "a::/b", vec!["./tool"]),
+            ("sh", "a::/b", vec!["a/sh", "sh", "/b/sh"]),
+            ("sh", "", vec!["sh"]),
+        ] {
+            let mut configuration = command("exit 0");
+            configuration.target = super::super::CommandTarget::Path(CString::new(target).unwrap());
+            configuration.env_clear = true;
+            configuration.env.push((CString::new("PATH").unwrap(), CString::new(path).unwrap()));
+            let prepared = Prepared::new(&configuration).unwrap();
+            assert_eq!(
+                prepared.candidates.iter().map(|candidate| candidate.to_str().unwrap()).collect::<Vec<_>>(),
+                expected,
+            );
+            assert_eq!(prepared.environment[0].as_bytes(), format!("PATH={path}").as_bytes());
+            assert_eq!(prepared.argv.len(), configuration.argv.len() + 1);
+            assert_eq!(prepared.envp.len(), 2);
+            assert_eq!(prepared.argv.last().copied(), Some(core::ptr::null()));
+            assert_eq!(prepared.envp.last().copied(), Some(core::ptr::null()));
+        }
+        // An absent PATH uses the OS default without installing it in the child environment.
+        let mut configuration = command("exit 0");
+        configuration.env_clear = true;
+        configuration.target = super::super::CommandTarget::Path(CString::new("sh").unwrap());
+        let prepared = Prepared::new(&configuration).unwrap();
+        let size = unsafe { libc::confstr(libc::_CS_PATH, core::ptr::null_mut(), 0) };
+        assert!(size > 0);
+        let mut default = vec![0_u8; size];
+        assert_eq!(unsafe { libc::confstr(libc::_CS_PATH, default.as_mut_ptr().cast(), size) }, size);
+        assert_eq!(default.pop(), Some(0));
+        let expected: Vec<Vec<u8>> = default.split(|byte| *byte == b':').map(|prefix| {
+            let mut candidate = prefix.to_vec();
+            if !candidate.is_empty() { candidate.push(b'/'); }
+            candidate.extend_from_slice(b"sh");
+            candidate
+        }).collect();
+        assert_eq!(prepared.candidates.iter().map(|candidate| candidate.as_bytes()).collect::<Vec<_>>(), expected);
+        assert!(prepared.environment.is_empty());
+        // Bypassing search does not bypass validation of the supplied final environment.
+        for target in ["/bin/sh", "sh"] {
+            for invalid_key in [false, true] {
+                let mut configuration = command("exit 0");
+                configuration.env_clear = true;
+                configuration.target = super::super::CommandTarget::Path(CString::new(target).unwrap());
+                let invalid = CString::new(vec![0xff_u8]).unwrap();
+                configuration.env.push(if invalid_key {
+                    (invalid, CString::new("value").unwrap())
+                } else {
+                    (CString::new("PATH").unwrap(), invalid)
+                });
+                assert!(matches!(Prepared::new(&configuration), Err(AL_INVALID)));
+            }
+        }
+    }
+    #[cfg(feature = "alloc-count")]
+    #[test]
+    fn prepared_path_allocation_probe() {
+        let before = super::super::global_alloc_count();
+        std::hint::black_box(vec![17_u8; 64]);
+        assert!(super::super::global_alloc_count() > before, "allocator probe is active");
+        for image in [false, true] {
+            if image && !cfg!(target_os = "linux") { continue; }
+            let mut configuration = command("exit 0");
+            configuration.env_clear = true;
+            let path = "a".repeat(4096);
+            configuration.env.push((CString::new("PATH").unwrap(), CString::new(path.as_str()).unwrap()));
+            if image {
+                configuration.target = super::super::CommandTarget::Image(
+                    std::fs::File::open("/dev/null").unwrap().into(),
+                );
+            }
+            let before = super::super::global_alloc_count();
+            let prepared = std::hint::black_box(Prepared::new(&configuration).unwrap());
+            let allocations = super::super::global_alloc_count() - before;
+            assert_eq!(prepared.environment[0].as_bytes(), format!("PATH={path}").as_bytes());
+            assert_eq!(prepared.argv.last().copied(), Some(core::ptr::null()));
+            assert_eq!(prepared.envp.last().copied(), Some(core::ptr::null()));
+            assert_eq!(prepared.candidates.len(), if image { 0 } else { 1 });
+            assert!(allocations <= if image { 11 } else { 13 }, "unused PATH copy: image={image}, allocations={allocations}");
+            println!("prepared image={image}: {allocations} Rust allocation/reallocation calls");
         }
     }
     #[test]
