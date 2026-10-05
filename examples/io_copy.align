@@ -7,14 +7,17 @@ import std.io
 // Memory stays O(buffer) (a fixed 64 KiB transfer buffer), never O(file size) — no matter how big
 // the file is. `io.copy` *borrows* both handles (it does not consume them, like `print`'s
 // argument), so `w` is still usable afterward — here it appends a trailing newline, then drops
-// (flush + close) at scope end. Returns the number of bytes transferred.
+// (close) at scope end. Explicit flush must succeed before the count is printed.
+// The destination must be absent; a late error may leave a partial new output.
+// Flush does not promise durable storage. The reported count excludes the appended newline.
 pub fn main(args: array<str>) -> Result<(), Error> {
   // Require source and destination before opening either file.
   if args.len() != 3 { return Err(Error.Invalid) }
   r := fs.open(args[1])?
-  w := fs.create(args[2])?
+  w := fs.create_exclusive(args[2])?
   n := io.copy(r, w)?
   w.write("\n")?
+  w.flush()?
   print(n)
   return Ok(())
 }
