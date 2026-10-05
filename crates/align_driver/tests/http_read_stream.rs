@@ -216,6 +216,27 @@ fn receive_peer(
 }
 
 #[test]
+fn bounded_fetch_example_rejects_degraded_read_window() {
+    assert!(backend_available(), "fetch example requires the LLVM backend");
+    let source = fixture("examples/http_fetch.align");
+    assert_eq!(source.matches("buffer(65536)").count(), 1);
+    let degraded = source.replace("buffer(65536)", "buffer(0)");
+    let example = ReceiveExample::build_source("http-fetch-degraded-window", &degraded);
+    for bytes in [b"unread\0\xff".as_slice(), b""] {
+        let listener = receive_listener();
+        let url = format!("http://127.0.0.1:{}/binary", listener.local_addr().unwrap().port());
+        let mut child = example.start(&["--url", &url], false);
+        let mut socket = receive_peer(&listener, &child, None);
+        let mut response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", bytes.len()).into_bytes();
+        response.extend_from_slice(bytes);
+        socket.write_all(&response).expect("degraded-window response");
+        drop(socket);
+        example.assert_exit(child.wait(), Some(2));
+        assert!(example.stdout().is_empty());
+    }
+}
+
+#[test]
 fn bounded_fetch_example_preserves_binary_framing_and_emits_before_completion() {
     if !backend_available() {
         return;

@@ -19,6 +19,11 @@ continues to demonstrate nonconsuming copy by appending one newline and printing
 the count of source bytes. No library, compiler, API, ABI, allocation policy or
 native filesystem implementation changes.
 
+Plan114 also requires file_copy's fixed buffer capacity to equal 65536 before
+the first read. An unavailable window returns Invalid; the already-created
+destination remains empty and the input is unchanged. io_copy uses the existing
+native copy operation and creates no source-level read window.
+
 | Closure axis | Owner |
 | --- | --- |
 | Actual example sources and ordinary completion | `file_copy_examples` compiles both checked-in files. Empty, short binary and multi-window payloads keep exact bytes; `io_copy` alone appends its documented newline and prints the source length. |

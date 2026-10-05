@@ -22,8 +22,9 @@ the request. Accept only final status 200; another status returns
 content-type restriction, decoding, authentication or URL discovery in the example.
 Existing constructor and transport errors propagate.
 
-Allocate one explicit 65536-byte output buffer and bind one unbuffered stdout
-writer after successful status admission. Repeated `stream.read(out)` overwrites
+Allocate one explicit 65536-byte output buffer after successful status admission.
+Require its capacity to equal 65536 or return `Error.Invalid` before reading;
+then bind one unbuffered stdout writer. Repeated `stream.read(out)` overwrites
 the buffer without growth; a positive result is written through
 `output.write(out.bytes())` before the next read. Zero means
 exact HTTP body completion. Preserve every binary octet and expose no chunk
@@ -55,6 +56,7 @@ There is no new artifact/cache identity or prerequisite milestone.
 | Binary preservation and exact completion | fixed buffer, read/write loop | Same target: fixed/chunked/close-delimited/interim responses, all octet values and multiple windows |
 | Incremental output with a single reused window | write before the next read | Same target: first body prefix observed while the response remains incomplete |
 | Positive cumulative cap and failure propagation | client cap and `?` | Same target: exact/exceeded known and unknown lengths, truncated body, stalled head/body and stdout failure |
+| Unavailable read window | capacity admission before the first read | Same target: actual source with a zero-window constructor requires normal Invalid and no output for empty/nonempty bodies; plan114 |
 | Ordinary source and native cleanup | source compiled from the checked-in example; fixture, child and socket owners | Same target: actual alignc build/run, exclusive ArtifactStage, bounded process-group kill/reap and socket waits |
 | Guide parity | chapter 18 English and Japanese | Author ledger-to-prose pass and syntax/execution owner |
 
