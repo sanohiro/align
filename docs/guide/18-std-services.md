@@ -87,6 +87,7 @@ one 64 KiB buffer and one unbuffered stdout writer, bound before the loop:
 consumes its borrowed byte view before the next read. A zero count means
 completion. Chunk framing is removed by the stream;
 the application performs no UTF-8 conversion or whole-body accumulation.
+An unavailable 64 KiB window returns `Error.Invalid` before the first read.
 
 `--max-body-bytes` defaults to 64 MiB and accepts 1..1073741824 decoded bytes.
 `--timeout-ns` defaults to 30 seconds and must be positive. Both limits are
@@ -201,6 +202,7 @@ import std.fs
 fn sha256_reader(input: reader) -> Result<string, Error> {
     digest := crypto.sha256_stream()
     mut chunk := buffer(65536)
+    if chunk.capacity() != 65536 { return Err(Error.Invalid) }
     loop {
         n := input.read(chunk)?
         if n == 0 { break }
@@ -221,6 +223,8 @@ Each read replaces the buffer's initialized bytes. Update borrows those bytes
 only for the call; the next read can reuse the same storage. Input is binary,
 so NUL and non-UTF-8 bytes need no conversion. `finish()` consumes the digest
 and produces an owned 32-byte result; hex encoding produces an owned string.
+The capacity check rejects an unavailable window with `Error.Invalid` before
+reading, so it cannot produce a digest by mistaking that condition for EOF.
 `?` propagates file/read errors and ordinary Drop releases the reader and any
 unfinished digest. A digest describes the bytes actually read, rather than
 certifying a stable filesystem snapshot. See the

@@ -104,6 +104,7 @@ What remains — iteration whose trip count is decided *by the iteration itself*
 ```align
 mut total := 0
 mut buf := buffer(4096)
+if buf.capacity() != 4096 { return Err(Error.Invalid) }
 n_read := loop {
     n := r.read(buf)?               // errors still exit the function, as always
     if n == 0 { break total }       // break is the only loop exit

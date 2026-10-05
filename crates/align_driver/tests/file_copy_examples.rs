@@ -105,8 +105,11 @@ fn run(command: &mut Command) -> Output {
 }
 
 fn build(stage: &Path, name: &str) -> std::path::PathBuf {
-    std::fs::write(stage.join("main.align"), common::fixture(&format!("examples/{name}.align")))
-        .expect("write actual example");
+    build_source(stage, common::fixture(&format!("examples/{name}.align")))
+}
+
+fn build_source(stage: &Path, source: &str) -> std::path::PathBuf {
+    std::fs::write(stage.join("main.align"), source).expect("write actual example");
     let result = run(Command::new(env!("CARGO_BIN_EXE_alignc"))
         .args(["build", "main.align", "--profile", "dev"])
         .current_dir(stage).env("ALIGNC_CACHE", "off").env("TMPDIR", stage));
@@ -118,6 +121,27 @@ fn assert_error(output: &Output, code: i32) {
     assert_eq!(output.status.code(), Some(code.clamp(1, 255)), "{output:?}");
     assert!(output.stdout.is_empty(), "no success count on failure: {output:?}");
     assert_eq!(output.stderr, format!("error: code {code}\n").as_bytes(), "{output:?}");
+}
+
+#[test]
+fn actual_copy_example_rejects_degraded_read_window() {
+    assert!(common::backend_available(), "example owner requires the LLVM backend");
+    let source = common::fixture("examples/file_copy.align");
+    assert_eq!(source.matches("buffer(65536)").count(), 1);
+    let degraded = source.replace("buffer(65536)", "buffer(0)");
+    let stage = align_driver::ArtifactStage::temp("copy-degraded-window").unwrap();
+    let root = stage.path();
+    let exe = build_source(root, &degraded);
+    let input = root.join("source");
+    let destination = root.join("destination");
+    for bytes in [b"unread\0\xff".as_slice(), b""] {
+        std::fs::write(&input, bytes).unwrap();
+        let output = run(Command::new(&exe).arg(&input).arg(&destination));
+        assert_error(&output, 2);
+        assert_eq!(std::fs::read(&input).unwrap(), bytes);
+        assert!(std::fs::read(&destination).unwrap().is_empty());
+        std::fs::remove_file(&destination).unwrap();
+    }
 }
 
 #[test]
