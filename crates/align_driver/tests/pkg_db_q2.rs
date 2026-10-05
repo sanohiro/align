@@ -1439,6 +1439,181 @@ fn main(args: array<str>) -> Result<(), Error> {
     );
 }
 
+#[test]
+fn postgres_required_float_text_preserves_finite_extremes() {
+    if !backend_available() {
+        return;
+    }
+    let Some(url) = live_postgres_url("PostgreSQL canonical float Text parameters") else {
+        return;
+    };
+    const QUERY: &str = r#"module app.float_text_query
+import pkg.db
+import pkg.db.postgres
+
+pub Params { value: f64 }
+pub Row { bits: str }
+pub fn query() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
+  "SELECT encode(float8send(CAST(:value AS float8)), 'hex') AS bits", [],
+  [pkg.db.postgres.QueryOption.ParameterType("value", "float8")],
+)
+"#;
+    let main = r#"module main
+import pkg.db
+import pkg.db.postgres
+import app.float_text_query
+
+extern "C" fn align_rt_f64_from_bits(bits: u64) -> f64
+
+fn row_matches(borrow mut rows: pkg.db.rows<app.float_text_query.Row>, expected: str) -> bool {
+  available := pkg.db.next(rows) else { return false }
+  row := available else { return false }
+  if row.bits != expected { return false }
+  match pkg.db.next(rows) else { return false } {
+    Some(_) => false
+    None => true
+  }
+}
+
+fn direct(borrow connection: pkg.db.conn, value: f64, expected: str) -> bool {
+  mut rows := pkg.db.postgres.rows_native(
+    pkg.db.exec_conn(connection), app.float_text_query.query(),
+    app.float_text_query.Params { value: value }, [],
+    [pkg.db.postgres.ExecuteOption.ParameterFormat("value", pkg.db.postgres.Format.Text)],
+  ) else { return false }
+  return row_matches(rows, expected)
+}
+
+fn prepared(
+  borrow mut statement: pkg.db.stmt<app.float_text_query.Params, app.float_text_query.Row>,
+  value: f64, expected: str,
+) -> bool {
+  mut rows := pkg.db.postgres.rows_stmt_native(
+    statement, app.float_text_query.Params { value: value }, [],
+    [pkg.db.postgres.ExecuteOption.ParameterFormat("value", pkg.db.postgres.Format.Text)],
+  ) else { return false }
+  return row_matches(rows, expected)
+}
+
+fn run(url: str) -> i32 {
+  connection := pkg.db.postgres.connect(url, []) else { return 1 }
+  mut statement := pkg.db.prepare(
+    pkg.db.exec_conn(connection), app.float_text_query.query(), [],
+  ) else { return 2 }
+  bits: [u64; 8] := [
+    0x16687e92154ef7ac, 0x6974e718d7d7625a,
+    0x7fefffffffffffff, 0xffefffffffffffff,
+    0x0010000000000000, 0x0000000000000001,
+    0x8000000000000001, 0x8000000000000000,
+  ]
+  expected := [
+    "16687e92154ef7ac", "6974e718d7d7625a", "7fefffffffffffff", "ffefffffffffffff",
+    "0010000000000000", "0000000000000001", "8000000000000001", "8000000000000000",
+  ]
+  mut index := 0
+  loop {
+    if index == bits.len() { break }
+    value := unsafe { align_rt_f64_from_bits(bits[index]) }
+    if !direct(connection, value, expected[index]) { return 10 + (index as i32) }
+    if !prepared(statement, value, expected[index]) { return 20 + (index as i32) }
+    index = index + 1
+  }
+  return 42
+}
+
+fn main(args: array<str>) -> Result<(), Error> {
+  print(run(args[1]))
+  return Ok(())
+}
+"#;
+    let files = package_files(main).module("app/float_text_query.align", QUERY);
+    // Keep every fixture below one exclusively acquired, immediately guarded directory.
+    let stage = align_driver::ArtifactStage::temp("pkg-db-q2-float-text")
+        .expect("acquire float Text fixture");
+    for (name, source) in files.files() {
+        let path = stage.path().join(name);
+        std::fs::create_dir_all(path.parent().expect("module parent")).expect("module directory");
+        std::fs::write(path, source).expect("write module");
+    }
+    let entry = stage.path().join("main.align").display().to_string();
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, &entry, main);
+    assert!(!checked.diags.has_errors(), "{}",
+        align_driver::format_diagnostics(&sm, &checked.diags));
+    let mut unit_sm = SourceMap::new();
+    let per_unit = check_per_unit(&mut unit_sm, &entry, main);
+    assert!(!per_unit.diags.has_errors(), "{}",
+        align_driver::format_diagnostics(&unit_sm, &per_unit.diags));
+    let mir = lower_to_mir_with_static_descriptors(&checked, &mut sm, stage.path())
+        .expect("install static descriptors");
+    let object = stage.path().join("main.o");
+    let executable = stage.path().join(format!("main{}", std::env::consts::EXE_SUFFIX));
+    emit_object_file(&mir, &object, BuildTarget::Baseline, Profile::Release, &[], false)
+        .expect("codegen float Text owner");
+    link_executable(&align_driver::CDriver::default(), &object, &executable,
+        &mir.link_libs, Profile::Release).expect("link float Text owner");
+
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+    struct ChildOwner {
+        child: Option<std::process::Child>,
+        deadline: Instant,
+    }
+    impl Drop for ChildOwner {
+        fn drop(&mut self) {
+            if let Some(child) = self.child.as_mut() {
+                if let Ok(pid) = i32::try_from(child.id()) {
+                    // SAFETY: the owned child leads its own process group.
+                    unsafe { libc::kill(-pid, libc::SIGKILL) };
+                }
+                let _ = child.kill();
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => break,
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
+                        Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+                    }
+                    if Instant::now() >= self.deadline {
+                        eprintln!("float Text child kill/reap exceeded its owner deadline");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let stdout = stage.path().join("stdout");
+    let stderr = stage.path().join("stderr");
+    let mut command = std::process::Command::new(executable);
+    command.arg(&url).process_group(0)
+        .stdout(std::fs::File::create(&stdout).expect("stdout capture"))
+        .stderr(std::fs::File::create(&stderr).expect("stderr capture"));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut owner = ChildOwner {
+        child: Some(command.spawn().expect("spawn float Text owner")),
+        deadline,
+    };
+    let status = loop {
+        assert!(Instant::now() + Duration::from_secs(5) < owner.deadline,
+            "float Text child exceeded its work deadline");
+        match owner.child.as_mut().expect("armed child").try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => panic!("poll float Text child: {error}"),
+        }
+    };
+    owner.child.take();
+    let output = std::process::Output {
+        status,
+        stdout: std::fs::read(stdout).expect("stdout evidence"),
+        stderr: std::fs::read(stderr).expect("stderr evidence"),
+    };
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.stdout, b"42\n", "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
 /// The Layer-1 migration's forward guard for this suite.
 ///
 /// Regenerate ONLY with a reviewed reason, from the panic message this emits.
