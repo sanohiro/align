@@ -9,6 +9,8 @@ import std.io
 // argument), so `w` is still usable afterward — here it appends a trailing newline, then drops
 // (flush + close) at scope end. Returns the number of bytes transferred.
 pub fn main(args: array<str>) -> Result<(), Error> {
+  // Require source and destination before opening either file.
+  if args.len() != 3 { return Err(Error.Invalid) }
   r := fs.open(args[1])?
   w := fs.create(args[2])?
   n := io.copy(r, w)?
