@@ -1,0 +1,51 @@
+import std.io
+import std.process
+
+// Run an explicit executable and forward binary stdout/stderr before waiting for exit.
+pub fn main(args: array<str>) -> Result<(), Error> {
+    if args.len() < 2 { return Err(Error.Invalid) }
+    window_bytes: i64 := 65536
+    mut initial: array_builder<u8> := array_builder(window_bytes)
+    mut filled: i64 := 0
+    loop {
+        if filled == window_bytes { break }
+        initial.push(0 as u8)
+        filled = filled + 1
+    }
+    mut bytes := initial.build()
+    command := process.command(args[1], args[1..])
+    mut child := command.start()?
+    output := io.stdout
+    diagnostics := io.stderr
+    mut stdout_done := false
+    mut stderr_done := false
+    loop {
+        if !stdout_done {
+            match child.read_stdout(bytes)? {
+                Some(count) => {
+                    if count == 0 { stdout_done = true } else { output.write(bytes[0..count])? }
+                }
+                None => {}
+            }
+        }
+        if !stderr_done {
+            match child.read_stderr(bytes)? {
+                Some(count) => {
+                    if count == 0 { stderr_done = true } else { diagnostics.write(bytes[0..count])? }
+                }
+                None => {}
+            }
+        }
+        if stdout_done && stderr_done { break }
+        child.poll(process.readiness {
+            stdout: !stdout_done,
+            stderr: !stderr_done,
+            status: false
+        }, 1000000000)?
+    }
+    result := child.wait()?
+    match result.termination {
+        Exited(code) => if code == 0 { Ok(()) } else { Err(Error.Invalid) }
+        Signaled(_) => Err(Error.Invalid)
+    }
+}
