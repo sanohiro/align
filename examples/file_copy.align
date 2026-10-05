@@ -2,14 +2,15 @@ module main
 
 import std.fs
 
-// Byte-exact file copy (std.io Slice 1): `fs.open` a reader, `fs.create` a writer, then stream
+// Byte-exact file copy: `fs.open` a reader, `fs.create_exclusive` a new writer, then stream
 // through a fixed-window `buffer` — memory stays O(buffer), never O(file size). The output buffer is
-// a visible `mut` local owned by the loop; at EOF (`read` returns 0) both handles drop.
+// a visible `mut` local owned by the loop. Flush errors propagate before success; a late failure
+// may leave a partial new output. Flush does not promise durable storage.
 fn copy_all(r: reader, w: writer) -> Result<(), Error> {
   mut buf := buffer(65536)
   loop {
     n := r.read(buf)?
-    if n == 0 { break Ok(()) }
+    if n == 0 { break w.flush() }
     w.write(buf.bytes())?
   }
 }
@@ -18,7 +19,8 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   // Require source and destination before opening either file.
   if args.len() != 3 { return Err(Error.Invalid) }
   r := fs.open(args[1])?
-  w := fs.create(args[2])?
+  // Refuse every occupied destination, including aliases of the input.
+  w := fs.create_exclusive(args[2])?
   copy_all(r, w)?
   return Ok(())
 }
