@@ -41,6 +41,8 @@ mod encoding_writes_tests;
 mod decompression_frames_tests;
 #[cfg(test)]
 mod base64_quantum_tests;
+#[cfg(test)]
+mod sample_permutation_tests;
 use buffer_storage::BufferStorage;
 mod json_number;
 mod time_formats;
@@ -17805,6 +17807,7 @@ static FREE_CALLS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64
 #[cfg(all(feature = "alloc-count", test))]
 std::thread_local! {
     static GLOBAL_ALLOC_CALLS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+    static GLOBAL_ALLOC_BYTES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
 #[cfg(all(feature = "alloc-count", test))]
@@ -17816,6 +17819,7 @@ unsafe impl std::alloc::GlobalAlloc for CountingGlobalAllocator {
         let ptr = unsafe { std::alloc::GlobalAlloc::alloc(&std::alloc::System, layout) };
         if !ptr.is_null() {
             let _ = GLOBAL_ALLOC_CALLS.try_with(|count| count.set(count.get().wrapping_add(1)));
+            let _ = GLOBAL_ALLOC_BYTES.try_with(|bytes| bytes.set(bytes.get().wrapping_add(layout.size())));
         }
         ptr
     }
@@ -17824,6 +17828,7 @@ unsafe impl std::alloc::GlobalAlloc for CountingGlobalAllocator {
         let ptr = unsafe { std::alloc::GlobalAlloc::alloc_zeroed(&std::alloc::System, layout) };
         if !ptr.is_null() {
             let _ = GLOBAL_ALLOC_CALLS.try_with(|count| count.set(count.get().wrapping_add(1)));
+            let _ = GLOBAL_ALLOC_BYTES.try_with(|bytes| bytes.set(bytes.get().wrapping_add(layout.size())));
         }
         ptr
     }
@@ -17843,6 +17848,7 @@ unsafe impl std::alloc::GlobalAlloc for CountingGlobalAllocator {
         };
         if !new_ptr.is_null() {
             let _ = GLOBAL_ALLOC_CALLS.try_with(|count| count.set(count.get().wrapping_add(1)));
+            let _ = GLOBAL_ALLOC_BYTES.try_with(|bytes| bytes.set(bytes.get().wrapping_add(new_size)));
         }
         new_ptr
     }
@@ -17855,6 +17861,12 @@ static COUNTING_GLOBAL_ALLOCATOR: CountingGlobalAllocator = CountingGlobalAlloca
 #[cfg(all(feature = "alloc-count", test))]
 fn global_alloc_count() -> u64 {
     GLOBAL_ALLOC_CALLS.with(core::cell::Cell::get)
+}
+
+/// Cumulative successfully requested Rust allocation bytes, not live bytes or RSS.
+#[cfg(all(feature = "alloc-count", test))]
+fn global_alloc_bytes() -> usize {
+    GLOBAL_ALLOC_BYTES.with(core::cell::Cell::get)
 }
 
 /// Opt-in requested-live-byte probe used by the `pkg.ws` resource owner. It tracks only allocation
@@ -18781,13 +18793,52 @@ pub unsafe extern "C" fn align_rt_rng_shuffle(state: *mut u64, ptr: *mut u8, len
     }
 }
 
+// An explicit deterministic hasher avoids acquiring unrelated OS randomness. Map iteration
+// order never participates in sampling: it represents displaced permutation slots only.
+type SampleSlots = std::collections::HashMap<
+    usize,
+    usize,
+    std::hash::BuildHasherDefault<std::hash::DefaultHasher>,
+>;
+
+/// Select slot j from the unselected suffix starting at i, retiring i after the swap.
+/// Missing entries represent identity slots. The caller guarantees i <= j < n.
+fn sample_sparse_select(slots: &mut SampleSlots, i: usize, j: usize) -> usize {
+    let selected = slots.remove(&j).unwrap_or(j);
+    if j != i {
+        let displaced = slots.remove(&i).unwrap_or(i);
+        slots.insert(j, displaced);
+    }
+    selected
+}
+
+/// Both representations use exactly the same bounded draws and emit in selection order.
+/// k <= n; each emitted index is in 0..n and appears once. Sparse scratch has at most k
+/// entries and insertions; the dense representation remains preferable for larger samples.
+fn sample_indices(s: &mut [u64; 4], n: usize, k: usize, mut emit: impl FnMut(usize, usize)) {
+    let mut select = |i| i + bounded(s, (n - i) as u64) as usize;
+    if k <= n / 512 {
+        let mut slots = SampleSlots::with_capacity_and_hasher(k, Default::default());
+        for i in 0..k {
+            let selected = sample_sparse_select(&mut slots, i, select(i));
+            emit(i, selected);
+        }
+    } else {
+        let mut indices: Vec<usize> = (0..n).collect();
+        for i in 0..k {
+            indices.swap(i, select(i));
+            emit(i, indices[i]);
+        }
+    }
+}
+
 /// `r.sample(xs, k)` — draw `k` elements of the slice (`src`/`src_len`, element size `elem_size`)
 /// without replacement, into a fresh owned `array<T>` returned as `{ptr, len}` (buffer from
 /// [`align_rt_alloc`], freed by the bound local's `Drop`). `k < 0` or `k > src_len` aborts — it is
 /// impossible to draw that many distinct items. Advances the rng.
 ///
-/// v1 uses a full `0..n` index permutation (O(n) scratch) partially shuffled to its first `k` —
-/// correctness before speed; an O(k) Floyd's-sample is a later optimization behind this signature.
+/// Partial Fisher-Yates uses O(k) displaced-slot scratch for sparse draws and an O(n)
+/// contiguous index permutation otherwise, preserving the exact draws and final RNG state.
 ///
 /// # Safety
 /// `state` must point to a valid `[u64; 4]`; `src`/`src_len`/`elem_size` must describe a readable
@@ -18819,17 +18870,11 @@ pub unsafe extern "C" fn align_rt_rng_sample(
         .unwrap_or_else(|| panic_abort("rand.sample: output size overflow"));
     let out = align_rt_alloc(out_bytes); // kk > 0 → non-null (or aborts on OOM)
     let s = unsafe { &mut *(state as *mut [u64; 4]) };
-    // Partial Fisher-Yates: select the first `kk` of a shuffled permutation of `0..n`, copying each
-    // chosen source element into the output in draw order.
-    let mut idx: Vec<usize> = (0..n).collect();
-    for i in 0..kk {
-        // Pick uniformly from the not-yet-selected suffix [i, n).
-        let j = i + bounded(s, (n - i) as u64) as usize;
-        idx.swap(i, j);
-        let srcp = unsafe { src.add(idx[i] * es) };
+    sample_indices(s, n, kk, |i, selected| {
+        let srcp = unsafe { src.add(selected * es) };
         let dstp = unsafe { out.add(i * es) };
         unsafe { core::ptr::copy_nonoverlapping(srcp, dstp, es) };
-    }
+    });
     AlignStr { ptr: out as *const u8, len: kk as i64 }
 }
 
