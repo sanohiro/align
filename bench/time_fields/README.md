@@ -39,9 +39,16 @@ Baseline: `47126ca29357bf5e6d5f57cf2c1256e8a7f63d2c`. Both producers use Rust
 1.96.1; macOS ARM64 uses Apple clang 21.0.0 and Linux ARM64 uses GCC 12.2.0.
 Linux is the local VM with `taskset -c 0`. Both hosts pass the independent C
 goldens. The following are the medians of all 14 samples per arm and format,
-with per-format ABBA, no concurrent agent builds/tests, and no discarded or
-additional samples. Times include native allocation/free and the common C
-status/count checks.
+with per-format ABBA and no concurrent agent builds/tests. Every sample from
+these paired runs contributes to the medians. Times include native
+allocation/free and the common C status/count checks.
+
+Separate retained build-qualification runs produced seven samples per format
+and producer on each host; later script-reproduction runs produced seven
+candidate basic-ISO samples per host. Those runs checked the built consumer and
+the checked-in runner. They did not follow the paired ABBA order and are not
+included in the paired comparison above; no paired sample was discarded and no
+paired case was repeated.
 
 | Format | macOS baseline → candidate | Linux baseline → candidate |
 | --- | ---: | ---: |
