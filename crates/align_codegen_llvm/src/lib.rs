@@ -6880,17 +6880,36 @@ fn emit_main_wrapper<'c>(
     let entry = ctx.append_basic_block(main, "entry");
     builder.position_at_end(entry);
 
-    // Marshal argv into the `array<str>` argument, or call with no args.
+    // Admit and marshal argv before entering the Align body, or call with no args.
     let call_args: Vec<inkwell::values::BasicMetadataValueEnum> = if has_args {
         let args_build = unkeyed(runtime_abi::UnkeyedRuntimeKey::ArgsBuild);
         let argc = main.get_nth_param(0).expect("argc").into_int_value();
         let argv = main.get_nth_param(1).expect("argv").into_pointer_value();
-        let args_val = builder
-            .build_call(args_build, &[argc.into(), argv.into()], "args")
+        let args_type = slice_struct_type(ctx);
+        let args_slot = builder.build_alloca(args_type, "args.slot").map_err(lower)?;
+        let status = builder
+            .build_call(args_build, &[argc.into(), argv.into(), args_slot.into()], "args.status")
             .map_err(lower)?
             .try_as_basic_value()
             .basic()
-            .ok_or_else(|| CodegenError::Lowering("args_build returned void".into()))?;
+            .ok_or_else(|| CodegenError::Lowering("args_build returned void".into()))?
+            .into_int_value();
+        let invalid = builder
+            .build_int_compare(IntPredicate::NE, status, i32t.const_zero(), "args.invalid")
+            .map_err(lower)?;
+        let rejected = ctx.append_basic_block(main, "args.rejected");
+        let admitted = ctx.append_basic_block(main, "args.admitted");
+        builder.build_conditional_branch(invalid, rejected, admitted).map_err(lower)?;
+        builder.position_at_end(rejected);
+        let exit = builder
+            .build_call(report, &[status.into()], "args.exit")
+            .map_err(lower)?
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| CodegenError::Lowering("report returned void".into()))?;
+        builder.build_return(Some(&exit)).map_err(lower)?;
+        builder.position_at_end(admitted);
+        let args_val = builder.build_load(args_type, args_slot, "args").map_err(lower)?;
         vec![args_val.into()]
     } else {
         vec![]
@@ -28205,44 +28224,32 @@ fn main() -> i32 = 0
                 .collect::<Vec<_>>(),
         );
 
-        // The closest source-valid result is a two-word `layout(C)` value. Its `u64, i64`
-        // fields cross the SysV boundary as `{ i64, i64 }`, never as ArgsBuild's native
-        // `{ ptr, i64 }` view, so the production fixed-row predicate must reject it.
-        let layout_c = mir("layout(C) ArgsWords { data: u64, len: i64 }\n\
-             extern \"C\" fn align_rt_args_build(argc: i32, argv: raw) -> ArgsWords\n\
-             fn main() -> i32 = 0\n");
+        // The exact status/out-pointer shape is now source-expressible but remains
+        // compiler-private. Also reject the former closest source-valid aggregate shape.
+        // That aggregate is source-supported only on x86-64 SysV, regardless of the host.
         Target::initialize_x86(&InitializationConfig::default());
         let triple = inkwell::targets::TargetTriple::create("x86_64-unknown-linux-gnu");
         let target = Target::from_triple(&triple).unwrap();
         let tm = target
             .create_target_machine(
-                &triple,
-                "x86-64-v2",
-                "",
-                OptimizationLevel::Default,
-                RelocMode::PIC,
-                CodeModel::Default,
+                &triple, "x86-64-v2", "", OptimizationLevel::Default,
+                RelocMode::PIC, CodeModel::Default,
             )
             .unwrap();
-        let ctx = Context::create();
-        let module = ctx.create_module("args_build_layout_c");
-        let error = match build_module(
-            &ctx,
-            &module,
-            &layout_c,
-            &tm,
-            None,
-            &[],
-            false,
-            ModuleScope::Whole,
-        ) {
-            Ok(_) => panic!("the closest source-valid aggregate matched ArgsBuild's view ABI"),
-            Err(error) => error,
-        };
-        assert_eq!(
-            error.to_string(),
-            "lowering failed: native extern ABI mismatch:616c69676e5f72745f617267735f6275696c64",
-        );
+        for declaration in [
+            "extern \"C\" fn align_rt_args_build(argc: i32, argv: raw, output: raw) -> i32\n",
+            "layout(C) ArgsWords { data: u64, len: i64 }\nextern \"C\" fn align_rt_args_build(argc: i32, argv: raw) -> ArgsWords\n",
+        ] {
+            let program = mir(&format!("{declaration}fn main() -> i32 = 0\n"));
+            let ctx = Context::create();
+            let module = ctx.create_module("args_build_source_extern");
+            let error = match build_module(&ctx, &module, &program, &tm, None, &[], false, ModuleScope::Whole) {
+                Ok(_) => panic!("source extern acquired the private argv producer"),
+                Err(error) => error,
+            };
+            assert_eq!(error.to_string(),
+                "lowering failed: native extern ABI mismatch:616c69676e5f72745f617267735f6275696c64");
+        }
     }
 
     #[test]

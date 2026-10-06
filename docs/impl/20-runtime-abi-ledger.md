@@ -1619,7 +1619,7 @@ Unkeyed native records:
 | Owner | Exact LLVM function type | Runtime export presence |
 |---|---|---|
 | main error wrapper | `i32 @align_rt_report_error(i32)` | every Unit/Result main wrapper; effects record above |
-| argv wrapper | `{ ptr, i64 } @align_rt_args_build(i32, ptr)` | only argv main; effects record above |
+| argv wrapper | `i32 @align_rt_args_build(i32, ptr, ptr)` | only argv main; 0 success, 2 Invalid; final pointer is canonical-zero or owned header output; effects record above |
 | arena implementation | `void @align_rt_arena_reset(ptr)` | always linked; runtime-internal; effects record above |
 | allocator implementation | `ptr @align_rt_realloc(ptr, i64)` | always linked; runtime-internal; effects record above |
 | HTTP implementation | `i32 @align_rt_http_serialize(ptr, ptr)` | always linked; runtime-internal; effects record above |
@@ -1659,13 +1659,16 @@ them. The other sixteen yield no unconditional compiler handle. An exact
 compatible source extern may declare or reuse every non-test-control unkeyed row except
 `ArgsBuild` through the ordinary extern path. The four compiler-private
 `core.test` rows reject source reuse by policy. The remaining thirteen unkeyed rows
-are source-reachable. `ArgsBuild`
-returns the native `{ptr, i64}` argv view, which no source-valid extern return
-can express: `str`/slice view returns are rejected, `raw` is not a valid
-`layout(C)` field, and the closest source-valid `layout(C) { u64, i64 }` return
-lowers as `{i64, i64}` rather than `{ptr, i64}`. It is therefore wrapper-only,
-the only non-test-control base unkeyed row whose ABI has no compatible
-source-extern form. The legacy mixed string map remains as a handle-only alias seam
+are source-reachable. `ArgsBuild` is explicitly wrapper-only: source externs cannot reuse
+its identity, including the exact source-expressible status/output-pointer shape. Its A92 row
+returns 0 after admitting every native argument as UTF-8 and publishing one owned header array,
+or 2 (`AL_INVALID`) with canonical-zero output. Negative argc, malformed null/count shape,
+unrepresentable extents, null entries and invalid text reject before allocation. Zero argc
+succeeds empty; empty argument text is valid. The wrapper reports rejection and exits before
+calling the Align body. The runtime borrows argv bytes and transfers only header ownership;
+its conservative IndirectStorage effects and argv escape ordinal 1 remain unchanged.
+[Plan 121](121-command-line-text-admission.md) owns the exact admission and closure contract.
+The legacy mixed string map remains as a handle-only alias seam
 for unchanged `Rvalue::Call(String)` resolution through c1: it is populated in
 post-c1 class order from stored definitions, non-shadowed imports, externs,
 alphabetical `RuntimeKey::ALL` aliases, then existing generated aliases. The
@@ -1726,8 +1729,8 @@ Tests compare:
   458 exact registry function types through the production compatibility
   predicate, one return mutation per row, and one mutation of every parameter
   ordinal; source-valid compatible reuse for a keyed builtin and the thirteen
-  source-reachable unkeyed rows; exact `ArgsBuild` `str` rejection plus the
-  source-valid `layout(C) { u64, i64 }` aggregate mismatch; and
+  source-reachable unkeyed rows; explicit `ArgsBuild` exact status/out-pointer source
+  rejection plus the former `str` and `layout(C) { u64, i64 }` return negatives; and
   compatible reuse representatives for the source-expressible emitted
   attribute forms, with the native row supplying its derived attributes; the
   checked-in golden covers all twelve effect classes, including rows whose

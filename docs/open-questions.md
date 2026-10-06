@@ -785,6 +785,12 @@ and no language semantics existed for those values. The am-e prerequisite closes
 before malformed-HIR header validation. This preserves the three specified forms and deliberately
 rejects only the undefined-ABI corner.
 
+The argv boundary admits every argument, including the program name, as UTF-8 before allocating
+the owned header array or entering the Align body. Empty text is valid and accepted bytes are
+unchanged. Invalid text reports builtin `Error.Invalid` and exits 2 through the existing reporter;
+no body side effects occur. Text bytes remain borrowed for the process lifetime. No-argument
+main forms do not inspect argv.
+
 Record: `draft.md` Error handling, `docs/language-spec.md`, `docs/design-notes.md`,
 `docs/impl/07-roadmap.md`, `docs/impl/17-library-boundary-prerequisites.md`
 

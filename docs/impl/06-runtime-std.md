@@ -213,7 +213,8 @@ Called for arithmetic errors other than overflow such as divide-by-zero (`draft.
 
 ```text
 i32 align_rt_start(i32 argc, char** argv):
-  args = convert argv into an array<str> (arena/static)
+  reject any non-UTF-8 argument (including argv[0]) with Invalid report/exit 2
+  args = allocate owned array<str> headers borrowing process-lifetime argv bytes
   r = user_main(args)               // pub fn main(args) -> Result<(), Error>
   match r:
     Ok      => return 0

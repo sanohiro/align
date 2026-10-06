@@ -31,6 +31,8 @@ mod cli_usage_tests;
 mod fs_read_tests;
 #[cfg(test)]
 mod env_tests;
+#[cfg(test)]
+mod args_tests;
 use buffer_storage::BufferStorage;
 mod json_number;
 mod time_formats;
@@ -2238,45 +2240,59 @@ pub unsafe extern "C" fn align_rt_fs_read_bytes_view(path: *const u8, path_len: 
     unsafe { fs_read_view_impl(path, path_len, arena, out, false) }
 }
 
-/// Build the `args: array<str>` value for `main` from the C `argc`/`argv`. Returns the owned
-/// `array<str>` as an `{ptr, len}`: a freshly [`align_rt_alloc`]'d buffer of `argc` `AlignStr`
-/// (`{ptr,len}`) entries, each a zero-copy view of one argv string (length via `strlen`). The
-/// element string bytes are argv's (process-lifetime, not freed); only the `AlignStr` buffer is
-/// owned, freed by the generated `Drop` of the `args` local at `main` exit. `argc <= 0` → an empty
-/// `{null,0}` array.
+/// Admit native argv as UTF-8 before building `main`'s owned `array<str>` header buffer.
+/// Returns 0 on success or `AL_INVALID` on invalid count, pointer shape, extent, or text.
+/// Zero argc succeeds without allocation. Error/empty output is canonical `{null,0}`.
+/// Successful nonempty output owns only the `AlignStr` buffer; element bytes borrow argv
+/// for the process lifetime. Ordinary array Drop frees the buffer, never the argument bytes.
 ///
 /// # Safety
-/// `argv` must point to `argc` valid, NUL-terminated C strings (the platform `main` contract).
+/// Non-null `out` must be aligned and writable for one `AlignStr`, disjoint from all inputs.
+/// Positive-count non-null `argv` must be aligned and readable for `argc` pointers. Non-null
+/// entries must point to readable NUL-terminated C strings. The table and bytes stay stable
+/// throughout this call; successful text bytes stay readable throughout subsequent use.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_args_build(argc: i32, argv: *const *const u8) -> AlignStr {
-    if argc <= 0 || argv.is_null() {
-        return AlignStr { ptr: core::ptr::null(), len: 0 };
+pub unsafe extern "C" fn align_rt_args_build(argc: i32, argv: *const *const u8, out: *mut AlignStr) -> i32 {
+    if out.is_null() {
+        return AL_INVALID;
     }
-    let n = argc as usize;
-    // Buffer of `n` AlignStr entries; sized in bytes for `align_rt_alloc` (a `c_void*`-granular
-    // bump/heap allocator). The element views point into argv, so the buffer is the only owned part.
-    // `checked_mul` guards a 32-bit `usize` overflow (`n` up to `i32::MAX` × the entry size), which
-    // would otherwise under-allocate and then heap-overflow the store loop below.
-    let bytes = n
-        .checked_mul(core::mem::size_of::<AlignStr>())
-        .and_then(|b| i64::try_from(b).ok())
-        .unwrap_or_else(|| panic_abort("arguments buffer size overflow"));
-    let buf = align_rt_alloc(bytes) as *mut AlignStr;
+    unsafe { *out = AlignStr { ptr: core::ptr::null(), len: 0 } };
+    let Ok(n) = safe_len(i64::from(argc)) else { return AL_INVALID };
+    if n == 0 {
+        return 0;
+    }
+    if argv.is_null() {
+        return AL_INVALID;
+    }
+    let extent = |width| {
+        n.checked_mul(width)
+            .and_then(|bytes| i64::try_from(bytes).ok())
+            .filter(|bytes| safe_len(*bytes).is_ok())
+    };
+    if extent(core::mem::size_of::<*const u8>()).is_none() {
+        return AL_INVALID;
+    }
+    let Some(bytes) = extent(core::mem::size_of::<AlignStr>()) else { return AL_INVALID };
+    // Admit every entry, including argv[0], before the first allocation or publication.
     for i in 0..n {
         let cstr = unsafe { *argv.add(i) };
-        let len = if cstr.is_null() {
-            0
-        } else {
-            // strlen: scan to the NUL.
-            let mut l = 0usize;
-            while unsafe { *cstr.add(l) } != 0 {
-                l += 1;
-            }
-            l as i64
-        };
+        if cstr.is_null() {
+            return AL_INVALID;
+        }
+        let text = unsafe { std::ffi::CStr::from_ptr(cstr.cast()) }.to_bytes();
+        if i64::try_from(text.len()).is_err() || !validate_utf8(text) {
+            return AL_INVALID;
+        }
+    }
+    let buf = align_rt_alloc(bytes).cast::<AlignStr>();
+    for i in 0..n {
+        let cstr = unsafe { *argv.add(i) };
+        // Stability and the complete first pass prove this length fits i64.
+        let len = unsafe { std::ffi::CStr::from_ptr(cstr.cast()) }.to_bytes().len() as i64;
         unsafe { *buf.add(i) = AlignStr { ptr: cstr, len } };
     }
-    AlignStr { ptr: buf as *const u8, len: argc as i64 }
+    unsafe { *out = AlignStr { ptr: buf.cast(), len: i64::from(argc) } };
+    0
 }
 
 /// `chunks(n)`: split the `{src, src_len}` view (element size `elem_size` bytes, `src_len` =

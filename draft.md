@@ -822,6 +822,12 @@ forms use a generated C `main` wrapper returning `i32`; Unit maps to exit 0 and 
 mapping above. The exact-i32 no-argument form is the C entry directly. Every other return or
 parameter shape is a compile error rather than a non-C-ABI external `main`.
 
+Before an argv main begins, every native argument, including `args[0]`, must be valid UTF-8.
+Empty arguments are valid; accepted bytes are preserved. Invalid text reports `Error.Invalid`
+(`error: code 2` on stderr) and exits with 2 before the argument-array allocation or any Align
+body execution. The array owns its header buffer; text views borrow process-lifetime argv bytes.
+No-argument main forms do not inspect argv.
+
 **Context is structured, not free-form.** To attach context to an error — where it occurred, what
 failed — give the error variant a payload that *carries that data*: a position, a code, a name.
 There is no free-form string-chaining (`anyhow`-style `.with_context("…")`); the structured payload

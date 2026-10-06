@@ -3444,7 +3444,8 @@ pub(super) fn native_extern_abi_matches<'c>(
     ctx: &'c Context,
 ) -> bool {
     match runtime_abi_for_symbol(symbol) {
-        Some(RuntimeAbiId::Unkeyed(key)) if is_test_control_key(key) => false,
+        Some(RuntimeAbiId::Unkeyed(key))
+            if is_test_control_key(key) || key == UnkeyedRuntimeKey::ArgsBuild => false,
         Some(id) => actual == function_type(id, ctx),
         None => true,
     }
@@ -4155,8 +4156,8 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
             params: &[NativeType::I32],
         },
         RuntimeAbiShape::A92 => RuntimeAbiShapeSpec {
-            ret: NativeReturn::PtrLen,
-            params: &[NativeType::I32, NativeType::Ptr],
+            ret: NativeReturn::I32,
+            params: &[NativeType::I32, NativeType::Ptr, NativeType::Ptr],
         },
         RuntimeAbiShape::A93 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
@@ -4630,8 +4631,8 @@ mod tests {
         for row in rows {
             let symbol = row.symbol;
             let expected = row.function_type(&ctx);
-            let compiler_private =
-                matches!(row.key, RuntimeAbiId::Unkeyed(key) if is_test_control_key(key));
+            let compiler_private = matches!(row.key, RuntimeAbiId::Unkeyed(key)
+                if is_test_control_key(key) || key == super::UnkeyedRuntimeKey::ArgsBuild);
             assert_eq!(
                 native_extern_abi_matches(symbol, expected, &ctx),
                 !compiler_private,
