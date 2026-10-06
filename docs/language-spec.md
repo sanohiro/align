@@ -600,7 +600,11 @@ builtins.
 The entry signature is exact. No-argument `main` returns only `()`, exact `i32`, or
 `Result<(), Error>`; `main(args: array<str>)` returns exactly `Result<(), Error>`. Unit and Result
 forms use an i32-returning C wrapper; exact i32 is the C entry directly. Every other parameter or
-return shape is a compile error.
+return shape is a compile error. Native arguments, including the program name, must be valid
+UTF-8 before an argv main starts or its header array is allocated. Empty arguments are valid
+and accepted bytes are unchanged. Invalid text reports `Error.Invalid` (`error: code 2` on
+stderr) and exits 2 without running the Align body. Only the header array is owned; text
+borrows process-lifetime argv bytes. No-argument main forms do not inspect argv.
 
 ### Data processing
 

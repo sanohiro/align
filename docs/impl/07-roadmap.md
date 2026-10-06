@@ -858,7 +858,10 @@ the MMv2 region model rather than a `main`-only special case), in three steps:
 - **[done] PR-C** — `main(args: array<str>)` ABI + argv marshalling. `main(args: array<str>) ->
   Result<(), Error>` is accepted; the C `main` wrapper takes `(argc, argv)` and calls
   `align_rt_args_build` (a buffer of `str` views into argv — argv strings process-lifetime, the
-  buffer `Drop`-freed at `main` exit), then `align_main(args)`. `alignc run` forwards trailing args
+  buffer `Drop`-freed at `main` exit), then `align_main(args)`. Native arguments, including
+  argv[0], must all pass UTF-8 admission before allocation/body execution; invalid text reports
+  `Error.Invalid` and exits 2. Empty text is valid. No-argument entries do not inspect argv.
+  `alignc run` forwards trailing args
   to the program. The §19 program now runs from a file path in `args[1]`.
 - **[settled, no code] PR-D** — the one apparent residual was the `json.decode<array<User>>(data)`
   generic-*call* syntax. Resolved by **design, not implementation**: Align has no expression-position

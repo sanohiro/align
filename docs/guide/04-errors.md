@@ -98,6 +98,10 @@ If an `Err` propagates out of `main`, the process exits non-zero — each `Error
 
 Programs receive command-line arguments through `main(args: array<str>)`; `args[1]` is the first user argument. This example requires one path argument and returns `Error.Invalid` for any other count. Checking before indexing prevents an out-of-bounds abort when no path was supplied. There is no global argument list or `env.args`.
 
+All arguments, including the program name, are checked for valid UTF-8 before this `main` runs.
+Empty arguments are valid. Invalid text reports `error: code 2` and exits with 2 without running
+the body. A `main` without an argument parameter does not inspect command-line text.
+
 ## Your own error types
 
 Any sum type can be an error. When the called function and its caller use the same error type, `?` propagates it directly; that type need not be the built-in `Error`. If they use different error types, convert explicitly with `map_err`. A `Result<T, ParseErr>` cannot propagate unchanged through a function returning `Result<T, Error>`:

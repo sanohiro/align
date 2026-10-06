@@ -457,7 +457,7 @@ key|XmlNext|xml_next|IndirectStorage|declare i32 @align_rt_xml_next(ptr) #2
 key|XmlParse|xml_parse|IndirectStorage|declare i32 @align_rt_xml_parse(ptr, i64, ptr) #2
 key|XmlText|xml_text|IndirectStorage|declare i32 @align_rt_xml_text(ptr, ptr) #2
 unkeyed|ReportError|IndirectStorage|declare i32 @align_rt_report_error(i32) #2
-unkeyed|ArgsBuild|IndirectStorage|declare { ptr, i64 } @align_rt_args_build(i32, ptr) #2
+unkeyed|ArgsBuild|IndirectStorage|declare i32 @align_rt_args_build(i32, ptr, ptr captures(none)) #2
 unkeyed|ArenaReset|HostState|declare void @align_rt_arena_reset(ptr) #2
 unkeyed|Realloc|IndirectStorage|declare ptr @align_rt_realloc(ptr, i64) #2
 unkeyed|HttpSerialize|HostState|declare i32 @align_rt_http_serialize(ptr, ptr) #2

@@ -1076,6 +1076,12 @@ Result go through one generated i32 wrapper, so exit behavior is defined without
 language about additional platform entry ABIs. Rejecting every other return type is preferable to
 silently exposing a bool, float, or aggregate under C's `main` symbol.
 
+Native argument bytes enter the text model only after complete UTF-8 validation, including the
+program name. Invalid text uses the existing Invalid exit/reporting path before body execution
+or argument-array allocation. This keeps every published `str` valid without lossy decoding
+or a second argument API. Accepted text remains borrowed from process-lifetime argv storage;
+only the header array is allocated and owned. No-argument entries need no argument admission.
+
 ## The safety stance
 
 Align is intentionally positioned between the following.
