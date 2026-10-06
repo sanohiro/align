@@ -605,7 +605,8 @@ import pkg.db.sqlite
 import pkg.db.postgres
 
 fn main() -> i32 {
-  return match env.get("ALIGN_DB_Q2_INHERITED") {
+  optional := env.get("ALIGN_DB_Q2_INHERITED") else { return 3 }
+  return match optional {
     Some(value) => if value == "inherited-value" { 42 } else { 2 }
     None => 1
   }

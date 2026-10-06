@@ -3772,9 +3772,21 @@ out := c.run()?
 ### std.env
 
 ```text
-env.get(name: str) -> Option<string>
+env.get(name: str) -> Result<Option<string>, Error>
 env.set(name: str, value: str) -> Result<(), Error>
 ```
+
+`env.get` returns `Ok(None)` only when the name is unset. A present empty value
+is `Ok(Some(""))`; other present values are copied into an independently owned
+string. Names must be nonempty UTF-8 without NUL or `=`. Invalid names and
+native values that are not valid UTF-8 return `Error.Invalid`; no lossy decoding
+or absence coercion occurs. Name validation precedes environment lookup and
+output allocation; value validation precedes output allocation. The name is
+borrowed only for the call, with transient NUL-terminated native scratch.
+Successful nonempty output owns one payload; absent, invalid and empty output
+allocate no payload. A later sequential `env.set` does not change that copy.
+Environment mutation must not overlap environment access; the existing native
+concurrency restriction remains, with no hidden serialization.
 
 `args` is deliberately **not** here: `main(args: array<str>)` (§17/§19) is the one way to reach
 argv — there is no `env.args`.

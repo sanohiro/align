@@ -56,6 +56,13 @@ error keep protocol/CLI parsing deterministic. Checked conversion preserves the
 ordinary wrapping arithmetic rule: conversion rejects unrepresentable text.
 Borrowing bytes and returning a scalar avoids hidden allocation or retained views.
 
+Environment lookup composes the existing error and optional models:
+`Result<Option<string>, Error>` distinguishes an unset variable from native
+bytes that cannot form text. Invalid UTF-8 is `Error.Invalid`; returning None
+or replacing bytes would hide the failure. A fresh owned copy remains valid
+after sequential environment mutation. [Plan 120](impl/120-environment-text-admission.md)
+owns the native admission and nested-result closure.
+
 UTF-8 byte offsets can be queried with `str.is_char_boundary(i64)` before slicing.
 The total predicate shares MIR boundary logic with ordinary slicing, while
 slicing retains its terminal failure contract. Prefix/suffix comparison already

@@ -2265,8 +2265,10 @@ fn retained(borrow connection: pkg.db.conn, driver: str) -> i32 {
 }
 
 fn main() -> i32 {
-  driver := env.get("ALIGN_DB_DRIVER") else { return 90 }
-  case := env.get("ALIGN_DB_CASE") else { return 91 }
+  optional_driver := env.get("ALIGN_DB_DRIVER") else { return 92 }
+  driver := optional_driver else { return 90 }
+  optional_case := env.get("ALIGN_DB_CASE") else { return 93 }
+  case := optional_case else { return 91 }
   if case == "__list__" {
     print("present_values")
     print("absent_values")
@@ -3314,8 +3316,10 @@ import pkg.db.postgres
 import pkg.db.sqlite
 
 fn main() -> i32 {
-  driver := env.get("ALIGN_DB_DRIVER") else { return 90 }
-  case := env.get("ALIGN_DB_CASE") else { return 91 }
+  optional_driver := env.get("ALIGN_DB_DRIVER") else { return 92 }
+  driver := optional_driver else { return 90 }
+  optional_case := env.get("ALIGN_DB_CASE") else { return 93 }
+  case := optional_case else { return 91 }
   if driver == "" { return 92 }
   if case == "__list__" {
     print("hang")

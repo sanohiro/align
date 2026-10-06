@@ -54420,7 +54420,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.path", &format!("path.{method}"), span);
                 return self.check_path_op(method, args, span);
             }
-            // `std.env` — `env.get(name)` -> Option<string>; `env.set(name, value)` -> Result<(), Error>.
+            // `std.env` — `env.get(name)` -> Result<Option<string>, Error>; `env.set` -> Result<(), Error>.
             if module == "env" && matches!(method, "get" | "set") {
                 self.require_import("std.env", &format!("env.{method}"), span);
                 return self.check_env_op(method, args, span);
@@ -63930,7 +63930,7 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// `std.env` — `env.get(name)` -> `Option<string>` (owned; the environment is volatile, so the
+    /// `std.env` — `env.get(name)` -> `Result<Option<string>, Error>` (owned; the environment is volatile, so the
     /// value is copied out, never a view); `env.set(name, value)` -> `Result<(), Error>`. Builtins.
     fn check_env_op(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
@@ -63941,7 +63941,13 @@ impl<'a, 't> Checker<'a, 't> {
                 return err;
             }
             let name = self.check_str_init(&args[0]);
-            return Expr { kind: ExprKind::EnvGet { name: Box::new(name) }, ty: Ty::Option(Scalar::String), span };
+            if name.ty == Ty::Error { return err; }
+            let option = intern_tagged_type(self.tagged_types, hir::TaggedType::Option(Scalar::String));
+            return Expr {
+                kind: ExprKind::EnvGet { name: Box::new(name) },
+                ty: Ty::Result(Scalar::Tagged(option), Scalar::Enum(self.error_enum_id)),
+                span,
+            };
         }
         // `env.set(name, value)`.
         if args.len() != 2 {

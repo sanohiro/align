@@ -307,7 +307,7 @@ pub fn main() -> i32 {
 /// the bound `v` views `resp`'s buffer, so returning it past `resp`'s `Drop` is a use-after-free.
 /// (This is the codebase's first `Option<borrowed-view>`; the fix threads the scrutinee's non-Static
 /// region into every arm-payload binding, closing the gap for every future `Option<view>` /
-/// `Result<view>`, not just http — `env.get`'s `Option<string>` is owned, so it never exposed it.)
+/// `Result<view>`, not just http — `env.get`'s `Result<Option<string>, Error>` is owned, so it never exposed it.)
 #[test]
 fn resp_header_view_cannot_escape_via_match_binding() {
     let src = "\

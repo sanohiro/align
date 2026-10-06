@@ -1518,8 +1518,9 @@ required `import` — the `core.json` pattern, not yet Align-over-FFI library co
   (`fs.read_file_view`) is rejected from escaping the arena; the #297-class trap avoided). The
   view-safe POSIX edge choices: `dir` of a path with no separator is the **empty** view (not `.`,
   which isn't a substring); an all-`/` path's `base`/`dir` is `/`; `ext` of a dotfile (leading `.`)
-  is empty. `env.get` -> `Option<string>` (owned — the environment is volatile, so a view would
-  dangle after a later `env.set`; a present-but-empty value is `Some("")`, distinct from `None`);
+  is empty. `env.get` -> `Result<Option<string>, Error>` (owned — the environment is volatile,
+  so a view would dangle after a later `env.set`; present empty is `Ok(Some(""))`, unset is
+  `Ok(None)`, invalid names/non-UTF-8 values are `Error.Invalid`; plan120 owns admission);
   `env.set` -> `Result<(), Error>` (plain `setenv`; concurrent `env.set` from another `task_group`
   task is documented **undefined** per POSIX — no hidden serializing lock). `time.now` (`CLOCK_REALTIME`
   via `SystemTime`) / `time.instant` (`CLOCK_MONOTONIC` via a process-lazy `Instant` base, guaranteed
@@ -1528,7 +1529,7 @@ required `import` — the `core.json` pattern, not yet Align-over-FFI library co
   three are Impure; `path.*` are Pure (lexical byte ops). Implementation: sema builtin dispatch +
   MIR `Rvalue` + `align_rt_path_*`/`env_*`/`time_*` runtime, the `core.json`/std.fs precedent.
   **Completion condition met:** a round-trip per module — `path.join` then `dir`/`base`/`ext` recover
-  the pieces; `env.set` then `env.get` round-trips (and an unset name is `None`); `time.instant()`
+  the pieces; `env.set` then `env.get` round-trips (and an unset name is `Ok(None)`); `time.instant()`
   around `time.sleep(ns)` shows elapsed `ns` monotonically increasing — plus `normalize`
   representative + edge cases, the base/dir/ext view region escape rejection, and the invalid-name /
   import-required negatives (`tests/m9_path_env_time.rs`, 10 + `align_runtime` unit tests, 7).

@@ -2338,8 +2338,8 @@ pub enum Rvalue {
         path: Operand,
     },
     /// `env.get(name)` — write the owned `string` value `{ptr,len}` of environment variable `name`
-    /// into `out` (or `{null,0}` if unset), returning an `i32` present flag (`1` = set, `0` = unset).
-    /// The caller branches into `Some`/`None`. Impure.
+    /// into `out` (zero on absent/error). Returns `i32`: 1 present, 0 absent, negative fixed
+    /// Error status on failure. The caller constructs `Result<Option<string>, Error>`. Impure.
     EnvGet {
         name: Operand,
         out: Slot,
@@ -9288,8 +9288,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 b.push(Stmt::Let(v, Rvalue::PathNormalize { path: po }));
                 Operand::Value(v)
             }
-            // `env.get(name)` → `Option<string>`: the runtime writes the owned value into `out` and
-            // returns a present flag; branch `Some(<value>)` / `None`.
+            // Native present/absent/error constructs independently owned optional text.
             hir::ExprKind::EnvGet { name } => lower_env_get(b, name, e.ty),
             // `env.set(name, value)` → `Result<(), Error>` from an i32 errno-status.
             hir::ExprKind::EnvSet { name, value } => {
@@ -19515,8 +19514,8 @@ fn lower_json_doc_at(
 }
 
 /// `d.as_str()` on a `json.doc` → the runtime writes a `str` view into an out slot and returns an
-/// `i32` present flag; branch `Some(<view>)` / `None`. Mirrors [`lower_env_get`], but the payload is a
-/// borrowed `str` view (region-bound to `doc` in sema — the None arm's zeroed slot needs no free).
+/// `i32` present flag; branch `Some(<view>)` / `None`. The payload is a borrowed `str` view
+/// (region-bound to `doc` in sema — the None arm's zeroed slot needs no free).
 #[inline(never)]
 fn lower_json_doc_as_str(b: &mut Builder, doc: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(Ty::Str);
@@ -19817,50 +19816,72 @@ fn lower_owned_string_result(
     Operand::Value(r)
 }
 
-/// `env.get(name)` → `Option<string>`: the runtime writes the owned value `{ptr,len}` into an out
-/// slot and returns an `i32` present flag; branch `Some(<value>)` (flag != 0) / `None` (flag == 0).
-/// Mirrors [`lower_fs_read_file`]'s out-slot shape, building an `Option` (not a `Result`).
+/// Construct the existing nested Result/Option ownership path from native present/absent/error.
 fn lower_env_get(b: &mut Builder, name: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(Ty::String);
     let n = lower_required!(b, lower_expr(b, name), Operand::Const(Const::Unit));
-    let flag = b.fresh_value(status_ty());
-    b.push(Stmt::Let(flag, Rvalue::EnvGet { name: n, out }));
-
-    let present = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(
-        present,
-        Rvalue::Bin(
-            BinOp::Ne,
-            Operand::Value(flag),
-            Operand::Const(Const::Int(0, status_ty())),
-        ),
-    ));
-    let some_bb = b.new_block();
-    let none_bb = b.new_block();
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(code, Rvalue::EnvGet { name: n, out }));
+    let is_ok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(is_ok, Rvalue::Bin(
+        BinOp::Ge, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())),
+    )));
+    let ok = b.new_block();
+    let error = b.new_block();
     let join = b.new_block();
-    let rslot = b.new_slot(result_ty);
-    b.terminate(Term::Branch(Operand::Value(present), some_bb, none_bb));
+    let result = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(is_ok), ok, error));
 
-    // Some: load the materialized owned string `{ptr,len}` (it owns its buffer now) and wrap it.
-    b.cur = some_bb;
-    let s = b.fresh_value(Ty::String);
-    b.push(Stmt::Let(s, Rvalue::Load(out)));
-    let somev = b.fresh_value(result_ty);
-    b.push(Stmt::Let(somev, Rvalue::OptionSome(Operand::Value(s))));
-    b.push(Stmt::Store(rslot, Operand::Value(somev)));
+    b.cur = ok;
+    let option_ty = Ty::Option(Scalar::String);
+    let option = b.new_slot(option_ty);
+    let present = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(present, Rvalue::Bin(
+        BinOp::Ne, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())),
+    )));
+    let some = b.new_block();
+    let none = b.new_block();
+    let wrap = b.new_block();
+    b.terminate(Term::Branch(Operand::Value(present), some, none));
+
+    // Only the present path loads/transfers the fresh owned native payload.
+    b.cur = some;
+    let text = b.fresh_value(Ty::String);
+    b.push(Stmt::Let(text, Rvalue::Load(out)));
+    let value = b.fresh_value(option_ty);
+    b.push(Stmt::Let(value, Rvalue::OptionSome(Operand::Value(text))));
+    b.push(Stmt::Store(option, Operand::Value(value)));
+    b.terminate(Term::Goto(wrap));
+
+    b.cur = none;
+    let value = b.fresh_value(option_ty);
+    b.push(Stmt::Let(value, Rvalue::OptionNone));
+    b.push(Stmt::Store(option, Operand::Value(value)));
+    b.terminate(Term::Goto(wrap));
+
+    b.cur = wrap;
+    let payload = b.fresh_value(option_ty);
+    b.push(Stmt::Let(payload, Rvalue::Load(option)));
+    let success = b.fresh_value(result_ty);
+    b.push(Stmt::Let(success, Rvalue::ResultOk(Operand::Value(payload))));
+    b.push(Stmt::Store(result, Operand::Value(success)));
     b.terminate(Term::Goto(join));
 
-    // None: the out slot was zeroed (`{null,0}`) → nothing to free.
-    b.cur = none_bb;
-    let nonev = b.fresh_value(result_ty);
-    b.push(Stmt::Let(nonev, Rvalue::OptionNone));
-    b.push(Stmt::Store(rslot, Operand::Value(nonev)));
+    b.cur = error;
+    let status = b.fresh_value(status_ty());
+    b.push(Stmt::Let(status, Rvalue::Bin(
+        BinOp::Sub, Operand::Const(Const::Int(0, status_ty())), Operand::Value(code),
+    )));
+    let failure = make_error_from_status(b, status, result_ty);
+    let rejected = b.fresh_value(result_ty);
+    b.push(Stmt::Let(rejected, Rvalue::ResultErr(failure)));
+    b.push(Stmt::Store(result, Operand::Value(rejected)));
     b.terminate(Term::Goto(join));
 
     b.cur = join;
-    let r = b.fresh_value(result_ty);
-    b.push(Stmt::Let(r, Rvalue::Load(rslot)));
-    Operand::Value(r)
+    let value = b.fresh_value(result_ty);
+    b.push(Stmt::Let(value, Rvalue::Load(result)));
+    Operand::Value(value)
 }
 
 /// `fs.read_dir(path)` → the runtime writes the owned `array<string>` `{ptr,len}` into an out slot
@@ -22510,7 +22531,7 @@ fn lower_http_get_many(
 
 /// Build an `Option<payload>` from a runtime present-flag + out-slot: `flag != 0` → `Some(Load(out))`,
 /// else `None` (the out slot was zeroed, so `None` owns nothing). Shared by `re.captures` (payload =
-/// owned `captures` handle) and `caps.group` (payload = Copy `regex_match`), mirroring `env.get`.
+/// owned `captures` handle) and `caps.group` (payload = Copy `regex_match`).
 fn lower_present_flag_option(
     b: &mut Builder,
     flag: ValueId,
@@ -22696,7 +22717,7 @@ fn lower_regex_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             Operand::Value(v)
         }
         hir::ExprKind::RegexCaptures { regex, text } => {
-            // `Option<captures>` (owned Move handle) — the `env.get` out-slot + present-flag shape.
+            // `Option<captures>` (owned Move handle) uses an out-slot and present flag.
             let out = b.new_slot(Ty::Captures);
             let re = lower_required!(b, lower_expr(b, regex), Operand::Const(Const::Unit));
             let t = lower_required!(b, lower_expr(b, text), Operand::Const(Const::Unit));
@@ -22845,8 +22866,8 @@ fn lower_http_response_result(
 
 /// `resp.header(name)` → the runtime writes a `str` view (`{ptr,len}`) into an out slot and returns
 /// an `i32` present flag; branch `Some(<view>)` / `None`. The view borrows `resp` (region-bound in
-/// sema). Mirrors [`lower_env_get`], but the payload is a borrowed `str` view (not an owned string —
-/// the None arm's zeroed out slot needs no free either way). Out-of-line for `expr_depth` headroom.
+/// sema). The payload is borrowed; the None arm's zeroed slot needs no cleanup.
+/// Out-of-line for `expr_depth` headroom.
 #[inline(never)]
 fn lower_http_resp_header(
     b: &mut Builder,

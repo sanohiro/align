@@ -1586,7 +1586,13 @@ connection. Separately, one `next` may scan at most its output capacity plus 262
 source bytes, including ignored and control-only fields; exceeding that structural work guard is
 `Error.Invalid`. The exact contract is the client-streaming ledger in
 `docs/impl/std-design/http.md`; the surface was implemented on 2026-08-30.
-`std.env`: `get`/`set` only — `args` comes solely from
+`std.env`: `get(name: str) -> Result<Option<string>, Error>` returns `Ok(None)`
+for an unset name and independently owned UTF-8 text for a present value,
+including `Ok(Some(""))` for empty. Empty/NUL/`=` names and invalid UTF-8 native
+values are `Error.Invalid`, validated before lookup or output allocation as
+applicable. Names borrow for the call with transient native scratch; only
+nonempty success allocates an output payload. `set` returns `Result<(), Error>`;
+mutation must not overlap environment access. `args` comes solely from
 `main(args: array<str>)`, there is no `env.args`. `std.time`: one `i64`-nanosecond timeline, no
 `Duration` type — `now()`
 (wall), `instant()` (monotonic), `sleep(ns)`. Recoverably fallible `std` functions return

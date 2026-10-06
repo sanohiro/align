@@ -1,9 +1,9 @@
 //! M9 Slice 4 — std.path / std.env / std.time. `path.join`/`base`/`dir`/`ext`/`normalize`
 //! (pure lexical POSIX string ops; `base`/`dir`/`ext` are zero-copy `str` views of the input, so
-//! their region is inherited from it), `env.get`/`env.set` (owned `Option<string>` / `Result`),
+//! their region is inherited from it), `env.get`/`env.set` (owned `Result<Option<string>, Error>` / `Result`),
 //! and `time.now`/`time.instant`/`time.sleep` (one `i64`-nanosecond timeline). The completion
 //! condition: a round-trip per module — `path.join` then `dir`/`base`/`ext` recover the pieces;
-//! `env.set` then `env.get` round-trips (and an unset name is `None`); `time.instant()` around a
+//! `env.set` then `env.get` round-trips (and an unset name is `Ok(None)`); `time.instant()` around a
 //! `time.sleep(ns)` shows elapsed `ns` monotonically increasing. (`docs/impl/07-roadmap.md` M9
 //! Slice 4; `draft.md` §18.2.)
 
@@ -156,7 +156,7 @@ fn env_get_inherits_process_environment() {
     let prog = "\
 import std.env
 pub fn main() -> Result<(), Error> {
-  match env.get(\"ALIGN_M9_INHERITED\") {
+  match env.get(\"ALIGN_M9_INHERITED\")? {
     Some(v) => print(v),
     None => print(\"none\"),
   }
@@ -172,7 +172,7 @@ pub fn main() -> Result<(), Error> {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "inherited-value\n");
 }
 
-/// `env.set` then `env.get` round-trips the value; an unset name yields `None`.
+/// `env.set` then `env.get` round-trips the value; an unset name yields `Ok(None)`.
 #[test]
 fn env_set_get_round_trip() {
     if !backend_available() {
@@ -182,11 +182,11 @@ fn env_set_get_round_trip() {
 import std.env
 pub fn main() -> Result<(), Error> {
   env.set(\"ALIGN_M9_SLICE4\", \"value-123\")?
-  match env.get(\"ALIGN_M9_SLICE4\") {
+  match env.get(\"ALIGN_M9_SLICE4\")? {
     Some(v) => print(v),
     None => print(\"none\"),
   }
-  match env.get(\"ALIGN_M9_DEFINITELY_UNSET_ZZZ\") {
+  match env.get(\"ALIGN_M9_DEFINITELY_UNSET_ZZZ\")? {
     Some(v) => print(v),
     None => print(\"none\"),
   }

@@ -1344,7 +1344,7 @@ merely because its `Ty` matches.
 | `PathJoin` | `env[]; child[a,b]`; `Str,Str; result String; new owned string; Pure`. |
 | `PathComponent` | `env[kind]`; `child[path]`; `Str; result Str; view inherits path provenance; Pure`. |
 | `PathNormalize` | `env[]; child[path]`; `Str; result String; new owned string; Pure`. |
-| `EnvGet` | `env[]; child[name]`; `Str; result Option<String>; Some owns a fresh string; Impure`. |
+| `EnvGet` | `env[]; child[name]`; `Str; result Result<Option<String>, builtin Error>; exact nested Option<String>; Some owns a fresh string; Impure`. |
 | `EnvSet` | `env[]; child[name,value]`; `Str,Str; result ERR(Unit); borrowed; Impure`. |
 | `TimeNow` | `env[]; child[]; result i64; Impure`. |
 | `TimeInstant` | `env[]; child[]; result i64; Impure`. |
