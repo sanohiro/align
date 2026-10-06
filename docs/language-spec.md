@@ -1646,6 +1646,16 @@ rather than surfacing a `Result`) — `seed_with(s)` is **deterministic**, for t
 reproducibility. `lo >= hi` (`range`) and `k < 0` or
 `k > xs.len()` (`sample`) are programmer errors and abort at runtime, like out-of-bounds indexing.
 
+`std.compress`: `gzip_decompress(data: bytes)` and `zstd_decompress(data: bytes)` return
+`Result<buffer, Error>` with independently owned output after consuming the entire borrowed input.
+Calls are Impure. Concatenated gzip members and current ordinary/skippable zstd frames are accepted;
+skippable frames contribute no output. Empty input, legacy zstd, corrupt/truncated later data and
+trailing bytes (including gzip zero padding) return `Error.Invalid` without partial output.
+The inclusive 1 GiB aggregate payload cap permits exact-cap empty/skippable suffixes and does not
+bound native workspace or RSS. Native resource/output allocation failures retain `Error.Code`;
+final header OOM retains terminal runtime policy. Exact admission and error precedence are in
+[the compression design](impl/std-design/compress.md).
+
 Incremental SHA-256 uses `crypto.sha256_stream() -> crypto.digest`,
 `d.update(data: bytes) -> ()`, and consuming `d.finish() -> array<u8>`.
 The qualified-only `crypto.digest` requires `import std.crypto` and is a Move

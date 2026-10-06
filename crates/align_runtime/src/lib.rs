@@ -37,6 +37,8 @@ mod args_tests;
 mod html_text_tests;
 #[cfg(test)]
 mod encoding_writes_tests;
+#[cfg(test)]
+mod decompression_frames_tests;
 use buffer_storage::BufferStorage;
 mod json_number;
 mod time_formats;
@@ -14311,6 +14313,7 @@ unsafe extern "C" {
     fn deflateEnd(strm: *mut ZStream) -> c_int;
     fn inflateInit2_(strm: *mut ZStream, window_bits: c_int, version: *const c_char, stream_size: c_int) -> c_int;
     fn inflate(strm: *mut ZStream, flush: c_int) -> c_int;
+    fn inflateReset(strm: *mut ZStream) -> c_int;
     fn inflateEnd(strm: *mut ZStream) -> c_int;
 }
 
@@ -14328,7 +14331,8 @@ fn zlib_error_to_status(ret: c_int) -> i32 {
 /// Ensure `out` has spare capacity for more bytes: if it is full, grow its capacity (exponential,
 /// so the loop is amortized O(n)), clamped to `max_cap`. Returns `Ok(false)` if the cap is already
 /// reached (no room can be added — the decompress-bomb signal), `Ok(true)` if there is now spare
-/// capacity, or `Err(AL_CODE)` on allocation failure. `try_reserve_exact` never overshoots `max_cap`.
+/// capacity, or `Err(AL_CODE)` on allocation failure. The requested capacity never exceeds `max_cap`;
+/// allocators may supply extra capacity, so callers also clamp the native output span to the cap.
 fn grow_output(out: &mut Vec<u8>, max_cap: usize) -> Result<bool, i32> {
     if out.len() >= max_cap {
         return Ok(false); // cap reached — caller decides (bomb → Error.Invalid)
@@ -14420,9 +14424,9 @@ fn deflate_run(strm: &mut ZStream, input: &[u8]) -> Result<Vec<u8>, i32> {
     }
 }
 
-/// Decompress the gzip stream `data`, returning the inflated bytes or an `AL_*` status. Output is
-/// capped at [`GZIP_MAX_OUTPUT`] (the bomb guard): exceeding it → `AL_INVALID`. Truncated input
-/// (zlib needs more but none remains) and corrupt input both map to `AL_INVALID`.
+/// Decompress every gzip member in `data`, returning their concatenated bytes or an `AL_*` status.
+/// Aggregate output is capped at [`GZIP_MAX_OUTPUT`] (the bomb guard): exceeding it → `AL_INVALID`.
+/// Truncated input (zlib needs more but none remains) and corrupt input both map to `AL_INVALID`.
 fn gzip_inflate(data: &[u8]) -> Result<Vec<u8>, i32> {
     let mut strm = ZStream::zeroed();
     let ret = unsafe {
@@ -14441,54 +14445,76 @@ fn gzip_inflate(data: &[u8]) -> Result<Vec<u8>, i32> {
     result
 }
 
-/// Drive `inflate` to `Z_STREAM_END` over `data`, enforcing the `max_cap` output cap (the bomb
-/// guard). Input is fed in `u32`-sized chunks; output grows via [`grow_output`] up to `max_cap`.
-/// `max_cap` is a parameter (not the [`GZIP_MAX_OUTPUT`] constant directly) so a unit test can drive
-/// the bomb path with a tiny cap.
+/// Decode every gzip member, enforcing one inclusive aggregate output cap. The native owners
+/// use small caps and input windows to exercise the same loop without multi-gigabyte fixtures.
 fn inflate_run(strm: &mut ZStream, data: &[u8], max_cap: usize) -> Result<Vec<u8>, i32> {
+    inflate_run_with_chunk(strm, data, max_cap, c_uint::MAX as usize)
+}
+
+fn inflate_run_with_chunk(strm: &mut ZStream, data: &[u8], max_cap: usize, input_chunk: usize) -> Result<Vec<u8>, i32> {
+    if input_chunk == 0 || c_uint::try_from(input_chunk).is_err() || data.is_empty() {
+        return Err(AL_INVALID);
+    }
     let mut out: Vec<u8> = Vec::new();
     let mut pos: usize = 0;
+    let mut member_start = 0;
+    let mut probe = 0u8;
     loop {
-        if strm.avail_in == 0 {
-            if pos >= data.len() {
-                // zlib wants more input but the stream never reached `Z_STREAM_END` → truncated.
-                return Err(AL_INVALID);
-            }
-            let take = (data.len() - pos).min(c_uint::MAX as usize);
+        if strm.avail_in == 0 && pos < data.len() {
+            let take = (data.len() - pos).min(input_chunk);
             strm.next_in = data[pos..].as_ptr();
             strm.avail_in = take as c_uint;
             pos += take;
         }
-        // Make output room, enforcing the cap. `false` = the cap is full but the stream isn't done →
-        // the output would exceed `max_cap` → a decompress bomb.
-        if !grow_output(&mut out, max_cap)? {
-            return Err(AL_INVALID);
-        }
-        // Clamp spare capacity to `max_cap - out.len()` too: `try_reserve_exact` may overshoot the
-        // requested amount (allocator over-allocation), so `capacity` alone is not a reliable cap
-        // proxy. The subtraction can't underflow — `grow_output` just returned `Ok(true)`, which
-        // guarantees `out.len() < max_cap`.
-        let spare = (out.capacity() - out.len())
-            .min(max_cap - out.len())
-            .min(c_uint::MAX as usize);
-        unsafe {
-            strm.next_out = out.as_mut_ptr().add(out.len());
+        let at_cap = out.len() == max_cap;
+        if at_cap {
+            // A full payload may still be followed by metadata or empty members. Give zlib one
+            // live scratch byte to distinguish completion from overflow without growing output.
+            strm.next_out = &mut probe;
+            strm.avail_out = 1;
+        } else {
+            if !grow_output(&mut out, max_cap)? {
+                return Err(AL_INVALID);
+            }
+            let spare = (out.capacity() - out.len())
+                .min(max_cap - out.len())
+                .min(c_uint::MAX as usize);
+            strm.next_out = unsafe { out.as_mut_ptr().add(out.len()) };
             strm.avail_out = spare as c_uint;
         }
         let before = strm.avail_out;
+        let in_before = strm.avail_in;
         let ret = unsafe { inflate(strm, Z_NO_FLUSH) };
         let produced = (before - strm.avail_out) as usize;
-        // SAFETY: zlib wrote `produced` bytes into the spare capacity we just pointed it at.
-        unsafe { out.set_len(out.len() + produced) };
-        match ret {
-            Z_STREAM_END => return Ok(out),
-            Z_OK => {} // progress made / possible — loop (refills input or grows output as needed)
-            // We always pass a non-empty output window, so `Z_BUF_ERROR` means "needs more input".
-            // Retry only if unconsumed input remains to feed; otherwise the stream is truncated or
-            // genuinely stuck — an invalid gzip stream, not a runtime error.
-            Z_BUF_ERROR if strm.avail_in == 0 && pos < data.len() => {}
-            Z_BUF_ERROR => return Err(AL_INVALID),
-            other => return Err(zlib_error_to_status(other)), // Z_DATA_ERROR / Z_NEED_DICT / … → Invalid
+        if !matches!(ret, Z_OK | Z_STREAM_END | Z_BUF_ERROR) {
+            return Err(zlib_error_to_status(ret));
+        }
+        if at_cap {
+            if produced != 0 { return Err(AL_INVALID); }
+        } else {
+            // SAFETY: zlib initialized produced bytes within the supplied, cap-clamped spare span.
+            unsafe { out.set_len(out.len() + produced) };
+        }
+        if ret == Z_STREAM_END {
+            let remaining = usize::try_from(strm.avail_in).map_err(|_| AL_CODE)?;
+            let consumed = pos.checked_sub(remaining).ok_or(AL_CODE)?;
+            if consumed <= member_start { return Err(AL_INVALID); }
+            if remaining == 0 && pos == data.len() { return Ok(out); }
+            // Reset keeps the gzip-only mode and reuses native storage. Preserve the unread
+            // input window explicitly; total_in/total_out are member-local, not aggregate counts.
+            let next_in = strm.next_in;
+            let avail_in = strm.avail_in;
+            strm.next_out = core::ptr::null_mut();
+            strm.avail_out = 0;
+            let reset = unsafe { inflateReset(strm) };
+            if reset != Z_OK { return Err(zlib_error_to_status(reset)); }
+            strm.next_in = next_in;
+            strm.avail_in = avail_in;
+            member_start = consumed;
+        } else if strm.avail_in == in_before && produced == 0 {
+            // A nonempty output window was supplied. No consumption/output means truncated or
+            // stuck input, even when the engine has buffered bits and no new input remains.
+            return Err(AL_INVALID);
         }
     }
 }
@@ -14646,8 +14672,8 @@ fn zstd_compress_impl(data: &[u8], level: i64) -> Result<Vec<u8>, i32> {
     Ok(out)
 }
 
-/// `compress.zstd_decompress(data)` — inflate the zstd frame `data` via the streaming API, returning
-/// the decompressed bytes or an `AL_*` status. Output is capped at [`ZSTD_MAX_OUTPUT`] (the bomb
+/// `compress.zstd_decompress(data)` — inflate every current ordinary/skippable frame in `data`,
+/// returning concatenated bytes or an `AL_*` status. Aggregate output is capped at [`ZSTD_MAX_OUTPUT`] (the bomb
 /// guard) — `ZSTD_getFrameContentSize` is never trusted for sizing. The `DStream` is freed on every
 /// path (init failure, decode error, success).
 fn zstd_decompress_impl(data: &[u8]) -> Result<Vec<u8>, i32> {
@@ -14668,7 +14694,12 @@ fn zstd_decompress_impl(data: &[u8]) -> Result<Vec<u8>, i32> {
     result
 }
 
-/// Drive `ZSTD_decompressStream` to frame completion over `data`, enforcing the `max_cap` output cap
+/// Current RFC 8878 ordinary/skippable frames only, independent of native legacy build flags.
+fn zstd_current_frame(data: &[u8]) -> bool {
+    matches!(data, [0x28, 0xb5, 0x2f, 0xfd, ..] | [0x50..=0x5f, 0x2a, 0x4d, 0x18, ..])
+}
+
+/// Drive `ZSTD_decompressStream` through every frame in `data`, enforcing the `max_cap` output cap
 /// (the bomb guard). The whole input is available at once (a fully-buffered byte view); output grows
 /// via the shared [`grow_output`] up to `max_cap`. `max_cap` is a parameter (not [`ZSTD_MAX_OUTPUT`]
 /// directly) so a unit test can drive the bomb path with a tiny cap. Never dereferences the stream
@@ -14676,35 +14707,43 @@ fn zstd_decompress_impl(data: &[u8]) -> Result<Vec<u8>, i32> {
 fn zstd_decompress_stream(zds: *mut c_void, data: &[u8], max_cap: usize) -> Result<Vec<u8>, i32> {
     let mut out: Vec<u8> = Vec::new();
     let mut input = ZstdInBuffer { src: data.as_ptr() as *const c_void, size: data.len(), pos: 0 };
+    let mut frame_start = 0;
+    let mut at_boundary = true;
+    let mut probe = 0u8;
     loop {
-        // Make output room, enforcing the cap. `false` = the cap is full but the frame isn't done →
-        // the output would exceed `max_cap` → a decompress bomb.
-        if !grow_output(&mut out, max_cap)? {
+        if at_boundary && !zstd_current_frame(&data[input.pos..]) {
             return Err(AL_INVALID);
         }
-        // `grow_output` returned `Ok(true)`, so `out.len() < out.capacity()` and `out.len() < max_cap`
-        // both hold → `spare >= 1` and neither subtraction underflows.
-        let spare = (out.capacity() - out.len()).min(max_cap - out.len());
-        let mut output = ZstdOutBuffer {
-            dst: unsafe { out.as_mut_ptr().add(out.len()) as *mut c_void },
-            size: spare,
-            pos: 0,
+        at_boundary = false;
+        let at_cap = out.len() == max_cap;
+        let (dst, spare) = if at_cap {
+            ((&mut probe as *mut u8).cast(), 1)
+        } else {
+            if !grow_output(&mut out, max_cap)? { return Err(AL_INVALID); }
+            (unsafe { out.as_mut_ptr().add(out.len()).cast() },
+                (out.capacity() - out.len()).min(max_cap - out.len()))
         };
+        let mut output = ZstdOutBuffer { dst, size: spare, pos: 0 };
         let in_before = input.pos;
         let ret = unsafe { ZSTD_decompressStream(zds, &mut output, &mut input) };
-        // SAFETY: zstd wrote `output.pos` bytes into the spare capacity we pointed it at.
-        unsafe { out.set_len(out.len() + output.pos) };
         if unsafe { ZSTD_isError(ret) } != 0 {
             return Err(zstd_decompress_error_to_status(ret));
         }
-        if ret == 0 {
-            return Ok(out); // frame completely decoded and fully flushed
+        if at_cap {
+            if output.pos != 0 { return Err(AL_INVALID); }
+        } else {
+            // SAFETY: zstd initialized output.pos bytes in the supplied, cap-clamped spare span.
+            unsafe { out.set_len(out.len() + output.pos) };
         }
-        // `ret > 0`: more work. Require forward progress — if this call neither consumed input nor
-        // produced output and all input is gone, the frame needs bytes that never arrive → truncated
-        // (an invalid stream, not a runtime error). A non-empty output window (spare >= 1) means a
-        // stalled `output.pos == 0` is genuine, not a zero-window artifact.
-        if output.pos == 0 && input.pos == in_before && input.pos >= input.size {
+        if ret == 0 {
+            // Completion can flush buffered output without consuming new input in this step;
+            // require progress since the frame boundary, not just since the final step.
+            if input.pos <= frame_start { return Err(AL_INVALID); }
+            if input.pos == input.size { return Ok(out); }
+            frame_start = input.pos;
+            at_boundary = true;
+        } else if output.pos == 0 && input.pos == in_before {
+            // The fully buffered input and nonempty output window cannot make further progress.
             return Err(AL_INVALID);
         }
     }

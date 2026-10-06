@@ -1,5 +1,13 @@
 # Align Design Notes
 
+Whole-input decompression must not silently accept a valid prefix and discard later bytes.
+`std.compress` therefore concatenates every gzip member or current ordinary/skippable zstd frame,
+validates later checksums and suffixes, and publishes owned output only after complete success.
+An inclusive aggregate payload cap needs a one-byte scratch probe at the limit so metadata and
+empty frames can finish without permitting additional payload. Explicit zstd magic admission
+keeps format support independent of native legacy build flags. The cap is not an RSS promise.
+[Plan 124](impl/124-complete-decompression.md) records the exact boundary.
+
 Elementary float functions preserve operation identity without inventing a
 repository-owned math library. `exp`, `exp2`, `log`, `log2`, and `log10` lower
 to LLVM scalar or vector intrinsics; explicit vectors are lane-wise at the
