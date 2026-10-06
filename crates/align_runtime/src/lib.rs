@@ -23,6 +23,8 @@ mod http_accept_budget_tests;
 mod net_service_tests;
 #[cfg(test)]
 mod http_pool_storage_tests;
+#[cfg(test)]
+mod http_batch_input_tests;
 use buffer_storage::BufferStorage;
 mod json_number;
 mod time_formats;
@@ -20058,8 +20060,8 @@ pub struct HttpRequest {
 }
 
 /// The request fields the serializer and client exchange only borrow. Builder-backed requests use
-/// [`HttpRequest::as_view`]; the convenience `get` / `post` calls can point directly at their FFI
-/// inputs, so a synchronous exchange does not allocate owned method, URL, or body copies first.
+/// [`HttpRequest::as_view`]; the convenience `get` / `post` calls and scoped GET batches can point
+/// directly at their inputs without owned method, URL, or body copies for a synchronous exchange.
 #[derive(Clone, Copy)]
 struct HttpRequestView<'a> {
     method: &'a str,
@@ -24828,16 +24830,25 @@ unsafe fn http_client_perform(
     }
 }
 
-fn http_get_request(url: String) -> HttpRequest {
-    HttpRequest {
-        method: "GET".to_string(),
+fn http_get_request(url: &str) -> HttpRequestView<'_> {
+    HttpRequestView {
+        method: "GET",
         url,
-        headers: Vec::new(),
-        body: Vec::new(),
+        headers: &[],
+        body: &[],
         body_present: false,
         timeout_ns: 0,
         max_response_body_bytes: 0,
     }
+}
+
+/// Retain typed URL views for sharing with scoped workers, preserving native lossy conversion.
+///
+/// # Safety
+/// Every nonnull, positive-length input range must remain live and immutable for the returned
+/// borrow's lifetime. The descriptor slice alone does not own the bytes its pointers describe.
+unsafe fn http_get_many_urls(views: &[AlignStr]) -> Vec<std::borrow::Cow<'_, str>> {
+    views.iter().map(|s| String::from_utf8_lossy(unsafe { bytes_view(s.ptr, s.len) })).collect()
 }
 
 /// `cl.get(url)` — perform a `GET url` (plaintext or verified TLS for `https://`) over a pooled or
@@ -24862,15 +24873,7 @@ pub unsafe extern "C" fn align_rt_http_client_get(
     let Some(url) = (unsafe { abi_str_view(url_ptr, url_len) }) else {
         return AL_INVALID;
     };
-    let req = HttpRequestView {
-        method: "GET",
-        url,
-        headers: &[],
-        body: &[],
-        body_present: false,
-        timeout_ns: 0,
-        max_response_body_bytes: 0,
-    };
+    let req = http_get_request(url);
     unsafe { http_client_perform(client, req, out, None) }
 }
 
@@ -24896,7 +24899,8 @@ pub unsafe extern "C" fn align_rt_http_client_get(
 /// # Safety
 /// `client` must be null or a valid [`HttpClient`] (shared across the workers — its interior is
 /// `Mutex`-guarded); `urls_ptr`/`urls_len` a valid range of `AlignStr` `str` views; `out` a writable
-/// `{ptr,len}` slot.
+/// `{ptr,len}` slot. The URL descriptors and their bytes must remain live and immutable until
+/// this synchronous call returns; every scoped worker has joined before return.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_http_get_many(
     client: *mut HttpClient,
@@ -24921,16 +24925,13 @@ pub unsafe extern "C" fn align_rt_http_get_many(
     if n == 0 {
         return 0; // empty batch → Ok empty {null,0}
     }
-    // Materialize the immutable requests up front. Each URL is copied from the caller's borrowed view
-    // exactly once, then the uniquely claiming worker borrows its request for the scoped exchange.
+    // Prepare typed shared views before spawning workers. Valid UTF-8 stays borrowed from the
+    // caller; only defensive lossy conversion owns bytes. The scoped join bounds every borrow.
     let views = unsafe { safe_slice(urls_ptr, urls_len) };
     if views.len() != n {
         return AL_INVALID; // a null/short view range under a positive len — malformed
     }
-    let requests: Vec<HttpRequest> = views
-        .iter()
-        .map(|s| http_get_request(String::from_utf8_lossy(unsafe { bytes_view(s.ptr, s.len) }).into_owned()))
-        .collect();
+    let urls = unsafe { http_get_many_urls(views) };
 
     // Per-index result slots (input order) + per-index status (0 = ok). Atomics so the workers write
     // disjoint slots without a lock; each index is claimed by exactly one worker.
@@ -24971,7 +24972,7 @@ pub unsafe extern "C" fn align_rt_http_get_many(
                     let code = unsafe {
                         http_client_perform(
                             shared.ptr(),
-                            requests[i].as_view(),
+                            http_get_request(&urls[i]),
                             &mut resp,
                             Some(client_body_limit_snapshot),
                         )
@@ -44095,12 +44096,12 @@ mod tests {
             assert_eq!(actual, expected);
             assert_eq!(actual.capacity(), actual.len());
         }
-        let batch = http_get_request("http://example.com/object".to_owned());
+        let batch = http_get_request("http://example.com/object");
         assert_eq!(batch.body_present, false);
         let empty_view = HttpRequestView {
             body: &[],
             body_present: true,
-            ..batch.as_view()
+            ..batch
         };
         assert_eq!(
             http_serialize_core(empty_view),
@@ -48706,110 +48707,38 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
     }
 
     #[test]
-    fn http_get_request_moves_url_without_copy() {
+    fn http_get_request_borrows_url_without_copy() {
         let url = "http://127.0.0.1/identity".to_string();
         let ptr = url.as_ptr();
-        let req = http_get_request(url);
-        assert_eq!(req.url.as_ptr(), ptr, "building the immutable GET request must move, not clone, its owned URL");
+        let req = http_get_request(&url);
+        assert_eq!(req.url.as_ptr(), ptr, "GET preparation must borrow its URL");
     }
 
-    /// Manual allocation-inclusive gate for prebuilding immutable requests before workers claim
-    /// indices. The staged control reproduces the former `Vec<String>` plus per-worker URL clone;
-    /// the direct path creates the retained `Vec<HttpRequest>` in one pass. Run with:
-    ///
-    /// `cargo test -p align_runtime --release http_get_many_request_copy_probe -- --ignored
-    /// --nocapture --test-threads=1`.
+    /// Measure caller-thread Rust allocations in the complete batch entry, excluding setup and
+    /// worker/network allocations. Invalid URL syntax avoids transport work. Run with alloc-count.
+    #[cfg(feature = "alloc-count")]
     #[test]
-    #[ignore]
-    fn http_get_many_request_copy_probe() {
-        use std::hint::black_box;
-
-        #[inline(never)]
-        fn construct(views: &[AlignStr], direct: bool) -> usize {
-            if direct {
-                let requests: Vec<HttpRequest> = views
-                    .iter()
-                    .map(|s| http_get_request(String::from_utf8_lossy(unsafe { bytes_view(s.ptr, s.len) }).into_owned()))
-                    .collect();
-                let checksum = requests.iter().fold(0usize, |sum, req| {
-                    black_box(req.url.as_ptr());
-                    sum.wrapping_add(req.url.len())
-                });
-                black_box(requests);
-                checksum
-            } else {
-                let urls: Vec<String> = views
-                    .iter()
-                    .map(|s| String::from_utf8_lossy(unsafe { bytes_view(s.ptr, s.len) }).into_owned())
-                    .collect();
-                let mut checksum = 0usize;
-                for url in &urls {
-                    let req = http_get_request(url.clone());
-                    black_box(req.url.as_ptr());
-                    checksum = checksum.wrapping_add(req.url.len());
-                    black_box(req);
-                }
-                black_box(urls);
-                checksum
-            }
-        }
-
-        fn time(views: &[AlignStr], direct: bool, iters: usize) -> f64 {
-            let start = std::time::Instant::now();
-            let mut checksum = 0usize;
-            for _ in 0..iters {
-                checksum ^= black_box(construct)(black_box(views), black_box(direct));
-            }
-            black_box(checksum);
-            start.elapsed().as_nanos() as f64 / iters as f64
-        }
-
-        fn median(mut samples: Vec<f64>) -> f64 {
-            samples.sort_by(f64::total_cmp);
-            samples[samples.len() / 2]
-        }
-
-        println!("http.get_many request construction (median of 9, allocation-inclusive ns/batch):");
-        println!(" urls | url bytes | staged       | direct       | staged/direct | allocations removed");
-        for n in [1usize, 8, 64, 1024] {
-            for url_len in [32usize, 2048] {
-                let storage: Vec<String> = (0..n)
-                    .map(|i| {
-                        let mut url = format!("http://127.0.0.1/{i}/");
-                        url.push_str(&"x".repeat(url_len.saturating_sub(url.len())));
-                        url
-                    })
-                    .collect();
-                let views: Vec<AlignStr> = storage.iter().map(|url| as_view(url)).collect();
-                let iters = match (n, url_len) {
-                    (1, 32) => 100_000,
-                    (1, _) => 20_000,
-                    (8, 32) => 20_000,
-                    (8, _) => 2_000,
-                    (64, 32) => 2_000,
-                    (64, _) => 200,
-                    (1024, 32) => 100,
-                    _ => 10,
-                };
-                let mut staged = Vec::with_capacity(9);
-                let mut direct = Vec::with_capacity(9);
-                for trial in 0..9 {
-                    if trial % 2 == 0 {
-                        staged.push(time(&views, false, iters));
-                        direct.push(time(&views, true, iters));
-                    } else {
-                        direct.push(time(&views, true, iters));
-                        staged.push(time(&views, false, iters));
-                    }
-                }
-                assert_eq!(construct(&views, false), construct(&views, true));
-                let staged = median(staged);
-                let direct = median(direct);
-                println!(
-                    "{n:>5} | {url_len:>9} | {staged:>12.1} | {direct:>12.1} | {:>13.2}x | {n}",
-                    staged / direct
-                );
-            }
+    #[ignore = "manual before/after batch input allocation measurement"]
+    fn http_get_many_caller_allocation_probe() {
+        let before = global_alloc_count();
+        let witness = std::hint::black_box(vec![std::hint::black_box(7_u8); 32]);
+        assert!(global_alloc_count() > before, "allocator counter is active");
+        drop(witness);
+        for n in [0_usize, 1, 8, 64, 1024] {
+            let url = "invalid-url".to_owned();
+            let views: Vec<AlignStr> = (0..n).map(|_| as_view(&url)).collect();
+            let mut out = AlignStr { ptr: core::ptr::null(), len: 0 };
+            let before = global_alloc_count();
+            let status = unsafe {
+                align_rt_http_get_many(
+                    core::ptr::null_mut(), views.as_ptr(), i64::try_from(n).unwrap(), 4, &mut out,
+                )
+            };
+            let allocations = global_alloc_count() - before;
+            unsafe { align_rt_free_response_array(out.ptr.cast_mut(), out.len) };
+            assert_eq!(status, if n == 0 { 0 } else { AL_INVALID });
+            assert!(out.ptr.is_null() && out.len == 0);
+            eprintln!("batch caller: urls={n}, Rust allocations={allocations}");
         }
     }
 

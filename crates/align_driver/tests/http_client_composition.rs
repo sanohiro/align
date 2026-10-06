@@ -479,6 +479,7 @@ fn main() -> Result<(), Error> {{
 }
 
 fn capture_requests(mut socket: TcpStream) -> Vec<Vec<u8>> {
+    socket.set_nonblocking(false).unwrap();
     socket
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
@@ -662,6 +663,64 @@ fn main() -> Result<(), Error> {
 "#,
         "0\n",
     );
+}
+
+#[test]
+fn nonempty_batch_outlives_scoped_url_and_client_owners() {
+    if !backend_available() {
+        return;
+    }
+    for unit in [false, true] {
+        for profile in [Profile::Dev, Profile::Release] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let authority = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+            let main = format!(
+                r#"module main
+import helpers
+import std.http
+
+fn fetch(url: str) -> Result<array<http_response>, Error> {{
+  owned := url.clone()
+  urls := [owned[0..]]
+  client := helpers.client()
+  client.timeout(1000000000)
+  return helpers.batch(client, urls)
+}}
+fn main() -> Result<(), Error> {{
+  responses := fetch("http://{authority}/borrowed")?
+  print(responses.len())
+  print(responses[0].status())
+  print(responses[0].body().as_str()?)
+  return Ok(())
+}}
+"#
+            );
+            let project = Project::new(&main);
+            let exe = project.build(&main, unit, profile);
+            std::thread::scope(|scope| {
+                let peer = scope.spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(15);
+                    loop {
+                        assert!(Instant::now() < deadline, "batch peer accept deadline");
+                        match listener.accept() {
+                            Ok((socket, _)) => break capture_requests(socket),
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(error) => panic!("accept: {error}"),
+                        }
+                    }
+                });
+                assert_eq!(run_bounded(&exe), "1\n200\nabc\n", "{unit}/{profile:?}");
+                assert_eq!(
+                    peer.join().unwrap(),
+                    [format!("GET /borrowed HTTP/1.1\r\nHost: {authority}\r\n\r\n").into_bytes()]
+                );
+            });
+        }
+    }
 }
 
 #[test]
