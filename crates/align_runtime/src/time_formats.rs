@@ -1,6 +1,8 @@
 //! Allocation-free UTC calendar engine for the exact named wire-format ledger.
 use crate::{AL_INVALID, AlignStr, owned_str_exact};
-use core::fmt::Write;
+
+#[cfg(test)]
+mod rendering_tests;
 
 const SECOND: i128 = 1_000_000_000;
 const DAY: i128 = 86_400 * SECOND;
@@ -77,15 +79,26 @@ struct Text {
     bytes: [u8; 32],
     len: usize,
 }
-impl Write for Text {
-    fn write_str(&mut self, value: &str) -> core::fmt::Result {
-        let end = self.len.checked_add(value.len()).ok_or(core::fmt::Error)?;
-        self.bytes
-            .get_mut(self.len..end)
-            .ok_or(core::fmt::Error)?
-            .copy_from_slice(value.as_bytes());
+impl Text {
+    fn push(&mut self, value: &[u8]) -> Option<()> {
+        let end = self.len.checked_add(value.len())?;
+        self.bytes.get_mut(self.len..end)?.copy_from_slice(value);
         self.len = end;
-        Ok(())
+        Some(())
+    }
+
+    fn digits<const WIDTH: usize>(&mut self, value: i128) -> Option<()> {
+        let mut value = u32::try_from(value).ok()?;
+        let end = self.len.checked_add(WIDTH)?;
+        for byte in self.bytes.get_mut(self.len..end)?.iter_mut().rev() {
+            *byte = b'0' + u8::try_from(value % 10).ok()?;
+            value /= 10;
+        }
+        if value != 0 {
+            return None;
+        }
+        self.len = end;
+        Some(())
     }
 }
 
@@ -106,37 +119,60 @@ fn format(ns: i64, kind: i32) -> Option<Text> {
     };
     match kind {
         0 | 1 => {
-            write!(
-                out,
-                "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}"
-            )
-            .ok()?;
+            out.digits::<4>(i128::from(year))?;
+            out.push(b"-")?;
+            out.digits::<2>(i128::from(month))?;
+            out.push(b"-")?;
+            out.digits::<2>(i128::from(day))?;
+            out.push(b"T")?;
+            out.digits::<2>(hour)?;
+            out.push(b":")?;
+            out.digits::<2>(minute)?;
+            out.push(b":")?;
+            out.digits::<2>(second)?;
             if kind == 1 {
-                write!(out, ".{:03}", fraction / 1_000_000).ok()?;
+                out.push(b".")?;
+                out.digits::<3>(fraction / 1_000_000)?;
             } else if fraction != 0 {
                 let start = out.len;
-                write!(out, ".{fraction:09}").ok()?;
+                out.push(b".")?;
+                out.digits::<9>(fraction)?;
                 while out.len > start && out.bytes.get(out.len - 1) == Some(&b'0') {
                     out.len -= 1;
                 }
             }
-            out.write_str("Z").ok()?;
+            out.push(b"Z")?;
         }
         2 => {
             let weekday = WEEKDAYS.get(usize::try_from((days + 4).rem_euclid(7)).ok()?)?;
             let month_name = MONTHS.get(usize::try_from(month - 1).ok()?)?;
-            write!(
-                out,
-                "{weekday}, {day:02} {month_name} {year:04} {hour:02}:{minute:02}:{second:02} GMT"
-            )
-            .ok()?;
+            out.push(weekday.as_bytes())?;
+            out.push(b", ")?;
+            out.digits::<2>(i128::from(day))?;
+            out.push(b" ")?;
+            out.push(month_name.as_bytes())?;
+            out.push(b" ")?;
+            out.digits::<4>(i128::from(year))?;
+            out.push(b" ")?;
+            out.digits::<2>(hour)?;
+            out.push(b":")?;
+            out.digits::<2>(minute)?;
+            out.push(b":")?;
+            out.digits::<2>(second)?;
+            out.push(b" GMT")?;
         }
-        3 => write!(
-            out,
-            "{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z"
-        )
-        .ok()?,
-        4 => write!(out, "{year:04}{month:02}{day:02}").ok()?,
+        3 | 4 => {
+            out.digits::<4>(i128::from(year))?;
+            out.digits::<2>(i128::from(month))?;
+            out.digits::<2>(i128::from(day))?;
+            if kind == 3 {
+                out.push(b"T")?;
+                out.digits::<2>(hour)?;
+                out.digits::<2>(minute)?;
+                out.digits::<2>(second)?;
+                out.push(b"Z")?;
+            }
+        }
         _ => return None,
     }
     Some(out)
