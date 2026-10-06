@@ -45870,6 +45870,8 @@ event: first\nevent:\ndata: x\n\n";
                     Err(error) => return Err(error),
                 }
             };
+            // Accepted sockets inherit nonblocking mode on macOS; these reads wait for a head.
+            socket.set_nonblocking(false)?;
             socket.set_read_timeout(Some(Duration::from_secs(2)))?;
             socket.set_write_timeout(Some(Duration::from_secs(2)))?;
             let mut request = Vec::new();
@@ -47682,7 +47684,10 @@ event: first\nevent:\ndata: x\n\n";
                     Err(error) => panic!("accept first request: {error}"),
                 }
             };
+            // The listener polls, but each request/response exchange uses bounded blocking I/O.
+            first.set_nonblocking(false).unwrap();
             first.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            first.set_write_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
             let mut request = [0u8; 1024];
             assert!(first.read(&mut request).unwrap() > 0);
             first.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").unwrap();
@@ -47694,6 +47699,9 @@ event: first\nevent:\ndata: x\n\n";
             loop {
                 match listener.accept() {
                     Ok((mut retry, _)) => {
+                        retry.set_nonblocking(false).unwrap();
+                        retry.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                        retry.set_write_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
                         let _ = retry.read(&mut request);
                         let _ = retry.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
                         return 2;
@@ -48016,6 +48024,10 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
                     Err(_) => break,
                 };
                 accepted += 1;
+                // SSL_accept/read/write below require blocking I/O, independently of accept mode.
+                sock.set_nonblocking(false).unwrap();
+                sock.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                sock.set_write_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
                 let fd = sock.into_raw_fd();
                 unsafe {
                     let ssl = SSL_new(ctx);
@@ -48581,7 +48593,9 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
                     Ok((mut sock, _)) => {
                         accepted += 1;
                         workers.push(std::thread::spawn(move || {
+                            sock.set_nonblocking(false).unwrap();
                             sock.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                            sock.set_write_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
                             let mut buf: Vec<u8> = Vec::new();
                             let mut tmp = [0u8; 512];
                             loop {
@@ -48642,7 +48656,9 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             while workers.len() < 2 && std::time::Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut socket, _)) => workers.push(std::thread::spawn(move || {
+                        socket.set_nonblocking(false).unwrap();
                         socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                        socket.set_write_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
                         let mut request = Vec::new();
                         let mut scratch = [0u8; 512];
                         while !request.windows(4).any(|window| window == b"\r\n\r\n") {
