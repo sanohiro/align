@@ -1634,8 +1634,9 @@ handles (each swept through every pass, the reader/writer discipline). Full API 
   smoke check; `shuffle` preserves the multiset (Fisher-Yates permutation); `sample` returns `k`
   distinct items; `lo >= hi` / `k` out of range abort; `rng` is Copy (value pass / reassign);
   `import std.rand` required — `tests/m10_rand.rs` (12) + `align_runtime` unit tests (5).
-  v1 `sample` uses an O(n) index-permutation scratch (correctness before speed); an O(k) Floyd's-
-  sample is a later optimization behind the same signature.
+  `sample` preserves partial-Fisher-Yates draws with O(k) displaced-slot scratch for sparse
+  selections and O(n) contiguous scratch otherwise; [plan 126](126-sparse-random-sampling.md)
+  owns exact RNG/output parity and measured scratch/latency qualification.
 - **Slice 3 — std.cli — DONE.** `cli.command`/`c.flag_bool`/`c.flag_str`/`c.flag_i64`/`c.parse`/
   `p.get_bool`/`p.get_str`/`p.get_i64`/`c.usage` — a flag-registration parser over
   `main(args: array<str>)`'s `array<str>`, not a second argv source. Two new **Move** handle types
