@@ -50,24 +50,27 @@ fn civil_days(year: i64, month: i64, day: i64) -> Option<i64> {
 }
 
 fn civil_date(days: i64) -> Option<(i64, i64, i64)> {
-    let (mut lo, mut hi) = (0, 10_000);
-    while lo + 1 < hi {
-        let mid = (lo + hi) / 2;
-        if year_start(mid) <= days {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    let mut day = days - year_start(lo);
-    for month in 1..=12 {
-        let count = month_days(lo, month)?;
-        if day < count {
-            return Some((lo, month, day + 1));
-        }
-        day -= count;
-    }
-    None
+    // Gregorian 400-year/March-based decomposition, after Howard Hinnant's
+    // public-domain derivation: https://howardhinnant.github.io/date_algorithms.html
+    let shifted = days.checked_add(719_468)?;
+    let era = shifted.div_euclid(146_097);
+    // Each cycle contains exactly 146097 days; the remaining arithmetic stays bounded:
+    // within <= 146096, year_in_era <= 399, march_day <= 365, march_month <= 11.
+    let within = shifted.rem_euclid(146_097);
+    let year_in_era = (within - within / 1460 + within / 36524 - within / 146096) / 365;
+    let march_day = within - (365 * year_in_era + year_in_era / 4 - year_in_era / 100);
+    let march_month = (5 * march_day + 2) / 153;
+    let day = march_day - (153 * march_month + 2) / 5 + 1;
+    let month = if march_month < 10 {
+        march_month + 3
+    } else {
+        march_month - 9
+    };
+    let year = era
+        .checked_mul(400)?
+        .checked_add(year_in_era)?
+        .checked_add(i64::from(month <= 2))?;
+    Some((year, month, day))
 }
 
 struct Text {
@@ -579,5 +582,83 @@ mod tests {
             );
             crate::align_rt_free(text.ptr.cast_mut());
         }
+    }
+    /// Local allocation-inclusive formatter measurement; never a correctness/CI timing gate.
+    /// Run before and after the change with:
+    /// `scripts/cargo.sh test -p align_runtime --release --lib
+    /// time_formats::tests::complete_format_entry_probe -- --exact --ignored --nocapture
+    /// --test-threads=1`.
+    #[test]
+    #[ignore]
+    fn complete_format_entry_probe() {
+        use std::hint::black_box;
+        let inputs = [
+            i64::MIN,
+            i64::MIN + 86_400_000_000_000,
+            -951_782_400_123_456_789,
+            -1,
+            0,
+            1,
+            951_782_400_123_456_789,
+            1_791_000_000_123_456_789,
+            i64::MAX,
+        ];
+        for kind in 0..5 {
+            let mut samples = Vec::new();
+            let mut checksum = 0_i64;
+            for _ in 0..9 {
+                let start = std::time::Instant::now();
+                for _ in 0..20_000 {
+                    for &ns in &inputs {
+                        let mut output = AlignStr {
+                            ptr: core::ptr::null(),
+                            len: 0,
+                        };
+                        let status = unsafe {
+                            align_rt_time_format(&mut output, black_box(ns), black_box(kind))
+                        };
+                        checksum = checksum.wrapping_add(i64::from(status) ^ output.len);
+                        if !output.ptr.is_null() {
+                            checksum = checksum.wrapping_add(i64::from(unsafe { *output.ptr }));
+                        }
+                        unsafe { crate::align_rt_free(output.ptr.cast_mut()) };
+                    }
+                }
+                samples.push(start.elapsed().as_secs_f64() * 1e9 / 180_000.0);
+            }
+            black_box(checksum);
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "kind={kind} median_ns={:.2} min_ns={:.2} max_ns={:.2} checksum={checksum}",
+                samples[4], samples[0], samples[8]
+            );
+        }
+    }
+
+    #[test]
+    fn civil_date_matches_every_representable_epoch_day() {
+        let first = i64::try_from(i128::from(i64::MIN).div_euclid(DAY)).unwrap();
+        let last = i64::try_from(i128::from(i64::MAX).div_euclid(DAY)).unwrap();
+        // Independently advance the civil calendar from the lower endpoint's known date.
+        // This covers 1700/1800/1900/2100/2200 non-leap centuries and the 2000 leap era.
+        let mut expected = (1677_i64, 9_i64, 21_i64);
+        let ordinary_months = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        for serial in first..=last {
+            assert_eq!(civil_date(serial), Some(expected), "epoch day {serial}");
+            let (year, month, day) = expected;
+            assert_eq!(civil_days(year, month, day), Some(serial));
+            let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+            let days_in_month = ordinary_months[usize::try_from(month - 1).unwrap()]
+                + i64::from(month == 2 && leap);
+            expected = if day < days_in_month {
+                (year, month, day + 1)
+            } else if month < 12 {
+                (year, month + 1, 1)
+            } else {
+                (year + 1, 1, 1)
+            };
+        }
+        assert_eq!(expected, (2262, 4, 12));
+        assert_eq!(last - first + 1, 213_504);
     }
 }
