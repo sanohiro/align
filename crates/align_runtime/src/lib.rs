@@ -33,6 +33,8 @@ mod fs_read_tests;
 mod env_tests;
 #[cfg(test)]
 mod args_tests;
+#[cfg(test)]
+mod html_text_tests;
 use buffer_storage::BufferStorage;
 mod json_number;
 mod time_formats;
@@ -13696,8 +13698,8 @@ fn html_escape_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
 }
 
 /// `encoding.html_escape(data)` — replace `& < > " '` with their HTML entities so the result is safe
-/// to interpolate into element text or a quoted attribute. Returns an owned `string`. Bytes are
-/// otherwise copied through, so valid UTF-8 in gives valid UTF-8 out.
+/// to interpolate into element text or a quoted attribute. Accepts UTF-8 text and returns an owned
+/// `string`. Other bytes, including embedded NUL, are copied unchanged.
 ///
 /// There is deliberately no `html_unescape` here: reversing HTML means resolving the full named
 /// character reference set, which is an HTML *parser*'s table, not a codec's — a partial one would
@@ -13705,10 +13707,25 @@ fn html_escape_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
 /// beside the other codecs.
 ///
 /// # Safety
-/// `ptr`/`len` must describe a valid byte range for the call.
+/// Nonempty `ptr`/`len` must describe one live, initialized, readable byte allocation, stable for
+/// the call. Detectable malformed extent and invalid UTF-8 abort before allocation. Empty input
+/// permits a null pointer. No input bytes are retained.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_html_escape(ptr: *const u8, len: i64) -> AlignStr {
-    let data = unsafe { bytes_view(ptr, len) };
+    let Ok(len) = safe_len(len) else {
+        panic_abort("html escape input is not valid text");
+    };
+    let data = if len == 0 {
+        &[]
+    } else {
+        if ptr.is_null() || ptr.addr().checked_add(len).is_none() {
+            panic_abort("html escape input is not valid text");
+        }
+        unsafe { core::slice::from_raw_parts(ptr, len) }
+    };
+    if core::str::from_utf8(data).is_err() {
+        panic_abort("html escape input is not valid text");
+    }
     let Some(out_len) = html_escaped_len(data) else {
         align_rt_alloc_size_fail();
     };

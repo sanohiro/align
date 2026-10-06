@@ -1630,10 +1630,15 @@ The exact bounded grammar, endpoint, ABI and ownership contract is in `impl/std-
 the unreserved set becomes `%XX`) / `form` (`application/x-www-form-urlencoded` — the same rule but
 space is `+`; encode one key or value at a time, the `=`/`&` joining them are structure) encode+decode,
 plus `percent_encode_path` (encode-only; owned output, call-borrowed bytes/str/string,
-preserving `/` and unreserved bytes without decoding or normalization), and `html_escape` (encode-only: `& < > " '` become entities, making one output safe in both element
-text and a quoted attribute; reversing HTML needs a parser's full entity table, not a codec)
-(decode returns an owned `buffer` — no
-UTF-8 invariant on `bytes`; invalid input is `Error.Invalid`) plus `utf8_valid`. `std.rand`
+preserving `/` and unreserved bytes without decoding or normalization).
+`html_escape(data: str) -> string` auto-borrows owned strings; raw bytes require
+explicit `.as_str()?` conversion. It replaces `& < > " '` with entities for HTML
+element text or quoted attribute content and preserves other UTF-8 bytes,
+including NUL. Output owns independent storage. Invalid native text or detectable
+malformed extent aborts before allocation. It is encode-only: reversing HTML
+requires a parser's complete entity table. Decoders return owned `buffer` values
+with no UTF-8 guarantee; invalid encoded input returns `Error.Invalid`.
+`utf8_valid` tests byte-view validity without converting it. `std.rand`
 (non-cryptographic): `rand.seed()`/`seed_with(s)` produce a **Copy** `rng` value (state-only, no
 fd — unlike `reader`/`writer`); `r.next()`/`r.range(lo, hi)`/`r.shuffle(out xs)`/`r.sample(xs, k)`
 take a `mut` receiver. Only `rand.seed()` is OS-seeded (via `getrandom`/`urandom`; a failure aborts

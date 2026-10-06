@@ -9712,8 +9712,9 @@ impl<'a> BodyValidator<'a> {
                 let (falls, breaks) = strict_flow(&flows);
                 Some((Ty::Slice(u8_scalar), falls, breaks))
             }
-            hir::ExprKind::EncodingEncode { data, .. } => {
-                (byte_view(data.ty)).then(|| strict(Ty::String, &[data]))?
+            hir::ExprKind::EncodingEncode { kind, data } => {
+                (if *kind == hir::EncodingKind::Html { data.ty == Ty::Str } else { byte_view(data.ty) })
+                    .then(|| strict(Ty::String, &[data]))?
             }
             hir::ExprKind::EncodingDecode { input, kind } => {
                 (input.ty == Ty::Str && !matches!(kind, hir::EncodingKind::Utf8Lossy | hir::EncodingKind::Html | hir::EncodingKind::PercentPath))

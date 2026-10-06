@@ -1942,6 +1942,16 @@ Repository owner and CI commands preserve the same property with the existing qu
 success is phase/aggregate summaries, while failure or interruption replays the captured diagnostic
 log without changing selection or verdict.
 
+## Why HTML escaping accepts text
+
+HTML escaping substitutes five ASCII characters and copies every other byte.
+It cannot turn arbitrary binary input into a valid owned `string`. Its input is
+therefore `str`, with the ordinary owned-string borrow; bytes cross the existing
+explicit fallible `.as_str()` boundary first. Independent native UTF-8 admission
+preserves the invariant for incompatible callers before output allocation.
+Other byte encoders produce ASCII or explicitly replace invalid UTF-8 and keep
+their byte domain. No second text conversion or error model is needed.
+
 ## Why an HTML builder is opaque
 
 An escape-by-default API cannot hand callers an ordinary `builder`. That would leave

@@ -1370,7 +1370,7 @@ merely because its `Ty` matches.
 | `RunBytesCode` *(Request 11)* | `env[]; child[out]`; `LocalHandle(RunBytes,out); result i64; borrowed; Pure`. |
 | `RunBytesStdout` *(Request 11)* | `env[]; child[out]`; `LocalHandle(RunBytes,out); result bytes; view inherits out provenance; Pure`. |
 | `RunBytesStderr` *(Request 11)* | `env[]; child[out]`; `LocalHandle(RunBytes,out); result bytes; view inherits out provenance; Pure`. |
-| `EncodingEncode` | `env[kind]`; `child[data]`; `byte-view; result String; fresh owned output; Pure`. |
+| `EncodingEncode` | `env[kind]`; `child[data]`; `Str for Html, byte-view for other kinds; result String; fresh owned output; Pure`. |
 | `EncodingDecode` | `env[kind]`; `child[input]`; `Str; result ERR(Buffer); fresh owned output on success; Pure`. |
 | `Utf8Valid` | `env[]; child[data]`; `bytes; result Bool; borrowed; Pure`. |
 | `Compress` | `env[kind]`; `child[data,level]`; `byte-view,i64; result ERR(Buffer); fresh owned output; Impure`. |
@@ -1465,7 +1465,7 @@ merely because its `Ty` matches.
 | `EncodingKind::Hex` | Lowercase hex encode and exact existing case-accepting decode contract. |
 | `EncodingKind::Percent` | RFC 3986 component percent encoding; uppercase hex on encode, either case on decode. |
 | `EncodingKind::Form` | Form component encoding: space maps to `+`; decode reverses `+` and percent escapes. |
-| `EncodingKind::Html` | HTML entity escaping is encode-only; `EncodingDecode { kind: Html }` rejects. |
+| `EncodingKind::Html` | HTML entity escaping is encode-only and requires a Str child after source string auto-borrow; `EncodingDecode { kind: Html }` rejects. |
 | `CompressKind::Gzip` | gzip framing/runtime pair; level 0 through 9. |
 | `CompressKind::Zstd` | zstd framing/runtime pair; compression level is exactly `0..=22`. |
 | `PathComponentKind::Base` | Returns final path component view. |

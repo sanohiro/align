@@ -5836,7 +5836,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.seed = Some(XmlAccessProvenance::Owned);
                 }
             }
-            Rvalue::EncodingEncode { data, .. } => {
+            Rvalue::EncodingEncode { kind, data } => {
                 let data_ty = xml_operand_base_ty(self.graph.function, &data);
                 let byte_view = matches!(
                     data_ty,
@@ -5845,7 +5845,12 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         signed: false,
                     })))
                 );
-                if result_ty != Ty::String || !path.is_empty() || !byte_view {
+                let valid_input = if kind == hir::EncodingKind::Html {
+                    data_ty == Some(Ty::Str)
+                } else {
+                    byte_view
+                };
+                if result_ty != Ty::String || !path.is_empty() || !valid_input {
                     equation.invalid = true;
                 } else {
                     let Some(data_ty) = data_ty else {
@@ -9398,6 +9403,16 @@ fn validate_resource_rvalues_component(
                             && operand_ty(function, value) == Some(Ty::Str)
                             && result == Ty::Unit
                     }
+                    // Check even discarded results: owned-value provenance is demand-driven.
+                    Rvalue::EncodingEncode { kind: hir::EncodingKind::Html, data } => {
+                        result == Ty::String
+                            && operand_ty(function, data) == Some(Ty::Str)
+                            && xml_call_arguments_valid(
+                                std::slice::from_ref(data),
+                                &[Ty::Str],
+                                &[align_ast::ParamMode::ByValue],
+                            )
+                    }
                     Rvalue::TemplateHtmlToString { resource, output } => {
                         function.name.as_str() == "pkg.template$to_string"
                             && template_html_resource_matches(program, *resource)
@@ -11605,6 +11620,47 @@ pub fn direct_runtime_key_is_valid(key: RuntimeKey, args: &[Ty], ret: Ty, progra
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn html_text_mir_rejects_malformed_returned_and_discarded_producers() -> Result<(), Box<dyn std::error::Error>> {
+        for discard in [false, true] {
+            let mut diagnostics = align_diag::Diagnostics::new();
+            let body = if discard {
+                "{ encoding.html_escape(text); return 0 }"
+            } else { "= encoding.html_escape(text)" };
+            let ret = if discard { "i32" } else { "string" };
+            let source = format!("import std.encoding\nfn escape(text: str, raw: slice<u8>, owned: string) -> {ret} {body}\n");
+            let tokens = align_lexer::tokenize(0, &source, &mut diagnostics);
+            let ast = align_parser::parse_file(tokens, &mut diagnostics);
+            let hir = align_sema::check_file(&ast, &mut diagnostics);
+            assert!(!diagnostics.has_errors(), "{:?}", diagnostics.iter().collect::<Vec<_>>());
+            let base = crate::lower_program(&hir);
+            validate_mir_producers(&base)?;
+            let defined = base.fns.iter().map(|f| f.name.clone()).collect::<BTreeSet<_>>();
+            for mutation in 0..4 {
+                let mut bad = base.clone();
+                let function = bad.fns.iter_mut().find(|f| f.name.as_str() == "escape").ok_or("escape fixture")?;
+                let mut count = 0;
+                for block in &mut function.blocks {
+                    for statement in &mut block.stmts {
+                        if let Stmt::Let(value, Rvalue::EncodingEncode { kind: hir::EncodingKind::Html, data }) = statement {
+                            match mutation {
+                                0 => *data = Operand::Arg(1),
+                                1 => *data = Operand::Arg(2),
+                                2 => *data = Operand::Value(u32::MAX),
+                                _ => *function.value_tys.get_mut(usize::try_from(*value)?).ok_or("HTML result")? = Ty::Bool,
+                            }
+                            count += 1;
+                        }
+                    }
+                }
+                assert_eq!(count, 1);
+                assert!(validate_mir_producers(&bad).is_err(), "discard={discard}, mutation={mutation}");
+                assert!(validate_partition_resource_rvalues(&bad, &defined).is_err(), "partition discard={discard}, mutation={mutation}");
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn math_producers_share_complete_arity_input_and_result_rules()

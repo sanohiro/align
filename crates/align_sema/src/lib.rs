@@ -64537,6 +64537,15 @@ impl<'a, 't> Checker<'a, 't> {
             let result_ty = Ty::Result(Scalar::Buffer, Scalar::Enum(self.error_enum_id));
             return Expr { kind: ExprKind::EncodingDecode { kind, input: Box::new(input) }, ty: result_ty, span };
         }
+        // HTML preserves ordinary bytes, so its input must already be text. Raw bytes use
+        // the explicit fallible `as_str()` conversion before this infallible transform.
+        if kind == hir::EncodingKind::Html {
+            let data = self.check_str_init(&args[0]);
+            if self.resolve(data.ty) != Ty::Str {
+                return err;
+            }
+            return Expr { kind: ExprKind::EncodingEncode { kind, data: Box::new(data) }, ty: Ty::String, span };
+        }
         // An encode takes a byte view (str / string / slice<u8>) and returns an owned `string`.
         let mut data = self.check_expr(&args[0], None);
         let u8s = Scalar::Int(IntTy { bits: 8, signed: false });
