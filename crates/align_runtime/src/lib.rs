@@ -428,7 +428,7 @@ fn fs_read_owned(mut file: std::fs::File, direct_len: Option<usize>) -> Result<A
         let payload = Payload(align_rt_alloc(size as i64));
         let filled = unsafe { fs_read_exact_raw(payload.0, len, |dst, remaining| {
             let count = read(file.as_raw_fd(), dst.cast(), remaining);
-            if count < 0 { Err(std::io::Error::last_os_error()) } else { Ok(count as usize) }
+            usize::try_from(count).map_err(|_| std::io::Error::last_os_error())
         }) };
         // The initialized one-byte probe detects growth beyond the metadata snapshot. Retry
         // EINTR through read_exact; EOF means the directly filled payload is the complete file.
