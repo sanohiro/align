@@ -148,14 +148,15 @@ closure-callback replacement form (needs escaping first-class closures), languag
 
 1. **R1 `find_all`** — establishes runtime-materialized `array<regex_match>` (the
    `lower_json_decode_struct_array` template, minus the `Result`: out slot receives `{ptr, len}`,
-   `Load`, return). Runtime `align_rt_regex_find_all` collects `find_iter` into a fresh
-   `align_rt_alloc` buffer; empty result is `{null, 0}` (`Drop` is null-safe).
+   `Load`, return). Runtime `align_rt_regex_find_all` collects `find_iter` directly into a growing
+   C alloc/realloc-family buffer, without a Rust span vector or final copy; empty result is
+   `{null, 0}` (`Drop` is null-safe).
 2. **R2 `replace` / `replace_all`** — independent; owned `string` via `AlignStr` (the `str_clone` /
    `PathJoin` return-by-value shape). Always materializes an owned buffer (a no-match `Cow::Borrowed`
    is cloned out).
 3. **R3 `split`** — same representation and plumbing as R1; the runtime walks matches and emits the
-   between-match spans, including empty leading/trailing/interior fields and one empty field for empty
-   input.
+   between-match spans, including empty leading/trailing/interior fields. Empty input produces one
+   empty field when the pattern does not match, and two when it has an empty match.
 4. **R4 `captures` + `group_count` + `group_index` + `caps.group`** — adds `Ty::Captures` /
    `Scalar::Captures` (swept through every Move/drop `matches!` list, the codegen ptr-type +
    destructor arms, and every exhaustive HIR/MIR walk), `align_rt_regex_captures*` runtime.
