@@ -147,6 +147,77 @@ fn usage_extent_admission_and_fill_refuse_incomplete_publication() {
 #[cfg(feature = "alloc-count")]
 #[test]
 fn usage_allocates_no_rust_temporary_storage() {
+    use std::time::{Duration, Instant};
+    const CHILD: &str = "ALIGN_CLI_USAGE_ALLOCATION_CHILD";
+    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
+        // Other allocation owners can enable/reset the process-global requested-live probe.
+        // An exact-filter child keeps that instrumentation inactive throughout this measurement.
+        struct ChildOwner {
+            child: Option<std::process::Child>,
+            deadline: Instant,
+        }
+        impl Drop for ChildOwner {
+            fn drop(&mut self) {
+                let Some(child) = self.child.as_mut() else {
+                    return;
+                };
+                // This child only formats text and spawns no descendants, so direct kill suffices.
+                loop {
+                    match child.kill() {
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::Interrupted
+                                && Instant::now() < self.deadline => {}
+                        _ => break,
+                    }
+                }
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => return,
+                        Ok(None) if Instant::now() < self.deadline => {
+                            std::thread::sleep(Duration::from_millis(5))
+                        }
+                        Ok(None) => break,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::Interrupted
+                                && Instant::now() < self.deadline => {}
+                        Err(_) => return,
+                    }
+                }
+                eprintln!("CLI allocation child could not be reaped before its deadline");
+            }
+        }
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cli_usage_tests::usage_allocates_no_rust_temporary_storage",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn isolated CLI allocation owner");
+        let mut owner = ChildOwner {
+            child: Some(child),
+            deadline: Instant::now() + Duration::from_secs(15),
+        };
+        let execution_deadline = owner.deadline - Duration::from_secs(5);
+        let status = loop {
+            assert!(
+                Instant::now() < execution_deadline,
+                "CLI allocation child exceeded deadline"
+            );
+            match owner.child.as_mut().unwrap().try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("poll CLI allocation child: {error}"),
+            }
+        };
+        owner.child.take();
+        assert!(status.success(), "isolated CLI allocation owner: {status}");
+        return;
+    }
+    assert!(!REQUESTED_LIVE_PROBE.lock().unwrap().active);
     // Initialize only the alloc-count feature's requested-live probe. Its mutex may allocate
     // lazily on macOS; no CLI rendering is warmed before the complete-entry measurement.
     let probe_witness = align_rt_alloc(1);
