@@ -47,7 +47,7 @@ impl CallEscapeSummary {
         let functions: Vec<_> = functions.into_iter().collect();
         let mut result = Self::default();
         if !functions.iter().flat_map(|f| &f.blocks).flat_map(|block| &block.stmts).any(|stmt| {
-            matches!(stmt, Stmt::Let(_, Rvalue::BufferNew { capacity: Operand::Const(crate::Const::Int(cap, _)), fill: None }) if *cap <= OBJECT_LIMIT as i128)
+            matches!(stmt, Stmt::Let(_, Rvalue::BufferNew { capacity: Operand::Const(crate::Const::Int(cap, _)), fill: None, alignment: Operand::Const(crate::Const::Int(1, _)) }) if *cap <= OBJECT_LIMIT as i128)
         }) { return result; }
         for f in &functions {
             for (arg, slot) in f.params.iter().enumerate() {
@@ -286,7 +286,7 @@ fn operation_types_match(f: &Function, id: ValueId, rv: &Rvalue) -> bool {
         signed: true,
     });
     let (result, inputs) = match rv {
-        Rvalue::BufferNew { capacity: cap, fill: None } => (Ty::Buffer, operand_ty(f, cap) == Some(integer)),
+        Rvalue::BufferNew { capacity: cap, fill: None, alignment } => (Ty::Buffer, operand_ty(f, cap) == Some(integer) && operand_ty(f, alignment) == Some(integer) && matches!(alignment, Operand::Const(crate::Const::Int(1, _)))),
         Rvalue::BufferPut {
             buffer,
             value,
@@ -667,7 +667,7 @@ pub fn plan(f: &Function, calls: &CallEscapeSummary) -> ByteStoragePlan {
         .iter()
         .flat_map(|block| &block.stmts)
         .filter_map(|stmt| {
-            if let Stmt::Let(id, Rvalue::BufferNew { capacity: Operand::Const(crate::Const::Int(cap, _)), fill: None }) =
+            if let Stmt::Let(id, Rvalue::BufferNew { capacity: Operand::Const(crate::Const::Int(cap, _)), fill: None, alignment: Operand::Const(crate::Const::Int(1, _)) }) =
                 stmt
                 && *cap <= OBJECT_LIMIT as i128
             {

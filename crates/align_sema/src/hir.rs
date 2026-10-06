@@ -1629,10 +1629,10 @@ pub enum ExprKind {
     /// `Result<i64, Error>`. Impure (a syscall — the length is not cached). (A4.)
     FileLen { file: Box<Expr> },
     FileSync { file: Box<Expr> },
-    /// `buffer(cap)` — open an owned growable byte buffer with read window `cap` (a `str`-less byte
+    /// `buffer(cap, alignment)` — open an owned growable byte buffer with read window `cap` (a `str`-less byte
     /// sink for `reader.read`). The `ty` is [`crate::Ty::Buffer`] (an owned Move handle, `Drop`-freed).
-    /// Pure (allocation only), like `BuilderNew`.
-    BufferNew { capacity: Box<Expr>, fill: Option<Box<Expr>> },
+    /// Pure (allocation only), like `BuilderNew`; omitted source alignment becomes i64 1.
+    BufferNew { capacity: Box<Expr>, fill: Option<Box<Expr>>, alignment: Box<Expr> },
     /// `b.bytes()` — a `slice<u8>` view of the buffer's current contents. Borrows the buffer
     /// (region-tracked: the view must not outlive `b`). Pure.
     BufferBytes { buffer: Box<Expr> },

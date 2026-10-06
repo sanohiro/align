@@ -16916,9 +16916,10 @@ impl EffectScan<'_> {
             // Constructing a `writer`/`reader`/`buffer` is allocation only (no I/O → pure, like
             // `BuilderNew`); the reads/writes below reach the OS, so those are impure.
             ExprKind::WriterStd { .. } | ExprKind::ReaderStdin => {}
-            ExprKind::BufferNew { capacity, fill } => {
+            ExprKind::BufferNew { capacity, fill, alignment } => {
                 walk!(capacity);
                 if let Some(fill) = fill { walk!(fill); }
+                walk!(alignment);
             }
             ExprKind::WriterWrite { writer, arg, .. } => {
                 walk!(writer);
@@ -29684,9 +29685,10 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(length, depth);
                 self.walk(value, depth);
             }
-            ExprKind::BufferNew { capacity, fill } => {
+            ExprKind::BufferNew { capacity, fill, alignment } => {
                 self.walk(capacity, depth);
                 if let Some(fill) = fill { self.walk(fill, depth); }
+                self.walk(alignment, depth);
             },
             k @ (ExprKind::ArrayBuilderNew { .. } | ExprKind::ArrayBuilderPush { .. }
             | ExprKind::ArrayBuilderAppend { .. } | ExprKind::ArrayBuilderBuild(_)) => self.walk_array_builder(k, depth),
@@ -47191,9 +47193,10 @@ impl<'a> MoveCheck<'a> {
                     self.invalidate_storage(buffer);
                 }
             }
-            ExprKind::BufferNew { capacity, fill } => {
+            ExprKind::BufferNew { capacity, fill, alignment } => {
                 move_expr!(self, capacity, moved, false, false);
                 if let Some(fill) = fill { move_expr!(self, fill, moved, false, false); }
+                move_expr!(self, alignment, moved, false, false);
             },
             // `array_builder` growth ops — the consume semantics live in an `#[inline(never)]` helper
             // so its arm locals stay out of this recursive frame (#296): the builder is **borrowed**
@@ -54252,18 +54255,20 @@ impl<'a, 't> Checker<'a, 't> {
             && !self.name_in_scope(module)
         {
             if module == "buffer" && method == "filled" {
-                if args.len() != 2 {
-                    self.diags.error("'buffer.filled' expects length and byte value".to_string(), span);
+                if !(2..=3).contains(&args.len()) {
+                    self.diags.error("'buffer.filled' expects length, byte value, and optional alignment".to_string(), span);
                     return err;
                 }
                 let length = self.check_expr(&args[0], Some(Ty::Int(IntTy { bits: 64, signed: true })));
                 let value = self.check_expr(&args[1], Some(Ty::Int(IntTy { bits: 8, signed: false })));
-                if self.resolve(length.ty) != Ty::Int(IntTy { bits: 64, signed: true })
+                let alignment = self.check_buffer_alignment(args.get(2), span);
+                if self.resolve(alignment.ty) != Ty::Int(IntTy { bits: 64, signed: true })
+                    || self.resolve(length.ty) != Ty::Int(IntTy { bits: 64, signed: true })
                     || self.resolve(value.ty) != Ty::Int(IntTy { bits: 8, signed: false })
                 {
                     return err;
                 }
-                return Expr { kind: ExprKind::BufferNew { capacity: Box::new(length), fill: Some(Box::new(value)) }, ty: Ty::Buffer, span };
+                return Expr { kind: ExprKind::BufferNew { capacity: Box::new(length), fill: Some(Box::new(value)), alignment: Box::new(alignment) }, ty: Ty::Buffer, span };
             }
             if module == "test" && matches!(method, "expect" | "expect_eq") {
                 self.require_import("core.test", &format!("test.{method}"), span);
@@ -61126,19 +61131,25 @@ impl<'a, 't> Checker<'a, 't> {
     /// `reader.read` fills). `cap` is a required `i64` (a 0-window buffer reads nothing).
     fn check_buffer_new(&mut self, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        let [cap] = args else {
-            self.diags.error(format!("'buffer' takes a capacity (1 argument, the read window in bytes), got {}", args.len()), span);
-            return err;
-        };
-        let c = self.check_expr(cap, Some(Ty::Int(IntTy { bits: 64, signed: true })));
-        if c.ty == Ty::Error {
+        if !(1..=2).contains(&args.len()) {
+            self.diags.error(format!("'buffer' takes capacity and optional alignment (1 or 2 arguments), got {}", args.len()), span);
             return err;
         }
-        if !c.ty.is_int_like() {
-            self.diags.error(format!("'buffer' capacity must be an integer, got {}", ty_name(c.ty)), cap.span);
+        let integer = Ty::Int(IntTy { bits: 64, signed: true });
+        let capacity = self.check_expr(&args[0], Some(integer));
+        let alignment = self.check_buffer_alignment(args.get(1), span);
+        if self.resolve(capacity.ty) != integer || self.resolve(alignment.ty) != integer {
             return err;
         }
-        Expr { kind: ExprKind::BufferNew { capacity: Box::new(c), fill: None }, ty: Ty::Buffer, span }
+        Expr { kind: ExprKind::BufferNew { capacity: Box::new(capacity), fill: None, alignment: Box::new(alignment) }, ty: Ty::Buffer, span }
+    }
+
+    fn check_buffer_alignment(&mut self, argument: Option<&ast::Expr>, span: Span) -> Expr {
+        let integer = Ty::Int(IntTy { bits: 64, signed: true });
+        match argument {
+            Some(argument) => self.check_expr(argument, Some(integer)),
+            None => Expr { kind: ExprKind::Int(1), ty: integer, span },
+        }
     }
 
     /// Open an empty growable typed array builder. `array_builder()` preserves the individually
@@ -70870,9 +70881,10 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(length);
                 self.finalize_expr(value);
             }
-            ExprKind::BufferNew { capacity, fill } => {
+            ExprKind::BufferNew { capacity, fill, alignment } => {
                 self.finalize_expr(capacity);
                 if let Some(fill) = fill { self.finalize_expr(fill); }
+                self.finalize_expr(alignment);
             },
             k @ (ExprKind::ArrayBuilderNew { .. } | ExprKind::ArrayBuilderPush { .. }
             | ExprKind::ArrayBuilderAppend { .. } | ExprKind::ArrayBuilderBuild(_)) => self.finalize_array_builder(k),

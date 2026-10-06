@@ -892,6 +892,23 @@ acquires one payload; initialization is O(length). The handle may allocate.
 Negative/overflowing counts abort before allocation and OOM aborts. The existing
 `buffer(capacity)` remains a best-effort empty read window.
 
+Both constructors accept an optional trailing `alignment: i64`, default 1:
+`buffer(capacity, alignment)` and `buffer.filled(length, value, alignment)`.
+Arguments are evaluated once in source order. Alignment must be a power of two
+from 1 through 536870912. Any other value aborts before payload or handle
+allocation, including when capacity/length is zero or invalid; alignment
+admission precedes size admission. Existing best-effort reservation and terminal
+filled/growth failure policies remain. The first payload address is a multiple
+of the requested alignment, including the non-dereferenceable empty sentinel.
+Growth preserves alignment, while possibly moving the address; bounded reads
+preserve both. Move/return transfers the guarantee with the owner; replacement
+adopts the replacement's guarantee. Drop uses the matching allocation layout.
+Borrowing, initialized length, usable capacity and view invalidation are
+unchanged. This does not align interior offsets, promise physical residency or
+speed, or strengthen LLVM view-load assumptions. `align(N)` remains the
+struct/fixed-array storage attribute; constructor arguments select buffer payload
+storage directly. See [plan 131](impl/131-aligned-buffer-payload.md).
+
 `b.capacity() -> i64` is a Pure, zero-argument, nonconsuming query of a
 buffer's usable read-window capacity, independent of initialized `b.len()`.
 The existing stable local/field and borrowed-payload receiver rules apply;

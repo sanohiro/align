@@ -12620,6 +12620,7 @@ fn hir_body_validator_native() {
             hir::ExprKind::BufferNew {
                 fill: None,
                 capacity: Box::new(native_i64()),
+                alignment: Box::new(native_i64()),
             },
             Ty::Buffer,
         ),
@@ -19353,7 +19354,7 @@ fn scalar_inspection_and_capacity_records_reject_forged_operands() {
                         _ => expression.ty = Ty::Int(IntTy { bits: 64, signed: false }),
                     }
                 }
-                hir::ExprKind::BufferNew { capacity, fill } => {
+                hir::ExprKind::BufferNew { capacity, fill, .. } => {
                     match mutation {
                         0 => capacity.ty = Ty::Bool,
                         1 => { let Some(fill) = fill.as_mut() else { panic!("filled fixture") }; fill.ty = Ty::Bool; },
@@ -19738,4 +19739,27 @@ fn html_text_hir_rejects_byte_and_unnormalized_owned_operands() -> Result<(), Bo
     let binary = checked_source_program("import std.encoding\nfn encode(raw: slice<u8>) -> string = encoding.hex_encode(raw)\n");
     assert!(!is_empty(&lower_program(&binary)));
     Ok(())
+}
+
+#[test]
+fn buffer_alignment_hir_requires_exact_operand_and_result() {
+    for source in [
+        "fn f(alignment: i64) -> buffer { b := buffer(3, alignment); return b }",
+        "fn f(alignment: i64) -> buffer { b := buffer.filled(3, 7, alignment); return b }",
+    ] {
+        let base = checked_source_program(source);
+        assert!(!is_empty(&lower_program(&base)));
+        for mutation in 0..4 {
+            let mut malformed = base.clone();
+            let expression = body_first_let_init_mut(&mut malformed, "f");
+            let hir::ExprKind::BufferNew { alignment, .. } = &mut expression.kind else { panic!("buffer fixture"); };
+            match mutation {
+                0 => alignment.ty = Ty::Bool,
+                1 => alignment.ty = Ty::Int(IntTy { bits: 64, signed: false }),
+                2 => alignment.kind = hir::ExprKind::Bool(false),
+                _ => expression.ty = Ty::String,
+            }
+            assert_body_entrypoints_empty("buffer-alignment-forged", &malformed);
+        }
+    }
 }

@@ -15,7 +15,13 @@ independent improvements from current `main`: completing, reviewing, or adopting
 the parked work is not a prerequisite. Keep its source and evidence archived
 outside the active worktree so they do not obstruct unrelated checks or pulls.
 
-## Next work (handoff updated 2026-10-04)
+## Next work (handoff updated 2026-10-07)
+
+Plan131 adds explicit payload alignment as an optional final i64 argument to
+`buffer` and `buffer.filled`. The owner preserves it through growth and transfer;
+bounded reads preserve the address. Native layout/admission and compiler/ABI/
+cache owners cover the capability. Recoverable allocation failure and external
+align-llm adoption remain pending; K1 and plan61 remain deferred.
 
 The owner resumed independent std/library improvements on 2026-10-04, with
 existing-module usability first, useful bounded transport/library capabilities

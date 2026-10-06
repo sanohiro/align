@@ -222,7 +222,7 @@ fn allocation_sources() -> (String, String) {
     let root_source = fixture("apps/kv/pkg/kv.align");
     assert_eq!(
         (root_source.len(), source_fingerprint(root_source)),
-        (22_712, 0x8aa6_186e_52cf_8e79),
+        (22_731, 0x43baddaf3b8c3820),
         "pkg.kv source changed; refresh the allocation rewrite inventory",
     );
     let native = [
@@ -1421,7 +1421,8 @@ int64_t align_kv_alloc_reader_read(void *reader, void *buffer) {
     return view_length;
 }
 
-void *align_kv_alloc_buffer_new(int64_t capacity) {
+void *align_kv_alloc_buffer_new(int64_t capacity, int64_t alignment) {
+  if (alignment != 1) abort();
     buffer_new_calls += 1;
     if (capacity != 32768) protocol_errors += 1;
     return &buffer_token;

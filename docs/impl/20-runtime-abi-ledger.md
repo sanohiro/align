@@ -1538,7 +1538,7 @@ from the bodies. A merged body also carries no producer string attribute.
 | A46 | `ptr @SYM(ptr, ptr, i64, i64, i64, i64, ptr)` | `align_rt_par_map` |
 | A47 | `ptr @SYM()` | `align_rt_io_reader_stdin`, `align_rt_http_client_new`, `align_rt_crypto_digest_new` |
 | A48 | `ptr @SYM(i32, i32)` | `align_rt_io_writer_std` |
-| A49 | `ptr @SYM(i64)` | `align_rt_buffer_new`, `align_rt_http_response_new` |
+| A49 | `ptr @SYM(i64)` | `align_rt_http_response_new` |
 | A50 | `ptr @SYM(ptr)` | `align_rt_tg_wait`, `align_rt_tcp_conn_reader`, `align_rt_tcp_conn_writer`, `align_rt_io_reader_buffered` |
 | A51 | `ptr @SYM(ptr, i64)` | `align_rt_builder_init_bounded_stack`, `align_rt_cli_command_new` |
 | A52 | `ptr @SYM(ptr, i64, ptr, i64)` | `align_rt_command_new`, `align_rt_http_request_new` |
@@ -1985,12 +1985,14 @@ No new ABI attributes, wire format, runtime layout or probe category is added.
 ## Issue batch constructor ABI
 
 Plan 65 adds two keyed/base exports and changes three constructor signatures.
-The Buffer and ArrayBuilder physical layouts are unchanged. Compiler and runtime
+At that boundary the Buffer and ArrayBuilder physical layouts were unchanged;
+plan 131 replaces Buffer payload storage with an alignment-retaining owner. Compiler and runtime
 migrate together; no compatibility exports are retained.
 
 | Shape | Exact declaration | Semantics |
 | --- | --- | --- |
-| BufferFilled | `ptr @align_rt_buffer_filled(i64 length, i8 value)` | Validate length against target isize before allocation; OOM aborts. Return one owned handle with exactly initialized length. Zero has no payload; nonzero has one payload acquisition. |
+| BufferFilled | `ptr @align_rt_buffer_filled(i64 length, i8 value, i64 alignment)` | Validate alignment first (plan 131), then length against target layout limits before allocation; OOM aborts. Return one owned handle with exactly initialized length. Zero has no payload; nonzero has one payload acquisition. |
+| ArrayBuilderCapacity (BufferNew key) | `ptr @align_rt_buffer_new(i64 capacity, i64 alignment)` | Plan 131: power-of-two alignment 1..536870912, checked before size or allocation. Best-effort capacity reserve still degrades to zero; the aligned empty sentinel owns no payload. Nonempty storage and all growth retain the requested alignment; Drop uses its exact Layout. |
 | BufferAppendFilled | `void @align_rt_buffer_append_filled(ptr buffer, i64 length, i8 value)` | Row B's append member. A null handle is a no-op. Validate length against target isize, then the published length plus it, before touching the payload; an invalid or overflowing request aborts with the window unchanged, and OOM aborts. Truncate to the logical length, then one reserve plus one resize — never a growth sequence. Zero length publishes nothing. |
 | ArrayBuilderCapacity | `noalias ptr @align_rt_array_builder_new(i64 stride, i64 capacity) {nofree nounwind}` | Fresh heap header; validated count × stride before any acquisition; initialized length zero; nonzero requested storage reserved. |
 | ArrayBuilderRegionCapacity | `noalias ptr @align_rt_array_builder_new_in(ptr arena, i64 stride, i64 align, i64 capacity) {nounwind}` | Existing arena/stride/alignment validation precedes count/layout validation and allocation. Header and initial chunk belong to the arena; length zero. |

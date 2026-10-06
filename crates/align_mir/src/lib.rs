@@ -2040,8 +2040,8 @@ pub enum Rvalue {
     FileLen {
         file: Operand,
     },
-    /// `buffer(cap)` — open an owned byte buffer with read window `cap`, yielding an opaque handle.
-    BufferNew { capacity: Operand, fill: Option<Operand> },
+    /// `buffer(cap, alignment)` — open an aligned owned byte buffer with read window `cap`.
+    BufferNew { capacity: Operand, fill: Option<Operand>, alignment: Operand },
     /// `b.bytes()` — a `slice<u8>` view `{ptr,len}` of the buffer's current contents (borrow).
     BufferBytes(Operand),
     /// `b.len()` — the buffer's current byte count (`i64`).
@@ -9001,7 +9001,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 b.push(Stmt::Let(code, value));
                 lower_status_result(b, code, e.ty)
             }
-            hir::ExprKind::BufferNew { capacity, fill } => {
+            hir::ExprKind::BufferNew { capacity, fill, alignment } => {
                 lower_required_binding!(
                     b,
                     cap = lower_expr(b, capacity),
@@ -9012,7 +9012,8 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                     lower_required_binding!(b, value = lower_expr(b, fill), Operand::Const(Const::Unit));
                     Some(value)
                 } else { None };
-                b.push(Stmt::Let(v, Rvalue::BufferNew { capacity: cap, fill }));
+                lower_required_binding!(b, alignment = lower_expr(b, alignment), Operand::Const(Const::Unit));
+                b.push(Stmt::Let(v, Rvalue::BufferNew { capacity: cap, fill, alignment }));
                 Operand::Value(v)
             }
             hir::ExprKind::BufferBytes { buffer } => {
