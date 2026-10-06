@@ -24,7 +24,20 @@ pub fn main() -> Result<(), Error> {
 }
 ```
 
-The types state the trust boundary. **Encoding** can't fail → returns `string` directly. **Decoding** is parsing untrusted input → returns `Result<buffer, Error>`, and the payload is a `buffer` — raw bytes — because decoded data carries no UTF-8 guarantee; run `utf8_valid` (or hand it to something binary-safe) before treating it as text. `base64url_*` uses the URL-safe alphabet without padding, and hex decoding accepts both cases.
+The types state the trust boundary. **Encoding** can't fail → returns `string` directly. **Decoding** is parsing untrusted input → returns `Result<buffer, Error>`, and the payload is a `buffer` — raw bytes — because decoded data carries no UTF-8 guarantee; use `.as_str()?` to obtain a validated text view, or pass it to a byte-oriented API. `base64url_*` uses the URL-safe alphabet without padding, and hex decoding accepts both cases.
+
+`encoding.html_escape(data: str) -> string` accepts text; an owned `string`
+auto-borrows. Use `.as_str()?` to validate raw bytes before escaping:
+
+```align
+bytes := encoding.hex_decode("3c2622")?
+text := bytes.bytes().as_str()?
+print(encoding.html_escape(text)) // &lt;&amp;&quot;
+```
+
+It escapes `& < > " '` and preserves other UTF-8 bytes, including NUL. The result
+owns its storage independently of the input. This is escaping for HTML element
+text or quoted attribute content; URL and script policies remain separate.
 
 ## `std.regex`
 

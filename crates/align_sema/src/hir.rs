@@ -1942,7 +1942,8 @@ pub enum ExprKind {
     /// `encoding.base64_encode`/`base64url_encode`/`hex_encode(data)` — encode a byte view (`str` /
     /// owned `string` (auto-borrowed) / `slice<u8>`) into a freshly heap-allocated owned `string`
     /// (the `ty` is [`crate::Ty::String`]). `kind` selects the alphabet. Pure (a byte transform, no
-    /// I/O); `data` is borrowed, never consumed (like `hash64` / `print`).
+    /// I/O); `data` is borrowed, never consumed (like `hash64` / `print`). Html requires `Str`;
+    /// owned source strings are normalized through `StrBorrow` before this node.
     EncodingEncode { kind: EncodingKind, data: Box<Expr> },
     /// `encoding.base64_decode`/`base64url_decode`/`hex_decode(s)` — decode a `str` into an owned
     /// `buffer` (`bytes` carries no UTF-8 invariant, so a decoded blob is not a `str`); invalid

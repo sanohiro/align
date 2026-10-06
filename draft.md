@@ -3950,9 +3950,16 @@ encoding.percent_encode_path(data: bytes) -> string     // same rule, preserving
 encoding.percent_decode(s: str) -> Result<buffer, Error> // `%` not followed by 2 hex -> Error.Invalid
 encoding.form_encode(data: bytes) -> string             // x-www-form-urlencoded; space -> `+`
 encoding.form_decode(s: str) -> Result<buffer, Error>    // `+` -> space, %XX -> byte
-encoding.html_escape(data: bytes) -> string             // & < > " ' -> entities (text + attribute safe)
+encoding.html_escape(data: str) -> string               // & < > " ' -> entities (text + attribute safe)
 encoding.utf8_valid(b: bytes) -> bool                   // check before turning bytes into str
 ```
+
+`html_escape` accepts text (`str` or an owned `string` borrowed for the call), not
+raw bytes. Convert a byte view explicitly with `.as_str()?` before escaping it.
+It preserves all other UTF-8 bytes, including embedded NUL, and returns independent
+owned output; empty output allocates nothing. Invalid native text or detectable
+malformed extent aborts before allocation. The exact admission contract is in
+`docs/impl/122-html-text-admission.md`.
 
 Decode returns an owned `buffer` — `bytes` carries no UTF-8 invariant, so a decoded blob is not a
 `str` — consistent with the sink/owned-return convention above. SIMD (Lemire's

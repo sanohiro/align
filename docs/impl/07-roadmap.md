@@ -1613,6 +1613,9 @@ handles (each swept through every pass, the reader/writer discipline). Full API 
   invalid input (bad symbol / bad length / wrong alphabet / odd-length or non-hex) rejected as
   `Error.Invalid`; and `utf8_valid` positive/negative cases — `tests/m10_encoding.rs` (11) +
   `align_runtime` unit tests (7).
+  HTML escaping accepts `str` (owned strings auto-borrow), with explicit `.as_str()?`
+  for raw bytes. Plan 122 closes source, checked IR and independent native UTF-8
+  admission before allocation; the existing five-entity output remains unchanged.
 - **Slice 2 — std.rand — DONE.** `rand.seed()`/`rand.seed_with(s)` produce a **Copy** `rng`
   ([`Ty::Rng`], the 256-bit Xoshiro256++ state as `[4 x i64]` — a value, not a Move handle: it owns
   no fd, so it is passed/returned/reassigned by value and is *never* on the Move/drop/escape path);

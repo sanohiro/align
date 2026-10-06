@@ -19717,3 +19717,25 @@ fn os_memory_hir_rejects_forged_result_in_every_entrypoint() -> Result<(), &'sta
     }
     Ok(())
 }
+
+#[test]
+fn html_text_hir_rejects_byte_and_unnormalized_owned_operands() -> Result<(), Box<dyn std::error::Error>> {
+    let source = "import std.encoding\nfn escape(text: str, raw: slice<u8>, owned: string) -> string = encoding.html_escape(text)\n";
+    let base = checked_source_program(source);
+    assert!(validate_hir::body_only_metadata_is_valid(&base));
+    for argument in [1usize, 2] {
+        let mut bad = base.clone();
+        let function = bad.fns.iter_mut().find(|f| f.name == "escape").ok_or("escape fixture")?;
+        let parameter = *function.params.get(argument).ok_or("HTML parameter")?;
+        let local = function.locals.get(usize::try_from(parameter)?).ok_or("HTML local")?;
+        let replacement = native_local(parameter, local.ty);
+        let value = function.body.value.as_mut().ok_or("HTML value")?;
+        let hir::ExprKind::EncodingEncode { data, .. } = &mut value.kind else { return Err("HTML fixture".into()); };
+        **data = replacement;
+        assert_body_entrypoints_empty("html-text-input", &bad);
+    }
+    // A sibling byte encoder still admits a raw view, including arbitrary binary data.
+    let binary = checked_source_program("import std.encoding\nfn encode(raw: slice<u8>) -> string = encoding.hex_encode(raw)\n");
+    assert!(!is_empty(&lower_program(&binary)));
+    Ok(())
+}

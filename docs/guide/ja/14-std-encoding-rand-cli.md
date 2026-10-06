@@ -24,7 +24,20 @@ pub fn main() -> Result<(), Error> {
 }
 ```
 
-エンコードは失敗しないため、直接 `string` を返します。デコードは入力が不正な場合もあるため、`Result<buffer, Error>` を返します。成功時の `buffer` は生のバイト列で、UTF-8 として有効とは限りません。テキストとして扱うなら `utf8_valid` で検証し、バイナリのまま扱うならバイト列を受け取る API に渡します。`base64url_*` はパディングなしの URL セーフな文字集合を使い、hex のデコードは大文字と小文字の両方を受け付けます。
+エンコードは失敗しないため、直接 `string` を返します。デコードは入力が不正な場合もあるため、`Result<buffer, Error>` を返します。成功時の `buffer` は生のバイト列で、UTF-8 として有効とは限りません。テキストとして扱うなら `.as_str()?` で検証済みのビューを取得し、バイナリのまま扱うならバイト列を受け取る API に渡します。`base64url_*` はパディングなしの URL セーフな文字集合を使い、hex のデコードは大文字と小文字の両方を受け付けます。
+
+`encoding.html_escape(data: str) -> string` はテキストを受け取り、所有する
+`string` は自動で借用します。生バイト列は `.as_str()?` で検証してから渡します。
+
+```align
+bytes := encoding.hex_decode("3c2622")?
+text := bytes.bytes().as_str()?
+print(encoding.html_escape(text)) // &lt;&amp;&quot;
+```
+
+`& < > " '` をエスケープし、NUL を含む他の UTF-8 バイトは保持します。戻り値は
+入力と独立した領域を所有します。HTML の要素テキストと引用符付き属性の内容に
+使う処理であり、URL やスクリプトのポリシーは別途必要です。
 
 ## `std.regex`
 

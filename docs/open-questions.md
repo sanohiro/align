@@ -3593,6 +3593,16 @@ explicit threat boundary. The exact contract and closure matrix are authoritativ
 `docs/impl/36-fs-private-temp-plan.md`; release and external consumer adoption remain pending, and
 M9 stays closed.
 
+### HTML escape text admission — SETTLED (2026-10-06)
+
+`encoding.html_escape(data: str) -> string` borrows owned strings normally and
+rejects raw byte arguments. `.as_str()?` is the explicit validated conversion.
+The native row independently rejects invalid UTF-8 or detectable malformed extent
+before allocation; the exact five-entity mapping, Pure behavior and independent
+owned output remain. [Plan 122](impl/122-html-text-admission.md) owns admission,
+ordering, allocation and compiler/runtime validation. Other byte encoders retain
+their input domain; K1 remains deferred.
+
 ### M10 scope decision (2026-07-04)
 
 Settled ahead of any `std.encoding`/`std.rand`/`std.cli` implementation (`impl/07-roadmap.md` M10;

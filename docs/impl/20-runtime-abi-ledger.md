@@ -2168,3 +2168,13 @@ unchanged environment-mutation exclusion, allocation and ownership closure are
 [plan 120](120-environment-text-admission.md). Key, declaration, registry count
 and interface encoding remain unchanged; normal compiler/runtime source
 identity invalidates compiled artifacts after this coordinated change.
+
+## HTML escape text admission (plan 122)
+
+`HtmlEscape` retains A84 `{ ptr, i64 } @align_rt_html_escape(ptr, i64)` and
+`ArgRead` call-only input attributes. Source input is `str` (owned string
+borrows). The native implementation validates signed extent and null/range
+shape, then complete UTF-8, before checked escaped size and allocation.
+Detectable malformed input aborts; empty input permits null and returns null/zero
+without allocation. Accepted output owns one independent final allocation.
+No symbol, layout, effect, interface tag or compiler-owned resource changes.

@@ -2372,7 +2372,8 @@ pub enum Rvalue {
     TimeParse { kind: hir::TimeFormatKind, input: Operand, out: Slot },
     /// `encoding.base64_encode`/`base64url_encode`/`hex_encode(data)` — encode the byte view `data`
     /// (`{ptr,len}`) into a freshly heap-allocated owned `string`, returned by value as a `{ptr,len}`
-    /// (like `PathNormalize`). `kind` selects the alphabet. Pure.
+    /// (like `PathNormalize`). `kind` selects the alphabet. Pure. Html requires a Str operand;
+    /// other encoders retain their byte-view input domain.
     EncodingEncode {
         kind: hir::EncodingKind,
         data: Operand,
