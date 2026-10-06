@@ -4034,9 +4034,21 @@ event, allocation, ABI, and closure ledger is `docs/impl/std-design/xml.md`.
 ### std.compress
 
 ```text
-gzip
-zstd
+compress.gzip_compress(data: bytes, level: i64) -> Result<buffer, Error>
+compress.gzip_decompress(data: bytes) -> Result<buffer, Error>
+compress.zstd_compress(data: bytes, level: i64) -> Result<buffer, Error>
+compress.zstd_decompress(data: bytes) -> Result<buffer, Error>
 ```
+
+Inputs are borrowed binary views; successful output is an independent owned buffer. Calls are
+Impure. Decompression consumes one or more complete gzip members or current ordinary/skippable
+zstd frames and concatenates their outputs; skippable frames contribute no bytes. Empty input,
+legacy zstd, corrupt/truncated later frames, and trailing bytes (including gzip zero padding)
+return `Error.Invalid`, with no partial output. The inclusive 1 GiB limit applies to aggregate
+output; exact-limit empty/skippable suffixes remain valid. Native resource/output allocation
+failures retain `Error.Code`; final header OOM retains terminal runtime policy. The limit does not
+bound native workspace or RSS. See `docs/impl/std-design/compress.md` for exact format admission,
+error precedence, and allocation rules.
 
 ### std.rand
 

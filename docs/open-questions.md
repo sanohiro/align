@@ -13,6 +13,17 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### Complete-input decompression (SETTLED 2026-10-06)
+
+`std.compress` consumes all borrowed input, concatenating complete gzip members or current
+ordinary/skippable zstd frames into one independently owned buffer. Empty input, legacy zstd,
+corrupt/truncated later input, and trailing bytes (including gzip zero padding) are Invalid;
+partial output never escapes. The inclusive 1 GiB aggregate payload cap allows further empty or
+skippable frames at the limit. Native errors take precedence over the one-byte overflow probe;
+existing resource/allocation error policy remains. No streaming API or RSS bound is introduced.
+[Plan 124](impl/124-complete-decompression.md) and the
+[compression design](impl/std-design/compress.md) own the exact contract.
+
 ### Immediate array materialization before sum (SETTLED 2026-10-05)
 
 The standard lint set includes structural advice for a finalized numeric sum
