@@ -39,6 +39,8 @@ mod html_text_tests;
 mod encoding_writes_tests;
 #[cfg(test)]
 mod decompression_frames_tests;
+#[cfg(test)]
+mod base64_quantum_tests;
 use buffer_storage::BufferStorage;
 mod json_number;
 mod time_formats;
@@ -13412,11 +13414,15 @@ fn hex_encode_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
 /// invalid input: a symbol outside the chosen alphabet, a stray `=` before the trailing padding,
 /// a length whose non-pad remainder is 1 (impossible group), inconsistent padding, or non-zero
 /// trailing bits (non-canonical). Padding is optional when absent; when present it must complete a
-/// 4-char group. Scalar reference implementation.
+/// 4-char group. Scalar quantum implementation.
 fn base64_decode_impl(input: &[u8], url: bool) -> Option<Vec<u8>> {
     // The reverse table is built once at compile time (see `base64_decode_table`), so a decode is a
     // pure table lookup — no per-call setup.
     let table = if url { &BASE64_URL_TABLE } else { &BASE64_STD_TABLE };
+    // A nonempty encoding starts with an alphabet symbol; reject it before reserving output.
+    if input.first().is_some_and(|byte| table[usize::from(*byte)] == 0xff) {
+        return None;
+    }
     // Split off trailing `=` padding (at most 2). A `=` anywhere before the padding is rejected
     // below (it maps to 0xFF in the table since it is not an alphabet symbol).
     let mut end = input.len();
@@ -13438,24 +13444,39 @@ fn base64_decode_impl(input: &[u8], url: bool) -> Option<Vec<u8>> {
     if pads > 0 && !(content.len() + pads).is_multiple_of(4) {
         return None;
     }
-    let mut out: Vec<u8> = Vec::with_capacity(content.len() / 4 * 3 + 2);
-    let mut acc: u32 = 0;
-    let mut nbits: u32 = 0;
-    for &c in content {
-        let v = table[c as usize];
-        if v == 0xFF {
-            return None; // outside the alphabet (includes a mid-string `=`).
+    let mut quanta = content.chunks_exact(4);
+    let (tail, tail_len) = match quanta.remainder() {
+        [] => ([0, 0], 0),
+        [a, b] => {
+            let a = table[usize::from(*a)];
+            let b = table[usize::from(*b)];
+            if a | b == 0xff || b & 0x0f != 0 { return None; }
+            ([(a << 2) | (b >> 4), 0], 1)
         }
-        acc = (acc << 6) | v as u32;
-        nbits += 6;
-        if nbits >= 8 {
-            nbits -= 8;
-            out.push((acc >> nbits) as u8);
+        [a, b, c] => {
+            let a = table[usize::from(*a)];
+            let b = table[usize::from(*b)];
+            let c = table[usize::from(*c)];
+            if a | b | c == 0xff || c & 0x03 != 0 { return None; }
+            ([(a << 2) | (b >> 4), (b << 4) | (c >> 2)], 2)
         }
+        _ => return None, // remainder one was rejected before allocating
+    };
+    let out_len = quanta.len().checked_mul(3)?.checked_add(tail_len)?;
+    let mut out = Vec::with_capacity(out_len);
+    for quantum in &mut quanta {
+        let a = table[usize::from(quantum[0])];
+        let b = table[usize::from(quantum[1])];
+        let c = table[usize::from(quantum[2])];
+        let d = table[usize::from(quantum[3])];
+        if a | b | c | d == 0xff {
+            return None;
+        }
+        out.extend_from_slice(&[(a << 2) | (b >> 4), (b << 4) | (c >> 2), (c << 6) | d]);
     }
-    // Any leftover bits must be zero — a canonical encoding never sets the discarded padding bits.
-    if nbits > 0 && (acc & ((1 << nbits) - 1)) != 0 {
-        return None;
+    if tail_len > 0 {
+        out.push(tail[0]);
+        if tail_len == 2 { out.push(tail[1]); }
     }
     Some(out)
 }
