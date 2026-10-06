@@ -42,6 +42,8 @@ mod decompression_frames_tests;
 #[cfg(test)]
 mod base64_quantum_tests;
 #[cfg(test)]
+mod hex_group_tests;
+#[cfg(test)]
 mod sample_permutation_tests;
 #[cfg(test)]
 mod regex_match_storage_tests;
@@ -13517,6 +13519,58 @@ fn hex_val(c: u8) -> Option<u8> {
     }
 }
 
+const HEX_DECODE_TABLE: [u8; 256] = {
+    let mut table = [0xff; 256];
+    let mut index = 0;
+    let mut value = 0;
+    while index < 10 {
+        table[0x30 + index] = value; // ASCII 0..9
+        index += 1;
+        value += 1;
+    }
+    index = 0;
+    value = 10;
+    while index < 6 {
+        table[0x41 + index] = value; // ASCII A..F
+        table[0x61 + index] = value; // ASCII a..f
+        index += 1;
+        value += 1;
+    }
+    table
+};
+
+fn hex_decode_impl(input: &[u8]) -> Option<Vec<u8>> {
+    if !input.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(input.len() / 2);
+    let mut groups = input.chunks_exact(8);
+    for group in &mut groups {
+        let a = HEX_DECODE_TABLE[usize::from(group[0])];
+        let b = HEX_DECODE_TABLE[usize::from(group[1])];
+        let c = HEX_DECODE_TABLE[usize::from(group[2])];
+        let d = HEX_DECODE_TABLE[usize::from(group[3])];
+        let e = HEX_DECODE_TABLE[usize::from(group[4])];
+        let f = HEX_DECODE_TABLE[usize::from(group[5])];
+        let g = HEX_DECODE_TABLE[usize::from(group[6])];
+        let h = HEX_DECODE_TABLE[usize::from(group[7])];
+        // Valid nibbles use only the low four bits; any invalid byte supplies 0xff.
+        if a | b | c | d | e | f | g | h == 0xff {
+            return None;
+        }
+        out.extend_from_slice(&[a << 4 | b, c << 4 | d, e << 4 | f, g << 4 | h]);
+    }
+    for pair in groups.remainder().chunks_exact(2) {
+        let hi = HEX_DECODE_TABLE[usize::from(pair[0])];
+        let lo = HEX_DECODE_TABLE[usize::from(pair[1])];
+        if hi | lo == 0xff {
+            return None;
+        }
+        out.push(hi << 4 | lo);
+    }
+    Some(out)
+}
+
 /// `encoding.base64_encode(data)` — standard alphabet + padding. Returns an owned `string`.
 ///
 /// # Safety
@@ -13615,26 +13669,7 @@ pub unsafe extern "C" fn align_rt_base64url_decode(ptr: *const u8, len: i64, out
 /// `ptr`/`len` must describe a valid byte range; `out` must point to a writable handle slot.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_hex_decode(ptr: *const u8, len: i64, out: *mut *mut Buffer) -> i32 {
-    let input = unsafe { bytes_view(ptr, len) };
-    let decoded = if input.len() % 2 != 0 {
-        None
-    } else {
-        let mut v = Vec::with_capacity(input.len() / 2);
-        let mut ok = true;
-        let mut i = 0;
-        while i < input.len() {
-            match (hex_val(input[i]), hex_val(input[i + 1])) {
-                (Some(hi), Some(lo)) => v.push(hi << 4 | lo),
-                _ => {
-                    ok = false;
-                    break;
-                }
-            }
-            i += 2;
-        }
-        if ok { Some(v) } else { None }
-    };
-    unsafe { decode_into(decoded, out) }
+    unsafe { decode_into(hex_decode_impl(bytes_view(ptr, len)), out) }
 }
 
 /// An RFC 3986 §2.3 *unreserved* byte — the set percent-encoding leaves untouched.
