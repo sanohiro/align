@@ -12277,6 +12277,9 @@ fn hir_body_validator_native() {
     program
         .tagged_types
         .push(hir::TaggedType::Option(Scalar::Struct(http_sse_event)));
+    let env_option = program.tagged_types.len() as u32;
+    program.tagged_types.push(hir::TaggedType::Option(Scalar::String));
+    let env_result = native_result(Ty::Tagged(env_option), error);
     let i32_ty = int(32);
     let u8_scalar = Scalar::Int(IntTy { bits: 8, signed: false });
     let bytes = Ty::Slice(u8_scalar);
@@ -13196,10 +13199,10 @@ fn hir_body_validator_native() {
             hir::ExprKind::EnvGet {
                 name: Box::new(native_str()),
             },
-            Ty::Option(Scalar::String),
+            env_result,
         ),
         Vec::new(),
-        Ty::Option(Scalar::String)
+        env_result
     );
     add!(
         "native_env_set",
@@ -14702,6 +14705,21 @@ fn hir_body_validator_native() {
         "native nominal metadata"
     );
     assert!(body_core_metadata_is_valid(&program), "native body metadata");
+
+    // The former Option-only result and malformed nested payload must both fail closed.
+    for bad in [Ty::Option(Scalar::String), native_result(Ty::String, error)] {
+        let mut reject = program.clone();
+        body_value_expression_mut(&mut reject, "native_env_get").ty = bad;
+        assert!(!body_core_metadata_is_valid(&reject), "stale environment result {bad:?}");
+    }
+    let mut reject = program.clone();
+    reject.tagged_types[env_option as usize] = hir::TaggedType::Option(Scalar::Str);
+    assert!(!body_core_metadata_is_valid(&reject), "environment result must own its text");
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "native_env_get");
+    let hir::ExprKind::EnvGet { name } = &mut expression.kind else { panic!("env fixture"); };
+    name.ty = Ty::Bool;
+    assert!(!body_core_metadata_is_valid(&reject), "environment name must be str");
 
     for fault in 0..4 {
         let mut reject = program.clone();

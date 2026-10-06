@@ -29,6 +29,8 @@ mod http_batch_input_tests;
 mod cli_usage_tests;
 #[cfg(test)]
 mod fs_read_tests;
+#[cfg(test)]
+mod env_tests;
 use buffer_storage::BufferStorage;
 mod json_number;
 mod time_formats;
@@ -15233,36 +15235,49 @@ unsafe fn path_output_append(dst: *mut u8, len: &mut usize, absolute: bool, comp
 }
 
 /// `env.get(name)` — write the owned `string` `{ptr,len}` value of environment variable `name` into
-/// `*out` (or `{null,0}` if unset / the name is invalid), returning `1` if set, `0` if not. The
+/// `*out`, returning `1` if present, `0` if absent, or `-AL_INVALID` for an invalid name/value.
+/// Absent/error output is `{null,0}`. Names are nonempty UTF-8 without NUL or `=`; values must be
+/// valid UTF-8. Validate before publishing any owned text. The
 /// value is copied out (owned) — the environment is volatile, so a view would dangle after a later
 /// `env.set`. A present-but-empty value is `1` with a `{null,0}` (empty owned) string — distinct
 /// from absent (`0`).
 ///
 /// # Safety
-/// `nptr`/`nlen` must describe a valid byte range, and `out` a valid `*mut AlignStr`, for the call.
+/// A non-null `out` must be writable/aligned and disjoint from the readable name range.
+/// A positive admitted name extent must describe readable immutable bytes. Environment mutation
+/// must not overlap the call; native value storage is borrowed only until its validated copy.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_env_get(nptr: *const u8, nlen: i64, out: *mut AlignStr) -> i32 {
-    unsafe { *out = AlignStr { ptr: core::ptr::null(), len: 0 } };
-    let name = unsafe { bytes_view(nptr, nlen) };
-    // `getenv` needs a NUL-terminated name; an empty name or an interior NUL can never name a
-    // variable, so treat it as absent.
-    if name.is_empty() || name.contains(&0) {
-        return 0;
+    if out.is_null() {
+        return -AL_INVALID;
     }
-    let mut c = Vec::with_capacity(name.len() + 1);
+    unsafe { *out = AlignStr { ptr: core::ptr::null(), len: 0 } };
+    let Ok(n) = safe_len(nlen) else { return -AL_INVALID; };
+    if n == 0 || nptr.is_null() {
+        return -AL_INVALID;
+    }
+    let Some(capacity) = n.checked_add(1).filter(|n| *n <= isize::MAX.unsigned_abs()) else {
+        return -AL_INVALID;
+    };
+    let name = unsafe { std::slice::from_raw_parts(nptr, n) };
+    if !validate_utf8(name) || name.contains(&0) || name.contains(&b'=') {
+        return -AL_INVALID;
+    }
+    let mut c = Vec::with_capacity(capacity);
     c.extend_from_slice(name);
     c.push(0);
     let v = unsafe { getenv(c.as_ptr()) };
     if v.is_null() {
         return 0;
     }
-    // `strlen(v)`, then copy the bytes into an owned buffer immediately (before any later `setenv`
-    // could invalidate the returned pointer).
-    let mut n = 0usize;
-    while unsafe { *v.add(n) } != 0 {
-        n += 1;
+    // libc supplies a readable NUL-terminated value. The environment exclusion keeps it live
+    // through validation and cloning; the returned string never borrows native storage.
+    let value = unsafe { std::ffi::CStr::from_ptr(v.cast()) }.to_bytes();
+    let Ok(length) = i64::try_from(value.len()) else { return -AL_INVALID; };
+    if !validate_utf8(value) {
+        return -AL_INVALID;
     }
-    unsafe { *out = align_rt_str_clone(v, n as i64) };
+    unsafe { *out = align_rt_str_clone(value.as_ptr(), length) };
     1
 }
 
@@ -42885,21 +42900,6 @@ mod tests {
     }
 
     // --- std.env / std.time (Slice 4) ---------------------------------------------------------
-
-    #[test]
-    fn env_set_get_round_trip() {
-        let (np, nl) = view_of("ALIGN_RT_TEST_VAR");
-        let (vp, vl) = view_of("rt-value");
-        assert_eq!(unsafe { align_rt_env_set(np, nl, vp, vl) }, 0);
-        let mut out = AlignStr { ptr: std::ptr::null(), len: 0 };
-        assert_eq!(unsafe { align_rt_env_get(np, nl, &mut out) }, 1, "the var is set");
-        assert_eq!(owned_str(out), "rt-value");
-        // An unset name → flag 0, {null,0}.
-        let (up, ul) = view_of("ALIGN_RT_UNSET_ZZZ");
-        let mut out2 = AlignStr { ptr: std::ptr::null(), len: 0 };
-        assert_eq!(unsafe { align_rt_env_get(up, ul, &mut out2) }, 0, "the var is unset");
-        assert!(out2.ptr.is_null());
-    }
 
     #[test]
     fn env_set_invalid_name_is_invalid() {

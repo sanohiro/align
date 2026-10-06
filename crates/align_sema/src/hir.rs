@@ -1816,8 +1816,9 @@ pub enum ExprKind {
     /// pure string operation — no symlink resolution, no filesystem access. Pure.
     PathNormalize { path: Box<Expr> },
     /// `env.get(name)` — the value of environment variable `name` as a freshly heap-allocated owned
-    /// `string`, or `None` if unset (the `ty` is `Option<string>`; the string is owned because the
-    /// environment is volatile — a view would dangle after a later `env.set`). Impure (reads process
+    /// `string`, or absence if unset (the `ty` is `Result<Option<string>, Error>`; invalid names
+    /// or non-UTF-8 values return Invalid). The string is owned because the
+    /// environment is volatile — a view would dangle after a later `env.set`. Impure (reads process
     /// environment).
     EnvGet { name: Box<Expr> },
     /// `env.set(name, value)` — set environment variable `name` to `value` (the `ty` is

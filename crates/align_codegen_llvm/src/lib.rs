@@ -18839,7 +18839,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("http_stream_reject returns i32 status")
             }
-            // env.get — write the owned value {ptr,len} into `out`, return an i32 present flag.
+            // env.get — write owned text to `out`; return present/absent/negative-error status.
             Rvalue::EnvGet { name, out } => {
                 let out_ptr = self.slots[out];
                 self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
@@ -26220,13 +26220,16 @@ fn length(borrow value: string) -> i64 = value.len()
 fn load(borrow name: Option<string>) -> Record {
   return match name {
     None => Record { present: true, value: "".clone() },
-    Some(variable) => match env.get(variable) {
+    Some(variable) => {
+      optional := env.get(variable) else { return Record { present: false, value: "".clone() } }
+      match optional {
       None => Record { present: false, value: "".clone() },
       Some(value) => if length(value) == 0 {
         Record { present: false, value: "".clone() }
       } else {
         Record { present: true, value: value }
       },
+      }
     },
   }
 }

@@ -9597,7 +9597,11 @@ impl<'a> BodyValidator<'a> {
                 (path.ty == Ty::Str).then(|| strict(Ty::String, &[path]))?
             }
             hir::ExprKind::EnvGet { name } => {
-                (name.ty == Ty::Str).then(|| strict(Ty::Option(Scalar::String), &[name]))?
+                let option_id = self.program.tagged_types.iter().position(|tagged| {
+                    *tagged == hir::TaggedType::Option(Scalar::String)
+                })?;
+                (name.ty == Ty::Str)
+                    .then(|| result(Ty::Tagged(u32::try_from(option_id).ok()?), &[name]))?
             }
             hir::ExprKind::EnvSet { name, value } => {
                 (name.ty == Ty::Str && value.ty == Ty::Str)

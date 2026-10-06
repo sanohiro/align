@@ -3485,6 +3485,15 @@ Settled ahead of any `std.io`/`std.fs`/`std.path`/`std.env`/`std.time` implement
    dispatch + required `import`.** "`std` as a real Align-over-FFI library" remains a Future item —
    not reopened for M9.
 
+`std.env.get(name: str) -> Result<Option<string>, Error>` applies these settled
+rules at the native text boundary: unset is `Ok(None)`, present empty is
+`Ok(Some(""))`, and invalid names or non-UTF-8 native values are
+`Err(Error.Invalid)`. A name is nonempty UTF-8 without NUL or `=`. The runtime
+validates before lookup/output allocation and returns independent owned text;
+there is no lossy decoding or invalid-as-absent fallback. The existing exclusion
+of overlapping environment mutation/access remains. [Plan 120](impl/120-environment-text-admission.md)
+owns the implementation closure.
+
 ### Request 14 — exclusive filesystem publication (SHIPPED 2026-08-19)
 
 `std.fs` adds the explicit publication primitives

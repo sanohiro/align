@@ -2151,3 +2151,17 @@ that claim. Calls remain advisory and independent; no RAM admission or VRAM
 accounting is implied. The declaration/effect/export owners cover both rows;
 forged MIR status/output and native output/allocation owners qualify the exact
 scalar boundary. No native type, interface format or optional probe is added.
+
+## Environment text admission (plan 120)
+
+`EnvGet` retains A08 `i32(ptr, i64, ptr)` and HostState effects. Native return
+1 means present owned UTF-8 text, 0 means absent, and -2 means Invalid name or
+native text. MIR negates an error status before the shared fixed Error mapping
+and constructs `Result<Option<string>, Error>`. Null output rejects before
+access; writable output is canonical zero on absent/error. Name extent,
+UTF-8 and nonempty/NUL/equals grammar precede native lookup; complete native
+value UTF-8 admission precedes owned cloning. The exact public contract,
+unchanged environment-mutation exclusion, allocation and ownership closure are
+[plan 120](120-environment-text-admission.md). Key, declaration, registry count
+and interface encoding remain unchanged; normal compiler/runtime source
+identity invalidates compiled artifacts after this coordinated change.

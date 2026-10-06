@@ -605,7 +605,8 @@ import pkg.db.sqlite
 import pkg.db.postgres
 
 fn main() -> i32 {
-  return match env.get("ALIGN_DB_Q2_INHERITED") {
+  optional := env.get("ALIGN_DB_Q2_INHERITED") else { return 3 }
+  return match optional {
     Some(value) => if value == "inherited-value" { 42 } else { 2 }
     None => 1
   }
@@ -1619,7 +1620,7 @@ fn main(args: array<str>) -> Result<(), Error> {
 /// Regenerate ONLY with a reviewed reason, from the panic message this emits.
 const LAYER1_FINGERPRINT_GOLDEN: &str = "\
 pkg-db-q2-common-postgres a9428d3064bd4bbe
-pkg-db-q2-inherited-environment e683f9105f9dc29b
+pkg-db-q2-inherited-environment 6b238881e77c869c
 pkg-db-q2-postgres-bytea 5ed11aecc1521c4c
 pkg-db-q2-postgres-connect-options 656bca47d6e7057a
 pkg-db-q2-postgres-native-scalar c09ae5eb7915a814

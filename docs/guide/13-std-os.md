@@ -207,7 +207,7 @@ pub fn main() -> Result<(), Error> {
     print(path.normalize("a/./b/../c"))         // a/c — lexical only, no filesystem touch
 
     env.set("ALIGN_GUIDE", "yes")?
-    match env.get("ALIGN_GUIDE") {              // Option<string> — absence isn't an error
+    match env.get("ALIGN_GUIDE")? {             // Result<Option<string>, Error>
         Some(v) => print(v),
         None    => print("unset"),
     }
@@ -224,6 +224,6 @@ pub fn main() -> Result<(), Error> {
 A few details affect how you use these APIs:
 
 - `path.base`/`dir`/`ext` return **views into their input** — no allocation, and the region rules apply (a view of an arena-mapped path can't outlive the arena).
-- `env.get` returns `Option`, not `Result`: an unset variable is a normal answer, not a failure. The types tell you which kind of "no" you're getting.
+- `env.get` returns `Result<Option<string>, Error>`: `Ok(None)` means unset, `Ok(Some(""))` means present but empty, and invalid names or non-UTF-8 values are `Error.Invalid`. Names must be nonempty and contain neither NUL nor `=`. The returned string owns its copy; environment mutation must not overlap environment access.
 - Durations are plain `i64` nanoseconds — no `Duration` type, no unit enum, no conversion API. `instant()` for intervals, `now()` for timestamps, and passing an `i32` is a type error (no implicit widening, per chapter [02](02-language-basics.md)).
 - Program arguments arrive through `main(args: array<str>)`; there is no `env.args` API.

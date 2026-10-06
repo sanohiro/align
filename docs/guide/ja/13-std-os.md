@@ -209,7 +209,7 @@ pub fn main() -> Result<(), Error> {
     print(path.normalize("a/./b/../c"))         // a/c — lexical only, no filesystem touch
 
     env.set("ALIGN_GUIDE", "yes")?
-    match env.get("ALIGN_GUIDE") {              // Option<string> — absence isn't an error
+    match env.get("ALIGN_GUIDE")? {             // Result<Option<string>, Error>
         Some(v) => print(v),
         None    => print("unset"),
     }
@@ -226,6 +226,6 @@ pub fn main() -> Result<(), Error> {
 各 API を使う際には、次の点にも注意してください。
 
 - `path.base`、`path.dir`、`path.ext` は**入力文字列へのビュー**を返し、新しいメモリを確保しません。アリーナに属する文字列へのビューは、そのアリーナより長く保持できません。
-- `env.get` は `Option` を返します。環境変数が未設定であることを、操作の失敗を表す `Result` と区別しています。
+- `env.get` は `Result<Option<string>, Error>` を返します。`Ok(None)` は未設定、`Ok(Some(""))` は設定済みの空文字列です。不正な名前や UTF-8 として不正な値は `Error.Invalid` になります。名前は空でなく、NUL と `=` を含めません。返された文字列は独立したコピーを所有します。環境変数の変更と参照を並行して行ってはいけません。
 - 時間の間隔は `i64` のナノ秒で表します。`Duration` 型、単位を表す enum、変換 API はありません。経過時間には `instant()`、タイムスタンプには `now()` を使います。`i32` を渡すと型エラーになります。暗黙の型拡張は行われません（第 [02](02-language-basics.md) 章）。
 - コマンドライン引数は `main(args: array<str>)` で受け取ります。`env.args` API はありません。

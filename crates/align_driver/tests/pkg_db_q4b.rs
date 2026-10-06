@@ -2265,8 +2265,10 @@ fn retained(borrow connection: pkg.db.conn, driver: str) -> i32 {
 }
 
 fn main() -> i32 {
-  driver := env.get("ALIGN_DB_DRIVER") else { return 90 }
-  case := env.get("ALIGN_DB_CASE") else { return 91 }
+  optional_driver := env.get("ALIGN_DB_DRIVER") else { return 92 }
+  driver := optional_driver else { return 90 }
+  optional_case := env.get("ALIGN_DB_CASE") else { return 93 }
+  case := optional_case else { return 91 }
   if case == "__list__" {
     print("present_values")
     print("absent_values")
@@ -2341,13 +2343,13 @@ const PARITY_CASES: &[ParityCase] = &[
 ///
 /// Regenerate ONLY with a reviewed reason, from the panic message this emits.
 const PARITY_FINGERPRINT_GOLDEN: &str = "\
-pkg-db-q4b-full-matrix-parity/absent_values/postgres 4cad22592ca0f28e
-pkg-db-q4b-full-matrix-parity/absent_values/sqlite 45b77196aed3010e
-pkg-db-q4b-full-matrix-parity/counters/postgres 09b9e5206ca760f8
-pkg-db-q4b-full-matrix-parity/one_retained_bytes/postgres 97f12ca2ac41eeee
-pkg-db-q4b-full-matrix-parity/one_retained_bytes/sqlite 03fb5d6b73eec75c
-pkg-db-q4b-full-matrix-parity/present_values/postgres a6249a2ad1dff904
-pkg-db-q4b-full-matrix-parity/present_values/sqlite cc9ee209135e1136
+pkg-db-q4b-full-matrix-parity/absent_values/postgres 273fef4ae75d6657
+pkg-db-q4b-full-matrix-parity/absent_values/sqlite bf865bf967ea5d0f
+pkg-db-q4b-full-matrix-parity/counters/postgres 03d8749577614d5d
+pkg-db-q4b-full-matrix-parity/one_retained_bytes/postgres 6137d087b62fb42d
+pkg-db-q4b-full-matrix-parity/one_retained_bytes/sqlite d4556100c92453a7
+pkg-db-q4b-full-matrix-parity/present_values/postgres f6754b8929a09e17
+pkg-db-q4b-full-matrix-parity/present_values/sqlite d3bae4ad6e2bc995
 ";
 
 #[test]
@@ -3314,8 +3316,10 @@ import pkg.db.postgres
 import pkg.db.sqlite
 
 fn main() -> i32 {
-  driver := env.get("ALIGN_DB_DRIVER") else { return 90 }
-  case := env.get("ALIGN_DB_CASE") else { return 91 }
+  optional_driver := env.get("ALIGN_DB_DRIVER") else { return 92 }
+  driver := optional_driver else { return 90 }
+  optional_case := env.get("ALIGN_DB_CASE") else { return 93 }
+  case := optional_case else { return 91 }
   if driver == "" { return 92 }
   if case == "__list__" {
     print("hang")
