@@ -1216,7 +1216,7 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
         RuntimeKey::BufferNew => RuntimeAbi {
             key,
             symbol: "align_rt_buffer_new",
-            shape: RuntimeAbiShape::A49,
+            shape: RuntimeAbiShape::ArrayBuilderCapacity,
         },
         RuntimeKey::BufferPut => RuntimeAbi {
             key,
@@ -3875,7 +3875,7 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
         },
         RuntimeAbiShape::BufferFilled => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,
-            params: &[NativeType::I64, NativeType::U8],
+            params: &[NativeType::I64, NativeType::U8, NativeType::I64],
         },
         RuntimeAbiShape::A49 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,

@@ -193,6 +193,21 @@ The complete operation is compiler-lowered, with no new runtime export or
 fallible-slice API. Record: draft §12, language digest, core string design and
 [plan 66](impl/66-array-prefix-and-text-boundary-plan.md).
 
+### Explicit owned buffer payload alignment
+
+Settled by [plan 131](impl/131-aligned-buffer-payload.md): `buffer(capacity,
+alignment)` and `buffer.filled(length, value, alignment)` accept an optional
+trailing i64 alignment (default 1). Arguments evaluate once in source order;
+native admission checks power-of-two 1..536870912 before size admission or any
+allocation, aborting invalid alignment even for an empty request. Existing
+best-effort versus terminal allocation policies remain. The payload, including
+an empty non-dereferenceable sentinel, has the requested minimum alignment.
+Growth preserves it; move/return carries it and replacement adopts the new
+owner's guarantee. Drop uses the original layout. Read-window capacity, byte
+initialization and view invalidation are unchanged. align(N) keeps its existing
+struct/fixed-array meaning. Recoverable OOM, aligned interior offsets and a
+portable performance improvement are not supplied by this capability.
+
 ### Scalar inspection and explicit capacity (issue batch 1049–1053)
 
 Settled by plan 65: scalar f32/f64 `to_bits`, `is_finite`, `is_nan`,

@@ -1311,7 +1311,7 @@ merely because its `Ty` matches.
 | `FilePwrite` | `env[]; child[file,data,offset]`; `File, byte-view, i64; result ERR(i64); borrowed; Impure`. |
 | `FileLen` | `env[]; child[file]`; `File; result ERR(i64); borrowed; Impure`. |
 | `FileSync` | `env[]; child[file]`; `LocalHandle(File,file); result ERR(Unit); borrowed; Impure`. |
-| `BufferNew` | `env[fill presence]; child[capacity,fill?]`; capacity is i64; present fill is u8. Result Buffer; fresh owned allocation; Pure. Absent fill retains the empty read window; present fill guarantees initialized length.. |
+| `BufferNew` | `env[fill presence]; child[capacity,fill?,alignment]`; capacity and alignment are exactly i64; present fill is u8. Omitted source alignment becomes constant 1. Result Buffer; fresh owned allocation; Pure. Children evaluate in this order with termination guards. Runtime alignment admission precedes size/allocation; absent fill retains the empty read window and present fill guarantees initialized length (plan 131). |
 | `BufferBytes` | `env[]; child[buffer]`; `Buffer; result bytes; view inherits buffer provenance; Pure`. |
 | `StrBytes` | `env[]; child[inner]`; `Str; result bytes; view inherits string provenance; Pure`. |
 | `BufferLen` | `env[]; child[buffer]`; `Buffer; result i64; borrowed; Pure`. |

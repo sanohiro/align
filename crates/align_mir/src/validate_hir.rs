@@ -9287,13 +9287,13 @@ impl<'a> BodyValidator<'a> {
                 (local(file, Ty::File) && file.ty == Ty::File)
                     .then(|| result(Ty::Int(align_sema::IntTy { bits: 64, signed: true }), &[file]))?
             }
-            hir::ExprKind::BufferNew { capacity, fill } => {
-                if capacity.ty != i64 { return None; }
+            hir::ExprKind::BufferNew { capacity, fill, alignment } => {
+                if capacity.ty != i64 || alignment.ty != i64 { return None; }
                 if let Some(fill) = fill {
                     if fill.ty != Ty::Int(align_sema::IntTy { bits: 8, signed: false }) { return None; }
-                    strict(Ty::Buffer, &[capacity, fill])
+                    strict(Ty::Buffer, &[capacity, fill, alignment])
                 } else {
-                    strict(Ty::Buffer, &[capacity])
+                    strict(Ty::Buffer, &[capacity, alignment])
                 }
             }
             hir::ExprKind::BufferBytes { buffer } => {

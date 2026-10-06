@@ -2111,6 +2111,17 @@ without creating initialized elements, for both heap and explicit region modes.
 They preserve heap transfer and region compaction at freeze. New guaranteed
 materializers use terminal allocation failure, matching core's existing model.
 
+## Explicit buffer payload alignment
+
+Plan 131 selects alignment at buffer construction through one optional final
+integer argument on both constructors. The owner retains this property through
+growth and transfer; the handle's local slot cannot confer it. Reusing align(N)
+on arbitrary buffer bindings would require a hidden reallocation/copy or
+initializer-shape exceptions, so its existing storage meaning remains. A single
+storage owner also adopts ordinary Vec-producing results without copying and
+frees every allocation with its original layout. Capacity remains a read-window
+observation; alignment does not promise residency, speed or recoverable OOM.
+
 ## Observable buffer read-window capacity
 
 Plan 87 exposes the existing descriptor's usable capacity through `b.capacity()`.

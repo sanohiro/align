@@ -5764,7 +5764,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.seed = Some(XmlAccessProvenance::Shared);
                 }
             }
-            Rvalue::BufferNew { capacity, fill } => {
+            Rvalue::BufferNew { capacity, fill, alignment } => {
+                self.check_operand(&mut equation, &alignment, Ty::Int(align_sema::IntTy { bits: 64, signed: true }));
                 if result_ty != Ty::Buffer { equation.invalid = true; }
                 self.check_operand(&mut equation, &capacity, Ty::Int(align_sema::IntTy { bits: 64, signed: true }));
                 if let Some(fill) = &fill {

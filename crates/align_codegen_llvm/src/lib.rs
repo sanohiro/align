@@ -16708,12 +16708,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("writer operation returns i32")
             }
-            Rvalue::BufferNew { capacity, fill } => {
+            Rvalue::BufferNew { capacity, fill, alignment } => {
                 let mut args = vec![self.operand(capacity)?.into()];
                 let key = if let Some(fill) = fill {
                     args.push(self.operand(fill)?.into());
                     RuntimeKey::BufferFilled
                 } else { RuntimeKey::BufferNew };
+                args.push(self.operand(alignment)?.into());
                 let call = self.builder
                     .build_call(self.runtime(key), &args, "buf")
                     .map_err(|e| self.err(e))?;
@@ -31596,6 +31597,39 @@ fn main() -> i32 = 0
                 );
             }
         }
+    }
+
+    #[test]
+    fn buffer_alignment_mir_requires_exact_operands_and_result() -> Result<(), &'static str> {
+        for source in [
+            "fn f(alignment: i64) -> buffer = buffer(3, alignment)\nfn main() {}",
+            "fn f(alignment: i64) -> buffer = buffer.filled(3, 7, alignment)\nfn main() {}",
+        ] {
+            let base = mir(source);
+            assert!(emit_llvm_ir(&base, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_ok());
+            for mutation in 0..5 {
+                let mut bad = base.clone();
+                let mut changed = false;
+                for function in &mut bad.fns {
+                    for block in &mut function.blocks {
+                        for statement in &mut block.stmts {
+                            let Stmt::Let(value, Rvalue::BufferNew { alignment, capacity, .. }) = statement else { continue; };
+                            changed = true;
+                            match mutation {
+                                0 => *alignment = Operand::Const(Const::Bool(false)),
+                                1 => *alignment = Operand::Value(u32::MAX),
+                                2 => *alignment = Operand::Const(Const::Int(64, Ty::Int(IntTy { bits: 64, signed: false }))),
+                                3 => *capacity = Operand::Const(Const::Unit),
+                                _ => *function.value_tys.get_mut(usize::try_from(*value).map_err(|_| "value index")?).ok_or("value type")? = Ty::String,
+                            }
+                        }
+                    }
+                }
+                assert!(changed);
+                assert!(emit_llvm_ir(&bad, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_err(), "alignment/{mutation}");
+            }
+        }
+        Ok(())
     }
 
     #[test]

@@ -940,9 +940,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::FilePwrite { file, data, offset } => format!("file_pwrite({}, {}, {})", operand_str(file), operand_str(data), operand_str(offset)),
         Rvalue::FileSync(file) => format!("file_sync({})", operand_str(file)),
         Rvalue::FileLen { file } => format!("file_len({})", operand_str(file)),
-        Rvalue::BufferNew { capacity, fill } => match fill {
-            Some(value) => format!("buffer_filled({}, {})", operand_str(capacity), operand_str(value)),
-            None => format!("buffer_new({})", operand_str(capacity)),
+        Rvalue::BufferNew { capacity, fill, alignment } => match fill {
+            Some(value) => format!("buffer_filled({}, {}, {})", operand_str(capacity), operand_str(value), operand_str(alignment)),
+            None => format!("buffer_new({}, {})", operand_str(capacity), operand_str(alignment)),
         },
         Rvalue::BufferBytes(buf) => format!("buffer_bytes({})", operand_str(buf)),
         Rvalue::BufferLen(buf) => format!("buffer_len({})", operand_str(buf)),

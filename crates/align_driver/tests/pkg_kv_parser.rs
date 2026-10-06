@@ -117,7 +117,7 @@ fn instrument_parser_work(source: String) -> (String, ParserWorkInventory) {
     let region = &source[start..];
     let fingerprint = normalized_source_fingerprint(region);
     assert_eq!(
-        fingerprint, 17_493_975_231_586_487_682,
+        fingerprint, 14_849_363_909_088_421_227,
         "pkg.kv parser source shape changed; audit every reachable scan and refresh the inventory",
     );
 
@@ -465,9 +465,9 @@ fn parser_sources() -> (String, String, ParserWorkInventory) {
         },
     ];
     let root_source = fixture("apps/kv/pkg/kv.align");
-    assert_source_fingerprint("pkg.kv", root_source, 9_990_699_685_482_827_385);
+    assert_source_fingerprint("pkg.kv", root_source, 4880456890897414176);
     let root = replace_required(root_source, "pkg.kv", &native);
-    assert_source_fingerprint("rewritten pkg.kv", &root, 14_607_054_099_248_186_247);
+    assert_source_fingerprint("rewritten pkg.kv", &root, 2278485981234288666);
 
     // Keep byte advancement exact and independent of the exhaustive parser-work hooks. The source
     // inventory below makes a new loop, index, comparison, match, helper, or call-site change an
@@ -1620,6 +1620,7 @@ fn build_c_fixture(cases: &[Case], inventory: ParserWorkInventory) -> String {
     let mut source = format!(
         r#"#include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define READ_CAPACITY 32768
@@ -1917,7 +1918,8 @@ void align_kv_parser_stub_writer_free(void *writer) {
     }
 }
 
-void *align_kv_parser_stub_buffer_new(int64_t capacity) {
+void *align_kv_parser_stub_buffer_new(int64_t capacity, int64_t alignment) {
+  if (alignment != 1) abort();
     buffer_new_calls += 1;
     if (capacity != READ_CAPACITY || buffer_in_use) {
         protocol_errors += 1;

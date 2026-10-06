@@ -11752,11 +11752,18 @@ impl Buffer {
     }
 }
 
-/// `buffer(cap)` — open an owned byte buffer whose read window is `cap` bytes (`<= 0` → empty).
+fn buffer_storage_with_alignment(alignment: i64) -> BufferStorage {
+    let Ok(alignment) = usize::try_from(alignment) else {
+        panic_abort("buffer alignment must be a power of two between 1 and 536870912");
+    };
+    BufferStorage::new(alignment)
+}
+
+/// `buffer(cap, alignment)` — open an owned byte buffer whose read window is `cap` bytes (`<= 0` → empty).
 #[unsafe(no_mangle)]
-pub extern "C" fn align_rt_buffer_new(cap: i64) -> *mut Buffer {
+pub extern "C" fn align_rt_buffer_new(cap: i64, alignment: i64) -> *mut Buffer {
+    let mut data = buffer_storage_with_alignment(alignment);
     let requested = safe_len(cap).unwrap_or(0);
-    let mut data = Vec::new();
     // `try_reserve` so a bogus/huge capacity fails softly instead of aborting on OOM. The read
     // window is capped to what was actually reserved, so `reader.read`'s later `resize(cap)` can
     // never trigger a new (infallible, abort-on-OOM) allocation — a huge `buffer(cap)` degrades to
@@ -11765,19 +11772,21 @@ pub extern "C" fn align_rt_buffer_new(cap: i64) -> *mut Buffer {
         Ok(()) => requested,
         Err(_) => 0,
     };
-    let buffer = Box::into_raw(Box::new(Buffer { data: data.into(), cap, len: 0 }));
+    #[cfg(test)]
+    if owned_allocator_failpoint() { panic_abort("buffer header allocation failed"); }
+    let buffer = Box::into_raw(Box::new(Buffer { data, cap, len: 0 }));
     #[cfg(feature = "alloc-count")]
     requested_live_insert(1, buffer.cast(), 64usize.saturating_add(cap));
     buffer
 }
 
-/// `buffer.filled(length, value)` — exactly initialized bytes in one payload acquisition.
+/// `buffer.filled(length, value, alignment)` — exactly initialized bytes in one aligned payload acquisition.
 #[unsafe(no_mangle)]
-pub extern "C" fn align_rt_buffer_filled(length: i64, value: u8) -> *mut Buffer {
+pub extern "C" fn align_rt_buffer_filled(length: i64, value: u8, alignment: i64) -> *mut Buffer {
+    let mut data = buffer_storage_with_alignment(alignment);
     let requested = safe_len(length).unwrap_or_else(|()| align_rt_alloc_size_fail());
     #[cfg(test)]
     if requested > 0 && owned_allocator_failpoint() { panic_abort("buffer allocation failed"); }
-    let mut data = Vec::new();
     if data.try_reserve_exact(requested).is_err() {
         panic_abort("buffer allocation failed");
     }
@@ -11785,7 +11794,7 @@ pub extern "C" fn align_rt_buffer_filled(length: i64, value: u8) -> *mut Buffer 
     let cap = data.capacity();
     #[cfg(test)]
     if owned_allocator_failpoint() { panic_abort("buffer header allocation failed"); }
-    let buffer = Box::into_raw(Box::new(Buffer { data: data.into(), cap, len: requested }));
+    let buffer = Box::into_raw(Box::new(Buffer { data, cap, len: requested }));
     #[cfg(feature = "alloc-count")]
     requested_live_insert(1, buffer.cast(), 64usize.saturating_add(cap));
     buffer
@@ -28316,6 +28325,7 @@ const _: extern "C" fn(i32, u8, u8, i32, u32) -> i32 = align_rt_test_report_v1;
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("aligned_buffer_tests.rs");
 
     #[test]
     fn str_parse_i64_grammar_range_and_raw_extents() {
@@ -29877,7 +29887,7 @@ mod tests {
 
         let mut r: *mut Reader = std::ptr::null_mut();
         assert_eq!(unsafe { align_rt_io_reader_open(path_bytes.as_ptr(), path_bytes.len() as i64, &mut r) }, 0);
-        let b = align_rt_buffer_new(3);
+        let b = align_rt_buffer_new(3, 1);
         assert_eq!(unsafe { align_rt_buffer_capacity(b) }, 3);
         assert_eq!(unsafe { align_rt_buffer_capacity(core::ptr::null_mut()) }, 0);
         // First read: up to 3 bytes ("hel").
@@ -29952,7 +29962,7 @@ mod tests {
     fn read_line_strip_and_count_table() {
         // "a\n" | "\r\n" (empty via CRLF) | "\n" (empty via LF) | "bc\r\n" | "tail" (EOF, no term).
         let (r, path) = buffered_reader_over("table", b"a\n\r\n\nbc\r\ntail");
-        let b = align_rt_buffer_new(4);
+        let b = align_rt_buffer_new(4, 1);
 
         assert_eq!(read_one_line(r, b), (2, b"a".to_vec()), "'a\\n' → body 'a', consumed 2");
         assert_eq!(read_one_line(r, b), (2, b"".to_vec()), "'\\r\\n' → empty body, consumed 2");
@@ -29972,7 +29982,7 @@ mod tests {
     #[test]
     fn read_line_empty_file_is_eof() {
         let (r, path) = buffered_reader_over("emptyfile", b"");
-        let b = align_rt_buffer_new(4);
+        let b = align_rt_buffer_new(4, 1);
         assert_eq!(read_one_line(r, b), (0, b"".to_vec()));
         unsafe { align_rt_buffer_free(b) };
         unsafe { align_rt_io_reader_free(r) };
@@ -29984,7 +29994,7 @@ mod tests {
     #[test]
     fn read_after_read_line_serves_lookahead() {
         let (r, path) = buffered_reader_over("interleave", b"AB\nCDEFG");
-        let b = align_rt_buffer_new(64);
+        let b = align_rt_buffer_new(64, 1);
         assert_eq!(read_one_line(r, b), (3, b"AB".to_vec()));
         // The surplus "CDEFG" lives in the lookahead; a plain read must serve it.
         let n = unsafe { align_rt_io_reader_read(r, b) };
@@ -30005,7 +30015,7 @@ mod tests {
         let body_len = content.len();
         content.push(b'\n');
         let (r, path) = buffered_reader_over("spanning", &content);
-        let b = align_rt_buffer_new(16);
+        let b = align_rt_buffer_new(16, 1);
         let (n, body) = read_one_line(r, b);
         assert_eq!(n, body_len as i64 + 1, "consumed = body + '\\n'");
         assert_eq!(body.len(), body_len);
@@ -30027,7 +30037,7 @@ mod tests {
         std::fs::write(&path, &content).unwrap();
         let r = ReaderTestHandle(Box::into_raw(Box::new(Reader::unbuffered(std::fs::File::open(&path).unwrap().into_raw_fd(), true))));
         unsafe { align_rt_io_reader_buffered(r.0); }
-        let b = BufferTestHandle(align_rt_buffer_new(16));
+        let b = BufferTestHandle(align_rt_buffer_new(16, 1));
         let n = unsafe { align_rt_io_reader_read_line(r.0, b.0) };
         let backing_capacity = unsafe { (*b.0).data.with_mut(|data| data.capacity()) };
         drop(b);
@@ -30045,7 +30055,7 @@ mod tests {
         std::fs::write(&path, &exact).unwrap();
         let r = ReaderTestHandle(Box::into_raw(Box::new(Reader::unbuffered(std::fs::File::open(&path).unwrap().into_raw_fd(), true))));
         unsafe { align_rt_io_reader_buffered(r.0); }
-        let b = BufferTestHandle(align_rt_buffer_new(16));
+        let b = BufferTestHandle(align_rt_buffer_new(16, 1));
         let n = unsafe { align_rt_io_reader_read_line(r.0, b.0) };
         let body_length = unsafe { &*b.0 }.data.len();
         let body_matches = unsafe { &*b.0 }.data.iter().all(|byte| *byte == b'z');
@@ -30082,7 +30092,7 @@ mod tests {
                     std::fs::write(&path, &input[split..]).unwrap();
                     let r = ReaderTestHandle(Box::into_raw(Box::new(Reader::unbuffered(std::fs::File::open(&path).unwrap().into_raw_fd(), true))));
                     unsafe { align_rt_io_reader_buffered(r.0); }
-                    let b = BufferTestHandle(align_rt_buffer_new(32));
+                    let b = BufferTestHandle(align_rt_buffer_new(32, 1));
                     let reader = unsafe { &mut *r.0 };
                     reader.buf.clear();
                     reader.buf.extend_from_slice(&input[..split]);
@@ -30161,7 +30171,7 @@ mod tests {
         std::fs::write(&path, b"abc\r\n").unwrap();
         let r = ReaderTestHandle(Box::into_raw(Box::new(Reader::unbuffered(std::fs::File::open(&path).unwrap().into_raw_fd(), true))));
         unsafe { align_rt_io_reader_buffered(r.0); }
-        let b = BufferTestHandle(align_rt_buffer_new(0));
+        let b = BufferTestHandle(align_rt_buffer_new(0, 1));
         assert_eq!(read_line_with_cap(unsafe { &mut *r.0 }, unsafe { &mut *b.0 }, 3), 5);
         assert_eq!(unsafe { &*b.0 }.data.as_slice(), b"abc");
         assert_eq!(unsafe { align_rt_buffer_capacity(b.0) }, 3);
@@ -30603,7 +30613,7 @@ mod tests {
         assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
         assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC, 0);
         assert_eq!(unsafe { align_rt_io_file_len(file) }, 6);
-        let buffer = align_rt_buffer_new(8);
+        let buffer = align_rt_buffer_new(8, 1);
         assert_eq!(unsafe { align_rt_io_file_pread(file, buffer, 4) }, 2);
         assert_eq!(unsafe { &*buffer }.data.as_slice(), b"ef");
         assert_eq!(unsafe { align_rt_io_file_pread(file, buffer, 6) }, 0);
@@ -30650,7 +30660,7 @@ mod tests {
         let file = std::fs::File::open(&path)?;
         let mut handle = RwFile { fd: file.as_raw_fd() };
         for (start, requested, offset) in [(0, 2, 0), (2, 4, 4), (4, 5, 13), (4, 12, 0), (4, 0, 0), (4, 5, 16)] {
-            let ptr = align_rt_buffer_new(16);
+            let ptr = align_rt_buffer_new(16, 1);
             let _owner = BufferTestHandle(ptr);
             unsafe { align_rt_buffer_append(ptr, b"----".as_ptr(), 4); }
             let (_, _, capacity, address) = snapshot(ptr);
@@ -30669,7 +30679,7 @@ mod tests {
         // A reserve-only buffer extends from zero without publishing gaps; an initialized buffer
         // can fill disjoint positions while preserving its other bytes and exact logical length.
         for filled in [false, true] {
-            let ptr = if filled { align_rt_buffer_filled(16, b'-') } else { align_rt_buffer_new(16) };
+            let ptr = if filled { align_rt_buffer_filled(16, b'-', 1) } else { align_rt_buffer_new(16, 1) };
             let _owner = BufferTestHandle(ptr);
             let address = unsafe { (*ptr).data.writable_ptr() };
             let capacity = unsafe { (*ptr).cap };
@@ -30680,7 +30690,7 @@ mod tests {
             assert_eq!(unsafe { (*ptr).cap }, capacity);
             assert_eq!(unsafe { (*ptr).data.writable_ptr() }, address);
         }
-        let ptr = align_rt_buffer_new(16);
+        let ptr = align_rt_buffer_new(16, 1);
         let _owner = BufferTestHandle(ptr);
         unsafe { align_rt_buffer_append(ptr, b"----".as_ptr(), 4); }
         let original = snapshot(ptr);
@@ -30717,7 +30727,7 @@ mod tests {
 
     #[test]
     fn file_pread_into_native_attempt_transitions() {
-        let ptr = align_rt_buffer_new(8);
+        let ptr = align_rt_buffer_new(8, 1);
         let _owner = BufferTestHandle(ptr);
         unsafe { align_rt_buffer_append(ptr, b"AB".as_ptr(), 2); }
         let buffer = unsafe { &mut *ptr };
@@ -30776,7 +30786,7 @@ mod tests {
         assert_eq!(unsafe { align_rt_io_file_len(f) }, 21);
 
         // pread "World!" back at offset 7 into a 6-byte window.
-        let b = align_rt_buffer_new(6);
+        let b = align_rt_buffer_new(6, 1);
         assert_eq!(unsafe { align_rt_io_file_pread(f, b, 7) }, 6);
         let mut view = AlignStr { ptr: std::ptr::null(), len: 0 };
         unsafe { align_rt_buffer_bytes(b, &mut view) };
@@ -30805,7 +30815,7 @@ mod tests {
         assert_eq!(unsafe { align_rt_io_file_pwrite(f, b"abcde".as_ptr(), 5, 0) }, 5);
 
         // An 8-byte window at offset 2: only 3 bytes remain ("cde") — the actual count.
-        let b = align_rt_buffer_new(8);
+        let b = align_rt_buffer_new(8, 1);
         assert_eq!(unsafe { align_rt_io_file_pread(f, b, 2) }, 3);
         let mut view = AlignStr { ptr: std::ptr::null(), len: 0 };
         unsafe { align_rt_buffer_bytes(b, &mut view) };
@@ -30885,7 +30895,7 @@ mod tests {
             assert_eq!(unsafe { align_rt_io_file_create(pb.as_ptr(), pb.len() as i64, &mut f) }, 0);
             let owner = FileTestHandle(f);
             assert_eq!(unsafe { align_rt_io_file_pwrite(f, b"payload".as_ptr(), 7, 0) }, 7);
-            let b = align_rt_buffer_new(7);
+            let b = align_rt_buffer_new(7, 1);
             assert_eq!(unsafe { align_rt_io_file_pread(f, b, 0) }, 7);
             unsafe { align_rt_buffer_free(b) };
             drop(owner);
@@ -30937,11 +30947,11 @@ mod tests {
     fn buffer_capacity_tracks_read_window_not_allocator_spare() {
         assert_eq!(unsafe { align_rt_buffer_capacity(core::ptr::null_mut()) }, 0);
         for requested in [0, -5, 3, 17] {
-            let b = BufferTestHandle(align_rt_buffer_new(requested));
+            let b = BufferTestHandle(align_rt_buffer_new(requested, 1));
             assert_eq!(unsafe { align_rt_buffer_capacity(b.0) }, if (0..=17).contains(&requested) { requested } else { 0 });
             assert_eq!(unsafe { align_rt_buffer_len(b.0) }, 0);
         }
-        let b = BufferTestHandle(align_rt_buffer_new(3));
+        let b = BufferTestHandle(align_rt_buffer_new(3, 1));
         unsafe {
             // A valid window may be smaller than its allocator's spare storage. Querying must
             // preserve that native-fill bound rather than reveal/reclassify the spare bytes.
@@ -30963,7 +30973,7 @@ mod tests {
             assert_eq!((*b.0).data.writable_ptr(), pointer);
         }
         for length in [0, 1, 17] {
-            let b = BufferTestHandle(align_rt_buffer_filled(length, 0xa5));
+            let b = BufferTestHandle(align_rt_buffer_filled(length, 0xa5, 1));
             assert!(unsafe { align_rt_buffer_capacity(b.0) } >= length);
             assert_eq!(unsafe { align_rt_buffer_len(b.0) }, length);
         }
@@ -30982,7 +30992,7 @@ mod tests {
         let path = root.0.join("input");
         std::fs::write(&path, b"abcdef\r\n\nxy").unwrap();
         let reader = ReaderTestHandle(Box::into_raw(Box::new(Reader::unbuffered(std::fs::File::open(&path).unwrap().into_raw_fd(), true))));
-        let b = BufferTestHandle(align_rt_buffer_new(2));
+        let b = BufferTestHandle(align_rt_buffer_new(2, 1));
         for (consumed, length, capacity) in [(8, 6, 6), (1, 0, 6), (2, 2, 6), (0, 0, 6)] {
             assert_eq!(unsafe { align_rt_io_reader_read_line(reader.0, b.0) }, consumed);
             assert_eq!(unsafe { align_rt_buffer_len(b.0) }, length);
@@ -31006,14 +31016,14 @@ mod tests {
     fn buffer_huge_capacity_degrades_to_empty_window_not_abort() {
         // A pathological capacity must fail softly (an empty read window), never abort the process
         // on an infallible allocation. `read` into it then yields 0 (nothing to fill).
-        let b = align_rt_buffer_new(i64::MAX);
+        let b = align_rt_buffer_new(i64::MAX, 1);
         let bref = unsafe { &*b };
         assert_eq!(bref.cap, 0, "an unreservable capacity degrades to a 0-byte window");
         assert_eq!(unsafe { align_rt_buffer_capacity(b) }, 0);
         assert_eq!(unsafe { align_rt_buffer_len(b) }, 0);
         unsafe { align_rt_buffer_free(b) };
         // A negative capacity is also an empty window (never a wrapping `as usize`).
-        let b2 = align_rt_buffer_new(-5);
+        let b2 = align_rt_buffer_new(-5, 1);
         assert_eq!(unsafe { &*b2 }.cap, 0);
         unsafe { align_rt_buffer_free(b2) };
     }
@@ -31022,7 +31032,7 @@ mod tests {
     fn buffer_put_and_append_layout_and_endianness() {
         // A2 encode: typed puts append `width` bytes in the requested order; `append` copies a raw
         // blob after. LE writes the low bytes first, BE reverses; a single byte is order-agnostic.
-        let b = align_rt_buffer_new(0);
+        let b = align_rt_buffer_new(0, 1);
         unsafe {
             align_rt_buffer_put(b, 0x41, 1, 0); // u8 -> 41
             align_rt_buffer_put(b, 0x1234, 2, 0); // u16 LE -> 34 12
@@ -31047,7 +31057,7 @@ mod tests {
             align_rt_buffer_put(core::ptr::null_mut(), 0, 4, 0); // null handle: no-op
             align_rt_buffer_append(core::ptr::null_mut(), b"x".as_ptr(), 1);
         }
-        let b = align_rt_buffer_new(0);
+        let b = align_rt_buffer_new(0, 1);
         unsafe {
             align_rt_buffer_put(b, 0xdead, 0, 0); // width 0 -> no-op
             align_rt_buffer_put(b, 0xdead, 9, 0); // width > 8 -> no-op
@@ -32415,7 +32425,7 @@ mod tests {
 
         // Non-consumption: both handles are still valid after the copy. The reader is now at EOF;
         // the writer can still append.
-        let b = align_rt_buffer_new(16);
+        let b = align_rt_buffer_new(16, 1);
         assert_eq!(unsafe { align_rt_io_reader_read(r, b) }, 0, "the borrowed reader is at EOF, still usable");
         assert_eq!(unsafe { align_rt_io_writer_write(w, b"!".as_ptr(), 1) }, 0, "the borrowed writer still writes");
 
@@ -32483,7 +32493,7 @@ mod tests {
             } else if mode != 0 {
                 assert_eq!(unsafe { align_rt_io_reader_buffered(reader.0) }, reader.0);
                 if mode == 2 {
-                    let line = BufferTestHandle(align_rt_buffer_new(16));
+                    let line = BufferTestHandle(align_rt_buffer_new(16, 1));
                     assert_eq!(unsafe { align_rt_io_reader_read_line(reader.0, line.0) }, 3);
                     let line = unsafe { &*line.0 };
                     assert_eq!(&line.data[..line.len], b"AB");
@@ -32517,7 +32527,7 @@ mod tests {
                     let reader = unsafe { &*fixture.reader.0 };
                     assert_eq!(reader.buf.as_ptr(), pointer, "mode {mode}, size {size}");
                     assert_eq!(reader.buf.capacity(), capacity);
-                    let probe = BufferTestHandle(align_rt_buffer_new(1));
+                    let probe = BufferTestHandle(align_rt_buffer_new(1, 1));
                     assert_eq!(unsafe { align_rt_io_reader_read(fixture.reader.0, probe.0) }, 0);
                     assert_eq!(unsafe { align_rt_io_writer_write(fixture.writer.0, b"!".as_ptr(), 1) }, 0);
                     assert_eq!(unsafe { align_rt_io_writer_flush(fixture.writer.0) }, 0);
@@ -32573,7 +32583,7 @@ mod tests {
                 assert_eq!(status, expected);
                 let cursor = fixture.cursor();
                 let before_flush = unsafe { (*fixture.writer.0).buf.clone() };
-                let probe = BufferTestHandle(align_rt_buffer_new(32));
+                let probe = BufferTestHandle(align_rt_buffer_new(32, 1));
                 let next = unsafe { align_rt_io_reader_read(fixture.reader.0, probe.0) };
                 let probe_bytes = unsafe { &*probe.0 };
                 let next_bytes = probe_bytes.data[..probe_bytes.len].to_vec();
@@ -34280,11 +34290,11 @@ mod tests {
     fn explicit_constructor_capacity_preserves_payload_and_initialized_prefix() {
         let _serial = REGION_ARRAY_BUILDER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for capacity in [0usize, 1, 4, 40, 128] {
-            let filled = align_rt_buffer_filled(i64::try_from(capacity).unwrap(), 0xa5);
+            let filled = align_rt_buffer_filled(i64::try_from(capacity).unwrap(), 0xa5, 1);
             unsafe {
                 assert_eq!((*filled).len, capacity);
                 assert!((*filled).cap >= capacity);
-                let view = (*filled).data.with_mut(|data| data.clone());
+                let view = (*filled).data.with_mut(|data| data.to_vec());
                 assert_eq!(view, vec![0xa5; capacity]);
                 align_rt_buffer_free(filled);
             }
@@ -34324,15 +34334,15 @@ mod tests {
         // top of whatever is already published, without a growth sequence or a per-byte call.
         for length in [0usize, 1, 7, 4096, 65536] {
             for value in [0x00u8, 0xff] {
-                let constructed = align_rt_buffer_filled(i64::try_from(length).unwrap(), value);
-                let appended = align_rt_buffer_new(0);
+                let constructed = align_rt_buffer_filled(i64::try_from(length).unwrap(), value, 1);
+                let appended = align_rt_buffer_new(0, 1);
                 unsafe {
                     align_rt_buffer_append_filled(appended, i64::try_from(length).unwrap(), value);
                     assert_eq!((*appended).len, length, "length {length} value {value:#x}");
                     assert_eq!((*appended).len, (*constructed).len);
                     assert!((*appended).cap >= length);
-                    let lhs = (*constructed).data.with_mut(|data| data.clone());
-                    let rhs = (*appended).data.with_mut(|data| data.clone());
+                    let lhs = (*constructed).data.with_mut(|data| data.to_vec());
+                    let rhs = (*appended).data.with_mut(|data| data.to_vec());
                     assert_eq!(lhs, rhs, "length {length} value {value:#x} contents differ");
                     align_rt_buffer_free(constructed);
                     align_rt_buffer_free(appended);
@@ -34341,7 +34351,7 @@ mod tests {
         }
 
         // It extends: already-published bytes survive, and repeated calls accumulate.
-        let b = align_rt_buffer_new(0);
+        let b = align_rt_buffer_new(0, 1);
         unsafe {
             align_rt_buffer_put(b, 0x11, 1, 0);
             align_rt_buffer_append_filled(b, 3, 0xaa);
@@ -34349,7 +34359,7 @@ mod tests {
             align_rt_buffer_append_filled(b, 2, 0xcc);
             assert_eq!((*b).len, 6);
             assert_eq!(
-                (*b).data.with_mut(|data| data.clone()),
+                (*b).data.with_mut(|data| data.to_vec()),
                 vec![0x11, 0xaa, 0xaa, 0xaa, 0xcc, 0xcc]
             );
             align_rt_buffer_free(b);
@@ -35870,10 +35880,10 @@ mod tests {
             OWNED_ALLOC_FAIL_AFTER.store(fail_after, core::sync::atomic::Ordering::Relaxed);
             match mode.as_ref() {
                 "filled-payload" | "filled-header" => {
-                    let _ = align_rt_buffer_filled(8, 7);
+                    let _ = align_rt_buffer_filled(8, 7, 1);
                 }
                 "filled-empty-header" => {
-                    let _ = align_rt_buffer_filled(0, 7);
+                    let _ = align_rt_buffer_filled(0, 7, 1);
                 }
                 "builder-capacity" => {
                     let _ = align_rt_array_builder_new(8, 40);
@@ -40641,7 +40651,7 @@ mod tests {
         assert!(!w.is_null() && !r.is_null());
         assert_eq!(unsafe { align_rt_io_writer_write(w, b"ping".as_ptr(), 4) }, 0, "write reaches the socket");
 
-        let b = align_rt_buffer_new(16);
+        let b = align_rt_buffer_new(16, 1);
         let n = unsafe { align_rt_io_reader_read(r, b) };
         assert_eq!(n, 4, "the echo server returns the 4 bytes");
         let got = unsafe { &*b };
@@ -40758,7 +40768,7 @@ mod tests {
         // Arm a 200ms receive deadline, then read from the silent peer.
         unsafe { align_rt_tcp_read_timeout(conn, 200_000_000) };
         let r = unsafe { align_rt_tcp_conn_reader(conn) };
-        let b = align_rt_buffer_new(16);
+        let b = align_rt_buffer_new(16, 1);
         let start = std::time::Instant::now();
         let n = unsafe { align_rt_io_reader_read(r, b) };
         let elapsed = start.elapsed();
@@ -40860,7 +40870,7 @@ mod tests {
             unsafe { align_rt_io_writer_write(writer, b"ping".as_ptr(), 4) },
             0
         );
-        let buffer = align_rt_buffer_new(4);
+        let buffer = align_rt_buffer_new(4, 1);
         assert_eq!(unsafe { align_rt_io_reader_read(reader, buffer) }, 4);
         let buffer_ref = unsafe { &*buffer };
         assert_eq!(&buffer_ref.data[..buffer_ref.len], b"pong");
@@ -40918,7 +40928,7 @@ mod tests {
 
         let r = unsafe { align_rt_tcp_conn_reader(conn) };
         let w = unsafe { align_rt_tcp_conn_writer(conn) };
-        let b = align_rt_buffer_new(16);
+        let b = align_rt_buffer_new(16, 1);
         let n = unsafe { align_rt_io_reader_read(r, b) };
         assert_eq!(n, 5, "the accepted conn reads the client's 5 bytes");
         let got = unsafe { &*b };
@@ -41032,7 +41042,7 @@ mod tests {
         peer.send_to(b"ping", ("127.0.0.1", srv_port as u16)).expect("peer sends to server");
 
         // The Align socket receives the datagram (recv_from fills the buffer, returns the count).
-        let b = align_rt_buffer_new(16);
+        let b = align_rt_buffer_new(16, 1);
         let n = unsafe { align_rt_udp_recv_from(sock, b) };
         assert_eq!(n, 4, "recv_from returns the datagram's 4 bytes");
         let got = unsafe { &*b };
@@ -41066,7 +41076,7 @@ mod tests {
 
         let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("peer bind");
         peer.send_to(b"hi", ("127.0.0.1", port as u16)).expect("peer sends to wildcard socket");
-        let b = align_rt_buffer_new(8);
+        let b = align_rt_buffer_new(8, 1);
         let n = unsafe { align_rt_udp_recv_from(sock, b) };
         assert_eq!(n, 2, "the wildcard socket receives the loopback datagram");
 
@@ -41087,7 +41097,7 @@ mod tests {
 
         let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("peer bind");
         peer.send_to(b"0123456789", ("127.0.0.1", port as u16)).expect("peer sends a 10-byte datagram");
-        let b = align_rt_buffer_new(4); // smaller than the datagram
+        let b = align_rt_buffer_new(4, 1); // smaller than the datagram
         let n = unsafe { align_rt_udp_recv_from(sock, b) };
         assert_eq!(n, 4, "recv_from into a too-small buffer returns the capacity (truncated)");
         let got = unsafe { &*b };
@@ -43269,7 +43279,7 @@ mod tests {
     #[test]
     fn crypto_random_fills_the_whole_capacity() {
         // A 4096-byte fill spans the full capacity, is not left all-zero, and updates `len`.
-        let b = align_rt_buffer_new(4096);
+        let b = align_rt_buffer_new(4096, 1);
         unsafe { align_rt_crypto_random(b) };
         let bref = unsafe { &*b };
         assert_eq!(bref.len, 4096, "the whole capacity is filled (len == cap)");
@@ -43284,8 +43294,8 @@ mod tests {
     #[test]
     fn crypto_random_two_fills_differ() {
         // Two independent 32-byte fills are (almost surely) different key material.
-        let a = align_rt_buffer_new(32);
-        let b = align_rt_buffer_new(32);
+        let a = align_rt_buffer_new(32, 1);
+        let b = align_rt_buffer_new(32, 1);
         unsafe { align_rt_crypto_random(a) };
         unsafe { align_rt_crypto_random(b) };
         let (ar, br) = unsafe { (&*a, &*b) };
@@ -43299,7 +43309,7 @@ mod tests {
     #[test]
     fn crypto_random_edge_cases() {
         // A zero-capacity buffer fills nothing (len stays 0, no panic).
-        let z = align_rt_buffer_new(0);
+        let z = align_rt_buffer_new(0, 1);
         unsafe { align_rt_crypto_random(z) };
         assert_eq!(unsafe { &*z }.len, 0, "a zero-capacity buffer fills nothing");
         unsafe { align_rt_buffer_free(z) };
@@ -45496,7 +45506,7 @@ mod tests {
     }
 
     fn read_http_stream_all(stream: *mut HttpReadStream, capacity: i64) -> Vec<u8> {
-        let buffer = align_rt_buffer_new(capacity);
+        let buffer = align_rt_buffer_new(capacity, 1);
         let mut body = Vec::new();
         loop {
             let mut count = -1;
@@ -45762,7 +45772,7 @@ data:\ndata:\n\n";
             let url = format!("http://127.0.0.1:{port}/events");
             let client = align_rt_http_client_new();
             let stream = open_http_sse_stream(client, &url);
-            let buffer = align_rt_buffer_new(128);
+            let buffer = align_rt_buffer_new(128, 1);
 
             let (status, first, event, data, id) = http_sse_next_owned(stream, buffer);
             assert_eq!(status, 0);
@@ -45808,7 +45818,7 @@ event: first\nevent:\ndata: x\n\n";
         let url = format!("http://127.0.0.1:{port}/events");
         let client = align_rt_http_client_new();
         let stream = open_http_sse_stream(client, &url);
-        let buffer = align_rt_buffer_new(64);
+        let buffer = align_rt_buffer_new(64, 1);
 
         let (status, event, kind, data, id) = http_sse_next_owned(stream, buffer);
         assert_eq!(status, 0);
@@ -45836,7 +45846,7 @@ event: first\nevent:\ndata: x\n\n";
             let url = format!("http://127.0.0.1:{port}/events");
             let client = align_rt_http_client_new();
             let stream = open_http_sse_stream(client, &url);
-            let buffer = align_rt_buffer_new(capacity);
+            let buffer = align_rt_buffer_new(capacity, 1);
 
             let (status, event, kind, data, _) = http_sse_next_owned(stream, buffer);
             assert_eq!(status, expected_status, "capacity {capacity}");
@@ -45870,7 +45880,7 @@ event: first\nevent:\ndata: x\n\n";
             let url = format!("http://127.0.0.1:{port}/events");
             let client = align_rt_http_client_new();
             let stream = open_http_sse_stream(client, &url);
-            let buffer = align_rt_buffer_new(8);
+            let buffer = align_rt_buffer_new(8, 1);
             let (status, event, _, _, _) = http_sse_next_owned(stream, buffer);
             if body.ends_with(b"\n\n") {
                 assert_eq!(status, AL_HTTP_BODY_LIMIT);
@@ -45899,7 +45909,7 @@ event: first\nevent:\ndata: x\n\n";
         let url = format!("http://127.0.0.1:{port}/events");
         let client = align_rt_http_client_new();
         let stream = open_http_sse_stream(client, &url);
-        let buffer = align_rt_buffer_new(64);
+        let buffer = align_rt_buffer_new(64, 1);
         let (status, event, _, _, _) = http_sse_next_owned(stream, buffer);
         assert_eq!(
             status, AL_INVALID,
@@ -45941,7 +45951,7 @@ event: first\nevent:\ndata: x\n\n";
             let client = align_rt_http_client_new();
             unsafe { align_rt_http_client_max_response_body_bytes(client, limit) };
             let stream = open_http_sse_stream(client, &url);
-            let buffer = align_rt_buffer_new(8);
+            let buffer = align_rt_buffer_new(8, 1);
             for attempt in 0..=usize::from(expected != 0) {
                 let (status, event, _, data, _) = http_sse_next_owned(stream, buffer);
                 assert_eq!(status, expected, "{label} attempt {attempt}");
@@ -45968,7 +45978,7 @@ event: first\nevent:\ndata: x\n\n";
         let client = align_rt_http_client_new();
         for _ in 0..2 {
             let stream = open_http_sse_stream(client, &url);
-            let buffer = align_rt_buffer_new(8);
+            let buffer = align_rt_buffer_new(8, 1);
             let (status, event, _, data, _) = http_sse_next_owned(stream, buffer);
             assert_eq!(status, 0);
             assert_eq!(event.present, 1);
@@ -46013,7 +46023,7 @@ event: first\nevent:\ndata: x\n\n";
             0,
         );
         let stream = unsafe { align_rt_http_read_stream_sse(raw) };
-        let buffer = align_rt_buffer_new(64);
+        let buffer = align_rt_buffer_new(64, 1);
         for _ in 0..2 {
             let (status, event, _, _, _) = http_sse_next_owned(stream, buffer);
             assert_eq!(status, AL_TIMEOUT);
@@ -46037,7 +46047,7 @@ event: first\nevent:\ndata: x\n\n";
         let client = align_rt_http_client_new();
         let stream = open_http_sse_stream(client, &url);
 
-        let small = align_rt_buffer_new(9);
+        let small = align_rt_buffer_new(9, 1);
         let (status, event, _, _, id) = http_sse_next_owned(stream, small);
         assert_eq!(status, 0);
         assert_eq!(event.present, 1);
@@ -46046,7 +46056,7 @@ event: first\nevent:\ndata: x\n\n";
         assert_eq!(state.block.capacity(), HTTP_MAX_SSE_METADATA + 9);
         assert_eq!(state.committed_id.capacity(), 1);
 
-        let larger = align_rt_buffer_new(14);
+        let larger = align_rt_buffer_new(14, 1);
         let (status, event, _, _, id) = http_sse_next_owned(stream, larger);
         assert_eq!(status, 0);
         assert_eq!(event.present, 1);
@@ -46182,7 +46192,7 @@ event: first\nevent:\ndata: x\n\n";
             unsafe { align_rt_http_client_timeout(client.0, 1_000_000_000) };
             let stream = guarded_read_window_stream(&client, &url);
             assert_eq!(unsafe { align_rt_http_read_stream_sse(stream.0) }, stream.0);
-            let output = BufferTestHandle(align_rt_buffer_new((HTTP_CLIENT_READ_CHUNK + 7) as i64));
+            let output = BufferTestHandle(align_rt_buffer_new((HTTP_CLIENT_READ_CHUNK + 7) as i64, 1));
             let trace = HttpReadWindowTrace::new();
             peer.release_body();
             let (status, event, name, data, id) = http_sse_next_owned(stream.0, output.0);
@@ -46214,7 +46224,7 @@ event: first\nevent:\ndata: x\n\n";
             unsafe { align_rt_http_client_timeout(client.0, 1_000_000_000) };
             let stream = guarded_read_window_stream(&client, &url);
             assert_eq!(unsafe { align_rt_http_read_stream_sse(stream.0) }, stream.0);
-            let output = BufferTestHandle(align_rt_buffer_new(8));
+            let output = BufferTestHandle(align_rt_buffer_new(8, 1));
             let trace = HttpReadWindowTrace::new();
             peer.release_body();
             let (status, event, _, data, _) = http_sse_next_owned(stream.0, output.0);
@@ -46240,7 +46250,7 @@ event: first\nevent:\ndata: x\n\n";
             let client = HttpClientTestHandle(align_rt_http_client_new());
             unsafe { align_rt_http_client_timeout(client.0, 1_000_000_000) };
             let stream = guarded_read_window_stream(&client, &url);
-            let output = BufferTestHandle(align_rt_buffer_new(8));
+            let output = BufferTestHandle(align_rt_buffer_new(8, 1));
             let trace = HttpReadWindowTrace::new();
             peer.release_body();
             let mut count = -1;
@@ -46264,7 +46274,7 @@ event: first\nevent:\ndata: x\n\n";
             unsafe { align_rt_http_client_timeout(client.0, 1_000_000_000) };
             let stream = guarded_read_window_stream(&client, &url);
             assert_eq!(unsafe { align_rt_http_read_stream_sse(stream.0) }, stream.0);
-            let output = BufferTestHandle(align_rt_buffer_new(8));
+            let output = BufferTestHandle(align_rt_buffer_new(8, 1));
             let trace = HttpReadWindowTrace::new();
             peer.release_body();
             for attempt in 0..2 {
@@ -46325,7 +46335,7 @@ event: first\nevent:\ndata: x\n\n";
                 let url = format!("http://127.0.0.1:{port}/events");
                 let client = align_rt_http_client_new();
                 let stream = open_http_sse_stream(client, &url);
-                let buffer = align_rt_buffer_new(capacity as i64);
+                let buffer = align_rt_buffer_new(capacity as i64, 1);
                 let (status, event, _, data, _) = http_sse_next_owned(stream, buffer);
                 if extra == 0 {
                     assert_eq!(status, 0, "{kind}");
@@ -46356,7 +46366,7 @@ event: first\nevent:\ndata: x\n\n";
             let client = align_rt_http_client_new();
             unsafe { align_rt_http_client_max_response_body_bytes(client, limit) };
             let stream = open_http_sse_stream(client, &url);
-            let buffer = align_rt_buffer_new(capacity as i64);
+            let buffer = align_rt_buffer_new(capacity as i64, 1);
             for attempt in 0..2 {
                 let (status, event, _, _, _) = http_sse_next_owned(stream, buffer);
                 assert_eq!(status, expected, "{label} attempt {attempt}");
@@ -46378,7 +46388,7 @@ event: first\nevent:\ndata: x\n\n";
             let url = format!("http://127.0.0.1:{port}/close-events");
             let client = align_rt_http_client_new();
             let stream = open_http_sse_stream(client, &url);
-            let buffer = align_rt_buffer_new(capacity as i64);
+            let buffer = align_rt_buffer_new(capacity as i64, 1);
             for attempt in 0..2 {
                 let (status, event, _, _, _) = http_sse_next_owned(stream, buffer);
                 assert_eq!(status, expected, "close extra {extra} attempt {attempt}");
@@ -46399,7 +46409,7 @@ event: first\nevent:\ndata: x\n\n";
         let url = format!("http://127.0.0.1:{port}/events");
         let client = align_rt_http_client_new();
         let raw = open_http_read_stream(client, &url);
-        let prefix = align_rt_buffer_new(1);
+        let prefix = align_rt_buffer_new(1, 1);
         let mut count = 0;
         assert_eq!(
             unsafe { align_rt_http_read_stream_read(raw, prefix, &mut count) },
@@ -46407,7 +46417,7 @@ event: first\nevent:\ndata: x\n\n";
         );
         assert_eq!(count, 1);
         let stream = unsafe { align_rt_http_read_stream_sse(raw) };
-        let output = align_rt_buffer_new(64);
+        let output = align_rt_buffer_new(64, 1);
         let (status, terminal, _, _, _) = http_sse_next_owned(stream, output);
         assert_eq!(status, 0);
         assert_eq!(
@@ -46440,8 +46450,8 @@ event: first\nevent:\ndata: x\n\n";
         assert!(empty.ptr.is_null());
         assert_eq!(empty.len, 0);
 
-        let buffer = align_rt_buffer_new(8);
-        let zero = align_rt_buffer_new(0);
+        let buffer = align_rt_buffer_new(8, 1);
+        let zero = align_rt_buffer_new(0, 1);
         let mut event = AlignHttpSseNext {
             present: 9,
             retry_present: 9,
@@ -46560,7 +46570,7 @@ event: first\nevent:\ndata: x\n\n";
         let url = format!("http://127.0.0.1:{port}/");
         let client = align_rt_http_client_new();
         let stream = open_http_read_stream(client, &url);
-        let buffer = align_rt_buffer_new(8);
+        let buffer = align_rt_buffer_new(8, 1);
         for _ in 0..2 {
             let mut count = 99;
             assert_eq!(
@@ -46641,7 +46651,7 @@ event: first\nevent:\ndata: x\n\n";
         assert!(header.ptr.is_null());
         assert_eq!(header.len, 0);
 
-        let zero = align_rt_buffer_new(0);
+        let zero = align_rt_buffer_new(0, 1);
         let mut count = 7;
         assert_eq!(
             unsafe {
@@ -46652,7 +46662,7 @@ event: first\nevent:\ndata: x\n\n";
         assert_eq!(count, 0);
         unsafe { align_rt_buffer_free(zero) };
 
-        let buffer = align_rt_buffer_new(4);
+        let buffer = align_rt_buffer_new(4, 1);
         unsafe { align_rt_buffer_put(buffer, u64::from(b'x'), 1, 0) };
         assert_eq!(unsafe { align_rt_buffer_len(buffer) }, 1);
         assert_eq!(
@@ -46689,7 +46699,7 @@ event: first\nevent:\ndata: x\n\n";
         let url = format!("http://127.0.0.1:{port}/zero-state");
         let live_client = align_rt_http_client_new();
         let stream = open_http_read_stream(live_client, &url);
-        let zero = align_rt_buffer_new(0);
+        let zero = align_rt_buffer_new(0, 1);
         let mut count = 9;
         assert_eq!(
             unsafe { align_rt_http_read_stream_read(stream, zero, &mut count) },
@@ -46844,7 +46854,7 @@ event: first\nevent:\ndata: x\n\n";
             let client = align_rt_http_client_new();
             unsafe { align_rt_http_client_max_response_body_bytes(client, 5) };
             let stream = open_http_read_stream(client, &url);
-            let buffer = align_rt_buffer_new(8);
+            let buffer = align_rt_buffer_new(8, 1);
             let mut count = -1;
             assert_eq!(
                 unsafe { align_rt_http_read_stream_read(stream, buffer, &mut count) },
@@ -46879,7 +46889,7 @@ event: first\nevent:\ndata: x\n\n";
         let client = align_rt_http_client_new();
         unsafe { align_rt_http_client_max_response_body_bytes(client, 5) };
         let stream = open_http_read_stream(client, &url);
-        let buffer = align_rt_buffer_new(2);
+        let buffer = align_rt_buffer_new(2, 1);
         let mut count = -1;
         assert_eq!(
             unsafe { align_rt_http_read_stream_read(stream, buffer, &mut count) },
@@ -46938,7 +46948,7 @@ event: first\nevent:\ndata: x\n\n";
         // The request override was snapshotted by construction; a later client setter cannot
         // lengthen this stream's receive deadline.
         unsafe { align_rt_http_client_timeout(client, 1_000_000_000) };
-        let buffer = align_rt_buffer_new(2);
+        let buffer = align_rt_buffer_new(2, 1);
         for _ in 0..2 {
             let mut count = 99;
             assert_eq!(
@@ -48600,7 +48610,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         let client = align_rt_http_client_new();
         for _ in 0..2 {
             let stream = open_http_sse_stream(client, &url);
-            let buffer = align_rt_buffer_new(64);
+            let buffer = align_rt_buffer_new(64, 1);
             let (status, event, kind, data, id) = http_sse_next_owned(stream, buffer);
             assert_eq!(status, 0);
             assert_eq!(event.present, 1);
@@ -48638,7 +48648,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         let url = format!("https://127.0.0.1:{port}/events");
         let client = align_rt_http_client_new();
         let stream = open_http_sse_stream(client, &url);
-        let buffer = align_rt_buffer_new(capacity as i64);
+        let buffer = align_rt_buffer_new(capacity as i64, 1);
         let (status, terminal, _, _, _) = http_sse_next_owned(stream, buffer);
         assert_eq!(status, 0);
         assert_eq!(terminal.present, 0);
@@ -49455,7 +49465,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         peer.read_exact(&mut head).expect("read Upgrade response");
         assert_eq!(head, expected);
 
-        let buffer = align_rt_buffer_new(8);
+        let buffer = align_rt_buffer_new(8, 1);
         peer.write_all(b"hello").unwrap();
         assert_eq!(unsafe { align_rt_http_upgrade_read_exact(out, buffer, 5) }, 0);
         assert_eq!(unsafe { (*buffer).data.as_slice() }, b"hello");
@@ -49508,7 +49518,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             sticky: 0,
             deadline: None,
         }));
-        let buffer = align_rt_buffer_new(1);
+        let buffer = align_rt_buffer_new(1, 1);
         assert_eq!(unsafe { align_rt_http_upgrade_deadline(upgrade, 1) }, 0);
         assert_eq!(unsafe { align_rt_http_upgrade_read_exact(upgrade, buffer, 1) }, AL_TIMEOUT);
         assert_eq!(unsafe { align_rt_http_upgrade_write(upgrade, b"x".as_ptr(), 1) }, AL_TIMEOUT);
@@ -49556,13 +49566,13 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
                 );
             },
             "read-negative-count" => {
-                let buffer = align_rt_buffer_new(0);
+                let buffer = align_rt_buffer_new(0, 1);
                 unsafe {
                     align_rt_http_upgrade_read_exact(core::ptr::null_mut(), buffer, -1);
                 }
             }
             "read-over-capacity" => {
-                let buffer = align_rt_buffer_new(0);
+                let buffer = align_rt_buffer_new(0, 1);
                 unsafe {
                     align_rt_http_upgrade_read_exact(core::ptr::null_mut(), buffer, 1);
                 }
@@ -52199,7 +52209,7 @@ mod regex_tests {
         assert!(!buffer.is_null());
         let buffer = unsafe { Box::from_raw(buffer) };
         assert_eq!(buffer.len, buffer.data.len());
-        buffer.data.clone()
+        buffer.data.to_vec()
     }
 
     fn codec_golden(hex: &str) -> Vec<u8> {
