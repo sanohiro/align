@@ -25,6 +25,8 @@ mod net_service_tests;
 mod http_pool_storage_tests;
 #[cfg(test)]
 mod http_batch_input_tests;
+#[cfg(test)]
+mod cli_usage_tests;
 use buffer_storage::BufferStorage;
 mod json_number;
 mod time_formats;
@@ -19954,6 +19956,47 @@ pub unsafe extern "C" fn align_rt_cli_get_str(parsed: *const CliParsed, name_ptr
     }
 }
 
+/// Share the exact usage rendering between byte counting and final-payload initialization.
+struct CliUsageSink<F>(F);
+
+impl<F: FnMut(&str) -> std::fmt::Result> std::fmt::Write for CliUsageSink<F> {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        (self.0)(text)
+    }
+}
+
+fn cli_usage_render(command: &CliCommand, out: &mut impl std::fmt::Write) -> std::fmt::Result {
+    writeln!(out, "usage: {} [flags]", command.name)?;
+    for flag in &command.flags {
+        write!(out, "  --{}", flag.name)?;
+        match &flag.default {
+            CliDefault::Bool => out.write_str("  (bool)\n")?,
+            CliDefault::Str(default) => writeln!(out, "  (str, default: {default})")?,
+            CliDefault::I64(default) => writeln!(out, "  (i64, default: {default})")?,
+        }
+    }
+    Ok(())
+}
+
+fn cli_usage_add_len(total: usize, part: usize) -> Option<usize> {
+    total.checked_add(part)
+        .filter(|&n| isize::try_from(n).is_ok() && i64::try_from(n).is_ok())
+}
+
+fn cli_usage_fill(command: &CliCommand, out: &mut [core::mem::MaybeUninit<u8>]) -> std::fmt::Result {
+    let mut offset = 0usize;
+    cli_usage_render(command, &mut CliUsageSink(|text: &str| {
+        let end = offset.checked_add(text.len()).ok_or(std::fmt::Error)?;
+        let destination = out.get_mut(offset..end).ok_or(std::fmt::Error)?;
+        for (slot, byte) in destination.iter_mut().zip(text.as_bytes()) {
+            slot.write(*byte);
+        }
+        offset = end;
+        Ok(())
+    }))?;
+    if offset == out.len() { Ok(()) } else { Err(std::fmt::Error) }
+}
+
 /// `c.usage()` — render `cmd`'s flag table into a fresh owned `string` `{ptr,len}` (freed by the
 /// bound local's `Drop` via `align_rt_free`). Null-`cmd` yields an empty string.
 ///
@@ -19965,28 +20008,20 @@ pub unsafe extern "C" fn align_rt_cli_usage(cmd: *const CliCommand) -> AlignStr 
         return AlignStr { ptr: core::ptr::null(), len: 0 };
     }
     let c = unsafe { &*cmd };
-    let mut s = String::new();
-    s.push_str("usage: ");
-    s.push_str(&c.name);
-    s.push_str(" [flags]\n");
-    for f in &c.flags {
-        s.push_str("  --");
-        s.push_str(&f.name);
-        match &f.default {
-            CliDefault::Bool => s.push_str("  (bool)\n"),
-            CliDefault::Str(d) => {
-                s.push_str("  (str, default: ");
-                s.push_str(d);
-                s.push_str(")\n");
-            }
-            CliDefault::I64(d) => {
-                s.push_str("  (i64, default: ");
-                s.push_str(&d.to_string());
-                s.push_str(")\n");
-            }
-        }
+    let mut len = 0;
+    if cli_usage_render(c, &mut CliUsageSink(|text: &str| {
+        len = cli_usage_add_len(len, text.len()).ok_or(std::fmt::Error)?;
+        Ok(())
+    })).is_err() {
+        align_rt_alloc_size_fail();
     }
-    owned_str_copy(s.as_bytes())
+    // SAFETY: both passes use the same immutable command and renderer. The fill helper checks
+    // every destination range and full initialization before the owned result can be published.
+    unsafe { owned_str_exact(len, |out| {
+        if cli_usage_fill(c, out).is_err() {
+            align_rt_alloc_size_fail();
+        }
+    }) }
 }
 
 /// Free a `cli command` (its flag table). Null-safe.
