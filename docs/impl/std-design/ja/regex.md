@@ -153,13 +153,14 @@ caps.group(i: i64)                   -> Option<regex_match>   // absent group = 
 1. **R1 `find_all`** — ランタイムが実体化する `array<regex_match>` を確立する
    （`lower_json_decode_struct_array` のテンプレートから `Result` を除いた形。out スロットが
    `{ptr, len}` を受け取り、`Load` して return）。ランタイム `align_rt_regex_find_all` は
-   `find_iter` を新しい `align_rt_alloc` バッファへ収集する。空結果は `{null, 0}`（`Drop` は
-   null 安全）。
+   `find_iter` を拡張可能な C alloc/realloc 系のバッファへ直接収集する。Rust の範囲ベクタと
+   最終コピーは不要。空結果は `{null, 0}`（`Drop` は null 安全）。
 2. **R2 `replace` / `replace_all`** — 独立。所有 `string` を `AlignStr` 経由で返す（`str_clone` /
    `PathJoin` の値返しの形）。常に所有バッファを実体化する（一致なしの `Cow::Borrowed` はクローン
    して返す）。
 3. **R3 `split`** — R1 と同じ表現・配線。ランタイムが一致を走査し、一致間の範囲を出力する。
-   先頭・末尾・内部の空フィールド、および空入力に対する 1 つの空フィールドも含む。
+   先頭・末尾・内部の空フィールドも含む。空入力では、パターンが一致しなければ空フィールド
+   1 つ、空一致があれば空フィールド 2 つを返す。
 4. **R4 `captures` + `group_count` + `group_index` + `caps.group`** — `Ty::Captures` /
    `Scalar::Captures` を追加し（すべての Move/drop の `matches!` 一覧、codegen の ptr 型 +
    デストラクタのアーム、すべての網羅的な HIR/MIR ウォークに通す）、`align_rt_regex_captures*`

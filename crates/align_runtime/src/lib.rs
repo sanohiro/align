@@ -43,6 +43,8 @@ mod decompression_frames_tests;
 mod base64_quantum_tests;
 #[cfg(test)]
 mod sample_permutation_tests;
+#[cfg(test)]
+mod regex_match_storage_tests;
 use buffer_storage::BufferStorage;
 mod json_number;
 mod time_formats;
@@ -9872,33 +9874,49 @@ pub struct AlignRegexMatch {
 }
 
 /// ABI layout of an owned `array<regex_match>` header (`{ptr, len}`) returned by `find_all`/`split`.
-/// The buffer is `len` contiguous [`AlignRegexMatch`] elements from [`align_rt_alloc`]; the generated
-/// `Drop` shallow-frees `ptr` (the elements are POD i64 pairs — no per-element free). Identical wire
-/// shape to [`AlignStr`]; a named type keeps the element pointer honest.
+/// The buffer is `len` initialized contiguous [`AlignRegexMatch`] elements in C alloc/realloc-family
+/// storage; generated `Drop` shallow-frees `ptr` (the elements are POD i64 pairs with no
+/// per-element free). Identical wire shape to [`AlignStr`]; a named type keeps the element pointer honest.
 #[repr(C)]
 pub struct AlignMatchArray {
     pub ptr: *mut AlignRegexMatch,
     pub len: i64,
 }
 
-/// Copy a match span vector into a fresh `align_rt_alloc` buffer and publish it through `out`. An
-/// empty vector owns no buffer (`{null, 0}`, `Drop`-safe). Shared by `find_all` and `split`.
-///
-/// # Safety
-/// `out` must point to writable storage for one [`AlignMatchArray`].
-unsafe fn publish_match_array(v: &[AlignRegexMatch], out: *mut AlignMatchArray) {
-    let count = v.len();
-    if count == 0 {
-        unsafe { out.write(AlignMatchArray { ptr: core::ptr::null_mut(), len: 0 }) };
-        return;
+/// Scoped heap-only builder. Its stack header never becomes an Align object; the payload
+/// transfers directly to the returned array and stays compatible with `align_rt_free`.
+struct RegexMatchOutput(ArrayBuilder);
+
+impl RegexMatchOutput {
+    fn new() -> Self {
+        Self(array_builder_value(regex_offset(core::mem::size_of::<AlignRegexMatch>())))
     }
-    let bytes = count
-        .checked_mul(core::mem::size_of::<AlignRegexMatch>())
-        .and_then(|b| i64::try_from(b).ok())
-        .unwrap_or_else(|| panic_abort("regex: result size overflow"));
-    let dst = align_rt_alloc(bytes) as *mut AlignRegexMatch;
-    unsafe { core::ptr::copy_nonoverlapping(v.as_ptr(), dst, count) };
-    unsafe { out.write(AlignMatchArray { ptr: dst, len: count as i64 }) };
+
+    fn push(&mut self, span: AlignRegexMatch) {
+        // This private builder is always heap-only. Checked reserve establishes cap * stride
+        // and C-malloc alignment; spare slots need no growth or arena dispatch. len < cap
+        // proves the typed offset and increment fit that allocation, including after growth.
+        if self.0.len == self.0.cap {
+            unsafe { self.0.reserve(1) };
+        }
+        let destination = unsafe { self.0.data.cast::<AlignRegexMatch>().add(self.0.len) };
+        unsafe { destination.write(span) };
+        self.0.len += 1;
+    }
+
+    fn finish(mut self) -> AlignMatchArray {
+        let len = regex_offset(self.0.len);
+        let ptr = core::mem::replace(&mut self.0.data, core::ptr::null_mut()).cast();
+        AlignMatchArray { ptr, len }
+    }
+}
+
+impl Drop for RegexMatchOutput {
+    fn drop(&mut self) {
+        if !self.0.data.is_null() {
+            unsafe { align_rt_free(self.0.data) };
+        }
+    }
 }
 
 /// Convert a byte offset to `i64`, aborting past `i64::MAX` (mirrors `align_rt_regex_find`).
@@ -10007,8 +10025,9 @@ pub unsafe extern "C" fn align_rt_regex_find(
 }
 
 /// Find every leftmost, non-overlapping match and materialize an owned `array<regex_match>` into
-/// `out`. Returns `0` always (a search over valid UTF-8 is total). Empty input or no match yields an
-/// empty array (`{null, 0}`). The Rust `find_iter` advances past empty matches by one character, so
+/// `out`. Returns `0` always (a search over valid UTF-8 is total). No match yields an
+/// empty array (`{null, 0}`); an empty-matching pattern may produce a span even on empty input.
+/// The Rust `find_iter` advances past empty matches by one character, so
 /// no infinite loop and every offset is a UTF-8 char boundary.
 ///
 /// # Safety
@@ -10031,19 +10050,24 @@ pub unsafe extern "C" fn align_rt_regex_find_all(
     let Some(text) = (unsafe { abi_str_view(text_ptr, text_len) }) else {
         return 0;
     };
-    let v: Vec<AlignRegexMatch> = unsafe { &*handle }
-        .inner
-        .find_iter(text)
-        .map(|m| AlignRegexMatch { start: regex_offset(m.start()), end: regex_offset(m.end()) })
-        .collect();
-    unsafe { publish_match_array(&v, out) };
+    let mut matches = unsafe { &*handle }.inner.find_iter(text);
+    let Some(first) = matches.next() else {
+        return 0;
+    };
+    let mut output = RegexMatchOutput::new();
+    output.push(AlignRegexMatch { start: regex_offset(first.start()), end: regex_offset(first.end()) });
+    for m in matches {
+        output.push(AlignRegexMatch { start: regex_offset(m.start()), end: regex_offset(m.end()) });
+    }
+    unsafe { out.write(output.finish()) };
     0
 }
 
 /// Split `text` around every leftmost, non-overlapping match and materialize the between-match field
 /// spans as an owned `array<regex_match>` into `out`. Returns `0` always. Mirrors Rust `Regex::split`:
-/// leading/trailing/interior empty fields are kept, empty input yields one empty field `[0, 0)`, and
-/// a pattern matching the whole string yields two empty fields. Each span is a `[start, end)` byte
+/// leading/trailing/interior empty fields are kept. No match over empty input yields one empty
+/// field `[0, 0)`; a pattern matching the whole string (including empty) yields two empty fields.
+/// Each span is a `[start, end)` byte
 /// range into `text`; the caller slices `text[p.start..p.end]`.
 ///
 /// # Safety
@@ -10068,14 +10092,14 @@ pub unsafe extern "C" fn align_rt_regex_split(
     };
     // Walk the match boundaries directly (Rust `split` yields substrings; we want the offsets).
     // `find_iter` handles empty-match advancement, so a zero-width delimiter cannot loop.
-    let mut v: Vec<AlignRegexMatch> = Vec::new();
+    let mut output = RegexMatchOutput::new();
     let mut last = 0usize;
     for m in unsafe { &*handle }.inner.find_iter(text) {
-        v.push(AlignRegexMatch { start: regex_offset(last), end: regex_offset(m.start()) });
+        output.push(AlignRegexMatch { start: regex_offset(last), end: regex_offset(m.start()) });
         last = m.end();
     }
-    v.push(AlignRegexMatch { start: regex_offset(last), end: regex_offset(text.len()) });
-    unsafe { publish_match_array(&v, out) };
+    output.push(AlignRegexMatch { start: regex_offset(last), end: regex_offset(text.len()) });
+    unsafe { out.write(output.finish()) };
     0
 }
 
