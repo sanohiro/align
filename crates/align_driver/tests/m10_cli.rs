@@ -177,11 +177,10 @@ pub fn main(args: array<str>) -> Result<(), Error> {
     // Force the Err path with an unknown flag; usage must still render on the borrowed command.
     let out = build_and_run_args("m10-cli-usage", prog, &["--bogus"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    let s = String::from_utf8_lossy(&out.stdout);
-    assert!(s.contains("usage: tool"), "usage header missing: {s}");
-    assert!(s.contains("--verbose"), "verbose flag missing: {s}");
-    assert!(s.contains("--name"), "name flag missing: {s}");
-    assert!(s.contains("--count"), "count flag missing: {s}");
+    assert_eq!(
+        out.stdout,
+        b"usage: tool [flags]\n  --verbose  (bool)\n  --name  (str, default: world)\n  --count  (i64, default: 3)\n"
+    );
 }
 
 /// `get_*` on an unregistered name aborts at runtime (a programmer error — no comptime check is
