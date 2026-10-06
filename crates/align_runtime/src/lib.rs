@@ -27,6 +27,8 @@ mod http_pool_storage_tests;
 mod http_batch_input_tests;
 #[cfg(test)]
 mod cli_usage_tests;
+#[cfg(test)]
+mod fs_read_tests;
 use buffer_storage::BufferStorage;
 mod json_number;
 mod time_formats;
@@ -369,60 +371,87 @@ pub unsafe extern "C" fn align_rt_fs_read_file(path: *const u8, path_len: i64, o
     let Some(path_str) = (unsafe { abi_str_view(path, path_len) }) else {
         return 1;
     };
-    use std::io::Read;
-    // Fast path: a regular file with a known nonzero length — allocate the owned buffer once and
-    // read straight into it, skipping the `std::fs::read` Vec and the second copy into the runtime
-    // allocator (~1.8× on a 128 MiB file; `work/io_perf_probe.rs`). Special / streaming files
-    // (length 0, `/proc`, pipes, char devices) and any file that shrinks or grows under us fall
-    // back to the copy path below — which re-opens by path, so a partial read here is harmless.
-    if let Ok((mut file, meta)) = std::fs::File::open(path_str).and_then(|f| f.metadata().map(|m| (f, m))) {
-        let flen = meta.len();
-        // Regular files only (`is_file`), nonzero length (skips empty / size-unknown special
-        // files). `isize::try_from` is the single guard that keeps the rest sound on every
-        // target: a positive `isize` fits both `usize` (the slice len) and `i64` (the alloc
-        // size) losslessly, and is `<= isize::MAX` so `from_raw_parts_mut` is not UB. A larger
-        // file (only reachable on a 32-bit target) just takes the fallback path.
-        if meta.is_file() && flen > 0
-            && let Ok(len_z) = isize::try_from(flen) {
-                let len_i = len_z as i64;
-                let len_u = len_z as usize;
-                let dst = align_rt_alloc(len_i);
-                let buf = unsafe { core::slice::from_raw_parts_mut(dst, len_u) };
-                // `read_exact` fills the whole buffer (a shorter file errors). On success one
-                // more read must hit EOF — otherwise the file grew past the snapshot and the
-                // buffer would silently truncate, so fall back. Any failure frees and falls back.
-                if file.read_exact(buf).is_ok() && matches!(file.read(&mut [0u8; 1]), Ok(0)) {
-                    // A `str`/`string` is always valid UTF-8 (draft §7/§12); binary content is read via
-                    // `reader.read(buffer)`. Invalid → `Error.Invalid` (no fallback: re-reading yields
-                    // the same bytes). `buf`'s borrow of `dst` ends here, so the free below is sound.
-                    if !validate_utf8(buf) {
-                        unsafe { align_rt_free(dst) };
-                        return AL_INVALID;
-                    }
-                    unsafe { *out = AlignStr { ptr: dst, len: len_i } };
-                    return 0;
-                }
-                unsafe { align_rt_free(dst) };
-            }
-    }
-    // Fallback (empty / special / changed file): read into a Vec, then copy into the owned buffer.
-    let data = match std::fs::read(path_str) {
-        Ok(d) => d,
+    let file = match std::fs::File::open(path_str) {
+        Ok(file) => file,
         Err(_) => return 1,
     };
-    // A `str`/`string` is always valid UTF-8 (draft §7/§12); reject binary content before it becomes
-    // a `str` (binary reads use `reader.read(buffer)`). `Error.Invalid` (== `AL_INVALID`).
-    if !validate_utf8(&data) {
-        return AL_INVALID;
+    // Metadata is only an optimization for owned reads. A failed query still reads the same
+    // opened file; reopening a FIFO would discard its sole writer and wait for another one.
+    let direct_len = file.metadata().ok().and_then(|meta| {
+        (meta.is_file() && meta.len() > 0)
+            .then(|| isize::try_from(meta.len()).ok().map(|len| len as usize))
+            .flatten()
+    });
+    match fs_read_owned(file, direct_len) {
+        Ok(value) => { unsafe { *out = value }; 0 }
+        Err(status) => status,
     }
-    let len = data.len() as i64;
-    // Copy into the runtime's own allocator so the generated `Drop` (which calls `free`) owns it.
-    let dst = align_rt_alloc(len);
-    if len > 0 {
-        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len()) };
+}
+
+/// Fill raw allocation storage without presenting uninitialized bytes to Rust's `Read` trait.
+///
+/// # Safety
+/// `dst` must be writable for `len` bytes, with `len <= isize::MAX`. The callback may not access
+/// outside its supplied extent. A returned count within that extent must name initialized bytes;
+/// an oversized count is rejected without inspecting storage.
+unsafe fn fs_read_exact_raw(
+    dst: *mut u8,
+    len: usize,
+    mut read_chunk: impl FnMut(*mut u8, usize) -> std::io::Result<usize>,
+) -> std::io::Result<()> {
+    let mut initialized = 0;
+    while initialized < len {
+        let remaining = len - initialized;
+        match read_chunk(unsafe { dst.add(initialized) }, remaining) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(count) if count <= remaining => initialized += count,
+            Ok(_) => return Err(std::io::ErrorKind::InvalidData.into()),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {},
+            Err(error) => return Err(error),
+        }
     }
-    unsafe { *out = AlignStr { ptr: dst, len } };
-    0
+    Ok(())
+}
+
+/// Read one acquired file, preserving its identity across direct-read fallback. `direct_len`
+/// is the admitted regular-file metadata snapshot, never a length for a streaming file.
+fn fs_read_owned(mut file: std::fs::File, direct_len: Option<usize>) -> Result<AlignStr, i32> {
+    use std::io::{Read, Seek};
+    use std::os::fd::AsRawFd;
+    if let Some(len) = direct_len {
+        let Ok(size) = isize::try_from(len) else { return Err(1) };
+        // Arm cleanup before any read or validation; only complete publication releases it.
+        struct Payload(*mut u8);
+        impl Drop for Payload {
+            fn drop(&mut self) { unsafe { align_rt_free(self.0) }; }
+        }
+        let payload = Payload(align_rt_alloc(size as i64));
+        let filled = unsafe { fs_read_exact_raw(payload.0, len, |dst, remaining| {
+            let count = read(file.as_raw_fd(), dst.cast(), remaining);
+            if count < 0 { Err(std::io::Error::last_os_error()) } else { Ok(count as usize) }
+        }) };
+        // The initialized one-byte probe detects growth beyond the metadata snapshot. Retry
+        // EINTR through read_exact; EOF means the directly filled payload is the complete file.
+        let at_eof = filled.is_ok()
+            && matches!(file.read_exact(&mut [0u8; 1]), Err(error)
+                if error.kind() == std::io::ErrorKind::UnexpectedEof);
+        if at_eof {
+            let bytes = if len == 0 { &[] } else {
+                unsafe { core::slice::from_raw_parts(payload.0, len) }
+            };
+            if !validate_utf8(bytes) { return Err(AL_INVALID); }
+            let value = AlignStr { ptr: payload.0, len: size as i64 };
+            core::mem::forget(payload);
+            return Ok(value);
+        }
+        // A changed regular file or read error must restart on this descriptor, not a path
+        // that may now refer to a different inode. Special files never enter this seek path.
+        file.rewind().map_err(|_| 1)?;
+    }
+    let mut data = Vec::new();
+    file.read_to_end(&mut data).map_err(|_| 1)?;
+    if !validate_utf8(&data) { return Err(AL_INVALID); }
+    Ok(owned_str_copy(&data))
 }
 
 /// `fs.write_file(path, data)` — create/truncate `path` (a `str` view) and write all of `data` (a
@@ -2065,7 +2094,7 @@ pub unsafe extern "C" fn align_rt_udp_recv_from(sock: *mut UdpSocket, buf: *mut 
     }
 }
 
-/// Read the whole file at `path` into a fresh **arena** allocation, writing a `{ptr,len}` view to
+/// Read the already-open file into a fresh **arena** allocation, writing a `{ptr,len}` view to
 /// `out` — the [`align_rt_fs_read_file_view`] / [`align_rt_fs_read_bytes_view`] fallback for special
 /// / zero-length files. Returns `0` or a mapped errno; an empty file yields `{null,0}`. Unlike
 /// `fs.read_file` (heap-owned, `Drop`-freed), this buffer is arena-owned (bulk-freed at arena end),
@@ -2076,16 +2105,17 @@ pub unsafe extern "C" fn align_rt_udp_recv_from(sock: *mut UdpSocket, buf: *mut 
 ///
 /// # Safety
 /// `arena` must be a valid arena handle; `out` must point to a writable `{ptr,len}` slot.
-unsafe fn read_file_view_into_arena(path: &str, arena: *mut Arena, out: *mut AlignStr, validate: bool) -> i32 {
+unsafe fn read_file_view_into_arena(mut file: std::fs::File, arena: *mut Arena, out: *mut AlignStr, validate: bool) -> i32 {
     // The sole current caller already guards this boundary, but keep the helper independently
     // null-safe so a future fallback path cannot turn a missing arena handle into UB.
     if arena.is_null() {
         return AL_INVALID;
     }
-    let data = match std::fs::read(path) {
-        Ok(d) => d,
-        Err(e) => return io_error_to_status(&e),
-    };
+    use std::io::Read;
+    let mut data = Vec::new();
+    if let Err(error) = file.read_to_end(&mut data) {
+        return io_error_to_status(&error);
+    }
     if data.is_empty() {
         return 0; // already {null,0}
     }
@@ -2178,10 +2208,9 @@ unsafe fn fs_read_view_impl(path: *const u8, path_len: i64, arena: *mut Arena, o
             // mmap failed (rare — e.g. a filesystem that can't map): fall through to the copy path.
         }
     // Fallback: read the true contents into arena memory (special files, /proc, zero-length, or a
-    // failed mmap). A directory errors here (`std::fs::read` on a dir → mapped errno). Re-reads by
-    // path, so dropping `file` first is fine.
-    drop(file);
-    unsafe { read_file_view_into_arena(path_str, arena, out, validate) }
+    // failed mmap). The same descriptor keeps a FIFO writer attached and preserves file identity
+    // if the path is replaced. Reading a directory still returns its mapped errno.
+    unsafe { read_file_view_into_arena(file, arena, out, validate) }
 }
 
 /// # Safety
