@@ -139,49 +139,99 @@ pub fn main() -> i32 {
   }
 }
 "#;
-    let files = [("main.align", main), ("helper.align", helper)];
-    let whole = build_exe_multi("environment-text-whole", &files, "main.align");
-    let units = build_per_unit_multi("environment-text-unit", &files, "main.align");
-    let encoded = align_interface::serialize(&units.unit("helper").summary);
-    let decoded = align_interface::deserialize(&encoded).expect("decode environment interface");
-    let named = |path: &str, args| align_interface::IType::Named {
-        path: path.to_owned(),
-        args,
-    };
-    let expected = named(
-        "Result",
-        vec![
-            named("Option", vec![named("string", Vec::new())]),
-            named("Error", Vec::new()),
-        ],
-    );
-    for name in ["read", "generic"] {
-        let function = decoded
-            .fns
-            .iter()
-            .find(|function| function.name == name)
-            .unwrap();
-        assert_eq!(
-            function.ret, expected,
-            "{name}: serialized nested owned result"
-        );
-    }
-    assert_eq!(align_interface::serialize(&decoded), encoded);
-    let objects = units.emit_objects(false);
-    let references: Vec<&std::path::Path> = objects.iter().map(|p| p.as_path()).collect();
-    let executable = units.dir.join("environment-text-unit");
-    link_objects(
-        &align_driver::CDriver::default(),
-        &references,
-        &executable,
-        &units.link_libs_union(),
-        Profile::Release,
-    )
-    .unwrap();
-    for binary in [&whole.exe, &executable] {
+    let stage = align_driver::ArtifactStage::temp("environment-text")
+        .expect("exclusive environment fixture");
+    std::fs::write(stage.path().join("helper.align"), helper).unwrap();
+    let entry = stage.path().join("main.align");
+    std::fs::write(&entry, main).unwrap();
+    for per_unit in [false, true] {
+        let mut sm = SourceMap::new();
+        let programs = if per_unit {
+            let walk = build_per_unit(&mut sm, entry.to_str().unwrap(), main);
+            assert!(
+                !walk.diags.has_errors(),
+                "{}",
+                align_driver::format_diagnostics(&sm, &walk.diags)
+            );
+            let encoded = align_interface::serialize(
+                &walk
+                    .units
+                    .iter()
+                    .find(|unit| unit.unit == "helper")
+                    .unwrap()
+                    .summary,
+            );
+            let decoded =
+                align_interface::deserialize(&encoded).expect("decode environment interface");
+            let named = |path: &str, args| align_interface::IType::Named {
+                path: path.to_owned(),
+                args,
+            };
+            let expected = named(
+                "Result",
+                vec![
+                    named("Option", vec![named("string", Vec::new())]),
+                    named("Error", Vec::new()),
+                ],
+            );
+            for name in ["read", "generic"] {
+                let function = decoded
+                    .fns
+                    .iter()
+                    .find(|function| function.name == name)
+                    .unwrap();
+                assert_eq!(
+                    function.ret, expected,
+                    "{name}: serialized nested owned result"
+                );
+            }
+            assert_eq!(align_interface::serialize(&decoded), encoded);
+            walk.units
+                .into_iter()
+                .map(|unit| unit.mir)
+                .collect::<Vec<_>>()
+        } else {
+            let checked = check(&mut sm, entry.to_str().unwrap(), main);
+            assert!(
+                !checked.diags.has_errors(),
+                "{}",
+                align_driver::format_diagnostics(&sm, &checked.diags)
+            );
+            vec![lower_to_mir(&checked.hir)]
+        };
+        let mut objects = Vec::new();
+        let mut libraries = Vec::new();
+        for (index, mir) in programs.iter().enumerate() {
+            let object = stage.path().join(format!("{per_unit}-{index}.o"));
+            emit_object_file(
+                mir,
+                &object,
+                BuildTarget::Baseline,
+                Profile::Release,
+                &[],
+                false,
+            )
+            .expect("environment codegen");
+            objects.push(object);
+            for library in &mir.link_libs {
+                if !libraries.contains(library) {
+                    libraries.push(library.clone());
+                }
+            }
+        }
+        let binary = stage.path().join(format!("environment-{per_unit}"));
+        let references: Vec<_> = objects.iter().map(|p| p.as_path()).collect();
+        link_objects(
+            &align_driver::CDriver::default(),
+            &references,
+            &binary,
+            &libraries,
+            Profile::Release,
+        )
+        .expect("environment link");
         let mut child = ChildOwner {
             child: Some(
-                std::process::Command::new(binary)
+                std::process::Command::new(&binary)
                     .env("ALIGN_ENV_TEXT_GOOD", "original日本語")
                     .env("ALIGN_ENV_TEXT_EMPTY", "")
                     .env("ALIGN_ENV_TEXT_BAD", OsStr::from_bytes(b"\xff\xc0"))
