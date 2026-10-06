@@ -35,6 +35,8 @@ mod env_tests;
 mod args_tests;
 #[cfg(test)]
 mod html_text_tests;
+#[cfg(test)]
+mod encoding_writes_tests;
 use buffer_storage::BufferStorage;
 mod json_number;
 mod time_formats;
@@ -13613,7 +13615,6 @@ fn percent_encode_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
 
 fn percent_encode_into_with_slash(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>], preserve_slash: bool) {
     const HEX: [u8; 16] = *b"0123456789ABCDEF";
-    assert_eq!(percent_encoded_len_with_slash(data, preserve_slash), Some(out.len()), "percent destination length mismatch");
     let mut o = 0;
     for &b in data {
         if is_unreserved(b) || (preserve_slash && b == b'/') {
@@ -13626,6 +13627,7 @@ fn percent_encode_into_with_slash(data: &[u8], out: &mut [core::mem::MaybeUninit
             o += 3;
         }
     }
+    assert_eq!(o, out.len(), "percent destination length mismatch");
 }
 
 /// Decode percent-escapes in `input`. A `%` must be followed by exactly two hex digits, else the
@@ -13679,7 +13681,6 @@ fn html_escaped_len(data: &[u8]) -> Option<usize> {
 
 /// Write `data` HTML-escaped into `out` (exactly [`html_escaped_len`] bytes).
 fn html_escape_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
-    assert_eq!(html_escaped_len(data), Some(out.len()), "html destination length mismatch");
     let mut o = 0;
     for &b in data {
         match html_entity(b) {
@@ -13695,6 +13696,7 @@ fn html_escape_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
             }
         }
     }
+    assert_eq!(o, out.len(), "html destination length mismatch");
 }
 
 /// `encoding.html_escape(data)` — replace `& < > " '` with their HTML entities so the result is safe
@@ -14063,7 +14065,6 @@ fn form_encoded_len(data: &[u8]) -> Option<usize> {
 /// every other non-unreserved byte becomes `%XX`.
 fn form_encode_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
     const HEX: [u8; 16] = *b"0123456789ABCDEF";
-    assert_eq!(form_encoded_len(data), Some(out.len()), "form destination length mismatch");
     let mut o = 0;
     for &b in data {
         if b == b' ' {
@@ -14079,6 +14080,7 @@ fn form_encode_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
             o += 3;
         }
     }
+    assert_eq!(o, out.len(), "form destination length mismatch");
 }
 
 /// Decode `application/x-www-form-urlencoded`: `+` is a space, `%XX` is a byte, everything else
