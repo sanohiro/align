@@ -12281,8 +12281,9 @@ fn request11_expr_kind_inventory_tripwire() {
         // FloatScope, BytesView, SliceAsBytes, and HttpServerMaxRequestBodyBytes are explicit in
         // validation, source-shape, replay and ownership. OsMemory adds one nullary
         // Copy Result family with explicit checked-HIR validation and no retained storage.
+        // BufferTryNew adds one explicit fallible owned-buffer construction family.
         variants,
-        352,
+        353,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }

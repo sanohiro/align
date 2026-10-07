@@ -2060,7 +2060,7 @@ mutations, the declaration golden and native exports close this boundary.
 Plan 85 adds `IoFileCreateExclusive` / `align_rt_io_file_create_exclusive` with
 A08 `i32(ptr path, i64 byte_len, ptr out_file)`, the existing conservative
 HostState effects and File shell/free provenance. At introduction, counts were 451 keyed,
-469 base, 478 alloc-count, 473 par-map-probe, 469 task-group-probe and 482 maximum.
+469 base, 476 alloc-count, 473 par-map-probe, 469 task-group-probe and 480 maximum.
 Null output rejects first; valid output is cleared before extent/capacity/text
 validation. Empty/invalid UTF-8/NUL paths reject before one native exclusive open,
 mode 0644 subject to umask. Success alone publishes the owned read/write fd.

@@ -71,8 +71,8 @@ impl Drop for ChildOwner {
     }
 }
 
-fn run(command: &mut std::process::Command) -> std::process::ExitStatus {
-    let mut owner = ChildOwner {
+fn spawn(command: &mut std::process::Command) -> ChildOwner {
+    ChildOwner {
         child: Some(
             command
                 .process_group(0)
@@ -81,12 +81,11 @@ fn run(command: &mut std::process::Command) -> std::process::ExitStatus {
                 .expect("spawn owner command"),
         ),
         deadline: Instant::now() + Duration::from_secs(30),
-    };
-    owner.wait()
+    }
 }
 
-fn build(stage: &align_driver::ArtifactStage, source: &str, per_unit: bool, name: &str) -> PathBuf {
-    let entry = stage.path().join("main.align");
+fn build(stage: &std::path::Path, source: &str, per_unit: bool, name: &str) -> PathBuf {
+    let entry = stage.join("main.align");
     std::fs::write(&entry, source).unwrap();
     let mut sm = SourceMap::new();
     let programs = if per_unit {
@@ -114,11 +113,11 @@ fn build(stage: &align_driver::ArtifactStage, source: &str, per_unit: bool, name
         );
         vec![lower_to_mir(&checked.hir)]
     };
-    let mut objects = vec![stage.path().join("probe.o")];
+    let mut objects = vec![stage.join("probe.o")];
     let mut libraries = Vec::new();
     let llc = align_driver::llvm_tool("llc").expect("matched LLVM llc");
     for (index, mir) in programs.iter().enumerate() {
-        let object = stage.path().join(format!("{name}-{index}.o"));
+        let object = stage.join(format!("{name}-{index}.o"));
         // Count generated ownership transitions while delegating to the real runtime. The C
         // ledger rejects duplicate frees before they reach the allocator and checks leaks at exit.
         let ir = emit_llvm_ir(
@@ -133,15 +132,17 @@ fn build(stage: &align_driver::ArtifactStage, source: &str, per_unit: bool, name
         .replace("@align_rt_buffer_try_new(", "@probe_buffer_try_new(")
         .replace("@align_rt_buffer_try_filled(", "@probe_buffer_try_filled(")
         .replace("@align_rt_buffer_free(", "@probe_buffer_free(");
-        let input = stage.path().join(format!("{name}-{index}.ll"));
+        let input = stage.join(format!("{name}-{index}.ll"));
         std::fs::write(&input, ir).unwrap();
         assert!(
-            run(std::process::Command::new(&llc)
+            std::process::Command::new(&llc)
                 .args(["-filetype=obj", "-relocation-model=pic"])
                 .arg(input)
                 .arg("-o")
-                .arg(&object))
-            .success()
+                .arg(&object)
+                .status()
+                .unwrap()
+                .success()
         );
         objects.push(object);
         for library in &mir.link_libs {
@@ -150,7 +151,7 @@ fn build(stage: &align_driver::ArtifactStage, source: &str, per_unit: bool, name
             }
         }
     }
-    let executable = stage.path().join(name);
+    let executable = stage.join(name);
     let refs = objects
         .iter()
         .map(|path| path.as_path())
@@ -168,9 +169,28 @@ fn build(stage: &align_driver::ArtifactStage, source: &str, per_unit: bool, name
 
 #[test]
 fn fallible_buffer_whole_unit_control_and_cleanup() {
-    assert!(backend_available() && cc_available());
+    const CHILD_STAGE: &str = "ALIGN_FALLIBLE_BUFFER_STAGE";
+    if let Some(path) = std::env::var_os(CHILD_STAGE) {
+        control_and_cleanup(std::path::Path::new(&path));
+        return;
+    }
     let stage = align_driver::ArtifactStage::temp("fallible-buffer").unwrap();
-    std::fs::write(stage.path().join("probe.c"), r#"
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "fallible_buffer_whole_unit_control_and_cleanup",
+            "--nocapture",
+        ])
+        .env(CHILD_STAGE, stage.path());
+    // One parent-owned deadline covers every transitive tool probe, link and execution.
+    // Descendants inherit this child's process group; none starts a separate group.
+    assert!(spawn(&mut command).wait().success());
+}
+
+fn control_and_cleanup(stage: &std::path::Path) {
+    assert!(backend_available() && cc_available());
+    std::fs::write(stage.join("probe.c"), r#"
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -219,14 +239,16 @@ int64_t align_buffer_mark(int64_t value) { order = order * 10 + value; return va
 int64_t align_buffer_order(void) { return order; }
 "#).unwrap();
     assert!(
-        run(std::process::Command::new("cc")
+        std::process::Command::new("cc")
             .arg("-c")
-            .arg(stage.path().join("probe.c"))
+            .arg(stage.join("probe.c"))
             .arg("-o")
-            .arg(stage.path().join("probe.o")))
-        .success()
+            .arg(stage.join("probe.o"))
+            .status()
+            .unwrap()
+            .success()
     );
-    std::fs::write(stage.path().join("helper.align"), r#"module helper
+    std::fs::write(stage.join("helper.align"), r#"module helper
 pub fn make<T>(marker: T, alignment: i64) -> Result<buffer, Error> = buffer.try_new(3, alignment)
 pub fn result(alignment: i64) -> Result<buffer, Error> = buffer.try_filled(3, 7, alignment)
 pub fn keep(value: buffer) -> buffer = value
@@ -294,13 +316,16 @@ fn main() -> Result<(), Error> {
 "#;
     for per_unit in [false, true] {
         let executable = build(
-            &stage,
+            stage,
             source,
             per_unit,
             if per_unit { "unit" } else { "whole" },
         );
         assert!(
-            run(&mut std::process::Command::new(executable)).success(),
+            std::process::Command::new(executable)
+                .status()
+                .unwrap()
+                .success(),
             "unit={per_unit}"
         );
     }
@@ -427,4 +452,110 @@ fn fallible_buffer_cache_identity() {
         }
         snapshots.push(snapshot);
     }
+}
+
+#[test]
+#[ignore = "invoked only by the bounded subprocess cleanup owner"]
+fn fallible_buffer_stalled_helper() {
+    match std::env::var("ALIGN_FALLIBLE_BUFFER_STALL")
+        .unwrap()
+        .as_str()
+    {
+        "probe" => {
+            cc_available();
+            panic!("stalled cc probe unexpectedly returned");
+        }
+        "helper" => {
+            let socket = std::env::var_os("ALIGN_FALLIBLE_BUFFER_SOCKET").unwrap();
+            let _connection = std::os::unix::net::UnixStream::connect(socket).unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        _ => panic!("unknown helper mode"),
+    }
+}
+
+#[test]
+fn fallible_buffer_stalled_helper_cleanup() {
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+    // Darwin Unix sockets cannot use its long ambient TMPDIR path.
+    let stage =
+        align_driver::ArtifactStage::in_dir(std::path::Path::new("/tmp"), "fb-stall").unwrap();
+    let path = stage.path().to_path_buf();
+    let socket = path.join("socket");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let cc = path.join("cc");
+    std::fs::write(&cc, "#!/bin/sh\nexport ALIGN_FALLIBLE_BUFFER_STALL=helper\nexec \"$ALIGN_FALLIBLE_BUFFER_TEST\" --exact fallible_buffer_stalled_helper --ignored --nocapture\n").unwrap();
+    std::fs::set_permissions(&cc, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let executable = std::env::current_exe().unwrap();
+    let mut command = std::process::Command::new(&executable);
+    command
+        .args([
+            "--exact",
+            "fallible_buffer_stalled_helper",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("ALIGN_FALLIBLE_BUFFER_STALL", "probe")
+        .env("ALIGN_FALLIBLE_BUFFER_SOCKET", &socket)
+        .env("ALIGN_FALLIBLE_BUFFER_TEST", &executable)
+        .env("PATH", &path);
+    let mut owner = spawn(&mut command);
+    let pid = i32::try_from(owner.child.as_ref().unwrap().id()).unwrap();
+    let (mut connection, _) = loop {
+        owner.tick();
+        match listener.accept() {
+            Ok(connection) => break connection,
+            Err(error)
+                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
+            Err(error) => panic!("stalled-helper barrier: {error}"),
+        }
+    };
+    // The actual cc_available descendant is now blocked. Exhaust only the work budget,
+    // retaining the same five-second cleanup reserve used by normal fixture execution.
+    owner.deadline = Instant::now() + Duration::from_secs(5);
+    let timed_out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || owner.wait()));
+    assert!(
+        timed_out.is_err(),
+        "stalled helper must hit the local deadline"
+    );
+    connection.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut byte = [0];
+    let read = loop {
+        assert!(
+            Instant::now() < deadline,
+            "stalled descendant retained its socket"
+        );
+        match connection.read(&mut byte) {
+            Err(error)
+                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) =>
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            result => break result.unwrap(),
+        }
+    };
+    assert_eq!(
+        read, 0,
+        "descendant must release its live socket after group cleanup"
+    );
+    assert_eq!(
+        unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+    drop(connection);
+    drop(listener);
+    drop(stage);
+    assert!(
+        !path.exists(),
+        "parent must remove artifacts after child cleanup"
+    );
 }
