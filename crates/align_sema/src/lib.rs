@@ -19685,6 +19685,9 @@ std::thread_local! {
     // Legacy terminal probing and actual skipped/probed block counts for the differential owner.
     static ESCAPE_TERMINAL_PROBE_TEST: std::cell::Cell<(bool, usize, usize)> =
         const { std::cell::Cell::new((false, 0, 0)) };
+    // Legacy retained inputs and actual empty/completed input retirements, isolated per owner.
+    static ESCAPE_REPLAY_RETIREMENT_TEST: std::cell::Cell<(bool, usize, usize)> =
+        const { std::cell::Cell::new((false, 0, 0)) };
 }
 
 /// One compact checked-HIR control-flow graph for escape provenance. Syntax traversal only builds
@@ -19701,6 +19704,29 @@ struct EscapeFlowCfg<'a> {
 struct EscapeFlowBlock<'a> {
     ops: Vec<EscapeFlowOp<'a>>,
     successors: Vec<EscapeFlowBlockId>,
+}
+
+impl EscapeFlowBlock<'_> {
+    fn retire_replayed_input(&self, input: &mut Option<EscapeState>, completed_ops: usize) {
+        #[cfg(test)]
+        if ESCAPE_REPLAY_RETIREMENT_TEST.with(|mode| mode.get().0) {
+            return;
+        }
+        // push_flow_op appends each block's indices in order, even across interleaved blocks.
+        if completed_ops == self.ops.len() {
+            #[cfg(test)]
+            let was_live = input.is_some();
+            *input = None;
+            #[cfg(test)]
+            if was_live && input.is_none() {
+                ESCAPE_REPLAY_RETIREMENT_TEST.with(|mode| {
+                    let (legacy, empty, completed) = mode.get();
+                    mode.set((legacy, empty + usize::from(completed_ops == 0),
+                        completed + usize::from(completed_ops != 0)));
+                });
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -20496,12 +20522,16 @@ impl<'a> EscapeCheck<'a> {
 
         std::mem::swap(self.diags, &mut sink);
         let mut emit_states = inputs;
+        for (state, block) in emit_states.iter_mut().zip(&self.flow.blocks) {
+            block.retire_replayed_input(state, 0);
+        }
         for (block, index) in self.flow.replay_order.clone() {
             let Some(state) = &mut emit_states[block] else {
                 continue;
             };
             let op = self.flow.blocks[block].ops[index].clone();
             self.apply_flow_op(op, state, storage_provenance);
+            self.flow.blocks[block].retire_replayed_input(&mut emit_states[block], index + 1);
         }
     }
 
@@ -82061,14 +82091,60 @@ fn main() -> i32 = 0
     }
 
     #[test]
+    fn escape_replay_inputs_release_only_after_last_use() {
+        use std::sync::Arc;
+        let blocks = [0, 3, 1, 2, 1].map(|count| EscapeFlowBlock {
+            ops: (0..count).map(EscapeFlowOp::ExpressionStart).collect(),
+            successors: Vec::new(),
+        });
+        let mut inputs = (0..5).map(|_| {
+            let mut state = EscapeState::default();
+            state.completed_expressions.insert(7, EscapeArgumentSnapshot::fail_closed());
+            Some(state)
+        }).collect::<Vec<_>>();
+        let payloads = inputs.iter().map(|input| {
+            Arc::downgrade(input.as_ref().unwrap().completed_expressions.values.get(&7).unwrap())
+        }).collect::<Vec<_>>();
+        // A distinct saved state must keep shared payloads alive after this input retires.
+        let retained = inputs[3].clone();
+        inputs[4] = None; // unreachable
+        let counts = || payloads.iter().map(std::sync::Weak::strong_count).collect::<Vec<_>>();
+        assert_eq!(counts(), [1, 1, 1, 2, 0]);
+        for (block, input) in blocks.iter().zip(&mut inputs) {
+            block.retire_replayed_input(input, 0);
+        }
+        assert_eq!(counts(), [0, 1, 1, 2, 0], "only the empty block may retire before replay");
+        let replay = [
+            (1, 0, [0, 1, 1, 2, 0]),
+            (3, 0, [0, 1, 1, 2, 0]),
+            (4, 0, [0, 1, 1, 2, 0]),
+            (1, 1, [0, 1, 1, 2, 0]),
+            (2, 0, [0, 1, 0, 2, 0]),
+            (3, 1, [0, 1, 0, 1, 0]),
+            (1, 2, [0, 0, 0, 1, 0]),
+        ];
+        for (block, index, expected) in replay {
+            if inputs[block].is_some() {
+                blocks[block].retire_replayed_input(&mut inputs[block], index + 1);
+            }
+            assert_eq!(counts(), expected, "block {block}, operation {index}");
+        }
+        assert!(inputs.iter().all(Option::is_none));
+        drop(retained);
+        assert_eq!(counts(), [0; 5], "the separate saved owner releases the shared payload last");
+    }
+
+    #[test]
     fn escape_flow_terminal_replay_preserves_metadata_and_diagnostics() {
-        struct Reset((bool, usize, usize));
+        struct Reset((bool, usize, usize), (bool, usize, usize));
         impl Drop for Reset {
             fn drop(&mut self) {
                 ESCAPE_TERMINAL_PROBE_TEST.with(|mode| mode.set(self.0));
+                ESCAPE_REPLAY_RETIREMENT_TEST.with(|mode| mode.set(self.1));
             }
         }
-        let _reset = Reset(ESCAPE_TERMINAL_PROBE_TEST.with(|mode| mode.get()));
+        let _reset = Reset(ESCAPE_TERMINAL_PROBE_TEST.with(|mode| mode.get()),
+            ESCAPE_REPLAY_RETIREMENT_TEST.with(|mode| mode.get()));
         let cases = [
             ("empty", "fn main() {}\n", true),
             (
@@ -82167,12 +82243,23 @@ fn main() -> i32 = 0
             ),
         ];
         let mut owned_cases = 0;
+        let mut retired_empty = 0;
+        let mut retired_completed = 0;
         for (name, source, accepted) in cases {
+            ESCAPE_REPLAY_RETIREMENT_TEST.with(|mode| mode.set((true, 0, 0)));
             ESCAPE_TERMINAL_PROBE_TEST.with(|mode| mode.set((true, 0, 0)));
             let (legacy, legacy_diagnostics) = check(source);
             let (_, legacy_skipped, legacy_probed) = ESCAPE_TERMINAL_PROBE_TEST.with(|mode| mode.get());
             ESCAPE_TERMINAL_PROBE_TEST.with(|mode| mode.set((false, 0, 0)));
+            let (retained, retained_diagnostics) = check(source);
+            assert_eq!(ESCAPE_REPLAY_RETIREMENT_TEST.with(|mode| mode.get()), (true, 0, 0));
+            ESCAPE_REPLAY_RETIREMENT_TEST.with(|mode| mode.set((false, 0, 0)));
+            ESCAPE_TERMINAL_PROBE_TEST.with(|mode| mode.set((false, 0, 0)));
             let (candidate, candidate_diagnostics) = check(source);
+            let (_, empty, completed) = ESCAPE_REPLAY_RETIREMENT_TEST.with(|mode| mode.get());
+            assert!(empty + completed > 0, "{name}: no actual input retired");
+            retired_empty += empty;
+            retired_completed += completed;
             let (_, candidate_skipped, candidate_probed) =
                 ESCAPE_TERMINAL_PROBE_TEST.with(|mode| mode.get());
             let messages = |diagnostics: &Diagnostics| {
@@ -82202,6 +82289,10 @@ fn main() -> i32 = 0
                 body_analysis_facts_equal(&legacy, &candidate),
                 "{name}: complete published body facts, assignment flags or Drop metadata changed",
             );
+            assert_eq!(messages(&candidate_diagnostics), messages(&retained_diagnostics),
+                "{name}: input retirement changed diagnostic order, spans or messages");
+            assert!(body_analysis_facts_equal(&retained, &candidate),
+                "{name}: input retirement changed published facts, assignment flags or Drop metadata");
             assert_eq!(legacy_skipped, 0, "{name}: legacy mode skipped work");
             assert!(legacy_probed > 0, "{name}: fixture never probed a terminal");
             assert!(
@@ -82218,6 +82309,8 @@ fn main() -> i32 = 0
             owned_cases >= 4,
             "metadata parity must exercise real owned values"
         );
+        assert!(retired_empty > 0 && retired_completed > 0,
+            "real replay must exercise both empty and completed input retirement");
     }
 
     #[test]
