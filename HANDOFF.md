@@ -24,14 +24,14 @@ LLVM owners qualify it. Plan138 supplies the ARM64 Linux/macOS sibling ABI;
 plan137 supplies non-owning raw fields and padding/register separation. Bool/char
 FFI, consumer adoption and K1/plan61 remain deferred.
 
-Build-performance items15–18 remove both generation-formation table copies
+Build-performance items15–19 remove both generation-formation table copies
 through complete prevalidation and direct commit, preserve unaffected generation
-leaf collections, and skip empty generation-ending propagation after directory
-updates. Exact collision/error ordering, late-invalid atomicity, fresh/old
-payloads, non-Clone Drop and actual allocation-identity owners qualify the
-boundaries. Item18's local 512-array checks improve another 1.42x/1.42x
-(straight-line whole/per-unit) and 1.69x/1.69x (loop whole/per-unit), with identical
-MIR, LLVM, checked-work outputs and diagnostics.
+leaf collections, skip empty generation-ending propagation after directory
+updates, and retain terminal escape blocks for final replay without duplicate
+fixpoint probes. Exact-state/allocation owners and old/new body-fact, cleanup and
+diagnostic comparisons qualify the boundaries. Item19's local 512-value match
+checks improve another 1.09x/1.10x (whole/per-unit), and straight fixed-array
+checks improve 1.17x/1.11x, with identical MIR, LLVM, checked-work and diagnostics.
 Earlier items11–14 reduce escape-state copies, empty exceptional-region work,
 edge propagation and unrelated generation-table updates. Other fact/state copies
 and repeated traversals remain superlinear; Request37 consumer acceptance and

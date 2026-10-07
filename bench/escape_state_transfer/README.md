@@ -1,6 +1,6 @@
 # Compiler check-time scaling measurement
 
-This local benchmark owns plan 21 items 11–18 checking measurements. It
+This local benchmark owns plan 21 items 11–19 checking measurements. It
 compares release compiler binaries on the same generated straight arithmetic,
 Result `?`, and Result `match` chains inside a loop. Each case uses 16, 128 or
 512 values. `--corpus storage` selects fixed-array declarations in straight-line
@@ -240,3 +240,27 @@ their prior behavior. The guard avoids whole-state reconstruction when the
 already-collected historical roots are empty. Other state/fact copies and
 repeated traversals remain superlinear; these measurements do not establish a
 whole-client budget or change runtime allocation policy.
+
+## Item 19 result (2026-10-07)
+
+The same host/profile compares merged
+`03922e10e7161ac4bc058f4b1523e31165312fc9` with terminal escape-flow probes
+skipped while retaining every input and the complete source-order replay.
+No build/test jobs overlap measurement; `DYLD_SHARED_REGION` is unset for both
+binaries. Numeric and storage corpora run with `--llvm-parity`. [Full samples and hashes](results-terminal-probes-macos.json)
+retain 30 cells with five alternating samples after warmup.
+
+| 512-value shape | Command | Baseline median | Candidate median | Ratio |
+| --- | --- | ---: | ---: | ---: |
+| Result match | check | 1.025 s | 0.943 s | 1.09x |
+| Result match | per-unit check | 1.936 s | 1.766 s | 1.10x |
+| Straight fixed arrays | check | 0.150 s | 0.128 s | 1.17x |
+| Straight fixed arrays | per-unit check | 0.308 s | 0.277 s | 1.11x |
+
+All 15 source MIR/LLVM pairs, checked-work outputs and rejected diagnostics
+match. All 16-value medians remain within 1 ms. Straight/try numeric and loop
+array control differences remain below 8 ms. The differential semantic owner
+compares complete published body facts, cleanup metadata and ordered diagnostics
+against the original terminal-probing algorithm; a disabled-skip mutation must
+fail its actual probe-count assertion. Nonterminal state copies and repeated
+traversals remain superlinear; no whole-client time budget is established.

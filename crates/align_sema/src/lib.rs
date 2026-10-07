@@ -19562,6 +19562,13 @@ fn seed_escape_parameter_storage(
 
 type EscapeFlowBlockId = usize;
 
+#[cfg(test)]
+std::thread_local! {
+    // Legacy terminal probing and actual skipped/probed block counts for the differential owner.
+    static ESCAPE_TERMINAL_PROBE_TEST: std::cell::Cell<(bool, usize, usize)> =
+        const { std::cell::Cell::new((false, 0, 0)) };
+}
+
 /// One compact checked-HIR control-flow graph for escape provenance. Syntax traversal only builds
 /// these blocks and edges; the worklist below is the single place that joins paths and computes
 /// loop fixpoints. Keeping transfers as references to already-checked HIR avoids a second IR while
@@ -20326,9 +20333,33 @@ impl<'a> EscapeCheck<'a> {
 
         while let Some(block) = worklist.pop_front() {
             pending[block] = false;
+            // A terminal block cannot change another input. Keep its joined input for the
+            // source-order replay, which still emits diagnostics and final cleanup metadata.
+            let terminal = self.flow.blocks[block].successors.is_empty();
+            if terminal {
+                #[cfg(test)]
+                let probe_terminal = ESCAPE_TERMINAL_PROBE_TEST.with(|mode| mode.get().0);
+                #[cfg(not(test))]
+                let probe_terminal = false;
+                if !probe_terminal {
+                    #[cfg(test)]
+                    ESCAPE_TERMINAL_PROBE_TEST.with(|mode| {
+                        let (legacy, skipped, probed) = mode.get();
+                        mode.set((legacy, skipped + 1, probed));
+                    });
+                    continue;
+                }
+            }
             let Some(mut state) = inputs[block].clone() else {
                 continue;
             };
+            #[cfg(test)]
+            if terminal {
+                ESCAPE_TERMINAL_PROBE_TEST.with(|mode| {
+                    let (legacy, skipped, probed) = mode.get();
+                    mode.set((legacy, skipped, probed + 1));
+                });
+            }
             let ops = self.flow.blocks[block].ops.clone();
             let successors = self.flow.blocks[block].successors.clone();
             for op in ops {
@@ -81406,6 +81437,166 @@ fn main() -> i32 = 0
             current.storage_completed_expressions.get(&7).unwrap() as *const EscapeValueFact,
             value_address,
             "an untouched fact must retain its allocation across changed and unchanged joins"
+        );
+    }
+
+    #[test]
+    fn escape_flow_terminal_replay_preserves_metadata_and_diagnostics() {
+        struct Reset((bool, usize, usize));
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                ESCAPE_TERMINAL_PROBE_TEST.with(|mode| mode.set(self.0));
+            }
+        }
+        let _reset = Reset(ESCAPE_TERMINAL_PROBE_TEST.with(|mode| mode.get()));
+        let cases = [
+            ("empty", "fn main() {}\n", true),
+            (
+                "replacement-return",
+                concat!(
+                    "fn choose(flag: bool) -> string {\n",
+                    "  mut text := \"initial\".clone()\n",
+                    "  if flag { text = \"changed\".clone()\n    return text }\n",
+                    "  return \"other\".clone()\n}\n",
+                    "fn main() { print(choose(true)) }\n",
+                ),
+                true,
+            ),
+            (
+                "match-loop",
+                concat!(
+                    "fn make(flag: bool) -> Result<string, Error> {\n",
+                    "  if flag { return Ok(\"item\".clone()) }\n",
+                    "  return Err(Error.Invalid)\n}\n",
+                    "fn collect(flag: bool) -> Result<string, Error> {\n",
+                    "  mut text := \"initial\".clone()\n  mut turn := 0\n",
+                    "  loop {\n    if turn == 2 { break }\n",
+                    "    next := match make(flag) {\n",
+                    "      Ok(value) => { value }, Err(error) => { return Err(error) }\n",
+                    "    }\n    text = next\n    turn = turn + 1\n  }\n",
+                    "  return Ok(text)\n}\n",
+                    "fn main() { text := collect(true) else { return }\n  print(text) }\n",
+                ),
+                true,
+            ),
+            (
+                "try-map-else",
+                concat!(
+                    "fn make(flag: bool) -> Result<string, Error> {\n",
+                    "  if flag { return Ok(\"item\".clone()) }\n",
+                    "  return Err(Error.Invalid)\n}\n",
+                    "fn collect(flag: bool) -> Result<string, Error> {\n",
+                    "  first := make(flag).map_err(fn error: Error { error })?\n",
+                    "  second := make(flag) else { return Ok(first) }\n",
+                    "  return Ok(second)\n}\n",
+                    "fn main() { text := collect(true) else { return }\n  print(text) }\n",
+                ),
+                true,
+            ),
+            (
+                "arena-return",
+                concat!(
+                    "fn count(flag: bool) -> i64 {\n",
+                    "  arena out {\n    text := \"regional\".clone_in(out)\n",
+                    "    if flag { return text.len() }\n    print(text)\n  }\n",
+                    "  text := \"individual\".clone()\n  return text.len()\n}\n",
+                    "fn main() { print(count(true)) }\n",
+                ),
+                true,
+            ),
+            (
+                "terminal-builder",
+                concat!(
+                    "fn count(flag: bool) -> i64 {\n",
+                    "  mut values: array_builder<i64> := array_builder()\n",
+                    "  values.push(3)\n",
+                    "  if flag { built := values.build()\n    return built.len() }\n",
+                    "  return 0\n}\nfn main() { print(count(true)) }\n",
+                ),
+                true,
+            ),
+            (
+                "nested-terminal-owned-record",
+                concat!(
+                    "Item { text: string, code: i64 }\n",
+                    "fn count(flag: bool) -> i64 {\n",
+                    "  if flag {\n    item := Item { text: \"owned\".clone(), code: 4 }\n",
+                    "    if item.code == 4 { return item.text.len() }\n",
+                    "    return item.code\n  }\n  return 0\n}\n",
+                    "fn main() { print(count(true)) }\n",
+                ),
+                true,
+            ),
+            (
+                "terminal-local-view",
+                concat!(
+                    "fn bad(flag: bool) -> str {\n",
+                    "  if flag { owner := \"short\".clone()\n    return owner }\n",
+                    "  return \"static\"\n}\nfn main() {}\n",
+                ),
+                false,
+            ),
+            (
+                "terminal-arena-return",
+                concat!(
+                    "fn bad() -> string {\n  arena out {\n",
+                    "    text := \"short\".clone_in(out)\n    return text\n  }\n}\n",
+                    "fn main() {}\n",
+                ),
+                false,
+            ),
+        ];
+        let mut owned_cases = 0;
+        for (name, source, accepted) in cases {
+            ESCAPE_TERMINAL_PROBE_TEST.with(|mode| mode.set((true, 0, 0)));
+            let (legacy, legacy_diagnostics) = check(source);
+            let (_, legacy_skipped, legacy_probed) = ESCAPE_TERMINAL_PROBE_TEST.with(|mode| mode.get());
+            ESCAPE_TERMINAL_PROBE_TEST.with(|mode| mode.set((false, 0, 0)));
+            let (candidate, candidate_diagnostics) = check(source);
+            let (_, candidate_skipped, candidate_probed) =
+                ESCAPE_TERMINAL_PROBE_TEST.with(|mode| mode.get());
+            let messages = |diagnostics: &Diagnostics| {
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| {
+                        (
+                            diagnostic.severity,
+                            diagnostic.span,
+                            diagnostic.message.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                !candidate_diagnostics.has_errors(),
+                accepted,
+                "{name}: {:?}",
+                messages(&candidate_diagnostics),
+            );
+            assert_eq!(
+                messages(&candidate_diagnostics),
+                messages(&legacy_diagnostics),
+                "{name}: diagnostic order, spans or messages changed",
+            );
+            assert!(
+                body_analysis_facts_equal(&legacy, &candidate),
+                "{name}: complete published body facts, assignment flags or Drop metadata changed",
+            );
+            assert_eq!(legacy_skipped, 0, "{name}: legacy mode skipped work");
+            assert!(legacy_probed > 0, "{name}: fixture never probed a terminal");
+            assert!(
+                candidate_skipped > 0,
+                "{name}: fixture never skipped a terminal"
+            );
+            assert_eq!(candidate_probed, 0, "{name}: terminal was probed again");
+            owned_cases += usize::from(candidate.fns.iter().any(|function| {
+                !function.drop_individual_locals.is_empty()
+                    && !function.drop_individual_exprs.is_empty()
+            }));
+        }
+        assert!(
+            owned_cases >= 4,
+            "metadata parity must exercise real owned values"
         );
     }
 

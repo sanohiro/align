@@ -3216,3 +3216,50 @@ control median differences stay below 6 ms; all 16-value controls stay within
 2 ms. The benchmark README and `results-empty-retirement-macos.json` retain
 samples and hashes. Nonempty propagation, other copies and repeated traversals
 remain; consumer acceptance and near-linear scaling are not established.
+
+## Item 19: terminal escape-flow probes
+
+A bounded release profile of 1,024 Result-match expressions still attributes
+substantial checking work to `solve_flow` input-state cloning. A reachable block
+with no successors cannot contribute a state to the fixpoint. Its fixed input
+must remain available for the existing source-order diagnostic replay, which
+also derives final cleanup metadata. Skip only that block's
+probe transfer and clone, while retaining its incoming joins and complete replay.
+
+Transfer writes outside EscapeState are declaration depth, declaration Drop
+maps, expression Drop facts and assignment cleanup cells. Only declaration depth
+is read during transfer; its function-unique declaration dominates any reachable
+use, so a terminal declaration cannot feed another block. Drop maps/cells finish
+under the same replay. Expression facts accumulate a conjunction of must-own
+observations; final joined inputs subsume earlier inputs under the existing
+region/must-own lattice. The differential owner compares every published body
+fact, including these metadata and ordered diagnostics, with terminal probing
+enabled. Do not prune facts,
+change successor edges, suppress reachable diagnostics or alter a loop join.
+K1/plan61 and consumer acceptance remain deferred.
+
+| Closure axis | Implementation and owner |
+| --- | --- |
+| Reachability and convergence | Preserve every incoming state, successor join, worklist order and pending transition. Only a block with an empty successor list skips the probe. Nonempty edges, including backedges and self-edges, use the existing algorithm. Compare complete checked HIR and ordered diagnostics against the original algorithm on branch/loop/return/divergence fixtures. |
+| Metadata and lifecycle | Inventory all transfer writes outside EscapeState and every reader. Compare exact declaration/local Drop facts and expression cleanup cells for heap/arena, mixed ownership, match bindings, early returns, error propagation and terminal calls. Source construction, move-in/out, nulling, Drop, replacement and return stay unchanged. |
+| One-shot replay | Retain terminal inputs until the same replay-order walk and execute every reachable terminal operation there. Reuse lifetime/return-error owners, including invalid early-return paths and divergent siblings. A test-only probe counter must distinguish the removed duplicate work without changing production state. |
+| Analysis boundaries | No public type, IR variant, summary/interface/ABI or runtime allocation changes. Reuse storage-generation, generic/imported whole/per-unit, builder/region/return provenance owners. Baseline/candidate checked-HIR and MIR/LLVM/diagnostic parity cover the control-path shape. |
+| Measurement | Reuse the bounded numeric/storage release corpus with warmup and five alternating samples. Require a useful measured benefit before shipping; report residual superlinear work and no client-time promise. |
+
+This is an internal scheduling refinement under the existing fixed-point
+and source-order replay strategy. Complete the author metadata/matrix pass before
+retaining an implementation, then include its boundary proof in the one fresh
+preflight review. The handwritten capability is below 1,000 lines.
+
+The nine-case differential owner covers empty functions, replacement/return,
+owned match/loop joins, try/map_err/else, arena and builder exits, nested owned
+records and invalid local/arena returns. It retains exact published body facts
+and diagnostic severity/order/span/message. Actual skipped/probed counts reject
+restoring terminal probes. Full sema owners and the array-builder, region,
+return-provenance and borrow-liveness driver suites retain the surrounding proof.
+The existing 30-cell numeric/storage benchmark preserves all 15 MIR/raw LLVM
+pairs and rejected diagnostics. Local 512-value match checks improve 1.09x/1.10x
+(whole/per-unit); straight fixed-array checks improve 1.17x/1.11x. Numeric and
+loop-array controls remain within 8 ms and every 16-value control within 1 ms.
+Samples/hashes are in `results-terminal-probes-macos.json`; residual superlinear
+work and external Request37 acceptance remain.
