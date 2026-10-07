@@ -1,6 +1,6 @@
 # Compiler check-time scaling measurement
 
-This local benchmark owns plan 21 items 11–22 checking measurements. It
+This local benchmark owns plan 21 items 11–24 checking measurements. It
 compares release compiler binaries on the same generated straight arithmetic,
 Result `?`, and Result `match` chains inside a loop. Each case uses 16, 128 or
 512 values. `--corpus storage` selects fixed-array declarations in straight-line
@@ -385,3 +385,34 @@ ordered writes, seeds, collision-resolving key equality and lifecycle behavior;
 existing full-state, generation, snapshot and diagnostic owners retain semantics.
 Map copies and repeated traversal remain superlinear; this does not establish a
 whole-client time bound or a runtime allocation improvement.
+
+## Item 24 result (2026-10-07)
+
+The same host/profile compares item23's merged
+`da540889f44afe33f7e7ae806a642bb6ce22d360` with final-use retirement of diagnostic
+replay inputs. The candidate starts from `acdcfd5f4b89aff7471a90b9d68e32093573630e`;
+its intervening SIGPIPE test correction has no production compiler change.
+The fixed-point solver, operation order, facts, Arc sharing and Send/Sync remain.
+No builds/tests overlap measurement; `DYLD_SHARED_REGION` is unset for both
+binaries. Both corpora use `--llvm-parity`.
+[Full samples and hashes](results-replay-retirement-macos.json) retain all
+30 cells with five alternating samples after warmup.
+
+| 512-value shape | Command | Baseline median | Candidate median | Ratio |
+| --- | --- | ---: | ---: | ---: |
+| match | check | 0.323 s | 0.316 s | 1.02x |
+| match | check-per-unit | 0.639 s | 0.610 s | 1.05x |
+| fixed | check | 0.127 s | 0.127 s | 1.00x |
+| fixed | check-per-unit | 0.264 s | 0.264 s | 1.00x |
+| loop-fixed | check | 0.724 s | 0.721 s | 1.00x |
+| loop-fixed | check-per-unit | 1.458 s | 1.452 s | 1.00x |
+
+Five alternating release samples improve 512-value Result-match whole/per-unit
+medians from 0.323/0.639 s to 0.316/0.610 s (1.02x/1.05x). All 15 MIR/raw LLVM
+pairs, actual checked-work outputs and four rejected controls agree across
+30 cells. Every 16-value control stays within 0.2 ms, numeric straight/try
+controls within 0.3 ms and storage controls within 5.6 ms.
+This is a small measured improvement, without a uniform-speedup, peak-memory,
+near-linear or consumer-time claim. Omitting retirement fails the actual
+reference-lifetime owner; byte-identical restoration passes all 326 sema owners
+and the five driver suites (238 passed, one existing ignored).

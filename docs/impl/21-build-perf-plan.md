@@ -3507,3 +3507,51 @@ acceptance and K1/plan61 remain deferred.
 
 Resetting the seed on each write fails the canonical protocol owner. Byte-identical
 restoration retains the measured source hash; all 325 sema owners pass afterward.
+
+## Item 24: retire escape replay inputs after their final use
+
+The bounded post-item23 profile still spends time releasing saved block inputs
+at the end of diagnostic replay. Keep the fixed-point solver, immutable Arc
+payloads, Send/Sync, joins and exact replay sequence unchanged. Only after the
+worklist finishes, release inputs of blocks with no operations; after replaying
+a block's final operation, release that block's input immediately. This retires
+compiler scratch, not source values or emitted runtime cleanup.
+
+`push_flow_op` is the sole producer of replay entries: it appends an operation
+and its old block-local length together. Consequently each block's final index
+is its operation count minus one, even when the global replay interleaves blocks.
+Never infer last use from block numbering, successor emptiness or adjacency in
+the global replay. Reachability remains the existing optional input. Retire only
+after `apply_flow_op` has returned the complete state to its input slot; all
+published diagnostics and body/Drop facts remain independently owned.
+
+### Implementation closure matrix
+
+| Axis | Implementation and owner |
+| --- | --- |
+| Formation and last-use authority | Preserve the single append producer and all operation indices. `escape_replay_inputs_release_only_after_last_use` covers empty, unreachable, one/many-op and interleaved block inputs; actual Arc counts prove retention before the final operation and release afterward. Removing retirement must fail this owner. |
+| Move-in/out, replacement, Drop and return | Inputs move once from the solver into replay, operations retain the existing owned-state swap, then the exact completed slot becomes None. No payload mutation, extra state copy or source Drop change. Existing shared-map lifecycle, join identity and owned-transfer owners remain. |
+| If/match/else/try/map_err, loops, joins and exits | `escape_flow_terminal_replay_preserves_metadata_and_diagnostics` reuses its existing corpus to compare retained and early-retired inputs with identical ordered severity/span/message and complete published body/assignment/Drop facts. Include interleaved replay directly; do not duplicate the source corpus. |
+| Malformed input and generic behavior | Full sema plus array_builder_transfer, m12_array_builder, fb_region, return_provenance and borrow_liveness owners retain fail-closed, imported and generic cases. No checked-HIR, IR variant or validation order change. |
+| Interfaces, whole/per-unit and runtime provenance | No serialization or ABI change. Existing numeric/storage corpus requires all MIR/raw LLVM pairs, checked-work output and rejected diagnostics to agree. Runtime allocation and ownership remain unchanged. |
+| Performance acceptance | First the existing 12-cell pilot against the retained item23 release binary, then all 30 numeric/storage cells with five alternating post-warmup samples and the same bounded child owner. Run without competing builds/tests. Retain only useful benefit with explicit control-regression assessment; no peak-memory, uniform-speedup, near-linear or consumer-time promise. |
+
+This follows the reviewed items19–23 replay and immutable-state strategy; it does
+not change analysis authority or source lifetime semantics. The author matrix
+pass precedes implementation and one fresh preflight review checks the complete
+boundary. One small capability owns construction through final scratch release;
+expected handwritten changes are below 1,000 lines. K1/plan61 and consumer
+acceptance remain deferred. Replacing Arc with Rc would weaken the existing
+Send/Sync contract and is excluded; the rejected outer-table sharing experiment
+is also excluded.
+
+Five alternating release samples improve 512-value Result-match whole/per-unit
+medians from 0.323/0.639 s to 0.316/0.610 s (1.02x/1.05x). All 15 MIR/raw LLVM
+pairs, actual checked-work outputs and four rejected controls agree across
+30 cells. Every 16-value control stays within 0.2 ms, numeric straight/try
+controls within 0.3 ms and storage controls within 5.6 ms.
+`results-replay-retirement-macos.json` records all samples and exact identities.
+This is a small measured improvement, without a uniform-speedup, peak-memory,
+near-linear or consumer-time claim. Omitting retirement fails the actual
+reference-lifetime owner; byte-identical restoration passes all 326 sema owners
+and the five driver suites (238 passed, one existing ignored).
