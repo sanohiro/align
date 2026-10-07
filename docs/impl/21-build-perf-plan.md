@@ -3383,3 +3383,62 @@ the measured Result-match benefit, without a uniform-speedup or client-time
 promise. `results-shared-values-macos.json` retains samples and hashes. Fresh Arc
 allocation, map copies and repeated traversal remain; consumer acceptance and
 K1/plan61 remain deferred.
+
+## Item 22: shared completion and argument snapshots
+
+The item21 profile still reaches state cloning, legacy-map joins and whole-state
+release while checking long Result-match functions. The two maps
+`argument_snapshots` and `completed_expressions` still copy their complete
+`EscapeArgumentSnapshot` values into each saved state. These payloads contain
+regions, mutable-backing roots and locality/allocation bits; none is mutated in
+place after insertion. Keep their completion-time authority unchanged while
+reusing item21's shared immutable storage.
+
+Generalize the private map to `EscapeFactMap<K, V>`. Its empty Default and Clone
+must not require payload Default or Clone; Default also needs no default key.
+Only keys and Arc references copy. Borrowed reads, immutable retention, owned
+insertion and reference removal retain item21's behavior. Pass each original
+idempotent join as an explicit closure; compare complete payloads, retain equal
+and unchanged outputs, share absent incoming keys and preserve exact change bits
+and capacity reservation. Keep selected generation renaming in the
+`EscapeValueFact` specialization alone. No general mutable payload access exists.
+
+Both added snapshot maps use this same implementation. Existing reads still
+clone an owned snapshot explicitly when needed. Loop completion is the sole
+removed snapshot consumed as a value; `Arc::unwrap_or_clone` preserves unique
+transfer and shared extraction. Call-argument updates remain owned local staging
+followed by replacement. Do not alter those temporary staging maps or any legacy
+region/backing map. No source ownership, diagnostic, cleanup, CFG, replay,
+interface, IR, ABI or runtime allocation contract changes. K1/plan61 remain deferred.
+
+### Implementation closure matrix
+
+| Axis | Implementation and owner |
+| --- | --- |
+| Generic formation, copy and Drop | `EscapeFactMap` has explicit Default and Clone implementations without payload bounds. `escape_fact_map_clone_needs_no_payload_clone` uses a non-Clone/non-Default payload and non-Default key, with actual shared identity and local Drop counts. Requiring payload Clone must fail compilation at this owner. Existing value-map lifecycle/extraction owners remain. |
+| Both snapshot consumers | `escape_snapshots_preserve_shared_isolation` exercises actual argument and expression maps across copy, replacement, removal and unique/shared extraction; retained backing roots and all snapshot fields remain exact. Existing mutable-call and terminal metadata owners retain completion-time semantics. |
+| Joins and existing values | All six maps call the same structural join machinery with the original type's join. Existing `escape_state_join_preserves_facts_changes_and_storage` covers every field, both orders and repeated/disjoint/one-sided inputs; direct old self-join laws remain. Existing shared-value join and selected-generation identity owners must still pass. |
+| Move-in/out, nulling, replacement, return and malformed input | No evaluator changes except owned loop-snapshot extraction. Full sema plus array-builder transfer/build, region, return-provenance and borrow-liveness driver owners retain observable behavior and fail-closed paths. |
+| If/match/else/try/map_err, loops/joins and early exits | Reuse the terminal old/new complete-body metadata and ordered-diagnostic differential owner; no flow, convergence or replay change. |
+| Generics, interfaces and whole/per-unit parity | No persisted/compiler-public type changes. Existing imported/generic owner suites and the numeric/storage corpus retain MIR/raw LLVM, checked-work, rejected diagnostics and runtime cleanup behavior. |
+| Performance acceptance | Pilot before retaining the change, then all existing 30 numeric/storage 16/128/512 cells with warmup, five alternating samples, no competing builds/tests and the 20-second child budget. Record Arc insertion overhead and control regressions honestly; no uniform-speedup, near-linear or client-time guarantee. |
+
+This reuses the independently reviewed item21 ownership strategy for an additional
+immutable payload type. Perform the author matrix pass and fold the new consumer
+boundary into one fresh preflight review; no separate strategy review is needed.
+The capability generalizes the one implementation and migrates both snapshot
+consumers together, with no dormant path. It is expected below 1,000 handwritten
+changed lines. Existing item21 remains independently useful with its measured
+value-fact improvement; this boundary owns legacy snapshot payload copying.
+
+Requiring payload Clone fails compilation at the non-Clone owner. The measured
+source is restored byte-for-byte and all 323 sema owners pass afterward.
+
+Five alternating release samples improve 512-value Result-match whole/per-unit
+medians from 0.485/0.916 s to 0.390/0.777 s (1.24x/1.18x). All 15 MIR/raw LLVM
+pairs, actual checked-work outputs and four rejected controls match across
+30 cells. Every 16-value control stays within 0.4 ms and numeric straight/try
+controls within 0.32 ms. Storage differences stay within 6.8 ms, including small
+increases in loop cases. `results-shared-snapshots-macos.json` records all samples
+and hashes. Map copying, reference counts and repeated traversal remain;
+consumer acceptance and K1/plan61 remain deferred.

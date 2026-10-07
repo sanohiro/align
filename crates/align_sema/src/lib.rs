@@ -18569,13 +18569,26 @@ impl EscapeValueFact {
 
 /// Saved states share immutable value payloads. Owned consumers still clone explicitly;
 /// only selected generation renaming mutates an installed payload, after detaching it.
-#[derive(Clone, Default, PartialEq, Eq, Debug)]
-struct EscapeValueMap<K: Eq + std::hash::Hash> {
-    values: std::collections::HashMap<K, std::sync::Arc<EscapeValueFact>>,
+#[derive(PartialEq, Eq, Debug)]
+struct EscapeFactMap<K: Eq + std::hash::Hash, V> {
+    values: std::collections::HashMap<K, std::sync::Arc<V>>,
 }
 
-impl<K: Eq + std::hash::Hash> EscapeValueMap<K> {
-    fn get(&self, key: &K) -> Option<&EscapeValueFact> {
+impl<K: Eq + std::hash::Hash, V> Default for EscapeFactMap<K, V> {
+    fn default() -> Self {
+        Self { values: std::collections::HashMap::new() }
+    }
+}
+
+impl<K: Eq + std::hash::Hash + Clone, V> Clone for EscapeFactMap<K, V> {
+    fn clone(&self) -> Self {
+        // Neither forming an empty map nor sharing it needs to form or clone a payload.
+        Self { values: self.values.clone() }
+    }
+}
+
+impl<K: Eq + std::hash::Hash, V> EscapeFactMap<K, V> {
+    fn get(&self, key: &K) -> Option<&V> {
         self.values.get(key).map(std::sync::Arc::as_ref)
     }
 
@@ -18583,18 +18596,20 @@ impl<K: Eq + std::hash::Hash> EscapeValueMap<K> {
         self.values.contains_key(key)
     }
 
-    fn insert(&mut self, key: K, value: EscapeValueFact) {
+    fn insert(&mut self, key: K, value: V) {
         self.values.insert(key, std::sync::Arc::new(value));
     }
 
-    fn remove(&mut self, key: &K) -> Option<std::sync::Arc<EscapeValueFact>> {
+    fn remove(&mut self, key: &K) -> Option<std::sync::Arc<V>> {
         self.values.remove(key)
     }
 
-    fn retain(&mut self, mut keep: impl FnMut(&K, &EscapeValueFact) -> bool) {
+    fn retain(&mut self, mut keep: impl FnMut(&K, &V) -> bool) {
         self.values.retain(|key, value| keep(key, value));
     }
+}
 
+impl<K: Eq + std::hash::Hash> EscapeFactMap<K, EscapeValueFact> {
     fn rename_generations(&mut self, renames: &StorageGenerationRenames) {
         for value in self.values.values_mut() {
             if value.generations_change(renames) {
@@ -18604,8 +18619,8 @@ impl<K: Eq + std::hash::Hash> EscapeValueMap<K> {
     }
 }
 
-impl<K: Eq + std::hash::Hash + Clone> EscapeValueMap<K> {
-    fn join_from(&mut self, incoming: &Self) -> bool {
+impl<K: Eq + std::hash::Hash + Clone, V: Eq> EscapeFactMap<K, V> {
+    fn join_from(&mut self, incoming: &Self, join: impl std::ops::Fn(&V, &V) -> V) -> bool {
         EscapeState::reserve_join(&mut self.values, incoming.values.len());
         let mut changed = false;
         for (key, value) in &incoming.values {
@@ -18614,7 +18629,7 @@ impl<K: Eq + std::hash::Hash + Clone> EscapeValueMap<K> {
                     if entry.get() == value {
                         continue;
                     }
-                    let next = entry.get().join(value);
+                    let next = join(entry.get(), value);
                     if entry.get().as_ref() != &next {
                         entry.insert(std::sync::Arc::new(next));
                         changed = true;
@@ -18906,18 +18921,18 @@ struct EscapeState {
     /// Generation-based storage facts formed from the shared closed classifier. These coexist
     /// with the legacy region/backing maps during E1, but already contain every value/completion
     /// surface required for the later authority switch.
-    storage_values: EscapeValueMap<LocalId>,
+    storage_values: EscapeFactMap<LocalId, EscapeValueFact>,
     storage: StorageGenerationTables<EscapeGenerationEntry, EscapeGenerationContent>,
-    storage_argument_snapshots: EscapeValueMap<(usize, usize)>,
-    storage_completed_expressions: EscapeValueMap<usize>,
-    storage_callable_snapshots: EscapeValueMap<usize>,
+    storage_argument_snapshots: EscapeFactMap<(usize, usize), EscapeValueFact>,
+    storage_completed_expressions: EscapeFactMap<usize, EscapeValueFact>,
+    storage_callable_snapshots: EscapeFactMap<usize, EscapeValueFact>,
     backing_storage: std::collections::HashMap<LocalId, EscapeBackingStorage>,
     /// Completion-time eager-argument facts, keyed by call-expression identity and argument
     /// ordinal. Entries are overwritten on each loop iteration and consumed by `MutableCall`.
-    argument_snapshots: std::collections::HashMap<(usize, usize), EscapeArgumentSnapshot>,
+    argument_snapshots: EscapeFactMap<(usize, usize), EscapeArgumentSnapshot>,
     /// Completion facts for every evaluated expression node. Parent expressions consume these
     /// instead of re-reading child syntax from state already changed by a later eager sibling.
-    completed_expressions: std::collections::HashMap<usize, EscapeArgumentSnapshot>,
+    completed_expressions: EscapeFactMap<usize, EscapeArgumentSnapshot>,
     /// Return-relevant capture region of an indirect callee, frozen immediately after the callee
     /// expression completes and before argument zero runs. The callable value itself may be
     /// rebound by a later eager argument, but the runtime still invokes the completed value.
@@ -19050,10 +19065,16 @@ impl EscapeState {
             true
         });
         changed |= hash_join(region, &other.region, |a, b| a.shorter(*b));
-        changed |= storage_values.join_from(&other.storage_values);
-        changed |= storage_argument_snapshots.join_from(&other.storage_argument_snapshots);
-        changed |= storage_completed_expressions.join_from(&other.storage_completed_expressions);
-        changed |= storage_callable_snapshots.join_from(&other.storage_callable_snapshots);
+        changed |= storage_values.join_from(&other.storage_values, EscapeValueFact::join);
+        changed |= storage_argument_snapshots.join_from(
+            &other.storage_argument_snapshots, EscapeValueFact::join,
+        );
+        changed |= storage_completed_expressions.join_from(
+            &other.storage_completed_expressions, EscapeValueFact::join,
+        );
+        changed |= storage_callable_snapshots.join_from(
+            &other.storage_callable_snapshots, EscapeValueFact::join,
+        );
         changed |= tree_join(
             directory,
             &other.storage.directory.entries,
@@ -19077,16 +19098,8 @@ impl EscapeState {
                 changed = true;
             }
         }
-        changed |= hash_join(
-            argument_snapshots,
-            &other.argument_snapshots,
-            EscapeArgumentSnapshot::join,
-        );
-        changed |= hash_join(
-            completed_expressions,
-            &other.completed_expressions,
-            EscapeArgumentSnapshot::join,
-        );
+        changed |= argument_snapshots.join_from(&other.argument_snapshots, EscapeArgumentSnapshot::join);
+        changed |= completed_expressions.join_from(&other.completed_expressions, EscapeArgumentSnapshot::join);
         changed |= hash_join(
             callable_capture_snapshots,
             &other.callable_capture_snapshots,
@@ -22518,7 +22531,8 @@ impl<'a> EscapeCheck<'a> {
                     // Break edges already selected the value and its generation. Reclassification
                     // would invent an unknown view and lose the selected caller/storage lifetime.
                     (
-                        completed.unwrap_or_else(EscapeArgumentSnapshot::fail_closed),
+                        completed.map(std::sync::Arc::unwrap_or_clone)
+                            .unwrap_or_else(EscapeArgumentSnapshot::fail_closed),
                         stored.map(std::sync::Arc::unwrap_or_clone)
                             .unwrap_or_else(|| self.fail_closed_escape_value(expression.ty, depth)),
                     )
@@ -81222,6 +81236,111 @@ fn main() -> i32 = 0
     }
 
     #[test]
+    fn escape_fact_map_clone_needs_no_payload_clone() {
+        use std::sync::Arc;
+        #[derive(Clone, PartialEq, Eq, Hash)]
+        struct Key(u32);
+        struct Payload<'a>(&'a std::cell::Cell<usize>);
+        impl Drop for Payload<'_> {
+            fn drop(&mut self) { self.0.set(self.0.get() + 1); }
+        }
+        let drops = std::cell::Cell::new(0);
+        // No Default for either key or payload, and no Clone for the payload.
+        let mut map = EscapeFactMap::default();
+        map.insert(Key(7), Payload(&drops));
+        let mut shared = map.clone();
+        assert!(Arc::ptr_eq(map.values.get(&Key(7)).unwrap(), shared.values.get(&Key(7)).unwrap()));
+        assert_eq!(Arc::strong_count(map.values.get(&Key(7)).unwrap()), 2);
+        map.insert(Key(7), Payload(&drops));
+        assert_eq!(drops.get(), 0, "saved state still owns the replaced payload");
+        let removed = shared.remove(&Key(7)).unwrap();
+        assert!(shared.values.is_empty());
+        assert_eq!(Arc::strong_count(&removed), 1);
+        drop(removed);
+        assert_eq!(drops.get(), 1);
+        drop(map);
+        assert_eq!(drops.get(), 2);
+        drop(shared);
+        assert_eq!(drops.get(), 2, "each payload drops exactly once");
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<EscapeState>();
+    }
+
+    #[test]
+    fn escape_snapshots_preserve_shared_isolation() {
+        use std::sync::Arc;
+        for known in [false, true] {
+            for individual in [false, true] {
+                let snapshot = EscapeArgumentSnapshot {
+                    content_region: Region::Caller(1),
+                    retained_contained_region: Region::Arena(2),
+                    storage_region: Region::Frame,
+                    retained_storage_region: Region::Static,
+                    mutable_backing: EscapeBackingStorage {
+                        region: Region::Arena(3),
+                        roots: [7, 8].into_iter().collect(),
+                        known,
+                    },
+                    storage_is_local: true,
+                    individual,
+                    may_individual: true,
+                };
+                let mut state = EscapeState::default();
+                state.argument_snapshots.insert((7, 0), snapshot.clone());
+                state.completed_expressions.insert(7, snapshot.clone());
+                let mut copy = state.clone();
+                assert!(Arc::ptr_eq(
+                    state.argument_snapshots.values.get(&(7, 0)).unwrap(),
+                    copy.argument_snapshots.values.get(&(7, 0)).unwrap(),
+                ));
+                assert!(Arc::ptr_eq(
+                    state.completed_expressions.values.get(&7).unwrap(),
+                    copy.completed_expressions.values.get(&7).unwrap(),
+                ));
+                macro_rules! replace_owned {
+                    ($field:ident, $key:expr) => {{
+                        let mut owned = copy.$field.get(&$key).unwrap().clone();
+                        owned.mutable_backing.roots.clear();
+                        owned.content_region = Region::Arena(4);
+                        copy.$field.insert($key, owned.clone());
+                        assert!(copy.$field.get(&$key) == Some(&owned));
+                        assert!(state.$field.get(&$key) == Some(&snapshot));
+                    }};
+                }
+                replace_owned!(argument_snapshots, (7, 0));
+                replace_owned!(completed_expressions, 7);
+
+                for shared in [false, true] {
+                    macro_rules! extract_owned {
+                        ($field:ident, $key:expr) => {{
+                            let mut state = EscapeState::default();
+                            state.$field.insert($key, snapshot.clone());
+                            let saved = shared.then(|| state.clone());
+                            let root = state.$field.get(&$key).unwrap()
+                                .mutable_backing.roots.first().unwrap() as *const LocalId;
+                            let removed = state.$field.remove(&$key).unwrap();
+                            assert_eq!(Arc::strong_count(&removed), if shared { 2 } else { 1 });
+                            assert!(!state.$field.contains_key(&$key));
+                            let mut owned = Arc::unwrap_or_clone(removed);
+                            assert!(owned == snapshot);
+                            let owned_root = owned.mutable_backing.roots.first().unwrap() as *const LocalId;
+                            assert_eq!(owned_root == root, !shared);
+                            owned.mutable_backing.roots.clear();
+                            if let Some(saved) = saved {
+                                assert!(saved.$field.get(&$key) == Some(&snapshot));
+                                assert_eq!(saved.$field.get(&$key).unwrap()
+                                    .mutable_backing.roots.first().unwrap() as *const LocalId, root);
+                            }
+                        }};
+                    }
+                    extract_owned!(argument_snapshots, (7, 0));
+                    extract_owned!(completed_expressions, 7);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn escape_value_map_preserves_shared_payload_lifecycle() {
         use std::sync::Arc;
         let fact = EscapeValueFact {
@@ -81233,7 +81352,7 @@ fn main() -> i32 = 0
             may_individual: true,
             ..EscapeValueFact::default()
         };
-        let mut original = EscapeValueMap::default();
+        let mut original = EscapeFactMap::default();
         original.insert(7, fact.clone());
         let first = Arc::downgrade(original.values.get(&7).unwrap());
         let mut copy = original.clone();
@@ -81295,8 +81414,8 @@ fn main() -> i32 = 0
             (Some(short.clone()), Some(long.clone())),
             (Some(long), Some(short)),
         ] {
-            let mut current = EscapeValueMap::default();
-            let mut incoming = EscapeValueMap::default();
+            let mut current = EscapeFactMap::default();
+            let mut incoming = EscapeFactMap::default();
             if let Some(value) = &left { current.insert(7, value.clone()); }
             if let Some(value) = &right { incoming.insert(7, value.clone()); }
             let saved = current.clone();
@@ -81307,7 +81426,7 @@ fn main() -> i32 = 0
             };
             let changed = left != expected;
             let address = current.get(&7).map(|value| value as *const EscapeValueFact);
-            assert_eq!(current.join_from(&incoming), changed);
+            assert_eq!(current.join_from(&incoming, EscapeValueFact::join), changed);
             assert_eq!(current.get(&7), expected.as_ref());
             assert_eq!(saved.get(&7), left.as_ref(), "saved state changed");
             assert_eq!(incoming.get(&7), right.as_ref(), "incoming state changed");
@@ -81319,8 +81438,8 @@ fn main() -> i32 = 0
                 assert_ne!(current.get(&7).map(|value| value as *const EscapeValueFact), address);
             }
             let address = current.get(&7).map(|value| value as *const EscapeValueFact);
-            assert!(!current.join_from(&incoming));
-            assert!(!current.join_from(&current.clone()));
+            assert!(!current.join_from(&incoming, EscapeValueFact::join));
+            assert!(!current.join_from(&current.clone(), EscapeValueFact::join));
             assert_eq!(current.get(&7).map(|value| value as *const EscapeValueFact), address);
         }
     }
