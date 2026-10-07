@@ -351,6 +351,7 @@ fn runtime_effects(id: RuntimeAbiId) -> RuntimeEffects {
         RuntimeAbiId::Keyed(RuntimeKey::ArrayBuilderFreeStrings) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::Indirect, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::ArrayBuilderFreeStringsStack) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::Indirect, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::ArrayBuilderInitStack) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::ArrayBuilderLen) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::ArrayBuilderNew) => RuntimeEffects { class: EffectClass::AllocNew, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: true, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::ArrayBuilderNewIn) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: true, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::ArrayBuilderPush) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
@@ -379,6 +380,7 @@ fn runtime_effects(id: RuntimeAbiId) -> RuntimeEffects {
         RuntimeAbiId::Keyed(RuntimeKey::BuilderInitStack) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::BuilderIntoString) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::BuilderIntoStringStack) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BuilderLen) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::BuilderNew) => RuntimeEffects { class: EffectClass::AllocNew, argmem: ArgMem::None, params: &[], escapes: &[0], releases: Release::None, returns_fresh: true, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::BuilderPopComma) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::BuilderWrite) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
@@ -1132,6 +1134,11 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
             symbol: "align_rt_array_builder_init_stack",
             shape: RuntimeAbiShape::ArrayBuilderStackCapacity,
         },
+        RuntimeKey::ArrayBuilderLen => RuntimeAbi {
+            key,
+            symbol: "align_rt_array_builder_len",
+            shape: RuntimeAbiShape::A29,
+        },
         RuntimeKey::ArrayBuilderNew => RuntimeAbi {
             key,
             symbol: "align_rt_array_builder_new",
@@ -1283,6 +1290,11 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
             key,
             symbol: "align_rt_builder_into_string_stack",
             shape: RuntimeAbiShape::A83,
+        },
+        RuntimeKey::BuilderLen => RuntimeAbi {
+            key,
+            symbol: "align_rt_builder_len",
+            shape: RuntimeAbiShape::A29,
         },
         RuntimeKey::BuilderNew => RuntimeAbi {
             key,
@@ -3134,15 +3146,15 @@ fn validate_effects(abi: RuntimeAbi, effects: RuntimeEffects) -> Result<(), Stri
 }
 
 pub(super) fn validate_registry() -> Result<(), String> {
-    if RuntimeKey::ALL.len() != 460 || keyed_runtime_abis().len() != 460 {
+    if RuntimeKey::ALL.len() != 462 || keyed_runtime_abis().len() != 462 {
         return Err("runtime ABI registry invariant: key-count".to_string());
     }
-    if runtime_abis().count() != 478 {
+    if runtime_abis().count() != 480 {
         return Err("runtime ABI registry invariant: base-count".to_string());
     }
 
     let mut keys = HashSet::with_capacity(RuntimeKey::ALL.len());
-    let mut symbols = HashSet::with_capacity(478);
+    let mut symbols = HashSet::with_capacity(480);
     for abi in keyed_runtime_abis() {
         validate_effects(abi, runtime_effects(abi.key))?;
         let key = abi
@@ -4472,17 +4484,17 @@ mod tests {
         );
         validate_registry().unwrap_or_else(|error| panic!("valid runtime registry: {error}"));
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 478);
+        assert_eq!(rows.len(), 480);
         assert_eq!(
             rows.iter().map(|row| row.key).collect::<HashSet<_>>().len(),
-            478
+            480
         );
         assert_eq!(
             rows.iter()
                 .map(|row| row.symbol)
                 .collect::<HashSet<_>>()
                 .len(),
-            478
+            480
         );
         for (key, row) in RuntimeKey::ALL.into_iter().zip(keyed_runtime_abis()) {
             assert_eq!(row.key, RuntimeAbiId::Keyed(key));
@@ -4511,7 +4523,7 @@ mod tests {
     #[test]
     fn runtime_effects_registry_is_total_and_structurally_valid() {
         validate_registry().unwrap();
-        assert_eq!(runtime_abis().map(|abi| runtime_effects(abi.key)).count(), 478);
+        assert_eq!(runtime_abis().map(|abi| runtime_effects(abi.key)).count(), 480);
 
         let expect_rule = |abi, effects, rule: &str| {
             let error = validate_effects(abi, effects).unwrap_err();
@@ -4638,7 +4650,7 @@ mod tests {
     fn runtime_abi_extern_type_matrix_is_exact_for_every_row_and_ordinal() {
         let ctx = inkwell::context::Context::create();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 478);
+        assert_eq!(rows.len(), 480);
 
         for row in rows {
             let symbol = row.symbol;

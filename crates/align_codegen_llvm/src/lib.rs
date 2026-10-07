@@ -10197,7 +10197,7 @@ fn stack_header_plan(f: &Function) -> StackHeaderPlan {
                         | Rvalue::BuilderWriteBool(b, _)
                         | Rvalue::BuilderWriteChar(b, _)
                         | Rvalue::BuilderWriteFloat(b, _)
-                        | Rvalue::BuilderToString(b) => {
+                        | Rvalue::BuilderToString(b) | Rvalue::BuilderLen(b) => {
                             allow_loaded(b, &load_defs, &owner, &mut allowed_loads, &mut bad)
                         }
                         Rvalue::BuilderWriteStrIntStr(b, _, _, _) => {
@@ -10209,7 +10209,7 @@ fn stack_header_plan(f: &Function) -> StackHeaderPlan {
                         Rvalue::ArrayBuilderPush { builder, .. }
                         | Rvalue::ArrayBuilderPushStr { builder, .. }
                         | Rvalue::ArrayBuilderAppend { builder, .. }
-                        | Rvalue::ArrayBuilderBuild { builder } => {
+                        | Rvalue::ArrayBuilderBuild { builder } | Rvalue::ArrayBuilderLen(builder) => {
                             allow_loaded(builder, &load_defs, &owner, &mut allowed_loads, &mut bad);
                         }
                         Rvalue::Call(_, args) => {
@@ -16880,6 +16880,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.runtime(RuntimeKey::BufferLen), &[bp], "buflen")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("buffer_len returns i64")
+            }
+            Rvalue::BuilderLen(owner) | Rvalue::ArrayBuilderLen(owner) => {
+                let pointer = self.operand(owner)?.into();
+                let key = if matches!(rv, Rvalue::BuilderLen(_)) {
+                    RuntimeKey::BuilderLen
+                } else {
+                    RuntimeKey::ArrayBuilderLen
+                };
+                self.builder.build_call(self.runtime(key), &[pointer], "builder_len")
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value().basic()
+                    .ok_or_else(|| self.err("builder length returned no basic value"))?
             }
             Rvalue::BufferCapacity(buf) => {
                 let bp = self.operand(buf)?.into();
@@ -32040,6 +32052,45 @@ fn main() -> i32 = 0
     }
 
     #[test]
+    fn builder_length_mir_requires_exact_owner_and_i64() -> Result<(), &'static str> {
+        for ty in ["builder", "array_builder<i64>", "array_builder<vec4<i32>>",
+            "array_builder<mask4<i32>>", "array_builder<[i64; 2]>", "array_builder<[Row; 1]>"] {
+            let base = mir(&format!("Row {{ value: i64 }}\nfn query(borrow value: {ty}) -> i64 = value.len()\nfn main() {{}}\n"));
+            assert!(emit_llvm_ir(&base, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_ok(), "valid {ty}");
+            for mutation in 0..6 {
+                let mut bad = base.clone();
+                let mut changed = false;
+                for function in &mut bad.fns {
+                    for block in &mut function.blocks {
+                        for statement in &mut block.stmts {
+                            let Stmt::Let(value, operation) = statement else { continue; };
+                            let (Rvalue::BuilderLen(receiver) | Rvalue::ArrayBuilderLen(receiver)) = operation else { continue; };
+                            changed = true;
+                            match mutation {
+                                0 => *function.value_tys.get_mut(usize::try_from(*value).map_err(|_| "value index")?).ok_or("value type")? = Ty::Bool,
+                                1 => *receiver = Operand::Const(Const::Unit),
+                                2 => *receiver = Operand::Value(u32::MAX),
+                                3 => {
+                                    let Operand::Value(source) = receiver else { return Err("length receiver SSA"); };
+                                    *function.value_tys.get_mut(usize::try_from(*source).map_err(|_| "receiver index")?).ok_or("receiver type")? = Ty::Buffer;
+                                }
+                                4 => {
+                                    let source = receiver.clone();
+                                    *operation = if ty == "builder" { Rvalue::ArrayBuilderLen(source) } else { Rvalue::BuilderLen(source) };
+                                }
+                                _ => *receiver = Operand::Const(Const::Int(0, Ty::Int(IntTy { bits: 64, signed: true }))),
+                            }
+                        }
+                    }
+                }
+                assert!(changed, "fixture must contain length observation");
+                assert!(emit_llvm_ir(&bad, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_err(), "{ty}/{mutation}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn buffer_capacity_mir_gate_requires_exact_native_receiver() -> Result<(), &'static str> {
         let base = mir("fn capacity(borrow value: buffer) -> i64 = value.capacity()\nfn main() {}\n");
         assert!(emit_llvm_ir(&base, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_ok());
@@ -39664,11 +39715,13 @@ fn main() -> i32 = 0
             "fn main() -> i32 {\n\
                b := builder()\n\
                b.write(\"x\")\n\
+               before := b.len()\n\
                s := b.to_string()\n\
                mut a: array_builder<i64> := array_builder()\n\
                a.push(7)\n\
+               count := a.len()\n\
                xs := a.build()\n\
-               return (s.len() + xs.len()) as i32\n\
+               return (before + count + s.len() + xs.len()) as i32\n\
              }\n",
         );
         assert!(out.contains("call ptr @align_rt_builder_init_stack("), "local builder should use stack init:\n{out}");
@@ -39738,7 +39791,7 @@ fn main() -> i32 = 0
         ] {
             for mode in ["borrow", "borrow mut"] {
                 let out = ir(&format!(
-                    "fn observe({mode} output: {ty}) {{}}\n\
+                    "fn observe({mode} output: {ty}) -> i64 = output.len()\n\
                      fn main() -> i32 {{ mut output: {ty} := {constructor}; observe(output);\n\
                        result := output.{finish}(); return result.len() as i32 }}\n"
                 ));

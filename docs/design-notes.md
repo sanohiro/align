@@ -1287,6 +1287,16 @@ direction, not a v1 commitment, and it must not distort the language into a GPU-
 
 ---
 
+## Why unfinished builders expose scalar lengths
+
+A progress counter needs only the producer-owned initialized count. Returning an
+i64 from either builder family preserves grow-then-freeze: no view can outlive a
+reallocation, and no second collection or ownership rule is introduced. Text
+counts UTF-8 bytes; typed builders count elements across their existing storage
+modes. Checked conversion is necessary even with bounded allocation sizes because
+zero-width region elements have no corresponding byte-size bound. Plan 140 owns
+the exact source/native contract; indexed and byte-view readers remain deferred.
+
 ## Why recursive heap record builders stop at record/string array elements
 
 The heap `array_builder` accepts Options and dynamic arrays inside its view-free record graph, but

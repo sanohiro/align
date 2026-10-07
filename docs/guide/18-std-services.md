@@ -275,7 +275,7 @@ Arguments are evaluated even for a disabled level. Use `if logger.enabled(log.le
 Three other tools support streaming and larger programs:
 
 - `fs.create_rw` / `fs.open_rw` with `pread`, `pwrite`, and `len` for offset-addressed files.
-- `array_builder<T>` with `push`, `append`, and consuming `build()` for a result whose final length is discovered while reading.
+- `array_builder<T>` with `push`, `append`, nonconsuming `len()`, and consuming `build()` for a result whose final length is discovered while reading.
 - buffered `read_line` and arena checkpoint/reset for streaming workloads, plus HTTP response streaming described above.
 
 Choose the narrowest layer that names the work: `reader`/`writer` for bytes, `std.net` for sockets, `std.http` for HTTP, and `pkg` for routing, middleware, protocols, and frameworks. The first-party `pkg.web`, `pkg.frame`, and `pkg.auth` packages now provide concrete examples; chapter [23](23-packages.md) introduces them.

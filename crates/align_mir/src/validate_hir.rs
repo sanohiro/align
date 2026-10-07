@@ -4777,7 +4777,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::StrBytes { .. }
             | hir::ExprKind::BytesView { .. }
             | hir::ExprKind::SliceAsBytes { .. }
-            | hir::ExprKind::BufferLen { .. } | hir::ExprKind::BufferCapacity { .. }
+            | hir::ExprKind::BufferLen { .. } | hir::ExprKind::BufferCapacity { .. } | hir::ExprKind::BuilderLen { .. } | hir::ExprKind::ArrayBuilderLen { .. }
             | hir::ExprKind::BytesRead { .. }
             | hir::ExprKind::BytesSet { .. }
             | hir::ExprKind::BytesFill { .. }
@@ -5178,7 +5178,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::BufferNew { .. } | hir::ExprKind::BufferTryNew { .. }
             | hir::ExprKind::BufferBytes { .. }
             | hir::ExprKind::StrBytes { .. }
-            | hir::ExprKind::BufferLen { .. } | hir::ExprKind::BufferCapacity { .. }
+            | hir::ExprKind::BufferLen { .. } | hir::ExprKind::BufferCapacity { .. } | hir::ExprKind::BuilderLen { .. } | hir::ExprKind::ArrayBuilderLen { .. }
             | hir::ExprKind::BufferAppend { .. }
             | hir::ExprKind::BufferAppendFilled { .. }
             | hir::ExprKind::ArrayBuilderAppend { .. }
@@ -9337,6 +9337,20 @@ impl<'a> BodyValidator<'a> {
                     return None;
                 }
                 strict(Ty::Slice(u8_scalar), &[slice])
+            }
+            hir::ExprKind::BuilderLen { builder } | hir::ExprKind::ArrayBuilderLen { builder } => {
+                let owner = if matches!(expression.kind, hir::ExprKind::BuilderLen { .. }) {
+                    Ty::Builder
+                } else {
+                    let element = builder.ty.array_builder_element()?;
+                    if !self.array_builder_elem_ok(element) && !self.array_builder_region_elem_ok(element) {
+                        return None;
+                    }
+                    builder.ty
+                };
+                (matches!(builder.kind, hir::ExprKind::Local(_))
+                    && builder.ty == owner && self.handle_receiver_place(builder, context, owner))
+                    .then(|| strict(i64, &[builder]))?
             }
             hir::ExprKind::BufferLen { buffer } | hir::ExprKind::BufferCapacity { buffer } => {
                 (self.handle_receiver_place(buffer, context, Ty::Buffer) && buffer.ty == Ty::Buffer)

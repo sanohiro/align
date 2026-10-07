@@ -2050,6 +2050,10 @@ pub enum Rvalue {
     BufferLen(Operand),
     /// The fixed caller-selected read window, independent of the buffer's current published len.
     BufferCapacity(Operand),
+    /// Read the initialized UTF-8 byte count without consuming the builder.
+    BuilderLen(Operand),
+    /// Read the total initialized element count of an admitted array builder.
+    ArrayBuilderLen(Operand),
     /// Checked zero-copy `slice<u8>` to `Option<slice<T>>` descriptor view.
     /// The little-endian requirement is retained for driver target admission.
     BytesView {
@@ -9048,6 +9052,21 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 );
                 let v = b.fresh_value(e.ty);
                 b.push(Stmt::Let(v, Rvalue::BufferLen(bop)));
+                Operand::Value(v)
+            }
+            hir::ExprKind::BuilderLen { builder } | hir::ExprKind::ArrayBuilderLen { builder } => {
+                lower_required_binding!(
+                    b,
+                    owner = lower_expr(b, builder),
+                    Operand::Const(Const::Unit)
+                );
+                let v = b.fresh_value(e.ty);
+                let value = if matches!(e.kind, hir::ExprKind::BuilderLen { .. }) {
+                    Rvalue::BuilderLen(owner)
+                } else {
+                    Rvalue::ArrayBuilderLen(owner)
+                };
+                b.push(Stmt::Let(v, value));
                 Operand::Value(v)
             }
             hir::ExprKind::BufferCapacity { buffer } => {
@@ -31796,6 +31815,16 @@ fn main() -> i32 = 0
     }
 
     const BUILDER_WRITE_SRC: &str = "pub fn build() -> i64 {\n  b := builder()\n  b.write(\"item-\")\n  b.write_int(1)\n  b.write(\"-status \")\n  res := b.to_string()\n  return res.len()\n}\n";
+
+    #[test]
+    fn builder_length_is_a_write_fusion_barrier() {
+        let p = lower("pub fn observe() -> i64 { b := builder(); b.write(\"a\"); first := b.len(); b.write_int(42); second := b.len(); b.write(\"b\"); return first + second + b.to_string().len() }\n");
+        assert_eq!(count_stmts(&p, |statement| matches!(statement, Stmt::Let(_, Rvalue::BuilderLen(_)))), 2);
+        assert_eq!(count_stmts(&p, |statement| matches!(statement, Stmt::Let(_, Rvalue::BuilderWriteStrIntStr(..)))), 0);
+        assert_eq!(count_stmts(&p, |statement| matches!(statement, Stmt::Let(_, Rvalue::BuilderWriteStr(..)))), 2);
+        let adjacent = lower(BUILDER_WRITE_SRC);
+        assert_eq!(count_stmts(&adjacent, |statement| matches!(statement, Stmt::Let(_, Rvalue::BuilderWriteStrIntStr(..)))), 1);
+    }
 
     #[test]
     fn builder_str_int_str_is_fused() {

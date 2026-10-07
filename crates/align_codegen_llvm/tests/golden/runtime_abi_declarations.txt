@@ -11,6 +11,7 @@ key|ArrayBuilderFreeStack|array_builder_free_stack|IndirectStorage|declare void 
 key|ArrayBuilderFreeStrings|array_builder_free_strings|IndirectStorage|declare void @align_rt_array_builder_free_strings(ptr) #2
 key|ArrayBuilderFreeStringsStack|array_builder_free_strings_stack|IndirectStorage|declare void @align_rt_array_builder_free_strings_stack(ptr) #2
 key|ArrayBuilderInitStack|array_builder_init_stack|IndirectStorage|declare ptr @align_rt_array_builder_init_stack(ptr, i64, i64) #2
+key|ArrayBuilderLen|array_builder_len|IndirectStorage|declare i64 @align_rt_array_builder_len(ptr) #2
 key|ArrayBuilderNew|array_builder_new|AllocNew|declare noalias ptr @align_rt_array_builder_new(i64, i64) #0
 key|ArrayBuilderNewIn|array_builder_new_in|IndirectStorage|declare noalias ptr @align_rt_array_builder_new_in(ptr, i64, i64, i64) #2
 key|ArrayBuilderPush|array_builder_push|IndirectStorage|declare void @align_rt_array_builder_push(ptr, i64) #2
@@ -39,6 +40,7 @@ key|BuilderFreeStack|builder_free_stack|IndirectStorage|declare void @align_rt_b
 key|BuilderInitStack|builder_init_stack|IndirectStorage|declare ptr @align_rt_builder_init_stack(ptr, ptr captures(none), i64) #2
 key|BuilderIntoString|builder_into_string|IndirectStorage|declare { ptr, i64 } @align_rt_builder_into_string(ptr) #2
 key|BuilderIntoStringStack|builder_into_string_stack|IndirectStorage|declare { ptr, i64 } @align_rt_builder_into_string_stack(ptr) #2
+key|BuilderLen|builder_len|IndirectStorage|declare i64 @align_rt_builder_len(ptr) #2
 key|BuilderNew|builder_new|AllocNew|declare noalias ptr @align_rt_builder_new(ptr, i64) #0
 key|BuilderPopComma|builder_pop_comma|IndirectStorage|declare void @align_rt_builder_pop_comma(ptr) #2
 key|BuilderWrite|builder_write|IndirectStorage|declare void @align_rt_builder_write(ptr, ptr, i64) #2

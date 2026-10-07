@@ -1324,6 +1324,8 @@ merely because its `Ty` matches.
 | `StrBytes` | `env[]; child[inner]`; `Str; result bytes; view inherits string provenance; Pure`. |
 | `BufferLen` | `env[]; child[buffer]`; `Buffer; result i64; borrowed; Pure`. |
 | `BufferCapacity` | `env[]; child[buffer]`; exact stable Buffer receiver and i64 result; borrowed, Pure, no retained view. Observes descriptor read-window capacity, not initialized length or allocator spare (plan 87). |
+| `BuilderLen` | `env[]; child[builder]`; exact stable local Builder receiver, authenticated against its local/parameter declaration; result exactly i64, Pure and nonconsuming. Counts initialized UTF-8 bytes including NUL; no retained dependency, allocation or view (plan 140). |
+| `ArrayBuilderLen` | `env[]; child[builder]`; exact stable local of one of all five admitted builder families, with valid element graph and declaration; result exactly i64, Pure and nonconsuming. Counts total initialized elements across existing heap/region modes without traversal or compaction; no retained dependency (plan 140). |
 | `BytesRead` | `env[be]`; `child[bytes,offset]`; `bytes,i64; result exact stored read scalar in {i8/u8/i16/u16/i32/u32/i64/u64/f32/f64}; be must be false for one-byte widths; borrowed bounds-checked read; Pure`. |
 | `BufferPut` | `env[be]`; `child[buffer,value]`; `SourceMutLocal(Buffer,buffer); value exact supported binary scalar; be false for one-byte widths; result Unit; buffer mutated; Pure`. |
 | `BufferAppend` | `env[]; child[buffer,data]`; `SourceMutLocal(Buffer,buffer),byte-view; result Unit; data borrowed, buffer mutated; Pure`. |

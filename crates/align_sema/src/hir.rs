@@ -1129,6 +1129,8 @@ pub enum ExprKind {
     /// `b.to_string()` — finish a builder into an **owned** `string`, consuming (moving) the
     /// builder. The `ty` is [`crate::Ty::String`].
     BuilderToString(Box<Expr>),
+    /// Nonconsuming initialized UTF-8 byte count of a stable builder; Pure, Static i64.
+    BuilderLen { builder: Box<Expr> },
     /// `[e1, e2, ...]` — a fixed-length array literal. `elem` is the element type
     /// (a scalar, or a struct for an array-of-structs whose elements are `StructLit`s).
     /// `pooled` (doc-13 §8.4, S3) is set only at a qualifying `let` binding whose every element
@@ -1707,6 +1709,8 @@ pub enum ExprKind {
     /// Heap storage transfers zero-copy; region chunks compact once into the same region. The `ty`
     /// is [`crate::Ty::DynArray`] (or the AoS struct-array form) of the element.
     ArrayBuilderBuild(Box<Expr>),
+    /// Nonconsuming total initialized element count of any admitted builder family.
+    ArrayBuilderLen { builder: Box<Expr> },
     /// `fs.write_file(path, data)` — create/truncate `path` (a `str`) and write all of `data`, then
     /// close. `data` is a `str`/`bytes` (`slice<u8>`) view, or — when `builder` is set — a `builder`'s
     /// accumulated bytes (borrowed, not consumed). The `ty` is `Result<(), Error>`. Impure.

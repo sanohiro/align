@@ -12309,7 +12309,7 @@ fn request11_expr_kind_inventory_tripwire() {
         // Copy Result family with explicit checked-HIR validation and no retained storage.
         // BufferTryNew adds one explicit fallible owned-buffer construction family.
         variants,
-        353,
+        355,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -12754,6 +12754,14 @@ fn hir_body_validator_native() {
         vec![body_test_local(0, "buffer", Ty::Buffer, false, false)],
         i64_ty
     );
+    for (label, owner_ty) in [("native_builder_len", Ty::Builder),
+        ("native_array_builder_len", Ty::ArrayBuilder(align_sema::Scalar::Int(align_sema::IntTy { bits: 64, signed: true })))] {
+        let builder = Box::new(native_local(0, owner_ty));
+        let kind = if owner_ty == Ty::Builder { hir::ExprKind::BuilderLen { builder } }
+            else { hir::ExprKind::ArrayBuilderLen { builder } };
+        add!(label, body_test_expr(kind, i64_ty),
+            vec![body_test_local(0, "builder", owner_ty, false, false)], i64_ty);
+    }
     add!(
         "native_buffer_capacity",
         body_test_expr(
@@ -19707,6 +19715,41 @@ fn sync_methods_hir_reject_forged_native_types() -> Result<(), &'static str> {
                 },
             }
             assert_body_entrypoints_empty(&format!("sync-{ty}-{mutation}"), &bad);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn builder_length_hir_rejects_forged_receiver_place_and_result() -> Result<(), &'static str> {
+    for ty in ["builder", "array_builder<i64>", "array_builder<vec4<i32>>",
+        "array_builder<mask4<i32>>", "array_builder<[i64; 2]>", "array_builder<[Row; 1]>"] {
+        let base = checked_source_program(&format!(
+            "Row {{ value: i64 }}\nfn query(borrow value: {ty}) -> i64 = value.len()\nfn main() {{}}\n"));
+        assert!(validate_hir::body_only_metadata_is_valid(&base), "valid {ty}");
+        assert!(lower_program_checked(&base, false, None).is_ok(), "valid {ty}");
+        for mutation in 0..6 {
+            let mut bad = base.clone();
+            let function = bad.fns.iter_mut().find(|f| f.name == "query").ok_or("query function")?;
+            let value = function.body.value.as_mut().ok_or("query value")?;
+            let (hir::ExprKind::BuilderLen { builder } | hir::ExprKind::ArrayBuilderLen { builder }) = &mut value.kind
+                else { return Err("length operation"); };
+            match mutation {
+                0 => builder.ty = Ty::Buffer,
+                1 => builder.kind = hir::ExprKind::Bool(false),
+                2 => builder.kind = hir::ExprKind::Local(u32::MAX),
+                3 => {
+                    value.ty = Ty::Bool;
+                    function.ret = Ty::Bool;
+                }
+                4 => {
+                    let receiver = builder.clone();
+                    value.kind = if ty == "builder" { hir::ExprKind::ArrayBuilderLen { builder: receiver } }
+                        else { hir::ExprKind::BuilderLen { builder: receiver } };
+                }
+                _ => builder.ty = Ty::ArrayBuilder(align_sema::Scalar::Struct(u32::MAX)),
+            }
+            assert_body_entrypoints_empty(&format!("builder-length-{ty}-{mutation}"), &bad);
         }
     }
     Ok(())

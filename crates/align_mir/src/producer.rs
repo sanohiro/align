@@ -1597,6 +1597,18 @@ pub fn native_owner_mir_contract<'a>(
             }
             contract.operands.push((alignment, i64_ty, read));
         }
+        Rvalue::BuilderLen(builder) | Rvalue::ArrayBuilderLen(builder) => {
+            let owner = if matches!(value, Rvalue::BuilderLen(_)) {
+                Ty::Builder
+            } else {
+                match xml_operand_base_ty(function, builder) {
+                    Some(ty) if ty.is_array_builder() => ty,
+                    _ => Ty::Error,
+                }
+            };
+            contract.result = i64_ty;
+            contract.operands = vec![(builder, owner, read)];
+        }
         Rvalue::BufferCapacity(buffer) => {
             contract.result = i64_ty;
             contract.operands = vec![(buffer, Ty::Buffer, read)];
@@ -6518,6 +6530,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::BufferBytes(..)
             | Rvalue::BufferLen(..)
             | Rvalue::BufferCapacity(..)
+            | Rvalue::BuilderLen(..) | Rvalue::ArrayBuilderLen(..)
             | Rvalue::BytesRead { .. }
             | Rvalue::BytesSet { .. }
             | Rvalue::BytesFill { .. }

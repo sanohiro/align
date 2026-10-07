@@ -32,6 +32,7 @@ a + b                      -> compile error; builder is the one concatenation pa
 
 b := builder()  /  builder(cap)
 b.write(s: str|string)  /  b.write_int(i: i64)
+b.len()                    -> i64        // initialized UTF-8 byte count
 b.to_string()              -> string     // the finisher (there is no finish()/build())
 
 fn append(borrow mut output: builder, text: str)  // direct helper declaration
@@ -53,6 +54,14 @@ formation remain excluded. The existing function-type result grammar can spell
 `fn() -> builder`, but forming such a function value remains rejected.
 [Plan 82](../82-text-builder-parameter-plan.md) owns this boundary;
 `text_builder_params.rs` owns source/native and whole-program/per-unit parity.
+
+`b.len() -> i64` is a Pure, nonconsuming observation of initialized UTF-8 bytes, including embedded NUL.
+It takes no arguments, allocates nothing, retains no view or owner dependency,
+and may be called on immutable bound locals or admitted borrowed/owned helper
+parameters. Bind temporary or control-result receivers first. Reserved capacity
+is not length. An unrepresentable count raises the allocation-size hard error
+without wrapping or saturation. Further growth and consuming finish remain
+valid. [Plan 140](../140-builder-length-plan.md) owns the source/native contract.
 
 ## Type & ownership classification
 
