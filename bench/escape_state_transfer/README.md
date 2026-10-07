@@ -1,6 +1,6 @@
 # Compiler check-time scaling measurement
 
-This local benchmark owns plan 21 items 11–24 checking measurements. It
+This local benchmark owns plan 21 items 11–25 checking measurements. It
 compares release compiler binaries on the same generated straight arithmetic,
 Result `?`, and Result `match` chains inside a loop. Each case uses 16, 128 or
 512 values. `--corpus storage` selects fixed-array declarations in straight-line
@@ -416,3 +416,30 @@ This is a small measured improvement, without a uniform-speedup, peak-memory,
 near-linear or consumer-time claim. Omitting retirement fails the actual
 reference-lifetime owner; byte-identical restoration passes all 326 sema owners
 and the five driver suites (238 passed, one existing ignored).
+
+## Item 25 result (2026-10-08)
+
+The same host/profile compares merged
+`7d42007971d4e773e51afb3126f7314eb7936aef` with an ordinary inline hint on the
+canonical wyhash entry. Its algorithm body, seeds and callers are unchanged.
+No builds/tests overlap measurement; `DYLD_SHARED_REGION` is unset for both
+binaries. Both corpora use `--llvm-parity`.
+[Full samples and hashes](results-inline-hash-macos.json) retain all 30 cells
+with five alternating samples after warmup.
+
+| 512-value shape | Command | Baseline median | Candidate median | Ratio |
+| --- | --- | ---: | ---: | ---: |
+| match | check | 0.328 s | 0.309 s | 1.06x |
+| match | check-per-unit | 0.629 s | 0.596 s | 1.05x |
+| fixed | check | 0.131 s | 0.130 s | 1.01x |
+| fixed | check-per-unit | 0.274 s | 0.273 s | 1.00x |
+| loop-fixed | check | 0.760 s | 0.758 s | 1.00x |
+| loop-fixed | check-per-unit | 1.528 s | 1.527 s | 1.00x |
+
+All 15 source MIR/raw LLVM pairs, actual checked-work outputs and four distinct
+rejected controls agree (the rejected controls run in both corpora). Every
+16-value control stays within 1 ms, numeric straight/try controls within 1.3 ms
+and storage controls within 2.1 ms. The candidate compiler is 14,738,496 bytes,
+256 bytes smaller than the baseline. No uniform-speedup, runtime-throughput,
+near-linear scaling or consumer-time claim is made. Map copies and repeated
+analysis remain; Request 37 consumer acceptance stays external.

@@ -54,6 +54,7 @@ fn wyr3(p: &[u8], k: usize) -> u64 {
 }
 
 /// wyhash final v3 over `key` with `seed`. Faithful port of the reference scalar path.
+#[inline]
 pub fn wyhash(key: &[u8], seed: u64) -> u64 {
     let len = key.len();
     let mut seed = seed ^ wymix(seed ^ WY_SECRET[0], WY_SECRET[1]);

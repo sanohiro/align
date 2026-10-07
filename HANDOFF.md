@@ -30,7 +30,7 @@ LLVM owners qualify it. Plan138 supplies the ARM64 Linux/macOS sibling ABI;
 plan137 supplies non-owning raw fields and padding/register separation. Bool/char
 FFI, consumer adoption and K1/plan61 remain deferred.
 
-Build-performance items15–24 remove generation-formation table copies, preserve
+Build-performance items15–25 remove generation-formation table copies, preserve
 unaffected generation collections, skip empty ending propagation and duplicate
 terminal probes, and reduce state-join and saved-fact copying costs. Items21–22
 share immutable value and completion/argument payloads through one private map;
@@ -42,6 +42,9 @@ MIR/LLVM and diagnostic owners qualify the boundaries. Item24's local 512-value
 Result-match medians change from 0.323/0.639 s to 0.316/0.610 s (whole/per-unit);
 short controls stay within 0.2 ms and storage controls within 5.6 ms. Earlier items11–14 reduce escape-state copies, empty
 exceptional-region work, edge propagation and unrelated generation table updates.
+Item25 exposes unchanged canonical hashing to cross-crate inlining; its local
+512-value Result-match medians improve from 0.328/0.629 s to 0.309/0.596 s,
+with exact generated-code/diagnostic parity and unchanged hash vectors.
 Map copies, reference counts and repeated traversals remain superlinear;
 Request37 consumer acceptance and K1/plan61 remain deferred.
 
