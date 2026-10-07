@@ -31038,17 +31038,22 @@ fn rename_storage_generation_map<T>(
     renames: &StorageGenerationRenames,
     mut join: impl FnMut(&mut T, T),
 ) {
-    let mut renamed = std::collections::BTreeMap::new();
-    for (generation, value) in std::mem::take(entries) {
-        let generation = renames.apply(&generation);
-        match renamed.entry(generation) {
+    for origin in &renames.origins {
+        let Some(mut current) = entries.remove(&StorageGeneration::Current(origin.clone())) else {
+            continue;
+        };
+        match entries.entry(StorageGeneration::Prior(origin.clone())) {
             std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(value);
+                entry.insert(current);
             }
-            std::collections::btree_map::Entry::Occupied(mut entry) => join(entry.get_mut(), value),
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                // The original ordered rebuild encountered Current before Prior. Preserve
+                // that operand order even for a noncommutative join; origins also stay sorted.
+                std::mem::swap(entry.get_mut(), &mut current);
+                join(entry.get_mut(), current);
+            }
         }
     }
-    *entries = renamed;
 }
 
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
@@ -76193,6 +76198,177 @@ mod tests {
                 signed: true,
             })),
             HttpUpgradeCarrierClass::None,
+        );
+    }
+
+    #[test]
+    fn storage_generation_selected_map_transition() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let mut origins = Vec::new();
+        for path in [
+            vec![],
+            vec![BorrowProjection::StructField(2), BorrowProjection::ResultOk],
+        ] {
+            origins.extend([
+                StorageOrigin::Producer {
+                    expression: 17,
+                    result_path: path.clone().into(),
+                },
+                StorageOrigin::InlinePlace {
+                    local: 3,
+                    path: path.clone().into(),
+                },
+                StorageOrigin::CallMutation {
+                    call: 23,
+                    destination_parameter: 1,
+                    path: path.into(),
+                },
+            ]);
+        }
+        origins.extend(
+            [ByteValidationKind::Utf8, ByteValidationKind::Codec].map(|kind| {
+                StorageOrigin::ByteValidation {
+                    expression: 29,
+                    kind,
+                }
+            }),
+        );
+        origins.sort();
+        let unknown = StorageOrigin::inline_place(99, &[]);
+        for present in 0..4 {
+            for mask in 0..(1 << origins.len()) {
+                let mut input = BTreeMap::from([
+                    (StorageGeneration::parameter_value(0, &[]), vec![1000]),
+                    (
+                        StorageGeneration::caller_storage(1, &[BorrowProjection::OptionSome]),
+                        vec![1001],
+                    ),
+                ]);
+                for (index, origin) in origins.iter().enumerate() {
+                    if present & 1 != 0 {
+                        input.insert(StorageGeneration::Current(origin.clone()), vec![index * 2]);
+                    }
+                    if present & 2 != 0 {
+                        input.insert(
+                            StorageGeneration::Prior(origin.clone()),
+                            vec![index * 2 + 1],
+                        );
+                    }
+                }
+                let renames = StorageGenerationRenames {
+                    origins: origins
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| mask & (1 << index) != 0)
+                        .map(|(_, origin)| origin.clone())
+                        .chain([unknown.clone()])
+                        .collect::<BTreeSet<_>>(),
+                };
+                let mut expected = input.clone();
+                let mut expected_calls = Vec::new();
+                for (index, origin) in origins.iter().enumerate() {
+                    if mask & (1 << index) != 0 && present & 1 != 0 {
+                        expected.remove(&StorageGeneration::Current(origin.clone()));
+                        let mut value = vec![index * 2];
+                        if present & 2 != 0 {
+                            expected_calls.push((vec![index * 2], vec![index * 2 + 1]));
+                            value.push(index * 2 + 1);
+                        }
+                        expected.insert(StorageGeneration::Prior(origin.clone()), value);
+                    }
+                }
+                let mut calls = Vec::new();
+                rename_storage_generation_map(&mut input, &renames, |current, prior| {
+                    calls.push((current.clone(), prior.clone()));
+                    current.extend(prior);
+                });
+                assert_eq!(input, expected, "presence {present}, selection {mask}");
+                assert_eq!(
+                    calls, expected_calls,
+                    "collision operand/order {present}/{mask}"
+                );
+                // A second transition has no selected Current left and cannot rejoin Prior.
+                rename_storage_generation_map(&mut input, &renames, |_, _| {
+                    panic!("rejoined Prior")
+                });
+                assert_eq!(input, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn storage_generation_map_noop_preserves_entries() {
+        let mut entries = (0..64)
+            .map(|local| {
+                (
+                    StorageGeneration::Current(StorageOrigin::inline_place(local, &[])),
+                    local,
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let identities = entries
+            .iter()
+            .map(|(key, value)| (key.clone(), std::ptr::from_ref(value)))
+            .collect::<Vec<_>>();
+        for renames in [
+            StorageGenerationRenames::default(),
+            StorageGenerationRenames::from_origins([StorageOrigin::inline_place(99, &[])]),
+        ] {
+            rename_storage_generation_map(&mut entries, &renames, |_, _| panic!("no collision"));
+            for (key, address) in &identities {
+                assert_eq!(
+                    std::ptr::from_ref(entries.get(key).unwrap()),
+                    *address,
+                    "a no-op must retain the existing table entries"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn storage_generation_map_transition_moves_payloads_once() {
+        struct Value {
+            bytes: Vec<u8>,
+            drops: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+        impl Drop for Value {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+        let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+        let origin = StorageOrigin::inline_place(0, &[]);
+        let stable = StorageGeneration::parameter_value(0, &[]);
+        let mut entries = [
+            (StorageGeneration::Current(origin.clone()), 1),
+            (StorageGeneration::Prior(origin.clone()), 2),
+            (stable.clone(), 3),
+        ]
+        .into_iter()
+        .map(|(key, byte)| {
+            (
+                key,
+                Value {
+                    bytes: vec![byte],
+                    drops: drops.clone(),
+                },
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+        let stable_storage = entries[&stable].bytes.as_ptr();
+        rename_storage_generation_map(
+            &mut entries,
+            &StorageGenerationRenames::from_origins([origin.clone()]),
+            |current, prior| current.bytes.extend_from_slice(&prior.bytes),
+        );
+        assert_eq!(entries[&StorageGeneration::Prior(origin)].bytes, [1, 2]);
+        assert_eq!(entries[&stable].bytes.as_ptr(), stable_storage);
+        assert_eq!(drops.get(), 1, "only the joined prior payload is retired");
+        drop(entries);
+        assert_eq!(
+            drops.get(),
+            3,
+            "every original payload is retired exactly once"
         );
     }
 

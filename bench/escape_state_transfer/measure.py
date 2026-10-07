@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded local before/after checking measurement (plan 21, items 11 and 12)."""
+"""Bounded local before/after checking measurement (plan 21, items 11–14)."""
 import argparse
 import hashlib
 import json
@@ -44,6 +44,16 @@ def run(binary, command, source):
 
 
 def source_text(kind, count):
+    if kind in ("fixed", "loop-fixed"):
+        lines = ["fn main() {", "  mut total := 0"]
+        if kind == "loop-fixed":
+            lines.extend(["  mut turn := 0", "  loop {", "    if turn == 2 { break }"])
+        for index in range(count):
+            lines.extend([f"  value{index} := [1, 2, 3, 4]",
+                          f"  total = total + value{index}[0]"])
+        if kind == "loop-fixed":
+            lines.extend(["    turn = turn + 1", "  }"])
+        return "\n".join(lines + ["  print(total)", "}"]) + "\n"
     lines = [
         "fn step(value: i64) -> Result<i64, Error> = Ok(value + 1)",
         "fn exercise() -> Result<i64, Error> {",
@@ -83,17 +93,19 @@ def main():
     parser.add_argument("--repeats", type=int, default=5, choices=range(1, 11))
     parser.add_argument("--llvm-parity", action="store_true",
                         help="also compare raw LLVM, including cold attributes and branch weights")
+    parser.add_argument("--corpus", choices=("numeric", "storage"), default="numeric")
     args = parser.parse_args()
     binaries = {"baseline": args.baseline.resolve(), "candidate": args.candidate.resolve()}
     print(json.dumps({"binaries": {
         name: {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
         for name, path in binaries.items()
-    }, "repeats": args.repeats}), flush=True)
+    }, "repeats": args.repeats, "corpus": args.corpus}), flush=True)
     # Both revisions consume the exact same path and bytes. Each check is a fresh process;
     # neither check command reuses a persisted frontend cache.
     with tempfile.TemporaryDirectory(prefix="align-escape-transfer-") as temporary:
         directory = Path(temporary)
-        for kind in ("straight", "try", "match"):
+        kinds = ("straight", "try", "match") if args.corpus == "numeric" else ("fixed", "loop-fixed")
+        for kind in kinds:
             for count in (16, 128, 512):
                 source = directory / f"{kind}-{count}.align"
                 text = source_text(kind, count)
@@ -112,19 +124,26 @@ def main():
                     del outputs
                 for command in ("check", "check-per-unit"):
                     samples = {name: [] for name in binaries}
+                    checked_output = {}
                     for round_number in range(args.repeats + 1):
                         order = list(binaries) if round_number % 2 == 0 else list(reversed(binaries))
                         for name in order:
                             code, stdout, stderr, elapsed = run(binaries[name], command, source)
                             if code != 0 or stderr:
                                 raise RuntimeError(f"{name} {command} {source.name}: exit={code}, {stderr!r}")
+                            observed = stdout.decode("utf-8")
+                            if "ok: checked " not in observed or checked_output.setdefault(name, observed) != observed:
+                                raise RuntimeError(f"unstable checked-work evidence: {name} {source.name}")
                             if round_number:
                                 samples[name].append(elapsed)
+                    if checked_output["baseline"] != checked_output["candidate"]:
+                        raise RuntimeError(f"checked-work parity failed: {source.name} {command}")
                     print(json.dumps({
                         "kind": kind, "values": count, "source_bytes": len(text.encode()),
                         "source_lines": len(text.splitlines()), "command": command,
                         "source_sha256": hashlib.sha256(text.encode()).hexdigest(),
                         "mir_sha256": mir_digest, "samples_seconds": samples,
+                        "checked_output": checked_output,
                         **({"llvm_sha256": llvm_digest} if llvm_digest is not None else {}),
                         "median_seconds": {name: statistics.median(values) for name, values in samples.items()},
                     }), flush=True)

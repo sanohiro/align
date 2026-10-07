@@ -24,11 +24,14 @@ LLVM owners qualify it. Plan138 supplies the ARM64 Linux/macOS sibling ABI;
 plan137 supplies non-owning raw fields and padding/register separation. Bool/char
 FFI, consumer adoption and K1/plan61 remain deferred.
 
-Build-performance item13 moves the final initial escape-flow output and joins
-existing inputs in place, preserving every fact and diagnostic. Exact-state and
-allocation-identity owners qualify the mechanics; local 512-value Result-match
-whole/per-unit checks improve 1.08x/1.07x. Block input copies and superlinear
-scaling remain; Request37 consumer acceptance and K1/plan61 stay deferred.
+Build-performance item14 updates only selected Current-to-Prior generation-table
+entries while preserving every fact and collision order. Exact map, no-op storage,
+Drop and whole/per-unit owners qualify it. Local 512-array checks improve
+1.54x/1.55x (straight-line whole/per-unit) and 1.80x/1.81x (loop whole/per-unit),
+with identical MIR, LLVM and diagnostics. Earlier items11–13 reduce escape-state
+copies, empty exceptional-region work and edge propagation. Remaining table/fact
+copies and repeated analysis are superlinear; Request37 consumer acceptance and
+K1/plan61 remain deferred.
 
 Plan136 separates array-builder value dependencies from the consumed local slot,
 so loop-local build results remain usable after replacement. Exact receiver
@@ -36,16 +39,6 @@ reservations also reject push/append operands that invalidate the builder before
 the action. Retained element/region lifetimes and read-only origins remain;
 whole/per-unit owners qualify the Request 46 repair. Array-field assignment,
 consumer adoption and K1/plan61 remain deferred.
-
-Build-performance item 11 removes two complete escape-analysis state copies per
-flow transfer while preserving every fact, CFG edge, join, diagnostic and Drop
-classification. A storage-identity owner, sema regression corpus and whole/per-unit
-MIR/diagnostic comparisons qualify it. Local release measurements improve long
-straight/try/match checks. Item 12 skips cold-region dominance when no exceptional
-edge exists; the 512-value per-unit match check falls from 8.895 to 2.091 s with
-identical MIR, LLVM and diagnostics. Remaining semantic/block/join costs are still
-superlinear. Request 37 consumer recombination and acceptance stay external;
-K1/plan61 remain deferred.
 
 Plan135 adds explicit fallible aligned construction through `buffer.try_new`
 and `buffer.try_filled`. Payload and handle refusal return Code(ENOMEM), invalid
