@@ -1,6 +1,6 @@
 # Compiler check-time scaling measurement
 
-This local benchmark owns plan 21 items 11–25 checking measurements. It
+This local benchmark owns plan 21 items 11–26 checking measurements. It
 compares release compiler binaries on the same generated straight arithmetic,
 Result `?`, and Result `match` chains inside a loop. Each case uses 16, 128 or
 512 values. `--corpus storage` selects fixed-array declarations in straight-line
@@ -443,3 +443,29 @@ and storage controls within 2.1 ms. The candidate compiler is 14,738,496 bytes,
 256 bytes smaller than the baseline. No uniform-speedup, runtime-throughput,
 near-linear scaling or consumer-time claim is made. Map copies and repeated
 analysis remain; Request 37 consumer acceptance stays external.
+
+## Item 26 result (2026-10-08)
+
+The same host/profile compares merged
+`a005581981796aa1f98f3a11f36abbd8a3a0acee` with direct evaluation of the
+`ty_may_borrow` root before using the descendant worklist. The exact type match,
+visited identities and descendant order remain. No builds/tests overlap
+measurement; `DYLD_SHARED_REGION` is unset for both binaries. Both corpora use
+`--llvm-parity`. [Full samples and hashes](results-borrow-root-macos.json)
+retain all 30 cells with five alternating samples after warmup.
+
+| 512-value shape | Command | Baseline median | Candidate median | Ratio |
+| --- | --- | ---: | ---: | ---: |
+| match | check | 0.305 s | 0.303 s | 1.01x |
+| match | check-per-unit | 0.588 s | 0.590 s | 1.00x |
+| fixed | check | 0.130 s | 0.129 s | 1.01x |
+| fixed | check-per-unit | 0.267 s | 0.264 s | 1.01x |
+| loop-fixed | check | 0.749 s | 0.733 s | 1.02x |
+| loop-fixed | check-per-unit | 1.509 s | 1.469 s | 1.03x |
+
+All 15 source MIR/raw LLVM pairs, actual checked-work outputs and four distinct
+rejected controls agree (the rejected controls run in both corpora). Every 16-value control stays within 0.6 ms, numeric controls within 2.2 ms
+and straight fixed-array controls within 3 ms. The Result-match per-unit
+control increases 1.7 ms. The improvement is local to the measured workload,
+without a uniform-speedup, runtime-allocation,
+near-linear or consumer-time claim. Request 37 consumer acceptance stays external.

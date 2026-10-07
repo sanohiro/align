@@ -3172,18 +3172,18 @@ fn ty_contains_leaf(
 /// than Move/region tracking: an owned `string` or response owns its storage, while `str`, `slice`,
 /// a borrowed reader/writer, and aggregates containing those views carry borrow provenance.
 pub fn ty_may_borrow(
-    ty: Ty,
+    mut ty: Ty,
     structs: &[StructDef],
     tuples: &[hir::TupleDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> bool {
-    let mut work = vec![ty];
+    let mut work = Vec::new();
     let mut visited_structs = HashSet::new();
     let mut visited_tuples = HashSet::new();
     let mut visited_enums = HashSet::new();
     let mut visited_tagged = HashSet::new();
-    while let Some(ty) = work.pop() {
+    loop {
         match ty {
             Ty::Str
             | Ty::Slice(_)
@@ -3271,8 +3271,11 @@ pub fn ty_may_borrow(
             }
             _ => {}
         }
+        match work.pop() {
+            Some(next) => ty = next,
+            None => return false,
+        }
     }
-    false
 }
 
 /// A resource can retain another resource, but cannot retain the storage of an ordinary

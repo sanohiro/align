@@ -3586,3 +3586,36 @@ controls within 1.3 ms and storage controls within 2.1 ms. The compiler binary
 shrinks by 256 bytes. `results-inline-hash-macos.json` retains samples and exact
 source/binary identities. This is a local compiler-time improvement, with no
 uniform-speedup, runtime-throughput, near-linear or consumer-time promise.
+
+## Item 26: evaluate the borrow-query root before allocating its worklist
+
+`ty_may_borrow` currently pushes its root into a newly allocated Vec on every
+query, including terminal scalar and view roots. Evaluate that same root first;
+keep the initially empty Vec for descendants. The exact type match, descendant
+push/pop order, four visited sets, missing-definition behavior and early true
+returns remain. Exhausting the descendant worklist still returns false. This
+adds no separate type classifier, recursion, memoization or source capability.
+
+### Implementation closure matrix
+
+| Axis | Implementation and owner |
+| --- | --- |
+| Root and descendant traversal | Only the initial worklist entry and loop control change. Preserve every existing match arm byte-for-byte. Existing full sema, deep-type closure and header-mediated nominal-cycle owners retain scalar/view, aggregate, tagged, repeated/cyclic and missing-definition behavior. |
+| Ownership and all control paths | The complete type query returns the same boolean to existing consumers. No source construction, move-in/out, nulling, replacement, Drop, return, branch/loop join, eager completion or malformed-input rule changes. Existing builder, region, return-provenance and borrow-liveness driver owners remain. |
+| Generic and compilation boundaries | Keep the same type-definition context and visited identities; no HIR/MIR, interface, cache or ABI change. Imported/generic owners and all numeric/storage MIR/raw LLVM pairs and rejected diagnostics qualify whole/per-unit parity. |
+| Performance acceptance | First the existing 12-cell pilot against the exact post-item25 merged release binary, then all 30 cells with five alternating samples, warmup, actual checked-work output and bounded child cleanup. Retain only a useful measured improvement with control-regression assessment. No runtime resource, uniform-speedup or consumer-time guarantee. |
+
+This is a scratch-work refinement of the existing iterative query, with unchanged
+analysis authority. Complete the author matrix pass before coding and one fresh
+full-diff preflight review on a retained candidate. K1/plan61 and the parked
+aggregate-provenance repair remain deferred. The complete capability is below
+1,000 handwritten changed lines.
+
+Five alternating release samples improve 512-value fixed-array-loop whole/per-unit
+medians from 0.749/1.509 s to 0.733/1.469 s (1.02x/1.03x). All 15 MIR/raw LLVM
+pairs, actual checked-work outputs and four distinct rejected controls agree
+across 30 cells. Every 16-value control stays within 0.6 ms, numeric controls
+within 2.2 ms and straight fixed-array controls within 3 ms. The Result-match
+per-unit control increases 1.7 ms; no uniform speedup is claimed.
+`results-borrow-root-macos.json` retains complete samples and source/binary
+identities. This does not establish near-linear or consumer-level checking time.
