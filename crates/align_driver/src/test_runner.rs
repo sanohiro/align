@@ -2152,6 +2152,7 @@ mod tests {
     #[ignore = "spawned by controlled_write_sigpipe_process_owner in an isolated process"]
     fn controlled_write_sigpipe_process_probe() {
         let case = std::env::var("ALIGN_TEST_SIGPIPE_CASE").expect("SIGPIPE case");
+        assert!(sigpipe_is_blocked(), "probe must inherit its owner's mask");
         let (initially_blocked, pre_pending, closed) = match case.as_str() {
             "success-unblocked" => (false, false, false),
             "success-blocked-pending" => (true, true, false),
@@ -2188,7 +2189,12 @@ mod tests {
                 sigpipe_is_blocked(),
                 "terminal EPIPE path restored the mask"
             );
-            assert!(sigpipe_is_pending(), "terminal EPIPE path lost SIGPIPE");
+            // Darwin targets the process for pipe EPIPE, and sigpending only observes this
+            // thread. Its generated signal may belong to libtest's blocked main thread.
+            // A pre-existing thread-directed raise must remain pending on either platform.
+            if pre_pending || cfg!(target_os = "linux") {
+                assert!(sigpipe_is_pending(), "terminal EPIPE path lost SIGPIPE");
+            }
         } else {
             match result {
                 Ok(()) => {}
@@ -2206,34 +2212,95 @@ mod tests {
                 .expect("read controlled byte");
             assert_eq!(byte, [b'x']);
         }
+        assert_eq!(current_action(libc::SIGPIPE).sa_sigaction, libc::SIG_DFL);
         drop(controller);
     }
 
     #[test]
     fn controlled_write_sigpipe_process_owner() {
+        use std::os::unix::process::CommandExt;
+
+        // This exact-filter child creates threads, but never descendant processes. Keep the
+        // existing native direct-child owners and one deadline across work and unwind cleanup.
+        struct ProbeOwner {
+            child: ChildGuard,
+            deadline: Instant,
+        }
+        impl Drop for ProbeOwner {
+            fn drop(&mut self) {
+                if self.child.armed {
+                    let _ = self.child.kill(self.deadline);
+                    let _ = self.child.reap(self.deadline);
+                    self.child.abandon();
+                }
+            }
+        }
+        let parent_blocked = sigpipe_is_blocked();
+        let parent_pending = sigpipe_is_pending();
+        let mut blocked: libc::sigset_t = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::sigemptyset(&mut blocked) }, 0);
+        assert_eq!(unsafe { libc::sigaddset(&mut blocked, libc::SIGPIPE) }, 0);
+        let stage = align_driver::ArtifactStage::temp("sigpipe-probe").expect("probe stage");
         for case in [
             "success-unblocked",
             "success-blocked-pending",
             "closed-unblocked",
             "closed-blocked-pending",
         ] {
-            let output = std::process::Command::new(
+            let stdout = stage.path().join(format!("{case}.stdout"));
+            let stderr = stage.path().join(format!("{case}.stderr"));
+            let mut command = std::process::Command::new(
                 std::env::current_exe().expect("current test executable"),
-            )
-            .args([
-                "--ignored",
-                "--exact",
-                "test_runner::tests::controlled_write_sigpipe_process_probe",
-                "--test-threads=1",
-            ])
-            .env("ALIGN_TEST_SIGPIPE_CASE", case)
-            .output()
-            .expect("spawn SIGPIPE probe");
+            );
+            command
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "test_runner::tests::controlled_write_sigpipe_process_probe",
+                    "--test-threads=1",
+                ])
+                .env("ALIGN_TEST_SIGPIPE_CASE", case)
+                .stdout(File::create(&stdout).expect("probe stdout"))
+                .stderr(File::create(&stderr).expect("probe stderr"));
+            // Only the exec child changes its mask. All libtest threads inherit the block;
+            // the probe later changes its own thread to the selected original state.
+            unsafe {
+                command.pre_exec(move || {
+                    let code =
+                        libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, std::ptr::null_mut());
+                    if code == 0 {
+                        Ok(())
+                    } else {
+                        Err(io::Error::from_raw_os_error(code))
+                    }
+                });
+            }
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let work_deadline = deadline - CLEANUP_TIMEOUT;
+            let child = command.spawn().expect("spawn SIGPIPE probe");
+            let mut owner = ProbeOwner {
+                child: ChildGuard::new(child.id() as i32),
+                deadline,
+            };
+            while !child_is_terminal_until(owner.child.pid, work_deadline).expect("observe probe") {
+                assert!(
+                    Instant::now() < work_deadline,
+                    "SIGPIPE probe timed out"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let status = owner.child.reap(deadline).expect("reap SIGPIPE probe");
             assert!(
-                output.status.success(),
-                "SIGPIPE probe `{case}` failed\nstdout:\n{}\nstderr:\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+                status.success(),
+                "SIGPIPE probe `{case}` failed ({status})\nstdout:\n{}\nstderr:\n{}",
+                std::fs::read_to_string(&stdout).expect("read probe stdout"),
+                std::fs::read_to_string(&stderr).expect("read probe stderr")
+            );
+            assert_eq!(sigpipe_is_blocked(), parent_blocked, "parent mask changed");
+            assert_eq!(
+                sigpipe_is_pending(),
+                parent_pending,
+                "parent pending set changed"
             );
         }
     }
