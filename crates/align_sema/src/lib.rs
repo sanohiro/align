@@ -20344,11 +20344,9 @@ impl<'a> EscapeCheck<'a> {
                 let changed = EscapeState::merge_input(
                     &mut inputs[successor], &mut state, index + 1 == successors.len(),
                 );
-                if changed {
-                    if !pending[successor] {
-                        pending[successor] = true;
-                        worklist.push_back(successor);
-                    }
+                if changed && !pending[successor] {
+                    pending[successor] = true;
+                    worklist.push_back(successor);
                 }
             }
         }
