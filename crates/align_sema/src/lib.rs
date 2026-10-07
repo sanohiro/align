@@ -31403,6 +31403,14 @@ struct StorageHeaderFormation<DirectoryEntry, ContentFact> {
     content: Option<ContentFact>,
 }
 
+struct PreparedStorageHeader<DirectoryEntry, ContentFact> {
+    path: StoragePath,
+    generation: StorageGeneration,
+    descriptor: StorageHeaderDescriptor,
+    directory: DirectoryEntry,
+    content: ContentFact,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct StorageFormationCommit {
     headers: ProjectedHeaderFact,
@@ -31430,7 +31438,7 @@ impl<DirectoryEntry, ContentFact> Default
     }
 }
 
-impl<DirectoryEntry: Clone, ContentFact: Clone>
+impl<DirectoryEntry, ContentFact>
     StorageGenerationTables<DirectoryEntry, ContentFact>
 {
     /// Validate every result leaf and initializer before publishing recency or either table.
@@ -31472,17 +31480,18 @@ impl<DirectoryEntry: Clone, ContentFact: Clone>
         let mut batch_paths = std::collections::BTreeSet::new();
         let mut batch_generations = std::collections::BTreeSet::new();
         let mut renames = StorageGenerationRenames::default();
-        for formation in &formations {
-            match (&formation.directory, &formation.content) {
+        let mut prepared = Vec::with_capacity(formations.len());
+        for formation in formations {
+            let (directory, content) = match (formation.directory, formation.content) {
                 (None, None) => return Err(StorageFormationError::MissingInitializer),
-                (Some(_), Some(_)) => {}
+                (Some(directory), Some(content)) => (directory, content),
                 (Some(_), None) | (None, Some(_)) => {
                     return Err(StorageFormationError::MalformedInitializer);
                 }
-            }
-            if !valid_paths.contains_key(&formation.path) {
+            };
+            let Some(&descriptor) = valid_paths.get(&formation.path) else {
                 return Err(StorageFormationError::NotHeaderPath);
-            }
+            };
             if formation.generation.path() != formation.path {
                 return Err(StorageFormationError::GenerationPathMismatch);
             }
@@ -31495,6 +31504,13 @@ impl<DirectoryEntry: Clone, ContentFact: Clone>
             if let StorageGeneration::Current(origin) = &formation.generation {
                 renames.insert(origin.clone());
             }
+            prepared.push(PreparedStorageHeader {
+                path: formation.path,
+                generation: formation.generation,
+                descriptor,
+                directory,
+                content,
+            });
         }
 
         // Existing Current entries selected by this completion are legal: the transaction first
@@ -31512,34 +31528,27 @@ impl<DirectoryEntry: Clone, ContentFact: Clone>
             }
         }
 
-        let mut next = self.clone();
-        next.directory
+        // Admission is complete. Demotion vacates every incoming Current key. A newly
+        // occupied Prior key could collide only with a same-origin Current formation,
+        // which already failed duplicate-path admission; all other keys were checked above.
+        // Concrete payloads and descriptors make this commit infallible for admitted input.
+        self.directory
             .rename_current_to_prior(&renames, &mut join_directory);
-        next.contents
+        self.contents
             .rename_current_to_prior(&renames, &mut join_content);
         let mut headers = ProjectedHeaderFact::default();
-        for formation in formations {
-            if next.directory.entries.contains_key(&formation.generation)
-                || next.contents.entries.contains_key(&formation.generation)
-            {
-                return Err(StorageFormationError::DuplicateGeneration);
-            }
-            let (Some(directory), Some(content)) = (formation.directory, formation.content) else {
-                return Err(StorageFormationError::MalformedInitializer);
-            };
-            next.directory
+        for formation in prepared {
+            self.directory
                 .entries
-                .insert(formation.generation.clone(), directory);
-            next.contents
+                .insert(formation.generation.clone(), formation.directory);
+            self.contents
                 .entries
-                .insert(formation.generation.clone(), content);
-            let descriptor = valid_paths[&formation.path];
+                .insert(formation.generation.clone(), formation.content);
             headers.leaves.insert(
                 formation.path,
-                StorageHeaderLeaf::known_typed(formation.generation, descriptor),
+                StorageHeaderLeaf::known_typed(formation.generation, formation.descriptor),
             );
         }
-        *self = next;
         Ok(StorageFormationCommit { headers, renames })
     }
 
@@ -76373,6 +76382,372 @@ mod tests {
     }
 
     #[test]
+    fn storage_generation_formation_commit_matrix() {
+        use std::cell::RefCell;
+        use std::collections::BTreeMap;
+        type Tables = StorageGenerationTables<Vec<u8>, Vec<u8>>;
+        let scalar = IntTy {
+            bits: 64,
+            signed: true,
+        };
+        let ty = Ty::DynArray(Scalar::Int(scalar));
+        let descriptor = StorageHeaderDescriptor {
+            ty,
+            kind: StorageHeaderKind::OwnedDynamic,
+        };
+        let context = StorageTypeContext {
+            structs: &[],
+            tuples: &[],
+            enums: &[],
+            tagged_types: &[],
+        };
+        let origin = StorageOrigin::inline_place(5, &[]);
+        let keys = [
+            StorageGeneration::Current(origin.clone()),
+            StorageGeneration::Prior(origin.clone()),
+            StorageGeneration::parameter_value(7, &[]),
+            StorageGeneration::caller_storage(9, &[]),
+        ];
+        for mask in 0..16 {
+            for selected in 0..4 {
+                let mut tables = Tables::default();
+                for (index, key) in keys.iter().enumerate() {
+                    if mask & (1 << index) != 0 {
+                        tables
+                            .directory
+                            .entries
+                            .insert(key.clone(), vec![10 + index as u8]);
+                        tables
+                            .contents
+                            .entries
+                            .insert(key.clone(), vec![20 + index as u8]);
+                    }
+                }
+                let mut expected = tables.clone();
+                let callbacks = RefCell::new(Vec::new());
+                let result = tables.try_form_headers(
+                    ty,
+                    vec![StorageHeaderFormation {
+                        path: vec![],
+                        generation: keys[selected].clone(),
+                        directory: Some(vec![100]),
+                        content: Some(vec![200]),
+                    }],
+                    context,
+                    |current, prior| {
+                        callbacks
+                            .borrow_mut()
+                            .push(("directory", current.clone(), prior.clone()));
+                        current.extend(prior);
+                    },
+                    |current, prior| {
+                        callbacks
+                            .borrow_mut()
+                            .push(("content", current.clone(), prior.clone()));
+                        current.extend(prior);
+                    },
+                );
+                if selected != 0 && mask & (1 << selected) != 0 {
+                    assert_eq!(result, Err(StorageFormationError::DuplicateGeneration));
+                    assert!(callbacks.borrow().is_empty());
+                } else {
+                    let mut expected_callbacks = Vec::new();
+                    if selected == 0 && mask & 1 != 0 {
+                        expected.directory.entries.remove(&keys[0]);
+                        expected.contents.entries.remove(&keys[0]);
+                        let (directory, content) = if mask & 2 != 0 {
+                            expected_callbacks = vec![
+                                ("directory", vec![10], vec![11]),
+                                ("content", vec![20], vec![21]),
+                            ];
+                            (vec![10, 11], vec![20, 21])
+                        } else {
+                            (vec![10], vec![20])
+                        };
+                        expected
+                            .directory
+                            .entries
+                            .insert(keys[1].clone(), directory);
+                        expected.contents.entries.insert(keys[1].clone(), content);
+                    }
+                    expected
+                        .directory
+                        .entries
+                        .insert(keys[selected].clone(), vec![100]);
+                    expected
+                        .contents
+                        .entries
+                        .insert(keys[selected].clone(), vec![200]);
+                    let commit = result.unwrap();
+                    assert_eq!(
+                        commit.headers,
+                        ProjectedHeaderFact {
+                            leaves: BTreeMap::from([(
+                                vec![],
+                                StorageHeaderLeaf::known_typed(keys[selected].clone(), descriptor)
+                            )]),
+                        }
+                    );
+                    assert_eq!(
+                        commit.renames.origins,
+                        if selected == 0 {
+                            [origin.clone()].into_iter().collect()
+                        } else {
+                            Default::default()
+                        }
+                    );
+                    assert_eq!(*callbacks.borrow(), expected_callbacks);
+                }
+                assert_eq!(tables, expected, "selected {selected}, present {mask}");
+            }
+        }
+
+        let tuples = [hir::TupleDef {
+            elems: vec![
+                Scalar::DynArray(PrimScalar::Int(scalar)),
+                Scalar::DynArray(PrimScalar::Int(scalar)),
+            ],
+        }];
+        let context = StorageTypeContext {
+            tuples: &tuples,
+            ..context
+        };
+        let origins = [
+            StorageOrigin::inline_place(10, &[BorrowProjection::TupleElement(0)]),
+            StorageOrigin::inline_place(11, &[BorrowProjection::TupleElement(1)]),
+        ];
+        let mut baseline = Tables::default();
+        let mut expected = Tables::default();
+        for (index, origin) in origins.iter().enumerate() {
+            let n = index as u8;
+            for (key, directory, content) in [
+                (
+                    StorageGeneration::Current(origin.clone()),
+                    vec![10 + n],
+                    vec![30 + n],
+                ),
+                (
+                    StorageGeneration::Prior(origin.clone()),
+                    vec![20 + n],
+                    vec![40 + n],
+                ),
+            ] {
+                baseline.directory.entries.insert(key.clone(), directory);
+                baseline.contents.entries.insert(key, content);
+            }
+            expected
+                .directory
+                .entries
+                .insert(StorageGeneration::Current(origin.clone()), vec![100 + n]);
+            expected
+                .contents
+                .entries
+                .insert(StorageGeneration::Current(origin.clone()), vec![200 + n]);
+            expected.directory.entries.insert(
+                StorageGeneration::Prior(origin.clone()),
+                vec![10 + n, 20 + n],
+            );
+            expected.contents.entries.insert(
+                StorageGeneration::Prior(origin.clone()),
+                vec![30 + n, 40 + n],
+            );
+        }
+        let mut commits = Vec::new();
+        for order in [[0, 1], [1, 0]] {
+            let mut tables = baseline.clone();
+            let callbacks = RefCell::new(Vec::new());
+            commits.push(
+                tables
+                    .try_form_headers(
+                        Ty::Tuple(0),
+                        order
+                            .into_iter()
+                            .map(|index| StorageHeaderFormation {
+                                path: vec![BorrowProjection::TupleElement(index as u32)],
+                                generation: StorageGeneration::Current(origins[index].clone()),
+                                directory: Some(vec![100 + index as u8]),
+                                content: Some(vec![200 + index as u8]),
+                            })
+                            .collect(),
+                        context,
+                        |current, prior| {
+                            callbacks.borrow_mut().push((
+                                "directory",
+                                current.clone(),
+                                prior.clone(),
+                            ));
+                            current.extend(prior);
+                        },
+                        |current, prior| {
+                            callbacks.borrow_mut().push((
+                                "content",
+                                current.clone(),
+                                prior.clone(),
+                            ));
+                            current.extend(prior);
+                        },
+                    )
+                    .unwrap(),
+            );
+            assert_eq!(tables, expected);
+            assert_eq!(
+                *callbacks.borrow(),
+                vec![
+                    ("directory", vec![10], vec![20]),
+                    ("directory", vec![11], vec![21]),
+                    ("content", vec![30], vec![40]),
+                    ("content", vec![31], vec![41]),
+                ]
+            );
+        }
+        assert_eq!(
+            commits[0], commits[1],
+            "written batch order preserves canonical headers and renames"
+        );
+
+        for order in [[0, 1], [1, 0]] {
+            let mut tables = Tables::default();
+            tables.directory.entries.insert(keys[0].clone(), vec![10]);
+            tables.contents.entries.insert(keys[0].clone(), vec![20]);
+            let before = tables.clone();
+            assert_eq!(
+                tables.try_form_headers(
+                    ty,
+                    order
+                        .into_iter()
+                        .map(|index| StorageHeaderFormation {
+                            path: vec![],
+                            generation: keys[index].clone(),
+                            directory: Some(vec![100]),
+                            content: Some(vec![200]),
+                        })
+                        .collect(),
+                    context,
+                    |_, _| panic!("invalid batch must not join directory"),
+                    |_, _| panic!("invalid batch must not join content"),
+                ),
+                Err(StorageFormationError::DuplicateHeaderPath)
+            );
+            assert_eq!(
+                tables, before,
+                "Current/Prior same-path collision rejects before demotion"
+            );
+        }
+    }
+
+    #[test]
+    fn storage_generation_formation_moves_payloads_once() {
+        struct Value {
+            bytes: Vec<u8>,
+            drops: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+        impl Drop for Value {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+        let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+        let value = |byte| Value {
+            bytes: vec![byte],
+            drops: drops.clone(),
+        };
+        let context = StorageTypeContext {
+            structs: &[],
+            tuples: &[],
+            enums: &[],
+            tagged_types: &[],
+        };
+        let ty = Ty::DynArray(Scalar::Int(IntTy {
+            bits: 64,
+            signed: true,
+        }));
+        let origin = StorageOrigin::inline_place(5, &[]);
+        let current = StorageGeneration::Current(origin.clone());
+        let prior = StorageGeneration::Prior(origin);
+        let stable = StorageGeneration::parameter_value(1, &[]);
+        let mut tables = StorageGenerationTables::default();
+        tables.directory.entries.insert(stable.clone(), value(1));
+        tables.contents.entries.insert(stable.clone(), value(2));
+        let backing = (
+            tables.directory.entries[&stable].bytes.as_ptr(),
+            tables.contents.entries[&stable].bytes.as_ptr(),
+        );
+        for round in 0..3 {
+            tables
+                .try_form_headers(
+                    ty,
+                    vec![StorageHeaderFormation {
+                        path: vec![],
+                        generation: current.clone(),
+                        directory: Some(value(10 + round)),
+                        content: Some(value(20 + round)),
+                    }],
+                    context,
+                    |current, prior| current.bytes.extend_from_slice(&prior.bytes),
+                    |current, prior| current.bytes.extend_from_slice(&prior.bytes),
+                )
+                .unwrap();
+            assert_eq!(drops.get(), if round == 2 { 2 } else { 0 });
+            assert_eq!(tables.directory.entries[&current].bytes, [10 + round]);
+            assert_eq!(tables.contents.entries[&current].bytes, [20 + round]);
+            assert_eq!(
+                (
+                    tables.directory.entries[&stable].bytes.as_ptr(),
+                    tables.contents.entries[&stable].bytes.as_ptr()
+                ),
+                backing
+            );
+        }
+        assert_eq!(tables.directory.entries[&prior].bytes, [11, 10]);
+        assert_eq!(tables.contents.entries[&prior].bytes, [21, 20]);
+        assert_eq!(
+            tables.try_form_headers(
+                ty,
+                vec![
+                    StorageHeaderFormation {
+                        path: vec![],
+                        generation: current.clone(),
+                        directory: Some(value(30)),
+                        content: Some(value(40))
+                    },
+                    StorageHeaderFormation {
+                        path: vec![],
+                        generation: prior.clone(),
+                        directory: Some(value(50)),
+                        content: None
+                    },
+                ],
+                context,
+                |_, _| panic!("rejected batch must not join directory"),
+                |_, _| panic!("rejected batch must not join content"),
+            ),
+            Err(StorageFormationError::MalformedInitializer)
+        );
+        assert_eq!(
+            drops.get(),
+            5,
+            "only the three rejected payloads are retired"
+        );
+        assert_eq!(tables.directory.entries[&current].bytes, [12]);
+        assert_eq!(tables.contents.entries[&current].bytes, [22]);
+        assert_eq!(tables.directory.entries[&prior].bytes, [11, 10]);
+        assert_eq!(tables.contents.entries[&prior].bytes, [21, 20]);
+        assert_eq!(
+            (
+                tables.directory.entries[&stable].bytes.as_ptr(),
+                tables.contents.entries[&stable].bytes.as_ptr()
+            ),
+            backing
+        );
+        drop(tables);
+        assert_eq!(
+            drops.get(),
+            11,
+            "every supplied non-Clone payload is dropped exactly once"
+        );
+    }
+
+    #[test]
     fn storage_generation_formation_and_malformed_matrix() {
         let u8_ = IntTy {
             bits: 8,
@@ -76717,6 +77092,116 @@ mod tests {
             );
             assert_eq!(forward_tables, before);
         }
+        // Late and multiply-invalid records must reject before any earlier result advances.
+        for (invalid, expected) in [
+            (
+                StorageHeaderFormation {
+                    directory: None,
+                    content: None,
+                    ..one_formation.clone()
+                },
+                StorageFormationError::MissingInitializer,
+            ),
+            (
+                StorageHeaderFormation {
+                    directory: None,
+                    ..one_formation.clone()
+                },
+                StorageFormationError::MalformedInitializer,
+            ),
+            (
+                StorageHeaderFormation {
+                    content: None,
+                    ..one_formation.clone()
+                },
+                StorageFormationError::MalformedInitializer,
+            ),
+            (
+                StorageHeaderFormation {
+                    path: vec![BorrowProjection::TupleElement(u32::MAX)],
+                    directory: None,
+                    content: None,
+                    ..one_formation.clone()
+                },
+                StorageFormationError::MissingInitializer,
+            ),
+            (
+                StorageHeaderFormation {
+                    path: tuple_zero.clone(),
+                    generation: one_generation.clone(),
+                    ..one_formation.clone()
+                },
+                StorageFormationError::GenerationPathMismatch,
+            ),
+        ] {
+            for late in [false, true] {
+                let before = forward_tables.clone();
+                let mut batch = Vec::new();
+                if late {
+                    batch.push(zero_formation.clone());
+                }
+                batch.push(invalid.clone());
+                assert_eq!(
+                    forward_tables.try_form_headers(
+                        Ty::Tuple(0),
+                        batch,
+                        context,
+                        |_, _| panic!("invalid batch must not join directory"),
+                        |_, _| panic!("invalid batch must not join content"),
+                    ),
+                    Err(expected),
+                    "late = {late}"
+                );
+                assert_eq!(forward_tables, before);
+            }
+        }
+        for malformed_type in [false, true] {
+            for mismatched_keys in [false, true] {
+                for empty in [false, true] {
+                    let mut tables = forward_tables.clone();
+                    if mismatched_keys {
+                        // Equal cardinality does not establish directory/content key parity.
+                        let content = tables.contents.entries.remove(&zero_generation).unwrap();
+                        tables.contents.entries.insert(
+                            StorageGeneration::prior(StorageOrigin::producer(&first, &tuple_zero)),
+                            content,
+                        );
+                    }
+                    let before = tables.clone();
+                    let mut batch = Vec::new();
+                    if !empty {
+                        batch.push(StorageHeaderFormation {
+                            directory: None,
+                            content: None,
+                            ..one_formation.clone()
+                        });
+                    }
+                    let expected = if malformed_type {
+                        StorageFormationError::MalformedType
+                    } else if mismatched_keys {
+                        StorageFormationError::MalformedInitializer
+                    } else {
+                        StorageFormationError::MissingInitializer
+                    };
+                    assert_eq!(
+                        tables.try_form_headers(
+                            if malformed_type {
+                                Ty::Tuple(u32::MAX)
+                            } else {
+                                Ty::Tuple(0)
+                            },
+                            batch,
+                            context,
+                            |_, _| panic!("invalid batch must not join directory"),
+                            |_, _| panic!("invalid batch must not join content"),
+                        ),
+                        Err(expected)
+                    );
+                    assert_eq!(tables, before);
+                }
+            }
+        }
+
         let mut projection_tables = StorageGenerationTables::<u32, BorrowRoots>::default();
         for (parameter, root_ty, path) in [
             (
