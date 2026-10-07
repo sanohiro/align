@@ -107,6 +107,18 @@ reallocating a bound source array can invalidate a live result even when its
 copied bytes are static. Owned `string` elements and comparator overloads
 remain unsupported (plan 88).
 
+A `sort_by_key` key may be any existing scalar `Ord` value, including owned
+`string`. The callable executes once per surviving element in input order.
+String key bytes remain live through all comparisons. Their returned cleanup
+bits select an unsorted transient column of owning headers; one recursive Drop
+releases independently owned keys after sorting.
+The comparison columns hold borrowed `str` headers, with no implicit byte clone.
+The explicit sort terminal allocates that additional owner column for nonempty
+owned-string key input; its returned elements and their lifetimes are unchanged.
+Current String producers return heap owners even inside an arena; `clone_in`
+returns a borrowed `str`, whose keys keep the existing shallow cleanup.
+[Plan 134](../134-owned-string-sort-keys.md) owns this cleanup boundary.
+
 ## Type & ownership classification
 
 - Fixed arrays are Copy values; source-formed fixed arrays of Move structs (`[User{name}]` with

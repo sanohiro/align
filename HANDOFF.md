@@ -17,6 +17,12 @@ outside the active worktree so they do not obstruct unrelated checks or pulls.
 
 ## Next work (handoff updated 2026-10-07)
 
+Plan134 admits owned String sort keys through the ordinary return-cleanup ABI.
+Comparisons retain borrowed headers while one unsorted owner column releases
+heap keys exactly once. Whole/per-unit stable-order, evaluation-order, malformed
+HIR, lifetime, mixed-bit ABI and active allocation/free owners cover the
+capability. Move elements, comparator overloads, K1 and plan61 remain deferred.
+
 Plan133 certifies text-byte element reads through their original text producer,
 including byte-derived range bounds and Request 124's Unicode scan loops.
 Read-only backing and founded-input checks remain intact; whole/per-unit
@@ -138,8 +144,8 @@ Request 27's Copy string-sorting boundary is implemented in plan 88:
 Results own their array spine and retain borrowed byte-owner lifetimes, with no
 implicit string clone. Stable ordering, exact key effects, generic/imported
 whole/per-unit parity, control/owner invalidation and forged HIR owners cover the
-boundary. Move string elements/keys, general comparators and consumer adoption
-remain deferred. Continue independent capabilities with K1 deferred.
+boundary. Plan134 adds owned string keys through the ordinary cleanup ABI.
+Move string elements, general comparators and consumer adoption remain deferred. Continue independent capabilities with K1 deferred.
 
 Request 35's capacity-accessor trigger is implemented in plan 87:
 `b.capacity() -> i64` is Pure and nonconsuming and reports the existing usable

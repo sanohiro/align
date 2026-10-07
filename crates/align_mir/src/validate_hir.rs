@@ -2853,6 +2853,12 @@ struct SpawnContext {
     ok: Scalar,
 }
 
+#[derive(Clone, Copy)]
+enum PipelineOutput {
+    Copy,
+    SortKey,
+}
+
 #[derive(Clone)]
 struct BodyContext {
     function: usize,
@@ -10383,9 +10389,10 @@ impl<'a> BodyValidator<'a> {
         captures: &[hir::Expr],
         capture_flows: &[BodyFlow],
         input: Ty,
-        output: Ty,
+        output: (Ty, PipelineOutput),
         context: &BodyContext,
     ) -> bool {
+        let (output, output_domain) = output;
         let Some(signature) = self.resolve_signature(func) else {
             return false;
         };
@@ -10399,7 +10406,13 @@ impl<'a> BodyValidator<'a> {
                 !self.body_ty_matches(flow.ty, capture.ty) || !self.ty_copy_ok(flow.ty, context)
             })
             || !self.ty_copy_ok(input, context)
-            || !self.ty_copy_ok(output, context)
+            || !match output_domain {
+                PipelineOutput::Copy => self.ty_copy_ok(output, context),
+                PipelineOutput::SortKey => {
+                    orderable_body_ty(output)
+                        && (self.ty_copy_ok(output, context) || output == Ty::String)
+                }
+            }
         {
             return false;
         }
@@ -10506,7 +10519,7 @@ impl<'a> BodyValidator<'a> {
                     captures,
                     capture_flows,
                     current,
-                    stage.out_ty,
+                    (stage.out_ty, PipelineOutput::Copy),
                     context,
                 ) {
                     return None;
@@ -10524,7 +10537,7 @@ impl<'a> BodyValidator<'a> {
                         captures,
                         capture_flows,
                         current,
-                        Ty::Bool,
+                        (Ty::Bool, PipelineOutput::Copy),
                         context,
                     )
                 {
@@ -10612,7 +10625,7 @@ impl<'a> BodyValidator<'a> {
                     captures,
                     &capture_flows,
                     elem,
-                    Ty::Bool,
+                    (Ty::Bool, PipelineOutput::Copy),
                     context,
                 ) {
                     return None;
@@ -10767,7 +10780,7 @@ impl<'a> BodyValidator<'a> {
                     captures,
                     &capture_flows,
                     final_elem,
-                    *key_ty,
+                    (*key_ty, PipelineOutput::SortKey),
                     context,
                 ) {
                     return None;
@@ -10867,7 +10880,7 @@ impl<'a> BodyValidator<'a> {
                     captures,
                     &capture_flows,
                     final_elem,
-                    Ty::Bool,
+                    (Ty::Bool, PipelineOutput::Copy),
                     context,
                 ) {
                     return None;
@@ -10909,7 +10922,7 @@ impl<'a> BodyValidator<'a> {
                     captures,
                     &capture_flows,
                     input_elem,
-                    *elem,
+                    (*elem, PipelineOutput::Copy),
                     context,
                 ) {
                     return None;

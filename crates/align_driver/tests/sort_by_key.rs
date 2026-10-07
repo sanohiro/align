@@ -63,37 +63,16 @@ fn sort_by_key_non_orderable_key_rejected() {
     assert!(check_errs("sbk-bad-key", src));
 }
 
-/// An owned `string` key is orderable (`Ord` compares it through the same `str` comparator), but
-/// the fused sort buffers one key per element and has no per-key drop. Sema stopped at
-/// orderability, so a `string` key passed `check` and then failed HIR validation at the MIR
-/// boundary as an internal error instead of being diagnosed.
-///
-/// This owns the wording for both key-function spellings; `align_mir`'s
-/// `move_copy_positions_are_refused_by_the_producer_not_the_boundary` owns the property that the
-/// build stops here (a `check`-only assertion about the boundary would be vacuously true, since
-/// `check` never runs it).
+/// Owned string keys cross the checked-HIR boundary with the ordinary cleanup ABI.
 #[test]
-fn sort_by_key_move_key_rejected() {
-    for (label, src) in [
-        (
-            "named-fn",
-            "fn key(x: i64) -> string = \"k\".clone()\nfn main() -> Result<(), Error> {\n  s := [3, 1, 2].sort_by_key(key)\n  print(s[0])\n  return Ok(())\n}\n",
-        ),
-        (
-            "lambda",
-            "fn main() -> Result<(), Error> {\n  s := [3, 1, 2].sort_by_key(fn x { \"k\".clone() })\n  print(s[0])\n  return Ok(())\n}\n",
-        ),
+fn sort_by_key_owned_key_admitted() {
+    for (label, source) in [
+        ("named", "fn key(x: i64) -> string = \"k\".clone()\nfn main() -> i32 { values := [3, 1, 2].sort_by_key(key); return values[0] as i32 }"),
+        ("lambda", "fn main() -> i32 { values := [3, 1, 2].sort_by_key(fn x { \"k\".clone() }); return values[0] as i32 }"),
     ] {
-        let diagnostics = check_diagnostics(&format!("sbk-move-key-{label}"), src);
-        assert!(
-            diagnostics.contains("'sort_by_key' cannot buffer a Move key"),
-            "an owned `string` key must be diagnosed ({label}):\n{diagnostics}",
-        );
-        // The key function's return type is the user's to choose, so this row — unlike the element
-        // rows — can name a workaround that actually exists.
-        assert!(
-            diagnostics.contains("return a Copy key (int/float/char) or a borrowed `str`"),
-            "the diagnostic must point at the real workaround ({label}):\n{diagnostics}",
-        );
+        let mut map = SourceMap::new();
+        let checked = check(&mut map, label, source);
+        assert!(!checked.diags.has_errors(), "{}", align_driver::format_diagnostics(&map, &checked.diags));
+        assert!(!lower_to_mir(&checked.hir).fns.is_empty());
     }
 }

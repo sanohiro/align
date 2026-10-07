@@ -713,11 +713,13 @@ exactly the scalar hierarchy it declares.
 Ordering (`<` `<=` `>` `>=`) follows the same shape: defined for numbers, `char`, and — the same
 one visible-length case — `str`/`string`, whose order is **byte-lexicographic** (for valid UTF-8
 this equals Unicode scalar order). It is deterministic and locale-free; dictionary/locale
-collation is a library concern (`pkg`), never the operator. A `sort_by_key` key is a **Copy** `Ord`
-value: a number, a `char`, or a borrowed `str`. An owned `string` key is **not** supported today —
-it satisfies `Ord`, but the checker rejects it because the fused sort path has no per-key Drop
-(the deferral is recorded in `docs/impl/19-hir-validation-ledger.md`). Return a Copy key or a
-borrowed `str`.
+collation is a library concern (`pkg`), never the operator. A `sort_by_key` key is an `Ord`
+value: a number, a `char`, a borrowed `str`, or an owned `string`. Each key is evaluated once
+in surviving input order and remains live until comparisons finish. Owned string keys use
+the ordinary returned cleanup bit; independently owned bytes are dropped exactly once after
+sorting. Comparison scratch contains
+only borrowed headers; sorting makes no implicit byte clone. The materializing terminal adds
+one transient owner-header column for owned string keys (plan 134).
 Aggregates have no order, exactly as they have no `==`.
 
 Direct `.sort()` accepts Copy `Ord` elements: numbers, `char` and `str`.

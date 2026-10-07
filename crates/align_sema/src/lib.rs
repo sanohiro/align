@@ -60719,7 +60719,7 @@ impl<'a, 't> Checker<'a, 't> {
 
     /// `source.….sort_by_key(f)` — materialize the surviving (primitive scalar) elements and sort
     /// them ascending by `f(element)`. Copy string views are also admitted. The element is ordered
-    /// by the key; the key `f` must return an orderable value (int/float/char, or a `str` compared
+    /// by the key; the key `f` returns an orderable value (int/float/char or str/string compared
     /// byte-lexicographically). `f` may be a named function or a lambda (which may capture).
     fn check_array_sort_by_key(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
@@ -60753,30 +60753,18 @@ impl<'a, 't> Checker<'a, 't> {
         if key_ty == Ty::Error {
             return err;
         }
-        // The key must be an orderable type: a numeric/char scalar, or a `str` (byte-lexicographic —
+        // The key must be an orderable type: a numeric/char scalar, or `str`/`string` (byte-lexicographic —
         // sorting a name column is the motivating case; `Bound::Ord.satisfied_by` is the shared
         // source of truth for what "orderable" means).
         if !Bound::Ord.satisfied_by(key_ty) {
             self.diags.error(
-                format!("'sort_by_key' key must be an orderable scalar (int/float/char/str), got {}", ty_name(key_ty)),
+                format!("'sort_by_key' key must be an orderable scalar (int/float/char/str/string), got {}", ty_name(key_ty)),
                 span,
             );
             return err;
         }
-        // Orderable is not enough: the fused sort buffers one key per element and has no per-key
-        // Drop, so an owned `string` key (orderable, but Move) must be rejected here rather than
-        // one gate later at the MIR boundary. Unlike the element positions below, this one has a
-        // real workaround, because the key function's return type is the user's to choose.
-        if self.reject_move_copy_position(
-            key_ty,
-            "sort_by_key",
-            "buffer",
-            "key",
-            " — return a Copy key (int/float/char) or a borrowed `str`",
-            span,
-        ) {
-            return err;
-        }
+        // Owned String keys use the ordinary returned cleanup bit and a separate owner column.
+        // Other pipeline output positions remain Copy-only.
         Expr {
             kind: ExprKind::ArraySortBy { source: Box::new(source), stages, key_func, captures, key_ty, elem },
             ty: Ty::DynArray(scalar),
@@ -85348,14 +85336,14 @@ fn exit_branch(flag: bool) -> i64 {
         );
     }
 
-    /// The copy-position side of the same rule: a value an operation *buffers*, *collects*,
+    /// The copy-position side of the same rule: an element an operation *collects*,
     /// *views*, *rearranges*, *draws*, or *writes* must be Copy too, because the checked-HIR body
     /// validator refuses a Move value in each of those positions (`ty_copy_ok` / `scalar_copy_ok`).
     ///
     /// The axis is the **reachable `slice<Move>` parameter domain**. View formation and
     /// projection are independent of ownership-copying consumers, so
     /// "a Move element collection cannot be constructed" never proves a gate unreachable. Three of
-    /// these six rows (`shuffle`, `sample`, `map_into`) were live internal errors that argument had
+    /// these five element rows (`shuffle`, `sample`, `map_into`) were live internal errors that argument had
     /// dismissed.
     ///
     /// This owner pins the exact diagnostics. `align_mir`'s
@@ -85369,13 +85357,6 @@ fn exit_branch(flag: bool) -> i64 {
         assert!(!d.has_errors(), "a `slice<string>` parameter must stay declarable and passable");
 
         for (name, source, expected) in [
-            // `Ord` admits owned `string`, but the fused sort buffers one key per element with no
-            // per-key drop — orderability alone is not enough.
-            (
-                "sort_by_key key",
-                "fn key(x: i64) -> string = \"k\".clone()\nfn main() -> i32 {\n  s := [3, 1, 2].sort_by_key(key)\n  return s[0] as i32\n}\n",
-                "'sort_by_key' cannot buffer a Move key",
-            ),
             // `to_array`'s Move-*struct* arm had a message; its scalar arm admitted any
             // `ty_to_scalar`, owned `string` included.
             (
@@ -85416,9 +85397,9 @@ fn exit_branch(flag: bool) -> i64 {
             );
         }
 
-        // Over-rejecting would take the whole surface away: a borrowed `str` key is orderable and
-        // Copy, and every Copy element still passes each gate.
+        // String/str keys are orderable, and Copy elements still pass each element gate.
         for (name, source) in [
+            ("string key", "fn key(x: i64) -> string = \"k\".clone()\nfn main() -> i32 {\n  s := [3, 1, 2].sort_by_key(key)\n  return s[0] as i32\n}\n"),
             ("str key", "fn key(x: i64) -> str = \"k\"\nfn main() -> i32 {\n  s := [3, 1, 2].sort_by_key(key)\n  return s[0] as i32\n}\n"),
             ("copy to_array", "fn f(xs: slice<i64>) -> i64 = xs.to_array().len()\nfn main() -> i32 = 0\n"),
             ("copy chunks", "fn f(xs: slice<i64>) -> i64 = xs.chunks(2).len()\nfn main() -> i32 = 0\n"),
@@ -85429,7 +85410,7 @@ fn exit_branch(flag: bool) -> i64 {
             let (_p, d) = check(source);
             assert!(
                 !d.has_errors(),
-                "{name}: a Copy value must still be accepted, got {:?}",
+                "{name}: a supported value must still be accepted, got {:?}",
                 d.iter().map(|e| e.message.clone()).collect::<Vec<_>>()
             );
         }

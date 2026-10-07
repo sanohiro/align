@@ -327,10 +327,11 @@ no structural equality (explicit fields / `match` / pipeline instead). No shadow
 once per scope chain — with one exception, two **disjoint sibling blocks** may each bind the same
 name, because neither is in the other's chain. Floats are IEEE 754 and never abort (`x/0.0` → `±inf`, NaN ≠ NaN); only
 integer division aborts. `str`/`string` are `Ord` (byte-lexicographic; locale collation is a
-library concern), so strings sort and compare. A `sort_by_key` key is a **Copy** `Ord` value — a
-number, a `char`, or a borrowed `str`; the checker rejects an owned `string` key because the fused
-sort path has no per-key Drop (see `docs/impl/19-hir-validation-ledger.md`). Return a Copy key or a
-borrowed `str`.
+library concern), so strings sort and compare. A `sort_by_key` key is an `Ord` value: a number,
+`char`, borrowed `str`, or owned `string`. Keys are evaluated once in surviving input order and
+retained until comparisons finish. The ordinary returned cleanup bit controls ownership;
+independently owned string bytes are dropped exactly once after sorting. Comparison scratch holds borrowed headers, without an implicit byte clone; the explicit
+materializing terminal adds one transient owner-header column for string keys (plan 134).
 
 Direct `.sort()` accepts Copy `Ord` elements: numbers, `char` and `str`.
 `sort_by_key` accepts primitive Copy elements and `str`. Both return an owned

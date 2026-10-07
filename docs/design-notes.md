@@ -2199,10 +2199,17 @@ use the stable MIR sort already used by numbers and recorded keys. String
 materialization owns only a result spine; keeping content-region and owner
 generation facts avoids an implicit clone and prevents the fresh allocation
 from laundering a local byte borrow. Keyed string elements use the same rule.
-Move strings and general comparators require separate ownership/callable work.
+Move string elements and general comparators require separate ownership/callable work.
 Existing conservative bound-source generation loans remain the shared collector
 rule. Precision beyond those loans is separate work; allocating a new spine
 does not make replacing a live source binding admissible.
+
+Plan 134 completes the previously deferred owned-string key path. Sorting keeps
+comparison headers separate from an unsorted ownership column. The key call's
+ordinary cleanup bit selects an owning header or null for that column, so its
+single recursive Drop releases only keys carrying ownership.
+Keys remain live for all comparisons without implicit byte copies or ownership
+flags that must move through the sort algorithm. Source elements remain Copy.
 
 ### Direct bounded reads preserve caller-selected storage (Request 38)
 

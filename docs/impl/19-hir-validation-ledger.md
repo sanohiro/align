@@ -1120,7 +1120,7 @@ means:
 | `ArrayScan` | `env[stages,func,captures.len,elem]`: func resolves reducer signature and elem is admitted output element. `child[source,stage children,init,captures]`; `post[PIPE; init/accumulator elem; reducer returns elem; result DynArray(payload(elem)); owned allocation, emitted values copied]`. |
 | `ArrayDot` | `env[elem]`: numeric scalar type. `child[a,b]`; `post[a/b fixed arrays of elem with exactly equal static length; result elem; borrowed reads]`. |
 | `ArraySort` | `env[stages,elem]`: exact Copy Ord scalar Int, Float, Char or Str. `child[source,stage children]`; `post[PIPE final element elem; result DynArray(payload(elem)); new owned spine sorted stably ascending; Str elements retain source/stage content lifetime and owner generations]`. |
-| `ArraySortBy` | `env[stages,key_func,key_ty,elem,captures.len]`: NUL-free key_func resolves callable; elem is primitive admitted Copy source scalar or Str; key_ty is concrete Copy orderable scalar. `child[source,stage children,captures]`; `post[PIPE final element elem; key func params elem,captures and return key_ty; result DynArray(payload(elem)); new owned spine; Str elements retain source/stage content lifetime and owner generations]`. |
+| `ArraySortBy` | `env[stages,key_func,key_ty,elem,captures.len]`: NUL-free key_func resolves callable; elem is primitive admitted Copy source scalar or Str; key_ty is a concrete orderable scalar, including owned String under plan 134. `child[source,stage children,captures]`; `post[PIPE final element elem; key func params elem,captures and return key_ty; result DynArray(payload(elem)); new owned spine; Str elements retain source/stage content lifetime and owner generations]`. |
 | `ArrayToArray` | `env[stages,elem]`: elem is the exact admitted materializable element. `child[source,stage children]`; `post[PIPE final element elem; result DynArray(payload(elem)) or DynStructArray(id) according to elem; new owned allocation and exact element transfers]`. |
 | `ArrayToSoa` | `env[struct_id]`: in-range nonempty SoA-admissible flat struct and the expression is lexically inside an active arena. `child[source]`; `post[source fixed/dynamic StructArray(struct_id); result Soa(struct_id); source borrowed; result storage belongs to that exact active arena]`. |
 | `ArrayMapInto` | `env[stages,elem]`: elem is admitted Copy scalar and every stage is length-preserving (`Map`/`Project`, no filter). `child[source,stage children,dst]`; `post[PIPE final element elem; dst writable Slice(elem), exact equal-length runtime contract and semantic no-alias proof; result Unit; dst mutated, no allocation]`. |
@@ -1651,11 +1651,11 @@ copy positions had no producer gate at all:
 | `sample` element | `rng_elem_ok`'s `scalar_copy_ok` | Worse: the drawn values are copied into a fresh owned `array<T>`, so each `string` is freed twice. |
 | `map_into` element | `ArrayMapInto`'s `scalar_copy_ok` | Writing into `dst` overwrites owned headers without dropping them and copies the source's. |
 
-All six now call one shared helper, `Checker::reject_move_copy_position`, which
-asks `align_sema::ty_capture_is_move` — the same predicate `ty_copy_ok` asks — so
-producer and validator cannot drift again. Only `sort_by_key` names a workaround,
-because the key function's return type is the user's to choose; the element rows
-deliberately say the capability is deferred rather than invent one.
+All six originally used `Checker::reject_move_copy_position`, which asks
+`align_sema::ty_capture_is_move`, the same predicate as `ty_copy_ok`. Plan 134
+replaces only the sort-key output restriction with complete String ownership
+lowering. The other five positions remain Copy-only; their producer and checked
+boundary continue to enforce the same ownership rule.
 
 **Re-check of every other copy gate under this axis.** Each row was retested with
 a `slice<string>` parameter, not merely reasoned about:
@@ -1872,12 +1872,21 @@ The fresh independent plan review is scoped to these matrices and the single
 capability boundary. The final full-diff review uses the reopened axis
 `storage-generation-projections`.
 
-**Still deferred: admitting Move keys or elements.** Lowering either
-needs per-element Drop in the owning path — the same shape as #739's deferred
-fixed-array Move elements, not a validator edit. That remains a separate
-capability. Do not "fix" a Copy gate without the MIR support: accepting a Move
-value the path cannot drop trades a rejected program for a leak or a double free.
-Until then the reachable witness for the `ord-key` row stays a `str` key.
+**Plan 134: owned String sort keys.** The sort-key callable alone may return
+String through the ordinary dynamic-cleanup ABI. Input elements and captures
+remain Copy; other pipeline outputs retain their existing Copy rule. Checked
+HIR authenticates the exact key signature, Ord output, parameter modes and
+cleanup ABI. MIR keeps comparisons as Str headers and a separate unsorted
+nullable String owner column; the returned cleanup bit selects each stored
+owner, and every post-decoration exit reaches its one recursive Drop. The
+`sort_owned_keys` driver target owns whole/per-unit ordering, exact callback
+counts, heap keys over arena views, mixed-bit ABI fixtures and allocation/free
+balance with a missing-Drop mutation. MIR `owned_sort_keys_preserve_cleanup_and_copy_comparisons` owns the
+cleanup-bit/store linkage and comparison storage; malformed key metadata is
+owned by `owned_string_sort_key_hir_rejects_forged_metadata`.
+
+Move source elements and non-Ord outputs remain deferred. Do not remove their
+Copy gates without complete ownership lowering.
 
 Owners:
 `align_mir::validate_hir_tests::move_copy_positions_are_refused_by_the_producer_not_the_boundary`
@@ -1888,7 +1897,6 @@ internal error. (A `check`-only assertion that the diagnostics do not mention
 `failed HIR validation` is vacuously true, because `check` never runs the
 boundary; do not add one.) The surface-local wording owners are
 `align_sema::move_copy_positions_are_rejected`,
-`align_driver::sort_by_key::sort_by_key_move_key_rejected`,
 `align_driver::array_materialize::to_array_of_a_move_scalar_element_is_diagnosed`,
 `align_driver::chunks::chunks_over_a_move_element_array_is_diagnosed`,
 `align_driver::m10_rand::move_element_slices_are_rejected_by_shuffle_and_sample`,
