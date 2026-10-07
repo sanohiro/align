@@ -136,16 +136,28 @@ impl BufferStorage {
         #[cfg(test)]
         let previous = (self.writable.addr(), self.capacity);
         #[cfg(test)]
-        match ALLOCATION_PROBE.replace(0) {
+        let force_move = match ALLOCATION_PROBE.replace(0) {
             1 => return Err(()),
             2 => crate::panic_abort("buffer test allocation reached"),
-            _ => {}
-        }
+            3 => true,
+            _ => false,
+        };
+        #[cfg(not(test))]
+        let force_move = false;
         // SAFETY: the new nonzero layout is checked and retains the old alignment. Reallocation
         // transfers the initialized prefix on success and leaves the old allocation on failure.
         let replacement = unsafe {
             if self.capacity == 0 {
                 alloc(layout)
+            } else if force_move {
+                // Test-only relocation witness: the old owner is live during acquisition, so
+                // success cannot reuse its address. Failure leaves that owner unchanged.
+                let replacement = alloc(layout);
+                if !replacement.is_null() {
+                    core::ptr::copy_nonoverlapping(self.writable, replacement, self.len);
+                    dealloc(self.writable, self.layout());
+                }
+                replacement
             } else {
                 realloc(self.writable, self.layout(), layout.size())
             }
@@ -187,11 +199,33 @@ impl BufferStorage {
     pub(super) fn extend_from_slice(&mut self, bytes: &[u8]) {
         self.reserve(bytes.len());
         // SAFETY: reserve proved the full suffix fits; a live slice cannot overlap an exclusive
-        // owner. The native self-append entrypoint snapshots raw aliases before this operation.
+        // owner. The native append entrypoint routes raw aliases through a snapshot or offset.
         unsafe {
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.writable.add(self.len), bytes.len())
         };
         self.len += bytes.len();
+    }
+    pub(super) fn extend_from_within(&mut self, start: usize, length: usize) {
+        if !start.checked_add(length).is_some_and(|end| end <= self.len) {
+            crate::panic_abort("buffer copy source is outside initialized prefix");
+        }
+        if length == 0 {
+            return;
+        }
+        let Some(new_len) = self.len.checked_add(length) else {
+            crate::panic_abort("buffer allocation failed");
+        };
+        self.reserve(length);
+        // SAFETY: reservation preserves the initialized prefix. Derive both pointers from the
+        // current allocation after growth; the admitted source ends before the destination.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                self.writable.add(start),
+                self.writable.add(self.len),
+                length,
+            );
+        }
+        self.len = new_len;
     }
     pub(super) fn push(&mut self, byte: u8) {
         self.reserve(1);
@@ -328,6 +362,12 @@ mod tests {
                 );
                 assert_eq!(&storage[..3], b"abc");
                 assert!(storage[3..].iter().all(|byte| *byte == 0x5a));
+                super::ALLOCATION_PROBE.set(3);
+                storage.extend_from_within(0, 8193);
+                assert_eq!(super::ALLOCATION_PROBE.get(), 0);
+                assert_ne!(storage.writable_ptr(), before.0);
+                assert_eq!(storage.len(), 16386);
+                assert_eq!(&storage[..8193], &storage[8193..]);
                 storage.clear();
                 assert_eq!(storage.writable_ptr().addr() % alignment, 0);
             }
@@ -345,7 +385,7 @@ mod tests {
             assert_eq!(ptr, storage.as_ptr());
             assert_eq!(storage.as_slice(), b"adopted");
         });
-        assert_eq!(events.iter().filter(|event| event.0).count(), 13);
+        assert_eq!(events.iter().filter(|event| event.0).count(), 19);
         let mut live = std::collections::BTreeMap::new();
         for AllocationEvent(acquire, pointer, size, alignment) in events {
             assert_ne!(pointer, 0);
@@ -426,7 +466,7 @@ mod tests {
                 unsafe { core::slice::from_raw_parts(second.ptr, 4) },
                 b"ABCd"
             );
-            // A self-append must snapshot before the mutation guard can grow storage.
+            // A self-append must preserve its source through possible storage growth.
             unsafe { align_rt_buffer_append(owner.0, first.ptr, first.len) };
             let appended = view(owner.0);
             assert_eq!(appended.len, 8);
