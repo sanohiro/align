@@ -18567,16 +18567,48 @@ impl EscapeValueFact {
     }
 }
 
+/// Only compiler-issued local/expression identities use this private hash builder.
+/// Source text keys and persisted hashes retain their existing owners.
+#[derive(Clone)]
+struct EscapeFactHashBuilder(u64);
+
+impl Default for EscapeFactHashBuilder {
+    fn default() -> Self {
+        Self(std::hash::BuildHasher::hash_one(
+            &std::collections::hash_map::RandomState::new(), 0u8,
+        ))
+    }
+}
+
+struct EscapeFactHasher(u64);
+
+impl std::hash::BuildHasher for EscapeFactHashBuilder {
+    type Hasher = EscapeFactHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        EscapeFactHasher(self.0)
+    }
+}
+
+impl std::hash::Hasher for EscapeFactHasher {
+    fn finish(&self) -> u64 { self.0 }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // Hash fixes the ordered write sequence for equal keys. This is not a flat-stream hash.
+        self.0 = align_hash::wyhash(bytes, self.0);
+    }
+}
+
 /// Saved states share immutable value payloads. Owned consumers still clone explicitly;
 /// only selected generation renaming mutates an installed payload, after detaching it.
 #[derive(PartialEq, Eq, Debug)]
 struct EscapeFactMap<K: Eq + std::hash::Hash, V> {
-    values: std::collections::HashMap<K, std::sync::Arc<V>>,
+    values: std::collections::HashMap<K, std::sync::Arc<V>, EscapeFactHashBuilder>,
 }
 
 impl<K: Eq + std::hash::Hash, V> Default for EscapeFactMap<K, V> {
     fn default() -> Self {
-        Self { values: std::collections::HashMap::new() }
+        Self { values: std::collections::HashMap::with_hasher(EscapeFactHashBuilder::default()) }
     }
 }
 
@@ -18951,8 +18983,8 @@ struct EscapeState {
 }
 
 impl EscapeState {
-    fn reserve_join<K: Eq + std::hash::Hash, V>(
-        current: &mut std::collections::HashMap<K, V>,
+    fn reserve_join<K: Eq + std::hash::Hash, V, S: std::hash::BuildHasher>(
+        current: &mut std::collections::HashMap<K, V, S>,
         incoming_len: usize,
     ) {
         // Their union contains at least as many keys as either input.
@@ -81233,6 +81265,79 @@ fn main() -> i32 = 0
         assert!(EscapeState::merge_input(&mut absent, &mut EscapeState::default(), true));
         assert!(absent.is_some());
         assert!(!EscapeState::merge_input(&mut absent, &mut EscapeState::default(), true));
+    }
+
+    #[test]
+    fn escape_fact_hash_matches_canonical_write_sequence() {
+        use std::hash::{BuildHasher, Hasher};
+        for seed in [0, 1, u64::MAX, 0x0102_0304_0506_0708] {
+            let builder = EscapeFactHashBuilder(seed);
+            let mut hasher = builder.build_hasher();
+            assert_eq!(hasher.finish(), seed);
+            let mut expected = seed;
+            for bytes in [&[][..], &[0, 255], &[1, 2, 3, 4, 5, 6, 7, 8, 9]] {
+                expected = align_hash::wyhash(bytes, expected);
+                hasher.write(bytes);
+                assert_eq!(hasher.finish(), expected);
+                assert_eq!(hasher.finish(), expected, "finish does not reset the state");
+            }
+            for local in [0u32, 1, 256, u32::MAX] {
+                assert_eq!(builder.hash_one(local), align_hash::wyhash(&local.to_ne_bytes(), seed));
+                assert_eq!(builder.hash_one(local), builder.clone().hash_one(local));
+            }
+            for expression in [0usize, 1, 4096, usize::MAX] {
+                let first = align_hash::wyhash(&expression.to_ne_bytes(), seed);
+                assert_eq!(builder.hash_one(expression), first);
+                for ordinal in [0usize, 1, 17, usize::MAX] {
+                    assert_eq!(builder.hash_one((expression, ordinal)),
+                        align_hash::wyhash(&ordinal.to_ne_bytes(), first));
+                }
+            }
+        }
+        let builder = EscapeFactHashBuilder::default();
+        assert_eq!(builder.hash_one((17usize, 29usize)), builder.clone().hash_one((17usize, 29usize)));
+    }
+
+    #[test]
+    fn escape_fact_hash_preserves_integer_key_maps() {
+        fn verify<K: Clone + Eq + std::hash::Hash + std::fmt::Debug>(keys: Vec<K>) {
+            for seed in [0, u64::MAX] {
+                let make = |seed| EscapeFactMap {
+                    values: std::collections::HashMap::with_hasher(EscapeFactHashBuilder(seed)),
+                };
+                let mut map = make(seed);
+                let mut expected = std::collections::HashMap::new();
+                for (value, key) in keys.iter().enumerate() {
+                    map.insert(key.clone(), value);
+                    expected.insert(key.clone(), value);
+                }
+                let saved = map.clone();
+                let original = expected.clone();
+                let mut incoming = make(seed ^ 0x0102_0304_0506_0708);
+                for (index, key) in keys.iter().enumerate().step_by(2) {
+                    incoming.insert(key.clone(), index + 100);
+                    let value = expected.entry(key.clone()).or_insert(0);
+                    *value = (*value).max(index + 100);
+                }
+                assert_eq!(map.join_from(&incoming, |a, b| (*a).max(*b)), expected != original);
+                assert!(!map.join_from(&incoming, |a, b| (*a).max(*b)));
+                for key in &keys {
+                    assert_eq!(map.get(key), expected.get(key));
+                    assert_eq!(saved.get(key), original.get(key), "saved payload changed");
+                }
+                for key in keys.iter().step_by(3) {
+                    assert_eq!(map.remove(key).as_deref(), expected.remove(key).as_ref());
+                }
+                map.retain(|_, value| value % 2 == 0);
+                expected.retain(|_, value| *value % 2 == 0);
+                assert_eq!(map.values.len(), expected.len());
+                for key in &keys { assert_eq!(map.get(key), expected.get(key)); }
+            }
+        }
+        verify(vec![0u32, 1, 2, 256, 4096, u32::MAX, 0]);
+        verify(vec![0usize, 1, 2, 256, 4096, usize::MAX, 0]);
+        verify(vec![(0usize, 0usize), (0, 1), (1, 0), (1, 1), (4096, 0),
+                    (4096, 17), (usize::MAX, 0), (0, usize::MAX), (usize::MAX, usize::MAX), (0, 0)]);
     }
 
     #[test]

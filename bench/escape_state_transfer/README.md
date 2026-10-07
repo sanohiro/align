@@ -354,3 +354,34 @@ owner makes accidental deep-copy requirements fail compilation; actual snapshot
 owners preserve independent replacement and unique/shared owned extraction.
 Map storage, reference-count work and repeated traversal still leave superlinear
 cost; no whole-client time or runtime allocation improvement is established.
+
+## Item 23 result (2026-10-07)
+
+The same host/profile compares merged
+`8fc48d6d84d2098ab3b156329f9a15047093d2c7` with canonical wyhash for the six
+private escape fact-map key tables. Keys are compiler-issued integer identities;
+per-map seeds, full key equality, payload sharing and original joins remain.
+Source text tables and persisted hashes retain their existing owners.
+No builds/tests overlap measurement; `DYLD_SHARED_REGION` is unset for both
+binaries. Numeric and storage corpora run with `--llvm-parity`.
+[Full samples and hashes](results-key-hash-macos.json) retain all 30 cells with
+five alternating samples after warmup from the final implementation.
+
+| 512-value shape | Command | Baseline median | Candidate median | Ratio |
+| --- | --- | ---: | ---: | ---: |
+| Result match | check | 0.392 s | 0.333 s | 1.18x |
+| Result match | per-unit check | 0.794 s | 0.643 s | 1.23x |
+| Straight fixed arrays | check | 0.129 s | 0.128 s | 1.01x |
+| Straight fixed arrays | per-unit check | 0.269 s | 0.266 s | 1.01x |
+| Loop fixed arrays | check | 0.746 s | 0.750 s | 1.00x |
+| Loop fixed arrays | per-unit check | 1.484 s | 1.474 s | 1.01x |
+
+All 15 source MIR/raw LLVM pairs, actual checked-work outputs and four rejected
+controls agree. Numeric straight/try median differences stay within 2.6 ms;
+every 16-value control stays within 0.6 ms. Storage differences stay within
+10.8 ms, including a 3.5 ms increase in the 512-value loop whole-program check.
+No uniform-speedup claim is made. Protocol and integer-key map owners preserve
+ordered writes, seeds, collision-resolving key equality and lifecycle behavior;
+existing full-state, generation, snapshot and diagnostic owners retain semantics.
+Map copies and repeated traversal remain superlinear; this does not establish a
+whole-client time bound or a runtime allocation improvement.

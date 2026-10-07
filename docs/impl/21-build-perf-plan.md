@@ -3442,3 +3442,68 @@ controls within 0.32 ms. Storage differences stay within 6.8 ms, including small
 increases in loop cases. `results-shared-snapshots-macos.json` records all samples
 and hashes. Map copying, reference counts and repeated traversal remain;
 consumer acceptance and K1/plan61 remain deferred.
+
+## Item 23: hash internal escape-map identities with the canonical hash
+
+The post-item22 bounded profile still reaches SipHash inside fact-map joins and
+rehashing. A shared-table candidate was rejected after its alternating pilot:
+512-match whole/per-unit checking slowed 19.9%/16.2%, and fixed-loop controls
+slowed about 6%. Its complete patch, measurements and review remain local; no
+shared-table implementation is retained.
+
+Use the existing `align_hash::wyhash` only for the six private EscapeFactMap
+key tables. Their production keys are compiler-issued u32 locals, usize HIR
+expression identities and (expression, argument ordinal) pairs. Payloads, key
+equality, map storage, joins, missing-input rules, ownership and selective Arc
+mutation stay unchanged. Every other map, including source text/string tables,
+continues its existing hash strategy. This is not a persisted hash, a source
+API or an adversarial string-key hash.
+
+A private cloned builder keeps a per-map seed derived from a fresh standard
+RandomState. Each built hasher starts at that seed. Each Hash-provided write
+feeds the exact bytes into canonical wyhash, with the previous result as seed;
+finish observes the current state without resetting it. This deliberately
+preserves the ordered write sequence, not a flat-stream wyhash promise. Rust's
+[Hasher contract](https://doc.rust-lang.org/std/hash/trait.Hasher.html) permits
+write boundaries to affect the hash; equal keys must issue the same ordered
+calls. Use ordinary Hash for keys and full key equality for collision resolution.
+The adapter owns no heap allocation, unsafe code, key encoding, truncation or
+new hash algorithm. Default keeps the existing allocation-free empty HashMap;
+cloning retains the seed and the existing shared-payload ownership.
+
+Generalize the existing reserve_join helper over BuildHasher without changing
+its capacity rule or any legacy-map caller. Add the direct workspace align_hash
+dependency; do not copy the algorithm into sema. No HIR/MIR/interface/runtime ABI,
+source ownership, diagnostics, generic contract or allocation policy changes.
+K1/plan61 and consumer acceptance remain deferred.
+
+### Implementation closure matrix
+
+| Axis | Implementation and owner |
+| --- | --- |
+| Hash protocol and construction | `escape_fact_hash_matches_canonical_write_sequence` compares explicit empty/single/multiple write states with the canonical function, repeated finish and continued writes, fixed seeds and cloned builders; typed local/expression/ordinal Hash calls must retain all bytes and order. No new security or portable encoding promise. |
+| Key equality and map lifecycle | `escape_fact_hash_preserves_integer_key_maps` compares insertion, replacement, clone isolation, removal, retain and joins for u32, usize and tuple keys, including zero/max and aligned identity patterns, across two fixed seeds against ordinary maps. Reuse non-Clone payload, exact Drop, payload sharing, snapshot extraction and selected-generation owners. |
+| All six joins and deterministic analysis | Existing full-state join/idempotence and old/new terminal-probe complete-fact/ordered-diagnostic owners retain semantics across independent map seeds. No pointer-based equality, evaluator, convergence, active-sum, backing or missing-input changes. |
+| Ownership/control/malformed input | Full sema and array_builder_transfer, m12_array_builder, fb_region, return_provenance and borrow_liveness driver owners cover move-in/out, nulling, Drop, replacement, return, if/match/else/try/map_err, loops/joins/early exits and malformed input. |
+| Generic/interface/whole/per-unit | Existing imported/generic owners plus numeric/storage corpus: all 15 MIR/raw LLVM pairs, actual checked work and four rejection controls must agree. Hash state is neither serialized nor emitted. Runtime allocation and provenance remain unchanged. Cargo/DB scope follows the normal committed-range classifier. |
+| Performance acceptance | First a pilot, then all 30 numeric/storage 16/128/512 whole/per-unit cells, five alternating post-warmup samples, 20-second child budget, no concurrent builds/tests. Retain only useful measured benefit with explicit short/storage regression assessment; no uniform-speedup, near-linear or client-time promise. |
+
+The author inventory confines this change to one private table hasher and its
+six existing consumers. Ownership and safety strategy remain the independently
+reviewed items21–22 strategy; the new hash does not authorize fact or control-flow
+changes. Fold boundary checking into one fresh committed-candidate preflight
+review. One capability includes the adapter, direct dependency, all consumers
+and owners; expected handwritten diff is below 1,000 lines.
+
+Five alternating release samples improve 512-value Result-match whole/per-unit
+medians from 0.392/0.794 s to 0.333/0.643 s (1.18x/1.23x). All 15 MIR/raw LLVM
+pairs, actual checked-work outputs and four rejected controls agree across all
+30 cells. Every 16-value control stays within 0.6 ms; numeric straight/try
+controls stay within 2.6 ms and storage controls within 10.8 ms. The 512-value
+loop whole-program check increases 3.5 ms. `results-key-hash-macos.json` records
+all samples and hashes. Retain this tradeoff without a uniform-speedup,
+near-linear scaling, client-time or runtime-resource promise. Consumer
+acceptance and K1/plan61 remain deferred.
+
+Resetting the seed on each write fails the canonical protocol owner. Byte-identical
+restoration retains the measured source hash; all 325 sema owners pass afterward.
