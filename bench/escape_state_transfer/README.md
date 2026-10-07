@@ -1,6 +1,6 @@
 # Compiler check-time scaling measurement
 
-This local benchmark owns plan 21 items 11–15 checking measurements. It
+This local benchmark owns plan 21 items 11–16 checking measurements. It
 compares release compiler binaries on the same generated straight arithmetic,
 Result `?`, and Result `match` chains inside a loop. Each case uses 16, 128 or
 512 values. `--corpus storage` selects fixed-array declarations in straight-line
@@ -156,3 +156,32 @@ the original Clone-bound helper fails the non-Clone payload owner at compile
 time. Outer staging copies, key-parity scans and repeated analysis remain;
 these local measurements do not establish near-linear checking or Request 37's
 consumer acceptance, and do not claim fewer runtime allocations.
+
+
+## Item 16 result (2026-10-07)
+
+The same host/profile compares merged
+`811437746fb5576be1550ae0e9fb42edb3a71a3a` with direct validated formation in
+both checkers. Both binaries run with `DYLD_SHARED_REGION=private`; no build/test
+jobs overlap measurement. Run both corpora with `--llvm-parity`.
+[Full samples and hashes](results-formation-transaction-macos.json) retain all 30
+cells and five alternating samples after warmup.
+
+| 512 fixed-array declarations | Baseline median | Candidate median | Ratio |
+| --- | ---: | ---: | ---: |
+| Straight-line check | 0.434 s | 0.361 s | 1.20x |
+| Straight-line per-unit check | 0.867 s | 0.723 s | 1.20x |
+| Loop check | 4.261 s | 3.892 s | 1.09x |
+| Loop per-unit check | 8.596 s | 7.655 s | 1.12x |
+
+All 15 numeric/storage source MIR and raw LLVM pairs, actual CLI checked-work
+outputs and four rejected-source controls agree across both corpora. Numeric
+median changes stay below 9 ms, and the 16-value controls stay below 1 ms.
+
+Complete admission precedes existing-payload renaming and table key transitions,
+so callers no longer need a separate full table copy for failure atomicity.
+Fresh payloads and all external observations retain their existing semantics.
+Actual EscapeCheck/MoveCheck caller owners detect restoration of the copies by
+pinning unrelated release-set backing. Other fact/state copies and repeated
+analysis remain superlinear; these measurements do not establish Request 37's
+consumer budget or a runtime allocation improvement.

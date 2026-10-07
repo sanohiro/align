@@ -19030,7 +19030,7 @@ impl EscapeState {
         changed
     }
 
-    fn rename_storage_generations(&mut self, renames: &StorageGenerationRenames) {
+    fn rename_storage_observers(&mut self, renames: &StorageGenerationRenames) {
         if renames.origins.is_empty() {
             return;
         }
@@ -19046,6 +19046,13 @@ impl EscapeState {
         for fact in self.storage_callable_snapshots.values_mut() {
             fact.rename_generations(renames);
         }
+    }
+
+    fn rename_storage_generations(&mut self, renames: &StorageGenerationRenames) {
+        if renames.origins.is_empty() {
+            return;
+        }
+        self.rename_storage_observers(renames);
         // Dependencies are value facts too. Rename them before folding the table keys so a carrier
         // or nested header cannot retain a stale Current reference to the newly formed generation.
         for content in self.storage.contents.entries.values_mut() {
@@ -19487,29 +19494,21 @@ fn seed_escape_parameter_storage(
     let headers = if formations.is_empty() {
         ProjectedHeaderFact::default()
     } else {
-        let renames = StorageGenerationRenames::from_origins(formations.iter().filter_map(
-            |formation| match &formation.generation {
-                StorageGeneration::Current(origin) => Some(origin.clone()),
-                StorageGeneration::Prior(_)
-                | StorageGeneration::ParameterValue { .. }
-                | StorageGeneration::CallerStorage { .. } => None,
-            },
-        ));
-        let mut next = state.storage.clone();
-        for content in next.contents.entries.values_mut() {
-            content.rename_generations(&renames);
-        }
-        let Ok(commit) = next.try_form_headers(
+        let Ok(commit) = state.storage.try_form_headers(
             ty,
             formations,
             context,
+            |_, contents, renames| {
+                for content in contents {
+                    content.rename_generations(renames);
+                }
+            },
             |existing, incoming| *existing = existing.join(&incoming),
             |existing, incoming| *existing = existing.join(&incoming),
         ) else {
             return;
         };
-        state.rename_storage_generations(&commit.renames);
-        state.storage = next;
+        state.rename_storage_observers(&commit.renames);
         commit.headers
     };
     let owns_dynamic = !borrowed
@@ -22090,29 +22089,21 @@ impl<'a> EscapeCheck<'a> {
         if formations.is_empty() {
             return value;
         }
-        let renames = StorageGenerationRenames::from_origins(formations.iter().filter_map(
-            |formation| match &formation.generation {
-                StorageGeneration::Current(origin) => Some(origin.clone()),
-                StorageGeneration::Prior(_)
-                | StorageGeneration::ParameterValue { .. }
-                | StorageGeneration::CallerStorage { .. } => None,
-            },
-        ));
-        let mut next = self.state.storage.clone();
-        for content in next.contents.entries.values_mut() {
-            content.rename_generations(&renames);
-        }
-        let Ok(commit) = next.try_form_headers(
+        let Ok(commit) = self.state.storage.try_form_headers(
             expression.ty,
             formations,
             context,
+            |_, contents, renames| {
+                for content in contents {
+                    content.rename_generations(renames);
+                }
+            },
             |existing, incoming| *existing = existing.join(&incoming),
             |existing, incoming| *existing = existing.join(&incoming),
         ) else {
             return self.fail_closed_escape_value(expression.ty, depth);
         };
-        self.state.rename_storage_generations(&commit.renames);
-        self.state.storage = next;
+        self.state.rename_storage_observers(&commit.renames);
         value.headers = value.headers.join(&commit.headers);
         value
     }
@@ -22358,29 +22349,21 @@ impl<'a> EscapeCheck<'a> {
             return value;
         }
 
-        let renames = StorageGenerationRenames::from_origins(formations.iter().filter_map(
-            |formation| match &formation.generation {
-                StorageGeneration::Current(origin) => Some(origin.clone()),
-                StorageGeneration::Prior(_)
-                | StorageGeneration::ParameterValue { .. }
-                | StorageGeneration::CallerStorage { .. } => None,
-            },
-        ));
-        let mut next = self.state.storage.clone();
-        for content in next.contents.entries.values_mut() {
-            content.rename_generations(&renames);
-        }
-        let Ok(commit) = next.try_form_headers(
+        let Ok(commit) = self.state.storage.try_form_headers(
             expression.ty,
             formations,
             context,
+            |_, contents, renames| {
+                for content in contents {
+                    content.rename_generations(renames);
+                }
+            },
             |existing, incoming| *existing = existing.join(&incoming),
             |existing, incoming| *existing = existing.join(&incoming),
         ) else {
             return self.fail_closed_escape_value(expression.ty, depth);
         };
-        self.state.rename_storage_generations(&commit.renames);
-        self.state.storage = next;
+        self.state.rename_storage_observers(&commit.renames);
         value.headers = value.headers.join(&commit.headers);
         value
     }
@@ -31450,6 +31433,11 @@ impl<DirectoryEntry, ContentFact>
         root: Ty,
         formations: Vec<StorageHeaderFormation<DirectoryEntry, ContentFact>>,
         context: StorageTypeContext<'_>,
+        rename_existing: impl FnOnce(
+            std::collections::btree_map::ValuesMut<'_, StorageGeneration, DirectoryEntry>,
+            std::collections::btree_map::ValuesMut<'_, StorageGeneration, ContentFact>,
+            &StorageGenerationRenames,
+        ),
         mut join_directory: impl FnMut(&mut DirectoryEntry, DirectoryEntry),
         mut join_content: impl FnMut(&mut ContentFact, ContentFact),
     ) -> Result<StorageFormationCommit, StorageFormationError> {
@@ -31532,6 +31520,13 @@ impl<DirectoryEntry, ContentFact>
         // occupied Prior key could collide only with a same-origin Current formation,
         // which already failed duplicate-path admission; all other keys were checked above.
         // Concrete payloads and descriptors make this commit infallible for admitted input.
+        // Existing payloads may refer to the old Current; fresh initializers must not be renamed.
+        // Value iterators prevent this phase from changing the admitted key set.
+        rename_existing(
+            self.directory.entries.values_mut(),
+            self.contents.entries.values_mut(),
+            &renames,
+        );
         self.directory
             .rename_current_to_prior(&renames, &mut join_directory);
         self.contents
@@ -31574,6 +31569,7 @@ impl<DirectoryEntry, ContentFact>
                 content: Some(content),
             }],
             context,
+            |_, _, _| {},
             join_directory,
             join_content,
         )
@@ -34767,7 +34763,7 @@ impl<'a> MoveCheck<'a> {
         self.borrow_mut_place_snapshots = places;
     }
 
-    fn storage_type_context(&self) -> StorageTypeContext<'_> {
+    fn storage_type_context(&self) -> StorageTypeContext<'a> {
         StorageTypeContext {
             structs: self.structs,
             tuples: self.tuples,
@@ -34885,18 +34881,18 @@ impl<'a> MoveCheck<'a> {
         if formations.is_empty() {
             return;
         }
-        let mut next = self.borrows.storage.clone();
-        if let Ok(commit) = next.try_form_headers(
+        let context = self.storage_type_context();
+        if let Ok(commit) = self.borrows.storage.try_form_headers(
             ty,
             formations,
-            self.storage_type_context(),
+            context,
+            |_, _, _| {},
             |existing, incoming| *existing = existing.join(&incoming),
             |existing, incoming| *existing = existing.join(&incoming),
         ) {
             self.borrows.rename_header_state(&commit.renames);
             self.borrows.rename_root_state(&commit.renames);
             self.record_storage_advances(&commit.renames);
-            self.borrows.storage = next;
             self.borrows.headers.insert(local, commit.headers);
         }
     }
@@ -38979,25 +38975,19 @@ impl<'a> MoveCheck<'a> {
         if formations.is_empty() {
             return headers.join(&carried).join(&unknown);
         }
-        let renames = StorageGenerationRenames::from_origins(formations.iter().filter_map(
-            |formation| match &formation.generation {
-                StorageGeneration::Current(origin) => Some(origin.clone()),
-                StorageGeneration::Prior(_)
-                | StorageGeneration::ParameterValue { .. }
-                | StorageGeneration::CallerStorage { .. } => None,
-            },
-        ));
-        let mut next = self.borrows.storage.clone();
-        for content in next.contents.entries.values_mut() {
-            content.rename_generations(&renames);
-        }
-        for entry in next.directory.entries.values_mut() {
-            entry.rename_generations(&renames);
-        }
-        let Ok(commit) = next.try_form_headers(
+        let context = self.storage_type_context();
+        let Ok(commit) = self.borrows.storage.try_form_headers(
             expression.ty,
             formations,
-            self.storage_type_context(),
+            context,
+            |directory, contents, renames| {
+                for content in contents {
+                    content.rename_generations(renames);
+                }
+                for entry in directory {
+                    entry.rename_generations(renames);
+                }
+            },
             |existing, incoming| *existing = existing.join(&incoming),
             |existing, incoming| *existing = existing.join(&incoming),
         ) else {
@@ -39007,7 +38997,6 @@ impl<'a> MoveCheck<'a> {
         self.borrows.rename_root_state(&commit.renames);
         self.rename_external_storage_snapshots(&commit.renames);
         self.record_storage_advances(&commit.renames);
-        self.borrows.storage = next;
         headers = headers
             .join(&commit.headers)
             .join(&carried)
@@ -39250,25 +39239,19 @@ impl<'a> MoveCheck<'a> {
             return carriers.join(&unknown);
         }
 
-        let renames = StorageGenerationRenames::from_origins(formations.iter().filter_map(
-            |formation| match &formation.generation {
-                StorageGeneration::Current(origin) => Some(origin.clone()),
-                StorageGeneration::Prior(_)
-                | StorageGeneration::ParameterValue { .. }
-                | StorageGeneration::CallerStorage { .. } => None,
-            },
-        ));
-        let mut next = self.borrows.storage.clone();
-        for content in next.contents.entries.values_mut() {
-            content.rename_generations(&renames);
-        }
-        for entry in next.directory.entries.values_mut() {
-            entry.rename_generations(&renames);
-        }
-        let Ok(commit) = next.try_form_headers(
+        let context = self.storage_type_context();
+        let Ok(commit) = self.borrows.storage.try_form_headers(
             expression.ty,
             formations,
-            self.storage_type_context(),
+            context,
+            |directory, contents, renames| {
+                for content in contents {
+                    content.rename_generations(renames);
+                }
+                for entry in directory {
+                    entry.rename_generations(renames);
+                }
+            },
             |existing, incoming| *existing = existing.join(&incoming),
             |existing, incoming| *existing = existing.join(&incoming),
         ) else {
@@ -39278,7 +39261,6 @@ impl<'a> MoveCheck<'a> {
         self.borrows.rename_root_state(&commit.renames);
         self.rename_external_storage_snapshots(&commit.renames);
         self.record_storage_advances(&commit.renames);
-        self.borrows.storage = next;
         commit.headers.join(&carriers).join(&unknown)
     }
 
@@ -76434,6 +76416,15 @@ mod tests {
                         content: Some(vec![200]),
                     }],
                     context,
+                    |directory, contents, renames| {
+                        assert_eq!(renames.origins.contains(&origin), selected == 0);
+                        callbacks.borrow_mut().push(("payloads", vec![], vec![]));
+                        for value in directory.chain(contents) {
+                            for byte in value {
+                                *byte += 1;
+                            }
+                        }
+                    },
                     |current, prior| {
                         callbacks
                             .borrow_mut()
@@ -76451,18 +76442,28 @@ mod tests {
                     assert_eq!(result, Err(StorageFormationError::DuplicateGeneration));
                     assert!(callbacks.borrow().is_empty());
                 } else {
-                    let mut expected_callbacks = Vec::new();
+                    let mut expected_callbacks = vec![("payloads", vec![], vec![])];
+                    for value in expected
+                        .directory
+                        .entries
+                        .values_mut()
+                        .chain(expected.contents.entries.values_mut())
+                    {
+                        for byte in value {
+                            *byte += 1;
+                        }
+                    }
                     if selected == 0 && mask & 1 != 0 {
                         expected.directory.entries.remove(&keys[0]);
                         expected.contents.entries.remove(&keys[0]);
                         let (directory, content) = if mask & 2 != 0 {
-                            expected_callbacks = vec![
-                                ("directory", vec![10], vec![11]),
-                                ("content", vec![20], vec![21]),
-                            ];
-                            (vec![10, 11], vec![20, 21])
+                            expected_callbacks.extend([
+                                ("directory", vec![11], vec![12]),
+                                ("content", vec![21], vec![22]),
+                            ]);
+                            (vec![11, 12], vec![21, 22])
                         } else {
-                            (vec![10], vec![20])
+                            (vec![11], vec![21])
                         };
                         expected
                             .directory
@@ -76570,6 +76571,12 @@ mod tests {
                             })
                             .collect(),
                         context,
+                        |directory, contents, renames| {
+                            assert_eq!(renames.origins, origins.iter().cloned().collect());
+                            assert_eq!(directory.count(), 4);
+                            assert_eq!(contents.count(), 4);
+                            callbacks.borrow_mut().push(("payloads", vec![], vec![]));
+                        },
                         |current, prior| {
                             callbacks.borrow_mut().push((
                                 "directory",
@@ -76593,6 +76600,7 @@ mod tests {
             assert_eq!(
                 *callbacks.borrow(),
                 vec![
+                    ("payloads", vec![], vec![]),
                     ("directory", vec![10], vec![20]),
                     ("directory", vec![11], vec![21]),
                     ("content", vec![30], vec![40]),
@@ -76623,6 +76631,7 @@ mod tests {
                         })
                         .collect(),
                     context,
+                    |_, _, _| panic!("invalid batch must not mutate payloads"),
                     |_, _| panic!("invalid batch must not join directory"),
                     |_, _| panic!("invalid batch must not join content"),
                 ),
@@ -76683,6 +76692,13 @@ mod tests {
                         content: Some(value(20 + round)),
                     }],
                     context,
+                    |directory, contents, _| {
+                        for value in directory.chain(contents) {
+                            for byte in &mut value.bytes {
+                                *byte += 10;
+                            }
+                        }
+                    },
                     |current, prior| current.bytes.extend_from_slice(&prior.bytes),
                     |current, prior| current.bytes.extend_from_slice(&prior.bytes),
                 )
@@ -76698,8 +76714,8 @@ mod tests {
                 backing
             );
         }
-        assert_eq!(tables.directory.entries[&prior].bytes, [11, 10]);
-        assert_eq!(tables.contents.entries[&prior].bytes, [21, 20]);
+        assert_eq!(tables.directory.entries[&prior].bytes, [21, 30]);
+        assert_eq!(tables.contents.entries[&prior].bytes, [31, 40]);
         assert_eq!(
             tables.try_form_headers(
                 ty,
@@ -76718,6 +76734,7 @@ mod tests {
                     },
                 ],
                 context,
+                |_, _, _| panic!("rejected batch must not mutate payloads"),
                 |_, _| panic!("rejected batch must not join directory"),
                 |_, _| panic!("rejected batch must not join content"),
             ),
@@ -76730,8 +76747,8 @@ mod tests {
         );
         assert_eq!(tables.directory.entries[&current].bytes, [12]);
         assert_eq!(tables.contents.entries[&current].bytes, [22]);
-        assert_eq!(tables.directory.entries[&prior].bytes, [11, 10]);
-        assert_eq!(tables.contents.entries[&prior].bytes, [21, 20]);
+        assert_eq!(tables.directory.entries[&prior].bytes, [21, 30]);
+        assert_eq!(tables.contents.entries[&prior].bytes, [31, 40]);
         assert_eq!(
             (
                 tables.directory.entries[&stable].bytes.as_ptr(),
@@ -76739,6 +76756,8 @@ mod tests {
             ),
             backing
         );
+        assert_eq!(tables.directory.entries[&stable].bytes, [31]);
+        assert_eq!(tables.contents.entries[&stable].bytes, [32]);
         drop(tables);
         assert_eq!(
             drops.get(),
@@ -76977,6 +76996,7 @@ mod tests {
                 Ty::Tuple(0),
                 vec![zero_formation.clone(), one_formation.clone()],
                 context,
+                |_, _, _| {},
                 |existing, incoming| *existing += incoming,
                 |existing, incoming| existing.extend(incoming),
             )
@@ -76987,6 +77007,7 @@ mod tests {
                 Ty::Tuple(0),
                 vec![one_formation.clone(), zero_formation.clone()],
                 context,
+                |_, _, _| {},
                 |existing, incoming| *existing += incoming,
                 |existing, incoming| existing.extend(incoming),
             )
@@ -77008,6 +77029,7 @@ mod tests {
                     },
                 ],
                 context,
+                |_, _, _| panic!("invalid batch must not mutate payloads"),
                 |existing, incoming| *existing += incoming,
                 |existing, incoming| existing.extend(incoming),
             ),
@@ -77085,6 +77107,7 @@ mod tests {
                     Ty::Tuple(0),
                     formations,
                     context,
+                    |_, _, _| panic!("invalid batch must not mutate payloads"),
                     |existing, incoming| *existing += incoming,
                     |existing, incoming| existing.extend(incoming),
                 ),
@@ -77146,6 +77169,7 @@ mod tests {
                         Ty::Tuple(0),
                         batch,
                         context,
+                        |_, _, _| panic!("invalid batch must not mutate payloads"),
                         |_, _| panic!("invalid batch must not join directory"),
                         |_, _| panic!("invalid batch must not join content"),
                     ),
@@ -77192,6 +77216,7 @@ mod tests {
                             },
                             batch,
                             context,
+                            |_, _, _| panic!("invalid batch must not mutate payloads"),
                             |_, _| panic!("invalid batch must not join directory"),
                             |_, _| panic!("invalid batch must not join content"),
                         ),
@@ -78672,6 +78697,12 @@ fn main() -> i32 = 0
             span,
         };
         let outer_headers = checker.form_storage_completion(&outer, &BorrowFact::default());
+        let outer_generation = outer_headers.leaves[&vec![BorrowProjection::StructField(0)]]
+            .generations.iter().next().unwrap().generation.clone();
+        let outer_release_address = std::ptr::from_ref(
+            checker.borrows.storage.directory.entries[&outer_generation]
+                .releases.iter().next().unwrap(),
+        );
         checker.loop_iter_drops.push(Vec::new());
         let inner = Expr {
             kind: ExprKind::Call {
@@ -78683,6 +78714,12 @@ fn main() -> i32 = 0
             span,
         };
         let inner_headers = checker.form_storage_completion(&inner, &BorrowFact::default());
+        assert_eq!(
+            std::ptr::from_ref(checker.borrows.storage.directory.entries[&outer_generation]
+                .releases.iter().next().unwrap()),
+            outer_release_address,
+            "forming another generation must not clone the unrelated release set",
+        );
         let path = vec![BorrowProjection::StructField(0)];
         for (headers, depth, expression) in [
             (&outer_headers, 1, MoveCheck::expr_key(&outer)),
@@ -79119,6 +79156,280 @@ fn main() -> i32 = 0
             MoveControlEdge::join_reachable([Some(skip.clone()), None]) == Some(skip),
             "a diverging edge contributes neither value nor state",
         );
+    }
+
+    #[test]
+    fn escape_storage_generation_publication_matrix() {
+        let descriptor = StorageHeaderDescriptor {
+            ty: Ty::Array(
+                Scalar::Int(IntTy {
+                    signed: true,
+                    bits: 64,
+                }),
+                4,
+            ),
+            kind: StorageHeaderKind::InlineFixed,
+        };
+        let origin = StorageOrigin::inline_place(7, &[]);
+        let current = StorageGeneration::Current(origin.clone());
+        let prior = StorageGeneration::Prior(origin.clone());
+        let unrelated = StorageGeneration::Current(StorageOrigin::inline_place(8, &[]));
+        let stable = StorageGeneration::parameter_value(0, &[]);
+        let caller = StorageGeneration::caller_storage(1, &[]);
+        let absent = StorageOrigin::inline_place(99, &[]);
+        let fact = |selected: bool| {
+            let mut leaf = StorageHeaderLeaf::unknown_typed(
+                [BorrowRoot::Param(2)].into_iter().collect(),
+                descriptor,
+            );
+            leaf.generations = [
+                if selected {
+                    prior.clone()
+                } else {
+                    current.clone()
+                },
+                prior.clone(),
+                unrelated.clone(),
+                stable.clone(),
+                caller.clone(),
+            ]
+            .into_iter()
+            .map(|generation| StorageGenerationRef {
+                generation,
+                content_path: vec![BorrowProjection::StructField(1)],
+                erase_readonly: true,
+            })
+            .collect();
+            EscapeValueFact {
+                non_storage: EscapeRegionFact::from_direct(Region::Caller(3)),
+                headers: ProjectedHeaderFact::from_leaf(
+                    vec![BorrowProjection::ResultOk, BorrowProjection::StructField(0)],
+                    leaf,
+                ),
+                content_ended: [(vec![BorrowProjection::OptionSome], BorrowEnd::Dropped)]
+                    .into_iter()
+                    .collect(),
+                content_unknown: [vec![BorrowProjection::ResultErr]].into_iter().collect(),
+                storage_is_local: true,
+                individual: false,
+                may_individual: true,
+            }
+        };
+        let entry = |local, ended| EscapeGenerationEntry {
+            descriptor: Some(descriptor),
+            storage_region: Region::Arena(local),
+            retention_region: Region::Arena(local),
+            allocation: EscapeAllocationMode {
+                individual: local == 7,
+                may_individual: true,
+            },
+            releases: [EscapeReleasePlace::Local {
+                local,
+                path: Vec::new(),
+            }]
+            .into_iter()
+            .collect(),
+            ended,
+        };
+        let content = |local, selected| EscapeGenerationContent {
+            direct_regions: EscapeRegionFact::from_direct(Region::Caller(local)),
+            dependencies: fact(selected).headers,
+        };
+        for presence in 0..4 {
+            for mode in 0..3 {
+                let selected = mode == 2;
+                let renames = StorageGenerationRenames::from_origins(match mode {
+                    0 => vec![],
+                    1 => vec![absent.clone()],
+                    _ => vec![origin.clone(), absent.clone()],
+                });
+                let mut before = EscapeState::default();
+                // Legacy facts and unrelated entries must survive either operation unchanged.
+                before.region.insert(20, Region::Arena(5));
+                before
+                    .active_sum
+                    .insert(20, [BorrowProjection::ResultOk].into_iter().collect());
+                before
+                    .argument_snapshots
+                    .insert((30, 0), EscapeArgumentSnapshot::fail_closed());
+                before
+                    .completed_expressions
+                    .insert(30, EscapeArgumentSnapshot::fail_closed());
+                before
+                    .callable_capture_snapshots
+                    .insert(30, Region::Caller(4));
+                before.local_backed_slice.insert(20);
+                before.individual.insert(20, true);
+                before.individual_may.insert(20, true);
+                before.storage_values.insert(7, fact(false));
+                before
+                    .storage_argument_snapshots
+                    .insert((30, 1), fact(false));
+                before.storage_completed_expressions.insert(30, fact(false));
+                before.storage_callable_snapshots.insert(30, fact(false));
+                for key in [&unrelated, &stable, &caller] {
+                    before
+                        .storage
+                        .directory
+                        .entries
+                        .insert(key.clone(), entry(8, None));
+                    before
+                        .storage
+                        .contents
+                        .entries
+                        .insert(key.clone(), content(8, false));
+                }
+                if presence & 1 != 0 {
+                    before
+                        .storage
+                        .directory
+                        .entries
+                        .insert(current.clone(), entry(7, None));
+                    before
+                        .storage
+                        .contents
+                        .entries
+                        .insert(current.clone(), content(7, false));
+                }
+                if presence & 2 != 0 {
+                    before
+                        .storage
+                        .directory
+                        .entries
+                        .insert(prior.clone(), entry(9, Some(BorrowEnd::Dropped)));
+                    before
+                        .storage
+                        .contents
+                        .entries
+                        .insert(prior.clone(), content(9, false));
+                }
+                let mut observed = before.clone();
+                observed.rename_storage_observers(&renames);
+                let mut expected = before.clone();
+                expected.storage_values.insert(7, fact(selected));
+                expected
+                    .storage_argument_snapshots
+                    .insert((30, 1), fact(selected));
+                expected
+                    .storage_completed_expressions
+                    .insert(30, fact(selected));
+                expected
+                    .storage_callable_snapshots
+                    .insert(30, fact(selected));
+                assert!(
+                    observed == expected,
+                    "observer-only state {presence}/{mode}"
+                );
+                assert_eq!(observed.storage, before.storage, "old tables were updated");
+
+                let mut complete = before.clone();
+                complete.rename_storage_generations(&renames);
+                for key in [&unrelated, &stable, &caller] {
+                    expected
+                        .storage
+                        .contents
+                        .entries
+                        .insert(key.clone(), content(8, selected));
+                }
+                if presence & 1 != 0 {
+                    expected
+                        .storage
+                        .contents
+                        .entries
+                        .insert(current.clone(), content(7, selected));
+                }
+                if presence & 2 != 0 {
+                    expected
+                        .storage
+                        .contents
+                        .entries
+                        .insert(prior.clone(), content(9, selected));
+                }
+                if selected && presence & 1 != 0 {
+                    expected.storage.directory.entries.remove(&current);
+                    expected.storage.contents.entries.remove(&current);
+                    let directory = if presence & 2 != 0 {
+                        entry(7, None).join(&entry(9, Some(BorrowEnd::Dropped)))
+                    } else {
+                        entry(7, None)
+                    };
+                    let contents = if presence & 2 != 0 {
+                        content(7, true).join(&content(9, true))
+                    } else {
+                        content(7, true)
+                    };
+                    expected
+                        .storage
+                        .directory
+                        .entries
+                        .insert(prior.clone(), directory);
+                    expected
+                        .storage
+                        .contents
+                        .entries
+                        .insert(prior.clone(), contents);
+                }
+                assert!(complete == expected, "complete state {presence}/{mode}");
+
+                // The old staging algorithm supplies an independent complete-state oracle.
+                // New Current payloads retain their fresh references after direct commit.
+                let fresh = match mode {
+                    0 => StorageGeneration::parameter_value(42, &[]),
+                    1 => StorageGeneration::Current(absent.clone()),
+                    _ => current.clone(),
+                };
+                let mut next = expected.storage.clone();
+                next.directory
+                    .entries
+                    .insert(fresh.clone(), entry(10, None));
+                next.contents
+                    .entries
+                    .insert(fresh.clone(), content(10, false));
+                complete.storage = next;
+                let mut committed = before.clone();
+                let commit = committed
+                    .storage
+                    .try_form_headers(
+                        descriptor.ty,
+                        vec![StorageHeaderFormation {
+                            path: Vec::new(),
+                            generation: fresh.clone(),
+                            directory: Some(entry(10, None)),
+                            content: Some(content(10, false)),
+                        }],
+                        StorageTypeContext {
+                            structs: &[],
+                            tuples: &[],
+                            enums: &[],
+                            tagged_types: &[],
+                        },
+                        |_, contents, renames| {
+                            for content in contents {
+                                content.rename_generations(renames);
+                            }
+                        },
+                        |existing, incoming| *existing = existing.join(&incoming),
+                        |existing, incoming| *existing = existing.join(&incoming),
+                    )
+                    .unwrap();
+                committed.rename_storage_observers(&commit.renames);
+                assert!(
+                    committed == complete,
+                    "direct publication differs {presence}/{mode}"
+                );
+                assert_eq!(
+                    committed.storage.contents.entries[&fresh],
+                    content(10, false)
+                );
+                assert_eq!(
+                    commit.headers,
+                    ProjectedHeaderFact::from_leaf(
+                        Vec::new(),
+                        StorageHeaderLeaf::known_typed(fresh, descriptor),
+                    )
+                );
+            }
+        }
     }
 
     #[test]
@@ -79662,6 +79973,10 @@ fn main() -> i32 = 0
             Some(Region::Caller(3)),
         );
 
+        let fixed_release_address = std::ptr::from_ref(
+            state.storage.directory.entries[&fixed_generation].releases.iter().next().unwrap(),
+        );
+
         seed_escape_parameter_storage(
             &mut state,
             4,
@@ -79736,6 +80051,12 @@ fn main() -> i32 = 0
             assert!(!state.storage_values[&position].individual);
             assert!(!state.storage_values[&position].may_individual);
         }
+        assert_eq!(
+            std::ptr::from_ref(state.storage.directory.entries[&fixed_generation]
+                .releases.iter().next().unwrap()),
+            fixed_release_address,
+            "seeding later parameters must not clone existing release sets",
+        );
         assert_eq!(
             state.storage.directory.entries.len(),
             7,
