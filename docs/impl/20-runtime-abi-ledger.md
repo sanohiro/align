@@ -1388,9 +1388,10 @@ traversal, taking the registry to 298 keyed / 311 base / 319 maximum optional-pr
 | `IoWriterCreateExclusiveBeneath` | `align_rt_io_writer_create_exclusive_beneath` | A12: `i32 @SYM(ptr, i64, ptr, i64, ptr)` |
 
 Both constructors keep the existing reader/writer output-slot convention: validate the slot first,
-clear it, validate/copy/parse the complete root before inspecting relative, then
-validate/copy/parse the complete relative before a filesystem call and traverse from retained
-directory descriptors. The runtime publishes a handle only after the final regular-file open or
+clear it, validate/parse/copy the complete root before inspecting relative, then
+validate/parse/copy the complete relative before a filesystem call and traverse from retained
+directory descriptors. Each path is fully admitted before its private copy allocates; an earlier
+valid root may already own its copy when relative admission fails. The runtime publishes a handle only after the final regular-file open or
 exclusive create succeeds. The exact declaration golden, key/symbol bijection, exports,
 whole/per-unit declarations, and rt-LTO inventory update in the same capability. The public
 contract and closure matrix are in

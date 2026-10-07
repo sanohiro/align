@@ -47,9 +47,11 @@ and synchronized ordering prose. Expected handwritten changes remain below 1,000
 
 ## Documentation closure
 
-Plan29 section1.1 and its closure-row wording, plan94's representation section,
-and the ordering sentence in English and Japanese std-design/fs now complete
-each path's validation/grammar before its copy, retaining root-before-relative.
+Plan29 section1.1 and its closure-row wording, plan34's exact validation order,
+runtime ABI ledger20's retained-root row, plan94's representation section, and
+the ordering sentence in English and Japanese std-design/fs now complete each
+path's validation/grammar before its copy, retaining root-before-relative and
+the possibility of an earlier root copy on relative rejection.
 Other specification/design/settled records already require complete lexical
 admission before I/O without fixing the private copy order; their promises do not
 change and should not be restated. Record status once in HANDOFF at completion.

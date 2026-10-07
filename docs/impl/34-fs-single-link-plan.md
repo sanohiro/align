@@ -29,8 +29,8 @@ or process-global state.
 The constructor preserves this order:
 
 1. reject a null output slot, otherwise clear it to null;
-2. validate, copy, and parse the complete root;
-3. validate, copy, and parse the complete relative path;
+2. validate and parse the complete root, then allocate its private copy;
+3. validate and parse the complete relative path, then allocate its private copy;
 4. retain the starting directory and traverse root components in written order;
 5. traverse relative parent components in written order;
 6. observe the final entry without following it and require a regular file;
