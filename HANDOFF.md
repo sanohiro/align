@@ -17,6 +17,11 @@ outside the active worktree so they do not obstruct unrelated checks or pulls.
 
 ## Next work (handoff updated 2026-10-07)
 
+Plan132 corrects owned resource value provenance across match/control results:
+transferred owners do not borrow their source slot, while explicit parent/ref
+dependencies remain. Whole/per-unit mutable-use and exact-Drop owners cover
+Request 125; external align-llm adoption remains consumer-owned.
+
 Plan131 adds explicit payload alignment as an optional final i64 argument to
 `buffer` and `buffer.filled`. The owner preserves it through growth and transfer;
 bounded reads preserve the address. Native layout/admission and compiler/ABI/

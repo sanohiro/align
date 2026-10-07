@@ -212,6 +212,337 @@ fn main() -> i32 {
     assert_eq!(String::from_utf8_lossy(&per_unit.stdout), "ok\n");
 }
 
+fn resource_control_fixture(files: &[(&str, &str)]) -> align_driver::ArtifactStage {
+    let stage =
+        align_driver::ArtifactStage::temp("resource-control").expect("exclusive resource fixture");
+    for (name, source) in files {
+        let path = stage.path().join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, source).unwrap();
+    }
+    stage
+}
+
+fn run_resource_control(
+    stage: &align_driver::ArtifactStage,
+    per_unit: bool,
+) -> std::process::Output {
+    use std::io::ErrorKind;
+    use std::time::{Duration, Instant};
+    let entry = stage.path().join("main.align");
+    let source = std::fs::read_to_string(&entry).unwrap();
+    let mut sm = SourceMap::new();
+    let programs = if per_unit {
+        let built = build_per_unit(&mut sm, entry.to_str().unwrap(), &source);
+        assert!(
+            !built.diags.has_errors(),
+            "{}",
+            align_driver::format_diagnostics(&sm, &built.diags)
+        );
+        for unit in &built.units {
+            let bytes = align_interface::serialize(&unit.summary);
+            let replayed = align_interface::deserialize(&bytes).unwrap();
+            assert_eq!(bytes, align_interface::serialize(&replayed));
+        }
+        built
+            .units
+            .into_iter()
+            .map(|unit| unit.mir)
+            .collect::<Vec<_>>()
+    } else {
+        let checked = check(&mut sm, entry.to_str().unwrap(), &source);
+        assert!(
+            !checked.diags.has_errors(),
+            "{}",
+            align_driver::format_diagnostics(&sm, &checked.diags)
+        );
+        vec![lower_to_mir(&checked.hir)]
+    };
+    let mut objects = Vec::new();
+    let mut libraries = Vec::new();
+    for (index, mir) in programs.iter().enumerate() {
+        let object = stage.path().join(format!("{per_unit}-{index}.o"));
+        emit_object_file(
+            mir,
+            &object,
+            BuildTarget::Baseline,
+            Profile::Release,
+            &[],
+            false,
+        )
+        .expect("resource codegen");
+        objects.push(object);
+        for library in &mir.link_libs {
+            if !libraries.contains(library) {
+                libraries.push(library.clone());
+            }
+        }
+    }
+    let executable = stage.path().join(format!("run-{per_unit}"));
+    let refs = objects
+        .iter()
+        .map(|path| path.as_path())
+        .collect::<Vec<_>>();
+    link_objects(
+        &align_driver::CDriver::default(),
+        &refs,
+        &executable,
+        &libraries,
+        Profile::Release,
+    )
+    .expect("resource link");
+
+    struct ChildOwner {
+        child: Option<std::process::Child>,
+        deadline: Instant,
+    }
+    impl Drop for ChildOwner {
+        fn drop(&mut self) {
+            let Some(child) = self.child.as_mut() else {
+                return;
+            };
+            // This fixture only allocates/frees and prints; it cannot launch descendants.
+            loop {
+                match child.kill() {
+                    Err(error)
+                        if error.kind() == ErrorKind::Interrupted
+                            && Instant::now() < self.deadline => {}
+                    _ => break,
+                }
+            }
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) if Instant::now() < self.deadline => {
+                        std::thread::sleep(Duration::from_millis(1))
+                    }
+                    Err(error)
+                        if error.kind() == ErrorKind::Interrupted
+                            && Instant::now() < self.deadline => {}
+                    _ => {
+                        eprintln!("resource child did not reap before deadline");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    let stdout = stage.path().join(format!("stdout-{per_unit}"));
+    let stderr = stage.path().join(format!("stderr-{per_unit}"));
+    let mut command = std::process::Command::new(executable);
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::fs::File::create(&stdout).unwrap())
+        .stderr(std::fs::File::create(&stderr).unwrap());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut owner = ChildOwner {
+        child: Some(command.spawn().expect("spawn resource owner")),
+        deadline,
+    };
+    let status = loop {
+        assert!(
+            Instant::now() + Duration::from_secs(5) < owner.deadline,
+            "resource child exceeded work deadline"
+        );
+        match owner.child.as_mut().unwrap().try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => panic!("poll resource child: {error}"),
+        }
+    };
+    owner.child.take();
+    std::process::Output {
+        status,
+        stdout: std::fs::read(stdout).unwrap(),
+        stderr: std::fs::read(stderr).unwrap(),
+    }
+}
+
+#[test]
+fn owned_resource_control_results_keep_receiving_mutable_authority() {
+    let internal = INTERNAL.replace("raw.free(handle)", "raw.free(handle); print(101)");
+    let root = format!(
+        "{ROOT}\n{}",
+        r#"
+pub fn fallible(flag: bool) -> Result<conn, Error> {
+  if flag { return Ok(open()) }
+  return Err(Error.Invalid)
+}
+pub fn identity<T>(value: T) -> T = value
+pub fn inspect_mut(borrow mut owner: conn) -> bool = present(resource.borrow(owner))
+"#
+    );
+    let cases = [
+        "local_open()?",
+        "match local_open() { Ok(value) => value, Err(error) => { return Err(error) } }",
+        "match pkg.db.fallible(true) { Ok(value) => value, Err(error) => { return Err(error) } }",
+        "match Some(pkg.db.open()) { Some(value) => value, None => { return Err(Error.Invalid) } }",
+        "match Choice.Owner(pkg.db.open()) { Owner(value) => value, Empty => { return Err(Error.Invalid) } }",
+        "if flag { value := pkg.db.open(); value } else { other := pkg.db.open(); other }",
+        "{ value := pkg.db.open(); value }",
+        "loop { value := pkg.db.open(); break value }",
+        "pkg.db.fallible(true) else { return Err(Error.Invalid) }",
+        "match pkg.db.fallible(true).map_err(keep_error) { Ok(value) => value, Err(error) => { return Err(error) } }",
+    ];
+    let mut entry = String::from(
+        r#"module main
+import pkg.db
+Holder { owner: pkg.db.conn }
+Nested { holder: Holder }
+Choice { Owner(pkg.db.conn), Empty }
+fn wrap(owner: pkg.db.conn) -> Holder = Holder { owner: owner }
+fn inspect(borrow mut holder: Holder) -> bool = pkg.db.present(resource.borrow(holder.owner))
+fn inspect_nested(borrow mut nested: Nested) -> bool = pkg.db.present(resource.borrow(nested.holder.owner))
+fn local_open() -> Result<pkg.db.conn, Error> = pkg.db.fallible(true)
+fn keep_error(value: Error) -> Error = value
+"#,
+    );
+    for (index, expression) in cases.iter().enumerate() {
+        entry.push_str(&format!(
+            r#"
+fn case_{index}(flag: bool) -> Result<(), Error> {{
+  owner := {expression}
+  mut holder := wrap(pkg.db.identity(owner))
+  if !inspect(holder) {{ return Err(Error.Invalid) }}
+  holder = wrap(pkg.db.open())
+  if !inspect(holder) {{ return Err(Error.Invalid) }}
+  return Ok(())
+}}
+"#
+        ));
+    }
+    entry.push_str(r#"
+fn aggregate() -> Result<(), Error> {
+  result: Result<Holder, Error> := Ok(wrap(pkg.db.open()))
+  extracted := match result { Ok(value) => value, Err(error) => { return Err(error) } }
+  mut holder := pkg.db.identity(extracted)
+  if !inspect(holder) { return Err(Error.Invalid) }
+  mut nested := match Some(Nested { holder: wrap(pkg.db.open()) }) {
+    Some(value) => value,
+    None => { return Err(Error.Invalid) },
+  }
+  if !inspect_nested(nested) { return Err(Error.Invalid) }
+  return Ok(())
+}
+fn direct() -> Result<(), Error> {
+  mut owner := match pkg.db.fallible(true) { Ok(value) => value, Err(error) => { return Err(error) } }
+  if !pkg.db.inspect_mut(owner) { return Err(Error.Invalid) }
+  return Ok(())
+}
+fn early_error() -> Result<(), Error> {
+  held := pkg.db.open()
+  owner := match pkg.db.fallible(false) { Ok(value) => value, Err(error) => { return Err(error) } }
+  mut holder := wrap(owner)
+  if !inspect(holder) { return Err(Error.Invalid) }
+  return Ok(())
+}
+fn main() -> i32 {
+"#);
+    for index in 0..cases.len() {
+        entry.push_str(&format!("  case_{index}(true) else {{ return 1 }}\n"));
+    }
+    entry.push_str(
+        r#"  case_5(false) else { return 1 }
+  aggregate() else { return 2 }
+  direct() else { return 4 }
+  match early_error() { Ok(value) => { return 3 }, Err(error) => {} }
+  return 42
+}
+"#,
+    );
+    let project = [
+        ("pkg/db/internal/resource.align", internal.as_str()),
+        ("pkg/db.align", root.as_str()),
+        ("main.align", entry.as_str()),
+    ];
+    assert!(backend_available(), "resource transfer owner requires LLVM");
+    let stage = resource_control_fixture(&project);
+    let expected = "101\n".repeat(cases.len() * 2 + 6);
+    for per_unit in [false, true] {
+        let output = run_resource_control(&stage, per_unit);
+        assert_eq!(
+            output.status.code(),
+            Some(42),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+    }
+}
+
+#[test]
+fn owned_resource_control_results_preserve_actual_dependencies() {
+    let root = format!(
+        "{ROOT}\n{}",
+        r#"
+pub fn child(parent: resource_ref<conn>) -> Result<conn, Error> {
+  unsafe { return Ok(resource.from_raw_borrowed(raw.alloc(8), parent)) }
+}
+pub fn mutate(borrow mut owner: conn) {}
+pub fn consume(owner: conn) {}
+"#
+    );
+    for (name, transfer, action, diagnostic) in [
+        (
+            "child-mutate",
+            "child := match pkg.db.child(resource.borrow(parent)) { Ok(value) => value, Err(error) => { return } }; holder := Holder { owner: child }",
+            "pkg.db.mutate(parent)",
+            "dependent resource/reference",
+        ),
+        (
+            "child-move",
+            "child := match pkg.db.child(resource.borrow(parent)) { Ok(value) => value, Err(error) => { return } }; holder := Holder { owner: child }",
+            "pkg.db.consume(parent)",
+            "dependent resource/reference",
+        ),
+        (
+            "reference-mutate",
+            "reference := match Some(resource.borrow(parent)) { Some(value) => value, None => { return } }",
+            "pkg.db.mutate(parent); print(pkg.db.present(reference))",
+            "while dependent resource/reference",
+        ),
+        (
+            "reference-move",
+            "reference := resource.borrow(parent); owner := match Some(parent) { Some(value) => value, None => { return } }",
+            "print(pkg.db.present(reference))",
+            "while dependent resource/reference",
+        ),
+    ] {
+        let entry = format!(
+            r#"module main
+import pkg.db
+Holder {{ owner: pkg.db.conn }}
+fn main() {{ mut parent := pkg.db.open(); {transfer}; {action} }}
+"#
+        );
+        let project = [
+            ("pkg/db/internal/resource.align", INTERNAL),
+            ("pkg/db.align", root.as_str()),
+            ("main.align", entry.as_str()),
+        ];
+        let stage = resource_control_fixture(&project);
+        let path = stage.path().join("main.align");
+        for per_unit in [false, true] {
+            let mut sm = SourceMap::new();
+            let diags = if per_unit {
+                check_per_unit(&mut sm, path.to_str().unwrap(), &entry).diags
+            } else {
+                check(&mut sm, path.to_str().unwrap(), &entry).diags
+            };
+            let rendered = align_driver::format_diagnostics(&sm, &diags);
+            assert!(
+                diags.has_errors(),
+                "{name}: per_unit={per_unit} accepted invalid dependency"
+            );
+            assert!(
+                rendered.contains(diagnostic),
+                "{name}: per_unit={per_unit}: {rendered}"
+            );
+        }
+    }
+}
+
 #[test]
 fn dependent_resource_blocks_parent_move_until_child_drop() {
     let root = "\
