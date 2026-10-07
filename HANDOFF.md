@@ -17,6 +17,11 @@ outside the active worktree so they do not obstruct unrelated checks or pulls.
 
 ## Next work (handoff updated 2026-10-07)
 
+Plan133 certifies text-byte element reads through their original text producer,
+including byte-derived range bounds and Request 124's Unicode scan loops.
+Read-only backing and founded-input checks remain intact; whole/per-unit
+execution and malformed-producer owners cover the correction. K1 stays deferred.
+
 Plan132 corrects owned resource value provenance across match/control results:
 transferred owners do not borrow their source slot, while explicit parent/ref
 dependencies remain. Whole/per-unit mutable-use and exact-Drop owners cover

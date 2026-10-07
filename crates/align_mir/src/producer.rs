@@ -3539,6 +3539,23 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 } else if path.is_empty() {
                     self.add_operand(&mut equation, &operand, source_ty, Vec::new());
                 } else {
+                    // Text has no Element type path. A byte-view retype exposes its bytes,
+                    // so an element read is grounded in the text at the enclosing path.
+                    // Keep that source as a read dependency; it must still be initialized
+                    // and readable, and the view never gains writable backing authority.
+                    if path.last() == Some(&XmlAccessPathSegment::Element) {
+                        let prefix = &path[..path.len() - 1];
+                        let source = xml_selected_ty(self.graph.program, source_ty, prefix);
+                        let view = xml_selected_ty(self.graph.program, result_ty, prefix);
+                        if let (
+                            Some(text @ (Ty::String | Ty::Str)),
+                            Some(Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false }))),
+                        ) = (source, view)
+                        {
+                            self.add_read_operand(&mut equation, &operand, text, prefix.to_vec());
+                            return equation;
+                        }
+                    }
                     let Some(source_selected) =
                         xml_selected_ty(self.graph.program, source_ty, &path)
                     else {
@@ -11621,6 +11638,133 @@ pub fn direct_runtime_key_is_valid(key: RuntimeKey, args: &[Ty], ret: Ty, progra
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_byte_retype_producers_preserve_grounding_and_authority()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let lower = |source: &str| {
+            let mut diagnostics = align_diag::Diagnostics::new();
+            let tokens = align_lexer::tokenize(0, source, &mut diagnostics);
+            let ast = align_parser::parse_file(tokens, &mut diagnostics);
+            let hir = align_sema::check_file(&ast, &mut diagnostics);
+            assert!(
+                !diagnostics.has_errors(),
+                "{:?}",
+                diagnostics.iter().collect::<Vec<_>>()
+            );
+            crate::lower_program(&hir)
+        };
+        let bytes = Ty::Slice(Scalar::Int(IntTy {
+            bits: 8,
+            signed: false,
+        }));
+        for parameter in ["text: str", "borrow text: string"] {
+            let source = format!(
+                "fn selected({parameter}) -> str {{ bytes := text.bytes(); return text[bytes[0] as i64..text.len()] }}\n"
+            );
+            let base = lower(&source);
+            let defined = base
+                .fns
+                .iter()
+                .map(|f| f.name.clone())
+                .collect::<BTreeSet<_>>();
+            validate_mir_producers(&base)?;
+            validate_partition_resource_rvalues(&base, &defined)?;
+            for mutation in 0..4 {
+                let mut bad = base.clone();
+                let function = bad
+                    .fns
+                    .iter_mut()
+                    .find(|f| f.name.as_str() == "selected")
+                    .ok_or("selected fixture")?;
+                let (block, statement, value) = function
+                    .blocks
+                    .iter()
+                    .enumerate()
+                    .find_map(|(block, body)| {
+                        body.stmts
+                            .iter()
+                            .enumerate()
+                            .find_map(|(statement, node)| match node {
+                                Stmt::Let(value, Rvalue::Use(_))
+                                    if function.value_tys.get(*value as usize) == Some(&bytes) =>
+                                {
+                                    Some((block, statement, *value))
+                                }
+                                _ => None,
+                            })
+                    })
+                    .ok_or("actual text byte retype")?;
+                match mutation {
+                    0 => {
+                        function.blocks[block].stmts[statement] =
+                            Stmt::Let(value, Rvalue::Use(Operand::Value(u32::MAX)))
+                    }
+                    1 => {
+                        function.value_tys[value as usize] = Ty::Slice(Scalar::Int(IntTy {
+                            bits: 16,
+                            signed: false,
+                        }))
+                    }
+                    2 => {
+                        let slot = u32::try_from(function.slots.len())?;
+                        function.slots.push(Ty::Str);
+                        function.slot_align.push(None);
+                        let uninitialized = u32::try_from(function.value_tys.len())?;
+                        function.value_tys.push(Ty::Str);
+                        function.blocks[block].stmts[statement] =
+                            Stmt::Let(value, Rvalue::Use(Operand::Value(uninitialized)));
+                        function.blocks[block]
+                            .stmts
+                            .insert(statement, Stmt::Let(uninitialized, Rvalue::Load(slot)));
+                    }
+                    _ => function.param_modes[0] = align_ast::ParamMode::Out,
+                }
+                assert!(
+                    validate_mir_producers(&bad).is_err(),
+                    "{parameter}, mutation {mutation}"
+                );
+                assert!(
+                    validate_partition_resource_rvalues(&bad, &defined).is_err(),
+                    "partition {parameter}, mutation {mutation}"
+                );
+            }
+        }
+
+        // Option retypes are already admitted by the MIR contract. Exercise the projected
+        // byte leaf through that wrapper even when source lowering constructs it differently.
+        let mut wrapped = lower(
+            "fn selected(optional: Option<slice<u8>>, text: str) -> str { bytes := optional else { return text }; return text[bytes[0] as i64..text.len()] }\n",
+        );
+        let function = wrapped
+            .fns
+            .iter_mut()
+            .find(|f| f.name.as_str() == "selected")
+            .ok_or("optional fixture")?;
+        let parameter = function.params[0];
+        function.slots[parameter as usize] = Ty::Option(Scalar::Str);
+        let mut changed = 0;
+        for block in &mut function.blocks {
+            for node in &mut block.stmts {
+                if let Stmt::Let(_, value @ Rvalue::Load(_)) = node
+                    && matches!(value, Rvalue::Load(slot) if *slot == parameter)
+                {
+                    *value = Rvalue::Use(Operand::Arg(0));
+                    changed += 1;
+                }
+            }
+        }
+        assert_eq!(changed, 1);
+        validate_mir_producers(&wrapped)?;
+        let defined = wrapped
+            .fns
+            .iter()
+            .map(|f| f.name.clone())
+            .collect::<BTreeSet<_>>();
+        validate_partition_resource_rvalues(&wrapped, &defined)?;
+
+        Ok(())
+    }
 
     #[test]
     fn html_text_mir_rejects_malformed_returned_and_discarded_producers() -> Result<(), Box<dyn std::error::Error>> {
