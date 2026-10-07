@@ -241,7 +241,8 @@ embedding API; the adversarial probe owns that extra process setup.
 | Exclusive fixture ownership and bounded probe cleanup | ArtifactStage plus immediate direct-child guard and one work/cleanup deadline; this libtest probe launches no descendant process |
 | Failure-report cleanup before summary; passing-summary cleanup | closed_report_sinks_exit_numerically_and_remove_stages crosses failing and passing source with closed stdout, checking exact surviving diagnostic and numeric exit 1 |
 | Stderr diagnostic failure and both sinks closed | Same CLI owner crosses cache diagnostics and failure reporting with closed stderr/both; no summary or recursive diagnostic |
-| Native descriptors, artifacts and process groups | Immediate File owners, exclusive outer ArtifactStage/private TMPDIR, file-backed capture and bounded CLI group/child guard; assert private stages absent before fixture Drop |
+| Native descriptors, artifacts and process groups | Immediate File owners, exclusive outer ArtifactStage/private TMPDIR and file-backed capture; the bounded CLI guard gives SIGTERM cleanup authority to the live runner before pinned-group/direct hard retirement and reap; assert private stages absent before fixture Drop |
+| Transitive tool admission and separately grouped row timeout | No external availability subprocess; actual tools run inside the CLI guard. Explicit two-second row limit precedes the fifty-second outer work limit; one sixty-second deadline reserves graceful and forced cleanup. Stalled linker and exec-row controls force the owner timeout, then assert their published PID is absent before fixture removal |
 | Types, construction, Move/Drop/replacement/return, branches, generics, interfaces, whole/per-unit, ABI/cache and allocation parity | No semantic or production implementation changes; existing owners remain applicable |
 
 The independent plan review found two P2 omissions: legacy core_test scratch and
@@ -260,3 +261,14 @@ existing descendant-timeout owner, which also passes there. Removing the child
 mask, writer mask or terminal stage removal independently fails the intended
 owner; byte-identical restoration passes. The production runner prefix remains
 identical to main. The author matrix-to-diff pass is complete.
+
+The preflight review found an unbounded legacy cc version probe and an outer
+hard-kill path that could orphan a separately grouped test row. The coherent
+owner correction removes the external availability probe entirely and keeps
+actual tool work inside the bounded CLI. Before forced group/direct retirement,
+the owner gives a live runner up to three seconds within its original deadline
+to forward SIGTERM and discharge its row. Explicit row/outer deadline ordering
+and stalled-linker/exec-row controls close the transitive process cell. These
+controls force the outer timeout while the published process is live, exercise
+Drop, and require ESRCH before fixture removal; the row also requires stage
+absence. This is a local test-lifecycle correction, with no production change.

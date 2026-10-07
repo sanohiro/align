@@ -687,7 +687,7 @@ fn closed_report_sinks_exit_numerically_and_remove_stages() {
     use std::os::unix::process::CommandExt;
     use std::process::{Child, ExitStatus};
 
-    if !available() {
+    if !align_driver::backend_available() {
         return;
     }
 
@@ -698,16 +698,31 @@ fn closed_report_sinks_exit_numerically_and_remove_stages() {
         deadline: Instant,
     }
     impl Owner {
-        fn retire(&mut self) -> std::io::Result<ExitStatus> {
+        fn terminal(&self) -> std::io::Result<bool> {
             let child = self
                 .child
-                .as_mut()
+                .as_ref()
                 .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ECHILD))?;
-            let pid = i32::try_from(child.id())
-                .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let code = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    child.id(),
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if code == 0 {
+                Ok(unsafe { info.si_pid() } != 0)
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+
+        fn signal(&self, pid: i32, signal: i32) {
             for target in [-pid, pid] {
                 loop {
-                    if unsafe { libc::kill(target, libc::SIGKILL) } == 0 {
+                    if unsafe { libc::kill(target, signal) } == 0 {
                         break;
                     }
                     let error = std::io::Error::last_os_error();
@@ -716,8 +731,42 @@ fn closed_report_sinks_exit_numerically_and_remove_stages() {
                     }
                 }
             }
+        }
+
+        fn retire(&mut self) -> std::io::Result<ExitStatus> {
+            let pid = i32::try_from(
+                self.child
+                    .as_ref()
+                    .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ECHILD))?
+                    .id(),
+            )
+            .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+            // A generated test row has its own PGID. Give the live CLI its bounded native
+            // shutdown window to forward SIGTERM, kill/reap that row and remove its stage.
+            // During linking, the same signal also reaches tools in the CLI's own group.
+            self.signal(pid, libc::SIGTERM);
+            let graceful = (Instant::now() + Duration::from_secs(3))
+                .min(self.deadline - Duration::from_secs(2));
+            loop {
+                match self.terminal() {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
+                }
+                if Instant::now() >= graceful {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.signal(pid, libc::SIGKILL);
             let status = loop {
-                match child.try_wait() {
+                match self
+                    .child
+                    .as_mut()
+                    .expect("owned child remains pinned")
+                    .try_wait()
+                {
                     Ok(Some(status)) => break status,
                     Ok(None) => {}
                     Err(error) if error.kind() == ErrorKind::Interrupted => {}
@@ -742,35 +791,24 @@ fn closed_report_sinks_exit_numerically_and_remove_stages() {
             }
         }
 
-        fn wait(&mut self) -> ExitStatus {
-            let pid = self.child.as_ref().expect("owned CLI child").id();
+        fn wait_until(&mut self, work_deadline: Instant) -> std::io::Result<ExitStatus> {
             loop {
-                assert!(
-                    Instant::now() + Duration::from_secs(2) < self.deadline,
-                    "closed-sink CLI exceeded work deadline"
-                );
-                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-                let code = unsafe {
-                    libc::waitid(
-                        libc::P_PID,
-                        pid,
-                        &mut info,
-                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-                    )
-                };
-                if code == 0 && unsafe { info.si_pid() } != 0 {
-                    return self
-                        .retire()
-                        .expect("retire closed-sink CLI group and child");
+                if Instant::now() >= work_deadline {
+                    return Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT));
                 }
-                if code == -1 {
-                    assert_eq!(
-                        std::io::Error::last_os_error().kind(),
-                        ErrorKind::Interrupted
-                    );
+                match self.terminal() {
+                    Ok(true) => return self.retire(),
+                    Ok(false) => {}
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
                 }
                 std::thread::sleep(Duration::from_millis(1));
             }
+        }
+
+        fn wait(&mut self) -> ExitStatus {
+            self.wait_until(self.deadline - Duration::from_secs(10))
+                .expect("closed-sink CLI work and cleanup")
         }
     }
     impl Drop for Owner {
@@ -791,18 +829,22 @@ fn closed_report_sinks_exit_numerically_and_remove_stages() {
         ("passing-summary", true, true, false, false),
         ("cache-diagnostic", true, false, true, true),
         ("both-sinks", false, true, true, false),
+        ("stalled-linker", true, false, false, false),
+        ("stalled-row", true, false, false, false),
     ] {
         let root = stage.path().join(label);
         std::fs::create_dir(&root).expect("case directory");
         let temp = root.join("tmp");
         std::fs::create_dir(&temp).expect("private child temporary directory");
-        std::fs::write(
-            root.join("main.align"),
+        let source = if label == "stalled-row" {
+            concat!("module closed_sink\nimport std.process\n",
+                "test \"row\" { process.exec(\"/bin/sh\", [\"/bin/sh\", \"-c\", \"echo $$ > live.pid; exec /bin/sleep 30\"][0..3])? }\n").to_owned()
+        } else {
             format!(
                 "module closed_sink\nimport core.test\ntest \"row\" {{ test.expect({passes}) }}\n"
-            ),
-        )
-        .expect("closed-sink source");
+            )
+        };
+        std::fs::write(root.join("main.align"), source).expect("closed-sink source");
         let stdout = root.join("stdout");
         let stderr = root.join("stderr");
         let stdout_file = File::create(&stdout).expect("stdout capture");
@@ -811,7 +853,7 @@ fn closed_report_sinks_exit_numerically_and_remove_stages() {
         drop(read);
         let mut command = Command::new(env!("CARGO_BIN_EXE_alignc"));
         command
-            .args(["test", "main.align"])
+            .args(["test", "main.align", "--timeout-ns=2000000000"])
             .current_dir(&root)
             .env("ALIGNC_CACHE", "off")
             .env("TMPDIR", &temp)
@@ -830,11 +872,77 @@ fn closed_report_sinks_exit_numerically_and_remove_stages() {
         if cache_stats {
             command.arg("--cache-stats");
         }
+        if label == "stalled-linker" {
+            use std::os::unix::fs::PermissionsExt;
+            let tool = root.join("stalled-cc");
+            std::fs::write(&tool, "#!/bin/sh\necho $$ > live.pid\nexec /bin/sleep 30\n")
+                .expect("stalled compiler driver");
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700))
+                .expect("executable compiler driver");
+            command.arg("--cc").arg(&tool);
+        }
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut owner = Owner {
             child: Some(command.spawn().expect("spawn closed-sink CLI")),
             deadline,
         };
+        if label.starts_with("stalled-") {
+            let marker = root.join("live.pid");
+            while !marker.is_file() {
+                assert!(
+                    Instant::now() + Duration::from_secs(10) < deadline,
+                    "{label}: no PID marker"
+                );
+                assert!(
+                    !owner.terminal().expect("observe stalled fixture"),
+                    "{label}: exited before stall"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let pid = loop {
+                if let Ok(pid) = std::fs::read_to_string(&marker)
+                    .expect("PID marker")
+                    .trim()
+                    .parse::<i32>()
+                {
+                    break pid;
+                }
+                assert!(
+                    Instant::now() + Duration::from_secs(10) < deadline,
+                    "{label}: incomplete PID marker"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                0,
+                "{label}: fixture was not live"
+            );
+            let error = owner
+                .wait_until(Instant::now())
+                .expect_err("forced owner timeout");
+            assert_eq!(error.raw_os_error(), Some(libc::ETIMEDOUT));
+            drop(owner);
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                -1,
+                "{label}: process survived owner cleanup"
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+            if label == "stalled-row" {
+                assert!(
+                    std::fs::read_dir(&temp)
+                        .expect("row stages")
+                        .next()
+                        .is_none(),
+                    "row stage survived graceful owner cleanup"
+                );
+            }
+            continue;
+        }
         let status = owner.wait();
         let out = std::fs::read(&stdout).expect("read stdout capture");
         let err = std::fs::read(&stderr).expect("read stderr capture");
