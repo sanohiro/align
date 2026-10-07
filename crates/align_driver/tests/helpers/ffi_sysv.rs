@@ -20,5 +20,4 @@ pub(super) fn run(stage: &Path) {
         );
     }
     println!("SysV native record calls: {calls}, whole/per-unit");
-    super::cache_alignment(stage);
 }

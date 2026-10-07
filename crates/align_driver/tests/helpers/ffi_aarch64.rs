@@ -254,5 +254,4 @@ pub(super) fn run(stage: &Path) {
         );
     }
     println!("ARM64 native record cases: {count}, whole/per-unit");
-    super::cache_alignment(stage);
 }

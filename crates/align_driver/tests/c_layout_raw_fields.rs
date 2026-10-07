@@ -100,16 +100,31 @@ fn helper(stage: &Path, role: &str) -> Command {
     command
 }
 
-#[test]
-fn c_layout_raw_whole_and_per_unit() {
+fn run_owned_role(role: &str) {
     let stage = ArtifactStage::temp("c-layout-raw").unwrap();
-    let status = ChildGroup::spawn(&mut helper(stage.path(), "compile")).wait();
+    let status = ChildGroup::spawn(&mut helper(stage.path(), role)).wait();
     assert!(
         status.success(),
-        "{}\n{}",
-        fs::read_to_string(stage.path().join("compile.stdout")).unwrap(),
-        fs::read_to_string(stage.path().join("compile.stderr")).unwrap()
+        "{role}\n{}\n{}",
+        fs::read_to_string(stage.path().join(format!("{role}.stdout"))).unwrap(),
+        fs::read_to_string(stage.path().join(format!("{role}.stderr"))).unwrap()
     );
+}
+
+#[test]
+fn c_layout_raw_whole_and_per_unit() {
+    run_owned_role("compile");
+}
+
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")),
+))]
+#[test]
+fn c_layout_record_alignment_cache_round_trip() {
+    // The same-symbol cold/warm/change/restore cycle is an independent native owner.
+    // Give it its own existing work/cleanup budget instead of extending the combined one.
+    run_owned_role("alignment-cache");
 }
 
 #[test]
@@ -119,6 +134,7 @@ fn c_layout_raw_helper() {
     let stage = Path::new(&stage);
     match std::env::var("ALIGN_C_LAYOUT_RAW_ROLE").unwrap().as_str() {
         "compile" => compile_and_run(stage),
+        "alignment-cache" => cache_alignment(stage),
         "leader" => {
             // Deliberately leave a live descendant after the group leader exits. Its ownership
             // remains with the parent test's ChildGroup, not with this intentionally short helper.
