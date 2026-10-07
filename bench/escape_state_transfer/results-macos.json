@@ -1,0 +1,558 @@
+{
+  "date": "2026-10-07",
+  "host": "Apple M1, macOS arm64",
+  "rustc": "1.96.1",
+  "llvm": "22.1.8",
+  "profile": "release",
+  "baseline_commit": "e17648b39ff8bdbdf8492b756a459d339f22569d",
+  "candidate": "escape-flow state transfer; same transfer match/CFG/joins",
+  "repeats": 5,
+  "binary_sha256": {
+    "baseline": "e8f2f4b32bd17ca9054000aa45f4538a635975b5eb110879b509222a5fa87178",
+    "candidate": "1572f5c2b3c6547dcd26c09dc7ab182ac6cd5445ac488f31476b9e3221aa4346"
+  },
+  "measurements": [
+    {
+      "kind": "straight",
+      "values": 16,
+      "source_bytes": 721,
+      "source_lines": 28,
+      "command": "check",
+      "source_sha256": "a3d36f490e750706ec653ab68ed7ad98039988ca38c728053ad3b33a3cc56523",
+      "mir_sha256": "ad04b012730a15d9d7680d9f9566a7d00f3cfb9c41811890ba39cade16bd3cb6",
+      "samples_seconds": {
+        "baseline": [
+          0.024864250000973698,
+          0.024265791002108017,
+          0.024627457998576574,
+          0.024343207998754224,
+          0.024190250001993263
+        ],
+        "candidate": [
+          0.023140542001783615,
+          0.023043040997436037,
+          0.022872999998071464,
+          0.02264787500098464,
+          0.022690041001624195
+        ]
+      },
+      "median_seconds": {
+        "baseline": 0.024343207998754224,
+        "candidate": 0.022872999998071464
+      }
+    },
+    {
+      "kind": "straight",
+      "values": 16,
+      "source_bytes": 721,
+      "source_lines": 28,
+      "command": "check-per-unit",
+      "source_sha256": "a3d36f490e750706ec653ab68ed7ad98039988ca38c728053ad3b33a3cc56523",
+      "mir_sha256": "ad04b012730a15d9d7680d9f9566a7d00f3cfb9c41811890ba39cade16bd3cb6",
+      "samples_seconds": {
+        "baseline": [
+          0.028346457998850383,
+          0.0283373339989339,
+          0.02822050000031595,
+          0.02817000000140979,
+          0.027740207999158883
+        ],
+        "candidate": [
+          0.02624170899798628,
+          0.025396625002031215,
+          0.025188916999468347,
+          0.02539045800222084,
+          0.024997584001539508
+        ]
+      },
+      "median_seconds": {
+        "baseline": 0.02822050000031595,
+        "candidate": 0.02539045800222084
+      }
+    },
+    {
+      "kind": "straight",
+      "values": 128,
+      "source_bytes": 3801,
+      "source_lines": 140,
+      "command": "check",
+      "source_sha256": "a3e307d64eb031a340d0eef10734315573bd51f98388a88ad87888fd6133b778",
+      "mir_sha256": "9741ff2d07c127e907966335c7772a10c24bdfe1f7c9fc057254b3b30433115e",
+      "samples_seconds": {
+        "baseline": [
+          0.08962962500299909,
+          0.08938825000223005,
+          0.08992791700075031,
+          0.08914699999877485,
+          0.08958308300134377
+        ],
+        "candidate": [
+          0.028805292000470217,
+          0.02889787499952945,
+          0.029011041999183362,
+          0.02882429199962644,
+          0.028783791000023484
+        ]
+      },
+      "median_seconds": {
+        "baseline": 0.08958308300134377,
+        "candidate": 0.02882429199962644
+      }
+    },
+    {
+      "kind": "straight",
+      "values": 128,
+      "source_bytes": 3801,
+      "source_lines": 140,
+      "command": "check-per-unit",
+      "source_sha256": "a3e307d64eb031a340d0eef10734315573bd51f98388a88ad87888fd6133b778",
+      "mir_sha256": "9741ff2d07c127e907966335c7772a10c24bdfe1f7c9fc057254b3b30433115e",
+      "samples_seconds": {
+        "baseline": [
+          0.15861041699827183,
+          0.1587622500010184,
+          0.15919058299914468,
+          0.15912799999932759,
+          0.15875933399729547
+        ],
+        "candidate": [
+          0.03815470799963805,
+          0.03825449999931152,
+          0.038122333000501385,
+          0.03797787499934202,
+          0.038072125000326196
+        ]
+      },
+      "median_seconds": {
+        "baseline": 0.1587622500010184,
+        "candidate": 0.038122333000501385
+      }
+    },
+    {
+      "kind": "straight",
+      "values": 512,
+      "source_bytes": 14937,
+      "source_lines": 524,
+      "command": "check",
+      "source_sha256": "54aa317c93567c816c4b2b22b6f3652627977c4bbeb4a2d2b19755d19c33fa46",
+      "mir_sha256": "4708caa062e6b429ca8e254f8521c73a80ad179ff3b625c37acb1d05e5d56338",
+      "samples_seconds": {
+        "baseline": [
+          0.9659910000009404,
+          0.9649089160011499,
+          0.9652475830007461,
+          0.9675826669990784,
+          0.9634690839993709
+        ],
+        "candidate": [
+          0.04915520799841033,
+          0.049116791000415105,
+          0.04897245800020755,
+          0.04918912500215811,
+          0.04925662499954342
+        ]
+      },
+      "median_seconds": {
+        "baseline": 0.9652475830007461,
+        "candidate": 0.04915520799841033
+      }
+    },
+    {
+      "kind": "straight",
+      "values": 512,
+      "source_bytes": 14937,
+      "source_lines": 524,
+      "command": "check-per-unit",
+      "source_sha256": "54aa317c93567c816c4b2b22b6f3652627977c4bbeb4a2d2b19755d19c33fa46",
+      "mir_sha256": "4708caa062e6b429ca8e254f8521c73a80ad179ff3b625c37acb1d05e5d56338",
+      "samples_seconds": {
+        "baseline": [
+          1.9139623749979364,
+          1.9181554169990704,
+          1.9162919169975794,
+          1.9119107919977978,
+          1.9157567910006037
+        ],
+        "candidate": [
+          0.08159504099967307,
+          0.08170291599890334,
+          0.08170475000224542,
+          0.08154162500068196,
+          0.08155824999994365
+        ]
+      },
+      "median_seconds": {
+        "baseline": 1.9157567910006037,
+        "candidate": 0.08159504099967307
+      }
+    },
+    {
+      "kind": "try",
+      "values": 16,
+      "source_bytes": 769,
+      "source_lines": 28,
+      "command": "check",
+      "source_sha256": "7cef2d8d0d3433cdc0edb94dfdd575b27582abe7277e54b5621a9c144300f101",
+      "mir_sha256": "a1dd0d5c77b96e92598ff7c829b8b8d3171988bca754ad9387818c51462e4352",
+      "samples_seconds": {
+        "baseline": [
+          0.025353000000905013,
+          0.02544941700034542,
+          0.025613040997995995,
+          0.025450249999266816,
+          0.02556295899921679
+        ],
+        "candidate": [
+          0.023800082999514416,
+          0.02359324999997625,
+          0.02372099999774946,
+          0.023637374997633742,
+          0.023519334001321113
+        ]
+      },
+      "median_seconds": {
+        "baseline": 0.025450249999266816,
+        "candidate": 0.023637374997633742
+      }
+    },
+    {
+      "kind": "try",
+      "values": 16,
+      "source_bytes": 769,
+      "source_lines": 28,
+      "command": "check-per-unit",
+      "source_sha256": "7cef2d8d0d3433cdc0edb94dfdd575b27582abe7277e54b5621a9c144300f101",
+      "mir_sha256": "a1dd0d5c77b96e92598ff7c829b8b8d3171988bca754ad9387818c51462e4352",
+      "samples_seconds": {
+        "baseline": [
+          0.03031974999976228,
+          0.030213207999622682,
+          0.030206791998352855,
+          0.03022058300120989,
+          0.030297208999400027
+        ],
+        "candidate": [
+          0.026393291998829227,
+          0.0265653749993362,
+          0.026472833997104317,
+          0.026547208002739353,
+          0.026519416998780798
+        ]
+      },
+      "median_seconds": {
+        "baseline": 0.03022058300120989,
+        "candidate": 0.026519416998780798
+      }
+    },
+    {
+      "kind": "try",
+      "values": 128,
+      "source_bytes": 4185,
+      "source_lines": 140,
+      "command": "check",
+      "source_sha256": "50128907be1028c2349eab2ca884ca019d33d4355b28d44fae88710e7d745088",
+      "mir_sha256": "7594f0c88dbb5425cddbbe1e28d3652475394db4935fd2c451aa70d10de13415",
+      "samples_seconds": {
+        "baseline": [
+          0.11790974999894388,
+          0.11774591699941084,
+          0.11764887499884935,
+          0.1178330000002461,
+          0.1180413750007574
+        ],
+        "candidate": [
+          0.03205866700227489,
+          0.032100958000228275,
+          0.032050624999101274,
+          0.03204674999869894,
+          0.0318662090030557
+        ]
+      },
+      "median_seconds": {
+        "baseline": 0.1178330000002461,
+        "candidate": 0.032050624999101274
+      }
+    },
+    {
+      "kind": "try",
+      "values": 128,
+      "source_bytes": 4185,
+      "source_lines": 140,
+      "command": "check-per-unit",
+      "source_sha256": "50128907be1028c2349eab2ca884ca019d33d4355b28d44fae88710e7d745088",
+      "mir_sha256": "7594f0c88dbb5425cddbbe1e28d3652475394db4935fd2c451aa70d10de13415",
+      "samples_seconds": {
+        "baseline": [
+          0.21709862499847077,
+          0.21738995899795555,
+          0.21724566600096296,
+          0.21766654199745972,
+          0.21727499999906286
+        ],
+        "candidate": [
+          0.04592929100181209,
+          0.04586299999937182,
+          0.04597583400027361,
+          0.04593620900050155,
+          0.04589362499973504
+        ]
+      },
+      "median_seconds": {
+        "baseline": 0.21727499999906286,
+        "candidate": 0.04592929100181209
+      }
+    },
+    {
+      "kind": "try",
+      "values": 512,
+      "source_bytes": 16473,
+      "source_lines": 524,
+      "command": "check",
+      "source_sha256": "4a8bf496f41a50724c57312886aa9acebb41e25f52d43db25157ea8bf20e0fa9",
+      "mir_sha256": "429620d1c81a4e6604408688015c61bca761cc5e694e4ad3134d988438cf4759",
+      "samples_seconds": {
+        "baseline": [
+          1.3696044579992304,
+          1.3654256670015457,
+          1.3691448749996198,
+          1.3676626669985126,
+          1.3695693330009817
+        ],
+        "candidate": [
+          0.06100404199969489,
+          0.061047625000355765,
+          0.06095600000116974,
+          0.06146212499879766,
+          0.06106379199991352
+        ]
+      },
+      "median_seconds": {
+        "baseline": 1.3691448749996198,
+        "candidate": 0.061047625000355765
+      }
+    },
+    {
+      "kind": "try",
+      "values": 512,
+      "source_bytes": 16473,
+      "source_lines": 524,
+      "command": "check-per-unit",
+      "source_sha256": "4a8bf496f41a50724c57312886aa9acebb41e25f52d43db25157ea8bf20e0fa9",
+      "mir_sha256": "429620d1c81a4e6604408688015c61bca761cc5e694e4ad3134d988438cf4759",
+      "samples_seconds": {
+        "baseline": [
+          2.7332859999987704,
+          2.7341755839988764,
+          2.7363853750030103,
+          2.743904624996503,
+          2.7364903749985388
+        ],
+        "candidate": [
+          0.11961758400138933,
+          0.12187195799924666,
+          0.11969224999847938,
+          0.11973212500015507,
+          0.11929495799995493
+        ]
+      },
+      "median_seconds": {
+        "baseline": 2.7363853750030103,
+        "candidate": 0.11969224999847938
+      }
+    },
+    {
+      "kind": "match",
+      "values": 16,
+      "source_bytes": 1873,
+      "source_lines": 28,
+      "command": "check",
+      "source_sha256": "fde7dd454d145467073cd64c02a5226933afd0a7582532485395fcabcd0a50cd",
+      "mir_sha256": "98520d30d899766193b30c8d64de2b964de625ed6149be0e7b05581dc4a49be7",
+      "samples_seconds": {
+        "baseline": [
+          0.03306258299926412,
+          0.03269133300273097,
+          0.0327476669990574,
+          0.03291566699772375,
+          0.03325625000070431
+        ],
+        "candidate": [
+          0.02710583400039468,
+          0.027266999997664243,
+          0.02706529200077057,
+          0.02773495799920056,
+          0.02832029100318323
+        ]
+      },
+      "median_seconds": {
+        "baseline": 0.03291566699772375,
+        "candidate": 0.027266999997664243
+      }
+    },
+    {
+      "kind": "match",
+      "values": 16,
+      "source_bytes": 1873,
+      "source_lines": 28,
+      "command": "check-per-unit",
+      "source_sha256": "fde7dd454d145467073cd64c02a5226933afd0a7582532485395fcabcd0a50cd",
+      "mir_sha256": "98520d30d899766193b30c8d64de2b964de625ed6149be0e7b05581dc4a49be7",
+      "samples_seconds": {
+        "baseline": [
+          0.04543187499803025,
+          0.0453791670006467,
+          0.04550470799949835,
+          0.04520945900003426,
+          0.04531712500102003
+        ],
+        "candidate": [
+          0.0339165419973142,
+          0.03419104099884862,
+          0.03411549999873387,
+          0.034082334001141135,
+          0.034111791999748675
+        ]
+      },
+      "median_seconds": {
+        "baseline": 0.0453791670006467,
+        "candidate": 0.034111791999748675
+      }
+    },
+    {
+      "kind": "match",
+      "values": 128,
+      "source_bytes": 13017,
+      "source_lines": 140,
+      "command": "check",
+      "source_sha256": "ff9245b208d893db1dabcf2d51d702c743f5522568a578308f4181d0e8092f6a",
+      "mir_sha256": "4bc201f94940e6edd59f01a5d986567f5d07b4a7a0be2a9eb426ca29a88f42df",
+      "samples_seconds": {
+        "baseline": [
+          0.42364529200131074,
+          0.42526483300025575,
+          0.4229107920000388,
+          0.4224440409998351,
+          0.42281216599803884
+        ],
+        "candidate": [
+          0.11160312499850988,
+          0.11165095899923472,
+          0.1116073340017465,
+          0.11107737500060466,
+          0.11173758400036604
+        ]
+      },
+      "median_seconds": {
+        "baseline": 0.4229107920000388,
+        "candidate": 0.1116073340017465
+      }
+    },
+    {
+      "kind": "match",
+      "values": 128,
+      "source_bytes": 13017,
+      "source_lines": 140,
+      "command": "check-per-unit",
+      "source_sha256": "ff9245b208d893db1dabcf2d51d702c743f5522568a578308f4181d0e8092f6a",
+      "mir_sha256": "4bc201f94940e6edd59f01a5d986567f5d07b4a7a0be2a9eb426ca29a88f42df",
+      "samples_seconds": {
+        "baseline": [
+          0.9296154170006048,
+          0.9318823749999865,
+          0.9384229160023096,
+          0.9321584579993214,
+          0.9321980419990723
+        ],
+        "candidate": [
+          0.30781629199918825,
+          0.31144475000110106,
+          0.3121967919978488,
+          0.31038995800190605,
+          0.31029141699764295
+        ]
+      },
+      "median_seconds": {
+        "baseline": 0.9321584579993214,
+        "candidate": 0.31038995800190605
+      }
+    },
+    {
+      "kind": "match",
+      "values": 512,
+      "source_bytes": 51801,
+      "source_lines": 524,
+      "command": "check",
+      "source_sha256": "94a24fb80bc3dabec54c815a0dc94bd745b80d5e375c881c15312add5b09016f",
+      "mir_sha256": "5aa86b3b70268c91e5267ac35a2ee3685ae1ab21a90d1564bd23e2fe208dca78",
+      "samples_seconds": {
+        "baseline": [
+          5.976617374999478,
+          5.961640707999322,
+          5.9763387919992965,
+          5.964041708000877,
+          5.9610732500004815
+        ],
+        "candidate": [
+          1.0998936659998435,
+          1.0922841249994235,
+          1.1000894169992534,
+          1.096161999998003,
+          1.094308917003218
+        ]
+      },
+      "median_seconds": {
+        "baseline": 5.964041708000877,
+        "candidate": 1.096161999998003
+      }
+    },
+    {
+      "kind": "match",
+      "values": 512,
+      "source_bytes": 51801,
+      "source_lines": 524,
+      "command": "check-per-unit",
+      "source_sha256": "94a24fb80bc3dabec54c815a0dc94bd745b80d5e375c881c15312add5b09016f",
+      "mir_sha256": "5aa86b3b70268c91e5267ac35a2ee3685ae1ab21a90d1564bd23e2fe208dca78",
+      "samples_seconds": {
+        "baseline": [
+          18.549570417002542,
+          18.673873957999604,
+          18.63989604100061,
+          18.670178209002188,
+          18.755719875000068
+        ],
+        "candidate": [
+          8.945742624997365,
+          8.93894383299994,
+          8.824924541000655,
+          8.923726375000115,
+          8.942366708000918
+        ]
+      },
+      "median_seconds": {
+        "baseline": 18.670178209002188,
+        "candidate": 8.93894383299994
+      }
+    },
+    {
+      "rejection": "local-view",
+      "command": "check",
+      "diagnostics_equal": true
+    },
+    {
+      "rejection": "local-view",
+      "command": "check-per-unit",
+      "diagnostics_equal": true
+    },
+    {
+      "rejection": "readonly-bytes",
+      "command": "check",
+      "diagnostics_equal": true
+    },
+    {
+      "rejection": "readonly-bytes",
+      "command": "check-per-unit",
+      "diagnostics_equal": true
+    }
+  ]
+}

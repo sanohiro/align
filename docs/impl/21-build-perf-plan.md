@@ -28,6 +28,7 @@ Order is priority.
 | 6 | Function-level incremental compilation | Implemented — explicit `--thin-lto` builds form sealed support/function partitions, retain a fresh global thin-link, and cache exact partition-qualified prelink/backend artifacts |
 | 7 | PR CI wall time | Implemented — source-mtime restoration makes the restored Cargo cache actually hit, and a trusted-classifier platform scope bounds a tooling-tier PR to one compile-only leg; see below |
 | 8 | Owner tests run an unoptimized compiler | Implemented (this PR) — `[profile.dev] opt-level = 1` cut `pkg_db_a1` 3.96x (486.6s -> 122.8s wall) because every owner test drives the in-process `alignc` frontend/codegen at Rust `opt-level = 0`; see below |
+| 11 | Escape-flow state transfer | Implemented — move complete analysis states through each transfer instead of cloning every accumulated fact twice; measured whole/per-unit improvements and remaining scaling are recorded below |
 
 ## Background
 
@@ -2790,3 +2791,60 @@ the script's Bash syntax, and fail-closed rejection of an unknown mode. The
 first PR run after this change records the codegen step and complete job timings
 on all three platforms. This item makes no runtime-performance claim and adds
 no benchmark or timeout.
+
+
+## Item 11: escape-flow state transfer
+
+Request 37 reports excessive checking cost for long functions and Result match
+arms inside loops. A current release-compiler reproduction uses one loop with
+16 through 512 sequential scalar values, comparing straight arithmetic, `?`, and
+Result `match` with block arms. At 256/512 values, exploratory macOS checks take
+0.269/0.964 s, 0.374/1.366 s, and 1.561/6.147 s respectively. These are synthetic
+provider cases, not the external consumer's recombined module or its acceptance.
+A two-second sample attributes the dominant path to `EscapeState` cloning inside
+`EscapeCheck::apply_flow_op`: every transfer clones the complete input into the
+checker and clones the result back, for both solving and diagnostic replay.
+
+The selected boundary transfers that same owned state into the existing
+operation evaluator and restores the private checker workspace afterward. The
+transfer match remains separate from the wrapper so an ordinary early return
+cannot skip restoration. Rust continues to own both complete states on unwind;
+no pointer, borrowed fact or new cleanup authority escapes. Checker state is
+private scratch: only the existing Drop metadata and diagnostics leave the
+checker. Its callers never consume the last transfer's duplicate scratch state.
+
+There is no source, type, ownership, lifetime, allocation, IR, interface, ABI or
+cache contract change. Every transfer, fact, CFG edge, join, fixpoint iteration,
+source-order diagnostic replay and Drop classification remains. Block input and
+join snapshots still clone; this capability does not promise linear checking.
+K1/plan61, fact pruning, provenance widening and consumer adoption remain deferred.
+
+### Implementation closure matrix
+
+| Axis | Implementation boundary | Owner |
+| --- | --- | --- |
+| Construction, move-in/out and source replacement | `apply_flow_op` lends the complete state by ownership exchange, calls the unchanged transfer evaluator and restores its scratch state. There is no field-by-field inventory that could omit a future fact. | `escape_flow_transfer_reuses_owned_state` checks complete-state equality, independent workspace restoration and retained allocation identity across present/absent expression invalidations. |
+| Drop and unwind | Both exchanged Rust values remain ordinarily owned throughout. No manual allocation/free or source Drop decision changes. A transfer's ordinary early return returns to the wrapper before restoration. Panic aborts that check; no reusable-checker-after-panic API is promised. | The same state owner plus existing `align_sema --lib` Drop/arena/escape owners; Rust ownership enforces single destruction. |
+| All source control paths | Both solve and diagnostic replay use the same wrapper for `if`, `match`, `else`, `?`, `map_err`, joins, loops, breaks and early exits. No path or transfer kind is skipped. | Existing `align_sema --lib` control/lifetime owners and `align_driver --test fallible_buffer` whole/per-unit Result/control/exact-Drop owner. |
+| Storage provenance and malformed inputs | Storage generations, eager snapshots, active sums, current facts and legacy facts move together; their formation, validation and conservative unknown behavior are unchanged. | `escape_storage_generation_resolver_matrix`, `escape_storage_generation_parameter_seed_matrix`, and the complete sema owner. |
+| Generic, interface and compilation parity | The same body-analysis entry reaches the wrapper for instantiated and imported functions; no serialized format or function summary changes. | Existing sema generic/import owners; fallible-buffer interface round-trip, cache and whole/per-unit owner. |
+| Diagnostics and generated metadata | Preserve diagnostic order/text and Drop metadata; only the unused scratch copy is removed. | Baseline/candidate accepted-source MIR and rejected-source diagnostics compare byte-for-byte in the local benchmark; semantic rejection remains covered by deterministic owners. |
+| Runtime provenance and allocation | Generated program allocation, ownership and runtime ABI are untouched. Compiler analysis avoids the two full-state copies per transfer. | State allocation-identity owner fails if the copy wrapper returns; existing driver exact-Drop owner. |
+| Performance qualification | Compare release binaries on short and long straight/try/match cases, with alternating repeated runs, explicit bounded children and no reused frontend cache. Report observed residual scaling instead of promising a whole-client budget. | Local `bench/escape_state_transfer/measure.py`; benchmark only, not a timing gate. |
+
+This preserves the reviewed analysis strategy and public contracts. The author
+matrix-to-diff pass and one implementation preflight review own boundary checking;
+no separate public-design review is required. The small producer/consumer wrapper
+is one useful capability and needs no dormant prerequisite PR.
+
+### Qualification
+
+The allocation-identity owner and all 301 sema tests pass. Release before/after
+measurements on Apple M1 (Rust 1.96.1, LLVM 22.1.8) retain five alternating samples
+per shape/size/command. At 512 values, whole-program straight/try/match medians
+improve from 0.965/1.369/5.964 s to 0.049/0.061/1.096 s; per-unit match improves
+from 18.670 to 8.939 s. All nine accepted-source MIR comparisons and four
+rejected-source diagnostic comparisons agree byte-for-byte. Six 16-value
+controls show no median regression. The benchmark README and checked-in samples
+own the precise measurements and remaining superlinear factors. This is a
+partial provider improvement; Request 37 consumer acceptance stays external.

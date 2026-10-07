@@ -19762,7 +19762,8 @@ struct EscapeCheck<'a> {
     enums: &'a [hir::EnumDef],
     /// Interned nested Option/Result payloads.
     tagged_types: &'a [hir::TaggedType],
-    /// Region and local-backed-slice provenance at the current control-flow point.
+    /// The owned flow state while a transfer runs; private scratch between transfers.
+    /// Callers consume diagnostics and Drop metadata, never this workspace.
     state: EscapeState,
     /// Region used to classify each owned local's function-wide cleanup. Unlike `state`, this keeps
     /// declarations from diverging branches: their exit path still needs the right arena-vs-heap
@@ -22356,7 +22357,18 @@ impl<'a> EscapeCheck<'a> {
         state: &mut EscapeState,
         storage_provenance: &EscapeStorageProvenance<'_>,
     ) {
-        self.state = state.clone();
+        // Transfer the complete owned state, including future fact fields, without copying
+        // every accumulated expression at every operation. The workspace is private scratch.
+        std::mem::swap(&mut self.state, state);
+        self.apply_flow_transfer(op, storage_provenance);
+        std::mem::swap(&mut self.state, state);
+    }
+
+    fn apply_flow_transfer(
+        &mut self,
+        op: EscapeFlowOp<'a>,
+        storage_provenance: &EscapeStorageProvenance<'_>,
+    ) {
         match op {
             EscapeFlowOp::Stmt(stmt, depth) => self.apply_stmt(stmt, depth),
             EscapeFlowOp::ExpressionStart(expression) => {
@@ -22633,7 +22645,6 @@ impl<'a> EscapeCheck<'a> {
                 self.check_return_escape(value, depth)
             }
         }
-        *state = self.state.clone();
     }
 
     /// Whether a by-value call argument contains storage the callee must not individually drop.
@@ -79384,6 +79395,89 @@ fn main() -> i32 = 0
                 }
             }
         }
+    }
+
+    #[test]
+    fn escape_flow_transfer_reuses_owned_state() {
+        let (program, diagnostics) = check("fn main() {}\n");
+        assert!(!diagnostics.has_errors());
+        let mut diagnostics = Diagnostics::new();
+        let mut checker = EscapeCheck {
+            f: &program.fns[0],
+            diags: &mut diagnostics,
+            named_return_region: &std::collections::HashMap::new(),
+            named_param_modes: &std::collections::HashMap::new(),
+            named_borrow_mut_retention: &std::collections::HashMap::new(),
+            named_view_effect: &std::collections::HashMap::new(),
+            callable_targets: &[],
+            callable_target_ids: &std::collections::HashMap::new(),
+            fn_types: &program.fn_types,
+            tuples: &program.tuples,
+            structs: &program.structs,
+            enums: &program.enums,
+            tagged_types: &program.tagged_types,
+            state: EscapeState::default(),
+            drop_region: std::collections::HashMap::new(),
+            drop_individual: std::collections::HashMap::new(),
+            drop_individual_exprs: std::collections::HashMap::new(),
+            decl_depth: std::collections::HashMap::new(),
+            borrowed_projection_owners: std::collections::HashMap::new(),
+            task_group_regions: Vec::new(),
+            allocation_regions: Vec::new(),
+            allocation_region_by_expr: std::collections::HashMap::new(),
+            region_capabilities: std::collections::HashMap::new(),
+            flow: EscapeFlowCfg::new(),
+            flow_current: 0,
+            loop_exit_blocks: Vec::new(),
+            collecting_walk_children: false,
+            walk_children: Vec::new(),
+        };
+        let provenance = EscapeStorageProvenance {
+            named_return_borrow: &std::collections::HashMap::new(),
+            callable_target_ids: &std::collections::HashMap::new(),
+            callable_targets: &[],
+        };
+        let mut state = EscapeState::default();
+        state.region.insert(7, Region::Arena(2));
+        state.individual.insert(7, true);
+        state.individual_may.insert(7, true);
+        for key in 0..64 {
+            let fact = EscapeValueFact {
+                non_storage: EscapeRegionFact::at_path(&[], Region::Caller(0)),
+                individual: true,
+                may_individual: true,
+                ..EscapeValueFact::default()
+            };
+            state.storage_completed_expressions.insert(key, fact.clone());
+            state.storage_argument_snapshots.insert((key, 0), fact.clone());
+            state.storage_callable_snapshots.insert(key, fact);
+            state.completed_expressions.insert(key, EscapeArgumentSnapshot::fail_closed());
+            state.argument_snapshots.insert((key, 0), EscapeArgumentSnapshot::fail_closed());
+            state.callable_capture_snapshots.insert(key, Region::Frame);
+        }
+        // The workspace deliberately disagrees with the transferred state. It must neither
+        // contaminate the input nor receive its result; it is reusable private scratch.
+        checker.state.region.insert(7, Region::Static);
+        let workspace = checker.state.clone();
+        let workspace_storage = checker.state.region.get(&7).unwrap() as *const Region;
+        let fact_storage = state.storage_completed_expressions.get(&63).unwrap()
+            as *const EscapeValueFact;
+        let mut expected = state.clone();
+        for key in [0, 8, 999, 0] {
+            expected.completed_expressions.remove(&key);
+            expected.storage_completed_expressions.remove(&key);
+            expected.argument_snapshots.retain(|(call, _), _| *call != key);
+            expected.storage_argument_snapshots.retain(|(call, _), _| *call != key);
+            expected.callable_capture_snapshots.remove(&key);
+            expected.storage_callable_snapshots.remove(&key);
+            checker.apply_flow_op(EscapeFlowOp::ExpressionStart(key), &mut state, &provenance);
+            assert!(state == expected, "complete transfer state differs for {key}");
+            assert!(checker.state == workspace, "workspace was not restored");
+            assert_eq!(checker.state.region.get(&7).unwrap() as *const Region, workspace_storage);
+            assert_eq!(state.storage_completed_expressions.get(&63).unwrap() as *const EscapeValueFact,
+                fact_storage, "an untouched fact's storage was copied");
+        }
+        assert!(!checker.diags.has_errors());
     }
 
     fn check(src: &str) -> (Program, Diagnostics) {
