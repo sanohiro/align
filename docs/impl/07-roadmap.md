@@ -1469,6 +1469,11 @@ required `import` — the `core.json` pattern, not yet Align-over-FFI library co
   Plan131 adds optional payload alignment to both buffer constructors, retained
   through growth/move/return and matched at Drop. Existing allocation-failure
   policies remain; runtime/layout and whole/per-unit/cache/ABI owners qualify it.
+  Plan135 adds fallible `buffer.try_new`/`buffer.try_filled` construction:
+  exact initial capacity and existing aligned Move ownership on Ok, Invalid
+  before allocation, Code(ENOMEM) for payload/handle refusal with full cleanup.
+  Deterministic native refusal/layout, whole/per-unit cleanup, malformed IR,
+  cache and ABI owners cover it; ordinary construction/growth is unchanged.
   The **errno→`Error` fixed table** (`draft.md` §18.2) is one runtime helper (`io_error_to_status`)
   + one MIR decode (`make_error_from_status`, branchless), shared by `fs.read_file`/`fs.open`/
   `fs.create`/read/write/flush. **Completion condition met:** an Align program byte-exact-copies a

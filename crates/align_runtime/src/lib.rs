@@ -11800,6 +11800,66 @@ pub extern "C" fn align_rt_buffer_filled(length: i64, value: u8, alignment: i64)
     buffer
 }
 
+/// Acquire both payload and handle before publishing an owner. The same global allocator and
+/// exact header Layout back this allocation and canonical Box-based buffer Drop.
+unsafe fn buffer_try_new(length: i64, fill: Option<u8>, alignment: i64, out: *mut *mut Buffer) -> i32 {
+    if out.is_null() { return AL_INVALID; }
+    // SAFETY: the caller supplies writable output storage. Errors leave its canonical null.
+    unsafe { out.write(core::ptr::null_mut()) };
+    let Ok(alignment) = usize::try_from(alignment) else { return AL_INVALID; };
+    if !alignment.is_power_of_two() || alignment > (1 << 29) { return AL_INVALID; }
+    let Ok(requested) = usize::try_from(length) else { return AL_INVALID; };
+    if std::alloc::Layout::from_size_align(requested, alignment).is_err() { return AL_INVALID; }
+    let mut data = BufferStorage::new(alignment);
+    if data.try_reserve_exact(requested).is_err() { return AL_CODE + libc::ENOMEM; }
+    let len = if let Some(value) = fill {
+        // The exact reservation is already admitted; resize initializes without growth.
+        data.resize(requested, value);
+        requested
+    } else { 0 };
+    #[cfg(test)]
+    if buffer_constructor_probe::refuse_header() { return AL_CODE + libc::ENOMEM; }
+    let layout = std::alloc::Layout::new::<Buffer>();
+    // SAFETY: Buffer's nonzero Layout is fixed and valid. A refused header leaves data owned
+    // on the stack, so its exact payload layout is retired on return.
+    let pointer = unsafe { std::alloc::alloc(layout).cast::<Buffer>() };
+    if pointer.is_null() { return AL_CODE + libc::ENOMEM; }
+    // SAFETY: freshly allocated, correctly aligned storage holds one initialized Buffer.
+    // Box uses the same global allocator/Layout and immediately guards test instrumentation.
+    let buffer = unsafe {
+        pointer.write(Buffer { data, cap: requested, len });
+        Box::from_raw(pointer)
+    };
+    #[cfg(test)]
+    buffer_constructor_probe::header_event(true, pointer);
+    #[cfg(feature = "alloc-count")]
+    requested_live_insert(1, pointer.cast(), 64usize.saturating_add(requested));
+    // SAFETY: the output was checked above; ownership transfers exactly once on success.
+    unsafe { out.write(Box::into_raw(buffer)) };
+    0
+}
+
+/// `buffer.try_new(capacity, alignment)` — recoverable exact read-window construction.
+///
+/// # Safety
+/// A nonnull out must point to writable, aligned pointer storage and contain no live owner.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_buffer_try_new(capacity: i64, alignment: i64, out: *mut *mut Buffer) -> i32 {
+    unsafe { buffer_try_new(capacity, None, alignment, out) }
+}
+
+/// `buffer.try_filled(length, value, alignment)` — recoverable initialized construction.
+///
+/// # Safety
+/// A nonnull out must point to writable, aligned pointer storage and contain no live owner.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_buffer_try_filled(length: i64, value: u8, alignment: i64, out: *mut *mut Buffer) -> i32 {
+    unsafe { buffer_try_new(length, Some(value), alignment, out) }
+}
+
+#[cfg(test)]
+mod buffer_constructor_probe;
+
 /// `b.bytes()` — a `slice<u8>` view of the buffer's current contents (`data[..len]`), written to
 /// `out` as a `{ptr,len}`. The view borrows the buffer (region-tracked; must not outlive it).
 ///
@@ -11850,12 +11910,14 @@ pub unsafe extern "C" fn align_rt_buffer_capacity(b: *mut Buffer) -> i64 {
 /// Free a `buffer` (its heap storage). Null-safe.
 ///
 /// # Safety
-/// `b` must be null or a pointer from [`align_rt_buffer_new`], not yet freed.
+/// `b` must be null or a live owned Buffer from a runtime producer, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_buffer_free(b: *mut Buffer) {
     if !b.is_null() {
         #[cfg(feature = "alloc-count")]
         requested_live_remove(1, b.cast());
+        #[cfg(test)]
+        buffer_constructor_probe::header_event(false, b);
         drop(unsafe { Box::from_raw(b) });
     }
 }

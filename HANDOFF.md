@@ -17,6 +17,15 @@ outside the active worktree so they do not obstruct unrelated checks or pulls.
 
 ## Next work (handoff updated 2026-10-07)
 
+Plan135 adds explicit fallible aligned construction through `buffer.try_new`
+and `buffer.try_filled`. Payload and handle refusal return Code(ENOMEM), invalid
+admission returns Invalid before allocation, and Ok owns an exact initial
+read window. Native allocation/layout and whole/per-unit Result cleanup,
+malformed-IR and cache owners qualify it. Ordinary constructors and later growth
+keep their policies; physical-memory admission and consumer adoption are external.
+The owner requested continued capability/PR/merge work on 2026-10-07 until told
+to stop; this supersedes plan129's one-batch stop, preserving K1/plan61 deferrals.
+
 Plan134 admits owned String sort keys through the ordinary return-cleanup ABI.
 Comparisons retain borrowed headers while one unsorted owner column releases
 heap keys exactly once. Whole/per-unit stable-order, evaluation-order, malformed
@@ -36,8 +45,8 @@ Request 125; external align-llm adoption remains consumer-owned.
 Plan131 adds explicit payload alignment as an optional final i64 argument to
 `buffer` and `buffer.filled`. The owner preserves it through growth and transfer;
 bounded reads preserve the address. Native layout/admission and compiler/ABI/
-cache owners cover the capability. Recoverable allocation failure and external
-align-llm adoption remain pending; K1 and plan61 remain deferred.
+cache owners cover the capability. Plan135 separately supplies recoverable
+construction; external align-llm adoption and K1/plan61 remain deferred.
 
 The owner resumed independent std/library improvements on 2026-10-04, with
 existing-module usability first, useful bounded transport/library capabilities

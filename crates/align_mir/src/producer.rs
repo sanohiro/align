@@ -1588,6 +1588,15 @@ pub fn native_owner_mir_contract<'a>(
         access: XmlAccessProvenance::Owned,
     };
     match value {
+        Rvalue::BufferTryNew { capacity, fill, alignment, out } => {
+            contract.result = i32_ty;
+            contract.outputs = vec![(*out, Ty::Buffer)];
+            contract.operands.push((capacity, i64_ty, read));
+            if let Some(fill) = fill {
+                contract.operands.push((fill, Ty::Int(IntTy { bits: 8, signed: false }), read));
+            }
+            contract.operands.push((alignment, i64_ty, read));
+        }
         Rvalue::BufferCapacity(buffer) => {
             contract.result = i64_ty;
             contract.operands = vec![(buffer, Ty::Buffer, read)];
@@ -1889,6 +1898,7 @@ fn xml_written_slots(rvalue: &Rvalue) -> Vec<(Slot, XmlAccessProvenance)> {
         | Rvalue::CapturesGroup { out, .. }
         | Rvalue::TimeFormat { out, .. }
         | Rvalue::TimeParse { out, .. }
+        | Rvalue::BufferTryNew { out, .. }
         | Rvalue::EncodingDecode { out, .. }
         | Rvalue::CompressCompress { out, .. }
         | Rvalue::CompressDecompress { out, .. }
@@ -6560,6 +6570,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::CapturesGroup { .. }
             | Rvalue::TimeFormat { .. }
             | Rvalue::TimeParse { .. }
+            | Rvalue::BufferTryNew { .. }
             | Rvalue::EncodingDecode { .. }
             | Rvalue::CompressCompress { .. }
             | Rvalue::CompressDecompress { .. }

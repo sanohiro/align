@@ -4771,7 +4771,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::FilePread { .. } | hir::ExprKind::FilePreadInto { .. }
             | hir::ExprKind::FilePwrite { .. }
             | hir::ExprKind::FileLen { .. } | hir::ExprKind::FileSync { .. }
-            | hir::ExprKind::BufferNew { .. }
+            | hir::ExprKind::BufferNew { .. } | hir::ExprKind::BufferTryNew { .. }
             | hir::ExprKind::BufferBytes { .. }
             | hir::ExprKind::StrBytes { .. }
             | hir::ExprKind::BytesView { .. }
@@ -5174,7 +5174,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::FilePread { .. } | hir::ExprKind::FilePreadInto { .. }
             | hir::ExprKind::FilePwrite { .. }
             | hir::ExprKind::FileLen { .. } | hir::ExprKind::FileSync { .. }
-            | hir::ExprKind::BufferNew { .. }
+            | hir::ExprKind::BufferNew { .. } | hir::ExprKind::BufferTryNew { .. }
             | hir::ExprKind::BufferBytes { .. }
             | hir::ExprKind::StrBytes { .. }
             | hir::ExprKind::BufferLen { .. } | hir::ExprKind::BufferCapacity { .. }
@@ -9300,6 +9300,15 @@ impl<'a> BodyValidator<'a> {
                     strict(Ty::Buffer, &[capacity, fill, alignment])
                 } else {
                     strict(Ty::Buffer, &[capacity, alignment])
+                }
+            }
+            hir::ExprKind::BufferTryNew { capacity, fill, alignment } => {
+                if capacity.ty != i64 || alignment.ty != i64 { return None; }
+                if let Some(fill) = fill {
+                    if fill.ty != Ty::Int(align_sema::IntTy { bits: 8, signed: false }) { return None; }
+                    result(Ty::Buffer, &[capacity, fill, alignment])
+                } else {
+                    result(Ty::Buffer, &[capacity, alignment])
                 }
             }
             hir::ExprKind::BufferBytes { buffer } => {

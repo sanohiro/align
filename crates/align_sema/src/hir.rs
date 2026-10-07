@@ -1633,6 +1633,8 @@ pub enum ExprKind {
     /// sink for `reader.read`). The `ty` is [`crate::Ty::Buffer`] (an owned Move handle, `Drop`-freed).
     /// Pure (allocation only), like `BuilderNew`; omitted source alignment becomes i64 1.
     BufferNew { capacity: Box<Expr>, fill: Option<Box<Expr>>, alignment: Box<Expr> },
+    /// Explicit fallible aligned allocation: Pure, independently owned Result<buffer, Error>.
+    BufferTryNew { capacity: Box<Expr>, fill: Option<Box<Expr>>, alignment: Box<Expr> },
     /// `b.bytes()` — a `slice<u8>` view of the buffer's current contents. Borrows the buffer
     /// (region-tracked: the view must not outlive `b`). Pure.
     BufferBytes { buffer: Box<Expr> },

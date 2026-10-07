@@ -2122,6 +2122,20 @@ storage owner also adopts ordinary Vec-producing results without copying and
 frees every allocation with its original layout. Capacity remains a read-window
 observation; alignment does not promise residency, speed or recoverable OOM.
 
+## Recoverable buffer construction
+
+Plan 135 uses explicit `buffer.try_new` and `buffer.try_filled` with the existing
+`Result<buffer, Error>` model. Capacity observation alone cannot report a failed
+handle allocation; both payload and handle acquisition therefore belong to one
+fallible publication boundary. Alignment admission precedes size admission,
+invalid input returns Invalid, and allocator refusal returns Code(ENOMEM).
+A failed handle acquisition releases its payload before returning Err. The
+successful owner uses ordinary buffer cleanup and alignment, with exact initial
+read-window capacity. Existing constructors and later growth retain their
+policies. This admits bounded windows without claiming physical-memory residency
+or catching process termination. No new error type, unwinding or allocator
+configuration is introduced.
+
 ## Observable buffer read-window capacity
 
 Plan 87 exposes the existing descriptor's usable capacity through `b.capacity()`.

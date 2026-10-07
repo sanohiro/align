@@ -2042,6 +2042,8 @@ pub enum Rvalue {
     },
     /// `buffer(cap, alignment)` — open an aligned owned byte buffer with read window `cap`.
     BufferNew { capacity: Operand, fill: Option<Operand>, alignment: Operand },
+    /// Fallible construction writes an owned Buffer to out and returns i32 status.
+    BufferTryNew { capacity: Operand, fill: Option<Operand>, alignment: Operand, out: Slot },
     /// `b.bytes()` — a `slice<u8>` view `{ptr,len}` of the buffer's current contents (borrow).
     BufferBytes(Operand),
     /// `b.len()` — the buffer's current byte count (`i64`).
@@ -9015,6 +9017,18 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 lower_required_binding!(b, alignment = lower_expr(b, alignment), Operand::Const(Const::Unit));
                 b.push(Stmt::Let(v, Rvalue::BufferNew { capacity: cap, fill, alignment }));
                 Operand::Value(v)
+            }
+            hir::ExprKind::BufferTryNew { capacity, fill, alignment } => {
+                lower_required_binding!(b, capacity = lower_expr(b, capacity), Operand::Const(Const::Unit));
+                let fill = if let Some(fill) = fill {
+                    lower_required_binding!(b, value = lower_expr(b, fill), Operand::Const(Const::Unit));
+                    Some(value)
+                } else { None };
+                lower_required_binding!(b, alignment = lower_expr(b, alignment), Operand::Const(Const::Unit));
+                let out = b.new_slot(Ty::Buffer);
+                let code = b.fresh_value(status_ty());
+                b.push(Stmt::Let(code, Rvalue::BufferTryNew { capacity, fill, alignment, out }));
+                emit_status_buffer_result(b, code, out, e.ty)
             }
             hir::ExprKind::BufferBytes { buffer } => {
                 lower_required_binding!(
@@ -21420,7 +21434,7 @@ fn lower_encoding_decode(
 /// `status` (0 = ok; `AL_INVALID` -> `Error.Invalid`; `>= AL_CODE` -> `Error.Code`): branch the
 /// already-emitted `code` into `Ok(<buffer>)` / `Err(<mapped status>)` of `result_ty`. The `out`
 /// slot must have been caller-zeroed by codegen so the `Err` path (null handle) frees nothing.
-/// Shared by `encoding.*_decode` and the `std.compress` codecs.
+/// Shared by fallible buffer construction, `encoding.*_decode` and `std.compress`.
 fn emit_status_buffer_result(b: &mut Builder, code: ValueId, out: Slot, result_ty: Ty) -> Operand {
     let isok = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(
