@@ -1145,11 +1145,14 @@ by-name-invisible cache-density win. A `layout(C)` attribute (`layout(C) Point {
 `align(N)`) is the escape hatch — it pins a struct to a stable, C-compatible flat layout (declaration
 order, natural alignment, no reordering). Among structs, only such a struct may be written to / read
 from `raw` memory (`raw.store`/`raw.load` of a whole struct) — the pointer-based FFI pattern. Its fields must be
-FFI-mappable scalars. On **x86-64 Linux (SysV AMD64) only**, a `layout(C)` struct in the ABI's
+integers, floats, or `raw` pointers. Pointer fields retain native pointer size/alignment and are
+non-owning Copy values: no implicit free, pointee copy, lifetime extension or dereference authority.
+Direct raw fields in ordinary structs and generic C records remain rejected
+([plan137](impl/137-c-layout-raw-fields.md)). On **x86-64 Linux (SysV AMD64) only**, a `layout(C)` struct in the ABI's
 register classes and no larger than 16 bytes may also cross by value; a struct that the ABI would
 classify MEMORY — or that is larger — is **rejected** rather than silently passed in memory, and
 every other platform ABI stays pointer-only. The same boundary is enforced under **register
-pressure**: SysV puts a struct in registers only if all its eightbytes fit the class registers left
+pressure**: SysV puts a struct in registers only if all its non-padding eightbytes fit the class registers left
 after the preceding arguments, so a signature where a by-value struct argument would fall to memory
 (a two-eightbyte struct after five integer arguments, say) is rejected too — reorder it earlier or
 pass it by pointer.

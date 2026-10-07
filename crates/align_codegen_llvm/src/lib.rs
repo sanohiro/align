@@ -7774,7 +7774,7 @@ fn abi_type<'c>(
 // This is SysV-AMD64-only; every other target is rejected in `build_module` (a wrong per-target
 // register rule is the one FFI corner that silently miscompiles, so we never guess).
 //
-// Completeness within our field domain: a `layout(C)` struct's fields are integer/float scalars
+// Completeness within our field domain: a `layout(C)` struct's fields are integers/floats/raw pointers
 // (`align_sema` enforces this), each naturally aligned, so no field straddles an eightbyte boundary
 // and the only classes are INTEGER and SSE — never X87/COMPLEX_X87. A struct larger than two
 // eightbytes (> 16 bytes) is MEMORY as a whole (no `__m256`/SSEUP in the domain), handled separately.
@@ -7806,8 +7806,11 @@ impl Eb {
 /// eightbyte classes, its byte size, and its struct id (to reconstruct the value at a call site).
 #[derive(Clone)]
 struct StructAbi {
-    /// One class per eightbyte, in ascending byte order (length 1 or 2).
+    /// One class per occupied eightbyte, in ascending byte order (length 1 or 2).
     ebs: Vec<Eb>,
+    /// Complete storage size in eightbytes, including explicit aggregate tail padding that
+    /// consumes no register. Coercion stores/loads the whole struct and must retain this space.
+    storage_eightbytes: usize,
     /// The struct id, indexing the LLVM struct-type / struct-def tables.
     id: u32,
 }
@@ -7830,7 +7833,7 @@ fn classify_struct_abi(
     // A zero-size (empty) struct has no C ABI representation; sema rejects it as an FFI type before
     // codegen, so it never reaches here — but stay total (no eightbytes to classify).
     if size == 0 {
-        return Some(StructAbi { ebs: Vec::new(), id });
+        return Some(StructAbi { ebs: Vec::new(), storage_eightbytes: 0, id });
     }
     let eb_count = size.div_ceil(8) as usize; // 1 or 2 eightbytes
     let mut ebs: Vec<Option<Eb>> = vec![None; eb_count];
@@ -7847,9 +7850,10 @@ fn classify_struct_abi(
             Some(Eb::Sse) | None => cls,
         });
     }
-    // A pure-padding eightbyte cannot occur for a size-accounted struct; default to INTEGER (a
-    // valid GP register) so the function is total.
-    Some(StructAbi { ebs: ebs.into_iter().map(|c| c.unwrap_or(Eb::Integer)).collect(), id })
+    // Natural scalar fields cannot leave a full interior eightbyte empty, but align(16) can
+    // append one. SysV NO_CLASS tail padding consumes no register. Keep the complete storage
+    // size separately: an aggregate store/load still reaches that tail even when no register does.
+    Some(StructAbi { ebs: ebs.into_iter().flatten().collect(), storage_eightbytes: eb_count, id })
 }
 
 /// How one `extern "C"` parameter crosses the ABI boundary.
@@ -19194,7 +19198,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                     // load one `i64`/`double` per eightbyte — the SysV register form.
                                     // The padded slot keeps every 8-byte load in bounds even when the
                                     // last eightbyte is only partially occupied.
-                                    let slot = self.eightbyte_slot(sabi.ebs.len())?;
+                                    let slot = self.eightbyte_slot(sabi.storage_eightbytes)?;
                                     self.builder.build_store(slot, val.into_struct_value()).map_err(|e| self.err(e))?;
                                     for (i, &eb) in sabi.ebs.iter().enumerate() {
                                         let p = self.eightbyte_ptr(slot, i)?;
@@ -19256,7 +19260,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .try_as_basic_value()
                         .basic()
                         .ok_or_else(|| self.err(format!("extern '{name}' returns a struct by value but produced no value")))?;
-                    let slot = self.eightbyte_slot(sabi.ebs.len())?;
+                    let slot = self.eightbyte_slot(sabi.storage_eightbytes)?;
                     self.builder.build_store(slot, rv).map_err(|e| self.err(e))?;
                     let sty = self.struct_types[sabi.id as usize];
                     let sv = self.builder.build_load(sty, slot, "ffiret").map_err(|e| self.err(e))?;
@@ -26860,6 +26864,190 @@ fn main() -> i32 = 0
             d.iter().map(|diagnostic| &diagnostic.message).collect::<Vec<_>>(),
         );
         lower_program(&hir)
+    }
+
+    #[test]
+    fn c_layout_raw_and_sysv_padding_keep_storage_separate_from_registers() -> Result<(), String> {
+        Target::initialize_x86(&InitializationConfig::default());
+        let triple = inkwell::targets::TargetTriple::create("x86_64-unknown-linux-gnu");
+        let tm = Target::from_triple(&triple)
+            .map_err(|error| error.to_string())?
+            .create_target_machine(
+                &triple,
+                "x86-64-v2",
+                "",
+                OptimizationLevel::Default,
+                RelocMode::PIC,
+                CodeModel::Default,
+            )
+            .ok_or("x86 target machine is unavailable")?;
+        let ctx = Context::create();
+        let td = tm.get_target_data();
+        for (ty, field, expected) in [
+            (
+                Ty::Raw,
+                ctx.ptr_type(AddressSpace::default()).into(),
+                Eb::Integer,
+            ),
+            (
+                Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                }),
+                ctx.i64_type().into(),
+                Eb::Integer,
+            ),
+            (
+                Ty::Float(align_sema::FloatTy { bits: 64 }),
+                ctx.f64_type().into(),
+                Eb::Sse,
+            ),
+        ] {
+            for alignment in [None, Some(16)] {
+                let def = StructDef {
+                    name: "Cell".into(),
+                    source_name: "Cell".into(),
+                    fields: vec![align_sema::hir::FieldDef {
+                        name: "data".into(),
+                        ty,
+                    }],
+                    align: alignment,
+                    c_repr: true,
+                };
+                let st = ctx.opaque_struct_type("Cell");
+                let fields = if alignment.is_some() {
+                    vec![field, ctx.i8_type().array_type(8).into()]
+                } else {
+                    vec![field]
+                };
+                st.set_body(&fields, false);
+                let abi = classify_struct_abi(0, &st, &def, &td)
+                    .ok_or("register record classified as memory")?;
+                assert_eq!(abi.ebs, [expected]);
+                assert_eq!(
+                    abi.storage_eightbytes,
+                    if alignment.is_some() { 2 } else { 1 }
+                );
+                assert_eq!(
+                    align_sema::struct_abi_layout(0, &[def], &[], &[]),
+                    (td.get_abi_size(&st), u64::from(td.get_abi_alignment(&st)))
+                );
+            }
+        }
+        let source = r#"
+align(16) layout(C) Ptr { data: raw }
+align(16) layout(C) Int { data: i64 }
+align(16) layout(C) Flt { data: f64 }
+extern "C" fn probe_raw(value: Ptr, after: i64) -> Ptr
+extern "C" fn probe_int(value: Int, after: i64) -> Int
+extern "C" fn probe_float(value: Flt, after: i64) -> Flt
+extern "C" fn probe_gp(a: i64,b: i64,c: i64,d: i64,e: i64,value: Ptr,after: i64) -> Ptr
+extern "C" fn probe_sse(a: f64,b: f64,c: f64,d: f64,e: f64,f: f64,g: f64,value: Flt,after: i64) -> Flt
+fn main() -> i32 {
+  unsafe {
+    p := probe_raw(Ptr { data: raw.null() }, 77)
+    i := probe_int(Int { data: 42 }, 77)
+    f := probe_float(Flt { data: 3.5 }, 77)
+    q := probe_gp(1,2,3,4,5,Ptr { data: raw.null() },77)
+    g := probe_sse(1.0,2.0,3.0,4.0,5.0,6.0,7.0,Flt { data: 3.5 },77)
+    if p.data.is_null() && q.data.is_null() && i.data == 42 && f.data == 3.5 && g.data == 3.5 { return 0 }
+    return 1
+  }
+}
+"#;
+        let program = mir(source);
+        let module = ctx.create_module("c_layout_raw_sysv");
+        build_module(
+            &ctx,
+            &module,
+            &program,
+            &tm,
+            None,
+            &[],
+            false,
+            ModuleScope::Whole,
+        )
+        .map_err(|error| error.to_string())?;
+        module.verify().map_err(|error| error.to_string())?;
+        for name in ["probe_raw", "probe_int", "probe_float"] {
+            assert_eq!(
+                module
+                    .get_function(name)
+                    .ok_or_else(|| format!("missing {name}"))?
+                    .count_params(),
+                2,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            module
+                .get_function("probe_gp")
+                .ok_or("missing probe_gp")?
+                .count_params(),
+            7
+        );
+        assert_eq!(
+            module
+                .get_function("probe_sse")
+                .ok_or("missing probe_sse")?
+                .count_params(),
+            9
+        );
+        let ir = module.print_to_string().to_string();
+        let slots = ir
+            .lines()
+            .filter(|line| line.contains("sysv_slot") && line.contains(" = alloca "))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            slots.len(),
+            10,
+            "argument and return scratch for five calls"
+        );
+        assert!(
+            slots.iter().all(|line| line.contains("alloca [2 x i64]")),
+            "full padded scratch: {slots:?}"
+        );
+        for (field, preceding_ty, budget) in
+            [("raw", "i64", 6), ("i64", "i64", 6), ("f64", "f64", 8)]
+        {
+            for preceding in [budget - 1, budget, budget + 1] {
+                let args = (0..preceding)
+                    .map(|i| format!("p{i}: {preceding_ty}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let probe = mir(&format!(
+                    "align(16) layout(C) Cell {{ data: {field} }}\nextern \"C\" fn crowded({args}, value: Cell)\nfn main() {{}}\n"
+                ));
+                let probe_module = ctx.create_module("crowded");
+                let result = build_module(
+                    &ctx,
+                    &probe_module,
+                    &probe,
+                    &tm,
+                    None,
+                    &[],
+                    false,
+                    ModuleScope::Whole,
+                );
+                if preceding < budget {
+                    result.map_err(|error| error.to_string())?;
+                    assert_eq!(
+                        probe_module
+                            .get_function("crowded")
+                            .ok_or("missing crowded")?
+                            .count_params(),
+                        budget
+                    );
+                } else {
+                    let error = result.err().ok_or("exhausted registers were accepted")?;
+                    assert!(
+                        error.to_string().contains("passed in memory"),
+                        "{field}/{preceding}: {error}"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     fn borrowed_element_place_mut(program: &mut Program) -> &mut align_mir::BorrowedElementPlace {

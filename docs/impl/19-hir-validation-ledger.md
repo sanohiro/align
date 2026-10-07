@@ -1,5 +1,12 @@
 # Checked-HIR validation ledger
 
+Concrete `layout(C)` fields and extern struct signatures share the sema-owned
+`is_ffi_safe` integer/float/raw family predicate (plan137). The ordinary field
+predicate admits raw only when that containing definition has c_repr; malformed
+widths still fail ordinary type validation. Raw fields remain non-owning Copy
+values with no inferred pointee authority. The parameterized raw-field placement
+owner rejects non-C/raw and C/non-scalar mutations before MIR.
+
 ## Checked typed byte views (plan 78; implemented)
 
 `BytesView` authenticates an exact `slice<u8>` receiver, one of the eight

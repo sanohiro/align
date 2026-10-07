@@ -1369,7 +1369,8 @@ and the hot/cold field-split suggestion (needs heuristic design).
   and opts the struct into FFI). Only a `layout(C)` struct may be moved through a `raw` pointer:
   `raw.store`/`raw.load` are widened to accept a `layout(C)` struct value (the existing
   `Scalar::Struct` flows through `RawLoad`/`RawStore` unchanged; codegen does an unaligned aggregate
-  load/store — no new IR variant). Fields must be int/float (their C mapping is settled). This is the
+  load/store — no new IR variant). Fields admit int/float and non-owning raw pointers
+  ([plan137](137-c-layout-raw-fields.md)); pointer copies add no Drop or pointee authority. This is the
   pointer-based FFI pattern (hand C a buffer, read/write structs in it). `ast::StructDecl.c_repr`,
   `hir::StructDef.c_repr`. (`tests/layout_c.rs`, `examples/layout_c.align`.)
   **FFI views — DONE.** A `str`/`slice`/`bytes` view is FFI-safe as an extern **parameter**: it
