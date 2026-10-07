@@ -3039,3 +3039,75 @@ remain within 4 ms of baseline medians. Full samples and hashes are retained in
 `bench/escape_state_transfer/results-formation-commit-macos.json`. Outer staging
 copies and repeated analysis remain superlinear; no consumer time or runtime
 allocation improvement is claimed.
+
+
+## Item 16: validated storage-formation transactions
+
+Item15 makes every recoverable formation error precede table mutation. All six
+callers still clone the complete tables to rename existing value dependencies
+before invoking that helper. The shared commit can perform those payload updates
+after admission, eliminating the outer staging copies across both analyses.
+EscapeCheck must then rename only external observations so fresh table entries do
+not get demoted a second time.
+
+Extend `try_form_headers` with one post-admission callback receiving mutable
+**value iterators**, not table maps or keys, plus the validated rename set. After
+all existing validation succeeds, call it once to rename existing payloads,
+then demote directory and content keys and insert the prepared fresh records.
+Payload-only access cannot change the key/path collision proof from item15. The
+callback has no recoverable error result. All input-derived rejection stays before
+it; ordinary Rust ownership still handles destruction, and panic/allocation
+failure does not promise a reusable checker.
+
+All six production callers form directly into their owned tables and then rename
+external observations without touching the newly installed table. EscapeCheck's
+parameter, ordinary and map_err paths rename existing content dependencies only.
+MoveCheck's ordinary and map_err paths rename content before directory payloads;
+its parameter seed retains its existing no-op payload transformation. Fresh
+initializer payloads never pass through the existing-value callback. External
+headers, roots, control/loop/eager/callable snapshots, advance frames and final
+returned headers retain their existing order. Those operations do not read the
+newly installed primary tables; independent loop-break states retain their full
+renames. Two EscapeCheck in-place callers still need complete table renaming.
+The MoveCheck context accessor may return its already-held definition lifetime
+instead of tying borrowed definition tables to the checker borrow; this enables
+disjoint mutable access without copying context or changing any definition.
+
+No source ownership, lifetime, allocation, type, IR, interface, runtime ABI or
+cache contract changes. No fact is pruned and no source control path is skipped.
+K1/plan61, near-linear checking and consumer adoption remain deferred.
+
+### Implementation closure matrix
+
+| Closure axis | Implementation and owner |
+| --- | --- |
+| Type formation, admission and malformed input | Preserve `storage_type_paths`, initializer/path/generation admission, key parity, empty batch and deterministic validation precedence. Existing formation/malformed and commit matrices gain a callback counter: every failure must leave both tables unchanged and invoke no payload or join callback. Include valid first/invalid later, stable/Prior collision and malformed type/key parity. |
+| Commit ordering and collision proof | One callback gets only existing directory/content values after all validation. It renames payload dependencies before directory-then-content demotion and written-order fresh insertion. Extend the commit matrix with an exact callback/event trace and a fresh-versus-old payload discriminator, including Current/Prior joins, stable keys, empty rename sets and multi-result permutations. Existing noncommutative join owners retain their operand order. |
+| Construction, move-in/out, source nulling and Drop | Tables stay owned by their checker; prepared fresh payloads move once, and old values remain in place until selected key folds. No Clone bound or manual lifetime is introduced. Existing non-Clone exact-Drop formation owner gains existing-payload transformation and retains unrelated allocation identity. The EscapeCheck parameter-seed and MoveCheck completion owners also pin existing release-set backing through actual caller operations. Source move/replacement/return/Drop behavior remains covered by the five driver generation owners below. |
+| EscapeCheck callers and publication | Parameter, normal and map_err callers use the validated transaction, followed by `rename_storage_observers`; no old-table replacement or complete-table rename follows. The publication matrix pins all four external maps, nested references, fallback/readonly and ended facts, old/fresh discrimination and full-operation twins. Parameter-seed/resolver and repeated-control owners cover actual callers. The two in-place call/rebase consumers retain `rename_storage_generations`. |
+| MoveCheck callers and publication | Parameter seed uses the existing no-op payload phase; normal/map_err rename existing content then directory values. Header/root renames, external snapshots and advance records stay after successful commit and before fresh header use. Inspect each operation to prove it does not query the primary tables; loop-break states rename their own independent tables. Existing parameter, move-directory, repeated-recency and control-join owners qualify this sibling. |
+| All source control paths and cleanup | Reuse `return_provenance::storage_generation_move_replacement_escape_matrix` and `borrow_liveness::storage_generation_move_replacement_cleanup_control_matrix` for if/match/else/?/map_err, branch/loop joins, early exits, source consumption and cleanup. Rejection still publishes no external observation. Full sema is the bounded-gate owner. |
+| Generics, interfaces and provenance | Reuse `storage_generation_producer_content_matrix`, `storage_generation_nonwritable_carrier_matrix` and `storage_generation_interprocedural_allocation_parity_matrix` for imported/indirect calls, substitution, whole/per-unit and heap/arena/inline provenance. No persisted or runtime fact changes. |
+| Performance and generated outputs | Reuse numeric/storage release corpora, 16/128/512 sizes, five alternating samples after warmup, no competing builds/tests, actual checked-work output and byte-identical MIR/raw LLVM/rejected diagnostics. Keep the 20 s child budget and report remaining superlinear work; there is no consumer-time or runtime-resource promise. |
+
+The outer transaction now relies on the same complete prevalidation as item15,
+so one fresh independent adversarial plan review inspected the callback's
+restricted authority, failure atomicity, all six callers and publication ordering
+before implementation, with no actionable findings. The author matrix-to-diff pass and one fresh full-diff
+code review follow. Callback admission and all six consumers ship together as one
+useful capability; leaving cloned callers behind would duplicate proof and retain
+the measured cost. Expected hand-written change is below 1,000 lines, including
+parameterized owners and this matrix.
+
+
+Qualification closes the matrix with 15 sema generation owners and the five
+parameterized driver owners. Restoring the outer copies fails exactly the two
+actual-caller backing-identity owners; the other 13 sema generation owners pass.
+Five alternating Apple M1 release samples improve 512-array straight-line
+whole/per-unit medians from 0.434/0.867 s to 0.361/0.723 s (1.20x/1.20x), and
+loop medians from 4.261/8.596 s to 3.892/7.655 s (1.09x/1.12x). All 15 source
+MIR/raw-LLVM pairs, actual checked-work outputs and rejected diagnostics match.
+Numeric control median changes remain below 9 ms. The benchmark README and
+`results-formation-transaction-macos.json` retain all samples and hashes. Other
+fact/state copies and repeated analysis remain superlinear; consumer acceptance
+stays external.
