@@ -206,7 +206,7 @@ impl BufferStorage {
         self.len += bytes.len();
     }
     pub(super) fn extend_from_within(&mut self, start: usize, length: usize) {
-        if !start.checked_add(length).is_some_and(|end| end <= self.len) {
+        if start.checked_add(length).is_none_or(|end| end > self.len) {
             crate::panic_abort("buffer copy source is outside initialized prefix");
         }
         if length == 0 {
