@@ -18861,135 +18861,178 @@ struct EscapeState {
 }
 
 impl EscapeState {
-    fn join(&self, other: &Self) -> Self {
-        let mut joined = self.clone();
-        joined.active_sum.retain(|local, active| {
-            let Some(other) = other.active_sum.get(local) else {
-                return false;
-            };
-            active.extend(other.iter().copied());
-            true
-        });
-        for (&local, &region) in &other.region {
-            joined
-                .region
-                .entry(local)
-                .and_modify(|current| *current = current.shorter(region))
-                .or_insert(region);
-        }
-        for (&local, fact) in &other.storage_values {
-            joined
-                .storage_values
-                .entry(local)
-                .and_modify(|current| *current = current.join(fact))
-                .or_insert_with(|| fact.clone());
-        }
-        for (&key, fact) in &other.storage_argument_snapshots {
-            joined
-                .storage_argument_snapshots
-                .entry(key)
-                .and_modify(|current| *current = current.join(fact))
-                .or_insert_with(|| fact.clone());
-        }
-        for (&key, fact) in &other.storage_completed_expressions {
-            joined
-                .storage_completed_expressions
-                .entry(key)
-                .and_modify(|current| *current = current.join(fact))
-                .or_insert_with(|| fact.clone());
-        }
-        for (&key, fact) in &other.storage_callable_snapshots {
-            joined
-                .storage_callable_snapshots
-                .entry(key)
-                .and_modify(|current| *current = current.join(fact))
-                .or_insert_with(|| fact.clone());
-        }
-        for (generation, entry) in &other.storage.directory.entries {
-            joined
-                .storage
-                .directory
-                .entries
-                .entry(generation.clone())
-                .and_modify(|current| *current = current.join(entry))
-                .or_insert_with(|| entry.clone());
-        }
-        for (generation, content) in &other.storage.contents.entries {
-            joined
-                .storage
-                .contents
-                .entries
-                .entry(generation.clone())
-                .and_modify(|current| *current = current.join(content))
-                .or_insert_with(|| content.clone());
-        }
-        let backing_locals = self
-            .backing_storage
-            .keys()
-            .chain(other.backing_storage.keys())
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>();
-        for local in backing_locals {
-            let backing = match (
-                self.backing_storage.get(&local),
-                other.backing_storage.get(&local),
-            ) {
-                (Some(left), Some(right)) => left.join(right),
-                (Some(known), None) | (None, Some(known)) => {
-                    known.join(&EscapeBackingStorage::unknown())
-                }
-                (None, None) => continue,
-            };
-            joined.backing_storage.insert(local, backing);
-        }
-        for (&key, snapshot) in &other.argument_snapshots {
-            joined
-                .argument_snapshots
-                .entry(key)
-                .and_modify(|current| *current = current.join(snapshot))
-                .or_insert_with(|| snapshot.clone());
-        }
-        for (&key, snapshot) in &other.completed_expressions {
-            joined
-                .completed_expressions
-                .entry(key)
-                .and_modify(|current| *current = current.join(snapshot))
-                .or_insert_with(|| snapshot.clone());
-        }
-        for (&call, &region) in &other.callable_capture_snapshots {
-            joined
-                .callable_capture_snapshots
-                .entry(call)
-                .and_modify(|current| *current = current.shorter(region))
-                .or_insert(region);
-        }
-        for (&local, fact) in &other.callable_capture_region {
-            let current = joined.callable_capture_region.entry(local).or_default();
-            for (path, &region) in fact {
-                current
-                    .entry(path.clone())
-                    .and_modify(|current| *current = current.shorter(region))
-                    .or_insert(region);
+    /// The final initial successor can own the output directly. Earlier successors need
+    /// independent copies; a present input retains the ordinary finite join.
+    fn merge_input(input: &mut Option<Self>, output: &mut Self, last_successor: bool) -> bool {
+        match input {
+            Some(current) => current.join_from(output),
+            slot @ None => {
+                *slot = Some(if last_successor {
+                    std::mem::take(output)
+                } else {
+                    output.clone()
+                });
+                true
             }
         }
-        joined
-            .local_backed_slice
-            .extend(other.local_backed_slice.iter().copied());
-        for (&local, &individual) in &other.individual {
-            joined
-                .individual
-                .entry(local)
-                .and_modify(|current| *current &= individual)
-                .or_insert(individual);
+    }
+
+    /// Apply the same finite join in place. The worklist needs an exact change bit, not a
+    /// second complete state. Exhaustive destructuring keeps future fields in this inventory.
+    fn join_from(&mut self, other: &Self) -> bool {
+        fn update<V: PartialEq>(current: &mut V, next: V) -> bool {
+            if *current == next {
+                false
+            } else {
+                *current = next;
+                true
+            }
         }
-        for (&local, &individual) in &other.individual_may {
-            joined
-                .individual_may
-                .entry(local)
-                .and_modify(|current| *current |= individual)
-                .or_insert(individual);
+        fn hash_join<K: Eq + std::hash::Hash + Clone, V: Clone + PartialEq>(
+            current: &mut std::collections::HashMap<K, V>,
+            incoming: &std::collections::HashMap<K, V>,
+            join: impl std::ops::Fn(&V, &V) -> V,
+        ) -> bool {
+            let mut changed = false;
+            for (key, value) in incoming {
+                match current.entry(key.clone()) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        let next = join(entry.get(), value);
+                        changed |= update(entry.get_mut(), next);
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(value.clone());
+                        changed = true;
+                    }
+                }
+            }
+            changed
         }
-        joined
+        fn tree_join<K: Ord + Clone, V: Clone + PartialEq>(
+            current: &mut std::collections::BTreeMap<K, V>,
+            incoming: &std::collections::BTreeMap<K, V>,
+            join: impl std::ops::Fn(&V, &V) -> V,
+        ) -> bool {
+            let mut changed = false;
+            for (key, value) in incoming {
+                match current.entry(key.clone()) {
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        let next = join(entry.get(), value);
+                        changed |= update(entry.get_mut(), next);
+                    }
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(value.clone());
+                        changed = true;
+                    }
+                }
+            }
+            changed
+        }
+        let Self {
+            region,
+            active_sum,
+            storage_values,
+            storage:
+                StorageGenerationTables {
+                    directory: StorageGenerationDirectory { entries: directory },
+                    contents: StorageGenerationContents { entries: contents },
+                },
+            storage_argument_snapshots,
+            storage_completed_expressions,
+            storage_callable_snapshots,
+            backing_storage,
+            argument_snapshots,
+            completed_expressions,
+            callable_capture_snapshots,
+            callable_capture_region,
+            local_backed_slice,
+            individual,
+            individual_may,
+        } = self;
+        let mut changed = false;
+        active_sum.retain(|local, active| {
+            let Some(incoming) = other.active_sum.get(local) else {
+                changed = true;
+                return false;
+            };
+            let previous_len = active.len();
+            active.extend(incoming.iter().copied());
+            changed |= active.len() != previous_len;
+            true
+        });
+        changed |= hash_join(region, &other.region, |a, b| a.shorter(*b));
+        changed |= hash_join(storage_values, &other.storage_values, EscapeValueFact::join);
+        changed |= hash_join(
+            storage_argument_snapshots,
+            &other.storage_argument_snapshots,
+            EscapeValueFact::join,
+        );
+        changed |= hash_join(
+            storage_completed_expressions,
+            &other.storage_completed_expressions,
+            EscapeValueFact::join,
+        );
+        changed |= hash_join(
+            storage_callable_snapshots,
+            &other.storage_callable_snapshots,
+            EscapeValueFact::join,
+        );
+        changed |= tree_join(
+            directory,
+            &other.storage.directory.entries,
+            EscapeGenerationEntry::join,
+        );
+        changed |= tree_join(
+            contents,
+            &other.storage.contents.entries,
+            EscapeGenerationContent::join,
+        );
+        // A missing backing fact is unknown, not the identity. Treat both missing sides
+        // explicitly before inserting incoming-only keys, retaining the original strict join.
+        for (local, current) in backing_storage.iter_mut() {
+            let unknown = EscapeBackingStorage::unknown();
+            let incoming = other.backing_storage.get(local).unwrap_or(&unknown);
+            let next = current.join(incoming);
+            changed |= update(current, next);
+        }
+        for (&local, incoming) in &other.backing_storage {
+            if let std::collections::hash_map::Entry::Vacant(entry) = backing_storage.entry(local) {
+                entry.insert(incoming.join(&EscapeBackingStorage::unknown()));
+                changed = true;
+            }
+        }
+        changed |= hash_join(
+            argument_snapshots,
+            &other.argument_snapshots,
+            EscapeArgumentSnapshot::join,
+        );
+        changed |= hash_join(
+            completed_expressions,
+            &other.completed_expressions,
+            EscapeArgumentSnapshot::join,
+        );
+        changed |= hash_join(
+            callable_capture_snapshots,
+            &other.callable_capture_snapshots,
+            |a, b| a.shorter(*b),
+        );
+        for (&local, incoming) in &other.callable_capture_region {
+            match callable_capture_region.entry(local) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    changed |= tree_join(entry.get_mut(), incoming, |a, b| a.shorter(*b));
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(incoming.clone());
+                    changed = true;
+                }
+            }
+        }
+        let previous_len = local_backed_slice.len();
+        local_backed_slice.extend(other.local_backed_slice.iter().copied());
+        changed |= local_backed_slice.len() != previous_len;
+        changed |= hash_join(individual, &other.individual, |a, b| *a && *b);
+        changed |= hash_join(individual_may, &other.individual_may, |a, b| *a || *b);
+        changed
     }
 
     fn rename_storage_generations(&mut self, renames: &StorageGenerationRenames) {
@@ -20297,13 +20340,11 @@ impl<'a> EscapeCheck<'a> {
             for op in ops {
                 self.apply_flow_op(op, &mut state, storage_provenance);
             }
-            for successor in successors {
-                let next = match &inputs[successor] {
-                    Some(current) => current.join(&state),
-                    None => state.clone(),
-                };
-                if inputs[successor].as_ref() != Some(&next) {
-                    inputs[successor] = Some(next);
+            for (index, &successor) in successors.iter().enumerate() {
+                let changed = EscapeState::merge_input(
+                    &mut inputs[successor], &mut state, index + 1 == successors.len(),
+                );
+                if changed {
                     if !pending[successor] {
                         pending[successor] = true;
                         worklist.push_back(successor);
@@ -79417,6 +79458,327 @@ fn main() -> i32 = 0
                 }
             }
         }
+    }
+
+    #[test]
+    fn escape_flow_successor_publication_transfers_only_the_final_output() {
+        for present in [false, true] {
+            for final_edge in [false, true] {
+                let mut output = EscapeState::default();
+                output.region.insert(7, Region::Arena(2));
+                let expected = output.clone();
+                let address = output.region.get(&7).unwrap() as *const Region;
+                let mut input = present.then(EscapeState::default);
+                assert!(EscapeState::merge_input(&mut input, &mut output, final_edge));
+                assert!(input.as_ref() == Some(&expected));
+                if final_edge && !present {
+                    assert!(output == EscapeState::default());
+                    assert_eq!(input.as_ref().unwrap().region.get(&7).unwrap() as *const Region, address);
+                } else {
+                    assert!(output == expected, "non-final or joining edges retain the output");
+                    assert_eq!(output.region.get(&7).unwrap() as *const Region, address);
+                    assert_ne!(input.as_ref().unwrap().region.get(&7).unwrap() as *const Region, address);
+                }
+            }
+        }
+        // Reachability changes even when the first arriving state carries no facts.
+        let mut absent = None;
+        assert!(EscapeState::merge_input(&mut absent, &mut EscapeState::default(), true));
+        assert!(absent.is_some());
+        assert!(!EscapeState::merge_input(&mut absent, &mut EscapeState::default(), true));
+    }
+
+    #[test]
+    fn escape_state_join_preserves_facts_changes_and_storage() {
+        fn verify(name: &str, left: EscapeState, right: EscapeState, expected: EscapeState) {
+            for (mut current, incoming) in [(left.clone(), right.clone()), (right, left)] {
+                let should_change = current != expected;
+                assert_eq!(
+                    current.join_from(&incoming),
+                    should_change,
+                    "{name}: change bit"
+                );
+                assert!(current == expected, "{name}: joined facts");
+                assert!(
+                    !current.join_from(&incoming),
+                    "{name}: repeated input changed state"
+                );
+                assert!(current == expected, "{name}: repeated input changed facts");
+            }
+        }
+        let mut all_left = EscapeState::default();
+        let mut all_right = EscapeState::default();
+        let mut all_expected = EscapeState::default();
+        // Every map gets shared, one-sided and disjoint keys. Explicit expected values
+        // pin its join rule independently of the worklist's change detector.
+        macro_rules! map_cases {
+            ($($field:ident).+, $key:expr, $other_key:expr, $left:expr, $right:expr, $joined:expr) => {{
+                let a = $left;
+                let b = $right;
+                let joined = $joined;
+                all_left.$($field).+.insert($key, a.clone());
+                all_right.$($field).+.insert($key, b.clone());
+                all_expected.$($field).+.insert($key, joined.clone());
+                for layout in 0..4 {
+                    let mut left = EscapeState::default();
+                    let mut right = EscapeState::default();
+                    let mut expected = EscapeState::default();
+                    if layout != 2 {
+                        left.$($field).+.insert($key, a.clone());
+                        expected.$($field).+.insert($key, a.clone());
+                    }
+                    if layout != 1 {
+                        let key = if layout == 3 { $other_key } else { $key };
+                        right.$($field).+.insert(key.clone(), b.clone());
+                        expected.$($field).+.insert(key, if layout == 0 { joined.clone() } else { b.clone() });
+                    }
+                    verify(stringify!($($field).+), left, right, expected);
+                }
+            }};
+        }
+        let long = Region::Caller(2);
+        let short = Region::Arena(2);
+        map_cases!(region, 7, 8, long, short, short);
+        map_cases!(individual, 7, 8, true, false, false);
+        map_cases!(individual_may, 7, 8, false, true, true);
+        map_cases!(callable_capture_snapshots, 7, 8, long, short, short);
+        let captures = |region| {
+            [(vec![BorrowProjection::StructField(1)], region)]
+                .into_iter()
+                .collect::<CallableRegionFact>()
+        };
+        map_cases!(
+            callable_capture_region,
+            7,
+            8,
+            captures(long),
+            captures(short),
+            captures(short)
+        );
+        map_cases!(
+            callable_capture_region,
+            7,
+            8,
+            CallableRegionFact::new(),
+            CallableRegionFact::new(),
+            CallableRegionFact::new()
+        );
+
+        let descriptor = StorageHeaderDescriptor {
+            ty: Ty::DynArray(Scalar::Int(IntTy {
+                signed: true,
+                bits: 64,
+            })),
+            kind: StorageHeaderKind::OwnedDynamic,
+        };
+        let generation = StorageGeneration::parameter_value(0, &[]);
+        let other_generation = StorageGeneration::parameter_value(1, &[]);
+        let headers = ProjectedHeaderFact::from_leaf(
+            Vec::new(),
+            StorageHeaderLeaf::known_typed(generation.clone(), descriptor),
+        );
+        let fact = |region, individual: bool, ended| EscapeValueFact {
+            non_storage: EscapeRegionFact::at_path(&[BorrowProjection::StructField(1)], region),
+            headers: headers.clone(),
+            content_ended: [(vec![BorrowProjection::StructField(2)], ended)]
+                .into_iter()
+                .collect(),
+            content_unknown: [vec![BorrowProjection::StructField(3)]]
+                .into_iter()
+                .collect(),
+            storage_is_local: !individual,
+            individual,
+            may_individual: true,
+        };
+        let a = fact(long, true, BorrowEnd::Dropped);
+        let b = fact(short, false, BorrowEnd::Consumed);
+        let joined = b.clone();
+        map_cases!(storage_values, 7, 8, a.clone(), b.clone(), joined.clone());
+        map_cases!(
+            storage_argument_snapshots,
+            (7, 0),
+            (8, 0),
+            a.clone(),
+            b.clone(),
+            joined.clone()
+        );
+        map_cases!(
+            storage_completed_expressions,
+            7,
+            8,
+            a.clone(),
+            b.clone(),
+            joined.clone()
+        );
+        map_cases!(storage_callable_snapshots, 7, 8, a, b, joined);
+        let entry = |storage_region, retention_region, individual, ended, locals: &[LocalId]| {
+            EscapeGenerationEntry {
+                descriptor: Some(descriptor),
+                storage_region,
+                retention_region,
+                allocation: EscapeAllocationMode {
+                    individual,
+                    may_individual: true,
+                },
+                releases: locals
+                    .iter()
+                    .map(|&local| EscapeReleasePlace::Local {
+                        local,
+                        path: Vec::new(),
+                    })
+                    .collect(),
+                ended,
+            }
+        };
+        map_cases!(
+            storage.directory.entries,
+            generation.clone(),
+            other_generation.clone(),
+            entry(long, long, true, Some(BorrowEnd::Dropped), &[7]),
+            entry(short, short, false, Some(BorrowEnd::Consumed), &[8]),
+            entry(long, short, false, Some(BorrowEnd::Consumed), &[7, 8])
+        );
+        let contents = |region| EscapeGenerationContent {
+            direct_regions: EscapeRegionFact::at_path(&[BorrowProjection::ArrayElement(0)], region),
+            dependencies: headers.clone(),
+        };
+        map_cases!(
+            storage.contents.entries,
+            generation.clone(),
+            other_generation.clone(),
+            contents(long),
+            contents(short),
+            contents(short)
+        );
+        let snapshot = |region, backing_region, individual: bool| EscapeArgumentSnapshot {
+            content_region: region,
+            retained_contained_region: region,
+            storage_region: region,
+            retained_storage_region: region,
+            mutable_backing: EscapeBackingStorage::known(backing_region).rooted(7),
+            storage_is_local: !individual,
+            individual,
+            may_individual: true,
+        };
+        map_cases!(
+            argument_snapshots,
+            (7, 0),
+            (8, 0),
+            snapshot(long, long, true),
+            snapshot(short, short, false),
+            snapshot(short, long, false)
+        );
+        map_cases!(
+            completed_expressions,
+            7,
+            8,
+            snapshot(long, long, true),
+            snapshot(short, short, false),
+            snapshot(short, long, false)
+        );
+
+        // Active variants require presence on both sides, then union the alternatives.
+        for (left_present, right_present) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let mut left = EscapeState::default();
+            let mut right = EscapeState::default();
+            let mut expected = EscapeState::default();
+            if left_present {
+                left.active_sum
+                    .insert(7, [BorrowProjection::ResultOk].into_iter().collect());
+            }
+            if right_present {
+                right
+                    .active_sum
+                    .insert(7, [BorrowProjection::ResultErr].into_iter().collect());
+            }
+            if left_present && right_present {
+                expected.active_sum.insert(
+                    7,
+                    [BorrowProjection::ResultOk, BorrowProjection::ResultErr]
+                        .into_iter()
+                        .collect(),
+                );
+            }
+            if left_present && right_present {
+                all_left.active_sum = left.active_sum.clone();
+                all_right.active_sum = right.active_sum.clone();
+                all_expected.active_sum = expected.active_sum.clone();
+            }
+            verify("active_sum", left, right, expected);
+        }
+        for (left_present, right_present) in [(false, true), (true, false), (true, true)] {
+            let mut left = EscapeState::default();
+            let mut right = EscapeState::default();
+            let mut expected = EscapeState::default();
+            if left_present {
+                left.backing_storage
+                    .insert(7, EscapeBackingStorage::known(long).rooted(7));
+            }
+            if right_present {
+                right
+                    .backing_storage
+                    .insert(7, EscapeBackingStorage::known(short).rooted(8));
+            }
+            let both = left_present && right_present;
+            expected.backing_storage.insert(
+                7,
+                EscapeBackingStorage {
+                    region: if both { long } else { Region::Static },
+                    roots: [(left_present, 7), (right_present, 8)]
+                        .into_iter()
+                        .filter_map(|(present, id)| present.then_some(id))
+                        .collect(),
+                    known: both,
+                },
+            );
+            if both {
+                all_left.backing_storage = left.backing_storage.clone();
+                all_right.backing_storage = right.backing_storage.clone();
+                all_expected.backing_storage = expected.backing_storage.clone();
+            }
+            verify("backing_storage", left, right, expected);
+        }
+        let mut left = EscapeState::default();
+        let mut right = EscapeState::default();
+        let mut expected = EscapeState::default();
+        left.local_backed_slice.insert(7);
+        right.local_backed_slice.insert(8);
+        expected.local_backed_slice.extend([7, 8]);
+        all_left.local_backed_slice = left.local_backed_slice.clone();
+        all_right.local_backed_slice = right.local_backed_slice.clone();
+        all_expected.local_backed_slice = expected.local_backed_slice.clone();
+        verify("local_backed_slice", left, right, expected);
+        verify(
+            "all fields change together",
+            all_left,
+            all_right,
+            all_expected,
+        );
+
+        let mut current = EscapeState::default();
+        current.region.insert(7, long);
+        current
+            .storage_completed_expressions
+            .insert(7, fact(long, true, BorrowEnd::Dropped));
+        let address = current.region.get(&7).unwrap() as *const Region;
+        let value_address =
+            current.storage_completed_expressions.get(&7).unwrap() as *const EscapeValueFact;
+        let mut incoming = current.clone();
+        assert!(!current.join_from(&incoming));
+        assert_eq!(current.region.get(&7).unwrap() as *const Region, address);
+        assert_eq!(current.storage_completed_expressions.get(&7).unwrap() as *const EscapeValueFact,
+            value_address, "an unchanged join copied its saved state");
+        incoming.region.insert(7, short);
+        assert!(current.join_from(&incoming));
+        assert_eq!(current.region.get(&7), Some(&short));
+        assert_eq!(current.region.get(&7).unwrap() as *const Region, address);
+        assert_eq!(
+            current.storage_completed_expressions.get(&7).unwrap() as *const EscapeValueFact,
+            value_address,
+            "an untouched fact must retain its allocation across changed and unchanged joins"
+        );
     }
 
     #[test]

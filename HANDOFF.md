@@ -17,6 +17,12 @@ outside the active worktree so they do not obstruct unrelated checks or pulls.
 
 ## Next work (handoff updated 2026-10-07)
 
+Build-performance item13 moves the final initial escape-flow output and joins
+existing inputs in place, preserving every fact and diagnostic. Exact-state and
+allocation-identity owners qualify the mechanics; local 512-value Result-match
+whole/per-unit checks improve 1.08x/1.07x. Block input copies and superlinear
+scaling remain; Request37 consumer acceptance and K1/plan61 stay deferred.
+
 Plan136 separates array-builder value dependencies from the consumed local slot,
 so loop-local build results remain usable after replacement. Exact receiver
 reservations also reject push/append operands that invalidate the builder before

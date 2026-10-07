@@ -30,6 +30,7 @@ Order is priority.
 | 8 | Owner tests run an unoptimized compiler | Implemented (this PR) — `[profile.dev] opt-level = 1` cut `pkg_db_a1` 3.96x (486.6s -> 122.8s wall) because every owner test drives the in-process `alignc` frontend/codegen at Rust `opt-level = 0`; see below |
 | 11 | Escape-flow state transfer | Implemented — move complete analysis states through each transfer instead of cloning every accumulated fact twice; measured whole/per-unit improvements and remaining scaling are recorded below |
 | 12 | Empty exceptional-region inference | Implemented — avoid dominance analysis when no exceptional-edge record can seed a cold region; local per-unit Result-match measurement improves 4.25x at 512 values |
+| 13 | Escape-state edge propagation | Implemented — move the last initial edge output and update existing inputs in place under the same join rules; local long-match checks improve 1.07–1.08x |
 
 ## Background
 
@@ -2886,3 +2887,47 @@ All nine MIR/raw-LLVM comparisons and four rejected-source diagnostic comparison
 agree byte-for-byte. The existing two cold and three exceptional-edge owners pass;
 the benchmark README and `results-empty-region-macos.json` own exact samples and
 remaining scaling limits. Real-consumer recombination and acceptance stay external.
+
+## Item 13: escape-state edge propagation
+
+After items 11 and 12, a current release sample of the 512-value Result-match
+per-unit check still spends most samples in semantic analysis, including complete
+state cloning and destruction in `solve_flow`. Each incoming edge clones the
+saved destination, joins into that copy, compares the full result, then discards
+one complete state. The destination can instead retain its allocations while
+each existing field rule reports whether its value changed. Initial propagation
+also clones the complete output even at the final successor, after which nobody
+uses that output. Move it into a previously absent final input; earlier absent
+successors still receive independent clones and existing inputs still join.
+An initial join-only measurement shows only a 2% long-match improvement, so the
+capability includes both consumers of the edge output rather than attributing
+most first-publication copies to joins.
+
+This preserves the same finite state, keys, join rules, CFG, worklist order,
+transfers, diagnostic replay and cleanup metadata. No fact is pruned or inferred
+differently. Source types, ownership, lifetime, allocation, IR, interfaces,
+runtime ABI and cache formats do not change. Block transfer inputs still clone;
+this does not promise linear scaling. K1/plan61 and consumer adoption stay deferred.
+
+| Closure axis | Implementation boundary and owner |
+| --- | --- |
+| State construction and replacement | `EscapeState::merge_input` moves the output only into an absent final successor, clones for earlier absent successors, and joins present inputs. Its owner checks absent/present and first/final propagation, exact state retention and allocation identity. `EscapeState::join_from` updates every existing field and returns true exactly when the state changes. An exhaustive state destructure makes a new field a compile-time obligation. A parameterized state owner covers absent, equal, weaker, stronger and disjoint inputs for every field. |
+| May/must and missing facts | Preserve active-sum common-key/variant-union behavior, region shortening, allocation must-AND/may-OR, and backing union with fail-closed unknown on a missing side. The state owner checks both input orders and repeated joins, including present empty facts. |
+| Generations and retained dependencies | Reuse the existing projected value, directory and content joins, including endings, unknowns, releases, descriptors and separate lifetime/storage regions. Existing generation resolver, parameter and control-edge owners plus exact state expectations cover these cells. |
+| Moves, Drop, replacement and return | Only compiler scratch is updated. Existing transfer, source-nulling and runtime cleanup remain. Full sema owners and `array_builder_transfer`, `m12_array_builder`, `fb_region` whole/per-unit owners cover accepted and rejected lifetime/control cases. |
+| All control paths and diagnostics | Only the existing successor join is replaced. A previously absent input is still installed and enqueued even when empty; existing inputs enqueue only on a real change. Keep `if`, `match`, `else`, `?`, `map_err`, loop joins and early exits, with original source-order diagnostic replay. Full sema owners and baseline/candidate MIR/diagnostic comparisons qualify this boundary. |
+| Generic, interface and allocation parity | No serialized field or runtime owner changes. Imported/generic whole/per-unit owners remain; a storage-identity assertion rejects restoration of the complete-state copy, including unchanged joins. |
+| Performance | Reuse the bounded alternating release benchmark across all short/long straight, try and match shapes. Record full samples and remaining scaling; wall time is a local measurement, not a correctness gate. |
+
+This changes private update mechanics under the reviewed item11 analysis strategy.
+The author matrix pass and one fresh implementation review cover it; no new
+public contract or safety strategy requires a separate plan review. The join
+and its single worklist consumer form one capability.
+
+Qualification retains five alternating samples for each of 18 release cells on
+Apple M1 with no overlapping builds/tests. At 512 values, Result-match whole/per-unit
+medians change from 1.128/2.102 s to 1.049/1.969 s. Short and straight/try controls
+remain within 1 ms; nine MIR outputs and four diagnostic comparisons are identical.
+The original copy-based join fails the state-identity owner. Exact samples and
+remaining superlinear costs are in `bench/escape_state_transfer`; no whole-client
+acceptance or runtime allocation change is claimed.
