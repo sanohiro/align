@@ -6,6 +6,10 @@ and admits Copy `str` elements to `.sort_by_key(f)`. It reuses the stable MIR
 sort, scalar string comparison and borrowed-element collection representation.
 No comparator overload, owned-string copying, aggregate ordering or K1 is added.
 
+The Copy-key boundary and evidence below are historical to plan 88. Plan 134
+supersedes only the owned `string` key exclusion and its transient ownership
+strategy; direct Move elements and comparator overloads remain deferred.
+
 ## Public-contract ledger
 
 | Surface | Exact contract and owner |

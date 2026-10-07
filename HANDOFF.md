@@ -17,6 +17,12 @@ outside the active worktree so they do not obstruct unrelated checks or pulls.
 
 ## Next work (handoff updated 2026-10-07)
 
+Plan134 admits owned String sort keys through the ordinary return-cleanup ABI.
+Comparisons retain borrowed headers while one unsorted owner column releases
+heap keys exactly once. Whole/per-unit stable-order, evaluation-order, malformed
+HIR, lifetime, mixed-bit ABI and active allocation/free owners cover the
+capability. Move elements, comparator overloads, K1 and plan61 remain deferred.
+
 Plan133 certifies text-byte element reads through their original text producer,
 including byte-derived range bounds and Request 124's Unicode scan loops.
 Read-only backing and founded-input checks remain intact; whole/per-unit

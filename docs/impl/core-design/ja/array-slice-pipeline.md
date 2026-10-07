@@ -100,6 +100,16 @@ storage: field 'f' owns independent heap storage`。設計は
 借用が無効になる場合がある。所有する `string` 要素と comparator overload は
 未対応のままである（plan 88）。
 
+`sort_by_key` のキーは既存のスカラー `Ord` 値であり、所有する `string` も使える。
+キー関数は生き残った各要素につき入力順に1回実行され、キーのバイト列はすべての比較が
+終わるまで保持される。戻り値の cleanup bit に従い、並べ替えない一時列に所有ヘッダーを
+保持する。ソート後の1回の再帰的 Drop が独立して所有するキーを解放する。
+比較用の列は借用した `str` ヘッダーだけを持ち、バイト列を暗黙に clone しない。
+所有文字列キーの空でない入力では、明示的なソート終端がこの所有ヘッダー列を追加で確保する。
+返される要素とその寿命は変わらない。現在の String 生成処理は arena 内でも heap 所有を返す。
+`clone_in` は借用した `str` を返し、そのキーには従来どおり浅い cleanup を使う。[Plan 134](../../134-owned-string-sort-keys.md) が
+この cleanup の境界を規定する。
+
 ## Type & ownership classification
 
 - Fixed array は Copy 値である。所有権付きフィールドを持つ source-formed な Move struct 固定配列（`[User{name}]` など）には再帰的な要素 Drop がある。Move 要素全体の読み取りは、下記の明示的な shared-call place に限定される。

@@ -593,7 +593,11 @@ Completion condition (met): data allocated inside `arena {}` is freed at block e
   string elements. Stable results own their spines and retain byte-owner
   lifetime/generation facts. Whole/per-unit imported generic, algorithm-exit,
   effect-order, invalidation and forged-producer owners cover the capability.
-  Move strings and general comparators remain deferred.
+  Move string elements and general comparators remain deferred.
+- [done, plan 134] **Owned string sort keys** — preserve ordinary returned
+  cleanup bits in an unsorted nullable owner column; compare borrowed headers
+  and release independently owned key bytes after sorting. Copy source elements
+  and all other pipeline ownership restrictions remain.
 - [done] **`sort_by_key(f)`** — materialize the surviving (primitive scalar) elements and sort
   ascending by `f(element)` (an orderable scalar key: int/float/char). Reuses the MIR insertion
   sort (`lower_array_sort` gained an optional `SortKey`), comparing `key(a) > key(b)` instead of
@@ -4259,12 +4263,10 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
 
 ### Deferred / stance (pending confirmation in `open-questions.md`)
 
-- **Two implementation gaps, not restrictions** — a value-carrying `if`/`else` expression cannot
-  move an already-bound owned local out of an arm (every sibling form can), and a `sort_by_key` key
-  must be Copy because the fused sort path has no per-key Drop. Both are Category A in
-  `docs/impl/23-friction-ledger.md`: the design already describes the working behavior, so neither
-  needs a decision to change. Owned by `docs/open-questions.md` and
-  `docs/impl/19-hir-validation-ledger.md` respectively.
+- **Category A implementation closure** — plan 38 completed bound owned locals
+  in value-carrying `if` results. Plan 134 completes the remaining owned-string
+  sort-key Drop path. Both are implementation capabilities under plan 23, not
+  a reopening of a deliberate language restriction.
 - **YAML** — never in core/std; no "subset". If ever needed, a document-type parser
   (kubeconfig, compose), tested against that schema. Output is always JSON. (Only Ruby put YAML in
   its stdlib; it paid a ~10-year unsafe-load security cost.)

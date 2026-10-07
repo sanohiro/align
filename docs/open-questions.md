@@ -3818,8 +3818,12 @@ freedom that blocks optimization, no complexity, no soundness breaks; inconvenie
    direct, mixed-view, and generic `Ord` comparisons are implemented.
    Direct `.sort()` accepts the Copy `Ord` domain (numbers, `char`, `str`), and
    `.sort_by_key` accepts primitive Copy elements and `str`. Result spines own
-   no borrowed string bytes and retain source/stage content lifetimes. Move
-   string elements/keys and comparator overloads remain deferred (plan 88).
+   no borrowed string bytes and retain source/stage content lifetimes. Plan 134
+   adds owned `string` keys: each ordinary returned cleanup bit selects exactly
+   one owning header or null in an unsorted transient owner column; comparison
+   columns contain borrowed `str` headers. All key bytes remain live until
+   comparisons finish, then one recursive Drop frees independently owned keys. No implicit byte clone occurs.
+   Move string elements and comparator overloads remain deferred (plan 88).
    Existing conservative bound-source generation loans remain; fresh result
    storage does not promise release of a live source loan.
 2. **`else` works on `Result`** (`draft.md` §5 Result; guide ch04 rewritten): `v := f() else

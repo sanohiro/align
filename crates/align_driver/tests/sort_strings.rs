@@ -94,7 +94,6 @@ fn copy_sort_domain_and_diagnostics() {
         ("arity", "fn main() { values := [\"x\"].sort(1) }", "takes no arguments"),
         ("result", "fn main() { values: array<i64> := [\"x\"].sort() }", "type mismatch"),
         ("key", "fn main() { values := [\"x\"].sort_by_key(fn s: str { true }) }", "orderable"),
-        ("owned-key", "fn main() { values := [\"x\"].sort_by_key(fn s: str { s.clone() }) }", "Move key"),
         ("unresolved", "fn main() { values := missing.sort() }", "undefined"),
     ] {
         let checked = diff_check_multi(&format!("string-sort-{name}"), &[("main.align", source)], "main.align");

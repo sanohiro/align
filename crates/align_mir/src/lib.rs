@@ -18155,7 +18155,7 @@ fn sort_read(b: &mut Builder, buf: &Operand, idx: Operand, ty: Ty) -> Operand {
 
 /// Heap-allocate a transient `count`-element scratch buffer of `ty`, returning its raw buffer
 /// pointer (for `PtrStore`) and a `{ptr,len}` value (for `SliceIndex`). Always a free-standing heap
-/// allocation (arena-independent), balanced by a shallow-spine `DropValue` before the sort returns —
+/// allocation (arena-independent), balanced by `DropValue` before the sort returns (deep for the String owner column) —
 /// the same transient-scratch discipline `group_by` uses.
 fn sort_alloc_buf(b: &mut Builder, ty: Ty, len: &Operand) -> (Operand, Operand) {
     let ptr = b.fresh_value(Ty::Box(scalar_of(ty)));
@@ -18222,7 +18222,9 @@ fn sort_copy_step(
 /// buffer (decorate), carried alongside the elements through every move (so comparisons read a
 /// precomputed key, never re-call `f`), and freed at the end — the fix for the old per-comparison
 /// `key(arr[j])` recomputation. A `str` key is a borrowed `{ptr,len}` view (Copy), so freeing the
-/// key buffers is a shallow spine `DropValue` that never touches the pointed-to bytes.
+/// key buffers is a shallow spine `DropValue` that never touches the pointed-to bytes. Owned
+/// String keys use those same Copy comparison headers, plus an unsorted nullable String column
+/// selected by each call's cleanup bit. Its single recursive Drop releases only heap-owned keys.
 ///
 /// Elements are always Copy scalars, including borrowed `str` headers. The result and scratch
 /// spines never own string bytes, so no element needs a deep move/drop. Reads use `SliceIndex`; writes use
@@ -18268,23 +18270,23 @@ fn lower_array_sort(
         return Operand::Const(Const::Unit);
     }
     let has_keys = sort_key.is_some();
-    // The comparison-key type: the key type for `sort_by_key`, else the element type itself.
-    let kty = sort_key.as_ref().map(|sk| sk.key_ty).unwrap_or(elem);
+    let owned_keys = sort_key.as_ref().is_some_and(|sk| sk.key_ty == Ty::String);
+    // Sorting only copies comparison keys; ownership stays in a separate, unsorted column.
+    let kty = if owned_keys {
+        Ty::Str
+    } else {
+        sort_key.as_ref().map(|sk| sk.key_ty).unwrap_or(elem)
+    };
 
     // Lower the key function's captures ONCE (loop-invariant); `key_of` reuses them, so a
     // `sort_by_key` key is computed exactly N times (decorate), never per comparison.
     let key_of = |b: &mut Builder, v: Operand| -> Operand {
         match &sort_key {
             Some(sk) => {
-                let kc = b.fresh_value(sk.key_ty);
                 let mut args = Vec::with_capacity(1 + lowered_captures.len());
                 args.push(v);
                 args.extend(lowered_captures.iter().cloned());
-                b.push(Stmt::Let(
-                    kc,
-                    Rvalue::Call(DirectCall::Program(sk.func.clone()), args),
-                ));
-                Operand::Value(kc)
+                emit_named_call(b, sk.func.clone(), args, sk.key_ty)
             }
             None => v,
         }
@@ -18338,7 +18340,7 @@ fn lower_array_sort(
 
     b.cur = sort_start;
 
-    // Only the decorate buffer `keys` (`sort_by_key` only) is allocated up front — its lifetime spans
+    // The decorate buffer `keys` and any String owner column are allocated up front; they span
     // decorate, the ordered precheck, the insertion runs, and every merge. The element ping buffer
     // `tmp` (and, when keyed, the key ping buffer `ktmp`) are deferred behind the `len > 32` merge
     // gate below, so a `len <= 32` sort performs zero ping-buffer allocations (doc-12 §4.1). When
@@ -18348,6 +18350,12 @@ fn lower_array_sort(
     } else {
         (arr_ptr.clone(), arr.clone())
     };
+    let key_owners = owned_keys.then(|| {
+        let (pointer, values) = sort_alloc_buf(b, Ty::String, &len);
+        // Transfer staging only: this slot never has an independent Drop or cleanup flag.
+        let selected = b.new_slot(Ty::String);
+        (pointer, values, selected)
+    });
 
     // Pre-change baseline (`!delay_scratch`): allocate the ping buffers up front, like the original
     // algorithm, so the `none` variant is byte-for-byte the pre-change shape (minus the adaptive
@@ -18387,6 +18395,30 @@ fn lower_array_sort(
         let dvi = sort_load(b, di);
         let e = sort_read(b, &arr, dvi.clone(), elem);
         let k = key_of(b, e);
+        if !lowering_continues(b) {
+            return Operand::Const(Const::Unit);
+        }
+        let k = if let Some((pointer, _, selected)) = &key_owners {
+            let Some(cleanup) = b.value_drop_flag(&k) else {
+                b.terminate(Term::Unreachable);
+                return Operand::Const(Const::Unit);
+            };
+            let view = lower_view_retype(b, k.clone(), Ty::Str);
+            b.push(Stmt::DropFlagInit(*selected));
+            let retain = b.new_block();
+            let stored = b.new_block();
+            b.terminate(Term::Branch(cleanup, retain, stored));
+            b.cur = retain;
+            b.push(Stmt::Store(*selected, k));
+            b.terminate(Term::Goto(stored));
+            b.cur = stored;
+            let header = b.fresh_value(Ty::String);
+            b.push(Stmt::Let(header, Rvalue::Load(*selected)));
+            b.push(Stmt::PtrStore(pointer.clone(), dvi.clone(), Operand::Value(header)));
+            view
+        } else {
+            k
+        };
         b.push(Stmt::PtrStore(keys_ptr.clone(), dvi.clone(), k));
         let dn = sort_int(b, BinOp::Add, dvi, index_const(1));
         b.push(Stmt::Store(di, dn));
@@ -18824,6 +18856,9 @@ fn lower_array_sort(
     b.cur = free_keys;
     if has_keys {
         b.push(Stmt::DropValue(keys_val));
+    }
+    if let Some((_, owners, _)) = key_owners {
+        b.push(Stmt::DropValue(owners));
     }
     b.terminate(Term::Goto(ret));
 
