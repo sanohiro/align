@@ -1,6 +1,6 @@
 # Compiler check-time scaling measurement
 
-This local benchmark owns plan 21 items 11–21 checking measurements. It
+This local benchmark owns plan 21 items 11–22 checking measurements. It
 compares release compiler binaries on the same generated straight arithmetic,
 Result `?`, and Result `match` chains inside a loop. Each case uses 16, 128 or
 512 values. `--corpus storage` selects fixed-array declarations in straight-line
@@ -323,3 +323,34 @@ fact insertion adds Arc allocations and other hash-table/traversal work remains.
 Lifecycle, all-four-map mutation isolation and selected/no-op allocation owners
 qualify the implementation. This does not establish near-linear scaling, a
 whole-client time budget or a runtime allocation improvement.
+
+## Item 22 result (2026-10-07)
+
+The same host/profile compares merged
+`79fe45b5129296c3660b4223a1be4a7ecb95ff43` with argument and expression-completion
+snapshots sharing the same immutable fact-map storage as value facts. Generic
+map creation/copy requires no payload Default/Clone. Owned consumers and joins
+retain their original semantics.
+No builds/tests overlap measurement; `DYLD_SHARED_REGION` is unset for both
+binaries. Numeric and storage corpora run with `--llvm-parity`.
+[Full samples and hashes](results-shared-snapshots-macos.json) retain all 30 cells
+with five alternating samples after warmup from the final implementation.
+
+| 512-value shape | Command | Baseline median | Candidate median | Ratio |
+| --- | --- | ---: | ---: | ---: |
+| Result match | check | 0.485 s | 0.390 s | 1.24x |
+| Result match | per-unit check | 0.916 s | 0.777 s | 1.18x |
+| Straight fixed arrays | check | 0.129 s | 0.128 s | 1.00x |
+| Straight fixed arrays | per-unit check | 0.273 s | 0.266 s | 1.03x |
+| Loop fixed arrays | check | 0.726 s | 0.730 s | 0.99x |
+| Loop fixed arrays | per-unit check | 1.466 s | 1.468 s | 1.00x |
+
+All 15 source MIR/raw LLVM pairs, actual checked-work outputs and four rejected
+controls agree. Numeric straight/try median differences remain below 0.32 ms;
+all 16-value controls stay within 0.4 ms. Storage control differences stay within
+6.8 ms, with small increases in both 512-value loop cases. This qualifies the
+Result-match improvement without a uniform-speedup claim. The non-Clone payload
+owner makes accidental deep-copy requirements fail compilation; actual snapshot
+owners preserve independent replacement and unique/shared owned extraction.
+Map storage, reference-count work and repeated traversal still leave superlinear
+cost; no whole-client time or runtime allocation improvement is established.
