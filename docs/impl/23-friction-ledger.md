@@ -245,6 +245,23 @@ by treating this deliberate restriction as an implementation gap.
 | Count | **6 sites, 1 program**; not a full-corpus count |
 | Status | **refused** as requested. A `trait` declaration is a behavior hook written by the programmer, which is exactly what the admissible widening shape excludes; a structural record parameter is a new type surface that the settled no-traits rule closes, and it would make admission a per-call-site declaration rather than a property of the data. The count meets the five-site half of the reopen threshold and not the two-program half (1 of 2), so it is below the threshold regardless. |
 
+### B7 — `bool` in C extern signatures
+
+| | |
+|---|---|
+| Restriction | Align `bool` is not an admitted C extern parameter or return type. |
+| Settled reference | `docs/open-questions.md`, “FFI (foreign function interface)” and its deliberate bool/char boundary; `draft.md` §15, “Not in FFI v1”. |
+| Workaround shape | A C shim translates a native boolean result into an integer returned to Align. |
+| Occurrences | Request 32 in `../align-llm/docs/align-requests.md` reports `align_ggml_gallocr_reserve` and `align_ggml_gallocr_alloc`, originally at `scripts/ggml_shim.c:1069–1090`, called from `src/ggml_ffi.align:741–754`, in the align-llm program. Evidence assessed 2026-10-07; these are the report's historical locations, not a new full-corpus scan. |
+| Count | **2 reported wrapper sites, 1 program**. The same report's native predicate requirement is not counted without a separately identified mechanical wrapper. |
+| Status | Below the five-site/two-program reopen threshold; retain the restriction. Request 32's bool request remains PROPOSED, separately from its shipped raw-field and record-value ABI capabilities. |
+
+The requested alternative `c_bool` is a new programmer-selected type and does
+not satisfy the compiler-derived widening rule. A future proposal for the
+existing `bool` would still need the occurrence threshold and an exact native
+ABI contract; the request alone does not authorize either change. Consumer
+repinning and shim removal remain consumer-owned.
+
 ## Maintaining this file
 
 - Add a row the first time a restriction produces a mechanical workaround in real
