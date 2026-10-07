@@ -1312,6 +1312,7 @@ merely because its `Ty` matches.
 | `FileLen` | `env[]; child[file]`; `File; result ERR(i64); borrowed; Impure`. |
 | `FileSync` | `env[]; child[file]`; `LocalHandle(File,file); result ERR(Unit); borrowed; Impure`. |
 | `BufferNew` | `env[fill presence]; child[capacity,fill?,alignment]`; capacity and alignment are exactly i64; present fill is u8. Omitted source alignment becomes constant 1. Result Buffer; fresh owned allocation; Pure. Children evaluate in this order with termination guards. Runtime alignment admission precedes size/allocation; absent fill retains the empty read window and present fill guarantees initialized length (plan 131). |
+| `BufferTryNew` | Plan 135: `env[fill presence]; child[capacity,fill?,alignment]`; capacity/alignment exactly i64, present fill u8, omitted alignment constant 1. Exact result `Result<Buffer,builtin Error>`; Pure independent owned Ok payload. Source-ordered children have termination guards. Native alignment/count admission precedes acquisition, and failed publication leaves no owner. Normal Result cleanup and authority apply. |
 | `BufferBytes` | `env[]; child[buffer]`; `Buffer; result bytes; view inherits buffer provenance; Pure`. |
 | `StrBytes` | `env[]; child[inner]`; `Str; result bytes; view inherits string provenance; Pure`. |
 | `BufferLen` | `env[]; child[buffer]`; `Buffer; result i64; borrowed; Pure`. |

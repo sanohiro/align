@@ -944,6 +944,10 @@ fn rvalue_str(rv: &Rvalue) -> String {
             Some(value) => format!("buffer_filled({}, {}, {})", operand_str(capacity), operand_str(value), operand_str(alignment)),
             None => format!("buffer_new({}, {})", operand_str(capacity), operand_str(alignment)),
         },
+        Rvalue::BufferTryNew { capacity, fill, alignment, out } => match fill {
+            Some(value) => format!("buffer_try_filled({}, {}, {}, -> _{out})", operand_str(capacity), operand_str(value), operand_str(alignment)),
+            None => format!("buffer_try_new({}, {}, -> _{out})", operand_str(capacity), operand_str(alignment)),
+        },
         Rvalue::BufferBytes(buf) => format!("buffer_bytes({})", operand_str(buf)),
         Rvalue::BufferLen(buf) => format!("buffer_len({})", operand_str(buf)),
         Rvalue::BufferCapacity(buf) => format!("buffer_capacity({})", operand_str(buf)),

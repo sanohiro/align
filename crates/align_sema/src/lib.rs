@@ -16916,7 +16916,7 @@ impl EffectScan<'_> {
             // Constructing a `writer`/`reader`/`buffer` is allocation only (no I/O → pure, like
             // `BuilderNew`); the reads/writes below reach the OS, so those are impure.
             ExprKind::WriterStd { .. } | ExprKind::ReaderStdin => {}
-            ExprKind::BufferNew { capacity, fill, alignment } => {
+            ExprKind::BufferNew { capacity, fill, alignment } | ExprKind::BufferTryNew { capacity, fill, alignment } => {
                 walk!(capacity);
                 if let Some(fill) = fill { walk!(fill); }
                 walk!(alignment);
@@ -25211,7 +25211,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. }
             | ExprKind::FilePwrite { .. }
             | ExprKind::FileLen { .. } | ExprKind::FileSync { .. }
-            | ExprKind::BufferNew { .. }
+            | ExprKind::BufferNew { .. } | ExprKind::BufferTryNew { .. }
             | ExprKind::BufferLen { .. } | ExprKind::BufferCapacity { .. }
             | ExprKind::BytesRead { .. }
             | ExprKind::BytesSet { .. }
@@ -25685,7 +25685,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. }
             | ExprKind::FilePwrite { .. }
             | ExprKind::FileLen { .. } | ExprKind::FileSync { .. }
-            | ExprKind::BufferNew { .. }
+            | ExprKind::BufferNew { .. } | ExprKind::BufferTryNew { .. }
             | ExprKind::BufferLen { .. } | ExprKind::BufferCapacity { .. }
             | ExprKind::BytesRead { .. }
             | ExprKind::BytesSet { .. }
@@ -29685,7 +29685,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(length, depth);
                 self.walk(value, depth);
             }
-            ExprKind::BufferNew { capacity, fill, alignment } => {
+            ExprKind::BufferNew { capacity, fill, alignment } | ExprKind::BufferTryNew { capacity, fill, alignment } => {
                 self.walk(capacity, depth);
                 if let Some(fill) = fill { self.walk(fill, depth); }
                 self.walk(alignment, depth);
@@ -31949,7 +31949,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. }
         | ExprKind::FilePwrite { .. }
         | ExprKind::FileLen { .. } | ExprKind::FileSync { .. }
-        | ExprKind::BufferNew { .. }
+        | ExprKind::BufferNew { .. } | ExprKind::BufferTryNew { .. }
         | ExprKind::BufferLen { .. } | ExprKind::BufferCapacity { .. }
         | ExprKind::BytesRead { .. }
         | ExprKind::BytesSet { .. }
@@ -41026,7 +41026,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::FrameInnerJoin { .. }
             | ExprKind::IoCopy { .. } | ExprKind::FileCreateRw { .. }
             | ExprKind::FileOpenRw { .. } | ExprKind::FileOpenRo { .. } | ExprKind::FileCreateRwExclusive { .. } | ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. } | ExprKind::FilePwrite { .. }
-            | ExprKind::FileLen { .. } | ExprKind::FileSync { .. } | ExprKind::BufferNew { .. } | ExprKind::BufferLen { .. } | ExprKind::BufferCapacity { .. }
+            | ExprKind::FileLen { .. } | ExprKind::FileSync { .. } | ExprKind::BufferNew { .. } | ExprKind::BufferTryNew { .. } | ExprKind::BufferLen { .. } | ExprKind::BufferCapacity { .. }
             | ExprKind::BytesRead { .. }
             | ExprKind::BytesSet { .. }
             | ExprKind::BytesFill { .. }
@@ -47213,7 +47213,7 @@ impl<'a> MoveCheck<'a> {
                     self.invalidate_storage(buffer);
                 }
             }
-            ExprKind::BufferNew { capacity, fill, alignment } => {
+            ExprKind::BufferNew { capacity, fill, alignment } | ExprKind::BufferTryNew { capacity, fill, alignment } => {
                 move_expr!(self, capacity, moved, false, false);
                 if let Some(fill) = fill { move_expr!(self, fill, moved, false, false); }
                 move_expr!(self, alignment, moved, false, false);
@@ -54274,6 +54274,9 @@ impl<'a, 't> Checker<'a, 't> {
             && let Some(module) = single_name(p)
             && !self.name_in_scope(module)
         {
+            if module == "buffer" && matches!(method, "try_new" | "try_filled") {
+                return self.check_buffer_try_new(method, args, span);
+            }
             if module == "buffer" && method == "filled" {
                 if !(2..=3).contains(&args.len()) {
                     self.diags.error("'buffer.filled' expects length, byte value, and optional alignment".to_string(), span);
@@ -61150,6 +61153,34 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         Expr { kind: ExprKind::BufferNew { capacity: Box::new(capacity), fill: None, alignment: Box::new(alignment) }, ty: Ty::Buffer, span }
+    }
+
+    fn check_buffer_try_new(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let filled = method == "try_filled";
+        let required = if filled { 2 } else { 1 };
+        if !(required..=required + 1).contains(&args.len()) {
+            self.diags.error(format!("'buffer.{method}' expects {} and optional alignment",
+                if filled { "length and byte value" } else { "capacity" }), span);
+            return err;
+        }
+        let integer = Ty::Int(IntTy { bits: 64, signed: true });
+        let byte = Ty::Int(IntTy { bits: 8, signed: false });
+        let Some(size) = args.first() else { return err; };
+        let capacity = self.check_expr(size, Some(integer));
+        let fill = if filled {
+            let Some(value) = args.get(1) else { return err; };
+            Some(Box::new(self.check_expr(value, Some(byte))))
+        } else { None };
+        let alignment = self.check_buffer_alignment(args.get(required), span);
+        if self.resolve(capacity.ty) != integer || self.resolve(alignment.ty) != integer
+            || fill.as_ref().is_some_and(|value| self.resolve(value.ty) != byte) {
+            return err;
+        }
+        Expr {
+            kind: ExprKind::BufferTryNew { capacity: Box::new(capacity), fill, alignment: Box::new(alignment) },
+            ty: Ty::Result(Scalar::Buffer, Scalar::Enum(self.error_enum_id)), span,
+        }
     }
 
     fn check_buffer_alignment(&mut self, argument: Option<&ast::Expr>, span: Span) -> Expr {
@@ -70889,7 +70920,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(length);
                 self.finalize_expr(value);
             }
-            ExprKind::BufferNew { capacity, fill, alignment } => {
+            ExprKind::BufferNew { capacity, fill, alignment } | ExprKind::BufferTryNew { capacity, fill, alignment } => {
                 self.finalize_expr(capacity);
                 if let Some(fill) = fill { self.finalize_expr(fill); }
                 self.finalize_expr(alignment);
@@ -76936,14 +76967,22 @@ mod tests {
         // FloatScope is an explicit forwarding wrapper with no storage of its own.
         // HttpServerMaxRequestBodyBytes mutates a server setting and returns Unit.
         // FileSync and WriterSync borrow native owners and return unit/Error.
+        // BufferTryNew owns its Result payload and retains no input storage.
         // BufferCapacity is a non-retaining scalar observation of a borrowed owner.
         // HTTP timeout setters borrow an existing owner and return unit/Error.
         // OsMemory observes only Copy counts and retains no storage.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 352,
+            variants, 353,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
+
+        for filled in [false, true] {
+            let child = || Box::new(Expr { kind: ExprKind::Int(1), ty: Ty::Int(IntTy { bits: 64, signed: true }), span: Span::new(0, 0, 0) });
+            assert_eq!(storage_variant_policy(&ExprKind::BufferTryNew {
+                capacity: child(), fill: filled.then(child), alignment: child(),
+            }), StorageVariantPolicy::Fresh(StorageContentInitializer::Missing));
+        }
 
         for available in [false, true] {
             assert_eq!(storage_variant_policy(&ExprKind::OsMemory { available }),

@@ -33,6 +33,8 @@ enum NativeReturn {
 enum RuntimeAbiShape {
     BufferAppendFilled,
     BufferFilled,
+    BufferTryFilled,
+    BufferTryNew,
     ArrayBuilderCapacity,
     ArrayBuilderRegionCapacity,
     ArrayBuilderStackCapacity,
@@ -368,6 +370,8 @@ fn runtime_effects(id: RuntimeAbiId) -> RuntimeEffects {
         RuntimeAbiId::Keyed(RuntimeKey::BufferLen) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::BufferNew) => RuntimeEffects { class: EffectClass::AllocNew, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: true, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::BufferPut) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BufferTryFilled) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BufferTryNew) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[2], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::BuilderFinish) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::BuilderFinishStack) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::BuilderFree) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::Indirect, returns_fresh: false, diverges: false },
@@ -1223,6 +1227,8 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
             symbol: "align_rt_buffer_put",
             shape: RuntimeAbiShape::A67,
         },
+        RuntimeKey::BufferTryFilled => RuntimeAbi { key, symbol: "align_rt_buffer_try_filled", shape: RuntimeAbiShape::BufferTryFilled },
+        RuntimeKey::BufferTryNew => RuntimeAbi { key, symbol: "align_rt_buffer_try_new", shape: RuntimeAbiShape::BufferTryNew },
         RuntimeKey::BuilderFinish => RuntimeAbi {
             key,
             symbol: "align_rt_builder_finish",
@@ -3128,15 +3134,15 @@ fn validate_effects(abi: RuntimeAbi, effects: RuntimeEffects) -> Result<(), Stri
 }
 
 pub(super) fn validate_registry() -> Result<(), String> {
-    if RuntimeKey::ALL.len() != 458 || keyed_runtime_abis().len() != 458 {
+    if RuntimeKey::ALL.len() != 460 || keyed_runtime_abis().len() != 460 {
         return Err("runtime ABI registry invariant: key-count".to_string());
     }
-    if runtime_abis().count() != 476 {
+    if runtime_abis().count() != 478 {
         return Err("runtime ABI registry invariant: base-count".to_string());
     }
 
     let mut keys = HashSet::with_capacity(RuntimeKey::ALL.len());
-    let mut symbols = HashSet::with_capacity(476);
+    let mut symbols = HashSet::with_capacity(478);
     for abi in keyed_runtime_abis() {
         validate_effects(abi, runtime_effects(abi.key))?;
         let key = abi
@@ -3873,6 +3879,12 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
             params: &[NativeType::Ptr, NativeType::I64, NativeType::U8],
         },
+        RuntimeAbiShape::BufferTryFilled => RuntimeAbiShapeSpec {
+            ret: NativeReturn::I32, params: &[NativeType::I64, NativeType::U8, NativeType::I64, NativeType::Ptr],
+        },
+        RuntimeAbiShape::BufferTryNew => RuntimeAbiShapeSpec {
+            ret: NativeReturn::I32, params: &[NativeType::I64, NativeType::I64, NativeType::Ptr],
+        },
         RuntimeAbiShape::BufferFilled => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,
             params: &[NativeType::I64, NativeType::U8, NativeType::I64],
@@ -4460,17 +4472,17 @@ mod tests {
         );
         validate_registry().unwrap_or_else(|error| panic!("valid runtime registry: {error}"));
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 476);
+        assert_eq!(rows.len(), 478);
         assert_eq!(
             rows.iter().map(|row| row.key).collect::<HashSet<_>>().len(),
-            476
+            478
         );
         assert_eq!(
             rows.iter()
                 .map(|row| row.symbol)
                 .collect::<HashSet<_>>()
                 .len(),
-            476
+            478
         );
         for (key, row) in RuntimeKey::ALL.into_iter().zip(keyed_runtime_abis()) {
             assert_eq!(row.key, RuntimeAbiId::Keyed(key));
@@ -4499,7 +4511,7 @@ mod tests {
     #[test]
     fn runtime_effects_registry_is_total_and_structurally_valid() {
         validate_registry().unwrap();
-        assert_eq!(runtime_abis().map(|abi| runtime_effects(abi.key)).count(), 476);
+        assert_eq!(runtime_abis().map(|abi| runtime_effects(abi.key)).count(), 478);
 
         let expect_rule = |abi, effects, rule: &str| {
             let error = validate_effects(abi, effects).unwrap_err();
@@ -4626,7 +4638,7 @@ mod tests {
     fn runtime_abi_extern_type_matrix_is_exact_for_every_row_and_ordinal() {
         let ctx = inkwell::context::Context::create();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 476);
+        assert_eq!(rows.len(), 478);
 
         for row in rows {
             let symbol = row.symbol;
@@ -4681,6 +4693,7 @@ mod tests {
         let rows = [
             ("align_rt_buffer_append_filled", vec![2]),
             ("align_rt_buffer_filled", vec![1]),
+            ("align_rt_buffer_try_filled", vec![1]),
             ("align_rt_command_new_session", vec![1]),
             ("align_rt_fs_directory_access", vec![1, 2, 3]),
             ("align_rt_fs_directory_access_at", vec![3, 4, 5]),

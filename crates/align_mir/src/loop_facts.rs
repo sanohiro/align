@@ -325,7 +325,7 @@ macro_rules! unmodelled_rvalues {
         Rvalue::RegexCompile { .. } | Rvalue::RegexIsMatch { .. } | Rvalue::RegexFind { .. } |
         Rvalue::RegexFindAll { .. } | Rvalue::RegexSplit { .. } | Rvalue::RegexReplace { .. } |
         Rvalue::RegexCaptures { .. } | Rvalue::RegexGroupCount { .. } | Rvalue::RegexGroupIndex { .. } |
-        Rvalue::CapturesGroup { .. } | Rvalue::EncodingDecode { .. } | Rvalue::CompressCompress { .. } |
+        Rvalue::CapturesGroup { .. } | Rvalue::BufferTryNew { .. } | Rvalue::EncodingDecode { .. } | Rvalue::CompressCompress { .. } |
         Rvalue::CompressDecompress { .. } | Rvalue::Utf8Valid { .. } | Rvalue::CryptoCtEqual { .. } |
         Rvalue::CryptoRandom { .. } | Rvalue::CryptoHash { .. } | Rvalue::CryptoHmac { .. } |
         Rvalue::CryptoHkdf { .. } | Rvalue::CryptoAead { .. } | Rvalue::CryptoArgon2 { .. } |

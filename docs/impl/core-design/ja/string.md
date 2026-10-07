@@ -164,6 +164,23 @@ slice<T>.as_bytes() -> slice<u8>
 `align(N)` は構造体と固定配列の格納領域属性のままで、バッファのペイロードは
 コンストラクタ引数で直接指定する。[plan 131](../../131-aligned-buffer-payload.md) を参照。
 
+`buffer.try_new(capacity: i64, alignment: i64 = 1) -> Result<buffer, Error>` と
+`buffer.try_filled(length: i64, value: u8, alignment: i64 = 1) -> Result<buffer, Error>`
+は、Pure な明示的失敗可能構築を提供する（plan 135）。サイズは必須で、最後の
+alignment のみ省略可能。引数はソース順に一度ずつ評価する。まず alignment が
+1..536870912 の2の累乗であること、次に個数が非負でアラインメント丸めを含む
+対象の割り当て Layout に収まることを検証する。不正な入力は割り当て前に
+`Error.Invalid` を返す。ペイロードまたは管理領域の確保失敗は
+`Error.Code(ENOMEM)`（対応 Linux/macOS では12）を返し、管理領域の失敗時には
+取得済みペイロードを解放する。成功値は独立した Move buffer を所有する。
+`try_new` の長さは0、読み取り容量は capacity と一致し、`try_filled` の
+長さと容量は length と一致して全バイトが value で初期化される。ゼロ長には
+ペイロードが不要だが管理領域は必要。非ゼロでは各1回の確保を行い、filled の
+初期化は O(length)。アラインメント、移動、Drop、ビューは既存規則に従う。
+既存コンストラクタと後続の拡張の失敗ポリシーは変わらない。成功は物理メモリの
+常駐、後続の拡張、OS によるプロセス終了や初期化時の overcommit 失敗からの
+回復を保証しない。
+
 `b.capacity() -> i64` は現在の読み取りウィンドウ容量を返す、引数なしの Pure な
 非消費クエリである。初期化済みの `b.len()` とは独立し、追加確保やビューの保持は
 ない。既存の安定したローカル・フィールド・借用ペイロードの受信者規則に従う。

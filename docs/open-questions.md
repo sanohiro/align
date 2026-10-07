@@ -208,6 +208,21 @@ initialization and view invalidation are unchanged. align(N) keeps its existing
 struct/fixed-array meaning. Recoverable OOM, aligned interior offsets and a
 portable performance improvement are not supplied by this capability.
 
+### Recoverable owned buffer construction
+
+[Plan 135](impl/135-fallible-buffer-construction.md) settles explicit fallible construction:
+`buffer.try_new(capacity: i64, alignment: i64 = 1)` and
+`buffer.try_filled(length: i64, value: u8, alignment: i64 = 1)` return
+`Result<buffer, Error>`. Both are Pure; supplied arguments evaluate once in source
+order. Alignment 1..536870912 power-of-two admission precedes nonnegative,
+target-Layout-representable count admission. Invalid returns Error.Invalid before
+allocation. Payload or handle allocator refusal returns Error.Code(ENOMEM);
+handle refusal cleans any payload. Success owns one independent Move buffer,
+with exact initial capacity, zero new length or fully initialized filled length.
+Zero acquires only a handle. Alignment and canonical Drop follow the owner.
+Ordinary constructors/growth retain their existing policies; physical residency,
+OS termination recovery and fallible growth are outside this capability.
+
 ### Scalar inspection and explicit capacity (issue batch 1049–1053)
 
 Settled by plan 65: scalar f32/f64 `to_bits`, `is_finite`, `is_nan`,

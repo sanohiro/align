@@ -198,6 +198,24 @@ speed, or strengthen LLVM view-load assumptions. `align(N)` remains the
 struct/fixed-array storage attribute; constructor arguments select buffer payload
 storage directly. See [plan 131](../131-aligned-buffer-payload.md).
 
+`buffer.try_new(capacity: i64, alignment: i64 = 1) -> Result<buffer, Error>`
+and `buffer.try_filled(length: i64, value: u8, alignment: i64 = 1) -> Result<buffer, Error>`
+provide Pure, explicit fallible construction (plan 135). Size is required;
+alignment is the optional final argument. Arguments evaluate once in source
+order. Admission first checks power-of-two alignment 1..536870912, then a
+nonnegative count representable by the target allocation layout, including
+alignment rounding. Invalid admission returns `Error.Invalid` before allocation.
+Allocator refusal for either payload or handle returns `Error.Code(ENOMEM)`
+(12 on supported Linux/macOS); handle refusal releases any acquired payload.
+Success owns an independent Move buffer: `try_new` has length zero and usable
+capacity exactly capacity; `try_filled` has length/capacity exactly length and
+all bytes initialized to value. Zero needs no payload but still needs a handle;
+nonzero uses one payload and one handle acquisition. Filled initialization takes
+O(length) work. Alignment, move, Drop and view rules are the existing buffer rules.
+Existing constructors and later growth retain their failure policies. Success
+does not promise physical residency, later growth, or recovery from OS process
+termination/overcommit failure during initialization.
+
 `b.capacity() -> i64` is a Pure, zero-argument, nonconsuming query of a
 buffer's usable read-window capacity, independent of initialized `b.len()`.
 The existing stable local/field and borrowed-payload receiver rules apply;

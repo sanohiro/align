@@ -16721,6 +16721,22 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.apply_native_call_attributes(key, call);
                 call.try_as_basic_value().basic().expect("buffer_new returns a pointer")
             }
+            Rvalue::BufferTryNew { capacity, fill, alignment, out } => {
+                let mut args = vec![self.operand(capacity)?.into()];
+                let key = if let Some(fill) = fill {
+                    args.push(self.operand(fill)?.into());
+                    RuntimeKey::BufferTryFilled
+                } else { RuntimeKey::BufferTryNew };
+                args.push(self.operand(alignment)?.into());
+                let out_ptr = *self.slots.get(out).ok_or_else(|| self.err("missing buffer output slot"))?;
+                self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
+                    .map_err(|e| self.err(e))?;
+                args.push(out_ptr.into());
+                let call = self.builder.build_call(self.runtime(key), &args, "buffer_status")
+                    .map_err(|e| self.err(e))?;
+                self.apply_native_call_attributes(key, call);
+                call.try_as_basic_value().basic().ok_or_else(|| self.err("buffer constructor returned no status"))?
+            }
             Rvalue::BufferBytes(buf) => {
                 // The runtime writes the `{ptr,len}` view into a stack slot; load it back.
                 let bp = self.operand(buf)?.into();
@@ -31597,6 +31613,47 @@ fn main() -> i32 = 0
                 );
             }
         }
+    }
+
+    #[test]
+    fn fallible_buffer_mir_contract() -> Result<(), &'static str> {
+        for constructor in ["buffer.try_new(4)", "buffer.try_filled(4, 0)", "buffer.try_new(4, 0)"] {
+            let local = mir(&format!("fn f() -> u32 {{ mut b := {constructor} else {{ return 0 }}; b.put_u32_le(7); return b.bytes().u32_le(0) }}"));
+            let ir = emit_llvm_ir(&local, &BuildTarget::Baseline, Profile::Release, false, &[], None).map_err(|_| "local fallible construction")?;
+            assert_eq!(ir.matches("call i32 @align_rt_buffer_try_").count(), 1, "fallible admission cannot be stack-promoted");
+        }
+        for constructor in ["buffer.try_new(3, alignment)", "buffer.try_filled(3, 7, alignment)"] {
+            let base = mir(&format!("fn f(alignment: i64) -> Result<buffer, Error> = {constructor}\nfn main() {{}}"));
+            let ir = emit_llvm_ir(&base, &BuildTarget::Baseline, Profile::Release, false, &[], None).map_err(|_| "valid fallible buffer MIR")?;
+            assert!(ir.contains("call i32 @align_rt_buffer_try_"));
+            assert!(!ir.contains("call ptr @align_rt_buffer_new("));
+            for mutation in 0..9 {
+                let mut bad = base.clone();
+                let mut changed = false;
+                for function in &mut bad.fns {
+                    for block in &mut function.blocks {
+                        for statement in &mut block.stmts {
+                            let Stmt::Let(value, Rvalue::BufferTryNew { alignment, capacity, fill, out }) = statement else { continue; };
+                            changed = true;
+                            match mutation {
+                                0 => *alignment = Operand::Const(Const::Bool(false)),
+                                1 => *alignment = Operand::Value(u32::MAX),
+                                2 => *alignment = Operand::Const(Const::Int(64, Ty::Int(IntTy { bits: 64, signed: false }))),
+                                3 => *capacity = Operand::Const(Const::Unit),
+                                4 => *capacity = Operand::Value(u32::MAX),
+                                5 => *fill = Some(Operand::Const(Const::Bool(false))),
+                                6 => *out = u32::MAX,
+                                7 => *function.slots.get_mut(usize::try_from(*out).map_err(|_| "slot index")?).ok_or("output type")? = Ty::String,
+                                _ => *function.value_tys.get_mut(usize::try_from(*value).map_err(|_| "value index")?).ok_or("status type")? = Ty::Int(IntTy { bits: 64, signed: true }),
+                            }
+                        }
+                    }
+                }
+                assert!(changed);
+                assert_xml_producer_rejected(&bad, &format!("fallible-buffer/{mutation}"));
+            }
+        }
+        Ok(())
     }
 
     #[test]

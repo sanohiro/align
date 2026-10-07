@@ -7,6 +7,10 @@ read-address penalty motivates selecting the allocation rather than padding
 each consumer's window. Consumer code, pins and qualification remain external.
 Alignment alone makes no throughput, physical residency or GPU promise.
 
+[Plan 135](135-fallible-buffer-construction.md) separately specifies recoverable
+construction through try_new/try_filled. This record retains the ordinary
+constructors' best-effort/terminal behavior and the shared alignment guarantee.
+
 ## Public-contract ledger
 
 Declarations (the last argument is optional builtin syntax, not a new language

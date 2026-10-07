@@ -12281,8 +12281,9 @@ fn request11_expr_kind_inventory_tripwire() {
         // FloatScope, BytesView, SliceAsBytes, and HttpServerMaxRequestBodyBytes are explicit in
         // validation, source-shape, replay and ownership. OsMemory adds one nullary
         // Copy Result family with explicit checked-HIR validation and no retained storage.
+        // BufferTryNew adds one explicit fallible owned-buffer construction family.
         variants,
-        352,
+        353,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -19829,4 +19830,30 @@ fn buffer_alignment_hir_requires_exact_operand_and_result() {
             assert_body_entrypoints_empty("buffer-alignment-forged", &malformed);
         }
     }
+}
+
+#[test]
+fn fallible_buffer_hir_contract() -> Result<(), &'static str> {
+    for constructor in ["buffer.try_new(3, alignment)", "buffer.try_filled(3, 7, alignment)"] {
+        let source = format!("fn f(alignment: i64) -> Result<buffer, Error> {{ b := {constructor}; return b }}");
+        let base = checked_source_program(&source);
+        assert!(!is_empty(&lower_program(&base)));
+        for mutation in 0..8 {
+            let mut malformed = base.clone();
+            let expression = body_first_let_init_mut(&mut malformed, "f");
+            let hir::ExprKind::BufferTryNew { capacity, fill, alignment } = &mut expression.kind else { return Err("fallible buffer fixture"); };
+            match mutation {
+                0 => capacity.ty = Ty::Bool,
+                1 => capacity.kind = hir::ExprKind::Local(u32::MAX),
+                2 => alignment.ty = Ty::Int(IntTy { bits: 64, signed: false }),
+                3 => alignment.kind = hir::ExprKind::Bool(false),
+                4 => *fill = Some(Box::new(hir::Expr { kind: hir::ExprKind::Bool(false), ty: Ty::Bool, span: expression.span })),
+                5 => expression.ty = Ty::Buffer,
+                6 => expression.ty = Ty::Result(Scalar::String, Scalar::Bool),
+                _ => expression.ty = Ty::Result(Scalar::Buffer, Scalar::Bool),
+            }
+            assert_body_entrypoints_empty(&format!("fallible-buffer-{mutation}"), &malformed);
+        }
+    }
+    Ok(())
 }

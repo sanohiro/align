@@ -1128,6 +1128,11 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             fill: match fill { Some(value) => Some(boxed!(value)), None => None },
             alignment: boxed!(alignment),
         },
+        ExprKind::BufferTryNew { capacity, fill, alignment } => ExprKind::BufferTryNew {
+            capacity: boxed!(capacity),
+            fill: match fill { Some(value) => Some(boxed!(value)), None => None },
+            alignment: boxed!(alignment),
+        },
         ExprKind::BufferBytes { buffer } => ExprKind::BufferBytes {
             buffer: boxed!(buffer),
         },
@@ -2860,7 +2865,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         }
         ExprKind::BorrowedIndex { index, .. } => one!(index),
         ExprKind::ArrayBuilderNew { region, capacity, .. } => { optional!(region); one!(capacity); }
-        ExprKind::BufferNew { capacity, fill, alignment } => { one!(capacity); optional!(fill); one!(alignment); }
+        ExprKind::BufferNew { capacity, fill, alignment } | ExprKind::BufferTryNew { capacity, fill, alignment } => { one!(capacity); optional!(fill); one!(alignment); }
         ExprKind::BuilderNew { capacity } => optional!(capacity),
         ExprKind::SliceRange { recv, start, end } => {
             one!(recv);
