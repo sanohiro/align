@@ -1,6 +1,6 @@
 # Compiler check-time scaling measurement
 
-This local benchmark owns plan 21 items 11–19 checking measurements. It
+This local benchmark owns plan 21 items 11–20 checking measurements. It
 compares release compiler binaries on the same generated straight arithmetic,
 Result `?`, and Result `match` chains inside a loop. Each case uses 16, 128 or
 512 values. `--corpus storage` selects fixed-array declarations in straight-line
@@ -264,3 +264,31 @@ compares complete published body facts, cleanup metadata and ordered diagnostics
 against the original terminal-probing algorithm; a disabled-skip mutation must
 fail its actual probe-count assertion. Nonterminal state copies and repeated
 traversals remain superlinear; no whole-client time budget is established.
+
+## Item 20 result (2026-10-07)
+
+The same host/profile compares merged
+`2518ca3d1c084538611024b4f87d035ecd032ab3` with union-size lower-bound
+reservation and exact-equality construction guards in escape-state joins.
+No build/test jobs overlap measurement; `DYLD_SHARED_REGION` is unset for both
+binaries. Numeric and storage corpora run with `--llvm-parity`.
+[Full samples and hashes](results-join-cost-macos.json) retain all 30 cells with
+five alternating samples after warmup from the final implementation.
+
+| 512-value shape | Command | Baseline median | Candidate median | Ratio |
+| --- | --- | ---: | ---: | ---: |
+| Result match | check | 0.976 s | 0.784 s | 1.25x |
+| Result match | per-unit check | 1.802 s | 1.421 s | 1.27x |
+| Straight fixed arrays | check | 0.129 s | 0.128 s | 1.01x |
+| Straight fixed arrays | per-unit check | 0.280 s | 0.266 s | 1.05x |
+| Loop fixed arrays | check | 0.743 s | 0.727 s | 1.02x |
+| Loop fixed arrays | per-unit check | 1.496 s | 1.464 s | 1.02x |
+
+All 15 source MIR/raw LLVM pairs, actual checked-work outputs and four rejected
+controls agree. Numeric straight/try median differences remain below 2 ms;
+all 16-value controls stay within 0.5 ms. Direct self-join owners independently
+check idempotence before the equality guard can hide a defect. Capacity and
+actual construction-call owners fail when either optimization is disabled.
+The same fact lattice, missing-input rules and exact change detector remain.
+State copies and repeated traversal still leave superlinear work; no whole-client
+time budget or runtime allocation improvement is established.

@@ -18856,6 +18856,29 @@ struct EscapeState {
 }
 
 impl EscapeState {
+    fn reserve_join<K: Eq + std::hash::Hash, V>(
+        current: &mut std::collections::HashMap<K, V>,
+        incoming_len: usize,
+    ) {
+        // Their union contains at least as many keys as either input.
+        current.reserve(incoming_len.saturating_sub(current.len()));
+    }
+
+    /// Every caller supplies an idempotent fact join. Equal operands need no construction;
+    /// unequal operands still need the ordinary join, even when its output is unchanged.
+    fn join_value<V: Eq>(current: &mut V, incoming: &V, join: impl FnOnce(&V, &V) -> V) -> bool {
+        if current == incoming {
+            return false;
+        }
+        let next = join(current, incoming);
+        if *current == next {
+            false
+        } else {
+            *current = next;
+            true
+        }
+    }
+
     /// The final initial successor can own the output directly. Earlier successors need
     /// independent copies; a present input retains the ordinary finite join.
     fn merge_input(input: &mut Option<Self>, output: &mut Self, last_successor: bool) -> bool {
@@ -18875,25 +18898,17 @@ impl EscapeState {
     /// Apply the same finite join in place. The worklist needs an exact change bit, not a
     /// second complete state. Exhaustive destructuring keeps future fields in this inventory.
     fn join_from(&mut self, other: &Self) -> bool {
-        fn update<V: PartialEq>(current: &mut V, next: V) -> bool {
-            if *current == next {
-                false
-            } else {
-                *current = next;
-                true
-            }
-        }
-        fn hash_join<K: Eq + std::hash::Hash + Clone, V: Clone + PartialEq>(
+        fn hash_join<K: Eq + std::hash::Hash + Clone, V: Clone + Eq>(
             current: &mut std::collections::HashMap<K, V>,
             incoming: &std::collections::HashMap<K, V>,
             join: impl std::ops::Fn(&V, &V) -> V,
         ) -> bool {
+            EscapeState::reserve_join(current, incoming.len());
             let mut changed = false;
             for (key, value) in incoming {
                 match current.entry(key.clone()) {
                     std::collections::hash_map::Entry::Occupied(mut entry) => {
-                        let next = join(entry.get(), value);
-                        changed |= update(entry.get_mut(), next);
+                        changed |= EscapeState::join_value(entry.get_mut(), value, &join);
                     }
                     std::collections::hash_map::Entry::Vacant(entry) => {
                         entry.insert(value.clone());
@@ -18903,7 +18918,7 @@ impl EscapeState {
             }
             changed
         }
-        fn tree_join<K: Ord + Clone, V: Clone + PartialEq>(
+        fn tree_join<K: Ord + Clone, V: Clone + Eq>(
             current: &mut std::collections::BTreeMap<K, V>,
             incoming: &std::collections::BTreeMap<K, V>,
             join: impl std::ops::Fn(&V, &V) -> V,
@@ -18912,8 +18927,7 @@ impl EscapeState {
             for (key, value) in incoming {
                 match current.entry(key.clone()) {
                     std::collections::btree_map::Entry::Occupied(mut entry) => {
-                        let next = join(entry.get(), value);
-                        changed |= update(entry.get_mut(), next);
+                        changed |= EscapeState::join_value(entry.get_mut(), value, &join);
                     }
                     std::collections::btree_map::Entry::Vacant(entry) => {
                         entry.insert(value.clone());
@@ -18987,8 +19001,7 @@ impl EscapeState {
         for (local, current) in backing_storage.iter_mut() {
             let unknown = EscapeBackingStorage::unknown();
             let incoming = other.backing_storage.get(local).unwrap_or(&unknown);
-            let next = current.join(incoming);
-            changed |= update(current, next);
+            changed |= Self::join_value(current, incoming, EscapeBackingStorage::join);
         }
         for (&local, incoming) in &other.backing_storage {
             if let std::collections::hash_map::Entry::Vacant(entry) = backing_storage.entry(local) {
@@ -81148,6 +81161,63 @@ fn main() -> i32 = 0
     }
 
     #[test]
+    fn escape_join_reserves_union_lower_bound() {
+        for current_len in [0, 1, 16, 128] {
+            for incoming_len in [0, 1, 16, 128, 257] {
+                let mut current: std::collections::HashMap<usize, usize> =
+                    (0..current_len).map(|key| (key, key + 1)).collect();
+                let facts = current.clone();
+                let previous_capacity = current.capacity();
+                EscapeState::reserve_join(&mut current, incoming_len);
+                assert_eq!(current, facts, "reservation changed facts");
+                assert!(current.capacity() >= current_len.max(incoming_len));
+                if incoming_len <= previous_capacity {
+                    assert_eq!(current.capacity(), previous_capacity);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn escape_join_skips_only_equal_construction() {
+        let mut current = vec![1, 2];
+        let incoming = current.clone();
+        let address = current.as_ptr();
+        assert!(!EscapeState::join_value(&mut current, &incoming, |_, _| {
+            panic!("equal operands must not construct a joined value")
+        }));
+        assert_eq!(current.as_ptr(), address);
+        assert_eq!(incoming, [1, 2]);
+
+        for (incoming, expected, changed) in [
+            (vec![2], vec![1, 2], false),
+            (vec![3], vec![1, 2, 3], true),
+        ] {
+            let mut current = vec![1, 2];
+            let address = current.as_ptr();
+            let calls = std::cell::Cell::new(0);
+            let actual = EscapeState::join_value(&mut current, &incoming, |left, right| {
+                calls.set(calls.get() + 1);
+                left.iter()
+                    .chain(right)
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect()
+            });
+            assert_eq!(
+                calls.get(), 1,
+                "unequal inputs always require their ordinary join"
+            );
+            assert_eq!(actual, changed);
+            assert_eq!(current, expected);
+            if !changed {
+                assert_eq!(current.as_ptr(), address);
+            }
+        }
+    }
+
+    #[test]
     fn escape_state_join_preserves_facts_changes_and_storage() {
         fn verify(name: &str, left: EscapeState, right: EscapeState, expected: EscapeState) {
             for (mut current, incoming) in [(left.clone(), right.clone()), (right, left)] {
@@ -81252,6 +81322,28 @@ fn main() -> i32 = 0
         let a = fact(long, true, BorrowEnd::Dropped);
         let b = fact(short, false, BorrowEnd::Consumed);
         let joined = b.clone();
+        // Call the original joins directly: the optimized equality guard cannot prove
+        // its own idempotence precondition. Exercise empty, unknown and projected facts.
+        for seed in 0..32 {
+            let mut value = if seed & 1 == 0 { a.clone() } else { b.clone() };
+            value.individual = seed & 2 != 0;
+            value.may_individual = seed & 4 != 0;
+            value.storage_is_local = seed & 8 != 0;
+            value.non_storage.direct = (seed & 16 != 0).then_some(short);
+            for leaf in value.headers.leaves.values_mut() {
+                leaf.known = seed & 2 != 0;
+                leaf.descriptor = (seed & 4 != 0).then_some(descriptor);
+                if seed & 8 != 0 {
+                    leaf.fallback_roots.insert(BorrowRoot::ReadOnly);
+                }
+                if seed & 16 != 0 {
+                    leaf.generations.clear();
+                }
+            }
+            assert_eq!(value.join(&value), value);
+        }
+        let empty = EscapeValueFact::default();
+        assert_eq!(empty.join(&empty), empty);
         map_cases!(storage_values, 7, 8, a.clone(), b.clone(), joined.clone());
         map_cases!(
             storage_argument_snapshots,
@@ -81289,6 +81381,16 @@ fn main() -> i32 = 0
                 ended,
             }
         };
+        for ended in [None, Some(BorrowEnd::Dropped), Some(BorrowEnd::Consumed)] {
+            for individual in [false, true] {
+                for locals in [&[][..], &[7, 8][..]] {
+                    let mut value = entry(long, short, individual, ended, locals);
+                    assert_eq!(value.join(&value), value);
+                    value.descriptor = None;
+                    assert_eq!(value.join(&value), value);
+                }
+            }
+        }
         map_cases!(
             storage.directory.entries,
             generation.clone(),
@@ -81301,6 +81403,13 @@ fn main() -> i32 = 0
             direct_regions: EscapeRegionFact::at_path(&[BorrowProjection::ArrayElement(0)], region),
             dependencies: headers.clone(),
         };
+        for value in [
+            contents(long),
+            contents(short),
+            EscapeGenerationContent::default(),
+        ] {
+            assert_eq!(value.join(&value), value);
+        }
         map_cases!(
             storage.contents.entries,
             generation.clone(),
@@ -81319,6 +81428,22 @@ fn main() -> i32 = 0
             individual,
             may_individual: true,
         };
+        for region in [Region::Static, long, short, Region::Frame] {
+            for individual in [false, true] {
+                let value = snapshot(region, long, individual);
+                assert!(value.join(&value) == value);
+            }
+            for known in [false, true] {
+                let value = EscapeBackingStorage {
+                    region,
+                    roots: [7, 8].into_iter().collect(),
+                    known,
+                };
+                assert!(value.join(&value) == value);
+            }
+        }
+        let unknown = EscapeArgumentSnapshot::fail_closed();
+        assert!(unknown.join(&unknown) == unknown);
         map_cases!(
             argument_snapshots,
             (7, 0),

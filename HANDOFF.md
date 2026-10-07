@@ -24,18 +24,16 @@ LLVM owners qualify it. Plan138 supplies the ARM64 Linux/macOS sibling ABI;
 plan137 supplies non-owning raw fields and padding/register separation. Bool/char
 FFI, consumer adoption and K1/plan61 remain deferred.
 
-Build-performance items15–19 remove both generation-formation table copies
-through complete prevalidation and direct commit, preserve unaffected generation
-leaf collections, skip empty generation-ending propagation after directory
-updates, and retain terminal escape blocks for final replay without duplicate
-fixpoint probes. Exact-state/allocation owners and old/new body-fact, cleanup and
-diagnostic comparisons qualify the boundaries. Item19's local 512-value match
-checks improve another 1.09x/1.10x (whole/per-unit), and straight fixed-array
-checks improve 1.17x/1.11x, with identical MIR, LLVM, checked-work and diagnostics.
-Earlier items11–14 reduce escape-state copies, empty exceptional-region work,
-edge propagation and unrelated generation-table updates. Other fact/state copies
-and repeated traversals remain superlinear; Request37 consumer acceptance and
-K1/plan61 remain deferred.
+Build-performance items15–20 remove generation-formation table copies, preserve
+unaffected generation collections, skip empty ending propagation and duplicate
+terminal probes, and avoid repeated growth and equal-fact reconstruction during
+state joins. Exact-state/allocation owners, direct self-join laws and old/new
+body-fact, cleanup and diagnostic comparisons qualify the boundaries. Item20's
+local 512-value Result-match checks improve another 1.25x/1.27x (whole/per-unit),
+with identical MIR, LLVM, checked-work and diagnostics. Earlier items11–14 reduce
+escape-state copies, empty exceptional-region work, edge propagation and unrelated
+generation-table updates. Other fact/state copies and repeated traversals remain
+superlinear; Request37 consumer acceptance and K1/plan61 remain deferred.
 
 Plan136 separates array-builder value dependencies from the consumed local slot,
 so loop-local build results remain usable after replacement. Exact receiver
