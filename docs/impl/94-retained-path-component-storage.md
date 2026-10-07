@@ -18,9 +18,10 @@ rule. Only private Rust path storage and its native callers change.
 
 Keep the existing checked positive length, address extent and len-plus-one
 capacity checks; conditional UTF-8 validation and embedded-NUL rejection retain
-their order. Allocate and fill the same private terminated byte vector before
-component grammar validation. Validate every component before rewriting `/` to
-NUL or performing filesystem I/O. No native call receives caller-owned bytes.
+their order. Plan144 validates the complete component grammar before allocating
+and filling the same private terminated byte vector. Every component is validated
+before rewriting `/` to NUL or performing filesystem I/O. No native call receives
+caller-owned bytes.
 
 Store `component_start: usize`: the first component begins at zero for relative
 paths, one for ordinary absolute roots, and the original input length for the

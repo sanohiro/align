@@ -379,8 +379,10 @@ align_rt_fs_remove_empty_dir(
 ) -> i32
 ```
 
-Output-slot validation is first, then complete root validation/copy/grammar, complete relative
-validation/copy/grammar, root traversal, relative-parent traversal, and the final operation. Invalid
+Output-slot validation is first, then complete root validation/grammar/copy, complete relative
+validation/grammar/copy, root traversal, relative-parent traversal, and the final operation. Each
+path's complete view and grammar are validated before allocating its private copy; an earlier
+admitted path may already own its copy when a later path rejects. Invalid
 root grammar therefore wins over every relative-view error. Both slots are null on recoverable failure. Checked copy-size overflow is
 `Error.Invalid`; actual OOM is terminal. Private full-path copies become NUL-delimited component
 storage only after complete grammar validation; caller bytes are unchanged. At most two traversal

@@ -53,8 +53,8 @@ contract.
 The exact validation order is:
 
 1. reject a null output slot, then write a non-null slot to null;
-2. validate and copy the complete root view, then parse its complete component grammar;
-3. validate and copy the complete relative view, then parse its complete component grammar;
+2. validate the complete root view and component grammar, then allocate its private copy;
+3. validate the complete relative view and component grammar, then allocate its private copy;
 4. open and retain the starting directory and walk root components in written order;
 5. walk relative parent components in written order; and
 6. perform the operation-specific final observation/open or exclusive create.
@@ -67,7 +67,8 @@ There is no Unicode normalization, case folding, caller-input rewriting, lossy f
 or trailing-slash removal.
 
 Each complete owned path copy checks `len + 1` before allocation, appends one NUL, and lives through
-the call. After full grammar validation, the runtime replaces separator bytes only in those private
+the call. A rejected individual path allocates no private copy; an earlier admitted path may already
+own its copy when a later path rejects. After full grammar validation, the runtime replaces separator bytes only in those private
 copies with NUL component delimiters; caller bytes are never changed. The walk retains at most the
 current directory descriptor plus the next descriptor and closes the previous descriptor after the
 next one is safely acquired. Memory and live traversal-fd usage are `O(total path bytes)` and `O(1)`
@@ -372,7 +373,7 @@ propagated through the public summaries before implementation authorization:
 
 | Finding | Closure in this design pass |
 | --- | --- |
-| Root grammar and malformed relative-view precedence conflicted | Validation now completes root view validation, owned copy, and full grammar parsing before inspecting or allocating relative. Invalid root grammar therefore wins over every relative error, matching the public table and owner matrix. |
+| Root grammar and malformed relative-view precedence conflicted | Validation completes the root view, full grammar and owned copy before inspecting or allocating relative. Invalid root grammar therefore wins over every relative error, matching the public table and owner matrix. Plan144 moves each copy after its own complete grammar admission. |
 | The complete overlap matrix omitted same-final open/create | The overlap table now fixes absent, newly installed, pre-existing regular, and pre-existing non-regular outcomes; it promises no wait or byte snapshot, assigns barrier-controlled owner cases, and keeps C6's same-final input/output overlap forbidden by the consumer precondition. |
 
 The review log remains outside the worktree under `.git`. This table is the author-side
