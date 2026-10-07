@@ -37743,10 +37743,30 @@ impl<'a> MoveCheck<'a> {
             .map(|position| position as u32);
         if let Some(position) = region_param.or_else(|| self.borrowed_param_position(id)) {
             fact.direct.insert(BorrowRoot::Param(position));
-        } else if self.f.locals.get(id as usize).is_some_and(|local| local.ty == Ty::ArenaHandle)
-            || self.local_owns_view_storage(id)
-            || self.local_may_borrow(id)
-        {
+        } else if self.f.locals.get(id as usize).is_some_and(|local| {
+            // An owned resource value carries its explicit parent dependencies, not a borrow of
+            // the slot it is being moved from. Real borrows still acquire that slot's identity
+            // through local_storage_roots. Apply this to the complete resource-only type graph
+            // so match/if/loop results and aggregate moves cannot retain an arm-local owner.
+            !(self.is_move_ty(local.ty)
+                && ty_mentions_resource(
+                    local.ty,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                )
+                && has_only_resource_borrow_leaves(
+                    local.ty,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                ))
+                && (local.ty == Ty::ArenaHandle
+                    || self.local_owns_view_storage(id)
+                    || self.local_may_borrow(id))
+        }) {
             fact.direct.insert(BorrowRoot::Local(id));
         }
         fact

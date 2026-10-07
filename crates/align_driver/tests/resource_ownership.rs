@@ -213,6 +213,159 @@ fn main() -> i32 {
 }
 
 #[test]
+fn owned_resource_control_results_keep_receiving_mutable_authority() {
+    let internal = INTERNAL.replace("raw.free(handle)", "raw.free(handle); print(101)");
+    let root = format!("{ROOT}\n{}", r#"
+pub fn fallible(flag: bool) -> Result<conn, Error> {
+  if flag { return Ok(open()) }
+  return Err(Error.Invalid)
+}
+pub fn identity<T>(value: T) -> T = value
+pub fn inspect_mut(borrow mut owner: conn) -> bool = present(resource.borrow(owner))
+"#);
+    let cases = [
+        "local_open()?",
+        "match local_open() { Ok(value) => value, Err(error) => { return Err(error) } }",
+        "match pkg.db.fallible(true) { Ok(value) => value, Err(error) => { return Err(error) } }",
+        "match Some(pkg.db.open()) { Some(value) => value, None => { return Err(Error.Invalid) } }",
+        "match Choice.Owner(pkg.db.open()) { Owner(value) => value, Empty => { return Err(Error.Invalid) } }",
+        "if flag { value := pkg.db.open(); value } else { other := pkg.db.open(); other }",
+        "{ value := pkg.db.open(); value }",
+        "loop { value := pkg.db.open(); break value }",
+        "pkg.db.fallible(true) else { return Err(Error.Invalid) }",
+        "match pkg.db.fallible(true).map_err(keep_error) { Ok(value) => value, Err(error) => { return Err(error) } }",
+    ];
+    let mut entry = String::from(r#"module main
+import pkg.db
+Holder { owner: pkg.db.conn }
+Nested { holder: Holder }
+Choice { Owner(pkg.db.conn), Empty }
+fn wrap(owner: pkg.db.conn) -> Holder = Holder { owner: owner }
+fn inspect(borrow mut holder: Holder) -> bool = pkg.db.present(resource.borrow(holder.owner))
+fn inspect_nested(borrow mut nested: Nested) -> bool = pkg.db.present(resource.borrow(nested.holder.owner))
+fn local_open() -> Result<pkg.db.conn, Error> = pkg.db.fallible(true)
+fn keep_error(value: Error) -> Error = value
+"#);
+    for (index, expression) in cases.iter().enumerate() {
+        entry.push_str(&format!(r#"
+fn case_{index}(flag: bool) -> Result<(), Error> {{
+  owner := {expression}
+  mut holder := wrap(pkg.db.identity(owner))
+  if !inspect(holder) {{ return Err(Error.Invalid) }}
+  holder = wrap(pkg.db.open())
+  if !inspect(holder) {{ return Err(Error.Invalid) }}
+  return Ok(())
+}}
+"#));
+    }
+    entry.push_str(r#"
+fn aggregate() -> Result<(), Error> {
+  result: Result<Holder, Error> := Ok(wrap(pkg.db.open()))
+  extracted := match result { Ok(value) => value, Err(error) => { return Err(error) } }
+  mut holder := pkg.db.identity(extracted)
+  if !inspect(holder) { return Err(Error.Invalid) }
+  mut nested := match Some(Nested { holder: wrap(pkg.db.open()) }) {
+    Some(value) => value,
+    None => { return Err(Error.Invalid) },
+  }
+  if !inspect_nested(nested) { return Err(Error.Invalid) }
+  return Ok(())
+}
+fn direct() -> Result<(), Error> {
+  mut owner := match pkg.db.fallible(true) { Ok(value) => value, Err(error) => { return Err(error) } }
+  if !pkg.db.inspect_mut(owner) { return Err(Error.Invalid) }
+  return Ok(())
+}
+fn early_error() -> Result<(), Error> {
+  held := pkg.db.open()
+  owner := match pkg.db.fallible(false) { Ok(value) => value, Err(error) => { return Err(error) } }
+  mut holder := wrap(owner)
+  if !inspect(holder) { return Err(Error.Invalid) }
+  return Ok(())
+}
+fn main() -> i32 {
+"#);
+    for index in 0..cases.len() {
+        entry.push_str(&format!(
+            "  case_{index}(true) else {{ return 1 }}\n"
+        ));
+    }
+    entry.push_str(r#"  case_5(false) else { return 1 }
+  aggregate() else { return 2 }
+  direct() else { return 4 }
+  match early_error() { Ok(value) => { return 3 }, Err(error) => {} }
+  return 42
+}
+"#);
+    let project = [
+        ("pkg/db/internal/resource.align", internal.as_str()),
+        ("pkg/db.align", root.as_str()),
+        ("main.align", entry.as_str()),
+    ];
+    let checked = diff_check_multi("resource-control-transfer", &project, "main.align");
+    assert!(!checked.whole_errors, "{}", checked.whole_diags);
+    assert!(!checked.per_unit_errors, "{}", checked.per_unit_diags);
+    assert!(backend_available(), "resource transfer owner requires LLVM");
+    let expected = "101\n".repeat(cases.len() * 2 + 6);
+    let whole = build_and_run_multi("resource-control-transfer-whole", &project, "main.align");
+    let per_unit = build_per_unit_multi("resource-control-transfer-units", &project, "main.align")
+        .link_and_run();
+    for output in [whole, per_unit] {
+        assert_eq!(output.status.code(), Some(42), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+    }
+}
+
+#[test]
+fn owned_resource_control_results_preserve_actual_dependencies() {
+    let root = format!("{ROOT}\n{}", r#"
+pub fn child(parent: resource_ref<conn>) -> Result<conn, Error> {
+  unsafe { return Ok(resource.from_raw_borrowed(raw.alloc(8), parent)) }
+}
+pub fn mutate(borrow mut owner: conn) {}
+pub fn consume(owner: conn) {}
+"#);
+    for (name, transfer, action, diagnostic) in [
+        (
+            "child-mutate",
+            "child := match pkg.db.child(resource.borrow(parent)) { Ok(value) => value, Err(error) => { return } }; holder := Holder { owner: child }",
+            "pkg.db.mutate(parent)",
+            "dependent resource/reference",
+        ),
+        (
+            "child-move",
+            "child := match pkg.db.child(resource.borrow(parent)) { Ok(value) => value, Err(error) => { return } }; holder := Holder { owner: child }",
+            "pkg.db.consume(parent)",
+            "dependent resource/reference",
+        ),
+        (
+            "reference-mutate",
+            "reference := match Some(resource.borrow(parent)) { Some(value) => value, None => { return } }",
+            "pkg.db.mutate(parent); print(pkg.db.present(reference))",
+            "while dependent resource/reference",
+        ),
+        (
+            "reference-move",
+            "reference := resource.borrow(parent); owner := match Some(parent) { Some(value) => value, None => { return } }",
+            "print(pkg.db.present(reference))",
+            "while dependent resource/reference",
+        ),
+    ] {
+        let entry = format!(r#"module main
+import pkg.db
+Holder {{ owner: pkg.db.conn }}
+fn main() {{ mut parent := pkg.db.open(); {transfer}; {action} }}
+"#);
+        let project = [
+            ("pkg/db/internal/resource.align", INTERNAL),
+            ("pkg/db.align", root.as_str()),
+            ("main.align", entry.as_str()),
+        ];
+        assert_rejected(&format!("resource-control-{name}"), &project, diagnostic);
+    }
+}
+
+#[test]
 fn dependent_resource_blocks_parent_move_until_child_drop() {
     let root = "\
 module pkg.db
