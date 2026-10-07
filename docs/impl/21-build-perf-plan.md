@@ -2973,3 +2973,69 @@ runs. The original map reconstruction fails the no-op storage-identity owner.
 `bench/escape_state_transfer/results-recency-map-macos.json` retains full samples,
 hashes and controls. Remaining table/fact copies and repeated analysis remain
 superlinear; no consumer time budget or runtime allocation improvement is claimed.
+
+## Item 15: validated storage-formation commit
+
+After item14, an early one-second release sample of a 2,048 fixed-array check
+still observes generation-table clones in MoveCheck's completion path. The
+profiled check takes 9.01 s; this sample is not a whole-run cost percentage.
+Every production `try_form_headers` caller already stages its tables. The helper
+previously cloned the complete tables again after validating the input batch.
+This removes that inner copy while preserving the existing source and analysis contract.
+Caller staging, value-dependency renaming, directory/content sequencing and
+publication into EscapeCheck/MoveCheck remain unchanged.
+
+The helper validates and consumes the batch into private records containing
+an admitted path, exact descriptor, generation and both concrete initializers.
+Keep the current validation precedence: malformed type, unequal existing table
+key sets, empty batch; then each written formation's initializer presence,
+header path, generation/path agreement, duplicate generation and duplicate
+path; finally the sorted existing-key collision check. No table or recency
+mutation and no join callback occurs until every check succeeds. Validation
+errors retain the exact original directory and content values.
+
+The commit then demotes selected Current entries, directory before contents,
+and inserts the prepared entries and returned headers in written batch order.
+It has no input-dependent error arm. The prevalidation proof is complete:
+Current entries are vacated by demotion; stable/old Prior keys were checked;
+a new Prior collision could only come from a selected Current of the same
+origin, whose equal result path would already have failed duplicate-path
+admission. Batch generations are unique. A concrete initializer and descriptor
+were retained during validation, so commit has no Option extraction or indexing
+of unchecked source data. No public type, source ownership rule, runtime
+allocation, HIR/MIR shape, interface, cache record or lifetime policy changes.
+No fact is pruned. K1/plan61 and consumer adoption remain deferred.
+
+### Implementation closure matrix
+
+| Closure axis | Implementation and owner |
+| --- | --- |
+| Type formation and malformed input | Keep `storage_type_paths` and its admitted header domain. Extend `storage_generation_formation_and_malformed_matrix` with late missing/malformed initializers, malformed type/key parity, empty batch and deterministic multi-invalid precedence. Every rejection checks exact unchanged tables and zero join callbacks. |
+| Collision completeness and atomicity | A parameterized `storage_generation_formation_commit_matrix` crosses Current/Prior/ParameterValue/CallerStorage inputs with absent/Current/Prior/both existing keys, plus distinct-path multi-result permutations and mixed Current/Prior same-path rejection. Pin exact results, original error precedence, noncommutative Current-before-Prior joins and directory-before-content callbacks. All invalid later records leave both tables and recency unchanged. |
+| Compiler-owned move, replacement and Drop | Remove the helper's Clone bounds and move prepared payloads into tables. `storage_generation_formation_moves_payloads_once` uses non-Clone values with exact destructor counts through fresh, repeated and rejected batches; retained unrelated payload backing remains identical. This is a compile-time regression owner against restoring a whole-table clone, not a runtime timing assertion. Source move-in/out, nulling, replacement, return and Drop are unchanged. |
+| Callers and publication | Inspect all six production callers: EscapeCheck parameter seed, normal completion and map_err completion; the three MoveCheck siblings. Keep their outer staging copy, internal value renaming and external state/snapshot publication order. Existing parameter/resolver/repeated-control generation owners plus the full sema bounded target close the caller paths. |
+| Control and cleanup | Reuse `return_provenance::storage_generation_move_replacement_escape_matrix` and `borrow_liveness::storage_generation_move_replacement_cleanup_control_matrix` for if/match/else/?/map_err, branch/loop joins, early exits, consumed sources and cleanup. No control-flow or cleanup transition changes. |
+| Generic, interfaces and allocation provenance | Reuse `return_provenance::storage_generation_producer_content_matrix`, `storage_generation_nonwritable_carrier_matrix` and `storage_generation_interprocedural_allocation_parity_matrix` for typed producers, imported/indirect calls, generic substitution, whole/per-unit and heap/arena/inline parity. No new persisted fact or runtime owner is introduced. |
+| Performance and output parity | Reuse the bounded alternating numeric/storage release corpus at 16/128/512 with five samples after warmup, no competing builds/tests, actual CLI checked-work parity, byte-identical MIR/raw LLVM and rejected diagnostics. Keep the 20 s child budget. Record all samples and remaining outer copies and superlinear analysis; no near-linear or whole-client time promise. |
+
+The existing transaction contract remains, but its local implementation now
+relies on complete prevalidation instead of a disposable inner table clone. One
+independent adversarial plan review inspected the matrix, collision proof, all
+six callers and proposed owners before implementation, with no actionable
+findings. The ordinary one fresh full-diff code review follows implementation. The
+private checker has no reuse-after-panic contract; an allocation failure or join
+panic is not converted into a recoverable validation error. The capability is
+one independently useful helper change, with no dormant producer/consumer chain.
+
+Qualification closes the matrix with 14 sema generation owners and the five
+parameterized driver owners above. Restoring the original helper fails the
+non-Clone formation owner at compile time; the candidate is restored afterward.
+Five alternating Apple M1 release samples, without overlapping builds/tests,
+improve 512-array straight-line whole/per-unit medians from 0.512/1.025 s to
+0.433/0.867 s (1.18x/1.18x), and loop medians from 5.066/10.144 s to
+4.268/8.595 s (1.19x/1.18x). All 15 source MIR/raw-LLVM pairs, checked-work
+outputs and four rejected controls agree across both corpora. Numeric controls
+remain within 4 ms of baseline medians. Full samples and hashes are retained in
+`bench/escape_state_transfer/results-formation-commit-macos.json`. Outer staging
+copies and repeated analysis remain superlinear; no consumer time or runtime
+allocation improvement is claimed.

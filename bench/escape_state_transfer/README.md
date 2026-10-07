@@ -1,6 +1,6 @@
 # Compiler check-time scaling measurement
 
-This local benchmark owns plan 21 items 11–14 checking measurements. It
+This local benchmark owns plan 21 items 11–15 checking measurements. It
 compares release compiler binaries on the same generated straight arithmetic,
 Result `?`, and Result `match` chains inside a loop. Each case uses 16, 128 or
 512 values. `--corpus storage` selects fixed-array declarations in straight-line
@@ -128,3 +128,31 @@ all facts and diagnostics remain; unrelated entries no longer undergo complete
 map reconstruction. The no-op storage owner fails with the original algorithm.
 Table/fact copies and other repeated analysis still produce superlinear growth;
 these local measurements do not establish Request 37's real-client acceptance.
+
+## Item 15 result (2026-10-07)
+
+The same host/profile compares merged
+`6ffc322cd6eb1eb1607606cda31cd5399683dbf3` with validated storage-formation
+commit. Both binaries run with `DYLD_SHARED_REGION=private`; no build/test jobs
+overlap measurement. Run both numeric and storage corpora with `--llvm-parity`.
+[Full samples and hashes](results-formation-commit-macos.json) retain all 30
+cells, five alternating samples after warmup and actual CLI checked-work output.
+
+| 512 fixed-array declarations | Baseline median | Candidate median | Ratio |
+| --- | ---: | ---: | ---: |
+| Straight-line check | 0.512 s | 0.433 s | 1.18x |
+| Straight-line per-unit check | 1.025 s | 0.867 s | 1.18x |
+| Loop check | 5.066 s | 4.268 s | 1.19x |
+| Loop per-unit check | 10.144 s | 8.595 s | 1.18x |
+
+All 15 source MIR/LLVM pairs and checked-work outputs match. The four rejected
+source/command controls pass in both corpus runs. Numeric control medians differ
+by at most 4 ms; the 16-value numeric controls differ by less than 1 ms.
+
+Formation validates the complete batch before updating the caller's staged
+tables. Concrete prepared records remove one complete inner directory/content
+clone while preserving validation errors, recency and collision order. Restoring
+the original Clone-bound helper fails the non-Clone payload owner at compile
+time. Outer staging copies, key-parity scans and repeated analysis remain;
+these local measurements do not establish near-linear checking or Request 37's
+consumer acceptance, and do not claim fewer runtime allocations.

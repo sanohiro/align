@@ -24,14 +24,15 @@ LLVM owners qualify it. Plan138 supplies the ARM64 Linux/macOS sibling ABI;
 plan137 supplies non-owning raw fields and padding/register separation. Bool/char
 FFI, consumer adoption and K1/plan61 remain deferred.
 
-Build-performance item14 updates only selected Current-to-Prior generation-table
-entries while preserving every fact and collision order. Exact map, no-op storage,
-Drop and whole/per-unit owners qualify it. Local 512-array checks improve
-1.54x/1.55x (straight-line whole/per-unit) and 1.80x/1.81x (loop whole/per-unit),
-with identical MIR, LLVM and diagnostics. Earlier items11–13 reduce escape-state
-copies, empty exceptional-region work and edge propagation. Remaining table/fact
-copies and repeated analysis are superlinear; Request37 consumer acceptance and
-K1/plan61 remain deferred.
+Build-performance item15 removes the duplicate generation-formation table copy
+through complete prevalidation and a commit with concrete payloads. Exact
+collision/error ordering, late-invalid atomicity, non-Clone Drop and whole/per-unit
+owners qualify it. Local 512-array checks improve another 1.18x/1.18x
+(straight-line whole/per-unit) and 1.19x/1.18x (loop whole/per-unit), with identical
+MIR, LLVM and diagnostics. Earlier items11–14 reduce escape-state copies, empty
+exceptional-region work, edge propagation and unrelated generation-table updates.
+Remaining outer copies and repeated analysis are superlinear; Request37 consumer
+acceptance and K1/plan61 remain deferred.
 
 Plan136 separates array-builder value dependencies from the consumed local slot,
 so loop-local build results remain usable after replacement. Exact receiver
