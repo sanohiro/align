@@ -2112,6 +2112,8 @@ green. **Next: M13** (codegen quality & link hygiene, the pre-LLVM-upgrade wave)
   invalidate one — memory-safe by construction, which is exactly why growable `array<T>`
   itself was rejected. Surface: `array_builder<T>()`; `b.push(v)` / `b.append(xs: slice<T>)`
   on a `mut`-bound receiver (**Pure** — in-memory growth, the `BufferPut` class);
+  Plan 140 adds nonconsuming `b.len() -> i64` initialized-count observation,
+  including the text-builder byte-count sibling, without exposing unfinished views.
   `b.build() -> array<T>` consumes the builder (`.to_array()` rejected — it already means
   eager-materialize). **Freeze is zero-copy**: storage is `align_rt_alloc`-family memory grown
   via a NEW `align_rt_realloc` (amortized doubling), so `.build()` is a pure ptr+len retype

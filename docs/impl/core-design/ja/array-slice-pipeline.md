@@ -50,8 +50,16 @@ zip(a, b, ...)                     // lazy equal-length multi-source head (Copy 
 
 array_builder<T>()                 // 実装済みの heap grow/freeze 形式
 builder.push(value)
+builder.len() -> i64              // initialized element count
 builder.build() -> array<T>
 ```
+
+`b.len() -> i64` は初期化済みの要素数（許可された型と heap/region の組み合わせ全体。サイズ0の region 要素も含む）を返す Pure な操作であり、所有者を消費しない。
+引数はなく、アロケーションせず、ビューや所有者への依存を保持しない。変更不可の束縛済み
+ローカルや、既に許可された借用・値渡しの helper 引数からも呼び出せる。一時値や制御式の
+結果は先に束縛する。予約容量は長さに含まない。i64 に収まらない件数は、ラップや飽和を
+行わず allocation-size hard error にする。呼び出し後も追記と消費する finish を行える。
+[Plan 140](../../140-builder-length-plan.md) がソースと native の契約を定める。
 
 実装済みの heap-record 拡張は、natural alignment を持つ空でない view-free declared record を
 受け入れる。field は再帰的に Copy scalar、free-standing な `string`、または同じ record class

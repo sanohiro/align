@@ -2060,6 +2060,15 @@ rules. By-value parameters and results transfer the owner. Append copies text by
 and retains no input view; parameter passing itself allocates nothing. Builder
 aggregate placement and function-value formation remain outside the admitted surface.
 
+`b.len() -> i64` on a bound `builder` reports initialized UTF-8 bytes, including
+embedded NUL, independently of reserved capacity. It takes no arguments and is
+Pure, nonconsuming and allocation-free. Immutable locals and admitted shared,
+exclusive or by-value helper parameters may observe it; bind temporary or
+control-result receivers first. The Copy result retains no owner or view and
+may outlive the builder. Later writes and consuming `to_string()` remain valid.
+An unrepresentable initialized count raises the allocation-size hard error;
+there is no wrapping or saturation.
+
 ```align
 fn append_name(borrow mut output: builder, name: str) {
     output.write("hello ")
@@ -2956,6 +2965,7 @@ array_builder(out: region)      // explicit region
 array_builder(out: region, capacity: i64) // region with initial capacity
 b.push(v)               // append one element (mut receiver)
 b.append(xs: slice<T>)  // bulk-append Copy-scalar elements (mut receiver)
+b.len() -> i64         // initialized element count; shared, nonconsuming
 b.build() -> array<T>   // freeze into an owned array<T> (consumes the builder)
 ```
 
@@ -2966,6 +2976,18 @@ overflow abort before allocation; OOM aborts. Arguments evaluate once in source
 order. Heap freeze still transfers its payload without copying; region freeze
 still materializes one contiguous array in the selected region. Capacity does
 not change element admissibility, ownership, lifetime or effects.
+
+`b.len() -> i64` reports the initialized element count without consuming the
+builder, allocating, or compacting region chunks. It is Pure and takes no
+arguments. The query covers every admitted scalar/record, vector, mask,
+fixed-array and fixed-record-array builder form, with the existing allocation
+mode restrictions. Reserved capacity and element stride do not affect the count,
+including zero-width region elements. Immutable bound locals and admitted
+borrowed or owned helper parameters may query it; bind temporary or control
+results first. The Copy result has no retained lifetime dependency. A count
+outside i64 raises the allocation-size hard error without wrapping or saturation.
+Growth and consuming freeze retain their existing rules; no element or byte
+view is exposed before freeze.
 
 `array_builder<T>` is the **typed** member of the grow-then-freeze family — `builder`
 grows a `string`, `buffer` grows bytes, `array_builder<T>` grows an `array<T>`. It is

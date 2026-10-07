@@ -16,6 +16,8 @@
 // `align_rt_str_*` symbols.
 mod buffer_storage;
 #[cfg(test)]
+mod builder_length_tests;
+#[cfg(test)]
 mod http_stream_tests;
 #[cfg(test)]
 mod http_accept_budget_tests;
@@ -3192,6 +3194,22 @@ pub struct Builder {
 // entry alloca; fail compilation here if a future Rust layout change outgrows that conservative
 // envelope instead of silently writing past the caller's stack storage.
 const _: () = assert!(core::mem::size_of::<Builder>() <= 64 && core::mem::align_of::<Builder>() <= 16);
+
+fn initialized_builder_len(count: usize) -> i64 {
+    i64::try_from(count).unwrap_or_else(|_| align_rt_alloc_size_fail())
+}
+
+/// Observe initialized UTF-8 bytes without consuming, allocating, or mutating the builder.
+/// Null returns zero; an unrepresentable initialized count raises allocation-size failure.
+///
+/// # Safety
+/// A nonnull `b` must address a live, correctly aligned Builder with valid representation.
+/// Shared reads may overlap, but mutation and freeing must not overlap this observation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_builder_len(b: *mut Builder) -> i64 {
+    if b.is_null() { return 0; }
+    initialized_builder_len(unsafe { (*b).buf.len })
+}
 
 fn builder_value(arena: *mut Arena, capacity: i64) -> Builder {
     Builder { buf: BuilderBuf::new(capacity), arena }
@@ -18269,6 +18287,19 @@ const _: () = assert!(
         && core::mem::align_of::<ArrayBuilder>() <= 16
 );
 const _: () = assert!(core::mem::size_of::<ArrayBuilder>() + core::mem::size_of::<Buffer>() <= 128);
+
+/// Observe total initialized elements across heap storage or all region chunks.
+/// Null returns zero; an unrepresentable count raises allocation-size failure, including
+/// for zero-stride elements whose count is not bounded by allocated payload bytes.
+///
+/// # Safety
+/// A nonnull `b` must address a live, correctly aligned ArrayBuilder with valid representation.
+/// Shared reads may overlap, but mutation and freeing must not overlap this observation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_array_builder_len(b: *mut ArrayBuilder) -> i64 {
+    if b.is_null() { return 0; }
+    initialized_builder_len(unsafe { (*b).len })
+}
 
 fn array_builder_initial_bytes(capacity: i64, stride: usize) -> (usize, usize) {
     let count = safe_len(capacity).unwrap_or_else(|()| align_rt_alloc_size_fail());

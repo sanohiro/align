@@ -29,6 +29,7 @@ a + b                      -> compile error; builder is the one concatenation pa
 
 b := builder()  /  builder(cap)
 b.write(s: str|string)  /  b.write_int(i: i64)
+b.len()                    -> i64        // initialized UTF-8 byte count
 b.to_string()              -> string     // the finisher (there is no finish()/build())
 
 fn append(borrow mut output: builder, text: str)  // 直接呼び出す helper の宣言
@@ -49,6 +50,13 @@ handle の引数渡し自体はアロケーションしない。aggregate への
 その関数値の生成は引き続き拒否される。
 [Plan 82](../../82-text-builder-parameter-plan.md) がこの境界を定め、
 `text_builder_params.rs` がソース・native 実行・whole-program/per-unit の一致を検証する。
+
+`b.len() -> i64` は初期化済みの UTF-8 バイト数（埋め込み NUL を含む）を返す Pure な操作であり、所有者を消費しない。
+引数はなく、アロケーションせず、ビューや所有者への依存を保持しない。変更不可の束縛済み
+ローカルや、既に許可された借用・値渡しの helper 引数からも呼び出せる。一時値や制御式の
+結果は先に束縛する。予約容量は長さに含まない。i64 に収まらない件数は、ラップや飽和を
+行わず allocation-size hard error にする。呼び出し後も追記と消費する finish を行える。
+[Plan 140](../../140-builder-length-plan.md) がソースと native の契約を定める。
 
 ## Type & ownership classification
 

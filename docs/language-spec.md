@@ -855,6 +855,15 @@ ordinary Drop-before-store rules. By-value parameters/results transfer ownership
 Append copies input bytes without retaining a view; passing the handle allocates
 nothing. Aggregate placement and function-value formation remain excluded.
 
+`b.len() -> i64` on a bound `builder` reports initialized UTF-8 bytes, including
+embedded NUL, independently of reserved capacity. It takes no arguments and is
+Pure, nonconsuming and allocation-free. Immutable locals and admitted shared,
+exclusive or by-value helper parameters may observe it; bind temporary or
+control-result receivers first. The Copy result retains no owner or view and
+may outlive the builder. Later writes and consuming `to_string()` remain valid.
+An unrepresentable initialized count raises the allocation-size hard error;
+there is no wrapping or saturation.
+
 **Binary decode / encode.** Packed binary is read from a `bytes` view and written into a growable
 `buffer`, bounds-checked and **endian-explicit**: every multi-byte read/write names its byte order
 with a `_le` / `_be` suffix (`h.u32_le(0)`, `out.put_u64_be(n)`), and only `u8` / `i8` carry no
@@ -1345,6 +1354,18 @@ supplies T. Capacity is i64 and defaults to zero. It reserves at least that many
 pushes without growth, leaving initialized length zero. Negative counts and
 count × stride/target-size overflow abort before allocation; OOM aborts.
 Arguments evaluate once in order. Element and region rules remain unchanged.
+
+`b.len() -> i64` reports the initialized element count without consuming the
+builder, allocating, or compacting region chunks. It is Pure and takes no
+arguments. The query covers every admitted scalar/record, vector, mask,
+fixed-array and fixed-record-array builder form, with the existing allocation
+mode restrictions. Reserved capacity and element stride do not affect the count,
+including zero-width region elements. Immutable bound locals and admitted
+borrowed or owned helper parameters may query it; bind temporary or control
+results first. The Copy result has no retained lifetime dependency. A count
+outside i64 raises the allocation-size hard error without wrapping or saturation.
+Growth and consuming freeze retain their existing rules; no element or byte
+view is exposed before freeze.
 
 `array_builder<T>()` retains its individually owned heap/zero-copy-freeze form.
 Besides Copy scalars and `string`, it accepts nonempty naturally aligned declared records composed

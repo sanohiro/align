@@ -53,8 +53,17 @@ zip(a, b, ...)                     // lazy equal-length multi-source head (Copy 
 
 array_builder<T>()                 // shipped heap grow/freeze form
 builder.push(value)
+builder.len() -> i64              // initialized element count
 builder.build() -> array<T>
 ```
+
+`b.len() -> i64` is a Pure, nonconsuming observation of initialized elements across every admitted type and heap/region mode, including zero-width region elements.
+It takes no arguments, allocates nothing, retains no view or owner dependency,
+and may be called on immutable bound locals or admitted borrowed/owned helper
+parameters. Bind temporary or control-result receivers first. Reserved capacity
+is not length. An unrepresentable count raises the allocation-size hard error
+without wrapping or saturation. Further growth and consuming finish remain
+valid. [Plan 140](../140-builder-length-plan.md) owns the source/native contract.
 
 The shipped heap-record extension admits a nonempty, naturally aligned, view-free declared record
 whose fields recursively contain only Copy scalars, free-standing `string`, or the same record

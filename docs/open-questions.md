@@ -4772,6 +4772,16 @@ fast-systems-programming needs that any Align user hits, not engine-specific.
    borrowed field from a shorter row generation must be made owned with `clone_in(out)` before
    insertion. This is the common compound-output mechanism, not a database-private builder.
    Full contract and implementation order: `impl/17-library-boundary-prerequisites.md` §7.
+   **Scalar progress observation SETTLED 2026-10-08 (plan 140):** bound
+   `builder.len() -> i64` and `array_builder<T>.len() -> i64` are Pure,
+   allocation-free, nonconsuming zero-argument observations. Text counts
+   initialized UTF-8 bytes including NUL; typed builders count all initialized
+   elements across their admitted storage modes, including zero-width elements.
+   Immutable/shared/owned parameters follow existing type admission. Results
+   retain no owner dependency; temporary/control results must first be bound.
+   Counts outside i64 raise allocation-size failure without wrapping. No views
+   before freeze, element admission, growth and Drop rules remain unchanged.
+
 7. **Streaming line/record reads** *(general)* — `read_line`-class chunked record iteration over
    a reader; multi-GB `expert_trace.jsonl` is the concrete consumer for the already-recorded
    post-M9 "streaming×pipeline integration" backlog item.

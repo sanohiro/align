@@ -15,7 +15,13 @@ independent improvements from current `main`: completing, reviewing, or adopting
 the parked work is not a prerequisite. Keep its source and evidence archived
 outside the active worktree so they do not obstruct unrelated checks or pulls.
 
-## Next work (handoff updated 2026-10-07)
+## Next work (handoff updated 2026-10-08)
+
+Plan140 adds nonconsuming `.len()` observations to text and typed builders: initialized
+UTF-8 bytes or elements, independent of capacity and region chunking. The Pure Copy
+result retains no owner or view. Native count/allocation, malformed IR, write-fusion,
+header placement and whole/per-unit/cache owners qualify the boundary. Request28
+indexed/view readers and consumer adoption remain pending; K1/plan61 stay deferred.
 
 Plan139 completes LP64 GNU/musl Linux x86-64 C-record values, including large
 and register-exhausted byval arguments, whole-aggregate rollback, hidden sret

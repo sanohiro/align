@@ -951,6 +951,8 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::BufferBytes(buf) => format!("buffer_bytes({})", operand_str(buf)),
         Rvalue::BufferLen(buf) => format!("buffer_len({})", operand_str(buf)),
         Rvalue::BufferCapacity(buf) => format!("buffer_capacity({})", operand_str(buf)),
+        Rvalue::BuilderLen(owner) => format!("builder_len({})", operand_str(owner)),
+        Rvalue::ArrayBuilderLen(owner) => format!("array_builder_len({})", operand_str(owner)),
         Rvalue::BytesView { bytes, elem } => {
             format!("bytes_view_le<{elem:?}>({})", operand_str(bytes))
         }

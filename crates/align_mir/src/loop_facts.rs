@@ -303,7 +303,7 @@ macro_rules! unmodelled_rvalues {
         Rvalue::CryptoDigestFinish { .. } | Rvalue::FrameInnerJoin { .. } | Rvalue::IoCopy { .. } |
         Rvalue::FileCreateRw { .. } | Rvalue::FileOpenRw { .. } | Rvalue::FileOpenRo { .. } | Rvalue::FileCreateRwExclusive { .. } | Rvalue::FilePread { .. } | Rvalue::FilePreadInto { .. } |
         Rvalue::FilePwrite { .. } | Rvalue::FileLen { .. } | Rvalue::FileSync(..) | Rvalue::BufferNew { .. } |
-        Rvalue::BufferBytes { .. } | Rvalue::BufferLen { .. } | Rvalue::BufferCapacity { .. } |
+        Rvalue::BufferBytes { .. } | Rvalue::BufferLen { .. } | Rvalue::BufferCapacity { .. } | Rvalue::BuilderLen(..) | Rvalue::ArrayBuilderLen(..) |
         Rvalue::BytesSet { .. } | Rvalue::BytesFill { .. } |
         Rvalue::BytesCopyFrom { .. } | Rvalue::BufferPut { .. } | Rvalue::BufferAppend { .. } |
         Rvalue::BufferAppendFilled { .. } | Rvalue::ArrayBuilderNew { .. } | Rvalue::ArrayBuilderPush { .. } |
