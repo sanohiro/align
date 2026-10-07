@@ -3111,3 +3111,60 @@ Numeric control median changes remain below 9 ms. The benchmark README and
 `results-formation-transaction-macos.json` retain all samples and hashes. Other
 fact/state copies and repeated analysis remain superlinear; consumer acceptance
 stays external.
+
+
+## Item 17: preserve unaffected generation leaf collections
+
+Item16 removes table staging copies. A bounded profile of the resulting release
+compiler still spends substantial work rebuilding generation-bearing leaf sets
+when the selected Current-to-Prior origins are absent from those leaves. Each
+identity transformation allocates and sorts even though no key can change.
+
+Add one exhaustive generation-membership predicate matching the existing
+`StorageGenerationRenames::apply` condition, and an exhaustive BorrowRoot sibling
+predicate that observes only the four existing generation-bearing variants.
+Before rebuilding a header-reference set, borrow-root set, ended-root map or
+byte-validation generation set, check whether any key is selected. Leave an
+unaffected collection in place. Whenever a key is selected, retain the existing
+complete rebuild, set deduplication and ended-root minimum-error collision rule.
+Fallback and lifetime roots are checked independently even when a primary
+reference/generation set is unchanged.
+
+This is an exact identity fast path over existing facts. No source ownership,
+cleanup, lifetime, generation formation/admission, observation authority, control
+flow, summary, IR/interface or runtime ABI changes. It introduces no state-wide
+pruning or assumption that a first-seen producer cannot be observed. K1/plan61
+and consumer acceptance remain deferred.
+
+### Implementation closure matrix
+
+| Axis | Implementation and owner |
+| --- | --- |
+| Selection and stable siblings | Exhaustive predicates cover Current selected/absent, Prior, ParameterValue and CallerStorage; every BorrowRoot variant and ended reason. A parameterized `storage_generation_unaffected_leaf_rename_matrix` compares the resulting complete collections with the prior rebuild semantics for empty, absent, single and multiple selected origins. |
+| Header references and fallbacks | Cross selected references with exact nested content paths and read-only erasure. Equal generation plus unequal path/flag remains distinct. Empty/unchanged primary references cannot suppress fallback-root updates. Same matrix compares complete StorageHeaderLeaf state, including descriptor/known flags. |
+| Borrow roots and ended collisions | Cross live/ended observation and storage-local roots with all unchanged siblings. Current/Prior convergence deduplicates sets and preserves minimum BorrowEnd in ended maps. Same matrix checks original and reverse insertion orders. |
+| Byte validation | Independently cross primary generations, fallback roots and lifetime roots; preserve unknown and both validation-origin kinds. Same matrix compares complete backing state, including changes present only in fallback/lifetime sets. |
+| Allocation identity | `storage_generation_unaffected_leaf_allocations` pins nonempty owned path backing through all four unaffected collection updates. Restoring the rebuilds must fail the owner; real changes still compare equal to the previous algorithm. No manual allocation/free/Drop or source move/null behavior is introduced. |
+| Existing source and control semantics | Reuse all sema storage_generation owners plus five driver storage_generation owners in return_provenance and borrow_liveness for formation, move/replacement/return/Drop, if/match/else/?/map_err, branch/loop joins, early exits, malformed inputs, generics, whole/per-unit, interfaces and allocation provenance. No producer or analysis path is omitted. |
+| Performance | Reuse numeric/storage release corpora with 16/128/512 values, five alternating repetitions after warmup, the existing 20 s child deadline, no competing build/test load, actual checked-work output and exact MIR/raw LLVM/rejected diagnostics. Report remaining superlinear work; no client-time or runtime-resource claim. |
+
+Author matrix pass precedes implementation. The existing semantics and safety
+strategy remain unchanged: an exhaustive testable identity predicate precedes
+otherwise unchanged leaf updates. Boundary checking belongs to the one fresh
+preflight review. This single capability closes the same identity-rebuild cost
+across all four leaf mechanisms; expected handwritten change remains below 1,000
+lines. Qualification must demonstrate a useful measured benefit before shipping.
+
+
+Qualification closes the matrix with 17 sema generation owners and five driver
+generation owners. Restoring the four leaf rebuilds makes the allocation owner
+report all four lost backing identities for both empty and absent rename sets;
+the candidate source was restored byte-for-byte before the owners were rerun.
+Five alternating Apple M1 release samples improve 512-array straight-line
+whole/per-unit medians from 0.362/0.725 s to 0.230/0.459 s (1.57x/1.58x), and
+loop medians from 3.890/7.654 s to 1.279/2.558 s (3.04x/2.99x). All 15 source
+MIR/raw LLVM pairs, checked-work outputs and rejected diagnostics match. Numeric
+control median differences stay below 23 ms; all 16-value controls stay within
+5 ms. The benchmark README and `results-leaf-identity-macos.json` retain every
+sample and hash. Repeated traversals and remaining fact/state copies are still
+superlinear; consumer acceptance remains external.
