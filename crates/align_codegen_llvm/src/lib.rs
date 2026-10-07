@@ -26867,11 +26867,11 @@ fn main() -> i32 = 0
     }
 
     #[test]
-    fn c_layout_raw_and_sysv_padding_keep_storage_separate_from_registers() {
+    fn c_layout_raw_and_sysv_padding_keep_storage_separate_from_registers() -> Result<(), String> {
         Target::initialize_x86(&InitializationConfig::default());
         let triple = inkwell::targets::TargetTriple::create("x86_64-unknown-linux-gnu");
         let tm = Target::from_triple(&triple)
-            .unwrap()
+            .map_err(|error| error.to_string())?
             .create_target_machine(
                 &triple,
                 "x86-64-v2",
@@ -26880,7 +26880,7 @@ fn main() -> i32 = 0
                 RelocMode::PIC,
                 CodeModel::Default,
             )
-            .unwrap();
+            .ok_or("x86 target machine is unavailable")?;
         let ctx = Context::create();
         let td = tm.get_target_data();
         for (ty, field, expected) in [
@@ -26921,7 +26921,8 @@ fn main() -> i32 = 0
                     vec![field]
                 };
                 st.set_body(&fields, false);
-                let abi = classify_struct_abi(0, &st, &def, &td).unwrap();
+                let abi = classify_struct_abi(0, &st, &def, &td)
+                    .ok_or("register record classified as memory")?;
                 assert_eq!(abi.ebs, [expected]);
                 assert_eq!(
                     abi.storage_eightbytes,
@@ -26966,17 +26967,32 @@ fn main() -> i32 {
             false,
             ModuleScope::Whole,
         )
-        .unwrap();
-        module.verify().unwrap();
+        .map_err(|error| error.to_string())?;
+        module.verify().map_err(|error| error.to_string())?;
         for name in ["probe_raw", "probe_int", "probe_float"] {
             assert_eq!(
-                module.get_function(name).unwrap().count_params(),
+                module
+                    .get_function(name)
+                    .ok_or_else(|| format!("missing {name}"))?
+                    .count_params(),
                 2,
                 "{name}"
             );
         }
-        assert_eq!(module.get_function("probe_gp").unwrap().count_params(), 7);
-        assert_eq!(module.get_function("probe_sse").unwrap().count_params(), 9);
+        assert_eq!(
+            module
+                .get_function("probe_gp")
+                .ok_or("missing probe_gp")?
+                .count_params(),
+            7
+        );
+        assert_eq!(
+            module
+                .get_function("probe_sse")
+                .ok_or("missing probe_sse")?
+                .count_params(),
+            9
+        );
         let ir = module.print_to_string().to_string();
         let slots = ir
             .lines()
@@ -27014,13 +27030,16 @@ fn main() -> i32 {
                     ModuleScope::Whole,
                 );
                 if preceding < budget {
-                    result.unwrap();
+                    result.map_err(|error| error.to_string())?;
                     assert_eq!(
-                        probe_module.get_function("crowded").unwrap().count_params(),
+                        probe_module
+                            .get_function("crowded")
+                            .ok_or("missing crowded")?
+                            .count_params(),
                         budget
                     );
                 } else {
-                    let error = result.err().unwrap();
+                    let error = result.err().ok_or("exhausted registers were accepted")?;
                     assert!(
                         error.to_string().contains("passed in memory"),
                         "{field}/{preceding}: {error}"
@@ -27028,6 +27047,7 @@ fn main() -> i32 {
                 }
             }
         }
+        Ok(())
     }
 
     fn borrowed_element_place_mut(program: &mut Program) -> &mut align_mir::BorrowedElementPlace {
