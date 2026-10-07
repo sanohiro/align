@@ -34659,6 +34659,10 @@ impl<'a> MoveCheck<'a> {
                 arguments.insert(Self::expr_key(digest));
                 places.insert(Self::expr_key(digest));
             }
+            if let Some(receiver) = Self::array_builder_action_receiver(&expression.kind) {
+                arguments.insert(Self::expr_key(receiver));
+                places.insert(Self::expr_key(receiver));
+            }
             if let ExprKind::ArrayTruncate { receiver, .. } = &expression.kind {
                 arguments.insert(Self::expr_key(receiver));
                 places.insert(Self::expr_key(receiver));
@@ -37755,25 +37759,27 @@ impl<'a> MoveCheck<'a> {
         if let Some(position) = region_param.or_else(|| self.borrowed_param_position(id)) {
             fact.direct.insert(BorrowRoot::Param(position));
         } else if self.f.locals.get(id as usize).is_some_and(|local| {
-            // An owned resource value carries its explicit parent dependencies, not a borrow of
-            // the slot it is being moved from. Real borrows still acquire that slot's identity
-            // through local_storage_roots. Apply this to the complete resource-only type graph
-            // so match/if/loop results and aggregate moves cannot retain an arm-local owner.
-            !(self.is_move_ty(local.ty)
-                && ty_mentions_resource(
-                    local.ty,
-                    self.structs,
-                    self.tuples,
-                    self.enums,
-                    self.tagged_types,
-                )
-                && has_only_resource_borrow_leaves(
-                    local.ty,
-                    self.structs,
-                    self.tuples,
-                    self.enums,
-                    self.tagged_types,
-                ))
+            // Linear array builders carry their retained element/region facts, and owned
+            // resources their parent facts, not a borrow of the slot being moved from. Real
+            // receiver borrows still acquire that slot's identity through local_storage_roots.
+            // Cover every builder variant and the complete resource-only type graph so
+            // aliases and control results cannot retain a consumed arm/iteration-local owner.
+            !local.ty.is_array_builder()
+                && !(self.is_move_ty(local.ty)
+                    && ty_mentions_resource(
+                        local.ty,
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    )
+                    && has_only_resource_borrow_leaves(
+                        local.ty,
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    ))
                 && (local.ty == Ty::ArenaHandle
                     || self.local_owns_view_storage(id)
                     || self.local_may_borrow(id))
@@ -39523,6 +39529,13 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
+    fn array_builder_action_receiver(kind: &ExprKind) -> Option<&Expr> {
+        match Self::source_visible_mutation_action(kind) {
+            Some(SourceVisibleMutationAction::Builder { builder, .. }) => Some(builder),
+            _ => None,
+        }
+    }
+
     fn retire_builtin_action_input(&mut self, expression: &Expr, children: &mut Vec<usize>) {
         if let Some((file, buffer)) = Self::file_action_inputs(&expression.kind) {
             // File methods return scalars/unit, so their call-scoped owner reservations end here.
@@ -39536,7 +39549,8 @@ impl<'a> MoveCheck<'a> {
         }
         let receiver = match &expression.kind {
             ExprKind::ArrayTruncate { receiver, .. } => Some(receiver.as_ref()),
-            _ => Self::http_timeout_action_receiver(&expression.kind)
+            _ => Self::array_builder_action_receiver(&expression.kind)
+                .or_else(|| Self::http_timeout_action_receiver(&expression.kind))
                 .or_else(|| Self::reader_action_receiver(expression)),
         };
         if let Some(reader) = receiver {
@@ -45018,6 +45032,14 @@ impl<'a> MoveCheck<'a> {
                 self.invalidate_source_mutation_target(source);
             }
             SourceVisibleMutationAction::Builder { builder, retained } => {
+                // The action itself advances this snapshot, so post-action validation exempts
+                // it. A later eager operand may already have replaced or consumed the receiver.
+                self.validate_value_snapshot(
+                    Self::expr_key(expression),
+                    Self::expr_key(builder),
+                    expression.span,
+                );
+                self.borrows.finish_mutable_place_source(Self::expr_key(builder));
                 self.invalidate_builder_storage(builder);
                 if let ExprKind::Local(local) = builder.kind {
                     let retained = if matches!(expression.kind, ExprKind::ArrayBuilderAppend { .. }) {
@@ -79743,6 +79765,259 @@ fn main() -> i32 {
                 );
             }
         }
+    }
+
+    #[test]
+    fn array_builder_value_transfer_keeps_content_dependencies() {
+        let mut failures = Vec::new();
+        for (declaration, ty, value, read) in [
+            ("", "i64", "7", "rows[0]"),
+            ("", "string", "\"seven\".clone()", "rows[0].len()"),
+            (
+                "Row { value: i64 }",
+                "Row",
+                "Row { value: 7 }",
+                "rows[0].value",
+            ),
+            (
+                "Row { value: string }",
+                "Row",
+                "Row { value: \"seven\".clone() }",
+                "rows[0].value.len()",
+            ),
+        ] {
+            let make = format!(
+                "{{ mut made: array_builder<{ty}> := array_builder(); made.push({value}); made }}"
+            );
+            for (name, transfer) in [
+                ("direct", "next".to_string()),
+                ("alias", "{ alias := next; alias }".to_string()),
+                ("block", make.clone()),
+                ("if", format!("if index == 0 {make} else {make}")),
+                (
+                    "match",
+                    format!("match index {{ 0 => {make}, _ => {make} }}"),
+                ),
+                ("loop", format!("loop {{ break {make} }}")),
+                ("return", "make()".to_string()),
+            ] {
+                let source = format!(
+                    r#"
+{declaration}
+fn make() -> array_builder<{ty}> = {make}
+fn touch(borrow mut rows: array<{ty}>) -> i64 = rows.len()
+fn main() {{
+ mut first: array_builder<{ty}> := array_builder()
+ first.push({value})
+ mut rows := first.build()
+ mut index := 0
+ loop {{
+   if index == 2 {{ break }}
+   if index == 0 {{
+     mut next: array_builder<{ty}> := array_builder()
+     next.push({value})
+     selected := {transfer}
+     rows = selected.build()
+   }}
+   print(touch(rows))
+   print({read})
+   index = index + 1
+ }}
+ print({read})
+}}
+"#
+                );
+                let (_, diagnostics) = check(&source);
+                if diagnostics.has_errors() {
+                    failures.push(format!(
+                        "{ty}/{name}: {:?}",
+                        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn array_builder_region_siblings_transfer_value_provenance() {
+        for (ty, value) in [
+            ("i64", "1"),
+            ("vec4<i32>", "vector"),
+            ("mask4<i32>", "vector > vector"),
+            ("[i64; 2]", "[1, 2]"),
+            ("[Row; 2]", "[Row { value: 1 }, Row { value: 2 }]"),
+        ] {
+            let source = format!(r#"
+Row {{ value: i64 }}
+fn main() {{
+ arena out {{
+   vector: vec4<i32> := [1, 2, 3, 4]
+   mut first: array_builder<{ty}> := array_builder(out)
+   first.push({value})
+   mut rows := first.build()
+   mut index := 0
+   loop {{
+     if index == 2 {{ break }}
+     if index == 0 {{
+       mut next: array_builder<{ty}> := array_builder(out)
+       next.push({value})
+       alias := next
+       rows = alias.build()
+     }}
+     print(rows.len())
+     index = index + 1
+   }}
+   print(rows.len())
+ }}
+}}
+"#);
+            let (_, diagnostics) = check(&source);
+            assert!(!diagnostics.has_errors(), "{ty}: {:?}", diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn array_builder_transfer_retains_real_borrows_and_receiver_reservations() {
+        let mut failures = Vec::new();
+        // Region builders can retain borrowed elements. Moving the handle must preserve those
+        // dependencies through both scalar and record carriers, including loop-grown facts.
+        for (declaration, ty, element, read) in [
+            ("", "str", "input", "rows[0]"),
+            (
+                "Row { text: str }",
+                "Row",
+                "Row { text: input }",
+                "rows[0].text",
+            ),
+        ] {
+            for append in if ty == "str" {
+                &[false, true][..]
+            } else {
+                &[false][..]
+            } {
+                for invalidate in [false, true] {
+                    let grow = if *append {
+                        format!("items := [{element}]; pending.append(items[..])")
+                    } else {
+                        format!("pending.push({element})")
+                    };
+                    let source = format!(
+                        r#"
+{declaration}
+fn take(value: string) {{}}
+fn main() {{
+ owner := "text".clone()
+ input: str := owner
+ arena out {{
+   mut pending: array_builder<{ty}> := array_builder(out)
+   mut index := 0
+   loop {{ {grow}; index = index + 1; if index == 2 {{ break }} }}
+   alias := pending
+   rows := alias.build()
+   {invalidate}
+   print({read})
+ }}
+}}
+"#,
+                        invalidate = if invalidate { "take(owner)" } else { "" }
+                    );
+                    let (_, diagnostics) = check(&source);
+                    let messages = diagnostics
+                        .iter()
+                        .map(|d| d.message.as_str())
+                        .collect::<Vec<_>>();
+                    if diagnostics.has_errors() != invalidate
+                        || (invalidate
+                            && !messages
+                                .iter()
+                                .any(|m| m.contains("invalidated") || m.contains("outlive")))
+                    {
+                        failures.push(format!(
+                            "{ty}/append={append}/invalidate={invalidate}: {messages:?}"
+                        ));
+                    }
+                }
+            }
+        }
+        for (declaration, ty, value) in [
+            ("", "i64", "1"),
+            ("", "string", "\"one\".clone()"),
+            ("Row { value: i64 }", "Row", "Row { value: 1 }"),
+            (
+                "Row { value: string }",
+                "Row",
+                "Row { value: \"one\".clone() }",
+            ),
+        ] {
+            for action in ["b = array_builder()", "rows := b.build()"] {
+                for terminates in [false, true] {
+                    let source = format!(
+                        "{declaration}\nfn main() {{ mut b: array_builder<{ty}> := array_builder(); b.push({{ {action}; {exit} {value} }}) }}",
+                        exit = if terminates { "return;" } else { "" }
+                    );
+                    let (_, diagnostics) = check(&source);
+                    let messages = diagnostics
+                        .iter()
+                        .map(|d| d.message.as_str())
+                        .collect::<Vec<_>>();
+                    if diagnostics.has_errors() == terminates
+                        || (!terminates && !messages.iter().any(|m| m.contains("invalidated")))
+                    {
+                        failures.push(format!(
+                            "push {ty}/{action}/terminates={terminates}: {messages:?}"
+                        ));
+                    }
+                }
+            }
+        }
+        for (name, source, expected) in [
+            (
+                "borrowed_push_replace",
+                "fn bad(borrow mut b: array_builder<i64>) { b.push({ b = array_builder(); 1 }) }\nfn main() {}",
+                "invalidated",
+            ),
+            (
+                "borrowed_append_replace",
+                "fn bad(borrow mut b: array_builder<i64>, data: slice<i64>) { b.append({ b = array_builder(); data }) }\nfn main() {}",
+                "invalidated",
+            ),
+            (
+                "region_escape",
+                "fn main() { rows := arena out { mut b: array_builder<i64> := array_builder(out); b.push(1); alias := b; alias.build() }; print(rows[0]) }",
+                "escape",
+            ),
+            (
+                "moved_reuse",
+                "fn main() { mut b: array_builder<i64> := array_builder(); b.push(1); alias := b; rows := alias.build(); b.push(2) }",
+                "moved",
+            ),
+            (
+                "borrowed_consume",
+                "fn freeze(borrow mut b: array_builder<i64>) { rows := b.build() }\nfn main() {}",
+                "borrowed",
+            ),
+            (
+                "append_replace",
+                "fn main() { values := [1]; mut b: array_builder<i64> := array_builder(); b.append({ b = array_builder(); values[..] }) }",
+                "invalidated",
+            ),
+            (
+                "append_consume",
+                "fn main() { values := [1]; mut b: array_builder<i64> := array_builder(); b.append({ rows := b.build(); values[..] }) }",
+                "invalidated",
+            ),
+        ] {
+            let (_, diagnostics) = check(source);
+            let messages = diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>();
+            if !diagnostics.has_errors() || !messages.iter().any(|m| m.contains(expected)) {
+                failures.push(format!("{name}: {messages:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]

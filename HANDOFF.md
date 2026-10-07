@@ -17,6 +17,13 @@ outside the active worktree so they do not obstruct unrelated checks or pulls.
 
 ## Next work (handoff updated 2026-10-07)
 
+Plan136 separates array-builder value dependencies from the consumed local slot,
+so loop-local build results remain usable after replacement. Exact receiver
+reservations also reject push/append operands that invalidate the builder before
+the action. Retained element/region lifetimes and read-only origins remain;
+whole/per-unit owners qualify the Request 46 repair. Array-field assignment,
+consumer adoption and K1/plan61 remain deferred.
+
 Build-performance item 11 removes two complete escape-analysis state copies per
 flow transfer while preserving every fact, CFG edge, join, diagnostic and Drop
 classification. A storage-identity owner, sema regression corpus and whole/per-unit
