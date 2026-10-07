@@ -18533,6 +18533,23 @@ impl EscapeValueFact {
         self.headers.rename_generations(renames);
     }
 
+    fn generations_change(&self, renames: &StorageGenerationRenames) -> bool {
+        // Keep this inventory coupled to rename_generations: new fields need an explicit sweep.
+        let Self {
+            headers,
+            non_storage: _,
+            content_ended: _,
+            content_unknown: _,
+            storage_is_local: _,
+            individual: _,
+            may_individual: _,
+        } = self;
+        headers.leaves.values().any(|leaf| {
+            leaf.generations.iter().any(|reference| renames.changes(&reference.generation))
+                || leaf.fallback_roots.iter().any(|root| root.generation_changes(renames))
+        })
+    }
+
     fn has_projected_evidence(&self, path: &[BorrowProjection]) -> bool {
         self.non_storage.direct.is_some()
             || !self.non_storage.project_path(path).eq(&EscapeRegionFact::default())
@@ -18547,6 +18564,69 @@ impl EscapeValueFact {
             || self.content_unknown.iter().any(|candidate| {
                 candidate.is_empty() || candidate.starts_with(path)
             })
+    }
+}
+
+/// Saved states share immutable value payloads. Owned consumers still clone explicitly;
+/// only selected generation renaming mutates an installed payload, after detaching it.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct EscapeValueMap<K: Eq + std::hash::Hash> {
+    values: std::collections::HashMap<K, std::sync::Arc<EscapeValueFact>>,
+}
+
+impl<K: Eq + std::hash::Hash> EscapeValueMap<K> {
+    fn get(&self, key: &K) -> Option<&EscapeValueFact> {
+        self.values.get(key).map(std::sync::Arc::as_ref)
+    }
+
+    fn contains_key(&self, key: &K) -> bool {
+        self.values.contains_key(key)
+    }
+
+    fn insert(&mut self, key: K, value: EscapeValueFact) {
+        self.values.insert(key, std::sync::Arc::new(value));
+    }
+
+    fn remove(&mut self, key: &K) -> Option<std::sync::Arc<EscapeValueFact>> {
+        self.values.remove(key)
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&K, &EscapeValueFact) -> bool) {
+        self.values.retain(|key, value| keep(key, value));
+    }
+
+    fn rename_generations(&mut self, renames: &StorageGenerationRenames) {
+        for value in self.values.values_mut() {
+            if value.generations_change(renames) {
+                std::sync::Arc::make_mut(value).rename_generations(renames);
+            }
+        }
+    }
+}
+
+impl<K: Eq + std::hash::Hash + Clone> EscapeValueMap<K> {
+    fn join_from(&mut self, incoming: &Self) -> bool {
+        EscapeState::reserve_join(&mut self.values, incoming.values.len());
+        let mut changed = false;
+        for (key, value) in &incoming.values {
+            match self.values.entry(key.clone()) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if entry.get() == value {
+                        continue;
+                    }
+                    let next = entry.get().join(value);
+                    if entry.get().as_ref() != &next {
+                        entry.insert(std::sync::Arc::new(next));
+                        changed = true;
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(std::sync::Arc::clone(value));
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 }
 
@@ -18826,11 +18906,11 @@ struct EscapeState {
     /// Generation-based storage facts formed from the shared closed classifier. These coexist
     /// with the legacy region/backing maps during E1, but already contain every value/completion
     /// surface required for the later authority switch.
-    storage_values: std::collections::HashMap<LocalId, EscapeValueFact>,
+    storage_values: EscapeValueMap<LocalId>,
     storage: StorageGenerationTables<EscapeGenerationEntry, EscapeGenerationContent>,
-    storage_argument_snapshots: std::collections::HashMap<(usize, usize), EscapeValueFact>,
-    storage_completed_expressions: std::collections::HashMap<usize, EscapeValueFact>,
-    storage_callable_snapshots: std::collections::HashMap<usize, EscapeValueFact>,
+    storage_argument_snapshots: EscapeValueMap<(usize, usize)>,
+    storage_completed_expressions: EscapeValueMap<usize>,
+    storage_callable_snapshots: EscapeValueMap<usize>,
     backing_storage: std::collections::HashMap<LocalId, EscapeBackingStorage>,
     /// Completion-time eager-argument facts, keyed by call-expression identity and argument
     /// ordinal. Entries are overwritten on each loop iteration and consumed by `MutableCall`.
@@ -18970,22 +19050,10 @@ impl EscapeState {
             true
         });
         changed |= hash_join(region, &other.region, |a, b| a.shorter(*b));
-        changed |= hash_join(storage_values, &other.storage_values, EscapeValueFact::join);
-        changed |= hash_join(
-            storage_argument_snapshots,
-            &other.storage_argument_snapshots,
-            EscapeValueFact::join,
-        );
-        changed |= hash_join(
-            storage_completed_expressions,
-            &other.storage_completed_expressions,
-            EscapeValueFact::join,
-        );
-        changed |= hash_join(
-            storage_callable_snapshots,
-            &other.storage_callable_snapshots,
-            EscapeValueFact::join,
-        );
+        changed |= storage_values.join_from(&other.storage_values);
+        changed |= storage_argument_snapshots.join_from(&other.storage_argument_snapshots);
+        changed |= storage_completed_expressions.join_from(&other.storage_completed_expressions);
+        changed |= storage_callable_snapshots.join_from(&other.storage_callable_snapshots);
         changed |= tree_join(
             directory,
             &other.storage.directory.entries,
@@ -19047,18 +19115,10 @@ impl EscapeState {
         if renames.origins.is_empty() {
             return;
         }
-        for fact in self.storage_values.values_mut() {
-            fact.rename_generations(renames);
-        }
-        for fact in self.storage_argument_snapshots.values_mut() {
-            fact.rename_generations(renames);
-        }
-        for fact in self.storage_completed_expressions.values_mut() {
-            fact.rename_generations(renames);
-        }
-        for fact in self.storage_callable_snapshots.values_mut() {
-            fact.rename_generations(renames);
-        }
+        self.storage_values.rename_generations(renames);
+        self.storage_argument_snapshots.rename_generations(renames);
+        self.storage_completed_expressions.rename_generations(renames);
+        self.storage_callable_snapshots.rename_generations(renames);
     }
 
     fn rename_storage_generations(&mut self, renames: &StorageGenerationRenames) {
@@ -22459,7 +22519,8 @@ impl<'a> EscapeCheck<'a> {
                     // would invent an unknown view and lose the selected caller/storage lifetime.
                     (
                         completed.unwrap_or_else(EscapeArgumentSnapshot::fail_closed),
-                        stored.unwrap_or_else(|| self.fail_closed_escape_value(expression.ty, depth)),
+                        stored.map(std::sync::Arc::unwrap_or_clone)
+                            .unwrap_or_else(|| self.fail_closed_escape_value(expression.ty, depth)),
                     )
                 } else {
                     let snapshot = self.call_completion_snapshot(expression, depth);
@@ -80566,10 +80627,10 @@ fn main() -> i32 = 0
             context,
         );
         assert_eq!(
-            state.storage_values[&0].non_storage,
+            state.storage_values.get(&0).unwrap().non_storage,
             EscapeRegionFact::from_direct(Region::Caller(0)),
         );
-        assert!(state.storage_values[&0].headers.leaves.is_empty());
+        assert!(state.storage_values.get(&0).unwrap().headers.leaves.is_empty());
 
         seed_escape_parameter_storage(
             &mut state,
@@ -80580,7 +80641,7 @@ fn main() -> i32 = 0
             context,
         );
         assert_eq!(
-            state.storage_values[&1].non_storage.projected,
+            state.storage_values.get(&1).unwrap().non_storage.projected,
             [
                 (vec![BorrowProjection::StructField(0)], Region::Caller(1)),
                 (
@@ -80595,7 +80656,7 @@ fn main() -> i32 = 0
             .collect(),
             "a header-free aggregate still seeds every exact ordinary borrow leaf",
         );
-        assert!(state.storage_values[&1].headers.leaves.is_empty());
+        assert!(state.storage_values.get(&1).unwrap().headers.leaves.is_empty());
 
         seed_escape_parameter_storage(
             &mut state,
@@ -80607,7 +80668,7 @@ fn main() -> i32 = 0
         );
         let mixed_path = vec![BorrowProjection::StructField(1)];
         assert_eq!(
-            state.storage_values[&2].non_storage.projected,
+            state.storage_values.get(&2).unwrap().non_storage.projected,
             [(vec![BorrowProjection::StructField(0)], Region::Caller(2))]
                 .into_iter()
                 .collect(),
@@ -80615,7 +80676,7 @@ fn main() -> i32 = 0
         );
         let mixed_generation = StorageGeneration::caller_storage(2, &mixed_path);
         assert_eq!(
-            state.storage_values[&2].headers.leaves[&mixed_path].generations,
+            state.storage_values.get(&2).unwrap().headers.leaves[&mixed_path].generations,
             [StorageGenerationRef::root(mixed_generation.clone())]
                 .into_iter()
                 .collect(),
@@ -80645,7 +80706,7 @@ fn main() -> i32 = 0
         let fixed_generation =
             StorageGeneration::current(StorageOrigin::inline_place(3, &[]));
         assert_eq!(
-            state.storage_values[&3].headers.leaves[&Vec::new()].generations,
+            state.storage_values.get(&3).unwrap().headers.leaves[&Vec::new()].generations,
             [StorageGenerationRef::root(fixed_generation.clone())]
                 .into_iter()
                 .collect(),
@@ -80701,8 +80762,8 @@ fn main() -> i32 = 0
                 may_individual: true,
             },
         );
-        assert!(state.storage_values[&4].storage_is_local);
-        assert!(state.storage_values[&4].individual);
+        assert!(state.storage_values.get(&4).unwrap().storage_is_local);
+        assert!(state.storage_values.get(&4).unwrap().individual);
 
         seed_escape_parameter_storage(
             &mut state,
@@ -80744,9 +80805,9 @@ fn main() -> i32 = 0
                     may_individual: false,
                 },
             );
-            assert!(!state.storage_values[&position].storage_is_local);
-            assert!(!state.storage_values[&position].individual);
-            assert!(!state.storage_values[&position].may_individual);
+            assert!(!state.storage_values.get(&position).unwrap().storage_is_local);
+            assert!(!state.storage_values.get(&position).unwrap().individual);
+            assert!(!state.storage_values.get(&position).unwrap().may_individual);
         }
         assert_eq!(
             std::ptr::from_ref(state.storage.directory.entries[&fixed_generation]
@@ -81158,6 +81219,216 @@ fn main() -> i32 = 0
         assert!(EscapeState::merge_input(&mut absent, &mut EscapeState::default(), true));
         assert!(absent.is_some());
         assert!(!EscapeState::merge_input(&mut absent, &mut EscapeState::default(), true));
+    }
+
+    #[test]
+    fn escape_value_map_preserves_shared_payload_lifecycle() {
+        use std::sync::Arc;
+        let fact = EscapeValueFact {
+            non_storage: EscapeRegionFact::at_path(
+                &[BorrowProjection::StructField(2)], Region::Caller(1),
+            ),
+            content_unknown: [vec![BorrowProjection::StructField(3)]].into_iter().collect(),
+            individual: true,
+            may_individual: true,
+            ..EscapeValueFact::default()
+        };
+        let mut original = EscapeValueMap::default();
+        original.insert(7, fact.clone());
+        let first = Arc::downgrade(original.values.get(&7).unwrap());
+        let mut copy = original.clone();
+        assert!(Arc::ptr_eq(original.values.get(&7).unwrap(), copy.values.get(&7).unwrap()));
+        assert_eq!(Arc::strong_count(original.values.get(&7).unwrap()), 2);
+        let mut replacement = fact.clone();
+        replacement.storage_is_local = true;
+        copy.insert(7, replacement.clone());
+        assert_eq!(original.get(&7), Some(&fact));
+        assert_eq!(copy.get(&7), Some(&replacement));
+        let removed = original.remove(&7).unwrap();
+        assert!(!original.contains_key(&7));
+        assert_eq!(Arc::strong_count(&removed), 1);
+        let path_address = removed.content_unknown.first().unwrap().as_ptr();
+        let owned = Arc::unwrap_or_clone(removed);
+        assert_eq!(owned, fact);
+        assert_eq!(owned.content_unknown.first().unwrap().as_ptr(), path_address);
+        assert!(first.upgrade().is_none(), "unique extraction retires the Arc");
+
+        let mut copy_of_copy = copy.clone();
+        let removed = copy_of_copy.remove(&7).unwrap();
+        assert_eq!(Arc::strong_count(&removed), 2);
+        let path_address = removed.content_unknown.first().unwrap().as_ptr();
+        let mut owned = Arc::unwrap_or_clone(removed);
+        assert_eq!(owned, replacement);
+        assert_ne!(owned.content_unknown.first().unwrap().as_ptr(), path_address);
+        owned.content_unknown.clear();
+        assert_eq!(copy.get(&7), Some(&replacement), "owned extraction is independent");
+        assert_eq!(Arc::strong_count(copy.values.get(&7).unwrap()), 1);
+        let retained = Arc::downgrade(copy.values.get(&7).unwrap());
+        copy.insert(8, fact);
+        let discarded = Arc::downgrade(copy.values.get(&8).unwrap());
+        let before = copy.get(&7).unwrap() as *const EscapeValueFact;
+        copy.retain(|key, value| *key == 7 && value.storage_is_local);
+        assert_eq!(copy.get(&7).unwrap() as *const EscapeValueFact, before);
+        assert!(!copy.contains_key(&8));
+        assert!(discarded.upgrade().is_none());
+        drop(copy);
+        assert!(retained.upgrade().is_none(), "last owner releases the payload");
+        assert!(copy_of_copy.values.is_empty());
+    }
+
+    #[test]
+    fn escape_value_map_join_preserves_values_and_identity() {
+        use std::sync::Arc;
+        let short = EscapeValueFact {
+            non_storage: EscapeRegionFact::from_direct(Region::Arena(2)),
+            storage_is_local: true,
+            ..EscapeValueFact::default()
+        };
+        let long = EscapeValueFact {
+            non_storage: EscapeRegionFact::from_direct(Region::Caller(1)),
+            ..EscapeValueFact::default()
+        };
+        for (left, right) in [
+            (None, Some(short.clone())),
+            (Some(short.clone()), None),
+            (Some(short.clone()), Some(short.clone())),
+            (Some(short.clone()), Some(long.clone())),
+            (Some(long), Some(short)),
+        ] {
+            let mut current = EscapeValueMap::default();
+            let mut incoming = EscapeValueMap::default();
+            if let Some(value) = &left { current.insert(7, value.clone()); }
+            if let Some(value) = &right { incoming.insert(7, value.clone()); }
+            let saved = current.clone();
+            let expected = match (&left, &right) {
+                (Some(a), Some(b)) => Some(a.join(b)),
+                (Some(a), None) | (None, Some(a)) => Some(a.clone()),
+                (None, None) => None,
+            };
+            let changed = left != expected;
+            let address = current.get(&7).map(|value| value as *const EscapeValueFact);
+            assert_eq!(current.join_from(&incoming), changed);
+            assert_eq!(current.get(&7), expected.as_ref());
+            assert_eq!(saved.get(&7), left.as_ref(), "saved state changed");
+            assert_eq!(incoming.get(&7), right.as_ref(), "incoming state changed");
+            if !changed {
+                assert_eq!(current.get(&7).map(|value| value as *const EscapeValueFact), address);
+            } else if left.is_none() {
+                assert!(Arc::ptr_eq(current.values.get(&7).unwrap(), incoming.values.get(&7).unwrap()));
+            } else {
+                assert_ne!(current.get(&7).map(|value| value as *const EscapeValueFact), address);
+            }
+            let address = current.get(&7).map(|value| value as *const EscapeValueFact);
+            assert!(!current.join_from(&incoming));
+            assert!(!current.join_from(&current.clone()));
+            assert_eq!(current.get(&7).map(|value| value as *const EscapeValueFact), address);
+        }
+    }
+
+    #[test]
+    fn escape_shared_values_detach_only_selected_generations() {
+        fn values(state: &EscapeState) -> [&EscapeValueFact; 8] {
+            [
+                state.storage_values.get(&7).unwrap(),
+                state.storage_argument_snapshots.get(&(7, 0)).unwrap(),
+                state.storage_completed_expressions.get(&7).unwrap(),
+                state.storage_callable_snapshots.get(&7).unwrap(),
+                state.storage_values.get(&8).unwrap(),
+                state.storage_argument_snapshots.get(&(8, 0)).unwrap(),
+                state.storage_completed_expressions.get(&8).unwrap(),
+                state.storage_callable_snapshots.get(&8).unwrap(),
+            ]
+        }
+        let path = vec![BorrowProjection::StructField(2), BorrowProjection::OptionSome];
+        let origin = StorageOrigin::inline_place(7, &path);
+        let descriptor = StorageHeaderDescriptor { ty: Ty::Str, kind: StorageHeaderKind::View };
+        let untouched = EscapeValueFact {
+            headers: ProjectedHeaderFact::from_leaf(
+                path.clone(),
+                StorageHeaderLeaf::known_typed(StorageGeneration::parameter_value(0, &path), descriptor),
+            ),
+            ..EscapeValueFact::default()
+        };
+        for shared in [false, true] {
+            for phase in 0..3 {
+                let generation = match phase {
+                    0 => StorageGeneration::current(origin.clone()),
+                    1 => StorageGeneration::prior(origin.clone()),
+                    _ => StorageGeneration::caller_storage(0, &path),
+                };
+                // Primary references and every generation-bearing fallback root occur alone:
+                // the primary predicate cannot accidentally cover a missing fallback predicate.
+                for carrier in 0..5 {
+                    let mut leaf = StorageHeaderLeaf::unknown_typed(
+                        [BorrowRoot::ReadOnly, BorrowRoot::Param(1)].into_iter().collect(),
+                        descriptor,
+                    );
+                    if carrier == 0 {
+                        leaf.generations.insert(StorageGenerationRef {
+                            generation: generation.clone(),
+                            content_path: path.clone(),
+                            erase_readonly: true,
+                        });
+                    } else {
+                        leaf.fallback_roots.insert(match carrier {
+                            1 => BorrowRoot::Observation(generation.clone()),
+                            2 => BorrowRoot::EndedObservation(generation.clone(), BorrowEnd::Dropped),
+                            3 => BorrowRoot::StorageLocal(generation.clone(), 7, path.clone().into()),
+                            _ => BorrowRoot::EndedStorageLocal(
+                                generation.clone(), 7, path.clone().into(), BorrowEnd::Consumed,
+                            ),
+                        });
+                    }
+                    let fact = EscapeValueFact {
+                        non_storage: EscapeRegionFact::at_path(&path, Region::Arena(3)),
+                        headers: ProjectedHeaderFact::from_leaf(path.clone(), leaf),
+                        content_ended: [(path.clone(), BorrowEnd::Dropped)].into_iter().collect(),
+                        content_unknown: [path.clone()].into_iter().collect(),
+                        storage_is_local: true,
+                        individual: true,
+                        may_individual: true,
+                    };
+                    for mode in 0..3 {
+                        let renames = StorageGenerationRenames::from_origins(match mode {
+                            0 => vec![],
+                            1 => vec![StorageOrigin::inline_place(99, &path)],
+                            _ => vec![origin.clone()],
+                        });
+                        let mut state = EscapeState::default();
+                        for (key, value) in [(7, &fact), (8, &untouched)] {
+                            state.storage_values.insert(key, value.clone());
+                            state.storage_argument_snapshots.insert((key as usize, 0), value.clone());
+                            state.storage_completed_expressions.insert(key as usize, value.clone());
+                            state.storage_callable_snapshots.insert(key as usize, value.clone());
+                        }
+                        let before = values(&state).map(|value| value as *const EscapeValueFact);
+                        let saved = shared.then(|| state.clone());
+                        if let Some(saved) = &saved {
+                            assert_eq!(values(saved).map(|value| value as *const EscapeValueFact), before);
+                        }
+                        let mut expected = fact.clone();
+                        expected.rename_generations(&renames);
+                        let changed = mode == 2 && phase == 0;
+                        assert_eq!(expected != fact, changed);
+                        state.rename_storage_observers(&renames);
+                        for (index, value) in values(&state).into_iter().enumerate() {
+                            assert_eq!(value, if index < 4 { &expected } else { &untouched });
+                            if index < 4 && shared && changed {
+                                assert_ne!(value as *const EscapeValueFact, before[index]);
+                            } else {
+                                assert_eq!(value as *const EscapeValueFact, before[index]);
+                            }
+                        }
+                        if let Some(saved) = &saved {
+                            for (index, value) in values(saved).into_iter().enumerate() {
+                                assert_eq!(value, if index < 4 { &fact } else { &untouched });
+                                assert_eq!(value as *const EscapeValueFact, before[index]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

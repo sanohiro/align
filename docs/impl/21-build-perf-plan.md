@@ -3313,3 +3313,73 @@ checked-work outputs and rejected diagnostics match across the 30-cell corpus.
 Numeric straight/try controls stay within 2 ms and every 16-value control within
 0.5 ms. `results-join-cost-macos.json` retains samples and hashes. Other state
 copies, repeated traversal, consumer acceptance and K1/plan61 remain deferred.
+
+## Item 21: shared immutable escape-value payloads
+
+Bounded profiles of 1,024 Result-match expressions still reach
+`EscapeValueFact::clone` beneath `EscapeState::clone`. A later one-second sample
+also shows substantial join/rehashing work; sharing is not a complete scaling
+repair. Qualify its marginal benefit before retaining the capability.
+
+Store the four value-fact maps (`storage_values`, `storage_argument_snapshots`,
+`storage_completed_expressions`, `storage_callable_snapshots`) in one private
+`EscapeValueMap<K>` wrapper containing `HashMap<K, Arc<EscapeValueFact>>`.
+State copies still copy map keys/tables but share immutable payloads. `get`
+returns a borrowed `EscapeValueFact`; existing owned projections and call
+snapshots keep their explicit deep clones. Insertion accepts an owned fact and
+replaces one entry. Removal returns an Arc; only a consumed loop-completion fact
+uses `Arc::unwrap_or_clone`. Discarded completions release their reference without
+copying. Retention predicates receive immutable facts, never mutable payloads.
+No general mutable accessor or `DerefMut` exposes shared contents.
+
+Each map joins with item20's capacity lower bound, exact structural equality and
+unchanged change bit. Equal operands keep their current allocation. Unequal
+operands invoke the existing fact join; an unchanged result keeps the current
+allocation, while a changed result installs a fresh Arc. An absent key shares the
+incoming immutable payload. Pointer identity is neither a fact nor a join rule.
+Generation renaming first checks all projected header leaves for affected
+references or fallback roots, using the existing `StorageGenerationRenames::changes`
+and exhaustive `BorrowRoot::generation_changes` authorities. Only an affected
+fact goes through `Arc::make_mut` and the existing rename operation. Unaffected
+facts retain their allocation; selected mutations cannot change any saved state.
+The predicate inventory must remain coupled to all fields changed by
+`EscapeValueFact::rename_generations` (currently only projected headers).
+
+This changes compiler scratch ownership, not Align ownership, lifetime,
+allocation, checked-HIR facts, summaries, interfaces, MIR, ABI or runtime behavior.
+All four maps change together. No worklist, control edge, source-order replay,
+fact content or missing-input rule changes. Arc preserves Send/Sync capability
+without interior mutability or unsafe code. K1 and plan61 remain deferred.
+
+### Implementation closure matrix
+
+| Axis | Implementation and owner |
+| --- | --- |
+| Construction, copy and release | The private map accepts owned facts and clones only Arc references on state copy. `escape_value_map_preserves_shared_payload_lifecycle` compares exact values and live Arc/Weak identities across clone, insert/replace, remove, retain and Drop. Unique extraction transfers nested allocation; shared extraction yields an independent owned value. No process-global test counters. |
+| Mutation isolation and generation inventory | All four maps route through one selective rename method. `escape_shared_values_detach_only_selected_generations` crosses unique/shared state, empty/unrelated/selected renames, header generation references and each generation-bearing fallback-root variant, including ended roots, with exact old/new facts and payload identities. A mutation restoring deep state copies must fail sharing identities; eagerly detaching every fact must fail unaffected identities. Existing generation-rename collision owners retain deduplication and minimum-error proof. |
+| Joins and publication | `escape_value_map_join_preserves_values_and_identity` covers equal, unequal unchanged/changed and absent inputs, complete values, allocation identity and exact change bits. Existing `escape_state_join_preserves_facts_changes_and_storage` covers all four actual maps, operand orders, repeated and disjoint/one-sided inputs. `escape_flow_successor_publication_transfers_only_the_final_output` retains edge ownership. |
+| Move-in/out, nulling, replacement and return | Preserve owned-value producer/consumer clones, fixed/dynamic installation, source nulling, call publication, loop-value extraction and every fallback. Existing storage-generation and full sema owners plus `array_builder_transfer`, `m12_array_builder`, `fb_region`, `return_provenance`, and `borrow_liveness` driver owners cover actual source ownership and cleanup. |
+| Branches, loops, exits and malformed input | No evaluator or CFG changes. Existing terminal-probe differential owner covers if/match/else/try/map_err, loop/break, arena/builder exits, replacement, return and invalid local/arena escape, comparing complete published facts and ordered diagnostics. Full sema owners retain malformed-input behavior. |
+| Generic, interface, whole/per-unit and runtime parity | Existing imported/generic owner suites and numeric/storage corpus compare MIR/raw LLVM, rejection diagnostics and actual checked work. No serialization or runtime allocation changes; Arc is analysis-only and never persisted. |
+| Measurement and limits | Run the existing numeric/storage 16/128/512 corpora with warmup and five alternating samples, no concurrent builds/tests, 20-second child budget, all 15 MIR/raw LLVM pairs and four rejected controls. Check small-input Arc allocation overhead and remaining hash/traversal cost. Retain only a measured useful benefit without material control regressions; no near-linear, client-time or runtime-resource promise. |
+
+Complete the author inventory-to-matrix pass and one fresh independent plan
+review before implementation because internal payload ownership changes. Resolve
+that review's findings before coding. One coherent capability includes the map,
+all four consumers and discriminating owners; it is expected below 1,000
+handwritten changed lines. Complete an author matrix-to-diff pass and one fresh
+inspection-only preflight review on the committed candidate.
+
+Deep-copy and unconditional-detachment mutations each fail their separate new
+owner; the measured source is restored byte-for-byte.
+
+Five alternating release samples improve the 512-value Result-match whole/per-unit
+medians from 0.767/1.403 s to 0.478/0.912 s (1.60x/1.54x). All 15 source MIR/raw
+LLVM pairs, actual checked-work outputs and four rejected controls match across
+30 measurement cells. Every 16-value control stays within 0.6 ms and numeric
+straight/try controls within 1.1 ms. Straight fixed-array per-unit checking grows
+by 7.1 ms (2.7%); storage cases show no speedup. Retain that bounded tradeoff for
+the measured Result-match benefit, without a uniform-speedup or client-time
+promise. `results-shared-values-macos.json` retains samples and hashes. Fresh Arc
+allocation, map copies and repeated traversal remain; consumer acceptance and
+K1/plan61 remain deferred.
