@@ -37764,8 +37764,8 @@ impl<'a> MoveCheck<'a> {
             // receiver borrows still acquire that slot's identity through local_storage_roots.
             // Cover every builder variant and the complete resource-only type graph so
             // aliases and control results cannot retain a consumed arm/iteration-local owner.
-            !local.ty.is_array_builder()
-                && !(self.is_move_ty(local.ty)
+            !(local.ty.is_array_builder()
+                || (self.is_move_ty(local.ty)
                     && ty_mentions_resource(
                         local.ty,
                         self.structs,
@@ -37779,7 +37779,7 @@ impl<'a> MoveCheck<'a> {
                         self.tuples,
                         self.enums,
                         self.tagged_types,
-                    ))
+                    )))
                 && (local.ty == Ty::ArenaHandle
                     || self.local_owns_view_storage(id)
                     || self.local_may_borrow(id))
