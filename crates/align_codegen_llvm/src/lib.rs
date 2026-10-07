@@ -39,6 +39,8 @@ mod drop_codegen;
 mod ffi_aarch64;
 #[cfg(test)]
 mod ffi_aarch64_tests;
+#[cfg(test)]
+mod ffi_sysv_tests;
 mod llvm_build_id;
 /// Instrument-PGO driver-facing surface (production): the safe wrapper over the
 /// C++ shim's `align_pgo_run_pipeline` entry for `--pgo-instrument` / `--pgo-use`.
@@ -3856,7 +3858,7 @@ fn lower_prepared_module<'c>(
     // the declaration pass below is therefore all-or-nothing for this compatibility boundary.
     let triple = tm.get_triple();
     let triple_s = triple.as_str().to_string_lossy().to_ascii_lowercase();
-    let x86_64_sysv = triple_s.starts_with("x86_64") && triple_s.contains("linux");
+    let x86_64_sysv = sysv_record_target(&triple_s, &target_data);
     let arm_abi = ffi_aarch64::Abi::for_target(&triple_s, &target_data);
     for ext in &program.externs {
         let uses_byval_struct = matches!(ext.ret, Ty::Struct(_))
@@ -3869,7 +3871,7 @@ fn lower_prepared_module<'c>(
         }
         // A plain pointer function type cannot prove caller-copy or hidden-sret compatibility.
         // Fixed native rows remain the authority; they have no source C-record ABI contract.
-        if uses_byval_struct && arm_abi.is_some()
+        if uses_byval_struct
             && runtime_abi::runtime_abi_for_symbol(ext.name.as_str()).is_some()
         {
             return Err(CodegenError::Lowering(format!(
@@ -3897,7 +3899,7 @@ fn lower_prepared_module<'c>(
                         } else {
                             match classify_struct_abi(id, &st, def, &target_data) {
                                 Some(abi) => ParamAbi::StructRegs(abi),
-                                None => ParamAbi::StructMemory,
+                                None => ParamAbi::StructMemory(SysvMemory::new(id, st, def, &target_data)?),
                             }
                         }
                     }
@@ -3913,7 +3915,7 @@ fn lower_prepared_module<'c>(
                     } else {
                         match classify_struct_abi(id, &st, def, &target_data) {
                             Some(abi) => ReturnAbi::StructRegs(abi),
-                            None => ReturnAbi::StructMemory,
+                            None => ReturnAbi::StructMemory(SysvMemory::new(id, st, def, &target_data)?),
                         }
                     }
                 }
@@ -3928,21 +3930,24 @@ fn lower_prepared_module<'c>(
         let abi = extern_abi.get_mut(&ext.name)
             .ok_or_else(|| callable_target_error(&ext.name))?;
         if x86_64_sysv {
-            check_sysv_struct_args_fit(ext.name.as_str(), abi, &ext.params, &program.structs)?;
+            assign_sysv_struct_args(abi, &ext.params, &struct_types, &program.structs, &target_data)?;
         }
         use inkwell::attributes::{Attribute, AttributeLoc};
         let enum_attribute = |name, value| ctx.create_enum_attribute(Attribute::get_named_enum_kind_id(name), value);
         let mut param_types: Vec<BasicMetadataTypeEnum> = Vec::with_capacity(ext.params.len());
-        if let ReturnAbi::ArmRecord(record) = &abi.ret
-            && record.indirect()
-        {
-            let st = struct_types.get(record.id as usize)
+        let hidden_result = match &abi.ret {
+            ReturnAbi::ArmRecord(record) if record.indirect() => Some((record.id, record.alignment)),
+            ReturnAbi::StructMemory(record) => Some((record.id, record.alignment)),
+            _ => None,
+        };
+        if let Some((id, alignment)) = hidden_result {
+            let st = struct_types.get(id as usize)
                 .ok_or_else(|| CodegenError::Lowering("extern return record is missing".into()))?;
             param_types.push(ctx.ptr_type(AddressSpace::default()).into());
             abi.attributes.push((AttributeLoc::Param(0), ctx.create_type_attribute(
                 Attribute::get_named_enum_kind_id("sret"), (*st).into(),
             )));
-            abi.attributes.push((AttributeLoc::Param(0), enum_attribute("align", u64::from(record.alignment))));
+            abi.attributes.push((AttributeLoc::Param(0), enum_attribute("align", u64::from(alignment))));
         }
         for (pa, &ty) in abi.params.iter().zip(&ext.params) {
             let ordinal = u32::try_from(param_types.len())
@@ -3970,15 +3975,14 @@ fn lower_prepared_module<'c>(
                         abi.attributes.push((AttributeLoc::Param(ordinal), enum_attribute("alignstack", alignment)));
                     }
                 }
-                ParamAbi::StructMemory => {
-                    let sname = match ty {
-                        Ty::Struct(id) => program.structs[id as usize].name.as_str(),
-                        _ => "?",
-                    };
-                    return Err(CodegenError::Lowering(format!(
-                        "extern '{}': passing struct '{sname}' by value needs the > 16-byte MEMORY-class ABI (a `byval` pointer), which is not supported in FFI v1 — pass it by pointer (`raw`) instead",
-                        ext.name,
+                ParamAbi::StructMemory(record) => {
+                    let st = struct_types.get(record.id as usize)
+                        .ok_or_else(|| CodegenError::Lowering("SysV argument record is missing".into()))?;
+                    param_types.push(ctx.ptr_type(AddressSpace::default()).into());
+                    abi.attributes.push((AttributeLoc::Param(ordinal), ctx.create_type_attribute(
+                        Attribute::get_named_enum_kind_id("byval"), (*st).into(),
                     )));
+                    abi.attributes.push((AttributeLoc::Param(ordinal), enum_attribute("align", u64::from(record.byval_alignment()))));
                 }
             }
         }
@@ -4005,16 +4009,7 @@ fn lower_prepared_module<'c>(
                     None => ctx.void_type().fn_type(&param_types, false),
                 }
             }
-            ReturnAbi::StructMemory => {
-                let sname = match ext.ret {
-                    Ty::Struct(id) => program.structs[id as usize].name.as_str(),
-                    _ => "?",
-                };
-                return Err(CodegenError::Lowering(format!(
-                    "extern '{}': returning struct '{sname}' by value needs the > 16-byte MEMORY-class ABI (an `sret` pointer), which is not supported in FFI v1 — return it through an out-pointer (`raw`) parameter instead",
-                    ext.name,
-                )));
-            }
+            ReturnAbi::StructMemory(_) => ctx.void_type().fn_type(&param_types, false),
         };
         if !runtime_abi::native_extern_abi_matches(ext.name.as_str(), fn_ty, ctx) {
             return Err(CodegenError::Lowering(format!(
@@ -7888,8 +7883,8 @@ struct StructAbi {
 }
 
 /// Classify a `layout(C)` struct for SysV AMD64 by-value passing. Returns `Some(abi)` for a register
-/// struct (size ≤ 16 bytes) and `None` for a MEMORY struct (> 16 bytes — not register-passed;
-/// rejected in FFI v1). `st`/`def` are the struct's LLVM type and definition; `td` gives real field
+/// struct (size ≤ 16 bytes) and `None` for a MEMORY struct (> 16 bytes — not register-passed).
+/// `st`/`def` are the struct's LLVM type and definition; `td` gives real field
 /// offsets, so the classification tracks the actual emitted layout. Only called for a `layout(C)`
 /// struct on an x86-64 SysV target.
 fn classify_struct_abi(
@@ -7941,8 +7936,8 @@ enum ParamAbi {
     StructRegs(StructAbi),
     /// One ARM64 aggregate operand or a pointer to a caller-owned copy.
     ArmRecord(ffi_aarch64::Record),
-    /// The deferred SysV MEMORY-class argument (>16 bytes); currently rejected.
-    StructMemory,
+    /// A SysV byval stack argument, from size or whole-aggregate register exhaustion.
+    StructMemory(SysvMemory),
 }
 
 /// How an `extern "C"` return value crosses the ABI boundary.
@@ -7954,8 +7949,8 @@ enum ReturnAbi {
     StructRegs(StructAbi),
     /// An ARM64 aggregate/coerced result or a typed hidden result pointer.
     ArmRecord(ffi_aarch64::Record),
-    /// The deferred SysV MEMORY-class result (>16 bytes); currently rejected.
-    StructMemory,
+    /// A SysV hidden-result pointer for a large record.
+    StructMemory(SysvMemory),
 }
 
 /// The physical ABI plan for one `extern "C"` symbol.
@@ -7985,56 +7980,89 @@ fn struct_ret_type<'c>(ctx: &'c Context, abi: &StructAbi) -> BasicTypeEnum<'c> {
 const SYSV_INT_ARG_REGS: u32 = 6;
 const SYSV_SSE_ARG_REGS: u32 = 8;
 
-/// Enforce the SysV **all-or-nothing** rule for by-value struct *arguments*: a struct is passed in
-/// registers only if *every* one of its eightbytes fits in the class registers still free after the
-/// preceding arguments; otherwise the ABI puts the whole struct in memory via a `byval` pointer.
-///
-/// We do not implement that `byval` path — and, crucially, cannot fake it by flattening. A flattened
-/// `{i64,i64}` argument at the exhaustion boundary makes LLVM assign one eightbyte to the last free
-/// register and spill the other to the stack, whereas a clang-compiled callee reading a `byval`
-/// argument expects the whole struct on the stack; the two disagree (verified: a `{i64,i64}` passed
-/// after five `i64` args round-trips to garbage). So we **reject** any signature where a by-value
-/// struct argument would fall to memory, rather than silently miscompile. In every *accepted* case
-/// the struct fits in registers, and per-eightbyte flattening is byte-identical to clang's own
-/// flattened parameter form, so the call is correct.
-///
-/// Only struct arguments consume the budget check: a scalar/pointer/view that itself spills to the
-/// stack is lowered identically on both sides (a single stack slot), so it never diverges.
-fn check_sysv_struct_args_fit(
-    ext_name: &str,
-    abi: &ExternAbi,
+/// Select only the qualified LP64 Linux SysV record ABI, never x32 or a name prefix.
+fn sysv_record_target(triple: &str, data: &inkwell::targets::TargetData) -> bool {
+    let parts = triple.split('-').collect::<Vec<_>>();
+    matches!(parts.as_slice(), ["x86_64", _, "linux", "gnu" | "musl"])
+        && data.get_byte_ordering() == inkwell::targets::ByteOrdering::LittleEndian
+        && data.get_pointer_byte_size(None) == 8
+}
+
+/// Complete aligned storage for a SysV stack argument or hidden result.
+#[derive(Clone)]
+struct SysvMemory {
+    id: u32,
+    alignment: u32,
+    eightbytes: u32,
+}
+
+impl SysvMemory {
+    fn new(id: u32, st: StructType<'_>, def: &StructDef, data: &inkwell::targets::TargetData) -> Result<Self, CodegenError> {
+        let invalid = || CodegenError::Lowering("invalid SysV C-record ABI layout".into());
+        if !def.c_repr || def.fields.is_empty()
+            || def.align.is_some_and(|alignment| !alignment.is_power_of_two())
+            || !def.fields.iter().all(|field| match field.ty {
+                Ty::Raw => true,
+                Ty::Int(ty) => matches!(ty.bits, 8 | 16 | 32 | 64),
+                Ty::Float(ty) => matches!(ty.bits, 32 | 64),
+                _ => false,
+            }) {
+            return Err(invalid());
+        }
+        let size = data.get_abi_size(&st);
+        let alignment = data.get_abi_alignment(&st).max(def.align.unwrap_or(1));
+        if size == 0 || !alignment.is_power_of_two() {
+            return Err(invalid());
+        }
+        let eightbytes = u32::try_from(size.div_ceil(8)).map_err(|_| invalid())?;
+        Ok(Self { id, alignment, eightbytes })
+    }
+
+    fn byval_alignment(&self) -> u32 {
+        self.alignment.max(8)
+    }
+}
+
+/// Assign all-or-nothing aggregate registers in source order. Hidden sret consumes the first
+/// GP register. A byval stack argument consumes neither class, including when only one half of
+/// a mixed-class record was exhausted; later records can still use every remaining register.
+fn assign_sysv_struct_args(
+    abi: &mut ExternAbi,
     param_tys: &[Ty],
+    struct_types: &[StructType<'_>],
     structs: &[StructDef],
+    data: &inkwell::targets::TargetData,
 ) -> Result<(), CodegenError> {
-    let mut gp = 0u32;
+    let mut gp = u32::from(matches!(abi.ret, ReturnAbi::StructMemory(_)));
     let mut sse = 0u32;
-    for (i, (pa, ty)) in abi.params.iter().zip(param_tys).enumerate() {
+    for (pa, ty) in abi.params.iter_mut().zip(param_tys) {
         match pa {
             ParamAbi::Direct => {
                 if matches!(ty, Ty::Float(_)) {
-                    sse += 1;
+                    sse = (sse + 1).min(SYSV_SSE_ARG_REGS);
                 } else {
-                    gp += 1; // integer / `raw` pointer → a general-purpose register
+                    gp = (gp + 1).min(SYSV_INT_ARG_REGS);
                 }
             }
-            ParamAbi::ViewPtr => gp += 1, // a `str`/`slice` passes as one data pointer
+            ParamAbi::ViewPtr => gp = (gp + 1).min(SYSV_INT_ARG_REGS),
             ParamAbi::StructRegs(sabi) => {
-                let need_int = sabi.ebs.iter().filter(|e| matches!(e, Eb::Integer)).count() as u32;
-                let need_sse = sabi.ebs.iter().filter(|e| matches!(e, Eb::Sse)).count() as u32;
-                if gp + need_int > SYSV_INT_ARG_REGS || sse + need_sse > SYSV_SSE_ARG_REGS {
-                    let sname = &structs[sabi.id as usize].name;
-                    return Err(CodegenError::Lowering(format!(
-                        "extern '{ext_name}': by-value struct '{sname}' (argument {n}) would be passed in memory — the preceding arguments exhaust the SysV class registers ({SYSV_INT_ARG_REGS} integer / {SYSV_SSE_ARG_REGS} SSE), so the struct falls to the MEMORY-class `byval` ABI, which is not supported in FFI v1. Reorder the parameters so the struct fits in registers, or pass it by pointer (`raw`).",
-                        n = i + 1,
-                    )));
+                // At most two eightbytes; retain checked conversion at this metadata boundary.
+                let count = |class| u32::try_from(sabi.ebs.iter().filter(|&&eb| eb == class).count())
+                    .map_err(|_| CodegenError::Lowering("SysV register count overflows".into()));
+                let need_int = count(Eb::Integer)?;
+                let need_sse = count(Eb::Sse)?;
+                if need_int > SYSV_INT_ARG_REGS - gp || need_sse > SYSV_SSE_ARG_REGS - sse {
+                    let st = struct_types.get(sabi.id as usize)
+                        .ok_or_else(|| CodegenError::Lowering("SysV argument record is missing".into()))?;
+                    let def = structs.get(sabi.id as usize)
+                        .ok_or_else(|| CodegenError::Lowering("SysV argument definition is missing".into()))?;
+                    *pa = ParamAbi::StructMemory(SysvMemory::new(sabi.id, *st, def, data)?);
+                } else {
+                    gp += need_int;
+                    sse += need_sse;
                 }
-                gp += need_int;
-                sse += need_sse;
             }
-            // A > 16-byte MEMORY struct consumes no registers and is rejected separately (with a size
-            // message) in the declaration loop.
-            ParamAbi::StructMemory => {}
-            ParamAbi::ArmRecord(_) => {}
+            ParamAbi::StructMemory(_) | ParamAbi::ArmRecord(_) => {}
         }
     }
     Ok(())
@@ -12318,6 +12346,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
     fn eightbyte_slot(&self, n: usize) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
         let arr = self.ctx.i64_type().array_type(n as u32);
         self.alloca_at_entry(arr.into(), "sysv_slot")
+    }
+
+    /// Full independent byval/sret storage. The stronger byval alignment is also safe for results.
+    fn sysv_memory_slot(&self, record: &SysvMemory) -> Result<PointerValue<'c>, CodegenError> {
+        let storage = self.ctx.i64_type().array_type(record.eightbytes);
+        let slot = self.alloca_at_entry(storage.into(), "sysv_memory")?;
+        slot.as_instruction_value()
+            .ok_or_else(|| self.err("SysV record slot is not an instruction"))?
+            .set_alignment(record.byval_alignment()).map_err(|error| self.err(error))?;
+        Ok(slot)
     }
 
     /// A distinct, entry-hoisted argument copy or result slot, including explicit tail padding.
@@ -19262,19 +19300,23 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .get(name)
                     .copied()
                     .ok_or_else(|| callable_target_error(name))?;
-                // Foreign calls use the same target plan as their declaration. Each ARM64
-                // argument copy and result has separate entry storage, reusable across loops.
-                let arm_result_slot = match self.extern_abi.get(name) {
+                // Foreign calls use the declaration's plan. Every argument copy and indirect
+                // result has separate entry storage, reusable across loop iterations.
+                let record_result_slot = match self.extern_abi.get(name) {
                     Some(ExternAbi { ret: ReturnAbi::ArmRecord(record), .. }) => Some(self.arm_record_slot(record)?),
+                    Some(ExternAbi { ret: ReturnAbi::StructMemory(record), .. }) => Some(self.sysv_memory_slot(record)?),
                     _ => None,
                 };
                 let argv: Vec<inkwell::values::BasicMetadataValueEnum> = match self.extern_abi.get(name) {
                     Some(abi) => {
                         let mut v: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::with_capacity(args.len());
-                        if let ReturnAbi::ArmRecord(record) = &abi.ret
-                            && record.indirect()
-                        {
-                            v.push(arm_result_slot.ok_or_else(|| self.err("ARM64 result slot is missing"))?.into());
+                        let indirect_result = match &abi.ret {
+                            ReturnAbi::ArmRecord(record) => record.indirect(),
+                            ReturnAbi::StructMemory(_) => true,
+                            _ => false,
+                        };
+                        if indirect_result {
+                            v.push(record_result_slot.ok_or_else(|| self.err("foreign result slot is missing"))?.into());
                         }
                         for (o, pa) in args.iter().zip(&abi.params) {
                             let val = self.operand_by_value(o)?;
@@ -19311,9 +19353,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                         v.push(value.into());
                                     }
                                 }
-                                // `StructMemory` params were rejected at declaration time.
-                                ParamAbi::StructMemory => {
-                                    return Err(self.err(format!("extern '{name}': by-value MEMORY-class struct argument is unsupported")));
+                                ParamAbi::StructMemory(record) => {
+                                    let slot = self.sysv_memory_slot(record)?;
+                                    self.builder.build_store(slot, val).map_err(|error| self.err(error))?;
+                                    v.push(slot.into());
                                 }
                             }
                         }
@@ -19376,7 +19419,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     return Ok(Some(sv));
                 }
                 if let Some(ExternAbi { ret: ReturnAbi::ArmRecord(record), .. }) = self.extern_abi.get(name) {
-                    let slot = arm_result_slot.ok_or_else(|| self.err("ARM64 result slot is missing"))?;
+                    let slot = record_result_slot.ok_or_else(|| self.err("ARM64 result slot is missing"))?;
                     if !record.indirect() {
                         let value = cs.try_as_basic_value().basic()
                             .ok_or_else(|| self.err("ARM64 record call produced no result"))?;
@@ -19386,6 +19429,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .ok_or_else(|| self.err("ARM64 return record is missing"))?;
                     let value = self.builder.build_load(*st, slot, "arm_ret").map_err(|error| self.err(error))?;
                     return Ok(Some(value));
+                }
+                if let Some(ExternAbi { ret: ReturnAbi::StructMemory(record), .. }) = self.extern_abi.get(name) {
+                    let slot = record_result_slot.ok_or_else(|| self.err("SysV result slot is missing"))?;
+                    let st = self.struct_types.get(record.id as usize)
+                        .ok_or_else(|| self.err("SysV return record is missing"))?;
+                    return Ok(Some(self.builder.build_load(*st, slot, "sysv_ret").map_err(|error| self.err(error))?));
                 }
                 return Ok(cs.try_as_basic_value().basic());
             }
@@ -26989,6 +27038,7 @@ fn main() -> i32 = 0
 
     #[test]
     fn c_layout_raw_and_sysv_padding_keep_storage_separate_from_registers() -> Result<(), String> {
+        use inkwell::values::AnyValue;
         Target::initialize_x86(&InitializationConfig::default());
         let triple = inkwell::targets::TargetTriple::create("x86_64-unknown-linux-gnu");
         let tm = Target::from_triple(&triple)
@@ -27150,21 +27200,12 @@ fn main() -> i32 {
                     false,
                     ModuleScope::Whole,
                 );
-                if preceding < budget {
-                    result.map_err(|error| error.to_string())?;
-                    assert_eq!(
-                        probe_module
-                            .get_function("crowded")
-                            .ok_or("missing crowded")?
-                            .count_params(),
-                        budget
-                    );
-                } else {
-                    let error = result.err().ok_or("exhausted registers were accepted")?;
-                    assert!(
-                        error.to_string().contains("passed in memory"),
-                        "{field}/{preceding}: {error}"
-                    );
+                result.map_err(|error| error.to_string())?;
+                let function = probe_module.get_function("crowded").ok_or("missing crowded")?;
+                assert_eq!(function.count_params(), preceding + 1);
+                assert_eq!(function.print_to_string().to_string().contains("byval("), preceding >= budget);
+                if preceding >= budget {
+                    assert!(function.print_to_string().to_string().contains("align 16"));
                 }
             }
         }

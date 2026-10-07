@@ -1394,8 +1394,11 @@ and the hot/cold field-split suggestion (needs heuristic design).
   **x86-64 Linux SysV**, with complete-register-fit and <=16-byte restrictions.
   Plan138 adds little-endian LP64 ARM64 Linux/macOS record values, including HFA,
   large argument copies/results, explicit alignment and register exhaustion,
-  qualified through real C whole/per-unit/cache and exact codegen owners. Other
-  target ABIs and SysV MEMORY remain deferred. `bool`/`char` as FFI types retain
+  qualified through real C whole/per-unit/cache and exact codegen owners. Plan139
+  completes LP64 GNU/musl Linux x86-64 MEMORY arguments/results, whole-aggregate
+  register rollback and hidden-result GP accounting, with full aligned copies
+  and matching declaration/call attributes. Native whole/per-unit/cache and exact
+  LLVM owners qualify it. Other target ABIs remain deferred. `bool`/`char` as FFI types retain
   the integer representation (a C `_Bool` = `u8`,
   `char` = `i8`/`u8`, `char32_t` = `u32`; Align `char` is a Unicode scalar, not a C `char`), keeping
   one unambiguous way and dodging the `i1`-`zeroext` subtlety. `raw.ptr_cast<T>` — a typed reinterpret

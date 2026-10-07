@@ -1,19 +1,18 @@
 //! `extern "C"` by-value struct passing/returning — SysV AMD64, x86-64 Linux only (draft.md §15). A `layout(C)`
 //! struct (declaration-order, natural-alignment, scalar int/float/raw fields) crosses the C boundary in
-//! registers using the System V AMD64 classification: each eightbyte is INTEGER (→ a GP register /
+//! registers or memory using the System V AMD64 classification: each occupied eightbyte is INTEGER (→ a GP register /
 //! `i64` slot) or SSE (→ an XMM register / `double` slot); a two-register value returns as an
-//! `{T0,T1}` aggregate. Align reproduces exactly the coerced IR types clang emits, so each call is
-//! binary-compatible with a real C callee.
+//! `{T0,T1}` aggregate. Large or register-exhausted arguments use typed byval; large results use
+//! typed sret. The physical representation is binary-compatible with a real C callee.
 //!
-//! Every value test compiles a small C helper (via `cc`) that defines the by-value callee and links
+//! Native value tests compile a small C helper (via `cc`) that defines the by-value callee and links
 //! it against the Align object — the round trip validates the register coercion against a genuine C
-//! ABI, not a self-consistent guess. Tests are gated on both a working backend and `cc`.
+//! ABI. The memory-path IR checks complement the bounded C-layout owner's native matrix.
 //!
 //! Coverage of the eightbyte patterns: `{i32,i32}` (1×INTEGER), `{i64,i64}` (2×INTEGER),
 //! `{f64,f64}` (2×SSE), `{f32,f32}` (1×SSE, packed — clang's `<2 x float>`, we use `double`),
 //! `{i32,f32}` (1×INTEGER by the merge rule), a mixed `{i64,f64}` return (INTEGER,SSE → RAX,XMM0),
-//! single-register returns, a full param+return round trip, and the rejections (> 16-byte MEMORY,
-//! non-`layout(C)` struct).
+//! single-register returns, a full param+return round trip, and MEMORY-class arguments/results. Non-`layout(C)` records remain rejected.
 //!
 //! The value cases here retain the SysV-specific register/pressure contract. ARM64 native
 //! value passage has its own parameterized cases in the bounded C-layout owner. Unsupported
@@ -191,13 +190,9 @@ fn round_trip_param_and_return() {
 }
 
 #[test]
-fn oversized_struct_param_is_rejected_in_codegen() {
-    // A > 16-byte struct is MEMORY class (would need a `byval` pointer). FFI v1 rejects it — pass by
-    // pointer instead. It type-checks (the language accepts a `layout(C)` struct as an FFI type) but
-    // codegen refuses to emit a wrong/unsupported ABI. Gated on the backend so an unrelated
-    // target-machine failure can't masquerade as this rejection.
+fn oversized_struct_param_uses_byval() -> Result<(), String> {
     if !(sysv_target() && backend_available()) {
-        return;
+        return Ok(());
     }
     let mut sm = SourceMap::new();
     let src = "layout(C) Big { a: i64, b: i64, c: i64 }\nextern \"C\" fn f(b: Big) -> i32\nfn main() -> i32 {\n  unsafe { return f(Big { a: 1, b: 2, c: 3 }) }\n}\n";
@@ -205,17 +200,15 @@ fn oversized_struct_param_is_rejected_in_codegen() {
     assert!(!checked.diags.has_errors(), "a `layout(C)` struct is a valid FFI type at the language level");
     let mir = lower_to_mir(&checked.hir);
     let ir = emit_llvm_ir(&mir, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false);
-    assert!(ir.is_err(), "a > 16-byte by-value struct param must be rejected in codegen");
-    assert!(
-        ir.unwrap_err().contains("16-byte"),
-        "the diagnostic should explain the MEMORY-class size limit"
-    );
+    let ir = ir?;
+    assert!(ir.contains("byval("), "{ir}");
+    Ok(())
 }
 
 #[test]
-fn oversized_struct_return_is_rejected_in_codegen() {
+fn oversized_struct_return_uses_sret() -> Result<(), String> {
     if !(sysv_target() && backend_available()) {
-        return;
+        return Ok(());
     }
     let mut sm = SourceMap::new();
     let src = "layout(C) Big { a: i64, b: i64, c: i64 }\nextern \"C\" fn f() -> Big\nfn main() -> i32 {\n  unsafe { b := f(); return b.a as i32 }\n}\n";
@@ -223,11 +216,9 @@ fn oversized_struct_return_is_rejected_in_codegen() {
     assert!(!checked.diags.has_errors());
     let mir = lower_to_mir(&checked.hir);
     let ir = emit_llvm_ir(&mir, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false);
-    assert!(ir.is_err(), "a > 16-byte by-value struct return must be rejected in codegen");
-    assert!(
-        ir.unwrap_err().contains("16-byte"),
-        "the diagnostic should explain the MEMORY-class size limit, not fail for an unrelated reason"
-    );
+    let ir = ir?;
+    assert!(ir.contains("sret("), "{ir}");
+    Ok(())
 }
 
 #[test]
@@ -247,7 +238,7 @@ fn empty_struct_extern_is_rejected_in_sema() {
 //
 // A two-eightbyte struct is passed in registers only if *both* eightbytes fit in the class registers
 // free after the preceding arguments; otherwise the whole struct goes to memory (`byval`). We accept
-// the fits-in-registers cases (round-trip against a clang callee) and reject the exhaustion boundary
+// the fits-in-registers cases and use typed byval at the exhaustion boundary
 // (which we cannot lower correctly by flattening).
 
 #[test]
@@ -295,38 +286,35 @@ fn pressure_fits_six_preceding_sse_boundary() {
 }
 
 #[test]
-fn pressure_five_preceding_int_is_rejected() {
+fn pressure_five_preceding_int_uses_byval() -> Result<(), String> {
     if !(sysv_target() && backend_available()) {
-        return;
+        return Ok(());
     }
-    // 5 preceding integer args (only R9 free) + `{i64,i64}` needs 2 GP → the struct would go to
-    // memory (`byval`). clang lowers this as a `byval` pointer; flattening cannot mimic it, so we
-    // reject rather than silently miscompile.
     let mut sm = SourceMap::new();
     let src = "layout(C) L2 { a: i64, b: i64 }\nextern \"C\" fn f5(a: i64, b: i64, c: i64, d: i64, e: i64, s: L2) -> i64\nfn main() -> i32 {\n  unsafe { return f5(1, 2, 3, 4, 5, L2 { a: 10, b: 20 }) as i32 }\n}\n";
     let checked = check(&mut sm, "byval-press-5", src);
     assert!(!checked.diags.has_errors(), "the signature type-checks; the ABI limit is a codegen concern");
     let mir = lower_to_mir(&checked.hir);
     let ir = emit_llvm_ir(&mir, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false);
-    assert!(ir.is_err(), "a struct arg that falls to MEMORY under register pressure must be rejected");
-    let err = ir.unwrap_err();
-    assert!(err.contains("passed in memory") && err.contains("register"), "got: {err}");
+    let ir = ir?;
+    assert!(ir.contains("byval("), "{ir}");
+    Ok(())
 }
 
 #[test]
-fn pressure_seven_preceding_sse_is_rejected() {
+fn pressure_seven_preceding_sse_uses_byval() -> Result<(), String> {
     if !(sysv_target() && backend_available()) {
-        return;
+        return Ok(());
     }
-    // 7 preceding double args (only XMM7 free) + `{f64,f64}` needs 2 SSE → MEMORY. Rejected.
     let mut sm = SourceMap::new();
     let src = "layout(C) D2 { x: f64, y: f64 }\nextern \"C\" fn h7(a: f64, b: f64, c: f64, d: f64, e: f64, g: f64, h: f64, s: D2) -> f64\nfn main() -> i32 {\n  unsafe { return h7(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, D2 { x: 1.5, y: 2.5 }) as i32 }\n}\n";
     let checked = check(&mut sm, "byval-press-sse7", src);
     assert!(!checked.diags.has_errors());
     let mir = lower_to_mir(&checked.hir);
     let ir = emit_llvm_ir(&mir, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false);
-    assert!(ir.is_err(), "an SSE struct arg that falls to MEMORY under register pressure must be rejected");
-    assert!(ir.unwrap_err().contains("passed in memory"));
+    let ir = ir?;
+    assert!(ir.contains("byval("), "{ir}");
+    Ok(())
 }
 
 #[test]

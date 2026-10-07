@@ -2523,11 +2523,17 @@ Linux and little-endian LP64 ARM64 Linux/macOS. Their fields remain integers,
 floats or non-owning `raw` pointers. Calls retain the existing unsafe permission,
 Copy semantics and pointee obligations.
 
-On **x86-64 Linux (SysV AMD64)**, records up to 16 bytes pass/return in INTEGER
-or SSE register classes. Padding-only trailing eightbytes consume no register.
-Every occupied eightbyte of an argument must fit the class registers remaining
-after preceding arguments; otherwise the complete argument requires the deferred
-MEMORY ABI and the compiler rejects it. Larger records are also rejected.
+On **little-endian LP64 x86-64 Linux (SysV AMD64, GNU/musl)**, records up to
+16 bytes pass/return in INTEGER or SSE register classes. Padding-only trailing
+eightbytes consume no register. An argument uses registers only when every
+occupied eightbyte fits the remaining class registers; otherwise the complete
+argument uses an aligned by-value stack copy. Larger arguments use the same
+MEMORY path. A failed aggregate assignment consumes neither register class, so
+later arguments can still use the remaining registers. Large results use a
+separate aligned caller-owned result slot whose hidden pointer consumes the
+first GP argument register. Declaration and call share typed byval/sret
+attributes; argument alignment is max(record alignment, 8), result alignment is
+the record alignment. Explicit record alignment and full padded size are retained.
 
 On **ARM64 Linux (AAPCS64) and macOS (DarwinPCS)**, the complete admitted flat
 record domain supports arguments and results, including explicit `align(N)` and
@@ -2540,12 +2546,14 @@ covers full padded storage, is reused across loop iterations, and adds no heap
 allocation or pointee ownership. Native code may not retain that temporary copy
 or result pointer beyond the call. Narrow integer extension follows the target
 ABI on both declarations and calls. Fixed compiler/runtime symbols keep their
-registered ABI; ARM64 record-value declarations cannot redeclare those symbols.
+registered ABI; source record-value declarations cannot redeclare those symbols.
 
-[Plan138](docs/impl/138-aarch64-c-record-values.md) fixes the physical types,
-attributes and native acceptance matrix. Unsupported targets, including Windows,
-big-endian and ILP32 ARM, remain rejected before LLVM declarations. SysV MEMORY,
-variadics, callbacks and other target ABIs remain deferred.
+Both ABI families preserve the same Copy and temporary-storage rules above.
+[Plan138](docs/impl/138-aarch64-c-record-values.md) and
+[plan139](docs/impl/139-sysv-memory-c-record-values.md) fix their physical types,
+attributes and native acceptance matrices. Unsupported targets, including Windows,
+x86-64 Darwin, x32/ILP32, big-endian and unknown OS environments, remain rejected
+before LLVM declarations. Variadics, callbacks and other target ABIs remain deferred.
 
 ### Not in FFI v1 (deliberate boundaries)
 
