@@ -1,6 +1,6 @@
 # Compiler check-time scaling measurement
 
-This local benchmark owns plan 21 items 11 and 12 checking measurements. It
+This local benchmark owns plan 21 items 11–13 checking measurements. It
 compares release compiler binaries on the same generated straight arithmetic,
 Result `?`, and Result `match` chains inside a loop. Each case uses 16, 128 or
 512 values. Whole-program and per-unit checks run in fresh bounded processes.
@@ -76,3 +76,24 @@ The empty-edge case no longer builds a dominator relation that cannot contribute
 any exceptional block. Nonempty-edge dominance and remaining semantic analysis
 still cost work; this does not establish near-linear checking or Request 37's
 actual consumer acceptance. The earlier item11 measurements remain historical.
+
+## Item 13 result (2026-10-07)
+
+The same host/profile compares merged
+`c44ebf5704b613bf898f013f64f170642e6c4e86` with final initial-edge state transfer
+and in-place joins. Both binaries run with `DYLD_SHARED_REGION=private`; no
+builds/tests overlap. [Full samples and hashes](results-edge-propagation-macos.json)
+retain all 18 cells, nine matching MIR outputs and four matching rejected-source
+diagnostic comparisons, with five alternating samples after warmup.
+
+At 128/512 values, Result-match whole-program medians change from 0.122/1.128 s
+to 0.117/1.049 s; per-unit medians change from 0.213/2.102 s to 0.205/1.969 s.
+The 512-value improvements are 1.08x and 1.07x. All six 16-value controls and
+all straight/try controls remain within 1 ms of the baseline median. This is a
+modest local improvement, not near-linear scaling or a consumer time guarantee.
+
+A previously absent final successor receives the owned output without another
+complete copy. Existing successor inputs retain their allocations while joining;
+all facts, join rules, worklist order and diagnostics remain. Block evaluation
+still copies its saved input, so substantial block/state cost remains. Request 37
+consumer recombination and acceptance stay external.
