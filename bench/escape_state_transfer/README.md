@@ -1,6 +1,6 @@
 # Compiler check-time scaling measurement
 
-This local benchmark owns plan 21 items 11–17 checking measurements. It
+This local benchmark owns plan 21 items 11–18 checking measurements. It
 compares release compiler binaries on the same generated straight arithmetic,
 Result `?`, and Result `match` chains inside a loop. Each case uses 16, 128 or
 512 values. `--corpus storage` selects fixed-array declarations in straight-line
@@ -211,3 +211,32 @@ controls agree across both corpora. Numeric control median changes stay below
 owner detects restoring each of the four unnecessary rebuilds. Other state/fact
 copies and repeated traversals remain superlinear; these local results establish
 neither near-linear scaling nor Request37's whole-client acceptance.
+
+
+## Item 18 result (2026-10-07)
+
+The same host/profile compares merged
+`7d7fda59a941d060f91b1c4cc6725a15b98f7646` with empty generation-ending
+propagation skipped after every directory ending is recorded. Both binaries run
+with `DYLD_SHARED_REGION=private`; no build/test jobs overlap measurement.
+Run both numeric and storage corpora with `--llvm-parity`.
+[Full samples and hashes](results-empty-retirement-macos.json) retain all 30
+cells, five alternating samples after warmup and actual CLI checked-work output.
+
+| 512 fixed-array declarations | Baseline median | Candidate median | Ratio |
+| --- | ---: | ---: | ---: |
+| Straight-line check | 0.231 s | 0.163 s | 1.42x |
+| Straight-line per-unit check | 0.459 s | 0.324 s | 1.42x |
+| Loop check | 1.278 s | 0.756 s | 1.69x |
+| Loop per-unit check | 2.554 s | 1.508 s | 1.69x |
+
+All 15 source MIR/LLVM pairs, checked-work outputs and rejected diagnostics
+match. Numeric control median differences stay below 6 ms; all 16-value controls
+stay within 2 ms. The exact-state and actual staging-caller owner detects 420
+lost owned-path identities when the empty propagation is restored.
+
+Directory endings, opaque observations and every nonempty propagation retain
+their prior behavior. The guard avoids whole-state reconstruction when the
+already-collected historical roots are empty. Other state/fact copies and
+repeated traversals remain superlinear; these measurements do not establish a
+whole-client budget or change runtime allocation policy.

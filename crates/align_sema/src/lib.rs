@@ -33624,6 +33624,9 @@ impl BorrowState {
             }
             entry.ended = Some(entry.ended.map_or(how, |current| current.min(how)));
         }
+        if historical_roots.is_empty() {
+            return;
+        }
         self.mark_matching_roots_ended(how, |root| historical_roots.contains(root));
         self.invalidate_roots(&historical_roots, how);
     }
@@ -76237,6 +76240,302 @@ mod tests {
         );
     }
 
+    #[test]
+    fn storage_generation_empty_retirement_propagation() {
+        // The pre-fast-path algorithm is the oracle for every nonempty history.
+        fn original(state: &mut BorrowState, generations: &[StorageGeneration], how: BorrowEnd) {
+            let mut roots = BorrowRoots::new();
+            for generation in generations
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+            {
+                let Some(entry) = state.storage.directory.entries.get_mut(generation) else {
+                    continue;
+                };
+                roots.extend(entry.historical_release_roots.iter().cloned());
+                if entry
+                    .descriptor
+                    .is_some_and(|d| d.kind == StorageHeaderKind::OwnedOpaque)
+                {
+                    roots.insert(BorrowRoot::Observation(generation.clone()));
+                }
+                entry.ended = Some(entry.ended.map_or(how, |current| current.min(how)));
+            }
+            state.mark_matching_roots_ended(how, |root| roots.contains(root));
+            state.invalidate_roots(&roots, how);
+        }
+
+        fn fixture(
+            generation: &StorageGeneration,
+            history: bool,
+            kind: Option<StorageHeaderKind>,
+            prior: Option<BorrowEnd>,
+        ) -> BorrowState {
+            let path = vec![
+                BorrowProjection::StructField(2),
+                BorrowProjection::OptionSome,
+            ];
+            let roots = BorrowRoots::from([
+                BorrowRoot::Local(7),
+                BorrowRoot::StorageLocal(generation.clone(), 7, path.clone().into()),
+                BorrowRoot::IterTemp(1),
+                BorrowRoot::Param(0),
+                BorrowRoot::ParamStorage(0),
+                BorrowRoot::Observation(generation.clone()),
+                BorrowRoot::EndedLocal(7, BorrowEnd::Dropped),
+                BorrowRoot::EndedStorageLocal(
+                    generation.clone(),
+                    7,
+                    path.clone().into(),
+                    BorrowEnd::Dropped,
+                ),
+                BorrowRoot::EndedIterTemp(1, BorrowEnd::Dropped),
+                BorrowRoot::EndedParam(0, BorrowEnd::Dropped),
+                BorrowRoot::EndedParamStorage(0, BorrowEnd::Dropped),
+                BorrowRoot::EndedObservation(generation.clone(), BorrowEnd::Dropped),
+                BorrowRoot::ReadOnly,
+            ]);
+            let headers = ProjectedHeaderFact {
+                leaves: [(
+                    path.clone(),
+                    StorageHeaderLeaf {
+                        fallback_roots: roots.clone(),
+                        ..StorageHeaderLeaf::known(generation.clone())
+                    },
+                )]
+                .into(),
+            };
+            let mut entry = MoveGenerationEntry::new(
+                generation,
+                kind.map(|kind| StorageHeaderDescriptor {
+                    ty: Ty::Buffer,
+                    kind,
+                }),
+                [MoveReleasePlace::Staging {
+                    action: 23,
+                    operand: 0,
+                    path: path.clone(),
+                }]
+                .into(),
+            );
+            entry.ended = prior;
+            if history {
+                entry.historical_release_roots = roots.clone();
+            }
+            let sibling = StorageGeneration::Current(StorageOrigin::inline_place(99, &path));
+            let content = MoveValueFact {
+                non_storage: BorrowFact {
+                    direct: [BorrowRoot::Observation(sibling.clone())].into(),
+                    projected: [(path.clone(), roots.clone())].into(),
+                },
+                headers: headers.clone(),
+            };
+            let mut state = BorrowState::default();
+            state
+                .storage
+                .directory
+                .entries
+                .insert(generation.clone(), entry);
+            state.storage.directory.entries.insert(
+                sibling.clone(),
+                MoveGenerationEntry::new(&sibling, None, Default::default()),
+            );
+            state
+                .storage
+                .contents
+                .entries
+                .insert(generation.clone(), content.clone());
+            state.storage.contents.entries.insert(sibling, content);
+            state.sources.insert(1, roots.clone());
+            state.value_sources.insert(2, roots.clone());
+            state.pipeline_sources.insert(3, roots.clone());
+            state.headers.insert(1, headers.clone());
+            state.value_headers.insert(2, headers.clone());
+            state.pipeline_headers.insert(3, headers);
+            state.facts.insert(1, BorrowFact::from_direct(roots));
+            let existing = [(BorrowRoot::Local(7), BorrowEnd::Dropped)].into();
+            state.invalid.insert(1, existing);
+            state
+                .invalid_value_sources
+                .insert(2, [(BorrowRoot::Local(7), BorrowEnd::Dropped)].into());
+            state
+                .invalid_pipeline_sources
+                .insert(3, [(BorrowRoot::Local(7), BorrowEnd::Dropped)].into());
+            state
+                .active_sum
+                .insert(1, [BorrowProjection::OptionSome].into());
+            state.unmodified_borrow_mut_params.insert(0);
+            state
+        }
+
+        fn backing(state: &BorrowState, generation: &StorageGeneration) -> *const BorrowProjection {
+            let root = state.storage.contents.entries[generation]
+                .non_storage
+                .direct
+                .first()
+                .unwrap();
+            let BorrowRoot::Observation(generation) = root else {
+                panic!("owned path witness missing")
+            };
+            assert!(!generation.path().is_empty());
+            generation.path().as_ptr()
+        }
+
+        let path = [
+            BorrowProjection::StructField(2),
+            BorrowProjection::OptionSome,
+        ];
+        let origin = StorageOrigin::inline_place(4, &path);
+        let absent = StorageGeneration::Current(StorageOrigin::inline_place(100, &path));
+        let mut identity_losses = Vec::new();
+        for generation in [
+            StorageGeneration::Current(origin.clone()),
+            StorageGeneration::Prior(origin),
+            StorageGeneration::ParameterValue {
+                parameter: 0,
+                path: path.into(),
+            },
+            StorageGeneration::CallerStorage {
+                parameter: 0,
+                path: path.into(),
+            },
+        ] {
+            for kind in [
+                None,
+                Some(StorageHeaderKind::InlineFixed),
+                Some(StorageHeaderKind::OwnedOpaque),
+            ] {
+                for history in [false, true] {
+                    for prior in [None, Some(BorrowEnd::Consumed), Some(BorrowEnd::Dropped)] {
+                        for how in [BorrowEnd::Consumed, BorrowEnd::Dropped] {
+                            for input in [
+                                vec![],
+                                vec![absent.clone()],
+                                vec![generation.clone()],
+                                vec![absent.clone(), generation.clone(), generation.clone()],
+                            ] {
+                                let mut state = fixture(&generation, history, kind, prior);
+                                let mut expected = state.clone();
+                                let address = backing(&state, &generation);
+                                let present = input.contains(&generation);
+                                let propagates = present
+                                    && (history || kind == Some(StorageHeaderKind::OwnedOpaque));
+                                original(&mut expected, &input, how);
+                                state.end_generations(input.clone(), how);
+                                assert!(
+                                    state == expected,
+                                    "retirement mismatch: {generation:?}, {kind:?}, history={history}, prior={prior:?}, how={how:?}, input={input:?}"
+                                );
+                                assert_eq!(
+                                    state.storage.directory.entries[&generation].ended,
+                                    if present {
+                                        Some(prior.map_or(how, |old| old.min(how)))
+                                    } else {
+                                        prior
+                                    }
+                                );
+                                if !propagates && address != backing(&state, &generation) {
+                                    identity_losses.push((
+                                        generation.clone(),
+                                        kind,
+                                        history,
+                                        prior,
+                                        how,
+                                        input,
+                                    ));
+                                }
+                                if propagates {
+                                    let observed = BorrowRoot::Observation(generation.clone());
+                                    assert_eq!(state.invalid[&1].get(&observed), Some(&how));
+                                    if history {
+                                        assert_eq!(
+                                            state.invalid[&1].get(&BorrowRoot::Local(7)),
+                                            Some(&BorrowEnd::Dropped.min(how))
+                                        );
+                                    }
+                                    assert_eq!(
+                                        state.invalid_value_sources[&2].get(&observed),
+                                        Some(&how)
+                                    );
+                                    assert_eq!(
+                                        state.invalid_pipeline_sources[&3].get(&observed),
+                                        Some(&how)
+                                    );
+                                    assert!(
+                                        state.storage.contents.entries[&generation]
+                                            .non_storage
+                                            .projected[&path.to_vec()]
+                                            .contains(&BorrowRoot::EndedObservation(
+                                                generation.clone(),
+                                                how
+                                            ))
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Exercise the sampled production caller: retained frontiers cannot retire a value,
+            // but unretained staging entries still acquire endings even with no historical roots.
+            for kind in [None, Some(StorageHeaderKind::OwnedOpaque)] {
+                for history in [false, true] {
+                    for (frontier_present, retained) in
+                        [(false, false), (true, true), (true, false)]
+                    {
+                        let mut state = fixture(&generation, history, kind, None);
+                        let headers = ProjectedHeaderFact {
+                            leaves: [(vec![], StorageHeaderLeaf::known(generation.clone()))].into(),
+                        };
+                        let frontier = if frontier_present {
+                            headers.clone()
+                        } else {
+                            ProjectedHeaderFact::default()
+                        };
+                        let retained = if retained {
+                            headers
+                        } else {
+                            ProjectedHeaderFact::default()
+                        };
+                        let mut expected = state.clone();
+                        let ended = frontier_present && retained.leaves.is_empty();
+                        let inputs = if ended {
+                            vec![generation.clone()]
+                        } else {
+                            vec![]
+                        };
+                        original(&mut expected, &inputs, BorrowEnd::Dropped);
+                        let address = backing(&state, &generation);
+                        state.end_abandoned_staging_releases(
+                            &frontier,
+                            &retained,
+                            BorrowEnd::Dropped,
+                        );
+                        assert!(state == expected, "staging frontier transition changed");
+                        if (!ended || (!history && kind.is_none()))
+                            && address != backing(&state, &generation)
+                        {
+                            identity_losses.push((
+                                generation.clone(),
+                                kind,
+                                history,
+                                None,
+                                BorrowEnd::Dropped,
+                                inputs,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            identity_losses.is_empty(),
+            "empty retirement rebuilt owned content paths in {} cases: {:?}",
+            identity_losses.len(),
+            identity_losses.first()
+        );
+    }
     #[test]
     fn storage_generation_unaffected_leaf_rename_matrix() {
         use std::collections::{BTreeMap, BTreeSet};

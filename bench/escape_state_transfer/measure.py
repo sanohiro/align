@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded local before/after checking measurement (plan 21, items 11–17)."""
+"""Bounded local before/after checking measurement (plan 21, items 11–18)."""
 import argparse
 import hashlib
 import json
