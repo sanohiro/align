@@ -12,6 +12,32 @@ use align_lexer::tokenize;
 use align_parser::parse_file;
 use std::cell::Cell;
 
+#[test]
+fn c_layout_raw_fields_require_the_exact_scalar_domain() {
+    let program = checked_source_program(
+        "layout(C) Cell { data: raw }\nextern \"C\" fn echo(value: Cell) -> Cell\nfn main() {}\n",
+    );
+    assert!(validate_hir::type_placement_metadata_is_valid(&program));
+    let mut ordinary = program.clone();
+    ordinary.externs.clear();
+    ordinary.structs[0].c_repr = false;
+    assert_placement_rejected("ordinary raw field", &ordinary);
+    for ty in [
+        Ty::Bool,
+        Ty::Char,
+        Ty::Str,
+        Ty::String,
+        Ty::Buffer,
+        Ty::Slice(scalar_int(8)),
+        Ty::Option(Scalar::Bool),
+    ] {
+        let mut invalid = program.clone();
+        invalid.externs.clear();
+        invalid.structs[0].fields[0].ty = ty;
+        assert_placement_rejected(&format!("non-C field {ty:?}"), &invalid);
+    }
+}
+
 fn direct_program_name(call: &DirectCall) -> Option<&str> {
     match call {
         DirectCall::Program(target) => Some(target.as_str()),

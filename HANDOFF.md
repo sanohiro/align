@@ -17,6 +17,12 @@ outside the active worktree so they do not obstruct unrelated checks or pulls.
 
 ## Next work (handoff updated 2026-10-07)
 
+Plan137 admits non-owning raw pointer fields in concrete C-layout records.
+Whole/per-unit native storage, copy/control, import/cache and malformed-HIR
+owners cover Request32's pointer-record surface. SysV over-aligned tail padding
+no longer consumes registers, while coercion scratch retains full storage size.
+ARM64/MEMORY value passing, bool FFI, external adoption and K1/plan61 remain deferred.
+
 Build-performance item13 moves the final initial escape-flow output and joins
 existing inputs in place, preserving every fact and diagnostic. Exact-state and
 allocation-identity owners qualify the mechanics; local 512-value Result-match

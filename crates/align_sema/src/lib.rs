@@ -4444,15 +4444,10 @@ pub fn struct_abi_layout(
     ty_abi_layout(Ty::Struct(id), structs, enums, tagged_types)
 }
 
-/// Whether `ty` is a Move (owned) type — owns a heap buffer consumed on move. Includes Move structs
-/// and Move tuples; needs the struct/tuple tables to inspect composite members. The free-function
-/// form (vs `MoveCheck::is_move_ty`) is shared by the field-access checker.
-/// Whether a type may cross the C ABI boundary in an `extern "C"` signature (first FFI slice). A
-/// plain primitive scalar (integer or float) or the opaque `raw` byte pointer — the types with an
-/// obvious, stable C representation. `bool`/`char`, aggregates, and the owning collection types
-/// (`str`/`string`/`array`/…) are deferred: their C mapping needs a settled layout/marshaling rule
-/// (`bool` ABI width, `str`→pointer+len split, struct `layout(C)`), a later slice.
-fn is_ffi_safe(ty: Ty) -> bool {
+/// The scalar types with a direct C representation, also admitted as concrete `layout(C)`
+/// fields. Integer/float width validation belongs to ordinary type validation; this predicate
+/// selects the closed type family. `raw` is non-owning and grants no pointee authority.
+pub fn is_ffi_safe(ty: Ty) -> bool {
     matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Raw)
 }
 
@@ -9622,18 +9617,18 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
             // checked structurally here; its acyclicity and alignment are validated in pass 0b-2,
             // once all struct fields are populated. The field-specific array restrictions are
             // applied below after the complete struct table exists.
-            if !is_field_ok(ty, &tagged_types) {
+            if !(is_field_ok(ty, &tagged_types) || s.c_repr && ty == Ty::Raw) {
                 diags.error(
                     format!("struct field type is not supported here, got {}", ty_name(ty)),
                     f.span,
                 );
             }
             // A `layout(C)` struct promises a C-compatible flat layout, so its fields must be the
-            // FFI-mappable scalars (integers/floats). `bool`/`char`, `str`, and nested structs are
-            // deferred (their C representation is a later slice).
-            if s.c_repr && !matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Error) {
+            // FFI-mappable scalars (integers/floats/raw pointers). A pointer field has the same
+            // non-owning unsafe contract as a raw local; it never participates in Drop.
+            if s.c_repr && ty != Ty::Error && !is_ffi_safe(ty) {
                 diags.error(
-                    format!("a `layout(C)` struct field must be an integer or float (got {}) — other field types are a later FFI slice", ty_name(ty)),
+                    format!("a `layout(C)` struct field must be an integer, float, or raw pointer (got {}) — other field types are a later FFI slice", ty_name(ty)),
                     f.span,
                 );
             }

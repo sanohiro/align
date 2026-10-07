@@ -1412,8 +1412,9 @@ impl<'a> PlacementValidator<'a> {
                 if self.stream_carrier_class(field.ty) != align_sema::HttpStreamCarrierClass::None
                     || self.upgrade_carrier_class(field.ty)
                         != align_sema::HttpUpgradeCarrierClass::None
-                    || !self.field_type_ok(field.ty, abstract_node)
-                    || (definition.c_repr && !matches!(field.ty, Ty::Int(_) | Ty::Float(_)))
+                    || !(self.field_type_ok(field.ty, abstract_node)
+                        || definition.c_repr && field.ty == Ty::Raw)
+                    || (definition.c_repr && !align_sema::is_ffi_safe(field.ty))
                     || !self.inline_structs_unaligned(field.ty)
                 {
                     return false;
@@ -2343,7 +2344,7 @@ impl<'a> PlacementValidator<'a> {
                     && definition
                         .fields
                         .iter()
-                        .all(|field| matches!(field.ty, Ty::Int(_) | Ty::Float(_)))
+                        .all(|field| align_sema::is_ffi_safe(field.ty))
             })
     }
 }

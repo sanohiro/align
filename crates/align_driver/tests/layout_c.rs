@@ -1,9 +1,9 @@
 //! `layout(C)` struct ABI — slice 1 (draft.md §15). A `layout(C)` attribute marks a struct as having
 //! a stable, C-compatible flat byte layout (declaration-order fields, natural alignment, no
-//! reordering — Align's default layout, which the marker locks and opts into FFI). Only such a struct
+//! reordering). Only such a struct
 //! may be written to / read from `raw` memory (`raw.store`/`raw.load` of a whole struct at a byte
 //! offset), because only it promises a fixed representation. This is the pointer-based FFI pattern:
-//! hand C a `raw` buffer and read/write structs in it. (By-value register passing is a later slice.)
+//! hand C a `raw` buffer and read/write structs in it. (Register-class by-value passage is supported on x86-64 Linux.)
 
 mod common;
 use common::*;
@@ -80,7 +80,7 @@ fn non_layout_c_struct_load_is_rejected() {
 
 #[test]
 fn layout_c_with_non_scalar_field_is_rejected() {
-    // A `layout(C)` struct's fields must be integers/floats (their C mapping is settled); `str` and
+    // A `layout(C)` struct's fields must be integers/floats/raw pointers; `str` and
     // other field types are a later slice.
     assert!(!ok("layout(C) Bad { a: i32, s: str }\nfn main() -> i32 {\n  return 0\n}\n"));
 }

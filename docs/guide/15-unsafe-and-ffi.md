@@ -81,6 +81,11 @@ fn main() -> i32 {
 layout(C) Point { x: i32, y: i32 }      // matches `struct { int32_t x, y; }`
 ```
 
+Fields may be integers, floats, or `raw` pointers. A pointer-bearing record is Copy;
+copying, replacing or returning it never copies/frees the pointee or extends its
+lifetime. Pointer validity and dereferencing remain your responsibility inside
+`unsafe`. Direct raw fields in ordinary structs and generic C records are not supported.
+
 `layout(C)` structs can cross through a `raw` pointer. **By-value structs are supported only on x86-64 Linux using the SysV ABI**, and only when the complete struct fits the available argument or return registers (at most 16 bytes). Larger structs and signatures that exhaust the argument registers are rejected. On Apple Silicon and other targets, pass the struct by pointer; `layout(C)` alone does not enable by-value calls there.
 
 C-owned memory returns as `raw` because a C pointer carries no length. Use `raw.load` to read values, or obtain and validate the length before constructing a view.

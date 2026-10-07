@@ -326,7 +326,10 @@ reason. The one place a fixed byte layout matters — crossing to C, `raw` memor
 contract, by-value register passing — already has its marker, `layout(C)`, which pins declaration
 order. So the default optimizes for the machine, and the escape hatch is explicit and visible where a
 human or an ABI actually needs the bytes nailed down: hardware-friendly by default, "nothing hidden"
-where it counts.
+where it counts. A concrete C record may also hold an opaque `raw` field (plan137):
+the existing native pointer representation needs neither an integer-address encoding
+nor a new ownership model. Copying the record copies the pointer, with pointee
+validity and lifetime still governed by explicit unsafe operations.
 
 ---
 

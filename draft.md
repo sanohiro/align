@@ -2510,14 +2510,19 @@ unsafe {
 Among structs, only a `layout(C)` struct may be moved through a `raw` pointer (`raw.store`/`raw.load`
 of a whole struct), because only it promises a fixed representation — this is the pointer-based FFI
 pattern (hand C a buffer, read/write structs in it). Primitive scalars and `raw` pointers are the
-other admitted flat values. Its fields must be FFI-mappable scalars (integers, floats).
+other admitted flat values. Its fields must be FFI-mappable scalars (integers, floats, or `raw`
+pointers). A pointer field has native pointer size/alignment and remains non-owning: the record
+is Copy, adds no Drop, and never extends a pointee lifetime or grants dereference authority.
+Direct `raw` fields in ordinary structs and generic `layout(C)` declarations remain rejected.
+[Plan137](docs/impl/137-c-layout-raw-fields.md) records the exact field and validation contract.
 
 ### By-value structs (SysV AMD64 only)
 
 A `layout(C)` struct also crosses the boundary **by value**, using the System V AMD64 register
 convention — but *only* on x86-64 Linux. Each eightbyte of the struct is classified INTEGER (a
 general-purpose register) or SSE (an XMM register); a struct ≤ 16 bytes is passed/returned in
-registers, and the compiler emits exactly the coerced form a C compiler does (`i64`/`double`
+registers (padding-only trailing eightbytes consume no register), and the compiler emits the
+ABI-equivalent coerced form a C compiler does (`i64`/`double`
 argument slots, an `{T0,T1}` aggregate return), so a call is binary-compatible with a real C callee.
 This is the one FFI corner where a *wrong* per-target rule silently miscompiles, so it is deliberately
 scoped: on any non-SysV target the compiler **refuses** with a clear diagnostic (pass the struct by
