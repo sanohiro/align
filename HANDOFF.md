@@ -21,9 +21,11 @@ Build-performance item 11 removes two complete escape-analysis state copies per
 flow transfer while preserving every fact, CFG edge, join, diagnostic and Drop
 classification. A storage-identity owner, sema regression corpus and whole/per-unit
 MIR/diagnostic comparisons qualify it. Local release measurements improve long
-straight/try/match checks; block/join and per-unit costs remain superlinear.
-Request 37 consumer recombination and acceptance stay external; K1/plan61 remain
-deferred.
+straight/try/match checks. Item 12 skips cold-region dominance when no exceptional
+edge exists; the 512-value per-unit match check falls from 8.895 to 2.091 s with
+identical MIR, LLVM and diagnostics. Remaining semantic/block/join costs are still
+superlinear. Request 37 consumer recombination and acceptance stay external;
+K1/plan61 remain deferred.
 
 Plan135 adds explicit fallible aligned construction through `buffer.try_new`
 and `buffer.try_filled`. Payload and handle refusal return Code(ENOMEM), invalid

@@ -29,6 +29,7 @@ Order is priority.
 | 7 | PR CI wall time | Implemented — source-mtime restoration makes the restored Cargo cache actually hit, and a trusted-classifier platform scope bounds a tooling-tier PR to one compile-only leg; see below |
 | 8 | Owner tests run an unoptimized compiler | Implemented (this PR) — `[profile.dev] opt-level = 1` cut `pkg_db_a1` 3.96x (486.6s -> 122.8s wall) because every owner test drives the in-process `alignc` frontend/codegen at Rust `opt-level = 0`; see below |
 | 11 | Escape-flow state transfer | Implemented — move complete analysis states through each transfer instead of cloning every accumulated fact twice; measured whole/per-unit improvements and remaining scaling are recorded below |
+| 12 | Empty exceptional-region inference | Implemented — avoid dominance analysis when no exceptional-edge record can seed a cold region; local per-unit Result-match measurement improves 4.25x at 512 values |
 
 ## Background
 
@@ -2848,3 +2849,40 @@ rejected-source diagnostic comparisons agree byte-for-byte. Six 16-value
 controls show no median regression. The benchmark README and checked-in samples
 own the precise measurements and remaining superlinear factors. This is a
 partial provider improvement; Request 37 consumer acceptance stays external.
+
+
+## Item 12: empty exceptional-region inference
+
+After item 11, a two-second late sample of the 512-value Result-match per-unit
+check spends all 1,476 samples in `cold::exceptional_region`, mostly comparing
+large dominator sets. The pass builds those sets even when no exceptional edge
+exists. Plan70 §2.6 and `04-mir.md` §2.1 already define the region as blocks
+dominated by a recorded unlikely successor; ordinary `match` has no record.
+An empty edge collection therefore proves an empty region before CFG work.
+
+The capability returns that same empty result without building reachability,
+predecessors or dominators. Nonempty-edge analysis, exceptional-edge validation,
+call collection, the cold fixed point and LLVM attribute emission stay intact.
+There is no public source, type, ownership, cleanup, IR, interface, ABI, cache
+format or diagnostic change. K1/plan61 and consumer adoption remain deferred.
+
+| Closure axis | Implementation and owner |
+| --- | --- |
+| Empty/ordinary control flow and malformed input | A no-record function has no exceptional root for any CFG, including loops, joins and unreachable blocks. Return an empty region; existing MIR exceptional-edge admission/validation owners remain authoritative for malformed records. |
+| Recorded exceptional control flow | Preserve the complete existing nonempty-edge algorithm. `cold_inference_closes_two_levels_and_self_recursion` and `cold_inference_fails_closed_for_hot_exported_and_address_taken_functions` cover the classification and fixed point. |
+| Construction, moves, Drop, return and allocation | Only private compiler graph work is omitted. Source ownership and runtime allocation are untouched; existing lowering and semantic owner suites retain their contracts. |
+| Generic, interface and whole/per-unit parity | Both compilation paths use the same pass. Compare baseline/candidate MIR and checking diagnostics with the item11 corpus; existing MIR cold owners and LLVM cold-attribute/branch-weight owners retain the output contract. |
+| Performance | Reuse the bounded, alternating item11 release benchmark across straight/try/match and short/long cases. Retain the full measurements and residual scaling; no timing threshold is a correctness gate and no real-client budget is claimed. |
+
+This is an internal zero-input shortcut to the existing analysis, not a new
+analysis strategy. The author closure pass and one fresh preflight review own
+its boundary; no separate public-contract review is required.
+
+Qualification on the same Apple M1 release profile retains five alternating
+samples per cell with no overlapping builds/tests. Result-match per-unit medians
+at 128/512 values change from 0.311/8.895 s to 0.203/2.091 s. Whole-program and
+recorded-`?` controls remain close, as expected for paths unchanged by this guard.
+All nine MIR/raw-LLVM comparisons and four rejected-source diagnostic comparisons
+agree byte-for-byte. The existing two cold and three exceptional-edge owners pass;
+the benchmark README and `results-empty-region-macos.json` own exact samples and
+remaining scaling limits. Real-consumer recombination and acceptance stay external.
