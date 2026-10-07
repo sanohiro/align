@@ -24,13 +24,14 @@ LLVM owners qualify it. Plan138 supplies the ARM64 Linux/macOS sibling ABI;
 plan137 supplies non-owning raw fields and padding/register separation. Bool/char
 FFI, consumer adoption and K1/plan61 remain deferred.
 
-Build-performance items15–20 remove generation-formation table copies, preserve
+Build-performance items15–21 remove generation-formation table copies, preserve
 unaffected generation collections, skip empty ending propagation and duplicate
-terminal probes, and avoid repeated growth and equal-fact reconstruction during
-state joins. Exact-state/allocation owners, direct self-join laws and old/new
-body-fact, cleanup and diagnostic comparisons qualify the boundaries. Item20's
-local 512-value Result-match checks improve another 1.25x/1.27x (whole/per-unit),
-with identical MIR, LLVM, checked-work and diagnostics. Earlier items11–14 reduce
+terminal probes, and reduce state-join and saved-value copying costs. Item21
+shares immutable escape-value payloads, detaching only selected generation
+mutations. Exact-state/lifecycle/allocation owners and old/new body-fact, cleanup,
+MIR/LLVM and diagnostic comparisons qualify the boundaries. Its local 512-value
+Result-match checks improve another 1.60x/1.54x (whole/per-unit); straight
+fixed-array per-unit checks grow by 7.1 ms (2.7%). Earlier items11–14 reduce
 escape-state copies, empty exceptional-region work, edge propagation and unrelated
 generation-table updates. Other fact/state copies and repeated traversals remain
 superlinear; Request37 consumer acceptance and K1/plan61 remain deferred.
