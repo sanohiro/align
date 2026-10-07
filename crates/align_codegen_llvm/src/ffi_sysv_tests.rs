@@ -56,7 +56,7 @@ fn sysv_memory_types_attributes_storage_and_native_preflight() -> Result<(), Str
     let ctx = Context::create();
     let module = ctx.create_module("sysv_memory_owner");
     let (_, factory, count) = cases::sources();
-    assert!(count > 4096, "native case generation must be nonempty");
+    assert_eq!(count, 4336, "native case inventory changed");
     let program = tests::mir(&format!("{factory}\nfn main() -> i32 = exercise()\n"));
     build_module(
         &ctx,
@@ -73,7 +73,9 @@ fn sysv_memory_types_attributes_storage_and_native_preflight() -> Result<(), Str
     let data = tm.get_target_data();
     let mut calls = std::collections::HashMap::new();
     let mut scratch = std::collections::HashSet::new();
+    let mut total_record_calls = 0;
     for function in module.get_functions() {
+        let mut record_calls = 0;
         for block in function.get_basic_blocks() {
             for instruction in block.get_instructions() {
                 if instruction.get_opcode() == InstructionOpcode::Alloca {
@@ -85,6 +87,12 @@ fn sysv_memory_types_attributes_storage_and_native_preflight() -> Result<(), Str
                 if let Ok(call) = CallSiteValue::try_from(instruction)
                     && let Some(callee) = call.get_called_fn_value()
                 {
+                    let name = callee.get_name().to_string_lossy();
+                    if name.starts_with("sysv_")
+                        && !matches!(name.as_ref(), "sysv_data" | "sysv_pointer" | "sysv_seen")
+                    {
+                        record_calls += 1;
+                    }
                     for ordinal in 0..call.count_arguments() {
                         // Align's internal return-transport pass has its own storage contract.
                         if callee.get_name().to_string_lossy().starts_with("sysv_")
@@ -121,7 +129,19 @@ fn sysv_memory_types_attributes_storage_and_native_preflight() -> Result<(), Str
                 }
             }
         }
+        // Keep the ABI matrix out of one giant frontend/LLVM function. This bound
+        // includes the seven cross-record/loop probes in the coordinating function.
+        assert!(
+            record_calls <= 8,
+            "{} bundles {record_calls} native record calls",
+            function.get_name().to_string_lossy()
+        );
+        total_record_calls += record_calls;
     }
+    assert_eq!(
+        total_record_calls, 241,
+        "native call sites must all survive"
+    );
     let attrs = |function: FunctionValue<'_>, ordinal, kind| {
         function.get_enum_attribute(
             AttributeLoc::Param(ordinal),

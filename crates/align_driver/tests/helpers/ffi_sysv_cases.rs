@@ -149,7 +149,13 @@ pub(crate) fn sources() -> (String, String, usize) {
         };
         c.push_str(&format!("struct {ca} {name} {{ {cf} }};\n"));
         source.push_str(&format!("pub {aa}layout(C) {name} {{ {af} }}\n"));
-        body.push_str(&format!("original{name} := {name} {{ {values} }}\n"));
+        let original = format!("original{name} := {name} {{ {values} }}\n");
+        if matches!(
+            name.as_str(),
+            "Pair" | "Pointer" | "F8N1" | "F8N2" | "Mix" | "Pointers" | "Reverse" | "P32"
+        ) {
+            body.push_str(&original);
+        }
         for force_sret in [false, true] {
             if force_sret
                 && (row.size > 16 || !matches!(name.as_str(), "Pair" | "Mix" | "Reverse" | "F8N2"))
@@ -239,7 +245,12 @@ pub(crate) fn sources() -> (String, String, usize) {
                     "extern \"C\" fn {symbol}({}) -> {ret}\n",
                     ap.join(",")
                 ));
-                body.push_str(&format!(
+                // Keep each native pressure case in a bounded analysis/LLVM function.
+                // The parent still invokes every case and checks the exact total below.
+                body.push_str(&format!("if exercise_case{count}() != 0 {{ return 1 }}\n"));
+                let mut case_body =
+                    format!("fn exercise_case{count}() -> i32 {{ unsafe {{\n{original}");
+                case_body.push_str(&format!(
                     "result{count} := keep({symbol}({}))\n",
                     args.join(",")
                 ));
@@ -261,7 +272,11 @@ pub(crate) fn sources() -> (String, String, usize) {
                             .map(|(i, t)| check(&format!("result{count}"), t, i, i == 0)),
                     );
                 }
-                body.push_str(&format!("if {} {{ return 1 }}\n", checks.join(" || ")));
+                case_body.push_str(&format!(
+                    "if {} {{ return 1 }}\nreturn 0\n}} }}\n",
+                    checks.join(" || ")
+                ));
+                source.push_str(&case_body);
                 count += 1;
             }
         }
