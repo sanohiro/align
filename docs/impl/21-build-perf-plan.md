@@ -3263,3 +3263,53 @@ pairs and rejected diagnostics. Local 512-value match checks improve 1.09x/1.10x
 loop-array controls remain within 8 ms and every 16-value control within 1 ms.
 Samples/hashes are in `results-terminal-probes-macos.json`; residual superlinear
 work and external Request37 acceptance remain.
+
+## Item 20: escape-fact join cost
+
+A bounded release profile of 1,024 Result-match expressions places 236 of 693
+main-thread samples at two `solve_flow` call sites, predominantly in hash-table
+rehashing beneath them. State joins insert one entry at a time without reserving
+even their final key-count lower bound. Before each hash-map merge, reserve only
+`incoming.len().saturating_sub(current.len())`: the final union contains at least
+as many keys as either input. Existing capacity is reused. The request targets only that live-entry lower
+bound; the hash table keeps its ordinary capacity rounding.
+
+The same joins reconstruct equal values before discovering that nothing changed.
+Every existing fact join is idempotent: joining a value with itself returns that
+value. Compare the complete operands first and retain equal facts without calling
+the join. Unequal operands must still run the original join, even when its result
+is unchanged. Replace only a changed result and preserve the exact change bit.
+
+The closed caller inventory is region extrema, boolean AND/OR, projected lifetime
+and header facts, ended-reason minima, unknown/root/release unions, descriptor
+equality, backing-known AND and must/may allocation bits. All preserve self joins;
+none normalizes, validates or writes other analysis state. Active-sum presence rules,
+missing backing fallbacks and absent-key insertion keep their existing behavior.
+No fact, control edge, diagnostic, source ownership, runtime allocation policy,
+IR shape, interface or ABI changes. K1/plan61 remain deferred.
+
+### Implementation closure matrix
+
+| Axis | Implementation and owner |
+| --- | --- |
+| Hash capacity | `EscapeState::reserve_join` admits only the union-size lower bound before insertion. `escape_join_reserves_union_lower_bound` covers empty, smaller, equal and larger inputs and pre-existing capacity while comparing complete contents; disabling reservation fails it. The state-join owner covers overlapping, disjoint and one-sided actual map keys. |
+| Equal and unequal values | `EscapeState::join_value` bypasses construction only for exact equality. `escape_join_skips_only_equal_construction` observes zero calls for equal values and one call for unequal changed/unchanged outcomes, retaining unchanged backing identity; disabling the guard fails it. |
+| Idempotence and facts | `escape_state_join_preserves_facts_changes_and_storage` invokes the original joins directly on projected, unknown, empty, descriptor, lifetime, release and must/may combinations, independently of the optimized helper. Existing explicit expected states cover every field, both operand orders, repeated inputs, one-sided/disjoint keys and all fields together. |
+| Control and lifecycle | Preserve every input, successor, worklist transition, loop convergence and source-order replay. Construction, move-in/out, source nulling, Drop, replacement, return, if/match/else/try/map_err and early exits remain. Reuse terminal metadata/diagnostic differential and full sema owners plus array-builder, region, return-provenance and borrow-liveness driver suites. |
+| Analysis boundaries | No public type, IR, summary/interface or ABI changes. Existing owner suites retain generic/imported whole/per-unit, malformed-input, storage-generation and allocation/cleanup parity coverage. Compiler scratch alone changes. |
+| Measurement | Measure each mechanism's marginal contribution before retaining both as one join-cost capability. Then run the existing numeric/storage 16/128/512 corpora with warmup and five alternating samples, no competing builds/tests, the 20-second child budget, exact MIR/raw LLVM/rejected diagnostics and actual checked-work output. Report remaining superlinear work; no client-time or runtime-resource promise. |
+
+This preserves the existing finite fixed-point strategy and fact representation.
+The author-side law/matrix pass precedes implementation retention; one fresh
+preflight review checks these boundaries. The handwritten diff is below 1,000
+lines. One capability closes the join-cost boundary without a dormant split.
+
+
+Both disabled mechanisms fail their separate owner tests; the source is restored
+byte-for-byte before all 318 sema owners pass. The final release implementation's
+five alternating samples improve 512-value Result-match whole/per-unit medians
+from 0.976/1.802 s to 0.784/1.421 s (1.25x/1.27x). All 15 MIR/raw LLVM pairs,
+checked-work outputs and rejected diagnostics match across the 30-cell corpus.
+Numeric straight/try controls stay within 2 ms and every 16-value control within
+0.5 ms. `results-join-cost-macos.json` retains samples and hashes. Other state
+copies, repeated traversal, consumer acceptance and K1/plan61 remain deferred.
