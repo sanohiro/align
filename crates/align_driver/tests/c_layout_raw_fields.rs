@@ -356,11 +356,17 @@ fn main() -> i32 {
         build_and_run(stage, &source, per_unit, "pointer-storage");
     }
     cached_type_round_trip(stage);
+    // Independent native matrices must preserve the root fixture for later value probes.
+    let root_artifacts = ["probe.o", "factory.align"];
+    let original = root_artifacts.map(|name| fs::read(stage.join(name)).unwrap());
     if cfg!(all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))) {
         ffi_aarch64::run(stage);
     }
     if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
         ffi_sysv::run(stage);
+    }
+    for (name, bytes) in root_artifacts.into_iter().zip(original) {
+        assert_eq!(fs::read(stage.join(name)).unwrap(), bytes, "overwrote {name}");
     }
     if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
         let source = r#"

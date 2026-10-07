@@ -1,6 +1,9 @@
 //! Runs inside the existing C-layout owner's bounded group and private artifact stage.
 use std::{fs, path::Path};
 pub(super) fn run(stage: &Path) {
+    let directory = stage.join("sysv-values-stage");
+    fs::create_dir(&directory).unwrap();
+    let stage = directory.as_path();
     let (c, source, calls) = super::ffi_sysv_cases::sources();
     super::compile_c(stage, &c);
     fs::write(

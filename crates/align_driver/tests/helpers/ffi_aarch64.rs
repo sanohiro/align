@@ -55,6 +55,9 @@ fn check(name: &str, ty: &str, i: usize, changed: bool) -> String {
     }
 }
 pub(super) fn run(stage: &Path) {
+    let directory = stage.join("aarch64-values-stage");
+    fs::create_dir(&directory).unwrap();
+    let stage = directory.as_path();
     let mut records = Vec::new();
     for (name, fields, alignment, gp) in [
         ("Byte", vec!["u8"], 0, 1),
