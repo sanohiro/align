@@ -10389,10 +10389,10 @@ impl<'a> BodyValidator<'a> {
         captures: &[hir::Expr],
         capture_flows: &[BodyFlow],
         input: Ty,
-        output: Ty,
-        output_domain: PipelineOutput,
+        output: (Ty, PipelineOutput),
         context: &BodyContext,
     ) -> bool {
+        let (output, output_domain) = output;
         let Some(signature) = self.resolve_signature(func) else {
             return false;
         };
@@ -10519,8 +10519,7 @@ impl<'a> BodyValidator<'a> {
                     captures,
                     capture_flows,
                     current,
-                    stage.out_ty,
-                    PipelineOutput::Copy,
+                    (stage.out_ty, PipelineOutput::Copy),
                     context,
                 ) {
                     return None;
@@ -10538,8 +10537,7 @@ impl<'a> BodyValidator<'a> {
                         captures,
                         capture_flows,
                         current,
-                        Ty::Bool,
-                        PipelineOutput::Copy,
+                        (Ty::Bool, PipelineOutput::Copy),
                         context,
                     )
                 {
@@ -10627,8 +10625,7 @@ impl<'a> BodyValidator<'a> {
                     captures,
                     &capture_flows,
                     elem,
-                    Ty::Bool,
-                    PipelineOutput::Copy,
+                    (Ty::Bool, PipelineOutput::Copy),
                     context,
                 ) {
                     return None;
@@ -10783,8 +10780,7 @@ impl<'a> BodyValidator<'a> {
                     captures,
                     &capture_flows,
                     final_elem,
-                    *key_ty,
-                    PipelineOutput::SortKey,
+                    (*key_ty, PipelineOutput::SortKey),
                     context,
                 ) {
                     return None;
@@ -10884,8 +10880,7 @@ impl<'a> BodyValidator<'a> {
                     captures,
                     &capture_flows,
                     final_elem,
-                    Ty::Bool,
-                    PipelineOutput::Copy,
+                    (Ty::Bool, PipelineOutput::Copy),
                     context,
                 ) {
                     return None;
@@ -10927,8 +10922,7 @@ impl<'a> BodyValidator<'a> {
                     captures,
                     &capture_flows,
                     input_elem,
-                    *elem,
-                    PipelineOutput::Copy,
+                    (*elem, PipelineOutput::Copy),
                     context,
                 ) {
                     return None;

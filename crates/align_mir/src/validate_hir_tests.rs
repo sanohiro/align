@@ -239,20 +239,20 @@ fn copy_string_sort_hir_rejects_forged_metadata() {
 const OWNED_KEY_SORT: &str = "fn key(x: i64) -> string = \"key\".clone()\nfn sorted(xs: slice<i64>) -> array<i64> { value := xs.sort_by_key(key); return value }";
 
 #[test]
-fn owned_string_sort_key_hir_rejects_forged_metadata() {
+fn owned_string_sort_key_hir_rejects_forged_metadata() -> Result<(), &'static str> {
     let base = checked_source_program(OWNED_KEY_SORT);
     assert!(body_core_metadata_is_valid(&base));
     for mutation in 0..7 {
         let mut malformed = base.clone();
         if mutation < 2 {
-            let key = malformed.fns.iter_mut().find(|f| f.name == "key").unwrap();
+            let key = malformed.fns.iter_mut().find(|f| f.name == "key").ok_or("key fixture")?;
             if mutation == 0 { key.return_cleanup = hir::ReturnCleanupAbi::None; }
             else { key.param_modes[0] = align_ast::ParamMode::Borrow; }
         } else {
             let expression = body_first_let_init_mut(&mut malformed, "sorted");
             if mutation == 2 { expression.ty = Ty::DynArray(Scalar::Bool); }
             else {
-                let hir::ExprKind::ArraySortBy { source, key_func, key_ty, elem, .. } = &mut expression.kind else { panic!("owned sort fixture") };
+                let hir::ExprKind::ArraySortBy { source, key_func, key_ty, elem, .. } = &mut expression.kind else { return Err("owned sort fixture") };
                 match mutation {
                     3 => *key_ty = Ty::Bool,
                     4 => *key_func = "missing".into(),
@@ -274,14 +274,15 @@ fn owned_string_sort_key_hir_rejects_forged_metadata() {
             assert_body_entrypoints_empty(&format!("owned key mutation {mutation}"), &malformed);
         }
     }
+    Ok(())
 }
 
 #[test]
-fn owned_sort_keys_preserve_cleanup_and_copy_comparisons() {
+fn owned_sort_keys_preserve_cleanup_and_copy_comparisons() -> Result<(), String> {
     let hir = checked_source_program(OWNED_KEY_SORT);
     for program in [lower_program(&hir), lower_program_per_unit(&hir)] {
-        producer::validate_mir_producers(&program).expect("owned sort producer proof");
-        let function = program.fns.iter().find(|f| f.name.as_str() == "sorted").unwrap();
+        producer::validate_mir_producers(&program).map_err(|error| format!("owned sort producer proof: {error:?}"))?;
+        let function = program.fns.iter().find(|f| f.name.as_str() == "sorted").ok_or("sort fixture")?;
         let statements: Vec<_> = function.blocks.iter().flat_map(|b| &b.stmts).collect();
         assert!(!statements.iter().any(|s| matches!(s, Stmt::Let(_, Rvalue::StrClone(_)))), "sort never clones key bytes");
         let calls: Vec<_> = statements.iter().filter_map(|s| match s {
@@ -301,20 +302,21 @@ fn owned_sort_keys_preserve_cleanup_and_copy_comparisons() {
         }).collect();
         assert_eq!(stores.len(), 1);
         let selected = stores[0];
-        let branch = function.blocks.iter().find(|b| matches!(b.term, Term::Branch(Operand::Value(v), _, _) if v == cleanup)).unwrap();
+        let branch = function.blocks.iter().find(|b| matches!(b.term, Term::Branch(Operand::Value(v), _, _) if v == cleanup)).ok_or("cleanup branch")?;
         assert!(branch.stmts.iter().any(|s| matches!(s, Stmt::DropFlagInit(slot) if *slot == selected)));
-        let Term::Branch(_, retain, stored) = branch.term else { unreachable!() };
+        let Term::Branch(_, retain, stored) = branch.term else { return Err("cleanup branch".into()) };
         assert!(function.blocks[retain as usize].stmts.iter().any(|s| matches!(s, Stmt::Store(slot, Operand::Value(v)) if *slot == selected && *v == value)));
         assert!(matches!(function.blocks[retain as usize].term, Term::Goto(target) if target == stored));
         let header = function.blocks[stored as usize].stmts.iter().find_map(|s| match s {
             Stmt::Let(v, Rvalue::Load(slot)) if *slot == selected => Some(*v), _ => None,
-        }).unwrap();
+        }).ok_or("selected header")?;
         assert!(function.blocks[stored as usize].stmts.iter().any(|s| matches!(s, Stmt::PtrStore(Operand::Value(p), _, Operand::Value(v)) if *p == owner_pointers[0] && *v == header)));
         assert!(!statements.iter().any(|s| matches!(s, Stmt::Drop(slot) if *slot == selected)), "transferred staging slot is not an owner");
         assert_eq!(statements.iter().filter(|s| matches!(s, Stmt::DropValue(Operand::Value(v)) if function.value_tys[*v as usize] == Ty::DynArray(Scalar::String))).count(), 1);
         assert!(statements.iter().any(|s| matches!(s, Stmt::Let(_, Rvalue::HeapAllocBuf { elem: Ty::Str, .. }))));
         assert!(!statements.iter().any(|s| matches!(s, Stmt::Let(v, Rvalue::SliceIndex(..)) if function.value_tys[*v as usize] == Ty::String)), "comparison never loads an owning key");
     }
+    Ok(())
 }
 
 fn float_scope_parts(

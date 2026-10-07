@@ -144,8 +144,8 @@ Request 27's Copy string-sorting boundary is implemented in plan 88:
 Results own their array spine and retain borrowed byte-owner lifetimes, with no
 implicit string clone. Stable ordering, exact key effects, generic/imported
 whole/per-unit parity, control/owner invalidation and forged HIR owners cover the
-boundary. Move string elements/keys, general comparators and consumer adoption
-remain deferred. Continue independent capabilities with K1 deferred.
+boundary. Plan134 adds owned string keys through the ordinary cleanup ABI.
+Move string elements, general comparators and consumer adoption remain deferred. Continue independent capabilities with K1 deferred.
 
 Request 35's capacity-accessor trigger is implemented in plan 87:
 `b.capacity() -> i64` is Pure and nonconsuming and reports the existing usable
