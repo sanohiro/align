@@ -1,5 +1,5 @@
 //! Runs inside the C-layout owner's bounded process group and artifact stage.
-use std::{fs, path::Path, process::Command};
+use std::{fs, path::Path};
 struct Record {
     name: String,
     fields: Vec<&'static str>,
@@ -54,20 +54,10 @@ fn check(name: &str, ty: &str, i: usize, changed: bool) -> String {
         format!("{name}.f{i} != {}", value(ty, i, changed, false))
     }
 }
-fn compile_c(stage: &Path, source: &str) {
-    fs::write(stage.join("arm_probe.c"), source).unwrap();
-    assert!(
-        Command::new("cc")
-            .args(["-c", "-O2"])
-            .arg(stage.join("arm_probe.c"))
-            .arg("-o")
-            .arg(stage.join("probe.o"))
-            .status()
-            .unwrap()
-            .success()
-    );
-}
 pub(super) fn run(stage: &Path) {
+    let directory = stage.join("aarch64-values-stage");
+    fs::create_dir(&directory).unwrap();
+    let stage = directory.as_path();
     let mut records = Vec::new();
     for (name, fields, alignment, gp) in [
         ("Byte", vec!["u8"], 0, 1),
@@ -253,7 +243,7 @@ pub(super) fn run(stage: &Path) {
         ),
     );
     factory.push_str(&body);
-    compile_c(stage, &c);
+    super::compile_c(stage, &c);
     fs::write(stage.join("factory.align"), factory).unwrap();
     for per_unit in [false, true] {
         super::build_and_run(
@@ -264,73 +254,5 @@ pub(super) fn run(stage: &Path) {
         );
     }
     println!("ARM64 native record cases: {count}, whole/per-unit");
-    cache_alignment(stage);
-}
-
-fn cache_alignment(stage: &Path) {
-    let source = "import factory\nfn main() -> i32 = factory.marker()\n";
-    let entry = stage.join("main.align");
-    fs::write(&entry, source).unwrap();
-    let context = align_driver::CacheContext::at(stage.join("arm-cache"));
-    let mut snapshots = Vec::new();
-    for (round, alignment) in [16, 16, 32, 16].into_iter().enumerate() {
-        compile_c(
-            stage,
-            &format!(
-                "#include <stdint.h>\nstruct __attribute__((aligned({alignment}))) Cache {{ int64_t data; }};\nstruct Cache cache_echo(struct Cache value) {{ value.data+=1; return value; }}\n"
-            ),
-        );
-        fs::write(stage.join("factory.align"),format!("module factory\npub align({alignment}) layout(C) Cache {{ data:i64 }}\nextern \"C\" fn cache_echo(value:Cache) -> Cache\npub fn marker() -> i32 {{ unsafe {{ original := Cache {{ data:41 }}; result := cache_echo(original); if original.data != 41 || result.data != 42 {{ return 1 }}; return 0 }} }}\n")).unwrap();
-        let mut sm = align_span::SourceMap::new();
-        let mut built = align_driver::build_package(
-            &mut sm,
-            entry.to_str().unwrap(),
-            source,
-            &context,
-            align_driver::UnitReuse::Allowed,
-        );
-        assert!(
-            !built.diags.has_errors(),
-            "{}",
-            align_driver::format_diagnostics(&sm, &built.diags)
-        );
-        for name in ["factory", "main"] {
-            assert_eq!(
-                built
-                    .units
-                    .iter()
-                    .find(|unit| unit.unit == name)
-                    .unwrap()
-                    .frontend
-                    .as_ref()
-                    .unwrap()
-                    .hit,
-                matches!(round, 1 | 3),
-                "{round}/{name}"
-            );
-        }
-        let programs = (0..built.units.len())
-            .map(|i| built.materialize(i).unwrap().clone())
-            .collect::<Vec<_>>();
-        let snapshot = programs
-            .iter()
-            .map(|program| {
-                (
-                    program
-                        .structs
-                        .iter()
-                        .map(|record| (record.name.to_string(), record.align))
-                        .collect::<Vec<_>>(),
-                    align_mir::print::program_to_string(program),
-                )
-            })
-            .collect::<Vec<_>>();
-        match round {
-            1 | 3 => assert_eq!(snapshot, snapshots[0]),
-            2 => assert_ne!(snapshot, snapshots[0]),
-            _ => {}
-        }
-        snapshots.push(snapshot);
-        super::run_programs(stage, &programs, &format!("arm-cache-{round}"), 0);
-    }
+    super::cache_alignment(stage);
 }

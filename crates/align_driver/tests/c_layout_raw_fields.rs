@@ -3,6 +3,10 @@
 
 #[path = "helpers/ffi_aarch64.rs"]
 mod ffi_aarch64;
+#[path = "helpers/ffi_sysv_cases.rs"]
+mod ffi_sysv_cases;
+#[path = "helpers/ffi_sysv.rs"]
+mod ffi_sysv;
 
 use align_driver::{
     ArtifactStage, BuildTarget, Profile, build_per_unit, check, emit_llvm_ir, link_objects,
@@ -352,8 +356,17 @@ fn main() -> i32 {
         build_and_run(stage, &source, per_unit, "pointer-storage");
     }
     cached_type_round_trip(stage);
+    // Independent native matrices must preserve the root fixture for later value probes.
+    let root_artifacts = ["probe.o", "factory.align"];
+    let original = root_artifacts.map(|name| fs::read(stage.join(name)).unwrap());
     if cfg!(all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))) {
         ffi_aarch64::run(stage);
+    }
+    if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        ffi_sysv::run(stage);
+    }
+    for (name, bytes) in root_artifacts.into_iter().zip(original) {
+        assert_eq!(fs::read(stage.join(name)).unwrap(), bytes, "overwrote {name}");
     }
     if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
         let source = r#"
@@ -550,5 +563,87 @@ fn cached_type_round_trip(stage: &Path) {
             &format!("cached-{round}"),
             if integer { 17 } else { 0 },
         );
+    }
+}
+
+fn compile_c(stage: &Path, source: &str) {
+    fs::write(stage.join("native_probe.c"), source).unwrap();
+    assert!(
+        Command::new("cc")
+            .args(["-c", "-O2"])
+            .arg(stage.join("native_probe.c"))
+            .arg("-o")
+            .arg(stage.join("probe.o"))
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+fn cache_alignment(stage: &Path) {
+    let source = "import factory\nfn main() -> i32 = factory.marker()\n";
+    let entry = stage.join("main.align");
+    fs::write(&entry, source).unwrap();
+    let context = align_driver::CacheContext::at(stage.join("record-cache"));
+    let mut snapshots = Vec::new();
+    for (round, alignment) in [16, 16, 32, 16].into_iter().enumerate() {
+        compile_c(
+            stage,
+            &format!(
+                "#include <stdint.h>\nstruct __attribute__((aligned({alignment}))) Cache {{ int64_t data; }};\nstruct Cache cache_echo(struct Cache value) {{ value.data+=1; return value; }}\n"
+            ),
+        );
+        fs::write(stage.join("factory.align"),format!("module factory\npub align({alignment}) layout(C) Cache {{ data:i64 }}\nextern \"C\" fn cache_echo(value:Cache) -> Cache\npub fn marker() -> i32 {{ unsafe {{ original := Cache {{ data:41 }}; result := cache_echo(original); if original.data != 41 || result.data != 42 {{ return 1 }}; return 0 }} }}\n")).unwrap();
+        let mut sm = align_span::SourceMap::new();
+        let mut built = align_driver::build_package(
+            &mut sm,
+            entry.to_str().unwrap(),
+            source,
+            &context,
+            align_driver::UnitReuse::Allowed,
+        );
+        assert!(
+            !built.diags.has_errors(),
+            "{}",
+            align_driver::format_diagnostics(&sm, &built.diags)
+        );
+        for name in ["factory", "main"] {
+            assert_eq!(
+                built
+                    .units
+                    .iter()
+                    .find(|unit| unit.unit == name)
+                    .unwrap()
+                    .frontend
+                    .as_ref()
+                    .unwrap()
+                    .hit,
+                matches!(round, 1 | 3),
+                "{round}/{name}"
+            );
+        }
+        let programs = (0..built.units.len())
+            .map(|i| built.materialize(i).unwrap().clone())
+            .collect::<Vec<_>>();
+        let snapshot = programs
+            .iter()
+            .map(|program| {
+                (
+                    program
+                        .structs
+                        .iter()
+                        .map(|record| (record.name.to_string(), record.align))
+                        .collect::<Vec<_>>(),
+                    align_mir::print::program_to_string(program),
+                )
+            })
+            .collect::<Vec<_>>();
+        match round {
+            1 | 3 => assert_eq!(snapshot, snapshots[0]),
+            2 => assert_ne!(snapshot, snapshots[0]),
+            _ => {}
+        }
+        snapshots.push(snapshot);
+        run_programs(stage, &programs, &format!("record-cache-{round}"), 0);
     }
 }

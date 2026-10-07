@@ -98,7 +98,7 @@ provider answer without consumer code edits or commits.
 One capability must connect classification, attributes, aligned copy and result
 reconstruction: a dormant producer cannot be tested by an actual C caller.
 Darwin and Linux are sibling rules for the supported ARM64 platform family.
-SysV MEMORY is a separate useful ABI domain and can follow independently. The
+Plan139 subsequently completes the separate useful SysV MEMORY ABI domain. The
 implementation exceeds 1,000 handwritten lines because the two platform plans,
 24-shape exact LLVM owner, shared native pressure matrix and public ledger form
 one value-passage capability. Retaining this boundary avoids duplicating all

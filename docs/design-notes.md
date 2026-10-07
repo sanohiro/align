@@ -335,7 +335,11 @@ A pointer wrapper cannot substitute for a native API that takes or returns a
 record value. Linux and Darwin therefore receive their exact aggregate rules,
 including aligned caller copies and results, as one usable capability. The source
 still has one C-record/value model; physical calling rules stay in LLVM lowering.
-SysV MEMORY and bool/char FFI remain separate deferred decisions.
+Plan139 completes Linux x86-64 through one typed MEMORY argument path for both
+large records and exhausted register aggregates. Whole-aggregate rollback and
+the hidden-result register budget belong to that same physical plan. Independent
+aligned copies preserve the existing Copy contract without heap allocation.
+Bool/char FFI remains deferred.
 
 ---
 

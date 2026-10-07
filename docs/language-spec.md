@@ -1148,10 +1148,13 @@ from `raw` memory (`raw.store`/`raw.load` of a whole struct) — the pointer-bas
 integers, floats, or `raw` pointers. Pointer fields retain native pointer size/alignment and are
 non-owning Copy values: no implicit free, pointee copy, lifetime extension or dereference authority.
 Direct raw fields in ordinary structs and generic C records remain rejected
-([plan137](impl/137-c-layout-raw-fields.md)). On **x86-64 Linux (SysV AMD64)**,
-records up to 16 bytes may cross by value when every non-padding eightbyte fits
-the remaining INTEGER/SSE argument registers. Larger records and register-pressure
-MEMORY arguments remain rejected.
+([plan137](impl/137-c-layout-raw-fields.md)). On **little-endian LP64 x86-64
+Linux (SysV AMD64, GNU/musl)**, records up to 16 bytes use non-padding INTEGER/SSE
+eightbytes when every argument class fits. Larger or register-exhausted arguments
+use typed byval stack copies aligned to max(record alignment,8), consuming no
+registers. Failed aggregate assignment preserves both classes for later arguments.
+Large results use typed sret storage at record alignment; its hidden pointer
+consumes the first GP argument register (plan139).
 
 **Little-endian LP64 ARM64 Linux/macOS** supports the complete existing flat
 record domain by value, including explicit alignment, large records and exhausted
@@ -1161,9 +1164,11 @@ aligned caller stack copies and large results use caller result storage. Native
 parameter writes do not mutate the source; no heap allocation, pointee ownership
 or Drop is introduced. Full padded scratch is reused across loop iterations and
 native code may not retain its pointer beyond the call. Declaration/call scalar
-extensions and aggregate attributes agree. ARM record-value declarations cannot
-redeclare fixed compiler/runtime symbols. Unsupported targets fail before LLVM
-function declarations; SysV MEMORY and other target ABIs remain deferred.
+extensions and aggregate attributes agree. The same Copy, scratch and native
+write-isolation rules apply to both ABI families. Source record-value declarations
+cannot redeclare fixed compiler/runtime symbols. Unsupported targets, including
+x32/ILP32 and unknown OS environments, fail before LLVM function declarations;
+other target ABIs remain deferred.
 
 An `align(N)` attribute (`align(N) S { … }`, a power of two, composes with `layout(C)`) over-aligns a
 struct's storage — the max of `N` and the natural alignment, so it never under-aligns — for SIMD /
@@ -1212,8 +1217,8 @@ generation, so the parent cannot move/drop before the child. The private unsafe
 `Option<slice<FFIScalar>>` tied to that generation after shape/alignment/UTF-8 checks; foreign range
 validity remains the wrapper's unsafe obligation. No owner-free safe raw-to-view conversion exists.
 
-Deliberately deferred beyond the shipped FFI slices (draft §15): SysV MEMORY-class
-record values and target ABIs other than x86-64 Linux and LP64 ARM64 Linux/macOS;
+Deliberately deferred beyond the shipped FFI slices (draft §15): target ABIs
+other than LP64 x86-64 Linux and LP64 ARM64 Linux/macOS;
 `bool`/`char` as FFI types (use the integer types — a C `char` is `i8`/`u8`, a `char32_t` is `u32`;
 Align `char` is a Unicode scalar, not a C `char`), and a typed pointer cast `raw.ptr_cast<T>` (waits
 on typed pointers).

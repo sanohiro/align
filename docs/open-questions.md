@@ -5564,17 +5564,19 @@ measured 2.95x-positive/0.72x-negative LTO evidence:
 
 **Deliberately out of FFI v1** (draft §15 "Not in FFI v1", decided 2026-07-01 — defer over ship-half-right):
 - **A struct by value** — SHIPPED for x86-64 Linux SysV and little-endian LP64
-  ARM64 Linux/macOS (plan138). SysV retains its <=16-byte register-class and
-  complete-register-fit restriction; MEMORY remains deferred. Request32 supplies
-  the concrete ARM64 consumer. AAPCS64 and DarwinPCS support the complete admitted
+  ARM64 Linux/macOS (plan138). Plan139 completes little-endian LP64 GNU/musl
+  SysV with typed byval stack arguments for large records and register exhaustion,
+  whole-aggregate register rollback, and typed hidden sret results that consume
+  one GP register. Both preserve full storage and explicit alignment. Request32
+  supplies the concrete native consumer. AAPCS64 and DarwinPCS support the complete admitted
   flat record domain, including HFAs, explicit alignment, register exhaustion,
   aligned caller-owned argument copies and hidden result storage. The record is
   still Copy with no pointee ownership; native argument writes preserve the source,
   scratch is entry-hoisted and no heap allocation is added. Temporary native
   addresses cannot escape the call. Declaration/call attributes and scalar extension
   share one physical plan. Fixed native symbols retain their registered ABI and
-  reject ARM record-value redeclarations. Unsupported target ABIs remain rejected.
-  The plan138 ledger and native whole/per-unit/cache plus codegen attribute owners
+  reject source record-value redeclarations. Unsupported target ABIs remain rejected.
+  The plan138/139 ledgers and native whole/per-unit/cache plus codegen attribute owners
   qualify the boundary. This does not reopen bool/char FFI or K1/plan61.
 - **`bool` / `char` as FFI types** — use the integer types (C `_Bool` = `u8`, `char` = `i8`/`u8`, `char32_t` = `u32`; a `wchar_t` is platform-sized — pick the matching integer width). Align `char` is a 32-bit Unicode scalar (**not** a C `char`), so admitting it would invite the wrong mapping; `bool` stays out for the same one-unambiguous-way reason (and dodges the `i1`-`zeroext` ABI subtlety). Note: there is no `bool as int` cast today, so a `bool` reaches C as `if b { 1 } else { 0 }`.
 - **`raw.ptr_cast<T>`** — a *typed* reinterpret has nothing to reinterpret to while `raw` (opaque bytes) is the only pointer type; it earns meaning once FFI grows typed/external pointers.

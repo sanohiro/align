@@ -9,7 +9,7 @@ gap independently of K1 and plan61.
 The existing diagnostic explicitly defers other C field types to a later FFI
 slice. This extends the existing opaque pointer representation; it does not
 reopen the deliberate bool/char FFI restriction or create pointer ownership.
-ARM64 and SysV MEMORY-class value passing remain separate ABI work. A usable
+Plan138 and plan139 own the subsequent ARM64 and SysV MEMORY-class value-passage capabilities. A usable
 consumer ships here: construct, inspect, copy, update, return, raw-load/store,
 and exchange pointer-bearing records with C through the existing raw boundary.
 That consumer works on every supported host without a future ABI producer.
