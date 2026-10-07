@@ -189,7 +189,7 @@ all nine core_test owners and both exec-peer cases pass; the original EOF arm
 omission reproduces ECONNRESET, and native send tracing distinguishes the former
 pre-send unsigned-byte rejection from the now-successful completion datagram.
 The untouched SIGPIPE writer probe has an independently reproduced macOS baseline
-failure and is excluded only from that host's selected native-runner command.
+failure; the independent owner correction below closes that deferred test boundary.
 No new library API, GPU control or latency benchmark promise is introduced.
 
 The capability diff is approximately one thousand hand-written changed lines,
@@ -210,3 +210,53 @@ be reported absent or fail early, then reaps and proves absence. Its immediate
 ChildGuard also protects fixture failure cleanup. The real descendant-timeout
 owner closes the delayed other-parent consumer. This is the same local cleanup
 finding class and does not change the terminal/empty-group proof strategy.
+
+## Isolated SIGPIPE writer owner
+
+The deferred failure is a test-topology defect. Rust startup installs SIG_IGN
+for SIGPIPE, and the real CLI already returns numeric 1 for closed stdout,
+stderr and both sinks. The isolated probe deliberately installs SIG_DFL.
+Libtest nevertheless runs a main thread beside its single test thread. Darwin's
+pipe EPIPE uses process-directed psignal, so blocking only the test thread lets
+the signal terminate the unblocked libtest main thread. Darwin sigpending also
+observes only the calling thread's pending set; it need not expose that generated
+process-directed signal. A prior thread-directed raise remains observable.
+
+The probe owner blocks SIGPIPE only in its exec child, using a validated set and
+an async-signal-safe pre_exec mask operation. Libtest threads inherit the block.
+The probe proves inheritance before selecting its own original mask, then keeps
+the existing default-disposition writer test. Successful writes restore that
+mask; EPIPE retains the writer block. Both platforms retain pre-existing pending
+SIGPIPE, and Linux additionally requires the newly generated signal to be pending
+on the writer thread. No signal is consumed. Parent masks remain unchanged.
+The production writer, process dispositions, source contract and runtime ABI do
+not change. This private CLI writer is not a general multithreaded SIG_DFL
+embedding API; the adversarial probe owns that extra process setup.
+
+| Closure cell | Implementation / regression owner |
+| --- | --- |
+| Validated native mask; child-only mutation; parent isolation | controlled_write_sigpipe_process_owner checks native setup and parent mask parity; pre_exec contains only pthread_sigmask and nonallocating status construction |
+| Inheritance, initial blocked/unblocked, prior pending signal | controlled_write_sigpipe_process_probe asserts inherited blocking before selecting its four cases; SIG_DFL remains installed |
+| Success byte and original mask; terminal EPIPE and retained mask | Existing four-case probe, with platform-correct generated-pending assertion and unchanged prior-pending assertion |
+| Exclusive fixture ownership and bounded probe cleanup | ArtifactStage plus immediate direct-child guard and one work/cleanup deadline; this libtest probe launches no descendant process |
+| Failure-report cleanup before summary; passing-summary cleanup | closed_report_sinks_exit_numerically_and_remove_stages crosses failing and passing source with closed stdout, checking exact surviving diagnostic and numeric exit 1 |
+| Stderr diagnostic failure and both sinks closed | Same CLI owner crosses cache diagnostics and failure reporting with closed stderr/both; no summary or recursive diagnostic |
+| Native descriptors, artifacts and process groups | Immediate File owners, exclusive outer ArtifactStage/private TMPDIR, file-backed capture and bounded CLI group/child guard; assert private stages absent before fixture Drop |
+| Types, construction, Move/Drop/replacement/return, branches, generics, interfaces, whole/per-unit, ABI/cache and allocation parity | No semantic or production implementation changes; existing owners remain applicable |
+
+The independent plan review found two P2 omissions: legacy core_test scratch and
+unbounded command helpers cannot supply exclusive bounded ownership, and a
+passing-only stdout fixture misses pre-summary report-error cleanup. The matrix
+above resolves both before implementation. The correction uses existing owner
+binaries and makes no performance or new resource-size promise. Qualify the
+native probe and CLI owner on macOS and Linux; verify that removing child-mask
+setup or terminal stage removal fails the applicable owner before restoring the
+candidate. Run the author matrix-to-diff pass and one preflight full-diff review.
+
+Qualification closes the matrix: macOS native runner owners (nine) and all ten
+core_test owners pass. Linux native owners (eight) and the new four-case CLI
+owner pass; Linux container execution uses an init reaper, required by the
+existing descendant-timeout owner, which also passes there. Removing the child
+mask, writer mask or terminal stage removal independently fails the intended
+owner; byte-identical restoration passes. The production runner prefix remains
+identical to main. The author matrix-to-diff pass is complete.

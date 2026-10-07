@@ -91,8 +91,10 @@ existing std.cli and rejects unsupported residual compiler arguments before nati
 source, cache or artifact work. Plan96 restores the macOS core.test consumer
 through typed unsigned-byte native C ABI attributes, peer-close classification,
 bounded terminal observation and proven-empty-group cleanup. Linux/macOS native,
-compiler and execution owners cover the shared boundary; the independent baseline
-macOS SIGPIPE writer probe remains deferred. Plan97 adds a general binary GET
+compiler and execution owners cover the shared boundary. Its isolated SIGPIPE
+owner now controls libtest's inherited mask and checks platform-specific pending
+signals; real CLI closed-sink owners cover numeric exit and stage cleanup without
+changing the production writer. Plan97 adds a general binary GET
 example through existing std.cli/http/io, with a reused 64KiB window, explicit
 decoded-body cap and per-operation timeout. It writes incrementally to stdout;
 late errors may leave a prefix. No new library API or native mechanism is needed.

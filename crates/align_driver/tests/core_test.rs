@@ -679,3 +679,183 @@ fn graceful_signal_cleans_child_and_stage_then_exits_numerically() {
         assert!(!Path::new(&stage).exists());
     }
 }
+
+#[test]
+fn closed_report_sinks_exit_numerically_and_remove_stages() {
+    use std::fs::File;
+    use std::io::ErrorKind;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, ExitStatus};
+
+    if !available() {
+        return;
+    }
+
+    // Keep the leader unreaped until group retirement, so no signal can target a reused PID.
+    // Capture goes to files: an unread diagnostic pipe must not turn a failure into a hang.
+    struct Owner {
+        child: Option<Child>,
+        deadline: Instant,
+    }
+    impl Owner {
+        fn retire(&mut self) -> std::io::Result<ExitStatus> {
+            let child = self
+                .child
+                .as_mut()
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ECHILD))?;
+            let pid = i32::try_from(child.id())
+                .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+            for target in [-pid, pid] {
+                loop {
+                    if unsafe { libc::kill(target, libc::SIGKILL) } == 0 {
+                        break;
+                    }
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() != ErrorKind::Interrupted || Instant::now() >= self.deadline {
+                        break;
+                    }
+                }
+            }
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break status,
+                    Ok(None) => {}
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
+                }
+                if Instant::now() >= self.deadline {
+                    return Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            self.child.take();
+            loop {
+                let code = unsafe { libc::kill(-pid, 0) };
+                let error = std::io::Error::last_os_error();
+                if code == -1 && error.raw_os_error() == Some(libc::ESRCH) {
+                    return Ok(status);
+                }
+                if Instant::now() >= self.deadline {
+                    return Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        fn wait(&mut self) -> ExitStatus {
+            let pid = self.child.as_ref().expect("owned CLI child").id();
+            loop {
+                assert!(
+                    Instant::now() + Duration::from_secs(2) < self.deadline,
+                    "closed-sink CLI exceeded work deadline"
+                );
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                let code = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid,
+                        &mut info,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                };
+                if code == 0 && unsafe { info.si_pid() } != 0 {
+                    return self
+                        .retire()
+                        .expect("retire closed-sink CLI group and child");
+                }
+                if code == -1 {
+                    assert_eq!(
+                        std::io::Error::last_os_error().kind(),
+                        ErrorKind::Interrupted
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            if self.child.is_some() {
+                // The same deadline reserves cleanup time before any work-timeout panic.
+                // Keep Drop non-panicking if cleanup itself fails during an assertion unwind.
+                if let Err(error) = self.retire() {
+                    eprintln!("closed-sink owner cleanup failed: {error}");
+                }
+            }
+        }
+    }
+
+    let stage = align_driver::ArtifactStage::temp("closed-report-owner").expect("owner stage");
+    for (label, passes, stdout_closed, stderr_closed, cache_stats) in [
+        ("failure-report", false, true, false, false),
+        ("passing-summary", true, true, false, false),
+        ("cache-diagnostic", true, false, true, true),
+        ("both-sinks", false, true, true, false),
+    ] {
+        let root = stage.path().join(label);
+        std::fs::create_dir(&root).expect("case directory");
+        let temp = root.join("tmp");
+        std::fs::create_dir(&temp).expect("private child temporary directory");
+        std::fs::write(
+            root.join("main.align"),
+            format!(
+                "module closed_sink\nimport core.test\ntest \"row\" {{ test.expect({passes}) }}\n"
+            ),
+        )
+        .expect("closed-sink source");
+        let stdout = root.join("stdout");
+        let stderr = root.join("stderr");
+        let stdout_file = File::create(&stdout).expect("stdout capture");
+        let stderr_file = File::create(&stderr).expect("stderr capture");
+        let (read, write) = std::io::pipe().expect("closed report pipe");
+        drop(read);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_alignc"));
+        command
+            .args(["test", "main.align"])
+            .current_dir(&root)
+            .env("ALIGNC_CACHE", "off")
+            .env("TMPDIR", &temp)
+            .stdin(Stdio::null())
+            .stdout(if stdout_closed {
+                Stdio::from(write.try_clone().expect("stdout pipe"))
+            } else {
+                Stdio::from(stdout_file)
+            })
+            .stderr(if stderr_closed {
+                Stdio::from(write.try_clone().expect("stderr pipe"))
+            } else {
+                Stdio::from(stderr_file)
+            })
+            .process_group(0);
+        if cache_stats {
+            command.arg("--cache-stats");
+        }
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut owner = Owner {
+            child: Some(command.spawn().expect("spawn closed-sink CLI")),
+            deadline,
+        };
+        let status = owner.wait();
+        let out = std::fs::read(&stdout).expect("read stdout capture");
+        let err = std::fs::read(&stderr).expect("read stderr capture");
+        assert_eq!(
+            status.code(),
+            Some(1),
+            "{label}: {status}, {out:?}, {err:?}"
+        );
+        assert!(out.is_empty(), "{label}: summary escaped: {out:?}");
+        let expected = if stderr_closed {
+            b"".as_slice()
+        } else {
+            b"alignc: test runner report write failed (os error 32)\n".as_slice()
+        };
+        assert_eq!(err, expected, "{label}: wrong surviving diagnostic");
+        assert!(
+            std::fs::read_dir(&temp)
+                .expect("inspect child stages")
+                .next()
+                .is_none(),
+            "{label}: a private artifact stage survived before owner cleanup"
+        );
+    }
+}
