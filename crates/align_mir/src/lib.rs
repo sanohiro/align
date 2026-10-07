@@ -11221,9 +11221,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 path,
                 struct_id,
             } => lower_index_field(b, e, recv, index, path, *struct_id, e.ty),
-            hir::ExprKind::ArrayLit { .. } => {
-                unreachable!("array literal only appears as a let initializer or pipeline source")
-            }
+            hir::ExprKind::ArrayLit { .. } => lower_array_literal_value(b, e),
             hir::ExprKind::ArrayZip { .. } => {
                 unreachable!("zip is a lazy source lowered only by its pipeline terminal")
             }
@@ -14522,6 +14520,22 @@ fn materialize_array_literal(
         owns_elements.then_some(source),
         owns_elements.then_some(live.unwrap_or(Operand::Const(Const::Bool(false)))),
     ))
+}
+
+/// Explicit value consumers use the same inline construction as array fields. Transfer the
+/// completed temporary's cleanup fact to the SSA value before the enclosing consumer claims it.
+fn lower_array_literal_value(b: &mut Builder, value: &hir::Expr) -> Operand {
+    let Some((aggregate, owner, live)) = materialize_array_literal(b, value) else {
+        return Operand::Const(Const::Unit);
+    };
+    if let (Operand::Value(result), Some(flag)) = (&aggregate, live) {
+        b.attach_value_drop_flag(*result, flag.clone());
+        b.attach_value_temp_drop_flag(*result, flag);
+    }
+    if let Some(owner) = owner {
+        b.set_drop_flag(owner, false);
+    }
+    aggregate
 }
 
 fn store_value_at(b: &mut Builder, slot: Slot, path: &mut Vec<u32>, value: &hir::Expr) {
