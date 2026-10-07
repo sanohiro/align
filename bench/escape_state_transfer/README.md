@@ -1,9 +1,11 @@
 # Compiler check-time scaling measurement
 
-This local benchmark owns plan 21 items 11–13 checking measurements. It
+This local benchmark owns plan 21 items 11–14 checking measurements. It
 compares release compiler binaries on the same generated straight arithmetic,
 Result `?`, and Result `match` chains inside a loop. Each case uses 16, 128 or
-512 values. Whole-program and per-unit checks run in fresh bounded processes.
+512 values. `--corpus storage` selects fixed-array declarations in straight-line
+and loop bodies at the same sizes. Whole-program and per-unit checks run in
+fresh bounded processes.
 
 ```text
 python3 bench/escape_state_transfer/measure.py \
@@ -16,7 +18,9 @@ raw LLVM byte-for-byte and records its hash, covering emitted cold attributes
 and exceptional branch weights. Item 12 uses this option.
 
 One warmup precedes five alternating repetitions. JSON records actual binary,
-source and MIR hashes, source sizes, samples and medians. Accepted MIR and two
+source and MIR hashes, source sizes, samples and medians. New runs also retain
+the actual CLI checked-function/unit output and require it to agree between
+revisions and repetitions. Accepted MIR and two
 rejected-source diagnostic controls must agree before the run completes. These
 comparisons supplement deterministic semantic owners; elapsed time is not a
 correctness gate. Each compiler invocation has a 20-second work deadline and a
@@ -97,3 +101,30 @@ complete copy. Existing successor inputs retain their allocations while joining;
 all facts, join rules, worklist order and diagnostics remain. Block evaluation
 still copies its saved input, so substantial block/state cost remains. Request 37
 consumer recombination and acceptance stay external.
+
+## Item 14 result (2026-10-07)
+
+The same host/profile compares merged
+`c9c9edde401f209607810bd8b6a175e1eb21f2d8` with selected Current-to-Prior table
+updates. Both binaries run with `DYLD_SHARED_REGION=private`; no build/test jobs
+overlap measurement. Run the command above with `--corpus storage --llvm-parity`,
+and again with `--corpus numeric --llvm-parity` for the previous numeric controls.
+[Full samples and hashes](results-recency-map-macos.json) retain five alternating
+samples after warmup, actual CLI checked-work output and output parity evidence.
+
+| 512 fixed-array declarations | Baseline median | Candidate median | Ratio |
+| --- | ---: | ---: | ---: |
+| Straight-line check | 0.789 s | 0.511 s | 1.54x |
+| Straight-line per-unit check | 1.586 s | 1.023 s | 1.55x |
+| Loop check | 9.112 s | 5.052 s | 1.80x |
+| Loop per-unit check | 18.346 s | 10.134 s | 1.81x |
+
+All 15 numeric/storage source MIR and LLVM comparisons match. The four rejected
+source/command controls pass in both corpus runs. Numeric control medians differ
+by at most 6 ms; the 16-value numeric controls differ by less than 1 ms.
+
+Only named Current entries move into Prior. Collision operand/callback order,
+all facts and diagnostics remain; unrelated entries no longer undergo complete
+map reconstruction. The no-op storage owner fails with the original algorithm.
+Table/fact copies and other repeated analysis still produce superlinear growth;
+these local measurements do not establish Request 37's real-client acceptance.

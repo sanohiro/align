@@ -2931,3 +2931,45 @@ remain within 1 ms; nine MIR outputs and four diagnostic comparisons are identic
 The original copy-based join fails the state-identity owner. Exact samples and
 remaining superlinear costs are in `bench/escape_state_transfer`; no whole-client
 acceptance or runtime allocation change is claimed.
+
+## Item 14: selected storage-generation table updates
+
+Previously, the shared Current-to-Prior map transition rebuilt every directory/
+content entry even when its rename plan selected one producer or none. A local release
+check with 2,048 fixed-array declarations takes 14.6 s while profiled; an early
+one-second sample identifies those rebuilds in MoveCheck's completion path.
+This is evidence for a narrower update, not a whole-run cost percentage.
+
+This change updates only Current keys named by the existing sorted origin plan. A selected
+Current becomes Prior; on collision, join Current before the existing Prior,
+matching the original derived key order and callback order across origins.
+Unselected keys, absent Current keys, ParameterValue and CallerStorage remain.
+Both analysis tables keep their existing caller and join functions. Formation
+transactions, facts, validation, CFG, worklist, diagnostics, source ownership,
+Drop, interfaces, cache identity and runtime allocation remain unchanged.
+K1/plan61 and consumer adoption stay deferred.
+
+| Closure axis | Implementation and owner |
+| --- | --- |
+| Key formation and selection | Keep the existing typed origins and rename plan. `storage_generation_selected_map_transition` crosses all origin variants, root/projected paths, empty/absent/selected/all plans, Current-only/Prior-only/both/neither and stable caller keys; exact map results and ordered noncommutative collision callbacks preserve the original transition. |
+| Move, replacement and Drop | Only compiler-owned entries move; the generic helper needs no Clone bound. `storage_generation_map_transition_moves_payloads_once` uses non-Clone payloads and exact destruction counts. Source moves, nulling, replacement, return and Drop retain their existing owners. |
+| Unchanged map storage | `storage_generation_map_noop_preserves_entries` pins existing entry addresses for empty and absent plans. Restoring whole-map reconstruction must fail this owner. No address guarantee is made for keys affected by a real BTreeMap removal/insertion. |
+| Invalid input and atomicity | Formation's existing complete prevalidation and transactional publication remain. `storage_generation_formation_and_malformed_matrix` retains late-invalid/multi-result rejection; this update adds no error or panic source. The private checker has no reuse-after-panic contract. |
+| Control, generations and lifetime | Full sema owners retain every if/match/else/?/map_err, loop and early-exit path; existing repeated-control, resolver, parameter and generation-owner tests exercise both EscapeCheck and MoveCheck. No state or fact is pruned. |
+| Generic, interface and runtime parity | Existing `array_builder_transfer`, `m12_array_builder` and `fb_region` whole/per-unit owners retain imported/generic ownership and lifetime behavior. No IR/type/interface/runtime variant or persisted format changes. |
+| Performance and output parity | Extend the existing bounded alternating release benchmark with fixed and loop-fixed storage inputs at 16/128/512 declarations. Retain numeric controls, identical MIR/LLVM and rejected diagnostics, all samples and remaining superlinear costs. Per-child budgets remain 20 s; timing is a local measurement, not a correctness gate or whole-client promise. |
+
+This is a private representation-preserving update under the reviewed generation
+strategy. The author matrix pass and one fresh implementation review cover it;
+no public contract or safety-strategy change requires a separate plan review.
+
+Qualification uses five alternating release samples after warmup on Apple M1,
+with no overlapping builds/tests. At 512 fixed-array declarations, straight-line
+whole/per-unit medians improve from 0.789/1.586 s to 0.511/1.023 s (1.54x/1.55x);
+loop medians improve from 9.112/18.346 s to 5.052/10.134 s (1.80x/1.81x).
+All 15 numeric/storage source MIR and raw LLVM comparisons match, as do actual
+CLI checked-work counts and all four rejected source/command controls in both
+runs. The original map reconstruction fails the no-op storage-identity owner.
+`bench/escape_state_transfer/results-recency-map-macos.json` retains full samples,
+hashes and controls. Remaining table/fact copies and repeated analysis remain
+superlinear; no consumer time budget or runtime allocation improvement is claimed.
