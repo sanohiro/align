@@ -1391,13 +1391,12 @@ and the hot/cold field-split suggestion (needs heuristic design).
   pipeline/reducer/sort callback invocation is permitted only while its owning expression is
   lexically inside `unsafe`, and extern function values are rejected. **By-value struct passing shipped
   beyond v1** (#329, 2026-07-03): a `layout(C)` struct ≤ 16 bytes passes/returns in registers on
-  **x86-64 SysV only**, emitting clang's exact coercion and verified against a compiled-C-helper
-  round-trip harness; codegen refuses (rather than guesses) on any non-SysV target, a >16-byte
-  MEMORY-class struct, or a signature that would fall to the stack under register pressure (see
-  `docs/open-questions.md` → "FFI" for the full classification). Still deliberately out of v1 (draft
-  §15 "Not in FFI v1"): **AAPCS64 / other-arch by-value classification** and the MEMORY-class
-  `byval`/`sret` path (both wait on a concrete cross-arch/large-struct consumer — struct-by-pointer
-  already covers that shape). `bool`/`char` as FFI types — use the integer types (a C `_Bool` = `u8`,
+  **x86-64 Linux SysV**, with complete-register-fit and <=16-byte restrictions.
+  Plan138 adds little-endian LP64 ARM64 Linux/macOS record values, including HFA,
+  large argument copies/results, explicit alignment and register exhaustion,
+  qualified through real C whole/per-unit/cache and exact codegen owners. Other
+  target ABIs and SysV MEMORY remain deferred. `bool`/`char` as FFI types retain
+  the integer representation (a C `_Bool` = `u8`,
   `char` = `i8`/`u8`, `char32_t` = `u32`; Align `char` is a Unicode scalar, not a C `char`), keeping
   one unambiguous way and dodging the `i1`-`zeroext` subtlety. `raw.ptr_cast<T>` — a typed reinterpret
   is meaningless with one opaque pointer type; it waits on typed/external pointers.

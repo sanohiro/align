@@ -1,5 +1,5 @@
 //! `extern "C"` by-value struct passing/returning — SysV AMD64, x86-64 Linux only (draft.md §15). A `layout(C)`
-//! struct (declaration-order, natural-alignment, scalar int/float fields) crosses the C boundary in
+//! struct (declaration-order, natural-alignment, scalar int/float/raw fields) crosses the C boundary in
 //! registers using the System V AMD64 classification: each eightbyte is INTEGER (→ a GP register /
 //! `i64` slot) or SSE (→ an XMM register / `double` slot); a two-register value returns as an
 //! `{T0,T1}` aggregate. Align reproduces exactly the coerced IR types clang emits, so each call is
@@ -15,10 +15,9 @@
 //! single-register returns, a full param+return round trip, and the rejections (> 16-byte MEMORY,
 //! non-`layout(C)` struct).
 //!
-//! **This suite is x86-64-Linux-only**, because the feature is — codegen gates on the triple being
-//! `x86_64` *and* `linux`. On any other target it refuses to emit a by-value struct call at all,
-//! and `sysv_only_targets_fail_closed` is what runs instead, pinning that the refusal is a clear
-//! diagnostic rather than some other target's ABI applied silently.
+//! The value cases here retain the SysV-specific register/pressure contract. ARM64 native
+//! value passage has its own parameterized cases in the bounded C-layout owner. Unsupported
+//! hosts still fail closed; the codegen target owner checks their complete target domain.
 
 mod common;
 use common::*;
@@ -28,15 +27,12 @@ fn ok(src: &str) -> bool {
     !check(&mut sm, "ffi_byval", src).diags.has_errors()
 }
 
-/// By-value struct FFI is x86-64-Linux-only by design, so every test below is too — on any other
-/// target codegen refuses to emit the call at all (see `sysv_only_targets_fail_closed`, which is
-/// what runs there instead). Without this condition the whole suite fails against a compiler that
-/// is behaving exactly as specified.
+/// These value and pressure cases own the SysV rule; ARM64 uses a separate native matrix.
 fn gated() -> bool {
     sysv_target() && backend_available() && cc_available()
 }
 
-/// Whether this host is the one target where by-value struct passing is implemented.
+/// Whether this host uses the SysV value ABI.
 ///
 /// This must mirror `align_codegen_llvm`'s condition EXACTLY — it gates on the triple being
 /// `x86_64` *and* `linux`, so x86-64 macOS and Windows are refused too. Gating these tests on the
@@ -376,8 +372,11 @@ fn layout_c_struct_extern_type_checks() {
 /// time. The diagnostic must also name the offending target and the way out, since "your struct
 /// crosses the C boundary wrongly" is invisible otherwise.
 #[test]
-fn sysv_only_targets_fail_closed() {
-    if sysv_target() || !backend_available() {
+fn unsupported_targets_fail_closed() {
+    if sysv_target()
+        || cfg!(all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")))
+        || !backend_available()
+    {
         return;
     }
     let mut sm = SourceMap::new();
@@ -391,7 +390,7 @@ fn sysv_only_targets_fail_closed() {
     );
     let mir = lower_to_mir(&checked.hir);
     let err = emit_llvm_ir(&mir, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false)
-        .expect_err("by-value struct FFI must be refused on a non-SysV target");
+        .expect_err("by-value struct FFI must be refused on an unsupported target");
     assert!(
         err.contains("x86-64 SysV"),
         "the diagnostic must say which ABI is the supported one:\n{err}"

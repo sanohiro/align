@@ -2516,24 +2516,36 @@ is Copy, adds no Drop, and never extends a pointee lifetime or grants dereferenc
 Direct `raw` fields in ordinary structs and generic `layout(C)` declarations remain rejected.
 [Plan137](docs/impl/137-c-layout-raw-fields.md) records the exact field and validation contract.
 
-### By-value structs (SysV AMD64 only)
+### By-value structs
 
-A `layout(C)` struct also crosses the boundary **by value**, using the System V AMD64 register
-convention — but *only* on x86-64 Linux. Each eightbyte of the struct is classified INTEGER (a
-general-purpose register) or SSE (an XMM register); a struct ≤ 16 bytes is passed/returned in
-registers (padding-only trailing eightbytes consume no register), and the compiler emits the
-ABI-equivalent coerced form a C compiler does (`i64`/`double`
-argument slots, an `{T0,T1}` aggregate return), so a call is binary-compatible with a real C callee.
-This is the one FFI corner where a *wrong* per-target rule silently miscompiles, so it is deliberately
-scoped: on any non-SysV target the compiler **refuses** with a clear diagnostic (pass the struct by
-pointer instead) rather than guessing, and a struct larger than 16 bytes (MEMORY class, needing a
-`byval`/`sret` pointer) is likewise rejected — that shape is already served by struct-by-pointer, so
-a redundant second mechanism is not added. The same MEMORY boundary is enforced under register
-pressure: SysV passes a struct in registers only if *all* its eightbytes fit in the class registers
-left after the preceding arguments, else the whole struct goes to memory — so a signature where a
-by-value struct argument would fall to memory (e.g. a two-eightbyte struct after five integer
-arguments) is also rejected (reorder it earlier, or pass it by pointer). (AAPCS64 and the
-MEMORY-class `byval`/`sret` path are future work, added only when a concrete wrapper needs them.)
+Concrete nonempty `layout(C)` records cross `extern "C"` by value on x86-64
+Linux and little-endian LP64 ARM64 Linux/macOS. Their fields remain integers,
+floats or non-owning `raw` pointers. Calls retain the existing unsafe permission,
+Copy semantics and pointee obligations.
+
+On **x86-64 Linux (SysV AMD64)**, records up to 16 bytes pass/return in INTEGER
+or SSE register classes. Padding-only trailing eightbytes consume no register.
+Every occupied eightbyte of an argument must fit the class registers remaining
+after preceding arguments; otherwise the complete argument requires the deferred
+MEMORY ABI and the compiler rejects it. Larger records are also rejected.
+
+On **ARM64 Linux (AAPCS64) and macOS (DarwinPCS)**, the complete admitted flat
+record domain supports arguments and results, including explicit `align(N)` and
+register exhaustion. One to four equal floating-point fields without additional
+object padding use the homogeneous floating-point rule. Other records up to
+16 bytes use the platform's integer/aggregate form; larger records use a distinct
+aligned caller-owned stack copy for each argument and caller-owned result storage.
+C changes to a by-value parameter cannot modify the source record. ABI scratch
+covers full padded storage, is reused across loop iterations, and adds no heap
+allocation or pointee ownership. Native code may not retain that temporary copy
+or result pointer beyond the call. Narrow integer extension follows the target
+ABI on both declarations and calls. Fixed compiler/runtime symbols keep their
+registered ABI; ARM64 record-value declarations cannot redeclare those symbols.
+
+[Plan138](docs/impl/138-aarch64-c-record-values.md) fixes the physical types,
+attributes and native acceptance matrix. Unsupported targets, including Windows,
+big-endian and ILP32 ARM, remain rejected before LLVM declarations. SysV MEMORY,
+variadics, callbacks and other target ABIs remain deferred.
 
 ### Not in FFI v1 (deliberate boundaries)
 
