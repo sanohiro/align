@@ -3168,3 +3168,51 @@ control median differences stay below 23 ms; all 16-value controls stay within
 5 ms. The benchmark README and `results-leaf-identity-macos.json` retain every
 sample and hash. Repeated traversals and remaining fact/state copies are still
 superlinear; consumer acceptance remains external.
+
+
+## Item 18: skip empty generation-ending propagation
+
+A bounded profile after item17 identifies repeated generation-ending propagation
+as the next storage-check cost. `BorrowState::end_generations` completes the
+selected directory updates, then walks and reconstructs observer facts even when
+the collected historical-root set is empty. An empty membership predicate cannot
+end a root or add an invalidation.
+
+After consuming/deduplicating every input generation, updating every present
+entry's minimum ending and adding OwnedOpaque observation roots, return when the
+historical-root set is empty. Keep both existing propagation calls unchanged for
+nonempty roots. Never return before directory updates; an entry can acquire an
+ending without having historical roots. Missing entries retain their existing
+behavior. No inferred absence, directory-based pruning, changed reachability or
+new ownership/safety strategy is introduced. K1/plan61 remain deferred.
+
+### Implementation closure matrix
+
+| Axis | Implementation and owner |
+| --- | --- |
+| Empty, absent and root-free retirement | `end_generations` returns only after complete existing directory updates. `storage_generation_empty_retirement_propagation` checks empty input, absent entries, present root-free entries and duplicates, both BorrowEnd values and all prior ending states. The complete state equals independently formed expected state; a nonempty projected root path retains its actual backing allocation. |
+| Nonempty history and opaque observation | The same owner crosses historical local/temporary/parameter/storage/observation/read-only and already-ended roots with unknown, nonopaque and OwnedOpaque descriptors. Opaque entries synthesize an observation even with no history. Compare the complete state with the previous propagation semantics; actual changed root/invalid-map assertions exclude a vacuous fixture. |
+| Observer locations and collision order | Seed local, value and pipeline headers and source/invalid maps, direct/projected content roots and unrelated sibling generations. Preserve exact paths, sticky metadata and minimum ending/error order. Root-free directory endings remain visible even when propagation is skipped. |
+| Actual staging caller | Exercise empty and retained frontiers, an unretained root-free staging generation and an unretained historical/opaque staging generation through `end_abandoned_staging_releases`; no frontier/reachability change. Existing sema generation/action/control and five driver generation owners retain construction, move-in/out, nulling, Drop/replacement/return, if/match/else/?/map_err, joins, loops, early exits and malformed input coverage. |
+| Generic and compiled boundaries | Existing generation driver owners retain generic, whole/per-unit, interface and allocation-provenance coverage. No new type, HIR/MIR variant, serialization, runtime allocation, ABI or source diagnostic contract. |
+| Performance | Existing numeric/storage release corpus, 16/128/512 values, five alternating samples after warmup and no competing local builds/tests. Require actual checked-work and exact MIR/raw LLVM/rejected diagnostic parity. Removing the guard must fail the backing-identity owner. No near-linear, runtime allocation or client-time claim. |
+
+Author matrix pass precedes implementation. This is an identity fast path over
+an already-computed empty set; all nonempty propagation and directory transitions
+remain unchanged. The existing safety strategy is preserved, so the one fresh
+preflight review includes boundary checking. One small capability closes this
+failure domain; expected handwritten diff remains below 1,000 lines.
+
+
+Qualification closes the matrix with 18 sema generation owners and five driver
+generation owners. Removing the guard detects 420 lost backing identities across
+empty, absent and root-free generation inputs and the actual staging caller.
+The candidate source is restored byte-for-byte before rerunning the owners.
+Five alternating Apple M1 release samples improve 512-array straight-line
+whole/per-unit medians from 0.231/0.459 s to 0.163/0.324 s (1.42x/1.42x), and
+loop medians from 1.278/2.554 s to 0.756/1.508 s (1.69x/1.69x). All 15 source
+MIR/raw LLVM pairs, checked-work outputs and rejected diagnostics match. Numeric
+control median differences stay below 6 ms; all 16-value controls stay within
+2 ms. The benchmark README and `results-empty-retirement-macos.json` retain
+samples and hashes. Nonempty propagation, other copies and repeated traversals
+remain; consumer acceptance and near-linear scaling are not established.
