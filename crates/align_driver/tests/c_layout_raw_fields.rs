@@ -1,6 +1,9 @@
 //! Concrete C records retain opaque, non-owning pointer fields through storage and imports.
 #![cfg(unix)]
 
+#[path = "helpers/ffi_aarch64.rs"]
+mod ffi_aarch64;
+
 use align_driver::{
     ArtifactStage, BuildTarget, Profile, build_per_unit, check, emit_llvm_ir, link_objects,
     lower_to_mir,
@@ -349,6 +352,9 @@ fn main() -> i32 {
         build_and_run(stage, &source, per_unit, "pointer-storage");
     }
     cached_type_round_trip(stage);
+    if cfg!(all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))) {
+        ffi_aarch64::run(stage);
+    }
     if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
         let source = r#"
 layout(C) Pair { n: u64, data: raw }

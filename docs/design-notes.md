@@ -330,6 +330,12 @@ where it counts. A concrete C record may also hold an opaque `raw` field (plan13
 the existing native pointer representation needs neither an integer-address encoding
 nor a new ownership model. Copying the record copies the pointer, with pointee
 validity and lifetime still governed by explicit unsafe operations.
+Plan138 adds the ARM64 record-value ABI for Request32's existing C signatures.
+A pointer wrapper cannot substitute for a native API that takes or returns a
+record value. Linux and Darwin therefore receive their exact aggregate rules,
+including aligned caller copies and results, as one usable capability. The source
+still has one C-record/value model; physical calling rules stay in LLVM lowering.
+SysV MEMORY and bool/char FFI remain separate deferred decisions.
 
 ---
 

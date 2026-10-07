@@ -36,6 +36,9 @@ use align_mir::producer::{
 pub mod thinlto;
 
 mod drop_codegen;
+mod ffi_aarch64;
+#[cfg(test)]
+mod ffi_aarch64_tests;
 mod llvm_build_id;
 /// Instrument-PGO driver-facing surface (production): the safe wrapper over the
 /// C++ shim's `align_pgo_run_pipeline` entry for `--pgo-instrument` / `--pgo-use`.
@@ -149,7 +152,7 @@ pub const LLVM_TOOL_VERSION: &str = "22";
 
 /// The object-file format the build targets — the classification every format-dependent toolchain
 /// step shares (linker-flag spelling in the driver, `alignc size` inspection). Lives here, next to
-/// the other triple sniffing (the baseline-CPU floor in [`create_target_machine`], the SysV check in
+/// the other triple sniffing (the baseline-CPU floor in [`create_target_machine`], the foreign ABI check in
 /// `build_module`), so triple classification stays in one place: codegen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObjectFormat {
@@ -3854,68 +3857,117 @@ fn lower_prepared_module<'c>(
     let triple = tm.get_triple();
     let triple_s = triple.as_str().to_string_lossy().to_ascii_lowercase();
     let x86_64_sysv = triple_s.starts_with("x86_64") && triple_s.contains("linux");
+    let arm_abi = ffi_aarch64::Abi::for_target(&triple_s, &target_data);
     for ext in &program.externs {
         let uses_byval_struct = matches!(ext.ret, Ty::Struct(_))
             || ext.params.iter().any(|p| matches!(p, Ty::Struct(_)));
-        if uses_byval_struct && !x86_64_sysv {
+        if uses_byval_struct && !x86_64_sysv && arm_abi.is_none() {
             return Err(CodegenError::Lowering(format!(
-                "extern '{}' passes or returns a struct by value, which is only supported on x86-64 SysV (Linux) — the target is '{}'; pass the struct by pointer (`raw`) instead",
+                "extern '{}' passes or returns a struct by value, which requires x86-64 SysV (Linux) or little-endian ARM64 (Linux/macOS) — the target is '{}'; pass the struct by pointer (`raw`) instead",
                 ext.name, triple_s,
             )));
         }
+        // A plain pointer function type cannot prove caller-copy or hidden-sret compatibility.
+        // Fixed native rows remain the authority; they have no source C-record ABI contract.
+        if uses_byval_struct && arm_abi.is_some()
+            && runtime_abi::runtime_abi_for_symbol(ext.name.as_str()).is_some()
+        {
+            return Err(CodegenError::Lowering(format!(
+                "native extern ABI mismatch:{}", lowercase_hex(ext.name.as_bytes()),
+            )));
+        }
     }
-    let extern_abi: HashMap<ProgramCall, ExternAbi> = program
+    let mut extern_abi: HashMap<ProgramCall, ExternAbi> = program
         .externs
         .iter()
         .map(|e| {
-            let params = e
-                .params
-                .iter()
-                .map(|&ty| match ty {
-                    Ty::Struct(id) => match classify_struct_abi(
-                        id,
-                        &struct_types[id as usize],
-                        &program.structs[id as usize],
-                        &target_data,
-                    ) {
-                        Some(abi) => ParamAbi::StructRegs(abi),
-                        None => ParamAbi::StructMemory,
-                    },
+            let record = |id: u32| -> Result<_, CodegenError> {
+                let st = struct_types.get(id as usize)
+                    .ok_or_else(|| CodegenError::Lowering("extern record type is missing".into()))?;
+                let def = program.structs.get(id as usize)
+                    .ok_or_else(|| CodegenError::Lowering("extern record definition is missing".into()))?;
+                Ok((*st, def))
+            };
+            let params = e.params.iter().map(|&ty| {
+                Ok(match ty {
+                    Ty::Struct(id) => {
+                        let (st, def) = record(id)?;
+                        if let Some(target) = arm_abi {
+                            ParamAbi::ArmRecord(ffi_aarch64::Record::classify(id, st, def, &target_data, target)?)
+                        } else {
+                            match classify_struct_abi(id, &st, def, &target_data) {
+                                Some(abi) => ParamAbi::StructRegs(abi),
+                                None => ParamAbi::StructMemory,
+                            }
+                        }
+                    }
                     _ if is_ffi_view(ty) => ParamAbi::ViewPtr,
                     _ => ParamAbi::Direct,
                 })
-                .collect();
+            }).collect::<Result<Vec<_>, CodegenError>>()?;
             let ret = match e.ret {
-                Ty::Struct(id) => match classify_struct_abi(
-                    id,
-                    &struct_types[id as usize],
-                    &program.structs[id as usize],
-                    &target_data,
-                ) {
-                    Some(abi) => ReturnAbi::StructRegs(abi),
-                    None => ReturnAbi::StructMemory,
-                },
+                Ty::Struct(id) => {
+                    let (st, def) = record(id)?;
+                    if let Some(target) = arm_abi {
+                        ReturnAbi::ArmRecord(ffi_aarch64::Record::classify(id, st, def, &target_data, target)?)
+                    } else {
+                        match classify_struct_abi(id, &st, def, &target_data) {
+                            Some(abi) => ReturnAbi::StructRegs(abi),
+                            None => ReturnAbi::StructMemory,
+                        }
+                    }
+                }
                 _ => ReturnAbi::Direct,
             };
-            (e.name.clone(), ExternAbi { params, ret })
+            Ok((e.name.clone(), ExternAbi { params, ret, attributes: Vec::new() }))
         })
-        .collect();
+        .collect::<Result<_, CodegenError>>()?;
     let mut extern_fn_types: HashMap<String, FunctionType<'c>> =
         HashMap::with_capacity(program.externs.len());
     for ext in &program.externs {
-        let abi = extern_abi
-            .get(&ext.name)
+        let abi = extern_abi.get_mut(&ext.name)
             .ok_or_else(|| callable_target_error(&ext.name))?;
-        check_sysv_struct_args_fit(ext.name.as_str(), abi, &ext.params, &program.structs)?;
+        if x86_64_sysv {
+            check_sysv_struct_args_fit(ext.name.as_str(), abi, &ext.params, &program.structs)?;
+        }
+        use inkwell::attributes::{Attribute, AttributeLoc};
+        let enum_attribute = |name, value| ctx.create_enum_attribute(Attribute::get_named_enum_kind_id(name), value);
         let mut param_types: Vec<BasicMetadataTypeEnum> = Vec::with_capacity(ext.params.len());
+        if let ReturnAbi::ArmRecord(record) = &abi.ret
+            && record.indirect()
+        {
+            let st = struct_types.get(record.id as usize)
+                .ok_or_else(|| CodegenError::Lowering("extern return record is missing".into()))?;
+            param_types.push(ctx.ptr_type(AddressSpace::default()).into());
+            abi.attributes.push((AttributeLoc::Param(0), ctx.create_type_attribute(
+                Attribute::get_named_enum_kind_id("sret"), (*st).into(),
+            )));
+            abi.attributes.push((AttributeLoc::Param(0), enum_attribute("align", u64::from(record.alignment))));
+        }
         for (pa, &ty) in abi.params.iter().zip(&ext.params) {
+            let ordinal = u32::try_from(param_types.len())
+                .map_err(|_| CodegenError::Lowering("extern parameter ordinal overflows".into()))?;
             match pa {
-                ParamAbi::Direct => param_types
-                    .push(abi_type(ctx, ty, &struct_types, &enum_types, tagged_types).into()),
+                ParamAbi::Direct => {
+                    param_types.push(abi_type(ctx, ty, &struct_types, &enum_types, tagged_types).into());
+                    if let Some(target) = arm_abi
+                        && let Some(attribute) = ffi_aarch64::narrow_attribute(ctx, target, ty)
+                    {
+                        abi.attributes.push((AttributeLoc::Param(ordinal), attribute));
+                    }
+                }
                 ParamAbi::ViewPtr => param_types.push(ctx.ptr_type(AddressSpace::default()).into()),
                 ParamAbi::StructRegs(sabi) => {
                     for &eb in &sabi.ebs {
                         param_types.push(eb.llvm(ctx).into());
+                    }
+                }
+                ParamAbi::ArmRecord(record) => {
+                    param_types.push(record.argument_type(ctx)?.into());
+                    if let Some(target) = arm_abi
+                        && let Some(alignment) = record.argument_stack_alignment(target)
+                    {
+                        abi.attributes.push((AttributeLoc::Param(ordinal), enum_attribute("alignstack", alignment)));
                     }
                 }
                 ParamAbi::StructMemory => {
@@ -3932,6 +3984,11 @@ fn lower_prepared_module<'c>(
         }
         let fn_ty = match &abi.ret {
             ReturnAbi::Direct => {
+                if let Some(target) = arm_abi
+                    && let Some(attribute) = ffi_aarch64::narrow_attribute(ctx, target, ext.ret)
+                {
+                    abi.attributes.push((AttributeLoc::Return, attribute));
+                }
                 if ext.ret == Ty::Unit {
                     ctx.void_type().fn_type(&param_types, false)
                 } else {
@@ -3940,6 +3997,14 @@ fn lower_prepared_module<'c>(
                 }
             }
             ReturnAbi::StructRegs(sabi) => struct_ret_type(ctx, sabi).fn_type(&param_types, false),
+            ReturnAbi::ArmRecord(record) => {
+                let st = struct_types.get(record.id as usize)
+                    .ok_or_else(|| CodegenError::Lowering("extern return record is missing".into()))?;
+                match record.result_type(ctx, *st)? {
+                    Some(ty) => ty.fn_type(&param_types, false),
+                    None => ctx.void_type().fn_type(&param_types, false),
+                }
+            }
             ReturnAbi::StructMemory => {
                 let sname = match ext.ret {
                     Ty::Struct(id) => program.structs[id as usize].name.as_str(),
@@ -4125,8 +4190,8 @@ fn lower_prepared_module<'c>(
         });
     }
     // Declare foreign (`extern "C"`) functions under their C symbol, so a `Rvalue::Call` keyed by
-    // that name resolves. FFI-safe params/returns are scalars/`raw`/views/`layout(C)` structs — the
-    // signature reflects the SysV coerce plan above (flattened register slots for a by-value struct).
+    // that name resolves. FFI-safe params/returns are scalars/`raw`/views/`layout(C)` structs.
+    // The signature and attributes come from the target's physical record plan above.
     // No `mark_nounwind`: unlike an Align function, foreign code is outside our control, so we do not
     // assert it never unwinds.
     for ext in &program.externs {
@@ -4141,6 +4206,13 @@ fn lower_prepared_module<'c>(
         let fv = module
             .get_function(ext.name.as_str())
             .unwrap_or_else(|| module.add_function(ext.name.as_str(), fn_ty, None));
+        if runtime_abi::runtime_abi_for_symbol(ext.name.as_str()).is_none() {
+            let abi = extern_abi.get(&ext.name)
+                .ok_or_else(|| callable_target_error(&ext.name))?;
+            for &(location, attribute) in &abi.attributes {
+                fv.add_attribute(location, attribute);
+            }
+        }
         program_funcs.insert(ext.name.clone(), fv);
     }
     // The fixed native ABI table is the sole declaration/type/attribute authority. Program,
@@ -7771,8 +7843,8 @@ fn abi_type<'c>(
 // (ABI §3.2.3). We reproduce *exactly* the coerced IR types clang emits — flattened `i64`/`double`
 // arguments per eightbyte, an `{T0,T1}` aggregate return for two-register structs — so an Align call
 // is binary-compatible with a clang/gcc-compiled callee (both lower these same IR types identically).
-// This is SysV-AMD64-only; every other target is rejected in `build_module` (a wrong per-target
-// register rule is the one FFI corner that silently miscompiles, so we never guess).
+// This classifier owns SysV AMD64. ffi_aarch64 owns the supported ARM64 rules; other
+// targets are rejected in build_module instead of inheriting an unrelated register convention.
 //
 // Completeness within our field domain: a `layout(C)` struct's fields are integers/floats/raw pointers
 // (`align_sema` enforces this), each naturally aligned, so no field straddles an eightbyte boundary
@@ -7867,9 +7939,9 @@ enum ParamAbi {
     /// A `layout(C)` struct passed by value in registers: flattened to one `i64`/`double` argument
     /// per eightbyte.
     StructRegs(StructAbi),
-    /// A `layout(C)` struct too large for registers (> 16 bytes, MEMORY class). Rejected in FFI v1
-    /// — a `byval` pointer is semantically identical to the existing struct-by-pointer FFI, so we do
-    /// not add a redundant second mechanism.
+    /// One ARM64 aggregate operand or a pointer to a caller-owned copy.
+    ArmRecord(ffi_aarch64::Record),
+    /// The deferred SysV MEMORY-class argument (>16 bytes); currently rejected.
     StructMemory,
 }
 
@@ -7880,16 +7952,19 @@ enum ReturnAbi {
     Direct,
     /// A `layout(C)` struct returned by value in registers (≤ 16 bytes).
     StructRegs(StructAbi),
-    /// A `layout(C)` struct returned via a hidden `sret` pointer (> 16 bytes, MEMORY class).
-    /// Rejected in FFI v1 (deferred until a concrete C API needs a large by-value return).
+    /// An ARM64 aggregate/coerced result or a typed hidden result pointer.
+    ArmRecord(ffi_aarch64::Record),
+    /// The deferred SysV MEMORY-class result (>16 bytes); currently rejected.
     StructMemory,
 }
 
-/// The full SysV ABI plan for one `extern "C"` symbol.
+/// The physical ABI plan for one `extern "C"` symbol.
 #[derive(Clone)]
 struct ExternAbi {
     params: Vec<ParamAbi>,
     ret: ReturnAbi,
+    /// The same physical ordinal/attribute plan is applied to declarations and calls.
+    attributes: Vec<(inkwell::attributes::AttributeLoc, inkwell::attributes::Attribute)>,
 }
 
 /// The LLVM return type for a register-passed struct: a single scalar for a one-eightbyte struct,
@@ -7959,6 +8034,7 @@ fn check_sysv_struct_args_fit(
             // A > 16-byte MEMORY struct consumes no registers and is rejected separately (with a size
             // message) in the declaration loop.
             ParamAbi::StructMemory => {}
+            ParamAbi::ArmRecord(_) => {}
         }
     }
     Ok(())
@@ -9578,8 +9654,8 @@ struct FnGen<'c, 'a> {
     /// signedness, so the range-kernel boundary checks these `Ty`s as well as the generated LLVM
     /// function type before emitting a direct call.
     fn_sigs: &'a HashMap<ProgramCall, ParMapFunctionSignature>,
-    /// The SysV ABI plan for each `extern "C"` symbol — to coerce call arguments (view→data
-    /// pointer, `layout(C)` struct→register slots) and reconstruct a by-value struct return.
+    /// The target ABI plan for each `extern "C"` symbol — to coerce call arguments (view→data
+    /// pointer, C record→register/aggregate/caller-copy) and reconstruct a record return.
     extern_abi: &'a HashMap<ProgramCall, ExternAbi>,
     structs: &'a [StructDef],
     struct_types: &'a [StructType<'c>],
@@ -12242,6 +12318,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
     fn eightbyte_slot(&self, n: usize) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
         let arr = self.ctx.i64_type().array_type(n as u32);
         self.alloca_at_entry(arr.into(), "sysv_slot")
+    }
+
+    /// A distinct, entry-hoisted argument copy or result slot, including explicit tail padding.
+    fn arm_record_slot(&self, record: &ffi_aarch64::Record) -> Result<PointerValue<'c>, CodegenError> {
+        let storage = self.ctx.i64_type().array_type(record.scratch_eightbytes);
+        let slot = self.alloca_at_entry(storage.into(), "arm_record")?;
+        slot.as_instruction_value()
+            .ok_or_else(|| self.err("ARM64 record slot is not an instruction"))?
+            .set_alignment(record.scratch_alignment).map_err(|error| self.err(error))?;
+        Ok(slot)
     }
 
     /// The address of eightbyte `i` within an [`FnGen::eightbyte_slot`] — `slot + i * 8` bytes, via
@@ -19176,12 +19262,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .get(name)
                     .copied()
                     .ok_or_else(|| callable_target_error(name))?;
-                // A foreign call coerces each argument to its SysV form: a `str`/`slice` view → its
-                // data pointer; a `layout(C)` struct → one `i64`/`double` per eightbyte; everything
-                // else passes as its value. A non-extern call passes every argument directly.
+                // Foreign calls use the same target plan as their declaration. Each ARM64
+                // argument copy and result has separate entry storage, reusable across loops.
+                let arm_result_slot = match self.extern_abi.get(name) {
+                    Some(ExternAbi { ret: ReturnAbi::ArmRecord(record), .. }) => Some(self.arm_record_slot(record)?),
+                    _ => None,
+                };
                 let argv: Vec<inkwell::values::BasicMetadataValueEnum> = match self.extern_abi.get(name) {
                     Some(abi) => {
                         let mut v: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::with_capacity(args.len());
+                        if let ReturnAbi::ArmRecord(record) = &abi.ret
+                            && record.indirect()
+                        {
+                            v.push(arm_result_slot.ok_or_else(|| self.err("ARM64 result slot is missing"))?.into());
+                        }
                         for (o, pa) in args.iter().zip(&abi.params) {
                             let val = self.operand_by_value(o)?;
                             match pa {
@@ -19204,6 +19298,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                         let p = self.eightbyte_ptr(slot, i)?;
                                         let lv = self.builder.build_load(eb.llvm(self.ctx), p, "eb").map_err(|e| self.err(e))?;
                                         v.push(lv.into());
+                                    }
+                                }
+                                ParamAbi::ArmRecord(record) => {
+                                    let slot = self.arm_record_slot(record)?;
+                                    self.builder.build_store(slot, val).map_err(|error| self.err(error))?;
+                                    if record.indirect() {
+                                        v.push(slot.into());
+                                    } else {
+                                        let value = self.builder.build_load(record.argument_type(self.ctx)?, slot, "arm_arg")
+                                            .map_err(|error| self.err(error))?;
+                                        v.push(value.into());
                                     }
                                 }
                                 // `StructMemory` params were rejected at declaration time.
@@ -19236,12 +19341,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .builder
                     .build_call(callee, &argv, "call")
                     .map_err(|e| self.err(e))?;
-                if self.extern_abi.contains_key(name)
-                    && let Some(id) = runtime_abi::runtime_abi_for_symbol(name.as_str())
-                {
-                    runtime_abi::runtime_abi_by_id(id).apply_call_attributes(
-                        self.ctx, cs, &self.module.get_triple().as_str().to_string_lossy(),
-                    );
+                if let Some(abi) = self.extern_abi.get(name) {
+                    if let Some(id) = runtime_abi::runtime_abi_for_symbol(name.as_str()) {
+                        runtime_abi::runtime_abi_by_id(id).apply_call_attributes(
+                            self.ctx, cs, &self.module.get_triple().as_str().to_string_lossy(),
+                        );
+                    } else {
+                        for &(location, attribute) in &abi.attributes {
+                            cs.add_attribute(location, attribute);
+                        }
+                    }
                 }
                 if !self.extern_abi.contains_key(name) {
                     add_scalar_call_facts(
@@ -19265,6 +19374,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let sty = self.struct_types[sabi.id as usize];
                     let sv = self.builder.build_load(sty, slot, "ffiret").map_err(|e| self.err(e))?;
                     return Ok(Some(sv));
+                }
+                if let Some(ExternAbi { ret: ReturnAbi::ArmRecord(record), .. }) = self.extern_abi.get(name) {
+                    let slot = arm_result_slot.ok_or_else(|| self.err("ARM64 result slot is missing"))?;
+                    if !record.indirect() {
+                        let value = cs.try_as_basic_value().basic()
+                            .ok_or_else(|| self.err("ARM64 record call produced no result"))?;
+                        self.builder.build_store(slot, value).map_err(|error| self.err(error))?;
+                    }
+                    let st = self.struct_types.get(record.id as usize)
+                        .ok_or_else(|| self.err("ARM64 return record is missing"))?;
+                    let value = self.builder.build_load(*st, slot, "arm_ret").map_err(|error| self.err(error))?;
+                    return Ok(Some(value));
                 }
                 return Ok(cs.try_as_basic_value().basic());
             }
@@ -26853,7 +26974,7 @@ fn main() -> i32 = 0
         Ok(())
     }
 
-    fn mir(src: &str) -> Program {
+    pub(super) fn mir(src: &str) -> Program {
         let mut d = Diagnostics::new();
         let toks = tokenize(0, src, &mut d);
         let f = parse_file(toks, &mut d);

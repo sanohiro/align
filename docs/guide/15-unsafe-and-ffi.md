@@ -86,7 +86,16 @@ copying, replacing or returning it never copies/frees the pointee or extends its
 lifetime. Pointer validity and dereferencing remain your responsibility inside
 `unsafe`. Direct raw fields in ordinary structs and generic C records are not supported.
 
-`layout(C)` structs can cross through a `raw` pointer. **By-value structs are supported only on x86-64 Linux using the SysV ABI**, and only when the complete struct fits the available argument or return registers (at most 16 bytes). Larger structs and signatures that exhaust the argument registers are rejected. On Apple Silicon and other targets, pass the struct by pointer; `layout(C)` alone does not enable by-value calls there.
+`layout(C)` structs can cross through a `raw` pointer or by value on supported
+ABIs. On **x86-64 Linux**, a record must be at most 16 bytes and fit the available
+SysV argument/return registers; larger or register-exhausted arguments are rejected.
+**Apple Silicon and Linux ARM64** also support large records and exhausted
+registers. The compiler uses the platform ABI, including aligned temporary stack
+copies for large arguments and storage for large results. Native parameter writes
+leave the original record unchanged; pointers inside it still refer to their
+original pointees. These temporaries add no heap allocation and their addresses
+must not escape the native call. Other targets remain pointer-only. See
+[plan138](../impl/138-aarch64-c-record-values.md) for the exact platform contract.
 
 C-owned memory returns as `raw` because a C pointer carries no length. Use `raw.load` to read values, or obtain and validate the length before constructing a view.
 
