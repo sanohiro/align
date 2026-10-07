@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded local before/after measurement for escape-state transfer (plan 21/11)."""
+"""Bounded local before/after checking measurement (plan 21, items 11 and 12)."""
 import argparse
 import hashlib
 import json
@@ -81,6 +81,8 @@ def main():
     parser.add_argument("--baseline", required=True, type=Path)
     parser.add_argument("--candidate", required=True, type=Path)
     parser.add_argument("--repeats", type=int, default=5, choices=range(1, 11))
+    parser.add_argument("--llvm-parity", action="store_true",
+                        help="also compare raw LLVM, including cold attributes and branch weights")
     args = parser.parse_args()
     binaries = {"baseline": args.baseline.resolve(), "candidate": args.candidate.resolve()}
     print(json.dumps({"binaries": {
@@ -101,6 +103,13 @@ def main():
                     raise RuntimeError(f"MIR/diagnostic parity failed: {source.name}: {outputs[0][2]!r} / {outputs[1][2]!r}")
                 mir_digest = hashlib.sha256(outputs[0][1]).hexdigest()
                 del outputs
+                llvm_digest = None
+                if args.llvm_parity:
+                    outputs = [run(binary, "emit-llvm", source) for binary in binaries.values()]
+                    if any(output[0] != 0 for output in outputs) or outputs[0][1:3] != outputs[1][1:3]:
+                        raise RuntimeError(f"LLVM/diagnostic parity failed: {source.name}")
+                    llvm_digest = hashlib.sha256(outputs[0][1]).hexdigest()
+                    del outputs
                 for command in ("check", "check-per-unit"):
                     samples = {name: [] for name in binaries}
                     for round_number in range(args.repeats + 1):
@@ -116,6 +125,7 @@ def main():
                         "source_lines": len(text.splitlines()), "command": command,
                         "source_sha256": hashlib.sha256(text.encode()).hexdigest(),
                         "mir_sha256": mir_digest, "samples_seconds": samples,
+                        **({"llvm_sha256": llvm_digest} if llvm_digest is not None else {}),
                         "median_seconds": {name: statistics.median(values) for name, values in samples.items()},
                     }), flush=True)
         for label, text in (

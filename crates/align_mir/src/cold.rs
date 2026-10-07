@@ -152,6 +152,11 @@ fn reachable(function: &Function) -> Vec<bool> {
 }
 
 fn exceptional_region(function: &Function) -> HashSet<u32> {
+    // No exceptional successor can dominate a block when no edge records seed the region.
+    // Avoid computing the complete dominator relation for ordinary control flow.
+    if function.exceptional_edges.is_empty() {
+        return HashSet::new();
+    }
     let count = function.blocks.len();
     let reached = reachable(function);
     if count == 0 || reached.len() != count {

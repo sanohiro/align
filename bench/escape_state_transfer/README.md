@@ -1,6 +1,6 @@
-# Escape-flow state transfer measurement
+# Compiler check-time scaling measurement
 
-This local benchmark owns plan 21 item 11's compiler-checking measurement. It
+This local benchmark owns plan 21 items 11 and 12 checking measurements. It
 compares release compiler binaries on the same generated straight arithmetic,
 Result `?`, and Result `match` chains inside a loop. Each case uses 16, 128 or
 512 values. Whole-program and per-unit checks run in fresh bounded processes.
@@ -10,6 +10,10 @@ python3 bench/escape_state_transfer/measure.py \
   --baseline /absolute/path/to/baseline/alignc \
   --candidate /absolute/path/to/candidate/alignc > results.jsonl
 ```
+
+Add `--llvm-parity` when qualifying MIR optimization changes: it also compares
+raw LLVM byte-for-byte and records its hash, covering emitted cold attributes
+and exceptional branch weights. Item 12 uses this option.
 
 One warmup precedes five alternating repetitions. JSON records actual binary,
 source and MIR hashes, source sizes, samples and medians. Accepted MIR and two
@@ -24,7 +28,7 @@ The synthetic corpus diagnoses a reported request-37 cost; it is not the
 external consumer's recombined program. Block/join snapshots remain, so this
 change does not promise linear complexity or a whole-client time budget.
 
-## Local result (2026-10-07)
+## Item 11 result (2026-10-07)
 
 Apple M1, macOS arm64, Rust 1.96.1, LLVM 22.1.8, release binaries. The baseline
 is merged `e17648b39ff8bdbdf8492b756a459d339f22569d`; the candidate changes the
@@ -50,3 +54,25 @@ Residual scaling remains visible: match checks at 128/512 values take
 0.112/1.096 s, and per-unit checks take 0.310/8.939 s. The wrapper removes one
 measured cost; block snapshots, joins and other checking/lowering work remain.
 Request 37's real consumer recombination and full-module budget are unverified.
+
+
+## Item 12 result (2026-10-07)
+
+The same host/profile and corpus compare merged
+`8bb307b4f6ef608191e88e8728771a2bf1a509f9` with the empty exceptional-edge guard.
+No builds/tests overlap. [Full samples and hashes](results-empty-region-macos.json)
+retain all 18 cells, nine matching MIR and raw LLVM outputs, and four matching
+rejected-source diagnostic comparisons. Run the command above with `--llvm-parity`.
+
+At 128/512 values, Result-match `check-per-unit` medians improve from
+0.311/8.895 s to 0.203/2.091 s (1.53x/4.25x). The 512-value whole-program
+`check` remains 1.106/1.101 s, because it does not run the MIR cold pass. The
+512-value `?` per-unit control remains 0.119/0.119 s; it has exceptional records
+and continues through the existing algorithm. All six 16-value controls remain
+within 1 ms of their baseline medians. These are local observations, not a
+startup-time guarantee.
+
+The empty-edge case no longer builds a dominator relation that cannot contribute
+any exceptional block. Nonempty-edge dominance and remaining semantic analysis
+still cost work; this does not establish near-linear checking or Request 37's
+actual consumer acceptance. The earlier item11 measurements remain historical.
