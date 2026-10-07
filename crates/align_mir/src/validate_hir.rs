@@ -9349,7 +9349,7 @@ impl<'a> BodyValidator<'a> {
                     builder.ty
                 };
                 (matches!(builder.kind, hir::ExprKind::Local(_))
-                    && builder.ty == owner && self.handle_receiver_place(builder, context, owner))
+                    && self.handle_receiver_place(builder, context, owner))
                     .then(|| strict(i64, &[builder]))?
             }
             hir::ExprKind::BufferLen { buffer } | hir::ExprKind::BufferCapacity { buffer } => {

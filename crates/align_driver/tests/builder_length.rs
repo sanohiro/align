@@ -1,6 +1,55 @@
 //! Scalar progress observations preserve unfinished builder ownership.
-mod common;
-use common::*;
+#![cfg(unix)]
+#[path = "helpers/owned_fixture.rs"]
+mod owned_fixture;
+use align_driver::{backend_available, build_per_unit, check, emit_object_file, link_objects,
+    lower_to_mir, BuildTarget, Profile};
+use align_span::SourceMap;
+use std::path::Path;
+
+fn check_diagnostics(label: &str, source: &str) -> String {
+    let mut sources = SourceMap::new();
+    let checked = check(&mut sources, label, source);
+    align_driver::format_diagnostics(&sources, &checked.diags)
+}
+fn check_errs(label: &str, source: &str) -> bool {
+    let mut sources = SourceMap::new();
+    check(&mut sources, label, source).diags.has_errors()
+}
+
+// Called only inside owned_fixture::run, including every transitive native wait.
+fn execute(stage: &Path, files: &[(&str, &str)], per_unit: bool) -> Option<std::process::Output> {
+    for (name, source) in files { std::fs::write(stage.join(name), source).unwrap(); }
+    let entry = stage.join("main.align");
+    let source = std::fs::read_to_string(&entry).unwrap();
+    let mut sources = SourceMap::new();
+    let programs = if per_unit {
+        let walk = build_per_unit(&mut sources, entry.to_str().unwrap(), &source);
+        assert!(!walk.diags.has_errors(), "{}", align_driver::format_diagnostics(&sources, &walk.diags));
+        assert_eq!(walk.units.len(), files.len());
+        walk.units.into_iter().map(|unit| unit.mir).collect::<Vec<_>>()
+    } else {
+        let checked = check(&mut sources, entry.to_str().unwrap(), &source);
+        assert!(!checked.diags.has_errors(), "{}", align_driver::format_diagnostics(&sources, &checked.diags));
+        vec![lower_to_mir(&checked.hir)]
+    };
+    if !backend_available() { return None; }
+    let mut objects = Vec::new();
+    let mut libraries = Vec::new();
+    for (index, program) in programs.iter().enumerate() {
+        let object = stage.join(format!("{per_unit}-{index}.o"));
+        emit_object_file(program, &object, BuildTarget::Baseline, Profile::Release, &[], false).unwrap();
+        objects.push(object);
+        for library in &program.link_libs {
+            if !libraries.contains(library) { libraries.push(library.clone()); }
+        }
+    }
+    let executable = stage.join(format!("program-{per_unit}"));
+    link_objects(&align_driver::CDriver::default(),
+        &objects.iter().map(|path| path.as_path()).collect::<Vec<_>>(),
+        &executable, &libraries, Profile::Release).unwrap();
+    Some(std::process::Command::new(executable).output().unwrap())
+}
 
 fn assert_checked(label: &str, source: &str) {
     let mut sources = SourceMap::new();
@@ -52,6 +101,10 @@ fn formation_and_ownership() {
 
 #[test]
 fn text_progress_and_nonconsuming_helpers() {
+    owned_fixture::run("text_progress_and_nonconsuming_helpers", text_progress_and_nonconsuming_helpers_in);
+}
+
+fn text_progress_and_nonconsuming_helpers_in(stage: &Path) {
     let source = r#"fn text_count(borrow output: builder) -> i64 = output.len()
 fn element_count(borrow values: array_builder<i64>) -> i64 = values.len()
 fn main() -> i32 {
@@ -75,8 +128,7 @@ fn main() -> i32 {
 }
 "#;
     assert_checked("builder-length-progress", source);
-    if backend_available() {
-        let output = build_and_run("builder-length-progress", source);
+    if let Some(output) = execute(stage, &[("main.align", source)], false) {
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         assert_eq!(String::from_utf8_lossy(&output.stdout), "3\n5\n6\nあ425\n1\n2\n3\n18\n");
     }
@@ -84,6 +136,10 @@ fn main() -> i32 {
 
 #[test]
 fn all_element_families_and_allocation_modes() {
+    owned_fixture::run("all_element_families_and_allocation_modes", all_element_families_and_allocation_modes_in);
+}
+
+fn all_element_families_and_allocation_modes_in(stage: &Path) {
     let source = r#"Row { value: i64 }
 Owned { value: string }
 Zero { value: [i64; 0] }
@@ -145,8 +201,7 @@ fn main() -> i32 {
 }
 "#;
     assert_checked("builder-length-families", source);
-    if backend_available() {
-        let output = build_and_run("builder-length-families", source);
+    if let Some(output) = execute(stage, &[("main.align", source)], false) {
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         assert_eq!(String::from_utf8_lossy(&output.stdout), "1\n7\n1\n8\n1\ntext\n1\n1\n1\nview\n1\n3\n1\n3\n1\n5\n1\n6\n2\n2\n");
     }
@@ -154,6 +209,10 @@ fn main() -> i32 {
 
 #[test]
 fn observations_cross_control_and_units() {
+    owned_fixture::run("observations_cross_control_and_units", observations_cross_control_and_units_in);
+}
+
+fn observations_cross_control_and_units_in(stage: &Path) {
     let helper = r#"module lengths
 pub fn text(borrow output: builder) -> i64 = output.len()
 pub fn elements<T: RegionPlain>(borrow values: array_builder<T>) -> i64 = values.len()
@@ -212,11 +271,8 @@ fn main() -> i32 {
 }
 "#;
     let files = [("lengths.align", helper), ("main.align", source)];
-    let checked = diff_check_multi("builder-length-units", &files, "main.align");
-    assert!(!checked.whole_errors && !checked.per_unit_errors, "{}\n{}", checked.whole_diags, checked.per_unit_diags);
-    if !backend_available() { return; }
-    for output in [build_and_run_multi("builder-length-whole", &files, "main.align"),
-        build_per_unit_multi("builder-length-unit", &files, "main.align").link_and_run()] {
+    for per_unit in [false, true] {
+        let Some(output) = execute(stage, &files, per_unit) else { continue; };
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         assert_eq!(String::from_utf8_lossy(&output.stdout), "4\n1\n3\n4\n2\n6\n2\n3\nxy\n1\n2\n3\n3\n0\n2\n17\n");
     }
@@ -224,12 +280,15 @@ fn main() -> i32 {
 
 #[test]
 fn cached_generic_queries_preserve_outputs_after_edit_and_restore() {
-    let stage = align_driver::ArtifactStage::temp("builder-length-cache").unwrap();
-    let entry = stage.path().join("main.align");
-    let helper = stage.path().join("helper.align");
+    owned_fixture::run("cached_generic_queries_preserve_outputs_after_edit_and_restore", cached_generic_queries_preserve_outputs_after_edit_and_restore_in);
+}
+
+fn cached_generic_queries_preserve_outputs_after_edit_and_restore_in(stage: &Path) {
+    let entry = stage.join("main.align");
+    let helper = stage.join("helper.align");
     let main = "import helper\nfn main() { b := builder(); b.write(\"あ\"); mut a: array_builder<i64> := array_builder(); a.push(7); print(helper.text(b)); print(helper.count(a)) }\n";
     std::fs::write(&entry, main).unwrap();
-    let context = align_driver::CacheContext::at(stage.path().join("cache"));
+    let context = align_driver::CacheContext::at(stage.join("cache"));
     let mut snapshots = Vec::new();
     for (round, bias) in [0, 0, 1, 0].into_iter().enumerate() {
         std::fs::write(&helper, format!("module helper\npub fn text(borrow b: builder) -> i64 = b.len() + {bias}\npub fn count<T: RegionPlain>(borrow a: array_builder<T>) -> i64 = a.len() + {bias}\n")).unwrap();
@@ -247,7 +306,7 @@ fn cached_generic_queries_preserve_outputs_after_edit_and_restore() {
             let program = built.materialize(index).unwrap();
             snapshot.push(align_mir::print::program_to_string(&program));
             if backend_available() {
-                let object = stage.path().join(format!("{round}-{index}.o"));
+                let object = stage.join(format!("{round}-{index}.o"));
                 emit_object_file(&program, &object, BuildTarget::Baseline, Profile::Release, &[], false).unwrap();
                 objects.push(object);
                 for library in &program.link_libs {
@@ -262,7 +321,7 @@ fn cached_generic_queries_preserve_outputs_after_edit_and_restore() {
         }
         snapshots.push(snapshot);
         if backend_available() {
-            let executable = stage.path().join(format!("run-{round}"));
+            let executable = stage.join(format!("run-{round}"));
             let object_refs: Vec<_> = objects.iter().map(|path| path.as_path()).collect();
             link_objects(&align_driver::CDriver::default(), &object_refs, &executable, &libraries, Profile::Release).unwrap();
             let output = std::process::Command::new(executable).output().unwrap();
