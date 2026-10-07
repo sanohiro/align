@@ -12,6 +12,10 @@ import tempfile
 import time
 
 
+WORK_TIMEOUT_SECONDS = 20
+CLEANUP_TIMEOUT_SECONDS = 5
+
+
 def run(binary, command, source):
     child = None
     started = time.perf_counter()
@@ -24,17 +28,19 @@ def run(binary, command, source):
             start_new_session=True,
         )
         try:
-            stdout, stderr = child.communicate(timeout=20)
+            stdout, stderr = child.communicate(timeout=WORK_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired as error:
             raise RuntimeError(f"20-second budget: {binary.name} {command} {source.name}") from error
         return child.returncode, stdout, stderr, time.perf_counter() - started
     finally:
-        if child is not None and child.poll() is None:
+        if child is not None:
+            # The leader may exit while descendants still own its pipes or work.
+            # Retire the entire owned group regardless of the leader status.
             try:
                 os.killpg(child.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            child.communicate(timeout=5)
+            child.communicate(timeout=CLEANUP_TIMEOUT_SECONDS)
 
 
 def source_text(kind, count):

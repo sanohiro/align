@@ -16,7 +16,9 @@ source and MIR hashes, source sizes, samples and medians. Accepted MIR and two
 rejected-source diagnostic controls must agree before the run completes. These
 comparisons supplement deterministic semantic owners; elapsed time is not a
 correctness gate. Each compiler invocation has a 20-second work deadline and a
-five-second cleanup reserve, including process-group termination on failure.
+five-second cleanup reserve. Retirement kills the owned process group even if
+its direct leader has already exited, then reaps that leader. Run the actual
+exited-leader controls with `python3 bench/escape_state_transfer/test_measure.py`.
 
 The synthetic corpus diagnoses a reported request-37 cost; it is not the
 external consumer's recombined program. Block/join snapshots remain, so this
