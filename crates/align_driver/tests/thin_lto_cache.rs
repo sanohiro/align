@@ -232,7 +232,7 @@ fn gate7_cross_process_second_build_all_hit() {
     let alignc = env!("CARGO_BIN_EXE_alignc");
     let run = || {
         Command::new(alignc)
-            .args(["build", "main.align", "--thin-lto", "--cache-stats", "-p", "release"])
+            .args(["build", "main.align", "--thin-lto", "--cache-stats", "--profile", "release"])
             .current_dir(&proj.dir)
             .env("ALIGNC_CACHE", &shared)
             .output()

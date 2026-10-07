@@ -2829,7 +2829,7 @@ prove the rejection is by digest (not by a downstream bitcode-parse failure), wh
 S2's garbage-blob gate could not distinguish. No source change was needed to close 2a. **(3) Explicit
 compile-time regression bound** (the rt-lto bound discipline): a COLD `--thin-lto` build's wall-time
 over the fixed 4-unit chain must stay under `CAP = 3.0`× the flag-off cold build. Non-flaky by
-construction — the SAME real DEBUG-`alignc` subprocess, SAME sources, SAME `-p release`, only the
+construction — the SAME real DEBUG-`alignc` subprocess, SAME sources, SAME `--profile release`, only the
 `--thin-lto` flag differs; the large fixed cost (process spawn + debug-Rust frontend + `cc` link) is
 identical in both and appears in numerator and denominator, pulling the ratio toward 1. off/thin are
 INTERLEAVED per round (A then B in the same round, never all-off-then-all-thin — the block-sequential

@@ -126,7 +126,7 @@ fn gate_sv1_subprocess_build_twice_byte_identical() {
     let build = |root: &str| -> Vec<u8> {
         let _ = std::fs::remove_file(&exe_path); // never let a stale exe satisfy the comparison
         let out = Command::new(alignc)
-            .args(["build", "main.align", "--thin-lto", "--cache-stats", "-p", "release"])
+            .args(["build", "main.align", "--thin-lto", "--cache-stats", "--profile", "release"])
             .current_dir(&proj.dir)
             .env("ALIGNC_CACHE", proj.dir.join(root))
             .output()
@@ -235,7 +235,7 @@ fn gate_sv2b_stale_manifest_different_body_blob_rejected() {
 ///
 /// Why this cannot flake:
 ///   * Both builds are the SAME real DEBUG-`alignc` subprocess over the SAME sources at the SAME
-///     `-p release` profile — the only difference is the `--thin-lto` flag. The large fixed cost
+///     `--profile release` profile — the only difference is the `--thin-lto` flag. The large fixed cost
 ///     (process spawn + a debug-Rust frontend + the `cc` link) is IDENTICAL in both and appears in
 ///     BOTH numerator and denominator, pulling the ratio toward 1. ThinLTO's own delta (a second opt
 ///     pipeline pass + a ~0.1 ms thin-link) is a small fraction of that fixed cost.
@@ -262,7 +262,7 @@ fn gate_sv3_compile_time_regression_bound() {
 
     let one_build = |thin: bool| -> f64 {
         let mut cmd = Command::new(alignc);
-        cmd.args(["build", "main.align", "-p", "release"])
+        cmd.args(["build", "main.align", "--profile", "release"])
             .current_dir(&proj.dir)
             .env("ALIGNC_CACHE", "off");
         if thin {
