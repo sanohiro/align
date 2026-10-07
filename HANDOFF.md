@@ -17,6 +17,14 @@ outside the active worktree so they do not obstruct unrelated checks or pulls.
 
 ## Next work (handoff updated 2026-10-07)
 
+Build-performance item 11 removes two complete escape-analysis state copies per
+flow transfer while preserving every fact, CFG edge, join, diagnostic and Drop
+classification. A storage-identity owner, sema regression corpus and whole/per-unit
+MIR/diagnostic comparisons qualify it. Local release measurements improve long
+straight/try/match checks; block/join and per-unit costs remain superlinear.
+Request 37 consumer recombination and acceptance stay external; K1/plan61 remain
+deferred.
+
 Plan135 adds explicit fallible aligned construction through `buffer.try_new`
 and `buffer.try_filled`. Payload and handle refusal return Code(ENOMEM), invalid
 admission returns Invalid before allocation, and Ok owns an exact initial
