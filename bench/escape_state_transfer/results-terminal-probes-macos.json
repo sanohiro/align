@@ -1,0 +1,1061 @@
+{
+  "date": "2026-10-07",
+  "host": "Apple M1, macOS arm64",
+  "rustc": "1.96.1",
+  "llvm": "22.1.8",
+  "profile": "release",
+  "environment": {
+    "DYLD_SHARED_REGION": null
+  },
+  "baseline_commit": "03922e10e7161ac4bc058f4b1523e31165312fc9",
+  "candidate": "skip terminal-block probes while retaining fixed inputs and complete source-order replay",
+  "repeats": 5,
+  "binary_sha256": {
+    "baseline": "00e0912a9c0dc7a5b488b5844b27aae3e05a4a4b600a0bf6412c05ac46e7a009",
+    "candidate": "a0a4646a78954c0bfc2a35de9c0eaba8a710db7d29e8f2a8e062ba4734382aba"
+  },
+  "measurements": [
+    {
+      "kind": "straight",
+      "values": 16,
+      "source_bytes": 721,
+      "source_lines": 28,
+      "command": "check",
+      "source_sha256": "a3d36f490e750706ec653ab68ed7ad98039988ca38c728053ad3b33a3cc56523",
+      "mir_sha256": "ad04b012730a15d9d7680d9f9566a7d00f3cfb9c41811890ba39cade16bd3cb6",
+      "samples_seconds": {
+        "baseline": [
+          0.022632707994489465,
+          0.022951083003135864,
+          0.022682709000946488,
+          0.0225393750006333,
+          0.02252050000242889
+        ],
+        "candidate": [
+          0.022630082996329293,
+          0.022954166000999976,
+          0.02268637500674231,
+          0.022626166995905805,
+          0.022574957998585887
+        ]
+      },
+      "checked_output": {
+        "baseline": "ok: checked 3 function(s)\n",
+        "candidate": "ok: checked 3 function(s)\n"
+      },
+      "llvm_sha256": "4979e5f5257d033b6112e8886761532b9887980e5891f5c38e92b6963e11a019",
+      "median_seconds": {
+        "baseline": 0.022632707994489465,
+        "candidate": 0.022630082996329293
+      }
+    },
+    {
+      "kind": "straight",
+      "values": 16,
+      "source_bytes": 721,
+      "source_lines": 28,
+      "command": "check-per-unit",
+      "source_sha256": "a3d36f490e750706ec653ab68ed7ad98039988ca38c728053ad3b33a3cc56523",
+      "mir_sha256": "ad04b012730a15d9d7680d9f9566a7d00f3cfb9c41811890ba39cade16bd3cb6",
+      "samples_seconds": {
+        "baseline": [
+          0.024846707994583994,
+          0.024863625003490597,
+          0.02490737500193063,
+          0.024775124998996034,
+          0.02496358399366727
+        ],
+        "candidate": [
+          0.02490070900239516,
+          0.024774708006589208,
+          0.02472329200099921,
+          0.02472654200391844,
+          0.02483820899942657
+        ]
+      },
+      "checked_output": {
+        "baseline": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n",
+        "candidate": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n"
+      },
+      "llvm_sha256": "4979e5f5257d033b6112e8886761532b9887980e5891f5c38e92b6963e11a019",
+      "median_seconds": {
+        "baseline": 0.024863625003490597,
+        "candidate": 0.024774708006589208
+      }
+    },
+    {
+      "kind": "straight",
+      "values": 128,
+      "source_bytes": 3801,
+      "source_lines": 140,
+      "command": "check",
+      "source_sha256": "a3e307d64eb031a340d0eef10734315573bd51f98388a88ad87888fd6133b778",
+      "mir_sha256": "9741ff2d07c127e907966335c7772a10c24bdfe1f7c9fc057254b3b30433115e",
+      "samples_seconds": {
+        "baseline": [
+          0.028348332998575643,
+          0.028299958001298364,
+          0.03065049999713665,
+          0.030331832997035235,
+          0.029183166996517684
+        ],
+        "candidate": [
+          0.02832095899793785,
+          0.028485916001955047,
+          0.02818870799819706,
+          0.03011420800612541,
+          0.030050708999624476
+        ]
+      },
+      "checked_output": {
+        "baseline": "ok: checked 3 function(s)\n",
+        "candidate": "ok: checked 3 function(s)\n"
+      },
+      "llvm_sha256": "5cae3ae90c0ce161faa854a34cc93476d052fcb4a9afa03e862ba65d31707b5e",
+      "median_seconds": {
+        "baseline": 0.029183166996517684,
+        "candidate": 0.028485916001955047
+      }
+    },
+    {
+      "kind": "straight",
+      "values": 128,
+      "source_bytes": 3801,
+      "source_lines": 140,
+      "command": "check-per-unit",
+      "source_sha256": "a3e307d64eb031a340d0eef10734315573bd51f98388a88ad87888fd6133b778",
+      "mir_sha256": "9741ff2d07c127e907966335c7772a10c24bdfe1f7c9fc057254b3b30433115e",
+      "samples_seconds": {
+        "baseline": [
+          0.03725766700517852,
+          0.037230125002679415,
+          0.03748674999951618,
+          0.0373060420024558,
+          0.03732391700032167
+        ],
+        "candidate": [
+          0.037309332998120226,
+          0.03735895800491562,
+          0.03712537500541657,
+          0.03719529200316174,
+          0.03721262499311706
+        ]
+      },
+      "checked_output": {
+        "baseline": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n",
+        "candidate": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n"
+      },
+      "llvm_sha256": "5cae3ae90c0ce161faa854a34cc93476d052fcb4a9afa03e862ba65d31707b5e",
+      "median_seconds": {
+        "baseline": 0.0373060420024558,
+        "candidate": 0.03721262499311706
+      }
+    },
+    {
+      "kind": "straight",
+      "values": 512,
+      "source_bytes": 14937,
+      "source_lines": 524,
+      "command": "check",
+      "source_sha256": "54aa317c93567c816c4b2b22b6f3652627977c4bbeb4a2d2b19755d19c33fa46",
+      "mir_sha256": "4708caa062e6b429ca8e254f8521c73a80ad179ff3b625c37acb1d05e5d56338",
+      "samples_seconds": {
+        "baseline": [
+          0.04813845900207525,
+          0.04811491700093029,
+          0.048673500001314096,
+          0.048168916000577156,
+          0.04813241599913454
+        ],
+        "candidate": [
+          0.04807083400373813,
+          0.04815941699780524,
+          0.04797316700569354,
+          0.04827520799881313,
+          0.047915875002217945
+        ]
+      },
+      "checked_output": {
+        "baseline": "ok: checked 3 function(s)\n",
+        "candidate": "ok: checked 3 function(s)\n"
+      },
+      "llvm_sha256": "38c3efba651aec8467ed8e6145d9f7e24364ea1758a8e2c8318823334dfb8716",
+      "median_seconds": {
+        "baseline": 0.04813845900207525,
+        "candidate": 0.04807083400373813
+      }
+    },
+    {
+      "kind": "straight",
+      "values": 512,
+      "source_bytes": 14937,
+      "source_lines": 524,
+      "command": "check-per-unit",
+      "source_sha256": "54aa317c93567c816c4b2b22b6f3652627977c4bbeb4a2d2b19755d19c33fa46",
+      "mir_sha256": "4708caa062e6b429ca8e254f8521c73a80ad179ff3b625c37acb1d05e5d56338",
+      "samples_seconds": {
+        "baseline": [
+          0.07947324999986449,
+          0.07956783300323877,
+          0.0793105420016218,
+          0.07964504199480871,
+          0.07947179099573987
+        ],
+        "candidate": [
+          0.07975166699907277,
+          0.08043595900380751,
+          0.08249329200043576,
+          0.07965224999497877,
+          0.07968804200208979
+        ]
+      },
+      "checked_output": {
+        "baseline": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n",
+        "candidate": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n"
+      },
+      "llvm_sha256": "38c3efba651aec8467ed8e6145d9f7e24364ea1758a8e2c8318823334dfb8716",
+      "median_seconds": {
+        "baseline": 0.07947324999986449,
+        "candidate": 0.07975166699907277
+      }
+    },
+    {
+      "kind": "try",
+      "values": 16,
+      "source_bytes": 769,
+      "source_lines": 28,
+      "command": "check",
+      "source_sha256": "7cef2d8d0d3433cdc0edb94dfdd575b27582abe7277e54b5621a9c144300f101",
+      "mir_sha256": "a1dd0d5c77b96e92598ff7c829b8b8d3171988bca754ad9387818c51462e4352",
+      "samples_seconds": {
+        "baseline": [
+          0.023025708003842738,
+          0.022932375002710614,
+          0.022892999993928242,
+          0.022925375000340864,
+          0.02298875000269618
+        ],
+        "candidate": [
+          0.022918957998626865,
+          0.02276295800402295,
+          0.022775625002395827,
+          0.022870749999128748,
+          0.02285045900498517
+        ]
+      },
+      "checked_output": {
+        "baseline": "ok: checked 3 function(s)\n",
+        "candidate": "ok: checked 3 function(s)\n"
+      },
+      "llvm_sha256": "b3093af933627609d4ecb4ccc8e395f3bcbe807457a0fc4ca26885c42da657f2",
+      "median_seconds": {
+        "baseline": 0.022932375002710614,
+        "candidate": 0.02285045900498517
+      }
+    },
+    {
+      "kind": "try",
+      "values": 16,
+      "source_bytes": 769,
+      "source_lines": 28,
+      "command": "check-per-unit",
+      "source_sha256": "7cef2d8d0d3433cdc0edb94dfdd575b27582abe7277e54b5621a9c144300f101",
+      "mir_sha256": "a1dd0d5c77b96e92598ff7c829b8b8d3171988bca754ad9387818c51462e4352",
+      "samples_seconds": {
+        "baseline": [
+          0.025924875000782777,
+          0.02606437500071479,
+          0.025869707998936065,
+          0.025677083001937717,
+          0.02578883300157031
+        ],
+        "candidate": [
+          0.025575499996193685,
+          0.025749542000994552,
+          0.025624833993788343,
+          0.025718500000948552,
+          0.025530708000587765
+        ]
+      },
+      "checked_output": {
+        "baseline": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n",
+        "candidate": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n"
+      },
+      "llvm_sha256": "b3093af933627609d4ecb4ccc8e395f3bcbe807457a0fc4ca26885c42da657f2",
+      "median_seconds": {
+        "baseline": 0.025869707998936065,
+        "candidate": 0.025624833993788343
+      }
+    },
+    {
+      "kind": "try",
+      "values": 128,
+      "source_bytes": 4185,
+      "source_lines": 140,
+      "command": "check",
+      "source_sha256": "50128907be1028c2349eab2ca884ca019d33d4355b28d44fae88710e7d745088",
+      "mir_sha256": "7594f0c88dbb5425cddbbe1e28d3652475394db4935fd2c451aa70d10de13415",
+      "samples_seconds": {
+        "baseline": [
+          0.031257249996997416,
+          0.031237499999406282,
+          0.03152291599690216,
+          0.031225124999764375,
+          0.031153415999142453
+        ],
+        "candidate": [
+          0.031190166002488695,
+          0.031152916999417357,
+          0.031113999997614883,
+          0.031157290999544784,
+          0.031061124995176215
+        ]
+      },
+      "checked_output": {
+        "baseline": "ok: checked 3 function(s)\n",
+        "candidate": "ok: checked 3 function(s)\n"
+      },
+      "llvm_sha256": "8463362dc62a6fef6653cd1e3427e13165f64893cb6a84448a7dc2b7ce8c88e9",
+      "median_seconds": {
+        "baseline": 0.031237499999406282,
+        "candidate": 0.031152916999417357
+      }
+    },
+    {
+      "kind": "try",
+      "values": 128,
+      "source_bytes": 4185,
+      "source_lines": 140,
+      "command": "check-per-unit",
+      "source_sha256": "50128907be1028c2349eab2ca884ca019d33d4355b28d44fae88710e7d745088",
+      "mir_sha256": "7594f0c88dbb5425cddbbe1e28d3652475394db4935fd2c451aa70d10de13415",
+      "samples_seconds": {
+        "baseline": [
+          0.04519170899584424,
+          0.04502520799724152,
+          0.04518633400584804,
+          0.045079292001901194,
+          0.044952792006370146
+        ],
+        "candidate": [
+          0.04511770799581427,
+          0.045456959000148345,
+          0.045110625003871974,
+          0.04510816599940881,
+          0.0449013340039528
+        ]
+      },
+      "checked_output": {
+        "baseline": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n",
+        "candidate": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n"
+      },
+      "llvm_sha256": "8463362dc62a6fef6653cd1e3427e13165f64893cb6a84448a7dc2b7ce8c88e9",
+      "median_seconds": {
+        "baseline": 0.045079292001901194,
+        "candidate": 0.045110625003871974
+      }
+    },
+    {
+      "kind": "try",
+      "values": 512,
+      "source_bytes": 16473,
+      "source_lines": 524,
+      "command": "check",
+      "source_sha256": "4a8bf496f41a50724c57312886aa9acebb41e25f52d43db25157ea8bf20e0fa9",
+      "mir_sha256": "429620d1c81a4e6604408688015c61bca761cc5e694e4ad3134d988438cf4759",
+      "samples_seconds": {
+        "baseline": [
+          0.06105879099777667,
+          0.06112908299837727,
+          0.05959033399994951,
+          0.059533250001550186,
+          0.05944012499821838
+        ],
+        "candidate": [
+          0.059582084002613556,
+          0.05948779200116405,
+          0.059367709000071045,
+          0.059539166002650745,
+          0.05981400000018766
+        ]
+      },
+      "checked_output": {
+        "baseline": "ok: checked 3 function(s)\n",
+        "candidate": "ok: checked 3 function(s)\n"
+      },
+      "llvm_sha256": "d8494d92df57b0782093ceaed0136f09b5929ba0024f6559ba6397212a0ad202",
+      "median_seconds": {
+        "baseline": 0.05959033399994951,
+        "candidate": 0.059539166002650745
+      }
+    },
+    {
+      "kind": "try",
+      "values": 512,
+      "source_bytes": 16473,
+      "source_lines": 524,
+      "command": "check-per-unit",
+      "source_sha256": "4a8bf496f41a50724c57312886aa9acebb41e25f52d43db25157ea8bf20e0fa9",
+      "mir_sha256": "429620d1c81a4e6604408688015c61bca761cc5e694e4ad3134d988438cf4759",
+      "samples_seconds": {
+        "baseline": [
+          0.11744179199740756,
+          0.11674862499785377,
+          0.11707079200277803,
+          0.1171827080033836,
+          0.11703700000362005
+        ],
+        "candidate": [
+          0.11735866600065492,
+          0.11730995800462551,
+          0.11700574999849778,
+          0.11793125000258442,
+          0.11817129200062482
+        ]
+      },
+      "checked_output": {
+        "baseline": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n",
+        "candidate": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n"
+      },
+      "llvm_sha256": "d8494d92df57b0782093ceaed0136f09b5929ba0024f6559ba6397212a0ad202",
+      "median_seconds": {
+        "baseline": 0.11707079200277803,
+        "candidate": 0.11735866600065492
+      }
+    },
+    {
+      "kind": "match",
+      "values": 16,
+      "source_bytes": 1873,
+      "source_lines": 28,
+      "command": "check",
+      "source_sha256": "fde7dd454d145467073cd64c02a5226933afd0a7582532485395fcabcd0a50cd",
+      "mir_sha256": "98520d30d899766193b30c8d64de2b964de625ed6149be0e7b05581dc4a49be7",
+      "samples_seconds": {
+        "baseline": [
+          0.02652279099856969,
+          0.026497124999877997,
+          0.02671004099829588,
+          0.026491083001019433,
+          0.026576790995022748
+        ],
+        "candidate": [
+          0.026312041998608038,
+          0.026521125000726897,
+          0.026295707997633144,
+          0.02640191600221442,
+          0.026349958003265783
+        ]
+      },
+      "checked_output": {
+        "baseline": "ok: checked 3 function(s)\n",
+        "candidate": "ok: checked 3 function(s)\n"
+      },
+      "llvm_sha256": "d231e9cc6bfc56c3be4d73b2d89eee0868e8c1a15b1392d8f0ff77a40518b5f4",
+      "median_seconds": {
+        "baseline": 0.02652279099856969,
+        "candidate": 0.026349958003265783
+      }
+    },
+    {
+      "kind": "match",
+      "values": 16,
+      "source_bytes": 1873,
+      "source_lines": 28,
+      "command": "check-per-unit",
+      "source_sha256": "fde7dd454d145467073cd64c02a5226933afd0a7582532485395fcabcd0a50cd",
+      "mir_sha256": "98520d30d899766193b30c8d64de2b964de625ed6149be0e7b05581dc4a49be7",
+      "samples_seconds": {
+        "baseline": [
+          0.03280258299491834,
+          0.032871208000869956,
+          0.03286349999689264,
+          0.032804040994960815,
+          0.03297841700259596
+        ],
+        "candidate": [
+          0.03271320900239516,
+          0.03244408300088253,
+          0.03236170799937099,
+          0.03230504199746065,
+          0.03240820900100516
+        ]
+      },
+      "checked_output": {
+        "baseline": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n",
+        "candidate": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n"
+      },
+      "llvm_sha256": "d231e9cc6bfc56c3be4d73b2d89eee0868e8c1a15b1392d8f0ff77a40518b5f4",
+      "median_seconds": {
+        "baseline": 0.03286349999689264,
+        "candidate": 0.03240820900100516
+      }
+    },
+    {
+      "kind": "match",
+      "values": 128,
+      "source_bytes": 13017,
+      "source_lines": 140,
+      "command": "check",
+      "source_sha256": "ff9245b208d893db1dabcf2d51d702c743f5522568a578308f4181d0e8092f6a",
+      "mir_sha256": "4bc201f94940e6edd59f01a5d986567f5d07b4a7a0be2a9eb426ca29a88f42df",
+      "samples_seconds": {
+        "baseline": [
+          0.10506758299743524,
+          0.10466879200248513,
+          0.1043552089977311,
+          0.10500195900385734,
+          0.10445975000038743
+        ],
+        "candidate": [
+          0.09906404100183863,
+          0.09925454100448405,
+          0.09857399999600602,
+          0.09858337500190828,
+          0.09900875000312226
+        ]
+      },
+      "checked_output": {
+        "baseline": "ok: checked 3 function(s)\n",
+        "candidate": "ok: checked 3 function(s)\n"
+      },
+      "llvm_sha256": "d5081bd16fbfe4dfadb6973069511fe2f57f57e3c59c7075c8d5a8e3d1608601",
+      "median_seconds": {
+        "baseline": 0.10466879200248513,
+        "candidate": 0.09900875000312226
+      }
+    },
+    {
+      "kind": "match",
+      "values": 128,
+      "source_bytes": 13017,
+      "source_lines": 140,
+      "command": "check-per-unit",
+      "source_sha256": "ff9245b208d893db1dabcf2d51d702c743f5522568a578308f4181d0e8092f6a",
+      "mir_sha256": "4bc201f94940e6edd59f01a5d986567f5d07b4a7a0be2a9eb426ca29a88f42df",
+      "samples_seconds": {
+        "baseline": [
+          0.18977720799739473,
+          0.19230291699932422,
+          0.19266775000141934,
+          0.19112441699689953,
+          0.19068220800545532
+        ],
+        "candidate": [
+          0.17915533400082495,
+          0.17965912500221748,
+          0.1818545419955626,
+          0.17843258400534978,
+          0.1799257079983363
+        ]
+      },
+      "checked_output": {
+        "baseline": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n",
+        "candidate": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n"
+      },
+      "llvm_sha256": "d5081bd16fbfe4dfadb6973069511fe2f57f57e3c59c7075c8d5a8e3d1608601",
+      "median_seconds": {
+        "baseline": 0.19112441699689953,
+        "candidate": 0.17965912500221748
+      }
+    },
+    {
+      "kind": "match",
+      "values": 512,
+      "source_bytes": 51801,
+      "source_lines": 524,
+      "command": "check",
+      "source_sha256": "94a24fb80bc3dabec54c815a0dc94bd745b80d5e375c881c15312add5b09016f",
+      "mir_sha256": "5aa86b3b70268c91e5267ac35a2ee3685ae1ab21a90d1564bd23e2fe208dca78",
+      "samples_seconds": {
+        "baseline": [
+          1.024812457995722,
+          1.026810415998625,
+          1.028078874995117,
+          1.025014208003995,
+          1.0227698330054409
+        ],
+        "candidate": [
+          0.9434663330030162,
+          0.9411421670010895,
+          0.942499750002753,
+          0.9480663330032257,
+          0.9508374159995583
+        ]
+      },
+      "checked_output": {
+        "baseline": "ok: checked 3 function(s)\n",
+        "candidate": "ok: checked 3 function(s)\n"
+      },
+      "llvm_sha256": "25622043c686f0f42a1b5e671bb3c7b49e3abf94b91bdb27a814644fa43cd059",
+      "median_seconds": {
+        "baseline": 1.025014208003995,
+        "candidate": 0.9434663330030162
+      }
+    },
+    {
+      "kind": "match",
+      "values": 512,
+      "source_bytes": 51801,
+      "source_lines": 524,
+      "command": "check-per-unit",
+      "source_sha256": "94a24fb80bc3dabec54c815a0dc94bd745b80d5e375c881c15312add5b09016f",
+      "mir_sha256": "5aa86b3b70268c91e5267ac35a2ee3685ae1ab21a90d1564bd23e2fe208dca78",
+      "samples_seconds": {
+        "baseline": [
+          1.9378904589975718,
+          1.9363367090045358,
+          1.9317342080030357,
+          1.9334799159987597,
+          1.9444361249989015
+        ],
+        "candidate": [
+          1.770865499995125,
+          1.7610748329971102,
+          1.7608657500022673,
+          1.7657044170045992,
+          1.7858229589983239
+        ]
+      },
+      "checked_output": {
+        "baseline": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n",
+        "candidate": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n"
+      },
+      "llvm_sha256": "25622043c686f0f42a1b5e671bb3c7b49e3abf94b91bdb27a814644fa43cd059",
+      "median_seconds": {
+        "baseline": 1.9363367090045358,
+        "candidate": 1.7657044170045992
+      }
+    },
+    {
+      "kind": "fixed",
+      "values": 16,
+      "source_bytes": 906,
+      "source_lines": 36,
+      "command": "check",
+      "source_sha256": "44d105cd911c6a9052464be4d41fac40f70ca1575cd59428aa5288633dda5c98",
+      "mir_sha256": "a13b804e2dfe59e2c3d476cfb5d8d97e9f9c8fdf854d7227b0d9c46cfd2d3087",
+      "samples_seconds": {
+        "baseline": [
+          0.024430375000520144,
+          0.02434362499479903,
+          0.02418933300214121,
+          0.0242132080020383,
+          0.024374458997044712
+        ],
+        "candidate": [
+          0.024034916998061817,
+          0.024130874997354113,
+          0.0242115000000922,
+          0.024055165995378047,
+          0.02389966700138757
+        ]
+      },
+      "checked_output": {
+        "baseline": "ok: checked 1 function(s)\n",
+        "candidate": "ok: checked 1 function(s)\n"
+      },
+      "llvm_sha256": "c25fbd03b8b5108b49832b48dfa78a1a7b893646880b5bf2797872a8d68d9da2",
+      "median_seconds": {
+        "baseline": 0.02434362499479903,
+        "candidate": 0.024055165995378047
+      }
+    },
+    {
+      "kind": "fixed",
+      "values": 16,
+      "source_bytes": 906,
+      "source_lines": 36,
+      "command": "check-per-unit",
+      "source_sha256": "44d105cd911c6a9052464be4d41fac40f70ca1575cd59428aa5288633dda5c98",
+      "mir_sha256": "a13b804e2dfe59e2c3d476cfb5d8d97e9f9c8fdf854d7227b0d9c46cfd2d3087",
+      "samples_seconds": {
+        "baseline": [
+          0.029519415998947807,
+          0.028663249999226537,
+          0.028747042000759393,
+          0.028753083999617957,
+          0.02871058299933793
+        ],
+        "candidate": [
+          0.02986675000283867,
+          0.02814974999637343,
+          0.028091207997931633,
+          0.02839933300128905,
+          0.028014124996843748
+        ]
+      },
+      "checked_output": {
+        "baseline": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n",
+        "candidate": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n"
+      },
+      "llvm_sha256": "c25fbd03b8b5108b49832b48dfa78a1a7b893646880b5bf2797872a8d68d9da2",
+      "median_seconds": {
+        "baseline": 0.028747042000759393,
+        "candidate": 0.02814974999637343
+      }
+    },
+    {
+      "kind": "fixed",
+      "values": 128,
+      "source_bytes": 7122,
+      "source_lines": 260,
+      "command": "check",
+      "source_sha256": "6f072316a46701e0df34baf29ad848274827264327b66778eb9272cbcd049011",
+      "mir_sha256": "51af61155b4614ace684ebe120ec26ab3fa2c837d67294b885ac20bf4a07c201",
+      "samples_seconds": {
+        "baseline": [
+          0.04648270799953025,
+          0.046495124995999504,
+          0.046535000001313165,
+          0.04664591699838638,
+          0.046632583005703054
+        ],
+        "candidate": [
+          0.04372587500256486,
+          0.043538582998735365,
+          0.04353883399744518,
+          0.043687500001396984,
+          0.04346516599616734
+        ]
+      },
+      "checked_output": {
+        "baseline": "ok: checked 1 function(s)\n",
+        "candidate": "ok: checked 1 function(s)\n"
+      },
+      "llvm_sha256": "26b44eee8bb2a23d1d91cc0972fea4281b3533020f58342d281b00b4c8b82fcf",
+      "median_seconds": {
+        "baseline": 0.046535000001313165,
+        "candidate": 0.04353883399744518
+      }
+    },
+    {
+      "kind": "fixed",
+      "values": 128,
+      "source_bytes": 7122,
+      "source_lines": 260,
+      "command": "check-per-unit",
+      "source_sha256": "6f072316a46701e0df34baf29ad848274827264327b66778eb9272cbcd049011",
+      "mir_sha256": "51af61155b4614ace684ebe120ec26ab3fa2c837d67294b885ac20bf4a07c201",
+      "samples_seconds": {
+        "baseline": [
+          0.07938245900004404,
+          0.07919187500374392,
+          0.07922579100704752,
+          0.07897495799988974,
+          0.07931266700325068
+        ],
+        "candidate": [
+          0.07383158399898093,
+          0.07360887499817181,
+          0.07362941700557712,
+          0.07326491700223414,
+          0.0733792499959236
+        ]
+      },
+      "checked_output": {
+        "baseline": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n",
+        "candidate": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n"
+      },
+      "llvm_sha256": "26b44eee8bb2a23d1d91cc0972fea4281b3533020f58342d281b00b4c8b82fcf",
+      "median_seconds": {
+        "baseline": 0.07922579100704752,
+        "candidate": 0.07360887499817181
+      }
+    },
+    {
+      "kind": "fixed",
+      "values": 512,
+      "source_bytes": 29010,
+      "source_lines": 1028,
+      "command": "check",
+      "source_sha256": "eaaea0a6b7a0448e1243ddcc1f11e2afa7b35f935a63bc057afcfa4d05aea982",
+      "mir_sha256": "31a0917bd818b33e109caf423f00dbe48d895a665a3fe1c469825435b600a9e1",
+      "samples_seconds": {
+        "baseline": [
+          0.15082199999596924,
+          0.14997199999925215,
+          0.1508766250044573,
+          0.14856362499995157,
+          0.14861299999756739
+        ],
+        "candidate": [
+          0.1286780840018764,
+          0.12797112499538343,
+          0.12831229100265773,
+          0.1286346670021885,
+          0.12739729200256988
+        ]
+      },
+      "checked_output": {
+        "baseline": "ok: checked 1 function(s)\n",
+        "candidate": "ok: checked 1 function(s)\n"
+      },
+      "llvm_sha256": "e8b70cdbb781d8c803e5f9e1fb31d3166d6ea032233a078cce9733f282fad666",
+      "median_seconds": {
+        "baseline": 0.14997199999925215,
+        "candidate": 0.12831229100265773
+      }
+    },
+    {
+      "kind": "fixed",
+      "values": 512,
+      "source_bytes": 29010,
+      "source_lines": 1028,
+      "command": "check-per-unit",
+      "source_sha256": "eaaea0a6b7a0448e1243ddcc1f11e2afa7b35f935a63bc057afcfa4d05aea982",
+      "mir_sha256": "31a0917bd818b33e109caf423f00dbe48d895a665a3fe1c469825435b600a9e1",
+      "samples_seconds": {
+        "baseline": [
+          0.3106646250016638,
+          0.3141604170014034,
+          0.3078416249991278,
+          0.3079014999966603,
+          0.3081938329996774
+        ],
+        "candidate": [
+          0.27648704199964413,
+          0.2767671670007985,
+          0.2766860000047018,
+          0.2751162920030765,
+          0.27672049999819137
+        ]
+      },
+      "checked_output": {
+        "baseline": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n",
+        "candidate": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n"
+      },
+      "llvm_sha256": "e8b70cdbb781d8c803e5f9e1fb31d3166d6ea032233a078cce9733f282fad666",
+      "median_seconds": {
+        "baseline": 0.3081938329996774,
+        "candidate": 0.2766860000047018
+      }
+    },
+    {
+      "kind": "loop-fixed",
+      "values": 16,
+      "source_bytes": 982,
+      "source_lines": 41,
+      "command": "check",
+      "source_sha256": "06be713aa67b655a54649c2d72345d30198de847f9c0167d8ffb9fd674424621",
+      "mir_sha256": "2b261157b8b65706ff6f288646b25840be80829d48f87e640844be41d6b97c16",
+      "samples_seconds": {
+        "baseline": [
+          0.028520624997327104,
+          0.02855404200090561,
+          0.0285767909954302,
+          0.028595707997737918,
+          0.028578167002706323
+        ],
+        "candidate": [
+          0.028801666005165316,
+          0.028803792003600392,
+          0.02860704200429609,
+          0.02852770799654536,
+          0.028586832995642908
+        ]
+      },
+      "checked_output": {
+        "baseline": "ok: checked 1 function(s)\n",
+        "candidate": "ok: checked 1 function(s)\n"
+      },
+      "llvm_sha256": "7cde69c3928d194b4a19e676bc2a49e0422b2ce72048f584c7d2c7a8d362a3e1",
+      "median_seconds": {
+        "baseline": 0.0285767909954302,
+        "candidate": 0.02860704200429609
+      }
+    },
+    {
+      "kind": "loop-fixed",
+      "values": 16,
+      "source_bytes": 982,
+      "source_lines": 41,
+      "command": "check-per-unit",
+      "source_sha256": "06be713aa67b655a54649c2d72345d30198de847f9c0167d8ffb9fd674424621",
+      "mir_sha256": "2b261157b8b65706ff6f288646b25840be80829d48f87e640844be41d6b97c16",
+      "samples_seconds": {
+        "baseline": [
+          0.036862916000245605,
+          0.03688670800329419,
+          0.03932758399605518,
+          0.0371298329991987,
+          0.037146415997995064
+        ],
+        "candidate": [
+          0.03665599999658298,
+          0.037078332999954,
+          0.03732750000199303,
+          0.03677245900325943,
+          0.036750667000887915
+        ]
+      },
+      "checked_output": {
+        "baseline": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n",
+        "candidate": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n"
+      },
+      "llvm_sha256": "7cde69c3928d194b4a19e676bc2a49e0422b2ce72048f584c7d2c7a8d362a3e1",
+      "median_seconds": {
+        "baseline": 0.0371298329991987,
+        "candidate": 0.03677245900325943
+      }
+    },
+    {
+      "kind": "loop-fixed",
+      "values": 128,
+      "source_bytes": 7198,
+      "source_lines": 265,
+      "command": "check",
+      "source_sha256": "2b8e3a20fdd1d7343319b76af676da8c1ff41da229cf9c07835dc12a469b3442",
+      "mir_sha256": "273528e8112d97dea82a60f5d31dd6bc66fd521894185ddea45417aa90d0890c",
+      "samples_seconds": {
+        "baseline": [
+          0.10225470899604261,
+          0.10203629200259456,
+          0.10145400000328664,
+          0.10166604199912399,
+          0.10236795899982098
+        ],
+        "candidate": [
+          0.10151654199580662,
+          0.1020408749973285,
+          0.10305504199641291,
+          0.10140279100596672,
+          0.10240754199912772
+        ]
+      },
+      "checked_output": {
+        "baseline": "ok: checked 1 function(s)\n",
+        "candidate": "ok: checked 1 function(s)\n"
+      },
+      "llvm_sha256": "776f49a5b14597d00e9ada1ec7f00932d1ee29fdebeb46cec5a1c50f78aae3d6",
+      "median_seconds": {
+        "baseline": 0.10203629200259456,
+        "candidate": 0.1020408749973285
+      }
+    },
+    {
+      "kind": "loop-fixed",
+      "values": 128,
+      "source_bytes": 7198,
+      "source_lines": 265,
+      "command": "check-per-unit",
+      "source_sha256": "2b8e3a20fdd1d7343319b76af676da8c1ff41da229cf9c07835dc12a469b3442",
+      "mir_sha256": "273528e8112d97dea82a60f5d31dd6bc66fd521894185ddea45417aa90d0890c",
+      "samples_seconds": {
+        "baseline": [
+          0.1880847919965163,
+          0.19104925000283401,
+          0.18841750000137836,
+          0.18742383299832,
+          0.18721704099880299
+        ],
+        "candidate": [
+          0.18686354200326605,
+          0.18985783300013281,
+          0.1885709999987739,
+          0.18743566700140946,
+          0.1865890000044601
+        ]
+      },
+      "checked_output": {
+        "baseline": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n",
+        "candidate": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n"
+      },
+      "llvm_sha256": "776f49a5b14597d00e9ada1ec7f00932d1ee29fdebeb46cec5a1c50f78aae3d6",
+      "median_seconds": {
+        "baseline": 0.1880847919965163,
+        "candidate": 0.18743566700140946
+      }
+    },
+    {
+      "kind": "loop-fixed",
+      "values": 512,
+      "source_bytes": 29086,
+      "source_lines": 1033,
+      "command": "check",
+      "source_sha256": "4f66f03e103ca608553f68e3b94fb9c5e0098dee5139a192a5bef63fdfe732a8",
+      "mir_sha256": "712e35bf8085a140a9e0c6ba70752c4f2c18c9a807bc47fbd661eb3a4af7ab50",
+      "samples_seconds": {
+        "baseline": [
+          0.7358548330012127,
+          0.7401812500029337,
+          0.7379268749937182,
+          0.7391051250015153,
+          0.739113499999803
+        ],
+        "candidate": [
+          0.7364568750053877,
+          0.735563957998238,
+          0.7407440000024508,
+          0.7374916659973678,
+          0.7440712089955923
+        ]
+      },
+      "checked_output": {
+        "baseline": "ok: checked 1 function(s)\n",
+        "candidate": "ok: checked 1 function(s)\n"
+      },
+      "llvm_sha256": "ac1cd40031709ed7f8fd73003ec3507db9e1e2b00415ebd9b73a5e76ffed383c",
+      "median_seconds": {
+        "baseline": 0.7391051250015153,
+        "candidate": 0.7374916659973678
+      }
+    },
+    {
+      "kind": "loop-fixed",
+      "values": 512,
+      "source_bytes": 29086,
+      "source_lines": 1033,
+      "command": "check-per-unit",
+      "source_sha256": "4f66f03e103ca608553f68e3b94fb9c5e0098dee5139a192a5bef63fdfe732a8",
+      "mir_sha256": "712e35bf8085a140a9e0c6ba70752c4f2c18c9a807bc47fbd661eb3a4af7ab50",
+      "samples_seconds": {
+        "baseline": [
+          1.4975529579969589,
+          1.48639925000316,
+          1.4937800420011627,
+          1.4889326249976875,
+          1.4986444999958621
+        ],
+        "candidate": [
+          1.4847797080001328,
+          1.485702541001956,
+          1.486195500001486,
+          1.4953384160035057,
+          1.4870348749973346
+        ]
+      },
+      "checked_output": {
+        "baseline": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n",
+        "candidate": "unit main\n  (no dependencies)\nok: checked 1 unit(s) per-unit\n"
+      },
+      "llvm_sha256": "ac1cd40031709ed7f8fd73003ec3507db9e1e2b00415ebd9b73a5e76ffed383c",
+      "median_seconds": {
+        "baseline": 1.4937800420011627,
+        "candidate": 1.486195500001486
+      }
+    }
+  ],
+  "diagnostics": [
+    {
+      "rejection": "local-view",
+      "command": "check",
+      "diagnostics_equal": true
+    },
+    {
+      "rejection": "local-view",
+      "command": "check-per-unit",
+      "diagnostics_equal": true
+    },
+    {
+      "rejection": "readonly-bytes",
+      "command": "check",
+      "diagnostics_equal": true
+    },
+    {
+      "rejection": "readonly-bytes",
+      "command": "check-per-unit",
+      "diagnostics_equal": true
+    }
+  ]
+}
