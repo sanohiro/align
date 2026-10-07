@@ -17,6 +17,12 @@ outside the active worktree so they do not obstruct unrelated checks or pulls.
 
 ## Next work (handoff updated 2026-10-08)
 
+Plan143 removes the temporary byte snapshot for buffer self-appends wholly inside
+the published prefix. Checked offsets survive aligned payload relocation; other
+overlaps retain the snapshot. Actual allocator owners pin one fewer allocation
+and source-length fewer requested bytes, with whole/per-unit move/return and
+forced-relocation/layout coverage. No source API or borrow rule changes.
+
 Plan140 adds nonconsuming `.len()` observations to text and typed builders: initialized
 UTF-8 bytes or elements, independent of capacity and region chunking. The Pure Copy
 result retains no owner or view. Native count/allocation, malformed IR, write-fusion,

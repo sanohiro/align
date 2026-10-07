@@ -16,6 +16,8 @@
 // `align_rt_str_*` symbols.
 mod buffer_storage;
 #[cfg(test)]
+mod buffer_self_append_tests;
+#[cfg(test)]
 mod builder_length_tests;
 #[cfg(test)]
 mod http_stream_tests;
@@ -11990,24 +11992,30 @@ pub unsafe extern "C" fn align_rt_buffer_append(b: *mut Buffer, ptr: *const u8, 
         && n > 0
         && !ptr.is_null()
     {
-        // `b.append(b.bytes())` is a valid copy operation. Its source pointer aliases `b.data`, and
-        // `extend_from_slice` may reallocate that Vec before copying, which would otherwise leave the
-        // source slice dangling (a use-after-free). Detect any overlap with the current allocation
-        // by address and snapshot it before truncate/growth. The ordinary non-aliasing path remains
-        // allocation-free apart from the Vec's own required growth.
-        let src_start = ptr as usize;
+        // A self-append from the published prefix can retain its offset through growth. All
+        // other allocation overlaps need a snapshot before truncate/growth; external inputs
+        // retain the ordinary direct copy. Never dereference an old pointer after reallocation.
+        let src_start = ptr.addr();
         let src_end = src_start.checked_add(n);
-        let buf_start = b.data.as_ptr() as usize;
+        let buf_start = b.data.as_ptr().addr();
         let buf_end = buf_start.checked_add(b.data.capacity());
+        let prefix_offset = match (src_end, buf_start.checked_add(b.len)) {
+            (Some(end), Some(prefix_end)) if src_start >= buf_start && end <= prefix_end => {
+                Some(src_start - buf_start)
+            }
+            _ => None,
+        };
         let aliases_buffer = matches!(
             (src_end, buf_end),
             (Some(se), Some(be)) if src_start < be && buf_start < se
         );
-        let snapshot =
-            aliases_buffer.then(|| unsafe { core::slice::from_raw_parts(ptr, n) }.to_vec());
+        let snapshot = (prefix_offset.is_none() && aliases_buffer)
+            .then(|| unsafe { core::slice::from_raw_parts(ptr, n) }.to_vec());
 
         b.data.with_mut(|data| data.truncate(b.len));
-        if let Some(src) = snapshot {
+        if let Some(start) = prefix_offset {
+            b.data.with_mut(|data| data.extend_from_within(start, n));
+        } else if let Some(src) = snapshot {
             b.data.with_mut(|data| data.extend_from_slice(&src));
         } else {
             let src = unsafe { core::slice::from_raw_parts(ptr, n) };
