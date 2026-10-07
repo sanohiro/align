@@ -3555,3 +3555,34 @@ This is a small measured improvement, without a uniform-speedup, peak-memory,
 near-linear or consumer-time claim. Omitting retirement fails the actual
 reference-lifetime owner; byte-identical restoration passes all 326 sema owners
 and the five driver suites (238 passed, one existing ignored).
+
+## Item 25: expose canonical hashing to cross-crate inlining
+
+A bounded post-item24 profile reaches canonical wyhash in escape-map joins and
+rehashing. Its private helpers allow inlining, but the public byte-hash entry
+does not. Add the ordinary Rust inline hint to that one canonical function so
+cross-crate callers with fixed byte widths can optimize its existing length
+branches. Preserve every input, seed, operation and result. Do not duplicate the
+algorithm, add a typed alternate hash, force inlining or change map policy.
+
+### Implementation closure matrix
+
+| Axis | Implementation and owner |
+| --- | --- |
+| Hash contract and all lengths | The algorithm body remains byte-identical. Existing `align_hash` reference vectors, pinned PHF and all-length streamed parity owners qualify canonical output. No public signature, persisted identity or new allocation changes. |
+| Compiler maps and analysis | Existing canonical-write-sequence, integer-key map and full sema owners preserve seeds, key equality, all six fact maps, joins, CFG, diagnostics and cleanup facts. No fact, source move/nulling/Drop, replacement, return or malformed-input rule changes. |
+| Runtime and code generation | Runtime builtins, string interning and JSON perfect hashing continue through the same canonical implementation. Existing runtime `hash`, `phf`, `dict_encode` and adaptive string-group owners, codegen `phf_hash_is_pinned`, driver `hash`/`m5_json_bounded` and exact generated MIR/raw LLVM comparisons retain parity. No interface, ABI, ownership or generic admission changes. |
+| Performance acceptance | Compare the exact current-main and candidate release binaries without competing builds/tests. First the existing 12-cell pilot, then all 30 numeric/storage cells with five alternating samples, warmup, actual checked-work output and bounded cleanup. Record binary size and all control differences. Retain only useful benefit; no forced-inline, uniform-speedup, runtime-throughput or consumer-time promise. |
+
+The author pass checks the unchanged algorithm and its existing cross-crate
+consumers before implementation. One fresh preflight review checks the complete
+small capability. K1/plan61 and consumer acceptance remain deferred.
+
+Five alternating release samples improve 512-value Result-match whole/per-unit
+medians from 0.328/0.629 s to 0.309/0.596 s (1.06x/1.05x). All 15 MIR/raw LLVM
+pairs, actual checked-work outputs and four distinct rejected controls agree
+across 30 cells. Every 16-value control stays within 1 ms, numeric straight/try
+controls within 1.3 ms and storage controls within 2.1 ms. The compiler binary
+shrinks by 256 bytes. `results-inline-hash-macos.json` retains samples and exact
+source/binary identities. This is a local compiler-time improvement, with no
+uniform-speedup, runtime-throughput, near-linear or consumer-time promise.
