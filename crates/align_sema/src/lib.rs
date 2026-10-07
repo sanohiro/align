@@ -30539,6 +30539,24 @@ impl BorrowRoot {
         }
     }
 
+    fn generation_changes(&self, renames: &StorageGenerationRenames) -> bool {
+        match self {
+            Self::Observation(generation)
+            | Self::EndedObservation(generation, _)
+            | Self::StorageLocal(generation, _, _)
+            | Self::EndedStorageLocal(generation, _, _, _) => renames.changes(generation),
+            Self::Local(_)
+            | Self::IterTemp(_)
+            | Self::Param(_)
+            | Self::ParamStorage(_)
+            | Self::EndedLocal(..)
+            | Self::EndedIterTemp(..)
+            | Self::EndedParam(..)
+            | Self::EndedParamStorage(..)
+            | Self::ReadOnly => false,
+        }
+    }
+
     fn rename_generation(self, renames: &StorageGenerationRenames) -> Self {
         match self {
             Self::Observation(generation) => Self::Observation(renames.apply(&generation)),
@@ -30745,9 +30763,18 @@ impl StorageGenerationRenames {
         }
     }
 
+    fn changes(&self, generation: &StorageGeneration) -> bool {
+        match generation {
+            StorageGeneration::Current(origin) => self.origins.contains(origin),
+            StorageGeneration::Prior(_)
+            | StorageGeneration::ParameterValue { .. }
+            | StorageGeneration::CallerStorage { .. } => false,
+        }
+    }
+
     fn apply(&self, generation: &StorageGeneration) -> StorageGeneration {
         match generation {
-            StorageGeneration::Current(origin) if self.origins.contains(origin) => {
+            StorageGeneration::Current(origin) if self.changes(generation) => {
                 StorageGeneration::Prior(origin.clone())
             }
             StorageGeneration::Current(_)
@@ -30916,10 +30943,16 @@ impl StorageHeaderLeaf {
     }
 
     fn rename_generations(&mut self, renames: &StorageGenerationRenames) {
-        self.generations = std::mem::take(&mut self.generations)
-            .into_iter()
-            .map(|generation| generation.rename_generation(renames))
-            .collect();
+        if self
+            .generations
+            .iter()
+            .any(|reference| renames.changes(&reference.generation))
+        {
+            self.generations = std::mem::take(&mut self.generations)
+                .into_iter()
+                .map(|generation| generation.rename_generation(renames))
+                .collect();
+        }
         rename_borrow_roots(&mut self.fallback_roots, renames);
     }
 }
@@ -32374,6 +32407,9 @@ struct BorrowFact {
 }
 
 fn rename_borrow_roots(roots: &mut BorrowRoots, renames: &StorageGenerationRenames) {
+    if !roots.iter().any(|root| root.generation_changes(renames)) {
+        return;
+    }
     *roots = std::mem::take(roots)
         .into_iter()
         .map(|root| root.rename_generation(renames))
@@ -32381,6 +32417,9 @@ fn rename_borrow_roots(roots: &mut BorrowRoots, renames: &StorageGenerationRenam
 }
 
 fn rename_ended_roots(roots: &mut EndedRoots, renames: &StorageGenerationRenames) {
+    if !roots.keys().any(|root| root.generation_changes(renames)) {
+        return;
+    }
     let mut renamed = EndedRoots::new();
     for (root, how) in std::mem::take(roots) {
         let current = renamed
@@ -32752,11 +32791,17 @@ impl ByteValidationBacking {
     }
 
     fn rename_generations(&mut self, renames: &StorageGenerationRenames) {
-        self.generations = self
+        if self
             .generations
             .iter()
-            .map(|generation| renames.apply(generation))
-            .collect();
+            .any(|generation| renames.changes(generation))
+        {
+            self.generations = self
+                .generations
+                .iter()
+                .map(|generation| renames.apply(generation))
+                .collect();
+        }
         rename_borrow_roots(&mut self.fallback_roots, renames);
         rename_borrow_roots(&mut self.lifetime_roots, renames);
     }
@@ -76189,6 +76234,315 @@ mod tests {
                 signed: true,
             })),
             HttpUpgradeCarrierClass::None,
+        );
+    }
+
+    #[test]
+    fn storage_generation_unaffected_leaf_rename_matrix() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let path = vec![
+            BorrowProjection::StructField(2),
+            BorrowProjection::OptionSome,
+        ];
+        let origins = [
+            StorageOrigin::Producer {
+                expression: 17,
+                result_path: path.clone().into(),
+            },
+            StorageOrigin::inline_place(3, &path),
+            StorageOrigin::CallMutation {
+                call: 23,
+                destination_parameter: 1,
+                path: path.clone().into(),
+            },
+            StorageOrigin::ByteValidation {
+                expression: 29,
+                kind: ByteValidationKind::Utf8,
+            },
+            StorageOrigin::ByteValidation {
+                expression: 31,
+                kind: ByteValidationKind::Codec,
+            },
+        ];
+        let stable = [
+            StorageGeneration::parameter_value(0, &path),
+            StorageGeneration::caller_storage(1, &path),
+        ];
+        let unchanged_roots = [
+            BorrowRoot::Local(2),
+            BorrowRoot::IterTemp(3),
+            BorrowRoot::Param(0),
+            BorrowRoot::ParamStorage(1),
+            BorrowRoot::ReadOnly,
+            BorrowRoot::EndedLocal(2, BorrowEnd::Consumed),
+            BorrowRoot::EndedIterTemp(3, BorrowEnd::Dropped),
+            BorrowRoot::EndedParam(0, BorrowEnd::Consumed),
+            BorrowRoot::EndedParamStorage(1, BorrowEnd::Dropped),
+        ];
+        for present in 0..4 {
+            let mut generations = BTreeSet::from(stable.clone());
+            for origin in &origins {
+                if present & 1 != 0 {
+                    generations.insert(StorageGeneration::Current(origin.clone()));
+                }
+                if present & 2 != 0 {
+                    generations.insert(StorageGeneration::Prior(origin.clone()));
+                }
+            }
+            let mut roots = BorrowRoots::from(unchanged_roots.clone());
+            for generation in &generations {
+                roots.insert(BorrowRoot::Observation(generation.clone()));
+                roots.insert(BorrowRoot::StorageLocal(
+                    generation.clone(),
+                    5,
+                    path.clone().into(),
+                ));
+                for how in [BorrowEnd::Consumed, BorrowEnd::Dropped] {
+                    roots.insert(BorrowRoot::EndedObservation(generation.clone(), how));
+                    roots.insert(BorrowRoot::EndedStorageLocal(
+                        generation.clone(),
+                        5,
+                        path.clone().into(),
+                        how,
+                    ));
+                }
+            }
+            for selection in 0..(1 << origins.len()) {
+                for absent in [false, true] {
+                    let mut renames = StorageGenerationRenames::from_origins(
+                        origins
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| selection & (1 << i) != 0)
+                            .map(|(_, origin)| origin.clone()),
+                    );
+                    if absent {
+                        renames.insert(StorageOrigin::inline_place(99, &path));
+                    }
+                    // This independent selector pins the identity predicate, including all
+                    // origin classes; the rebuild oracles below retain the original algorithm.
+                    for generation in &generations {
+                        let expected = match generation {
+                            StorageGeneration::Current(origin) => {
+                                origins.iter().enumerate().any(|(i, selected)| {
+                                    selection & (1 << i) != 0 && selected == origin
+                                })
+                            }
+                            _ => false,
+                        };
+                        assert_eq!(renames.changes(generation), expected);
+                    }
+                    for root in &roots {
+                        assert_eq!(
+                            root.generation_changes(&renames),
+                            root.clone().rename_generation(&renames) != *root
+                        );
+                    }
+                    for populated in [false, true] {
+                        let input = if populated {
+                            roots.clone()
+                        } else {
+                            BorrowRoots::new()
+                        };
+                        let expected = input
+                            .iter()
+                            .cloned()
+                            .map(|root| root.rename_generation(&renames))
+                            .collect::<BorrowRoots>();
+                        let mut actual = input.clone();
+                        rename_borrow_roots(&mut actual, &renames);
+                        assert_eq!(actual, expected);
+                        for reverse in [false, true] {
+                            let mut entries = input
+                                .iter()
+                                .cloned()
+                                .map(|root| {
+                                    let how = if root.generation_changes(&renames) ^ reverse {
+                                        BorrowEnd::Consumed
+                                    } else {
+                                        BorrowEnd::Dropped
+                                    };
+                                    (root, how)
+                                })
+                                .collect::<Vec<_>>();
+                            if reverse {
+                                entries.reverse();
+                            }
+                            let mut actual = entries.iter().cloned().collect::<EndedRoots>();
+                            let mut expected = EndedRoots::new();
+                            for (root, how) in entries {
+                                expected
+                                    .entry(root.rename_generation(&renames))
+                                    .and_modify(|old| *old = (*old).min(how))
+                                    .or_insert(how);
+                            }
+                            rename_ended_roots(&mut actual, &renames);
+                            assert_eq!(
+                                actual, expected,
+                                "ended collision {present}/{selection}/{reverse}"
+                            );
+                        }
+                        // Primary, fallback and lifetime collections can change independently.
+                        for primary in 0..3 {
+                            let selected_generations = match primary {
+                                0 => BTreeSet::new(),
+                                1 => BTreeSet::from(stable.clone()),
+                                _ => generations.clone(),
+                            };
+                            let references = selected_generations
+                                .iter()
+                                .flat_map(|generation| {
+                                    [vec![], path.clone()].into_iter().flat_map(
+                                        move |content_path| {
+                                            [false, true].map(|erase_readonly| {
+                                                StorageGenerationRef {
+                                                    generation: generation.clone(),
+                                                    content_path: content_path.clone(),
+                                                    erase_readonly,
+                                                }
+                                            })
+                                        },
+                                    )
+                                })
+                                .collect::<BTreeSet<_>>();
+                            let mut actual = StorageHeaderLeaf {
+                                generations: references.clone(),
+                                descriptor: Some(StorageHeaderDescriptor {
+                                    ty: Ty::Str,
+                                    kind: StorageHeaderKind::View,
+                                }),
+                                known: populated,
+                                fallback_roots: input.clone(),
+                            };
+                            let expected_leaf = StorageHeaderLeaf {
+                                generations: references
+                                    .into_iter()
+                                    .map(|reference| reference.rename_generation(&renames))
+                                    .collect(),
+                                fallback_roots: expected.clone(),
+                                ..actual.clone()
+                            };
+                            actual.rename_generations(&renames);
+                            assert_eq!(actual, expected_leaf);
+                            for lifetime_present in [false, true] {
+                                let lifetime_roots = if lifetime_present {
+                                    roots.clone()
+                                } else {
+                                    BorrowRoots::new()
+                                };
+                                let mut actual = ByteValidationBacking {
+                                    generations: selected_generations.clone(),
+                                    fallback_roots: input.clone(),
+                                    lifetime_roots,
+                                    unknown: populated,
+                                };
+                                let expected_backing = ByteValidationBacking {
+                                    generations: selected_generations
+                                        .iter()
+                                        .map(|generation| renames.apply(generation))
+                                        .collect(),
+                                    fallback_roots: expected.clone(),
+                                    lifetime_roots: actual
+                                        .lifetime_roots
+                                        .iter()
+                                        .cloned()
+                                        .map(|root| root.rename_generation(&renames))
+                                        .collect(),
+                                    unknown: populated,
+                                };
+                                actual.rename_generations(&renames);
+                                assert_eq!(actual, expected_backing);
+                            }
+                        }
+                        // Projected parents must continue visiting every independent leaf.
+                        let mut fact = BorrowFact {
+                            direct: input.clone(),
+                            projected: BTreeMap::from([(path.clone(), input)]),
+                        };
+                        fact.rename_generations(&renames);
+                        assert_eq!(
+                            fact,
+                            BorrowFact {
+                                direct: expected.clone(),
+                                projected: BTreeMap::from([(path.clone(), expected)])
+                            }
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn storage_generation_unaffected_leaf_allocations() {
+        let path = [
+            BorrowProjection::StructField(2),
+            BorrowProjection::OptionSome,
+        ];
+        let generation = StorageGeneration::Current(StorageOrigin::inline_place(3, &path));
+        let mut lost = Vec::new();
+        for renames in [
+            StorageGenerationRenames::default(),
+            StorageGenerationRenames::from_origins([StorageOrigin::inline_place(99, &path)]),
+        ] {
+            let mut roots = BorrowRoots::from([BorrowRoot::Observation(generation.clone())]);
+            let address = match roots.first().unwrap() {
+                BorrowRoot::Observation(generation) => generation.path().as_ptr(),
+                _ => unreachable!(),
+            };
+            rename_borrow_roots(&mut roots, &renames);
+            if let BorrowRoot::Observation(generation) = roots.first().unwrap() {
+                if address != generation.path().as_ptr() {
+                    lost.push("borrow roots");
+                }
+            }
+            let mut ended = EndedRoots::from([(
+                BorrowRoot::Observation(generation.clone()),
+                BorrowEnd::Dropped,
+            )]);
+            let address = match ended.first_key_value().unwrap().0 {
+                BorrowRoot::Observation(generation) => generation.path().as_ptr(),
+                _ => unreachable!(),
+            };
+            rename_ended_roots(&mut ended, &renames);
+            if let BorrowRoot::Observation(generation) = ended.first_key_value().unwrap().0 {
+                if address != generation.path().as_ptr() {
+                    lost.push("ended roots");
+                }
+            }
+            let mut header = StorageHeaderLeaf::known(generation.clone());
+            let address = header
+                .generations
+                .first()
+                .unwrap()
+                .generation
+                .path()
+                .as_ptr();
+            header.rename_generations(&renames);
+            if address
+                != header
+                    .generations
+                    .first()
+                    .unwrap()
+                    .generation
+                    .path()
+                    .as_ptr()
+            {
+                lost.push("header references");
+            }
+            let mut backing = ByteValidationBacking {
+                generations: [generation.clone()].into_iter().collect(),
+                ..Default::default()
+            };
+            let address = backing.generations.first().unwrap().path().as_ptr();
+            backing.rename_generations(&renames);
+            if address != backing.generations.first().unwrap().path().as_ptr() {
+                lost.push("byte-validation generations");
+            }
+        }
+        assert!(
+            lost.is_empty(),
+            "unaffected leaf paths were reallocated: {lost:?}"
         );
     }
 

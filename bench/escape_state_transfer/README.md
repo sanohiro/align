@@ -1,6 +1,6 @@
 # Compiler check-time scaling measurement
 
-This local benchmark owns plan 21 items 11–16 checking measurements. It
+This local benchmark owns plan 21 items 11–17 checking measurements. It
 compares release compiler binaries on the same generated straight arithmetic,
 Result `?`, and Result `match` chains inside a loop. Each case uses 16, 128 or
 512 values. `--corpus storage` selects fixed-array declarations in straight-line
@@ -185,3 +185,29 @@ Actual EscapeCheck/MoveCheck caller owners detect restoration of the copies by
 pinning unrelated release-set backing. Other fact/state copies and repeated
 analysis remain superlinear; these measurements do not establish Request 37's
 consumer budget or a runtime allocation improvement.
+
+
+## Item 17 result (2026-10-07)
+
+The same host/profile compares merged
+`fa2d83b8f70a63f869574b498b9c6e954bb0f58d` with exact identity guards for
+header-reference sets, borrow-root sets, ended-root maps and byte-validation
+generation sets. The selected-key rebuilds and collision rules remain unchanged;
+fallback and lifetime roots are checked independently. Both binaries use
+`DYLD_SHARED_REGION=private`; no builds/tests overlap measurement.
+[Full samples and hashes](results-leaf-identity-macos.json) retain five alternating
+samples after warmup, all 30 command/shape/size cells and checked-work evidence.
+
+| 512 fixed-array declarations | Baseline median | Candidate median | Ratio |
+| --- | ---: | ---: | ---: |
+| Straight-line check | 0.362 s | 0.230 s | 1.57x |
+| Straight-line per-unit check | 0.725 s | 0.459 s | 1.58x |
+| Loop check | 3.890 s | 1.279 s | 3.04x |
+| Loop per-unit check | 7.654 s | 2.558 s | 2.99x |
+
+All 15 source MIR/raw LLVM pairs, actual checked-work outputs and four rejected
+controls agree across both corpora. Numeric control median changes stay below
+23 ms; all 16-value controls stay within 5 ms. A deterministic backing-identity
+owner detects restoring each of the four unnecessary rebuilds. Other state/fact
+copies and repeated traversals remain superlinear; these local results establish
+neither near-linear scaling nor Request37's whole-client acceptance.
