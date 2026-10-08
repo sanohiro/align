@@ -15,8 +15,10 @@ not durable synchronization or atomic publication. A late read/write/flush error
 may leave a partial newly created output; the examples do not remove it.
 
 `file_copy` remains byte-exact with one visible 64 KiB caller buffer. `io_copy`
-continues to demonstrate nonconsuming copy by appending one newline and printing
-the count of source bytes. No library, compiler, API, ABI, allocation policy or
+continues to demonstrate nonconsuming copy by appending one newline and writing
+the count of source bytes. An explicit template string holds that count plus LF;
+a checked stdout write propagates failure after the destination flush. The
+completed destination remains in place if count delivery fails. No library, compiler, API, ABI, allocation policy or
 native filesystem implementation changes.
 
 Plan148 uses buffer.try_new(65536)? for file_copy's fixed window before the
@@ -29,6 +31,7 @@ native copy operation and creates no source-level read window.
 | Actual example sources and ordinary completion | `file_copy_examples` compiles both checked-in files. Empty, short binary and multi-window payloads keep exact bytes; `io_copy` alone appends its documented newline and prints the source length. |
 | Destination admission | The same owner crosses an ordinary occupied output, identical source path, hard link, source symlink, dangling symlink and directory. Source bytes, occupied destination bytes and link identities survive refusal. |
 | Input and argument failure | Invalid arity and missing input create no destination. Existing library path/permission/native error owners remain applicable. |
+| Count-output failure | io_copy with read-only stdout must return exact native EBADF after producing the complete copy plus LF. Source bytes remain unchanged and the completed destination remains visible. |
 | Buffered completion failure | A child-only zero RLIMIT_FSIZE with SIGXFSZ ignored produces EFBIG on a fresh output. Both actual examples must exit through the ordinary error boundary, publish no success count and preserve the input. The partial output remains caller-visible. Restoring omitted flush must fail this owner. |
 | Fixture lifecycle | One exclusive ArtifactStage owns source, executable and data paths. A fresh process group and one deadline own each child from spawn through capture and cleanup; pipe reads are nonblocking and capped. Limits and signal disposition change only in the child. |
 

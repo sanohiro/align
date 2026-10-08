@@ -349,6 +349,7 @@ fn bounded_fetch_example_validates_cli_before_network_or_output() {
         let help = !args.is_empty();
         assert_eq!(example.start(&args, false).wait().success(), help);
         if help {
+            example.assert_exit(example.start(&args, true).wait(), Some(libc::EBADF));
             let output = String::from_utf8(example.stdout()).expect("help text");
             for flag in ["--url", "--max-body-bytes", "--timeout-ns", "--help"] {
                 assert!(output.contains(flag), "{output}");
@@ -598,6 +599,9 @@ fn bounded_sse_watch_example_validates_cli_before_connecting() {
     for default in ["1024", "65536", "67108864", "30000000000"] {
         assert!(usage.contains(default));
     }
+    example.assert_exit(example.start(
+        &["--help", "--url", &url, "--max-events=0", "--event-bytes=0", "--timeout-ns=-1"], true,
+    ).wait(), Some(libc::EBADF));
     assert_eq!(
         listener.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock

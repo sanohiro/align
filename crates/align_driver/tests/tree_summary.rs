@@ -1,5 +1,7 @@
 //! Execute the retained-directory composition example, including its failure cleanup.
 mod common;
+#[path = "helpers/owned_fixture.rs"]
+mod owned_fixture;
 use common::*;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
@@ -322,4 +324,51 @@ int64_t tree_fd_count(void) {
         output.status.code(),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn checked_summary_and_help_output() {
+    owned_fixture::run("checked_summary_and_help_output", |root| {
+        assert!(backend_available(), "tree output owner requires LLVM");
+        let fixture = Fixture::new("checked-output");
+        let whole = build_exe("tree-checked-output-whole", source());
+        let units = build_per_unit_multi("tree-checked-output-units",
+            &[("main.align", source())], "main.align");
+        let objects = units.emit_objects(false);
+        let refs: Vec<_> = objects.iter().map(|path| path.as_path()).collect();
+        let unit_exe = units.dir.join(format!("tree{}", std::env::consts::EXE_SUFFIX));
+        link_objects(&align_driver::CDriver::default(), &refs, &unit_exe,
+            &units.link_libs_union(), Profile::Release).unwrap();
+        let readonly = root.join("readonly");
+        std::fs::write(&readonly, b"unchanged").unwrap();
+        let missing = fixture.directory.join("missing");
+        let missing = missing.to_str().unwrap();
+        for exe in [&whole.exe, &unit_exe] {
+            for (args, error) in [
+                (vec!["--root", fixture.path()], libc::EBADF),
+                (vec!["--help", "--root", missing, "--max-depth", "65"], libc::EBADF),
+                (vec!["--root", missing], 1),
+                (vec!["--root", fixture.path(), "--max-depth", "65"], 2),
+                (vec!["--help", "--unknown"], 2),
+            ] {
+                // All compile/link/run descendants remain in the parent's bounded group;
+                // file-backed streams cannot deadlock on capture pipe capacity.
+                let status = std::process::Command::new(exe).args(&args)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::fs::File::open(&readonly).unwrap())
+                    .stderr(std::fs::File::create(root.join("stderr")).unwrap())
+                    .status().unwrap();
+                let stderr = std::fs::read(root.join("stderr")).unwrap();
+                assert_eq!(status.code(), Some(error), "{args:?}: {stderr:?}");
+                assert_eq!(stderr, format!("error: code {error}\n").as_bytes(), "{args:?}");
+                assert_eq!(std::fs::read(&readonly).unwrap(), b"unchanged");
+            }
+            let output = std::process::Command::new(exe)
+                .args(["--root", fixture.path()]).output().unwrap();
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+            assert!(output.stderr.is_empty());
+            assert_eq!(output.stdout,
+                b"entries\n1\ndirectories\n1\nregular_files\n0\nsymlinks\n0\nother\n0\nlogical_bytes\n0\n");
+        }
+    });
 }

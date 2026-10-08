@@ -309,6 +309,10 @@ fn bounded_file_sha256_example_binary_cli_and_errors() {
     assert!(stderr.is_empty());
     let usage = String::from_utf8(usage).unwrap();
     assert!(usage.contains("file") && usage.contains("max-input-bytes"));
+    let (status, stdout, stderr) = example.run(
+        b"abc", &["--help", "--file", "blocked", "--max-input-bytes", "-1"], true,
+    );
+    assert_digest_example_error(&status, &stdout, &stderr, libc::EBADF);
     let (status, stdout, stderr) =
         example.run(b"abc", &["--max-input-bytes", "2305843009213693951"], false);
     assert!(status.success());

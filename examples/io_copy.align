@@ -18,6 +18,8 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   n := io.copy(r, w)?
   w.write("\n")?
   w.flush()?
-  print(n)
+  report := template "{n}\n"
+  output := io.stdout
+  output.write(report)?
   return Ok(())
 }

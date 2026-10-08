@@ -34,10 +34,13 @@ beyond the selected maximum depth is an error, including an empty directory. Exa
 the selected entry limit succeeds; a further entry fails before its metadata
 query. Native errors propagate. Invalid limits, negative regular-file sizes,
 checked byte-sum overflow and observed/opened child identity disagreement are
-`Error.Invalid`. No partial summary is printed on failure.
+`Error.Invalid`. Admission and traversal failures emit no summary. Checked stdout
+writes propagate their error; an output failure may leave a prefix.
 
-Success prints six label/value pairs in fixed order: entries, directories,
+Success writes six label/value pairs in fixed order: entries, directories,
 regular_files, symlinks, other, logical_bytes. Every count and sum is `i64`.
+An explicit owned template string holds the report before its checked write. Help
+also uses checked stdout writes, preserving usage plus the additional LF.
 Hard-linked names count separately; bytes are logical size, not disk usage.
 Concurrent mutation can change observations or cause errors. The result is not
 a stable snapshot, a deadline guarantee or a sandbox against mount traversal.
@@ -52,7 +55,8 @@ Entry and depth limits bound application work and recursion, not syscall time.
 | Child identity check across separate observations | opened descriptor metadata compared with observed device/inode | Author inspection; existing plan 45 owns native admission/race injection |
 | Logical size and checked aggregation | nonnegative size and checked_add | Known regular sizes and hard-linked names; overflow discriminated by a direct helper owner |
 | Named owners close on recursion, return and ? | existing directory/cursor/name Move cleanup | Repeated successful and failed walks with native descriptor and requested-live-byte oracles |
-| Existing whole/per-unit lowering | unchanged source checked in both modes | Example source formation and a native per-unit walk |
+| Existing whole/per-unit lowering | source checked in both modes | Example source formation, a native per-unit walk, and complete main output/error execution |
+| Checked stdout completion | report template and unbuffered writer; checked help writes | Read-only stdout returns exact EBADF after successful traversal or help admission; parse/limit/open errors retain precedence. Successful report bytes remain exact. |
 
 All per-entry owned names and native path copies are visible through the existing
 operations. Traversal retains directory/cursor owners along the active path;

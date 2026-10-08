@@ -11,7 +11,8 @@ HTTP package is unnecessary.
 `examples/http_fetch.align` writes one GET response body to stdout. Its existing
 CLI parser accepts `--url` (default empty), `--max-body-bytes` (default 67108864),
 `--timeout-ns` (default 30000000000), and `--help` (default false).
-Parse first; successful help prints usage and returns before validation or I/O.
+Parse first; help writes usage plus the additional LF through checked stdout
+writes, before numeric validation or network/input I/O. Output errors propagate.
 Otherwise reject empty URL, then a body cap outside 1..1073741824, then a
 nonpositive timeout, with `Error.Invalid`, before creating the client.
 URL encoding, embedded NUL and syntax use existing request admission.

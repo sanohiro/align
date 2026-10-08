@@ -469,6 +469,8 @@ fn bounded_csv_summary_example_admission_and_output() {
             for flag in ["file", "max-input-bytes", "max-rows", "crlf", "help"] {
                 assert!(usage.contains(flag), "{usage}");
             }
+            summary_error(&run_summary(exe, root, ordinary,
+                &["--help", "--file", "fifo", "--max-rows", "-1"], true), libc::EBADF);
             summary_error(&run_summary(exe, root, ordinary, &default, true), libc::EBADF);
         }
     });
