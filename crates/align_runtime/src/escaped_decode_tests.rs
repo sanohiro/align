@@ -28,12 +28,13 @@ fn decoders() -> [fn(&[u8]) -> Option<Vec<u8>>; 2] {
 
 #[test]
 fn every_escape_suffix_matches_scalar_admission() {
-    let mut input = vec![b'a'; 32];
+    let prefix = 128;
+    let mut input = vec![b'a'; prefix];
     input.extend_from_slice(b"%00+tail");
     for high in 0..=u8::MAX {
         for low in 0..=u8::MAX {
-            input[33] = high;
-            input[34] = low;
+            input[prefix + 1] = high;
+            input[prefix + 2] = low;
             for (form, decode) in decoders().into_iter().enumerate() {
                 assert_eq!(
                     decode(&input),
@@ -82,6 +83,24 @@ fn ordinary_bytes_and_escapes_preserve_binary_values() {
                 "length={}, form={form}",
                 input.len()
             );
+        }
+    }
+}
+
+#[test]
+fn ordinary_run_boundaries_resume_exact_escape_and_plus_transitions() {
+    for length in (0..=65).chain([127, 128, 129, 255, 256, 257, 4095, 4096, 4097]) {
+        for prefix in [b"".as_slice(), b"%00", b"+", b"%2b+"] {
+            for tail in [b"".as_slice(), b"%ff", b"+%00+", b"%", b"%0", b"%G0"] {
+                let mut input = prefix.to_vec();
+                input.extend((0..length).map(|index| [b'a', 0, 0xff, b'~'][index % 4]));
+                input.extend_from_slice(tail);
+                input.extend_from_slice(b"ordinary+%25tail");
+                for (form, decode) in decoders().into_iter().enumerate() {
+                    assert_eq!(decode(&input), oracle(&input, form != 0),
+                        "run={length}, prefix={prefix:?}, tail={tail:?}, form={form}");
+                }
+            }
         }
     }
 }
