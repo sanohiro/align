@@ -34229,13 +34229,11 @@ impl BorrowState {
                     let observed = reachable.iter().filter(same_parameter).collect::<Vec<_>>();
                     // A symbolic caller field names a descriptor place. A view field may point
                     // into another field's storage, so distinct paths prove separation only
-                    // when both generations denote independent backing. Inline arrays own
-                    // their bytes in the record even though they have no heap release owner.
+                    // when both generations denote their own owned storage.
                     let owned_backing = |generation: &StorageGeneration| {
                         self.storage.directory.entries.get(generation)
                             .and_then(|entry| entry.descriptor)
-                            .is_some_and(|descriptor| descriptor.kind.owns_storage()
-                                || descriptor.kind == StorageHeaderKind::InlineFixed)
+                            .is_some_and(|descriptor| descriptor.kind.owns_storage())
                     };
                     if !unknown && !targets.is_empty() && !observed.is_empty()
                         && targets.iter().all(|generation| owned_backing(generation))
@@ -80048,7 +80046,7 @@ fn main() -> i32 = 0
                         StorageHeaderLeaf::known_typed(target.clone(), descriptor));
                     for include_owner in [false, true] {
                         let must_observe = borrowed_content || kind == StorageHeaderKind::View
-                            || (include_owner && same);
+                            || (include_owner && (same || kind == StorageHeaderKind::InlineFixed));
                         assert_eq!(state.exclusive_header_observations(&observed, &roots, &destination, include_owner),
                             if must_observe { roots.clone() } else { BorrowRoots::new() },
                             "{kind:?}, same={same}, borrowed={borrowed_content}, snapshot={include_owner}");
@@ -80061,6 +80059,40 @@ fn main() -> i32 = 0
             }
         }
         assert!(!StorageHeaderKind::InlineFixed.owns_storage(), "inline storage never gains heap release ownership");
+    }
+
+    #[test]
+    fn nested_inline_generations_remain_overlapping_observations() {
+        let scalar = Scalar::Int(IntTy { signed: true, bits: 64 });
+        let parent = StorageGeneration::caller_storage(0, &[BorrowProjection::StructField(0)]);
+        let child = StorageGeneration::caller_storage(0, &[
+            BorrowProjection::StructField(0), BorrowProjection::ArrayElement(0), BorrowProjection::StructField(0),
+        ]);
+        let parent_descriptor = StorageHeaderDescriptor { ty: Ty::StructArray(0, 1), kind: StorageHeaderKind::InlineFixed };
+        let child_descriptor = StorageHeaderDescriptor { ty: Ty::Array(scalar, 2), kind: StorageHeaderKind::InlineFixed };
+        let roots: BorrowRoots = [BorrowRoot::ParamStorage(0)].into();
+        let mut state = BorrowState::default();
+        for (generation, descriptor) in [(parent.clone(), parent_descriptor), (child.clone(), child_descriptor)] {
+            state.storage.directory.entries.insert(generation.clone(), MoveGenerationEntry::new(
+                &generation, Some(descriptor), Default::default()));
+            state.storage.contents.entries.insert(generation, MoveValueFact::default());
+        }
+        // A slice of the parent may retain only its root generation. Distinct identities
+        // cannot prove that its bytes are disjoint from the inline child array.
+        for (observed, destination, descriptor, target_descriptor) in [
+            (child.clone(), parent.clone(), child_descriptor, parent_descriptor),
+            (parent, child, parent_descriptor, child_descriptor),
+        ] {
+            let target = ProjectedHeaderFact::from_leaf(Vec::new(), StorageHeaderLeaf::known_typed(destination, target_descriptor));
+            let snapshot = ProjectedHeaderFact::from_leaf(Vec::new(), StorageHeaderLeaf::known_typed(observed.clone(), descriptor));
+            assert_eq!(state.exclusive_header_observations(&snapshot, &roots, &target, true), roots);
+            let element = if matches!(descriptor.ty, Ty::StructArray(..)) { Scalar::Struct(0) } else { scalar };
+            let view_descriptor = StorageHeaderDescriptor { ty: Ty::Slice(element), kind: StorageHeaderKind::View };
+            let view = ProjectedHeaderFact::from_leaf(Vec::new(), StorageHeaderLeaf::known_typed(observed, view_descriptor));
+            for include_owner in [false, true] {
+                assert_eq!(state.exclusive_header_observations(&view, &roots, &target, include_owner), roots);
+            }
+        }
     }
 
     #[test]
