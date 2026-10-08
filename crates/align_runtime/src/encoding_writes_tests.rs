@@ -38,6 +38,12 @@ fn encoding_writers_initialize_exact_destinations_and_reject_mismatches() {
         html_escape_into,
         form_encode_into,
     ];
+    let lengths: [fn(&[u8]) -> Option<usize>; 4] = [
+        percent_encoded_len,
+        |input| percent_encoded_len_with_slash(input, true),
+        html_escaped_len,
+        form_encoded_len,
+    ];
     for (kind, writer) in writers.into_iter().enumerate() {
         let mut cases = vec![
             vec![],
@@ -50,6 +56,9 @@ fn encoding_writers_initialize_exact_destinations_and_reject_mismatches() {
             1, 2, 3, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257,
         ] {
             cases.push(vec![b'&'; length]);
+            if kind != 2 {
+                cases.push((0u8..=255).cycle().take(length).collect());
+            }
         }
         if kind != 2 {
             cases.push((0u8..=255).collect());
@@ -57,6 +66,7 @@ fn encoding_writers_initialize_exact_destinations_and_reject_mismatches() {
         }
         for input in cases {
             let expected = reference(&input, kind);
+            assert_eq!(lengths[kind](&input), Some(expected.len()), "kind={kind}, input={input:?}");
             for sentinel in [0xa5, 0x5a] {
                 let mut output = vec![MaybeUninit::new(sentinel); expected.len()];
                 writer(&input, &mut output);
