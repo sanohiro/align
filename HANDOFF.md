@@ -2,13 +2,13 @@
 
 ## Current work direction
 
-The owner resumed continuous independent improvements on 2026-10-08 after
-Request135 was repaired and merged. Continue existing-library usability and
-measured execution/storage improvements through PR and merge, then advance to
-the next independent capability. The owner reaffirmed that PR/merge is not a
-stopping point: continue improvements and implementation until explicitly asked
-to stop. K1/plan61 and the separately parked aggregate-provenance experiment
-remain deferred.
+The owner stopped the continuous improvement loop after PR #1302 and then
+prioritized align-llm Request136 as a blocker. Plan159 repairs MIR certification
+of owned records containing plain fixed-array values, including imported
+construction, shared/mutable calls and nested Copy metadata. Complete this
+request's delivery and local release build, then stop; no further independent
+improvement loop is authorized. K1/plan61 and the separately parked general
+aggregate-provenance experiment remain deferred.
 
 External align-llm adoption and end-to-end/network measurements remain
 consumer-owned. Request126's
