@@ -425,7 +425,7 @@ struct XmlAccessEquation {
     // Storage joins can have several action-derived seeds. None also permits an
     // independent entry/ordinary-store seed; Some retains each action's own inputs.
     seed_inputs: Option<Vec<Vec<XmlAccessNode>>>,
-    copied_scalar: bool,
+    copied_bits: bool,
     seed: Option<XmlAccessProvenance>,
     dependencies: Vec<XmlAccessNode>,
     read_dependencies: Vec<XmlAccessNode>,
@@ -438,7 +438,7 @@ struct XmlAccessEquation {
 
 impl XmlAccessEquation {
     fn produced_access(&self, access: XmlAccessProvenance) -> XmlAccessProvenance {
-        if self.copied_scalar && matches!(access,
+        if self.copied_bits && matches!(access,
             XmlAccessProvenance::Owned | XmlAccessProvenance::Shared | XmlAccessProvenance::Exclusive)
         {
             XmlAccessProvenance::Owned
@@ -692,7 +692,7 @@ fn solve_xml_access_equations(
                 || !initialized.contains(*node)
                 || !values.contains_key(*node)
                 || values.get(*node) == Some(&XmlProducerState::Invalid)
-                || (equation.copied_scalar && values.get(*node).copied()
+                || (equation.copied_bits && values.get(*node).copied()
                     .is_none_or(|state| !OperandRequirement::READ.is_satisfied_by(state)))
                 || equation.checks.iter().any(|(dependency, requirement)| {
                     values
@@ -3729,6 +3729,33 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 if !self.graph.function.slots.get(slot as usize)
                     .is_some_and(|actual| xml_flow_matches(self.graph.program, *actual, result_ty)) {
                     equation.invalid = true;
+                } else if path.is_empty()
+                    && let Ty::Array(element, length) = result_ty
+                    && xml_plain_fixed_array_element(element)
+                {
+                    // A whole inline scalar array copies its elements, not a backing header.
+                    // Keep the literal completeness proof and every reaching element producer;
+                    // the copied-bits transform below changes only the resulting SSA authority.
+                    if !self.check_plain_fixed_array_operand(
+                        &mut equation, &Operand::Value(value), result_ty,
+                    ) {
+                        equation.invalid = true;
+                    } else if length == 0
+                        && !self.graph.function.params.contains(&slot)
+                        && self.graph.slot_stores.roots.get(slot as usize).is_some_and(Vec::is_empty)
+                    {
+                        // A checked empty literal has no element edge to found its zero bits.
+                        equation.seed = Some(XmlAccessProvenance::Owned);
+                    } else {
+                        // Empty arrays still copy their complete zero-bit value through
+                        // parameters/root stores. There is no element producer to select.
+                        let source_path = if length == 0 { Vec::new() }
+                            else { vec![XmlAccessPathSegment::Element] };
+                        Self::add_source(
+                            &mut equation,
+                            self.queue(XmlAccessNode::Slot(slot, source_path)),
+                        );
+                    }
                 } else {
                     Self::add_source(
                         &mut equation,
@@ -7184,7 +7211,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 .is_some_and(|stores| !stores.is_empty())
         {
             // This is an ordinary initialized array slot, not an anonymous literal-construction
-            // temporary. The caller's exact projected add_operand edge authenticates its root
+            // temporary. The caller's exact projected dependency authenticates its root
             // stores and later element writes; applying the construction-cardinality scan here
             // would reject parameters, copies, joins, and mutations as duplicate initialization.
             return true;
@@ -7578,12 +7605,13 @@ impl<'a> XmlAccessAnalyzer<'a> {
             let mut equation = match &node {
                 XmlAccessNode::Value(value, path) => {
                     let mut equation = self.value_equation(*value, path.clone());
-                    // A scalar SSA result copies bits out of storage; it does not inherit the
-                    // storage's borrow authority. Retain every grounding/check edge and absence
-                    // fact, and never apply this transform to storage or aggregate projections.
-                    equation.copied_scalar = path.is_empty()
+                    // Plain scalar and inline scalar-array SSA results copy bits out of
+                    // storage without inheriting its borrow authority. Retain every grounding,
+                    // check and absence fact; never transform storage or view-bearing values.
+                    equation.copied_bits = path.is_empty()
                         && self.graph.function.value_tys.get(*value as usize).is_some_and(|ty| {
                             matches!(ty, Ty::Unit | Ty::Bool | Ty::Char)
+                                || matches!(ty, Ty::Array(element, _) if xml_plain_fixed_array_element(*element))
                                 || xml_numeric_scalar_ty(*ty)
                                 || xml_numeric_vector_shape(*ty).is_some()
                                 || matches!(*ty, Ty::Mask(element, lanes @ (2 | 4 | 8 | 16))
@@ -12322,7 +12350,7 @@ mod tests {
     }
 
     #[test]
-    fn producer_copied_scalar_preserves_grounding_and_readability() {
+    fn producer_copied_bits_preserves_grounding_and_readability() {
         use XmlAccessProvenance::{Owned, Shared, Exclusive, Unreadable, Mixed};
         for seed in [None, Some(Owned), Some(Shared), Some(Exclusive), Some(Unreadable), Some(Mixed)] {
             for absent in [false, true] {
@@ -12331,7 +12359,7 @@ mod tests {
                 let mut equations = HashMap::from([
                     (storage.clone(), XmlAccessEquation { seed, dependencies: vec![copied.clone()],
                         ..XmlAccessEquation::default() }),
-                    (copied.clone(), XmlAccessEquation { copied_scalar: true, absent,
+                    (copied.clone(), XmlAccessEquation { copied_bits: true, absent,
                         dependencies: vec![storage.clone()], ..XmlAccessEquation::default() }),
                 ]);
                 let (values, invalid) = solve_xml_access_equations(&equations);
