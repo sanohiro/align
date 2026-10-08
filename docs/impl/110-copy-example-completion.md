@@ -19,8 +19,8 @@ continues to demonstrate nonconsuming copy by appending one newline and printing
 the count of source bytes. No library, compiler, API, ABI, allocation policy or
 native filesystem implementation changes.
 
-Plan114 also requires file_copy's fixed buffer capacity to equal 65536 before
-the first read. An unavailable window returns Invalid; the already-created
+Plan148 uses buffer.try_new(65536)? for file_copy's fixed window before the
+first read. Constructor errors propagate unchanged; the already-created
 destination remains empty and the input is unchanged. io_copy uses the existing
 native copy operation and creates no source-level read window.
 

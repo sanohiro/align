@@ -1,5 +1,11 @@
 # Admit fixed read windows in streaming examples
 
+Status: the original best-effort-window safeguard below is superseded by
+[plan148](148-fallible-example-read-windows.md). The examples now use plan135's
+fallible constructor and propagate its original error before reading; their
+source fixtures inject a typed constructor Err instead of a degraded success.
+The original defect and qualification record remain historical evidence.
+
 The existing best-effort buffer constructor can publish capacity zero when its
 payload reservation fails. A zero-capacity reader read returns zero without
 I/O; HTTP reads instead abort before the stream ABI. The file-copy and SHA-256

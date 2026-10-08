@@ -87,7 +87,7 @@ one 64 KiB buffer and one unbuffered stdout writer, bound before the loop:
 consumes its borrowed byte view before the next read. A zero count means
 completion. Chunk framing is removed by the stream;
 the application performs no UTF-8 conversion or whole-body accumulation.
-An unavailable 64 KiB window returns `Error.Invalid` before the first read.
+`buffer.try_new(65536)?` propagates an allocation error before the first read.
 
 `--max-body-bytes` defaults to 64 MiB and accepts 1..1073741824 decoded bytes.
 `--timeout-ns` defaults to 30 seconds and must be positive. Both limits are
@@ -125,9 +125,9 @@ block. There is no automatic reconnect or retry.
 
 `--event-bytes` defaults to 65536 and accepts 1..1048576. One explicit buffer is
 reused for every event. Its capacity bounds the combined event name, data and
-last ID, including fields omitted from stdout. A degraded buffer reservation
-returns Invalid before connecting. Event views are written before the next
-`next(out)` invalidates them; nothing accumulates the full event history.
+last ID, including fields omitted from stdout. `buffer.try_new(event_bytes)?`
+propagates an allocation error before connecting. Event views are written before
+the next `next(out)` invalidates them; nothing accumulates the full event history.
 
 `--max-body-bytes` defaults to 67108864 and accepts 1..1073741824 decoded bytes,
 including comments and control fields. `--timeout-ns` defaults to 30000000000
@@ -201,8 +201,7 @@ import std.fs
 
 fn sha256_reader(input: reader) -> Result<string, Error> {
     digest := crypto.sha256_stream()
-    mut chunk := buffer(65536)
-    if chunk.capacity() != 65536 { return Err(Error.Invalid) }
+    mut chunk := buffer.try_new(65536)?
     loop {
         n := input.read(chunk)?
         if n == 0 { break }
@@ -223,10 +222,10 @@ Each read replaces the buffer's initialized bytes. Update borrows those bytes
 only for the call; the next read can reuse the same storage. Input is binary,
 so NUL and non-UTF-8 bytes need no conversion. `finish()` consumes the digest
 and produces an owned 32-byte result; hex encoding produces an owned string.
-The capacity check rejects an unavailable window with `Error.Invalid` before
-reading, so it cannot produce a digest by mistaking that condition for EOF.
-`?` propagates file/read errors and ordinary Drop releases the reader and any
-unfinished digest. A digest describes the bytes actually read, rather than
+The fallible buffer constructor propagates an allocation error before reading,
+so it cannot produce a digest by mistaking an unavailable window for EOF.
+`?` propagates allocation/file/read errors and ordinary Drop releases the reader
+and any unfinished digest. A digest describes the bytes actually read, rather than
 certifying a stable filesystem snapshot. See the
 [incremental SHA-256 contract](../impl/std-design/crypto.md#incremental-sha-256)
 for the ownership and provider-failure rules.

@@ -7,8 +7,7 @@ import std.fs
 // a visible `mut` local owned by the loop. Flush errors propagate before success; a late failure
 // may leave a partial new output. Flush does not promise durable storage.
 fn copy_all(r: reader, w: writer) -> Result<(), Error> {
-  mut buf := buffer(65536)
-  if buf.capacity() != 65536 { return Err(Error.Invalid) }
+  mut buf := buffer.try_new(65536)?
   loop {
     n := r.read(buf)?
     if n == 0 { break w.flush() }

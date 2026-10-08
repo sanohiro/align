@@ -176,16 +176,17 @@ fn assert_digest_example_error(
 }
 
 #[test]
-fn bounded_file_sha256_example_rejects_degraded_read_window() {
+fn bounded_file_sha256_example_propagates_read_window_refusal() {
     assert!(backend_available(), "digest example requires the LLVM backend");
     let source = fixture("examples/file_sha256.align");
-    assert_eq!(source.matches("buffer(65536)").count(), 1);
-    let degraded = source.replace("buffer(65536)", "buffer(0)");
-    let example = DigestExample::build(&degraded);
+    assert_eq!(source.matches("buffer.try_new(65536)").count(), 1);
+    let refused = format!("{}\nfn refused_window() -> Result<buffer, Error> = Err(Error.Code(12))\n",
+        source.replace("buffer.try_new(65536)", "refused_window()"));
+    let example = DigestExample::build(&refused);
     for bytes in [b"unread\0\xff".as_slice(), b""] {
         for args in [vec![], vec!["--file", "input.bin"]] {
             let (status, stdout, stderr) = example.run(bytes, &args, false);
-            assert_digest_example_error(&status, &stdout, &stderr, 2);
+            assert_digest_example_error(&status, &stdout, &stderr, 12);
         }
     }
 }

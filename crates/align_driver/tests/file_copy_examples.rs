@@ -124,20 +124,21 @@ fn assert_error(output: &Output, code: i32) {
 }
 
 #[test]
-fn actual_copy_example_rejects_degraded_read_window() {
+fn actual_copy_example_propagates_read_window_refusal() {
     assert!(common::backend_available(), "example owner requires the LLVM backend");
     let source = common::fixture("examples/file_copy.align");
-    assert_eq!(source.matches("buffer(65536)").count(), 1);
-    let degraded = source.replace("buffer(65536)", "buffer(0)");
-    let stage = align_driver::ArtifactStage::temp("copy-degraded-window").unwrap();
+    assert_eq!(source.matches("buffer.try_new(65536)").count(), 1);
+    let refused = format!("{}\nfn refused_window() -> Result<buffer, Error> = Err(Error.Code(12))\n",
+        source.replace("buffer.try_new(65536)", "refused_window()"));
+    let stage = align_driver::ArtifactStage::temp("copy-refused-window").unwrap();
     let root = stage.path();
-    let exe = build_source(root, &degraded);
+    let exe = build_source(root, &refused);
     let input = root.join("source");
     let destination = root.join("destination");
     for bytes in [b"unread\0\xff".as_slice(), b""] {
         std::fs::write(&input, bytes).unwrap();
         let output = run(Command::new(&exe).arg(&input).arg(&destination));
-        assert_error(&output, 2);
+        assert_error(&output, 12);
         assert_eq!(std::fs::read(&input).unwrap(), bytes);
         assert!(std::fs::read(&destination).unwrap().is_empty());
         std::fs::remove_file(&destination).unwrap();
