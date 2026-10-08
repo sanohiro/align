@@ -70,18 +70,15 @@ impl Cell {
         if !self.escaped {
             return Some(raw);
         }
-        let mut n = 0usize;
+        let mut n = raw;
         let mut p = self.start;
-        while p < self.end {
-            if src[p] == b'"' {
-                if p + 1 >= self.end || src[p + 1] != b'"' {
-                    return None;
-                }
-                p += 2;
-            } else {
-                p += 1;
+        while let Some(offset) = next_quote(&src[p..self.end]) {
+            p += offset;
+            if p + 1 >= self.end || src[p + 1] != b'"' {
+                return None;
             }
-            n = n.checked_add(1)?;
+            p += 2;
+            n -= 1;
         }
         Some(n)
     }
@@ -93,11 +90,8 @@ impl Cell {
         }
         let mut p = self.start;
         let mut run = p;
-        while p < self.end {
-            if src[p] != b'"' {
-                p += 1;
-                continue;
-            }
+        while let Some(offset) = next_quote(&src[p..self.end]) {
+            p += offset;
             if p + 1 >= self.end || src[p + 1] != b'"' {
                 return None;
             }
@@ -870,6 +864,88 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn normalized_cells_match_scalar_chunks_and_lengths() {
+        fn check(raw: &[u8]) {
+            // Independent byte walk, including callbacks emitted before malformed suffixes.
+            let mut expected = Vec::new();
+            let mut p = 0;
+            let mut run = 0;
+            let mut valid = true;
+            while p < raw.len() {
+                if raw[p] != b'"' { p += 1; continue; }
+                if raw.get(p + 1) != Some(&b'"') { valid = false; break; }
+                expected.push(raw[run..p].to_vec());
+                expected.push(vec![b'"']);
+                p += 2;
+                run = p;
+            }
+            if valid { expected.push(raw[run..].to_vec()); }
+            // Quotes outside the selected extent must never participate in discovery.
+            let mut src = vec![b'"', b'!'];
+            src.extend_from_slice(raw);
+            src.extend_from_slice(b"!\"");
+            let cell = Cell { start: 2, end: 2 + raw.len(), escaped: true };
+            let mut actual = Vec::new();
+            assert_eq!(cell.chunks(&src, |chunk| actual.push(chunk.to_vec())), valid.then_some(()));
+            assert_eq!(actual, expected, "raw={raw:?}");
+            let decoded: Vec<u8> = expected.concat();
+            assert_eq!(cell.decoded_len(&src), valid.then_some(decoded.len()));
+            if valid {
+                assert_eq!(cell.hash(&src), Some(wyhash(&decoded, 0)));
+                assert!(cell.equals(&src, &decoded));
+                let mut different = decoded.clone();
+                different.push(b'!');
+                assert!(!cell.equals(&src, &different));
+                let mut copied = vec![0xa5; decoded.len() + 2];
+                assert_eq!(unsafe { cell.copy_decoded(&src, copied.as_mut_ptr().add(1)) }, Some(decoded.len()));
+                assert_eq!(&copied[1..1 + decoded.len()], decoded);
+                assert_eq!((copied[0], copied[copied.len() - 1]), (0xa5, 0xa5));
+            }
+        }
+        const ALPHABET: [u8; 4] = [b'"', b'x', b'\n', 0];
+        for length in 0..=7 {
+            for mut code in 0..4usize.pow(length) {
+                let mut raw = vec![0; usize::try_from(length).unwrap()];
+                for byte in &mut raw { *byte = ALPHABET[code % 4]; code /= 4; }
+                check(&raw);
+            }
+        }
+        for length in [15, 16, 17, 31, 32, 33, 255, 256, 65536] {
+            for tail in [b"".as_slice(), b"\"", b"\"x", b"\"\"", b"\"\"\"", b"\"\"tail"] {
+                let mut raw = vec![b'x'; length];
+                raw.extend_from_slice(b"\"\"\"\"\r\n,\0");
+                raw.extend(std::iter::repeat_n(b'y', length));
+                raw.extend_from_slice(tail);
+                check(&raw);
+            }
+        }
+    }
+
+    #[test]
+    fn long_normalized_text_preserves_exact_bytes_and_arena_extent() {
+        let fields = [field(b"note", 0x0310)];
+        for length in [0, 15, 16, 17, 4096, 65536] {
+            let mut expected = "é\0\r\n,".as_bytes().to_vec();
+            expected.extend(std::iter::repeat_n(b'x', length));
+            expected.extend_from_slice(b"\"\"tail\"");
+            let mut input = b"note\n\"".to_vec();
+            for &byte in &expected {
+                input.push(byte);
+                if byte == b'"' { input.push(byte); }
+            }
+            input.extend_from_slice(b"\"\n");
+            reset_probe();
+            let (status, out, _arena) = unsafe { decode(&input, &fields, HEADER_PRESENT, EOL_LF, 1) };
+            assert_eq!((status, out.len), (STATUS_OK, 1));
+            let note = unsafe { *out.ptr.cast::<AlignStr>() };
+            assert_eq!(note.len, i64::try_from(expected.len()).unwrap());
+            assert_eq!(note.ptr, unsafe { out.ptr.add(mem::size_of::<AlignStr>()) });
+            assert_eq!(unsafe { slice::from_raw_parts(note.ptr, expected.len()) }, expected);
+            assert_eq!(probe().allocations, 1);
         }
     }
 

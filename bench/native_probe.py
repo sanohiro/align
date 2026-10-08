@@ -10,7 +10,7 @@ import tempfile
 import time
 
 
-PROBES = ("csv_quoted_scan", "escaped_decode", "utf8_lossy")
+PROBES = ("csv_quoted_scan", "csv_normalization", "escaped_decode", "utf8_lossy")
 LIMITS = {"build": 900, "link": 60, "probe": 60}
 pending_signal = 0
 

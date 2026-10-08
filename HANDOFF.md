@@ -2,11 +2,11 @@
 
 ## Current work direction
 
-The owner stopped continuous independent improvements after PR #1296, then
-requested urgent repair of blocking align-llm Request 135 on 2026-10-08. Limit
-current work to restoring the CUDA entry's fixed-array sibling borrowing,
-qualification, PR/merge and the requested local release build. K1/plan61 and the
-separately parked aggregate-provenance experiment remain deferred.
+The owner resumed continuous independent improvements on 2026-10-08 after
+Request135 was repaired and merged. Continue existing-library usability and
+measured execution/storage improvements through PR and merge, then advance to
+the next independent capability. K1/plan61 and the separately parked
+aggregate-provenance experiment remain deferred.
 
 External align-llm adoption and end-to-end/network measurements remain
 consumer-owned. Request126's
@@ -31,6 +31,12 @@ the parked work is not a prerequisite. Keep its source and evidence archived
 outside the active worktree so they do not obstruct unrelated checks or pulls.
 
 ## Next work (handoff updated 2026-10-08)
+
+Plan153 reuses bulk quote discovery while measuring and copying escaped CSV
+text. Exact normalized bytes, chunk order, malformed refusal and arena layout
+remain unchanged. Native and whole/per-unit owners pass on macOS/Linux ARM64;
+`bench/csv_normalization` retains local long-field improvements and short-case
+measurement limits without a general latency promise.
 
 Plan152 restores fixed inline storage in mutable-call sibling exclusion without
 changing heap release ownership or discarding contained borrows. Request135's
