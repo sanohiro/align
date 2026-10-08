@@ -491,3 +491,129 @@ fn fixed_record_ownership_and_alias_negatives_keep_both_modes() {
         },
     );
 }
+
+#[test]
+fn empty_fixed_array_copies_preserve_whole_value_provenance() {
+    owned_fixture::run(
+        "empty_fixed_array_copies_preserve_whole_value_provenance",
+        |stage| {
+            let definitions =
+                "pub Value { bytes: buffer, counts: [i64; 0] }\nMeta { empty: [i64; 0] }\n";
+            let mut library = format!("module zero\n{definitions}");
+            for (index, body) in [
+            "empty: [i64; 0] := []; copied := empty; return Value { bytes: buffer.filled(8, 0), counts: copied }",
+            "metadata := Meta { empty: [] }; copied := metadata.empty; return Value { bytes: buffer.filled(8, 0), counts: copied }",
+            "empty: [i64; 0] := []; copied := if flag { empty } else { empty }; return Value { bytes: buffer.filled(8, 0), counts: copied }",
+        ].iter().enumerate() {
+            library.push_str(&format!("pub fn make{index}(flag: bool) -> Value {{ {body} }}\n"));
+        }
+            library.push_str("pub fn from_parameter(empty: [i64; 0]) -> Value { copied := empty; return Value { bytes: buffer.filled(8, 0), counts: copied } }\n");
+            library.push_str("pub fn from_borrow(borrow value: Value) -> Value { copied := value.counts; return Value { bytes: buffer.filled(8, 0), counts: copied } }\n");
+            let mut main = String::from("module main\nimport zero\nfn main() -> i32 {\n");
+            for index in 0..3 {
+                for flag in [false, true] {
+                    let name = format!("value{index}_{flag}");
+                    main.push_str(&format!("{name} := zero.make{index}({flag})\nif {name}.bytes.len() != 8 || {name}.counts.len() != 0 {{ return 1 }}\n"));
+                }
+            }
+            main.push_str("empty: [i64; 0] := []\nparameter := zero.from_parameter(empty)\nborrowed := zero.from_borrow(parameter)\nif borrowed.bytes.len() != 8 { return 2 }\nreturn 0\n}\n");
+            std::fs::write(stage.join("zero.align"), &library).unwrap();
+            let entry = stage.join("main.align");
+            std::fs::write(&entry, &main).unwrap();
+            let mut sources = SourceMap::new();
+            let checked = check(&mut sources, entry.to_str().unwrap(), &main);
+            assert!(
+                !checked.diags.has_errors(),
+                "{}",
+                align_driver::format_diagnostics(&sources, &checked.diags)
+            );
+            let program = lower_to_mir(&checked.hir);
+            assert_certification(&program, true, "zero-length copies");
+            execute(stage, &[program.clone()], "zero-whole");
+            let mut sources = SourceMap::new();
+            let built = build_per_unit(&mut sources, entry.to_str().unwrap(), &main);
+            assert!(
+                !built.diags.has_errors(),
+                "{}",
+                align_driver::format_diagnostics(&sources, &built.diags)
+            );
+            execute(
+                stage,
+                &built.units.into_iter().map(|u| u.mir).collect::<Vec<_>>(),
+                "zero-units",
+            );
+
+            for mutation in 0..3 {
+                let mut malformed = program.clone();
+                let function = malformed
+                    .fns
+                    .iter_mut()
+                    .find(|f| f.name.as_str() == "zero$make0")
+                    .unwrap();
+                let array_loads = function.blocks[0]
+                    .stmts
+                    .iter()
+                    .filter_map(|s| match s {
+                        align_mir::Stmt::Let(value, align_mir::Rvalue::Load(slot))
+                            if matches!(
+                                function.slots[*slot as usize],
+                                align_sema::Ty::Array(_, 0)
+                            ) =>
+                        {
+                            Some((*value, *slot))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let (loaded, slot) = array_loads[0];
+                match mutation {
+                    0 => {
+                        // A zero-bit copy chain must not ground itself.
+                        let (_, copied_slot) = array_loads[1];
+                        function.blocks[0].stmts.insert(
+                            0,
+                            align_mir::Stmt::Store(
+                                slot,
+                                align_mir::Operand::Value(array_loads[1].0),
+                            ),
+                        );
+                        assert_ne!(slot, copied_slot);
+                    }
+                    1 => {
+                        function.blocks[0].stmts.insert(
+                            0,
+                            align_mir::Stmt::StoreIndex(
+                                slot,
+                                align_mir::Operand::Const(align_mir::Const::Int(
+                                    0,
+                                    align_sema::Ty::Int(align_sema::IntTy {
+                                        bits: 64,
+                                        signed: true,
+                                    }),
+                                )),
+                                align_mir::Operand::Const(align_mir::Const::Bool(true)),
+                            ),
+                        );
+                    }
+                    2 => {
+                        let duplicate = align_mir::Stmt::Let(loaded, align_mir::Rvalue::Load(slot));
+                        function.blocks[0].stmts.push(duplicate);
+                    }
+                    _ => unreachable!(),
+                }
+                assert_certification(&malformed, false, &format!("zero mutation {mutation}"));
+            }
+            let mut unreadable = program;
+            unreadable
+                .fns
+                .retain(|f| f.name.as_str() == "zero$from_parameter");
+            let function = unreadable
+                .fns
+                .iter_mut()
+                .find(|f| f.name.as_str() == "zero$from_parameter")
+                .unwrap();
+            function.param_modes[0] = align_ast::ParamMode::Out;
+            assert_certification(&unreadable, false, "unreadable zero-bit argument");
+        },
+    );
+}

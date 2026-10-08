@@ -58,3 +58,16 @@ remain the owner set for unchanged control, allocation and lifetime rules.
 Standalone canonical borrows of a local fixed array can still reach the existing
 whole-storage producer refusal; this request repairs arrays inside owned records
 and does not expand that independent storage-descriptor proof.
+
+## Review correction
+
+The independent review found that a zero-length array copied through a local
+root store still requested an `Element` dependency from its empty literal.
+That path has no element producer. Retain whole-value dependencies for empty
+array root stores and parameters, while only a validated fresh empty literal
+may seed its own zero bits. `empty_fixed_array_copies_preserve_whole_value_provenance`
+executes named copies, record projections, both branch arms, by-value parameters
+and borrowed record fields in whole/per-unit modes. Full and partition mutations
+retain rejection of an ungrounded zero-bit copy cycle, malformed element writes,
+duplicate SSA producers and an unreadable argument isolated from caller checks.
+No other review findings or changes to proof strategy were required.

@@ -3747,9 +3747,13 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         // A checked empty literal has no element edge to found its zero bits.
                         equation.seed = Some(XmlAccessProvenance::Owned);
                     } else {
+                        // Empty arrays still copy their complete zero-bit value through
+                        // parameters/root stores. There is no element producer to select.
+                        let source_path = if length == 0 { Vec::new() }
+                            else { vec![XmlAccessPathSegment::Element] };
                         Self::add_source(
                             &mut equation,
-                            self.queue(XmlAccessNode::Slot(slot, vec![XmlAccessPathSegment::Element])),
+                            self.queue(XmlAccessNode::Slot(slot, source_path)),
                         );
                     }
                 } else {
@@ -7207,7 +7211,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 .is_some_and(|stores| !stores.is_empty())
         {
             // This is an ordinary initialized array slot, not an anonymous literal-construction
-            // temporary. The caller's exact projected add_operand edge authenticates its root
+            // temporary. The caller's exact projected dependency authenticates its root
             // stores and later element writes; applying the construction-cardinality scan here
             // would reject parameters, copies, joins, and mutations as duplicate initialization.
             return true;
