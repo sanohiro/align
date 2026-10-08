@@ -1,5 +1,21 @@
 # Session handoff
 
+## Current completion boundary
+
+The owner requested on 2026-10-08 that work stop after the current SSE storage
+improvement: adopt it through PR and merge if qualified, otherwise retain its
+verification result and clean up. This supersedes the earlier automatic
+capability-to-capability continuation. Do not start another improvement after
+this boundary without a new owner request. K1/plan61 and the separately parked
+aggregate-provenance experiment remain deferred.
+
+Remaining items are not an automatic continuation queue: external align-llm
+adoption and end-to-end/network measurements remain consumer-owned. Request126's
+borrowed-session loop refusal and Request28's indexed/view builder readers are
+unimplemented; they require their own provenance closure. Request78's enum fields
+and Request128's shared optional native-resource matching still lack their
+required friction-ledger evidence. No versioned release/tag was requested.
+
 ## Deferred K1
 
 Full K1 and adoption of the parked [plan 61 implementation](docs/impl/61-interprocedural-view-access-plan.md)
@@ -16,6 +32,15 @@ the parked work is not a prerequisite. Keep its source and evidence archived
 outside the active worktree so they do not obstruct unrelated checks or pulls.
 
 ## Next work (handoff updated 2026-10-08)
+
+Plan145 uses initialized-prefix storage for SSE work and committed IDs, avoiding
+zero-filled spare capacity while preserving exact allocation sizes, all public
+storage ceilings, event bytes and rollback. The local parser preparation/dispatch
+corpus improves on macOS and Linux; `bench/sse_prefix_storage` retains every
+sample and measurement limits. Native allocation measurements also now run in
+bounded exact-filter children, so ordinary parallel tests cannot contaminate
+process-global allocation/free or requested-live probes. No consumer adoption
+or network-throughput claim follows from these internal refinements.
 
 Plan144 validates each retained filesystem path's complete grammar before its
 private byte copy. Invalid individual parser inputs allocate nothing; valid
