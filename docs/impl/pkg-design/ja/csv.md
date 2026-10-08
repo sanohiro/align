@@ -95,14 +95,14 @@ Trade {
   symbol: str,
 }
 
-fn active_total(input: str) -> Result<i64, csv.Error> {
-  options := csv.DecodeOptions {
-    header: csv.Header.Present,
-    line_ending: csv.LineEnding.Lf,
+fn active_total(input: str) -> Result<i64, pkg.csv.Error> {
+  options := pkg.csv.DecodeOptions {
+    header: pkg.csv.Header.Present,
+    line_ending: pkg.csv.LineEnding.Lf,
     max_rows: 1000000,
   }
   arena out {
-    rows: soa<Trade> := csv.decode(input, out, options)?
+    rows: soa<Trade> := pkg.csv.decode(input, out, options)?
     return Ok(rows.where(.active).amount.sum())
   }
 }
