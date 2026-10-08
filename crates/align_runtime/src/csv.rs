@@ -181,6 +181,17 @@ struct Parser<'a> {
     eol: i32,
 }
 
+// Scan the first 16 bytes directly, then use the existing CPU-portable search for longer runs.
+fn next_quote(input: &[u8]) -> Option<usize> {
+    const PREFIX: usize = 16;
+    let head = input.len().min(PREFIX);
+    for (index, &byte) in input[..head].iter().enumerate() {
+        if byte == b'"' { return Some(index); }
+    }
+    if input.len() <= PREFIX { return None; }
+    memchr::memchr(b'"', &input[PREFIX..]).map(|index| PREFIX + index)
+}
+
 impl<'a> Parser<'a> {
     fn new(src: &'a [u8], eol: i32) -> Self {
         Self { src, pos: if src.starts_with(&[0xef, 0xbb, 0xbf]) { 3 } else { 0 }, eol }
@@ -224,10 +235,11 @@ impl<'a> Parser<'a> {
                 let start = self.pos;
                 let mut escaped = false;
                 loop {
-                    let Some(&b) = self.src.get(self.pos) else { return Err(STATUS_INVALID) };
-                    if b != b'"' {
-                        self.pos += 1;
-                        continue;
+                    let Some(&byte) = self.src.get(self.pos) else { return Err(STATUS_INVALID) };
+                    if byte != b'"' {
+                        let remaining = &self.src[self.pos..];
+                        self.pos += next_quote(remaining).unwrap_or(remaining.len());
+                        if self.pos == self.src.len() { return Err(STATUS_INVALID); }
                     }
                     if self.src.get(self.pos + 1) == Some(&b'"') {
                         escaped = true;
@@ -684,6 +696,77 @@ mod tests {
 
     fn reset_probe() { PROBE.with(|probe| probe.set(Probe::default())) }
     fn probe() -> Probe { PROBE.with(std::cell::Cell::get) }
+
+    #[test]
+    fn quote_search_matches_scalar_offsets() {
+        // Bytes other than a quote are all field data here, including separators and NUL.
+        const ALPHABET: [u8; 4] = [b'"', b'a', b'\n', 0];
+        for length in 0..=7 {
+            for mut code in 0..4usize.pow(length) {
+                let mut input = vec![0; usize::try_from(length).unwrap()];
+                for byte in &mut input {
+                    *byte = ALPHABET[code % 4];
+                    code /= 4;
+                }
+                assert_eq!(next_quote(&input), input.iter().position(|&byte| byte == b'"'), "{input:?}");
+            }
+        }
+        for length in [15, 16, 17, 31, 32, 33, 63, 64, 65, 255, 65536] {
+            let mut input = vec![b'x'; length];
+            assert_eq!(next_quote(&input), None);
+            for offset in [0, 1, length / 2, length - 1] {
+                input[offset] = b'"';
+                assert_eq!(next_quote(&input), Some(offset));
+                input[offset] = b'x';
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_record_spans_and_refusals_cross_search_boundaries() {
+        for length in [0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 65536] {
+            for eol in [EOL_LF, EOL_CRLF] {
+                let ending = if eol == EOL_LF { b"\n".as_slice() } else { b"\r\n".as_slice() };
+                for escaped in [false, true] {
+                    let mut input = vec![b'"'];
+                    input.extend(std::iter::repeat_n(b'x', length));
+                    if escaped { input.extend_from_slice(b"\"\"\r\n,\0"); }
+                    let end = input.len();
+                    input.extend_from_slice(b"\",tail");
+                    input.extend_from_slice(ending);
+                    let mut parser = Parser::new(&input, eol);
+                    let mut cells = Vec::new();
+                    let status = parser.record(None, |ordinal, cell| {
+                        cells.push((ordinal, cell.start, cell.end, cell.escaped));
+                        Ok(())
+                    });
+                    assert_eq!(status, Ok(Some(2)), "length={length}, escaped={escaped}, eol={eol}");
+                    assert_eq!(cells, [(0, 1, end, escaped), (1, end + 2, end + 6, false)]);
+                    assert_eq!(parser.pos, input.len());
+                    assert_eq!(parser.record(None, |_, _| panic!("no record after final EOL")), Ok(None));
+
+                    for suffix in [b"".as_slice(), b"\"\"", b"\"x"] {
+                        let mut invalid = input[..end].to_vec();
+                        invalid.extend_from_slice(suffix);
+                        let mut parser = Parser::new(&invalid, eol);
+                        let mut visited = Vec::new();
+                        let status = parser.record(None, |ordinal, cell| {
+                            visited.push((ordinal, cell.start, cell.end, cell.escaped));
+                            Ok(())
+                        });
+                        assert_eq!(status, Err(STATUS_INVALID));
+                        if suffix == b"\"x" {
+                            assert_eq!(visited, [(0, 1, end, escaped)]);
+                            assert_eq!(parser.pos, end + 1);
+                        } else {
+                            assert!(visited.is_empty());
+                            assert_eq!(parser.pos, invalid.len());
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn absent_decodes_columns_and_normalizes_only_doubled_quotes() {

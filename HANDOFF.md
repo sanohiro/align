@@ -33,6 +33,12 @@ outside the active worktree so they do not obstruct unrelated checks or pulls.
 
 ## Next work (handoff updated 2026-10-08)
 
+Plan150 uses existing bulk byte search for long quoted CSV runs, preserving short
+prefixes and the original doubled-quote transition. Native span/error/allocation
+and whole/per-unit application owners qualify unchanged grammar and ownership.
+`bench/csv_quoted_scan` retains macOS/Linux ARM64 long-field improvements, dense
+controls and short-case measurement limits; no general latency claim follows.
+
 Plan149 adds a runnable typed CSV summary in `apps/csv/main.align` through the
 existing package, regular-file reader, CLI and fallible buffers. Explicit byte
 and row caps bound materialization; complete UTF-8/CSV admission precedes checked
