@@ -1,20 +1,26 @@
 # Local native runtime probe runner
 
-The CSV field-discovery/normalization, percent/form escape and UTF-8 replacement probes share
+The Base64, CSV field-discovery/normalization, percent/form escape and UTF-8 replacement probes share
 `bench/native_probe.py`. Their existing entry points remain:
 
 ```sh
+bash bench/base64_decode/run.sh
 bash bench/csv_quoted_scan/run.sh
 bash bench/csv_normalization/run.sh
 bash bench/escaped_decode/run.sh
 bash bench/utf8_lossy/run.sh
 ```
 
-The runner accepts only those four probe names, builds the ordinary release
+The runner accepts only those five probe names, builds the ordinary release
 runtime through `scripts/cargo.sh`, links the selected `main.c` with `-O3` and
 the existing macOS/Linux library flags, and passes its CSV output through.
 `CC` selects one compiler executable (default `cc`); `CARGO_TARGET_DIR` selects
 the Cargo target directory (default `target`, relative to the repository).
+Before building, the runner refreshes the runtime source mtime without changing
+its bytes. This requires a writable checkout and forces the static-archive
+producer to run even with a shared target's Fresh fingerprint; a different
+producer's cached archive must not become a measured result.
+
 Empty values use the same defaults. `TMPDIR` follows Python's temporary-directory
 selection. Fixture contents, timing loops, output validation and historical
 measurement data belong to the individual probes and are unchanged.
@@ -33,3 +39,9 @@ in each phase. The fixture's descendant owns a socket: EOF proves actual exit.
 The owner also checks source/archive selection, empty environment defaults and
 scratch removal. Test-only interpreter shims shorten phase budgets without
 adding runtime configuration to the production runner.
+
+The producer owner additionally compiles a tiny real Rust static library,
+replaces its published and fingerprinted archive with another native producer,
+and runs the real build/link/probe sequence again. It verifies the original
+source's result and unchanged source bytes. Removing the mtime refresh makes
+this owner fail at the probe, even though Cargo reports the prior build Fresh.

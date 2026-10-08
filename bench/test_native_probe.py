@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Actual-process owners for native probe wrappers, phases and cleanup."""
 import os
+import importlib.util
+import shlex
 from pathlib import Path
 import shutil
 import signal
@@ -29,6 +31,53 @@ class RunnerOwnership(unittest.TestCase):
                 spawn.assert_not_called()
                 acquire.assert_not_called()
 
+    def test_refreshes_stale_published_runtime_without_changing_source(self):
+        cargo = shutil.which("cargo")
+        cc = shutil.which("cc")
+        ar = shutil.which("ar")
+        self.assertTrue(cargo and cc and ar, "the repository Rust/native toolchain is required")
+        with tempfile.TemporaryDirectory(prefix="align-probe-producer-") as temporary:
+            root = Path(temporary)
+            runtime = root / "crates/align_runtime/src/lib.rs"
+            runtime.parent.mkdir(parents=True)
+            source = '#[unsafe(no_mangle)] pub extern "C" fn producer() -> i32 { 11 }\n'
+            runtime.write_text(source)
+            (root / "Cargo.toml").write_text(
+                '[package]\nname = "align_runtime"\nversion = "0.0.0"\nedition = "2024"\n'
+                '[lib]\npath = "crates/align_runtime/src/lib.rs"\ncrate-type = ["staticlib"]\n')
+            (root / "scripts").mkdir()
+            (root / "scripts/cargo.sh").write_text(f'exec {shlex.quote(cargo)} "$@"\n')
+            directory = root / "bench/base64_decode"
+            directory.mkdir(parents=True)
+            (directory / "main.c").write_text('extern int producer(void); int main(void) { return producer() == 11 ? 0 : 2; }\n')
+            runner = root / "bench/native_probe.py"
+            shutil.copy(HERE / "native_probe.py", runner)
+            spec = importlib.util.spec_from_file_location("owned_producer_probe", runner)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            module.LIMITS = dict.fromkeys(module.LIMITS, 30)
+            previous = Path.cwd()
+            try:
+                os.chdir(root)
+                with patch.dict(os.environ, CARGO_TARGET_DIR=str(root / "target"), CC=cc), \
+                        patch.object(sys, "argv", [str(runner), "base64_decode"]), \
+                        patch.object(module.signal, "signal"):
+                    module.main()
+                    # Simulate another producer occupying the shared top-level archive
+                    # while Cargo's successful fingerprint for this source stays intact.
+                    (root / "other.c").write_text('int producer(void) { return 22; }\n')
+                    module.run_phase("link", [cc, "-c", "other.c", "-o", "other.o"])
+                    module.run_phase("link", [ar, "rcs", "other.a", "other.o"])
+                    archives = [root / "target/release/libalign_runtime.a"]
+                    cached = list((root / "target/release/deps").glob("libalign_runtime-*.a"))
+                    self.assertTrue(cached, "Cargo must publish its fingerprinted archive")
+                    for archive in [*archives, *cached]:
+                        shutil.copyfile(root / "other.a", archive)
+                    module.main()
+                    self.assertEqual(runtime.read_text(), source)
+            finally:
+                os.chdir(previous)
+
     def test_phase_lifecycle(self):
         for benchmark in native_probe.PROBES:
             for phase in ("build", "link", "probe"):
@@ -43,6 +92,9 @@ class RunnerOwnership(unittest.TestCase):
         shutil.copy(HERE / "native_probe.py", root / "bench/native_probe.py")
         shutil.copy(HERE / benchmark / "run.sh", directory / "run.sh")
         (directory / "main.c").touch()
+        runtime = root / "crates/align_runtime/src/lib.rs"
+        runtime.parent.mkdir(parents=True)
+        runtime.write_text("// owned runtime fixture\n")
         scratch = root / "scratch"
         scratch.mkdir()
         marker = root / "leader"

@@ -42,16 +42,17 @@ int main(void) {
         require(output && align_rt_buffer_len(output) == 3, "warmup output");
         align_rt_buffer_free(output);
     }
-    puts("input_bytes,kind,case,trial,calls,output_bytes,ns_per_call");
+    puts("input_bytes,encoded_bytes,kind,case,trial,calls,output_bytes,ns_per_call");
     for (size_t size = 0; size < sizeof(sizes)/sizeof(sizes[0]); ++size) {
         const size_t n = sizes[size];
         unsigned char *raw = malloc(n + 1), *text = malloc((n + 2)/3*4 + 1);
         require(raw && text, "fixture allocation");
         for (size_t i = 0; i < n; ++i) raw[i] = (unsigned char)(i * 73 + 251);
         for (int kind = 0; kind < 2; ++kind) {
-            for (int mode = 0; mode < (n >= 1024 ? 3 : 1); ++mode) {
+            for (int mode = 0; mode < (n >= 1024 ? 4 : 1); ++mode) {
                 size_t length = encode(raw, n, kind, text);
-                if (mode) text[mode == 1 ? 0 : length - 4] = '!';
+                if (mode == 3) memset(text + 1, '=', length - 1);
+                else if (mode) text[mode == 1 ? 0 : length - 4] = '!';
                 void *check = NULL; int status = decoders[kind](text, (int64_t)length, &check);
                 require(status == (mode ? 2 : 0), "oracle status");
                 if (mode) require(check == NULL, "invalid published output");
@@ -65,7 +66,7 @@ int main(void) {
                 size_t repeats = 2 * 1024 * 1024 / (length ? length : 1);
                 if (repeats > 30000) repeats = 30000;
                 if (repeats < 32) repeats = 32;
-                if (mode == 1) repeats = 30000;
+                if (mode == 1 || mode == 3) repeats = 30000;
                 if (mode == 2) repeats = 10000; /* Tail admission can also reject before the loop. */
                 for (int trial = 0; trial < 7; ++trial) {
                     uint64_t calls = 0, bytes = 0, start = now();
@@ -83,7 +84,7 @@ int main(void) {
                     }
                     uint64_t elapsed = now() - start;
                     require(calls == repeats && bytes == (mode ? 0 : repeats*n), "work accounting");
-                    printf("%zu,%d,%d,%d,%llu,%llu,%.2f\n", n, kind, mode, trial,
+                    printf("%zu,%zu,%d,%d,%d,%llu,%llu,%.2f\n", n, length, kind, mode, trial,
                            (unsigned long long)calls, (unsigned long long)bytes, (double)elapsed/calls);
                 }
             }
