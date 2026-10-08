@@ -1,5 +1,8 @@
 # UTF-8 replacement decoding probe
 
+The [shared native probe runner](../native_probe.md) owns build, link, execution
+and cleanup for this probe.
+
 `bash bench/utf8_lossy/run.sh` measures the ordinary release runtime's
 `align_rt_utf8_decode_lossy` entry point, including output allocation, writing
 and free. Fixed independent input/output pairs cover ASCII/NUL, valid multibyte
