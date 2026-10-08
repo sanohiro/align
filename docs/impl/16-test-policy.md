@@ -912,3 +912,21 @@ document the exact owner command that enables them.
 
 Consolidating the existing corpus is useful maintenance, but it must not
 interrupt a product milestone merely to improve a test-count metric.
+
+## Captured-process overflow fixture
+
+The `m11_process_command` overflow owner waits for a descendant's live Unix
+connection before releasing output. It then requires both `Error.Invalid` and
+connection EOF after group cleanup. A wall-clock marker could be written before
+the parent observed overflow, so it could report a failure on a loaded runner
+even when cleanup worked. No production timeout or process contract changes.
+
+| Fixture closure cell | Evidence owner |
+| --- | --- |
+| Descendant exists before overflow | Native child connects, waits for the owner's release byte, and only then acknowledges readiness to its parent through a pipe. |
+| Stdout, stderr and dual-stream overflow | One-byte-over-limit rows require Invalid plus descendant EOF; a delayed-release row retains a live connection across the former 200 ms threshold. |
+| No false clean result when group termination is omitted | Removing the group signal leaves the witnessed connection live and fails the EOF assertion; closing the owner's endpoint still retires the fixture descendant. |
+| Artifact and failure lifetime | Existing exclusive/bounded `owned_fixture` covers compile/link and row execution; a short exclusive socket directory and immediate direct-child guard retire resources on assertion unwind. Inner capture timeout precedes the fixture work deadline and outer owner deadline. |
+
+Only the leaf owner and this verification record change. Existing native capture
+state/error/reap owners and all other process tests retain their scope.
