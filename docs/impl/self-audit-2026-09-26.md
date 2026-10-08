@@ -97,10 +97,11 @@ reopens the caller-field/backing axis above. The revised boundary requires
 producer-owned evidence that each compared generation denotes an owned backing;
 the type of a borrowed view field cannot provide it. The distinct-owned-sibling
 positive owner remains necessary, so a root-wide conservative rejection
-is not a complete repair. An inline fixed-array sibling remains conservative:
-admitting it at this sema seam currently reaches an owned-leaf provenance
-rejection in the MIR producer, so it is outside this correction's proven
-boundary. The review log is bound to `3a759e05`; the correction
+is not a complete repair. This correction left inline fixed-array siblings
+conservative because a local aggregate-construction witness also reached an
+owned-leaf MIR producer refusal. [Plan152](152-owned-fixed-sibling-provenance.md)
+later closes the sema sibling exclusion and qualifies the real imported CUDA
+entry; the independent local aggregate-construction limitation remains. The review log is bound to `3a759e05`; the correction
 and its owner test belong in one coherent fix commit.
 The saved-view and eager-argument witnesses both pass on the reviewed compiler
 before this fix, then fail with the intended invalidated-observation diagnostic.
