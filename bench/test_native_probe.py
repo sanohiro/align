@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Actual-process owners for all CSV benchmark phases and scratch cleanup."""
+"""Actual-process owners for native probe wrappers, phases and cleanup."""
 import os
 from pathlib import Path
 import shutil
@@ -10,24 +10,39 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
+
+import native_probe
 
 
 HERE = Path(__file__).resolve().parent
 
 
 class RunnerOwnership(unittest.TestCase):
-    def test_phase_lifecycle(self):
-        for phase in ("build", "link", "probe"):
-            for ending in ("timeout", "exited-leader", "HUP", "INT", "TERM"):
-                with self.subTest(phase=phase, ending=ending), tempfile.TemporaryDirectory(
-                    prefix="align-csv-owner-"
-                ) as temporary:
-                    self.exercise(Path(temporary), phase, ending)
+    def test_rejects_unknown_probe_before_work(self):
+        for arguments in ([], ["unknown"], ["../utf8_lossy"], ["utf8_lossy", "extra"]):
+            with self.subTest(arguments=arguments), patch.object(sys, "argv", ["probe", *arguments]), \
+                    patch.object(native_probe.subprocess, "Popen") as spawn, \
+                    patch.object(native_probe.tempfile, "mkdtemp") as acquire:
+                with self.assertRaises(SystemExit):
+                    native_probe.main()
+                spawn.assert_not_called()
+                acquire.assert_not_called()
 
-    def exercise(self, root, phase, ending):
-        directory = root / "bench/csv_quoted_scan"
+    def test_phase_lifecycle(self):
+        for benchmark in ("csv_quoted_scan", "escaped_decode", "utf8_lossy"):
+            for phase in ("build", "link", "probe"):
+                for ending in ("timeout", "exited-leader", "HUP", "INT", "TERM"):
+                    with self.subTest(benchmark=benchmark, phase=phase, ending=ending), \
+                            tempfile.TemporaryDirectory(prefix="align-probe-owner-") as temporary:
+                        self.exercise(Path(temporary), benchmark, phase, ending)
+
+    def exercise(self, root, benchmark, phase, ending):
+        directory = root / "bench" / benchmark
         directory.mkdir(parents=True)
-        shutil.copy(HERE / "run.py", directory / "run.py")
+        shutil.copy(HERE / "native_probe.py", root / "bench/native_probe.py")
+        shutil.copy(HERE / benchmark / "run.sh", directory / "run.sh")
+        (directory / "main.c").touch()
         scratch = root / "scratch"
         scratch.mkdir()
         marker = root / "leader"
@@ -38,6 +53,10 @@ class RunnerOwnership(unittest.TestCase):
             "import os, pathlib, signal, socket, sys, time\n"
             "phase = 'link' if '-o' in sys.argv else ('build' if len(sys.argv) > 1 else 'probe')\n"
             "if phase == 'link':\n"
+            "    assert pathlib.Path('bench/' + os.environ['OWNER_BENCH'] + '/main.c').is_file()\n"
+            "    assert 'bench/' + os.environ['OWNER_BENCH'] + '/main.c' in sys.argv\n"
+            "    archives = [pathlib.Path(arg).resolve() for arg in sys.argv if arg.endswith('/libalign_runtime.a')]\n"
+            "    assert archives == [pathlib.Path('target/release/libalign_runtime.a').resolve()]\n"
             "    output = pathlib.Path(sys.argv[sys.argv.index('-o') + 1])\n"
             "    output.write_bytes(pathlib.Path(__file__).read_bytes())\n"
             "    output.chmod(0o700)\n"
@@ -56,21 +75,38 @@ class RunnerOwnership(unittest.TestCase):
             "        os._exit(0)\n"
             "    os.close(writer)\n"
             "    assert os.read(reader, 1) == b'R'\n"
-            "    pathlib.Path(os.environ['OWNER_MARKER']).write_text(str(os.getpid()))\n"
+            "    pathlib.Path(os.environ['OWNER_MARKER']).write_text(str(os.getpgrp()))\n"
             "    if os.environ['OWNER_ENDING'] != 'exited-leader': time.sleep(60)\n"
         )
         helper.chmod(0o700)
         (root / "scripts").mkdir()
-        (root / "scripts/cargo.sh").write_text('exec "$CC" build\n')
-        env = dict(os.environ, CC=str(helper), TMPDIR=str(scratch), OWNER_PHASE=phase,
+        (root / "scripts/cargo.sh").write_text('exec "${CC:-cc}" build\n')
+        (root / "bin").mkdir()
+        (root / "bin/cc").symlink_to(helper)
+        # The real shell wrapper dispatches to this interpreter shim. Only
+        # phase budgets change; argument forwarding and source selection stay real.
+        interpreter = root / "bin/python3"
+        interpreter.write_text(
+            f"#!{sys.executable}\n"
+            "import pathlib, sys\n"
+            "sys.dont_write_bytecode = True\n"
+            "sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'bench'))\n"
+            "import native_probe\n"
+            "native_probe.LIMITS = dict.fromkeys(native_probe.LIMITS, 1)\n"
+            "sys.argv = sys.argv[2:]\n"
+            "native_probe.main()\n"
+        )
+        interpreter.chmod(0o700)
+        env = dict(os.environ, CC="" if ending == "exited-leader" else str(helper),
+                   CARGO_TARGET_DIR="", TMPDIR=str(scratch),
+                   PATH=str(root / "bin") + os.pathsep + os.environ["PATH"],
+                   OWNER_PHASE=phase, OWNER_BENCH=benchmark,
                    OWNER_ENDING=ending, OWNER_SOCKET=str(address), OWNER_MARKER=str(marker))
-        # Exercise the actual runner, shortening only its fixed phase budgets.
-        bootstrap = ("import run; run.LIMITS = dict.fromkeys(run.LIMITS, 1); run.main()")
         with socket.socket(socket.AF_UNIX) as listener:
             listener.bind(str(address))
             listener.listen(1)
             listener.settimeout(4)
-            child = subprocess.Popen([sys.executable, "-B", "-c", bootstrap], cwd=directory,
+            child = subprocess.Popen(["bash", str(directory / "run.sh")], cwd=root,
                                      env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                      start_new_session=True)
             retired = False

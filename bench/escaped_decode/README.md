@@ -1,5 +1,8 @@
 # Percent/form escape lookup measurement
 
+The [shared native probe runner](../native_probe.md) owns build, link, execution
+and cleanup for this probe.
+
 Baseline: `89729abdf48ea8aea4c04534bdc823dc54c20b04`. The candidate reuses the existing hex decode table for both percent-escape decoders; [plan 146](../../docs/impl/146-percent-form-hex-lookup.md) owns its unchanged public contract and acceptance.
 
 Measured on 2026-10-08: Apple M1 macOS and Linux ARM64 Docker on the same host, Rust 1.96.1 ordinary release builds. Each platform links the same C harness at `-O3` to its baseline/candidate runtime archives, without allocation-probe features. Platform runs are sequential and no builds/tests run during timing. These are local decoder-entry measurements, not network/application throughput, RSS or a portable speed promise.
@@ -29,4 +32,4 @@ All observations: [macOS samples](macos-samples.csv), [Linux samples](linux-samp
 bash bench/escaped_decode/run.sh
 ```
 
-For comparison, build the baseline runtime at the commit above and link the same `main.c` against that archive, using the platform flags in `run.sh`. Alternate the two executables in the recorded process order, with no concurrent build/test load. Keep all samples and validate their producer work counts before comparing medians. Timing is not a correctness assertion.
+For comparison, build the baseline runtime at the commit above and link the same `main.c` against that archive, using the platform flags in `bench/native_probe.py`. Alternate the two executables in the recorded process order, with no concurrent build/test load. Keep all samples and validate their producer work counts before comparing medians. Timing is not a correctness assertion.

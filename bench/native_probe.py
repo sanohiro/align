@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Own the local CSV probe's build, link and execution process groups."""
+"""Own the local native runtime probes' build, link and execution process groups."""
 import os
 from pathlib import Path
 import signal
@@ -10,6 +10,7 @@ import tempfile
 import time
 
 
+PROBES = ("csv_quoted_scan", "escaped_decode", "utf8_lossy")
 LIMITS = {"build": 900, "link": 60, "probe": 60}
 pending_signal = 0
 
@@ -44,10 +45,10 @@ def run_phase(phase, argv, *, stdout=None):
                                os.WEXITED | os.WNOHANG | os.WNOWAIT)
             if result is not None and result.si_pid != 0:
                 if result.si_code != os.CLD_EXITED or result.si_status != 0:
-                    raise RuntimeError(f"CSV benchmark {phase} failed: {result}")
+                    raise RuntimeError(f"native probe {phase} failed: {result}")
                 return
             if time.monotonic() >= work_deadline:
-                raise RuntimeError(f"CSV benchmark {phase} exceeded {LIMITS[phase]} seconds")
+                raise RuntimeError(f"native probe {phase} exceeded {LIMITS[phase]} seconds")
             time.sleep(0.01)
     finally:
         # The whole group is retired even after a successful leader exit.
@@ -69,20 +70,21 @@ def run_phase(phase, argv, *, stdout=None):
                 os.kill(child.pid, signal.SIGKILL)
             child.wait(timeout=max(0, deadline - time.monotonic()))
         except (OSError, subprocess.SubprocessError) as error:
-            raise CleanupError(f"CSV benchmark {phase} cleanup failed") from error
+            raise CleanupError(f"native probe {phase} cleanup failed") from error
 
 
 def main():
-    if len(sys.argv) != 1:
-        raise SystemExit("usage: bench/csv_quoted_scan/run.sh")
+    if len(sys.argv) != 2 or sys.argv[1] not in PROBES:
+        raise SystemExit("usage: python3 bench/native_probe.py {" + ",".join(PROBES) + "}")
+    benchmark = sys.argv[1]
     for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, record_signal)
     system = os.uname().sysname
     if system not in ("Darwin", "Linux"):
-        raise SystemExit("CSV benchmark supports macOS and Linux")
-    os.chdir(Path(__file__).resolve().parents[2])
+        raise SystemExit("native probe supports macOS and Linux")
+    os.chdir(Path(__file__).resolve().parents[1])
     runtime = Path(os.environ.get("CARGO_TARGET_DIR") or "target") / "release/libalign_runtime.a"
-    scratch = tempfile.mkdtemp(prefix="align-csv-quoted-")
+    scratch = tempfile.mkdtemp(prefix=f"align-{benchmark}-")
     cleanup_safe = True
     try:
         run_phase("build", ["bash", "scripts/cargo.sh", "build", "-p", "align_runtime",
@@ -91,7 +93,7 @@ def main():
         flags = (["-Wl,-dead_strip"] if system == "Darwin" else
                  ["-Wl,--gc-sections", "-lpthread", "-ldl", "-lm"])
         run_phase("link", [os.environ.get("CC") or "cc", "-O3",
-                           "bench/csv_quoted_scan/main.c", str(runtime), *flags, "-o", probe])
+                           f"bench/{benchmark}/main.c", str(runtime), *flags, "-o", probe])
         run_phase("probe", [probe])
     except CleanupError:
         cleanup_safe = False
