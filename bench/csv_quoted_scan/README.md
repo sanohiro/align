@@ -1,4 +1,4 @@
-# CSV quoted-field discovery probe
+# CSV field discovery probe
 
 The [shared native probe runner](../native_probe.md) owns build, link, execution
 and cleanup for this probe.
@@ -33,11 +33,11 @@ rows accumulate independently and must match the expected work. Fixture creation
 descriptor setup and full-column validation are outside timing. No runtime
 allocation-count feature or test probe participates in timing.
 
-## Local comparison
+## Quoted discovery comparison (plan150)
 
-Baseline: `a0390bf925fa3a0cf6cc367e7e89b5000163ef5f`. Candidate: plan150 in this
-change. Apple M1, macOS 27.0.1 and Linux ARM64 in Docker on the same host, Rust
-1.96.1, ordinary release archives and `cc -O3`. Hosts ran sequentially with no
+Baseline: `a0390bf925fa3a0cf6cc367e7e89b5000163ef5f`. Candidate: plan150. Apple M1,
+macOS 27.0.1 and Linux ARM64 in Docker on the same host, Rust 1.96.1, ordinary
+release archives and `cc -O3`. Hosts ran sequentially with no
 competing builds or tests. Baseline/candidate processes ran in ABBA order;
 all 1736 observations are retained in the two sample CSVs (14 observations per
 arm/case/platform). No outlier is removed. Earlier short-trial exploration
@@ -67,3 +67,43 @@ case decreases by 0.39 us. The 128-row short case increases by 2.9% on macOS
 and decreases by 2.1% on Linux. This is local evidence for long-run discovery,
 not a universal latency, file-I/O throughput, RSS, x86 or consumer-adoption claim.
 There is no timing threshold in correctness tests.
+
+## Unquoted discovery comparison (plan151)
+
+Baseline: `85cfbe72e5287e77cd3ac1bc4a0344add630c102`. Candidate: plan151's
+inlined 16-byte scalar prefix and shared 256-byte bulk-search tail. The same
+unchanged 31-case C harness, runtime entry, descriptors, work checks and timing
+protocol above apply. Apple M1, macOS 27.0.1 and Linux ARM64 Docker on the same
+host, Rust 1.96.1, ordinary release archives and `cc -O3`; hosts ran sequentially
+without competing builds or tests. Each host ran baseline/candidate/candidate/
+baseline, with all 1736 final observations retained in `unquoted-macos-samples.csv`
+and `unquoted-linux-samples.csv` (14 per arm/case/platform). No outlier is removed.
+Earlier function-layout trials used different candidates and are not mixed into
+this final comparison.
+
+Medians in microseconds per complete call:
+
+| Pattern / logical body bytes / rows | macOS baseline | macOS candidate | Linux baseline | Linux candidate |
+| --- | ---: | ---: | ---: | ---: |
+| plain / 0 / 1 | 1.565 | 1.654 | 1.904 | 1.852 |
+| plain / 8 / 1 | 1.661 | 1.678 | 1.933 | 1.901 |
+| plain / 4096 / 1 | 10.761 | 2.255 | 11.106 | 5.178 |
+| plain / 65536 / 1 | 147.490 | 10.928 | 148.288 | 55.159 |
+| quoted / 16 / 1 | 2.447 | 2.057 | 1.951 | 1.734 |
+| escaped / 16 / 1 | 1.898 | 2.149 | 1.681 | 1.926 |
+| quoted / 4096 / 1 | 2.696 | 2.335 | 3.201 | 2.921 |
+| quoted / 65536 / 1 | 5.329 | 5.386 | 23.258 | 23.143 |
+| escaped / 65536 / 1 | 43.810 | 43.165 | 44.998 | 45.035 |
+| dense_quotes / 65536 / 1 | 88.414 | 88.542 | 88.942 | 88.903 |
+| unterminated / 65536 / 1 | 3.772 | 3.754 | 12.504 | 12.504 |
+| quoted / 8 / 128 | 9.205 | 9.295 | 8.973 | 9.005 |
+
+The 65536-byte unquoted case improves by 13.50x on macOS and 2.69x on Linux;
+the 4096-byte case also improves on both. Large quoted, dense-quote and malformed
+controls remain close to baseline. Short one-row values vary even for identical
+input bytes: the sixteen-byte quoted case improves while its byte-identical
+escaped case slows by 13.2% on macOS and 14.6% on Linux. The empty plain case
+also slows by 5.7% on macOS while improving on Linux. These samples therefore
+do not isolate a short-input effect. The 128-row short case changes by +1.0%
+on macOS and +0.4% on Linux. This qualifies local long-unquoted discovery only,
+with no universal latency, file-I/O, RSS, x86 or consumer-adoption claim.

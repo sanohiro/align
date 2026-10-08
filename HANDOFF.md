@@ -33,6 +33,12 @@ outside the active worktree so they do not obstruct unrelated checks or pulls.
 
 ## Next work (handoff updated 2026-10-08)
 
+Plan151 uses bounded bulk searches for long unquoted CSV fields. An inlined
+short prefix and shared search tail preserve original delimiter/error decisions,
+exact spans, callback order and allocation/ownership. Native and whole/per-unit
+application owners qualify the boundary. The existing CSV probe retains local
+macOS/Linux ARM64 long-field improvements and explicit short-case limits.
+
 Plan150 uses existing bulk byte search for long quoted CSV runs, preserving short
 prefixes and the original doubled-quote transition. Native span/error/allocation
 and whole/per-unit application owners qualify unchanged grammar and ownership.

@@ -192,6 +192,33 @@ fn next_quote(input: &[u8]) -> Option<usize> {
     memchr::memchr(b'"', &input[PREFIX..]).map(|index| PREFIX + index)
 }
 
+// Inline short-field discovery; share the bulk loop across parser instantiations.
+#[inline(always)]
+fn next_unquoted_boundary(input: &[u8]) -> Option<usize> {
+    const PREFIX: usize = 16;
+    let head = input.len().min(PREFIX);
+    for (index, &byte) in input[..head].iter().enumerate() {
+        if matches!(byte, b',' | b'\r' | b'\n' | b'"') { return Some(index); }
+    }
+    if input.len() <= PREFIX { return None; }
+    unquoted_boundary_tail(&input[PREFIX..]).map(|index| PREFIX + index)
+}
+
+#[inline(never)]
+fn unquoted_boundary_tail(input: &[u8]) -> Option<usize> {
+    // Bound lookahead when an invalid quote precedes a distant separator (or vice versa).
+    let mut offset = 0;
+    for chunk in input.chunks(256) {
+        let delimiter = memchr::memchr3(b',', b'\r', b'\n', chunk).unwrap_or(chunk.len());
+        if let Some(quote) = memchr::memchr(b'"', &chunk[..delimiter]) {
+            return Some(offset + quote);
+        }
+        if delimiter < chunk.len() { return Some(offset + delimiter); }
+        offset += chunk.len();
+    }
+    None
+}
+
 impl<'a> Parser<'a> {
     fn new(src: &'a [u8], eol: i32) -> Self {
         Self { src, pos: if src.starts_with(&[0xef, 0xbb, 0xbf]) { 3 } else { 0 }, eol }
@@ -259,7 +286,8 @@ impl<'a> Parser<'a> {
                     if self.src[self.pos] == b'"' {
                         return Err(STATUS_INVALID);
                     }
-                    self.pos += 1;
+                    let remaining = &self.src[self.pos..];
+                    self.pos += next_unquoted_boundary(remaining).unwrap_or(remaining.len());
                 }
                 Cell { start, end: self.pos, escaped: false }
             };
@@ -718,6 +746,83 @@ mod tests {
                 input[offset] = b'"';
                 assert_eq!(next_quote(&input), Some(offset));
                 input[offset] = b'x';
+            }
+        }
+    }
+
+    #[test]
+    fn unquoted_search_matches_first_special_byte() {
+        const ALPHABET: [u8; 6] = [b',', b'\r', b'\n', b'"', b'x', 0];
+        let special = |byte: &u8| ALPHABET[..4].contains(byte);
+        for length in 0..=6 {
+            for mut code in 0..6usize.pow(length) {
+                let mut input = vec![0; usize::try_from(length).unwrap()];
+                for byte in &mut input {
+                    *byte = ALPHABET[code % 6];
+                    code /= 6;
+                }
+                assert_eq!(next_unquoted_boundary(&input), input.iter().position(special), "{input:?}");
+            }
+        }
+        let offsets = [0, 1, 15, 16, 17, 255, 256, 271, 272, 273, 511, 512, 65535];
+        let mut input = vec![b'x'; 65536];
+        assert_eq!(next_unquoted_boundary(&input), None);
+        for &left in &offsets {
+            for &first in &ALPHABET[..4] {
+                input[left] = first;
+                assert_eq!(next_unquoted_boundary(&input), Some(left));
+                for &right in offsets.iter().filter(|&&right| right > left) {
+                    for &second in &ALPHABET[..4] {
+                        input[right] = second;
+                        assert_eq!(next_unquoted_boundary(&input), Some(left));
+                    }
+                    input[right] = b'x';
+                }
+                input[left] = b'x';
+            }
+        }
+        for length in [15, 16, 17, 255, 256, 271, 272, 273, 65536] {
+            assert_eq!(next_unquoted_boundary(&input[..length]), None);
+        }
+    }
+
+    #[test]
+    fn unquoted_record_spans_and_refusals_cross_search_boundaries() {
+        for length in [1, 15, 16, 17, 255, 256, 271, 272, 273, 65536] {
+            for eol in [EOL_LF, EOL_CRLF] {
+                let ending = if eol == EOL_LF { b"\n".as_slice() } else { b"\r\n".as_slice() };
+                for suffix in [b"".as_slice(), b",", b",tail", ending] {
+                    let mut input = vec![b'x'; length];
+                    input[length / 2] = 0;
+                    input.extend_from_slice(suffix);
+                    let mut parser = Parser::new(&input, eol);
+                    let mut cells = Vec::new();
+                    let status = parser.record(None, |ordinal, cell| {
+                        cells.push((ordinal, cell.start, cell.end, cell.escaped));
+                        Ok(())
+                    });
+                    let mut expected = vec![(0, 0, length, false)];
+                    if suffix.starts_with(b",") { expected.push((1, length + 1, input.len(), false)); }
+                    assert_eq!(status, Ok(Some(expected.len())));
+                    assert_eq!(cells, expected);
+                    assert_eq!(parser.pos, input.len());
+                    assert_eq!(parser.record(None, |_, _| panic!("no phantom final record")), Ok(None));
+                }
+                let wrong_ending = if eol == EOL_LF { b"\r\n".as_slice() } else { b"\n".as_slice() };
+                for suffix in [b"\"tail\n".as_slice(), b"\r", b"\rx", wrong_ending] {
+                    let mut input = vec![b'x'; length];
+                    input.extend_from_slice(suffix);
+                    let mut parser = Parser::new(&input, eol);
+                    assert_eq!(parser.record(None, |_, _| panic!("invalid field must not be visited")), Err(STATUS_INVALID));
+                    assert_eq!(parser.pos, length);
+                    let mut limited = Parser::new(&input, eol);
+                    assert_eq!(limited.record(Some((0, STATUS_LIMIT)), |_, _| panic!("limit precedes discovery")), Err(STATUS_LIMIT));
+                    assert_eq!(limited.pos, 0);
+                }
+                let input = vec![b'x'; length];
+                let mut malformed = Parser::new(&input, -1);
+                assert_eq!(malformed.record(None, |_, _| panic!("bad mode precedes discovery")), Err(STATUS_INVALID));
+                assert_eq!(malformed.pos, 0);
             }
         }
     }
