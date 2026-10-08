@@ -15,6 +15,8 @@
 // here. `pub use` re-exports `safe_slice` (used by `str_cmp`/`str_contains`/… below) and the four
 // `align_rt_str_*` symbols.
 mod buffer_storage;
+#[cfg(all(test, feature = "alloc-count"))]
+mod allocation_test;
 #[cfg(test)]
 mod buffer_self_append_tests;
 #[cfg(test)]
@@ -30318,14 +30320,14 @@ mod tests {
 
     // --- file (offset-addressed read/write, A4) ------------------------------------------------
 
-    struct FileFixtureDir(std::path::PathBuf);
+    pub(super) struct FileFixtureDir(pub(super) std::path::PathBuf);
     impl FileFixtureDir {
         fn acquire(path: std::path::PathBuf) -> std::io::Result<Self> {
             use std::os::unix::fs::DirBuilderExt;
             std::fs::DirBuilder::new().mode(0o700).create(&path)?;
             Ok(Self(path))
         }
-        fn new(tag: &str) -> Self {
+        pub(super) fn new(tag: &str) -> Self {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let nonce = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Self::acquire(std::env::temp_dir().join(format!("align-rt-file-{}-{tag}-{nonce}", std::process::id())))
@@ -35680,17 +35682,10 @@ mod tests {
         unsafe { align_rt_free(arr_ptr as *mut u8) };
     }
 
-    /// Serializes the alloc-count-asserting tests. The `ALLOC_CALLS`/`FREE_CALLS` counters are
-    /// process-global atomics, so two heavy-allocating tests running concurrently pollute each other's
-    /// snapshot deltas. Each such test holds this lock for its whole body (the `GET_MANY_SERVER_LOCK`
-    /// precedent), making the count assertions deterministic regardless of `--test-threads`.
-    #[cfg(feature = "alloc-count")]
-    pub(super) static ALLOC_COUNT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[cfg(feature = "alloc-count")]
     #[test]
     fn json_array_field_error_path_frees_buffer() {
-        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_isolated) = crate::allocation_test::enter() else { return; };
         // Memory-safety: when a sibling field fails AFTER an `array<Struct>` field decoded, the
         // partial struct's array buffer must be freed on the `Err` path (the caller doesn't drop a
         // failed decode). Parent { arr: array<Inner> @0, req: i64 @16 } with `req` missing.
@@ -35715,7 +35710,7 @@ mod tests {
     #[cfg(feature = "alloc-count")]
     #[test]
     fn json_owned_string_and_string_array_sibling_failure_free_every_owner() {
-        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(_isolated) = crate::allocation_test::enter() else { return; };
         let (id, argv, required) = (b"id", b"argv", b"required");
         let descriptors = [
             JsonField {
@@ -35774,7 +35769,7 @@ mod tests {
     #[cfg(feature = "alloc-count")]
     #[test]
     fn json_owned_string_array_mid_element_failure_frees_staging_payloads() {
-        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(_isolated) = crate::allocation_test::enter() else { return; };
         let argv = b"argv";
         let descriptors = [JsonField {
             name_ptr: argv.as_ptr(),
@@ -35811,7 +35806,7 @@ mod tests {
     #[cfg(feature = "alloc-count")]
     #[test]
     fn json_owned_recoverable_failure_prefix_matrix_frees_every_live_owner() {
-        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(_isolated) = crate::allocation_test::enter() else { return; };
         let (id, note, argv, count) = (b"id", b"note", b"argv", b"count");
         let descriptors = [
             JsonField {
@@ -35898,7 +35893,7 @@ mod tests {
     #[cfg(feature = "alloc-count")]
     #[test]
     fn json_owned_text_array_success_transition_matrix_drops_elements_then_spine_once() {
-        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(_isolated) = crate::allocation_test::enter() else { return; };
         let (id, note, argv) = (b"id", b"note", b"argv");
         let descriptors = [
             JsonField {
@@ -36070,7 +36065,7 @@ mod tests {
     #[cfg(feature = "alloc-count")]
     #[test]
     fn json_nested_move_struct_array_failure_no_double_free() {
-        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_isolated) = crate::allocation_test::enter() else { return; };
         // Memory-safety: a nested Move struct field (owns an `array<Struct>`) whose OWN decode fails
         // after the array allocated must not be freed twice — once by its parse_object cleanup and
         // again by the outer struct's cleanup. `drop_decoded_owned` nulls the slot after freeing, so
@@ -36104,7 +36099,7 @@ mod tests {
     #[cfg(feature = "alloc-count")]
     #[test]
     fn json_union_array_arm_trailing_garbage_frees_buffer() {
-        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_isolated) = crate::allocation_test::enter() else { return; };
         // Memory-safety (J2b): a top-level union whose live variant is an owned `array<Struct>`
         // materializes the AoS into the enum, but trailing garbage then fails the decode. The caller
         // has no bound value to drop on that `Err`, so `drop_decoded_union` must free the AoS — else it
@@ -36136,7 +36131,7 @@ mod tests {
     #[cfg(feature = "alloc-count")]
     #[test]
     fn json_scalar_array_field_sibling_failure_frees_buffer() {
-        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_isolated) = crate::allocation_test::enter() else { return; };
         // Memory-safety (T1b): an `array<scalar>` field (kind 7) decoded, then a required sibling field
         // fails the outer decode. `drop_decoded_owned`'s kind-7 arm must free the owned scalar buffer on
         // the `Err` path (the caller drops nothing on a failed decode) — else it leaks.
@@ -36161,7 +36156,7 @@ mod tests {
     #[cfg(feature = "alloc-count")]
     #[test]
     fn json_array_of_move_struct_sibling_failure_deep_frees_every_element() {
-        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_isolated) = crate::allocation_test::enter() else { return; };
         // Memory-safety (J3b): an `array<Move-struct>` field (`Chat { messages: array<Message> }`,
         // where each `Message` itself owns an `array<Part>`) decoded successfully, but a later sibling
         // field then fails the outer decode. `drop_decoded_owned`'s kind-5 arm must **deep-free** each
@@ -36194,7 +36189,7 @@ mod tests {
     #[cfg(feature = "alloc-count")]
     #[test]
     fn json_array_of_move_struct_mid_array_failure_frees_prior_elements() {
-        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_isolated) = crate::allocation_test::enter() else { return; };
         // Memory-safety (J3b): a malformed element PART-WAY through an `array<Move-struct>` must free the
         // owned buffers of the elements already decoded — `decode_struct_array_value`'s `cleanup_partial`
         // deep-frees `buf[0..count]` before bailing (the current failing element is cleaned by
@@ -36221,7 +36216,7 @@ mod tests {
     #[cfg(feature = "alloc-count")]
     #[test]
     fn json_decoded_optional_owner_failure_matrix() {
-        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_isolated) = crate::allocation_test::enter() else { return; };
         // Parent { meta: Option<Inner> @0/tag 0, tail: i64 @24 }; Inner { xs: array<i64> @0 }.
         // The optional payload becomes Some only after its nested object succeeds. A later parent
         // failure must then release the nested array and clear both the Option tag and payload.
@@ -36297,7 +36292,7 @@ mod tests {
     #[cfg(feature = "alloc-count")]
     #[test]
     fn json_decoded_owner_single_record_trailing_input() {
-        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_isolated) = crate::allocation_test::enter() else { return; };
         // A required owned field can be fully decoded before the entrypoint's final trailing-input
         // check rejects the document. That check is outside parse_object, so the entrypoint must run
         // the idempotent whole-record cleanup itself.
@@ -36353,7 +36348,7 @@ mod tests {
     #[cfg(feature = "alloc-count")]
     #[test]
     fn json_decoded_owner_speculation_transition_matrix() {
-        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_isolated) = crate::allocation_test::enter() else { return; };
         // The first record learns [arr, req]. The second record writes a fresh `arr` during
         // speculation, then its key mismatch forces fallback; fallback writes `arr` again and then
         // fails because `req` is absent. Both the speculative owner and fallback owner must be freed.
@@ -36471,7 +36466,7 @@ mod tests {
     #[cfg(feature = "alloc-count")]
     #[test]
     fn json_decoded_owner_aos_slow_failure_matrix() {
-        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_isolated) = crate::allocation_test::enter() else { return; };
         // These cases exercise a completed row plus a current partial row across malformed element,
         // missing top-level delimiter, and trailing-input failures. Staging bytes are not owners; all
         // nested arrays must be deep-cleaned before the staging Vec is dropped.
@@ -38134,10 +38129,9 @@ mod tests {
     #[test]
     #[cfg(all(feature = "alloc-count", any(target_os = "linux", target_os = "macos")))]
     fn fs_private_temp_allocates_output_before_mutation_and_frees_it_on_failure() {
-        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        let root = tmp_path("private-temp-allocation-order");
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir(&root).unwrap();
+        let Some(_isolated) = crate::allocation_test::enter() else { return; };
+        let fixture = FileFixtureDir::new("private-temp-allocation-order");
+        let root = std::fs::canonicalize(&fixture.0).unwrap();
         let root_bytes = root.to_str().unwrap().as_bytes().to_vec();
         let prefix = b"align_alloc_order";
         let (alloc_before, free_before) = (align_rt_alloc_count(), align_rt_free_count());
@@ -38156,7 +38150,6 @@ mod tests {
         assert_eq!(align_rt_alloc_count() - alloc_before, 1);
         assert_eq!(align_rt_free_count() - free_before, 1);
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
-        std::fs::remove_dir(root).unwrap();
     }
 
     #[test]
@@ -53387,9 +53380,7 @@ mod regex_tests {
     #[cfg(feature = "alloc-count")]
     #[test]
     fn template_html_shell_and_payload_allocation_counts_are_exact() {
-        let _serial = super::tests::ALLOC_COUNT_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let Some(_isolated) = crate::allocation_test::enter() else { return; };
         align_rt_requested_live_reset();
         let free_before = align_rt_free_count();
         let shell_alloc_before =
@@ -53599,7 +53590,7 @@ mod r63_tests {
     #[test]
     #[cfg(feature = "alloc-count")]
     fn r63_decode_failure_allocation_parity() {
-        let _guard = crate::tests::ALLOC_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_isolated) = crate::allocation_test::enter() else { return; };
         for width in [4_i32, 8] {
             let fields = [
                 JsonField { name_ptr: b"text".as_ptr(), name_len: 4, tag: (8 << 8) | 16, offset: 0, sub: core::ptr::null(), opt_tag: -1 },

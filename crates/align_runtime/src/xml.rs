@@ -1936,6 +1936,7 @@ mod tests {
     #[cfg(feature = "alloc-count")]
     #[test]
     fn allocation_ownership_is_exact_for_parse_getters_and_drop() {
+        let Some(_isolated) = crate::allocation_test::enter() else { return; };
         unsafe {
             let alloc_before = super::super::align_rt_alloc_count();
             let free_before = super::super::align_rt_free_count();
