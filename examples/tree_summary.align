@@ -2,6 +2,7 @@ module main
 
 import std.cli
 import std.fs
+import std.io
 
 // Read-only, byte-name traversal. Limits include the root; no full-tree array is built.
 // Symlinks and special entries are counted but never opened. Logical sizes count each name,
@@ -64,7 +65,10 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   command.flag_bool("help")
   parsed := command.parse(args)?
   if parsed.get_bool("help") {
-    print(command.usage())
+    usage := command.usage()
+    help_output := io.stdout
+    help_output.write(usage)?
+    help_output.write("\n")?
     return Ok(())
   }
   depth := parsed.get_i64("max-depth")
@@ -75,17 +79,8 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   directory := fs.open_directory(parsed.get_str("root"))?
   initial := Counts { entries: 1, directories: 1, regular_files: 0, symlinks: 0, other: 0, logical_bytes: 0 }
   counts := walk(directory, depth, entries, initial)?
-  print("entries")
-  print(counts.entries)
-  print("directories")
-  print(counts.directories)
-  print("regular_files")
-  print(counts.regular_files)
-  print("symlinks")
-  print(counts.symlinks)
-  print("other")
-  print(counts.other)
-  print("logical_bytes")
-  print(counts.logical_bytes)
+  report := template "entries\n{counts.entries}\ndirectories\n{counts.directories}\nregular_files\n{counts.regular_files}\nsymlinks\n{counts.symlinks}\nother\n{counts.other}\nlogical_bytes\n{counts.logical_bytes}\n"
+  output := io.stdout
+  output.write(report)?
   return Ok(())
 }

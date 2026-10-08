@@ -94,7 +94,7 @@ the application performs no UTF-8 conversion or whole-body accumulation.
 validated before network I/O. The HTTP timeout applies independently to each
 connect, send and transport receive; it does not bound DNS, stdout writes or
 the total download. A peer making progress can take longer than one timeout.
-Use `--help` separately to print usage. Empty URL, invalid limits and non-200
+Use `--help` separately to print usage; help writes also propagate stdout errors. Empty URL, invalid limits and non-200
 status return `Error.Invalid`; exceeding the body cap is `Error.Code(-1)`. Transport,
 framing, timeout and output errors propagate through `?`.
 
@@ -134,7 +134,7 @@ including comments and control fields. `--timeout-ns` defaults to 30000000000
 and must be positive; configure a longer interval for a quiet producer. The
 existing timeout bounds individual connect/send/transport-receive operations,
 not DNS, stdout writes or total watch duration. CLI limits are validated before
-network I/O, and `--help` reports usage separately. Output-window and body-cap
+network I/O, and `--help` reports usage separately through checked stdout writes. Output-window and body-cap
 refusals remain Code(-1); SSE source-work overflow is Invalid, with the body cap
 taking precedence at the same source boundary. Other transport, parser, timeout
 and output errors propagate. A late failure may leave a stdout prefix.
@@ -241,7 +241,8 @@ selection, an input byte cap and checked stdout writes:
 
 An omitted or empty `--file` reads stdin. `--max-input-bytes` defaults to 1 GiB
 and accepts 0..2305843009213693951; zero admits only empty input. Parsing and cap
-validation precede opening a file or reading stdin. Use `--help` for usage.
+validation precede opening a file or reading stdin. Use `--help` for usage;
+help writes also propagate stdout errors.
 The example reuses one 64 KiB window and emits one lowercase 64-character digest
 plus newline only after EOF. A cap violation returns `Error.Code(-1)` before
 updating the digest, but the read may already have consumed one window past the

@@ -13,7 +13,10 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   command.flag_bool("help")
   parsed := command.parse(args)?
   if parsed.get_bool("help") {
-    print(command.usage())
+    usage := command.usage()
+    help_output := io.stdout
+    help_output.write(usage)?
+    help_output.write("\n")?
     return Ok(())
   }
   url := parsed.get_str("url")

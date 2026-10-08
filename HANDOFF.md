@@ -34,6 +34,12 @@ outside the active worktree so they do not obstruct unrelated checks or pulls.
 
 ## Next work (handoff updated 2026-10-08)
 
+Plan157 checks stdout delivery for tree summaries, io.copy counts and the tree,
+digest, HTTP/SSE and CSV examples' help output. Native write errors propagate
+while successful bytes, admission order and completed file side effects remain.
+Actual-source owners pass on macOS/Linux ARM64, including whole/per-unit tree
+and CSV execution; builtin print and library contracts are unchanged.
+
 Plan156 counts percent/form expansion bytes before one checked final size
 calculation. Exact output, allocation and ownership remain unchanged. Native
 counter/writer and source owners pass on macOS/Linux ARM64; the expanded bounded

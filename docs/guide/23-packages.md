@@ -153,7 +153,7 @@ score-sum=5
 
 `--file` is required. The byte cap defaults to 8388608 and accepts 0..67108864;
 the data-row cap defaults to 100000 and accepts 0..1000000. LF is the default;
-`--crlf` explicitly selects CRLF. `--help` prints usage. Active scores are widened
+`--crlf` explicitly selects CRLF. `--help` prints usage with checked stdout writes. Active scores are widened
 to i64 before summing, so every admitted i32 score fits the aggregate bound.
 
 The application reserves the byte cap and a separate 64KiB read window with

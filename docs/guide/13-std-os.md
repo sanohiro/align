@@ -107,8 +107,9 @@ alignc run examples/tree_summary.align -- --root assets --max-depth 16 --max-ent
 It counts the root and every observed entry, classifies directories, regular
 files, symlinks and other entries, and sums regular-file logical sizes. Symlinks
 and special entries are counted without opening them; hard-linked names count
-separately. The explicit depth and entry limits reject excess work, and failures
-print no partial summary. Names are processed one at a time rather than collected
+separately. The explicit depth and entry limits reject excess work. Admission or
+traversal errors produce no summary. Summary and help writes propagate stdout
+errors; a write failure may leave a prefix. Names are processed one at a time rather than collected
 into a full-tree array. Native operations can still block; limits are not deadlines.
 Concurrent mutation can change observations or cause an error, so the summary is
 not a filesystem snapshot or a disk-usage measurement.

@@ -167,6 +167,29 @@ fn actual_copy_examples_preserve_occupied_destinations_and_complete_binary_outpu
             assert_eq!(output.stdout, if name == "io_copy" { format!("{size}\n").into_bytes() } else { Vec::new() });
             std::fs::remove_file(&destination).unwrap();
         }
+        if name == "io_copy" {
+            let readonly = std::fs::File::open(&source).unwrap();
+            let fd = readonly.as_raw_fd();
+            let mut command = Command::new(&exe);
+            command.arg(&source).arg(&destination);
+            // SAFETY: the parent keeps this read-only descriptor live until the guarded
+            // child exits. dup2 is async-signal-safe and changes only the child's stdout.
+            unsafe { command.pre_exec(move || {
+                if libc::dup2(fd, libc::STDOUT_FILENO) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            }); }
+            let output = run(&mut command);
+            assert_error(&output, libc::EBADF);
+            let data = std::fs::read(&source).unwrap();
+            let mut expected = data.clone();
+            expected.push(b'\n');
+            assert_eq!(std::fs::read(&destination).unwrap(), expected,
+                "count failure keeps the completed copy");
+            assert_eq!(data, (0..2 * 65536 + 19).map(|index| (index % 256) as u8).collect::<Vec<_>>());
+            std::fs::remove_file(&destination).unwrap();
+        }
         let original = b"input must survive\0\xff\n";
         std::fs::write(&source, original).unwrap();
         for kind in ["file", "same", "hardlink", "symlink", "dangling", "directory"] {
