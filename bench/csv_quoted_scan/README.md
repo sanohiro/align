@@ -7,6 +7,13 @@ output validation and arena teardown. The schema matches the summary app's
 text. Every successful row must decode to true and 7. Header-present LF input,
 native descriptor tags and the canonical hash entry point use the existing ABI.
 
+The Python 3 runner owns a separate process group for each phase, with fixed
+15-minute build, 60-second link and 60-second probe limits. HUP, INT, TERM,
+phase failure and timeout retire the group and reap its leader before scratch
+cleanup. A failed cleanup preserves scratch. The lifecycle owner
+`python3 -B bench/csv_quoted_scan/test_run.py` covers all three phases with a
+stalled command, a surviving descendant after leader exit and each signal.
+
 The corpus has 31 cases: five body patterns at 0, 8, 16, 64, 4096 and 65536
 logical body bytes, each with one row, plus 128 rows of eight-byte quoted bodies.
 `plain` is unquoted; `quoted` contains ordinary bytes; `escaped` adds one doubled
