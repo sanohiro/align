@@ -459,36 +459,300 @@ pub fn main() -> i32 { 0 }\n";
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn command_capture_overflow_kills_group_and_discards_partial() {
-    if !backend_available() || !std::path::Path::new("/bin/sh").exists() {
-        return;
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        assert!(backend_available(), "overflow owner requires the native backend");
+        // The surviving test owns every artifact; compiler work and native rows have separate
+        // guards, so a slow compiler cannot consume a later row's cleanup budget.
+        let stage_owner = align_driver::ArtifactStage::in_dir(std::path::Path::new("/tmp"), "capture").unwrap();
+        let stage = stage_owner.path();
+        // Only the descendant holds this connection. Its ready pipe prevents output until the
+        // owner has observed the live connection and explicitly released it, independent of load.
+        let c_source = r#"
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <errno.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <string.h>
+static int transfer(int fd, void *bytes, size_t n, int writing) {
+    while (n) {
+        ssize_t done = writing ? write(fd, bytes, n) : read(fd, bytes, n);
+        if (done < 0 && errno == EINTR) continue;
+        if (done <= 0) return 0;
+        bytes = (char *)bytes + done;
+        n -= (size_t)done;
     }
-    let marker = std::env::temp_dir().join(format!(
-        "align-command-overflow-marker-{}-{}",
-        std::process::id(),
-        thin_nonce()
-    ));
-    let _ = std::fs::remove_file(&marker);
-    let script = format!(
-        "(sleep 0.2; printf alive > '{}') & head -c 65537 /dev/zero & head -c 65537 /dev/zero 1>&2 & wait",
-        marker.display()
-    );
-    let src = format!(
-        "import std.process\n\
-pub fn main() -> i32 {{\n\
-  c := process.command(\"/bin/sh\", [\"/bin/sh\", \"-c\", \"{script}\"])\n\
-  c.max_capture_bytes(65536)\n\
-  match c.run() {{\n\
-    Ok(_) => 1,\n\
-    Err(e) => match e {{ Invalid => 42, _ => 2 }},\n\
-  }}\n\
-}}\n"
-    );
-    let out = build_and_run("command-capture-overflow-group", &src);
-    assert_eq!(out.status.code(), Some(42), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    assert!(!marker.exists(), "the overflow path must kill the owned descendant group");
+    return 1;
+}
+int main(int argc, char **argv) {
+    if (argc != 3) return 2;
+    int ready[2];
+    if (pipe(ready)) return 3;
+    pid_t child = fork();
+    if (child < 0) return 4;
+    if (!child) {
+        close(ready[0]);
+        struct sockaddr_un address = {0};
+        address.sun_family = AF_UNIX;
+        if (strlen(argv[1]) >= sizeof(address.sun_path)) _exit(5);
+        strcpy(address.sun_path, argv[1]);
+        int socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (socket_fd < 0 || connect(socket_fd, (void *)&address, sizeof(address))) _exit(6);
+        char token;
+        if (!transfer(socket_fd, &token, 1, 0) || token != 'R') _exit(7);
+        char acknowledgement = 'A';
+        if (!transfer(socket_fd, &acknowledgement, 1, 1)) _exit(8);
+        if (!transfer(ready[1], &token, 1, 1)) _exit(8);
+        close(ready[1]);
+        // Owner closure also releases this child when an assertion deliberately fails.
+        while (read(socket_fd, &token, 1) < 0 && errno == EINTR) {}
+        _exit(0); // Kernel closure is the descendant-exit witness.
+    }
+    close(ready[1]);
+    // A broken fixture cannot outlive the inner capture timeout after its caller disappears.
+    alarm(10);
+    char token;
+    if (!transfer(ready[0], &token, 1, 0)) return 9;
+    close(ready[0]);
+    if (!strcmp(argv[2], "cleanup")) {
+        while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
+        return 0;
+    }
+    char bytes[1024];
+    memset(bytes, 'x', sizeof(bytes));
+    for (int i = 0; i <= 64; i++) {
+        size_t n = i == 64 ? 1 : sizeof(bytes);
+        if (strcmp(argv[2], "stderr") && !transfer(1, bytes, n, 1)) return 10;
+        if (strcmp(argv[2], "stdout") && !transfer(2, bytes, n, 1)) return 11;
+    }
+    while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
+    return 0;
+}
+"#;
+        let c_path = stage.join("overflow.c");
+        let helper = stage.join("overflow");
+        std::fs::write(&c_path, c_source).unwrap();
+        let compiler_log = stage.join("compiler.log");
+        let mut compiler = Command::new(align_driver::CDriver::default().program());
+        compiler.args(["-std=c11", "-Wall", "-Wextra", "-Werror"])
+            .arg(&c_path).arg("-o").arg(&helper).current_dir(stage).env("TMPDIR", stage)
+            .stdout(Stdio::null()).stderr(std::fs::File::create(&compiler_log).unwrap());
+        assert!(CaptureFixtureChild::spawn(&mut compiler, true, false).wait().success(),
+            "{}", std::fs::read_to_string(&compiler_log).unwrap());
+        let source = r#"import std.process
+pub fn main(args: array<str>) -> Result<(), Error> {
+  c := process.command(args[1], [args[1], args[2], args[3]])
+  c.max_capture_bytes(65536)
+  c.timeout_ns(8_000_000_000)
+  match c.run() {
+    Ok(_) => process.exit(1),
+    Err(e) => match e { Invalid => Ok(()), _ => Err(e) },
+  }
+}
+"#;
+        std::fs::write(stage.join("main.align"), source).unwrap();
+        let mut compiler = Command::new(env!("CARGO_BIN_EXE_alignc"));
+        compiler.args(["build", "main.align", "--profile", "dev"])
+            .current_dir(stage).env("ALIGNC_CACHE", "off").env("TMPDIR", stage)
+            .stdout(Stdio::null()).stderr(std::fs::File::create(&compiler_log).unwrap());
+        assert!(CaptureFixtureChild::spawn(&mut compiler, true, false).wait().success(),
+            "{}", std::fs::read_to_string(&compiler_log).unwrap());
+        for stream in ["stdout", "stderr", "both", "cleanup", "compiler-group-cleanup"] {
+            let socket_path = stage.join(stream);
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let compiler_control = stream == "compiler-group-cleanup";
+            let mut command = Command::new(if compiler_control { helper.clone() } else { stage.join("main") });
+            if !compiler_control { command.arg(&helper); }
+            let row_log = stage.join(format!("{stream}.stderr"));
+            command.arg(&socket_path).arg(if compiler_control { "cleanup" } else { stream })
+                .stdout(Stdio::null()).stderr(std::fs::File::create(&row_log).unwrap());
+            let mut child = CaptureFixtureChild::spawn(&mut command, compiler_control, !compiler_control);
+            let (connection, _) = loop {
+                child.tick();
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => {}
+                    Err(error) => panic!("descendant readiness: {error}"),
+                }
+            };
+            let mut endpoint = CaptureFixtureConnection { stream: connection, deadline: child.deadline };
+            let connection = &mut endpoint.stream;
+            connection.set_nonblocking(true).unwrap();
+            let mut byte = [0];
+            assert_eq!(connection.read(&mut byte).unwrap_err().kind(), std::io::ErrorKind::WouldBlock,
+                "descendant must retain the live connection before overflow");
+            if stream == "both" {
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            connection.write_all(b"R").unwrap();
+            loop {
+                child.tick();
+                match connection.read(&mut byte) {
+                    Ok(1) => { assert_eq!(byte, *b"A"); break; }
+                    Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => {}
+                    result => panic!("descendant release acknowledgement: {result:?}"),
+                }
+            }
+            if stream == "cleanup" || compiler_control {
+                // Force assertion-unwind cleanup while both native processes are live. The row
+                // guard must preserve the runtime timeout; the compiler guard owns its group.
+                drop(child);
+            } else {
+                assert_eq!(child.wait().code(), Some(0), "{stream} overflow must return Invalid: {}",
+                    std::fs::read_to_string(&row_log).unwrap());
+            }
+            let eof_deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                std::thread::sleep(Duration::from_millis(2));
+                assert!(Instant::now() < eof_deadline,
+                    "{stream}: the overflow path must close the owned descendant connection");
+                match connection.read(&mut byte) {
+                    Ok(0) => break,
+                    Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => {}
+                    result => panic!("unexpected descendant evidence: {result:?}"),
+                }
+            }
+        }
+        let path = stage.to_path_buf();
+        drop(stage_owner);
+        assert!(!path.exists(), "supervisor must retire every fixture artifact");
+}
+
+#[cfg(unix)]
+struct CaptureFixtureConnection {
+    stream: std::os::unix::net::UnixStream,
+    deadline: std::time::Instant,
+}
+
+#[cfg(unix)]
+impl Drop for CaptureFixtureConnection {
+    fn drop(&mut self) {
+        use std::io::{ErrorKind, Read};
+        use std::time::{Duration, Instant};
+        // Closing only our write half releases the fixture's read while retaining its exit
+        // witness. Observe kernel EOF before the supervisor removes any owned artifact.
+        let _ = self.stream.shutdown(std::net::Shutdown::Write);
+        if self.stream.set_nonblocking(true).is_err() { return; }
+        loop {
+            match self.stream.read(&mut [0]) {
+                Ok(0) => return,
+                Ok(_) => {},
+                Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
+                result => { eprintln!("descendant retirement: {result:?}"); return; }
+            }
+            if Instant::now() >= self.deadline {
+                eprintln!("descendant retirement exceeded fixture deadline");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
+#[cfg(unix)]
+struct CaptureFixtureChild {
+    child: Option<std::process::Child>,
+    deadline: std::time::Instant,
+    group: bool,
+    graceful: bool,
+}
+
+#[cfg(unix)]
+impl CaptureFixtureChild {
+    fn spawn(command: &mut std::process::Command, group: bool, graceful: bool) -> Self {
+        use std::os::unix::process::CommandExt;
+        command.stdin(std::process::Stdio::null());
+        if group { command.process_group(0); }
+        Self {
+            child: Some(command.spawn().unwrap()),
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(if group { 60 } else { 20 }),
+            group,
+            graceful,
+        }
+    }
+    fn tick(&self) {
+        assert!(std::time::Instant::now() + std::time::Duration::from_secs(5) < self.deadline,
+            "overflow fixture exceeded its work deadline");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    fn terminal(&self) -> std::io::Result<bool> {
+        let Some(child) = &self.child else { return Ok(true); };
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // Keep the leader waitable until its entire owned group has been signalled.
+        let result = unsafe { libc::waitid(libc::P_PID, child.id(), &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) };
+        if result == 0 { Ok(unsafe { info.si_pid() } != 0) }
+        else { Err(std::io::Error::last_os_error()) }
+    }
+    fn wait(&mut self) -> std::process::ExitStatus {
+        loop {
+            self.tick();
+            match self.terminal() {
+                Ok(true) => return self.retire().unwrap(),
+                Ok(false) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("overflow fixture wait: {error}"),
+            }
+        }
+    }
+    fn retire(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        use std::time::{Duration, Instant};
+        if self.graceful {
+            // The Align caller owns a distinct native group. Keep it alive long enough for its
+            // eight-second capture timeout to signal that group and reap the C leader.
+            while Instant::now() + Duration::from_secs(3) < self.deadline {
+                match self.terminal() {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        let child = self.child.as_mut().unwrap();
+        if self.group {
+            let pid = i32::try_from(child.id()).unwrap();
+            // WNOWAIT pins this leader, so the group cannot have been recycled before retirement.
+            loop {
+                if unsafe { libc::kill(-pid, libc::SIGKILL) } == 0 { break; }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted || Instant::now() >= self.deadline { break; }
+            }
+        }
+        let _ = child.kill();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => { self.child.take(); return Ok(status); }
+                Ok(None) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+            if Instant::now() >= self.deadline {
+                return Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CaptureFixtureChild {
+    fn drop(&mut self) {
+        if self.child.is_some() {
+            if let Err(error) = self.retire() { eprintln!("overflow fixture retirement: {error}"); }
+        }
+    }
 }
 
 #[test]
