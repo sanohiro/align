@@ -5,8 +5,10 @@
 The owner resumed continuous independent improvements on 2026-10-08 after
 Request135 was repaired and merged. Continue existing-library usability and
 measured execution/storage improvements through PR and merge, then advance to
-the next independent capability. K1/plan61 and the separately parked
-aggregate-provenance experiment remain deferred.
+the next independent capability. The owner reaffirmed that PR/merge is not a
+stopping point: continue improvements and implementation until explicitly asked
+to stop. K1/plan61 and the separately parked aggregate-provenance experiment
+remain deferred.
 
 External align-llm adoption and end-to-end/network measurements remain
 consumer-owned. Request126's
@@ -31,6 +33,12 @@ the parked work is not a prerequisite. Keep its source and evidence archived
 outside the active worktree so they do not obstruct unrelated checks or pulls.
 
 ## Next work (handoff updated 2026-10-08)
+
+Plan155 copies long ordinary prefixes in percent/form decoding in bulk, then
+resumes the existing escape loop. Admission, independent output and exact
+allocation requests remain unchanged. Native and actual query/source owners
+pass on macOS/Linux ARM64; the retained comparison records long-prefix gains,
+small short-input costs and Linux sparse-control limits.
 
 Plan154 rejects excess Base64 padding at the third pad, preserving optional
 padding, canonical tails, Invalid/null publication and output ownership. Native,

@@ -13833,13 +13833,30 @@ fn percent_escape_byte(high: u8, low: u8) -> Option<u8> {
     if hi | lo == 0xff { None } else { Some(hi << 4 | lo) }
 }
 
+/// Use bulk copying only when the initial ordinary run can repay its setup cost.
+#[inline]
+fn escaped_literal_prefix<const FORM: bool>(input: &[u8]) -> usize {
+    const PREFIX: usize = 16;
+    if input.len() < 64 { return 0; }
+    for &byte in &input[..PREFIX] {
+        if byte == b'%' || (FORM && byte == b'+') { return 0; }
+    }
+    let tail = &input[PREFIX..];
+    PREFIX + if FORM {
+        memchr::memchr2(b'%', b'+', tail)
+    } else {
+        memchr::memchr(b'%', tail)
+    }.unwrap_or(tail.len())
+}
+
 /// Decode percent-escapes in `input`. A `%` must be followed by exactly two hex digits, else the
 /// whole input is invalid (`None`); any other byte passes through unchanged. This is the RFC 3986
 /// codec only — it deliberately does NOT map `+` to space, which is the distinct
 /// `application/x-www-form-urlencoded` rule.
 fn percent_decode_impl(input: &[u8]) -> Option<Vec<u8>> {
     let mut v = Vec::with_capacity(input.len());
-    let mut i = 0;
+    let mut i = escaped_literal_prefix::<false>(input);
+    v.extend_from_slice(&input[..i]);
     while i < input.len() {
         if input[i] == b'%' {
             // Need both hex digits in range: indices i+1 and i+2 must exist.
@@ -14288,7 +14305,8 @@ fn form_encode_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
 /// passes through. A `%` not followed by two hex digits invalidates the input (`None`).
 fn form_decode_impl(input: &[u8]) -> Option<Vec<u8>> {
     let mut v = Vec::with_capacity(input.len());
-    let mut i = 0;
+    let mut i = escaped_literal_prefix::<true>(input);
+    v.extend_from_slice(&input[..i]);
     while i < input.len() {
         match input[i] {
             b'+' => {
