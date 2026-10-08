@@ -2,6 +2,8 @@
 //! the transitive non-Send destination-region gate, and the bounded summary application.
 
 mod common;
+#[path = "helpers/owned_fixture.rs"]
+mod owned_fixture;
 use common::*;
 
 fn csv_source() -> &'static str { fixture("apps/csv/pkg/csv.align") }
@@ -295,86 +297,40 @@ fn canonical_source_and_private_empty_module_are_sealed() {
     }
 }
 
-// File-backed streams avoid pipe-pressure deadlocks. The child guard is armed immediately after
-// spawn, and one deadline includes execution, interrupted probes and kill/reap on failure.
-struct CsvExampleChild {
-    child: Option<std::process::Child>,
-    deadline: std::time::Instant,
-}
-impl CsvExampleChild {
-    fn spawn(command: &mut std::process::Command) -> Self {
-        use std::os::unix::process::CommandExt;
-        let child = command
-            .process_group(0)
-            .spawn()
-            .expect("spawn CSV example owner");
-        Self {
-            child: Some(child),
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+// Called only inside owned_fixture::run: its parent owns all scratch and bounds
+// backend discovery, code generation, native linking and generated applications.
+fn build_summary(root: &std::path::Path, source: &str, per_unit: bool) -> std::path::PathBuf {
+    std::fs::create_dir(root).unwrap();
+    for (name, contents) in files(source) {
+        let path = root.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+    let entry = root.join("main.align");
+    let mut sources = SourceMap::new();
+    let programs = if per_unit {
+        let walk = build_per_unit(&mut sources, entry.to_str().unwrap(), source);
+        assert!(!walk.diags.has_errors(), "{}", align_driver::format_diagnostics(&sources, &walk.diags));
+        walk.units.into_iter().map(|unit| unit.mir).collect::<Vec<_>>()
+    } else {
+        let checked = check(&mut sources, entry.to_str().unwrap(), source);
+        assert!(!checked.diags.has_errors(), "{}", align_driver::format_diagnostics(&sources, &checked.diags));
+        vec![lower_to_mir(&checked.hir)]
+    };
+    let mut objects = Vec::new();
+    let mut libraries = Vec::new();
+    for (index, program) in programs.iter().enumerate() {
+        let object = root.join(format!("{index}.o"));
+        emit_object_file(program, &object, BuildTarget::Baseline, Profile::Release, &[], false).unwrap();
+        objects.push(object);
+        for library in &program.link_libs {
+            if !libraries.contains(library) { libraries.push(library.clone()); }
         }
     }
-    fn wait(mut self) -> std::process::ExitStatus {
-        let work_deadline = self.deadline - std::time::Duration::from_secs(5);
-        loop {
-            assert!(
-                std::time::Instant::now() < work_deadline,
-                "CSV example work deadline"
-            );
-            match self.child.as_mut().expect("live owned child").try_wait() {
-                Ok(Some(status)) => {
-                    self.child.take();
-                    return status;
-                }
-                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) => panic!("poll CSV example: {error}"),
-            }
-        }
-    }
-}
-impl Drop for CsvExampleChild {
-    fn drop(&mut self) {
-        let Some(child) = self.child.as_mut() else {
-            return;
-        };
-        if let Ok(pid) = i32::try_from(child.id()) {
-            loop {
-                // SAFETY: the live owned application child leads its fresh process group.
-                if unsafe { libc::kill(-pid, libc::SIGKILL) } == 0 {
-                    break;
-                }
-                let error = std::io::Error::last_os_error();
-                if error.kind() != std::io::ErrorKind::Interrupted
-                    || std::time::Instant::now() >= self.deadline
-                {
-                    break;
-                }
-            }
-        }
-        loop {
-            match child.kill() {
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::Interrupted
-                        && std::time::Instant::now() < self.deadline => {}
-                _ => break,
-            }
-        }
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) => {
-                    eprintln!("CSV example cleanup probe failed: {error}");
-                    break;
-                }
-                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
-            }
-            if std::time::Instant::now() >= self.deadline {
-                eprintln!("CSV example kill/reap deadline exceeded");
-                break;
-            }
-        }
-    }
+    let exe = root.join(format!("summary{}", std::env::consts::EXE_SUFFIX));
+    let refs: Vec<_> = objects.iter().map(|path| path.as_path()).collect();
+    link_objects(&align_driver::CDriver::default(), &refs, &exe, &libraries, Profile::Release).unwrap();
+    exe
 }
 
 fn run_summary(
@@ -397,7 +353,8 @@ fn run_summary(
     command.args(args).current_dir(root)
         .stdin(std::process::Stdio::null()).stdout(stdout)
         .stderr(std::fs::File::create(root.join("stderr")).unwrap());
-    let status = CsvExampleChild::spawn(&mut command).wait();
+    // Inherit the exact-test child's group; its parent also retires native descendants.
+    let status = command.status().expect("run CSV summary");
     assert_eq!(std::fs::read(input).unwrap(), bytes, "input remains unchanged");
     std::process::Output {
         status,
@@ -420,119 +377,119 @@ fn summary_error(output: &std::process::Output, code: i32) {
 
 #[test]
 fn bounded_csv_summary_example_admission_and_output() {
-    assert!(backend_available(), "CSV application owner requires LLVM");
-    let source = fixture("apps/csv/main.align");
-    let project = files(source);
-    let whole = build_exe_multi("csv-summary-whole", &project, "main.align");
-    let units = build_per_unit_multi("csv-summary-units", &project, "main.align");
-    let objects = units.emit_objects(false);
-    let refs: Vec<_> = objects.iter().map(|p| p.as_path()).collect();
-    let unit_exe = units.dir.join(format!("summary{}", std::env::consts::EXE_SUFFIX));
-    link_objects(&align_driver::CDriver::default(), &refs, &unit_exe,
-        &units.link_libs_union(), Profile::Release).unwrap();
-    let stage = align_driver::ArtifactStage::temp("csv-summary-inputs").unwrap();
-    let root = stage.path();
-    let fifo = std::ffi::CString::new(root.join("fifo").as_os_str().as_encoded_bytes()).unwrap();
-    // SAFETY: the owned fixture path is NUL-terminated and names no existing entry.
-    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-    std::os::unix::fs::symlink(root.join("input.csv"), root.join("link.csv")).unwrap();
-    let ordinary = b"active,score\ntrue,7\nfalse,100\ntrue,-2\n";
-    for exe in [&whole.exe, &unit_exe] {
-        let default = ["--file", "input.csv"];
-        summary_ok(&run_summary(exe, root, ordinary, &default, false), 3, 2, 5);
-        summary_ok(&run_summary(exe, root, ordinary, &["--file", "link.csv"], false), 3, 2, 5);
-        summary_ok(&run_summary(exe, root, b"active,score", &default, false), 0, 0, 0);
-        summary_ok(&run_summary(exe, root, b"active,score\n", &["--file", "input.csv", "--max-rows", "0"], false), 0, 0, 0);
-        summary_ok(&run_summary(exe, root,
-            "\u{feff}note,score,active\n\"say \"\"hi\"\"\n世界\",2147483647,true\nx,2147483647,true".as_bytes(),
-            &default, false), 2, 2, 4294967294);
-        summary_ok(&run_summary(exe, root, b"score,active\n-2147483648,true\n-2147483648,true",
-            &default, false), 2, 2, -4294967296);
-        summary_ok(&run_summary(exe, root, b"active,score\r\ntrue,9\r\n",
-            &["--file", "input.csv", "--crlf"], false), 1, 1, 9);
-        summary_ok(&run_summary(exe, root, b"active,score\nfalse,9\n",
-            &["--file", "input.csv", "--max-rows", "1000000"], false), 1, 0, 0);
+    owned_fixture::run("bounded_csv_summary_example_admission_and_output", |root| {
+        assert!(backend_available(), "CSV application owner requires LLVM");
+        let source = fixture("apps/csv/main.align");
+        let whole = build_summary(&root.join("whole"), source, false);
+        let units = build_summary(&root.join("units"), source, true);
+        let inputs = root.join("inputs");
+        std::fs::create_dir(&inputs).unwrap();
+        let root = inputs.as_path();
+        let fifo = std::ffi::CString::new(root.join("fifo").as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: the owned fixture path is NUL-terminated and names no existing entry.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        std::os::unix::fs::symlink(root.join("input.csv"), root.join("link.csv")).unwrap();
+        let ordinary = b"active,score\ntrue,7\nfalse,100\ntrue,-2\n";
+        for exe in [&whole, &units] {
+            let default = ["--file", "input.csv"];
+            summary_ok(&run_summary(exe, root, ordinary, &default, false), 3, 2, 5);
+            summary_ok(&run_summary(exe, root, ordinary, &["--file", "link.csv"], false), 3, 2, 5);
+            summary_ok(&run_summary(exe, root, b"active,score", &default, false), 0, 0, 0);
+            summary_ok(&run_summary(exe, root, b"active,score\n", &["--file", "input.csv", "--max-rows", "0"], false), 0, 0, 0);
+            summary_ok(&run_summary(exe, root,
+                "\u{feff}note,score,active\n\"say \"\"hi\"\"\n世界\",2147483647,true\nx,2147483647,true".as_bytes(),
+                &default, false), 2, 2, 4294967294);
+            summary_ok(&run_summary(exe, root, b"score,active\n-2147483648,true\n-2147483648,true",
+                &default, false), 2, 2, -4294967296);
+            summary_ok(&run_summary(exe, root, b"active,score\r\ntrue,9\r\n",
+                &["--file", "input.csv", "--crlf"], false), 1, 1, 9);
+            summary_ok(&run_summary(exe, root, b"active,score\nfalse,9\n",
+                &["--file", "input.csv", "--max-rows", "1000000"], false), 1, 0, 0);
 
-        let byte_count = ordinary.len().to_string();
-        summary_ok(&run_summary(exe, root, ordinary,
-            &["--file", "input.csv", "--max-input-bytes", &byte_count, "--max-rows", "3"], false), 3, 2, 5);
-        let too_short = (ordinary.len() - 1).to_string();
-        summary_error(&run_summary(exe, root, ordinary,
-            &["--file", "input.csv", "--max-input-bytes", &too_short], false), -1);
-        for row_cap in ["0", "2"] {
+            let byte_count = ordinary.len().to_string();
+            summary_ok(&run_summary(exe, root, ordinary,
+                &["--file", "input.csv", "--max-input-bytes", &byte_count, "--max-rows", "3"], false), 3, 2, 5);
+            let too_short = (ordinary.len() - 1).to_string();
             summary_error(&run_summary(exe, root, ordinary,
-                &["--file", "input.csv", "--max-rows", row_cap], false), -1);
-        }
-        summary_error(&run_summary(exe, root, b"x",
-            &["--file", "input.csv", "--max-input-bytes", "0"], false), -1);
-        summary_error(&run_summary(exe, root, b"",
-            &["--file", "input.csv", "--max-input-bytes", "0"], false), 2);
+                &["--file", "input.csv", "--max-input-bytes", &too_short], false), -1);
+            for row_cap in ["0", "2"] {
+                summary_error(&run_summary(exe, root, ordinary,
+                    &["--file", "input.csv", "--max-rows", row_cap], false), -1);
+            }
+            summary_error(&run_summary(exe, root, b"x",
+                &["--file", "input.csv", "--max-input-bytes", "0"], false), -1);
+            summary_error(&run_summary(exe, root, b"",
+                &["--file", "input.csv", "--max-input-bytes", "0"], false), 2);
 
-        // UTF-8, quoted records and EOF independently straddle the fixed read window.
-        for size in [65535, 65536, 65537, 131091] {
-            let mut input = b"active,score,note\ntrue,1,\"".to_vec();
-            input.resize(size - 1, b'x');
-            input.push(b'"');
-            let maximum = size.to_string();
-            summary_ok(&run_summary(exe, root, &input,
-                &["--file", "input.csv", "--max-input-bytes", &maximum], false), 1, 1, 1);
-        }
-        let mut split = b"active,score,note\ntrue,1,\"".to_vec();
-        split.resize(65535, b'x');
-        split.extend_from_slice("é\n\"\"quoted\"\"\"".as_bytes());
-        summary_ok(&run_summary(exe, root, &split, &default, false), 1, 1, 1);
+            // UTF-8, quoted records and EOF independently straddle the fixed read window.
+            for size in [65535, 65536, 65537, 131091] {
+                let mut input = b"active,score,note\ntrue,1,\"".to_vec();
+                input.resize(size - 1, b'x');
+                input.push(b'"');
+                let maximum = size.to_string();
+                summary_ok(&run_summary(exe, root, &input,
+                    &["--file", "input.csv", "--max-input-bytes", &maximum], false), 1, 1, 1);
+            }
+            let mut split = b"active,score,note\ntrue,1,\"".to_vec();
+            split.resize(65535, b'x');
+            split.extend_from_slice("é\n\"\"quoted\"\"\"".as_bytes());
+            summary_ok(&run_summary(exe, root, &split, &default, false), 1, 1, 1);
 
-        for bad in [
-            b"".as_slice(), b"active\ntrue", b"active,active,score\ntrue,false,1",
-            b"active,score\ntrue,1,extra", b"active,score\ntrue", b"active,score\nTRUE,1",
-            b"active,score\ntrue,2147483648", b"active,score\ntrue,-2147483649",
-            b"active,score\ntrue,1\ntrue,no", b"active,score,note\ntrue,1,\"unclosed",
-            b"active,score,note\ntrue,1,\"closed\"x", b"active,score\r\ntrue,1\r\n",
-            b"active,score,note\ntrue,1,\xff", b"active,score,note\ntrue,1,\xc3",
-        ] {
-            summary_error(&run_summary(exe, root, bad, &default, false), 2);
-        }
-        summary_error(&run_summary(exe, root, ordinary,
-            &["--file", "input.csv", "--crlf"], false), 2);
+            for bad in [
+                b"".as_slice(), b"active\ntrue", b"active,active,score\ntrue,false,1",
+                b"active,score\ntrue,1,extra", b"active,score\ntrue", b"active,score\nTRUE,1",
+                b"active,score\ntrue,2147483648", b"active,score\ntrue,-2147483649",
+                b"active,score\ntrue,1\ntrue,no", b"active,score,note\ntrue,1,\"unclosed",
+                b"active,score,note\ntrue,1,\"closed\"x", b"active,score\r\ntrue,1\r\n",
+                b"active,score,note\ntrue,1,\xff", b"active,score,note\ntrue,1,\xc3",
+            ] {
+                summary_error(&run_summary(exe, root, bad, &default, false), 2);
+            }
+            summary_error(&run_summary(exe, root, ordinary,
+                &["--file", "input.csv", "--crlf"], false), 2);
 
-        for args in [
-            vec![], vec!["--file", ""], vec!["--unknown"], vec!["--file"],
-            vec!["--file", "missing", "--max-input-bytes", "-1"],
-            vec!["--file", "missing", "--max-input-bytes", "67108865"],
-            vec!["--file", "missing", "--max-rows", "-1"],
-            vec!["--file", "missing", "--max-rows", "1000001"],
-            vec!["--file", "fifo", "--max-rows", "nan"],
-            vec!["--file", "fifo"], vec!["--file", "."],
-        ] {
-            summary_error(&run_summary(exe, root, ordinary, &args, false), 2);
+            for args in [
+                vec![], vec!["--file", ""], vec!["--unknown"], vec!["--file"],
+                vec!["--file", "missing", "--max-input-bytes", "-1"],
+                vec!["--file", "missing", "--max-input-bytes", "67108865"],
+                vec!["--file", "missing", "--max-rows", "-1"],
+                vec!["--file", "missing", "--max-rows", "1000001"],
+                vec!["--file", "fifo", "--max-rows", "nan"],
+                vec!["--file", "fifo"], vec!["--file", "."],
+            ] {
+                summary_error(&run_summary(exe, root, ordinary, &args, false), 2);
+            }
+            summary_error(&run_summary(exe, root, ordinary, &["--file", "missing"], false), 1);
+            summary_error(&run_summary(exe, root, ordinary,
+                &["--file", "missing", "--max-input-bytes", "67108864"], false), 1);
+            let help = run_summary(exe, root, ordinary, &["--help"], false);
+            assert_eq!(help.status.code(), Some(0), "{help:?}");
+            assert!(help.stderr.is_empty(), "{help:?}");
+            let usage = String::from_utf8(help.stdout).unwrap();
+            for flag in ["file", "max-input-bytes", "max-rows", "crlf", "help"] {
+                assert!(usage.contains(flag), "{usage}");
+            }
+            summary_error(&run_summary(exe, root, ordinary, &default, true), libc::EBADF);
         }
-        summary_error(&run_summary(exe, root, ordinary, &["--file", "missing"], false), 1);
-        summary_error(&run_summary(exe, root, ordinary,
-            &["--file", "missing", "--max-input-bytes", "67108864"], false), 1);
-        let help = run_summary(exe, root, ordinary, &["--help"], false);
-        assert_eq!(help.status.code(), Some(0), "{help:?}");
-        assert!(help.stderr.is_empty(), "{help:?}");
-        let usage = String::from_utf8(help.stdout).unwrap();
-        for flag in ["file", "max-input-bytes", "max-rows", "crlf", "help"] {
-            assert!(usage.contains(flag), "{usage}");
-        }
-        summary_error(&run_summary(exe, root, ordinary, &default, true), libc::EBADF);
-    }
+    });
 }
 
 #[test]
 fn bounded_csv_summary_example_propagates_buffer_refusal() {
-    assert!(backend_available(), "CSV application owner requires LLVM");
-    let source = fixture("apps/csv/main.align");
-    let stage = align_driver::ArtifactStage::temp("csv-summary-refused").unwrap();
-    for call in ["buffer.try_new(maximum)", "buffer.try_new(65536)"] {
-        assert_eq!(source.matches(call).count(), 1);
-        let refused = format!("{}\nfn refused_buffer() -> Result<buffer, Error> = Err(Error.Code(12))\n",
-            source.replace(call, "refused_buffer()"));
-        let exe = build_exe_multi("csv-summary-refused", &files(&refused), "main.align");
-        for bytes in [b"".as_slice(), b"active,score\ntrue,1"] {
-            summary_error(&run_summary(&exe.exe, stage.path(), bytes,
-                &["--file", "input.csv"], false), 12);
+    owned_fixture::run("bounded_csv_summary_example_propagates_buffer_refusal", |root| {
+        assert!(backend_available(), "CSV application owner requires LLVM");
+        let source = fixture("apps/csv/main.align");
+        let inputs = root.join("inputs");
+        std::fs::create_dir(&inputs).unwrap();
+        for (index, call) in ["buffer.try_new(maximum)", "buffer.try_new(65536)"].iter().enumerate() {
+            assert_eq!(source.matches(call).count(), 1);
+            let refused = format!("{}\nfn refused_buffer() -> Result<buffer, Error> = Err(Error.Code(12))\n",
+                source.replace(call, "refused_buffer()"));
+            let exe = build_summary(&root.join(format!("refused-{index}")), &refused, false);
+            for bytes in [b"".as_slice(), b"active,score\ntrue,1"] {
+                summary_error(&run_summary(&exe, &inputs, bytes,
+                    &["--file", "input.csv"], false), 12);
+            }
         }
-    }
+    });
 }

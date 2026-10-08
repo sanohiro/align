@@ -17,7 +17,7 @@ No language, compiler, runtime, package API or ownership strategy changes.
 | Bound and encoding | Maintain `0 <= document.len() <= maximum`; reject a count above `maximum - document.len()` with `Error.Code(-1)` before append. Each admitted chunk is copied once into already reserved storage. Exact cap requires EOF; a rejection can observe one window beyond the cap. Convert the complete document with `bytes().as_str()?` only after EOF, allowing UTF-8 sequences and quoted records across read boundaries. No stable-content, time, RSS or whole-program OOM-recovery promise. |
 | Decode and cleanup | In one named arena call `csv.decode` with `Header.Present`, the explicit line ending and row cap. Map `csv.Error.Invalid` to builtin `Error.Invalid`, `LimitExceeded` to `Error.Code(-1)`. Original open/read/write errors propagate. Existing CSV validation precedes its arena allocation; existing arena OOM policy remains. The primitive-only SoA depends on the arena. Reader, both buffers, CLI owners, report string and arena retain ordinary cleanup on success and early error. |
 | Summary | Emit exactly `rows=N\nactive=N\nscore-sum=N\n`. Count all rows and active rows; widen each active i32 score to i64 before summing. At most 1000000 rows makes the sum representable even for every i32 extremum. Build the small report only after full admission/decode, then write through one bound stdout writer with `?`. Output failure may leave a prefix; input/parse failures emit no summary. |
-| Owner | Extend the existing `pkg_csv` target with actual checked-in application source and canonical package files. Whole/per-unit checks and execution cover ordinary/header-only/reordered/extra-column/BOM/quoted inputs, both line endings, signed extrema, windows and UTF-8 splits, byte and row caps, malformed grammar/UTF-8/schema, CLI validation, regular-file errors, constructor-error propagation and stdout refusal. Reuse the established exclusive ArtifactStage and file-backed child pattern, with one deadline and immediate kill/reap guard. No new shared harness or test binary. |
+| Owner | Extend the existing `pkg_csv` target with actual checked-in application source and canonical package files. Whole/per-unit checks and execution cover ordinary/header-only/reordered/extra-column/BOM/quoted inputs, both line endings, signed extrema, windows and UTF-8 splits, byte and row caps, malformed grammar/UTF-8/schema, CLI validation, regular-file errors, constructor-error propagation and stdout refusal. Reuse `helpers/owned_fixture.rs`: parent-owned exclusive ArtifactStage scratch and one bounded process group cover complete compile/link/run actions, with file-backed streams. Native descendants remain in that group. No new shared harness or test binary. |
 | Documentation | Guide23 English/Japanese links to runnable source, exact CLI/defaults, schema/output and error/limit policy. No duplicate package-design/spec promise. HANDOFF records the capability once after qualification. |
 
 This is one application composition, not a new streaming CSV parser. Existing
@@ -28,7 +28,7 @@ generic, lifetime and ABI coverage. No performance claim or benchmark is added.
 
 ## Qualification
 
-The existing target's ten tests pass on macOS ARM64 and Linux ARM64.
+The existing target's eleven active tests pass on macOS ARM64 and Linux ARM64.
 `bounded_csv_summary_example_admission_and_output` compiles the unmodified app
 through both whole-program and per-unit paths and applies the same input/error
 matrix to both executables. The signed-extrema cases require sums outside i32;
@@ -43,6 +43,12 @@ that original error with no output for empty and nonempty input. This is source
 composition evidence, not a new allocator failpoint or physical-memory claim.
 The documented CLI build and sample input also produce the exact three output
 lines. English/Japanese command, CSV and output blocks agree.
+
+The reused fixture's `stalled_linker_is_retired_before_scratch` owner supplies the
+stalled-native-operation negative control; its ignored probe runs only through
+that lifecycle owner. Both new application owners use direct compiler APIs within
+the supervised action and parent-owned scratch. They do not invoke the legacy
+predictable-path `common::TempProject` helpers or create nested process groups.
 
 ```text
 scripts/cargo.sh test -p align_driver --test pkg_csv
