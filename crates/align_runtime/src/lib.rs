@@ -22,6 +22,8 @@ mod buffer_self_append_tests;
 #[cfg(test)]
 mod builder_length_tests;
 #[cfg(test)]
+mod sse_storage_tests;
+#[cfg(test)]
 mod http_stream_tests;
 #[cfg(test)]
 mod http_accept_budget_tests;
@@ -17956,6 +17958,7 @@ static FREE_CALLS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64
 std::thread_local! {
     static GLOBAL_ALLOC_CALLS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
     static GLOBAL_ALLOC_BYTES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static GLOBAL_ZEROED_ALLOC_BYTES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
 #[cfg(all(feature = "alloc-count", test))]
@@ -17977,6 +17980,7 @@ unsafe impl std::alloc::GlobalAlloc for CountingGlobalAllocator {
         if !ptr.is_null() {
             let _ = GLOBAL_ALLOC_CALLS.try_with(|count| count.set(count.get().wrapping_add(1)));
             let _ = GLOBAL_ALLOC_BYTES.try_with(|bytes| bytes.set(bytes.get().wrapping_add(layout.size())));
+            let _ = GLOBAL_ZEROED_ALLOC_BYTES.try_with(|bytes| bytes.set(bytes.get().wrapping_add(layout.size())));
         }
         ptr
     }
@@ -18015,6 +18019,12 @@ fn global_alloc_count() -> u64 {
 #[cfg(all(feature = "alloc-count", test))]
 fn global_alloc_bytes() -> usize {
     GLOBAL_ALLOC_BYTES.with(core::cell::Cell::get)
+}
+
+/// Successfully requested zero-filled Rust allocation bytes, not physical writes or RSS.
+#[cfg(all(feature = "alloc-count", test))]
+fn global_zeroed_alloc_bytes() -> usize {
+    GLOBAL_ZEROED_ALLOC_BYTES.with(core::cell::Cell::get)
 }
 
 /// Opt-in requested-live-byte probe used by the `pkg.ws` resource owner. It tracks only allocation
@@ -23596,7 +23606,7 @@ const HTTP_MAX_SSE_METADATA: usize = 262_144;
 /// allocates the requested bound before releasing the old storage so the ledger's simultaneous
 /// old/new high-water claim is directly observable.
 struct HttpSseBytes {
-    storage: Box<[u8]>,
+    storage: Box<[core::mem::MaybeUninit<u8>]>,
     len: usize,
 }
 
@@ -23613,7 +23623,9 @@ impl HttpSseBytes {
     }
 
     fn as_slice(&self) -> &[u8] {
-        &self.storage[..self.len]
+        // SAFETY: push and the two committed-ID writers initialize every byte before publishing
+        // len; growth copies that prefix, and clear only shortens it. No spare byte is observed.
+        unsafe { core::slice::from_raw_parts(self.storage.as_ptr().cast::<u8>(), self.len) }
     }
 
     fn clear(&mut self) {
@@ -23624,8 +23636,8 @@ impl HttpSseBytes {
         if capacity <= self.capacity() {
             return;
         }
-        let mut replacement = vec![0u8; capacity].into_boxed_slice();
-        replacement[..self.len].copy_from_slice(self.as_slice());
+        let mut replacement = Box::<[u8]>::new_uninit_slice(capacity);
+        replacement[..self.len].write_copy_of_slice(self.as_slice());
         self.storage = replacement;
     }
 
@@ -23633,7 +23645,7 @@ impl HttpSseBytes {
         if self.len == self.capacity() {
             return Err(AL_INVALID);
         }
-        self.storage[self.len] = byte;
+        self.storage[self.len].write(byte);
         self.len += 1;
         Ok(())
     }
@@ -23902,12 +23914,7 @@ impl HttpSseState {
         let mut cursor = 0usize;
         http_sse_write_lossy(
             source,
-            // The helper only initializes slots; the retained allocation stays initialized.
-            unsafe {
-                core::slice::from_raw_parts_mut(
-                    self.committed_id.storage.as_mut_ptr().cast(), length,
-                )
-            },
+            &mut self.committed_id.storage[..length],
             &mut cursor,
         )?;
         if cursor != length {
@@ -23922,7 +23929,7 @@ impl HttpSseState {
             self.committed_id
                 .grow_exact(self.id_growth_capacity(source.len(), output_capacity));
         }
-        self.committed_id.storage[..source.len()].copy_from_slice(source);
+        self.committed_id.storage[..source.len()].write_copy_of_slice(source);
         self.committed_id.len = source.len();
     }
 
