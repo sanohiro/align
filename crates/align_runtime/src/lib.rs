@@ -48,6 +48,8 @@ mod encoding_writes_tests;
 #[cfg(test)]
 mod escaped_decode_tests;
 #[cfg(test)]
+mod utf8_lossy_tests;
+#[cfg(test)]
 mod decompression_frames_tests;
 #[cfg(test)]
 mod base64_quantum_tests;
@@ -13706,18 +13708,34 @@ fn utf8_lossy_parts(mut data: &[u8], mut emit: impl FnMut(&[u8])) {
     }
 }
 
+/// Reuse the first validation error for this exact input, then visit its remaining suffix.
+fn utf8_lossy_after_error(data: &[u8], error: core::str::Utf8Error, mut emit: impl FnMut(&[u8])) {
+    let (valid, rest) = data.split_at(error.valid_up_to());
+    emit(valid);
+    emit(b"\xef\xbf\xbd");
+    utf8_lossy_parts(&rest[error.error_len().unwrap_or(rest.len())..], emit);
+}
+
 /// UTF-8 maximal-subpart replacement, returned as independently owned text.
 /// # Safety
 /// ptr/len must describe a valid byte view for this call, as for other encoding transforms.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_utf8_decode_lossy(ptr: *const u8, len: i64) -> AlignStr {
     let data=unsafe { bytes_view(ptr,len) };
-    let mut count=Some(0usize);
-    utf8_lossy_parts(data,|part| { count=count.and_then(|n| n.checked_add(part.len())); });
+    let validated = core::str::from_utf8(data).map(|_| ());
+    let mut count=Some(data.len());
+    if let Err(error) = validated {
+        count=Some(0usize);
+        utf8_lossy_after_error(data,error,|part| { count=count.and_then(|n| n.checked_add(part.len())); });
+    }
     let Some(count)=count.filter(|n| *n <= isize::MAX.unsigned_abs() && i64::try_from(*n).is_ok()) else { align_rt_alloc_size_fail(); };
     unsafe { owned_str_exact(count,|out| {
+        let Err(error) = validated else {
+            for (destination, byte) in out.iter_mut().zip(data) { destination.write(*byte); }
+            return;
+        };
         let mut offset=0;
-        utf8_lossy_parts(data,|part| {
+        utf8_lossy_after_error(data,error,|part| {
             for (destination,byte) in out[offset..][..part.len()].iter_mut().zip(part) { destination.write(*byte); }
             offset+=part.len();
         });

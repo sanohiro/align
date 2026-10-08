@@ -33,6 +33,12 @@ outside the active worktree so they do not obstruct unrelated checks or pulls.
 
 ## Next work (handoff updated 2026-10-08)
 
+Plan147 reuses initial UTF-8 admission in replacement decoding, avoiding a second
+validation for valid input and reusing the first malformed prefix across both
+passes. Exact replacement bytes, independent owned output and payload allocation
+remain unchanged. Native and encoding owners cover the boundary; `bench/utf8_lossy`
+retains macOS/Linux valid-input improvements and control-case limits.
+
 Plan146 reuses the existing hex lookup table for percent/form escape decoding.
 Input grammar, decoded bytes, allocation requests and published read capacity
 remain unchanged. Native admission/allocation and encoding/query owners cover
