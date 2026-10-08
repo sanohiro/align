@@ -34,6 +34,12 @@ outside the active worktree so they do not obstruct unrelated checks or pulls.
 
 ## Next work (handoff updated 2026-10-08)
 
+Plan156 counts percent/form expansion bytes before one checked final size
+calculation. Exact output, allocation and ownership remain unchanged. Native
+counter/writer and source owners pass on macOS/Linux ARM64; the expanded bounded
+probe retains long-input improvements, short-case costs and unchanged HTML
+controls with all observations.
+
 Plan155 copies long ordinary prefixes in percent/form decoding in bulk, then
 resumes the existing escape loop. Admission, independent output and exact
 allocation requests remain unchanged. Native and actual query/source owners

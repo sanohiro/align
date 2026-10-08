@@ -1,6 +1,6 @@
 # Local native runtime probe runner
 
-The Base64, CSV field-discovery/normalization, percent/form escape and UTF-8 replacement probes share
+The Base64, CSV field-discovery/normalization, percent/form escape, escaped-output and UTF-8 replacement probes share
 `bench/native_probe.py`. Their existing entry points remain:
 
 ```sh
@@ -8,10 +8,11 @@ bash bench/base64_decode/run.sh
 bash bench/csv_quoted_scan/run.sh
 bash bench/csv_normalization/run.sh
 bash bench/escaped_decode/run.sh
+bash bench/encoding_writes/run.sh
 bash bench/utf8_lossy/run.sh
 ```
 
-The runner accepts only those five probe names, builds the ordinary release
+The runner accepts only those six probe names, builds the ordinary release
 runtime through `scripts/cargo.sh`, links the selected `main.c` with `-O3` and
 the existing macOS/Linux library flags, and passes its CSV output through.
 `CC` selects one compiler executable (default `cc`); `CARGO_TARGET_DIR` selects
@@ -23,7 +24,7 @@ producer's cached archive must not become a measured result.
 
 Empty values use the same defaults. `TMPDIR` follows Python's temporary-directory
 selection. Fixture contents, timing loops, output validation and historical
-measurement data belong to the individual probes and are unchanged.
+measurement data belong to the individual probes.
 
 Each build, link and probe command owns a new process group. Fixed limits are
 900, 60 and 60 seconds respectively, each reserving its last five seconds for

@@ -13795,11 +13795,10 @@ fn percent_encoded_len(data: &[u8]) -> Option<usize> {
 }
 
 fn percent_encoded_len_with_slash(data: &[u8], preserve_slash: bool) -> Option<usize> {
-    let mut n: usize = 0;
-    for &b in data {
-        n = n.checked_add(if is_unreserved(b) || (preserve_slash && b == b'/') { 1 } else { 3 })?;
-    }
-    Some(n)
+    let escaped = data.iter()
+        .filter(|&&b| !(is_unreserved(b) || (preserve_slash && b == b'/')))
+        .count();
+    data.len().checked_add(escaped.checked_mul(2)?)
 }
 
 /// Write `data` percent-encoded into `out` (exactly [`percent_encoded_len`] bytes). Upper-case hex
@@ -14272,11 +14271,8 @@ pub unsafe extern "C" fn align_rt_template_html_free_v1(builder_ptr: *mut Templa
 /// Encoded length under `application/x-www-form-urlencoded`: identical to percent-encoding except a
 /// space costs 1 byte (`+`) rather than 3.
 fn form_encoded_len(data: &[u8]) -> Option<usize> {
-    let mut n: usize = 0;
-    for &b in data {
-        n = n.checked_add(if is_unreserved(b) || b == b' ' { 1 } else { 3 })?;
-    }
-    Some(n)
+    let escaped = data.iter().filter(|&&b| !(is_unreserved(b) || b == b' ')).count();
+    data.len().checked_add(escaped.checked_mul(2)?)
 }
 
 /// Write `data` form-urlencoded into `out` (exactly [`form_encoded_len`] bytes): space becomes `+`,

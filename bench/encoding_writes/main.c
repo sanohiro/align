@@ -53,31 +53,42 @@ static size_t expected(const unsigned char *input, size_t length, int kind, unsi
     return written;
 }
 int main(void) {
-    const char *seeds[] = {"Alpha09-file_name/path~segment", "<item key=\"日本語\">two words & a/b?</item>'"};
-    const char *names[] = {"plain", "mixed"};
-    size_t sizes[] = {256, 4096, 65536};
+    const char *seeds[] = {"Alpha09-file_name/path~segment", "<item key=\"日本語\">two words & a/b?</item>'", "A", " /+%"};
+    const char *names[] = {"plain", "mixed", "unreserved", "dense"};
+    size_t sizes[] = {0, 1, 8, 64, 4096, 65536};
     Encode encoders[] = {align_rt_percent_encode, align_rt_percent_encode_path, align_rt_html_escape, align_rt_form_encode};
     puts("input,input_bytes,kind,trial,calls,output_bytes,ns_per_call");
-    for (int seed = 0; seed < 2; ++seed) {
+    for (int seed = 0; seed < 4; ++seed) {
         size_t unit = strlen(seeds[seed]);
-        for (int size = 0; size < 3; ++size) {
+        size_t previous_length = SIZE_MAX;
+        for (int size = 0; size < 6; ++size) {
+            if (size == 0 && seed != 0) continue;
             size_t length = ((sizes[size] + unit - 1) / unit) * unit;
-            unsigned char *input = malloc(length), *oracle = malloc(length * 6);
+            if (length == previous_length) continue;
+            previous_length = length;
+            unsigned char *input = malloc(length + 1), *oracle = malloc(length * 6 + 1);
             require(input && oracle, "fixture allocation");
             for (size_t i = 0; i < length; i += unit) memcpy(input + i, seeds[seed], unit);
-            size_t repeats = 4 * 1024 * 1024 / length;
+            size_t repeats = 4 * 1024 * 1024 / (length + 64);
             if (repeats < 64) repeats = 64;
             for (int kind = 0; kind < 4; ++kind) {
                 size_t output_length = expected(input, length, kind, oracle);
                 View check = encoders[kind](input, (int64_t)length);
-                require(check.len == (int64_t)output_length && check.ptr != NULL, "producer extent");
-                require(memcmp(check.ptr, oracle, output_length) == 0, "oracle mismatch");
+                require(check.len == (int64_t)output_length && (check.ptr != NULL) == (output_length != 0), "producer extent");
+                require(!output_length || memcmp(check.ptr, oracle, output_length) == 0, "oracle mismatch");
                 align_rt_free(check.ptr);
+                uint64_t warm_start = now();
+                do {
+                    View output = encoders[kind](input, (int64_t)length);
+                    require(output.len == (int64_t)output_length &&
+                        (output.ptr != NULL) == (output_length != 0), "warm producer extent");
+                    align_rt_free(output.ptr);
+                } while (now() - warm_start < UINT64_C(100000000));
                 for (int trial = 0; trial < 9; ++trial) {
                     uint64_t bytes = 0, calls = 0, start = now();
                     for (size_t call = 0; call < repeats; ++call) {
                         View output = encoders[kind](input, (int64_t)length);
-                        require(output.len == (int64_t)output_length && output.ptr != NULL, "timed producer extent");
+                        require(output.len == (int64_t)output_length && (output.ptr != NULL) == (output_length != 0), "timed producer extent");
                         bytes += (uint64_t)output.len; ++calls;
                         align_rt_free(output.ptr);
                     }
