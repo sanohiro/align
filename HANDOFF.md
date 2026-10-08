@@ -33,6 +33,12 @@ outside the active worktree so they do not obstruct unrelated checks or pulls.
 
 ## Next work (handoff updated 2026-10-08)
 
+Plan149 adds a runnable typed CSV summary in `apps/csv/main.align` through the
+existing package, regular-file reader, CLI and fallible buffers. Explicit byte
+and row caps bound materialization; complete UTF-8/CSV admission precedes checked
+summary output. Whole/per-unit execution, refusal/boundary owners and synchronized
+guides qualify the composition on macOS/Linux without a new library API.
+
 Plan148 adopts `buffer.try_new(...)?` in the file-copy, SHA-256, binary HTTP and
 SSE client examples and synchronized guides. Window allocation errors now retain
 their original code before reading/output (before connecting for SSE), with the

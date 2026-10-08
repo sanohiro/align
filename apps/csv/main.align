@@ -1,0 +1,73 @@
+module main
+
+import pkg.csv
+import std.cli
+import std.fs
+import std.io
+
+Score { active: bool, score: i32 }
+
+fn read_document(input: reader, maximum: i64) -> Result<buffer, Error> {
+  mut document := buffer.try_new(maximum)?
+  mut chunk := buffer.try_new(65536)?
+  loop {
+    count := input.read(chunk)?
+    if count == 0 { break }
+    if count > maximum - document.len() { return Err(Error.Code(-1)) }
+    document.append(chunk.bytes())
+  }
+  return Ok(document)
+}
+
+fn decode_error(error: pkg.csv.Error) -> Error = match error {
+  Invalid => Error.Invalid,
+  LimitExceeded => Error.Code(-1),
+}
+
+// Summarize a complete admitted document, with no output before validation succeeds.
+pub fn main(args: array<str>) -> Result<(), Error> {
+  command := cli.command("csv_summary")
+  command.flag_str("file", "")
+  command.flag_i64("max-input-bytes", 8388608)
+  command.flag_i64("max-rows", 100000)
+  command.flag_bool("crlf")
+  command.flag_bool("help")
+  parsed := command.parse(args)?
+  if parsed.get_bool("help") {
+    print(command.usage())
+    return Ok(())
+  }
+  path := parsed.get_str("file")
+  if path.len() == 0 { return Err(Error.Invalid) }
+  maximum := parsed.get_i64("max-input-bytes")
+  if maximum < 0 || maximum > 67108864 { return Err(Error.Invalid) }
+  row_limit := parsed.get_i64("max-rows")
+  if row_limit < 0 || row_limit > 1000000 { return Err(Error.Invalid) }
+  ending := if parsed.get_bool("crlf") { pkg.csv.LineEnding.CrLf } else { pkg.csv.LineEnding.Lf }
+  input := fs.open_regular(path)?
+  document := read_document(input, maximum)?
+  text := document.bytes().as_str()?
+  options := pkg.csv.DecodeOptions {
+    header: pkg.csv.Header.Present,
+    line_ending: ending,
+    max_rows: row_limit,
+  }
+  arena out {
+    decoded: Result<soa<Score>, pkg.csv.Error> := pkg.csv.decode(text, out, options)
+    rows := decoded.map_err(decode_error)?
+    active := rows.where(.active).count()
+    total := rows.where(.active).score.map(fn score { score as i64 }).sum()
+    report := builder()
+    report.write("rows=")
+    report.write_int(rows.len())
+    report.write("\nactive=")
+    report.write_int(active)
+    report.write("\nscore-sum=")
+    report.write_int(total)
+    report.write("\n")
+    summary := report.to_string()
+    output := io.stdout
+    output.write(summary)?
+  }
+  return Ok(())
+}
