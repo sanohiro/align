@@ -931,3 +931,28 @@ even when cleanup worked. No production timeout or process contract changes.
 
 Only the leaf owner and this verification record change. Existing native capture
 state/error/reap owners and all other process tests retain their scope.
+
+## Native allocation-counter isolation
+
+`align_rt_alloc_count`, `align_rt_free_count`, requested-live accounting and
+HTML-shell probes are process-global. A mutex held only by measuring tests cannot
+exclude ordinary native allocations from other libtest workers. Every native
+measurement must execute in an exact-filter child; existing argv/environment,
+file, HTML-escape and regex-storage owners already provide that boundary.
+
+The shared allocation owner replaces the seventeen `ALLOC_COUNT_LOCK` consumers
+and the unisolated XML ownership owner. Production probes and counter meanings
+stay unchanged. Each child runs exactly one existing body, retains its existing
+allocation/cleanup assertions, and proves its counters are active before measuring.
+
+| Closure cell | Owner evidence |
+| --- | --- |
+| Exact child admission and completed body | Derive the exact selector from the libtest thread name, bind it in child-only environment, and require a dedicated successful-body exit status. Zero selected tests and ordinary harness exit cannot attest completion. |
+| Failure and normal Drop | First-declared completion guard exits only after body-local guards have dropped; unwinding preserves failure. Panic and deliberately omitted completion controls must not pass. |
+| Timeout and artifacts | Parent exclusively acquires scratch, passes canonical child TMPDIR, and arms a bounded direct-child guard immediately after spawn. One deadline bounds polling, EINTR retries, kill and reap; parent scratch outlives the child. A stalled-body control must reach its witness before bounded retirement; immediate post-spawn unwind must leave a cached reaped SIGKILL status before scratch removal. |
+| Concurrent unrelated producers | Actual foreign-thread alloc/free churn runs in the parent while the child proves fresh exact global counters and requested-live state; a bypassed process boundary must fail. |
+| Same-root consumer sweep | All seventeen former lock users plus XML use the common boundary. Existing independently isolated argv, environment, whole-file, HTML and regex-storage observers retain their owners. Private-temp allocation ordering uses an exclusively acquired RAII directory. |
+
+Focused verification runs the affected JSON, private-temp, template-HTML, R63,
+XML and helper owners with normal parallel libtest execution on Linux and macOS.
+No language, runtime ABI, production allocation policy or benchmark claim changes.
