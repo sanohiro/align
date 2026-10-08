@@ -9159,8 +9159,8 @@ impl BeneathPath {
     }
 }
 
-/// Validate/copy either the root grammar or the strict relative grammar. The owned copy is made
-/// before component parsing, and separators are rewritten only after the entire grammar succeeds.
+/// Validate either the root grammar or strict relative grammar before acquiring its owned copy.
+/// Only fully admitted inputs become private terminated bytes and rewritten component separators.
 ///
 /// # Safety
 /// A positive length and non-null pointer must describe a readable immutable byte range.
@@ -9184,51 +9184,41 @@ unsafe fn abi_beneath_path_impl(ptr: *const u8, len: i64, root: bool, utf8: bool
         return Err(AL_INVALID);
     }
 
+    let special_root = root && matches!(source, b"." | b"/");
+    let absolute = root && source[0] == b'/';
+    let component_start = if special_root { n } else { usize::from(absolute) };
+    if !special_root {
+        if (!root && source[0] == b'/') || source[n - 1] == b'/' {
+            return Err(AL_INVALID);
+        }
+        let mut start = component_start;
+        while start < n {
+            let end = source[start..]
+                .iter()
+                .position(|byte| *byte == b'/')
+                .map_or(n, |offset| start + offset);
+            let component = &source[start..end];
+            if component.is_empty() || component == b"." || component == b".." {
+                return Err(AL_INVALID);
+            }
+            if end == n {
+                break;
+            }
+            start = end + 1;
+        }
+        if component_start >= n {
+            return Err(AL_INVALID);
+        }
+    }
+
     let mut bytes = Vec::with_capacity(capacity);
     bytes.extend_from_slice(source);
     bytes.push(0);
-
-    if root && source == b"." {
-        return Ok(BeneathPath {
-            bytes,
-            component_start: n,
-            absolute: false,
-        });
-    }
-    if root && source == b"/" {
-        return Ok(BeneathPath {
-            bytes,
-            component_start: n,
-            absolute: true,
-        });
-    }
-
-    let absolute = root && source[0] == b'/';
-    if (!root && source[0] == b'/') || source[n - 1] == b'/' {
-        return Err(AL_INVALID);
-    }
-    let component_start = usize::from(absolute);
-    let mut start = component_start;
-    while start < n {
-        let end = source[start..]
-            .iter()
-            .position(|byte| *byte == b'/')
-            .map_or(n, |offset| start + offset);
-        let component = &source[start..end];
-        if component.is_empty() || component == b"." || component == b".." {
-            return Err(AL_INVALID);
-        }
-        if end == n {
-            break;
-        }
-        start = end + 1;
-    }
-    if component_start >= n {
-        return Err(AL_INVALID);
-    }
-    for byte in &mut bytes[..n] {
-        if *byte == b'/' {
-            *byte = 0;
+    if !special_root {
+        for byte in &mut bytes[..n] {
+            if *byte == b'/' {
+                *byte = 0;
+            }
         }
     }
     Ok(BeneathPath {
@@ -38738,6 +38728,98 @@ mod tests {
         let _ = std::fs::remove_file(&rename_destination);
         for source in rename_sources {
             let _ = std::fs::remove_file(source);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn fs_beneath_complete_admission_precedes_private_allocation() {
+        #[cfg(feature = "alloc-count")]
+        {
+            let before = global_alloc_count();
+            let witness = std::hint::black_box(vec![std::hint::black_box(1u8); 32]);
+            assert!(global_alloc_count() > before, "actual Rust allocator witness");
+            drop(witness);
+        }
+        let observe = |source: &[u8], root: bool, utf8: bool, valid: bool| {
+            let mut input = source.to_vec();
+            let mut expected = source.to_vec();
+            if !(root && matches!(source, b"." | b"/")) {
+                for byte in &mut expected { if *byte == b'/' { *byte = 0; } }
+            }
+            expected.push(0);
+            #[cfg(feature = "alloc-count")]
+            let before = (global_alloc_count(), global_alloc_bytes());
+            let result = unsafe { abi_beneath_path_impl(input.as_ptr(), i64::try_from(input.len()).unwrap(), root, utf8) };
+            #[cfg(feature = "alloc-count")]
+            let observed = (global_alloc_count() - before.0, global_alloc_bytes() - before.1);
+            assert_eq!(result.is_ok(), valid, "root={root}, utf8={utf8}, input={source:?}");
+            #[cfg(feature = "alloc-count")]
+            assert_eq!(observed, (u64::from(valid), if valid { source.len() + 1 } else { 0 }),
+                "root={root}, utf8={utf8}, input length={}", source.len());
+            assert_eq!(input, source, "admission must preserve caller bytes");
+            match result {
+                Ok(path) => {
+                    input.fill(b'?');
+                    assert_eq!(path.bytes, expected, "native bytes must be independently owned");
+                    assert_eq!(path.absolute, root && source[0] == b'/');
+                    let start = if root && matches!(source, b"." | b"/") { source.len() }
+                        else { usize::from(root && source[0] == b'/') };
+                    assert_eq!(path.component_start, start);
+                }
+                Err(status) => assert_eq!(status, AL_INVALID),
+            }
+        };
+        let mut late_invalid = vec![b'a'; 65536];
+        late_invalid.extend_from_slice(b"/..");
+        for root in [false, true] {
+            for utf8 in [false, true] { observe(&late_invalid, root, utf8, false); }
+        }
+        // Literal admission expectations are independent of the production component walk.
+        for (source, root_valid, relative_valid, text_valid) in [
+            (b"".as_slice(), false, false, true),
+            (b".".as_slice(), true, false, true),
+            (b"/".as_slice(), true, false, true),
+            (b"..".as_slice(), false, false, true),
+            (b"a".as_slice(), true, true, true),
+            (b"a/b/c".as_slice(), true, true, true),
+            (b"/a/b/c".as_slice(), true, false, true),
+            (b".hidden/a..b".as_slice(), true, true, true),
+            (b"a\\b/ ".as_slice(), true, true, true),
+            ("日本/語".as_bytes(), true, true, true),
+            (b"a/".as_slice(), false, false, true),
+            (b"//".as_slice(), false, false, true),
+            (b"//a".as_slice(), false, false, true),
+            (b"/a//b".as_slice(), false, false, true),
+            (b"a//b".as_slice(), false, false, true),
+            (b"./a".as_slice(), false, false, true),
+            (b"../a".as_slice(), false, false, true),
+            (b"a/./b".as_slice(), false, false, true),
+            (b"a/../b".as_slice(), false, false, true),
+            (b"a/.".as_slice(), false, false, true),
+            (b"a/..".as_slice(), false, false, true),
+            (b"a\0b".as_slice(), false, false, true),
+            (b"raw-\xff/next".as_slice(), true, true, false),
+            (b"/raw-\xff/next".as_slice(), true, false, false),
+        ] {
+            for root in [false, true] {
+                for utf8 in [false, true] {
+                    observe(source, root, utf8, (if root { root_valid } else { relative_valid }) && (!utf8 || text_valid));
+                }
+            }
+        }
+        // Each malformed extent is rejected by metadata admission, before constructing a slice.
+        for (ptr, len) in [
+            (b"a".as_ptr(), -1), (b"a".as_ptr(), i64::MIN),
+            (core::ptr::null(), 0), (core::ptr::null(), 1),
+            (b"a".as_ptr(), i64::MAX),
+            (core::ptr::without_provenance(usize::MAX - 1), 3),
+        ] {
+            #[cfg(feature = "alloc-count")]
+            let before = (global_alloc_count(), global_alloc_bytes());
+            assert!(matches!(unsafe { abi_beneath_path_impl(ptr, len, true, true) }, Err(AL_INVALID)));
+            #[cfg(feature = "alloc-count")]
+            assert_eq!((global_alloc_count(), global_alloc_bytes()), before);
         }
     }
 

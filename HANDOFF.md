@@ -17,6 +17,12 @@ outside the active worktree so they do not obstruct unrelated checks or pulls.
 
 ## Next work (handoff updated 2026-10-08)
 
+Plan144 validates each retained filesystem path's complete grammar before its
+private byte copy. Invalid individual parser inputs allocate nothing; valid
+paths retain the same one-copy representation and root-before-relative ordering.
+macOS/Linux allocation, no-follow/race/cleanup and whole/per-unit owners qualify
+the change. Earlier valid operands may still own copies when later inputs fail.
+
 Plan143 removes the temporary byte snapshot for buffer self-appends wholly inside
 the published prefix. Checked offsets survive aligned payload relocation; other
 overlaps retain the snapshot. Actual allocator owners pin one fewer allocation

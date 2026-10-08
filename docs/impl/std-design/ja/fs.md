@@ -327,8 +327,9 @@ align_rt_fs_remove_empty_dir(
 ) -> i32
 ```
 
-検査順は output slot、root 全体の validation/copy/grammar、relative 全体の validation/copy/grammar、
-root traversal、relative-parent traversal、final operation とする。したがって不正な root grammar はすべての
+検査順は output slot、root 全体の validation/grammar/copy、relative 全体の validation/grammar/copy、
+root traversal、relative-parent traversal、final operation とする。各 path の view と grammar を完全に検証してから
+private copy を allocate する。後の path が不正な場合でも、先に受理した path の copy はすでに存在し得る。したがって不正な root grammar はすべての
 relative-view error より先になる。recoverable failure では両 slot とも
 null のままである。checked copy-size overflow は `Error.Invalid`、実際の OOM は terminal とする。完全な grammar
 検証後にだけ private な full-path copy を NUL 区切りの component storage にし、caller の byte は変更しない。
