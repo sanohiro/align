@@ -34204,10 +34204,11 @@ impl BorrowState {
                     })
             });
             let mut observed = self.resolve_headers(&selected).non_storage.live_roots();
-            // Retaining an allocation is not an old borrowed observation of that allocation.
-            // Its contained borrowed dependencies still participate in exclusion.
+            // Retaining owned storage (including inline bytes) is not an old borrowed
+            // observation of it. Contained borrowed dependencies still participate.
             if !include_owner && !contained_borrow_or_unknown
-                && leaf.descriptor.is_some_and(|descriptor| descriptor.kind.owns_storage()) {
+                && leaf.descriptor.is_some_and(|descriptor| descriptor.kind.owns_storage()
+                    || descriptor.kind == StorageHeaderKind::InlineFixed) {
                 let owned = self.header_release_roots(&selected);
                 observed.retain(|root| !owned.contains(root));
             }
@@ -34228,11 +34229,13 @@ impl BorrowState {
                     let observed = reachable.iter().filter(same_parameter).collect::<Vec<_>>();
                     // A symbolic caller field names a descriptor place. A view field may point
                     // into another field's storage, so distinct paths prove separation only
-                    // when both generations denote their own owned storage.
+                    // when both generations denote independent backing. Inline arrays own
+                    // their bytes in the record even though they have no heap release owner.
                     let owned_backing = |generation: &StorageGeneration| {
                         self.storage.directory.entries.get(generation)
                             .and_then(|entry| entry.descriptor)
-                            .is_some_and(|descriptor| descriptor.kind.owns_storage())
+                            .is_some_and(|descriptor| descriptor.kind.owns_storage()
+                                || descriptor.kind == StorageHeaderKind::InlineFixed)
                     };
                     if !unknown && !targets.is_empty() && !observed.is_empty()
                         && targets.iter().all(|generation| owned_backing(generation))
@@ -80009,6 +80012,55 @@ fn main() -> i32 = 0
             MoveControlEdge::join_reachable([Some(skip.clone()), None]) == Some(skip),
             "a diverging edge contributes neither value nor state",
         );
+    }
+
+    #[test]
+    fn fixed_sibling_exclusion_preserves_observations_and_contained_borrows() {
+        let scalar = Scalar::Int(IntTy { signed: true, bits: 64 });
+        let target = StorageGeneration::caller_storage(0, &[BorrowProjection::StructField(0)]);
+        let sibling = StorageGeneration::caller_storage(0, &[BorrowProjection::StructField(1)]);
+        let roots: BorrowRoots = [BorrowRoot::ParamStorage(0)].into();
+        for kind in [StorageHeaderKind::InlineFixed, StorageHeaderKind::OwnedDynamic, StorageHeaderKind::View] {
+            let descriptor = StorageHeaderDescriptor {
+                ty: match kind {
+                    StorageHeaderKind::InlineFixed => Ty::Array(scalar, 5),
+                    StorageHeaderKind::OwnedDynamic => Ty::DynArray(scalar),
+                    _ => Ty::Slice(scalar),
+                },
+                kind,
+            };
+            for same in [false, true] {
+                for borrowed_content in [false, true] {
+                    let observed_generation = if same { target.clone() } else { sibling.clone() };
+                    let mut state = BorrowState::default();
+                    for generation in [target.clone(), observed_generation.clone()] {
+                        state.storage.directory.entries.insert(generation.clone(), MoveGenerationEntry::new(
+                            &generation, Some(descriptor), Default::default()));
+                        state.storage.contents.entries.insert(generation, MoveValueFact::default());
+                    }
+                    if borrowed_content {
+                        state.storage.contents.entries.get_mut(&observed_generation).unwrap().non_storage =
+                            BorrowFact::from_direct(roots.clone());
+                    }
+                    let observed = ProjectedHeaderFact::from_leaf(Vec::new(),
+                        StorageHeaderLeaf::known_typed(observed_generation, descriptor));
+                    let destination = ProjectedHeaderFact::from_leaf(Vec::new(),
+                        StorageHeaderLeaf::known_typed(target.clone(), descriptor));
+                    for include_owner in [false, true] {
+                        let must_observe = borrowed_content || kind == StorageHeaderKind::View
+                            || (include_owner && same);
+                        assert_eq!(state.exclusive_header_observations(&observed, &roots, &destination, include_owner),
+                            if must_observe { roots.clone() } else { BorrowRoots::new() },
+                            "{kind:?}, same={same}, borrowed={borrowed_content}, snapshot={include_owner}");
+                    }
+                    state.storage.contents.entries.remove(&sibling);
+                    if !same {
+                        assert_eq!(state.exclusive_header_observations(&observed, &roots, &destination, true), roots);
+                    }
+                }
+            }
+        }
+        assert!(!StorageHeaderKind::InlineFixed.owns_storage(), "inline storage never gains heap release ownership");
     }
 
     #[test]

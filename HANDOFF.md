@@ -2,12 +2,11 @@
 
 ## Current work direction
 
-The owner resumed continuous independent improvements on 2026-10-08: select a
-recommended capability, implement and qualify it, complete PR and merge, then
-move to the next until asked to stop. This supersedes the earlier stop after
-the SSE storage improvement. Prioritize demonstrated existing-library usability
-and measured execution/storage improvements. K1/plan61 and the separately
-parked aggregate-provenance experiment remain deferred.
+The owner stopped continuous independent improvements after PR #1296, then
+requested urgent repair of blocking align-llm Request 135 on 2026-10-08. Limit
+current work to restoring the CUDA entry's fixed-array sibling borrowing,
+qualification, PR/merge and the requested local release build. K1/plan61 and the
+separately parked aggregate-provenance experiment remain deferred.
 
 External align-llm adoption and end-to-end/network measurements remain
 consumer-owned. Request126's
@@ -32,6 +31,12 @@ the parked work is not a prerequisite. Keep its source and evidence archived
 outside the active worktree so they do not obstruct unrelated checks or pulls.
 
 ## Next work (handoff updated 2026-10-08)
+
+Plan152 restores fixed inline storage in mutable-call sibling exclusion without
+changing heap release ownership or discarding contained borrows. Request135's
+exact witness checks/builds in both modes; imported execution/cache and genuine
+alias negatives qualify the boundary. The unmodified real CUDA entry also
+checks per-unit and builds/links locally; GPU adoption remains consumer-owned.
 
 Plan151 uses bounded bulk searches for long unquoted CSV fields. An inlined
 short prefix and shared search tail preserve original delimiter/error decisions,
