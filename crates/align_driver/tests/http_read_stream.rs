@@ -216,12 +216,13 @@ fn receive_peer(
 }
 
 #[test]
-fn bounded_fetch_example_rejects_degraded_read_window() {
+fn bounded_fetch_example_propagates_read_window_refusal() {
     assert!(backend_available(), "fetch example requires the LLVM backend");
     let source = fixture("examples/http_fetch.align");
-    assert_eq!(source.matches("buffer(65536)").count(), 1);
-    let degraded = source.replace("buffer(65536)", "buffer(0)");
-    let example = ReceiveExample::build_source("http-fetch-degraded-window", &degraded);
+    assert_eq!(source.matches("buffer.try_new(65536)").count(), 1);
+    let refused = format!("{}\nfn refused_window() -> Result<buffer, Error> = Err(Error.Code(12))\n",
+        source.replace("buffer.try_new(65536)", "refused_window()"));
+    let example = ReceiveExample::build_source("http-fetch-refused-window", &refused);
     for bytes in [b"unread\0\xff".as_slice(), b""] {
         let listener = receive_listener();
         let url = format!("http://127.0.0.1:{}/binary", listener.local_addr().unwrap().port());
@@ -229,9 +230,9 @@ fn bounded_fetch_example_rejects_degraded_read_window() {
         let mut socket = receive_peer(&listener, &child, None);
         let mut response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", bytes.len()).into_bytes();
         response.extend_from_slice(bytes);
-        socket.write_all(&response).expect("degraded-window response");
+        socket.write_all(&response).expect("refused-window response");
         drop(socket);
-        example.assert_exit(child.wait(), Some(2));
+        example.assert_exit(child.wait(), Some(12));
         assert!(example.stdout().is_empty());
     }
 }
@@ -782,23 +783,24 @@ fn bounded_sse_watch_example_owns_caps_and_failures() {
             "late failure preserves only the previous event"
         );
     }
-    // A constructor returning no usable window exercises admission independently of host OOM.
+    // A typed constructor refusal exercises propagation independently of host OOM.
     let source = fixture("examples/http_sse_watch.align");
-    assert_eq!(source.matches("buffer(event_bytes)").count(), 1);
-    let source = source.replace("buffer(event_bytes)", "buffer(0)");
-    let degraded = ReceiveExample::build_source("sse-watch-degraded-window", &source);
+    assert_eq!(source.matches("buffer.try_new(event_bytes)").count(), 1);
+    let source = format!("{}\nfn refused_window() -> Result<buffer, Error> = Err(Error.Code(12))\n",
+        source.replace("buffer.try_new(event_bytes)", "refused_window()"));
+    let refused = ReceiveExample::build_source("sse-watch-refused-window", &source);
     let listener = receive_listener();
     let url = format!(
         "http://127.0.0.1:{}/binary",
         listener.local_addr().unwrap().port()
     );
-    degraded.assert_exit(
-        degraded
+    refused.assert_exit(
+        refused
             .start(&["--url", &url, "--timeout-ns=100000000"], false)
             .wait(),
-        Some(2),
+        Some(12),
     );
-    assert!(degraded.stdout().is_empty());
+    assert!(refused.stdout().is_empty());
     assert_eq!(
         listener.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock

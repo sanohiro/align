@@ -159,8 +159,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 import std.fs
 
 fn pump(r: reader, w: writer) -> Result<(), Error> {
-    mut buf := buffer(4096)
-    if buf.capacity() != 4096 { return Err(Error.Invalid) }
+    mut buf := buffer.try_new(4096)?
     loop {
         n := r.read(buf)?           // fill buf to capacity; 0 = EOF
         if n == 0 { break Ok(()) }  // break carries the loop's value out
@@ -176,8 +175,9 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 }
 ```
 
-バッファの予約は失敗する場合があります。EOF まで読むループの前に容量を確認して
-ください。容量 0 の reader 読み取りは、入力を確認せずに 0 を返します。
+`buffer.try_new(4096)?` は要求した容量を確保するか、読み取り前に確保エラーを伝播します。
+これにより、領域を確保できない状態を EOF と取り違えません。容量 0 の reader 読み取りは、
+入力を確認せずに 0 を返します。
 
 読み込んだ内容をそのまま書き出すなら、`io.copy` で同じ処理を行えます。ファイルサイズによらず、一定量のメモリを使います。
 

@@ -157,8 +157,7 @@ The streaming tier, for data bigger than memory. Its control shape is the `loop`
 import std.fs
 
 fn pump(r: reader, w: writer) -> Result<(), Error> {
-    mut buf := buffer(4096)
-    if buf.capacity() != 4096 { return Err(Error.Invalid) }
+    mut buf := buffer.try_new(4096)?
     loop {
         n := r.read(buf)?           // fill buf to capacity; 0 = EOF
         if n == 0 { break Ok(()) }  // break carries the loop's value out
@@ -174,8 +173,9 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 }
 ```
 
-Buffer reservation is best-effort. Check capacity before an EOF-driven read
-loop: a zero-capacity reader read returns zero without observing the input.
+`buffer.try_new(4096)?` either supplies the exact read window or propagates the
+allocation error before reading. This avoids treating an unavailable window as
+EOF; a zero-capacity reader read returns zero without observing the input.
 
 And the shorthand for exactly that shape — `io.copy` (constant memory, whatever the file size):
 

@@ -8,8 +8,7 @@ import std.io
 
 fn sha256_reader(input: reader, maximum: i64) -> Result<string, Error> {
   digest := crypto.sha256_stream()
-  mut chunk := buffer(65536)
-  if chunk.capacity() != 65536 { return Err(Error.Invalid) }
+  mut chunk := buffer.try_new(65536)?
   mut seen: i64 := 0
   loop {
     count := input.read(chunk)?

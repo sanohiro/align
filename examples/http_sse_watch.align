@@ -28,8 +28,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   if maximum_body < 1 || maximum_body > 1073741824 { return Err(Error.Invalid) }
   timeout := parsed.get_i64("timeout-ns")
   if timeout < 1 { return Err(Error.Invalid) }
-  mut out := buffer(event_bytes)
-  if out.capacity() != event_bytes { return Err(Error.Invalid) }
+  mut out := buffer.try_new(event_bytes)?
 
   client := http.client()
   client.timeout(timeout)

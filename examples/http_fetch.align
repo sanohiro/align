@@ -30,8 +30,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   stream := client.request_stream(request)?
   if stream.status() != 200 { return Err(Error.Invalid) }
 
-  mut out := buffer(65536)
-  if out.capacity() != 65536 { return Err(Error.Invalid) }
+  mut out := buffer.try_new(65536)?
   output := io.stdout
   loop {
     count := stream.read(out)?

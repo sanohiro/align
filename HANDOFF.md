@@ -33,6 +33,12 @@ outside the active worktree so they do not obstruct unrelated checks or pulls.
 
 ## Next work (handoff updated 2026-10-08)
 
+Plan148 adopts `buffer.try_new(...)?` in the file-copy, SHA-256, binary HTTP and
+SSE client examples and synchronized guides. Window allocation errors now retain
+their original code before reading/output (before connecting for SSE), with the
+existing admission order and cleanup. Actual-source normal/refusal owners pass
+on macOS/Linux; the six edited guide snippets check.
+
 Plan147 reuses initial UTF-8 admission in replacement decoding, avoiding a second
 validation for valid input and reusing the first malformed prefix across both
 passes. Exact replacement bytes, independent owned output and payload allocation
