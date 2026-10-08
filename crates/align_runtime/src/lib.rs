@@ -46,6 +46,8 @@ mod html_text_tests;
 #[cfg(test)]
 mod encoding_writes_tests;
 #[cfg(test)]
+mod escaped_decode_tests;
+#[cfg(test)]
 mod decompression_frames_tests;
 #[cfg(test)]
 mod base64_quantum_tests;
@@ -13601,6 +13603,7 @@ fn base64_decode_impl(input: &[u8], url: bool) -> Option<Vec<u8>> {
 }
 
 /// A single hex digit's value, accepting both cases; `None` for a non-hex byte.
+#[cfg(test)]
 fn hex_val(c: u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),
@@ -13805,6 +13808,14 @@ fn percent_encode_into_with_slash(data: &[u8], out: &mut [core::mem::MaybeUninit
     assert_eq!(o, out.len(), "percent destination length mismatch");
 }
 
+/// Decode one admitted two-byte escape using the shared case-insensitive hex table.
+#[inline]
+fn percent_escape_byte(high: u8, low: u8) -> Option<u8> {
+    let hi = HEX_DECODE_TABLE[usize::from(high)];
+    let lo = HEX_DECODE_TABLE[usize::from(low)];
+    if hi | lo == 0xff { None } else { Some(hi << 4 | lo) }
+}
+
 /// Decode percent-escapes in `input`. A `%` must be followed by exactly two hex digits, else the
 /// whole input is invalid (`None`); any other byte passes through unchanged. This is the RFC 3986
 /// codec only — it deliberately does NOT map `+` to space, which is the distinct
@@ -13818,9 +13829,7 @@ fn percent_decode_impl(input: &[u8]) -> Option<Vec<u8>> {
             if i + 2 >= input.len() {
                 return None;
             }
-            let hi = hex_val(input[i + 1])?;
-            let lo = hex_val(input[i + 2])?;
-            v.push(hi << 4 | lo);
+            v.push(percent_escape_byte(input[i + 1], input[i + 2])?);
             i += 3;
         } else {
             v.push(input[i]);
@@ -14273,9 +14282,7 @@ fn form_decode_impl(input: &[u8]) -> Option<Vec<u8>> {
                 if i + 2 >= input.len() {
                     return None;
                 }
-                let hi = hex_val(input[i + 1])?;
-                let lo = hex_val(input[i + 2])?;
-                v.push(hi << 4 | lo);
+                v.push(percent_escape_byte(input[i + 1], input[i + 2])?);
                 i += 3;
             }
             b => {

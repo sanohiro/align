@@ -1,16 +1,16 @@
 # Session handoff
 
-## Current completion boundary
+## Current work direction
 
-The owner requested on 2026-10-08 that work stop after the current SSE storage
-improvement: adopt it through PR and merge if qualified, otherwise retain its
-verification result and clean up. This supersedes the earlier automatic
-capability-to-capability continuation. Do not start another improvement after
-this boundary without a new owner request. K1/plan61 and the separately parked
-aggregate-provenance experiment remain deferred.
+The owner resumed continuous independent improvements on 2026-10-08: select a
+recommended capability, implement and qualify it, complete PR and merge, then
+move to the next until asked to stop. This supersedes the earlier stop after
+the SSE storage improvement. Prioritize demonstrated existing-library usability
+and measured execution/storage improvements. K1/plan61 and the separately
+parked aggregate-provenance experiment remain deferred.
 
-Remaining items are not an automatic continuation queue: external align-llm
-adoption and end-to-end/network measurements remain consumer-owned. Request126's
+External align-llm adoption and end-to-end/network measurements remain
+consumer-owned. Request126's
 borrowed-session loop refusal and Request28's indexed/view builder readers are
 unimplemented; they require their own provenance closure. Request78's enum fields
 and Request128's shared optional native-resource matching still lack their
@@ -32,6 +32,13 @@ the parked work is not a prerequisite. Keep its source and evidence archived
 outside the active worktree so they do not obstruct unrelated checks or pulls.
 
 ## Next work (handoff updated 2026-10-08)
+
+Plan146 reuses the existing hex lookup table for percent/form escape decoding.
+Input grammar, decoded bytes, allocation requests and published read capacity
+remain unchanged. Native admission/allocation and encoding/query owners cover
+the boundary. The local macOS/Linux corpus improves dense and mixed escaped
+inputs while ordinary-input controls remain close to baseline; samples and
+measurement limits are retained in `bench/escaped_decode`.
 
 Plan145 uses initialized-prefix storage for SSE work and committed IDs, avoiding
 zero-filled spare capacity while preserving exact allocation sizes, all public
