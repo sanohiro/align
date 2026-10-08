@@ -125,6 +125,48 @@ It prints `<p>&lt;Align&gt;</p>`. `write` escapes text; `raw` inserts trusted ma
 
 With a header, fields are selected by name; without one, columns must match the record's declaration order and exact width. The result belongs to the destination arena. File reads are a separate `std.fs` operation, and errors use `pkg.csv.Error`, which you must handle or map before returning from a `main` that uses builtin `Error`. This first API decodes a complete document; it does not stream or encode CSV. See the [CSV design and example](../impl/pkg-design/csv.md#public-use).
 
+The runnable [CSV summary application](../../apps/csv/main.align) reads a regular
+UTF-8 file with named `active` (bool) and `score` (i32) columns. Column order may
+vary and extra columns are allowed. From the repository root:
+
+```sh
+alignc build apps/csv/main.align
+./main --file scores.csv --max-input-bytes 8388608 --max-rows 100000
+```
+
+For this LF input:
+
+```csv
+active,score
+true,7
+false,100
+true,-2
+```
+
+the exact output is:
+
+```text
+rows=3
+active=2
+score-sum=5
+```
+
+`--file` is required. The byte cap defaults to 8388608 and accepts 0..67108864;
+the data-row cap defaults to 100000 and accepts 0..1000000. LF is the default;
+`--crlf` explicitly selects CRLF. `--help` prints usage. Active scores are widened
+to i64 before summing, so every admitted i32 score fits the aggregate bound.
+
+The application reserves the byte cap and a separate 64KiB read window with
+fallible buffers, accumulates the complete input, then validates UTF-8 and
+decodes into a named arena. A quoted record or UTF-8 sequence may span windows.
+Exact byte/row caps succeed; excess input or a CSV limit returns `Error.Code(-1)`.
+Invalid options, UTF-8 or CSV return `Error.Invalid`; buffer, file and output
+errors propagate. No summary is emitted until input and decode succeed, although
+an output failure may leave a prefix. Ordinary symlinks are followed; FIFOs and
+other nonregular inputs are rejected. The byte cap can read one extra window
+before rejecting, does not limit I/O waiting, and does not promise a stable file
+snapshot or recoverability from every allocation failure.
+
 ## `pkg.frame`
 
 `pkg.frame` performs bounded stable inner joins over validated `core.codec` i64 or string columns. It returns owned `RowPair { left, right }` source ordinals in left-major, right-ascending order, so it does not materialize or retain either input batch. The required `max_pairs` makes duplicate-key fanout and output allocation visible. Nullable/composite keys, outer joins, adaptive build-side selection, parallelism, and spill are deliberately absent; the exact surface is in [`pkg.frame`'s design](../impl/pkg-design/frame.md).
