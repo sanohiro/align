@@ -32,6 +32,13 @@ outside the active worktree so they do not obstruct unrelated checks or pulls.
 
 ## Next work (handoff updated 2026-10-08)
 
+Plan154 rejects excess Base64 padding at the third pad, preserving optional
+padding, canonical tails, Invalid/null publication and output ownership. Native,
+allocation and source owners pass on macOS/Linux ARM64. The existing Base64
+probe now uses the shared bounded runner; every shared probe refreshes its
+runtime producer before measuring. Exact artifact-identity and lifecycle owners
+qualify that path; retained samples cover long refusal and normal-input limits.
+
 Plan153 reuses bulk quote discovery while measuring and copying escaped CSV
 text. Exact normalized bytes, chunk order, malformed refusal and arena layout
 remain unchanged. Native and whole/per-unit owners pass on macOS/Linux ARM64;

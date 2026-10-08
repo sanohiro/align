@@ -10,7 +10,7 @@ import tempfile
 import time
 
 
-PROBES = ("csv_quoted_scan", "csv_normalization", "escaped_decode", "utf8_lossy")
+PROBES = ("base64_decode", "csv_quoted_scan", "csv_normalization", "escaped_decode", "utf8_lossy")
 LIMITS = {"build": 900, "link": 60, "probe": 60}
 pending_signal = 0
 
@@ -87,6 +87,9 @@ def main():
     scratch = tempfile.mkdtemp(prefix=f"align-{benchmark}-")
     cleanup_safe = True
     try:
+        # Shared Cargo targets can retain another checkout's top-level archive
+        # while this checkout is Fresh. Refresh the actual producer, not its bytes.
+        Path("crates/align_runtime/src/lib.rs").touch()
         run_phase("build", ["bash", "scripts/cargo.sh", "build", "-p", "align_runtime",
                             "--release"], stdout=sys.stderr)
         probe = str(Path(scratch) / "probe")

@@ -13551,11 +13551,10 @@ fn base64_decode_impl(input: &[u8], url: bool) -> Option<Vec<u8>> {
     let mut end = input.len();
     let mut pads = 0usize;
     while end > 0 && input[end - 1] == b'=' {
+        // A third pad is already invalid; do not scan an unbounded rejected suffix.
+        if pads == 2 { return None; }
         end -= 1;
         pads += 1;
-    }
-    if pads > 2 {
-        return None;
     }
     let content = &input[..end];
     let rem = content.len() % 4;

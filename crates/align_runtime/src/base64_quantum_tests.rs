@@ -114,6 +114,20 @@ fn base64_quantum_every_symbol_position_and_tail_matches_scalar_oracle() {
 }
 
 #[test]
+fn base64_padding_suffixes_preserve_exact_admission() {
+    for url in [false, true] {
+        for body in [b"".as_slice(), b"A", b"AA", b"AAA", b"AAAA", b"Zm9v", b"+w", b"_w"] {
+            for pads in (0..=8).chain([32, 65_536]) {
+                let mut input = body.to_vec();
+                input.extend(std::iter::repeat_n(b'=', pads));
+                assert_eq!(base64_decode_impl(&input, url), oracle(&input, url),
+                    "url={url}, body={body:?}, pads={pads}");
+            }
+        }
+    }
+}
+
+#[test]
 fn base64_quantum_binary_lengths_and_padding_preserve_all_bytes() {
     for url in [false, true] {
         for padded in [false, true] {
@@ -151,7 +165,8 @@ fn base64_quantum_native_publication_is_atomic_and_independent() -> Result<(), S
             let buffer = unsafe { &*output.0 };
             assert_eq!(&buffer.data[..buffer.len], raw.as_slice());
         }
-        for suffix in [b"!AAA".as_slice(), b"AA!A", b"Zh", b"Zm9", b"Zg=", b"A"] {
+        let long_padding = vec![b'='; 65_536];
+        for suffix in [b"!AAA".as_slice(), b"AA!A", b"Zh", b"Zm9", b"Zg=", b"A", b"===", &long_padding] {
             let input = [b"Zm9v".as_slice(), suffix].concat();
             let size = i64::try_from(input.len()).map_err(|e| e.to_string())?;
             let mut output = BufferOwner(core::ptr::null_mut());
@@ -175,13 +190,14 @@ fn base64_quantum_allocates_only_nonempty_output_once() {
         "counter must observe Rust allocations"
     );
     drop(witness);
+    let long_padding = [b"A".as_slice(), &vec![b'='; 65_536]].concat();
     for url in [false, true] {
-        for input in [b"!AAA".as_slice(), b"=AAA", b"\xffAAA"] {
+        for input in [b"!AAA".as_slice(), b"=AAA", b"\xffAAA", b"A===", &long_padding] {
             let before = global_alloc_count();
             let output = base64_decode_impl(std::hint::black_box(input), url);
             let allocations = global_alloc_count() - before;
             assert!(output.is_none());
-            assert_eq!(allocations, 0, "invalid first symbol allocated output");
+            assert_eq!(allocations, 0, "invalid admission allocated output");
         }
         for length in [0, 1, 2, 3, 4, 31, 32, 1024] {
             let raw = (0..=u8::MAX).cycle().take(length).collect::<Vec<_>>();
