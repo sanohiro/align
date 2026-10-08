@@ -81,7 +81,7 @@ def main():
     if system not in ("Darwin", "Linux"):
         raise SystemExit("CSV benchmark supports macOS and Linux")
     os.chdir(Path(__file__).resolve().parents[2])
-    runtime = Path(os.environ.get("CARGO_TARGET_DIR", "target")) / "release/libalign_runtime.a"
+    runtime = Path(os.environ.get("CARGO_TARGET_DIR") or "target") / "release/libalign_runtime.a"
     scratch = tempfile.mkdtemp(prefix="align-csv-quoted-")
     cleanup_safe = True
     try:
@@ -90,7 +90,7 @@ def main():
         probe = str(Path(scratch) / "probe")
         flags = (["-Wl,-dead_strip"] if system == "Darwin" else
                  ["-Wl,--gc-sections", "-lpthread", "-ldl", "-lm"])
-        run_phase("link", [os.environ.get("CC", "cc"), "-O3",
+        run_phase("link", [os.environ.get("CC") or "cc", "-O3",
                            "bench/csv_quoted_scan/main.c", str(runtime), *flags, "-o", probe])
         run_phase("probe", [probe])
     except CleanupError:
