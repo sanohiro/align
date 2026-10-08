@@ -30,7 +30,7 @@ class RunnerOwnership(unittest.TestCase):
                 acquire.assert_not_called()
 
     def test_phase_lifecycle(self):
-        for benchmark in ("csv_quoted_scan", "escaped_decode", "utf8_lossy"):
+        for benchmark in native_probe.PROBES:
             for phase in ("build", "link", "probe"):
                 for ending in ("timeout", "exited-leader", "HUP", "INT", "TERM"):
                     with self.subTest(benchmark=benchmark, phase=phase, ending=ending), \

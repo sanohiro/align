@@ -1,15 +1,16 @@
 # Local native runtime probe runner
 
-The CSV quoted-field, percent/form escape and UTF-8 replacement probes share
+The CSV field-discovery/normalization, percent/form escape and UTF-8 replacement probes share
 `bench/native_probe.py`. Their existing entry points remain:
 
 ```sh
 bash bench/csv_quoted_scan/run.sh
+bash bench/csv_normalization/run.sh
 bash bench/escaped_decode/run.sh
 bash bench/utf8_lossy/run.sh
 ```
 
-The runner accepts only those three probe names, builds the ordinary release
+The runner accepts only those four probe names, builds the ordinary release
 runtime through `scripts/cargo.sh`, links the selected `main.c` with `-O3` and
 the existing macOS/Linux library flags, and passes its CSV output through.
 `CC` selects one compiler executable (default `cc`); `CARGO_TARGET_DIR` selects
