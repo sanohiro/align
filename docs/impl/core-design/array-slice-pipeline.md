@@ -288,6 +288,24 @@ nonzero length, none for zero; the Move handle may allocate. Initialization is
 O(length). Invalid/overflowing counts abort before allocation; OOM aborts.
 The ordinary `buffer(capacity)` remains a best-effort empty read window.
 
+All four constructors also accept a final optional
+`pages: buffer.page_policy = buffer.page_policy.Default` after alignment.
+`buffer.page_policy` is an import-free Copy enum with `Default` and `PreferHuge`.
+For example, `buffer.try_filled(size, 0, 64, buffer.page_policy.PreferHuge)`
+preserves the requested alignment on every supported OS, including after growth.
+Default retains the existing allocation path without extra page advice.
+PreferHuge currently adds a best-effort Linux optimization for fresh payloads
+of at least 2 MiB; macOS and unsupported hosts accept it and allocate normally.
+Smaller/empty payloads receive no advice. Growth retains the preference.
+Huge-page backing, residency, reduced RSS and faster execution are not promised;
+performance can improve or regress. Advice refusal adds no error; normal
+size/alignment/allocation errors remain. Native admission checks alignment, then
+policy tag (0 Default, 1 PreferHuge), then size. Invalid tags abort ordinary
+construction or return `Error.Invalid` from try constructors. Arguments evaluate
+once in source order. Eligible payloads own private mappings; advice covers only
+complete payload pages. Drop or failed handle acquisition unmaps the exact
+original extent. Plan 161 owns the mapping lifecycle and platform qualification.
+
 `b.append_filled(length: i64, value: u8) -> ()` is the family's append member.
 The receiver may also be a stable buffer field of a mutable owned local or a
 `borrow mut` complete record; its parent retains cleanup. Growth invalidates

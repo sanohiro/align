@@ -753,8 +753,8 @@ fn bounded_byte_object_rejects_forged_put_widths() {
         // A matching declared type cannot authorize a wider store: Load still emits actual.
         function.value_tys[input_id.expect("put input") as usize] = scalar;
         assert_eq!(align_mir::byte_storage::plan(function, &Default::default()).slots().count(), 1, "forged table reaches backend check");
-        let error = emit_llvm_ir(&mismatched, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false).expect_err("actual LLVM width/class must be checked");
-        assert!(error.contains("byte storage put operand does not match scalar width"), "{actual}/{claimed}: {error}");
+        let error = emit_llvm_ir(&mismatched, BuildTarget::Baseline, align_driver::Profile::Release, false, &[], false).expect_err("forged width/class must fail before lowering");
+        assert!(error.contains("native owner producer contract mismatch: BufferPut"), "{actual}/{claimed}: {error}");
     }
 
     let mut sm = SourceMap::new();

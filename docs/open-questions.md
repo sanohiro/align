@@ -197,7 +197,7 @@ fallible-slice API. Record: draft §12, language digest, core string design and
 
 Settled by [plan 131](impl/131-aligned-buffer-payload.md): `buffer(capacity,
 alignment)` and `buffer.filled(length, value, alignment)` accept an optional
-trailing i64 alignment (default 1). Arguments evaluate once in source order;
+i64 alignment (default 1). Arguments evaluate once in source order;
 native admission checks power-of-two 1..536870912 before size admission or any
 allocation, aborting invalid alignment even for an empty request. Existing
 best-effort versus terminal allocation policies remain. The payload, including
@@ -211,10 +211,10 @@ portable performance improvement are not supplied by this capability.
 ### Recoverable owned buffer construction
 
 [Plan 135](impl/135-fallible-buffer-construction.md) settles explicit fallible construction:
-`buffer.try_new(capacity: i64, alignment: i64 = 1)` and
-`buffer.try_filled(length: i64, value: u8, alignment: i64 = 1)` return
+`buffer.try_new(capacity: i64, alignment: i64 = 1, pages: buffer.page_policy = Default)` and
+`buffer.try_filled(length: i64, value: u8, alignment: i64 = 1, pages: buffer.page_policy = Default)` return
 `Result<buffer, Error>`. Both are Pure; supplied arguments evaluate once in source
-order. Alignment 1..536870912 power-of-two admission precedes nonnegative,
+order. Alignment 1..536870912 power-of-two admission and page policy precede nonnegative,
 target-Layout-representable count admission. Invalid returns Error.Invalid before
 allocation. Payload or handle allocator refusal returns Error.Code(ENOMEM);
 handle refusal cleans any payload. Success owns one independent Move buffer,
@@ -222,6 +222,18 @@ with exact initial capacity, zero new length or fully initialized filled length.
 Zero acquires only a handle. Alignment and canonical Drop follow the owner.
 Ordinary constructors/growth retain their existing policies; physical residency,
 OS termination recovery and fallible growth are outside this capability.
+
+### Explicit buffer page preference
+
+Settled by [plan 161](impl/161-buffer-page-policy.md): all four buffer constructors
+accept optional `pages: buffer.page_policy` after alignment, default Default.
+The Copy enum has Default and PreferHuge. Requested alignment, initialized bytes
+and ownership stay guaranteed. PreferHuge currently advises Linux private
+payload mappings of at least 2 MiB; macOS and unsupported hosts accept it and
+allocate normally. Growth retains the preference. Advice refusal adds no error;
+ordinary admission/allocation errors remain. Huge backing, residency, RSS and
+speed are not promised. Dedicated mapping ownership retires advice at exact
+unmapping; no global policy or new allocator configuration is exposed.
 
 ### Scalar inspection and explicit capacity (issue batch 1049–1053)
 

@@ -1123,15 +1123,17 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         },
         ExprKind::FileSync { file } => ExprKind::FileSync { file: boxed!(file) },
         ExprKind::FileLen { file } => ExprKind::FileLen { file: boxed!(file) },
-        ExprKind::BufferNew { capacity, fill, alignment } => ExprKind::BufferNew {
+        ExprKind::BufferNew { capacity, fill, alignment, pages } => ExprKind::BufferNew {
             capacity: boxed!(capacity),
             fill: match fill { Some(value) => Some(boxed!(value)), None => None },
             alignment: boxed!(alignment),
+            pages: boxed!(pages),
         },
-        ExprKind::BufferTryNew { capacity, fill, alignment } => ExprKind::BufferTryNew {
+        ExprKind::BufferTryNew { capacity, fill, alignment, pages } => ExprKind::BufferTryNew {
             capacity: boxed!(capacity),
             fill: match fill { Some(value) => Some(boxed!(value)), None => None },
             alignment: boxed!(alignment),
+            pages: boxed!(pages),
         },
         ExprKind::BufferBytes { buffer } => ExprKind::BufferBytes {
             buffer: boxed!(buffer),
@@ -2871,7 +2873,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         }
         ExprKind::BorrowedIndex { index, .. } => one!(index),
         ExprKind::ArrayBuilderNew { region, capacity, .. } => { optional!(region); one!(capacity); }
-        ExprKind::BufferNew { capacity, fill, alignment } | ExprKind::BufferTryNew { capacity, fill, alignment } => { one!(capacity); optional!(fill); one!(alignment); }
+        ExprKind::BufferNew { capacity, fill, alignment, pages } | ExprKind::BufferTryNew { capacity, fill, alignment, pages } => { one!(capacity); optional!(fill); one!(alignment); one!(pages); }
         ExprKind::BuilderNew { capacity } => optional!(capacity),
         ExprKind::SliceRange { recv, start, end } => {
             one!(recv);

@@ -7,8 +7,11 @@ pub(super) struct BufferStorage {
     writable: *mut u8,
     len: usize,
     capacity: usize,
-    alignment: usize,
+    alignment_policy: usize,
+    mapping: Option<super::buffer_pages::Mapping>,
 }
+
+const PREFER_HUGE: usize = 1 << 30;
 
 // SAFETY: moving the owner transfers the allocation and its exact layout together.
 unsafe impl Send for BufferStorage {}
@@ -24,7 +27,8 @@ impl From<Vec<u8>> for BufferStorage {
             writable,
             len: bytes.len(),
             capacity: bytes.capacity(),
-            alignment: 1,
+            alignment_policy: 1,
+            mapping: None,
         };
         #[cfg(test)]
         if owner.capacity != 0 {
@@ -53,10 +57,10 @@ impl Drop for BufferStorage {
     fn drop(&mut self) {
         if self.capacity != 0 {
             #[cfg(test)]
-            record(false, self.writable.addr(), self.capacity, self.alignment);
+            record(false, self.writable.addr(), self.capacity, self.alignment());
             // SAFETY: every acquisition records its exact valid Layout; Vec<u8> adoption uses
             // capacity bytes and alignment 1, never the allocator's incidental over-alignment.
-            unsafe { dealloc(self.writable, self.layout()) };
+            if self.mapping.is_none() { unsafe { dealloc(self.writable, self.layout()) }; }
         }
     }
 }
@@ -70,13 +74,14 @@ impl BufferStorage {
             writable: core::ptr::without_provenance_mut(alignment),
             len: 0,
             capacity: 0,
-            alignment,
+            alignment_policy: alignment,
+            mapping: None,
         }
     }
 
     fn layout(&self) -> Layout {
         // SAFETY: acquisition checked Layout formation; growth changes these fields atomically.
-        unsafe { Layout::from_size_align_unchecked(self.capacity, self.alignment) }
+        unsafe { Layout::from_size_align_unchecked(self.capacity, self.alignment()) }
     }
 
     pub(super) fn as_slice(&self) -> &[u8] {
@@ -94,8 +99,14 @@ impl BufferStorage {
         self.capacity
     }
     pub(super) fn alignment(&self) -> usize {
-        self.alignment
+        self.alignment_policy & !PREFER_HUGE
     }
+    pub(super) fn with_policy(alignment: usize, pages: i32) -> Self {
+        let mut storage = Self::new(alignment);
+        if pages == 1 { storage.alignment_policy |= PREFER_HUGE; }
+        storage
+    }
+    pub(super) fn prefers_huge(&self) -> bool { self.alignment_policy & PREFER_HUGE != 0 }
     pub(super) fn len(&self) -> usize {
         self.len
     }
@@ -125,14 +136,14 @@ impl BufferStorage {
         if required <= self.capacity {
             return Ok(());
         }
-        let required_layout = Layout::from_size_align(required, self.alignment).map_err(|_| ())?;
+        let required_layout = Layout::from_size_align(required, self.alignment()).map_err(|_| ())?;
         let layout = if exact {
             required_layout
         } else {
             self.capacity
                 .checked_mul(2)
                 .and_then(|capacity| {
-                    Layout::from_size_align(capacity.max(required).max(8), self.alignment).ok()
+                    Layout::from_size_align(capacity.max(required).max(8), self.alignment()).ok()
                 })
                 .unwrap_or(required_layout)
         };
@@ -147,45 +158,60 @@ impl BufferStorage {
         };
         #[cfg(not(test))]
         let force_move = false;
-        // SAFETY: the new nonzero layout is checked and retains the old alignment. Reallocation
-        // transfers the initialized prefix on success and leaves the old allocation on failure.
-        let replacement = unsafe {
-            if self.capacity == 0 {
-                if zeroed { alloc_zeroed(layout) } else { alloc(layout) }
-            } else if force_move {
-                // Test-only relocation witness: the old owner is live during acquisition, so
-                // success cannot reuse its address. Failure leaves that owner unchanged.
-                let replacement = alloc(layout);
-                if !replacement.is_null() {
-                    core::ptr::copy_nonoverlapping(self.writable, replacement, self.len);
-                    dealloc(self.writable, self.layout());
-                }
-                replacement
-            } else {
-                realloc(self.writable, self.layout(), layout.size())
+        let mapped = self.mapping.is_some()
+            || (self.prefers_huge() && super::buffer_pages::eligible(layout.size()));
+        if mapped {
+            let (mapping, replacement) = super::buffer_pages::allocate(layout.size(), self.alignment())?;
+            if self.len != 0 {
+                // SAFETY: the fresh mapping is disjoint; only the initialized prefix is copied.
+                unsafe { core::ptr::copy_nonoverlapping(self.writable, replacement, self.len) };
             }
-        };
-        if replacement.is_null() {
-            return Err(());
+            let old_pointer = self.writable;
+            let old_capacity = self.capacity;
+            let old_layout = self.layout();
+            let old_mapping = self.mapping.replace(mapping);
+            self.writable = replacement;
+            self.capacity = layout.size();
+            if old_capacity != 0 && old_mapping.is_none() {
+                // SAFETY: this was a global allocation with its exact original Layout.
+                unsafe { dealloc(old_pointer, old_layout) };
+            }
+            drop(old_mapping);
+        } else {
+            // SAFETY: both owners use the global allocator with their checked exact Layout.
+            let replacement = unsafe {
+                if self.capacity == 0 {
+                    if zeroed { alloc_zeroed(layout) } else { alloc(layout) }
+                } else if force_move {
+                    let replacement = alloc(layout);
+                    if !replacement.is_null() {
+                        core::ptr::copy_nonoverlapping(self.writable, replacement, self.len);
+                        dealloc(self.writable, self.layout());
+                    }
+                    replacement
+                } else {
+                    realloc(self.writable, self.layout(), layout.size())
+                }
+            };
+            if replacement.is_null() { return Err(()); }
+            // Publish returned provenance even for in-place realloc before any observer.
+            self.writable = replacement;
+            self.capacity = layout.size();
         }
-        // Publish the returned provenance even for in-place success, before test observers can
-        // unwind. The old pointer is no longer an owner after a successful realloc.
-        self.writable = replacement;
-        self.capacity = layout.size();
         #[cfg(test)]
         {
             if previous.1 != 0 {
-                record(false, previous.0, previous.1, self.alignment);
+                record(false, previous.0, previous.1, self.alignment());
             }
-            record(true, self.writable.addr(), self.capacity, self.alignment);
+            record(true, self.writable.addr(), self.capacity, self.alignment());
         }
         Ok(())
     }
 
     /// Fresh filled storage owns exactly one admitted payload. The allocator initializes zero
     /// bytes; other fills initialize the entire allocation before publishing its readable length.
-    pub(super) fn try_filled(length: usize, value: u8, alignment: usize) -> Result<Self, ()> {
-        let mut storage = Self::new(alignment);
+    pub(super) fn try_filled(length: usize, value: u8, alignment: usize, pages: i32) -> Result<Self, ()> {
+        let mut storage = Self::with_policy(alignment, pages);
         storage.grow(length, true, value == 0)?;
         if value != 0 && length != 0 {
             // SAFETY: grow acquired length writable bytes under the checked exact Layout.
@@ -466,7 +492,7 @@ mod tests {
     #[test]
     fn buffer_byte_views_preserve_writable_aliases() {
         for capacity in [0, 8] {
-            let owner = Owner(align_rt_buffer_new(capacity, 1));
+            let owner = Owner(align_rt_buffer_new(capacity, 1, 0));
             assert_eq!(view(owner.0).len, 0);
             unsafe { align_rt_buffer_append(owner.0, b"abcd".as_ptr(), 4) };
             let first = view(owner.0);
@@ -501,7 +527,7 @@ mod tests {
 
     #[test]
     fn buffer_byte_views_allow_shared_publication() {
-        let owner = Owner(align_rt_buffer_new(8, 1));
+        let owner = Owner(align_rt_buffer_new(8, 1, 0));
         unsafe { align_rt_buffer_append(owner.0, b"shared".as_ptr(), 6) };
         let buffer = unsafe { &*owner.0 };
         std::thread::scope(|scope| {

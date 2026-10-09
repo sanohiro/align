@@ -1045,10 +1045,11 @@ fn walk_body_records<'a>(
                     }
                     work.push((BodyRecord::Expr(capacity), child_depth));
                 }
-                ExprKind::BufferNew { capacity, fill, alignment } | ExprKind::BufferTryNew { capacity, fill, alignment } => {
+                ExprKind::BufferNew { capacity, fill, alignment, pages } | ExprKind::BufferTryNew { capacity, fill, alignment, pages } => {
                     work.push((BodyRecord::Expr(capacity), child_depth));
                     if let Some(value) = fill { work.push((BodyRecord::Expr(value), child_depth)); }
                     work.push((BodyRecord::Expr(alignment), child_depth));
+                    work.push((BodyRecord::Expr(pages), child_depth));
                 }
                 ExprKind::BuilderNew { capacity } => {
                     if let Some(value) = capacity.as_deref() {

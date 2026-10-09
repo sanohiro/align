@@ -13,7 +13,7 @@ extern "C" {
   fn align_rt_io_reader_free(reader: raw)
   fn align_rt_io_writer_write(writer: raw, bytes: slice<u8>, length: i64) -> i32
   fn align_rt_io_writer_free(writer: raw)
-  fn align_rt_buffer_new(capacity: i64, alignment: i64) -> raw
+  fn align_rt_buffer_new(capacity: i64, alignment: i64, pages: i32) -> raw
   fn align_rt_buffer_bytes(buffer: raw, out: raw)
   fn align_rt_buffer_capacity(buffer: raw) -> i64
   fn align_rt_buffer_free(buffer: raw)
@@ -223,7 +223,7 @@ fn send_set(
 
 fn new_read_input() -> raw {
   unsafe {
-    buffer := align_rt_buffer_new(READ_CHUNK_BYTES, 1)
+    buffer := align_rt_buffer_new(READ_CHUNK_BYTES, 1, 0)
     if buffer.is_null() || align_rt_buffer_capacity(buffer) != READ_CHUNK_BYTES {
       process.abort()
     }

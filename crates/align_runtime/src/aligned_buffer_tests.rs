@@ -13,9 +13,9 @@ fn aligned_buffer_construction_growth_reads_and_matching_drop() {
         for filled in [false, true] {
             let events = observe_allocations(|| {
                 let owner = BufferTestHandle(if filled {
-                    align_rt_buffer_filled(3, 0xa5, alignment)
+                    align_rt_buffer_filled(3, 0xa5, alignment, 0)
                 } else {
-                    align_rt_buffer_new(3, alignment)
+                    align_rt_buffer_new(3, alignment, 0)
                 });
                 assert_eq!(
                     allocation_event_count(),
@@ -86,13 +86,13 @@ fn aligned_buffer_construction_growth_reads_and_matching_drop() {
             assert!(live.is_empty());
         }
         let events = observe_allocations(|| {
-            let empty = BufferTestHandle(align_rt_buffer_filled(0, 0, alignment));
+            let empty = BufferTestHandle(align_rt_buffer_filled(0, 0, alignment, 0));
             assert_eq!(
                 unsafe { (*empty.0).data.writable_ptr().addr() }
                     % usize::try_from(alignment).unwrap(),
                 0
             );
-            let failed = BufferTestHandle(align_rt_buffer_new(i64::MAX, alignment));
+            let failed = BufferTestHandle(align_rt_buffer_new(i64::MAX, alignment, 0));
             assert_eq!(unsafe { align_rt_buffer_capacity(failed.0) }, 0);
         });
         assert!(events.is_empty(), "empty/failed hints acquire no payload");
@@ -100,7 +100,7 @@ fn aligned_buffer_construction_growth_reads_and_matching_drop() {
             std::fs::File::open(&path).unwrap().into_raw_fd(),
             true,
         ))));
-        let owner = BufferTestHandle(align_rt_buffer_new(1, alignment));
+        let owner = BufferTestHandle(align_rt_buffer_new(1, alignment, 0));
         unsafe { align_rt_io_reader_buffered(reader.0) };
         assert_eq!(
             unsafe { align_rt_io_reader_read_line(reader.0, owner.0) },
@@ -138,19 +138,42 @@ fn aligned_buffer_invalid_alignment_precedes_every_allocation() {
         assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) }, 0);
         OWNED_ALLOC_FAIL_AFTER.store(0, core::sync::atomic::Ordering::Relaxed);
         crate::buffer_storage::ALLOCATION_PROBE.set(2);
-        if index == 56 {
-            align_rt_buffer_filled(1, 0, 1);
+        if index == 63 {
+            #[cfg(target_os = "linux")]
+            {
+                OWNED_ALLOC_FAIL_AFTER.store(-1, core::sync::atomic::Ordering::Relaxed);
+                crate::buffer_storage::ALLOCATION_PROBE.set(0);
+                crate::buffer_pages::verify_retired_mapping_reuse();
+                return;
+            }
+        } else if index == 59 {
+            align_rt_buffer_new(-1, 64, 2);
+        } else if index == 60 {
+            align_rt_buffer_filled(-1, 0, 64, 2);
+        } else if index == 61 {
+            align_rt_buffer_filled(-1, 0, 3, 2);
+        } else if index == 62 {
+            #[cfg(target_os = "linux")]
+            {
+                OWNED_ALLOC_FAIL_AFTER.store(-1, core::sync::atomic::Ordering::Relaxed);
+                crate::buffer_storage::ALLOCATION_PROBE.set(0);
+                let owner = BufferTestHandle(align_rt_buffer_filled(2 << 20, 0, 64, 1));
+                crate::buffer_pages::REFUSE_RELEASE.set(true);
+                drop(owner);
+            }
+        } else if index == 56 {
+            align_rt_buffer_filled(1, 0, 1, 0);
         } else if index == 57 {
-            align_rt_buffer_new(0, 1);
+            align_rt_buffer_new(0, 1, 0);
         } else if index == 58 {
-            align_rt_buffer_new(1, 1);
+            align_rt_buffer_new(1, 1, 0);
         } else {
             let alignment = bad[index / 8];
             let size = sizes[(index / 2) % 4];
             if index % 2 == 0 {
-                align_rt_buffer_new(size, alignment);
+                align_rt_buffer_new(size, alignment, 0);
             } else {
-                align_rt_buffer_filled(size, 0, alignment);
+                align_rt_buffer_filled(size, 0, alignment, 0);
             }
         }
         panic!("invalid alignment or active allocation witness returned");
@@ -203,7 +226,7 @@ fn aligned_buffer_invalid_alignment_precedes_every_allocation() {
         }
     }
     let root = FileFixtureDir::new("aligned-admission");
-    for index in 0..59 {
+    for index in 0..if cfg!(target_os = "linux") { 64 } else { 62 } {
         let stderr = root.0.join(format!("{index}.err"));
         let process = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
@@ -223,10 +246,15 @@ fn aligned_buffer_invalid_alignment_precedes_every_allocation() {
             reaped: false,
         };
         let status = child.wait();
+        if index == 63 { assert!(status.success(), "mapping reuse child"); continue; }
         assert_eq!(status.signal(), Some(libc::SIGABRT), "case {index}");
         assert!(std::fs::metadata(&stderr).unwrap().len() < 16384);
         let output = std::fs::read_to_string(stderr).unwrap();
-        let expected = if index < 56 {
+        let expected = if index == 62 {
+            "buffer mapping release failed"
+        } else if index == 59 || index == 60 {
+            "buffer page policy must be Default or PreferHuge"
+        } else if index < 56 || index == 61 {
             "buffer alignment must be a power of two between 1 and 536870912"
         } else if index == 56 {
             "buffer allocation failed"

@@ -5722,6 +5722,22 @@ impl<'a> BodyValidator<'a> {
             })
     }
 
+    fn buffer_page_policy_ty(&self, ty: Ty) -> bool {
+        let Ty::Enum(id) = ty else {
+            return false;
+        };
+        let Some(definition) = self.program.enums.get(id as usize) else {
+            return false;
+        };
+        const NAMES: [&str; 2] = ["Default", "PreferHuge"];
+        definition.name == "buffer.page_policy"
+            && definition.source_name == "buffer.page_policy"
+            && definition.variants.len() == NAMES.len()
+            && definition.variants.iter().zip(NAMES).all(|(variant, expected)| {
+                variant.name == expected && variant.payload.is_empty() && variant.field_base == 1
+            })
+    }
+
         fn xml_event_ty(&self, ty: Ty) -> bool {
             let Ty::Enum(id) = ty else {
                 return false;
@@ -9305,22 +9321,22 @@ impl<'a> BodyValidator<'a> {
                 (local(file, Ty::File) && file.ty == Ty::File)
                     .then(|| result(Ty::Int(align_sema::IntTy { bits: 64, signed: true }), &[file]))?
             }
-            hir::ExprKind::BufferNew { capacity, fill, alignment } => {
-                if capacity.ty != i64 || alignment.ty != i64 { return None; }
+            hir::ExprKind::BufferNew { capacity, fill, alignment, pages } => {
+                if capacity.ty != i64 || alignment.ty != i64 || !self.buffer_page_policy_ty(pages.ty) { return None; }
                 if let Some(fill) = fill {
                     if fill.ty != Ty::Int(align_sema::IntTy { bits: 8, signed: false }) { return None; }
-                    strict(Ty::Buffer, &[capacity, fill, alignment])
+                    strict(Ty::Buffer, &[capacity, fill, alignment, pages])
                 } else {
-                    strict(Ty::Buffer, &[capacity, alignment])
+                    strict(Ty::Buffer, &[capacity, alignment, pages])
                 }
             }
-            hir::ExprKind::BufferTryNew { capacity, fill, alignment } => {
-                if capacity.ty != i64 || alignment.ty != i64 { return None; }
+            hir::ExprKind::BufferTryNew { capacity, fill, alignment, pages } => {
+                if capacity.ty != i64 || alignment.ty != i64 || !self.buffer_page_policy_ty(pages.ty) { return None; }
                 if let Some(fill) = fill {
                     if fill.ty != Ty::Int(align_sema::IntTy { bits: 8, signed: false }) { return None; }
-                    result(Ty::Buffer, &[capacity, fill, alignment])
+                    result(Ty::Buffer, &[capacity, fill, alignment, pages])
                 } else {
-                    result(Ty::Buffer, &[capacity, alignment])
+                    result(Ty::Buffer, &[capacity, alignment, pages])
                 }
             }
             hir::ExprKind::BufferBytes { buffer } => {

@@ -194,8 +194,8 @@ fn control_and_cleanup(stage: &std::path::Path) {
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
-extern int32_t align_rt_buffer_try_new(int64_t, int64_t, void **);
-extern int32_t align_rt_buffer_try_filled(int64_t, uint8_t, int64_t, void **);
+extern int32_t align_rt_buffer_try_new(int64_t, int64_t, int32_t, void **);
+extern int32_t align_rt_buffer_try_filled(int64_t, uint8_t, int64_t, int32_t, void **);
 extern void align_rt_buffer_free(void *);
 static void *live[128];
 static int acquired, freed;
@@ -211,17 +211,17 @@ static int32_t track(int32_t status, void *p) {
     for (int i = 0; i < 128; ++i) if (!live[i]) { live[i] = p; return 0; }
     abort();
 }
-int32_t probe_buffer_try_new(int64_t capacity, int64_t alignment, void **out) {
+int32_t probe_buffer_try_new(int64_t capacity, int64_t alignment, int32_t pages, void **out) {
     if (*out) abort();
     /* ABI-only refusal proves Code(ENOMEM) mapping; native owners inject actual allocation sites. */
     if (capacity == 12345) return 17;
-    int32_t status = align_rt_buffer_try_new(capacity, alignment, out);
+    int32_t status = align_rt_buffer_try_new(capacity, alignment, pages, out);
     return track(status, *out);
 }
-int32_t probe_buffer_try_filled(int64_t length, uint8_t value, int64_t alignment, void **out) {
+int32_t probe_buffer_try_filled(int64_t length, uint8_t value, int64_t alignment, int32_t pages, void **out) {
     if (*out) abort();
     if (length == 12345) return 17;
-    int32_t status = align_rt_buffer_try_filled(length, value, alignment, out);
+    int32_t status = align_rt_buffer_try_filled(length, value, alignment, pages, out);
     return track(status, *out);
 }
 void probe_buffer_free(void *p) {

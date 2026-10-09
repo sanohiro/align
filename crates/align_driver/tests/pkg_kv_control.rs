@@ -37,7 +37,7 @@ const _: unsafe extern "C" fn(*mut align_runtime::Reader) = align_runtime::align
 const _: unsafe extern "C" fn(*mut align_runtime::Writer, *const u8, i64) -> i32 =
     align_runtime::align_rt_io_writer_write;
 const _: unsafe extern "C" fn(*mut align_runtime::Writer) = align_runtime::align_rt_io_writer_free;
-const _: extern "C" fn(i64, i64) -> *mut align_runtime::Buffer = align_runtime::align_rt_buffer_new;
+const _: extern "C" fn(i64, i64, i32) -> *mut align_runtime::Buffer = align_runtime::align_rt_buffer_new;
 const _: unsafe extern "C" fn(*mut align_runtime::Buffer, *mut align_runtime::AlignStr) =
     align_runtime::align_rt_buffer_bytes;
 const _: unsafe extern "C" fn(*mut align_runtime::Buffer) -> i64 =
@@ -134,9 +134,9 @@ const NATIVE_REWRITES: [RewriteContract; 13] = [
     RewriteContract {
         original: "align_rt_buffer_new",
         replacement: "align_kv_control_buffer_new",
-        declaration: "fn align_rt_buffer_new(capacity: i64, alignment: i64) -> raw",
-        live_calls: &[("buffer := align_rt_buffer_new(READ_CHUNK_BYTES, 1)", 1)],
-        c_signature: "void *align_kv_control_buffer_new(int64_t capacity, int64_t alignment)",
+        declaration: "fn align_rt_buffer_new(capacity: i64, alignment: i64, pages: i32) -> raw",
+        live_calls: &[("buffer := align_rt_buffer_new(READ_CHUNK_BYTES, 1, 0)", 1)],
+        c_signature: "void *align_kv_control_buffer_new(int64_t capacity, int64_t alignment, int32_t pages)",
     },
     RewriteContract {
         original: "align_rt_buffer_bytes",
@@ -368,7 +368,7 @@ fn control_sources() -> (String, String) {
     let internal = fixture("apps/kv/pkg/kv/internal/resource.align");
     assert_eq!(
         (root.len(), source_fingerprint(root)),
-        (22_731, 0x43baddaf3b8c3820)
+        (22_746, 0x74e773c2a60f0e68)
     );
     assert_eq!(
         (internal.len(), source_fingerprint(internal)),
@@ -1729,8 +1729,8 @@ int64_t align_kv_control_reader_read(void *reader, void *buffer) {
     return reply_length;
 }
 
-void *align_kv_control_buffer_new(int64_t capacity, int64_t alignment) {
-  if (alignment != 1) abort();
+void *align_kv_control_buffer_new(int64_t capacity, int64_t alignment, int32_t pages) {
+  if (alignment != 1 || pages != 0) abort();
     buffer_new_calls += 1;
     if (selected_case != CASE_STRINGS || buffer_live || capacity != 32768) _Exit(81);
     buffer_live = 1;

@@ -117,7 +117,7 @@ fn instrument_parser_work(source: String) -> (String, ParserWorkInventory) {
     let region = &source[start..];
     let fingerprint = normalized_source_fingerprint(region);
     assert_eq!(
-        fingerprint, 14_849_363_909_088_421_227,
+        fingerprint, 9_603_090_764_391_692_185,
         "pkg.kv parser source shape changed; audit every reachable scan and refresh the inventory",
     );
 
@@ -465,9 +465,9 @@ fn parser_sources() -> (String, String, ParserWorkInventory) {
         },
     ];
     let root_source = fixture("apps/kv/pkg/kv.align");
-    assert_source_fingerprint("pkg.kv", root_source, 4880456890897414176);
+    assert_source_fingerprint("pkg.kv", root_source, 8423828907866656360);
     let root = replace_required(root_source, "pkg.kv", &native);
-    assert_source_fingerprint("rewritten pkg.kv", &root, 2278485981234288666);
+    assert_source_fingerprint("rewritten pkg.kv", &root, 13773884386557459882);
 
     // Keep byte advancement exact and independent of the exhaustive parser-work hooks. The source
     // inventory below makes a new loop, index, comparison, match, helper, or call-site change an
@@ -1918,8 +1918,8 @@ void align_kv_parser_stub_writer_free(void *writer) {
     }
 }
 
-void *align_kv_parser_stub_buffer_new(int64_t capacity, int64_t alignment) {
-  if (alignment != 1) abort();
+void *align_kv_parser_stub_buffer_new(int64_t capacity, int64_t alignment, int32_t pages) {
+  if (alignment != 1 || pages != 0) abort();
     buffer_new_calls += 1;
     if (capacity != READ_CAPACITY || buffer_in_use) {
         protocol_errors += 1;
