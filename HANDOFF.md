@@ -2,13 +2,13 @@
 
 ## Current work direction
 
-The owner stopped the continuous improvement loop after PR #1302 and then
-prioritized align-llm Request136 as a blocker. Plan159 repairs MIR certification
-of owned records containing plain fixed-array values, including imported
-construction, shared/mutable calls and nested Copy metadata. Complete this
-request's delivery and local release build, then stop; no further independent
-improvement loop is authorized. K1/plan61 and the separately parked general
-aggregate-provenance experiment remain deferred.
+The owner stopped the continuous improvement loop after PR #1302. Request136's
+owned fixed-array record certification is delivered in PR #1303. Current work
+is the explicitly requested align-llm Requests138–140 batch (plan160): zeroed
+buffer acquisition, stable buffer-field growth and exact malformed-JSON Invalid
+mapping. Complete this batch's delivery and local release build, then stop; no
+further independent improvement loop is authorized. K1/plan61 and the separately
+parked general aggregate-provenance experiment remain deferred.
 
 External align-llm adoption and end-to-end/network measurements remain
 consumer-owned. Request126's

@@ -104,6 +104,45 @@ fn assert_header_retired(events: &[HeaderEvent], expected: usize) {
 }
 
 #[test]
+fn zero_filled_payloads_keep_layout_initialization_and_failure_ownership() -> Result<(), core::num::TryFromIntError> {
+    for shift in 0..=29 {
+        let alignment = 1_i64 << shift;
+        let expected_alignment = usize::try_from(alignment)?;
+        for length in [0, 17] {
+            let expected_length = usize::try_from(length)?;
+            for fallible in [false, true] {
+                let (payloads, headers, _, _) = observe(false, false, || {
+                    let owner = if fallible {
+                        let mut out = core::ptr::null_mut();
+                        assert_eq!(unsafe { align_rt_buffer_try_filled(length, 0, alignment, &mut out) }, 0);
+                        Owner(out)
+                    } else { Owner(align_rt_buffer_filled(length, 0, alignment)) };
+                    let buffer = unsafe { &mut *owner.0 };
+                    assert_eq!((buffer.len, buffer.cap, buffer.data.len()), (expected_length, expected_length, expected_length));
+                    assert!(buffer.data.iter().all(|byte| *byte == 0));
+                    assert_eq!(buffer.data.writable_ptr().addr() % expected_alignment, 0);
+                    buffer.data.fill(0xa5);
+                });
+                assert_eq!(payloads.len(), if length == 0 { 0 } else { 2 });
+                assert_retired(&payloads);
+                if fallible { assert_header_retired(&headers, 1); }
+            }
+        }
+    }
+    for (payload, header) in [(true, false), (false, true), (true, true)] {
+        let (payloads, headers, _, _) = observe(payload, header, || {
+            let mut out = core::ptr::dangling_mut();
+            assert_eq!(unsafe { align_rt_buffer_try_filled(17, 0, 64, &mut out) }, AL_CODE + libc::ENOMEM);
+            assert!(out.is_null());
+        });
+        assert_eq!(payloads.len(), if payload { 0 } else { 2 });
+        assert_retired(&payloads);
+        assert!(headers.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
 fn fallible_buffer_admission_and_failures() {
     for filled in [false, true] {
         for count in [i64::MIN, -1, 0, 1, i64::MAX] {

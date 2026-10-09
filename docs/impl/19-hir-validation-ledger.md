@@ -1266,9 +1266,7 @@ predicate, not type equality alone:
 - `SourceMutLocal(T,e)` is exactly a bare source local whose checked child is
   `LocalHandle(T,e)` and whose local has `is_mut == true`. It is required
   exactly for `ArrayBuilderPush.builder`, `ArrayBuilderAppend.builder`,
-  `RandNext.rng`, `RandRange.rng`, `RandSample.rng`,
-  `BufferPut.buffer`, `BufferAppend.buffer`, and
-  `BufferAppendFilled.buffer`. `RandShuffle` additionally
+  `RandNext.rng`, `RandRange.rng`, and `RandSample.rng`. `RandShuffle` additionally
   requires its `rng` to satisfy that predicate and its `xs` to be the
   producer's writable `Slice(T)` local: `is_mut == true`, not read-only, and
   admitted primitive element `T`. Am-v adds the same
@@ -1278,6 +1276,12 @@ predicate, not type equality alone:
   inspects `Local.is_mut`: mutation of a Command, CliCommand, HttpRequest,
   HttpClient, ResponseBuilder, HttpStream, Reader, Writer, File, socket, or
   other runtime object's interior state is not source binding reassignment.
+- `MutableBufferPlace(e)` accepts a validated Buffer local or nonempty stable
+  field path with a source-mutable complete root. Parameter mode must be ByValue
+  or BorrowMut independently of `is_mut`; shared match payloads are excluded.
+  Exact field types/path and source fact replay remain required. Buffer growth
+  reserves its receiver through eager arguments, then invalidates old complete-
+  owner buffer views without transferring or nulling the owner (plan160).
 - A row marked `consume-any` transfers the complete temporary and is exempt;
   ordinary `consume` does not erase a row's stated receiver-place gate. The
   complete consume-any set is `ReaderBuffered.reader`,
@@ -1327,9 +1331,9 @@ merely because its `Ty` matches.
 | `BuilderLen` | `env[]; child[builder]`; exact stable local Builder receiver, authenticated against its local/parameter declaration; result exactly i64, Pure and nonconsuming. Counts initialized UTF-8 bytes including NUL; no retained dependency, allocation or view (plan 140). |
 | `ArrayBuilderLen` | `env[]; child[builder]`; exact stable local of one of all five admitted builder families, with valid element graph and declaration; result exactly i64, Pure and nonconsuming. Counts total initialized elements across existing heap/region modes without traversal or compaction; no retained dependency (plan 140). |
 | `BytesRead` | `env[be]`; `child[bytes,offset]`; `bytes,i64; result exact stored read scalar in {i8/u8/i16/u16/i32/u32/i64/u64/f32/f64}; be must be false for one-byte widths; borrowed bounds-checked read; Pure`. |
-| `BufferPut` | `env[be]`; `child[buffer,value]`; `SourceMutLocal(Buffer,buffer); value exact supported binary scalar; be false for one-byte widths; result Unit; buffer mutated; Pure`. |
-| `BufferAppend` | `env[]; child[buffer,data]`; `SourceMutLocal(Buffer,buffer),byte-view; result Unit; data borrowed, buffer mutated; Pure`. |
-| `BufferAppendFilled` | `env[]; child[buffer,length,value]`; `SourceMutLocal(Buffer,buffer), length exactly i64, value exactly u8; result Unit; both operands Copy, buffer mutated; Pure`. Zero length is a valid no-op; a negative or overflowing length aborts at runtime before any write, like the `BufferNew` filled constructor. |
+| `BufferPut` | `env[be]`; `child[buffer,value]`; `MutableBufferPlace(buffer); value exact supported binary scalar; be false for one-byte widths; result Unit; buffer mutated; Pure`. |
+| `BufferAppend` | `env[]; child[buffer,data]`; `MutableBufferPlace(buffer),byte-view; result Unit; data borrowed, buffer mutated; Pure`. |
+| `BufferAppendFilled` | `env[]; child[buffer,length,value]`; `MutableBufferPlace(buffer), length exactly i64, value exactly u8; result Unit; both operands Copy, buffer mutated; Pure`. Zero length is a valid no-op; a negative or overflowing length aborts at runtime before any write, like the `BufferNew` filled constructor. |
 | `ArrayBuilderNew` | `env[elem]`: exact nonrecursive descriptor `Scalar(S)` or `Aggregate(Vec(S,N) | Mask(S,N) | FixedArray(S,N) | FixedStructArray(id,N))`. `child[region?,capacity]`; capacity is i64 (omitted source capacity is an explicit zero record); with no region, admit exactly primitive Copy scalars, String, or `Scalar(Struct(id))` with `HTR(id)`; with a region, require the descriptor's concrete type to be recursively `RegionPlain`. Result `ArrayBuilder(elem)`; new owned heap allocation or explicitly region-owned allocation; Pure. An unknown/malformed struct/tagged/array id or closed-predicate failure rejects before MIR allocation. |
 | `ArrayBuilderPush` | `env[moves_value]`; `child[builder,value]`; `SourceMutLocal(ArrayBuilder(elem),builder), value exact `elem.ty()`; `moves_value` iff `elem == Scalar(String)` or `elem == Scalar(Struct(id)) && HTRMove(id)`; result Unit. A true bit consumes and nulls the complete source, a false bit copies the producer-valid value with any region provenance, and the builder is mutated. A wrong bit or malformed recursive record graph rejects before MIR ownership transfer. |
 | `ArrayBuilderAppend` | `env[]; child[builder,data]`; descriptor must be `Scalar(copy elem)`, `SourceMutLocal(ArrayBuilder(elem),builder), data Slice(elem)`; result Unit; data borrowed, builder mutated; Pure. Aggregate descriptors use `push`. |

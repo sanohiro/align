@@ -242,6 +242,9 @@ growth success; existing best-effort construction and terminal growth/OOM
 policies remain ([plan 87](../87-buffer-read-capacity-plan.md)).
 
 `b.append_filled(length: i64, value: u8) -> ()` is the family's append member.
+The receiver may also be a stable buffer field of a mutable owned local or a
+`borrow mut` complete record; its parent retains cleanup. Growth invalidates
+earlier buffer views from that complete owner, including sibling buffer views.
 It extends a `mut buffer`'s published window by exactly `length` bytes of
 `value` in one growth, never a growth sequence or a call per byte. Zero length
 is a no-op; a negative or overflowing length aborts before any write, the same

@@ -1613,6 +1613,16 @@ pub fn native_owner_mir_contract<'a>(
             contract.result = i64_ty;
             contract.operands = vec![(buffer, Ty::Buffer, read)];
         }
+        Rvalue::BufferPut { buffer, value, scalar, .. } => {
+            contract.operands = vec![(buffer, Ty::Buffer, write), (value, *scalar, read)];
+        }
+        Rvalue::BufferAppend { buffer, data } => {
+            contract.operands = vec![(buffer, Ty::Buffer, write), (data, byte_view(data), read)];
+        }
+        Rvalue::BufferAppendFilled { buffer, length, value } => {
+            contract.operands = vec![(buffer, Ty::Buffer, write), (length, i64_ty, read),
+                (value, Ty::Int(IntTy { bits: 8, signed: false }), read)];
+        }
         Rvalue::FileCreateRw { path, out } | Rvalue::FileOpenRw { path, out }
         | Rvalue::FileOpenRo { path, out } | Rvalue::FileCreateRwExclusive { path, out } => {
             contract.result = i32_ty;

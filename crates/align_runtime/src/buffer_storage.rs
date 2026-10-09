@@ -1,7 +1,7 @@
 //! Owned byte storage whose shared publications retain writable pointer provenance.
 
 use core::ops::{Deref, DerefMut};
-use std::alloc::{Layout, alloc, dealloc, realloc};
+use std::alloc::{Layout, alloc, alloc_zeroed, dealloc, realloc};
 
 pub(super) struct BufferStorage {
     writable: *mut u8,
@@ -93,6 +93,9 @@ impl BufferStorage {
     pub(super) fn capacity(&self) -> usize {
         self.capacity
     }
+    pub(super) fn alignment(&self) -> usize {
+        self.alignment
+    }
     pub(super) fn len(&self) -> usize {
         self.len
     }
@@ -118,7 +121,7 @@ impl BufferStorage {
         }
     }
 
-    fn grow(&mut self, required: usize, exact: bool) -> Result<(), ()> {
+    fn grow(&mut self, required: usize, exact: bool, zeroed: bool) -> Result<(), ()> {
         if required <= self.capacity {
             return Ok(());
         }
@@ -148,7 +151,7 @@ impl BufferStorage {
         // transfers the initialized prefix on success and leaves the old allocation on failure.
         let replacement = unsafe {
             if self.capacity == 0 {
-                alloc(layout)
+                if zeroed { alloc_zeroed(layout) } else { alloc(layout) }
             } else if force_move {
                 // Test-only relocation witness: the old owner is live during acquisition, so
                 // success cannot reuse its address. Failure leaves that owner unchanged.
@@ -179,11 +182,24 @@ impl BufferStorage {
         Ok(())
     }
 
+    /// Fresh filled storage owns exactly one admitted payload. The allocator initializes zero
+    /// bytes; other fills initialize the entire allocation before publishing its readable length.
+    pub(super) fn try_filled(length: usize, value: u8, alignment: usize) -> Result<Self, ()> {
+        let mut storage = Self::new(alignment);
+        storage.grow(length, true, value == 0)?;
+        if value != 0 && length != 0 {
+            // SAFETY: grow acquired length writable bytes under the checked exact Layout.
+            unsafe { storage.writable.write_bytes(value, length) };
+        }
+        storage.len = length;
+        Ok(storage)
+    }
+
     pub(super) fn try_reserve_exact(&mut self, additional: usize) -> Result<(), ()> {
-        self.grow(self.len.checked_add(additional).ok_or(())?, true)
+        self.grow(self.len.checked_add(additional).ok_or(())?, true, false)
     }
     pub(super) fn try_reserve(&mut self, additional: usize) -> Result<(), ()> {
-        self.grow(self.len.checked_add(additional).ok_or(())?, false)
+        self.grow(self.len.checked_add(additional).ok_or(())?, false, false)
     }
     fn reserve(&mut self, additional: usize) {
         if self.try_reserve(additional).is_err() {

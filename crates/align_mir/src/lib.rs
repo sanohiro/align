@@ -19537,7 +19537,7 @@ fn lower_json_doc(b: &mut Builder, input: &hir::Expr, result_ty: Ty) -> Operand 
     b.push(Stmt::Store(rslot, Operand::Value(okv)));
     b.terminate(Term::Goto(join));
 
-    // Err (malformed input): the out slot was zeroed; map the status (`Error.Invalid`).
+    // Err: map the common AL_INVALID status without reading the failed output slot.
     b.cur = err_bb;
     let errv = b.fresh_value(result_ty);
     let ec = make_error_from_status(b, code, result_ty);
