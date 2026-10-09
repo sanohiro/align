@@ -178,6 +178,21 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 allocation error before reading. This avoids treating an unavailable window as
 EOF; a zero-capacity reader read returns zero without observing the input.
 
+For a large buffer, an explicit page preference is available:
+
+```align
+fn cache(size: i64) -> Result<buffer, Error> =
+    buffer.try_filled(size, 0, 64, buffer.page_policy.PreferHuge)
+```
+
+The requested alignment (64 here) is guaranteed, including after growth.
+The page optimization currently applies only on Linux, for allocations of at
+least 2 MiB. macOS accepts the same call and performs ordinary allocation.
+Huge-page backing and speedups are not guaranteed; workloads can become faster
+or slower, so measure yours. The default is `buffer.page_policy.Default`.
+All four buffer constructors accept this final option after alignment.
+Hint refusal adds no error; normal invalid-input and allocation errors remain.
+
 And the shorthand for exactly that shape — `io.copy` (constant memory, whatever the file size):
 
 ```align

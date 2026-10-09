@@ -911,7 +911,7 @@ acquires one payload; initialization is O(length). The handle may allocate.
 Negative/overflowing counts abort before allocation and OOM aborts. The existing
 `buffer(capacity)` remains a best-effort empty read window.
 
-Both constructors accept an optional trailing `alignment: i64`, default 1:
+Both constructors accept an optional `alignment: i64`, default 1:
 `buffer(capacity, alignment)` and `buffer.filled(length, value, alignment)`.
 Arguments are evaluated once in source order. Alignment must be a power of two
 from 1 through 536870912. Any other value aborts before payload or handle
@@ -928,11 +928,11 @@ speed, or strengthen LLVM view-load assumptions. `align(N)` remains the
 struct/fixed-array storage attribute; constructor arguments select buffer payload
 storage directly. See [plan 131](impl/131-aligned-buffer-payload.md).
 
-`buffer.try_new(capacity: i64, alignment: i64 = 1) -> Result<buffer, Error>`
-and `buffer.try_filled(length: i64, value: u8, alignment: i64 = 1) -> Result<buffer, Error>`
+`buffer.try_new(capacity: i64, alignment: i64 = 1, pages: buffer.page_policy = Default) -> Result<buffer, Error>`
+and `buffer.try_filled(length: i64, value: u8, alignment: i64 = 1, pages: buffer.page_policy = Default) -> Result<buffer, Error>`
 provide Pure, explicit fallible construction (plan 135). Size is required;
-alignment is the optional final argument. Arguments evaluate once in source
-order. Admission first checks power-of-two alignment 1..536870912, then a
+alignment and page policy are optional trailing arguments. Arguments evaluate once in source
+order. Admission first checks power-of-two alignment 1..536870912, then page policy and a
 nonnegative count representable by the target allocation layout, including
 alignment rounding. Invalid admission returns `Error.Invalid` before allocation.
 Allocator refusal for either payload or handle returns `Error.Code(ENOMEM)`
@@ -945,6 +945,24 @@ O(length) work. Alignment, move, Drop and view rules are the existing buffer rul
 Existing constructors and later growth retain their failure policies. Success
 does not promise physical residency, later growth, or recovery from OS process
 termination/overcommit failure during initialization.
+
+All four constructors also accept a final optional
+`pages: buffer.page_policy = buffer.page_policy.Default` after alignment.
+`buffer.page_policy` is an import-free Copy enum with `Default` and `PreferHuge`.
+For example, `buffer.try_filled(size, 0, 64, buffer.page_policy.PreferHuge)`
+preserves the requested alignment on every supported OS, including after growth.
+Default retains the existing allocation path without extra page advice.
+PreferHuge currently adds a best-effort Linux optimization for fresh payloads
+of at least 2 MiB; macOS and unsupported hosts accept it and allocate normally.
+Smaller/empty payloads receive no advice. Growth retains the preference.
+Huge-page backing, residency, reduced RSS and faster execution are not promised;
+performance can improve or regress. Advice refusal adds no error; normal
+size/alignment/allocation errors remain. Native admission checks alignment, then
+policy tag (0 Default, 1 PreferHuge), then size. Invalid tags abort ordinary
+construction or return `Error.Invalid` from try constructors. Arguments evaluate
+once in source order. Eligible payloads own private mappings; advice covers only
+complete payload pages. Drop or failed handle acquisition unmaps the exact
+original extent. Plan 161 owns the mapping lifecycle and platform qualification.
 
 `b.capacity() -> i64` is a Pure, zero-argument, nonconsuming query of a
 buffer's usable read-window capacity, independent of initialized `b.len()`.

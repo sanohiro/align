@@ -1588,7 +1588,7 @@ pub fn native_owner_mir_contract<'a>(
         access: XmlAccessProvenance::Owned,
     };
     match value {
-        Rvalue::BufferTryNew { capacity, fill, alignment, out } => {
+        Rvalue::BufferTryNew { capacity, fill, alignment, pages, out } => {
             contract.result = i32_ty;
             contract.outputs = vec![(*out, Ty::Buffer)];
             contract.operands.push((capacity, i64_ty, read));
@@ -1596,6 +1596,7 @@ pub fn native_owner_mir_contract<'a>(
                 contract.operands.push((fill, Ty::Int(IntTy { bits: 8, signed: false }), read));
             }
             contract.operands.push((alignment, i64_ty, read));
+            contract.operands.push((pages, i32_ty, read));
         }
         Rvalue::BuilderLen(builder) | Rvalue::ArrayBuilderLen(builder) => {
             let owner = if matches!(value, Rvalue::BuilderLen(_)) {
@@ -5840,8 +5841,9 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.seed = Some(XmlAccessProvenance::Shared);
                 }
             }
-            Rvalue::BufferNew { capacity, fill, alignment } => {
+            Rvalue::BufferNew { capacity, fill, alignment, pages } => {
                 self.check_operand(&mut equation, &alignment, Ty::Int(align_sema::IntTy { bits: 64, signed: true }));
+                self.check_operand(&mut equation, &pages, Ty::Int(align_sema::IntTy { bits: 32, signed: true }));
                 if result_ty != Ty::Buffer { equation.invalid = true; }
                 self.check_operand(&mut equation, &capacity, Ty::Int(align_sema::IntTy { bits: 64, signed: true }));
                 if let Some(fill) = &fill {

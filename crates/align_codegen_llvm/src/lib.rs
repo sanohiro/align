@@ -16836,26 +16836,28 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("writer operation returns i32")
             }
-            Rvalue::BufferNew { capacity, fill, alignment } => {
+            Rvalue::BufferNew { capacity, fill, alignment, pages } => {
                 let mut args = vec![self.operand(capacity)?.into()];
                 let key = if let Some(fill) = fill {
                     args.push(self.operand(fill)?.into());
                     RuntimeKey::BufferFilled
                 } else { RuntimeKey::BufferNew };
                 args.push(self.operand(alignment)?.into());
+                args.push(self.operand(pages)?.into());
                 let call = self.builder
                     .build_call(self.runtime(key), &args, "buf")
                     .map_err(|e| self.err(e))?;
                 self.apply_native_call_attributes(key, call);
                 call.try_as_basic_value().basic().expect("buffer_new returns a pointer")
             }
-            Rvalue::BufferTryNew { capacity, fill, alignment, out } => {
+            Rvalue::BufferTryNew { capacity, fill, alignment, pages, out } => {
                 let mut args = vec![self.operand(capacity)?.into()];
                 let key = if let Some(fill) = fill {
                     args.push(self.operand(fill)?.into());
                     RuntimeKey::BufferTryFilled
                 } else { RuntimeKey::BufferTryNew };
                 args.push(self.operand(alignment)?.into());
+                args.push(self.operand(pages)?.into());
                 let out_ptr = *self.slots.get(out).ok_or_else(|| self.err("missing buffer output slot"))?;
                 self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
                     .map_err(|e| self.err(e))?;
@@ -31989,13 +31991,13 @@ fn main() -> i32 = 0
             let ir = emit_llvm_ir(&base, &BuildTarget::Baseline, Profile::Release, false, &[], None).map_err(|_| "valid fallible buffer MIR")?;
             assert!(ir.contains("call i32 @align_rt_buffer_try_"));
             assert!(!ir.contains("call ptr @align_rt_buffer_new("));
-            for mutation in 0..9 {
+            for mutation in 0..12 {
                 let mut bad = base.clone();
                 let mut changed = false;
                 for function in &mut bad.fns {
                     for block in &mut function.blocks {
                         for statement in &mut block.stmts {
-                            let Stmt::Let(value, Rvalue::BufferTryNew { alignment, capacity, fill, out }) = statement else { continue; };
+                            let Stmt::Let(value, Rvalue::BufferTryNew { alignment, capacity, fill, pages, out }) = statement else { continue; };
                             changed = true;
                             match mutation {
                                 0 => *alignment = Operand::Const(Const::Bool(false)),
@@ -32006,7 +32008,10 @@ fn main() -> i32 = 0
                                 5 => *fill = Some(Operand::Const(Const::Bool(false))),
                                 6 => *out = u32::MAX,
                                 7 => *function.slots.get_mut(usize::try_from(*out).map_err(|_| "slot index")?).ok_or("output type")? = Ty::String,
-                                _ => *function.value_tys.get_mut(usize::try_from(*value).map_err(|_| "value index")?).ok_or("status type")? = Ty::Int(IntTy { bits: 64, signed: true }),
+                                8 => *function.value_tys.get_mut(usize::try_from(*value).map_err(|_| "value index")?).ok_or("status type")? = Ty::Int(IntTy { bits: 64, signed: true }),
+                                9 => *pages = Operand::Const(Const::Bool(false)),
+                                10 => *pages = Operand::Value(u32::MAX),
+                                _ => *pages = Operand::Const(Const::Int(0, Ty::Int(IntTy { bits: 64, signed: true }))),
                             }
                         }
                     }
@@ -32026,20 +32031,23 @@ fn main() -> i32 = 0
         ] {
             let base = mir(source);
             assert!(emit_llvm_ir(&base, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_ok());
-            for mutation in 0..5 {
+            for mutation in 0..8 {
                 let mut bad = base.clone();
                 let mut changed = false;
                 for function in &mut bad.fns {
                     for block in &mut function.blocks {
                         for statement in &mut block.stmts {
-                            let Stmt::Let(value, Rvalue::BufferNew { alignment, capacity, .. }) = statement else { continue; };
+                            let Stmt::Let(value, Rvalue::BufferNew { alignment, capacity, pages, .. }) = statement else { continue; };
                             changed = true;
                             match mutation {
                                 0 => *alignment = Operand::Const(Const::Bool(false)),
                                 1 => *alignment = Operand::Value(u32::MAX),
                                 2 => *alignment = Operand::Const(Const::Int(64, Ty::Int(IntTy { bits: 64, signed: false }))),
                                 3 => *capacity = Operand::Const(Const::Unit),
-                                _ => *function.value_tys.get_mut(usize::try_from(*value).map_err(|_| "value index")?).ok_or("value type")? = Ty::String,
+                                4 => *function.value_tys.get_mut(usize::try_from(*value).map_err(|_| "value index")?).ok_or("value type")? = Ty::String,
+                                5 => *pages = Operand::Const(Const::Bool(false)),
+                                6 => *pages = Operand::Value(u32::MAX),
+                                _ => *pages = Operand::Const(Const::Int(0, Ty::Int(IntTy { bits: 64, signed: true }))),
                             }
                         }
                     }

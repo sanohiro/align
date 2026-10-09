@@ -34,9 +34,9 @@ impl Drop for Owner {
 fn construct(filled: bool, count: i64, alignment: i64, out: &mut *mut Buffer) -> i32 {
     unsafe {
         if filled {
-            align_rt_buffer_try_filled(count, 0xa5, alignment, out)
+            align_rt_buffer_try_filled(count, 0xa5, alignment, 0, out)
         } else {
-            align_rt_buffer_try_new(count, alignment, out)
+            align_rt_buffer_try_new(count, alignment, 0, out)
         }
     }
 }
@@ -114,9 +114,9 @@ fn zero_filled_payloads_keep_layout_initialization_and_failure_ownership() -> Re
                 let (payloads, headers, _, _) = observe(false, false, || {
                     let owner = if fallible {
                         let mut out = core::ptr::null_mut();
-                        assert_eq!(unsafe { align_rt_buffer_try_filled(length, 0, alignment, &mut out) }, 0);
+                        assert_eq!(unsafe { align_rt_buffer_try_filled(length, 0, alignment, 0, &mut out) }, 0);
                         Owner(out)
-                    } else { Owner(align_rt_buffer_filled(length, 0, alignment)) };
+                    } else { Owner(align_rt_buffer_filled(length, 0, alignment, 0)) };
                     let buffer = unsafe { &mut *owner.0 };
                     assert_eq!((buffer.len, buffer.cap, buffer.data.len()), (expected_length, expected_length, expected_length));
                     assert!(buffer.data.iter().all(|byte| *byte == 0));
@@ -132,7 +132,7 @@ fn zero_filled_payloads_keep_layout_initialization_and_failure_ownership() -> Re
     for (payload, header) in [(true, false), (false, true), (true, true)] {
         let (payloads, headers, _, _) = observe(payload, header, || {
             let mut out = core::ptr::dangling_mut();
-            assert_eq!(unsafe { align_rt_buffer_try_filled(17, 0, 64, &mut out) }, AL_CODE + libc::ENOMEM);
+            assert_eq!(unsafe { align_rt_buffer_try_filled(17, 0, 64, 0, &mut out) }, AL_CODE + libc::ENOMEM);
             assert!(out.is_null());
         });
         assert_eq!(payloads.len(), if payload { 0 } else { 2 });
@@ -196,11 +196,11 @@ fn fallible_buffer_admission_and_failures() {
     }
     let (payloads, headers, payload_pending, header_pending) = observe(true, true, || unsafe {
         assert_eq!(
-            align_rt_buffer_try_new(1, 1, core::ptr::null_mut()),
+            align_rt_buffer_try_new(1, 1, 0, core::ptr::null_mut()),
             AL_INVALID
         );
         assert_eq!(
-            align_rt_buffer_try_filled(1, 0, 1, core::ptr::null_mut()),
+            align_rt_buffer_try_filled(1, 0, 1, 0, core::ptr::null_mut()),
             AL_INVALID
         );
     });
@@ -280,4 +280,61 @@ fn fallible_buffer_layout_and_window() {
             assert_header_retired(&headers, 1);
         }
     }
+}
+
+
+#[test]
+fn buffer_page_policy_native_admission_and_header_refusal() {
+    for filled in [false, true] {
+        for policy in [i32::MIN, -1, 2, i32::MAX] {
+            for alignment in [-1, 0, 3, 64] {
+                for count in [-1, 0, 1, i64::MAX] {
+                    let (payloads, headers, payload_pending, header_pending) = observe(true, true, || {
+                        let mut out = core::ptr::dangling_mut();
+                        let status = unsafe {
+                            if filled { align_rt_buffer_try_filled(count, 0, alignment, policy, &mut out) }
+                            else { align_rt_buffer_try_new(count, alignment, policy, &mut out) }
+                        };
+                        assert_eq!(status, AL_INVALID);
+                        assert!(out.is_null());
+                    });
+                    assert!(payloads.is_empty() && headers.is_empty());
+                    assert_eq!((payload_pending, header_pending), (1, true));
+                }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        for refuse_payload in [false, true] {
+            let mappings = buffer_pages::observe_events(true, || {
+                buffer_pages::REFUSE_MAPPING.set(refuse_payload);
+                let (_, headers, _, _) = observe(false, true, || {
+                    let mut out = core::ptr::dangling_mut();
+                    let status = unsafe {
+                        if filled { align_rt_buffer_try_filled(2 << 20, 0, 64, 1, &mut out) }
+                        else { align_rt_buffer_try_new(2 << 20, 64, 1, &mut out) }
+                    };
+                    assert_eq!(status, AL_CODE + libc::ENOMEM);
+                    assert!(out.is_null());
+                });
+                assert!(headers.is_empty());
+            });
+            if refuse_payload { assert!(mappings.is_empty()); }
+            else {
+                assert_eq!(mappings.len(), 3);
+                let buffer_pages::Event::Acquire(base, span, _, _) = mappings[0] else { panic!("acquisition") };
+                assert!(matches!(mappings[1], buffer_pages::Event::Advice(_, _, false)));
+                assert!(matches!(mappings[2], buffer_pages::Event::Release(address, length) if address == base && length == span));
+            }
+        }
+    }
+    unsafe {
+        assert_eq!(align_rt_buffer_try_new(-1, 0, 2, core::ptr::null_mut()), AL_INVALID);
+        assert_eq!(align_rt_buffer_try_filled(-1, 0, 0, 2, core::ptr::null_mut()), AL_INVALID);
+    }
+    #[cfg(target_os = "linux")]
+    buffer_pages::observe_events(false, || {
+        buffer_pages::REFUSE_MAPPING.set(true);
+        let owner = Owner(align_rt_buffer_new(2 << 20, 64, 1));
+        assert_eq!(unsafe { align_rt_buffer_capacity(owner.0) }, 0);
+    });
 }

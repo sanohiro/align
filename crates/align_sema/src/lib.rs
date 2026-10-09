@@ -9418,6 +9418,19 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         });
     }
 
+    // Explicit per-buffer allocation preference; no import is needed for the builtin buffer.
+    {
+        let id = enums.len() as u32;
+        enum_ids.insert("buffer.page_policy".to_string(), id);
+        enums.push(hir::EnumDef {
+            name: "buffer.page_policy".to_string(),
+            source_name: "buffer.page_policy".to_string(),
+            variants: ["Default", "PreferHuge"].into_iter().map(|name| hir::EnumVariant {
+                name: name.to_string(), payload: Vec::new(), field_base: 1,
+            }).collect(),
+        });
+    }
+
     // The builtin `regex_match` struct (`std.regex`) — a plain Copy pair of UTF-8 byte offsets.
     // Visible everywhere and reserved, like `argon2_params`, so `find` can return an ordinary
     // `Option<regex_match>` without adding another special aggregate representation.
@@ -9460,6 +9473,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         (*enum_ids.get("Error").expect("builtin Error id"), "Error".to_string()),
         (*enum_ids.get("json.kind").expect("builtin json.kind id"), "json.kind".to_string()),
         (*enum_ids.get("log.level").expect("builtin log.level id"), "log.level".to_string()),
+        (*enum_ids.get("buffer.page_policy").expect("builtin buffer.page_policy id"), "buffer.page_policy".to_string()),
     ]);
 
     // Build the generic templates: resolve each template's fields / payloads with its type
@@ -16914,10 +16928,11 @@ impl EffectScan<'_> {
             // Constructing a `writer`/`reader`/`buffer` is allocation only (no I/O → pure, like
             // `BuilderNew`); the reads/writes below reach the OS, so those are impure.
             ExprKind::WriterStd { .. } | ExprKind::ReaderStdin => {}
-            ExprKind::BufferNew { capacity, fill, alignment } | ExprKind::BufferTryNew { capacity, fill, alignment } => {
+            ExprKind::BufferNew { capacity, fill, alignment, pages } | ExprKind::BufferTryNew { capacity, fill, alignment, pages } => {
                 walk!(capacity);
                 if let Some(fill) = fill { walk!(fill); }
                 walk!(alignment);
+                walk!(pages);
             }
             ExprKind::WriterWrite { writer, arg, .. } => {
                 walk!(writer);
@@ -29897,10 +29912,11 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(length, depth);
                 self.walk(value, depth);
             }
-            ExprKind::BufferNew { capacity, fill, alignment } | ExprKind::BufferTryNew { capacity, fill, alignment } => {
+            ExprKind::BufferNew { capacity, fill, alignment, pages } | ExprKind::BufferTryNew { capacity, fill, alignment, pages } => {
                 self.walk(capacity, depth);
                 if let Some(fill) = fill { self.walk(fill, depth); }
                 self.walk(alignment, depth);
+                self.walk(pages, depth);
             },
             k @ (ExprKind::ArrayBuilderNew { .. } | ExprKind::ArrayBuilderPush { .. }
             | ExprKind::ArrayBuilderAppend { .. } | ExprKind::ArrayBuilderBuild(_)) => self.walk_array_builder(k, depth),
@@ -47524,10 +47540,11 @@ impl<'a> MoveCheck<'a> {
                     self.invalidate_storage(buffer);
                 }
             }
-            ExprKind::BufferNew { capacity, fill, alignment } | ExprKind::BufferTryNew { capacity, fill, alignment } => {
+            ExprKind::BufferNew { capacity, fill, alignment, pages } | ExprKind::BufferTryNew { capacity, fill, alignment, pages } => {
                 move_expr!(self, capacity, moved, false, false);
                 if let Some(fill) = fill { move_expr!(self, fill, moved, false, false); }
                 move_expr!(self, alignment, moved, false, false);
+                move_expr!(self, pages, moved, false, false);
             },
             // `array_builder` growth ops — the consume semantics live in an `#[inline(never)]` helper
             // so its arm locals stay out of this recursive frame (#296): the builder is **borrowed**
@@ -48688,6 +48705,7 @@ struct Checker<'a, 't> {
     json_kind_enum_id: u32,
     /// The id of the builtin `log.level` enum. Runtime calls receive only its validated field 0.
     log_level_enum_id: u32,
+    buffer_page_policy_enum_id: u32,
     /// The id of the builtin `xml.event` enum returned by `xml.reader.next()`.
     xml_event_enum_id: u32,
     /// The id of the builtin `codec.kind` enum. Its ordinal is the canonical wire tag.
@@ -48913,6 +48931,7 @@ impl<'a, 't> Checker<'a, 't> {
             // `Error`), so its id is always present in `enum_ids`.
             json_kind_enum_id: *enum_ids.get("json.kind").expect("builtin json.kind enum registered"),
             log_level_enum_id: *enum_ids.get("log.level").expect("builtin log.level enum registered"),
+            buffer_page_policy_enum_id: *enum_ids.get("buffer.page_policy").expect("builtin buffer.page_policy enum registered"),
             xml_event_enum_id: *enum_ids
                 .get("xml.event")
                 .expect("builtin xml.event enum registered"),
@@ -51963,6 +51982,7 @@ impl<'a, 't> Checker<'a, 't> {
         }
         // Qualified `mod.Type` — the receiver is itself a pure dotted name.
         let Some(flat) = flatten_module_path(recv) else { return Ok(None) };
+        if flat == "buffer.page_policy" { return Ok(Some(flat)); }
         if flat == "log.level" {
             if !self.imports.contains("std.log") {
                 self.diags.error(
@@ -54589,20 +54609,22 @@ impl<'a, 't> Checker<'a, 't> {
                 return self.check_buffer_try_new(method, args, span);
             }
             if module == "buffer" && method == "filled" {
-                if !(2..=3).contains(&args.len()) {
-                    self.diags.error("'buffer.filled' expects length, byte value, and optional alignment".to_string(), span);
+                if !(2..=4).contains(&args.len()) {
+                    self.diags.error("'buffer.filled' expects length, byte value, and optional alignment and page policy".to_string(), span);
                     return err;
                 }
                 let length = self.check_expr(&args[0], Some(Ty::Int(IntTy { bits: 64, signed: true })));
                 let value = self.check_expr(&args[1], Some(Ty::Int(IntTy { bits: 8, signed: false })));
                 let alignment = self.check_buffer_alignment(args.get(2), span);
-                if self.resolve(alignment.ty) != Ty::Int(IntTy { bits: 64, signed: true })
+                let pages = self.check_buffer_pages(args.get(3), span);
+                if self.resolve(pages.ty) != Ty::Enum(self.buffer_page_policy_enum_id)
+                    || self.resolve(alignment.ty) != Ty::Int(IntTy { bits: 64, signed: true })
                     || self.resolve(length.ty) != Ty::Int(IntTy { bits: 64, signed: true })
                     || self.resolve(value.ty) != Ty::Int(IntTy { bits: 8, signed: false })
                 {
                     return err;
                 }
-                return Expr { kind: ExprKind::BufferNew { capacity: Box::new(length), fill: Some(Box::new(value)), alignment: Box::new(alignment) }, ty: Ty::Buffer, span };
+                return Expr { kind: ExprKind::BufferNew { capacity: Box::new(length), fill: Some(Box::new(value)), alignment: Box::new(alignment), pages: Box::new(pages) }, ty: Ty::Buffer, span };
             }
             if module == "test" && matches!(method, "expect" | "expect_eq") {
                 self.require_import("core.test", &format!("test.{method}"), span);
@@ -61453,25 +61475,27 @@ impl<'a, 't> Checker<'a, 't> {
     /// `reader.read` fills). `cap` is a required `i64` (a 0-window buffer reads nothing).
     fn check_buffer_new(&mut self, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        if !(1..=2).contains(&args.len()) {
-            self.diags.error(format!("'buffer' takes capacity and optional alignment (1 or 2 arguments), got {}", args.len()), span);
+        if !(1..=3).contains(&args.len()) {
+            self.diags.error(format!("'buffer' takes capacity and optional alignment and page policy (1 to 3 arguments), got {}", args.len()), span);
             return err;
         }
         let integer = Ty::Int(IntTy { bits: 64, signed: true });
         let capacity = self.check_expr(&args[0], Some(integer));
         let alignment = self.check_buffer_alignment(args.get(1), span);
-        if self.resolve(capacity.ty) != integer || self.resolve(alignment.ty) != integer {
+        let pages = self.check_buffer_pages(args.get(2), span);
+        if self.resolve(pages.ty) != Ty::Enum(self.buffer_page_policy_enum_id)
+            || self.resolve(capacity.ty) != integer || self.resolve(alignment.ty) != integer {
             return err;
         }
-        Expr { kind: ExprKind::BufferNew { capacity: Box::new(capacity), fill: None, alignment: Box::new(alignment) }, ty: Ty::Buffer, span }
+        Expr { kind: ExprKind::BufferNew { capacity: Box::new(capacity), fill: None, alignment: Box::new(alignment), pages: Box::new(pages) }, ty: Ty::Buffer, span }
     }
 
     fn check_buffer_try_new(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let filled = method == "try_filled";
         let required = if filled { 2 } else { 1 };
-        if !(required..=required + 1).contains(&args.len()) {
-            self.diags.error(format!("'buffer.{method}' expects {} and optional alignment",
+        if !(required..=required + 2).contains(&args.len()) {
+            self.diags.error(format!("'buffer.{method}' expects {} and optional alignment and page policy",
                 if filled { "length and byte value" } else { "capacity" }), span);
             return err;
         }
@@ -61484,13 +61508,25 @@ impl<'a, 't> Checker<'a, 't> {
             Some(Box::new(self.check_expr(value, Some(byte))))
         } else { None };
         let alignment = self.check_buffer_alignment(args.get(required), span);
-        if self.resolve(capacity.ty) != integer || self.resolve(alignment.ty) != integer
+        let pages = self.check_buffer_pages(args.get(required + 1), span);
+        if self.resolve(pages.ty) != Ty::Enum(self.buffer_page_policy_enum_id)
+            || self.resolve(capacity.ty) != integer || self.resolve(alignment.ty) != integer
             || fill.as_ref().is_some_and(|value| self.resolve(value.ty) != byte) {
             return err;
         }
         Expr {
-            kind: ExprKind::BufferTryNew { capacity: Box::new(capacity), fill, alignment: Box::new(alignment) },
+            kind: ExprKind::BufferTryNew { capacity: Box::new(capacity), fill, alignment: Box::new(alignment), pages: Box::new(pages) },
             ty: Ty::Result(Scalar::Buffer, Scalar::Enum(self.error_enum_id)), span,
+        }
+    }
+
+    fn check_buffer_pages(&mut self, argument: Option<&ast::Expr>, span: Span) -> Expr {
+        let ty = Ty::Enum(self.buffer_page_policy_enum_id);
+        match argument {
+            Some(argument) => self.check_expr(argument, Some(ty)),
+            None => Expr { kind: ExprKind::EnumValue {
+                enum_id: self.buffer_page_policy_enum_id, variant: 0, payload: Vec::new(),
+            }, ty, span },
         }
     }
 
@@ -71224,10 +71260,11 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(length);
                 self.finalize_expr(value);
             }
-            ExprKind::BufferNew { capacity, fill, alignment } | ExprKind::BufferTryNew { capacity, fill, alignment } => {
+            ExprKind::BufferNew { capacity, fill, alignment, pages } | ExprKind::BufferTryNew { capacity, fill, alignment, pages } => {
                 self.finalize_expr(capacity);
                 if let Some(fill) = fill { self.finalize_expr(fill); }
                 self.finalize_expr(alignment);
+                self.finalize_expr(pages);
             },
             k @ (ExprKind::ArrayBuilderNew { .. } | ExprKind::ArrayBuilderPush { .. }
             | ExprKind::ArrayBuilderAppend { .. } | ExprKind::ArrayBuilderBuild(_)) => self.finalize_array_builder(k),
@@ -74502,6 +74539,13 @@ fn resolve_type(
                 }
             };
         }
+    }
+    if path.segments.len() == 2 && path.segments[0].name == "buffer" && name == "page_policy" {
+        if !args.is_empty() {
+            diags.error("`buffer.page_policy` takes no type arguments".to_string(), span);
+            return Ty::Error;
+        }
+        return cx.enum_ids.get("buffer.page_policy").map(|&id| Ty::Enum(id)).unwrap_or(Ty::Error);
     }
     // `std.log` exposes only qualified type names. Both require the capability import; `level` is
     // the ordinary builtin enum registered above and `logger` is the opaque Move handle.
@@ -78579,7 +78623,7 @@ mod tests {
         for filled in [false, true] {
             let child = || Box::new(Expr { kind: ExprKind::Int(1), ty: Ty::Int(IntTy { bits: 64, signed: true }), span: Span::new(0, 0, 0) });
             assert_eq!(storage_variant_policy(&ExprKind::BufferTryNew {
-                capacity: child(), fill: filled.then(child), alignment: child(),
+                capacity: child(), fill: filled.then(child), alignment: child(), pages: child(),
             }), StorageVariantPolicy::Fresh(StorageContentInitializer::Missing));
         }
 

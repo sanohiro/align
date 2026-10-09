@@ -12317,6 +12317,13 @@ fn request11_expr_kind_inventory_tripwire() {
 #[test]
 fn hir_body_validator_native() {
     let mut program = baseline_program();
+    let pages_id = u32::try_from(program.enums.len()).unwrap_or_else(|_| panic!("fixture enum count"));
+    program.enums.push(EnumDef {
+        name: "buffer.page_policy".to_string(), source_name: "buffer.page_policy".to_string(),
+        variants: ["Default", "PreferHuge"].into_iter().map(|name| EnumVariant {
+            name: name.to_string(), payload: Vec::new(), field_base: 1,
+        }).collect(),
+    });
     let process_wait = push_process_wait_schema(&mut program);
     let heap_record = program.structs.len() as u32;
     program.structs.push(StructDef {
@@ -12715,6 +12722,7 @@ fn hir_body_validator_native() {
                 fill: None,
                 capacity: Box::new(native_i64()),
                 alignment: Box::new(native_i64()),
+                pages: Box::new(body_test_expr(hir::ExprKind::EnumValue { enum_id: pages_id, variant: 0, payload: Vec::new() }, Ty::Enum(pages_id))),
             },
             Ty::Buffer,
         ),
@@ -19907,10 +19915,10 @@ fn fallible_buffer_hir_contract() -> Result<(), &'static str> {
         let source = format!("fn f(alignment: i64) -> Result<buffer, Error> {{ b := {constructor}; return b }}");
         let base = checked_source_program(&source);
         assert!(!is_empty(&lower_program(&base)));
-        for mutation in 0..8 {
+        for mutation in 0..11 {
             let mut malformed = base.clone();
             let expression = body_first_let_init_mut(&mut malformed, "f");
-            let hir::ExprKind::BufferTryNew { capacity, fill, alignment } = &mut expression.kind else { return Err("fallible buffer fixture"); };
+            let hir::ExprKind::BufferTryNew { capacity, fill, alignment, pages } = &mut expression.kind else { return Err("fallible buffer fixture"); };
             match mutation {
                 0 => capacity.ty = Ty::Bool,
                 1 => capacity.kind = hir::ExprKind::Local(u32::MAX),
@@ -19919,7 +19927,10 @@ fn fallible_buffer_hir_contract() -> Result<(), &'static str> {
                 4 => *fill = Some(Box::new(hir::Expr { kind: hir::ExprKind::Bool(false), ty: Ty::Bool, span: expression.span })),
                 5 => expression.ty = Ty::Buffer,
                 6 => expression.ty = Ty::Result(Scalar::String, Scalar::Bool),
-                _ => expression.ty = Ty::Result(Scalar::Buffer, Scalar::Bool),
+                7 => expression.ty = Ty::Result(Scalar::Buffer, Scalar::Bool),
+                8 => pages.ty = Ty::Bool,
+                9 => pages.kind = hir::ExprKind::Local(u32::MAX),
+                _ => { if let hir::ExprKind::EnumValue { variant, .. } = &mut pages.kind { *variant = 2; } },
             }
             assert_body_entrypoints_empty(&format!("fallible-buffer-{mutation}"), &malformed);
         }
@@ -19957,6 +19968,31 @@ fn stable_buffer_growth_hir_authenticates_the_complete_mutable_root() -> Result<
                 }
             }
             assert!(!validate_hir::body_only_metadata_is_valid(&bad), "{operation}/{mutation}");
+        }
+    }
+    Ok(())
+}
+
+
+#[test]
+fn buffer_page_policy_hir_authenticates_builtin_definition() -> Result<(), &'static str> {
+    for call in ["buffer(3, 64, p)", "buffer.filled(3, 7, 64, p)",
+        "buffer.try_new(3, 64, p) else buffer(0)", "buffer.try_filled(3, 7, 64, p) else buffer(0)"] {
+        let source = format!("fn f(p: buffer.page_policy) -> buffer {{ b := {call}; return b }}");
+        let base = checked_source_program(&source);
+        assert!(!is_empty(&lower_program(&base)));
+        for mutation in 0..6 {
+            let mut malformed = base.clone();
+            let definition = malformed.enums.iter_mut().find(|e| e.name == "buffer.page_policy").ok_or("policy enum")?;
+            match mutation {
+                0 => definition.name = "Other".to_string(),
+                1 => definition.source_name = "Other".to_string(),
+                2 => { definition.variants.pop(); },
+                3 => definition.variants[0].name = "Other".to_string(),
+                4 => definition.variants[1].payload.push(Scalar::Bool),
+                _ => definition.variants[1].field_base = 2,
+            }
+            assert_body_entrypoints_empty(&format!("buffer-page-definition-{mutation}"), &malformed);
         }
     }
     Ok(())

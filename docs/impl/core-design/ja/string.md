@@ -157,7 +157,7 @@ slice<T>.as_bytes() -> slice<u8>
 停止する。通常の `buffer(capacity)` は従来どおり best-effort の空の読み取り
 ウィンドウを作る。
 
-両コンストラクタは末尾に省略可能な `alignment: i64` を受け取り、既定値は 1。
+両コンストラクタは省略可能な `alignment: i64` を受け取り、既定値は 1。
 呼び出しは `buffer(capacity, alignment)` と
 `buffer.filled(length, value, alignment)`。引数はソース順に一度ずつ評価する。
 アラインメントは 1 以上 536870912 以下の 2 の冪でなければならず、それ以外は
@@ -172,11 +172,11 @@ slice<T>.as_bytes() -> slice<u8>
 `align(N)` は構造体と固定配列の格納領域属性のままで、バッファのペイロードは
 コンストラクタ引数で直接指定する。[plan 131](../../131-aligned-buffer-payload.md) を参照。
 
-`buffer.try_new(capacity: i64, alignment: i64 = 1) -> Result<buffer, Error>` と
-`buffer.try_filled(length: i64, value: u8, alignment: i64 = 1) -> Result<buffer, Error>`
-は、Pure な明示的失敗可能構築を提供する（plan 135）。サイズは必須で、最後の
-alignment のみ省略可能。引数はソース順に一度ずつ評価する。まず alignment が
-1..536870912 の2の累乗であること、次に個数が非負でアラインメント丸めを含む
+`buffer.try_new(capacity: i64, alignment: i64 = 1, pages: buffer.page_policy = Default) -> Result<buffer, Error>` と
+`buffer.try_filled(length: i64, value: u8, alignment: i64 = 1, pages: buffer.page_policy = Default) -> Result<buffer, Error>`
+は、Pure な明示的失敗可能構築を提供する（plan 135）。サイズは必須で、末尾の
+alignment と pages は省略可能。引数はソース順に一度ずつ評価する。まず alignment が
+1..536870912 の2の累乗であること、次に方針、個数が非負でアラインメント丸めを含む
 対象の割り当て Layout に収まることを検証する。不正な入力は割り当て前に
 `Error.Invalid` を返す。ペイロードまたは管理領域の確保失敗は
 `Error.Code(ENOMEM)`（対応 Linux/macOS では12）を返し、管理領域の失敗時には
@@ -188,6 +188,24 @@ alignment のみ省略可能。引数はソース順に一度ずつ評価する�
 既存コンストラクタと後続の拡張の失敗ポリシーは変わらない。成功は物理メモリの
 常駐、後続の拡張、OS によるプロセス終了や初期化時の overcommit 失敗からの
 回復を保証しない。
+
+4種類のコンストラクタは alignment の後に、省略可能な最後の引数
+`pages: buffer.page_policy = buffer.page_policy.Default` を受け取る。
+`buffer.page_policy` は import 不要の Copy 列挙型で、`Default` と
+`PreferHuge` を持つ。例えば
+`buffer.try_filled(size, 0, 64, buffer.page_policy.PreferHuge)` は、
+拡張後も含め全対応 OS で指定した整列を保証する。
+Default は追加のページヒントなしで従来の確保経路を使う。
+PreferHuge の最適化は現在 Linux の2 MiB以上の新規領域が対象。
+macOS など未対応 OS でも指定を受け付け、通常の確保を行う。
+小さい領域や空領域にもヒントを付けない。方針は拡張後も維持する。
+巨大ページ、物理常駐、RSS削減、高速化は保証せず、速度は改善も悪化もあり得る。
+ヒント拒否のエラーは追加しない。通常のサイズ・整列・確保エラーは従来どおり。
+native の検証順は alignment、方針タグ（Default=0、PreferHuge=1）、サイズ。
+不正タグは通常の構築を停止し、try では `Error.Invalid` を返す。
+引数はソース順に一度ずつ評価する。対象領域は専用マッピングで所有し、
+ペイロード内の完全なページだけにヒントを付ける。Drop や管理領域の確保失敗では、
+元のマッピング全体を正確に解放する。所有権と OS 対応の詳細は plan 161 を参照。
 
 `b.capacity() -> i64` は現在の読み取りウィンドウ容量を返す、引数なしの Pure な
 非消費クエリである。初期化済みの `b.len()` とは独立し、追加確保やビューの保持は

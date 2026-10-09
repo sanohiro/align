@@ -1,5 +1,10 @@
 # Explicit owned byte-buffer payload alignment
 
+[Plan 161](161-buffer-page-policy.md) extends every constructor below with an
+optional final page preference after alignment. Default retains the global
+allocator path described here; eligible Linux PreferHuge payloads use private
+mappings and exact unmapping. Validation order is alignment, policy, size.
+
 Status: implemented capability, independent of deferred K1 and plan 61.
 Requests 33 and 127 in the external align-llm register provide the consumer
 evidence: native tensor windows require aligned payloads, and a measured WSL
@@ -13,12 +18,12 @@ constructors' best-effort/terminal behavior and the shared alignment guarantee.
 
 ## Public-contract ledger
 
-Declarations (the last argument is optional builtin syntax, not a new language
+Declarations (trailing arguments use optional builtin syntax, not a new language
 default-parameter feature):
 
 ```text
-buffer(capacity: i64, alignment: i64 = 1) -> buffer
-buffer.filled(length: i64, value: u8, alignment: i64 = 1) -> buffer
+buffer(capacity: i64, alignment: i64 = 1, pages: buffer.page_policy = Default) -> buffer
+buffer.filled(length: i64, value: u8, alignment: i64 = 1, pages: buffer.page_policy = Default) -> buffer
 ```
 
 Positional calls:
@@ -35,13 +40,13 @@ mut output := buffer.filled(4096, 0, 64)
 | Storage promise | The first payload address is a multiple of requested alignment. Nonempty storage uses one allocation with that alignment; an empty allocation has a non-dereferenceable aligned sentinel and no payload acquisition. Existing capacity()/len() meanings and initialization are unchanged. Filled nonzero construction initializes exactly length bytes in one payload acquisition. Alignment is a lower bound, never an exact allocator placement. |
 | Ownership/lifetime | Return the existing Move buffer. The allocation's requested alignment travels with its owner through move, return, replacement, containers and borrowed helpers. Ordinary replacement transfers the new owner's alignment; it does not retrofit the old one. bytes() retains existing generation, lifetime and read/write authority. No stronger LLVM slice-load alignment or foreign-pointer authority is inferred. |
 | Mutation | Put, append, append_filled and growing read_line preserve the allocation's requested alignment; growth may move the address and invalidates views under existing rules. Bounded reader/file/socket/HTTP/random fills preserve the allocation and alignment. Short/EOF/error behavior, initialized length and read-window capacity are unchanged. |
-| Allocation/Drop | One BufferStorage implementation owns pointer, initialized length, allocation capacity and alignment. It uses checked size/Layout formation and matching allocation/deallocation layouts. Growth uses checked std::alloc::realloc with the original Layout and unchanged alignment, preserving the initialized prefix. Null retains the old owner; success publishes the returned provenance/capacity before any observer, even when the address is unchanged. Zero-capacity growth uses alloc; plan160's fresh zero-filled constructors use alloc_zeroed with the same exact Layout. Existing caller failure policy remains. Hidden allocator capacity never enlarges the public read window. No implicit copy is added to construction, move or replacement. |
+| Allocation/Drop | Plan 161 owns PreferHuge mapping acquisition/growth/Drop; this global-allocation path applies to Default or ineligible PreferHuge. One BufferStorage implementation owns pointer, initialized length, allocation capacity and alignment. It uses checked size/Layout formation and matching allocation/deallocation layouts. Growth uses checked std::alloc::realloc with the original Layout and unchanged alignment, preserving the initialized prefix. Null retains the old owner; success publishes the returned provenance/capacity before any observer, even when the address is unchanged. Zero-capacity growth uses alloc; plan160's fresh zero-filled constructors use alloc_zeroed with the same exact Layout. Existing caller failure policy remains. Hidden allocator capacity never enlarges the public read window. No implicit copy is added to construction, move or replacement. |
 | Existing producers | Decoders, HTTP/compression/crypto and other Vec-producing operations transfer their allocation to the same storage owner at alignment 1, with no copy. They promise no explicit higher alignment. Existing nonempty Vec capacity determines its exact deallocation Layout. |
 | Purity | Constructors remain Pure allocation operations. Runtime alignment admission adds no native I/O, global state, descriptor or retained input. |
 | Syntax relationship | align(N) continues to describe struct/fixed-array storage. A buffer binding holds a movable handle, so aligning its binding slot would not select payload alignment. Constructor arguments select the allocation directly and work inside expressions and helper returns without hidden reallocation or syntax-only initializer exceptions. No raw.alloc change or second aligned-buffer type is introduced. |
-| Native ABI | Replace existing compiler-private signatures with `ptr align_rt_buffer_new(i64 capacity, i64 alignment)` and `ptr align_rt_buffer_filled(i64 length, i8 value, i64 alignment)`. No compatibility symbols. RuntimeKey identities/counts and fresh-owned-result effects stay; signatures, scalar C ABI attributes and runtime fingerprint change together. Native alignment checks are identical to source calls. |
+| Native ABI | Replace existing compiler-private signatures with `ptr align_rt_buffer_new(i64 capacity, i64 alignment, i32 pages)` and `ptr align_rt_buffer_filled(i64 length, i8 value, i64 alignment, i32 pages)`. No compatibility symbols. RuntimeKey identities/counts and fresh-owned-result effects stay; signatures, scalar C ABI attributes and runtime fingerprint change together. Native alignment checks are identical to source calls. |
 | IR and persistence | BufferNew gains a required i64 alignment child/operand; omitted source arguments become constant 1 before HIR publication. Validate exact Buffer/i64/u8 equations before lowering/LLVM. All traversals, substitution, effect/provenance and source serialization preserve/evaluate the child. No new enum variant. Generic interfaces persist source templates; no interface encoding change because interfaces persist source templates rather than BufferNew bodies. Compiler/runtime build identities invalidate prior artifacts through existing content fingerprints. |
-| Optimization | Existing stack-buffer promotion remains eligible only for constant alignment 1. Other constant/dynamic alignment constructors stay on their explicit allocation path. Promotion must never elide validation, manufacture a payload alignment or change the public read window. No new aligned-load optimization is selected. |
+| Optimization | Existing stack-buffer promotion remains eligible only for constant alignment 1 and proved Default page policy. Other constant/dynamic alignment constructors stay on their explicit allocation path. Promotion must never elide validation, manufacture a payload alignment or change the public read window. No new aligned-load optimization is selected. |
 | Prerequisites/boundary | Uses shipped buffer ownership, capacity and bounded pread. No deferred interprocedural authority work, fallible-allocation redesign, custom allocator, static aligned-buffer type or consumer adoption is required. Recoverable allocation failure stays a separate design. |
 
 ## Implementation closure matrix

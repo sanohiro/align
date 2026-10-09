@@ -233,6 +233,24 @@ clone は独立した所有文字列になる。
 停止する。通常の `buffer(capacity)` は従来どおり best-effort の空の読み取り
 ウィンドウを作る。
 
+4種類のコンストラクタは alignment の後に、省略可能な最後の引数
+`pages: buffer.page_policy = buffer.page_policy.Default` を受け取る。
+`buffer.page_policy` は import 不要の Copy 列挙型で、`Default` と
+`PreferHuge` を持つ。例えば
+`buffer.try_filled(size, 0, 64, buffer.page_policy.PreferHuge)` は、
+拡張後も含め全対応 OS で指定した整列を保証する。
+Default は追加のページヒントなしで従来の確保経路を使う。
+PreferHuge の最適化は現在 Linux の2 MiB以上の新規領域が対象。
+macOS など未対応 OS でも指定を受け付け、通常の確保を行う。
+小さい領域や空領域にもヒントを付けない。方針は拡張後も維持する。
+巨大ページ、物理常駐、RSS削減、高速化は保証せず、速度は改善も悪化もあり得る。
+ヒント拒否のエラーは追加しない。通常のサイズ・整列・確保エラーは従来どおり。
+native の検証順は alignment、方針タグ（Default=0、PreferHuge=1）、サイズ。
+不正タグは通常の構築を停止し、try では `Error.Invalid` を返す。
+引数はソース順に一度ずつ評価する。対象領域は専用マッピングで所有し、
+ペイロード内の完全なページだけにヒントを付ける。Drop や管理領域の確保失敗では、
+元のマッピング全体を正確に解放する。所有権と OS 対応の詳細は plan 161 を参照。
+
 `b.append_filled(length: i64, value: u8) -> ()` は同じファミリの append メンバー
 である。`mut buffer` の公開ウィンドウを `value` の `length` バイト分ちょうど
 伸ばす。拡張は一度だけで、拡張の連続やバイトごとの呼び出しにはならない。

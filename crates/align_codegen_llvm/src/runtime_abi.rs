@@ -32,6 +32,7 @@ enum NativeReturn {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuntimeAbiShape {
     BufferAppendFilled,
+    BufferNew,
     BufferFilled,
     BufferTryFilled,
     BufferTryNew,
@@ -371,8 +372,8 @@ fn runtime_effects(id: RuntimeAbiId) -> RuntimeEffects {
         RuntimeAbiId::Keyed(RuntimeKey::BufferLen) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::BufferNew) => RuntimeEffects { class: EffectClass::AllocNew, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: true, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::BufferPut) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
-        RuntimeAbiId::Keyed(RuntimeKey::BufferTryFilled) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[3], releases: Release::None, returns_fresh: false, diverges: false },
-        RuntimeAbiId::Keyed(RuntimeKey::BufferTryNew) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BufferTryFilled) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[4], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::BufferTryNew) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[3], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::BuilderFinish) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::BuilderFinishStack) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::BuilderFree) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::Indirect, returns_fresh: false, diverges: false },
@@ -1227,7 +1228,7 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
         RuntimeKey::BufferNew => RuntimeAbi {
             key,
             symbol: "align_rt_buffer_new",
-            shape: RuntimeAbiShape::ArrayBuilderCapacity,
+            shape: RuntimeAbiShape::BufferNew,
         },
         RuntimeKey::BufferPut => RuntimeAbi {
             key,
@@ -3891,15 +3892,18 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
             params: &[NativeType::Ptr, NativeType::I64, NativeType::U8],
         },
+        RuntimeAbiShape::BufferNew => RuntimeAbiShapeSpec {
+            ret: NativeReturn::Ptr, params: &[NativeType::I64, NativeType::I64, NativeType::I32],
+        },
         RuntimeAbiShape::BufferTryFilled => RuntimeAbiShapeSpec {
-            ret: NativeReturn::I32, params: &[NativeType::I64, NativeType::U8, NativeType::I64, NativeType::Ptr],
+            ret: NativeReturn::I32, params: &[NativeType::I64, NativeType::U8, NativeType::I64, NativeType::I32, NativeType::Ptr],
         },
         RuntimeAbiShape::BufferTryNew => RuntimeAbiShapeSpec {
-            ret: NativeReturn::I32, params: &[NativeType::I64, NativeType::I64, NativeType::Ptr],
+            ret: NativeReturn::I32, params: &[NativeType::I64, NativeType::I64, NativeType::I32, NativeType::Ptr],
         },
         RuntimeAbiShape::BufferFilled => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,
-            params: &[NativeType::I64, NativeType::U8, NativeType::I64],
+            params: &[NativeType::I64, NativeType::U8, NativeType::I64, NativeType::I32],
         },
         RuntimeAbiShape::A49 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,

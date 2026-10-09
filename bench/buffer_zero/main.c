@@ -9,8 +9,8 @@
 #include <unistd.h>
 
 typedef struct { unsigned char *ptr; int64_t len; } View;
-extern void *align_rt_buffer_filled(int64_t, unsigned char, int64_t);
-extern int32_t align_rt_buffer_try_filled(int64_t, unsigned char, int64_t, void **);
+extern void *align_rt_buffer_filled(int64_t, unsigned char, int64_t, int32_t);
+extern int32_t align_rt_buffer_try_filled(int64_t, unsigned char, int64_t, int32_t, void **);
 extern void align_rt_buffer_bytes(void *, View *);
 extern void align_rt_buffer_free(void *);
 typedef struct { struct timespec wall; struct rusage usage; } Stamp;
@@ -40,8 +40,8 @@ static void report(int fallible, size_t n, unsigned char value, int alignment,
 static void row(int fallible, size_t n, unsigned char value, int alignment, int trial) {
     Stamp start = stamp();
     void *buffer = NULL;
-    if (fallible) require(align_rt_buffer_try_filled((int64_t)n, value, alignment, &buffer) == 0);
-    else buffer = align_rt_buffer_filled((int64_t)n, value, alignment);
+    if (fallible) require(align_rt_buffer_try_filled((int64_t)n, value, alignment, 0, &buffer) == 0);
+    else buffer = align_rt_buffer_filled((int64_t)n, value, alignment, 0);
     require(buffer != NULL);
     report(fallible, n, value, alignment, trial, "acquire", start);
     View view = {0}; align_rt_buffer_bytes(buffer, &view);

@@ -181,6 +181,20 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 これにより、領域を確保できない状態を EOF と取り違えません。容量 0 の reader 読み取りは、
 入力を確認せずに 0 を返します。
 
+大きいバッファでは、ページ方針を明示できる。
+
+```align
+fn cache(size: i64) -> Result<buffer, Error> =
+    buffer.try_filled(size, 0, 64, buffer.page_policy.PreferHuge)
+```
+
+指定した整列（この例では64バイト）は拡張後も保証する。
+ページ最適化は現在 Linux の2 MiB以上の確保のみが対象。macOS でも同じ指定を
+受け付け、通常のメモリ確保を行う。巨大ページや高速化は保証せず、処理によって
+速くも遅くもなるため実測して選ぶ。既定値は `buffer.page_policy.Default`。
+4種類の buffer コンストラクタすべてで、alignment の後に指定できる。
+ヒント拒否のエラーは追加しない。通常の不正入力や確保失敗のエラーは従来どおり。
+
 読み込んだ内容をそのまま書き出すなら、`io.copy` で同じ処理を行えます。ファイルサイズによらず、一定量のメモリを使います。
 
 ```align

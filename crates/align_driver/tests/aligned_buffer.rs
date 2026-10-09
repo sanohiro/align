@@ -175,8 +175,8 @@ fn aligned_buffer_whole_unit_imports_growth_and_control() {
         r#"
 #include <stdint.h>
 #include <stdlib.h>
-extern void *align_rt_buffer_new(int64_t, int64_t);
-extern void *align_rt_buffer_filled(int64_t, uint8_t, int64_t);
+extern void *align_rt_buffer_new(int64_t, int64_t, int32_t);
+extern void *align_rt_buffer_filled(int64_t, uint8_t, int64_t, int32_t);
 extern void align_rt_buffer_free(void *);
 static void *live[128];
 static int acquired, freed;
@@ -191,11 +191,11 @@ static void *track(void *p) {
     for (int i = 0; i < 128; ++i) if (!live[i]) { live[i] = p; return p; }
     abort();
 }
-void *probe_buffer_new(int64_t capacity, int64_t alignment) {
-    return track(align_rt_buffer_new(capacity, alignment));
+void *probe_buffer_new(int64_t capacity, int64_t alignment, int32_t pages) {
+    return track(align_rt_buffer_new(capacity, alignment, pages));
 }
-void *probe_buffer_filled(int64_t length, uint8_t value, int64_t alignment) {
-    return track(align_rt_buffer_filled(length, value, alignment));
+void *probe_buffer_filled(int64_t length, uint8_t value, int64_t alignment, int32_t pages) {
+    return track(align_rt_buffer_filled(length, value, alignment, pages));
 }
 void probe_buffer_free(void *p) {
     if (!p) return;
@@ -343,6 +343,8 @@ fn aligned_buffer_stack_promotion_requires_default_alignment() {
     for (argument, promoted) in [
         ("", true),
         (", 1", true),
+        (", 1, buffer.page_policy.Default", true),
+        (", 1, buffer.page_policy.PreferHuge", false),
         (", 64", false),
         (", 0", false),
         (", alignment", false),

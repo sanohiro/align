@@ -2004,8 +2004,8 @@ migrate together; no compatibility exports are retained.
 
 | Shape | Exact declaration | Semantics |
 | --- | --- | --- |
-| BufferFilled | `ptr @align_rt_buffer_filled(i64 length, i8 value, i64 alignment)` | Validate alignment first (plan 131), then length against target layout limits before allocation; OOM aborts. Return one owned handle with exactly initialized length. Zero has no payload; nonzero has one payload acquisition. |
-| ArrayBuilderCapacity (BufferNew key) | `ptr @align_rt_buffer_new(i64 capacity, i64 alignment)` | Plan 131: power-of-two alignment 1..536870912, checked before size or allocation. Best-effort capacity reserve still degrades to zero; the aligned empty sentinel owns no payload. Nonempty storage and all growth retain the requested alignment; Drop uses its exact Layout. |
+| BufferFilled | `ptr @align_rt_buffer_filled(i64 length, i8 value, i64 alignment, i32 pages)` | Validate alignment then page policy (plans 131/161), then length against target layout limits before allocation; OOM aborts. Return one owned handle with exactly initialized length. Zero has no payload; nonzero has one payload acquisition. |
+| BufferNew | `ptr @align_rt_buffer_new(i64 capacity, i64 alignment, i32 pages)` | Plan 131: power-of-two alignment 1..536870912, checked before size or allocation. Best-effort capacity reserve still degrades to zero; the aligned empty sentinel owns no payload. Nonempty storage and all growth retain the requested alignment; Drop uses its exact Layout or original mapping extent (plan 161). |
 | BufferAppendFilled | `void @align_rt_buffer_append_filled(ptr buffer, i64 length, i8 value)` | Row B's append member. A null handle is a no-op. Validate length against target isize, then the published length plus it, before touching the payload; an invalid or overflowing request aborts with the window unchanged, and OOM aborts. Truncate to the logical length, then one reserve plus one resize — never a growth sequence. Zero length publishes nothing. |
 | ArrayBuilderCapacity | `noalias ptr @align_rt_array_builder_new(i64 stride, i64 capacity) {nofree nounwind}` | Fresh heap header; validated count × stride before any acquisition; initialized length zero; nonzero requested storage reserved. |
 | ArrayBuilderRegionCapacity | `noalias ptr @align_rt_array_builder_new_in(ptr arena, i64 stride, i64 align, i64 capacity) {nounwind}` | Existing arena/stride/alignment validation precedes count/layout validation and allocation. Header and initial chunk belong to the arena; length zero. |
@@ -2198,14 +2198,16 @@ No symbol, layout, effect, interface tag or compiler-owned resource changes.
 
 | Key | Exact native signature | Publication contract |
 | --- | --- | --- |
-| BufferTryFilled | `i32 @align_rt_buffer_try_filled(i64 length, i8 value, i64 alignment, ptr out)` | Exact initialized length/capacity; unsigned-byte target C ABI attributes follow the registry. |
-| BufferTryNew | `i32 @align_rt_buffer_try_new(i64 capacity, i64 alignment, ptr out)` | Zero initialized length and exact usable capacity. |
+| BufferTryFilled | `i32 @align_rt_buffer_try_filled(i64 length, i8 value, i64 alignment, i32 pages, ptr out)` | Exact initialized length/capacity; unsigned-byte target C ABI attributes follow the registry. |
+| BufferTryNew | `i32 @align_rt_buffer_try_new(i64 capacity, i64 alignment, i32 pages, ptr out)` | Zero initialized length and exact usable capacity. |
 
 Codegen initializes the Buffer out slot to null; native clears a nonnull out
 before validation. Null out returns AL_INVALID without allocation. Otherwise
-validate alignment then target-Layout count before acquiring any storage.
+validate alignment, then i32 page policy (0 Default, 1 PreferHuge), then target-Layout count before acquiring any storage.
 Statuses are 0 success, AL_INVALID (2) invalid admission, AL_CODE (5) + ENOMEM
 allocator refusal. Header refusal drops its payload; success publishes once.
+Output escape ordinals are 3 for BufferTryNew and 4 for BufferTryFilled.
+PreferHuge advice refusal adds no error; plan 161 owns mapping lifecycle.
 The existing status decoder constructs Result with normal Buffer cleanup.
 No pointer/null convention is exposed as a public source API.
 

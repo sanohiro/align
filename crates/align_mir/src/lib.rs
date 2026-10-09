@@ -2040,10 +2040,10 @@ pub enum Rvalue {
     FileLen {
         file: Operand,
     },
-    /// `buffer(cap, alignment)` — open an aligned owned byte buffer with read window `cap`.
-    BufferNew { capacity: Operand, fill: Option<Operand>, alignment: Operand },
+    /// `buffer(cap, alignment, pages)` — explicit alignment and page preference.
+    BufferNew { capacity: Operand, fill: Option<Operand>, alignment: Operand, pages: Operand },
     /// Fallible construction writes an owned Buffer to out and returns i32 status.
-    BufferTryNew { capacity: Operand, fill: Option<Operand>, alignment: Operand, out: Slot },
+    BufferTryNew { capacity: Operand, fill: Option<Operand>, alignment: Operand, pages: Operand, out: Slot },
     /// `b.bytes()` — a `slice<u8>` view `{ptr,len}` of the buffer's current contents (borrow).
     BufferBytes(Operand),
     /// `b.len()` — the buffer's current byte count (`i64`).
@@ -8587,6 +8587,28 @@ fn lower_contracted_binary(
     None
 }
 
+fn lower_buffer_page_policy(b: &mut Builder, expression: &hir::Expr) -> Operand {
+    if let hir::ExprKind::EnumValue { variant, payload, .. } = &expression.kind
+        && payload.is_empty()
+    {
+        return Operand::Const(Const::Int(i128::from(*variant), status_ty()));
+    }
+    let value = lower_expr(b, expression);
+    if !lowering_continues(b) { return terminated_operand(); }
+    let Ty::Enum(enum_id) = expression.ty else { return Operand::Const(Const::Unit); };
+    let prefers_huge = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(prefers_huge, Rvalue::EnumTagEq {
+        enum_id, scrutinee: value, variant: 1,
+    }));
+    let tag = b.fresh_value(status_ty());
+    b.push(Stmt::Let(tag, Rvalue::Select {
+        cond: Operand::Value(prefers_huge),
+        a: Operand::Const(Const::Int(1, status_ty())),
+        b: Operand::Const(Const::Int(0, status_ty())),
+    }));
+    Operand::Value(tag)
+}
+
 fn lower_expr(b: &mut Builder, root: &hir::Expr) -> Operand {
     if !lowering_continues(b) {
         return terminated_operand();
@@ -9007,7 +9029,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 b.push(Stmt::Let(code, value));
                 lower_status_result(b, code, e.ty)
             }
-            hir::ExprKind::BufferNew { capacity, fill, alignment } => {
+            hir::ExprKind::BufferNew { capacity, fill, alignment, pages } => {
                 lower_required_binding!(
                     b,
                     cap = lower_expr(b, capacity),
@@ -9019,19 +9041,21 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                     Some(value)
                 } else { None };
                 lower_required_binding!(b, alignment = lower_expr(b, alignment), Operand::Const(Const::Unit));
-                b.push(Stmt::Let(v, Rvalue::BufferNew { capacity: cap, fill, alignment }));
+                lower_required_binding!(b, pages = lower_buffer_page_policy(b, pages), Operand::Const(Const::Unit));
+                b.push(Stmt::Let(v, Rvalue::BufferNew { capacity: cap, fill, alignment, pages }));
                 Operand::Value(v)
             }
-            hir::ExprKind::BufferTryNew { capacity, fill, alignment } => {
+            hir::ExprKind::BufferTryNew { capacity, fill, alignment, pages } => {
                 lower_required_binding!(b, capacity = lower_expr(b, capacity), Operand::Const(Const::Unit));
                 let fill = if let Some(fill) = fill {
                     lower_required_binding!(b, value = lower_expr(b, fill), Operand::Const(Const::Unit));
                     Some(value)
                 } else { None };
                 lower_required_binding!(b, alignment = lower_expr(b, alignment), Operand::Const(Const::Unit));
+                lower_required_binding!(b, pages = lower_buffer_page_policy(b, pages), Operand::Const(Const::Unit));
                 let out = b.new_slot(Ty::Buffer);
                 let code = b.fresh_value(status_ty());
-                b.push(Stmt::Let(code, Rvalue::BufferTryNew { capacity, fill, alignment, out }));
+                b.push(Stmt::Let(code, Rvalue::BufferTryNew { capacity, fill, alignment, pages, out }));
                 emit_status_buffer_result(b, code, out, e.ty)
             }
             hir::ExprKind::BufferBytes { buffer } => {

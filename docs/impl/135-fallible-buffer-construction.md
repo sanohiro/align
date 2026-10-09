@@ -1,5 +1,10 @@
 # Fallible owned buffer construction
 
+[Plan 161](161-buffer-page-policy.md) extends every constructor below with an
+optional final page preference after alignment. Default retains the global
+allocator path described here; eligible Linux PreferHuge payloads use private
+mappings and exact unmapping. Validation order is alignment, policy, size.
+
 Status: implemented capability, independent of deferred K1 and plan 61.
 
 Request 35's capacity query and requests 33/127's alignment are shipped. Bounded
@@ -13,8 +18,8 @@ it does not catch fatal errors or introduce unwinding.
 Declarations (optional final arguments are builtin arities, not general defaults):
 
 ```text
-buffer.try_new(capacity: i64, alignment: i64 = 1) -> Result<buffer, Error>
-buffer.try_filled(length: i64, value: u8, alignment: i64 = 1) -> Result<buffer, Error>
+buffer.try_new(capacity: i64, alignment: i64 = 1, pages: buffer.page_policy = Default) -> Result<buffer, Error>
+buffer.try_filled(length: i64, value: u8, alignment: i64 = 1, pages: buffer.page_policy = Default) -> Result<buffer, Error>
 ```
 
 Positional calls:
@@ -26,23 +31,23 @@ fn initialized(size: i64) -> Result<buffer, Error> = buffer.try_filled(size, 0)
 
 | Surface | Exact contract |
 | --- | --- |
-| `buffer.try_new(capacity: i64, alignment: i64 = 1) -> Result<buffer, Error>` | One or two positional arguments; capacity is required. Pure. Success has initialized length 0 and usable read-window capacity exactly capacity. Zero requests no payload but still acquires one owned handle. No source byte copy. |
-| `buffer.try_filled(length: i64, value: u8, alignment: i64 = 1) -> Result<buffer, Error>` | Two or three positional arguments. Pure. Success has length and usable capacity exactly length, with every byte initialized to value. Zero acquires no payload. Nonzero initialization is O(length), with one payload allocation; no timing/throughput/RSS promise. |
-| Admission/evaluation | All supplied arguments evaluate once left-to-right before native admission. Existing exact i64/u8 source typing and ordinary inference apply. Alignment is a power of two 1..536870912; validate it first, even for zero/negative/oversized length. Then validate nonnegative count and target Layout representability, including alignment padding/limits. Invalid alignment or size returns Error.Invalid before allocation. |
-| Allocation/errors | After admission, acquire the aligned payload (unless count 0), initialize it only for filled, then acquire the header using the same Rust global allocation family and Layout as canonical Box-based Drop. Either allocator refusal returns Error.Code(ENOMEM), currently 12 on supported Linux/macOS. A header refusal drops the acquired payload with its exact original layout before returning. No successful degraded window, partial owner, hidden retry or fallback alignment. |
+| `buffer.try_new(capacity: i64, alignment: i64 = 1, pages: buffer.page_policy = Default) -> Result<buffer, Error>` | One to three positional arguments; capacity is required. Pure. Success has initialized length 0 and usable read-window capacity exactly capacity. Zero requests no payload but still acquires one owned handle. No source byte copy. |
+| `buffer.try_filled(length: i64, value: u8, alignment: i64 = 1, pages: buffer.page_policy = Default) -> Result<buffer, Error>` | Two to four positional arguments. Pure. Success has length and usable capacity exactly length, with every byte initialized to value. Zero acquires no payload. Nonzero initialization is O(length), with one payload allocation; no timing/throughput/RSS promise. |
+| Admission/evaluation | All supplied arguments evaluate once left-to-right before native admission. Existing exact i64/u8 source typing and ordinary inference apply. Alignment is a power of two 1..536870912; validate it first, even for zero/negative/oversized length. Then validate the page policy (plan 161) and nonnegative count and target Layout representability, including alignment padding/limits. Invalid alignment, page policy or size returns Error.Invalid before allocation. |
+| Allocation/errors | After admission, acquire the aligned payload (unless count 0), initialize it only for filled, then acquire the header using the same Rust global allocation family and Layout as canonical Box-based Drop. Either allocator refusal returns Error.Code(ENOMEM), currently 12 on supported Linux/macOS. A header refusal drops the acquired payload with its exact original Layout or mapping extent before returning (plan 161). No successful degraded window, partial owner, hidden retry or fallback alignment. |
 | Ownership/lifetime | Ok owns one independent Move buffer, including inside an arena. Err owns no handle/payload. Ordinary construction, move-in/out, source nulling, return, replacement and canonical recursive Drop apply; no view is returned by a constructor. The alignment guarantee and existing byte-view lifetime/write-authority rules follow the buffer owner. |
 | Subsequent operations | Existing bounded read/pread_into reuse admitted capacity and preserve its payload address. Ordinary append/put/read_line growth retains its existing terminal allocation-failure policy. Constructor success does not promise page residency, physical-memory admission, future growth, or recovery from OS process termination/overcommit failure during byte initialization. |
 | Existing surface | `buffer(...)`, `buffer.filled(...)`, capacity(), their defaults and best-effort/terminal failure semantics are unchanged. The try constructors are explicit fallible operations, not deprecated aliases, implicit retries or a second optional/error model. No fallible growth/reset/truncate operation is added. |
-| Native ABI | `i32 align_rt_buffer_try_new(i64 capacity, i64 alignment, ptr out)` and `i32 align_rt_buffer_try_filled(i64 length, i8 value, i64 alignment, ptr out)`. Codegen zeroes the Buffer output slot; native entry clears a nonnull output before admission, and publishes exactly once on success. Null out returns AL_INVALID without allocation. Otherwise statuses are 0 success, AL_INVALID invalid admission, AL_CODE+ENOMEM allocator refusal. Value follows the existing unsigned-byte C ABI rule: declaration/call zeroext on x86_64 and Apple ARM64, plain i8 on Linux AArch64. Pointer and integer widths follow the runtime ledger. |
+| Native ABI | `i32 align_rt_buffer_try_new(i64 capacity, i64 alignment, i32 pages, ptr out)` and `i32 align_rt_buffer_try_filled(i64 length, i8 value, i64 alignment, i32 pages, ptr out)`. Codegen zeroes the Buffer output slot; native entry clears a nonnull output before admission, and publishes exactly once on success. Null out returns AL_INVALID without allocation. Otherwise statuses are 0 success, AL_INVALID invalid admission, AL_CODE+ENOMEM allocator refusal. Value follows the existing unsigned-byte C ABI rule: declaration/call zeroext on x86_64 and Apple ARM64, plain i8 on Linux AArch64. Pointer and integer widths follow the runtime ledger. |
 | Compiler ownership | Sema owns arity/type checking and Pure effects; checked HIR authenticates the exact Result<Buffer,Error> result and every operand. MIR owns source order, normal status-to-Result construction and cleanup. LLVM only lowers authenticated MIR/native ABI. Native implementation shares one private allocation/cleanup path for both entrypoints. |
-| Artifact identity | No new public type, error variant, layout or nominal identity. Generic interfaces persist source templates, not HIR/MIR bodies: replay retains both operation names and all arguments, with no interface format/version change. Existing source, compiler-binary and runtime content fingerprints separate old/new artifacts. No new type fingerprint, ambient configuration or persistent/exchanged format. |
+| Artifact identity | The fallible-construction surface adds no error variant or ownership type; plan 161 adds the ordinary buffer.page_policy enum. Generic interfaces persist source templates, not HIR/MIR bodies: replay retains both operation names and all arguments, with no interface format/version change. Existing source, compiler-binary and runtime content fingerprints separate old/new artifacts. No new type fingerprint, ambient configuration or persistent/exchanged format. |
 | Prerequisites/scope | Existing Buffer Result payload/control/drop and plan 131 aligned storage. K1/plan 61, external consumer code/adoption, fallible growth and general allocator configuration remain outside scope. This is a complete usable constructor capability. |
 
 ## Representation and allocation authority
 
-Use a distinct HIR `BufferTryNew { capacity, fill: Option<Expr>, alignment }`
+Use a distinct HIR `BufferTryNew { capacity, fill: Option<Expr>, alignment, pages }`
 returning exact `Result<Buffer,builtin Error>`. A MIR `BufferTryNew { capacity,
-fill: Option<Operand>, alignment, out: Slot }` returns i32 status and writes
+fill: Option<Operand>, alignment, pages, out: Slot }` returns i32 status and writes
 one Buffer slot. The lowering evaluates operands with termination guards,
 allocates the output slot, then reuses `emit_status_buffer_result` for
 normal Result construction. LLVM zeroes the output before the native call and lowers that operation, selecting
@@ -52,7 +57,7 @@ The native registry grows by two: 460 keyed, 478 base, 485 alloc-count,
 482 par-map-probe and 489 maximum exports; unsigned-byte rows grow to seven.
 
 A shared native helper validates alignment via checked conversion, power of
-two and upper bound, then count via checked conversion and
+two and upper bound, then the policy tag and count via checked conversion and
 `Layout::from_size_align`. It reserves exact BufferStorage payload, initializes
 filled bytes without another reserve, and acquires the header with
 `std::alloc::alloc(Layout::new::<Buffer>())`. Null means ENOMEM, with stack-owned

@@ -26,13 +26,13 @@ key|BufferAppend|buffer_append|IndirectStorage|declare void @align_rt_buffer_app
 key|BufferAppendFilled|buffer_append_filled|IndirectStorage|declare void @align_rt_buffer_append_filled(ptr, i64, i8 zeroext) #2
 key|BufferBytes|buffer_bytes|IndirectStorage|declare void @align_rt_buffer_bytes(ptr, ptr) #2
 key|BufferCapacity|buffer_capacity|IndirectStorage|declare i64 @align_rt_buffer_capacity(ptr) #2
-key|BufferFilled|buffer_filled|AllocNew|declare noalias ptr @align_rt_buffer_filled(i64, i8 zeroext, i64) #0
+key|BufferFilled|buffer_filled|AllocNew|declare noalias ptr @align_rt_buffer_filled(i64, i8 zeroext, i64, i32) #0
 key|BufferFree|buffer_free|IndirectStorage|declare void @align_rt_buffer_free(ptr) #2
 key|BufferLen|buffer_len|IndirectStorage|declare i64 @align_rt_buffer_len(ptr) #2
-key|BufferNew|buffer_new|AllocNew|declare noalias ptr @align_rt_buffer_new(i64, i64) #0
+key|BufferNew|buffer_new|AllocNew|declare noalias ptr @align_rt_buffer_new(i64, i64, i32) #0
 key|BufferPut|buffer_put|IndirectStorage|declare void @align_rt_buffer_put(ptr, i64, i64, i32) #2
-key|BufferTryFilled|buffer_try_filled|IndirectStorage|declare i32 @align_rt_buffer_try_filled(i64, i8 zeroext, i64, ptr) #2
-key|BufferTryNew|buffer_try_new|IndirectStorage|declare i32 @align_rt_buffer_try_new(i64, i64, ptr) #2
+key|BufferTryFilled|buffer_try_filled|IndirectStorage|declare i32 @align_rt_buffer_try_filled(i64, i8 zeroext, i64, i32, ptr) #2
+key|BufferTryNew|buffer_try_new|IndirectStorage|declare i32 @align_rt_buffer_try_new(i64, i64, i32, ptr) #2
 key|BuilderFinish|builder_finish|IndirectStorage|declare { ptr, i64 } @align_rt_builder_finish(ptr) #2
 key|BuilderFinishStack|builder_finish_stack|IndirectStorage|declare { ptr, i64 } @align_rt_builder_finish_stack(ptr) #2
 key|BuilderFree|builder_free|IndirectStorage|declare void @align_rt_builder_free(ptr) #2

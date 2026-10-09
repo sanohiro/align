@@ -152,10 +152,7 @@ fn matrix() {
                     let mut measured = [(0u64, 0usize); 2];
                     for reference in [false, true] {
                         let capacity = if reserved { size * 2 } else { size };
-                        let owner = Owner(align_rt_buffer_new(
-                            i64::try_from(capacity).unwrap(),
-                            alignment,
-                        ));
+                        let owner = Owner(align_rt_buffer_new(i64::try_from(capacity).unwrap(), alignment, 0));
                         unsafe {
                             align_rt_buffer_append(
                                 owner.0,

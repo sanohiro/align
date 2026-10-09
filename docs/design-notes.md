@@ -2145,7 +2145,7 @@ materializers use terminal allocation failure, matching core's existing model.
 
 ## Explicit buffer payload alignment
 
-Plan 131 selects alignment at buffer construction through one optional final
+Plan 131 selects alignment at buffer construction through an optional
 integer argument on both constructors. The owner retains this property through
 growth and transfer; the handle's local slot cannot confer it. Reusing align(N)
 on arbitrary buffer bindings would require a hidden reallocation/copy or
@@ -2159,7 +2159,7 @@ observation; alignment does not promise residency, speed or recoverable OOM.
 Plan 135 uses explicit `buffer.try_new` and `buffer.try_filled` with the existing
 `Result<buffer, Error>` model. Capacity observation alone cannot report a failed
 handle allocation; both payload and handle acquisition therefore belong to one
-fallible publication boundary. Alignment admission precedes size admission,
+fallible publication boundary. Alignment and page-policy admission precede size admission,
 invalid input returns Invalid, and allocator refusal returns Code(ENOMEM).
 A failed handle acquisition releases its payload before returning Err. The
 successful owner uses ordinary buffer cleanup and alignment, with exact initial
@@ -2167,6 +2167,19 @@ read-window capacity. Existing constructors and later growth retain their
 policies. This admits bounded windows without claiming physical-memory residency
 or catching process termination. No new error type, unwinding or allocator
 configuration is introduced.
+
+## Explicit buffer page preference
+
+Plan 161 makes page preference an ordinary trailing enum argument on all four
+constructors. Measured benefits depend on the workload and pointer placement;
+Default therefore retains its allocation path. PreferHuge is portable source
+with initially Linux-only advice, and unsupported hosts allocate normally.
+Requested alignment remains guaranteed independently of page backing.
+Eligible allocations own private mappings because global-allocator byte ownership
+does not prove that page advice ends at deallocation. Exact unmapping closes
+that lifetime without changing process-wide THP policy or promising speed.
+Advice refusal keeps the same valid owner; acquisition failure retains the
+constructor's existing failure policy.
 
 ## Observable buffer read-window capacity
 
