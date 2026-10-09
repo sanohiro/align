@@ -104,10 +104,12 @@ fn assert_header_retired(events: &[HeaderEvent], expected: usize) {
 }
 
 #[test]
-fn zero_filled_payloads_keep_layout_initialization_and_failure_ownership() {
+fn zero_filled_payloads_keep_layout_initialization_and_failure_ownership() -> Result<(), core::num::TryFromIntError> {
     for shift in 0..=29 {
         let alignment = 1_i64 << shift;
+        let expected_alignment = usize::try_from(alignment)?;
         for length in [0, 17] {
+            let expected_length = usize::try_from(length)?;
             for fallible in [false, true] {
                 let (payloads, headers, _, _) = observe(false, false, || {
                     let owner = if fallible {
@@ -116,9 +118,9 @@ fn zero_filled_payloads_keep_layout_initialization_and_failure_ownership() {
                         Owner(out)
                     } else { Owner(align_rt_buffer_filled(length, 0, alignment)) };
                     let buffer = unsafe { &mut *owner.0 };
-                    assert_eq!((buffer.len, buffer.cap, buffer.data.len()), (length as usize, length as usize, length as usize));
+                    assert_eq!((buffer.len, buffer.cap, buffer.data.len()), (expected_length, expected_length, expected_length));
                     assert!(buffer.data.iter().all(|byte| *byte == 0));
-                    assert_eq!(buffer.data.writable_ptr().addr() % alignment as usize, 0);
+                    assert_eq!(buffer.data.writable_ptr().addr() % expected_alignment, 0);
                     buffer.data.fill(0xa5);
                 });
                 assert_eq!(payloads.len(), if length == 0 { 0 } else { 2 });
@@ -137,6 +139,7 @@ fn zero_filled_payloads_keep_layout_initialization_and_failure_ownership() {
         assert_retired(&payloads);
         assert!(headers.is_empty());
     }
+    Ok(())
 }
 
 #[test]

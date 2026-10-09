@@ -19928,20 +19928,20 @@ fn fallible_buffer_hir_contract() -> Result<(), &'static str> {
 }
 
 #[test]
-fn stable_buffer_growth_hir_authenticates_the_complete_mutable_root() {
+fn stable_buffer_growth_hir_authenticates_the_complete_mutable_root() -> Result<(), &'static str> {
     for operation in ["append_filled(1, 0 as u8)", "append(\"x\")", "put_u16_le(1 as u16)"] {
         let source = format!("Inner {{ bytes: buffer }}\nHolder {{ inner: Inner, other: i64 }}\nfn grow(borrow mut holder: Holder) = holder.inner.bytes.{operation}\nfn main() {{}}\n");
         let base = checked_source_program(&source);
         assert!(validate_hir::body_only_metadata_is_valid(&base), "{operation}");
         for mutation in 0..6 {
             let mut bad = base.clone();
-            let function = bad.fns.iter_mut().find(|f| f.name == "grow").unwrap();
+            let function = bad.fns.iter_mut().find(|f| f.name == "grow").ok_or("missing grow fixture")?;
             let root = function.params[0];
             match mutation {
                 0 => function.param_modes[0] = align_ast::ParamMode::Borrow,
                 1 => function.locals[root as usize].is_mut = false,
                 _ => {
-                    let expr = function.body.value.as_mut().unwrap();
+                    let expr = function.body.value.as_mut().ok_or("missing growth expression")?;
                     let buffer = match &mut expr.kind {
                         hir::ExprKind::BufferPut { buffer, .. } | hir::ExprKind::BufferAppend { buffer, .. }
                         | hir::ExprKind::BufferAppendFilled { buffer, .. } => buffer,
@@ -19959,4 +19959,5 @@ fn stable_buffer_growth_hir_authenticates_the_complete_mutable_root() {
             assert!(!validate_hir::body_only_metadata_is_valid(&bad), "{operation}/{mutation}");
         }
     }
+    Ok(())
 }
