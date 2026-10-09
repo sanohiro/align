@@ -4668,7 +4668,7 @@ fast-systems-programming needs that any Align user hits, not engine-specific.
      defaulted to LE would hide the byte order — rejected. Single-byte `u8`/`i8` carry no suffix.
    - **API.** Read on a `bytes` (`slice<u8>`) view: `bytes.<scalar>(off) -> scalar` for `scalar` in
      `u8, i8, u16_le, u16_be, i16_le, i16_be, u32_le, u32_be, i32_le, i32_be, u64_le, u64_be,
-     i64_le, i64_be, f32_le, f32_be, f64_le, f64_be`. Encode on a growable `buffer` (a `mut` local):
+     i64_le, i64_be, f32_le, f32_be, f64_le, f64_be`. Encode on a growable `buffer` (a stable mutable local or field):
      `buffer.put_<scalar>(v) -> ()` (the same 18-name set, `put_`-prefixed) plus
      `buffer.append(data) -> ()` (copy a raw `bytes`/`str`/`string` blob). Read-back via the existing
      `.bytes()` / `.len()`.
@@ -5143,6 +5143,15 @@ match projections, support their existing non-consuming receivers: buffer
 the handle and its only cleanup; byte views retain that owner’s generation and
 lifetime. Plain field assignment still moves, and exclusive partial-Move-field
 arguments remain excluded. [Request 61’s contract](impl/37-borrowed-buffer-writer-plan.md) owns receiver validation and closure.
+
+Buffer growth (`append_filled`, `append`, and scalar `put_*`) also accepts a
+stable field path rooted in a mutable owned local or a `borrow mut` complete
+record. The parent retains sole cleanup. Receiver and arguments are evaluated
+once; terminating arguments perform no growth. Shared roots, borrowed match
+payloads and arbitrary exclusive partial-field calls remain rejected. Growth
+ends earlier buffer views from the complete owner, including sibling buffer
+views; fresh views and independently backed slice fields remain usable.
+
 
 Ordinary indexing of an admitted `array<str>` or AoS array of Copy records with any admitted
 region-bearing Copy field, including direct or nested `str` and `slice<T>` fields,

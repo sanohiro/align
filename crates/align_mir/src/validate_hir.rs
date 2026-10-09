@@ -5642,6 +5642,17 @@ impl<'a> BodyValidator<'a> {
                 || matches!(&expression.kind, hir::ExprKind::Field { path, .. } if !path.is_empty()))
     }
 
+    fn mutable_buffer_receiver(&self, expression: &hir::Expr, context: &BodyContext) -> bool {
+        if !self.handle_receiver_place(expression, context, Ty::Buffer) { return false; }
+        let root = match expression.kind {
+            hir::ExprKind::Local(root) | hir::ExprKind::Field { root, .. } => root,
+            _ => return false,
+        };
+        let Some(root_ty) = self.local_type(context, root) else { return false; };
+        let local = hir::Expr { kind: hir::ExprKind::Local(root), ty: root_ty, span: expression.span };
+        self.source_mut_local(context, &local, root_ty)
+    }
+
     fn logger_place(&self, expression: &hir::Expr, context: &BodyContext) -> bool {
         self.local_handle_place(context, expression, Ty::Logger)
     }
@@ -9398,7 +9409,7 @@ impl<'a> BodyValidator<'a> {
             }
             hir::ExprKind::BufferPut { buffer, value, be } => {
                 let width = self.binary_scalar_width(value.ty)?;
-                if !mutable_local(buffer, Ty::Buffer)
+                if !self.mutable_buffer_receiver(buffer, context)
                     || buffer.ty != Ty::Buffer
                     || (width == 1 && *be)
                 {
@@ -9407,7 +9418,7 @@ impl<'a> BodyValidator<'a> {
                 strict(Ty::Unit, &[buffer, value])
             }
             hir::ExprKind::BufferAppend { buffer, data } => {
-                if !mutable_local(buffer, Ty::Buffer)
+                if !self.mutable_buffer_receiver(buffer, context)
                     || buffer.ty != Ty::Buffer
                     || !byte_view(data.ty)
                 {
@@ -9420,7 +9431,7 @@ impl<'a> BodyValidator<'a> {
                 length,
                 value,
             } => {
-                if !mutable_local(buffer, Ty::Buffer)
+                if !self.mutable_buffer_receiver(buffer, context)
                     || buffer.ty != Ty::Buffer
                     || length.ty != i64
                     || !self.body_ty_matches(value.ty, align_sema::scalar_to_ty(u8_scalar))

@@ -34936,7 +34936,8 @@ impl<'a> MoveCheck<'a> {
                 arguments.insert(Self::expr_key(digest));
                 places.insert(Self::expr_key(digest));
             }
-            if let Some(receiver) = Self::array_builder_action_receiver(&expression.kind) {
+            if let Some(receiver) = Self::array_builder_action_receiver(&expression.kind)
+                .or_else(|| Self::buffer_growth_receiver(&expression.kind)) {
                 arguments.insert(Self::expr_key(receiver));
                 places.insert(Self::expr_key(receiver));
             }
@@ -39792,6 +39793,14 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
+    fn buffer_growth_receiver(kind: &ExprKind) -> Option<&Expr> {
+        match kind {
+            ExprKind::BufferPut { buffer, .. } | ExprKind::BufferAppend { buffer, .. }
+            | ExprKind::BufferAppendFilled { buffer, .. } => Some(buffer),
+            _ => None,
+        }
+    }
+
     fn array_builder_action_receiver(kind: &ExprKind) -> Option<&Expr> {
         match Self::source_visible_mutation_action(kind) {
             Some(SourceVisibleMutationAction::Builder { builder, .. }) => Some(builder),
@@ -39813,6 +39822,7 @@ impl<'a> MoveCheck<'a> {
         let receiver = match &expression.kind {
             ExprKind::ArrayTruncate { receiver, .. } => Some(receiver.as_ref()),
             _ => Self::array_builder_action_receiver(&expression.kind)
+                .or_else(|| Self::buffer_growth_receiver(&expression.kind))
                 .or_else(|| Self::http_timeout_action_receiver(&expression.kind))
                 .or_else(|| Self::reader_action_receiver(expression)),
         };
@@ -45288,6 +45298,11 @@ impl<'a> MoveCheck<'a> {
         };
         match action {
             SourceVisibleMutationAction::Storage(destination) => {
+                if Self::buffer_growth_receiver(&expression.kind).is_some() {
+                    let key = Self::expr_key(destination);
+                    self.validate_value_snapshot(Self::expr_key(expression), key, expression.span);
+                    self.borrows.finish_mutable_place_source(key);
+                }
                 self.invalidate_storage(destination);
             }
             SourceVisibleMutationAction::StorageAndSource { storage, source } => {
@@ -68625,8 +68640,28 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// Growth borrows the existing handle; the complete mutable root retains cleanup.
+    fn require_mut_buffer_receiver(&mut self, receiver: &Expr) -> bool {
+        let root = match &receiver.kind {
+            ExprKind::Local(root) | ExprKind::Field { root, .. } => *root,
+            _ => {
+                self.diags.error("buffer growth needs a stable mutable local or field".to_string(), receiver.span);
+                return false;
+            }
+        };
+        let mutable = self.locals.get(root as usize).is_some_and(|local| local.is_mut)
+            && !self.borrowed_projection_places.contains_key(&root)
+            && self.current_params.iter().position(|parameter| *parameter == root)
+                .is_none_or(|position| matches!(self.current_param_modes.get(position),
+                    Some(ast::ParamMode::ByValue | ast::ParamMode::BorrowMut)));
+        if !mutable {
+            self.diags.error("buffer growth requires a mutable owned root or `borrow mut` complete owner".to_string(), receiver.span);
+        }
+        mutable
+    }
+
     /// `buf.put_<scalar>_<le|be>(v)` — append `v`'s bytes to a growable `buffer` (A2, the encode dual
-    /// of [`Self::check_bytes_read`]). The receiver must be a `mut buffer` local (mutated in place,
+    /// of [`Self::check_bytes_read`]). The receiver must be a stable mutable buffer place (mutated in place,
     /// like an `rng` method); `v` must match the scalar `scalar` exactly.
     fn check_buffer_put(&mut self, recv: &ast::Expr, scalar: Ty, be: bool, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
@@ -68640,22 +68675,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
             return err;
         }
-        // The receiver must be a bound **mut** local — the write grows the buffer in place.
-        let Some((bid, _)) = self.place_local(recv) else {
-            self.diags.error(
-                format!("'.{method}()' needs a `mut` buffer local (bind it first: `mut b := buffer(0)`, then `b.{method}(...)`) — it grows the buffer in place"),
-                recv.span,
-            );
-            return err;
-        };
-        if !self.locals[bid as usize].is_mut {
-            let name = self.locals[bid as usize].name.clone();
-            self.diags.error(
-                format!("cannot grow immutable buffer '{name}' (declare with `mut`) — '.{method}()' appends in place"),
-                recv.span,
-            );
-            return err;
-        }
+        if !self.require_mut_buffer_receiver(&recv_expr) { return err; }
         let [v_arg] = args else {
             self.diags.error(format!("'.{method}()' takes 1 argument (the value to append), got {}", args.len()), span);
             return err;
@@ -68675,7 +68695,7 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     /// `buf.append(data)` — copy a raw `bytes` (`slice<u8>`) blob onto a growable `buffer` (A2). The
-    /// receiver must be a `mut buffer` local; `data` is a `str`/`string`/`slice<u8>` view (borrowed,
+    /// receiver must be a stable mutable buffer place; `data` is a `str`/`string`/`slice<u8>` view (borrowed,
     /// copied in).
     fn check_buffer_append(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
@@ -68689,21 +68709,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
             return err;
         }
-        let Some((bid, _)) = self.place_local(recv) else {
-            self.diags.error(
-                "'.append()' needs a `mut` buffer local (bind it first: `mut b := buffer(0)`, then `b.append(...)`) — it grows the buffer in place".to_string(),
-                recv.span,
-            );
-            return err;
-        };
-        if !self.locals[bid as usize].is_mut {
-            let name = self.locals[bid as usize].name.clone();
-            self.diags.error(
-                format!("cannot grow immutable buffer '{name}' (declare with `mut`) — '.append()' appends in place"),
-                recv.span,
-            );
-            return err;
-        }
+        if !self.require_mut_buffer_receiver(&recv_expr) { return err; }
         let [data_arg] = args else {
             self.diags.error(format!("'.append()' takes 1 argument (a bytes/str blob), got {}", args.len()), span);
             return err;
@@ -68737,7 +68743,7 @@ impl<'a, 't> Checker<'a, 't> {
     /// `buffer` (Plan 65 Row B2). The append member of the bulk-write family whose constructor is
     /// `buffer.filled(length, value)` and whose in-place member is `slice<u8>.fill(value)`: same
     /// `(i64, u8)` argument grammar, same terminal policy for an invalid count, one growth rather
-    /// than a per-byte sequence. Like `.append()` it needs a `mut buffer` local.
+    /// than a per-byte sequence. Like `.append()` it needs a stable mutable buffer place.
     fn check_buffer_append_filled(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let recv_expr = self.check_expr(recv, None);
@@ -68750,21 +68756,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
             return err;
         }
-        let Some((bid, _)) = self.place_local(recv) else {
-            self.diags.error(
-                "'.append_filled()' needs a `mut` buffer local (bind it first: `mut b := buffer(0)`, then `b.append_filled(n, v)`) — it grows the buffer in place".to_string(),
-                recv.span,
-            );
-            return err;
-        };
-        if !self.locals[bid as usize].is_mut {
-            let name = self.locals[bid as usize].name.clone();
-            self.diags.error(
-                format!("cannot grow immutable buffer '{name}' (declare with `mut`) — '.append_filled()' appends in place"),
-                recv.span,
-            );
-            return err;
-        }
+        if !self.require_mut_buffer_receiver(&recv_expr) { return err; }
         let [length_arg, value_arg] = args else {
             self.diags.error(format!("'.append_filled()' takes 2 arguments (a length and a byte value), got {}", args.len()), span);
             return err;

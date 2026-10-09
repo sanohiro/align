@@ -8342,7 +8342,7 @@ impl<'a> DocBuilder<'a> {
 }
 
 /// `json.doc(s)` — parse `input` into an arena-backed tape. On success writes the root `{ tape, 0 }`
-/// handle into `out` (a 16-byte `{ptr, i64}` slot) and returns 0; on malformed input returns 1
+/// handle into `out` (a 16-byte `{ptr, i64}` slot) and returns 0; on malformed input returns AL_INVALID
 /// (leaving `out` zeroed → the Align side maps it to `Err(Error.Invalid)`). The whole input is
 /// UTF-8-validated once (every `str` view handed out later is a zero-copy slice of it).
 ///
@@ -8351,18 +8351,19 @@ impl<'a> DocBuilder<'a> {
 /// must point to 16 writable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_json_doc_parse(input: *const u8, input_len: i64, arena: *mut Arena, out: *mut DocHandle) -> i32 {
-    if arena.is_null() || out.is_null() {
-        return 1;
-    }
+    if out.is_null() { return AL_INVALID; }
+    // SAFETY: a nonnull output is writable by the caller contract. No failure publishes a tape.
+    unsafe { out.write(DocHandle { tape: core::ptr::null(), node: 0 }) };
+    if arena.is_null() { return AL_INVALID; }
     // The tape stores byte offsets as `u32`, so a >4 GiB input is out of range (rejected, not a
     // panic). `safe_len` also rejects a negative / oversized length at the FFI boundary.
-    let Ok(len) = safe_len(input_len) else { return 1 };
+    let Ok(len) = safe_len(input_len) else { return AL_INVALID };
     if len > u32::MAX as usize {
-        return 1;
+        return AL_INVALID;
     }
     let src: &[u8] = unsafe { safe_slice(input, input_len) };
     if !validate_utf8(src) {
-        return 1;
+        return AL_INVALID;
     }
     let mut db = DocBuilder { p: JsonParser::new(src), nodes: Vec::new(), scratch: Vec::new() };
     let ok = (|| -> Option<()> {
@@ -8378,7 +8379,7 @@ pub unsafe extern "C" fn align_rt_json_doc_parse(input: *const u8, input_len: i6
         Some(())
     })();
     if ok.is_none() {
-        return 1;
+        return AL_INVALID;
     }
     // Copy the tape (nodes + header) into the arena so it is bulk-freed at arena end. The Align-side
     // handle is region-tied to min(input, arena), so nothing here can outlive either.
@@ -8389,7 +8390,7 @@ pub unsafe extern "C" fn align_rt_json_doc_parse(input: *const u8, input_len: i6
     } else {
         // `checked_mul`: on a 32-bit target `n * 16` wraps for `n > 256M` (n is bounded by `u32::MAX`
         // above, so this only bites 32-bit) — bail rather than under-allocate and copy OOB.
-        let Some(bytes) = n.checked_mul(core::mem::size_of::<DocNode>()) else { return 1 };
+        let Some(bytes) = n.checked_mul(core::mem::size_of::<DocNode>()) else { return AL_INVALID };
         let dst = arena_ref.alloc_uninit(bytes, core::mem::align_of::<DocNode>()) as *mut DocNode;
         unsafe { core::ptr::copy_nonoverlapping(db.nodes.as_ptr(), dst, n) };
         dst as *const DocNode
@@ -11801,14 +11802,13 @@ pub extern "C" fn align_rt_buffer_new(cap: i64, alignment: i64) -> *mut Buffer {
 /// `buffer.filled(length, value, alignment)` — exactly initialized bytes in one aligned payload acquisition.
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_buffer_filled(length: i64, value: u8, alignment: i64) -> *mut Buffer {
-    let mut data = buffer_storage_with_alignment(alignment);
+    // Validate alignment before count/allocation, as in the ordinary constructor.
+    let admitted = buffer_storage_with_alignment(alignment);
     let requested = safe_len(length).unwrap_or_else(|()| align_rt_alloc_size_fail());
     #[cfg(test)]
     if requested > 0 && owned_allocator_failpoint() { panic_abort("buffer allocation failed"); }
-    if data.try_reserve_exact(requested).is_err() {
-        panic_abort("buffer allocation failed");
-    }
-    data.resize(requested, value);
+    let data = BufferStorage::try_filled(requested, value, admitted.alignment())
+        .unwrap_or_else(|()| panic_abort("buffer allocation failed"));
     let cap = data.capacity();
     #[cfg(test)]
     if owned_allocator_failpoint() { panic_abort("buffer header allocation failed"); }
@@ -11828,13 +11828,16 @@ unsafe fn buffer_try_new(length: i64, fill: Option<u8>, alignment: i64, out: *mu
     if !alignment.is_power_of_two() || alignment > (1 << 29) { return AL_INVALID; }
     let Ok(requested) = usize::try_from(length) else { return AL_INVALID; };
     if std::alloc::Layout::from_size_align(requested, alignment).is_err() { return AL_INVALID; }
-    let mut data = BufferStorage::new(alignment);
-    if data.try_reserve_exact(requested).is_err() { return AL_CODE + libc::ENOMEM; }
-    let len = if let Some(value) = fill {
-        // The exact reservation is already admitted; resize initializes without growth.
-        data.resize(requested, value);
-        requested
-    } else { 0 };
+    let (data, len) = if let Some(value) = fill {
+        let Ok(data) = BufferStorage::try_filled(requested, value, alignment) else {
+            return AL_CODE + libc::ENOMEM;
+        };
+        (data, requested)
+    } else {
+        let mut data = BufferStorage::new(alignment);
+        if data.try_reserve_exact(requested).is_err() { return AL_CODE + libc::ENOMEM; }
+        (data, 0)
+    };
     #[cfg(test)]
     if buffer_constructor_probe::refuse_header() { return AL_CODE + libc::ENOMEM; }
     let layout = std::alloc::Layout::new::<Buffer>();
@@ -52076,9 +52079,40 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             let arena = align_rt_arena_begin();
             let mut h = DocHandle { tape: core::ptr::null(), node: 0 };
             let code = unsafe { align_rt_json_doc_parse(bad.as_ptr(), bad.len() as i64, arena, &mut h) };
-            assert_eq!(code, 1, "expected Err for malformed input {bad:?}");
+            assert_eq!(code, AL_INVALID, "expected Invalid for malformed input {bad:?}");
             unsafe { align_rt_arena_end(arena) };
         }
+    }
+
+    #[test]
+    fn json_doc_failures_publish_only_invalid_and_recover() {
+        struct ArenaOwner(*mut Arena);
+        impl Drop for ArenaOwner {
+            fn drop(&mut self) { unsafe { align_rt_arena_end(self.0) }; }
+        }
+        let arena = ArenaOwner(align_rt_arena_begin());
+        let mut out = DocHandle { tape: core::ptr::null(), node: 0 };
+        let good = br#"{"nested": [1, {}]}"#;
+        let bad: &[&[u8]] = &[b"", b"{", b"[", b"\"", b"tru", b"null!", b"[1,]", b"{\"a\":}", &[0xff]];
+        for input in bad {
+            // Reuse a previously successful output: rejection must not leave that handle live.
+            assert_eq!(unsafe { align_rt_json_doc_parse(good.as_ptr(), good.len() as i64, arena.0, &mut out) }, 0);
+            assert!(!out.tape.is_null());
+            let before = unsafe { ((*arena.0).chunks.len(), (*arena.0).off, (*arena.0).maps.len()) };
+            assert_eq!(unsafe { align_rt_json_doc_parse(input.as_ptr(), input.len() as i64, arena.0, &mut out) }, AL_INVALID);
+            assert!(out.tape.is_null());
+            assert_eq!(out.node, 0);
+            assert_eq!(unsafe { ((*arena.0).chunks.len(), (*arena.0).off, (*arena.0).maps.len()) }, before);
+        }
+        for length in [-1, i64::from(u32::MAX) + 1] {
+            assert_eq!(unsafe { align_rt_json_doc_parse(good.as_ptr(), length, arena.0, &mut out) }, AL_INVALID);
+            assert!(out.tape.is_null());
+        }
+        assert_eq!(unsafe { align_rt_json_doc_parse(core::ptr::null(), 0, arena.0, &mut out) }, AL_INVALID);
+        assert_eq!(unsafe { align_rt_json_doc_parse(good.as_ptr(), good.len() as i64, core::ptr::null_mut(), &mut out) }, AL_INVALID);
+        assert_eq!(unsafe { align_rt_json_doc_parse(good.as_ptr(), good.len() as i64, arena.0, core::ptr::null_mut()) }, AL_INVALID);
+        assert_eq!(unsafe { align_rt_json_doc_parse(good.as_ptr(), good.len() as i64, arena.0, &mut out) }, 0);
+        assert_eq!(unsafe { align_rt_json_doc_len(out.tape, out.node) }, 1);
     }
 }
 

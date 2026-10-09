@@ -5,6 +5,7 @@ The Base64, CSV field-discovery/normalization, percent/form escape, escaped-outp
 
 ```sh
 bash bench/base64_decode/run.sh
+bash bench/buffer_zero/run.sh
 bash bench/csv_quoted_scan/run.sh
 bash bench/csv_normalization/run.sh
 bash bench/escaped_decode/run.sh
@@ -12,7 +13,7 @@ bash bench/encoding_writes/run.sh
 bash bench/utf8_lossy/run.sh
 ```
 
-The runner accepts only those six probe names, builds the ordinary release
+The runner accepts only those seven probe names, builds the ordinary release
 runtime through `scripts/cargo.sh`, links the selected `main.c` with `-O3` and
 the existing macOS/Linux library flags, and passes its CSV output through.
 `CC` selects one compiler executable (default `cc`); `CARGO_TARGET_DIR` selects

@@ -14,9 +14,10 @@ handle ownership or admit exclusive calls on arbitrary partial Move fields.
 
 A plain `alias := owner.handle` remains an ordinary Move expression; this
 capability does not silently turn assignment into borrowing. Use a direct
-non-consuming receiver, or the existing borrowed-match binding. Buffer mutation
-methods requiring an exclusive local (`put_*`, `append`, `read(out: ...)`) keep
-their current place gate. A numeric-stream owner can encode through its existing
+non-consuming receiver, or the existing borrowed-match binding. Plan160 completes stable mutable field receivers for `put_*`, `append`, and
+`append_filled`; the complete root must be mutable and exclusively accessible,
+with no borrowed match payload. Native output operations such as `read(out: ...)`
+retain their existing exclusive-local gate. A numeric-stream owner can encode through its existing
 byte view while its complete stream is borrowed. No special stream type, method,
 network retention behavior, positional buffer operation or application codec is
 introduced.

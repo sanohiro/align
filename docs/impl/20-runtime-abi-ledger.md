@@ -28,6 +28,13 @@ Historical vectors/version transitions and current shipped ABI inventories below
 remain baseline records, not alternate implementation contracts. In particular,
 plan 47 records the replacement ABI counts and rows.
 
+`align_rt_json_doc_parse` uses common status encoding: zero on success and
+`AL_INVALID` (2) on malformed input or invalid native admission. A nonnull output
+is canonicalized to `{null, 0}` before validation; failed output is never read.
+The existing JSON scalar/record decoders use their own numeric failure code and
+explicit Error.Code construction, not this common-status conversion. Ordinary I/O
+mapping and missing-key document navigation are unchanged (plan160).
+
 ## Unsigned-byte C ABI arguments
 
 The typed registry records its narrow native arguments as unsigned bytes, matching

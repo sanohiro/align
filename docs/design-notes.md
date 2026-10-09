@@ -469,6 +469,15 @@ the handle and its only cleanup; byte views retain that owner’s generation and
 lifetime. Plain field assignment still moves, and exclusive partial-Move-field
 arguments remain excluded. [Request 61’s contract](impl/37-borrowed-buffer-writer-plan.md) owns receiver validation and closure.
 
+Buffer growth (`append_filled`, `append`, and scalar `put_*`) also accepts a
+stable field path rooted in a mutable owned local or a `borrow mut` complete
+record. The parent retains sole cleanup. Receiver and arguments are evaluated
+once; terminating arguments perform no growth. Shared roots, borrowed match
+payloads and arbitrary exclusive partial-field calls remain rejected. Growth
+ends earlier buffer views from the complete owner, including sibling buffer
+views; fresh views and independently backed slice fields remain usable.
+
+
 **A Copy view read through a borrowed array projection keeps the projection roots.** Widening the
 payload grammar to `array<str>` and AoS arrays of Copy records is unsafe if ordinary `Index` or
 field projection silently treats the projected binding as static. Direct, field, and projected
