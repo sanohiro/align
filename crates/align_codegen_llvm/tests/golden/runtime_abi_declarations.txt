@@ -147,6 +147,7 @@ key|FsCursorFree|fs_cursor_free|HostState|declare void @align_rt_fs_cursor_free(
 key|FsCursorNext|fs_cursor_next|HostState|declare i32 @align_rt_fs_cursor_next(ptr, ptr, ptr) #2
 key|FsDirectoryAccess|fs_directory_access|HostState|declare i32 @align_rt_fs_directory_access(ptr, i8 zeroext, i8 zeroext, i8 zeroext, ptr) #2
 key|FsDirectoryAccessAt|fs_directory_access_at|HostState|declare i32 @align_rt_fs_directory_access_at(ptr, ptr, i64, i8 zeroext, i8 zeroext, i8 zeroext, ptr) #2
+key|FsDirectoryAvailableSpace|fs_directory_available_space|HostState|declare i32 @align_rt_fs_directory_available_space(ptr, ptr) #2
 key|FsDirectoryCreateDir|fs_directory_create_dir|HostState|declare i32 @align_rt_fs_directory_create_dir(ptr, ptr, i64, i32) #2
 key|FsDirectoryCreateNew|fs_directory_create_new|HostState|declare i32 @align_rt_fs_directory_create_new(ptr, ptr, i64, ptr) #2
 key|FsDirectoryCreateSymlink|fs_directory_create_symlink|HostState|declare i32 @align_rt_fs_directory_create_symlink(ptr, ptr, i64, ptr, i64) #2

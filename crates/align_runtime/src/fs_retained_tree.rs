@@ -416,6 +416,60 @@ unsafe fn descriptor_metadata<T>(owner: *mut T, out: *mut u8, fd: impl FnOnce(&T
         Ok(())
     })())
 }
+
+fn directory_space_stat(fd: i32) -> Result<libc::statvfs, i32> {
+    #[cfg(test)]
+    if let Some(result) = SPACE_QUERY.with(|query| {
+        query.borrow_mut().as_mut().map(|query| {
+            query.calls += 1;
+            match query.errno {
+                Some(errno) => Err(io_error_to_status(&std::io::Error::from_raw_os_error(errno))),
+                None => Ok(query.stat),
+            }
+        })
+    }) {
+        return result;
+    }
+    let mut stat = core::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    // SAFETY: integer-only native storage is valid when zeroed; reserved fields stay initialized.
+    // fstatvfs writes the observation fields on success.
+    os_status(unsafe { libc::fstatvfs(fd, stat.as_mut_ptr()) })?;
+    Ok(unsafe { stat.assume_init() })
+}
+
+/// # Safety
+/// Owner is a live borrowed Directory; out is fresh exclusive eight-byte, alignment-eight scratch.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_fs_directory_available_space(
+    owner: *mut c_void,
+    out: *mut i64,
+) -> i32 {
+    status((|| {
+        let owner = owner.cast::<Directory>();
+        unsafe { prepare(&[Output::typed(out)], owner_extent(owner), None)?; }
+        let stat = directory_space_stat(unsafe { (*owner).fd.0 })?;
+        if stat.f_frsize == 0 { return Err(AL_INVALID); }
+        // f_bsize can be the preferred I/O size (notably on macOS), not the block-count unit.
+        let bytes = u128::from(stat.f_bavail)
+            .checked_mul(u128::from(stat.f_frsize))
+            .and_then(|bytes| i64::try_from(bytes).ok())
+            .ok_or(AL_INVALID)?;
+        unsafe { out.write(bytes); }
+        Ok(())
+    })())
+}
+
+#[cfg(test)]
+struct SpaceQuery {
+    stat: libc::statvfs,
+    errno: Option<i32>,
+    calls: usize,
+}
+#[cfg(test)]
+thread_local! {
+    static SPACE_QUERY: core::cell::RefCell<Option<SpaceQuery>> = const { core::cell::RefCell::new(None) };
+}
+
 unsafe fn descriptor_mode<T>(owner: *mut T, mode: u32, fd: impl FnOnce(&T) -> i32) -> i32 {
     status((|| {
         unsafe {
@@ -829,6 +883,138 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    struct SpaceInjection;
+    impl SpaceInjection {
+        fn new(blocks: libc::fsblkcnt_t, fragment: libc::c_ulong, errno: Option<i32>) -> Self {
+            let mut stat: libc::statvfs = unsafe { core::mem::zeroed() };
+            stat.f_bavail = blocks;
+            stat.f_frsize = fragment;
+            stat.f_bsize = 8192; // Deliberately differs from the allocation-block size.
+            SPACE_QUERY.with(|query| *query.borrow_mut() = Some(SpaceQuery { stat, errno, calls: 0 }));
+            Self
+        }
+        fn calls(&self) -> usize {
+            SPACE_QUERY.with(|query| query.borrow().as_ref().unwrap().calls)
+        }
+    }
+    impl Drop for SpaceInjection {
+        fn drop(&mut self) { SPACE_QUERY.with(|query| *query.borrow_mut() = None); }
+    }
+    fn space_owner(path: &std::path::Path) -> Result<OwnedDirectory, Box<dyn std::error::Error>> {
+        let canonical = path.canonicalize()?;
+        let bytes = canonical.as_os_str().as_bytes();
+        let mut owner = core::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_fs_directory_open(bytes.as_ptr(), i64::try_from(bytes.len())?, &mut owner) }, 0);
+        Ok(OwnedDirectory(owner))
+    }
+
+    #[test]
+    fn available_space_arithmetic_errors_and_admission() -> TestResult {
+        let fixture = crate::tests::FileFixtureDir::new("available-space");
+        let owner = space_owner(&fixture.0)?;
+        let largest = libc::c_ulong::try_from(i64::MAX)?;
+        for (blocks, fragment, expected) in [
+            (0, 4096, Ok(0)), (1, 1, Ok(1)), (3, 4096, Ok(12288)),
+            (1, largest, Ok(i64::MAX)),
+            (0, 0, Err(AL_INVALID)), (1, 0, Err(AL_INVALID)),
+            (1, largest + 1, Err(AL_INVALID)),
+            (2, largest, Err(AL_INVALID)),
+            (libc::fsblkcnt_t::MAX, libc::c_ulong::MAX, Err(AL_INVALID)),
+        ] {
+            let injected = SpaceInjection::new(blocks, fragment, None);
+            let mut out = -7;
+            let status = unsafe { align_rt_fs_directory_available_space(owner.0, &mut out) };
+            assert_eq!((status, out), match expected { Ok(bytes) => (0, bytes), Err(error) => (error, 0) });
+            assert_eq!(injected.calls(), 1);
+        }
+        for (errno, expected) in [
+            (libc::EACCES, AL_DENIED), (libc::ENOTSUP, AL_CODE + libc::ENOTSUP),
+            (libc::ENOSYS, AL_CODE + libc::ENOSYS), (libc::EIO, AL_CODE + libc::EIO),
+        ] {
+            // Native failure wins over the invalid zero fragment and oversized native fields.
+            let injected = SpaceInjection::new(libc::fsblkcnt_t::MAX, 0, Some(errno));
+            let mut out = -7;
+            assert_eq!(unsafe { align_rt_fs_directory_available_space(owner.0, &mut out) }, expected);
+            assert_eq!(out, 0);
+            assert_eq!(injected.calls(), 1);
+        }
+        let injected = SpaceInjection::new(1, 1, Some(libc::EIO));
+        let mut scratch = [77_i64; 2];
+        let overflow = core::ptr::without_provenance_mut::<i64>(usize::MAX - 7);
+        for out in [core::ptr::null_mut(), scratch.as_mut_ptr().cast::<u8>().wrapping_add(1).cast(), overflow, owner.0.cast()] {
+            assert_eq!(unsafe { align_rt_fs_directory_available_space(owner.0, out) }, AL_INVALID);
+            assert_eq!(scratch, [77, 77]);
+        }
+        for invalid in [core::ptr::null_mut(), owner.0.cast::<u8>().wrapping_add(1).cast(),
+            core::ptr::without_provenance_mut(usize::MAX - (align_of::<Directory>() - 1))] {
+            assert_eq!(unsafe { align_rt_fs_directory_available_space(invalid, &mut scratch[0]) }, AL_INVALID);
+            assert_eq!(scratch, [77, 77]);
+        }
+        assert_eq!(injected.calls(), 0);
+        drop(injected);
+        let mut metadata = Metadata::default();
+        assert_eq!(unsafe { align_rt_fs_directory_metadata(owner.0, (&mut metadata as *mut Metadata).cast()) }, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn available_space_retains_descriptor_identity() -> TestResult {
+        let fixture = crate::tests::FileFixtureDir::new("available-space-rename");
+        let original = fixture.0.join("original");
+        let renamed = fixture.0.join("renamed");
+        std::fs::create_dir(&original)?;
+        let owner = space_owner(&original)?;
+        std::fs::rename(&original, &renamed)?;
+        assert!(!original.exists());
+        let mut out = -7;
+        assert_eq!(unsafe { align_rt_fs_directory_available_space(owner.0, &mut out) }, 0);
+        assert!(out >= 0);
+        std::fs::remove_dir(renamed)?;
+        assert_eq!(unsafe { align_rt_fs_directory_available_space(owner.0, &mut out) }, 0);
+        assert!(out >= 0);
+        // An actual failed native query leaves cleared scratch and acquires no descriptor.
+        let mut invalid = Directory { fd: BeneathFd(-1) };
+        assert_eq!(unsafe { align_rt_fs_directory_available_space((&mut invalid as *mut Directory).cast(), &mut out) }, AL_CODE + libc::EBADF);
+        assert_eq!(out, 0);
+        Ok(())
+    }
+
+    #[cfg(feature = "alloc-count")]
+    #[test]
+    fn available_space_allocation_parity() -> TestResult {
+        let Some(_isolated) = crate::allocation_test::enter() else { return Ok(()); };
+        let fixture = crate::tests::FileFixtureDir::new("available-space-allocation");
+        let owner = space_owner(&fixture.0)?;
+        let before = global_alloc_count();
+        let layout = std::alloc::Layout::new::<u64>();
+        let allocate = std::hint::black_box(std::alloc::alloc as unsafe fn(std::alloc::Layout) -> *mut u8);
+        let witness = unsafe { allocate(layout) };
+        assert!(!witness.is_null());
+        assert!(global_alloc_count() > before);
+        unsafe { std::alloc::dealloc(witness, layout); }
+        for errno in [None, Some(libc::EIO)] {
+            let injected = SpaceInjection::new(3, 4096, errno);
+            let mut out = -7;
+            let before = (global_alloc_count(), align_rt_alloc_count(), align_rt_free_count());
+            let result = unsafe { align_rt_fs_directory_available_space(owner.0, &mut out) };
+            let after = (global_alloc_count(), align_rt_alloc_count(), align_rt_free_count());
+            assert_eq!(after, before);
+            assert_eq!(result, errno.map_or(0, |errno| AL_CODE + errno));
+            assert_eq!(injected.calls(), 1);
+        }
+        let mut invalid = Directory { fd: BeneathFd(-1) };
+        for (pointer, expected) in [(owner.0, 0), ((&mut invalid as *mut Directory).cast(), AL_CODE + libc::EBADF)] {
+            let mut out = -7;
+            let before = (global_alloc_count(), align_rt_alloc_count(), align_rt_free_count());
+            let result = unsafe { align_rt_fs_directory_available_space(pointer, &mut out) };
+            let after = (global_alloc_count(), align_rt_alloc_count(), align_rt_free_count());
+            assert_eq!(result, expected);
+            assert_eq!(after, before);
+            assert!(out >= 0);
+        }
+        Ok(())
+    }
     struct Fixture(std::path::PathBuf);
     impl Fixture {
         fn new() -> std::io::Result<Self> {

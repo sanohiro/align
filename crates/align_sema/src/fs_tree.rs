@@ -7,6 +7,7 @@ pub enum FsTreeKind {
     DirectoryCursor,
     CursorNext,
     DirectoryMetadata,
+    DirectoryAvailableSpace,
     DirectoryMetadataAt,
     DirectoryOpenDir,
     DirectoryOpenRead,
@@ -48,14 +49,16 @@ pub enum Output {
     Unit,
     OwnedBytes,
     Bool,
+    I64,
 }
 
 impl FsTreeKind {
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::DirectoryOpen,
         Self::DirectoryCursor,
         Self::CursorNext,
         Self::DirectoryMetadata,
+        Self::DirectoryAvailableSpace,
         Self::DirectoryMetadataAt,
         Self::DirectoryOpenDir,
         Self::DirectoryOpenRead,
@@ -86,7 +89,7 @@ impl FsTreeKind {
             Self::DirectoryAccessAt => &[Owner(Ty::FsDirectory), Bytes, AccessMode],
             Self::DirectoryCreateSymlink => &[Owner(Ty::FsDirectory), Bytes, Bytes],
             Self::DirectoryOpen => &[Text],
-            Self::DirectoryCursor | Self::DirectoryMetadata => &[Owner(Ty::FsDirectory)],
+            Self::DirectoryCursor | Self::DirectoryMetadata | Self::DirectoryAvailableSpace => &[Owner(Ty::FsDirectory)],
             Self::CursorNext => &[Owner(Ty::FsDirCursor)],
             Self::DirectoryMetadataAt
             | Self::DirectoryOpenDir
@@ -107,6 +110,7 @@ impl FsTreeKind {
     }
     pub fn output(self) -> Output {
         match self {
+            Self::DirectoryAvailableSpace => Output::I64,
             Self::DirectoryReadLink => Output::OwnedBytes,
             Self::DirectoryMetadataFollow => Output::Metadata,
             Self::DirectoryAccess | Self::DirectoryAccessAt => Output::Bool,
@@ -139,6 +143,7 @@ impl FsTreeKind {
             (Ty::FsDirectory, "create_symlink") => Self::DirectoryCreateSymlink,
             (Ty::FsDirectory, "cursor") => Self::DirectoryCursor,
             (Ty::FsDirectory, "metadata") => Self::DirectoryMetadata,
+            (Ty::FsDirectory, "available_space") => Self::DirectoryAvailableSpace,
             (Ty::FsDirectory, "metadata_at") => Self::DirectoryMetadataAt,
             (Ty::FsDirectory, "open_dir") => Self::DirectoryOpenDir,
             (Ty::FsDirectory, "open_read") => Self::DirectoryOpenRead,
@@ -224,6 +229,7 @@ pub fn result_type(
         }
         Output::OwnedBytes => Scalar::DynArray(crate::PrimScalar::Int(IntTy { bits: 8, signed: false })),
         Output::Bool => Scalar::Bool,
+        Output::I64 => Scalar::Int(IntTy { bits: 64, signed: true }),
         Output::Unit => Scalar::Unit,
     };
     Some(Ty::Result(ok, Scalar::Enum(error)))

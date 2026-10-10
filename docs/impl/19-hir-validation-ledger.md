@@ -2254,6 +2254,13 @@ opaque owners use the existing structural Move carrier and cleanup rules.
 The HIR owner is `retained_tree_records`; the LLVM owner is
 `retained_tree_mir_gate`, including closed output discriminators and scratch types.
 
+Plan 162 adds `DirectoryAvailableSpace` with exactly one FsDirectory local
+receiver and `Result<i64, Error>`. The closed table rejects other arities,
+receiver types and result/error identities. MIR requires signed i32 status and
+fresh exclusive signed-i64 scratch under the distinct I64 output discriminator;
+existing native-owner provenance validation applies before LLVM. The same
+`retained_tree_records` and `retained_tree_mir_gate` owners cover the extension.
+
 ### R87 dynamic-array JSON root certification
 
 `JsonEncodePlan::Pieces` accepts a dynamic array root only as one complete

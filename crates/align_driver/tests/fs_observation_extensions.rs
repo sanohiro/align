@@ -134,3 +134,127 @@ fn private_project(tag: &str, files: &[(&str, &str)], entry: &str) -> Proj {
     }
     project
 }
+
+#[path = "helpers/owned_fixture.rs"]
+mod owned_fixture;
+
+const SPACE_HELPER: &str = r#"module space
+import std.fs
+pub fn query<T>(borrow directory: fs.directory, marker: T) -> Result<i64, Error> = directory.available_space()
+pub fn detached(marker: i64) -> i64 { directory := fs.open_directory(".") else { return 0 }; return query(directory, marker) else 0 }
+pub fn flow(borrow directory: fs.directory) -> Result<i64, Error> {
+  first := if true { directory.available_space()? } else { 0 }
+  second := match directory.available_space() { Ok(value) => value, Err(error) => { return Err(error) } }
+  third := directory.available_space() else -1
+  fourth := directory.available_space().map_err(fn error: Error { error })?
+  fifth := loop { break directory.available_space()? }
+  if first < 0 || second < 0 || third < 0 || fourth < 0 || fifth < 0 { return Err(Error.Invalid) }
+  return directory.available_space()
+}
+"#;
+
+// All compilation, native linking and execution run under the fixture's bounded process group.
+fn space_execute(stage: &std::path::Path, programs: &[align_mir::Program], name: &str) {
+    if !align_driver::backend_available() { return; }
+    let mut objects = Vec::new();
+    let mut libraries = Vec::new();
+    for (index, program) in programs.iter().enumerate() {
+        let object = stage.join(format!("{name}-{index}.o"));
+        align_driver::emit_object_file(program, &object, align_driver::BuildTarget::Baseline,
+            align_driver::Profile::Release, &[], false).unwrap();
+        objects.push(object);
+        for library in &program.link_libs {
+            if !libraries.contains(library) { libraries.push(library.clone()); }
+        }
+    }
+    let executable = stage.join(name);
+    align_driver::link_objects(&align_driver::CDriver::default(),
+        &objects.iter().map(|path| path.as_path()).collect::<Vec<_>>(), &executable,
+        &libraries, align_driver::Profile::Release).unwrap();
+    let output = std::process::Command::new(executable).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout, b"true\ntrue\n");
+}
+
+#[test]
+fn available_space_composition_and_cache() {
+    owned_fixture::run("available_space_composition_and_cache", |stage| {
+        let root = stage.canonicalize().unwrap();
+        let source = format!(r#"import std.fs
+import space
+fn main() -> Result<(), Error> {{
+  detached := {{
+    directory := fs.open_directory({:?})?
+    direct := directory.available_space()?
+    generic := space.query(directory, 42)?
+    flow := space.flow(directory)?
+    if direct < 0 || generic < 0 || flow < 0 {{ return Err(Error.Invalid) }}
+    directory.available_space()
+  }}
+  print(detached? >= 0)
+  print(detached? >= 0)
+  return Ok(())
+}}
+"#, root.to_str().unwrap());
+        let entry = stage.join("main.align");
+        std::fs::write(&entry, &source).unwrap();
+        std::fs::write(stage.join("space.align"), SPACE_HELPER).unwrap();
+        let context = align_driver::CacheContext::at(stage.join("cache"));
+        for mode in 0..4 {
+            let mut sources = align_span::SourceMap::new();
+            let programs = match mode {
+                0 => {
+                    let checked = align_driver::check(&mut sources, entry.to_str().unwrap(), &source);
+                    assert!(!checked.diags.has_errors(), "{}", align_driver::format_diagnostics(&sources, &checked.diags));
+                    let effects = align_sema::fn_effects(&checked.hir, &std::collections::HashMap::new());
+                    let flows = checked.hir.fns.iter().filter(|function| function.name.ends_with("flow")).collect::<Vec<_>>();
+                    assert_eq!(flows.len(), 1, "{effects:?}");
+                    assert_eq!(effects.get(&flows[0].name), Some(&align_sema::FnEffect::Impure));
+                    vec![align_driver::lower_to_mir(&checked.hir)]
+                }
+                1 => {
+                    let built = align_driver::build_per_unit(&mut sources, entry.to_str().unwrap(), &source);
+                    assert!(!built.diags.has_errors(), "{}", align_driver::format_diagnostics(&sources, &built.diags));
+                    built.units.into_iter().map(|unit| unit.mir).collect()
+                }
+                _ => {
+                    let mut built = align_driver::build_package(&mut sources, entry.to_str().unwrap(), &source,
+                        &context, align_driver::UnitReuse::Allowed);
+                    assert!(!built.diags.has_errors(), "{}", align_driver::format_diagnostics(&sources, &built.diags));
+                    assert!(built.units.iter().all(|unit| unit.frontend.as_ref().unwrap().hit == (mode == 3)));
+                    (0..built.units.len()).map(|index| built.materialize(index).unwrap().clone()).collect()
+                }
+            };
+            space_execute(stage, &programs, &format!("space-{mode}"));
+        }
+    });
+}
+
+#[test]
+fn available_space_formation_and_effects() {
+    owned_fixture::run("available_space_formation_and_effects", |stage| {
+        std::fs::write(stage.join("space.align"), SPACE_HELPER).unwrap();
+        let entry = stage.join("main.align");
+        for source in [
+            "import std.fs\nfn bad(borrow d: fs.directory) -> Result<i64,Error> = d.available_space(1)\nfn main() {}",
+            "import std.fs\nfn bad(borrow d: reader) -> Result<i64,Error> = d.available_space()\nfn main() {}",
+            "import std.fs\nfn bad(borrow d: fs.directory) -> Result<bool,Error> = d.available_space()\nfn main() {}",
+            "fn bad(borrow d: fs.directory) -> Result<i64,Error> = d.available_space()\nfn main() {}",
+            "import std.fs\nfn bad() -> Result<i64,Error> = (fs.open_directory(\".\")?).available_space()\nfn main() {}",
+            "import std.fs\nimport space\nfn main() { values := [1, 2]; print(values.par_map(space.detached).sum()) }",
+        ] {
+            std::fs::write(&entry, source).unwrap();
+            for per_unit in [false, true] {
+                let mut sources = align_span::SourceMap::new();
+                let diags = if per_unit {
+                    align_driver::build_per_unit(&mut sources, entry.to_str().unwrap(), source).diags
+                } else {
+                    align_driver::check(&mut sources, entry.to_str().unwrap(), source).diags
+                };
+                assert!(diags.has_errors(), "accepted: {source}");
+                let text = align_driver::format_diagnostics(&sources, &diags);
+                if source.contains(".par_map(") { assert!(text.contains("requires a Pure function"), "{text}"); }
+            }
+        }
+    });
+}

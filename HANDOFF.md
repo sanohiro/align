@@ -2,20 +2,24 @@
 
 ## Current work direction
 
-The owner stopped the continuous improvement loop after PR #1302. Request136's
-owned fixed-array record certification is delivered in PR #1303. Current work
-is the explicitly requested align-llm Requests138–140 batch (plan160): zeroed
-buffer acquisition, stable buffer-field growth and exact malformed-JSON Invalid
-mapping. Complete this batch's delivery and local release build, then stop; no
-further independent improvement loop is authorized. K1/plan61 and the separately
-parked general aggregate-provenance experiment remain deferred.
+The owner resumed continuous planned feature and improvement work on 2026-10-10:
+finish each capability through PR and merge, then continue until asked to stop.
+Align v0.9.0 is released. Requests138–141 are included; release artifacts cover
+Linux x86_64/aarch64 and macOS aarch64.
 
-External align-llm adoption and end-to-end/network measurements remain
-consumer-owned. Request126's
-borrowed-session loop refusal and Request28's indexed/view builder readers are
-unimplemented; they require their own provenance closure. Request78's enum fields
-and Request128's shared optional native-resource matching still lack their
-required friction-ledger evidence. No versioned release/tag was requested.
+[Plan162](docs/impl/162-retained-directory-available-space.md) delivers Request144's
+retained-directory available-byte observation. It uses native non-privileged
+filesystem accounting, checked scalar publication and no Align/Rust heap
+allocation. It remains advisory: quota/reservation policy and fallible download
+writes belong to the consumer. External align-llm adoption and end-to-end/network
+measurements remain consumer-owned.
+
+K1/plan61 and the separately parked general aggregate-provenance experiment
+remain deferred. Request126's borrowed-session loop refusal and Request28's
+indexed/view builder readers require their own provenance closure. Request78's
+enum fields and Request128's shared optional native-resource matching still lack
+their required friction-ledger evidence. Requests142–143 are separate ownership
+extensions, not prerequisites of the filesystem observation.
 
 ## Deferred K1
 

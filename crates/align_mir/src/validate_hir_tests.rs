@@ -19077,10 +19077,10 @@ fn move_slice_records_reject_forged_shapes() -> Result<(), &'static str> {
 
 #[test]
 fn retained_tree_records() -> Result<(), &'static str> {
-    let base = checked_source_program("import std.fs\nfn root(path: str) -> Result<fs.directory,Error> = fs.open_directory(path)\nfn next(cursor: fs.dir_cursor) -> Result<Option<fs.dir_entry>,Error> = cursor.next()\nfn mode(directory: fs.directory) -> Result<(),Error> = directory.create_dir(\"x\",448)\nfn main() {}\n");
+    let base = checked_source_program("import std.fs\nfn root(path: str) -> Result<fs.directory,Error> = fs.open_directory(path)\nfn next(cursor: fs.dir_cursor) -> Result<Option<fs.dir_entry>,Error> = cursor.next()\nfn mode(directory: fs.directory) -> Result<(),Error> = directory.create_dir(\"x\",448)\nfn space(borrow directory: fs.directory) -> Result<i64,Error> = directory.available_space()\nfn main() {}\n");
     assert!(!is_empty(&lower_program(&base)));
-    for name in ["root", "next", "mode"] {
-        for mutation in 0..4 {
+    for name in ["root", "next", "mode", "space"] {
+        for mutation in 0..if name == "space" { 6 } else { 4 } {
             let mut bad = base.clone();
             let expression = bad.fns.iter_mut().find(|function| function.name == name).ok_or("operation")?.body.value.as_mut().ok_or("tail")?;
             let hir::ExprKind::FsTree { args, kind } = &mut expression.kind else { return Err("filesystem record"); };
@@ -19088,7 +19088,12 @@ fn retained_tree_records() -> Result<(), &'static str> {
                 0 => expression.ty = Ty::Bool,
                 1 => args.clear(),
                 2 => args[0] = native_i64(),
-                _ => *kind = align_sema::fs_tree::FsTreeKind::FileSetMode,
+                3 => *kind = align_sema::fs_tree::FsTreeKind::FileSetMode,
+                4 => expression.ty = Ty::Result(Scalar::Int(IntTy { bits: 64, signed: true }), Scalar::Bool),
+                _ => {
+                    let Ty::Result(_, error) = expression.ty else { return Err("filesystem result"); };
+                    expression.ty = Ty::Result(Scalar::Int(IntTy { bits: 32, signed: true }), error);
+                }
             }
             assert_body_entrypoints_empty("malformed retained filesystem record", &bad);
         }

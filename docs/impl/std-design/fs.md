@@ -574,6 +574,18 @@ accept arbitrary non-NUL bytes. Ancestors are admitted without following symlink
 readers additionally require regular-file kind and descriptor identity revalidation.
 The single-link form requires descriptor link count one before publication.
 
+`directory.available_space() -> Result<i64, Error>` observes nonnegative available
+bytes using `fstatvfs` on the retained descriptor on Linux/macOS. It multiplies
+the native non-privileged available-block count by the fundamental block size
+(`f_bavail * f_frsize`); zero is valid, while a zero block size or an unrepresentable
+byte count returns Invalid. Native failures keep the existing Error mapping.
+The shared call allocates no Align/Rust heap storage and its Copy result survives
+owner Drop. It neither reserves storage nor promises writability or later write
+success. Native quota, container, remote and shared-volume accounting limitations
+remain; there is no extra quota query, pathname lookup or fallback. Observations
+can change immediately and native queries may block. Exact admission and ABI are
+in [plan 162](../162-retained-directory-available-space.md).
+
 Directory, reader, writer and file each expose `metadata() -> Result<fs.metadata,
 Error>` and `set_mode(mode: u32) -> Result<(), Error>` on the descriptor. Mode is
 0..07777; invalid bits fail before I/O, and named creation checks path before mode.

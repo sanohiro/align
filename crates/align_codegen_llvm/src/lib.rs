@@ -17439,6 +17439,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     FsTreeKind::DirectoryOpen => RuntimeKey::FsDirectoryOpen,
                     FsTreeKind::DirectoryCursor => RuntimeKey::FsDirectoryCursor,
                     FsTreeKind::CursorNext => RuntimeKey::FsCursorNext,
+                    FsTreeKind::DirectoryAvailableSpace => RuntimeKey::FsDirectoryAvailableSpace,
                     FsTreeKind::DirectoryMetadata => RuntimeKey::FsDirectoryMetadata,
                     FsTreeKind::DirectoryMetadataAt => RuntimeKey::FsDirectoryMetadataAt,
                     FsTreeKind::DirectoryOpenDir => RuntimeKey::FsDirectoryOpenDir,
@@ -41119,7 +41120,7 @@ fn main() -> i32 = 0
     }
 
     #[test]
-    fn retained_tree_mir_gate() {
+    fn retained_tree_mir_gate() -> Result<(), &'static str> {
         let mut source = String::from("import std.fs\nfn main() {}\nfn root(path: str) -> Result<fs.directory, Error> = fs.open_directory(path)\n");
         for (name, owner, method, args, result) in [
             ("links", "fs.directory", "read_link", "\"x\", 4", "array<u8>"),
@@ -41130,6 +41131,7 @@ fn main() -> i32 = 0
             ("cursor", "fs.directory", "cursor", "", "fs.dir_cursor"),
             ("next", "fs.dir_cursor", "next", "", "Option<fs.dir_entry>"),
             ("dm", "fs.directory", "metadata", "", "fs.metadata"),
+            ("space", "fs.directory", "available_space", "", "i64"),
             ("at", "fs.directory", "metadata_at", "\"x\"", "fs.metadata"),
             ("od", "fs.directory", "open_dir", "\"x\"", "fs.directory"),
             ("read", "fs.directory", "open_read", "\"x\"", "reader"),
@@ -41168,6 +41170,7 @@ fn main() -> i32 = 0
                     }
                     for replacement in [align_mir::FsTreeOutput::None, align_mir::FsTreeOutput::Owner(u32::MAX),
                         align_mir::FsTreeOutput::Bytes(u32::MAX), align_mir::FsTreeOutput::Bool(u32::MAX),
+                        align_mir::FsTreeOutput::I64(u32::MAX),
                         align_mir::FsTreeOutput::Metadata(u32::MAX), align_mir::FsTreeOutput::CursorNext { entry: u32::MAX, present: u32::MAX }] {
                         if replacement == *output { continue; }
                         let mut bad = base.clone();
@@ -41178,6 +41181,30 @@ fn main() -> i32 = 0
                         let mut bad = base.clone();
                         bad.fns[fi].slots[slot as usize] = Ty::Raw;
                         assert_xml_producer_rejected(&bad, "filesystem output type");
+                    }
+                    if let align_mir::FsTreeOutput::I64(slot) = *output {
+                        let ty = Ty::Int(IntTy { bits: 64, signed: true });
+                        for mutation in 0..3 {
+                            let mut bad = base.clone();
+                            let function = &mut bad.fns[fi];
+                            let inserted = match mutation {
+                                0 => Some(Stmt::Store(slot, Operand::Const(align_mir::Const::Int(0, ty)))),
+                                1 => {
+                                    let duplicate = u32::try_from(function.value_tys.len()).map_err(|_| "fixture value count")?;
+                                    function.value_tys.push(function.value_tys[*value as usize]);
+                                    Some(Stmt::Let(duplicate, Rvalue::FsTree { kind: *kind, args: args.clone(), output: *output }))
+                                }
+                                _ => {
+                                    function.slots[slot as usize] = Ty::Int(IntTy { bits: 64, signed: false });
+                                    None
+                                }
+                            };
+                            if let Some(inserted) = inserted {
+                                function.blocks[bi].stmts.insert(si, inserted);
+                                if !function.blocks[bi].stmt_lines.is_empty() { function.blocks[bi].stmt_lines.insert(si, (0, 0)); }
+                            }
+                            assert_xml_producer_rejected(&bad, "filesystem scalar scratch provenance/width");
+                        }
                     }
                     let mut bad = base.clone();
                     if let Stmt::Let(_, Rvalue::FsTree { args, .. }) = &mut bad.fns[fi].blocks[bi].stmts[si] { args.clear(); }
@@ -41194,6 +41221,32 @@ fn main() -> i32 = 0
                 assert_xml_producer_rejected(&bad, "filesystem reserved schema");
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn available_space_scalar_layout_and_publication() -> Result<(), String> {
+        let program = mir("import std.fs\nfn query(borrow directory: fs.directory) -> Result<i64, Error> = directory.available_space()\nfn main() {}\n");
+        let function = program.fns.iter().find(|function| function.name.as_str() == "query").ok_or("query function")?;
+        let (block, slot) = function.blocks.iter().find_map(|block| {
+            block.stmts.iter().find_map(|statement| match statement {
+                Stmt::Let(_, Rvalue::FsTree { output: align_mir::FsTreeOutput::I64(slot), .. }) => Some((block, *slot)),
+                _ => None,
+            })
+        }).ok_or("scalar native output")?;
+        let Term::Branch(_, success, _) = block.term else { return Err("status must branch before publication".into()); };
+        let loads = function.blocks.iter().enumerate().filter_map(|(index, block)| {
+            block.stmts.iter().any(|statement| matches!(statement, Stmt::Let(_, Rvalue::Load(out)) if *out == slot)).then_some(index)
+        }).collect::<Vec<_>>();
+        assert_eq!(loads, vec![usize::try_from(success).map_err(|_| "success block index")?]);
+        let ir = emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None).map_err(|error| format!("{error:?}"))?;
+        let calls = ir.lines().filter(|line| line.contains("call i32 @align_rt_fs_directory_available_space(")).collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1);
+        let scratch = calls[0].rsplit_once("ptr ").ok_or("native output argument")?.1.split(')').next().ok_or("output name")?;
+        assert!(ir.contains(&format!("{scratch} = alloca i64, align 8")), "{ir}");
+        assert!(ir.contains(&format!("load i64, ptr {scratch}, align 8")), "{ir}");
+        assert!(ir.contains("declare i32 @align_rt_fs_directory_available_space(ptr, ptr)"));
+        Ok(())
     }
 
     #[test]

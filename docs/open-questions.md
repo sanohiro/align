@@ -318,6 +318,10 @@ local before/after evidence under the plan, not an unmeasured speed claim.
   implicit sort/stat/flush, recursive deletion or source snapshot guarantee.
   [Plan 45](impl/45-retained-byte-tree-plan.md) fixes the nineteen operations,
   exclusive cursor advancement, no-follow admission and failure precedence.
+  [Plan 162](impl/162-retained-directory-available-space.md) adds the shared,
+  Impure `directory.available_space() -> Result<i64, Error>` observation using
+  the retained descriptor. Native non-privileged bytes are advisory, checked and
+  allocation-free in Align/Rust; no reservation, quota adjustment or write guarantee.
 
 - **Ordinary directory operations:** `fs.create_dir` creates one directory with normal
   umask semantics; `fs.is_dir` returns Result<bool,Error>, preserving metadata errors.
