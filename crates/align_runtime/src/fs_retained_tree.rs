@@ -886,7 +886,7 @@ mod tests {
 
     struct SpaceInjection;
     impl SpaceInjection {
-        fn new(blocks: u64, fragment: u64, errno: Option<i32>) -> Self {
+        fn new(blocks: libc::fsblkcnt_t, fragment: libc::c_ulong, errno: Option<i32>) -> Self {
             let mut stat: libc::statvfs = unsafe { core::mem::zeroed() };
             stat.f_bavail = blocks;
             stat.f_frsize = fragment;
@@ -913,13 +913,14 @@ mod tests {
     fn available_space_arithmetic_errors_and_admission() -> TestResult {
         let fixture = crate::tests::FileFixtureDir::new("available-space");
         let owner = space_owner(&fixture.0)?;
+        let largest = libc::c_ulong::try_from(i64::MAX)?;
         for (blocks, fragment, expected) in [
             (0, 4096, Ok(0)), (1, 1, Ok(1)), (3, 4096, Ok(12288)),
-            (i64::MAX.unsigned_abs(), 1, Ok(i64::MAX)),
+            (1, largest, Ok(i64::MAX)),
             (0, 0, Err(AL_INVALID)), (1, 0, Err(AL_INVALID)),
-            (i64::MAX.unsigned_abs() + 1, 1, Err(AL_INVALID)),
-            (i64::MAX.unsigned_abs(), 2, Err(AL_INVALID)),
-            (u64::MAX, u64::MAX, Err(AL_INVALID)),
+            (1, largest + 1, Err(AL_INVALID)),
+            (2, largest, Err(AL_INVALID)),
+            (libc::fsblkcnt_t::MAX, libc::c_ulong::MAX, Err(AL_INVALID)),
         ] {
             let injected = SpaceInjection::new(blocks, fragment, None);
             let mut out = -7;
@@ -932,7 +933,7 @@ mod tests {
             (libc::ENOSYS, AL_CODE + libc::ENOSYS), (libc::EIO, AL_CODE + libc::EIO),
         ] {
             // Native failure wins over the invalid zero fragment and oversized native fields.
-            let injected = SpaceInjection::new(u64::MAX, 0, Some(errno));
+            let injected = SpaceInjection::new(libc::fsblkcnt_t::MAX, 0, Some(errno));
             let mut out = -7;
             assert_eq!(unsafe { align_rt_fs_directory_available_space(owner.0, &mut out) }, expected);
             assert_eq!(out, 0);

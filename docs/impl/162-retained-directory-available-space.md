@@ -124,3 +124,21 @@ The author-side extraction of `must`, `exact`, `every`, `before`, `reject` and
 All newly added driver compile/link/run paths use `owned_fixture::run`, including
 transitive native helper waits, with exclusively acquired scratch. Existing
 legacy driver helpers receive no new callers.
+
+### Preflight finding closure
+
+The candidate review found two local verification defects, closed together:
+
+- Native test records now use `libc::fsblkcnt_t` and `libc::c_ulong`, rather than
+  assuming both fields are u64. Pinned libc uses a u32 block count on macOS.
+  Synthetic i64::MAX and oversized-product controls use native-representable
+  counts and fragment sizes without truncation. Production's widening checked
+  arithmetic and the public contract are unchanged.
+- The native ABI export/signature audit and every current inventory now include
+  the new row: 463 keyed, 481 base/task, 488 allocation, 485 parallel, 492 combined.
+  Historical capability counts remain historical. The independent native-IR and
+  static-archive audit verifies all feature combinations against the golden.
+
+These fixes preserve the reviewed strategy, IR shape and capability boundary.
+They close against the original findings, native-width test compilation and the
+focused runtime/ABI owners; no second full-diff review is needed.
