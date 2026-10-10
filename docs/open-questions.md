@@ -165,11 +165,13 @@ record field stores the array inline and its stable field place supports the
 ordinary fixed-array operations without allocation. Copy/Move, recursive
 Move-record cleanup, element exclusions, bounds, mutation and borrowed-slice
 lifetime remain the existing singular rules. Arbitrary temporary receivers,
-nested fixed-array elements and independently owned scalar elements other than `string` remain
-excluded. Plan164 completes the deferred per-element String lifecycle under Category A: fixed
+nested fixed-array elements and independently owned scalar elements other than `string` or the
+ordinary dynamic-array headers in plan165 remain excluded. Plan164 completes the deferred per-element String lifecycle under Category A: fixed
 String arrays are Move even when empty, index to borrowed `str`, and form read-only
 `slice<string>` views. Whole construction/move/replacement/Drop retain exactly one owner;
-indexed String writes and unrelated Move consumers remain excluded. Record: draft §7, language
+indexed String writes and unrelated Move consumers remain excluded. Plan165 completes ordinary
+`[array<P>; N]` and AoS `[array<Record>; N]` ownership and shared indexed inspection, with no outer
+allocation, indexed ownership extraction or specialized/nested dynamic representation. Record: draft §7, language
 digest, [plan 73](impl/73-fixed-array-field-plan.md), and [plan164](impl/164-fixed-owned-string-arrays.md).
 
 ### Checked decimal text conversion (SETTLED 2026-10-01)
@@ -5187,10 +5189,10 @@ text type rather than adding a general reference value. Whole Move records remai
 ordinary values; their existing direct-field read and explicit shared-borrow call cover the shipped
 record surface.
 
-The dynamic-aggregate extension also permits an indexed Move element of an admitted ordinary
-dynamic array only as the argument to an explicit shared-`borrow` parameter on a direct, imported,
-or function-value target. A source-formed fixed `StructArray` admits the same call place only for an
-indexed Move field with an integer-literal index; a whole fixed Move element remains unavailable.
+The dynamic-aggregate extension and plan165 permit an indexed Move element of an admitted
+ordinary fixed/dynamic array or slice only as the argument to an explicit shared-`borrow` parameter
+on a direct, imported, or function-value target. Whole fixed elements admit constant/runtime indices;
+a fixed `StructArray` indexed Move field still requires an integer-literal index.
 Its base must be a stable local, borrowed/projection binding, or struct-field path. The complete source root is reserved from once-only index evaluation through all
 later arguments and the call action; a move, Drop, replacement, transfer, or mutable borrow that
 might overlap it is rejected, while unrelated mutation remains valid. MIR emits the existing bounds

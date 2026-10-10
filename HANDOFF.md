@@ -24,7 +24,15 @@ owned-string arrays. Inline `[string; N]` construction, whole transfer/replaceme
 recursive Drop and borrowed `str`/`slice<string>` views share the existing owner
 model. Counted whole/per-unit/cache execution closes partial failure and cleanup;
 malformed HIR/MIR and stale-view owners keep formation and lifetime checks aligned.
-Other scalar-Move element families and general producer expansion remain excluded.
+General producer expansion remains excluded.
+
+[Plan165](docs/impl/165-fixed-dynamic-array-elements.md) delivers ordinary dynamic-array
+headers in fixed storage for Request143. Whole construction/transfer/replacement and
+recursive Drop share the existing ownership model; stable shared indexed calls also
+cover fixed String/Move-record siblings. Native counters, HIR/MIR mutation owners
+and whole/per-unit/cache replay cover the boundary. Indexed ownership extraction,
+specialized inner arrays, nested dynamic representations and the recorded
+conservative loop/aggregate-provenance refusals remain excluded.
 
 K1/plan61 and the separately parked general aggregate-provenance experiment
 remain deferred. Request126's borrowed-session loop refusal and Request28's

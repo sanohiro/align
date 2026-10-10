@@ -44,6 +44,7 @@ elsewhere and are **not** ledger rows.
 |---|---|---|
 | Bound owned locals in value-carrying `if` results. | `docs/impl/38-bound-if-result-plan.md`; `draft.md` §6.3 | DONE 2026-09-09. Selected-edge transfer and path-local replacement cleanup. |
 | Owned `string` sort keys lacked per-key Drop in the fused sort path, so admission was limited to **Copy** `Ord` keys. | `docs/impl/19-hir-validation-ledger.md`; spec text in `docs/language-spec.md` and `draft.md` | DONE 2026-10-07: plan 134 supplies per-key ownership and cleanup. This is a missing implementation capability, not a decision about keys. |
+| Fixed ordinary dynamic-array headers lacked per-element Move/Drop (align-llm Request143). | [Plan165](165-fixed-dynamic-array-elements.md), plans08/28/44/73 | Complete inline header lifecycle and stable shared inspection; specialized/recursive dynamic representations and indexed ownership extraction remain excluded. |
 | Fixed owned-string arrays lacked per-element Move/Drop; PR739 rejected an admission that leaked. | [Plan164](164-fixed-owned-string-arrays.md), plans08/44/73 | DONE 2026-10-10: complete inline String lifecycle and borrowed views; no general scalar-Move collection widening. |
 
 These are A because the existing ownership design already supplies the behavior; the missing

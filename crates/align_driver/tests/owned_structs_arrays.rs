@@ -1,7 +1,7 @@
 //! Slice 4a: a fixed array of a **Move** struct (a struct that owns a `string`/owned field). The
 //! array is dropped **element-by-element** at scope exit — each element's owned fields freed once,
-//! no leak, no double-free. Construction + scalar-field read are supported; mutation (reassign /
-//! element store) and reading an owned field out of an element are deferred (Slice 4b).
+//! no leak, no double-free. Construction, scalar-field reads, whole replacement and element stores are supported;
+//! owned-field reads use their explicit borrowed projection rules.
 
 mod common;
 use common::*;
@@ -91,17 +91,15 @@ fn element_replace_from_a_variable_consumes_the_source() {
 }
 
 #[test]
-fn whole_array_reassignment_is_rejected() {
-    // A fixed array can't be *wholly* reassigned (array values aren't materialized) — assign
-    // elements individually. Clean error for a Move-struct array (and a scalar array alike).
-    assert!(check_errs(
-        "ms-array-whole-reassign",
-        "User { name: string }\nfn main() -> i32 {\n  mut us := [User{name: \"a\".clone()}]\n  us = [User{name: \"b\".clone()}]\n  return 0\n}\n"
-    ));
-    assert!(check_errs(
-        "scalar-array-whole-reassign",
-        "fn main() -> i32 {\n  mut xs := [1, 2, 3]\n  xs = [4, 5, 6]\n  return 0\n}\n"
-    ));
+fn whole_array_reassignment_materializes_fixed_values() {
+    // Plan164 completed whole fixed-value replacement. The counted owner in
+    // fixed_owned_strings covers old-payload Drop; this source owner keeps both siblings admitted.
+    for (label, source) in [
+        ("ms-array-whole-reassign", "User { name: string }\nfn main() { mut us := [User { name: \"a\".clone() }]; us = [User { name: \"b\".clone() }] }\n"),
+        ("scalar-array-whole-reassign", "fn main() { mut xs := [1, 2, 3]; xs = [4, 5, 6] }\n"),
+    ] {
+        assert!(!check_errs(label, source), "{label}");
+    }
 }
 
 #[test]

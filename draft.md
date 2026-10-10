@@ -457,10 +457,10 @@ contained region roots. No clone, allocation, cleanup bit, source null, or owner
 created; `.clone()` remains the explicit path to an owned result. Other whole Move elements remain
 unavailable as ordinary values.
 
-An explicit shared-`borrow` call may take one indexed Move element from an ordinary dynamic scalar
-or AoS record array. A source-formed fixed AoS record array admits the same call place only for an
-indexed Move field with an integer-literal index, such as `inspect(rows[0].field)`; a whole fixed
-Move element remains unavailable. The selected direct, imported, or function-value target's
+An explicit shared-`borrow` call may take one indexed Move element from an admitted ordinary
+fixed/dynamic array or slice. Whole fixed elements accept constant or runtime indices under
+plan165; an indexed Move field of a fixed AoS record array still requires an integer-literal index,
+such as `inspect(rows[0].field)`. The selected direct, imported, or function-value target's
 corresponding parameter must be `borrow`, and the base must be a stable local,
 borrowed/projection binding, or struct-field path. The complete array root is reserved from the
 once-only index evaluation through every later call argument and the call action: an operation that
@@ -1227,7 +1227,8 @@ decimal integer literal in `0..=u32::MAX`, is part of the type,
 and may be written anywhere a type annotation is accepted. Existing placement rules still reject
 aggregates at unsupported native extern/raw boundaries. `N` is not an expression or const generic.
 The element uses the same closed domain as a fixed array literal. Owned `string` elements are
-admitted; nested fixed arrays and other independently owned scalar elements remain excluded.
+admitted, as are the ordinary dynamic-array headers specified below; nested fixed arrays and
+other independently owned scalar elements remain excluded.
 An admitted Move record retains the existing in-place construction and recursive element-Drop rules. A literal checked against
 `[T; N]` must contain exactly `N` elements; `[]` constructs `[T; 0]`.
 
@@ -1246,9 +1247,22 @@ collection consumer/capture exclusions remain. `[]` obtains its String element t
 expected fixed-array or `slice<string>` context. [Plan164](docs/impl/164-fixed-owned-string-arrays.md)
 fixes the lifecycle and validation boundary.
 
+`[array<P>; N]` and `[array<Record>; N]` store existing ordinary dynamic-array headers inline.
+P is an existing primitive scalar (integer, float, bool, char, str or string); Record uses the
+existing AoS array representation and formation rules. The outer array is Move even at N=0,
+adds no allocation, and uses the same once-only construction, partial cleanup, whole transfer,
+replacement and recursive Drop rules. Stable fixed elements may be passed to an explicit shared
+`borrow` parameter at constant or runtime indices; this also applies to fixed String and Move
+record elements. Range/coercion may form `slice<array<P>>` or `slice<array<Record>>`; these views
+support length and shared indexed calls, retain backing and payload lifetimes, and cannot survive
+owner move/replacement. Ordinary owned indexing, indexed replacement/extraction, element
+`borrow mut`, specialized inner arrays and `array<array<T>>` remain excluded. Existing conservative
+control/producer refusals remain; [plan165](docs/impl/165-fixed-dynamic-array-elements.md) fixes the
+exact supported boundary.
+
 A struct field of type `[T; N]` is the array itself, inline in the struct layout. Reading, passing,
-or returning a Copy-element array copies its complete inline value; an array of owned strings or
-admitted Move records is Move, including at length zero, and follows the existing whole-owner rules. A fixed array may be rooted in a named
+or returning a Copy-element array copies its complete inline value; an array of admitted owned headers or
+Move records is Move, including at length zero, and follows the existing whole-owner rules. A fixed array may be rooted in a named
 local, parameter, or recursively selected field place, so `table.op[i]`, `table.op[a..b]`,
 `table.op.len()`, and `table.op[i] = value` on a mutable root use the ordinary checked fixed-array operations.
 A slice of a field borrows the containing storage. An arbitrary temporary remains ineligible as an

@@ -1,5 +1,13 @@
 # Borrowed slices of existing Move elements
 
+Implemented extension: [plan165](165-fixed-dynamic-array-elements.md) admits whole shared
+indexed elements of ordinary fixed arrays, including String and Move-record siblings, at constant
+or runtime indices. It also admits read-only slices of its ordinary owned dynamic-array headers.
+The fixed indexed Move-field path remains integer-literal-only. Historical fixed-base and
+nested-owning-element exclusions below are superseded only by that exact header domain; ordinary
+by-value Move reads, element replacement/extraction, `borrow mut`, specialized arrays and recursive
+dynamic-array representations remain excluded. Reservation, bounds and payload grammar are unchanged.
+
 The [R77–R83 composition](56-r77-r83-composition-plan.md) implementation closes
 shared text/call certification without widening by-value Move-element reads. It
 adds only explicit shared-call places for indexed Move fields: dynamic slice/AoS

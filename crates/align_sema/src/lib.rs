@@ -2563,9 +2563,9 @@ pub fn drop_plan(
                 work.push(Work::ExitFixedArray(length));
                 work.push(Work::Enter(Ty::Struct(id)));
             }
-            Work::Enter(Ty::Array(Scalar::String, length)) => {
+            Work::Enter(Ty::Array(element, length)) => {
                 work.push(Work::ExitFixedArray(length));
-                work.push(Work::Enter(Ty::String));
+                work.push(Work::Enter(scalar_to_ty(element)));
             }
             Work::Enter(Ty::Option(payload)) => {
                 work.push(Work::ExitOption);
@@ -4344,14 +4344,14 @@ pub fn collection_element_read_ok(
     !ty_capture_is_move(elem, structs, tuples, enums, tagged_types)
 }
 
-/// A read-only view may address an existing record or owned string without loading its owner.
+/// A read-only view may address an existing record or admitted owned header without loading it.
 /// Value-read and pipeline/materialization admission remain separate and unchanged.
 pub fn collection_element_view_ok(
     elem: Ty, structs: &[StructDef], tuples: &[hir::TupleDef],
     enums: &[hir::EnumDef], tagged_types: &[hir::TaggedType],
 ) -> bool {
     collection_element_read_ok(elem, structs, tuples, enums, tagged_types)
-        || elem == Ty::String
+        || fixed_owned_header_scalar(elem).is_some()
         || matches!(elem, Ty::Struct(id) if structs.get(id as usize).is_some())
 }
 
@@ -13046,11 +13046,7 @@ fn borrowed_element_metadata_is_valid(program: &hir::Program) -> bool {
             {
                 return false;
             }
-            let expected_element = match base.array_ty {
-                Ty::Slice(element) | Ty::DynArray(element) => Some(scalar_to_ty(element)),
-                Ty::DynStructArray(id, Layout::Aos) => Some(Ty::Struct(id)),
-                _ => None,
-            };
+            let expected_element = shared_index_element_type(base.array_ty);
             if expected_element != Some(base.element_ty)
                 || !ty_is_move(
                     base.element_ty,
@@ -19237,15 +19233,23 @@ impl EscapeState {
         into: &mut EscapeResolvedContent,
         path: &[BorrowProjection],
         nested: &EscapeResolvedStorage,
+        container: Option<StorageHeaderDescriptor>,
     ) {
         let mut selected = nested.content.clone();
-        // Inline-fixed dependencies are value producers whose elements are copied into the
-        // containing generation; their temporary slot does not become retained storage. Views and
-        // owned dynamic headers do retain the selected backing identity.
+        // Inline storage copies complete element values. A contained owning header transfers
+        // its allocation with that value; its previous slot lifetime is not a borrowed content
+        // region. Actual borrowed contents, unknown/ended evidence and arena modes remain below
+        // and in the independently forwarded child header's escape snapshot.
+        let transfers_owned_header = container.is_some_and(|descriptor| {
+            descriptor.kind == StorageHeaderKind::InlineFixed
+        });
         if nested
             .value_descriptor
             .or(nested.storage_descriptor)
-            .is_some_and(|descriptor| descriptor.kind != StorageHeaderKind::InlineFixed)
+            .is_some_and(|descriptor| {
+                descriptor.kind != StorageHeaderKind::InlineFixed
+                    && !(transfers_owned_header && descriptor.kind.owns_storage())
+            })
             && let Some(region) = nested.retention_region
         {
             selected.regions = selected
@@ -19427,14 +19431,14 @@ impl EscapeState {
                 for root in &leaf.fallback_roots {
                     let fallback =
                         self.resolve_fallback_root(root.clone(), leaf.descriptor, visiting);
-                    Self::add_nested_content(&mut resolved.content, path, &fallback);
+                    Self::add_nested_content(&mut resolved.content, path, &fallback, resolved.storage_descriptor);
                 }
                 for dependency in &leaf.generations {
                     let nested = self.resolve_storage_reference(dependency, visiting);
                     // A nested header is content of this generation. Its storage lifetime and
                     // recursively selected values shorten the parent content at `path`, but its
                     // descriptor/allocation/releases/ending never become parent backing metadata.
-                    Self::add_nested_content(&mut resolved.content, path, &nested);
+                    Self::add_nested_content(&mut resolved.content, path, &nested, resolved.storage_descriptor);
                 }
             }
         } else {
@@ -21507,6 +21511,12 @@ impl<'a> EscapeCheck<'a> {
                     expression.ty,
                 )
             }
+            ExprKind::ArrayLit { elems, .. } | ExprKind::ConstArray { elems, .. } => {
+                Self::join_escape_value_facts(elems.iter().enumerate().map(|(index, element)| {
+                    self.completed_escape_value(element)
+                        .prefixed(BorrowProjection::ArrayElement(index as u32))
+                }))
+            }
             ExprKind::StructLit { fields, .. } => Self::join_escape_value_facts(
                 fields
                     .iter()
@@ -22387,6 +22397,14 @@ impl<'a> EscapeCheck<'a> {
             individual: baseline.individual,
             may_individual: baseline.may_individual,
         };
+        let forwarded_paths = classification.results.iter()
+            .filter(|result| result.role == StorageExprRole::HeaderForwarder)
+            .map(|result| result.path.as_slice()).collect::<HashSet<_>>();
+        if !forwarded_paths.is_empty() {
+            let mut forwarded = self.forwarded_escape_value(expression, storage_provenance);
+            forwarded.headers.leaves.retain(|path, _| forwarded_paths.contains(path.as_slice()));
+            value = value.join(&forwarded);
+        }
         let mut formations = Vec::new();
         for (ordinal, result) in classification.results.iter().enumerate() {
             match result.role {
@@ -22551,11 +22569,7 @@ impl<'a> EscapeCheck<'a> {
                     );
                     value = value.join(&carrier);
                 }
-                StorageExprRole::HeaderForwarder => {
-                    value = value.join(
-                        &self.forwarded_escape_value(expression, storage_provenance),
-                    );
-                }
+                StorageExprRole::HeaderForwarder => {}
                 StorageExprRole::NoStorage => {
                     if result.initializer == StorageContentInitializer::CallSummary {
                         value = value.join(&self.escape_initializer_value(
@@ -31371,44 +31385,47 @@ struct StorageTypeContext<'a> {
 /// Fixed arrays keep their inline backing on replacement, so descend through their elements.
 /// Dynamic collections stop this walk: their allocation generation already owns their elements.
 fn has_inline_owned_storage(root: Ty, context: StorageTypeContext<'_>) -> bool {
-    has_inline_owned_leaf(root, context, |ty| matches!(ty, Ty::String | Ty::Buffer | Ty::Writer))
+    has_inline_owned_leaf(root, context, |ty, below_fixed| {
+        matches!(ty, Ty::String | Ty::Buffer | Ty::Writer)
+            || (below_fixed && matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(_, Layout::Aos)))
+    })
 }
 
 /// String values copy the payload pointer/length, whereas opaque handle values keep a stable
 /// handle across operations that change their contents. Only the former needs this value loan.
 fn has_inline_string_storage(root: Ty, context: StorageTypeContext<'_>) -> bool {
-    has_inline_owned_leaf(root, context, |ty| ty == Ty::String)
+    has_inline_owned_leaf(root, context, |ty, _| ty == Ty::String)
 }
 
 fn has_inline_owned_leaf(
     root: Ty,
     context: StorageTypeContext<'_>,
-    accepts: impl std::ops::Fn(Ty) -> bool,
+    accepts: impl std::ops::Fn(Ty, bool) -> bool,
 ) -> bool {
     // Terminal roots need neither a descendant worklist allocation nor a visited entry.
     match expand_tagged_ty(root, context.tagged_types) {
         Ty::Struct(_) | Ty::Tuple(_) | Ty::Enum(_) | Ty::Option(_) | Ty::Result(..)
         | Ty::Array(..) | Ty::StructArray(..) => {}
-        leaf => return accepts(leaf),
+        leaf => return accepts(leaf, false),
     }
-    let mut work = vec![root];
+    let mut work = vec![(root, false)];
     let mut seen = HashSet::new();
-    while let Some(ty) = work.pop() {
-        if !seen.insert(ty) {
+    while let Some((ty, below_fixed)) = work.pop() {
+        if !seen.insert((ty, below_fixed)) {
             continue;
         }
         match expand_tagged_ty(ty, context.tagged_types) {
-            leaf @ (Ty::String | Ty::Buffer | Ty::Writer) if accepts(leaf) => return true,
-            Ty::Array(element, length) if length != 0 => work.push(scalar_to_ty(element)),
-            Ty::StructArray(id, length) if length != 0 => work.push(Ty::Struct(id)),
+            leaf if accepts(leaf, below_fixed) => return true,
+            Ty::Array(element, length) if length != 0 => work.push((scalar_to_ty(element), true)),
+            Ty::StructArray(id, length) if length != 0 => work.push((Ty::Struct(id), true)),
             Ty::Struct(id) => {
                 if let Some(definition) = context.structs.get(id as usize) {
-                    work.extend(definition.fields.iter().map(|field| field.ty));
+                    work.extend(definition.fields.iter().map(|field| (field.ty, below_fixed)));
                 }
             }
             Ty::Tuple(id) => {
                 if let Some(definition) = context.tuples.get(id as usize) {
-                    work.extend(definition.elems.iter().copied().map(scalar_to_ty));
+                    work.extend(definition.elems.iter().copied().map(|element| (scalar_to_ty(element), below_fixed)));
                 }
             }
             Ty::Enum(id) => {
@@ -31417,14 +31434,14 @@ fn has_inline_owned_leaf(
                         definition
                             .variants
                             .iter()
-                            .flat_map(|variant| variant.payload.iter().copied().map(scalar_to_ty)),
+                            .flat_map(|variant| variant.payload.iter().copied().map(|element| (scalar_to_ty(element), below_fixed))),
                     );
                 }
             }
-            Ty::Option(payload) => work.push(scalar_to_ty(payload)),
+            Ty::Option(payload) => work.push((scalar_to_ty(payload), below_fixed)),
             Ty::Result(ok, err) => {
-                work.push(scalar_to_ty(ok));
-                work.push(scalar_to_ty(err));
+                work.push((scalar_to_ty(ok), below_fixed));
+                work.push((scalar_to_ty(err), below_fixed));
             }
             _ => {}
         }
@@ -32603,8 +32620,18 @@ fn classify_storage_expression(
             } else {
                 initializer
             };
+            // A fixed literal copies inline backing, including nested fixed record fields.
+            // Contained dynamic/view headers retain their existing producer generations.
+            let role = if initializer == StorageContentInitializer::FixedLiteral
+                && !header.path.is_empty()
+                && header.kind != StorageHeaderKind::InlineFixed
+            {
+                StorageExprRole::HeaderForwarder
+            } else {
+                header_role
+            };
             StorageClassifiedResult {
-                role: header_role,
+                role,
                 path: header.path,
                 header_kind: Some(header.kind),
                 header_ty: Some(header.ty),
@@ -38656,6 +38683,12 @@ impl<'a> MoveCheck<'a> {
                     )
                 },
             ),
+            ExprKind::ArrayLit { elems, .. } | ExprKind::ConstArray { elems, .. } => {
+                elems.iter().enumerate().fold(ProjectedHeaderFact::default(), |headers, (index, element)| {
+                    headers.join(&self.completed_headers(element)
+                        .prefixed(BorrowProjection::ArrayElement(index as u32)))
+                })
+            }
             ExprKind::Tuple { elems, .. } => elems.iter().enumerate().fold(
                 ProjectedHeaderFact::default(),
                 |headers, (index, element)| {
@@ -39377,7 +39410,18 @@ impl<'a> MoveCheck<'a> {
             return self.forwarded_headers(expression);
         }
         let mut unknown = ProjectedHeaderFact::default();
-        let mut carriers = ProjectedHeaderFact::default();
+        let mut carriers = {
+            let paths = classification.results.iter()
+                .filter(|result| result.role == StorageExprRole::HeaderForwarder)
+                .map(|result| result.path.as_slice()).collect::<HashSet<_>>();
+            let mut headers = if paths.is_empty() {
+                ProjectedHeaderFact::default()
+            } else {
+                self.forwarded_headers(expression)
+            };
+            headers.leaves.retain(|path, _| paths.contains(path.as_slice()));
+            headers
+        };
         let mut formations = Vec::new();
         let initialized_headers = self.initializer_headers(expression);
         for (ordinal, result) in classification.results.into_iter().enumerate() {
@@ -53126,12 +53170,8 @@ impl<'a, 't> Checker<'a, 't> {
         self.check_indirect_call(callee, args, expected, span)
     }
 
-    fn borrowed_dynamic_array_element(&self, ty: Ty) -> Option<Ty> {
-        match self.resolve(ty) {
-            Ty::Slice(element) | Ty::DynArray(element) => Some(scalar_to_ty(element)),
-            Ty::DynStructArray(id, Layout::Aos) => Some(Ty::Struct(id)),
-            _ => None,
-        }
+    fn borrowed_collection_element(&self, ty: Ty) -> Option<Ty> {
+        shared_index_element_type(self.resolve(ty))
     }
 
     fn borrowed_element_owner_fact(
@@ -53202,7 +53242,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
             _ => return None,
         };
-        let element_ty = self.borrowed_dynamic_array_element(receiver.ty)?;
+        let element_ty = self.borrowed_collection_element(receiver.ty)?;
         let owner_fact = self.borrowed_element_owner_fact(root_local, &path);
         Some(hir::BorrowedElementBase {
             root_local,
@@ -53244,9 +53284,9 @@ impl<'a, 't> Checker<'a, 't> {
         if receiver.ty == Ty::Error {
             return err();
         }
-        let Some(element_ty) = self.borrowed_dynamic_array_element(receiver.ty) else {
+        let Some(element_ty) = self.borrowed_collection_element(receiver.ty) else {
             self.diags.error(
-                "an indexed shared borrow requires an ordinary dynamic scalar array or AoS record array"
+                "an indexed shared borrow requires an ordinary fixed array, dynamic scalar/AoS array, or slice"
                     .to_string(),
                 span,
             );
@@ -58949,10 +58989,9 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return true;
         }
-        // Strings and in-place Move records have complete element transfer/cleanup and borrowed
-        // reads. Other Move scalars still lack that lifecycle; do not admit them merely because
-        // their representation fits a Scalar.
-        if !matches!(elem_ty, Ty::String | Ty::Struct(_))
+        // Inline owned headers and in-place Move records have complete transfer/cleanup and
+        // shared reads. Other Move scalars remain closed even when they fit a Scalar.
+        if fixed_owned_header_scalar(elem_ty).is_none() && !matches!(elem_ty, Ty::Struct(_))
             && drop_plan(elem_ty, self.structs, self.enums, self.tagged_types).needs_drop()
         {
             self.diags.error(
@@ -73287,6 +73326,7 @@ fn dynamic_array_type(
     tagged_types: &[hir::TaggedType],
 ) -> Option<Ty> {
     match element {
+        Ty::DynArray(_) | Ty::DynStructArray(..) => None,
         Ty::Struct(id) if structs.get(id as usize)?.align.is_none() => {
             Some(Ty::DynStructArray(id, Layout::Aos))
         }
@@ -73308,6 +73348,29 @@ fn dynamic_array_type(
     }
 }
 
+/// Independently owned headers with a complete fixed-element lifecycle. This is representation
+/// admission only; the caller still validates widths, record graphs and restricted resources.
+pub fn fixed_owned_header_scalar(ty: Ty) -> Option<Scalar> {
+    match ty {
+        Ty::String => Some(Scalar::String),
+        Ty::DynArray(element) => scalar_to_prim(element).map(Scalar::DynArray),
+        Ty::DynStructArray(id, Layout::Aos) => Some(Scalar::DynStructArray(id)),
+        _ => None,
+    }
+}
+
+/// Physical element selected by an ordinary shared indexed call. Payload admission and stable
+/// place validation are separate; a representable element never grants by-value Move access.
+pub fn shared_index_element_type(collection: Ty) -> Option<Ty> {
+    match collection {
+        Ty::Array(element, _) | Ty::Slice(element) | Ty::DynArray(element) => {
+            Some(scalar_to_ty(element))
+        }
+        Ty::StructArray(id, _) | Ty::DynStructArray(id, Layout::Aos) => Some(Ty::Struct(id)),
+        _ => None,
+    }
+}
+
 /// Form the exact fixed-array representation after a generic literal element is substituted.
 /// A template temporarily represents `[value: T]` as `Ty::Array(Param, N)`; a struct argument must
 /// select the dedicated inline `StructArray` form before body analysis and MIR validation.
@@ -73320,10 +73383,18 @@ pub fn fixed_array_type(
 ) -> Option<Ty> {
     match element {
         Ty::Struct(id) => Some(Ty::StructArray(id, length)),
-        Ty::String => Some(Ty::Array(Scalar::String, length)),
-        // Fixed arrays are the one inline aggregate form, not a recursive aggregate tree. Strings
-        // and Move records have complete element cleanup and non-consuming borrowed reads;
-        // other independently owned elements remain unsupported.
+        owned if fixed_owned_header_scalar(owned).is_some()
+            && !ty_mentions_resource(owned, structs, &[], enums, tagged_types)
+            && !ty_mentions_slice(owned, structs, &[], tagged_types)
+            && match owned {
+                Ty::DynStructArray(id, Layout::Aos) => structs.get(id as usize)
+                    .is_some_and(|definition| definition.align.is_none()),
+                _ => true,
+            } => {
+            fixed_owned_header_scalar(owned).map(|element| Ty::Array(element, length))
+        }
+        // Fixed arrays are inline storage. Other independently owned scalar families and
+        // recursively nested fixed storage remain outside the admitted element lifecycle.
         Ty::Array(..) | Ty::StructArray(..) => None,
         other if ty_is_move(other, structs, &[], enums, tagged_types) => None,
         other if ty_contains_restricted_collection_owner(other, structs, &[], enums, tagged_types) => None,
@@ -75332,6 +75403,10 @@ fn resolve_type(
             // An `array<Struct>` is a dynamic AoS (its own owned type); only a primitive
             // element resolves to the scalar `array<T>` (`DynArray`).
             match inner {
+                Ty::DynArray(_) | Ty::DynStructArray(..) => {
+                    diags.error("nested owned dynamic-array elements are not supported".to_string(), span);
+                    Ty::Error
+                }
                 // The existing batch-response owner has one canonical source spelling.
                 Ty::HttpResponse => Ty::DynResponseArray,
                 // An `align(N)` struct element would need its size padded to its alignment for a
@@ -78864,6 +78939,34 @@ mod tests {
                 valid: true,
             },
         );
+
+        for primitive in [PrimScalar::Bool, PrimScalar::Str, PrimScalar::String] {
+            let element = Scalar::DynArray(primitive);
+            let owned = scalar_to_ty(element);
+            assert!(!has_inline_owned_storage(owned, context));
+            for length in [0, 1, 2] {
+                let ty = Ty::Array(element, length);
+                let literal = Expr {
+                    kind: ExprKind::ArrayLit {
+                        elems: (0..length).map(|_| Expr { kind: ExprKind::Local(0), ty: owned, span }).collect(),
+                        elem: owned,
+                        pooled: false,
+                    },
+                    ty,
+                    span,
+                };
+                let classified = classify_storage_expression(&literal, context, None);
+                assert!(classified.valid);
+                assert_eq!(classified.results.len(), length as usize + 1);
+                assert_eq!(classified.results[0].role, StorageExprRole::HeaderProducer);
+                for (index, result) in classified.results[1..].iter().enumerate() {
+                    assert_eq!(result.role, StorageExprRole::HeaderForwarder);
+                    assert_eq!(result.path, vec![BorrowProjection::ArrayElement(index as u32)]);
+                    assert_eq!(result.header_ty, Some(owned));
+                }
+                assert_eq!(has_inline_owned_storage(ty, context), length != 0);
+            }
+        }
 
         let partition = Expr {
             kind: ExprKind::ArrayPartition {
@@ -90581,13 +90684,14 @@ fn exit_branch(flag: bool) -> i64 {
             align: None,
             c_repr: false,
         };
-        for leaf in [Ty::Bool, Ty::String] {
+        for leaf in [Ty::Bool, Ty::String, Ty::DynArray(Scalar::Bool), Ty::DynArray(Scalar::String), Ty::DynStructArray(3, Layout::Aos)] {
             for length in [0, 1, 2] {
                 for array in [Ty::StructArray(0, length), Ty::Array(ty_to_scalar(leaf).unwrap(), length)] {
                     let structs = vec![
                         record("Element", leaf),
                         record("ArrayOwner", array),
                         record("Nested", Ty::Struct(1)),
+                        record("InnerElement", Ty::Bool),
                     ];
                     let enums = vec![hir::EnumDef {
                         name: "Choice".into(), source_name: "Choice".into(),
@@ -90605,8 +90709,8 @@ fn exit_branch(flag: bool) -> i64 {
                     ] {
                         let plan = drop_plan(ty, &structs, &enums, &tagged);
                         assert!(plan.is_valid(), "{ty:?}/{leaf:?}");
-                        assert_eq!(plan.needs_drop(), leaf == Ty::String, "{ty:?}/{leaf:?}");
-                        assert_eq!(ty_is_move(ty, &structs, &[], &enums, &tagged), leaf == Ty::String);
+                        assert_eq!(plan.needs_drop(), leaf != Ty::Bool, "{ty:?}/{leaf:?}");
+                        assert_eq!(ty_is_move(ty, &structs, &[], &enums, &tagged), leaf != Ty::Bool);
                     }
                     assert_eq!(json_scan_row_is_copy(2, &structs, &enums, &tagged), leaf == Ty::Bool);
                 }

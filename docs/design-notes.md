@@ -2082,6 +2082,13 @@ publishes an owner without its cleanup proof. Indexed/range views retain the pay
 beside fixed backing storage: replacing the headers releases old bytes even though the inline
 storage survives. [Plan164](impl/164-fixed-owned-string-arrays.md) owns this Category A completion.
 
+[Plan165](impl/165-fixed-dynamic-array-elements.md) applies the same lifecycle to ordinary owned
+dynamic-array headers in fixed storage. Contained allocations move with the value while actual
+borrowed contents retain their input lifetimes. Fixed backing and inner payload release are separate
+identities: a stable inline address cannot keep a replaced heap buffer alive. Shared indexed calls
+inspect the existing header in place after the same reservation and bounds proof; no general
+reference or nested dynamic-array representation is introduced.
+
 ### Retained raw filesystem boundary
 
 Retained descriptors separate directory identity from mutable path names. Raw owned

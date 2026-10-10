@@ -106,6 +106,20 @@ String writes, implicit clones, `slice<str>` conversion and other Move consumer/
 are excluded. Other unsupported owning/nested element forms and arbitrary temporary receivers
 remain rejected. Exact contracts: plans 73 and [164](impl/164-fixed-owned-string-arrays.md).
 
+`[array<P>; N]` and `[array<Record>; N]` store existing ordinary dynamic-array headers inline.
+P is an existing primitive scalar (integer, float, bool, char, str or string); Record uses the
+existing AoS array representation and formation rules. The outer array is Move even at N=0,
+adds no allocation, and uses the same once-only construction, partial cleanup, whole transfer,
+replacement and recursive Drop rules. Stable fixed elements may be passed to an explicit shared
+`borrow` parameter at constant or runtime indices; this also applies to fixed String and Move
+record elements. Range/coercion may form `slice<array<P>>` or `slice<array<Record>>`; these views
+support length and shared indexed calls, retain backing and payload lifetimes, and cannot survive
+owner move/replacement. Ordinary owned indexing, indexed replacement/extraction, element
+`borrow mut`, specialized inner arrays and `array<array<T>>` remain excluded. Existing conservative
+control/producer refusals remain; [plan165](impl/165-fixed-dynamic-array-elements.md) fixes the
+exact supported boundary.
+
+
 ### Integer literals
 
 Decimal, or base-prefixed `0x` (hex) / `0o` (octal) / `0b` (binary); `_` may separate digits in any
@@ -296,10 +310,11 @@ allocation, cleanup bit, nulling, or transfer. Receiver/index order, termination
 behavior match every ordinary dynamic-array index. Other whole Move elements are not ordinary
 values.
 
-An indexed Move element of an admitted ordinary dynamic array may be passed only to an explicit
-shared-`borrow` parameter selected by a direct, imported, or function-value call. A source-formed
-fixed `StructArray` admits the same call place only for an indexed Move field with an integer-literal
-index, such as `inspect(rows[0].field)`; a whole fixed Move element remains unavailable. The array
+An indexed Move element of an admitted ordinary fixed/dynamic array or slice may be passed only
+to an explicit shared-`borrow` parameter selected by a direct, imported, or function-value call.
+Whole fixed elements accept constant or runtime indices under plan165. A source-formed fixed
+`StructArray` indexed Move field still requires an integer-literal index, such as
+`inspect(rows[0].field)`. The array
 base must be a stable local, borrowed/projection binding, or struct-field path. Its complete root is
 reserved from once-only index evaluation through every later argument and the call action; any
 possibly overlapping move, Drop, replacement, transfer, or mutable borrow is rejected. MIR emits
@@ -463,9 +478,9 @@ the source generation and every contained region through ordinary indexing, retu
 destination retention. A terminating index forms no bounds action or result.
 
 An indexed Move element is a stable call place only for an explicit shared-`borrow` parameter on a
-direct, imported, or function-value target and a stable ordinary dynamic-array base. A source-formed
-fixed `StructArray` admits only an indexed Move field at an integer-literal index; a whole fixed Move
-element remains unavailable. The base root
+direct, imported, or function-value target and a stable ordinary fixed/dynamic-array or admitted
+slice base. Whole fixed elements accept runtime indices; a fixed `StructArray` indexed Move field
+still requires an integer-literal index. The base root
 cannot be invalidated during once-only index evaluation, any later argument, or the call action.
 MIR checks bounds at the indexed argument position after index fallthrough, revalidates the root
 after later arguments, and forms the pointer only at the call. A terminating index forms none of
