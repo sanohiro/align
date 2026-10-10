@@ -939,6 +939,7 @@ pub enum FsTreeOutput {
     Metadata(Slot),
     Bytes(Slot),
     Bool(Slot),
+    I64(Slot),
     CursorNext { entry: Slot, present: Slot },
 }
 
@@ -21359,6 +21360,10 @@ fn lower_fs_tree(b: &mut Builder, kind: align_sema::fs_tree::FsTreeKind, args: &
             let ty = Ty::DynArray(Scalar::Int(IntTy { bits:8, signed:false }));
             (FsTreeOutput::Bytes(b.new_slot(ty)),ty)
         }
+        align_sema::fs_tree::Output::I64 => {
+            let ty = Ty::Int(IntTy { bits: 64, signed: true });
+            (FsTreeOutput::I64(b.new_slot(ty)), ty)
+        }
         align_sema::fs_tree::Output::Bool => (FsTreeOutput::Bool(b.new_slot(Ty::Bool)),Ty::Bool),
         align_sema::fs_tree::Output::Unit => (FsTreeOutput::None, Ty::Unit),
     };
@@ -21366,7 +21371,7 @@ fn lower_fs_tree(b: &mut Builder, kind: align_sema::fs_tree::FsTreeKind, args: &
     b.push(Stmt::Let(code, Rvalue::FsTree { kind, args: operands, output }));
     match output {
         FsTreeOutput::None => lower_status_result(b, code, result_ty),
-        FsTreeOutput::Owner(out) | FsTreeOutput::Metadata(out) | FsTreeOutput::Bytes(out) | FsTreeOutput::Bool(out) => emit_open_handle_result(b, code, out, payload_ty, result_ty),
+        FsTreeOutput::Owner(out) | FsTreeOutput::Metadata(out) | FsTreeOutput::Bytes(out) | FsTreeOutput::Bool(out) | FsTreeOutput::I64(out) => emit_open_handle_result(b, code, out, payload_ty, result_ty),
         FsTreeOutput::CursorNext { entry, present } => emit_cursor_result(b, code, entry, present, payload_ty, result_ty),
     }
 }

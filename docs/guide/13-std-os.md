@@ -97,6 +97,14 @@ decoding it as UTF-8 would reject valid Linux names. Metadata does not follow th
 final symlink. Opening a child directory admits and retains it without following
 symlinks. Directory and cursor owners close on scope exit, including `?` exits.
 
+`directory.available_space() -> Result<i64, Error>` reports available bytes on
+its filesystem on Linux/macOS, using the retained directory even after a rename.
+Zero is valid. The result is a Copy value independent of the directory's lifetime.
+Use it as advisory input for a download budget; keep write errors and partial-file
+cleanup. It reserves nothing, does not test writability, and does not add quota
+or container-limit accounting beyond the native filesystem report. Oversized
+counts return Invalid. Like other filesystem observations, the call may block.
+
 The complete [tree summary example](../../examples/tree_summary.align) composes
 these operations with ordinary recursion and a Copy count record:
 

@@ -493,6 +493,7 @@ fn runtime_effects(id: RuntimeAbiId) -> RuntimeEffects {
         RuntimeAbiId::Keyed(RuntimeKey::FsDirectoryCreateSymlink) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::FsDirectoryCursor) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::FsDirectoryFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::FsDirectoryAvailableSpace) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::FsDirectoryMetadata) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::FsDirectoryMetadataAt) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::FsDirectoryMetadataFollow) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
@@ -1669,6 +1670,7 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
         RuntimeKey::FsDirectoryOpen => RuntimeAbi { key, symbol: "align_rt_fs_directory_open", shape: RuntimeAbiShape::A08 },
         RuntimeKey::FsDirectoryCursor => RuntimeAbi { key, symbol: "align_rt_fs_directory_cursor", shape: RuntimeAbiShape::A19 },
         RuntimeKey::FsCursorNext => RuntimeAbi { key, symbol: "align_rt_fs_cursor_next", shape: RuntimeAbiShape::A24 },
+        RuntimeKey::FsDirectoryAvailableSpace => RuntimeAbi { key, symbol: "align_rt_fs_directory_available_space", shape: RuntimeAbiShape::A19 },
         RuntimeKey::FsDirectoryMetadata => RuntimeAbi { key, symbol: "align_rt_fs_directory_metadata", shape: RuntimeAbiShape::A19 },
         RuntimeKey::FsDirectoryReadLink => RuntimeAbi { key, symbol: "align_rt_fs_directory_read_link", shape: RuntimeAbiShape::A21 },
         RuntimeKey::FsDirectoryMetadataFollow => RuntimeAbi { key, symbol: "align_rt_fs_directory_metadata_follow", shape: RuntimeAbiShape::A22 },
@@ -3147,15 +3149,15 @@ fn validate_effects(abi: RuntimeAbi, effects: RuntimeEffects) -> Result<(), Stri
 }
 
 pub(super) fn validate_registry() -> Result<(), String> {
-    if RuntimeKey::ALL.len() != 462 || keyed_runtime_abis().len() != 462 {
+    if RuntimeKey::ALL.len() != 463 || keyed_runtime_abis().len() != 463 {
         return Err("runtime ABI registry invariant: key-count".to_string());
     }
-    if runtime_abis().count() != 480 {
+    if runtime_abis().count() != 481 {
         return Err("runtime ABI registry invariant: base-count".to_string());
     }
 
     let mut keys = HashSet::with_capacity(RuntimeKey::ALL.len());
-    let mut symbols = HashSet::with_capacity(480);
+    let mut symbols = HashSet::with_capacity(481);
     for abi in keyed_runtime_abis() {
         validate_effects(abi, runtime_effects(abi.key))?;
         let key = abi
@@ -4488,17 +4490,17 @@ mod tests {
         );
         validate_registry().unwrap_or_else(|error| panic!("valid runtime registry: {error}"));
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 480);
+        assert_eq!(rows.len(), 481);
         assert_eq!(
             rows.iter().map(|row| row.key).collect::<HashSet<_>>().len(),
-            480
+            481
         );
         assert_eq!(
             rows.iter()
                 .map(|row| row.symbol)
                 .collect::<HashSet<_>>()
                 .len(),
-            480
+            481
         );
         for (key, row) in RuntimeKey::ALL.into_iter().zip(keyed_runtime_abis()) {
             assert_eq!(row.key, RuntimeAbiId::Keyed(key));
@@ -4527,7 +4529,7 @@ mod tests {
     #[test]
     fn runtime_effects_registry_is_total_and_structurally_valid() {
         validate_registry().unwrap();
-        assert_eq!(runtime_abis().map(|abi| runtime_effects(abi.key)).count(), 480);
+        assert_eq!(runtime_abis().map(|abi| runtime_effects(abi.key)).count(), 481);
 
         let expect_rule = |abi, effects, rule: &str| {
             let error = validate_effects(abi, effects).unwrap_err();
@@ -4654,7 +4656,7 @@ mod tests {
     fn runtime_abi_extern_type_matrix_is_exact_for_every_row_and_ordinal() {
         let ctx = inkwell::context::Context::create();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 480);
+        assert_eq!(rows.len(), 481);
 
         for row in rows {
             let symbol = row.symbol;

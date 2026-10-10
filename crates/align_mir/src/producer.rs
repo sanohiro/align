@@ -1543,7 +1543,7 @@ pub fn fs_tree_output_slots(output: crate::FsTreeOutput) -> Vec<Slot> {
     use crate::FsTreeOutput::*;
     match output {
         None => Vec::new(),
-        Owner(slot) | Metadata(slot) | Bytes(slot) | Bool(slot) => vec![slot],
+        Owner(slot) | Metadata(slot) | Bytes(slot) | Bool(slot) | I64(slot) => vec![slot],
         CursorNext { entry, present } => vec![entry, present],
     }
 }
@@ -8326,6 +8326,7 @@ fn validate_host_mir(program: &Program) -> Result<(), ProducerError> {
             let slot_ty = |slot: Slot| function.slots.get(slot as usize).copied();
             let valid_output = match (kind.output(), *output) {
                 (Output::Unit, FsTreeOutput::None) => true,
+                (Output::I64, FsTreeOutput::I64(slot)) => slot_ty(slot) == Some(Ty::Int(IntTy { bits: 64, signed: true })),
                 (Output::Bool, FsTreeOutput::Bool(slot)) => slot_ty(slot) == Some(Ty::Bool),
                 (Output::OwnedBytes, FsTreeOutput::Bytes(slot)) => slot_ty(slot) == Some(Ty::DynArray(Scalar::Int(IntTy { bits:8, signed:false }))),
                 (Output::Directory, FsTreeOutput::Owner(slot)) => slot_ty(slot) == Some(Ty::FsDirectory),

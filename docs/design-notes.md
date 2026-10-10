@@ -2084,6 +2084,12 @@ observations and mode changes stay explicit; metadata does not flush a writer.
 Create failure never performs a racy rollback unlink. The exact nineteen-operation
 contract and hostile-mutation limits are in [plan 45](impl/45-retained-byte-tree-plan.md).
 
+The advisory `directory.available_space()` observation keeps the same retained
+identity without reopening a pathname. Native available bytes give applications
+an input for their own reserve/admission policy; quotas, reservation and write
+success remain separate. A checked Copy count needs no new owner or allocation.
+[Plan 162](impl/162-retained-directory-available-space.md) fixes the boundary.
+
 ### Process authority without application supervision
 
 R65's [final capability design](impl/50-r65-process-capability-handoff.md) keeps
