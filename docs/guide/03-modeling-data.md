@@ -66,7 +66,7 @@ fn main() -> i32 {
 
 The four elements live inline in `Table`: no array header or heap allocation. `N` must be a decimal integer literal, not a variable or a const parameter, and the initializer must have exactly that many elements. A Copy-element array is Copy, so passing a large table by value copies its full contents; use `borrow` or a slice when the function only reads it (chapter [05](05-memory.md)). A slice such as `table.weights[1..3]` borrows the table's storage. Bind a returned table before indexing its array field so the storage has a named owner.
 
-`[T; N]` has fixed length. Use `array<T>` for a dynamically sized owned collection. Nested fixed arrays and independently owned scalar elements such as `[string; 4]` are not supported; the complete element rules are in the [specification](../../draft.md#array).
+`[T; N]` has fixed length. Use `array<T>` for a dynamically sized owned collection. `[string; 4]` owns four strings inline and indexing borrows `str`; whole moves transfer ownership. Nested fixed arrays and other independently owned scalar element families are not supported; the complete element rules are in the [specification](../../draft.md#array).
 
 ## Sum types
 

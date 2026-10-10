@@ -165,8 +165,12 @@ record field stores the array inline and its stable field place supports the
 ordinary fixed-array operations without allocation. Copy/Move, recursive
 Move-record cleanup, element exclusions, bounds, mutation and borrowed-slice
 lifetime remain the existing singular rules. Arbitrary temporary receivers,
-nested fixed-array elements and independently owned scalar elements remain
-excluded. Record: draft §7, language digest and [plan 73](impl/73-fixed-array-field-plan.md).
+nested fixed-array elements and independently owned scalar elements other than `string` remain
+excluded. Plan164 completes the deferred per-element String lifecycle under Category A: fixed
+String arrays are Move even when empty, index to borrowed `str`, and form read-only
+`slice<string>` views. Whole construction/move/replacement/Drop retain exactly one owner;
+indexed String writes and unrelated Move consumers remain excluded. Record: draft §7, language
+digest, [plan 73](impl/73-fixed-array-field-plan.md), and [plan164](impl/164-fixed-owned-string-arrays.md).
 
 ### Checked decimal text conversion (SETTLED 2026-10-01)
 

@@ -450,7 +450,7 @@ those same owner-generation and input/arena roots through direct, field, and bor
 bases. Returned views and views retained into a `borrow mut` destination cannot outlive those roots.
 If the index expression terminates, no bounds action or result is formed.
 
-Ordinary indexing of `array<string>` returns a non-consuming `str` view of the selected owned
+Ordinary indexing of `array<string>`, `[string; N]`, or `slice<string>` returns a non-consuming `str` view of the selected owned
 string. Receiver and index keep the existing evaluation, termination, and hard bounds semantics;
 the array remains the sole element owner, and the view carries the complete source generation and
 contained region roots. No clone, allocation, cleanup bit, source null, or ownership transfer is
@@ -1226,14 +1226,29 @@ though explicit semicolons retain their existing statement-termination role. `N`
 decimal integer literal in `0..=u32::MAX`, is part of the type,
 and may be written anywhere a type annotation is accepted. Existing placement rules still reject
 aggregates at unsupported native extern/raw boundaries. `N` is not an expression or const generic.
-The element uses the same closed domain as a fixed array literal; nested fixed arrays and
-independently owned scalar elements remain excluded, while an admitted Move record retains the
-existing in-place construction and recursive element-Drop rules. A literal checked against
+The element uses the same closed domain as a fixed array literal. Owned `string` elements are
+admitted; nested fixed arrays and other independently owned scalar elements remain excluded.
+An admitted Move record retains the existing in-place construction and recursive element-Drop rules. A literal checked against
 `[T; N]` must contain exactly `N` elements; `[]` constructs `[T; 0]`.
 
+
+`[string; N]` stores N owned String headers inline; only the explicit element-producing expressions
+allocate. Construction evaluates each element once in source order and retains exactly one cleanup
+owner for each completed element until publication, including a later `?`, return or break. Whole
+moves null the complete source; Drop releases the live payloads exactly once in index order.
+Whole local/field replacement evaluates the complete RHS before dropping the old owner; exact
+self-replacement preserves it. Direct indexed String assignment remains unsupported.
+Indexing yields borrowed `str`; ranges and slice coercion yield read-only `slice<string>`, whose
+index also yields `str`. These views retain the source owner and payload lifetime, and cannot be
+used after a source move, whole replacement, destruction or overlapping exclusive access. They
+cannot escape a local owner. There is no implicit clone or `slice<str>` conversion. Other Move
+collection consumer/capture exclusions remain. `[]` obtains its String element type from an exact
+expected fixed-array or `slice<string>` context. [Plan164](docs/impl/164-fixed-owned-string-arrays.md)
+fixes the lifecycle and validation boundary.
+
 A struct field of type `[T; N]` is the array itself, inline in the struct layout. Reading, passing,
-or returning a Copy-element array copies its complete inline value; an array of admitted Move
-records is Move and follows the existing whole-owner rules. A fixed array may be rooted in a named
+or returning a Copy-element array copies its complete inline value; an array of owned strings or
+admitted Move records is Move, including at length zero, and follows the existing whole-owner rules. A fixed array may be rooted in a named
 local, parameter, or recursively selected field place, so `table.op[i]`, `table.op[a..b]`,
 `table.op.len()`, and `table.op[i] = value` on a mutable root use the ordinary checked fixed-array operations.
 A slice of a field borrows the containing storage. An arbitrary temporary remains ineligible as an

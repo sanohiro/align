@@ -350,8 +350,8 @@ fn fixed_array_cardinality_and_excluded_elements_fail_before_lowering() {
         ),
         ("nested", "Box { values: [[i64; 2]; 2] }\nfn main() {}\n"),
         (
-            "owned-string",
-            "Box { values: [string; 2] }\nfn main() {}\n",
+            "owned-array",
+            "Box { values: [array<i64>; 2] }\nfn main() {}\n",
         ),
         (
             "native-owner",

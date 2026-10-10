@@ -4038,6 +4038,7 @@ impl<'a> BodyValidator<'a> {
             return false;
         }
         match ty {
+            Ty::String => true,
             Ty::Struct(id) => self.program.structs.get(id as usize).is_some(),
             Ty::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
             Ty::Slice(_) => false,
@@ -11120,7 +11121,7 @@ impl<'a> BodyValidator<'a> {
                     }
                     _ => return None,
                 };
-                let result = if matches!(receiver.ty, Ty::DynArray(Scalar::String) | Ty::Slice(Scalar::String)) {
+                let result = if matches!(receiver.ty, Ty::Array(Scalar::String, _) | Ty::DynArray(Scalar::String) | Ty::Slice(Scalar::String)) {
                     Ty::Str
                 } else {
                     physical_result
@@ -11138,7 +11139,7 @@ impl<'a> BodyValidator<'a> {
                 let response_element_borrow =
                     receiver.ty == Ty::DynResponseArray && physical_result == Ty::HttpResponse;
                 let borrowed_string_element =
-                    matches!(receiver.ty, Ty::DynArray(Scalar::String) | Ty::Slice(Scalar::String)) && result == Ty::Str;
+                    matches!(receiver.ty, Ty::Array(Scalar::String, _) | Ty::DynArray(Scalar::String) | Ty::Slice(Scalar::String)) && result == Ty::Str;
                 if !response_element_borrow
                     && !borrowed_string_element
                     && !self.collection_element_read_ok(physical_result)
