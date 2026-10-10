@@ -13896,11 +13896,22 @@ fn html_entity(b: u8) -> Option<&'static [u8]> {
 
 /// Escaped length of `data`; `None` on overflow (the caller aborts before allocating).
 fn html_escaped_len(data: &[u8]) -> Option<usize> {
-    let mut n: usize = 0;
-    for &b in data {
-        n = n.checked_add(html_entity(b).map_or(1, |e| e.len()))?;
+    let mut length = data.len();
+    for chunk in data.chunks(32) {
+        // At most 32 * 5 additional bytes fit in u8. The narrow reduction can
+        // vectorize; checked arithmetic still owns the complete output extent.
+        let mut additional = 0u8;
+        for &byte in chunk {
+            additional += match byte {
+                b'<' | b'>' => 3,
+                b'&' | b'\'' => 4,
+                b'"' => 5,
+                _ => 0,
+            };
+        }
+        length = length.checked_add(usize::from(additional))?;
     }
-    Some(n)
+    Some(length)
 }
 
 /// Write `data` HTML-escaped into `out` (exactly [`html_escaped_len`] bytes).
