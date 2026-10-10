@@ -33,6 +33,9 @@ fn index_drop_plan(
                     }
                 }
             }
+            (Ty::StructArray(id, _), DropPlan::FixedArray { element, .. }) => {
+                work.push((Ty::Struct(id), element.as_ref()));
+            }
             (Ty::Option(payload), DropPlan::Option(child)) => {
                 work.push((scalar_to_ty(payload), child.as_ref()));
             }
@@ -529,24 +532,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         next: next + 1,
                     });
                     let ty = field.ty;
-                    let fixed_move_array = matches!(
+                    if !cached_plan_needs_drop(
+                        &mut drop_plans,
                         ty,
-                        Ty::StructArray(element, _)
-                            if struct_is_move(
-                                element,
-                                self.structs,
-                                self.enums,
-                                self.tagged_defs,
-                            )
-                    );
-                    if !fixed_move_array
-                        && !cached_plan_needs_drop(
-                            &mut drop_plans,
-                            ty,
-                            self.structs,
-                            self.enums,
-                            self.tagged_defs,
-                        )
+                        self.structs,
+                        self.enums,
+                        self.tagged_defs,
+                    )
                     {
                         continue;
                     }
@@ -605,15 +597,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let Some(&(field, ty)) = fields.get(next) else {
                         continue;
                     };
-                    let field_ptr = self
-                        .union_payload_ptr(aggregate, base, field, "droppayload")?
-                        .ok_or_else(|| self.err("droppable zero-sized tagged payload has no storage"))?;
                     work.push(Work::UnionFields {
                         base,
                         aggregate,
                         fields,
                         next: next + 1,
                     });
+                    // A record containing [Move; 0] remains semantically Move, but its
+                    // validated physical union payload can have no storage or owned leaves.
+                    if matches!(field, PhysicalPayload::OmittedZero { .. }) {
+                        continue;
+                    }
+                    let field_ptr = self
+                        .union_payload_ptr(aggregate, base, field, "droppayload")?
+                        .ok_or_else(|| self.err("droppable tagged payload has no storage"))?;
                     work.push(Work::Drop { base: field_ptr, ty });
                 }
                 Work::BranchUnion {
