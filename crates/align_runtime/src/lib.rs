@@ -13941,6 +13941,30 @@ fn html_escape_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
     }
 }
 
+fn html_entity_in_window(window: &[u8]) -> Option<usize> {
+    let prefix = window.len().min(16);
+    for (index, &byte) in window[..prefix].iter().enumerate() {
+        if html_entity(byte).is_some() { return Some(index); }
+    }
+    let tail = &window[prefix..];
+    let markup = memchr::memchr3(b'&', b'<', b'>', tail).unwrap_or(tail.len());
+    let first = memchr::memchr2(b'"', b'\'', &tail[..markup]).unwrap_or(markup);
+    (first < tail.len()).then_some(prefix + first)
+}
+
+/// Both discriminator searches are bounded together, including when only quotes occur.
+/// The search callback lets the owner count actual window extents without a timing gate.
+fn html_literal_run(data: &[u8], mut find: impl FnMut(&[u8]) -> Option<usize>) -> usize {
+    let mut offset = 0;
+    for window in data.chunks(256) {
+        if let Some(index) = find(window) {
+            return offset + index;
+        }
+        offset += window.len();
+    }
+    offset
+}
+
 fn html_escape_runs<const BULK_RUNS: bool>(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
     let mut i = 0;
     let mut o = 0;
@@ -13962,8 +13986,7 @@ fn html_escape_runs<const BULK_RUNS: bool>(data: &[u8], out: &mut [core::mem::Ma
                 if BULK_RUNS { ordinary += 1; }
                 if BULK_RUNS && ordinary == 16 && data.len() - i >= 64 {
                     let tail = &data[i..];
-                    let markup = memchr::memchr3(b'&', b'<', b'>', tail).unwrap_or(tail.len());
-                    let copied = memchr::memchr2(b'"', b'\'', &tail[..markup]).unwrap_or(markup);
+                    let copied = html_literal_run(tail, html_entity_in_window);
                     out[o..][..copied].write_copy_of_slice(&tail[..copied]);
                     i += copied;
                     o += copied;

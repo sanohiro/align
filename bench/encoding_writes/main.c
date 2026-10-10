@@ -53,12 +53,12 @@ static size_t expected(const unsigned char *input, size_t length, int kind, unsi
     return written;
 }
 int main(void) {
-    const char *seeds[] = {"Alpha09-file_name/path~segment", "<item key=\"日本語\">two words & a/b?</item>'", "A", " /+%", "&<>\"'", "a", "a"};
-    const char *names[] = {"plain", "mixed", "unreserved", "dense", "html_dense", "html_sparse", "html_late"};
+    const char *seeds[] = {"Alpha09-file_name/path~segment", "<item key=\"日本語\">two words & a/b?</item>'", "A", " /+%", "&<>\"'", "a", "a", "aaaaaaaaaaaaaaaa\"", "aaaaaaaaaaaaaaaa'", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"};
+    const char *names[] = {"plain", "mixed", "unreserved", "dense", "html_dense", "html_sparse", "html_late", "double_quote_runs", "apostrophe_runs", "double_quote_offset_runs", "apostrophe_offset_runs"};
     size_t sizes[] = {0, 1, 8, 64, 4096, 65536};
     Encode encoders[] = {align_rt_percent_encode, align_rt_percent_encode_path, align_rt_html_escape, align_rt_form_encode};
     puts("input,input_bytes,kind,trial,calls,output_bytes,ns_per_call");
-    for (int seed = 0; seed < 7; ++seed) {
+    for (int seed = 0; seed < 11; ++seed) {
         size_t unit = strlen(seeds[seed]);
         size_t previous_length = SIZE_MAX;
         for (int size = 0; size < 6; ++size) {

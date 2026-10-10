@@ -31,6 +31,53 @@ fn reference(input: &[u8], kind: usize) -> Vec<u8> {
 }
 
 #[test]
+fn html_discriminator_search_has_bounded_work_for_every_entity_group() {
+    for length in [0, 1, 255, 256, 257, 65536] {
+        let input = vec![b'a'; length];
+        let mut visited = 0;
+        let first = html_literal_run(&input, |window| {
+            assert!(window.len() <= 256);
+            visited += window.len();
+            html_entity_in_window(window)
+        });
+        assert_eq!(first, length);
+        assert_eq!(visited, length);
+    }
+    for &entity in b"&<>\"'" {
+        for prefix in [0, 1, 15, 16, 17, 63, 64, 255, 256, 257, 1024, 65536] {
+            let mut input = vec![b'a'; prefix];
+            input.push(entity);
+            input.extend_from_slice(&[b'z'; 65536]);
+            let mut visited = 0;
+            let first = html_literal_run(&input, |window| {
+                assert!(window.len() <= 256, "unbounded discriminator search");
+                visited += window.len();
+                html_entity_in_window(window)
+            });
+            assert_eq!(first, prefix);
+            // Each window is searched at most twice; total work is at most twice
+            // the ordinary prefix plus one fixed window, regardless of the suffix.
+            assert!(visited <= prefix + 256, "entity={entity}, prefix={prefix}, visited={visited}");
+        }
+        let mut repeated = vec![b'a'; 16];
+        repeated.push(entity);
+        let input = repeated.repeat(4096);
+        let mut cursor = 0;
+        let mut visited = 0;
+        while cursor < input.len() {
+            let copied = html_literal_run(&input[cursor..], |window| {
+                assert!(window.len() <= 256);
+                visited += window.len();
+                html_entity_in_window(window)
+            });
+            assert_eq!(copied, 16);
+            cursor += copied + 1;
+        }
+        assert!(visited <= 4096 * 256);
+    }
+}
+
+#[test]
 fn encoding_writers_initialize_exact_destinations_and_reject_mismatches() {
     let writers: [Writer; 4] = [
         percent_encode_into,
@@ -68,6 +115,11 @@ fn encoding_writers_initialize_exact_destinations_and_reject_mismatches() {
             cases.push((0u8..=255).collect());
             cases.push((0u8..=255).rev().collect());
         } else {
+            for &entity in b"&<>\"'" {
+                let mut run = vec![b'a'; 16];
+                run.push(entity);
+                cases.push(run.repeat(256));
+            }
             for length in (0..=84).chain([127, 128, 129, 255, 256, 257, 4095, 4096, 4097]) {
                 for &entity in b"&<>\"'" {
                     let mut input = vec![entity];
