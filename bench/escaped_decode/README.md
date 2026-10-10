@@ -3,6 +3,64 @@
 The [shared native probe runner](../native_probe.md) owns build, link, execution
 and cleanup for this probe.
 
+## Later ordinary runs, 2026-10-10
+
+Baseline: `38b8d76442e654fd14533ad4987c5e8688228591`. Plan167 counts
+sixteen consecutive ordinary bytes before bulk-searching a remaining extent of
+at least 64 bytes. Inputs below 80 bytes compile out this later-run counter.
+The initial prefix, hex admission and output allocation remain unchanged.
+
+Measured on Linux x86_64 WSL2, AMD Ryzen 9 5950X, pinned to CPU 0, Rust
+1.96.0 and Debian GCC 14.2.0. Both actual runtime producers rebuilt ordinary
+release archives; identical C source used `-O3 -Wall -Wextra -Werror`, with no
+overlapping builds/tests. Harness SHA256:
+`63ded617c3f27c0ede6312378a93f0661e810a88fc9a841ca6fb51acd37cc588`.
+Baseline/candidate archive SHA256:
+`262e4f87f580d7bd3f3647e276e2e528c59dbe87246a263a5963dc95b4351e84` /
+`9034c54ba9da19e1dae2cf0a094c1e2c6d48552e8ccbfc5743aca034462c7292`.
+
+The corpus adds `early_escape` (`%20+` followed by ordinary bytes) and
+`repeated_runs` (the same prefix, then `%2B+` every 256 bytes). The existing
+independent byte oracle, status/capacity checks and exact completed call/output
+counts cover all 66 cases. Each case has seven samples per process. Two final
+ABBA blocks supply 28 observations per arm/case (3,696 total). The second block
+uses the identical executables: the first block's late-escape form control had
+one candidate process at 1.84–2.07 microseconds and the other near 1.37, producing
+a 21.6% combined increase. The additional block resolves that arm discrepancy
+without discarding any sample; the all-sample increase is 2.4%.
+
+Medians in microseconds per complete decode/view/free call at approximately
+64 KiB, including the public buffer shell and destruction:
+
+| Input | Percent baseline → candidate | Form baseline → candidate |
+| --- | ---: | ---: |
+| plain | 1.242 → 1.262 | 1.441 → 1.458 |
+| sparse | 59.035 → 30.188 | 62.029 → 39.964 |
+| dense | 25.688 → 27.365 | 26.133 → 26.065 |
+| plus | 1.228 → 1.238 | 60.602 → 61.179 |
+| mixed | 40.370 → 41.270 | 40.731 → 41.836 |
+| late_escape | 1.265 → 1.240 | 1.377 → 1.410 |
+| early_escape | 60.635 → 1.307 | 63.022 → 1.402 |
+| repeated_runs | 60.908 → 6.411 | 61.825 → 6.762 |
+
+At 4 KiB, early-escape tails improve 97.2–97.4%, repeated runs 88.6–88.9%
+and sparse runs 33.6–52.0%. The largest increase below 128 bytes is 3.05 ns
+(53-byte sparse form, 70.50 → 73.55 ns). The largest long control increase
+is dense percent at 4 KiB: 1619.25 → 1805.60 ns (+11.5%); at 64 KiB it
+adds 1677.45 ns (+6.5%). Those costs are accepted alongside the later-run
+improvements, not hidden by a general decoder speed claim. These measurements
+do not establish ARM/macOS, network/application throughput or RSS behavior.
+
+Two superseded ABBA experiments are also retained, 1,848 observations each.
+Retrying prefix discovery after every delimiter regressed 64-KiB dense percent /
+form by 69.1% / 159.6% and plus-only form by 223.7%, so it was rejected.
+Counting runs at every input length reduced those costs but added up to 13.9 ns
+on a short case, motivating the final const specialization. All 7,392 raw
+observations are retained: [final comparison](runs-linux-x86_64-samples.csv),
+[per-delimiter experiment](runs-after-every-delimiter-linux-x86_64-samples.csv),
+and [all-length counter experiment](runs-counted-all-lengths-linux-x86_64-samples.csv).
+No observation is removed and no timing threshold is a correctness gate.
+
 ## Hex lookup comparison, 2026-10-08
 
 Baseline: `89729abdf48ea8aea4c04534bdc823dc54c20b04`. The candidate reuses the existing hex decode table for both percent-escape decoders; [plan 146](../../docs/impl/146-percent-form-hex-lookup.md) owns its unchanged public contract and acceptance.

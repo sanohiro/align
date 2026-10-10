@@ -41,12 +41,12 @@ static size_t expected(const unsigned char *input, size_t length, int form, unsi
     return written;
 }
 int main(void) {
-    const char *seeds[] = {"Alpha09-file_name/path~segment", "ordinary_query_value_with_long_runs%20next_value+tail", "%00%2B%ff%7F", "++++++++", "a%20b+c%2B", "a"};
-    const char *names[] = {"plain", "sparse", "dense", "plus", "mixed", "late_escape"};
+    const char *seeds[] = {"Alpha09-file_name/path~segment", "ordinary_query_value_with_long_runs%20next_value+tail", "%00%2B%ff%7F", "++++++++", "a%20b+c%2B", "a", "a", "a"};
+    const char *names[] = {"plain", "sparse", "dense", "plus", "mixed", "late_escape", "early_escape", "repeated_runs"};
     size_t sizes[] = {0, 8, 64, 4096, 65536};
     Decode decoders[] = {align_rt_percent_decode, align_rt_form_decode};
     puts("input,input_bytes,form,trial,calls,output_bytes,ns_per_call");
-    for (int seed = 0; seed < 6; ++seed) {
+    for (int seed = 0; seed < 8; ++seed) {
         size_t unit = strlen(seeds[seed]);
         for (int size = 0; size < 5; ++size) {
             if (size == 0 && seed != 0) continue;
@@ -57,6 +57,15 @@ int main(void) {
             if (seed == 5) {
                 require(length >= 8, "late escape fixture extent");
                 memcpy(input + length - 8, "%20+tail", 8);
+            }
+            if (seed >= 6) {
+                require(length >= 8, "ordinary run fixture extent");
+                memcpy(input, "%20+", 4);
+                if (seed == 7) {
+                    for (size_t i = 256; i + 4 <= length; i += 256) {
+                        memcpy(input + i, "%2B+", 4);
+                    }
+                }
             }
             size_t repeats = 2 * 1024 * 1024 / (length + 64);
             if (repeats < 64) repeats = 64;

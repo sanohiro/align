@@ -7,6 +7,12 @@ finish each capability through PR and merge, then continue until asked to stop.
 Align v0.9.0 is released. Requests138–141 are included; release artifacts cover
 Linux x86_64/aarch64 and macOS aarch64.
 
+[Plan167](docs/impl/167-escaped-decode-runs.md) extends percent/form bulk copying
+to long ordinary runs after escapes. Exact admission, output, allocation and
+publication remain unchanged; native/allocation and raw-query source owners
+pass. Local x86_64 measurements retain later-run gains, dense-input costs and
+all rejected experiments without a portable performance claim.
+
 [Plan162](docs/impl/162-retained-directory-available-space.md) delivers Request144's
 retained-directory available-byte observation. It uses native non-privileged
 filesystem accounting, checked scalar publication and no Align/Rust heap
