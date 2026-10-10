@@ -36,6 +36,9 @@ fn index_drop_plan(
             (Ty::StructArray(id, _), DropPlan::FixedArray { element, .. }) => {
                 work.push((Ty::Struct(id), element.as_ref()));
             }
+            (Ty::Array(scalar, _), DropPlan::FixedArray { element, .. }) => {
+                work.push((scalar_to_ty(scalar), element.as_ref()));
+            }
             (Ty::Option(payload), DropPlan::Option(child)) => {
                 work.push((scalar_to_ty(payload), child.as_ref()));
             }
@@ -105,9 +108,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 id: u32,
                 next: usize,
             },
-            FixedStructArray {
+            FixedArray {
                 base: inkwell::values::PointerValue<'c>,
-                id: u32,
+                element: Ty,
                 len: u32,
                 next: u32,
             },
@@ -456,9 +459,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     Ty::StructArray(id, len)
                         if struct_is_move(id, self.structs, self.enums, self.tagged_defs) =>
                     {
-                        work.push(Work::FixedStructArray {
+                        work.push(Work::FixedArray {
                             base,
-                            id,
+                            element: Ty::Struct(id),
+                            len,
+                            next: 0,
+                        });
+                    }
+                    Ty::Array(Scalar::String, len) => {
+                        work.push(Work::FixedArray {
+                            base,
+                            element: Ty::String,
                             len,
                             next: 0,
                         });
@@ -556,19 +567,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         ty,
                     });
                 }
-                Work::FixedStructArray {
+                Work::FixedArray {
                     base,
-                    id,
+                    element,
                     len,
                     next,
                 } => {
                     if next >= len {
                         continue;
                     }
-                    let element_ty = *self
-                        .struct_types
-                        .get(id as usize)
-                        .ok_or_else(|| self.err(format!("struct type id {id} is missing")))?;
+                    let element_ty = self.llvm_type(element);
                     let array_ty = element_ty.array_type(len);
                     let zero = self.ctx.i64_type().const_zero();
                     let index = self.ctx.i64_type().const_int(next as u64, false);
@@ -577,15 +585,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .build_in_bounds_gep(array_ty, base, &[zero, index], "dropnestel")
                             .map_err(|error| self.err(error))?
                     };
-                    work.push(Work::FixedStructArray {
+                    work.push(Work::FixedArray {
                         base,
-                        id,
+                        element,
                         len,
                         next: next + 1,
                     });
                     work.push(Work::Drop {
                         base: element_ptr,
-                        ty: Ty::Struct(id),
+                        ty: element,
                     });
                 }
                 Work::UnionFields {

@@ -8271,7 +8271,7 @@ fn is_signed(ty: Ty) -> bool {
 enum SlotZeroShape {
     /// One opaque handle pointer — a null pointer, 8 bytes.
     HandlePointer,
-    /// A fixed array of Move structs — the whole `[N x %Struct]` zeroed.
+    /// A fixed array — the whole inline aggregate zeroed.
     Array,
     /// A whole aggregate (`{tag,payload}` / struct / tuple / enum / dict) zeroed.
     Aggregate,
@@ -8295,7 +8295,7 @@ fn slot_zero_shape(ty: Ty, tagged_needs_drop: bool) -> SlotZeroShape {
     {
         return SlotZeroShape::HandlePointer;
     }
-    if matches!(ty, Ty::StructArray(..)) {
+    if matches!(ty, Ty::Array(..) | Ty::StructArray(..)) {
         return SlotZeroShape::Array;
     }
     if tagged_needs_drop
@@ -13673,6 +13673,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         // Drop site for this root type. It frees owned fields in declaration order,
                         // including nested Move structs (null-safe — moved-out storage was zeroed).
                         self.drop_struct_fields(self.slots[slot], sid)?;
+                    } else if matches!(ty, Ty::Array(Scalar::String, _)) {
+                        // Inline String slots own only their element payloads. Reuse the same
+                        // ascending cleanup as a fixed array nested in a record; never free the
+                        // inline array address or treat its first element as the whole header.
+                        self.drop_ty_at(self.slots[slot], ty)?;
                     } else if let Ty::StructArray(sid, n) = ty {
                         // A fixed array of a Move struct: drop each element's owned fields in turn
                         // (null-safe — the slot was zeroed by `DropFlagInit`). Unrolled: `n` is a
@@ -26797,6 +26802,9 @@ fn main() -> i32 = 0
             slot_zero_shape(Ty::StructArray(0, 2), false),
             SlotZeroShape::Array
         );
+        for length in [0, 1, 2, 37] {
+            assert_eq!(slot_zero_shape(Ty::Array(Scalar::String, length), false), SlotZeroShape::Array);
+        }
         assert_eq!(slot_zero_shape(Ty::Struct(0), false), SlotZeroShape::Aggregate);
         assert_eq!(slot_zero_shape(Ty::Enum(0), false), SlotZeroShape::Aggregate);
         assert_eq!(
@@ -38903,16 +38911,16 @@ fn main() -> i32 = 0
         // Fixed-array storage must agree for primitive, text and function elements. Unit's
         // stored i32 element deliberately differs from an omitted tagged Unit payload.
         for element in [
-            Scalar::Unit, Scalar::Bool, Scalar::Char, Scalar::Str, Scalar::Fn(0),
+            Scalar::Unit, Scalar::Bool, Scalar::Char, Scalar::Str, Scalar::String, Scalar::Fn(0),
             sc_int(8, false), sc_int(16, true), sc_int(32, false), sc_int(64, true),
             Scalar::Float(FloatTy { bits: 32 }), Scalar::Float(FloatTy { bits: 64 }),
         ] {
-            for length in [0, 1, 4] {
+            for length in [0, 1, 2, 4, 37] {
                 structs.push(sdef(&format!("Array{element:?}{length}"), false,
                     &[Ty::Bool, Ty::Array(element, length), i(64, true)]));
             }
         }
-        for length in [0, 1, 4] {
+        for length in [0, 1, 2, 4, 37] {
             structs.push(sdef(&format!("RecordArray{length}"), false,
                 &[Ty::Bool, Ty::StructArray(0, length), i(64, true)]));
         }

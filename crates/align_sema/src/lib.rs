@@ -2563,6 +2563,10 @@ pub fn drop_plan(
                 work.push(Work::ExitFixedArray(length));
                 work.push(Work::Enter(Ty::Struct(id)));
             }
+            Work::Enter(Ty::Array(Scalar::String, length)) => {
+                work.push(Work::ExitFixedArray(length));
+                work.push(Work::Enter(Ty::String));
+            }
             Work::Enter(Ty::Option(payload)) => {
                 work.push(Work::ExitOption);
                 work.push(Work::Enter(scalar_to_ty(payload)));
@@ -22172,7 +22176,7 @@ impl<'a> EscapeCheck<'a> {
             && matched_projected_candidate
             && !generations.is_empty();
         if known {
-            fallback_roots = opaque_handle_fallback_roots(
+            fallback_roots = inline_owned_fallback_roots(
                 &fallback_roots, self.f, self.storage_type_context(),
             );
         }
@@ -22455,7 +22459,7 @@ impl<'a> EscapeCheck<'a> {
                             source.content_ended.is_empty()
                                 && source.content_unknown.is_empty()
                         }) {
-                            fallback_roots = opaque_handle_fallback_roots(
+                            fallback_roots = inline_owned_fallback_roots(
                                 &fallback_roots, self.f, self.storage_type_context(),
                             );
                             value.non_storage = value.non_storage.join(
@@ -31363,9 +31367,30 @@ struct StorageTypeContext<'a> {
     tagged_types: &'a [hir::TaggedType],
 }
 
-/// Inline handles own storage not described by slice/array generation headers. Do not walk
-/// through collection headers: their allocation generation already owns their elements.
-fn has_inline_handle_storage(root: Ty, context: StorageTypeContext<'_>) -> bool {
+/// Inline owned leaves have release obligations not described by collection generation headers.
+/// Fixed arrays keep their inline backing on replacement, so descend through their elements.
+/// Dynamic collections stop this walk: their allocation generation already owns their elements.
+fn has_inline_owned_storage(root: Ty, context: StorageTypeContext<'_>) -> bool {
+    has_inline_owned_leaf(root, context, |ty| matches!(ty, Ty::String | Ty::Buffer | Ty::Writer))
+}
+
+/// String values copy the payload pointer/length, whereas opaque handle values keep a stable
+/// handle across operations that change their contents. Only the former needs this value loan.
+fn has_inline_string_storage(root: Ty, context: StorageTypeContext<'_>) -> bool {
+    has_inline_owned_leaf(root, context, |ty| ty == Ty::String)
+}
+
+fn has_inline_owned_leaf(
+    root: Ty,
+    context: StorageTypeContext<'_>,
+    accepts: impl std::ops::Fn(Ty) -> bool,
+) -> bool {
+    // Terminal roots need neither a descendant worklist allocation nor a visited entry.
+    match expand_tagged_ty(root, context.tagged_types) {
+        Ty::Struct(_) | Ty::Tuple(_) | Ty::Enum(_) | Ty::Option(_) | Ty::Result(..)
+        | Ty::Array(..) | Ty::StructArray(..) => {}
+        leaf => return accepts(leaf),
+    }
     let mut work = vec![root];
     let mut seen = HashSet::new();
     while let Some(ty) = work.pop() {
@@ -31373,7 +31398,9 @@ fn has_inline_handle_storage(root: Ty, context: StorageTypeContext<'_>) -> bool 
             continue;
         }
         match expand_tagged_ty(ty, context.tagged_types) {
-            Ty::Buffer | Ty::Writer => return true,
+            leaf @ (Ty::String | Ty::Buffer | Ty::Writer) if accepts(leaf) => return true,
+            Ty::Array(element, length) if length != 0 => work.push(scalar_to_ty(element)),
+            Ty::StructArray(id, length) if length != 0 => work.push(Ty::Struct(id)),
             Ty::Struct(id) => {
                 if let Some(definition) = context.structs.get(id as usize) {
                     work.extend(definition.fields.iter().map(|field| field.ty));
@@ -31405,8 +31432,8 @@ fn has_inline_handle_storage(root: Ty, context: StorageTypeContext<'_>) -> bool 
     false
 }
 
-// Compatible sibling headers do not certify an opaque handle's allocation identity.
-fn opaque_handle_fallback_roots(
+// Compatible sibling headers do not certify an inline owned leaf's release identity.
+fn inline_owned_fallback_roots(
     roots: &BorrowRoots,
     function: &Fn,
     context: StorageTypeContext<'_>,
@@ -31426,7 +31453,7 @@ fn opaque_handle_fallback_roots(
             };
             local
                 .and_then(|local| function.locals.get(local as usize))
-                .is_some_and(|local| has_inline_handle_storage(local.ty, context))
+                .is_some_and(|local| has_inline_owned_storage(local.ty, context))
         })
         .cloned()
         .collect()
@@ -34030,9 +34057,14 @@ impl BorrowState {
     }
 
     fn finish_value_source(&mut self, snapshot: usize) {
+        self.finish_value_observation(snapshot);
+        self.value_headers.remove(&snapshot);
+    }
+
+    /// Retire an already-completed read without erasing its producer/cleanup evidence.
+    fn finish_value_observation(&mut self, snapshot: usize) {
         self.value_sources.remove(&snapshot);
         self.invalid_value_sources.remove(&snapshot);
-        self.value_headers.remove(&snapshot);
         self.mutable_place_sources.remove(&snapshot);
         self.invalid_mutable_place_sources.remove(&snapshot);
     }
@@ -34809,10 +34841,10 @@ impl<'a> MoveCheck<'a> {
         if child_snapshots.is_empty() {
             return;
         }
-        // A completed result without borrowed state has already used its validated inputs. Their validity
-        // obligation does not survive as an operand of the next enclosing operation. Byte
-        // conversion similarly retains lifetime without retaining validation of the source text.
-        if !self.value_snapshot_needed(expression) || matches!(expression.kind, ExprKind::StrBytes { .. }) {
+        // Byte conversion retains lifetime without retaining validation of the source text.
+        // A completed independent value retires every input loan below, including an owned
+        // String header read only to compute a length or make an explicit copy.
+        if matches!(expression.kind, ExprKind::StrBytes { .. }) {
             for key in child_snapshots {
                 if let Some(roots) = self.borrows.value_sources.get_mut(key) {
                     roots.retain(|root| !root.is_byte_validation());
@@ -34837,6 +34869,12 @@ impl<'a> MoveCheck<'a> {
             &retained,
             BorrowEnd::Dropped,
         );
+        if !self.borrowed_value_snapshot_needed(expression) {
+            for key in child_snapshots {
+                self.borrows.finish_value_observation(*key);
+                self.walked_value_facts.remove(key);
+            }
+        }
     }
 
     fn clear_expression_value_snapshots(&mut self, expression: &Expr) {
@@ -37982,7 +38020,7 @@ impl<'a> MoveCheck<'a> {
         if let Some(headers) = self.borrows.headers.get(&id) {
             let mut roots = self.borrows.resolve_headers(headers).non_storage.live_roots();
             if self.f.locals.get(id as usize).is_some_and(|local| {
-                has_inline_handle_storage(local.ty, self.storage_type_context())
+                has_inline_owned_storage(local.ty, self.storage_type_context())
             }) {
                 roots.insert(self.stable_owner_root(id));
             }
@@ -38275,15 +38313,15 @@ impl<'a> MoveCheck<'a> {
                     .collect::<Vec<_>>();
                 let headers = self.local_headers(*root).project_path(&projection);
                 if headers.leaves.is_empty() {
-                    if !has_inline_handle_storage(e.ty, self.storage_type_context()) {
+                    if !has_inline_owned_storage(e.ty, self.storage_type_context()) {
                         roots.extend(self.local_storage_roots(*root));
                     }
                 } else {
                     roots.extend(self.borrows.resolve_headers(&headers).non_storage.live_roots());
                 }
-                // Selecting a mixed aggregate has the same opaque ownership obligation as
-                // selecting its handle leaf. Header presence is independent of that obligation.
-                if has_inline_handle_storage(e.ty, self.storage_type_context()) {
+                // Selecting a mixed aggregate retains the same payload release obligation as
+                // selecting its owned leaf. Header presence is independent of that obligation.
+                if has_inline_owned_storage(e.ty, self.storage_type_context()) {
                     roots.insert(self.stable_owner_root(*root));
                 }
             }
@@ -38453,6 +38491,12 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn value_snapshot_needed(&self, e: &Expr) -> bool {
+        self.borrowed_value_snapshot_needed(e)
+            // A loaded String header must survive a later operand consuming its payload owner.
+            || has_inline_string_storage(e.ty, self.storage_type_context())
+    }
+
+    fn borrowed_value_snapshot_needed(&self, e: &Expr) -> bool {
         let storage_paths = storage_type_paths(e.ty, self.storage_type_context());
         matches!(e.kind, ExprKind::BorrowedIndex { .. })
             || self.borrow_mut_place_snapshots.contains(&Self::expr_key(e))
@@ -38556,16 +38600,24 @@ impl<'a> MoveCheck<'a> {
         }
         match &expression.kind {
             ExprKind::Local(local) => self.local_headers(*local),
-            ExprKind::ArrayToSlice(inner) => self.retarget_root_header(
-                self.completed_headers(inner),
-                expression.ty,
-                &[],
-            ),
-            ExprKind::SliceRange { recv, .. } => self.retarget_root_header(
-                self.completed_headers(recv),
-                expression.ty,
-                &[],
-            ),
+            ExprKind::ArrayToSlice(inner)
+            | ExprKind::SliceRange { recv: inner, .. } => {
+                let mut headers = self.retarget_root_header(
+                    self.completed_headers(inner), expression.ty, &[],
+                );
+                // Inline backing survives replacement; the old owned payloads do not.
+                // Preserve their release owner beside the backing generation in the view.
+                if has_inline_owned_storage(inner.ty, self.storage_type_context()) {
+                    let roots = inline_owned_fallback_roots(
+                        &self.storage_roots(inner), self.f, self.storage_type_context(),
+                    );
+                    for leaf in headers.leaves.values_mut() {
+                        leaf.fallback_roots.extend(roots.iter().cloned());
+                        leaf.known &= leaf.fallback_roots.is_empty();
+                    }
+                }
+                headers
+            },
             ExprKind::Field { root, path } => {
                 let projections = path
                     .iter()
@@ -39205,7 +39257,7 @@ impl<'a> MoveCheck<'a> {
                         }
                     }
                     if matched && matched_exactly && !leaf.generations.is_empty() {
-                        leaf.fallback_roots = opaque_handle_fallback_roots(
+                        leaf.fallback_roots = inline_owned_fallback_roots(
                             &leaf.fallback_roots, self.f, self.storage_type_context(),
                         );
                         leaf.known = leaf.fallback_roots.is_empty();
@@ -39393,7 +39445,7 @@ impl<'a> MoveCheck<'a> {
                         }
                     }
                     if matched && matched_exactly && !leaf.generations.is_empty() {
-                        leaf.fallback_roots = opaque_handle_fallback_roots(
+                        leaf.fallback_roots = inline_owned_fallback_roots(
                             &leaf.fallback_roots, self.f, self.storage_type_context(),
                         );
                         leaf.known = leaf.fallback_roots.is_empty();
@@ -42218,7 +42270,8 @@ impl<'a> MoveCheck<'a> {
             .get(&local)
             .is_some_and(|headers| !headers.leaves.is_empty())
             && self.f.locals.get(local as usize).is_some_and(|record| {
-                storage_type_paths(record.ty, self.storage_type_context())
+                !has_inline_owned_storage(record.ty, self.storage_type_context())
+                    && storage_type_paths(record.ty, self.storage_type_context())
                     .headers
                     .iter()
                     .any(|header| header.kind.owns_storage())
@@ -43586,6 +43639,23 @@ impl<'a> MoveCheck<'a> {
                         "moving an owned field out through a nested path is not supported yet — clone it".to_string(),
                         expression.span,
                     );
+                    return;
+                }
+                ExprKind::TupleIndex { recv, index } if self.is_move_ty(expression.ty) => {
+                    if let ExprKind::Local(root) = recv.kind {
+                        if self.borrowed_param_mode(root).is_some()
+                            || self.borrowed_projection_owners.contains_key(&root)
+                        {
+                            self.diags.error("cannot move a field out of a borrowed tuple".to_string(), expression.span);
+                            return;
+                        }
+                        self.reject_live_resource_dependents(root, moved, expression.span);
+                        self.invalidate_mutable_place(root, &[*index]);
+                        if !self.completed_value_transfers_storage(expression) {
+                            self.invalidate_owner(root);
+                        }
+                        moved.insert(MovedKey::Field(root, *index));
+                    }
                     return;
                 }
                 ExprKind::ElemField {
@@ -45039,6 +45109,7 @@ impl<'a> MoveCheck<'a> {
         moved: &mut MovedSet,
         deferred_action: bool,
     ) {
+        self.reject_duplicate_action_sources(expression);
         match &expression.kind {
             ExprKind::Call { func, args, .. } => {
                 self.add_direct_parallel_transfer(func, args);
@@ -45166,6 +45237,96 @@ impl<'a> MoveCheck<'a> {
                     backing: self.mutable_backing(expression),
                 },
             );
+        }
+    }
+
+    /// Deferred operands are all evaluated before the action moves their sources. Consequently
+    /// ordinary read-after-move checking cannot detect two operands selecting the same owner.
+    /// Check the committed source places together, keeping alternative arms of one value in one
+    /// set. Each nested constructor is checked at its own completion, even when transfer is deferred.
+    fn reject_duplicate_action_sources(&mut self, expression: &Expr) {
+        let by_value = |mode: Option<&ast::ParamMode>| {
+            mode.is_none_or(|mode| *mode == ast::ParamMode::ByValue)
+        };
+        let inputs: Vec<&Expr> = match &expression.kind {
+            ExprKind::Call { func, args, .. } => {
+                if matches!(func.as_str(), "print" | "hash64" | "hash128") {
+                    return;
+                }
+                let modes = self.named_param_modes.get(func);
+                args.iter().enumerate().filter_map(|(index, argument)| {
+                    by_value(modes.and_then(|modes| modes.get(index))).then_some(argument)
+                }).collect()
+            }
+            ExprKind::CallFnValue { callee, args } => {
+                let modes = match callee.ty {
+                    Ty::Fn(id) => self.fn_types.get(id as usize),
+                    _ => None,
+                };
+                args.iter().enumerate().filter_map(|(index, argument)| {
+                    by_value(modes.and_then(|definition| definition.params.get(index)).map(|(mode, _)| mode))
+                        .then_some(argument)
+                }).collect()
+            }
+            ExprKind::RawCall { args, param_modes, .. } => args.iter().enumerate()
+                .filter_map(|(index, argument)| by_value(param_modes.get(index)).then_some(argument)).collect(),
+            _ => Self::action_values(expression),
+        };
+        if inputs.len() < 2 {
+            return;
+        }
+        let mut previous = MovedSet::new();
+        for input in inputs {
+            let mut selected = MovedSet::new();
+            let mut pending = vec![input];
+            while let Some(value) = pending.pop() {
+                if !self.is_move_ty(value.ty) {
+                    continue;
+                }
+                match &value.kind {
+                    ExprKind::Local(local) => { selected.insert(MovedKey::Whole(*local)); }
+                    ExprKind::Field { root, path } if path.len() == 1 => {
+                        selected.insert(MovedKey::Field(*root, path[0]));
+                    }
+                    ExprKind::TupleIndex { recv, index } => {
+                        if let ExprKind::Local(root) = recv.kind {
+                            selected.insert(MovedKey::Field(root, *index));
+                        }
+                    }
+                    ExprKind::ElemField { recv, index, path, .. } => {
+                        if let ExprKind::Local(local) = recv.kind
+                            && let ExprKind::Int(index) = index.kind
+                            && let Ok(index) = u32::try_from(index)
+                        {
+                            selected.insert(MovedKey::ElemField(local, index, path.clone().into_boxed_slice()));
+                        }
+                    }
+                    ExprKind::StructLit { fields, .. } => pending.extend(fields),
+                    ExprKind::Tuple { elems, .. } | ExprKind::ArrayLit { elems, .. } => pending.extend(elems),
+                    ExprKind::EnumValue { payload, .. } => pending.extend(payload),
+                    ExprKind::OptionSome(value) | ExprKind::ResultOk(value) | ExprKind::ResultErr(value) => pending.push(value),
+                    ExprKind::Block(block) | ExprKind::FloatScope { block, .. }
+                    | ExprKind::Arena(block) | ExprKind::NamedArena { block, .. }
+                    | ExprKind::TaskGroup(block) | ExprKind::Unsafe(block) => {
+                        pending.extend(block.value.as_deref());
+                    }
+                    ExprKind::If { then, els, .. } => {
+                        pending.extend(then.value.as_deref());
+                        pending.extend(els.value.as_deref());
+                    }
+                    ExprKind::Match { arms, .. } => pending.extend(arms.iter().map(|arm| &arm.body)),
+                    // A call, unwrap or loop result has already established its own transfer.
+                    _ => {}
+                }
+            }
+            if selected.iter().any(|source| match source {
+                MovedKey::Whole(local) => whole_moved(&previous, *local),
+                MovedKey::Field(local, field) => field_moved(&previous, *local, *field),
+                MovedKey::ElemField(local, index, path) => element_field_moved(&previous, *local, *index, path),
+            }) {
+                self.diags.error("the same owned source cannot be moved into multiple operands of one operation".to_string(), input.span);
+            }
+            previous.extend(selected);
         }
     }
 
@@ -50041,26 +50202,16 @@ impl<'a, 't> Checker<'a, 't> {
                 }
                 ast::Stmt::Assign { place, value } => match self.check_place(place) {
                     Place::Local { id, ty } => {
-                        // A fixed stack array (`Array` / `StructArray`) can't be *wholly* reassigned:
-                        // array values aren't materialized (only a `let` initializes one), and copying
-                        // a Move-struct array would double-own its elements. Reject cleanly — else an
-                        // array-literal RHS panics MIR lowering — and point at element assignment.
+                        // Fixed arrays use the ordinary aggregate materializer and assignment
+                        // lifecycle. Exact place self-assignment remains a checked no-op so it
+                        // cannot advance the inline storage generation.
                         let exact_self_assignment = self
                             .place_local(value)
                             .is_some_and(|(source, source_ty)| source == id && source_ty == ty);
                         if matches!(ty, Ty::Array(..) | Ty::StructArray(..))
                             && exact_self_assignment
                         {
-                            // Fixed arrays are not materialized as whole values, but an exact
-                            // place self-assignment has no runtime action to materialize. Accept it
-                            // as a checked no-op so it also cannot advance storage generations.
                             let _ = self.check_expr(value, Some(ty));
-                        } else if matches!(ty, Ty::Array(..) | Ty::StructArray(..)) {
-                            self.diags.error(
-                                format!("whole-array reassignment of {} is not supported yet (array values aren't materialized); assign elements individually, `a[i] = …`", ty_name(ty)),
-                                place.span,
-                            );
-                            let _ = self.check_expr(value, Some(ty)); // surface RHS errors; emit no store
                         } else {
                             // Mirror the `let` path: a slice/str place borrows its source.
                             let json_scan_spelling = self.json_scan_local_spellings.get(&id).cloned();
@@ -58798,11 +58949,10 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return true;
         }
-        // Fixed arrays have element-wise cleanup only for Move structs constructed in place. A
-        // scalar Move value (including owned `string` and `array<T>`) would be copied into the
-        // stack aggregate without a matching per-element null/drop path. Reject that complete
-        // class before `payload_scalar` can turn it into `Ty::Array`.
-        if !matches!(elem_ty, Ty::Struct(_))
+        // Strings and in-place Move records have complete element transfer/cleanup and borrowed
+        // reads. Other Move scalars still lack that lifecycle; do not admit them merely because
+        // their representation fits a Scalar.
+        if !matches!(elem_ty, Ty::String | Ty::Struct(_))
             && drop_plan(elem_ty, self.structs, self.enums, self.tagged_types).needs_drop()
         {
             self.diags.error(
@@ -63551,7 +63701,7 @@ impl<'a, 't> Checker<'a, 't> {
             // The array remains the sole owner of the selected string. `string` and `str` share
             // the same `{ptr,len}` representation, but the logical result carries no Drop and its
             // region/storage roots are inherited from the receiver below.
-            Ty::DynArray(Scalar::String) | Ty::Slice(Scalar::String) => Ty::Str,
+            Ty::Array(Scalar::String, _) | Ty::DynArray(Scalar::String) | Ty::Slice(Scalar::String) => Ty::Str,
             Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
             ty if let Some(elem) = ty.dyn_aggregate_array_element() => elem.ty(),
             // Indexing an `array<slice<T>>` (a `chunks` result) yields one chunk `slice<T>`.
@@ -73170,10 +73320,10 @@ pub fn fixed_array_type(
 ) -> Option<Ty> {
     match element {
         Ty::Struct(id) => Some(Ty::StructArray(id, length)),
-        // Fixed arrays are the one inline aggregate form, not a recursive aggregate tree. Move
-        // records remain the deliberate exception because StructArray owns and drops each element
-        // through its nominal definition; independently owned scalar elements would instead copy
-        // one owner word on indexing.
+        Ty::String => Some(Ty::Array(Scalar::String, length)),
+        // Fixed arrays are the one inline aggregate form, not a recursive aggregate tree. Strings
+        // and Move records have complete element cleanup and non-consuming borrowed reads;
+        // other independently owned elements remain unsupported.
         Ty::Array(..) | Ty::StructArray(..) => None,
         other if ty_is_move(other, structs, &[], enums, tagged_types) => None,
         other if ty_contains_restricted_collection_owner(other, structs, &[], enums, tagged_types) => None,
@@ -90433,31 +90583,33 @@ fn exit_branch(flag: bool) -> i64 {
         };
         for leaf in [Ty::Bool, Ty::String] {
             for length in [0, 1, 2] {
-                let structs = vec![
-                    record("Element", leaf),
-                    record("ArrayOwner", Ty::StructArray(0, length)),
-                    record("Nested", Ty::Struct(1)),
-                ];
-                let enums = vec![hir::EnumDef {
-                    name: "Choice".into(), source_name: "Choice".into(),
-                    variants: vec![hir::EnumVariant {
-                        name: "Value".into(), payload: vec![Scalar::Struct(2)], field_base: 1,
-                    }],
-                }];
-                let tagged = vec![hir::TaggedType::Option(Scalar::Struct(2))];
-                for ty in [
-                    Ty::StructArray(0, length), Ty::Struct(1), Ty::Struct(2),
-                    Ty::Option(Scalar::Struct(2)),
-                    Ty::Result(Scalar::Struct(2), Scalar::Bool),
-                    Ty::Result(Scalar::Bool, Scalar::Struct(2)),
-                    Ty::Enum(0), Ty::Tagged(0),
-                ] {
-                    let plan = drop_plan(ty, &structs, &enums, &tagged);
-                    assert!(plan.is_valid(), "{ty:?}/{leaf:?}");
-                    assert_eq!(plan.needs_drop(), leaf == Ty::String, "{ty:?}/{leaf:?}");
-                    assert_eq!(ty_is_move(ty, &structs, &[], &enums, &tagged), leaf == Ty::String);
+                for array in [Ty::StructArray(0, length), Ty::Array(ty_to_scalar(leaf).unwrap(), length)] {
+                    let structs = vec![
+                        record("Element", leaf),
+                        record("ArrayOwner", array),
+                        record("Nested", Ty::Struct(1)),
+                    ];
+                    let enums = vec![hir::EnumDef {
+                        name: "Choice".into(), source_name: "Choice".into(),
+                        variants: vec![hir::EnumVariant {
+                            name: "Value".into(), payload: vec![Scalar::Struct(2)], field_base: 1,
+                        }],
+                    }];
+                    let tagged = vec![hir::TaggedType::Option(Scalar::Struct(2))];
+                    for ty in [
+                        array, Ty::Struct(1), Ty::Struct(2),
+                        Ty::Option(Scalar::Struct(2)),
+                        Ty::Result(Scalar::Struct(2), Scalar::Bool),
+                        Ty::Result(Scalar::Bool, Scalar::Struct(2)),
+                        Ty::Enum(0), Ty::Tagged(0),
+                    ] {
+                        let plan = drop_plan(ty, &structs, &enums, &tagged);
+                        assert!(plan.is_valid(), "{ty:?}/{leaf:?}");
+                        assert_eq!(plan.needs_drop(), leaf == Ty::String, "{ty:?}/{leaf:?}");
+                        assert_eq!(ty_is_move(ty, &structs, &[], &enums, &tagged), leaf == Ty::String);
+                    }
+                    assert_eq!(json_scan_row_is_copy(2, &structs, &enums, &tagged), leaf == Ty::Bool);
                 }
-                assert_eq!(json_scan_row_is_copy(2, &structs, &enums, &tagged), leaf == Ty::Bool);
                 for malformed in [Ty::StructArray(99, length), Ty::StructArray(1, length)] {
                     let invalid = vec![record("Cycle", malformed), record("Back", Ty::Struct(0))];
                     let plan = drop_plan(Ty::Struct(0), &invalid, &[], &[]);

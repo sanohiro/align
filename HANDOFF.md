@@ -19,6 +19,13 @@ classification and semantic layout for fixed arrays inside records and sums.
 Native ownership counters and whole/per-unit/cache owners cover the existing
 inline contract. Fallible aggregate-producer expansion remains deferred.
 
+[Plan164](docs/impl/164-fixed-owned-string-arrays.md) delivers Request129's fixed
+owned-string arrays. Inline `[string; N]` construction, whole transfer/replacement,
+recursive Drop and borrowed `str`/`slice<string>` views share the existing owner
+model. Counted whole/per-unit/cache execution closes partial failure and cleanup;
+malformed HIR/MIR and stale-view owners keep formation and lifetime checks aligned.
+Other scalar-Move element families and general producer expansion remain excluded.
+
 K1/plan61 and the separately parked general aggregate-provenance experiment
 remain deferred. Request126's borrowed-session loop refusal and Request28's
 indexed/view builder readers require their own provenance closure. Request78's

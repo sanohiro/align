@@ -96,8 +96,15 @@ The literal must have exactly `N` elements; `[]` constructs `[T; 0]`. A struct f
 `N` elements inline, with no header, builder, heap allocation, or runtime allocation call. A fixed
 array may be rooted in a named local, parameter, or recursively selected field place for indexing,
 slicing, length, pipelines, and authorized mutation; a field slice borrows the containing storage.
-Copy and Move follow the element's existing fixed-array rules. Unsupported owning/nested element
-forms and arbitrary temporary receivers remain rejected. Exact contract: plan 73.
+Owned `string` elements are admitted: `[string; N]` is Move even at N=0. Elements are evaluated
+once in order; completed payloads retain exactly one cleanup owner through partial failure. Whole
+moves null the source, Drop frees the live payloads once in index order, and whole local/field
+replacement stages the RHS before old Drop. Exact self-replacement preserves the owner. Indexing
+borrows `str`; ranges/coercion produce read-only `slice<string>`. Views retain source/payload roots
+and reject use after move, replacement, destruction or overlapping exclusive access. Indexed
+String writes, implicit clones, `slice<str>` conversion and other Move consumer/capture widening
+are excluded. Other unsupported owning/nested element forms and arbitrary temporary receivers
+remain rejected. Exact contracts: plans 73 and [164](impl/164-fixed-owned-string-arrays.md).
 
 ### Integer literals
 
@@ -283,7 +290,7 @@ preserves the complete owner generation and input/arena roots for direct, field,
 borrowed-projection bases. Return and `borrow mut` retention cannot outlive those roots. A
 terminating index forms no bounds action or result.
 
-Indexing an `array<string>` yields a non-consuming `str` view. The array remains the sole owner;
+Indexing an `array<string>`, `[string; N]`, or `slice<string>` yields a non-consuming `str` view. The array remains the sole owner;
 the view carries its complete source generation and contained region roots and creates no clone,
 allocation, cleanup bit, nulling, or transfer. Receiver/index order, termination, and hard bounds
 behavior match every ordinary dynamic-array index. Other whole Move elements are not ordinary

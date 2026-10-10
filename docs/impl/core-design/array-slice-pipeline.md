@@ -16,7 +16,7 @@ surface + shape rules; the columnar layer is [soa-groupby.md](soa-groupby.md).
 ## The three collection forms
 
 ```text
-[a, b, c]        fixed array [T; N] — stack slot, compile-time length, Copy
+[a, b, c]        fixed array [T; N] — inline slots, compile-time length, Copy or Move by element
 array<T>         dynamic array — heap/arena {ptr,len}, Move (deep-dropped for owned string elements);
                  produced by .to_array(), chunks, json.decode, partition, sort
 slice<T>         borrowed view {ptr,len}, Copy, region = the data it points into
@@ -27,7 +27,13 @@ slice<T>         borrowed view {ptr,len}, Copy, region = the data it points into
 `[T; N]` also names the fixed-array type in annotations. A record field contains its N slots
 inline; no array header, builder or allocation is introduced. Named locals, parameters and stable
 field places share the same checked index/range/slice/pipeline/mutation operations. Copy/Move and
-element admission remain the literal's existing rules. Exact closure: [plan 73](../73-fixed-array-field-plan.md).
+element admission remain the literal's existing rules. `[string; N]` is Move even at N=0:
+construction owns each completed String through partial failure, whole moves null the source,
+and recursive Drop releases each payload exactly once. Whole replacement stages the RHS first.
+Indexing yields borrowed `str`; range/coercion yields read-only `slice<string>`. Views retain
+source and payload roots and cannot survive move, replacement, destruction or overlapping
+exclusive access. Indexed String writes and other Move consumer/capture exclusions remain.
+Exact closure: [plan 73](../73-fixed-array-field-plan.md) and [plan164](../164-fixed-owned-string-arrays.md).
 
 ## Signatures (verified)
 
@@ -164,7 +170,7 @@ and demanded where it matters (`par_map`; and pipeline lambdas reject allocation
 ## Errors & aborts
 
 No `Result` in this area. Shape mistakes are compile errors (unterminated pipeline, arity
-mismatch in a stage lambda, Move-element slicing or unsupported whole-value indexing, aliasing
+mismatch in a stage lambda, unsupported element slicing or whole-value indexing, aliasing
 `out` args, `map_into` source/dst overlap, unequal fixed `zip` lengths). Runtime aborts: index/range out of bounds,
 `map_into` length mismatch, or unequal runtime `zip` lengths.
 Empty input is an answer, never an error: `sum` 0, `count` 0, `any` false, `all` true; `min`/
@@ -186,7 +192,8 @@ input-vs-output scope; sources are allowed to alias one another and are never de
 ## Spec'd but not implemented
 
 - Slicing **Move-element** collections and ordinary whole-value indexing of every Move element
-  remain unsupported except for the implemented plan-30 `array<string>[i] -> str` view. Move-record
+  remain unsupported except for the owned-string `array<string>`/`[string; N]`/`slice<string>` views: indexing
+  yields `str` and ranges yield read-only `slice<string>`. Move-record
   arrays retain their direct-field view and explicit shared-borrow call-place forms. Dynamic
   slice/AoS record views accept a checked runtime index for a Move field; a source-formed fixed
   `StructArray` uses its static element path and requires an integer-literal index. The existing

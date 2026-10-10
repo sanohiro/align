@@ -1286,6 +1286,11 @@ fn xml_owned_leaf_paths(
     let mut leaves = Vec::new();
     let mut pending = vec![(root, Vec::new(), Vec::<Ty>::new())];
     while let Some((ty, path, mut ancestors)) = pending.pop() {
+        // Zero inline length has no owned element to certify. The whole value still carries
+        // its type's Move authority, authenticated through the ordinary root producer below.
+        if matches!(ty, Ty::Array(_, 0) | Ty::StructArray(_, 0)) {
+            continue;
+        }
         if matches!(ty, Ty::Str | Ty::String | Ty::XmlReader | Ty::Fn(_)) || http_client_owner_leaf(ty) {
             leaves.push((ty, path));
             continue;
@@ -1528,6 +1533,10 @@ fn xml_plain_fixed_array_element(element: Scalar) -> bool {
         element,
         Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char
     )
+}
+
+fn xml_fixed_array_load_needs_construction_proof(element: Scalar, length: u32) -> bool {
+    xml_plain_fixed_array_element(element) || (element == Scalar::String && length == 0)
 }
 
 /// Exact native-owner contracts, shared by value and out-slot producer checks.
@@ -3742,12 +3751,12 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                 } else if path.is_empty()
                     && let Ty::Array(element, length) = result_ty
-                    && xml_plain_fixed_array_element(element)
+                    && xml_fixed_array_load_needs_construction_proof(element, length)
                 {
                     // A whole inline scalar array copies its elements, not a backing header.
                     // Keep the literal completeness proof and every reaching element producer;
                     // the copied-bits transform below changes only the resulting SSA authority.
-                    if !self.check_plain_fixed_array_operand(
+                    if !self.check_fixed_array_construction_operand(
                         &mut equation, &Operand::Value(value), result_ty,
                     ) {
                         equation.invalid = true;
@@ -3789,10 +3798,17 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     bits: 64,
                     signed: true,
                 });
-                if !xml_source_ty_matches(self.graph.program, result_ty, element_ty)
+                let string_view = element_ty == Ty::String && result_ty == Ty::Str;
+                let result_matches = if element_ty == Ty::String {
+                    string_view
+                } else {
+                    xml_source_ty_matches(self.graph.program, result_ty, element_ty)
+                };
+                if !result_matches
                     || !xml_selected_ty(self.graph.program, slot_ty, &source_path)
                         .is_some_and(|source| {
                             xml_source_ty_matches(self.graph.program, source, selected_ty)
+                                || (string_view && source == Ty::String && selected_ty == Ty::Str)
                         })
                     || xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
                 {
@@ -3943,7 +3959,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                             self.graph.program,
                             scalar_to_ty(element),
                             scalar_to_ty(view),
-                        ) && xml_plain_fixed_array_element(element)
+                        ) && (xml_plain_fixed_array_element(element) || element == Scalar::String)
                             && u32::try_from(length) == Ok(actual)
                     }
                     _ => false,
@@ -7185,7 +7201,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
         }
     }
 
-    fn check_plain_fixed_array_operand(
+    fn check_fixed_array_construction_operand(
         &mut self,
         equation: &mut XmlAccessEquation,
         operand: &Operand,
@@ -7194,7 +7210,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
         let Ty::Array(element, length) = expected else {
             return false;
         };
-        if !xml_plain_fixed_array_element(element)
+        if !xml_fixed_array_load_needs_construction_proof(element, length)
             || xml_operand_base_ty(self.graph.function, operand) != Some(expected)
         {
             return false;
@@ -7429,8 +7445,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 equation.invalid = true;
                 continue;
             }
-            if matches!(stored_ty, Ty::Array(element, _) if xml_plain_fixed_array_element(element)) {
-                if !self.check_plain_fixed_array_operand(&mut equation, &operand, stored_ty) {
+            if matches!(stored_ty, Ty::Array(element, length) if xml_fixed_array_load_needs_construction_proof(element, length)) {
+                if !self.check_fixed_array_construction_operand(&mut equation, &operand, stored_ty) {
                     equation.invalid = true;
                     continue;
                 }

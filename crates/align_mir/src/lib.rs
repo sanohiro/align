@@ -13706,7 +13706,17 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
             if path.is_empty() {
                 (Src::Slot(slot), Operand::Const(Const::Int(n, i64_ty())))
             } else {
-                let slice = b.fresh_value(Ty::Slice(scalar_of(elem_ty)));
+                // The addressed storage keeps its physical element type. In particular a
+                // String slot projects a logical Str only at the subsequent indexed load.
+                let physical = match recv.ty {
+                    Ty::Array(element, _) => element,
+                    Ty::StructArray(id, _) => Scalar::Struct(id),
+                    _ => {
+                        b.terminate(Term::Unreachable);
+                        return Operand::Const(Const::Unit);
+                    }
+                };
+                let slice = b.fresh_value(Ty::Slice(physical));
                 b.push(Stmt::Let(slice, Rvalue::MakeFieldSlice(slot, path, n)));
                 (
                     Src::Slice(Operand::Value(slice)),
@@ -14634,12 +14644,10 @@ fn store_array_elems(
     elems: &[hir::Expr],
     elem: Ty,
 ) -> Option<Operand> {
-    if let Ty::Struct(sid) = elem
-        && struct_is_move(sid, &b.structs, &b.enums, &b.tagged_types)
-    {
-        // A fixed Move-struct array has one cleanup bit for every element. Keep each completed
+    if needs_drop_flag(elem, &b.structs, &b.tuples, &b.enums, &b.tagged_types) {
+        // A fixed Move array has one cleanup bit for every element. Keep each completed
         // element's fresh members under their exact hidden owners until the whole array succeeds;
-        // bound source structs likewise remain live until that point. A later element that returns
+        // bound source values likewise remain live until that point. A later element that returns
         // then cleans every completed member without treating the still-incomplete array as live.
         let mut owners = Vec::new();
         let mut array_drop_flag = None;
@@ -14670,7 +14678,9 @@ fn store_array_elems(
         for owner in owners {
             b.set_drop_flag(owner, false);
         }
-        return array_drop_flag;
+        // A completed empty owner is the identity for enclosing aggregate cleanup. False would
+        // suppress destruction of unrelated owned siblings when their flags are combined.
+        return Some(array_drop_flag.unwrap_or(Operand::Const(Const::Bool(true))));
     }
 
     if matches!(elem, Ty::Struct(_)) {
@@ -26927,8 +26937,8 @@ fn main() -> i32 {
         // Regression owner for the 62f48771 activation gap: sema reads a `string` element field
         // from an in-place Move-struct array as a borrowed `str` view, but the body validator
         // rejected it, silently dropping every checked function (empty binary, `_main` link
-        // failure). The valid struct shape must pass while scalar Move arrays fail before checked
-        // HIR because no per-element scalar Drop exists.
+        // failure). The valid struct shape must pass while unsupported scalar Move families fail
+        // before checked HIR. Fixed owned strings have their own plan164 lifecycle owner.
         let main = r#"module main
 User { name: string, age: i64 }
 fn main() -> i32 {
@@ -26983,19 +26993,8 @@ fn main() -> i32 {
             "an element-field read typed as the owned string must fail before MIR lowering",
         );
 
-        // Scalar Move elements have no fixed-array element-wise Drop. Sema must reject both the
-        // direct owned-string case and the nested owned-array case before the active HIR validator
-        // turns a producer/consumer disagreement into an internal error.
+        // Other scalar Move families retain their formation boundary.
         let scalar_move_cases = [
-            (
-                "owned string",
-                r#"module main
-fn main() -> i32 {
-  strings := ["owned".clone()]
-  return strings.len() as i32
-}
-"#,
-            ),
             (
                 "owned array",
                 r#"module main

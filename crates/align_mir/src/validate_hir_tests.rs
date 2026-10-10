@@ -9969,8 +9969,8 @@ fn hir_body_validator_storage_vector_array() {
         "a block cannot launder an existing Move-struct local into fixed-array admission",
     );
 
-    // No scalar Move value has a fixed-array element Drop path. This handcrafted HIR keeps the
-    // validator-side string rejection independent from sema, whose source gate rejects it first.
+    // Owned String is the scalar Move element with a complete fixed-array lifecycle. Keep this
+    // handcrafted positive independent from sema, then reject pooled owning construction.
     let owned_string = || {
         body_test_expr(
             hir::ExprKind::StrClone(Box::new(body_test_expr(
@@ -9982,7 +9982,7 @@ fn hir_body_validator_storage_vector_array() {
     };
     let mut owned_string_program = program.clone();
     owned_string_program.fns.push(body_unit_case(
-        "owned_string_array_rejected",
+        "owned_string_array_admitted",
         body_test_expr(
             hir::ExprKind::ArrayLit {
                 elems: vec![owned_string()],
@@ -9993,9 +9993,13 @@ fn hir_body_validator_storage_vector_array() {
         ),
     ));
     assert!(
-        !body_core_metadata_is_valid(&owned_string_program),
-        "an owned-string fixed array must fail closed at the HIR boundary",
+        body_core_metadata_is_valid(&owned_string_program),
+        "an owned-string fixed array has an element transfer/Drop path",
     );
+    let expression = body_statement_expression_mut(&mut owned_string_program, "owned_string_array_admitted");
+    let hir::ExprKind::ArrayLit { pooled, .. } = &mut expression.kind else { panic!("array fixture"); };
+    *pooled = true;
+    assert!(!body_core_metadata_is_valid(&owned_string_program), "owned strings cannot be pooled constants");
 
     // Resource owners and checked refs are excluded from fixed arrays recursively. Keep this
     // validator-side negative independent from sema so handcrafted HIR cannot bypass the source
@@ -10944,7 +10948,7 @@ fn hir_body_validator_pipeline_array_views() {
             body_core_metadata_is_valid(&reject)
                 == matches!(
                     source_ty,
-                    Ty::StructArray(..) | Ty::DynArray(_) | Ty::DynStructArray(..)
+                    Ty::Array(Scalar::String, _) | Ty::StructArray(..) | Ty::DynArray(_) | Ty::DynStructArray(..)
                 ),
             "{name}: view admission must preserve existing owning-array type formation"
         );

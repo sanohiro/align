@@ -2074,6 +2074,14 @@ field projection and shared-call places supply the usable consumers; no referenc
 type or implicit clone is introduced. Header reservations protect delayed call
 addressing, while returned-view facts retain the backing owner independently.
 
+Fixed owned-string arrays complete the same collection ownership model. Their earlier refusal
+was caused by missing element transfer/Drop, not a second text representation. Inline headers
+need no outer allocation; each explicit String producer keeps its existing allocation contract.
+Recursive cleanup and staging must land together with formation, so a partial constructor never
+publishes an owner without its cleanup proof. Indexed/range views retain the payload release owner
+beside fixed backing storage: replacing the headers releases old bytes even though the inline
+storage survives. [Plan164](impl/164-fixed-owned-string-arrays.md) owns this Category A completion.
+
 ### Retained raw filesystem boundary
 
 Retained descriptors separate directory identity from mutable path names. Raw owned
