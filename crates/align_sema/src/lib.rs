@@ -2359,6 +2359,10 @@ impl Drop for DropPlanRef {
 pub enum DropPlan {
     None,
     Leaf(Ty),
+    FixedArray {
+        element: DropPlanRef,
+        length: u32,
+    },
     Struct {
         id: u32,
         fields: Vec<(u32, DropPlanRef)>,
@@ -2392,7 +2396,8 @@ impl DropPlan {
                     take(field);
                 }
             }
-            DropPlan::Option(payload) => take(payload),
+            DropPlan::FixedArray { element: payload, .. }
+            | DropPlan::Option(payload) => take(payload),
             DropPlan::Result { ok, err } => {
                 take(ok);
                 take(err);
@@ -2420,7 +2425,8 @@ impl DropPlan {
                         return true;
                     }
                 }
-                DropPlan::Option(payload) => work.push(payload),
+                DropPlan::FixedArray { element: payload, .. }
+                | DropPlan::Option(payload) => work.push(payload),
                 DropPlan::Result { ok, err } => {
                     work.push(err);
                     work.push(ok);
@@ -2446,7 +2452,8 @@ impl DropPlan {
                 DropPlan::Struct { fields, .. } => {
                     work.extend(fields.iter().rev().map(|(_, plan)| plan.as_ref()));
                 }
-                DropPlan::Option(payload) => work.push(payload),
+                DropPlan::FixedArray { element: payload, .. }
+                | DropPlan::Option(payload) => work.push(payload),
                 DropPlan::Result { ok, err } => {
                     work.push(err);
                     work.push(ok);
@@ -2485,6 +2492,7 @@ pub fn drop_plan(
         Enter(Ty),
         ExitTagged(u32),
         ExitStruct { id: u32, fields: usize },
+        ExitFixedArray(u32),
         ExitOption,
         ExitResult,
         ExitEnum { id: u32, variants: Vec<usize> },
@@ -2550,6 +2558,10 @@ pub fn drop_plan(
                 for field in definition.fields.iter().rev() {
                     work.push(Work::Enter(field.ty));
                 }
+            }
+            Work::Enter(Ty::StructArray(id, length)) => {
+                work.push(Work::ExitFixedArray(length));
+                work.push(Work::Enter(Ty::Struct(id)));
             }
             Work::Enter(Ty::Option(payload)) => {
                 work.push(Work::ExitOption);
@@ -2677,6 +2689,19 @@ pub fn drop_plan(
                 struct_active.remove(&id);
                 struct_cache.insert(id, plan.clone());
                 built.push(plan);
+            }
+            Work::ExitFixedArray(length) => {
+                let Some(element) = built.pop() else {
+                    return DropPlan::Invalid;
+                };
+                built.push(Built {
+                    plan: DropPlanRef::new(DropPlan::FixedArray {
+                        element: element.plan,
+                        length,
+                    }),
+                    // Even [Move; 0] is Move: length does not change the element's ownership.
+                    needs_drop: element.needs_drop,
+                });
             }
             Work::ExitOption => {
                 let payload = built.pop().expect("option child plan");
@@ -4480,8 +4505,6 @@ pub fn ty_is_move(
 ) -> bool {
     drop_plan(ty, structs, enums, tagged_types).needs_drop()
         || ty_tuple_is_move(ty, tuples)
-        // A fixed array of Move structs owns every element recursively.
-        || matches!(ty, Ty::StructArray(id, _) if struct_is_move(id, structs, enums, tagged_types))
 }
 
 /// The pipeline stages of a stage-bearing pipeline node (else `None`). Lets the flow analyses
@@ -90400,6 +90423,52 @@ fn exit_branch(flag: bool) -> i64 {
     }
 
     #[test]
+    fn drop_plan_fixed_array_composes_through_every_wrapper() {
+        let record = |name: &str, ty| StructDef {
+            name: name.into(),
+            source_name: name.into(),
+            fields: vec![FieldDef { name: "value".into(), ty }],
+            align: None,
+            c_repr: false,
+        };
+        for leaf in [Ty::Bool, Ty::String] {
+            for length in [0, 1, 2] {
+                let structs = vec![
+                    record("Element", leaf),
+                    record("ArrayOwner", Ty::StructArray(0, length)),
+                    record("Nested", Ty::Struct(1)),
+                ];
+                let enums = vec![hir::EnumDef {
+                    name: "Choice".into(), source_name: "Choice".into(),
+                    variants: vec![hir::EnumVariant {
+                        name: "Value".into(), payload: vec![Scalar::Struct(2)], field_base: 1,
+                    }],
+                }];
+                let tagged = vec![hir::TaggedType::Option(Scalar::Struct(2))];
+                for ty in [
+                    Ty::StructArray(0, length), Ty::Struct(1), Ty::Struct(2),
+                    Ty::Option(Scalar::Struct(2)),
+                    Ty::Result(Scalar::Struct(2), Scalar::Bool),
+                    Ty::Result(Scalar::Bool, Scalar::Struct(2)),
+                    Ty::Enum(0), Ty::Tagged(0),
+                ] {
+                    let plan = drop_plan(ty, &structs, &enums, &tagged);
+                    assert!(plan.is_valid(), "{ty:?}/{leaf:?}");
+                    assert_eq!(plan.needs_drop(), leaf == Ty::String, "{ty:?}/{leaf:?}");
+                    assert_eq!(ty_is_move(ty, &structs, &[], &enums, &tagged), leaf == Ty::String);
+                }
+                assert_eq!(json_scan_row_is_copy(2, &structs, &enums, &tagged), leaf == Ty::Bool);
+                for malformed in [Ty::StructArray(99, length), Ty::StructArray(1, length)] {
+                    let invalid = vec![record("Cycle", malformed), record("Back", Ty::Struct(0))];
+                    let plan = drop_plan(Ty::Struct(0), &invalid, &[], &[]);
+                    assert!(plan.needs_drop(), "malformed array must fail closed");
+                    assert!(!plan.is_valid(), "{malformed:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn drop_plan_recurses_through_option_and_nested_structs() {
         let structs = vec![
             StructDef {
@@ -90601,12 +90670,17 @@ fn exit_branch(flag: bool) -> i64 {
                     c_repr: false,
                 }];
                 for depth in 1..DEPTH {
+                    let child = (depth - 1) as u32;
                     structs.push(StructDef {
                         name: format!("S{depth}"),
                         source_name: format!("S{depth}"),
                         fields: vec![FieldDef {
                             name: "next".to_string(),
-                            ty: Ty::Struct((depth - 1) as u32),
+                            ty: if depth % 3 == 0 {
+                                Ty::StructArray(child, 2)
+                            } else {
+                                Ty::Struct(child)
+                            },
                         }],
                         align: None,
                         c_repr: false,

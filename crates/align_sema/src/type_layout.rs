@@ -6,7 +6,8 @@ fn align_up(n: u64, align: u64) -> u64 {
     if align <= 1 {
         n
     } else {
-        (n + align - 1) & !(align - 1)
+        n.checked_add(align - 1)
+            .map_or(u64::MAX, |size| size & !(align - 1))
     }
 }
 
@@ -59,6 +60,7 @@ impl<'a> TypeLayoutCache<'a> {
             ExitOption,
             ExitResult,
             ExitTagged(u32),
+            ExitArray(u32),
         }
 
         let mut work = vec![Work::Enter(ty)];
@@ -81,6 +83,20 @@ impl<'a> TypeLayoutCache<'a> {
                     Ty::Bool => built.push((1, 1)),
                     Ty::Char => built.push((4, 4)),
                     Ty::Unit => built.push((0, 1)),
+                    Ty::Array(element, length) => {
+                        work.push(Work::ExitArray(length));
+                        // Unit payloads are omitted from unions, but fixed arrays use
+                        // scalar storage: LLVM's unit element is an i32 slot.
+                        if element == super::Scalar::Unit {
+                            built.push((4, 4));
+                        } else {
+                            work.push(Work::Enter(scalar_to_ty(element)));
+                        }
+                    }
+                    Ty::StructArray(id, length) => {
+                        work.push(Work::ExitArray(length));
+                        work.push(Work::Enter(Ty::Struct(id)));
+                    }
                     Ty::Tagged(id) => {
                         if let Some(&layout) = self.tagged_cache.get(&id) {
                             built.push(layout);
@@ -178,7 +194,7 @@ impl<'a> TypeLayoutCache<'a> {
                     let mut align = 1u64;
                     for (field_size, field_align) in layouts {
                         let field_align = field_align.max(1);
-                        size = align_up(size, field_align) + field_size;
+                        size = align_up(size, field_align).saturating_add(field_size);
                         align = align.max(field_align);
                     }
                     let effective = over_align.map_or(align, |value| align.max(value as u64));
@@ -226,6 +242,10 @@ impl<'a> TypeLayoutCache<'a> {
                     self.tagged_cache.insert(id, layout);
                     built.push(layout);
                 }
+                Work::ExitArray(length) => {
+                    let (stride, align) = built.pop().unwrap_or((0, 1));
+                    built.push((stride.saturating_mul(u64::from(length)), align));
+                }
             }
         }
         built.pop().unwrap_or((0, 1))
@@ -241,7 +261,7 @@ fn aggregate_layout(fields: &[(u64, u64)]) -> (u64, u64) {
             continue;
         }
         let field_align = field_align.max(1);
-        size = align_up(size, field_align) + field_size;
+        size = align_up(size, field_align).saturating_add(field_size);
         align = align.max(field_align);
     }
     (align_up(size, align), align)
@@ -255,7 +275,10 @@ fn tagged_union_layout(tag: (u64, u64), payload: (u64, u64)) -> (u64, u64) {
     let payload_align = payload.1.max(1);
     let align = tag.1.max(payload_align);
     let payload_offset = align_up(tag.0, payload_align);
-    (align_up(payload_offset + payload.0, align), align)
+    (
+        align_up(payload_offset.saturating_add(payload.0), align),
+        align,
+    )
 }
 
 pub fn ty_abi_layout(
@@ -274,6 +297,66 @@ mod tests {
 
     fn variant(name: &str, payload: Vec<Scalar>, field_base: u32) -> hir::EnumVariant {
         hir::EnumVariant { name: name.into(), payload, field_base }
+    }
+
+    #[test]
+    fn fixed_array_layout_composes_through_records_and_tags() {
+        let record = |name: &str, ty| StructDef {
+            name: name.into(),
+            source_name: name.into(),
+            fields: vec![crate::FieldDef {
+                name: "value".into(),
+                ty,
+            }],
+            align: None,
+            c_repr: false,
+        };
+        let i64 = Scalar::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        for length in [0, 1, 2, 37] {
+            let structs = [
+                record("Item", Ty::String),
+                record("Batch", Ty::StructArray(0, length)),
+            ];
+            let enums = [hir::EnumDef {
+                name: "Choice".into(),
+                source_name: "Choice".into(),
+                variants: vec![variant("Value", vec![Scalar::Struct(1)], 1)],
+            }];
+            let mut layouts = TypeLayoutCache::new(&structs, &enums, &[]);
+            assert_eq!(
+                layouts.layout(Ty::Array(i64, length)),
+                (8 * u64::from(length), 8)
+            );
+            assert_eq!(
+                layouts.layout(Ty::Array(Scalar::Unit, length)),
+                (4 * u64::from(length), 4)
+            );
+            assert_eq!(layouts.layout(Ty::Struct(1)), (16 * u64::from(length), 8));
+            let expected = if length == 0 {
+                (1, 1)
+            } else {
+                (8 + 16 * u64::from(length), 8)
+            };
+            assert_eq!(layouts.layout(Ty::Option(Scalar::Struct(1))), expected);
+            assert_eq!(
+                layouts.layout(Ty::Result(Scalar::Struct(1), Scalar::Unit)),
+                expected
+            );
+            assert_eq!(
+                layouts.layout(Ty::Enum(0)),
+                if length == 0 { (4, 4) } else { expected }
+            );
+        }
+        let huge = [
+            record("Large", Ty::Array(i64, u32::MAX)),
+            record("Overflow", Ty::StructArray(0, u32::MAX)),
+        ];
+        let mut layouts = TypeLayoutCache::new(&huge, &[], &[]);
+        assert_eq!(layouts.layout(Ty::Struct(1)), (u64::MAX, 8));
+        assert_eq!(layouts.layout(Ty::Option(Scalar::Struct(1))), (u64::MAX, 8));
     }
 
     #[test]

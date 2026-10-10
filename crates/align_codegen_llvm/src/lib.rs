@@ -38797,7 +38797,7 @@ fn main() -> i32 = 0
         }
 
         // Structs 0..=2 are nested targets referenced by later structs (ids are positional).
-        let structs = vec![
+        let mut structs = vec![
             sdef("Inner0", false, &[i(8, false), i(64, true)]),          // 0: reorders internally
             sdef("InnerC", true, &[i(8, false), i(64, true)]),           // 1: layout(C), decl order
             sdef("Pair", false, &[i(32, true), i(32, true)]),            // 2
@@ -38899,6 +38899,23 @@ fn main() -> i32 = 0
                 ],
             ),
         ];
+
+        // Fixed-array storage must agree for primitive, text and function elements. Unit's
+        // stored i32 element deliberately differs from an omitted tagged Unit payload.
+        for element in [
+            Scalar::Unit, Scalar::Bool, Scalar::Char, Scalar::Str, Scalar::Fn(0),
+            sc_int(8, false), sc_int(16, true), sc_int(32, false), sc_int(64, true),
+            Scalar::Float(FloatTy { bits: 32 }), Scalar::Float(FloatTy { bits: 64 }),
+        ] {
+            for length in [0, 1, 4] {
+                structs.push(sdef(&format!("Array{element:?}{length}"), false,
+                    &[Ty::Bool, Ty::Array(element, length), i(64, true)]));
+            }
+        }
+        for length in [0, 1, 4] {
+            structs.push(sdef(&format!("RecordArray{length}"), false,
+                &[Ty::Bool, Ty::StructArray(0, length), i(64, true)]));
+        }
 
         // Sum-type layouts referenced by the `SEnum*` fields above. Built exactly as codegen builds
         // `enum_types`: an explicit tag plus maximum-variant storage.

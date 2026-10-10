@@ -190,8 +190,8 @@ fn shell(kind: ShellKind, provenance: Provenance) -> LiveValue {
 /// This exhaustive match is deliberately only a cleanup-plan-variant tripwire. `align_sema`'s
 /// compiler-owned `variant_sweep_tripwire` owns additions to the complete `Ty`/`Scalar` inventory,
 /// while the positive and negative source fixtures below own the applicable formation edges. A
-/// `DropPlan` match cannot honestly claim to exhaust private storage-header analysis: fixed struct
-/// arrays compose their element plan outside `DropPlan` and are owned separately below.
+/// `DropPlan` includes fixed-array element ownership; storage-header analysis remains a
+/// separate concern from the cleanup graph.
 fn target_retainers(plan: &DropPlan, value: &LiveValue) -> usize {
     if matches!(value, LiveValue::MovedOut) {
         return 0;
@@ -218,6 +218,9 @@ fn target_retainers(plan: &DropPlan, value: &LiveValue) -> usize {
                 .zip(values)
                 .map(|((_, child), value)| target_retainers(child, value))
                 .sum()
+        }
+        DropPlan::FixedArray { element, length } => {
+            fixed_array_target_retainers(element, usize::try_from(*length).unwrap(), value)
         }
         DropPlan::Option(payload) => {
             let LiveValue::Option(value) = value else {
@@ -487,29 +490,6 @@ fn active_profiles(capacity: usize) -> Vec<ActiveProfile> {
     }
 }
 
-#[derive(Clone, Debug)]
-enum ClassifierPlan {
-    Drop(DropPlan),
-    FixedStructArray { element: DropPlan, length: usize },
-}
-
-impl ClassifierPlan {
-    fn is_valid(&self) -> bool {
-        match self {
-            Self::Drop(plan) | Self::FixedStructArray { element: plan, .. } => plan.is_valid(),
-        }
-    }
-
-    fn classify(&self, value: &LiveValue) -> usize {
-        match self {
-            Self::Drop(plan) => target_retainers(plan, value),
-            Self::FixedStructArray { element, length } => {
-                fixed_array_target_retainers(element, *length, value)
-            }
-        }
-    }
-}
-
 struct Formation<'a> {
     program: &'a align_sema::hir::Program,
     reader_holder: u32,
@@ -550,7 +530,7 @@ impl<'a> Formation<'a> {
         )
     }
 
-    fn plan(&self, carrier: Carrier) -> ClassifierPlan {
+    fn plan(&self, carrier: Carrier) -> DropPlan {
         let ty = match carrier {
             Carrier::DirectReader | Carrier::BufferedReader => Ty::Reader,
             Carrier::DirectWriter => Ty::Writer,
@@ -565,14 +545,9 @@ impl<'a> Formation<'a> {
             Carrier::LoggerRootedSum => Ty::Enum(self.logger_choice),
             Carrier::SumRootedSum => Ty::Enum(self.sum_choice),
             Carrier::TaggedRootedSum => Ty::Enum(self.tagged_choice),
-            Carrier::FixedReaderStructArray => {
-                return ClassifierPlan::FixedStructArray {
-                    element: self.drop_plan(Ty::Struct(self.reader_holder)),
-                    length: 3,
-                };
-            }
+            Carrier::FixedReaderStructArray => Ty::StructArray(self.reader_holder, 3),
         };
-        ClassifierPlan::Drop(self.drop_plan(ty))
+        self.drop_plan(ty)
     }
 
     fn active_value(
@@ -735,7 +710,7 @@ struct MatrixCase {
     count: TargetCountClass,
     expected_target: usize,
     label: String,
-    plan: ClassifierPlan,
+    plan: DropPlan,
     value: LiveValue,
 }
 
@@ -809,7 +784,7 @@ fn canonical_drop_graph_classifies_every_timeout_retainer_state() {
             "{}: malformed source-derived DropPlan",
             case.label,
         );
-        let count = case.plan.classify(&case.value);
+        let count = target_retainers(&case.plan, &case.value);
         assert_eq!(count, case.expected_target, "{}", case.label);
         assert_eq!(
             TargetCountClass::from_count(count),
@@ -1449,7 +1424,7 @@ fn replace_classified_probe(
 ) {
     let plan = formation.plan(carrier);
     let value = formation.active_value(carrier, arm, leaves);
-    let target = plan.classify(&value);
+    let target = target_retainers(&plan, &value);
     let total = leaves.iter().filter(|leaf| leaf.is_some()).count();
     assert!(
         source.contains(token),
@@ -1466,7 +1441,7 @@ fn replace_classified_state(
     value: LiveValue,
     total: usize,
 ) {
-    let target = formation.plan(carrier).classify(&value);
+    let target = target_retainers(&formation.plan(carrier), &value);
     assert!(
         source.contains(token),
         "lifecycle template omitted classifier token {token}",

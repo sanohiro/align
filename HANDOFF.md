@@ -14,6 +14,11 @@ allocation. It remains advisory: quota/reservation policy and fallible download
 writes belong to the consumer. External align-llm adoption and end-to-end/network
 measurements remain consumer-owned.
 
+[Plan163](docs/impl/163-fixed-array-recursive-drop.md) corrects recursive Move/Drop
+classification and semantic layout for fixed arrays inside records and sums.
+Native ownership counters and whole/per-unit/cache owners cover the existing
+inline contract. Fallible aggregate-producer expansion remains deferred.
+
 K1/plan61 and the separately parked general aggregate-provenance experiment
 remain deferred. Request126's borrowed-session loop refusal and Request28's
 indexed/view builder readers require their own provenance closure. Request78's
