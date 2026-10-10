@@ -55,8 +55,12 @@ fn encoding_writers_initialize_exact_destinations_and_reject_mismatches() {
         for length in [
             1, 2, 3, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257,
         ] {
-            cases.push(vec![b'&'; length]);
-            if kind != 2 {
+            for byte in b"&<>\"'" {
+                cases.push(vec![*byte; length]);
+            }
+            if kind == 2 {
+                cases.push(b"&<>\"'a".iter().copied().cycle().take(length).collect());
+            } else {
                 cases.push((0u8..=255).cycle().take(length).collect());
             }
         }

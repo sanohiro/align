@@ -7,19 +7,66 @@ and cleans its temporary executable. `CARGO_TARGET_DIR` and `CC` are supported;
 no optional native codec/crypto libraries are needed.
 
 Kind 0 is percent/component, 1 percent/path, 2 HTML, and 3 form. Plain and mixed
-UTF-8 seeds join unreserved and dense reserved-byte controls. Requested sizes
+UTF-8 seeds join unreserved, dense reserved-byte and dense five-entity HTML controls. Requested sizes
 are 0, 1, 8, 64, 4096 and 65536 bytes; whole seed repetitions preserve UTF-8,
 and CSV records actual lengths. Empty input appears once per encoder, and
-repeated rounded lengths are skipped, leaving 76 distinct cases. An independent
+repeated rounded lengths are skipped, leaving 96 distinct cases. An independent
 oracle checks exact bytes before timing. Each case warms for 100 ms, then emits
 nine samples including final output allocation/free. Returned lengths, calls
 and output bytes are observed, and empty/nonempty pointer shape is checked.
+
+## HTML narrow-count qualification
+
+Plan166 compares baseline `14f9326b` with the 32-byte/u8 HTML expansion
+reduction on Linux x86_64 (WSL2, AMD Ryzen 9 5950X, CPU 0 pinned), Rust
+1.96.0 and GCC 14.2. Both ordinary release runtime archives were rebuilt from
+their corresponding source before linking the identical expanded C harness
+with `-O3`. No local build/test work overlapped timing. The existing
+`native_probe.run_phase` bounded each link/probe and retired its process group.
+
+Four runs in ABBA order give 18 observations per arm/case.
+[All 3,456 observations](html-count-linux-x86_64-samples.csv) preserve every
+case, trial and producer call/output-byte count. The independent byte oracle,
+returned extents and counts agree in both arms. Median microseconds per
+complete HTML call, including final allocation/free:
+
+| Input | Bytes | Baseline | Candidate | Reduction |
+| --- | ---: | ---: | ---: | ---: |
+| plain | 65550 | 57.095 | 39.036 | 31.6% |
+| mixed | 65550 | 81.904 | 63.214 | 22.8% |
+| unreserved | 65536 | 50.121 | 34.077 | 32.0% |
+| dense reserved bytes | 65536 | 83.875 | 55.331 | 34.0% |
+| dense HTML entities | 65540 | 147.928 | 107.944 | 27.0% |
+
+The corresponding approximately 4-KiB HTML cases improve 22.5–34.6%.
+The largest short HTML increase is one unreserved byte, 12.45 → 13.40 ns
+(+0.95 ns); empty input rises 5.40 → 6.15 ns (+0.75 ns, 13.9%).
+Unchanged encoder controls vary too: their long medians range from -5.2% to
++6.0%, and the largest short increase is dense component encoding at 64 bytes,
+152.2 → 161.4 ns (+9.2 ns, 6.0%). These costs are retained and accepted
+alongside the HTML reductions; this experiment does not establish that other
+encoders have unchanged throughput. Host scheduling and code placement remain
+limitations. No ARM/macOS, application-throughput, RSS or portable-speed claim
+is made, and timing is not a correctness gate.
+
+A preceding three-usize-counter implementation was rejected: its long
+plain/unreserved/mixed HTML cases regressed 34.6%, 46.3% and 23.5%, despite
+a 4.4% dense-entity improvement. Its separate ABBA experiment retains
+[all 3,456 observations](html-count-three-counters-linux-x86_64-samples.csv).
+The narrow bounded reduction avoids those three wide reduction chains.
+
+Reproduce with ordinary release archives from the baseline and candidate,
+link each against this same `main.c` and flags, then run the two executables
+in baseline/candidate/candidate/baseline order pinned to the same CPU.
+Use `native_probe.run_phase` for each bounded build/link/probe, and refresh
+the runtime source mtime before each archive build as the normal wrapper does.
+The normal `run.sh` measures the current checkout with the same corpus.
 
 ## Expansion-count qualification
 
 Plan156 compares main `c6e7773` with the checked expansion-count implementation
 on macOS ARM64 (Apple M1, Clang 21) and Linux ARM64 (Docker on the same host,
-GCC 12.2, CPU 0 pinned), using Rust 1.96.1 ordinary release archives. Both
+GCC 12.2, CPU 0 pinned), using Rust 1.96.1 ordinary release archives. This earlier corpus had 76 cases and omitted the dense HTML seed. Both
 archives were rebuilt before linking identical harnesses with `-O3`; no agent
 build/test work overlapped either measurement. Four process runs in ABBA order
 give 18 observations per arm/case. The retained

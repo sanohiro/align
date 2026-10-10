@@ -34,6 +34,12 @@ and whole/per-unit/cache replay cover the boundary. Indexed ownership extraction
 specialized inner arrays, nested dynamic representations and the recorded
 conservative loop/aggregate-provenance refusals remain excluded.
 
+[Plan166](docs/impl/166-html-escape-length-count.md) reduces HTML output-length
+counting to bounded narrow sums with checked total sizing. Existing encoder and
+template bytes, allocation and publication remain unchanged. Linux x86_64 entry
+measurements improve the long HTML corpus by 22.5–34.6%; short/control costs
+and the rejected wide-counter experiment are retained without a portable claim.
+
 K1/plan61 and the separately parked general aggregate-provenance experiment
 remain deferred. Request126's borrowed-session loop refusal and Request28's
 indexed/view builder readers require their own provenance closure. Request78's
