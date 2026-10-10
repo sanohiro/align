@@ -31371,6 +31371,26 @@ struct StorageTypeContext<'a> {
 /// Fixed arrays keep their inline backing on replacement, so descend through their elements.
 /// Dynamic collections stop this walk: their allocation generation already owns their elements.
 fn has_inline_owned_storage(root: Ty, context: StorageTypeContext<'_>) -> bool {
+    has_inline_owned_leaf(root, context, |ty| matches!(ty, Ty::String | Ty::Buffer | Ty::Writer))
+}
+
+/// String values copy the payload pointer/length, whereas opaque handle values keep a stable
+/// handle across operations that change their contents. Only the former needs this value loan.
+fn has_inline_string_storage(root: Ty, context: StorageTypeContext<'_>) -> bool {
+    has_inline_owned_leaf(root, context, |ty| ty == Ty::String)
+}
+
+fn has_inline_owned_leaf(
+    root: Ty,
+    context: StorageTypeContext<'_>,
+    accepts: impl std::ops::Fn(Ty) -> bool,
+) -> bool {
+    // Terminal roots need neither a descendant worklist allocation nor a visited entry.
+    match expand_tagged_ty(root, context.tagged_types) {
+        Ty::Struct(_) | Ty::Tuple(_) | Ty::Enum(_) | Ty::Option(_) | Ty::Result(..)
+        | Ty::Array(..) | Ty::StructArray(..) => {}
+        leaf => return accepts(leaf),
+    }
     let mut work = vec![root];
     let mut seen = HashSet::new();
     while let Some(ty) = work.pop() {
@@ -31378,7 +31398,7 @@ fn has_inline_owned_storage(root: Ty, context: StorageTypeContext<'_>) -> bool {
             continue;
         }
         match expand_tagged_ty(ty, context.tagged_types) {
-            Ty::String | Ty::Buffer | Ty::Writer => return true,
+            leaf @ (Ty::String | Ty::Buffer | Ty::Writer) if accepts(leaf) => return true,
             Ty::Array(element, length) if length != 0 => work.push(scalar_to_ty(element)),
             Ty::StructArray(id, length) if length != 0 => work.push(Ty::Struct(id)),
             Ty::Struct(id) => {
@@ -34037,9 +34057,14 @@ impl BorrowState {
     }
 
     fn finish_value_source(&mut self, snapshot: usize) {
+        self.finish_value_observation(snapshot);
+        self.value_headers.remove(&snapshot);
+    }
+
+    /// Retire an already-completed read without erasing its producer/cleanup evidence.
+    fn finish_value_observation(&mut self, snapshot: usize) {
         self.value_sources.remove(&snapshot);
         self.invalid_value_sources.remove(&snapshot);
-        self.value_headers.remove(&snapshot);
         self.mutable_place_sources.remove(&snapshot);
         self.invalid_mutable_place_sources.remove(&snapshot);
     }
@@ -34816,10 +34841,10 @@ impl<'a> MoveCheck<'a> {
         if child_snapshots.is_empty() {
             return;
         }
-        // A completed result without borrowed state has already used its validated inputs. Their validity
-        // obligation does not survive as an operand of the next enclosing operation. Byte
-        // conversion similarly retains lifetime without retaining validation of the source text.
-        if !self.value_snapshot_needed(expression) || matches!(expression.kind, ExprKind::StrBytes { .. }) {
+        // Byte conversion retains lifetime without retaining validation of the source text.
+        // A completed independent value retires every input loan below, including an owned
+        // String header read only to compute a length or make an explicit copy.
+        if matches!(expression.kind, ExprKind::StrBytes { .. }) {
             for key in child_snapshots {
                 if let Some(roots) = self.borrows.value_sources.get_mut(key) {
                     roots.retain(|root| !root.is_byte_validation());
@@ -34844,6 +34869,12 @@ impl<'a> MoveCheck<'a> {
             &retained,
             BorrowEnd::Dropped,
         );
+        if !self.borrowed_value_snapshot_needed(expression) {
+            for key in child_snapshots {
+                self.borrows.finish_value_observation(*key);
+                self.walked_value_facts.remove(key);
+            }
+        }
     }
 
     fn clear_expression_value_snapshots(&mut self, expression: &Expr) {
@@ -38460,6 +38491,12 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn value_snapshot_needed(&self, e: &Expr) -> bool {
+        self.borrowed_value_snapshot_needed(e)
+            // A loaded String header must survive a later operand consuming its payload owner.
+            || has_inline_string_storage(e.ty, self.storage_type_context())
+    }
+
+    fn borrowed_value_snapshot_needed(&self, e: &Expr) -> bool {
         let storage_paths = storage_type_paths(e.ty, self.storage_type_context());
         matches!(e.kind, ExprKind::BorrowedIndex { .. })
             || self.borrow_mut_place_snapshots.contains(&Self::expr_key(e))
@@ -43604,6 +43641,23 @@ impl<'a> MoveCheck<'a> {
                     );
                     return;
                 }
+                ExprKind::TupleIndex { recv, index } if self.is_move_ty(expression.ty) => {
+                    if let ExprKind::Local(root) = recv.kind {
+                        if self.borrowed_param_mode(root).is_some()
+                            || self.borrowed_projection_owners.contains_key(&root)
+                        {
+                            self.diags.error("cannot move a field out of a borrowed tuple".to_string(), expression.span);
+                            return;
+                        }
+                        self.reject_live_resource_dependents(root, moved, expression.span);
+                        self.invalidate_mutable_place(root, &[*index]);
+                        if !self.completed_value_transfers_storage(expression) {
+                            self.invalidate_owner(root);
+                        }
+                        moved.insert(MovedKey::Field(root, *index));
+                    }
+                    return;
+                }
                 ExprKind::ElemField {
                     recv, index, path, ..
                 } if !path.is_empty() => {
@@ -45233,6 +45287,11 @@ impl<'a> MoveCheck<'a> {
                     ExprKind::Local(local) => { selected.insert(MovedKey::Whole(*local)); }
                     ExprKind::Field { root, path } if path.len() == 1 => {
                         selected.insert(MovedKey::Field(*root, path[0]));
+                    }
+                    ExprKind::TupleIndex { recv, index } => {
+                        if let ExprKind::Local(root) = recv.kind {
+                            selected.insert(MovedKey::Field(root, *index));
+                        }
                     }
                     ExprKind::ElemField { recv, index, path, .. } => {
                         if let ExprKind::Local(local) = recv.kind

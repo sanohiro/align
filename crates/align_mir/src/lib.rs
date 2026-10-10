@@ -14678,7 +14678,9 @@ fn store_array_elems(
         for owner in owners {
             b.set_drop_flag(owner, false);
         }
-        return array_drop_flag;
+        // A completed empty owner is the identity for enclosing aggregate cleanup. False would
+        // suppress destruction of unrelated owned siblings when their flags are combined.
+        return Some(array_drop_flag.unwrap_or(Operand::Const(Const::Bool(true))));
     }
 
     if matches!(elem, Ty::Struct(_)) {

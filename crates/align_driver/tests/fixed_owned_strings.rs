@@ -56,6 +56,11 @@ pub fn chosen(flag: bool) -> Batch<i64> = if flag { identity(make()) } else { ma
 const MAIN: &str = r#"module main
 import model
 WithSibling { batch: model.Batch<i64>, other: string }
+StringCell { text: string }
+ZeroFirst { empty: [string; 0], text: string }
+ZeroLast { text: string, empty: [string; 0] }
+ZeroRecords { empty: [StringCell; 0], text: string }
+ZeroRecordLast { text: string, empty: [StringCell; 0] }
 extern "C" fn align_rt_requested_live_reset()
 extern "C" fn align_rt_requested_live_bytes() -> i64
 extern "C" fn align_rt_alloc_count() -> i64
@@ -102,6 +107,34 @@ fn selected(flag: bool) -> i32 {
   text := "selected".clone()
   values := [if flag { text } else { text }]
   if values[0] != "selected" || live() != 8 { return 46 }
+  return 0
+}
+fn empty_siblings() -> i32 {
+  a: Option<ZeroFirst> := Some(ZeroFirst { empty: [], text: "x".clone() })
+  b: Result<ZeroLast, i64> := Ok(ZeroLast { text: "x".clone(), empty: [] })
+  c: Result<(), ZeroRecords> := Err(ZeroRecords { empty: [], text: "x".clone() })
+  d := ZeroRecordLast { text: "x".clone(), empty: [] }
+  if live() != 4 { return 70 }
+  return 0
+}
+fn tuple_inputs() -> i32 {
+  pair := ("alice".clone(), "bob".clone())
+  values := [pair.0, pair.1]
+  if values[0] != "alice" || values[1] != "bob" || live() != 8 { return 71 }
+  return 0
+}
+fn clone_input() -> i32 {
+  text := "owned".clone()
+  values := [text, text.clone()]
+  if values[0] != values[1] || live() != 10 { return 72 }
+  return 0
+}
+fn completed_copy_inputs() -> i32 {
+  text := "owned".clone()
+  values := [text.clone(), model.identity(text)]
+  length_text := "other".clone()
+  pair := (length_text.len(), model.identity(length_text))
+  if values[0] != values[1] || pair.0 != 5 || pair.1 != "other" || live() != 15 { return 76 }
   return 0
 }
 fn generic_and_views() -> i32 {
@@ -207,6 +240,14 @@ fn exercise() -> i32 {
   if status != 0 || live() != 0 { return 50 }
   status = selected(false)
   if status != 0 || live() != 0 { return 51 }
+  status = empty_siblings()
+  if status != 0 || live() != 0 { return 73 }
+  status = tuple_inputs()
+  if status != 0 || live() != 0 { return 74 }
+  status = clone_input()
+  if status != 0 || live() != 0 { return 75 }
+  status = completed_copy_inputs()
+  if status != 0 || live() != 0 { return 77 }
   status = generic_and_views()
   if status != 0 || live() != 0 { return 67 }
   status = replacement_controls()
@@ -270,7 +311,7 @@ fn main() -> i32 {
   if status != 0 { return status }
   allocated := unsafe { align_rt_alloc_count() } - allocations
   freed := unsafe { align_rt_free_count() } - frees
-  if allocated != 68 { return 30 }
+  if allocated != 79 { return 30 }
   if allocated != freed || live() != 0 { return 31 }
   return 0
 }
@@ -528,6 +569,50 @@ fn main() { value := Bad { marker: [0].to_array(), values: [[1].to_array(), [2].
                     "sum-duplicate",
                     r#"Choice { Both(string, string), Empty }
 fn main() { text := "owned".clone(); value := Choice.Both(text, text) }"#,
+                ),
+            ] {
+                cases.push((name, body.into()));
+            }
+            for (name, body) in [
+                (
+                    "tuple-field-duplicate",
+                    r#"fn main() { pair := ("owned".clone(), 0); values := [pair.0, pair.0] }"#,
+                ),
+                (
+                    "tuple-field-moved",
+                    r#"fn main() { pair := ("owned".clone(), 0); values := [pair.0]; print(pair.0) }"#,
+                ),
+                (
+                    "tuple-field-call-duplicate",
+                    r#"fn consume(a: string, b: string) {}
+fn main() { pair := ("owned".clone(), 0); consume(pair.0, pair.0) }"#,
+                ),
+                (
+                    "nested-call-consume",
+                    r#"fn identity(value: string) -> string = value
+fn main() { text := "owned".clone(); values := [text, identity(text)] }"#,
+                ),
+                (
+                    "nested-call-free",
+                    r#"fn discard(value: string) {}
+fn main() { text := "owned".clone(); values := [text, { discard(text); "new".clone() }] }"#,
+                ),
+                (
+                    "record-later-consume",
+                    r#"Pair { a: string, b: string }
+fn identity(value: string) -> string = value
+fn main() { text := "owned".clone(); value := Pair { a: text, b: identity(text) } }"#,
+                ),
+                (
+                    "nested-record-later-consume",
+                    r#"Pair { a: string, b: string }
+Outer { pair: Pair, last: string }
+fn identity(value: string) -> string = value
+fn main() { text := "owned".clone(); value := Outer { pair: Pair { a: text, b: "new".clone() }, last: identity(text) } }"#,
+                ),
+                (
+                    "later-replacement",
+                    r#"fn main() { mut text := "owned".clone(); values := [text, { text = "new".clone(); "last".clone() }] }"#,
                 ),
             ] {
                 cases.push((name, body.into()));
