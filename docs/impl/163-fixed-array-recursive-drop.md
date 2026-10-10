@@ -81,3 +81,14 @@ native lifecycle and source refusals; the exhaustive `pkg_kv_timeout_ownership`
 oracle covers every DropPlan variant. Existing Drop-emission, fixed-array-field,
 Move-array, field-replacement and Move-return targets retain the unchanged
 lowering paths. The producer boundary above is the explicit deferred cell.
+
+## Review correction
+
+The independent review found one array-storage sibling: `[(); N]` uses LLVM i32
+slots even though a tagged unit payload is omitted. Preserve that existing
+four-byte element storage in the semantic array walk. The parameterized
+semantic/LLVM parity owner now covers unit, boolean, character, text, function,
+all integer widths, both float widths and record arrays at lengths 0/1/4. A
+source unit-array record inside a sum executes in whole/per-unit/cache modes.
+The ordinary zero-sized tagged payload remains omitted. No ownership strategy
+or producer boundary changes follow from this correction.

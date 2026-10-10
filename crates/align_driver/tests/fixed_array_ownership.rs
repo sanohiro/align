@@ -14,6 +14,8 @@ pub Batch<T> { marker: T, values: [Item; 2] }
 pub Nested { batches: [Batch<i64>; 1] }
 pub Empty { values: [Item; 0] }
 pub Choice { Full(Batch<i64>), Empty(Empty) }
+pub UnitCells { marker: i64, units: [(); 4] }
+pub UnitChoice { Value(UnitCells) }
 pub fn make() -> Batch<i64> {
   return Batch { marker: 0, values: [Item { text: "alice".clone() }, Item { text: "bob".clone() }] }
 }
@@ -87,6 +89,8 @@ fn empty() {
   success: Result<model.Empty, i64> := Ok(model.Empty { values: [] })
   failure: Result<(), model.Empty> := Err(model.Empty { values: [] })
   choice := model.Choice.Empty(model.Empty { values: [] })
+  units := model.UnitChoice.Value(model.UnitCells { marker: 7, units: [(), (), (), ()] })
+  match units { Value(cells) => { print(cells.marker + cells.units.len()) } }
 }
 fn exercise() -> i32 {
   mut status := moved()
@@ -170,7 +174,7 @@ fn execute(stage: &Path, programs: &[align_mir::Program], label: &str) {
     let output = std::process::Command::new(executable).output().unwrap();
     assert!(output.status.success(), "{label}: {output:?}");
     assert!(
-        output.stdout.is_empty() && output.stderr.is_empty(),
+        output.stdout == b"11\n" && output.stderr.is_empty(),
         "{label}: {output:?}"
     );
 }

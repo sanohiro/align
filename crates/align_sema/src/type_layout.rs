@@ -85,7 +85,13 @@ impl<'a> TypeLayoutCache<'a> {
                     Ty::Unit => built.push((0, 1)),
                     Ty::Array(element, length) => {
                         work.push(Work::ExitArray(length));
-                        work.push(Work::Enter(scalar_to_ty(element)));
+                        // Unit payloads are omitted from unions, but fixed arrays use
+                        // scalar storage: LLVM's unit element is an i32 slot.
+                        if element == super::Scalar::Unit {
+                            built.push((4, 4));
+                        } else {
+                            work.push(Work::Enter(scalar_to_ty(element)));
+                        }
                     }
                     Ty::StructArray(id, length) => {
                         work.push(Work::ExitArray(length));
@@ -323,6 +329,10 @@ mod tests {
             assert_eq!(
                 layouts.layout(Ty::Array(i64, length)),
                 (8 * u64::from(length), 8)
+            );
+            assert_eq!(
+                layouts.layout(Ty::Array(Scalar::Unit, length)),
+                (4 * u64::from(length), 4)
             );
             assert_eq!(layouts.layout(Ty::Struct(1)), (16 * u64::from(length), 8));
             let expected = if length == 0 {
